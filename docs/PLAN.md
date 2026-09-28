@@ -134,7 +134,9 @@ Automated as an `assert_cmd` integration test using throwaway SSH keys generated
 - `module.registerHooks()` is release-candidate and needs Node 22.15+.
 - Vitest 5 experimental module modes are treated as non-attestable until studied.
 - Attestation refs grow; a `vci prune` for expired entries is a follow-up.
-- Spot-check re-runs, transparency logs and pytest adapter are later work; the `Adapter` trait and policy file leave room.
+- Spot-check re-runs and transparency logs are later work. The pytest adapter exists (`crates/vci-adapter/src/pytest.rs`,
+  collector in `py/pytest-plugin`, findings in `docs/spike-pytest.md`); `vci.toml` can hold several projects
+  (`[[projects]]`), e.g. a Vitest and a pytest project in one repository.
 
 ## Environment variables
 

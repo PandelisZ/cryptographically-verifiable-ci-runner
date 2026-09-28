@@ -17,14 +17,22 @@ conftest files, entry-point plugins and collection). It combines:
 
 Fail-open rules: anything we cannot classify is recorded; anything we cannot
 track at all becomes a ``taint`` record. Activity is ignored only when the
-Python stack consists solely of pytest/pluggy/stdlib/plugin frames (pytest's own
-bookkeeping); pytest's own *semantic* lookups (ini files, conftest.py and
-``__init__.py`` along the test path) are added explicitly at the end.
+Python stack of the *main thread* consists solely of pytest/pluggy/stdlib/plugin
+frames (pytest's own bookkeeping); activity on any other thread (thread pools,
+``asyncio.to_thread``) is always the test's. pytest's own *semantic* lookups (ini
+files, conftest.py and ``__init__.py`` along the test path) are added
+explicitly at the end.
+
+This module deliberately imports nothing that plain pytest would not have
+imported already (no ``hashlib``, no ``sysconfig``): a module the collector
+loaded would be found in ``sys.modules`` by the test's own ``import``, so the
+lookup a plain run makes (and that a shadowing ``src/hashlib.py`` would win)
+would never happen. Modules imported anyway are reported by ``__init__`` and
+their lookups added at the end.
 """
 
 from __future__ import annotations
 
-import hashlib
 import importlib.machinery
 import importlib.metadata
 import json
@@ -34,7 +42,6 @@ import re
 import site
 import stat as _stat
 import sys
-import sysconfig
 import threading
 import time
 import types
@@ -66,6 +73,10 @@ _o_env_copy = _Environ.copy
 _o_find_spec = importlib.machinery.FileFinder.find_spec
 
 _tls = threading.local()
+_MAIN_TID = threading.main_thread().ident
+
+# sqlite3 authorizer action code for ATTACH (sqlite3.SQLITE_ATTACH).
+_SQLITE_ATTACH = 24
 
 # Distributions whose frames count as "the tool" (pytest and its own deps).
 TOOL_TOPS = frozenset(
@@ -148,6 +159,8 @@ TAINT_EVENTS = frozenset(
         "smtplib.connect",
         "telnetlib.Telnet.open",
         "webbrowser.open",
+        # native code loaded into the process
+        "sqlite3.load_extension",
     }
 )
 # (event, index of the path argument(s), index of dir_fd or None)
@@ -235,6 +248,18 @@ def _busy() -> bool:
     return getattr(_tls, "busy", False)
 
 
+def _is_import_frame(f) -> bool:
+    """The import system itself (bytecode caches, pytest's assertion rewriter)."""
+    if f is None:
+        return False
+    fn = f.f_code.co_filename
+    return fn.startswith("<frozen importlib") or fn.replace(os.sep, "/").endswith("_pytest/assertion/rewrite.py")
+
+
+def _is_bytecode_cache(p: str) -> bool:
+    return p.endswith((".pyc", ".pyo")) or "__pycache__" in p.split(os.sep)
+
+
 class Collector:
     def __init__(self, out_dir: str):
         self.out_dir = os.path.abspath(out_dir)
@@ -250,6 +275,23 @@ class Collector:
         self.modules: dict = {}  # path -> via
         self.finder: set = set()  # (dir, tail, suffixes)
         self.symlink_reads: set = set()
+        # os.stat of an existing path (hashed like a read, but never an unowned env read)
+        self.statreads: set = set()
+        # realpath(): components that are real (non-symlink) directories or files,
+        # and components that did not exist
+        self.realpath_stats: set = set()
+        self.realpath_probes: set = set()
+        # sources of os.symlink(src, dst)
+        self.symlink_srcs: set = set()
+        # activity of the import system itself: (kind, path)
+        self.import_fs: set = set()
+        # file-backed sqlite3 databases the test connected to
+        self.sqlite_paths: set = set()
+        # modules imported because of this plugin (set by __init__)
+        self.own_modules: set = set()
+        # code objects of pytest functions whose callees act for the test
+        # (consuming parametrize argvalues/ids; set by __init__)
+        self.user_ctx_codes: frozenset = frozenset()
         self.self_dirs: list = []
         self.self_files: set = set()
         self.sys_path_seen: set = set()
@@ -286,15 +328,9 @@ class Collector:
     # ----- classification helpers -------------------------------------------------
 
     def _init_prefixes(self):
+        # The directory of os.py is the stdlib (lib-dynload lies inside it). sysconfig
+        # is not used: plain pytest does not import it (see the module docstring).
         stdlib = [os.path.dirname(os.__file__)]
-        for key in ("stdlib", "platstdlib"):
-            try:
-                p = sysconfig.get_paths().get(key)
-            except Exception:
-                p = None
-            # platstdlib can point into the venv; only keep it if it is not a prefix of site dirs
-            if p and key == "stdlib":
-                stdlib.append(p)
         self.stdlib = _prefixes(stdlib)
         sites = []
         try:
@@ -306,11 +342,6 @@ class Collector:
                 sites.append(site.getusersitepackages())
         except Exception:
             pass
-        for key in ("purelib", "platlib"):
-            try:
-                sites.append(sysconfig.get_paths()[key])
-            except Exception:
-                pass
         for e in sys.path:
             if e and os.path.basename(os.path.normpath(e)) in ("site-packages", "dist-packages"):
                 sites.append(e)
@@ -324,10 +355,6 @@ class Collector:
         self.base = _prefixes({sys.base_prefix, sys.base_exec_prefix, sys.prefix, sys.exec_prefix})
         # Console-script shims (.venv/bin/pytest) sit at the bottom of every stack.
         scripts = []
-        try:
-            scripts.append(sysconfig.get_path("scripts"))
-        except Exception:
-            pass
         for pre in {sys.prefix, sys.exec_prefix}:
             scripts.append(os.path.join(pre, "bin"))
             scripts.append(os.path.join(pre, "Scripts"))
@@ -369,15 +396,26 @@ class Collector:
         return False
 
     def stack(self):
-        """Return (first frame outside this plugin, any user frame on the stack)."""
+        """Return (first frame outside this plugin, any user frame on the stack).
+
+        Everything on a thread other than the main thread counts as the test's:
+        a worker thread's stack holds only stdlib frames (concurrent.futures,
+        pathlib) even when the test submitted the work. So does anything below
+        a frame of ``user_ctx_codes`` (pytest consuming lazy parametrize
+        argvalues/ids for the test)."""
         f = sys._getframe(1)
         first = None
+        if threading.get_ident() != _MAIN_TID:
+            while f is not None and f.f_code.co_filename.startswith(PKG_DIR):
+                f = f.f_back
+            return f, True
         user = False
+        ctx = self.user_ctx_codes
         while f is not None:
             fn = f.f_code.co_filename
             if first is None and not fn.startswith(PKG_DIR):
                 first = f
-            if not self.frame_is_tool(fn):
+            if f.f_code in ctx or not self.frame_is_tool(fn):
                 user = True
                 break
             f = f.f_back
@@ -412,8 +450,13 @@ class Collector:
 
     # ----- event sinks ------------------------------------------------------------
 
-    def fs(self, kind: str, abs_path):
+    def fs(self, kind: str, abs_path, first=None):
         if abs_path is None:
+            return
+        if _is_import_frame(first):
+            # The import system's own bytecode-cache traffic is dropped at the
+            # end; everything else it touches is recorded like any read.
+            self.import_fs.add((kind, abs_path))
             return
         getattr(self, kind + "s").add(abs_path)
 
@@ -443,9 +486,9 @@ class Collector:
             write = bool(fl & _WRITE_FLAGS)
             reads = (fl & (os.O_WRONLY | os.O_RDWR)) != os.O_WRONLY
         if write:
-            self.fs("write", abs_path)
+            self.fs("write", abs_path, first)
         if reads:
-            self.fs("read", abs_path)
+            self.fs("read", abs_path, first)
 
     def on_listdir(self, args):
         p = args[0] if args else "."
@@ -486,7 +529,15 @@ class Collector:
                     continue
             else:
                 abs_path = self.abspath(p, dir_fd if isinstance(dir_fd, int) else None)
-            self.fs("write", abs_path)
+            self.fs("write", abs_path, first)
+            if event == "os.symlink" and abs_path is not None:
+                # A link to a repository file (e.g. into tmp_path) makes the file
+                # readable under another name: record the target itself.
+                src = _to_str(args[0] if args else None)
+                if src is not None:
+                    if not os.path.isabs(src):
+                        src = os.path.join(os.path.dirname(abs_path), src)
+                    self.symlink_srcs.add(os.path.normpath(src))
 
     def on_two_path_write(self, event, args):
         # os.rename(src, dst, src_dir_fd, dst_dir_fd) / os.link(src, dst, src_dir_fd, dst_dir_fd)
@@ -498,10 +549,10 @@ class Collector:
         sfd = args[2] if len(args) > 2 else None
         dfd = args[3] if len(args) > 3 else None
         if event == "os.rename":
-            self.fs("write", self.abspath(src, sfd))
+            self.fs("write", self.abspath(src, sfd), first)
         else:
-            self.fs("read", self.abspath(src, sfd))
-        self.fs("write", self.abspath(dst, dfd))
+            self.fs("read", self.abspath(src, sfd), first)
+        self.fs("write", self.abspath(dst, dfd), first)
 
     def on_exec(self, args):
         code = args[0] if args else None
@@ -531,11 +582,23 @@ class Collector:
         if not user:
             return
         p = self.abspath(db)
+        # SQLite reads and writes the database, its -journal/-wal/-shm files and
+        # attached databases in C: a database inside the repository is tainted
+        # at the end (outside the repository or temp is fine).
+        self.sqlite_paths.add(p)
         try:
             _o_stat(p)
             self.fs("read", p)
         except OSError:
             self.fs("write", p)
+
+    def on_sqlite_handle(self, args):
+        """Every connection (``:memory:`` included) can ATTACH any file in C.
+        Connections made through ``sqlite3.connect`` get an authorizer that sees
+        the ATTACH (see ``_instrument_sqlite``); any other connection taints."""
+        con = args[0] if args else None
+        if con is None or _SQLITE_CONN is None or not isinstance(con, _SQLITE_CONN):
+            self.taint("sqlite3:connection-without-authorizer")
 
     def on_tempdir(self, args):
         p = self.abspath(args[0] if args else None)
@@ -557,12 +620,22 @@ class Collector:
             return
         abs_path = self.abspath(path, dir_fd)
         if first is not None and first.f_code.co_name in _REALPATH_FUNCS and "posixpath" in first.f_code.co_filename:
-            # realpath() lstat()s every component; only symlinks matter, and
-            # whatever the resolved path is used for is recorded separately.
-            if result is not None and _stat.S_ISLNK(result.st_mode):
+            # realpath() lstat()s every component. Its result depends on which
+            # components are symlinks (recorded with their targets), which are
+            # real directories/files (type observations) and where the path
+            # stops existing (probes). Only components inside the repository
+            # are kept at the end: the ancestors of the checkout differ anyway.
+            if missing:
+                self.realpath_probes.add(abs_path)
+            elif result is not None and _stat.S_ISLNK(result.st_mode):
                 self.symlink_reads.add(abs_path)
+            elif result is not None:
+                self.realpath_stats.add(abs_path)
             return
-        self.fs("probe" if missing else "read", abs_path)
+        if missing:
+            self.fs("probe", abs_path, first)
+        else:
+            self.fs("statread", abs_path, first)
 
     def on_find_spec(self, finder, fullname, spec):
         path = finder.path or _o_getcwd()
@@ -595,6 +668,52 @@ class Collector:
 
 
 _COLLECTOR: Collector | None = None
+_SQLITE_CONN = None  # sqlite3.Connection subclass that installs the ATTACH authorizer
+
+
+def _sqlite_authorizer(action, *_rest):
+    if action == _SQLITE_ATTACH:
+        c = _COLLECTOR
+        if c is not None and c.active:
+            c.taint("sqlite3:attach")
+    return 0  # SQLITE_OK: allow everything, the test sees no difference
+
+
+def _instrument_sqlite():
+    """Make ``sqlite3.connect`` build connections that carry an authorizer which
+    taints on ATTACH (SQLite opens attached files in C, unseen by audit hooks).
+
+    ``sqlite3.connect`` becomes ``functools.partial(connect, factory=...)`` (no
+    Python frame is added in front of the caller). A connection made any other
+    way (an explicit ``factory=``, ``sqlite3.Connection(...)``, a ``connect``
+    bound before this ran) has no authorizer and taints. A test that replaces
+    the authorizer with its own hides later ATTACHes (documented).
+
+    sqlite3 is imported here, before any test module: the lookups a plain run
+    would make for it are added at the end like for every module this plugin
+    imports."""
+    global _SQLITE_CONN
+    try:
+        import functools
+        import sqlite3
+        import sqlite3.dbapi2 as dbapi2
+    except Exception:
+        return
+    base = sqlite3.Connection
+
+    class Connection(base):
+        __slots__ = ()
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.set_authorizer(_sqlite_authorizer)
+
+    Connection.__module__ = base.__module__
+    Connection.__qualname__ = base.__qualname__
+    _SQLITE_CONN = Connection
+    wrapped = functools.partial(dbapi2.connect, factory=Connection)
+    sqlite3.connect = wrapped
+    dbapi2.connect = wrapped
 
 
 def _guarded(fn, *args):
@@ -620,6 +739,7 @@ _DISPATCH = {
     "import": "on_import",
     "ctypes.dlopen": "on_dlopen",
     "sqlite3.connect": "on_sqlite",
+    "sqlite3.connect/handle": "on_sqlite_handle",
     "tempfile.mkdtemp": "on_tempdir",
     "tempfile.mkstemp": "on_tempfile",
 }
@@ -750,6 +870,7 @@ def install(out_dir: str) -> Collector:
         return _COLLECTOR
     _COLLECTOR = Collector(out_dir)
     sys.addaudithook(_audit)
+    _instrument_sqlite()
     patches = {
         "stat": _stat_wrapper(_o_stat, False),
         "lstat": _stat_wrapper(_o_lstat, True),
@@ -801,15 +922,19 @@ def get() -> Collector | None:
 
 
 class _Classifier:
-    IGNORE, STDLIB, ENV, ROOT, OUTSIDE, PLUGIN = range(6)
+    IGNORE, STDLIB, ENV, ROOT, OUTSIDE, PLUGIN, CACHE = range(7)
+    _TEMP = 100  # internal: a temp path of this run (ignored unless it links elsewhere)
 
-    def __init__(self, c: Collector, root: str, extra_ignore):
+    def __init__(self, c: Collector, root: str, temp_dirs, cache_dirs):
         self.c = c
         self.root_raw = os.path.normpath(os.path.abspath(root))
         self.root = os.path.realpath(root)
         self.roots = _prefixes([root])
-        self.self_dirs = _prefixes(list(c.self_dirs) + list(extra_ignore))
+        self.self_dirs = _prefixes(list(c.self_dirs) + list(temp_dirs))
         self.self_files = set(c.self_files) | {os.path.realpath(p) for p in c.self_files}
+        self.cache_dirs = _prefixes(cache_dirs)
+        # vci runs pytest with PYTHONPYCACHEPREFIX=<fresh dir>: bytecode lives there
+        self.pycache = _prefixes([sys.pycache_prefix] if getattr(sys, "pycache_prefix", None) else [])
 
     def _raw(self, p: str) -> int:
         if p in ("/dev/null", os.devnull):
@@ -818,33 +943,81 @@ class _Classifier:
             return self.IGNORE
         if _under(p, self.c.plugin_entry) and not _under(p, self.roots):
             return self.PLUGIN
-        if _under(p, self.c.out):
+        if _under(p, self.c.out) or _under(p, self.pycache):
             return self.IGNORE
+        if _under(p, self.cache_dirs):
+            return self.CACHE
         if p in self.self_files or _under(p, self.self_dirs):
-            return self.IGNORE
+            return self._TEMP
         if _under(p, self.c.stdlib) and not _is_site_component(p):
             return self.STDLIB
         if _under(p, self.c.sites) or _under(p, self.c.venv):
             return self.ENV
         if _under(p, self.roots):
+            if ".pytest_cache" in self.rel(self.emit(p)).split(os.sep):
+                return self.CACHE
             return self.ROOT
         if _under(p, self.c.base):
             return self.ENV
         return self.OUTSIDE
 
+    def _follow(self, p: str):
+        """Resolve symlinks in `p` the way the OS would, but stop as soon as the
+        resolved prefix lies inside the root: the rest (including symlinks inside
+        the repository) is left to the manifest, which records every hop.
+        Returns None when the path cannot be resolved (loop)."""
+        parts = [x for x in p.split(os.sep) if x]
+        cur = os.sep
+        hops = 0
+        i = 0
+        while i < len(parts):
+            name = parts[i]
+            i += 1
+            if name == ".":
+                continue
+            if name == "..":
+                cur = os.path.dirname(cur)
+                continue
+            nxt = os.path.join(cur, name)
+            if _under(nxt, self.roots) and not _under(nxt, self.self_dirs):
+                return os.path.normpath(os.path.join(nxt, *parts[i:]))
+            try:
+                st = _o_lstat(nxt)
+            except OSError:
+                return os.path.normpath(os.path.join(nxt, *parts[i:]))
+            if _stat.S_ISLNK(st.st_mode):
+                hops += 1
+                if hops > 40:
+                    return None
+                try:
+                    t = _o_readlink(nxt)
+                except OSError:
+                    return None
+                if os.path.isabs(t):
+                    cur = os.sep
+                parts = [x for x in t.split(os.sep) if x] + parts[i:]
+                i = 0
+                continue
+            cur = nxt
+        return cur
+
     def classify(self, p: str):
         """Return (class, path to emit)."""
         k = self._raw(p)
-        if k == self.OUTSIDE:
+        if k in (self.OUTSIDE, self._TEMP):
+            # A temp path (tmp_path, mkdtemp) or an outside path may be a symlink
+            # into the repository: then it is the repository file that is used.
             try:
-                rp = os.path.realpath(p)
+                q = self._follow(p)
             except (OSError, ValueError):
-                rp = p
-            if rp != p:
-                k2 = self._raw(rp)
-                if k2 != self.OUTSIDE:
-                    return k2, (self.emit(rp) if k2 == self.ROOT else rp)
-            return k, p
+                q = None
+            if q is None:
+                return (self.OUTSIDE, p)
+            if q != p:
+                k2 = self._raw(q)
+                if k2 != self._TEMP:
+                    return k2, (self.emit(q) if k2 == self.ROOT else q)
+            return (self.IGNORE if k == self._TEMP else k), p
         if k == self.ROOT:
             return k, self.emit(p)
         return k, p
@@ -860,9 +1033,8 @@ class _Classifier:
     def rel(self, p: str) -> str:
         return os.path.relpath(p, self.root)
 
-    def noise_in_root(self, p: str) -> bool:
-        parts = self.rel(p).split(os.sep)
-        return "__pycache__" in parts or ".pytest_cache" in parts
+    def is_ancestor_of_root(self, p: str) -> bool:
+        return any(pre == p or pre.startswith(p.rstrip(os.sep) + os.sep) for pre in self.roots)
 
 
 def _exists(p: str):
@@ -885,13 +1057,19 @@ def _exists(p: str):
 
 
 class _DistIndex:
-    def __init__(self):
+    """Installed files -> (distribution, version), from the RECORD files, with the
+    RECORD hash to check that a file used by the test is the one installed."""
+
+    def __init__(self, dists=None):
+        self._dists = dists
         self._files = None
         self._pkgs = None
+        self._verified: dict = {}
 
     def _build(self):
         self._files = {}
-        for dist in importlib.metadata.distributions():
+        dists = self._dists if self._dists is not None else importlib.metadata.distributions()
+        for dist in dists:
             try:
                 name = dist.metadata["Name"]
                 ver = dist.version
@@ -905,15 +1083,45 @@ class _DistIndex:
                     p = os.path.normpath(os.path.abspath(str(dist.locate_file(f))))
                 except Exception:
                     continue
-                self._files.setdefault(p, (_norm_dist(name), ver))
+                h = getattr(f, "hash", None)
+                spec = (h.mode, h.value) if h is not None and getattr(h, "mode", None) else None
+                self._files.setdefault(p, (_norm_dist(name), ver, spec))
 
-    def lookup(self, p: str):
+    def _entry(self, p: str):
         if self._files is None:
             self._build()
         hit = self._files.get(p)
         if hit is None:
             hit = self._files.get(os.path.realpath(p))
         return hit
+
+    def lookup(self, p: str):
+        hit = self._entry(p)
+        return None if hit is None else hit[:2]
+
+    def modified(self, p: str) -> bool:
+        """True if `p` belongs to a distribution whose RECORD hash it no longer
+        matches (a hot-patched site-packages file keeps its version)."""
+        hit = self._entry(p)
+        if hit is None or hit[2] is None:
+            return False
+        if p in self._verified:
+            return self._verified[p]
+        mode, want = hit[2]
+        import base64
+        import hashlib  # imported only now: see the module docstring
+
+        try:
+            h = hashlib.new(mode)
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 16), b""):
+                    h.update(chunk)
+            got = base64.urlsafe_b64encode(h.digest()).rstrip(b"=").decode("ascii")
+            bad = got != want
+        except (OSError, ValueError):
+            bad = True
+        self._verified[p] = bad
+        return bad
 
     def lookup_module(self, modname: str):
         """Fallback via packages_distributions (only for dists without a RECORD)."""
@@ -969,22 +1177,23 @@ def _finalize(c: Collector, session, exitstatus) -> list:
 
     config = session.config
     root_path = str(config.rootpath)
-    extra_ignore = []
+    temp_dirs = []
     try:
         factory = getattr(config, "_tmp_path_factory", None)
         bt = getattr(factory, "_basetemp", None) if factory is not None else None
         if bt is not None:
-            extra_ignore.append(str(bt))
+            temp_dirs.append(str(bt))
     except Exception:
         pass
+    cache_dirs = []
     try:
         cache = getattr(config, "cache", None)
         cd = getattr(cache, "_cachedir", None)
         if cd is not None:
-            extra_ignore.append(str(cd))
+            cache_dirs.append(str(cd))
     except Exception:
         pass
-    cl = _Classifier(c, root_path, extra_ignore)
+    cl = _Classifier(c, root_path, temp_dirs, cache_dirs)
     root = cl.root
     dists = _DistIndex()
 
@@ -993,8 +1202,13 @@ def _finalize(c: Collector, session, exitstatus) -> list:
     reads: set = set()
     probes: set = set()
     readdirs: set = set()
+    stats: set = set()
     writes: set = set()
     outside_paths_taint = []
+
+    def noise(ep: str) -> bool:
+        """Import-system territory inside the root (bytecode caches)."""
+        return _is_bytecode_cache(cl.rel(ep))
 
     # --- module sources ---
     mod_sources = dict(c.modules)
@@ -1033,46 +1247,85 @@ def _finalize(c: Collector, session, exitstatus) -> list:
                 hit = dists.lookup_module(mn) if mn else None
             if hit is not None:
                 externals.add(hit)
+                if dists.modified(p):
+                    c.taint(f"external-file-modified:{hit[0]}:{p}")
             else:
                 top = os.path.basename(p).split(".", 1)[0]
                 if top in UNOWNED_ENV_MODULES:
                     continue
                 c.taint(f"unmapped-module:{p}")
+        elif k == cl.CACHE:
+            c.taint(f"pytest:cache-dir-access:module:{p}")
         else:
             modules.setdefault(ep, via)
             if k == cl.ROOT and p.endswith(ext_suffixes):
                 c.taint(f"native-extension-in-root:{cl.rel(ep)}")
 
     # --- fs observations ---
-    def put(kind, p, is_finder=False):
+    def put(kind, p, from_import=False):
         k, ep = cl.classify(p)
         if k in (cl.IGNORE, cl.STDLIB, cl.PLUGIN):
             return
+        if from_import and _is_bytecode_cache(p):
+            return  # the import system's bytecode cache (written/read for any import)
+        if k == cl.CACHE:
+            # pytest's cache is state outside the checkout (and `--lf` & co.)
+            c.taint(f"pytest:cache-dir-access:{kind}:{p}")
+            return
         if k == cl.ENV:
-            if kind == "read":
+            if kind in ("read", "statread"):
                 hit = dists.lookup(p)
                 if hit is not None:
                     externals.add(hit)
+                    if kind == "read" and dists.modified(p):
+                        c.taint(f"external-file-modified:{hit[0]}:{p}")
+                elif (
+                    kind == "read"
+                    and _exists(p) == "file"
+                    and not _is_bytecode_cache(p)
+                    and os.path.basename(p).split(".", 1)[0] not in UNOWNED_ENV_MODULES
+                ):
+                    # A file of the environment that belongs to no installed
+                    # distribution (pyvenv.cfg, a file dropped into site-packages):
+                    # nothing identifies its content.
+                    c.taint(f"unmapped-env-read:{p}")
             return
-        if k == cl.ROOT:
-            if cl.noise_in_root(ep):
-                return
-            if not is_finder and kind in ("read", "probe") and ep.endswith((".pyc", ".pyo")):
-                return
-        {"read": reads, "probe": probes, "readdir": readdirs, "write": writes}[kind].add(ep)
+        if kind == "statread":
+            kind = "read"
+        {"read": reads, "probe": probes, "readdir": readdirs, "write": writes, "stat": stats}[kind].add(ep)
 
     for p in c.writes:
         put("write", p)
     for p in c.reads:
         put("read", p)
+    for p in c.statreads:
+        put("statread", p)
     for p in c.probes:
         put("probe", p)
     for p in c.readdirs:
         put("readdir", p)
-    for p in c.symlink_reads:
+    for kind, p in c.import_fs:
+        put(kind, p, from_import=True)
+    # realpath(): only what lies inside the repository (its ancestors, and paths
+    # outside, differ between checkouts and are not inputs).
+    for src, kind in ((c.symlink_reads, "read"), (c.realpath_stats, "stat"), (c.realpath_probes, "probe")):
+        for p in src:
+            k, ep = cl.classify(p)
+            if k == cl.ROOT and ep != root:  # the checkout root is a directory by definition
+                {"read": reads, "stat": stats, "probe": probes}[kind].add(ep)
+    # os.symlink(src, dst): the link target inside the repository is readable
+    # through the link.
+    for p in c.symlink_srcs:
         k, ep = cl.classify(p)
-        if k == cl.ROOT and not cl.noise_in_root(ep):
-            reads.add(ep)
+        if k == cl.ROOT:
+            (probes if _exists(ep) is None else reads).add(ep)
+    # sqlite3 works on the database file, its -journal/-wal/-shm companions and
+    # attached files in C: none of that is visible, so a database inside the
+    # repository is not attestable.
+    for p in sorted(c.sqlite_paths):
+        k, ep = cl.classify(p)
+        if k == cl.ROOT:
+            c.taint(f"sqlite3:database-in-repository:{cl.rel(ep)}")
 
     # Start-up imports (before the plugin was loaded) could be shadowed by a module
     # created in a root directory that was already on sys.path then (e.g. the cwd
@@ -1086,7 +1339,7 @@ def _finalize(c: Collector, session, exitstatus) -> list:
         + importlib.machinery.BYTECODE_SUFFIXES
     )
     late = set()
-    if not _plugins_before_us(config):
+    if not _plugins_before_us(config, include_builtin=True):
         try:
             for pth in config.getini("pythonpath") or []:
                 late.add(os.path.normpath(str(pth)))
@@ -1109,9 +1362,25 @@ def _finalize(c: Collector, session, exitstatus) -> list:
                     c.finder.add((e, top, all_suffixes))
 
     # Import lookups: every candidate the FileFinder could have used.
+    # Modules this plugin imported (plain pytest would not have): the test's own
+    # import of such a module found it in sys.modules, so the lookup a plain run
+    # makes through every sys.path entry is added here.
+    seen_entries = []
+    for e in list(c.sys_path_seen) + list(sys.path):
+        if isinstance(e, str):
+            pe = os.path.normpath(os.path.join(_o_getcwd(), e))
+            if pe not in seen_entries and cl.classify(pe)[0] == cl.ROOT:
+                seen_entries.append(pe)
+    for name in sorted(c.own_modules):
+        top = name.split(".", 1)[0]
+        if top in sys.builtin_module_names or top == "vci_pytest":
+            continue
+        for e in seen_entries:
+            c.finder.add((e, top, all_suffixes))
+
     for d, tail, suffixes in c.finder:
         k, ed = cl.classify(d)
-        if k != cl.ROOT or cl.noise_in_root(ed):
+        if k != cl.ROOT or noise(ed):
             if k == cl.OUTSIDE:
                 outside_paths_taint.append(d)
             continue
@@ -1139,7 +1408,7 @@ def _finalize(c: Collector, session, exitstatus) -> list:
         p = os.path.normpath(os.path.join(cwd, e)) if not os.path.isabs(e or ".") else os.path.normpath(e)
         k, ep = cl.classify(p)
         if k == cl.ROOT:
-            if cl.noise_in_root(ep):
+            if noise(ep):
                 continue
             st = _exists(ep)
             if st is None:
@@ -1205,9 +1474,21 @@ def _finalize(c: Collector, session, exitstatus) -> list:
         if _exists(p) is None:
             readdirs.discard(p)
             probes.add(p)
+    for p in list(stats):
+        if _exists(p) is None:
+            stats.discard(p)
+            probes.add(p)
+        elif p in reads or p in readdirs:
+            stats.discard(p)  # a read or listing already covers the type
 
     # --- configuration taints ---
     _config_taints(c, config)
+    early = _plugins_before_us(config)
+    if early:
+        # pytest imports `-p` plugins from addopts/PYTEST_ADDOPTS before the
+        # command line's `-p vci_pytest`: what they read or imported then was
+        # never seen.
+        c.taint("pytest:plugin-imported-before-collector:" + ",".join(early))
 
     # --- env ---
     env = set(c.env)
@@ -1251,6 +1532,8 @@ def _finalize(c: Collector, session, exitstatus) -> list:
         common.append({"kind": "probe", "path": p})
     for p in sorted(readdirs):
         common.append({"kind": "readdir", "path": p})
+    for p in sorted(stats):
+        common.append({"kind": "stat", "path": p})
     for p in sorted(writes):
         common.append({"kind": "write", "path": p})
     for k in sorted(env):
@@ -1283,6 +1566,8 @@ def _finalize(c: Collector, session, exitstatus) -> list:
             "collector": COLLECTOR,
         }
         lines = [meta] + common + [{"kind": "taint", "reason": r} for r in c.taints] + [result]
+        import hashlib  # only now, after the tests ran (see the module docstring)
+
         name = hashlib.sha256(test_id.encode("utf-8")).hexdigest() + ".jsonl"
         dest = os.path.join(c.out_dir, name)
         tmp = dest + f".tmp{os.getpid()}"
@@ -1294,8 +1579,14 @@ def _finalize(c: Collector, session, exitstatus) -> list:
     return written
 
 
-def _plugins_before_us(config) -> bool:
-    """True if a `-p` plugin (other than blocks and vci_pytest) may have been imported before us."""
+def _plugins_before_us(config, include_builtin: bool = False) -> list:
+    """Names of `-p` plugins (other than blocks, vci_pytest and, unless
+    `include_builtin`, pytest's own built-in plugins) that may have been
+    imported before us."""
+    try:
+        from _pytest.config import builtin_plugins
+    except Exception:
+        builtin_plugins = set()
     try:
         args = list(config.getini("addopts") or [])
     except Exception:
@@ -1304,12 +1595,13 @@ def _plugins_before_us(config) -> bool:
     try:
         inv = list(config.invocation_params.args)
     except Exception:
-        return True
+        return ["<unknown invocation>"]
     try:
         inv = inv[: inv.index("vci_pytest") + 1] if "vci_pytest" in inv else inv
     except ValueError:
         pass
     args += inv
+    out = []
     for i, a in enumerate(args):
         a = str(a)
         name = None
@@ -1317,9 +1609,14 @@ def _plugins_before_us(config) -> bool:
             name = str(args[i + 1])
         elif a.startswith("-p") and len(a) > 2:
             name = a[2:]
-        if name and not name.startswith("no:") and name != "vci_pytest":
-            return True
-    return False
+        if (
+            name
+            and not name.startswith("no:")
+            and name != "vci_pytest"
+            and (include_builtin or name not in builtin_plugins)
+        ):
+            out.append(name)
+    return out
 
 
 def _has_pytest_table(path: str) -> bool:

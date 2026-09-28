@@ -1,7 +1,13 @@
-//! Parser for the `@vci/vitest` JSONL collector output.
+//! Parser for the collector JSONL output (`@vci/vitest` and `vci_pytest`).
 //!
 //! Anything unexpected (unknown record kinds, missing meta or result, bad
 //! JSON) is turned into a taint so the file is never attested.
+//!
+//! pytest-specific records: `meta` carries `adapter`, `python`,
+//! `implementation`, `pytest`, `platform`, `arch`; `write` records name
+//! paths the test wrote, deleted, renamed or created (the CLI refuses to
+//! attest a file that wrote inside the repository); an `env` record with key
+//! `*` means the whole environment was enumerated, which is a taint.
 
 use std::collections::BTreeSet;
 
@@ -21,9 +27,21 @@ pub struct Observed {
     /// Runner root reported by the collector (absolute).
     pub root: String,
     pub node: String,
+    /// Vitest version, or the pytest version for the pytest collector.
     pub runner_version: String,
     pub bundler_version: String,
     pub collector: String,
+    /// `meta.adapter`; `"vitest"` when absent (the Vitest collector does
+    /// not emit it).
+    pub adapter: String,
+    /// pytest collector: full Python version and implementation name.
+    pub python: String,
+    pub implementation: String,
+    /// pytest collector: `sys.platform` and `platform.machine()`.
+    pub platform: String,
+    pub arch: String,
+    /// Paths written, deleted, renamed or created by the test (absolute).
+    pub writes: BTreeSet<Utf8PathBuf>,
     /// Module files in the graph (absolute paths).
     pub modules: BTreeSet<Utf8PathBuf>,
     /// Successful reads/stats of files or directories.
@@ -32,6 +50,10 @@ pub struct Observed {
     pub probes: BTreeSet<Utf8PathBuf>,
     /// Directory listings.
     pub readdirs: BTreeSet<Utf8PathBuf>,
+    /// Paths whose type (not contents) was observed (pytest: `realpath()`
+    /// walking through a component): a directory is recorded as a directory,
+    /// a file like a read.
+    pub stats: BTreeSet<Utf8PathBuf>,
     /// External packages as (name, version).
     pub externals: BTreeSet<(String, String)>,
     /// Env var keys read.
@@ -85,9 +107,23 @@ pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
                 o.project = str_field(&v, "project").unwrap_or_default();
                 o.root = str_field(&v, "root").unwrap_or_default();
                 o.node = str_field(&v, "node").unwrap_or_default();
-                o.runner_version = str_field(&v, "vitest").unwrap_or_default();
+                o.adapter = str_field(&v, "adapter").unwrap_or_else(|| "vitest".into());
+                o.runner_version = if o.adapter == "pytest" {
+                    str_field(&v, "pytest").unwrap_or_default()
+                } else {
+                    str_field(&v, "vitest").unwrap_or_default()
+                };
                 o.bundler_version = str_field(&v, "vite").unwrap_or_default();
                 o.collector = str_field(&v, "collector").unwrap_or_default();
+                o.python = str_field(&v, "python").unwrap_or_default();
+                o.implementation = str_field(&v, "implementation").unwrap_or_default();
+                o.platform = str_field(&v, "platform").unwrap_or_default();
+                o.arch = str_field(&v, "arch").unwrap_or_default();
+            }
+            "write" => {
+                if let Some(p) = path_of(&mut o) {
+                    o.writes.insert(p);
+                }
             }
             "module" => {
                 if let Some(p) = path_of(&mut o) {
@@ -109,6 +145,11 @@ pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
                     o.readdirs.insert(p);
                 }
             }
+            "stat" => {
+                if let Some(p) = path_of(&mut o) {
+                    o.stats.insert(p);
+                }
+            }
             "external" => match (str_field(&v, "name"), str_field(&v, "version")) {
                 (Some(n), Some(ver)) if !n.is_empty() && !ver.is_empty() => {
                     o.externals.insert((n, ver));
@@ -116,6 +157,12 @@ pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
                 _ => o.taints.push(format!("vci:bad-external:{line}")),
             },
             "env" => match str_field(&v, "key") {
+                // The environment was enumerated (dict(os.environ), iteration,
+                // len, repr): every variable is an input, which cannot be
+                // hashed meaningfully.
+                Some(k) if k == "*" => o
+                    .taints
+                    .push("env:enumerated (the test read the whole environment)".into()),
                 Some(k) if !k.is_empty() => {
                     o.env_keys.insert(k);
                 }
@@ -232,6 +279,54 @@ mod tests {
         assert!(t.contains("bad-jsonl-line"), "{t}");
         assert!(t.contains("bad-path"), "{t}");
         assert!(t.contains("missing-result"), "{t}");
+    }
+
+    #[test]
+    fn parses_pytest_records() {
+        let (_t, d) = tmp();
+        let body = r#"{"v":1,"kind":"meta","testId":"tests/test_b.py","adapter":"pytest","python":"3.14.7","implementation":"cpython","pytest":"9.1.1","root":"/R","platform":"darwin","arch":"arm64","collector":"vci_pytest@0.1.0"}
+{"kind":"module","path":"/R/src/b.py","via":"finder"}
+{"kind":"module","path":"/R/tests/conftest.py","via":"conftest"}
+{"kind":"external","name":"pytest","version":"9.1.1"}
+{"kind":"read","path":"/R/fixtures/b.json"}
+{"kind":"probe","path":"/R/tests/b/__init__.py"}
+{"kind":"write","path":"/R/out.txt"}
+{"kind":"stat","path":"/R/fixtures"}
+{"kind":"env","key":"PYTEST_ADDOPTS"}
+{"kind":"result","state":"passed","tests":1,"failed":0,"skipped":0,"durationMs":65,"deselected":0,"exitStatus":0}
+"#;
+        let p = write(&d, "tests/test_b.py", body);
+        let o = parse_jsonl_file(&p).unwrap();
+        assert!(o.taints.is_empty(), "{:?}", o.taints);
+        assert_eq!(o.adapter, "pytest");
+        assert_eq!(o.runner_version, "9.1.1");
+        assert_eq!(o.python, "3.14.7");
+        assert_eq!(o.implementation, "cpython");
+        assert!(o.node.is_empty() && o.bundler_version.is_empty());
+        assert!(o.writes.contains(Utf8Path::new("/R/out.txt")));
+        assert!(o.modules.contains(Utf8Path::new("/R/tests/conftest.py")));
+        assert!(o.env_keys.contains("PYTEST_ADDOPTS"));
+        assert!(o.stats.contains(Utf8Path::new("/R/fixtures")));
+        assert!(o.result.unwrap().is_pass());
+    }
+
+    #[test]
+    fn enumerated_env_is_a_taint_and_vitest_meta_defaults_adapter() {
+        let (_t, d) = tmp();
+        let p = write(
+            &d,
+            "tests/test_e.py",
+            "{\"v\":1,\"kind\":\"meta\",\"testId\":\"tests/test_e.py\",\"adapter\":\"pytest\"}\n{\"kind\":\"env\",\"key\":\"*\"}\n{\"kind\":\"result\",\"state\":\"passed\",\"failed\":0}\n",
+        );
+        let o = parse_jsonl_file(&p).unwrap();
+        assert!(o.taints.iter().any(|t| t.starts_with("env:enumerated")));
+        assert!(!o.env_keys.contains("*"));
+        let p = write(
+            &d,
+            "x.test.ts",
+            "{\"v\":1,\"kind\":\"meta\",\"testId\":\"x.test.ts\"}\n{\"kind\":\"result\",\"state\":\"passed\",\"failed\":0}\n",
+        );
+        assert_eq!(parse_jsonl_file(&p).unwrap().adapter, "vitest");
     }
 
     #[test]

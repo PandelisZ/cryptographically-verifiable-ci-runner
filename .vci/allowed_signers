@@ -1,0 +1,2 @@
+# principal namespaces="vci-attest" key-type base64-key
+vci-demo-agent namespaces="vci-attest" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGh4O5kDDvyUt21whHxsScVnXHNQAN8VLFEF021pHiJm

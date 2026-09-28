@@ -193,14 +193,15 @@ Differences from the Vitest record in `docs/CONTRACTS.md`:
 
 - `meta` has `adapter`, `python`, `implementation`, `pytest`, `platform`, `arch`, `collector` instead of
   `project`, `vitest`, `vite`, `node`. `root` is the realpath of pytest's rootdir; all root paths use that prefix.
-- New kind `{"kind":"write","path":...}` for writes/deletes/renames/mkdir inside the root. **The current Rust parser
-  (`crates/vci-adapter/src/jsonl.rs`) does not know it and turns it into `vci:unknown-record-kind:write`, i.e. a
-  taint**, which is the intended effect until it is handled explicitly.
+- New kind `{"kind":"write","path":...}` for writes/deletes/renames/mkdir inside the root. The Rust parser
+  (`crates/vci-adapter/src/jsonl.rs`) now reads it into `Observed::writes`, and `vci run` refuses to attest a file
+  with a write inside the repository ("wrote inside the repository: <path>"). Unknown kinds remain taints.
 - `module.via` values: `finder`, `exec`, `sys.modules`, `pytest-plugin`, `test-file`, `conftest`.
 - `result` has extra `deselected` and `exitStatus`. `state` is `passed` only if exit status is 0, nothing failed
   or errored (collection errors count as failed) and at least one test passed; zero tests or all-skipped is `failed`.
 - `external.name` is the PEP 503 normalised distribution name (as in `uv.lock`).
-- `env` key `*` means the environment was enumerated (`dict(os.environ)`, `.copy()`, iteration, `len`, `repr`).
+- `env` key `*` means the environment was enumerated (`dict(os.environ)`, `.copy()`, iteration, `len`, `repr`); the
+  Rust parser turns it into the taint `env:enumerated`.
 
 ## Results
 

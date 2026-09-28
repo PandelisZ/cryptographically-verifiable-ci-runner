@@ -9,7 +9,10 @@ use vci_core::hash::blake3_hex;
 use crate::config::{EnvConfig, EnvMode};
 use crate::util::{glob_match, name_match};
 
-/// Always visible to tests, never hashed.
+/// Always visible to tests, hashed only when a test is seen reading one
+/// (except [`NEVER_HASHED`]). These differ between a laptop and a CI runner by
+/// definition (`CI`, `HOME`, `USER`, `TMPDIR`, `LANG`, ...), so a test that
+/// reads one is only skipped where the value is the same.
 pub const BUILTIN_PASS_THROUGH: &[&str] = &[
     "PATH",
     "HOME",
@@ -35,6 +38,13 @@ pub const BUILTIN_PASS_THROUGH: &[&str] = &[
     "APPDATA",
     "LOCALAPPDATA",
 ];
+
+/// Built-in pass-through variables that stay unhashed even when read: vci's
+/// own plumbing (`VCI_*`; `PYTHONPATH`, which vci sets to its collector for
+/// pytest and `vci run` refuses to attest a read of), Vitest's per-worker
+/// variables, and `NODE_OPTIONS` (vci sets it for Vitest and hashes the
+/// user's value globally).
+pub const NEVER_HASHED: &[&str] = &["VCI_*", "VITEST*", "NODE_OPTIONS", "PYTHONPATH"];
 
 /// Hashed in loose mode even when no read of it is observed (see
 /// [`FileEnv::required_keys`]).
@@ -65,6 +75,10 @@ pub struct FileEnv {
     pub declared: Vec<String>,
     pub pass_through: Vec<String>,
     pub inferred: Vec<String>,
+    /// Adapter-specific built-in pass-through (`Adapter::builtin_pass_through`),
+    /// on top of [`BUILTIN_PASS_THROUGH`]. Fixed by the adapter, so not part
+    /// of the digest (the adapter name is checked separately).
+    pub builtin: Vec<String>,
 }
 
 impl FileEnv {
@@ -86,7 +100,14 @@ impl FileEnv {
             declared,
             pass_through: pass,
             inferred: inferred.iter().map(|s| s.to_string()).collect(),
+            builtin: vec![],
         }
+    }
+
+    /// Add an adapter's built-in pass-through patterns.
+    pub fn with_builtin(mut self, builtin: &[&str]) -> Self {
+        self.builtin = builtin.iter().map(|s| s.to_string()).collect();
+        self
     }
 
     /// BLAKE3 over the mode and the sorted effective pattern lists.
@@ -111,19 +132,30 @@ impl FileEnv {
         blake3_hex(s.as_bytes())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_pass_through(&self, key: &str) -> bool {
         list_matches(&self.pass_through, key)
             || BUILTIN_PASS_THROUGH.iter().any(|p| name_match(p, key))
+            || self.builtin.iter().any(|p| name_match(p, key))
+    }
+
+    /// An observed read of `key` is hashed unless it is configured
+    /// pass-through (the user's decision) or in [`NEVER_HASHED`]. Built-in
+    /// pass-through variables that are read are hashed: they are visible to
+    /// tests so that tooling works, not because their values do not matter.
+    pub fn hashed_when_read(&self, key: &str) -> bool {
+        !list_matches(&self.pass_through, key) && !NEVER_HASHED.iter().any(|p| name_match(p, key))
     }
 
     /// Keys that must be hashed regardless of observation: declared patterns
     /// expanded against `child`, exact declared names even if unset, and
-    /// adapter-inferred variables present in `child`.
+    /// adapter-inferred variables present in `child` (inferred patterns may
+    /// exclude with `!pat`).
     pub fn required_keys(&self, child: &ChildEnvMap) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for k in child.keys() {
             if list_matches(&self.declared, k)
-                || (self.inferred.iter().any(|p| name_match(p, k))
+                || (list_matches(&self.inferred, k)
                     && !self
                         .declared
                         .iter()
@@ -150,12 +182,12 @@ impl FileEnv {
         out
     }
 
-    /// The full hashed key set: required keys plus observed reads that are
-    /// not pass-through.
+    /// The full hashed key set: required keys plus observed reads (see
+    /// [`Self::hashed_when_read`]).
     pub fn hashed_keys(&self, child: &ChildEnvMap, observed: &BTreeSet<String>) -> Vec<String> {
         let mut keys = self.required_keys(child);
         for k in observed {
-            if !self.is_pass_through(k) {
+            if self.hashed_when_read(k) {
                 keys.insert(k.clone());
             }
         }
@@ -212,9 +244,21 @@ impl ChildEnvMap {
 /// Build the environment the test process will see. In strict mode only
 /// built-in and configured pass-through, declared (for any file) and
 /// adapter-inferred variables are kept. In loose mode everything is kept.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_child_env(
     cfg: &EnvConfig,
     inferred: &[&str],
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> ChildEnvMap {
+    build_child_env_with(cfg, inferred, &[], parent)
+}
+
+/// [`build_child_env`] with an adapter's built-in pass-through patterns
+/// (`Adapter::builtin_pass_through`) also kept in strict mode.
+pub fn build_child_env_with(
+    cfg: &EnvConfig,
+    inferred: &[&str],
+    builtin: &[&str],
     parent: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> ChildEnvMap {
     let mut declared_any = cfg.global.clone();
@@ -232,6 +276,7 @@ pub fn build_child_env(
             EnvMode::Loose => true,
             EnvMode::Strict => {
                 BUILTIN_PASS_THROUGH.iter().any(|p| name_match(p, ks))
+                    || builtin.iter().any(|p| name_match(p, ks))
                     || list_matches(&pass_any, ks)
                     || list_matches(&declared_any, ks)
                     || inferred.iter().any(|p| name_match(p, ks))
@@ -322,7 +367,11 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let keys = f.hashed_keys(&child, &observed);
-        assert_eq!(keys, ["CI_REF", "NODE_ENV", "TZ", "UNDECLARED", "VITE_API"]);
+        // HOME is built-in pass-through: visible, and hashed because it was read.
+        assert_eq!(
+            keys,
+            ["CI_REF", "HOME", "NODE_ENV", "TZ", "UNDECLARED", "VITE_API"]
+        );
         let db = FileEnv::for_file(&cf, &["VITE_*"], "src/db/x.test.ts");
         assert!(
             db.hashed_keys(&child, &BTreeSet::new())
@@ -348,6 +397,130 @@ mod tests {
             f.hashed_keys(&with, &BTreeSet::new())
                 .contains(&"TZ".to_string())
         );
+    }
+
+    /// pytest: uv's variables reach the child in strict mode and are never
+    /// hashed; PYTEST_*/PYTHON* (reported as read by the collector) are
+    /// hashed, and removed from the child unless declared.
+    #[test]
+    fn pytest_builtin_pass_through() {
+        let c = cfg(EnvMode::Strict);
+        let builtin = vci_adapter::PYTEST_PASS_THROUGH;
+        let mut p = parent();
+        for (k, v) in [
+            ("UV_CACHE_DIR", "/c"),
+            ("VIRTUAL_ENV", "/v"),
+            ("PYTEST_ADDOPTS", "-x"),
+            ("PYTHONHASHSEED", "1"),
+            ("PYTHONPATH", "/p"),
+        ] {
+            p.push((k.into(), v.into()));
+        }
+        let child = build_child_env_with(&c, &[], builtin, p.clone());
+        assert!(child.get("UV_CACHE_DIR").is_some());
+        assert!(child.get("VIRTUAL_ENV").is_some());
+        assert!(child.get("PYTEST_ADDOPTS").is_none());
+        assert!(child.get("PYTHONHASHSEED").is_none());
+        // Without the adapter list, strict mode drops uv's variables.
+        assert!(build_child_env(&c, &[], p).get("UV_CACHE_DIR").is_none());
+        let f = FileEnv::for_file(&c, &[], "tests/test_a.py").with_builtin(builtin);
+        let observed: BTreeSet<String> = [
+            "PYTEST_ADDOPTS",
+            "PYTHONHASHSEED",
+            "UV_CACHE_DIR",
+            "PYTHONPATH",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let keys = f.hashed_keys(&child, &observed);
+        assert!(keys.contains(&"PYTEST_ADDOPTS".to_string()));
+        assert!(keys.contains(&"PYTHONHASHSEED".to_string()));
+        // Read by the test: hashed (built-in pass-through is not a promise
+        // that the value does not matter).
+        assert!(keys.contains(&"UV_CACHE_DIR".to_string()));
+        assert!(!keys.contains(&"PYTHONPATH".to_string()));
+        assert_eq!(
+            f.digest(),
+            FileEnv::for_file(&c, &[], "tests/test_a.py").digest()
+        );
+    }
+
+    /// Regression (loose mode): the interpreter reads PYTHON* variables in C
+    /// (`PYTHON_CPU_COUNT`, `PYTHONBREAKPOINT`, `PYTHON_GIL`, ...) where the
+    /// collector cannot see it; every one present must be hashed, and one
+    /// present in CI but not at attestation time must be required.
+    #[test]
+    fn loose_mode_hashes_every_python_and_pytest_variable() {
+        let mut c = cfg(EnvMode::Loose);
+        c.global.clear();
+        let hashed = vci_adapter::PYTEST_HASHED_ENV;
+        let mut p = parent();
+        for (k, v) in [
+            ("PYTHON_CPU_COUNT", "1"),
+            ("PYTEST_XDIST_AUTO_NUM_WORKERS", "2"),
+            ("PYTHONPATH", "/p"),
+        ] {
+            p.push((k.into(), v.into()));
+        }
+        let child = build_child_env_with(&c, &[], vci_adapter::PYTEST_PASS_THROUGH, p);
+        let f = FileEnv::for_file(&c, hashed, "tests/test_cpu.py")
+            .with_builtin(vci_adapter::PYTEST_PASS_THROUGH);
+        let req = f.required_keys(&child);
+        assert!(req.contains("PYTHON_CPU_COUNT"), "{req:?}");
+        assert!(req.contains("PYTEST_XDIST_AUTO_NUM_WORKERS"), "{req:?}");
+        assert!(!req.contains("PYTHONPATH"), "vci sets PYTHONPATH itself");
+        // Strict mode: not kept in the child (so hashed as unset on both sides).
+        let strict = cfg(EnvMode::Strict);
+        let mut p = parent();
+        p.push(("PYTHON_CPU_COUNT".into(), "1".into()));
+        let child = build_child_env_with(&strict, &[], vci_adapter::PYTEST_PASS_THROUGH, p);
+        assert!(child.get("PYTHON_CPU_COUNT").is_none());
+    }
+
+    /// Regression: built-in pass-through variables (CI, HOME, USER, TMPDIR,
+    /// LANG, ...) read by a test were never hashed, so a test asserting on
+    /// `os.environ.get("CI")` attested on a laptop was skipped in CI where it
+    /// fails. A read of one is hashed; configured pass-through stays unhashed.
+    #[test]
+    fn reads_of_builtin_pass_through_variables_are_hashed() {
+        let c = cfg(EnvMode::Strict);
+        let mut p = parent();
+        p.push(("CI".into(), "true".into()));
+        p.push(("HOME".into(), "/home/runner".into()));
+        p.push(("VCI_OUT".into(), "/tmp/x".into()));
+        p.push(("UV_CACHE_DIR".into(), "/c".into()));
+        let child = build_child_env_with(&c, &[], vci_adapter::PYTEST_PASS_THROUGH, p);
+        let f = FileEnv::for_file(&c, &[], "tests/test_ci.py")
+            .with_builtin(vci_adapter::PYTEST_PASS_THROUGH);
+        let observed: BTreeSet<String> = [
+            "CI",
+            "HOME",
+            "LANG",
+            "UV_CACHE_DIR",
+            "GITHUB_TOKEN",
+            "VCI_OUT",
+            "VITEST_POOL_ID",
+            "NODE_OPTIONS",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let keys = f.hashed_keys(&child, &observed);
+        for k in ["CI", "HOME", "LANG", "UV_CACHE_DIR"] {
+            assert!(
+                keys.contains(&k.to_string()),
+                "{k} must be hashed: {keys:?}"
+            );
+        }
+        // Configured pass-through (a user decision) and vci's/Vitest's own
+        // plumbing are never hashed.
+        for k in ["GITHUB_TOKEN", "VCI_OUT", "VITEST_POOL_ID", "NODE_OPTIONS"] {
+            assert!(
+                !keys.contains(&k.to_string()),
+                "{k} must not be hashed: {keys:?}"
+            );
+        }
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub struct VitestAdapter {
     js_plugin: Option<Utf8PathBuf>,
 }
 
-fn walk_up_find(start: &Utf8Path, rel: &str) -> Option<Utf8PathBuf> {
+pub(crate) fn walk_up_find(start: &Utf8Path, rel: &str) -> Option<Utf8PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
         let p = d.join(rel);
@@ -164,7 +164,7 @@ fn file_url(p: &Utf8Path) -> String {
     s
 }
 
-fn apply_env(cmd: &mut Command, env: &ChildEnv) {
+pub(crate) fn apply_env(cmd: &mut Command, env: &ChildEnv) {
     if let Some(vars) = env {
         cmd.env_clear();
         for (k, v) in vars {
@@ -175,7 +175,7 @@ fn apply_env(cmd: &mut Command, env: &ChildEnv) {
     cmd.env_remove("VCI_OUT");
 }
 
-fn describe(cmd: &Command) -> String {
+pub(crate) fn describe(cmd: &Command) -> String {
     let mut s = cmd.get_program().to_string_lossy().into_owned();
     for a in cmd.get_args() {
         s.push(' ');
@@ -351,6 +351,7 @@ impl Adapter for VitestAdapter {
             node,
             runner,
             bundler,
+            ..Default::default()
         })
     }
 

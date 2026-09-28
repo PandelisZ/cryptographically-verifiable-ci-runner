@@ -20,6 +20,11 @@ use crate::path::{PathError, RepoPath, strip_root};
 /// Maximum symlink hops followed from one observed path.
 pub const MAX_SYMLINK_HOPS: usize = 40;
 
+/// `hash` of an [`EntryKind::Dir`] entry: BLAKE3 of the bytes `dir`.
+pub fn dir_type_hash() -> String {
+    blake3_hex(b"dir")
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum EntryKind {
@@ -33,6 +38,10 @@ pub enum EntryKind {
     /// Directory; `hash` covers the sorted child names (and their types),
     /// `size` is the number of children.
     DirListing,
+    /// A real directory (not a symlink) whose contents were not observed, only
+    /// its type (e.g. a path component `realpath()` walked through); `hash` is
+    /// [`dir_type_hash`], `size` 0.
+    Dir,
 }
 
 impl EntryKind {
@@ -43,6 +52,7 @@ impl EntryKind {
             EntryKind::Symlink => "symlink",
             EntryKind::Absent => "absent",
             EntryKind::DirListing => "dirListing",
+            EntryKind::Dir => "dir",
         }
     }
 }
@@ -83,6 +93,7 @@ impl InputEntry {
             EntryKind::DirListing => {
                 format!("dirListing entries={} blake3={}", self.size, self.hash)
             }
+            EntryKind::Dir => "directory".to_owned(),
         }
     }
 
@@ -119,6 +130,10 @@ pub enum Observation {
     Probe,
     /// Directory listing. Must be a directory at capture time.
     ReadDir,
+    /// The path's type was observed, not its contents (`realpath()` walking a
+    /// component). Must exist at capture time: a file is recorded like a
+    /// `Read`, a directory as a type-only [`EntryKind::Dir`].
+    Stat,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -237,7 +252,13 @@ fn hash_dir(abs: &Utf8Path) -> Result<(String, u64), ManifestError> {
 }
 
 /// Observe the current state of one path without following a final symlink.
-fn observe(repo_root: &Utf8Path, path: &RepoPath) -> Result<InputEntry, ManifestError> {
+/// With `dir_type_only`, a directory is recorded as a type-only
+/// [`EntryKind::Dir`] instead of its listing.
+fn observe_as(
+    repo_root: &Utf8Path,
+    path: &RepoPath,
+    dir_type_only: bool,
+) -> Result<InputEntry, ManifestError> {
     let abs = path.to_abs(repo_root);
     let md = match lstat(&abs, path.is_root()) {
         Ok(md) => md,
@@ -257,6 +278,8 @@ fn observe(repo_root: &Utf8Path, path: &RepoPath) -> Result<InputEntry, Manifest
     } else if ft.is_file() {
         let (h, n) = hash_file(&abs)?;
         (EntryKind::File, exec_bit(&md), n, h)
+    } else if ft.is_dir() && dir_type_only {
+        (EntryKind::Dir, false, 0, dir_type_hash())
     } else if ft.is_dir() {
         let (h, n) = hash_dir(&abs)?;
         (EntryKind::DirListing, false, n, h)
@@ -369,17 +392,21 @@ fn capture_one(
 ) -> Result<Vec<InputEntry>, ManifestError> {
     let mut out = Vec::new();
     let fin = resolve_chain(repo_root, path, &mut out)?;
-    let e = observe(repo_root, &fin)?;
+    let e = observe_as(repo_root, &fin, obs == Observation::Stat)?;
     match (obs, e.kind) {
-        (Observation::Read, EntryKind::Absent) | (Observation::ReadDir, EntryKind::Absent) => {
+        (Observation::Read | Observation::ReadDir | Observation::Stat, EntryKind::Absent) => {
             return Err(ManifestError::ReadMissing(path.to_string()));
+        }
+        (Observation::Stat, EntryKind::File | EntryKind::Dir) => {}
+        (Observation::Stat, _) => {
+            return Err(ManifestError::ConflictingEntries(fin.to_string()));
         }
         (Observation::ReadDir, EntryKind::DirListing) => {}
         (Observation::ReadDir, _) => return Err(ManifestError::NotADirectory(path.to_string())),
         (Observation::Probe, EntryKind::Absent) => {}
         (Observation::Probe, _) => return Err(ManifestError::ProbeExists(path.to_string())),
         (Observation::Read, EntryKind::File | EntryKind::DirListing) => {}
-        (Observation::Read, EntryKind::Symlink) => {
+        (Observation::Read, EntryKind::Symlink | EntryKind::Dir) => {
             // resolve_chain only stops on a symlink if it vanished and was
             // recreated underneath us.
             return Err(ManifestError::ConflictingEntries(fin.to_string()));
@@ -450,6 +477,13 @@ impl InputManifest {
             .map(|(p, o)| capture_one(repo_root, p, *o))
             .collect::<Result<_, _>>()?;
         let mut entries: Vec<InputEntry> = per_obs.into_iter().flatten().collect();
+        // A type-only `Dir` is implied by a listing of the same directory.
+        let listed: std::collections::BTreeSet<RepoPath> = entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::DirListing)
+            .map(|e| e.path.clone())
+            .collect();
+        entries.retain(|e| e.kind != EntryKind::Dir || !listed.contains(&e.path));
         entries.sort();
         entries.dedup();
         for w in entries.windows(2) {
@@ -541,7 +575,7 @@ impl InputManifest {
             .entries
             .par_iter()
             .map(|exp| {
-                let act = observe(repo_root, &exp.path)?;
+                let act = observe_as(repo_root, &exp.path, exp.kind == EntryKind::Dir)?;
                 Ok(if exp.same_state(&act) {
                     None
                 } else {

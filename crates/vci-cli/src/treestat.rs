@@ -10,8 +10,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use vci_core::{EntryKind, InputEntry};
 
 /// Directories that are never walked (externals are represented by the
-/// lockfile and package versions, git internals are not inputs).
-const SKIP_DIRS: &[&str] = &[".git", "node_modules"];
+/// lockfile and package versions, git internals are not inputs). `.venv` is
+/// the environment `uv run` manages (and may sync during a run); the pytest
+/// collector reports what tests take from it as externals, never as paths.
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", ".venv"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatKey {
@@ -113,6 +115,9 @@ impl TreeStat {
             (EntryKind::Absent, None, None) => Ok(()),
             (EntryKind::Absent, _, _) => Err(format!("{rel}: existed during the run")),
             (_, Some(b), Some(n)) if *b == n => Ok(()),
+            // Only the type of a `Dir` entry is an input: entries added or
+            // removed inside it (a cache dir pytest creates) do not matter.
+            (EntryKind::Dir, Some(b), Some(n)) if b.kind == n.kind && b.ino == n.ino => Ok(()),
             (_, None, _) => Err(format!("{rel}: did not exist before the run")),
             _ => Err(format!("{rel}: modified during the run")),
         }

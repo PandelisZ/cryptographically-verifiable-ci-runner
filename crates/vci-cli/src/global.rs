@@ -274,6 +274,50 @@ pub fn module_context<'a>(
     Ok(c.out.into_iter().collect())
 }
 
+/// Python project files looked up from the project dir up to the repo root
+/// (a uv workspace keeps `uv.lock` at its root).
+const PYTHON_PROJECT_FILES: &[&str] = &["pyproject.toml", "uv.lock", ".python-version", "uv.toml"];
+
+/// Global observations for a pytest test file: `vci.toml`; `pyproject.toml`,
+/// `uv.lock`, `.python-version` and `uv.toml` from the project dir up to
+/// the repo root; and, in every directory from the test file's directory up
+/// to the project dir, every pytest config file name and `conftest.py`.
+/// Present files are reads, missing ones probes (so creating a
+/// `tests/pytest.ini` that would move pytest's rootdir, or a new
+/// `conftest.py`, changes the global input root).
+fn pytest_observations(
+    c: &mut Collector,
+    repo_root: &Utf8Path,
+    project_dir: &Utf8Path,
+    test_abs: &Utf8Path,
+) -> Result<()> {
+    let mut dir = Some(project_dir);
+    while let Some(d) = dir {
+        for n in PYTHON_PROJECT_FILES {
+            c.observe(&d.join(n))?;
+        }
+        if d == repo_root || !d.starts_with(repo_root) {
+            break;
+        }
+        dir = d.parent();
+    }
+    if !test_abs.starts_with(project_dir) {
+        bail!("test file {test_abs} is outside the project dir {project_dir}");
+    }
+    let mut dir = test_abs.parent();
+    while let Some(d) = dir {
+        for n in vci_adapter::PYTEST_CONFIG_NAMES {
+            c.observe(&d.join(n))?;
+        }
+        c.observe(&d.join("conftest.py"))?;
+        if d == project_dir {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
 /// Global observations for the test file at `test_abs`.
 pub fn observations(
     repo_root: &Utf8Path,
@@ -287,6 +331,14 @@ pub fn observations(
         visited: BTreeSet::new(),
     };
     c.observe(&repo_root.join(CONFIG_FILE))?;
+    match adapter.name() {
+        "vitest" => {}
+        "pytest" => {
+            pytest_observations(&mut c, repo_root, project_dir, test_abs)?;
+            return Ok(c.out.into_iter().collect());
+        }
+        other => bail!("no global input rules for adapter {other:?}"),
+    }
 
     // Package metadata and lockfiles from the project dir up to the repo root.
     let mut dir = Some(project_dir);
@@ -413,6 +465,39 @@ mod tests {
                 .any(|(p, _)| p.as_str().starts_with("node_modules/")),
             "{obs:?}"
         );
+    }
+
+    #[test]
+    fn pytest_global_inputs() {
+        let (_t, root) = tmp_repo();
+        write(&root, "py/pyproject.toml", "[tool.pytest.ini_options]\n");
+        write(&root, "py/uv.lock", "version = 1\n");
+        write(&root, "py/tests/conftest.py", "\n");
+        write(&root, "py/tests/unit/test_x.py", "\n");
+        write(&root, "py/conftest.py", "\n");
+        let adapter = vci_adapter::PytestAdapter::new(&root.join("py"));
+        let obs = observations(&root, &adapter, &root.join("py/tests/unit/test_x.py")).unwrap();
+        for (p, want) in [
+            ("vci.toml", Observation::Probe),
+            ("py/pyproject.toml", Observation::Read),
+            ("py/uv.lock", Observation::Read),
+            ("py/.python-version", Observation::Probe),
+            ("pyproject.toml", Observation::Probe),
+            ("uv.lock", Observation::Probe),
+            ("py/tests/conftest.py", Observation::Read),
+            ("py/conftest.py", Observation::Read),
+            ("py/tests/unit/conftest.py", Observation::Probe),
+            ("py/tests/unit/pytest.ini", Observation::Probe),
+            ("py/tests/setup.cfg", Observation::Probe),
+            ("py/tox.ini", Observation::Probe),
+        ] {
+            assert_eq!(find(&obs, p), Some(&want), "{p}: {obs:?}");
+        }
+        // Nothing of the Vitest rules (package.json, tsconfig) and nothing
+        // above the project dir for pytest config / conftest.
+        assert_eq!(find(&obs, "py/package.json"), None);
+        assert_eq!(find(&obs, "py/tests/unit/tsconfig.json"), None);
+        assert_eq!(find(&obs, "conftest.py"), None);
     }
 
     #[test]

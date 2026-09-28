@@ -34,6 +34,7 @@ class Records:
     reads: set = field(default_factory=set)
     probes: set = field(default_factory=set)
     readdirs: set = field(default_factory=set)
+    stats: set = field(default_factory=set)
     writes: set = field(default_factory=set)
     env: set = field(default_factory=set)
     externals: set = field(default_factory=set)
@@ -56,7 +57,7 @@ class Records:
         return out
 
     def all_paths(self) -> set:
-        return self.modules | self.reads | self.probes | self.readdirs | self.writes
+        return self.modules | self.reads | self.probes | self.readdirs | self.stats | self.writes
 
 
 def load(out: Path) -> dict:
@@ -70,8 +71,8 @@ def load(out: Path) -> dict:
             k = rec["kind"]
             if k == "module":
                 r.modules.add(rec["path"])
-            elif k in ("read", "probe", "readdir", "write"):
-                getattr(r, k + ("s" if k != "readdir" else "s")).add(rec["path"])
+            elif k in ("read", "probe", "readdir", "write", "stat"):
+                getattr(r, k + "s").add(rec["path"])
             elif k == "env":
                 r.env.add(rec["key"])
             elif k == "external":
@@ -375,6 +376,146 @@ EXTRA_FILES = {
         def test_skipped():
             pass
     """,
+    # ---- regressions from adversarial verification (false skips) ----
+    "data/thread.txt": "1\n",
+    "data/thread_map.txt": "1\n",
+    "tests/test_thread.py": """
+        import asyncio
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+        from pathlib import Path
+
+        ROOT = Path(__file__).resolve().parent.parent
+
+        def test_thread():
+            with ThreadPoolExecutor(1) as ex:
+                assert ex.submit((ROOT / "data" / "thread.txt").read_text).result() == "1\\n"
+                assert list(ex.map(Path.read_text, [ROOT / "data" / "thread_map.txt"])) == ["1\\n"]
+                assert ex.submit(os.getenv, "THREAD_FLAG", "on").result() == "on"
+
+            async def main():
+                return await asyncio.to_thread(os.getenv, "TO_THREAD_FLAG", "on")
+
+            assert asyncio.run(main()) == "on"
+    """,
+    "data/cases/one.txt": "1\n",
+    "data/cases/two.txt": "1\n",
+    "data/lazy.txt": "1\n",
+    "tests/test_lazy_param.py": """
+        import glob
+        from pathlib import Path
+
+        import pytest
+
+        ROOT = Path(__file__).resolve().parent.parent
+        CASES = ROOT / "data" / "cases"
+
+        @pytest.mark.parametrize("case", CASES.glob("*.txt"))
+        def test_glob(case):
+            assert case.name.endswith(".txt")
+
+        @pytest.mark.parametrize("case", glob.iglob(str(CASES / "*.txt")))
+        def test_iglob(case):
+            assert case.endswith(".txt")
+
+        @pytest.mark.parametrize("text", map(Path.read_text, [ROOT / "data" / "lazy.txt"]))
+        def test_map(text):
+            assert text == "1\\n"
+    """,
+    "data/sym_src.txt": "s\n",
+    "data/symdir/x.txt": "x\n",
+    "tests/test_symlink.py": """
+        import os
+        from pathlib import Path
+
+        ROOT = Path(__file__).resolve().parent.parent
+
+        def test_symlink(tmp_path):
+            os.symlink(ROOT / "data" / "sym_src.txt", tmp_path / "l")
+            assert (tmp_path / "l").read_text() == "s\\n"
+            os.symlink(ROOT / "data" / "symdir", tmp_path / "d")
+            assert os.listdir(tmp_path / "d") == ["x.txt"]
+    """,
+    "tests/test_shadow_stdlib.py": """
+        def test_hash():
+            import hashlib
+            import sysconfig
+            assert hashlib.sha256(b"").hexdigest().startswith("e3b0")
+            assert sysconfig.get_python_version()
+    """,
+    "tests/test_realpath.py": """
+        import os
+        from pathlib import Path
+
+        ROOT = Path(__file__).resolve().parent.parent
+
+        def test_realpath():
+            assert (ROOT / "data" / "ghost").resolve() == ROOT / "data" / "ghost"
+            assert os.path.realpath(ROOT / "data" / "pathlib.txt") == str(ROOT / "data" / "pathlib.txt")
+            assert (ROOT / "data").resolve() == ROOT / "data"
+    """,
+    "data/data.pyc": "\x01",
+    "tests/test_pyc_data.py": """
+        from pathlib import Path
+
+        ROOT = Path(__file__).resolve().parent.parent
+
+        def test_pyc():
+            assert (ROOT / "data" / "data.pyc").read_bytes() == b"\\x01"
+    """,
+    "tests/test_venv_cfg.py": """
+        import sys
+        from pathlib import Path
+
+        def test_cfg():
+            assert "home" in (Path(sys.prefix) / "pyvenv.cfg").read_text()
+    """,
+    "tests/test_cache_key.py": """
+        def test_cache(request):
+            assert request.config.cache.get("cache/lastfailed", {}) is not None
+    """,
+    "tests/test_cache_dir.py": """
+        from pathlib import Path
+
+        ROOT = Path(__file__).resolve().parent.parent
+
+        def test_cache_dir():
+            p = ROOT / ".pytest_cache" / "v" / "cache" / "lastfailed"
+            assert not p.exists() or p.read_text() is not None
+    """,
+    "tests/test_sqlite_attach.py": """
+        import sqlite3
+        from pathlib import Path
+
+        ROOT = Path(__file__).resolve().parent.parent
+
+        def test_attach(tmp_path):
+            con = sqlite3.connect(":memory:")
+            con.execute("ATTACH DATABASE ? AS o", (str(tmp_path / "other.db"),))
+            con.close()
+    """,
+    "tests/test_sqlite_repo.py": """
+        import sqlite3
+        from pathlib import Path
+
+        ROOT = Path(__file__).resolve().parent.parent
+
+        def test_repo_db():
+            con = sqlite3.connect(ROOT / "data" / "repo.db")
+            con.execute("select 1")
+            con.close()
+    """,
+    "tests/test_partly_skipped.py": """
+        import sys
+        import pytest
+
+        def test_ok():
+            pass
+
+        @pytest.mark.skipif(sys.platform != "nonexistent-os", reason="other platforms only")
+        def test_other_platform():
+            assert False
+    """,
 }
 
 
@@ -389,6 +530,12 @@ def project(tmp_path_factory):
         p = dst / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(textwrap.dedent(body).lstrip())
+    import sqlite3
+
+    con = sqlite3.connect(dst / "data" / "repo.db")
+    con.execute("create table t (v integer)")
+    con.commit()
+    con.close()
     return dst
 
 
@@ -563,3 +710,146 @@ def test_subinterpreter_taints(run_one):
     if r.result["skipped"] or r.result["tests"] == 0:  # module-level importorskip
         pytest.skip("concurrent.interpreters not available on this Python")
     assert any(t.startswith("subinterpreter:") for t in r.taints), r.taints
+
+
+# --------------------------------------------------------------------------- regressions
+# Each of these reproduced a false skip found by adversarial verification.
+
+
+def test_worker_thread_reads_and_env_are_recorded(run_one):
+    r = one(run_one("tests/test_thread.py", expect_rc=0))
+    assert {"data/thread.txt", "data/thread_map.txt"} <= r.rel("reads"), r.rel("reads")
+    assert {"THREAD_FLAG", "TO_THREAD_FLAG"} <= r.env, r.env
+    assert r.taints == []
+
+
+def test_lazy_parametrize_iterables_are_recorded(run_one, project, tmp_path):
+    r = one(run_one("tests/test_lazy_param.py", expect_rc=0))
+    assert "data/cases" in r.rel("readdirs"), r.rel("readdirs")
+    assert "data/lazy.txt" in r.rel("reads"), r.rel("reads")
+
+    # The collector must not change pytest's own behaviour: the same warnings
+    # (naming the iterable's type) are emitted with and without it.
+    def warnings_of(extra):
+        p = subprocess.run(
+            [str(VENV_BIN / "pytest"), *extra, "-q", "-W", "always", "tests/test_lazy_param.py"],
+            cwd=project,
+            env=child_env(tmp_path / "out2", tmp_path / "temproot2"),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return sorted(l for l in p.stdout.splitlines() if "RemovedIn" in l or "non-Collection" in l)
+
+    assert warnings_of(["-p", "vci_pytest"]) == warnings_of([])
+
+
+def test_symlink_into_repo_from_tmp_path_is_recorded(run_one):
+    r = one(run_one("tests/test_symlink.py", expect_rc=0))
+    assert "data/sym_src.txt" in r.rel("reads"), r.rel("reads")
+    assert "data/symdir" in r.rel("readdirs"), r.rel("readdirs")
+    assert r.taints == []
+    root = str(r.root) + os.sep
+    assert {p for p in r.all_paths() if not p.startswith(root)} == set()
+
+
+def test_stdlib_modules_are_not_preloaded_by_the_collector(run_one):
+    """A module the collector imported itself would never be looked up by the test,
+    so a shadowing src/hashlib.py created later would go unnoticed."""
+    r = one(run_one("tests/test_shadow_stdlib.py", expect_rc=0))
+    probes = r.rel("probes")
+    for name in ("hashlib", "sysconfig"):
+        assert {f"src/{name}.py", f"tests/{name}.py"} <= probes, (name, sorted(p for p in probes if name in p))
+
+
+def test_realpath_records_missing_and_regular_components(run_one):
+    r = one(run_one("tests/test_realpath.py", expect_rc=0))
+    assert "data/ghost" in r.rel("probes"), r.rel("probes")
+    assert "data/pathlib.txt" in r.rel("reads") | r.rel("stats"), r.rel("reads")
+    assert "data" in r.rel("stats"), r.rel("stats")
+    assert r.taints == []
+
+
+def test_user_reads_of_pyc_files_are_recorded(run_one):
+    r = one(run_one("tests/test_pyc_data.py", expect_rc=0))
+    assert "data/data.pyc" in r.rel("reads"), r.rel("reads")
+    assert not any("__pycache__" in p for p in r.rel("reads") | r.rel("writes")), r.rel("reads")
+
+
+def test_unowned_environment_file_read_taints(run_one):
+    r = one(run_one("tests/test_venv_cfg.py", expect_rc=0))
+    assert any(t.startswith("unmapped-env-read:") and t.endswith("pyvenv.cfg") for t in r.taints), r.taints
+
+
+def test_user_cache_key_read_taints(run_one):
+    r = one(run_one("tests/test_cache_key.py", expect_rc=0))
+    assert any(t.startswith("pytest:cache.get:cache/lastfailed") for t in r.taints), r.taints
+
+
+def test_user_cache_dir_access_taints(run_one):
+    r = one(run_one("tests/test_cache_dir.py", expect_rc=0))
+    assert any(t.startswith("pytest:cache-dir-access") for t in r.taints), r.taints
+
+
+def test_sqlite_attach_taints(run_one):
+    r = one(run_one("tests/test_sqlite_attach.py", expect_rc=0))
+    assert "sqlite3:attach" in r.taints, r.taints
+
+
+def test_sqlite_database_in_repository_taints(run_one):
+    r = one(run_one("tests/test_sqlite_repo.py", expect_rc=0))
+    assert any(t.startswith("sqlite3:database-in-repository:") for t in r.taints), r.taints
+
+
+def test_partly_skipped_file_reports_skips(run_one):
+    r = one(run_one("tests/test_partly_skipped.py", expect_rc=0))
+    assert r.result["skipped"] == 1 and r.result["failed"] == 0
+
+
+def test_plugin_from_addopts_imported_before_collector_taints(project, tmp_path):
+    """`addopts = "-p myplug"` is imported before the command line's `-p vci_pytest`,
+    so what it read at import time was never seen."""
+    dst = tmp_path / "addopts-proj"
+    shutil.copytree(project, dst, ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
+    pp = dst / "pyproject.toml"
+    pp.write_text(pp.read_text().replace('testpaths = ["tests"]', 'testpaths = ["tests"]\naddopts = "-p myplug"'))
+    (dst / "src" / "myplug.py").write_text(
+        "from pathlib import Path\nDATA = (Path(__file__).resolve().parent.parent / 'data' / 'io.txt').read_text()\n"
+    )
+    out = tmp_path / "out"
+    p = run(dst, ["tests/test_a.py"], out, tmp_path / "temproot")
+    assert p.returncode == 0, p.stdout + p.stderr
+    r = one(load(out))
+    assert any(t.startswith("pytest:plugin-imported-before-collector:myplug") for t in r.taints), r.taints
+
+
+def test_hot_patched_distribution_file_is_detected(tmp_path):
+    """A site-packages file edited in place keeps its distribution's version; the
+    collector compares every file it maps to a distribution with its RECORD hash."""
+    import base64
+    import importlib.metadata
+
+    sys.path.insert(0, str(PLUGIN_DIR))
+    try:
+        from vci_pytest import _collector
+    finally:
+        sys.path.remove(str(PLUGIN_DIR))
+    site = tmp_path / "site-packages"
+    (site / "mylib").mkdir(parents=True)
+    src = b"VALUE = 1\n"
+    (site / "mylib" / "__init__.py").write_bytes(src)
+    info = site / "mylib-1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: MyLib\nVersion: 1.0\n")
+    digest = base64.urlsafe_b64encode(hashlib.sha256(src).digest()).rstrip(b"=").decode()
+    (info / "RECORD").write_text(
+        f"mylib/__init__.py,sha256={digest},{len(src)}\nmylib-1.0.dist-info/METADATA,,\nmylib-1.0.dist-info/RECORD,,\n"
+    )
+    idx = _collector._DistIndex([importlib.metadata.PathDistribution(info)])
+    f = str(site / "mylib" / "__init__.py")
+    assert idx.lookup(f) == ("mylib", "1.0")
+    assert idx.modified(f) is False
+    assert idx.modified(str(info / "METADATA")) is False  # no hash recorded
+    (site / "mylib" / "__init__.py").write_bytes(b"VALUE = 2\n")
+    idx2 = _collector._DistIndex([importlib.metadata.PathDistribution(info)])
+    assert idx2.modified(f) is True

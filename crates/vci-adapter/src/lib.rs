@@ -10,14 +10,38 @@
 //! dropped record.
 
 mod jsonl;
+mod pytest;
 mod vitest;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 
 use camino::Utf8PathBuf;
 
 pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file};
+pub use pytest::{
+    JOBS_ENV, PY_PLUGIN_ENV, PYTEST_CONFIG_NAMES, PYTEST_HASHED_ENV, PYTEST_PASS_THROUGH,
+    PytestAdapter, UV_ENV, UV_RUN_ARGS, find_py_plugin, pytest_jobs,
+};
 pub use vitest::{JS_PLUGIN_ENV, VitestAdapter, find_js_plugin};
+
+/// Adapter names accepted in `vci.toml`.
+pub const ADAPTERS: &[&str] = &["vitest", "pytest"];
+
+/// Construct the adapter called `name` for `project_dir`.
+pub fn adapter_for(
+    name: &str,
+    project_dir: &camino::Utf8Path,
+) -> Result<Box<dyn Adapter>, AdapterError> {
+    match name {
+        "vitest" => Ok(Box::new(VitestAdapter::new(project_dir))),
+        "pytest" => Ok(Box::new(PytestAdapter::new(project_dir))),
+        other => Err(AdapterError::NotFound(format!(
+            "unsupported adapter {other:?} (supported: {})",
+            ADAPTERS.join(", ")
+        ))),
+    }
+}
 
 /// Errors from running or listing tests.
 #[derive(Debug, thiserror::Error)]
@@ -49,13 +73,29 @@ pub struct ListedFile {
     pub project: String,
 }
 
-/// Versions of the tools that make up the toolchain digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Versions of the tools that make up the toolchain digest. Fields an
+/// adapter does not use are empty (Vitest: `python`/`implementation`;
+/// pytest: `node`/`bundler`, and `runner` is the pytest version).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ToolVersions {
     pub node: String,
     pub runner: String,
     pub bundler: String,
+    /// Full Python version (`platform.python_version()`).
+    pub python: String,
+    /// `sys.implementation.name`.
+    pub implementation: String,
+    /// Versions of libraries bundled with the interpreter (pytest:
+    /// `sqlite=...;openssl=...`).
+    pub python_libs: String,
+    /// Every installed distribution as sorted `name==version` (pytest).
+    pub python_dists: Vec<String>,
 }
+
+/// External packages as the test process would resolve them now:
+/// normalised name -> every installed version (more than one version means
+/// the name is ambiguous and never matches).
+pub type InstalledExternals = BTreeMap<String, Vec<String>>;
 
 /// Result of a collecting run.
 #[derive(Debug)]
@@ -67,8 +107,8 @@ pub struct RunOutput {
 }
 
 /// A test-runner integration.
-pub trait Adapter {
-    /// Short adapter name recorded in predicates (`"vitest"`).
+pub trait Adapter: Send + Sync {
+    /// Short adapter name recorded in predicates (`"vitest"`, `"pytest"`).
     fn name(&self) -> &'static str;
     /// Absolute project directory (the runner's root).
     fn project_dir(&self) -> &camino::Utf8Path;
@@ -76,6 +116,41 @@ pub trait Adapter {
     fn list_test_files(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError>;
     /// Node / runner / bundler versions as resolved from the project.
     fn tool_versions(&self) -> Result<ToolVersions, AdapterError>;
+    /// [`Adapter::tool_versions`] as seen by a child process with `env`
+    /// (adapters that ask the interpreter override this).
+    fn tool_versions_with_env(&self, env: &ChildEnv) -> Result<ToolVersions, AdapterError> {
+        let _ = env;
+        self.tool_versions()
+    }
+    /// Env var patterns that always reach the child process and are never
+    /// hashed, in addition to the global built-in list (e.g. what the
+    /// runner's launcher needs to work at all in strict mode).
+    fn builtin_pass_through(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Env var patterns (`!pat` excludes) hashed whenever they are present in
+    /// the child environment, without being kept in strict mode (unlike
+    /// [`Adapter::inferred_env_patterns`]): variables the runtime reads where
+    /// no collector can see it.
+    fn hashed_env_patterns(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Warnings for `vci run` about the environment the tests run in (e.g. an
+    /// interpreter CI cannot reproduce).
+    fn warnings(&self, env: &ChildEnv) -> Vec<String> {
+        let _ = env;
+        vec![]
+    }
+    /// External packages installed in the environment the tests run in, for
+    /// adapters that can enumerate them (pytest). `None` means the caller
+    /// looks packages up itself (the npm `node_modules` layout).
+    fn installed_externals(
+        &self,
+        env: &ChildEnv,
+    ) -> Result<Option<InstalledExternals>, AdapterError> {
+        let _ = env;
+        Ok(None)
+    }
     /// Canonical per-file argv recorded in (and compared against) attestations.
     /// `project_rel` is the test file relative to the project dir.
     fn canonical_argv(&self, project_dir_rel_to_repo: &str, project_rel: &str) -> Vec<String>;

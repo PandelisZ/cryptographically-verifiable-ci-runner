@@ -1,0 +1,63 @@
+# .github/workflows/test.yml: run only the pytest files that no trusted
+# developer has already attested for these exact inputs.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be available to read policy from
+
+      # Attestations only match the exact Python version (major.minor.patch),
+      # implementation, bundled sqlite/OpenSSL versions and installed package
+      # set they were made with. Attest locally with a uv-managed interpreter
+      # whose exact version uv also ships for Linux (`uv python install 3.14.4`,
+      # "3.14.4" in .python-version, UV_PYTHON_PREFERENCE=only-managed), and
+      # pin the same uv version here as locally.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.7"
+
+      - name: Set up the project environment from uv.lock
+        run: uv sync --locked
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+
+      # The CLI and its pytest collector (py/pytest-plugin) come from the same
+      # vci checkout; VCI_PY_PLUGIN tells vci where the collector lives.
+      - name: Install vci
+        run: |
+          git clone --depth 1 https://github.com/OWNER/cryptographically-verifiable-ci "$RUNNER_TEMP/vci"
+          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+          echo "VCI_PY_PLUGIN=$RUNNER_TEMP/vci/py/pytest-plugin" >> "$GITHUB_ENV"
+
+      - name: Fetch attestations
+        run: vci fetch --remote origin
+
+      # Policy (vci.toml) and trust (.vci/allowed_signers) are read from the
+      # BASE commit, so a pull request cannot add its own signer. On pushes to
+      # main the base is the pushed commit itself: `vci init` lists
+      # refs/heads/main in policy.no_skip_refs, so everything runs there.
+      # `vci ci` runs each remaining file in its own
+      # `uv run --locked --exact pytest <file>` and exits non-zero if any fails.
+      - name: Plan, then run what is not attested
+        run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+
+      - name: Upload the audit log of skipped tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vci-audit
+          path: vci-audit.json

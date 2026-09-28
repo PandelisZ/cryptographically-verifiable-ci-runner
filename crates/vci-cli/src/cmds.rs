@@ -3,16 +3,17 @@
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::json;
-use vci_adapter::{Adapter, VitestAdapter};
+use vci_adapter::Adapter;
 use vci_attest::{AllowedSigners, Envelope, verify_envelope};
 use vci_git::AttestStore;
 
-use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, TEMPLATE};
+use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, template_for};
 use crate::ctx::{VciPredicate, open_repo};
 use crate::plan::{PlanOptions, plan, print};
 use crate::util::{now_unix, parse_rfc3339, rfc3339};
 
 pub const CI_SNIPPET: &str = include_str!("../../../examples/github-actions.yml");
+pub const CI_SNIPPET_PYTEST: &str = include_str!("../../../examples/github-actions-pytest.yml");
 
 pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i32> {
     let res = plan(&PlanOptions {
@@ -21,20 +22,70 @@ pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i3
     })?;
     print(&res, "text")?;
     let (repo, root) = open_repo()?;
-    let project_dir = res.project_dir.clone().unwrap_or_else(|| root.clone());
-    let adapter = VitestAdapter::new(&project_dir);
-    let env = res.child_env.as_ref().and_then(|c| c.to_child_env());
-    let run: Vec<String> = res.to_run().map(|f| f.file.clone()).collect();
-    let code = if res.run_all.is_some() {
-        eprintln!("vci ci: running all tests");
-        adapter.run_plain(&[], &env)?
-    } else if run.is_empty() {
-        eprintln!("vci ci: every test file is covered by a valid attestation; nothing to run");
-        Some(0)
-    } else {
-        eprintln!("vci ci: running {} test file(s)", run.len());
-        adapter.run_plain(&run, &env)?
-    };
+    // What to run, per project. With no project information at all (the
+    // repository layout could not be read), run the default project.
+    // (label, adapter, child env, files to run; None = everything)
+    type Job = (
+        String,
+        Box<dyn Adapter>,
+        vci_adapter::ChildEnv,
+        Option<Vec<String>>,
+    );
+    let mut jobs: Vec<Job> = Vec::new();
+    if res.projects.is_empty() {
+        let adapter = vci_adapter::adapter_for("vitest", &root)?;
+        jobs.push(("default project".into(), adapter, None, None));
+    }
+    for (i, p) in res.projects.iter().enumerate() {
+        let adapter = vci_adapter::adapter_for(&p.adapter, &p.dir)?;
+        let env = p.child_env.as_ref().and_then(|c| c.to_child_env());
+        let label = if p.name.is_empty() {
+            p.path.clone()
+        } else {
+            p.name.clone()
+        };
+        let files = if res.run_all.is_some() || p.run_all.is_some() {
+            None
+        } else {
+            Some(
+                res.to_run()
+                    .filter(|f| f.project_idx == i)
+                    .map(|f| f.file.clone())
+                    .collect(),
+            )
+        };
+        jobs.push((label, adapter, env, files));
+    }
+    let mut code: Option<i32> = Some(0);
+    let multi = jobs.len() > 1;
+    for (label, adapter, env, files) in &jobs {
+        let what = if multi {
+            format!(" of {label} ({})", adapter.name())
+        } else {
+            String::new()
+        };
+        let c = match files {
+            None => {
+                eprintln!("vci ci: running all tests{what}");
+                adapter.run_plain(&[], env)?
+            }
+            Some(run) if run.is_empty() => {
+                eprintln!(
+                    "vci ci: every test file{what} is covered by a valid attestation; nothing to run"
+                );
+                Some(0)
+            }
+            Some(run) => {
+                eprintln!("vci ci: running {} test file(s){what}", run.len());
+                adapter.run_plain(run, env)?
+            }
+        };
+        match (code, c) {
+            (Some(0), c) => code = c,
+            (Some(_), None) => code = None,
+            _ => {}
+        }
+    }
     let code = code.unwrap_or(1);
 
     let now = now_unix();
@@ -44,12 +95,14 @@ pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i3
         "baseRef": res.base_ref,
         "baseCommit": res.base_commit,
         "runAll": res.run_all,
+        "projects": res.projects,
         "skipped": res.skipped().map(|f| json!({
             "testId": f.test_id,
+            "project": f.project,
             "reason": f.reason,
             "by": f.by,
         })).collect::<Vec<_>>(),
-        "ran": res.to_run().map(|f| json!({"testId": f.test_id, "reason": f.reason})).collect::<Vec<_>>(),
+        "ran": res.to_run().map(|f| json!({"testId": f.test_id, "project": f.project, "reason": f.reason})).collect::<Vec<_>>(),
         "exitCode": code,
     });
     let path = audit_log.unwrap_or_else(|| root.join(format!(".vci/out/audit-{now}.json")));
@@ -138,14 +191,19 @@ pub fn init(
     key: Option<&Utf8Path>,
     principal: Option<String>,
     project: Option<String>,
+    adapter_name: Option<String>,
     install: bool,
 ) -> Result<i32> {
     let (_repo, root) = open_repo()?;
     let cfg_path = root.join(CONFIG_FILE);
+    let adapter_name = adapter_name.unwrap_or_else(|| "vitest".into());
+    if !vci_adapter::ADAPTERS.contains(&adapter_name.as_str()) {
+        bail!("unsupported adapter {adapter_name:?}");
+    }
     if cfg_path.exists() {
         eprintln!("vci init: {cfg_path} exists, leaving it alone");
     } else {
-        let mut text = TEMPLATE.to_owned();
+        let mut text = template_for(&adapter_name).to_owned();
         if let Some(p) = &project {
             text = text.replace("project = \".\"", &format!("project = {}", toml_str(p)));
         }
@@ -181,7 +239,32 @@ pub fn init(
     std::fs::write(&signers, existing)?;
 
     let config = crate::ctx::working_tree_config(&root)?;
-    let project_dir = root.join(config.project_rel());
+    let specs = config.project_specs();
+    if specs.iter().any(|s| s.adapter == "pytest") {
+        for s in specs.iter().filter(|s| s.adapter == "pytest") {
+            let dir = root.join(&s.rel);
+            if let Err(e) = vci_adapter::find_py_plugin(&dir) {
+                eprintln!("vci init: note: {e}");
+            }
+        }
+        if std::process::Command::new("uv")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!(
+                "vci init: note: the pytest adapter runs tests with `uv run --locked`; install uv"
+            );
+        }
+    }
+    let vitest: Vec<_> = specs.iter().filter(|s| s.adapter == "vitest").collect();
+    if vitest.is_empty() {
+        println!("Commit {CONFIG_FILE} and {ALLOWED_SIGNERS_FILE}. GitHub Actions example:\n");
+        println!("{CI_SNIPPET_PYTEST}");
+        return Ok(0);
+    }
+    let project_dir = root.join(&vitest[0].rel);
     if install {
         let spec = std::env::var(vci_adapter::JS_PLUGIN_ENV)
             .ok()
@@ -203,8 +286,7 @@ pub fn init(
             }
         }
     }
-    let adapter = VitestAdapter::new(&project_dir);
-    if vci_adapter::find_js_plugin(adapter.project_dir()).is_err() {
+    if vci_adapter::find_js_plugin(&project_dir).is_err() {
         eprintln!(
             "vci init: note: @vci/vitest not found; set {} or install it",
             vci_adapter::JS_PLUGIN_ENV

@@ -14,12 +14,12 @@ impl RepoPath {
     pub fn as_str(&self) -> &str;
 }
 
-pub enum EntryKind { File, Symlink, Absent, DirListing }
+pub enum EntryKind { File, Symlink, Absent, DirListing, Dir }   // Dir: a real directory, type only (hash = blake3("dir"), size 0)
 pub struct InputEntry { pub path: RepoPath, pub kind: EntryKind, pub exec: bool, pub size: u64, pub hash: String }
 pub struct External { pub name: String, pub version: String }
 pub struct EnvEntry { pub key: String, pub hash: String }   // blake3 of value; ABSENT_HASH if unset
 
-pub enum Observation { Read, Probe, ReadDir }  // what the collector saw
+pub enum Observation { Read, Probe, ReadDir, Stat }  // what the collector saw; Stat: type only (file -> File, dir -> Dir)
 
 pub struct InputManifest { pub entries: Vec<InputEntry>, pub externals: Vec<External>, pub env: Vec<EnvEntry> }
 impl InputManifest {
@@ -34,8 +34,16 @@ impl InputManifest {
 }
 pub struct Mismatch { pub what: String, pub expected: String, pub actual: String }
 
-pub struct Toolchain { pub node: String, pub vitest: String, pub vite: String, pub os: String, pub arch: String }
+pub struct Toolchain {                  // adapter-specific; unused fields are empty and omitted from JSON
+    pub node: String, pub vitest: String, pub vite: String,              // Vitest
+    pub python: String, pub implementation: String, pub pytest: String,  // pytest (python = major.minor.patch)
+    pub python_libs: String,          // pytest: "sqlite=<ver>;openssl=<OPENSSL_VERSION>"
+    pub python_dists: Vec<String>,    // pytest: every installed distribution, sorted "name==version"
+    pub os: String, pub arch: String,
+}
+impl Toolchain { pub fn diff(&self, now: &Toolchain) -> Vec<(&'static str, String, String)>; } // node by major, rest exact
 pub struct TestResult { pub state: String /* "passed" | "failed" */, pub tests: u32, pub failed: u32, pub skipped: u32, pub duration_ms: u64 }
+// is_pass(): state == "passed" && failed == 0 && skipped == 0 (a skipped or xfailed test did not run)
 pub struct Predicate {
     pub tool_version: String, pub adapter: String, pub test_id: String, pub argv: Vec<String>,
     pub repo_id: String, pub commit: String, pub tree_dirty: bool,
@@ -115,6 +123,7 @@ Invoked by the Rust adapter as: `VCI_OUT=<dir> npx vitest run --config <wrapper 
 {"kind":"read","path":"/abs/path"}
 {"kind":"probe","path":"/abs/path"}        // stat/exists/read that failed with ENOENT
 {"kind":"readdir","path":"/abs/path"}
+{"kind":"stat","path":"/abs/path"}         // pytest only: type observed (realpath() walking a component)
 {"kind":"env","key":"TZ"}
 {"kind":"taint","reason":"child_process.spawn"}
 {"kind":"result","state":"passed","tests":1,"failed":0,"skipped":0,"durationMs":12}
@@ -127,20 +136,29 @@ Paths are absolute; `testId` is relative to the project root with '/' separators
 ```rust
 pub type ChildEnv = Option<Vec<(OsString, OsString)>>;   // None = inherit; Some = env_clear + exactly these
 pub struct ListedFile { pub abs: Utf8PathBuf, pub project: String }
-pub struct ToolVersions { pub node: String, pub runner: String, pub bundler: String }
+pub struct ToolVersions { pub node: String, pub runner: String, pub bundler: String, pub python: String, pub implementation: String,
+                         pub python_libs: String, pub python_dists: Vec<String> }
+pub type InstalledExternals = BTreeMap<String, Vec<String>>;   // PEP 503 name -> installed versions
 pub struct Observed {            // one per collector JSONL file; anything unexpected becomes a taint
     pub test_id: String, pub project: String, pub root: String, pub node: String,
     pub runner_version: String, pub bundler_version: String, pub collector: String,
-    pub modules, reads, probes, readdirs: BTreeSet<Utf8PathBuf>,
+    pub adapter: String /* meta.adapter, "vitest" if absent */, pub python: String, pub implementation: String,
+    pub platform: String, pub arch: String,
+    pub modules, reads, probes, readdirs, stats, writes: BTreeSet<Utf8PathBuf>,
     pub externals: BTreeSet<(String, String)>, pub env_keys: BTreeSet<String>,
     pub taints: Vec<String>, pub result: Option<vci_core::TestResult>,
 }
 pub struct RunOutput { pub exit_code: Option<i32>, pub files: Vec<Observed> }
-pub trait Adapter {
+pub trait Adapter: Send + Sync {
     fn name(&self) -> &'static str;
     fn project_dir(&self) -> &Utf8Path;
     fn list_test_files(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError>;   // vitest list --filesOnly --json=<tmp>
     fn tool_versions(&self) -> Result<ToolVersions, AdapterError>;
+    fn tool_versions_with_env(&self, env: &ChildEnv) -> Result<ToolVersions, AdapterError>;  // default: tool_versions()
+    fn builtin_pass_through(&self) -> &'static [&'static str];                                // default: []
+    fn hashed_env_patterns(&self) -> &'static [&'static str];     // default: []; pytest: PYTHON*, PYTEST_*, !PYTHONPATH (hashed if present, not kept in strict mode)
+    fn warnings(&self, env: &ChildEnv) -> Vec<String>;           // default: []; pytest: interpreter not uv-managed
+    fn installed_externals(&self, env: &ChildEnv) -> Result<Option<InstalledExternals>, AdapterError>; // default: None
     fn canonical_argv(&self, project_dir_rel_to_repo: &str, project_rel: &str) -> Vec<String>; // ["vitest","run","--root",dir,file]
     fn config_candidates(&self) -> Vec<Utf8PathBuf>;
     fn snapshot_candidates(&self, test_abs: &Utf8Path) -> Vec<Utf8PathBuf>;
@@ -150,6 +168,11 @@ pub trait Adapter {
 }
 pub struct VitestAdapter;  // VitestAdapter::new(project_dir).with_js_plugin(dir)
 pub fn find_js_plugin(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_JS_PLUGIN, else node_modules/@vci/vitest
+pub struct PytestAdapter;  // PytestAdapter::new(project_dir).with_py_plugin(dir)
+pub fn find_py_plugin(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_PY_PLUGIN, else py/pytest-plugin near the exe / build checkout / project
+pub fn adapter_for(name: &str, project_dir: &Utf8Path) -> Result<Box<dyn Adapter>, AdapterError>; // "vitest" | "pytest"
+pub const PYTEST_CONFIG_NAMES: &[&str];   // pytest.toml, .pytest.toml, pytest.ini, .pytest.ini, pyproject.toml, tox.ini, setup.cfg
+pub const PYTEST_PASS_THROUGH: &[&str];   // UV, UV_*, VIRTUAL_ENV, PYTHONPATH, XDG_*_HOME, SSL_CERT_*, *_PROXY
 pub fn parse_jsonl_file(path) / parse_jsonl_dir(dir);  // top-level *.jsonl only
 ```
 
@@ -157,15 +180,46 @@ pub fn parse_jsonl_file(path) / parse_jsonl_dir(dir);  // top-level *.jsonl only
 runs `node node_modules/vitest/vitest.mjs run --config <wrapper> <files…>` with `VCI_OUT=<fresh temp dir>` and cwd =
 project dir, and sends Vitest's stdout to stderr so the CLI's stdout stays machine-readable.
 
+### pytest adapter
+
+All commands run with cwd = project dir through `uv run --locked --exact --no-env-file` (`$VCI_UV`, default `uv`;
+`UV_RUN_ARGS`), with the child env applied, `UV_ENV_FILE` removed, `UV_NO_ENV_FILE=1`,
+`PYTHONPYCACHEPREFIX=<fresh temp dir>` (bytecode is always compiled from the hashed sources) and `PYTHONPATH` removed
+unless set below:
+
+- `list_test_files`: `uv run --locked pytest --collect-only -q -p vci_list` with `PYTHONPATH=<tmp>` holding a helper
+  plugin that writes the files of the collected items as JSON (independent of the configured verbosity). Exit codes
+  other than 0 and 5 (no tests) — e.g. a collection error — are errors, so `vci plan` runs everything.
+- `tool_versions_with_env` / `installed_externals`: one `uv run --locked python <tmp>/vci_probe.py` (cached per
+  adapter) reporting `platform.python_version()`, `sys.implementation.name`, `pytest.__version__`, the bundled sqlite
+  and OpenSSL versions, `sys.base_prefix` and every installed distribution (PEP 503 names).
+- `run_collect`: one process per file, `$VCI_JOBS` (default CPUs, max 8) at a time:
+  `PYTHONPATH=<plugin dir> VCI_OUT=<fresh dir> uv run --locked pytest -p vci_pytest <file>`; each process's output is
+  written to stderr as one block; exit code 0 only if every process exited 0.
+- `run_plain`: with files, one `uv run pytest <file>` process per file (`$VCI_JOBS` at a time, output in blocks), the
+  isolation attestations are made with; without files, the whole suite in one process.
+- `canonical_argv`: `["pytest", "--rootdir", <project dir>, <file>]`; `config_candidates`: the pytest config names
+  in the project dir; no snapshot candidates or inferred env patterns; hashed env patterns `PYTHON*`, `PYTEST_*`,
+  `!PYTHONPATH`.
+
+Collector records (`docs/spike-pytest.md`): `meta` has `adapter: "pytest"`, `python`, `implementation`, `pytest`,
+`platform`, `arch`; `write` records are parsed into `Observed::writes` (the CLI refuses to attest a file with a write
+inside the repository); an `env` record with key `*` (environment enumerated) becomes a taint; unknown kinds stay
+taints.
+
 ## vci-cli predicate and storage
 
 The signed predicate is `vci_core::Predicate` flattened, plus `envConfigDigest` (docs/ENV.md), `projectDir` (repo
-relative) and `runnerProject` (Vitest project name). Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
+relative), `runnerProject` (Vitest project name) and `projectName` (the `[[projects]]` name; omitted in the
+single-project form). Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
 `input_root` is the per-file manifest root; `global_input_root` is the per-file global manifest root (lockfiles,
 package.json, `.npmrc`, config candidates and their relative references, tsconfig chain, `vci.toml`, the test's
-snapshot file, and the `NODE_OPTIONS` env hash). The store key passed to `AttestStore::put` as `input_root` is
-BLAKE3 over repo id, test id, input root, global input root, env config digest, toolchain and argv, so re-running
-with identical inputs replaces (renews) the stored envelope.
+snapshot file, and the `NODE_OPTIONS` env hash; for pytest: `vci.toml`, `pyproject.toml`/`uv.lock`/`.python-version`/
+`uv.toml` from the project dir up to the repo root, and every pytest config name and `conftest.py` from the test's
+directory up to the project dir). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
+test id, input root, global input root, env config digest, toolchain and argv (plus the pytest toolchain fields, the
+project name and a non-Vitest adapter name when set), so re-running with identical inputs replaces (renews) the
+stored envelope.
 
 ## Environment variables
 

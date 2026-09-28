@@ -1047,3 +1047,61 @@ fn case_collision_error_names_both_paths() {
         other => panic!("{other}"),
     }
 }
+
+/// `realpath()` walking a directory observes only that it is a real
+/// directory: its contents are not inputs, but replacing it with a symlink
+/// (which changes what `realpath()` returns) is a mismatch.
+#[cfg(unix)]
+#[test]
+fn stat_of_a_directory_is_type_only() {
+    let r = Repo::new();
+    r.write("fixtures/b.json", "{}");
+    r.write("other/b.json", "{}");
+    let obs = [(rp("fixtures"), Observation::Stat)];
+    let m = capture(&r.root, &obs);
+    let e = entry(&m, "fixtures");
+    assert_eq!(e.kind, EntryKind::Dir);
+    assert_eq!(e.size, 0);
+    assert!(diff(&m, &r.root).is_empty());
+    // New files inside do not matter.
+    r.write("fixtures/new.json", "{}");
+    assert!(diff(&m, &r.root).is_empty(), "{:?}", diff(&m, &r.root));
+    // The directory replaced by a symlink to an identical directory does.
+    r.rm("fixtures");
+    r.symlink("fixtures", "other");
+    assert_eq!(whats(&diff(&m, &r.root)), ["entry:fixtures"]);
+    // So does a file in its place.
+    r.rm("fixtures");
+    r.write("fixtures", "x");
+    assert_eq!(whats(&diff(&m, &r.root)), ["entry:fixtures"]);
+    // And its absence.
+    r.rm("fixtures");
+    assert_eq!(whats(&diff(&m, &r.root)), ["entry:fixtures"]);
+}
+
+#[test]
+fn stat_of_a_file_hashes_it_and_a_listing_implies_the_type() {
+    let r = Repo::new();
+    r.write("d/f.txt", "1");
+    let m = capture(
+        &r.root,
+        &[
+            (rp("d/f.txt"), Observation::Stat),
+            (rp("d"), Observation::Stat),
+            readdir("d"),
+        ],
+    );
+    assert_eq!(entry(&m, "d/f.txt").kind, EntryKind::File);
+    assert_eq!(entry(&m, "d").kind, EntryKind::DirListing);
+    assert_eq!(m.entries.len(), 2, "{:?}", m.entries);
+    r.write("d/f.txt", "2");
+    assert_eq!(whats(&diff(&m, &r.root)), ["entry:d/f.txt"]);
+    // A missing path cannot have been stat'ed.
+    let err = InputManifest::capture(&r.root, &[(rp("nope"), Observation::Stat)], vec![], &[]);
+    assert!(err.is_err());
+    // The `dir` tag is part of the root encoding.
+    let dir_only = capture(&r.root, &[(rp("d"), Observation::Stat)]);
+    let listing = capture(&r.root, &[readdir("d")]);
+    assert_ne!(dir_only.root(), listing.root());
+    assert_eq!(entry(&dir_only, "d").hash, crate::manifest::dir_type_hash());
+}

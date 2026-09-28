@@ -8,14 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use vci_adapter::Adapter;
 use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
 use vci_core::{InputManifest, PREDICATE_TYPE, test_key};
 use vci_git::{AttestStore, Repo, StoredEnvelope};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Platform};
-use crate::ctx::{Ctx, TestFile, VciPredicate, open_repo};
-use crate::envpolicy::{ChildEnvMap, FileEnv, build_child_env, lookup};
+use crate::ctx::{Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo};
+use crate::envpolicy::{ChildEnvMap, lookup};
 use crate::run::global_manifest;
 use crate::util::{glob_match, now_unix, parse_rfc3339};
 
@@ -105,12 +104,35 @@ pub struct FileVerdict {
     pub test_id: String,
     /// Relative to the project dir (what to pass to the runner).
     pub file: String,
+    /// `[[projects]]` name; omitted in the single-project form.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub project: String,
     pub skip: bool,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<CandidateInfo>,
     #[serde(skip)]
     pub candidates: Vec<Candidate>,
+    /// Index into [`PlanResult::projects`].
+    #[serde(skip)]
+    pub project_idx: usize,
+}
+
+/// Per-project part of a plan (what `vci ci` needs to run the remainder).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPlan {
+    /// Empty in the single-project form.
+    pub name: String,
+    /// Project dir relative to the repo root.
+    pub path: String,
+    pub adapter: String,
+    /// Set when every test file of this project must run; the reason.
+    pub run_all: Option<String>,
+    #[serde(skip)]
+    pub dir: camino::Utf8PathBuf,
+    #[serde(skip)]
+    pub child_env: Option<ChildEnvMap>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,17 +140,17 @@ pub struct FileVerdict {
 pub struct PlanResult {
     pub base_ref: Option<String>,
     pub base_commit: Option<String>,
-    /// Set when everything must run; the reason.
+    /// Set when everything (every project) must run; the reason.
     pub run_all: Option<String>,
     /// Configuration problems that do not change the verdicts (also printed
     /// to stderr).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    pub projects: Vec<ProjectPlan>,
     pub files: Vec<FileVerdict>,
+    /// The `[[projects]]` form is in use.
     #[serde(skip)]
-    pub project_dir: Option<camino::Utf8PathBuf>,
-    #[serde(skip)]
-    pub child_env: Option<ChildEnvMap>,
+    pub multi: bool,
 }
 
 impl PlanResult {
@@ -221,18 +243,42 @@ fn current_refs(repo: &Repo) -> Vec<String> {
     refs
 }
 
-/// Everything computed once per plan.
+/// Everything computed once per project.
 struct Verifier<'a> {
     ctx: &'a Ctx,
-    allowed: AllowedSigners,
+    project: &'a Project,
+    allowed: &'a AllowedSigners,
     now: i64,
     max_ttl: i64,
     repo_id: String,
     versions: vci_adapter::ToolVersions,
     child: ChildEnvMap,
+    /// pytest: installed distributions and the uv.lock pins.
+    python_externals: Option<PythonExternals>,
 }
 
-/// Top-level plan. Never fails: problems become `run_all`.
+/// What CI resolves Python externals against: the distributions installed in
+/// the `uv run --locked` environment, and the `uv.lock` pins.
+type PythonExternals = (
+    Result<vci_adapter::InstalledExternals, String>,
+    Result<Option<crate::externals::LockedPackages>, String>,
+);
+
+fn verdict_run(f: &TestFile, reason: &str) -> FileVerdict {
+    FileVerdict {
+        test_id: f.test_id.as_str().to_owned(),
+        file: f.project_rel.clone(),
+        project: String::new(),
+        skip: false,
+        reason: reason.to_owned(),
+        by: None,
+        candidates: vec![],
+        project_idx: f.project,
+    }
+}
+
+/// Top-level plan. Never fails: problems become `run_all` (for everything,
+/// or for one project).
 pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
     let (repo, root) = open_repo()?;
     let mut res = PlanResult {
@@ -240,9 +286,9 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
         base_commit: None,
         run_all: None,
         warnings: vec![],
+        projects: vec![],
         files: vec![],
-        project_dir: None,
-        child_env: None,
+        multi: false,
     };
 
     // 1. Policy and trust roots from the BASE commit.
@@ -301,17 +347,10 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             None
         }
     };
-    if res.run_all.is_none() {
-        let refs = current_refs(&repo);
-        if let Some(r) = refs
-            .iter()
-            .find(|r| config.policy.no_skip_refs.iter().any(|g| glob_match(g, r)))
-        {
-            res.run_all = Some(format!("policy.no_skip_refs matches {r}"));
-        }
-    }
+    let refs = current_refs(&repo);
+    res.multi = config.is_multi();
 
-    // 2. List test files (with the base project dir).
+    // 2. Projects (base config) and their test files.
     let ctx = match Ctx::new(repo, root.clone(), config) {
         Ok(c) => c,
         Err(e) => {
@@ -319,90 +358,147 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             return Ok(res);
         }
     };
-    let child = build_child_env(
-        &ctx.config.env,
-        ctx.adapter.inferred_env_patterns(),
-        std::env::vars_os(),
-    );
-    res.project_dir = Some(ctx.project_dir.clone());
-    res.child_env = Some(child.clone());
-    let files = match ctx
-        .adapter
-        .list_test_files(&child.to_child_env())
-        .map_err(anyhow::Error::from)
-        .and_then(|l| ctx.test_files(l))
-    {
-        Ok(f) => f,
-        Err(e) => {
-            res.run_all = Some(format!("listing test files failed: {e:#}"));
-            return Ok(res);
+    let mut files: Vec<TestFile> = Vec::new();
+    for (i, p) in ctx.projects.iter().enumerate() {
+        let child = p.child_env();
+        let mut run_all = res.run_all.clone();
+        if run_all.is_none()
+            && let Some(r) = refs
+                .iter()
+                .find(|r| p.policy.no_skip_refs.iter().any(|g| glob_match(g, r)))
+        {
+            run_all = Some(format!("policy.no_skip_refs matches {r}"));
         }
-    };
-    let files: Vec<TestFile> = match &opts.only {
-        Some(id) => files
-            .into_iter()
-            .filter(|f| f.test_id.as_str() == id)
-            .collect(),
-        None => files,
-    };
-    let mark_all = |res: &mut PlanResult, files: &[TestFile], reason: &str| {
-        res.files = files
-            .iter()
-            .map(|f| FileVerdict {
-                test_id: f.test_id.as_str().to_owned(),
-                file: f.project_rel.clone(),
-                skip: false,
-                reason: reason.to_owned(),
-                by: None,
-                candidates: vec![],
-            })
-            .collect();
-    };
-    if let Some(r) = res.run_all.clone() {
-        mark_all(&mut res, &files, &r);
-        return Ok(res);
+        match p
+            .adapter
+            .list_test_files(&child.to_child_env())
+            .map_err(anyhow::Error::from)
+            .and_then(|l| p.test_files(i, l))
+        {
+            Ok(f) => files.extend(f),
+            Err(e) => run_all = Some(format!("listing test files failed: {e:#}")),
+        }
+        res.projects.push(ProjectPlan {
+            name: p.name.clone(),
+            path: p.rel.clone(),
+            adapter: p.adapter.name().to_owned(),
+            run_all,
+            dir: p.dir.clone(),
+            child_env: Some(child),
+        });
     }
-    let allowed = allowed.expect("checked above");
+    mark_cross_project_ambiguity(&mut files);
+    if let Some(id) = &opts.only {
+        files.retain(|f| f.test_id.as_str() == id);
+    }
 
-    // 3. Toolchain, repo identity, stored candidates.
-    let setup = (|| -> Result<(String, vci_adapter::ToolVersions, i64, Vec<StoredEnvelope>)> {
-        let repo_id = ctx.repo.repo_id()?;
-        let versions = ctx.adapter.tool_versions()?;
-        let max_ttl = ctx.config.policy.max_ttl_secs()?;
-        let stored = AttestStore::new(&ctx.repo).list(None)?;
-        Ok((repo_id, versions, max_ttl, stored))
-    })();
-    let (repo_id, versions, max_ttl, stored) = match setup {
-        Ok(x) => x,
-        Err(e) => {
-            let r = format!("{e:#}");
-            res.run_all = Some(r.clone());
-            mark_all(&mut res, &files, &r);
-            return Ok(res);
-        }
+    // 3. Stored candidates (shared), then per project: toolchain, repo
+    // identity, and the checks.
+    let stored = if res.projects.iter().all(|p| p.run_all.is_some()) {
+        Ok(vec![])
+    } else {
+        AttestStore::new(&ctx.repo)
+            .list(None)
+            .map_err(|e| format!("{e:#}"))
     };
     let mut by_key: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
-    for s in stored {
-        by_key.entry(s.test_key.clone()).or_default().push(s);
+    match stored {
+        Ok(s) => {
+            for s in s {
+                by_key.entry(s.test_key.clone()).or_default().push(s);
+            }
+        }
+        Err(e) => {
+            for p in res.projects.iter_mut() {
+                p.run_all.get_or_insert_with(|| e.clone());
+            }
+        }
     }
-    let v = Verifier {
-        ctx: &ctx,
-        allowed,
-        now: now_unix(),
-        max_ttl,
-        repo_id,
-        versions,
-        child,
-    };
-
-    // 4./5. Per test file, per candidate.
-    for f in &files {
-        let cands = by_key
-            .remove(&test_key(f.test_id.as_str()))
-            .unwrap_or_default();
-        res.files.push(v.verdict(f, &cands));
+    let now = now_unix();
+    for (pi, project) in ctx.projects.iter().enumerate() {
+        let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
+        let verifier = match (&res.projects[pi].run_all, &allowed) {
+            (Some(r), _) => Err(r.clone()),
+            (None, None) => Err("no trusted signers".to_owned()),
+            (None, Some(allowed)) => {
+                let child = res.projects[pi].child_env.clone().unwrap_or_default();
+                let env = child.to_child_env();
+                (|| -> Result<Verifier<'_>> {
+                    let repo_id = ctx.repo.repo_id()?;
+                    let versions = project.adapter.tool_versions_with_env(&env)?;
+                    let max_ttl = project.policy.max_ttl_secs()?;
+                    let python_externals = if project.adapter.name() == "pytest" {
+                        Some((
+                            project
+                                .adapter
+                                .installed_externals(&env)
+                                .map_err(|e| e.to_string())
+                                .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned())),
+                            crate::externals::uv_lock_packages(&project.dir, &ctx.root),
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok(Verifier {
+                        ctx: &ctx,
+                        project,
+                        allowed,
+                        now,
+                        max_ttl,
+                        repo_id,
+                        versions,
+                        child,
+                        python_externals,
+                    })
+                })()
+                .map_err(|e| format!("{e:#}"))
+            }
+        };
+        match verifier {
+            Err(r) => {
+                res.projects[pi].run_all.get_or_insert_with(|| r.clone());
+                for f in mine {
+                    res.files.push(verdict_run(f, &r));
+                }
+            }
+            Ok(v) => {
+                for f in mine {
+                    let cands = by_key
+                        .remove(&test_key(f.test_id.as_str()))
+                        .unwrap_or_default();
+                    // A test id listed by two projects: both see the same
+                    // candidates (they are ambiguous and run anyway).
+                    if !cands.is_empty() {
+                        by_key.insert(test_key(f.test_id.as_str()), cands.clone());
+                    }
+                    res.files.push(v.verdict(f, &cands));
+                }
+            }
+        }
     }
+    finish(&mut res);
     Ok(res)
+}
+
+/// Fill in project names on verdicts; set the top-level `run_all` when every
+/// project runs everything.
+fn finish(res: &mut PlanResult) {
+    for f in res.files.iter_mut() {
+        if let Some(p) = res.projects.get(f.project_idx) {
+            f.project = p.name.clone();
+        }
+    }
+    if res.run_all.is_none()
+        && !res.projects.is_empty()
+        && res.projects.iter().all(|p| p.run_all.is_some())
+    {
+        res.run_all = res.projects[0].run_all.clone();
+    }
+    if let Some(r) = &res.run_all {
+        for p in res.projects.iter_mut() {
+            p.run_all.get_or_insert_with(|| r.clone());
+        }
+    }
 }
 
 /// When policy can't be read, still try to list files so the output names
@@ -410,52 +506,45 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
 fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) -> PlanResult {
     let reason = res.run_all.clone().unwrap_or_default();
     let config = crate::ctx::working_tree_config(&root).unwrap_or_default();
+    res.multi = config.is_multi();
     if let Ok(ctx) = Ctx::new(repo, root, config) {
-        let child = build_child_env(
-            &ctx.config.env,
-            ctx.adapter.inferred_env_patterns(),
-            std::env::vars_os(),
-        );
-        res.project_dir = Some(ctx.project_dir.clone());
-        if let Ok(files) = ctx
-            .adapter
-            .list_test_files(&child.to_child_env())
-            .map_err(anyhow::Error::from)
-            .and_then(|l| ctx.test_files(l))
-        {
-            res.files = files
-                .iter()
-                .map(|f| FileVerdict {
-                    test_id: f.test_id.as_str().to_owned(),
-                    file: f.project_rel.clone(),
-                    skip: false,
-                    reason: reason.clone(),
-                    by: None,
-                    candidates: vec![],
-                })
-                .collect();
+        let mut files = Vec::new();
+        for (i, p) in ctx.projects.iter().enumerate() {
+            let child = p.child_env();
+            if let Ok(f) = p
+                .adapter
+                .list_test_files(&child.to_child_env())
+                .map_err(anyhow::Error::from)
+                .and_then(|l| p.test_files(i, l))
+            {
+                files.extend(f);
+            }
+            res.projects.push(ProjectPlan {
+                name: p.name.clone(),
+                path: p.rel.clone(),
+                adapter: p.adapter.name().to_owned(),
+                run_all: Some(reason.clone()),
+                dir: p.dir.clone(),
+                child_env: Some(child),
+            });
         }
-        res.child_env = Some(child);
+        res.files = files.iter().map(|f| verdict_run(f, &reason)).collect();
     }
+    finish(&mut res);
     res
-}
-
-fn node_major(v: &str) -> &str {
-    v.split('.').next().unwrap_or(v)
 }
 
 impl Verifier<'_> {
     fn verdict(&self, f: &TestFile, cands: &[StoredEnvelope]) -> FileVerdict {
-        let mut out = FileVerdict {
-            test_id: f.test_id.as_str().to_owned(),
-            file: f.project_rel.clone(),
-            skip: false,
-            reason: String::new(),
-            by: None,
-            candidates: vec![],
-        };
+        let mut out = verdict_run(f, "");
         if f.ambiguous {
-            out.reason = "listed under more than one runner project".into();
+            out.reason =
+                "listed under more than one runner project (or by more than one vci project)"
+                    .into();
+            return out;
+        }
+        if let Some(g) = self.project.policy.never_skip_match(&f.project_rel) {
+            out.reason = format!("policy.never_skip matches {g:?}");
             return out;
         }
         if cands.is_empty() {
@@ -463,8 +552,8 @@ impl Verifier<'_> {
             return out;
         }
         // Current global inputs are the same for every candidate.
-        let global_now =
-            global_manifest(self.ctx, &self.child, &f.abs).map_err(|e| format!("{e:#}"));
+        let global_now = global_manifest(self.ctx, self.project, &self.child, &f.abs)
+            .map_err(|e| format!("{e:#}"));
         for s in cands {
             let mut info = CandidateInfo {
                 signer_ref: s.signer_ref.clone(),
@@ -525,7 +614,7 @@ impl Verifier<'_> {
         })?;
 
         // Signature, namespace, signer trust (base allowed_signers).
-        let verified = verify_envelope(&env, &self.allowed, self.now).map_err(|e| {
+        let verified = verify_envelope(&env, self.allowed, self.now).map_err(|e| {
             let (check, rank) = match &e {
                 VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => ("envelope", 1),
                 VerifyError::BadSignature(_) | VerifyError::NoSignatures => ("signature", 2),
@@ -653,55 +742,42 @@ impl Verifier<'_> {
                 f.test_id.as_str(),
             ));
         }
-        if p.core.adapter != self.ctx.adapter.name() {
+        let adapter = self.project.adapter.as_ref();
+        if p.core.adapter != adapter.name() {
             return Err(Failure::one(
                 "adapter",
                 8,
                 "adapter",
                 p.core.adapter.clone(),
-                self.ctx.adapter.name(),
+                adapter.name(),
             ));
         }
-        let argv = self
-            .ctx
-            .adapter
-            .canonical_argv(&self.ctx.project_rel, &f.project_rel);
+        let argv = adapter.canonical_argv(&self.project.rel, &f.project_rel);
         if p.core.argv != argv
-            || p.project_dir != self.ctx.project_rel
+            || p.project_dir != self.project.rel
             || p.runner_project != f.runner_project
+            || p.project_name != self.project.name
         {
             return Err(Failure::one(
                 "argv",
                 9,
                 "argv / project",
                 format!(
-                    "{:?} project {:?} runner project {:?}",
-                    p.core.argv, p.project_dir, p.runner_project
+                    "{:?} project {:?} runner project {:?} vci project {:?}",
+                    p.core.argv, p.project_dir, p.runner_project, p.project_name
                 ),
                 format!(
-                    "{argv:?} project {:?} runner project {:?}",
-                    self.ctx.project_rel, f.runner_project
+                    "{argv:?} project {:?} runner project {:?} vci project {:?}",
+                    self.project.rel, f.runner_project, self.project.name
                 ),
             ));
         }
 
-        // Toolchain.
+        // Toolchain (adapter-specific tools; see Toolchain::diff).
         let tc = &p.core.toolchain;
-        let mut tdiff = vec![];
-        if node_major(&tc.node) != node_major(&self.versions.node) {
-            tdiff.push((
-                "node major",
-                node_major(&tc.node).to_owned(),
-                node_major(&self.versions.node).to_owned(),
-            ));
-        }
-        if tc.vitest != self.versions.runner {
-            tdiff.push(("vitest", tc.vitest.clone(), self.versions.runner.clone()));
-        }
-        if tc.vite != self.versions.bundler {
-            tdiff.push(("vite", tc.vite.clone(), self.versions.bundler.clone()));
-        }
-        let platform = self.ctx.config.policy.platform_for(&f.project_rel);
+        let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
+        let mut tdiff = tc.diff(&now_tc);
+        let platform = self.project.policy.platform_for(&f.project_rel);
         let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
         if platform >= Platform::SameOs && tc.os != os {
             tdiff.push(("os", tc.os.clone(), os.to_owned()));
@@ -725,11 +801,7 @@ impl Verifier<'_> {
         }
 
         // Env configuration digest (base config).
-        let fenv = FileEnv::for_file(
-            &self.ctx.config.env,
-            self.ctx.adapter.inferred_env_patterns(),
-            &f.project_rel,
-        );
+        let fenv = self.project.file_env(&f.project_rel);
         if p.env_config_digest != fenv.digest() {
             return Err(Failure::one(
                 "env-config",
@@ -753,7 +825,7 @@ impl Verifier<'_> {
                 "passed, untainted (required)",
             ));
         }
-        if p.core.tree_dirty && !self.ctx.config.policy.allow_dirty {
+        if p.core.tree_dirty && !self.project.policy.allow_dirty {
             return Err(Failure::one(
                 "dirty",
                 13,
@@ -852,11 +924,27 @@ impl Verifier<'_> {
                     .collect(),
             });
         }
+        if adapter.name() == "pytest" {
+            let shadows = foreign_extension_shadows(&self.ctx.root, m);
+            if !shadows.is_empty() {
+                return Err(Failure {
+                    check: "inputs",
+                    rank: 15,
+                    details: shadows,
+                });
+            }
+        }
 
         // Externals: every attested package version must be what resolves now.
         let mut ext_diff = vec![];
         for e in &m.externals {
-            match crate::externals::installed(self.ctx.adapter.project_dir(), &e.name, &e.version) {
+            let found = match &self.python_externals {
+                Some((installed, locked)) => {
+                    crate::externals::python_installed(installed, locked, &e.name, &e.version)
+                }
+                None => crate::externals::installed(&self.project.dir, &e.name, &e.version),
+            };
+            match found {
                 Ok(()) => {}
                 Err(actual) => ext_diff.push(Detail {
                     what: format!("external:{}", e.name),
@@ -912,6 +1000,73 @@ impl Verifier<'_> {
     }
 }
 
+/// File name suffixes of native extension modules on any platform.
+const NATIVE_EXT: &[&str] = &[".so", ".pyd", ".dylib", ".sl"];
+
+/// Native extension modules that another platform's interpreter would import
+/// instead of an attested module (or that would satisfy an import that was
+/// probed as missing).
+///
+/// The collector probes only the running interpreter's extension suffixes
+/// (`x.cpython-314-darwin.so`, `x.abi3.so`, `x.so`), but CPython on Linux
+/// tries `x.cpython-314-x86_64-linux-gnu.so` first, Windows `x.cp314-win_amd64.pyd`,
+/// and so on. For every probed extension candidate, any file in that
+/// directory named `<stem>.<anything>.so|.pyd` (or `<stem>.so|.pyd`) fails
+/// the check.
+pub fn foreign_extension_shadows(root: &camino::Utf8Path, m: &InputManifest) -> Vec<Detail> {
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut out = Vec::new();
+    for e in &m.entries {
+        if e.kind != vci_core::EntryKind::Absent {
+            continue;
+        }
+        let p = e.path.as_str();
+        let (dir, name) = match p.rsplit_once('/') {
+            Some((d, n)) => (d.to_owned(), n),
+            None => (String::new(), p),
+        };
+        if !NATIVE_EXT.iter().any(|x| name.ends_with(x)) {
+            continue;
+        }
+        let Some((stem, _)) = name.split_once('.') else {
+            continue;
+        };
+        if !seen.insert((dir.clone(), stem.to_owned())) {
+            continue;
+        }
+        let abs = if dir.is_empty() {
+            root.to_owned()
+        } else {
+            root.join(&dir)
+        };
+        let Ok(rd) = std::fs::read_dir(&abs) else {
+            continue;
+        };
+        let prefix = format!("{stem}.");
+        let mut found: Vec<String> = rd
+            .flatten()
+            .filter_map(|d| d.file_name().into_string().ok())
+            .filter(|n| n.starts_with(&prefix) && NATIVE_EXT.iter().any(|x| n.ends_with(x)))
+            .collect();
+        found.sort();
+        for n in found {
+            let rel = if dir.is_empty() {
+                n.clone()
+            } else {
+                format!("{dir}/{n}")
+            };
+            out.push(Detail {
+                what: format!("entry:{rel}"),
+                expected: format!(
+                    "no native extension named {stem} (an import of it was looked up here)"
+                ),
+                actual: "exists: another platform's interpreter would import it".into(),
+            });
+        }
+    }
+    out
+}
+
 /// Load the plan and print it in `format`.
 pub fn print(res: &PlanResult, format: &str) -> Result<()> {
     match format {
@@ -919,20 +1074,45 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(res)?);
         }
         "github" => {
-            let run: Vec<&str> = res.to_run().map(|f| f.file.as_str()).collect();
-            let skip: Vec<&str> = res.skipped().map(|f| f.file.as_str()).collect();
+            // Single project: files relative to the project dir (what the
+            // runner takes). Several projects: repo-relative test ids, plus
+            // `run_<name>=` per project with project-relative files.
+            let name = |f: &FileVerdict| {
+                if res.multi {
+                    f.test_id.clone()
+                } else {
+                    f.file.clone()
+                }
+            };
+            let run: Vec<String> = res.to_run().map(name).collect();
+            let skip: Vec<String> = res.skipped().map(name).collect();
             for f in res.skipped() {
                 println!("::notice title=vci skip::{} {}", f.test_id, f.reason);
             }
             if let Some(r) = &res.run_all {
                 println!("::warning title=vci::running everything: {r}");
             }
-            let lines = format!(
+            let mut lines = format!(
                 "run_all={}\nrun={}\nskip={}\n",
                 res.run_all.is_some(),
                 run.join(" "),
                 skip.join(" ")
             );
+            if res.multi {
+                for (i, p) in res.projects.iter().enumerate() {
+                    let files: Vec<&str> = res
+                        .to_run()
+                        .filter(|f| f.project_idx == i)
+                        .map(|f| f.file.as_str())
+                        .collect();
+                    lines.push_str(&format!(
+                        "run_all_{0}={1}\nrun_{0}={2}\n",
+                        p.name,
+                        p.run_all.is_some(),
+                        files.join(" ")
+                    ));
+                }
+            }
             print!("{lines}");
             if let Ok(p) = std::env::var("GITHUB_OUTPUT")
                 && !p.is_empty()
@@ -953,10 +1133,21 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
             }
             if let Some(r) = &res.run_all {
                 println!("running everything: {r}");
+            } else if res.multi {
+                for p in &res.projects {
+                    if let Some(r) = &p.run_all {
+                        println!("running everything in {}: {r}", p.name);
+                    }
+                }
             }
             for f in &res.files {
+                let project = if res.multi {
+                    format!(" [{}]", f.project)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{} {}  ({})",
+                    "{} {}{project}  ({})",
                     if f.skip { "SKIP" } else { "RUN " },
                     f.test_id,
                     f.reason
@@ -1023,4 +1214,44 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vci_core::{Observation, RepoPath};
+
+    /// Regression: a macOS attestation probes `b.cpython-314-darwin.so`, but a
+    /// Linux interpreter imports `b.cpython-314-x86_64-linux-gnu.so` before
+    /// `b.py`; such a file must make the test run.
+    #[test]
+    fn foreign_platform_extensions_are_detected() {
+        let t = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("src/pkg")).unwrap();
+        std::fs::write(root.join("src/b.py"), "").unwrap();
+        let obs: Vec<(RepoPath, Observation)> = [
+            "src/b.cpython-314-darwin.so",
+            "src/b.abi3.so",
+            "src/pkg/__init__.cpython-314-darwin.so",
+            "src/c.py",
+        ]
+        .iter()
+        .map(|p| (RepoPath::new(p).unwrap(), Observation::Probe))
+        .collect();
+        let m = InputManifest::capture(&root, &obs, vec![], &[]).unwrap();
+        assert!(foreign_extension_shadows(&root, &m).is_empty());
+        std::fs::write(root.join("src/b.cpython-314-x86_64-linux-gnu.so"), "").unwrap();
+        std::fs::write(root.join("src/pkg/__init__.cp314-win_amd64.pyd"), "").unwrap();
+        std::fs::write(root.join("src/bb.cpython-314-x86_64-linux-gnu.so"), "").unwrap();
+        let d = foreign_extension_shadows(&root, &m);
+        let whats: Vec<&str> = d.iter().map(|d| d.what.as_str()).collect();
+        assert_eq!(
+            whats,
+            [
+                "entry:src/b.cpython-314-x86_64-linux-gnu.so",
+                "entry:src/pkg/__init__.cp314-win_amd64.pyd"
+            ]
+        );
+    }
 }

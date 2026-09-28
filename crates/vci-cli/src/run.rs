@@ -5,15 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use vci_adapter::{Adapter, Observed};
+use vci_adapter::Observed;
 use vci_attest::{Statement, Subject, sign_statement};
 use vci_core::{
     External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain, test_key,
 };
 use vci_git::AttestStore;
 
-use crate::ctx::{Ctx, TestFile, VciPredicate, open_repo, storage_key, working_tree_config};
-use crate::envpolicy::{ChildEnvMap, FileEnv, build_child_env, lookup};
+use crate::ctx::{
+    Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo, storage_key,
+    working_tree_config,
+};
+use crate::envpolicy::{ChildEnvMap, lookup};
 use crate::treestat::TreeStat;
 use crate::util::{now_unix, parse_duration, rfc3339};
 use crate::{global, keys};
@@ -26,33 +29,57 @@ pub struct RunArgs {
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Global manifest (per test file): global observations plus NODE_OPTIONS.
+/// Env vars hashed into every test file's global manifest, per adapter.
+fn global_env_keys(adapter: &str) -> Vec<String> {
+    match adapter {
+        // vci sets NODE_OPTIONS itself; a non-empty user value still matters.
+        "vitest" => vec!["NODE_OPTIONS".to_owned()],
+        // PYTEST_*/PYTHON* are reported per file by the collector.
+        _ => vec![],
+    }
+}
+
+/// Global manifest (per test file): global observations plus the adapter's
+/// global env keys (NODE_OPTIONS for Vitest).
 pub fn global_manifest(
     ctx: &Ctx,
+    project: &Project,
     child: &ChildEnvMap,
     test_abs: &Utf8Path,
 ) -> Result<InputManifest> {
-    let obs = global::observations(&ctx.root, &ctx.adapter, test_abs)?;
+    let obs = global::observations(&ctx.root, project.adapter.as_ref(), test_abs)?;
     let m = InputManifest::capture_with_env(
         &ctx.root,
         &obs,
         vec![],
-        &["NODE_OPTIONS".to_owned()],
+        &global_env_keys(project.adapter.name()),
         lookup(child),
     )?;
     m.check_case_collisions()?;
     Ok(m)
 }
 
-/// Observations of one test file, as repo paths. Err names the first path
-/// outside the repository.
+/// Observations of one test file, as repo paths (Vitest). Err names the
+/// first path outside the repository.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn observations(root: &Utf8Path, o: &Observed) -> Result<Vec<(RepoPath, Observation)>, String> {
+    observations_for(root, o, "vitest")
+}
+
+/// Observations of one test file for `adapter`: the collector's paths, plus
+/// (Vitest only) the package.json/tsconfig.json context of every module.
+pub fn observations_for(
+    root: &Utf8Path,
+    o: &Observed,
+    adapter: &str,
+) -> Result<Vec<(RepoPath, Observation)>, String> {
     let mut out = Vec::new();
-    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 4] = [
+    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 5] = [
         (&o.modules, Observation::Read),
         (&o.reads, Observation::Read),
         (&o.probes, Observation::Probe),
         (&o.readdirs, Observation::ReadDir),
+        (&o.stats, Observation::Stat),
     ];
     for (set, kind) in groups {
         for p in set {
@@ -64,29 +91,114 @@ pub fn observations(root: &Utf8Path, o: &Observed) -> Result<Vec<(RepoPath, Obse
     }
     // package.json / tsconfig.json that decide how each module resolves its
     // imports and is transformed.
-    let ctx = global::module_context(root, o.modules.iter().map(|p| p.as_path()))
-        .map_err(|e| format!("module context: {e:#}"))?;
-    out.extend(ctx);
+    if adapter == "vitest" {
+        let ctx = global::module_context(root, o.modules.iter().map(|p| p.as_path()))
+            .map_err(|e| format!("module context: {e:#}"))?;
+        out.extend(ctx);
+    }
     Ok(out)
 }
 
-pub fn toolchain(v: &vci_adapter::ToolVersions) -> Toolchain {
-    Toolchain {
-        node: v.node.clone(),
-        vitest: v.runner.clone(),
-        vite: v.bundler.clone(),
+/// The toolchain recorded for (and compared against) an attestation.
+pub fn toolchain_for(adapter: &str, v: &vci_adapter::ToolVersions) -> Toolchain {
+    let mut t = Toolchain {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
+        ..Default::default()
+    };
+    match adapter {
+        "pytest" => {
+            t.python = v.python.clone();
+            t.implementation = v.implementation.clone();
+            t.pytest = v.runner.clone();
+            t.python_libs = v.python_libs.clone();
+            t.python_dists = v.python_dists.clone();
+        }
+        _ => {
+            t.node = v.node.clone();
+            t.vitest = v.runner.clone();
+            t.vite = v.bundler.clone();
+        }
     }
+    t
 }
 
 struct Attestable {
     predicate: VciPredicate,
 }
 
+/// Collector versions vs the project's, per adapter.
+fn collector_toolchain_mismatch(
+    adapter: &str,
+    o: &Observed,
+    v: &vci_adapter::ToolVersions,
+) -> Option<String> {
+    match adapter {
+        "pytest" => (o.python != v.python
+            || o.implementation != v.implementation
+            || o.runner_version != v.runner)
+            .then(|| {
+                format!(
+                    "toolchain seen by the collector (python {} {}, pytest {}) differs from the project's (python {} {}, pytest {})",
+                    o.implementation,
+                    o.python,
+                    o.runner_version,
+                    v.implementation,
+                    v.python,
+                    v.runner
+                )
+            }),
+        _ => (o.node != v.node || o.runner_version != v.runner || o.bundler_version != v.bundler)
+            .then(|| {
+                format!(
+                    "toolchain seen by the collector (node {}, vitest {}, vite {}) differs from the project's (node {}, vitest {}, vite {})",
+                    o.node, o.runner_version, o.bundler_version, v.node, v.runner, v.bundler
+                )
+            }),
+    }
+}
+
+/// Names in a directory listing that a fresh CI checkout will not have:
+/// OS metadata and bytecode caches.
+const CHECKOUT_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", "__pycache__"];
+
+/// Warnings for attested directory listings that contain [`CHECKOUT_JUNK`]:
+/// the listing will differ in a fresh checkout, so the file will run there
+/// (never a false skip, but a lost skip worth knowing about).
+fn junk_in_listings(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in &m.entries {
+        if e.kind != vci_core::EntryKind::DirListing {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(e.path.to_abs(root)) else {
+            continue;
+        };
+        let junk: Vec<String> = rd
+            .flatten()
+            .filter_map(|d| d.file_name().into_string().ok())
+            .filter(|n| CHECKOUT_JUNK.contains(&n.as_str()))
+            .collect();
+        if !junk.is_empty() {
+            let dir = if e.path.as_str().is_empty() {
+                "."
+            } else {
+                e.path.as_str()
+            };
+            out.push(format!(
+                "the listing of {dir} includes {} (not in a fresh checkout, e.g. in CI): this attestation will not match there. Remove {} and run again.",
+                junk.join(", "),
+                if junk.len() == 1 { "it" } else { "them" }
+            ));
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_one(
     ctx: &Ctx,
+    project: &Project,
     o: &Observed,
     file: Option<&TestFile>,
     versions: &vci_adapter::ToolVersions,
@@ -94,47 +206,77 @@ fn check_one(
     pre_stat: &TreeStat,
     pre_global: &BTreeMap<String, Result<String, String>>,
     base: &PredicateBase,
+    locked: &Result<Option<crate::externals::LockedPackages>, String>,
 ) -> Result<Attestable, String> {
     let file = file.ok_or_else(|| "not in the runner's test file list".to_owned())?;
     if file.ambiguous {
-        return Err("listed under more than one runner project".into());
+        return Err(
+            "listed under more than one runner project (or by more than one vci project)".into(),
+        );
     }
-    if Utf8Path::new(&o.root) != ctx.adapter.project_dir()
-        && Utf8Path::new(&o.root).canonicalize_utf8().ok().as_deref()
-            != Some(ctx.adapter.project_dir())
+    let adapter = project.adapter.as_ref();
+    if o.adapter != adapter.name() {
+        return Err(format!(
+            "collector output is for adapter {:?}, not {:?}",
+            o.adapter,
+            adapter.name()
+        ));
+    }
+    if Utf8Path::new(&o.root) != adapter.project_dir()
+        && Utf8Path::new(&o.root).canonicalize_utf8().ok().as_deref() != Some(adapter.project_dir())
     {
         return Err(format!("collector root {} is not the project dir", o.root));
     }
     if !o.taints.is_empty() {
         return Err(format!("tainted: {}", o.taints.join(", ")));
     }
+    // Files the test created, changed or deleted inside the repository are
+    // outputs that later runs (or other test files) may read: not attestable.
+    let written: Vec<String> = o
+        .writes
+        .iter()
+        .filter_map(|p| RepoPath::from_abs(&ctx.root, p).ok())
+        .map(|p| p.as_str().to_owned())
+        .collect();
+    if !written.is_empty() {
+        return Err(format!(
+            "wrote inside the repository: {}",
+            written.join(", ")
+        ));
+    }
     let result = o.result.clone().ok_or("no result")?;
     if !result.is_pass() {
         return Err(format!(
-            "result {} ({} failed of {})",
-            result.state, result.failed, result.tests
+            "result {} ({} failed, {} skipped or xfailed of {}; a skipped test did not run, so it cannot be vouched for elsewhere)",
+            result.state, result.failed, result.skipped, result.tests
         ));
     }
-    if o.node != versions.node
-        || o.runner_version != versions.runner
-        || o.bundler_version != versions.bundler
-    {
-        return Err(format!(
-            "toolchain seen by the collector (node {}, vitest {}, vite {}) differs from the project's (node {}, vitest {}, vite {})",
-            o.node,
-            o.runner_version,
-            o.bundler_version,
-            versions.node,
-            versions.runner,
-            versions.bundler
-        ));
+    if adapter.name() == "pytest" {
+        // The test saw vci's own PYTHONPATH (the collector directory), which
+        // differs between machines and is not what a plain run sees.
+        if o.env_keys.contains("PYTHONPATH") {
+            return Err("read PYTHONPATH, which vci sets to its collector".into());
+        }
+        // Externals built from the repository itself are not identified by
+        // their version.
+        match locked {
+            Ok(Some(lock)) => {
+                for (n, _) in &o.externals {
+                    if let Some(why) = crate::externals::local_source_reason(lock, n) {
+                        return Err(why);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) if !o.externals.is_empty() => return Err(format!("uv.lock: {e}")),
+            Err(_) => {}
+        }
     }
-    let obs = observations(&ctx.root, o)?;
-    let fenv = FileEnv::for_file(
-        &ctx.config.env,
-        ctx.adapter.inferred_env_patterns(),
-        &file.project_rel,
-    );
+    if let Some(m) = collector_toolchain_mismatch(adapter.name(), o, versions) {
+        return Err(m);
+    }
+    let obs = observations_for(&ctx.root, o, adapter.name())?;
+    let fenv = project.file_env(&file.project_rel);
     let keys = fenv.hashed_keys(child, &o.env_keys);
     let externals: Vec<External> = o
         .externals
@@ -150,7 +292,8 @@ fn check_one(
     manifest
         .check_case_collisions()
         .map_err(|e| format!("inputs: {e}"))?;
-    let gm = global_manifest(ctx, child, &file.abs).map_err(|e| format!("global inputs: {e:#}"))?;
+    let gm = global_manifest(ctx, project, child, &file.abs)
+        .map_err(|e| format!("global inputs: {e:#}"))?;
     match pre_global.get(file.test_id.as_str()) {
         Some(Ok(root)) if *root == gm.root() => {}
         Some(Ok(_)) => return Err("global inputs changed during the run".into()),
@@ -164,15 +307,13 @@ fn check_one(
     }
     let core = Predicate {
         tool_version: TOOL_VERSION.to_owned(),
-        adapter: ctx.adapter.name().to_owned(),
+        adapter: adapter.name().to_owned(),
         test_id: file.test_id.as_str().to_owned(),
-        argv: ctx
-            .adapter
-            .canonical_argv(&ctx.project_rel, &file.project_rel),
+        argv: adapter.canonical_argv(&project.rel, &file.project_rel),
         repo_id: base.repo_id.clone(),
         commit: base.commit.clone(),
         tree_dirty: base.dirty,
-        toolchain: toolchain(versions),
+        toolchain: toolchain_for(adapter.name(), versions),
         global_input_root: gm.root(),
         input_root: manifest.root(),
         manifest,
@@ -186,8 +327,9 @@ fn check_one(
         predicate: VciPredicate {
             core,
             env_config_digest: fenv.digest(),
-            project_dir: ctx.project_rel.clone(),
+            project_dir: project.rel.clone(),
             runner_project: file.runner_project.clone(),
+            project_name: project.name.clone(),
         },
     })
 }
@@ -200,24 +342,26 @@ struct PredicateBase {
     ttl: i64,
 }
 
-/// Resolve CLI file arguments (relative to cwd) to project-relative paths.
-fn resolve_files(ctx: &Ctx, args: &[String], files: &[TestFile]) -> Result<Vec<String>> {
+/// Resolve CLI file arguments (relative to cwd) to indexes into `files`
+/// (every project that lists the file).
+fn resolve_files(args: &[String], files: &[TestFile]) -> Result<BTreeSet<usize>> {
     let cwd = crate::ctx::cwd()?;
-    let mut out = Vec::new();
+    let mut out = BTreeSet::new();
     for a in args {
-        let abs = cwd.join(a);
-        let abs = abs
+        let abs = cwd
+            .join(a)
             .canonicalize_utf8()
             .with_context(|| format!("test file {a}"))?;
-        let rel = abs
-            .strip_prefix(ctx.adapter.project_dir())
-            .with_context(|| format!("{a} is not inside the project dir {}", ctx.project_dir))?
-            .as_str()
-            .to_owned();
-        if !files.iter().any(|f| f.project_rel == rel) {
-            bail!("{a} is not a test file of this project (not listed by vitest)");
+        let hits: Vec<usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.abs == abs)
+            .map(|(i, _)| i)
+            .collect();
+        if hits.is_empty() {
+            bail!("{a} is not a test file of any project (not listed by the test runner)");
         }
-        out.push(rel);
+        out.extend(hits);
     }
     Ok(out)
 }
@@ -226,14 +370,6 @@ pub fn run(args: RunArgs) -> Result<i32> {
     let (repo, root) = open_repo()?;
     let config = working_tree_config(&root)?;
     let ttl = parse_duration(&args.ttl).context("--ttl")?;
-    let max = config.policy.max_ttl_secs()?;
-    if ttl > max {
-        bail!(
-            "--ttl {} exceeds policy.max_ttl {}; such attestations would be rejected",
-            args.ttl,
-            config.policy.max_ttl
-        );
-    }
     let ctx = Ctx::new(repo, root.clone(), config)?;
     let key = keys::discover(args.key.as_deref(), &root)?;
     let signer = key.signer_id();
@@ -248,110 +384,172 @@ pub fn run(args: RunArgs) -> Result<i32> {
         issued: now_unix(),
         ttl,
     };
-    let child = build_child_env(
-        &ctx.config.env,
-        ctx.adapter.inferred_env_patterns(),
-        std::env::vars_os(),
-    );
-    let child_env = child.to_child_env();
-    let files = ctx.test_files(ctx.adapter.list_test_files(&child_env)?)?;
-    let selected: Vec<String> = if args.files.is_empty() {
-        files.iter().map(|f| f.project_rel.clone()).collect()
+    let children: Vec<ChildEnvMap> = ctx.projects.iter().map(|p| p.child_env()).collect();
+    let locks: Vec<_> = ctx
+        .projects
+        .iter()
+        .map(|p| crate::externals::uv_lock_packages(&p.dir, &ctx.root))
+        .collect();
+    let mut files: Vec<TestFile> = Vec::new();
+    for (i, p) in ctx.projects.iter().enumerate() {
+        let listed = p
+            .adapter
+            .list_test_files(&children[i].to_child_env())
+            .with_context(|| format!("listing the test files of {}", p.label()))?;
+        files.extend(p.test_files(i, listed)?);
+    }
+    mark_cross_project_ambiguity(&mut files);
+    let selected: BTreeSet<usize> = if args.files.is_empty() {
+        (0..files.len()).collect()
     } else {
-        resolve_files(&ctx, &args.files, &files)?
+        resolve_files(&args.files, &files)?
     };
     if selected.is_empty() {
         bail!("no test files to run");
     }
-    for f in &files {
-        if selected.contains(&f.project_rel) {
-            let fe = FileEnv::for_file(
-                &ctx.config.env,
-                ctx.adapter.inferred_env_patterns(),
-                &f.project_rel,
+    let involved: BTreeSet<usize> = selected.iter().map(|&i| files[i].project).collect();
+    for &pi in &involved {
+        let p = &ctx.projects[pi];
+        let max = p.policy.max_ttl_secs()?;
+        if ttl > max {
+            bail!(
+                "--ttl {} exceeds policy.max_ttl {} of {}; such attestations would be rejected",
+                args.ttl,
+                p.policy.max_ttl,
+                p.label()
             );
-            for s in fe.secret_like() {
-                eprintln!(
-                    "vci: warning: declared env var {s} looks like a secret; its hash is published in attestations. Put it in pass_through instead."
-                );
-            }
         }
     }
-    let versions = ctx.adapter.tool_versions()?;
+    for &i in &selected {
+        let f = &files[i];
+        for s in ctx.projects[f.project]
+            .file_env(&f.project_rel)
+            .secret_like()
+        {
+            eprintln!(
+                "vci: warning: declared env var {s} looks like a secret; its hash is published in attestations. Put it in pass_through instead."
+            );
+        }
+    }
+    let mut versions = BTreeMap::new();
+    for &pi in &involved {
+        let p = &ctx.projects[pi];
+        let v = p
+            .adapter
+            .tool_versions_with_env(&children[pi].to_child_env())
+            .with_context(|| format!("tool versions of {}", p.label()))?;
+        versions.insert(pi, v);
+        for w in p.adapter.warnings(&children[pi].to_child_env()) {
+            eprintln!("vci: warning: {w}");
+        }
+    }
 
     // Before the run: tree metadata and global inputs.
     let pre_stat = TreeStat::snapshot(&root)?;
     let mut pre_global = BTreeMap::new();
-    for f in files.iter().filter(|f| selected.contains(&f.project_rel)) {
-        let r = global_manifest(&ctx, &child, &f.abs)
+    for &i in &selected {
+        let f = &files[i];
+        let r = global_manifest(&ctx, &ctx.projects[f.project], &children[f.project], &f.abs)
             .map(|m| m.root())
             .map_err(|e| format!("{e:#}"));
         pre_global.insert(f.test_id.as_str().to_owned(), r);
     }
 
-    let out = ctx.adapter.run_collect(&selected, &child_env)?;
-
-    let by_id: BTreeMap<&str, &TestFile> = files.iter().map(|f| (f.test_id.as_str(), f)).collect();
     let store = AttestStore::new(&ctx.repo);
     let mut attested = 0;
     let mut refused = 0;
-    let mut seen = BTreeSet::new();
-    for o in &out.files {
-        let id = ctx.test_id(&o.test_id).map(|p| p.as_str().to_owned()).ok();
-        let file = id.as_ref().and_then(|id| by_id.get(id.as_str()).copied());
-        let label = id.clone().unwrap_or_else(|| o.test_id.clone());
-        seen.insert(label.clone());
-        match check_one(
-            &ctx,
-            o,
-            file,
-            &versions,
-            &child,
-            &pre_stat,
-            &pre_global,
-            &base,
-        ) {
-            Err(reason) => {
-                refused += 1;
-                eprintln!("vci: not attesting {label}: {reason}");
-            }
-            Ok(a) => {
-                let p = &a.predicate;
-                let skey = storage_key(p);
-                let value = serde_json::to_value(p)?;
-                let mut digest = std::collections::BTreeMap::new();
-                digest.insert("blake3".to_owned(), p.core.input_root.clone());
-                let stmt = Statement::new(
-                    vec![Subject {
-                        name: p.core.test_id.clone(),
-                        digest,
-                    }],
-                    PREDICATE_TYPE,
-                    value,
-                );
-                let env = sign_statement(&stmt, &key.path)
-                    .with_context(|| format!("signing with {}", key.path))?;
-                store.put(&signer, &test_key(&p.core.test_id), &skey, &env.to_json())?;
-                attested += 1;
-                eprintln!(
-                    "vci: attested {label} ({} inputs, root {}) on refs/attest/v1/{signer}",
-                    p.core.manifest.entries.len(),
-                    &p.core.input_root[..16]
-                );
+    let mut exit: Option<i32> = Some(0);
+    for &pi in &involved {
+        let project = &ctx.projects[pi];
+        let child = &children[pi];
+        let mine: Vec<&TestFile> = selected
+            .iter()
+            .map(|&i| &files[i])
+            .filter(|f| f.project == pi)
+            .collect();
+        let rels: Vec<String> = mine.iter().map(|f| f.project_rel.clone()).collect();
+        if ctx.projects.len() > 1 {
+            eprintln!(
+                "vci: running {} test file(s) of {} ({})",
+                rels.len(),
+                project.label(),
+                project.adapter.name()
+            );
+        }
+        let out = project.adapter.run_collect(&rels, &child.to_child_env())?;
+        match (exit, out.exit_code) {
+            (Some(0), c) => exit = c,
+            (Some(_), None) => exit = None,
+            _ => {}
+        }
+        let by_id: BTreeMap<&str, &TestFile> =
+            mine.iter().map(|f| (f.test_id.as_str(), *f)).collect();
+        let mut seen = BTreeSet::new();
+        for o in &out.files {
+            let id = project
+                .test_id(&o.test_id)
+                .map(|p| p.as_str().to_owned())
+                .ok();
+            let file = id.as_ref().and_then(|id| by_id.get(id.as_str()).copied());
+            let label = id.clone().unwrap_or_else(|| o.test_id.clone());
+            seen.insert(label.clone());
+            match check_one(
+                &ctx,
+                project,
+                o,
+                file,
+                &versions[&pi],
+                child,
+                &pre_stat,
+                &pre_global,
+                &base,
+                &locks[pi],
+            ) {
+                Err(reason) => {
+                    refused += 1;
+                    eprintln!("vci: not attesting {label}: {reason}");
+                }
+                Ok(a) => {
+                    let p = &a.predicate;
+                    for w in junk_in_listings(&ctx.root, &p.core.manifest) {
+                        eprintln!("vci: warning: {label}: {w}");
+                    }
+                    let skey = storage_key(p);
+                    let value = serde_json::to_value(p)?;
+                    let mut digest = std::collections::BTreeMap::new();
+                    digest.insert("blake3".to_owned(), p.core.input_root.clone());
+                    let stmt = Statement::new(
+                        vec![Subject {
+                            name: p.core.test_id.clone(),
+                            digest,
+                        }],
+                        PREDICATE_TYPE,
+                        value,
+                    );
+                    let env = sign_statement(&stmt, &key.path)
+                        .with_context(|| format!("signing with {}", key.path))?;
+                    store.put(&signer, &test_key(&p.core.test_id), &skey, &env.to_json())?;
+                    attested += 1;
+                    eprintln!(
+                        "vci: attested {label} ({} inputs, root {}) on refs/attest/v1/{signer}",
+                        p.core.manifest.entries.len(),
+                        &p.core.input_root[..16]
+                    );
+                }
             }
         }
-    }
-    for f in files.iter().filter(|f| selected.contains(&f.project_rel)) {
-        if !seen.contains(f.test_id.as_str()) {
-            refused += 1;
-            eprintln!(
-                "vci: not attesting {}: the collector produced no output for it",
-                f.test_id
-            );
+        for f in &mine {
+            if !seen.contains(f.test_id.as_str()) {
+                refused += 1;
+                eprintln!(
+                    "vci: not attesting {}: the collector produced no output for it",
+                    f.test_id
+                );
+            }
         }
     }
     eprintln!("vci: {attested} attested, {refused} not attested");
-    Ok(out.exit_code.unwrap_or(1))
+    Ok(exit.unwrap_or(1))
 }
 
 #[cfg(test)]

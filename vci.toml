@@ -1,0 +1,28 @@
+# vci configuration. Policy is read from the BASE commit in CI.
+
+# Project directory (where pyproject.toml and uv.lock live), relative to the repo root.
+project = "demo/pytest-app"
+adapter = "pytest"
+
+[policy]
+# "any" | "same-os" | "exact": which OS/arch may satisfy CI. The Python
+# version (major.minor.patch) and implementation must always match.
+platform = "any"
+# Longest accepted attestation lifetime.
+max_ttl = "30d"
+# Accept attestations made from a working tree with uncommitted changes.
+allow_dirty = true
+# Refs on which nothing is ever skipped (globs; "*" stays within a segment).
+# Pushes to the default branch and tags run everything.
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# Test files (project-relative globs) that are never skipped, e.g. files whose
+# inputs no collector can see (see "pytest limitations" in the README).
+never_skip = []
+
+[env]
+# "strict": only declared and pass-through variables reach tests.
+mode = "strict"
+# Hashed into every test file's inputs.
+global = ["TZ"]
+# Visible to tests, never hashed. Put secrets here.
+pass_through = []

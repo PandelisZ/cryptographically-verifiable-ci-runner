@@ -1,15 +1,17 @@
-//! Shared context: repository, config, adapter, and the predicate wrapper.
+//! Shared context: repository, config, projects (each with its adapter), and
+//! the predicate wrapper.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
-use vci_adapter::{Adapter, VitestAdapter};
+use vci_adapter::Adapter;
 use vci_core::{Predicate, RepoPath};
 use vci_git::Repo;
 
-use crate::config::{CONFIG_FILE, Config};
+use crate::config::{CONFIG_FILE, Config, EnvConfig, Policy};
+use crate::envpolicy::{ChildEnvMap, FileEnv, build_child_env_with};
 
 /// The signed predicate: the `vci-core` [`Predicate`] plus vci-cli fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +25,10 @@ pub struct VciPredicate {
     pub project_dir: String,
     /// Runner project name (Vitest `projects`), empty if none.
     pub runner_project: String,
+    /// `[[projects]]` name in vci.toml; empty (and omitted) in the
+    /// single-project form, so those predicates serialise as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_name: String,
 }
 
 /// Storage key for an attestation: everything that must match for two
@@ -30,7 +36,7 @@ pub struct VciPredicate {
 /// replaces (renews) the stored envelope.
 pub fn storage_key(p: &VciPredicate) -> String {
     let tc = &p.core.toolchain;
-    let parts = [
+    let mut parts = vec![
         "vci/storage-key/v1",
         p.core.repo_id.as_str(),
         p.core.test_id.as_str(),
@@ -42,8 +48,40 @@ pub fn storage_key(p: &VciPredicate) -> String {
         tc.vite.as_str(),
         tc.os.as_str(),
         tc.arch.as_str(),
-        &p.core.argv.join("\0"),
     ];
+    let argv = p.core.argv.join("\0");
+    parts.push(&argv);
+    // Fields added after v1 only join the key when set, so Vitest keys in the
+    // single-project form are unchanged.
+    let dists = if tc.python_dists.is_empty() {
+        String::new()
+    } else {
+        vci_core::blake3_hex(tc.python_dists.join("\n").as_bytes())
+    };
+    let extra = [
+        ("python", tc.python.as_str()),
+        ("implementation", tc.implementation.as_str()),
+        ("pytest", tc.pytest.as_str()),
+        ("python_libs", tc.python_libs.as_str()),
+        ("python_dists", &dists),
+        ("project", p.project_name.as_str()),
+        (
+            "adapter",
+            if p.core.adapter == "vitest" {
+                ""
+            } else {
+                p.core.adapter.as_str()
+            },
+        ),
+    ];
+    let extra: Vec<String> = extra
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    for e in &extra {
+        parts.push(e);
+    }
     vci_core::blake3_hex(parts.join("\n").as_bytes())
 }
 
@@ -81,56 +119,76 @@ pub struct TestFile {
     pub project_rel: String,
     pub abs: Utf8PathBuf,
     pub runner_project: String,
-    /// Listed under more than one runner project: never attestable.
+    /// Listed under more than one runner project, or by more than one vci
+    /// project: never attestable, never skipped.
     pub ambiguous: bool,
+    /// Index into [`Ctx::projects`].
+    pub project: usize,
 }
 
-pub struct Ctx {
-    pub repo: Repo,
-    pub root: Utf8PathBuf,
-    pub config: Config,
-    pub project_rel: String,
-    pub project_dir: Utf8PathBuf,
-    pub adapter: VitestAdapter,
+/// One project of `vci.toml` with its adapter.
+pub struct Project {
+    /// `[[projects]]` name; empty in the single-project form.
+    pub name: String,
+    /// Project dir relative to the repo root ("." for the root).
+    pub rel: String,
+    /// Canonical absolute project dir.
+    pub dir: Utf8PathBuf,
+    pub policy: Policy,
+    pub env: EnvConfig,
+    pub adapter: Box<dyn Adapter>,
 }
 
-impl Ctx {
-    pub fn new(repo: Repo, root: Utf8PathBuf, config: Config) -> Result<Self> {
-        let project_rel = config.project_rel();
-        let project_dir = if project_rel == "." {
-            root.clone()
+impl Project {
+    /// Name for messages: the project name, else its directory.
+    pub fn label(&self) -> String {
+        if self.name.is_empty() {
+            self.rel.clone()
         } else {
-            root.join(&project_rel)
-        };
-        if !project_dir.is_dir() {
-            bail!("project dir {project_dir} does not exist");
+            self.name.clone()
         }
-        let project_dir = project_dir.canonicalize_utf8()?;
-        if !project_dir.starts_with(&root) {
-            bail!("project dir {project_dir} is outside the repository {root}");
-        }
-        let adapter = VitestAdapter::new(&project_dir);
-        Ok(Self {
-            repo,
-            root,
-            config,
-            project_rel,
-            project_dir,
-            adapter,
-        })
     }
 
     pub fn test_id(&self, project_rel: &str) -> Result<RepoPath> {
-        let joined = if self.project_rel == "." {
+        let joined = if self.rel == "." {
             project_rel.to_owned()
         } else {
-            format!("{}/{project_rel}", self.project_rel)
+            format!("{}/{project_rel}", self.rel)
         };
         Ok(RepoPath::new(&joined)?)
     }
 
-    /// Turn the runner's listing into test files keyed by test id.
-    pub fn test_files(&self, listed: Vec<vci_adapter::ListedFile>) -> Result<Vec<TestFile>> {
+    /// Effective env configuration for a test file of this project.
+    pub fn file_env(&self, project_rel: &str) -> FileEnv {
+        let inferred: Vec<&str> = self
+            .adapter
+            .inferred_env_patterns()
+            .iter()
+            .chain(self.adapter.hashed_env_patterns())
+            .copied()
+            .collect();
+        FileEnv::for_file(&self.env, &inferred, project_rel)
+            .with_builtin(self.adapter.builtin_pass_through())
+    }
+
+    /// The environment this project's test processes get.
+    pub fn child_env(&self) -> ChildEnvMap {
+        build_child_env_with(
+            &self.env,
+            self.adapter.inferred_env_patterns(),
+            self.adapter.builtin_pass_through(),
+            std::env::vars_os(),
+        )
+    }
+
+    /// Turn the runner's listing into test files of this project (project
+    /// index `idx`), one per test id; a file listed under several runner
+    /// projects is marked ambiguous.
+    pub fn test_files(
+        &self,
+        idx: usize,
+        listed: Vec<vci_adapter::ListedFile>,
+    ) -> Result<Vec<TestFile>> {
         let mut by_id: BTreeMap<String, TestFile> = BTreeMap::new();
         for f in listed {
             let rel = f
@@ -152,11 +210,73 @@ impl Ctx {
                             abs: f.abs,
                             runner_project: f.project,
                             ambiguous: false,
+                            project: idx,
                         },
                     );
                 }
             }
         }
         Ok(by_id.into_values().collect())
+    }
+}
+
+/// Mark every test id listed by more than one project as ambiguous (in all
+/// of them), so test ids stay unambiguous across projects.
+pub fn mark_cross_project_ambiguity(files: &mut [TestFile]) {
+    let mut seen: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    for f in files.iter() {
+        seen.entry(f.test_id.as_str().to_owned())
+            .or_default()
+            .insert(f.project);
+    }
+    for f in files.iter_mut() {
+        if seen.get(f.test_id.as_str()).is_some_and(|s| s.len() > 1) {
+            f.ambiguous = true;
+        }
+    }
+}
+
+pub struct Ctx {
+    pub repo: Repo,
+    pub root: Utf8PathBuf,
+    pub projects: Vec<Project>,
+}
+
+impl Ctx {
+    pub fn new(repo: Repo, root: Utf8PathBuf, config: Config) -> Result<Self> {
+        let mut projects = Vec::new();
+        for spec in config.project_specs() {
+            let dir = if spec.rel == "." {
+                root.clone()
+            } else {
+                root.join(&spec.rel)
+            };
+            let what = if spec.name.is_empty() {
+                "project dir".to_owned()
+            } else {
+                format!("project {:?} dir", spec.name)
+            };
+            if !dir.is_dir() {
+                bail!("{what} {dir} does not exist");
+            }
+            let dir = dir.canonicalize_utf8()?;
+            if !dir.starts_with(&root) {
+                bail!("{what} {dir} is outside the repository {root}");
+            }
+            let adapter = vci_adapter::adapter_for(&spec.adapter, &dir)?;
+            projects.push(Project {
+                name: spec.name,
+                rel: spec.rel,
+                dir,
+                policy: spec.policy,
+                env: spec.env,
+                adapter,
+            });
+        }
+        Ok(Self {
+            repo,
+            root,
+            projects,
+        })
     }
 }

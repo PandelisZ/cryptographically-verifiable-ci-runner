@@ -24,8 +24,11 @@ Patterns: exact names, `*` wildcards, and a leading `!` to exclude. Exclusions w
 |---|---|---|
 | Declared (`global`, per-file `env`) | yes | yes |
 | Pass-through (`pass_through`) | yes | no (name is recorded if read) |
-| Built-in pass-through: `PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*`, `TERM`, `CI`, `NODE_OPTIONS`, `VCI_*`, `VITEST*` | yes | no |
+| Built-in pass-through: `PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*`, `TERM`, `CI`, `NODE_OPTIONS`, `VCI_*`, `VITEST*` | yes | **only if the test file was observed reading it** (never `VCI_*`, `VITEST*`, `NODE_OPTIONS`) |
+| Adapter built-in pass-through, pytest: `UV`, `UV_*`, `VIRTUAL_ENV`, `PYTHONPATH` (set by vci), `XDG_{CACHE,CONFIG,DATA,BIN}_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase) | yes | **only if the test file was observed reading it** (never `PYTHONPATH`: a test that reads it is not attested) |
 | Adapter-inferred: `VITE_*` for Vitest (exposed through `import.meta.env`) | yes | yes |
+| pytest always-read: `PYTEST_ADDOPTS`, `PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTHONHASHSEED`, `PYTHONWARNINGS`, `PYTHONOPTIMIZE`, `PYTHONDEVMODE`, `PYTHONUTF8`, `PYTHONSAFEPATH`, `PYTHONNOUSERSITE`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONINTMAXSTRDIGITS`, `PYTHONIOENCODING`, `TZ` | only if declared (strict) | **yes** (reported as read by every file) |
+| pytest hashed-if-present: every `PYTHON*` and `PYTEST_*` except `PYTHONPATH` (the interpreter reads many in C: `PYTHON_CPU_COUNT`, `PYTHONBREAKPOINT`, `PYTHON_GIL`, ...) | only if declared (strict) | **yes, whenever present** (loose mode, or declared) |
 | Undeclared, strict mode | **no** (removed from the child environment) | recorded as absent if read |
 | Undeclared, loose mode | yes | yes, **if the test file was observed reading it** |
 | `TZ`, loose mode | yes | **always** (set or not): ICU reads it natively, never through the `process.env` proxy |
@@ -38,6 +41,30 @@ mode removes them: add them to `pass_through` or `global` to keep them.
 
 `NODE_OPTIONS` is pass-through because vci sets it, but if the user's value is non-empty it is hashed as part of the toolchain digest.
 
+Built-in pass-through variables are visible so that tooling works, not because their values cannot matter: `CI`,
+`HOME`, `USER`, `TMPDIR`, `LANG` differ between a laptop and a CI runner by definition. A test file observed reading
+one (`os.environ.get("CI")`, `os.path.expanduser`, `tempfile.gettempdir()`) gets its value hashed, so it is only
+skipped where the value is the same (in practice: not on a CI runner when it was attested on a laptop). Reads in C
+(`getenv` in a C extension, the `locale` module) are not observed. Configured `pass_through` stays unhashed: that is
+the user's decision.
+
+pytest: the interpreter and pytest read `PYTHON*` and `PYTEST_*` before any hook can observe them, so the collector
+reports the list above as read by every test file and they are **hashed** (never built-in pass-through). In strict
+mode they are removed from the child unless declared, so they hash as unset locally and in CI; declare one in
+`global` to set it (its value is then hashed). In loose mode every `PYTHON*`/`PYTEST_*` variable present is hashed
+(the pattern list `PYTHON*`, `PYTEST_*`, `!PYTHONPATH` is part of the env config digest), and one present in CI but
+not when the file was attested fails the env check. `PYTHONPATH` is the exception: vci always sets it to the collector
+directory (and removes it for listing and `vci ci`), so the user's value never reaches the tests and it is built-in
+pass-through; `vci run` refuses to attest a file that read it. uv's own variables are built-in pass-through so that
+`uv run` works in strict mode; they choose the interpreter and index, which the toolchain (exact Python version,
+bundled library versions, the full installed distribution set) and externals (installed version pinned by `uv.lock`)
+checks cover. `UV_ENV_FILE` has no effect: every `uv run` gets `--no-env-file` (a `.env` file would add variables
+after vci computed the environment it hashes). Reading the whole environment (`dict(os.environ)`, iteration, `len`, `repr`) is recorded as
+key `*` and makes the file non-attestable.
+
+With `[[projects]]` in vci.toml, each project's `env` table replaces the given top-level `[env]` keys for that
+project; the digest is computed from the project's effective configuration.
+
 ## What goes into the attestation
 
 Values are never stored. For each hashed variable the manifest holds `{ key, hash }` where `hash` is BLAKE3 of the value, or `ABSENT_HASH` if unset.
@@ -46,7 +73,8 @@ Per test file the hashed set is:
 
 1. every variable in the environment matching the declared patterns that apply to that file, plus every exact (non-wildcard) declared name even if unset;
 2. adapter-inferred variables present in the environment;
-3. variables observed being read at runtime that are not pass-through;
+3. variables observed being read at runtime, except configured `pass_through` and `VCI_*`, `VITEST*`,
+   `NODE_OPTIONS`, `PYTHONPATH` (built-in pass-through variables that are read are hashed);
 4. in loose mode, `TZ` (unless excluded with `!TZ`).
 
 The predicate also records `envConfigDigest`: BLAKE3 over the mode and the sorted effective pattern lists for that file.

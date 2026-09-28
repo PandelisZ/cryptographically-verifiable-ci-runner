@@ -36,7 +36,7 @@ enum Format {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Write vci.toml and .vci/allowed_signers, install @vci/vitest, print a CI snippet.
+    /// Write vci.toml and .vci/allowed_signers, install @vci/vitest (Vitest), print a CI snippet.
     Init {
         /// Add this public key (or private key with a .pub next to it) to allowed_signers.
         #[arg(long)]
@@ -47,6 +47,9 @@ enum Cmd {
         /// Project directory relative to the repo root.
         #[arg(long)]
         project: Option<String>,
+        /// Test runner adapter: vitest (default) or pytest.
+        #[arg(long)]
+        adapter: Option<String>,
         /// Do not run npm install.
         #[arg(long)]
         no_install: bool,
@@ -122,8 +125,9 @@ fn main() {
             key,
             principal,
             project,
+            adapter,
             no_install,
-        } => cmds::init(key.as_deref(), principal, project, !no_install),
+        } => cmds::init(key.as_deref(), principal, project, adapter, !no_install),
         Cmd::Run { files, key, ttl } => run::run(run::RunArgs { files, key, ttl }),
         Cmd::Plan { base_ref, format } => plan::plan(&plan::PlanOptions {
             base_ref,

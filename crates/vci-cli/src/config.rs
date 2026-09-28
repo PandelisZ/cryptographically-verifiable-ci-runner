@@ -1,4 +1,13 @@
-//! `vci.toml`: project location, skip policy and env configuration.
+//! `vci.toml`: project location(s), skip policy and env configuration.
+//!
+//! Two forms:
+//!
+//! * single project: top-level `project` (default `"."`) and `adapter`
+//!   (default `"vitest"`);
+//! * several projects: a `[[projects]]` array with `name`, `path`, `adapter`
+//!   and optional `[projects.policy]` / `[projects.env]` tables. Each key
+//!   given in a project's table replaces the top-level key of the same name
+//!   for that project; keys not given are inherited from `[policy]` / `[env]`.
 //!
 //! Unknown keys are errors: in `vci plan` a config that cannot be parsed
 //! means every test runs.
@@ -11,18 +20,22 @@ use crate::util::{glob_match, parse_duration};
 pub const CONFIG_FILE: &str = "vci.toml";
 pub const ALLOWED_SIGNERS_FILE: &str = ".vci/allowed_signers";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Project directory relative to the repo root.
-    #[serde(default = "default_project")]
-    pub project: String,
-    #[serde(default = "default_adapter")]
-    pub adapter: String,
+    /// Project directory relative to the repo root (single-project form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Adapter (single-project form); default `"vitest"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
     pub env: EnvConfig,
+    /// Multi-project form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectConfig>,
 }
 
 fn default_project() -> String {
@@ -32,15 +45,87 @@ fn default_adapter() -> String {
     "vitest".into()
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            project: default_project(),
-            adapter: default_adapter(),
-            policy: Policy::default(),
-            env: EnvConfig::default(),
-        }
+/// One entry of `[[projects]]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// Unique name (letters, digits, `.`, `_`, `-`); recorded in attestations.
+    pub name: String,
+    /// Project directory relative to the repo root.
+    #[serde(default = "default_project")]
+    pub path: String,
+    pub adapter: String,
+    #[serde(default)]
+    pub policy: Option<PolicyOverride>,
+    #[serde(default)]
+    pub env: Option<EnvOverride>,
+}
+
+/// Per-project policy keys; each one given replaces the top-level key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyOverride {
+    pub platform: Option<Platform>,
+    pub platform_overrides: Option<Vec<PlatformOverride>>,
+    pub max_ttl: Option<String>,
+    pub allow_dirty: Option<bool>,
+    pub no_skip_refs: Option<Vec<String>>,
+    pub never_skip: Option<Vec<String>>,
+}
+
+/// Per-project env keys; each one given replaces the top-level key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EnvOverride {
+    pub mode: Option<EnvMode>,
+    pub global: Option<Vec<String>>,
+    pub pass_through: Option<Vec<String>>,
+    pub files: Option<Vec<EnvFiles>>,
+}
+
+/// The effective configuration of one project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSpec {
+    /// Empty in the single-project form.
+    pub name: String,
+    /// Normalised project dir relative to the repo root ("." for the root).
+    pub rel: String,
+    pub adapter: String,
+    pub policy: Policy,
+    pub env: EnvConfig,
+}
+
+fn normalise_rel(p: &str) -> String {
+    let parts: Vec<&str> = p
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if parts.is_empty() {
+        ".".into()
+    } else {
+        parts.join("/")
     }
+}
+
+fn check_rel(what: &str, p: &str) -> Result<()> {
+    if p.is_empty() || p.starts_with('/') || p.contains('\\') || p.split('/').any(|c| c == "..") {
+        bail!("{what} must be a relative path inside the repo, got {p:?}");
+    }
+    Ok(())
+}
+
+fn check_adapter(a: &str) -> Result<()> {
+    if !vci_adapter::ADAPTERS.contains(&a) {
+        bail!(
+            "unsupported adapter {a:?} (supported: {})",
+            vci_adapter::ADAPTERS
+                .iter()
+                .map(|a| format!("{a:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -76,6 +161,11 @@ pub struct Policy {
     /// Refs (globs) on which nothing is ever skipped.
     #[serde(default)]
     pub no_skip_refs: Vec<String>,
+    /// Test files (project-relative globs) that are never skipped, e.g. files
+    /// with dependencies no collector can see (SQLite `ATTACH` behind a
+    /// custom authorizer, a C library reading files).
+    #[serde(default)]
+    pub never_skip: Vec<String>,
 }
 
 fn default_max_ttl() -> String {
@@ -93,6 +183,7 @@ impl Default for Policy {
             max_ttl: default_max_ttl(),
             allow_dirty: true,
             no_skip_refs: vec![],
+            never_skip: vec![],
         }
     }
 }
@@ -100,6 +191,14 @@ impl Default for Policy {
 impl Policy {
     pub fn max_ttl_secs(&self) -> Result<i64> {
         parse_duration(&self.max_ttl).context("policy.max_ttl")
+    }
+
+    /// The `never_skip` glob matching a project-relative test path, if any.
+    pub fn never_skip_match(&self, project_rel: &str) -> Option<&str> {
+        self.never_skip
+            .iter()
+            .find(|g| glob_match(g, project_rel))
+            .map(String::as_str)
     }
 
     /// Effective platform policy for a project-relative test path (the
@@ -155,30 +254,121 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.adapter != "vitest" {
-            bail!("unsupported adapter {:?} (only \"vitest\")", self.adapter);
-        }
-        let p = &self.project;
-        if p.is_empty() || p.starts_with('/') || p.contains('\\') || p.split('/').any(|c| c == "..")
-        {
-            bail!("project must be a relative path inside the repo, got {p:?}");
-        }
         self.policy.max_ttl_secs()?;
+        if self.projects.is_empty() {
+            check_adapter(self.adapter.as_deref().unwrap_or("vitest"))?;
+            check_rel("project", self.project.as_deref().unwrap_or("."))?;
+            return Ok(());
+        }
+        if self.project.is_some() || self.adapter.is_some() {
+            bail!(
+                "top-level `project`/`adapter` cannot be combined with [[projects]]; give each project a path and adapter"
+            );
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut dirs = std::collections::BTreeSet::new();
+        for p in &self.projects {
+            if p.name.is_empty()
+                || !p
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+            {
+                bail!(
+                    "project name {:?} must be non-empty and use only letters, digits, '.', '_' and '-'",
+                    p.name
+                );
+            }
+            if !names.insert(p.name.clone()) {
+                bail!("duplicate project name {:?}", p.name);
+            }
+            check_rel(&format!("project {:?} path", p.name), &p.path)?;
+            check_adapter(&p.adapter)?;
+            if !dirs.insert((normalise_rel(&p.path), p.adapter.clone())) {
+                bail!(
+                    "two projects use adapter {:?} in {:?}; they would list the same test files",
+                    p.adapter,
+                    normalise_rel(&p.path)
+                );
+            }
+        }
+        for s in self.project_specs() {
+            s.policy
+                .max_ttl_secs()
+                .with_context(|| format!("project {:?}", s.name))?;
+        }
         Ok(())
     }
 
-    /// Normalised project dir relative to the repo root ("." for the root).
+    /// Normalised project dir of the single-project form ("." for the root).
     pub fn project_rel(&self) -> String {
-        let parts: Vec<&str> = self
-            .project
-            .split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .collect();
-        if parts.is_empty() {
-            ".".into()
-        } else {
-            parts.join("/")
+        normalise_rel(self.project.as_deref().unwrap_or("."))
+    }
+
+    /// True for the `[[projects]]` form.
+    pub fn is_multi(&self) -> bool {
+        !self.projects.is_empty()
+    }
+
+    /// Effective configuration of every project, in file order.
+    pub fn project_specs(&self) -> Vec<ProjectSpec> {
+        if self.projects.is_empty() {
+            return vec![ProjectSpec {
+                name: String::new(),
+                rel: self.project_rel(),
+                adapter: self.adapter.clone().unwrap_or_else(default_adapter),
+                policy: self.policy.clone(),
+                env: self.env.clone(),
+            }];
         }
+        self.projects
+            .iter()
+            .map(|p| {
+                let mut policy = self.policy.clone();
+                if let Some(o) = &p.policy {
+                    if let Some(v) = o.platform {
+                        policy.platform = v;
+                    }
+                    if let Some(v) = &o.platform_overrides {
+                        policy.platform_overrides = v.clone();
+                    }
+                    if let Some(v) = &o.max_ttl {
+                        policy.max_ttl = v.clone();
+                    }
+                    if let Some(v) = o.allow_dirty {
+                        policy.allow_dirty = v;
+                    }
+                    if let Some(v) = &o.no_skip_refs {
+                        policy.no_skip_refs = v.clone();
+                    }
+                    if let Some(v) = &o.never_skip {
+                        policy.never_skip = v.clone();
+                    }
+                }
+                let mut env = self.env.clone();
+                if let Some(o) = &p.env {
+                    if let Some(v) = o.mode {
+                        env.mode = v;
+                    }
+                    if let Some(v) = &o.global {
+                        env.global = v.clone();
+                    }
+                    if let Some(v) = &o.pass_through {
+                        env.pass_through = v.clone();
+                    }
+                    if let Some(v) = &o.files {
+                        env.files = v.clone();
+                    }
+                }
+                ProjectSpec {
+                    name: p.name.clone(),
+                    rel: normalise_rel(&p.path),
+                    adapter: p.adapter.clone(),
+                    policy,
+                    env,
+                }
+            })
+            .collect()
     }
 }
 
@@ -197,7 +387,10 @@ max_ttl = "30d"
 # Accept attestations made from a working tree with uncommitted changes.
 allow_dirty = true
 # Refs on which nothing is ever skipped (globs; "*" stays within a segment).
-no_skip_refs = []
+# Pushes to the default branch and tags run everything.
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# Test files (globs) that are never skipped.
+never_skip = []
 
 # [[policy.platform_overrides]]
 # match = ["src/native/**"]
@@ -212,9 +405,191 @@ global = ["NODE_ENV", "TZ"]
 pass_through = []
 "#;
 
+/// Template written by `vci init --adapter pytest`.
+pub const PYTEST_TEMPLATE: &str = r#"# vci configuration. Policy is read from the BASE commit in CI.
+
+# Project directory (where pyproject.toml and uv.lock live), relative to the repo root.
+project = "."
+adapter = "pytest"
+
+[policy]
+# "any" | "same-os" | "exact": which OS/arch may satisfy CI. The Python
+# version (major.minor.patch) and implementation must always match.
+platform = "any"
+# Longest accepted attestation lifetime.
+max_ttl = "30d"
+# Accept attestations made from a working tree with uncommitted changes.
+allow_dirty = true
+# Refs on which nothing is ever skipped (globs; "*" stays within a segment).
+# Pushes to the default branch and tags run everything.
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# Test files (project-relative globs) that are never skipped, e.g. files whose
+# inputs no collector can see (see "pytest limitations" in the README).
+never_skip = []
+
+[env]
+# "strict": only declared and pass-through variables reach tests.
+mode = "strict"
+# Hashed into every test file's inputs.
+global = ["TZ"]
+# Visible to tests, never hashed. Put secrets here.
+pass_through = []
+"#;
+
+/// The `vci init` template for `adapter`.
+pub fn template_for(adapter: &str) -> &'static str {
+    match adapter {
+        "pytest" => PYTEST_TEMPLATE,
+        _ => TEMPLATE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the templates wrote `no_skip_refs = []`, so a push to main
+    /// (where the example workflow's base ref is the pushed commit itself)
+    /// trusted that commit's own allowed_signers.
+    #[test]
+    fn templates_never_skip_on_main_and_tags() {
+        for t in [TEMPLATE, PYTEST_TEMPLATE] {
+            let c = Config::parse(t).unwrap();
+            let refs = &c.project_specs()[0].policy.no_skip_refs;
+            assert!(
+                refs.iter().any(|r| glob_match(r, "refs/heads/main")),
+                "{refs:?}"
+            );
+            assert!(
+                refs.iter().any(|r| glob_match(r, "refs/tags/v1.0")),
+                "{refs:?}"
+            );
+            assert!(!refs.iter().any(|r| glob_match(r, "refs/heads/feature")));
+        }
+    }
+
+    #[test]
+    fn never_skip_globs_and_project_override() {
+        let c = Config::parse(
+            "[policy]\nnever_skip = [\"tests/test_attach*.py\"]\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"pytest\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"pytest\"\n[projects.policy]\nnever_skip = []\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(
+            s[0].policy.never_skip_match("tests/test_attach_db.py"),
+            Some("tests/test_attach*.py")
+        );
+        assert_eq!(s[0].policy.never_skip_match("tests/test_b.py"), None);
+        assert_eq!(
+            s[1].policy.never_skip_match("tests/test_attach_db.py"),
+            None
+        );
+    }
+
+    #[test]
+    fn pytest_template_parses() {
+        let c = Config::parse(PYTEST_TEMPLATE).unwrap();
+        let s = c.project_specs();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].adapter, "pytest");
+        assert_eq!(s[0].rel, ".");
+        assert_eq!(s[0].name, "");
+    }
+
+    #[test]
+    fn multi_project_form() {
+        let c = Config::parse(
+            r#"
+[policy]
+max_ttl = "20d"
+no_skip_refs = ["refs/heads/main"]
+[env]
+global = ["NODE_ENV"]
+
+[[projects]]
+name = "web"
+path = "./web/"
+adapter = "vitest"
+
+[[projects]]
+name = "py"
+path = "py"
+adapter = "pytest"
+[projects.policy]
+platform = "exact"
+[projects.env]
+global = ["TZ", "APP_*"]
+"#,
+        )
+        .unwrap();
+        assert!(c.is_multi());
+        let s = c.project_specs();
+        assert_eq!(s.len(), 2);
+        assert_eq!((s[0].name.as_str(), s[0].rel.as_str()), ("web", "web"));
+        assert_eq!(s[0].env.global, ["NODE_ENV"]);
+        assert_eq!(s[0].policy.platform, Platform::Any);
+        assert_eq!(s[1].adapter, "pytest");
+        assert_eq!(s[1].policy.platform, Platform::Exact);
+        // Inherited keys stay.
+        assert_eq!(s[1].policy.max_ttl, "20d");
+        assert_eq!(s[1].policy.no_skip_refs, ["refs/heads/main"]);
+        assert_eq!(s[1].env.global, ["TZ", "APP_*"]);
+    }
+
+    #[test]
+    fn multi_project_form_is_validated() {
+        let two = |a: &str, b: &str| {
+            format!(
+                "[[projects]]\nname = \"a\"\npath = \"x\"\nadapter = \"vitest\"\n[[projects]]\n{a}\n{b}\n"
+            )
+        };
+        assert!(
+            Config::parse(&two("name = \"a\"\npath = \"y\"", "adapter = \"pytest\"")).is_err(),
+            "duplicate name"
+        );
+        assert!(
+            Config::parse(&two("name = \"b\"\npath = \"./x\"", "adapter = \"vitest\"")).is_err(),
+            "same dir and adapter"
+        );
+        assert!(
+            Config::parse(&two("name = \"b\"\npath = \"x\"", "adapter = \"pytest\"")).is_ok(),
+            "same dir, different adapter"
+        );
+        assert!(
+            Config::parse(&two("name = \"b c\"\npath = \"y\"", "adapter = \"pytest\"")).is_err()
+        );
+        assert!(
+            Config::parse(&two(
+                "name = \"b\"\npath = \"../y\"",
+                "adapter = \"pytest\""
+            ))
+            .is_err()
+        );
+        assert!(Config::parse(&two("name = \"b\"\npath = \"y\"", "adapter = \"jest\"")).is_err());
+        assert!(
+            Config::parse(&format!(
+                "adapter = \"vitest\"\n{}",
+                two("name = \"b\"\npath = \"y\"", "adapter = \"pytest\"")
+            ))
+            .is_err(),
+            "mixed forms"
+        );
+        assert!(
+            Config::parse(&two(
+                "name = \"b\"\npath = \"y\"\nadapter = \"pytest\"\n[projects.policy]",
+                "max_ttl = \"soon\""
+            ))
+            .is_err()
+        );
+        assert!(
+            Config::parse(&two(
+                "name = \"b\"\npath = \"y\"\nadapter = \"pytest\"\n[projects.env]",
+                "modes = \"strict\""
+            ))
+            .is_err(),
+            "unknown key in an override"
+        );
+    }
 
     #[test]
     fn template_parses_to_defaults() {
@@ -233,6 +608,7 @@ mod tests {
         assert!(Config::parse("[policy]\nplatform = \"mars\"").is_err());
         assert!(Config::parse("[policy]\nmax_ttl = \"soon\"").is_err());
         assert!(Config::parse("adapter = \"jest\"").is_err());
+        assert!(Config::parse("adapter = \"pytest\"").is_ok());
     }
 
     #[test]
