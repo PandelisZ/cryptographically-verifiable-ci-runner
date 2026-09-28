@@ -1,0 +1,101 @@
+name: "vci: skip tests already attested"
+description: >
+  Builds vci from this action's pinned sources, fetches attestations, and runs
+  only the tests that no trusted signer has already run against identical inputs.
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  base-ref:
+    description: >
+      Commit that policy (vci.toml) and trust (.vci/allowed_signers) are read
+      from. Must not be controlled by the pull request. Defaults to the pull
+      request's base commit, or the pushed commit on push events.
+    default: ${{ github.event.pull_request.base.sha || github.sha }}
+  command:
+    description: "`ci` (plan, then run what is left) or `plan` (decide only)."
+    default: ci
+  remote:
+    description: Git remote to fetch attestation refs from.
+    default: origin
+  audit-log:
+    description: Where `vci ci` writes the JSON audit log of skipped and run tests.
+    default: vci-audit.json
+  working-directory:
+    description: Directory inside the repository to run vci from.
+    default: .
+
+outputs:
+  skipped:
+    description: Number of test units skipped.
+    value: ${{ steps.plan.outputs.skipped }}
+  run:
+    description: Number of test units that had to run.
+    value: ${{ steps.plan.outputs.run }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fingerprint vci sources
+      id: src
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        h=$(find Cargo.toml Cargo.lock crates -type f -not -path '*/target/*' | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-32)
+        echo "hash=$h" >> "$GITHUB_OUTPUT"
+        mkdir -p "$RUNNER_TEMP/vci-bin"
+
+    - name: Restore vci binary
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/vci-bin
+        key: vci-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.src.outputs.hash }}
+
+    - name: Build vci
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        CARGO_TARGET_DIR: ${{ runner.temp }}/vci-target
+      run: |
+        cargo build --release --locked -p vci-cli
+        cp "$CARGO_TARGET_DIR/release/vci" "$RUNNER_TEMP/vci-bin/vci"
+
+    - name: Put vci and its collectors on the path
+      shell: bash
+      run: |
+        echo "$RUNNER_TEMP/vci-bin" >> "$GITHUB_PATH"
+        echo "VCI_PY_PLUGIN=${{ github.action_path }}/py/pytest-plugin" >> "$GITHUB_ENV"
+        echo "VCI_JS_PLUGIN=${{ github.action_path }}/js/vitest-plugin" >> "$GITHUB_ENV"
+
+    - name: Fetch attestations
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: vci fetch --remote "${{ inputs.remote }}"
+
+    - name: Plan
+      id: plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE: ${{ inputs.base-ref }}
+      run: |
+        vci plan --base-ref "$BASE" --format text | tee "$RUNNER_TEMP/vci-plan.txt"
+        echo "skipped=$(grep -c '^SKIP ' "$RUNNER_TEMP/vci-plan.txt" || true)" >> "$GITHUB_OUTPUT"
+        echo "run=$(grep -c '^RUN ' "$RUNNER_TEMP/vci-plan.txt" || true)" >> "$GITHUB_OUTPUT"
+        {
+          echo '### vci plan'
+          echo '```'
+          cat "$RUNNER_TEMP/vci-plan.txt"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Run what is not attested
+      if: inputs.command == 'ci'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE: ${{ inputs.base-ref }}
+      run: vci ci --base-ref "$BASE" --audit-log "${{ inputs.audit-log }}"
