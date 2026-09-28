@@ -65,6 +65,50 @@ jobs:
       - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
 ```
 
+### Go
+
+```yaml
+    env:
+      CGO_ENABLED: "0"              # same values as used locally; both are declared in vci.toml [env] global
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2"      # exact version used locally
+
+      - run: go mod download
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+```
+
+### Rust
+
+```yaml
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"       # same release as rust-toolchain.toml
+
+      - run: cargo fetch --locked
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+```
+
+Run the job on the hosted runner directly, not in a `container:` job: attestations made as a normal user are not
+accepted by a verifier running as root.
+
+### Several languages in one job
+
+Set up every toolchain, then call the action once. This repository's own
+[workflow](../.github/workflows/ci.yml) does that for Python, Go and Rust.
+
 Replace `<commit-sha>` with a full commit SHA of this repository.
 
 ## Inputs and outputs
@@ -130,6 +174,7 @@ Cloning a private repository from another repository's workflow needs a token wi
 | `failed check: toolchain` | Python, Node, uv or package versions differ between the laptop and the runner |
 | `failed check: inputs` | A file the test depends on changed after it was attested; `vci explain` names it |
 | `failed check: signer` | The signing key is not in the base commit's `allowed_signers`, or it has expired |
+| A Go package or cargo target never skips on the runner | Its code depends on the platform (build tags, `_linux.go` files, `cfg(target_os)`, `runtime.GOOS`, floating-point maths): such units are only accepted on the same OS and architecture |
 | A test reads `CI`, `HOME` or `TMPDIR` | Those values differ on a runner, so that file always runs there |
 
 Run `vci explain <file> --base-ref origin/main` locally for the full reason.

@@ -9,6 +9,8 @@
 | `ssh-keygen` (OpenSSH 8.1+) and an Ed25519 SSH key | signing attestations |
 | Node 22.15+ and Vitest `>=3.2 <6` | Vitest projects |
 | [`uv`](https://docs.astral.sh/uv/) and pytest 9 | pytest projects |
+| Go (tested with 1.26.2) | Go projects |
+| `cargo`/`rustc` installed through `rustup` | Rust projects |
 
 macOS and Linux are supported.
 
@@ -58,6 +60,8 @@ Run these in the repository you want to speed up.
    ```sh
    vci init --adapter pytest --project . --key ~/.ssh/id_ed25519.pub --principal you@example.com
    # or: vci init --adapter vitest --key ~/.ssh/id_ed25519.pub --no-install
+   # or: vci init --adapter go     --key ~/.ssh/id_ed25519.pub
+   # or: vci init --adapter cargo  --key ~/.ssh/id_ed25519.pub
    ```
 
    This writes `vci.toml` (policy and env config) and `.vci/allowed_signers` (who may attest).
@@ -80,6 +84,25 @@ Run these in the repository you want to speed up.
    |---|---|
    | pytest | full Python version in `.python-version` (a uv-managed build such as `3.14.4`), `uv.lock`, the uv version, `UV_PYTHON_PREFERENCE=only-managed` |
    | Vitest | Node major version, `package-lock.json` |
+   | Go | exact Go version (`go version` must print the same on both sides), `go.sum`, `CGO_ENABLED=0` and `TZ=UTC` declared in `[env] global` and set on both sides |
+   | Rust | exact release in `rust-toolchain.toml` (a `rustup` build, not Homebrew's), `Cargo.lock`, `[env] mode = "strict"` |
+
+   One repository can hold several projects with different adapters: see "Several projects in one repository" in
+   the README, and this repository's own [`vci.toml`](../vci.toml).
+
+## What a test unit is
+
+| Adapter | Unit | Written as |
+|---|---|---|
+| `vitest` | test file | `src/b.test.ts` |
+| `pytest` | test file | `tests/test_b.py` |
+| `go` | package | `./b` (package directory) |
+| `cargo` | test target | `crates/b#lib`, `crates/b#test:name`, `crates/b#doc` |
+
+How inputs are found differs by adapter. Vitest, pytest and Go record what each unit actually read while it ran.
+Rust has no such hook, so the cargo adapter treats every file in the package directory and its in-repo dependencies
+as an input; files read from elsewhere in the repository must be declared. See "What the cargo adapter can and
+cannot see" in the README.
 
 ## Daily use
 
@@ -95,7 +118,14 @@ vci push
 git push
 ```
 
-`vci run` with no paths runs and attests every test file.
+For Go and Rust:
+
+```sh
+vci run ./b ./d --key ~/.ssh/id_ed25519                   # Go packages
+vci run 'crates/b#test:b' crates/a --key ~/.ssh/id_ed25519  # one cargo target; every target of a package
+```
+
+`vci run` with no paths runs and attests every unit.
 
 When a test is not skipped and you expected it to be:
 
