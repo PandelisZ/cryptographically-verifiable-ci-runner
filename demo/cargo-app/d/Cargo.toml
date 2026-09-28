@@ -1,0 +1,12 @@
+[package]
+name = "d"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+a = { path = "../a" }
+hex = "0.4.3"

@@ -1,28 +1,33 @@
-# vci configuration. Policy is read from the BASE commit in CI.
-
-# Project directory (where pyproject.toml and uv.lock live), relative to the repo root.
-project = "demo/pytest-app"
-adapter = "pytest"
+# vci configuration for this repository's demo projects.
+# Policy is read from the BASE commit in CI.
 
 [policy]
-# "any" | "same-os" | "exact": which OS/arch may satisfy CI. The Python
-# version (major.minor.patch) and implementation must always match.
+# "any" | "same-os" | "exact": which OS/arch may satisfy CI.
 platform = "any"
-# Longest accepted attestation lifetime.
 max_ttl = "30d"
-# Accept attestations made from a working tree with uncommitted changes.
 allow_dirty = true
-# Refs on which nothing is ever skipped (globs; "*" stays within a segment).
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
-# Test files (project-relative globs) that are never skipped, e.g. files whose
-# inputs no collector can see (see "pytest limitations" in the README).
 never_skip = []
 
 [env]
 # "strict": only declared and pass-through variables reach tests.
 mode = "strict"
-# Hashed into every test file's inputs.
-global = ["TZ"]
-# Visible to tests, never hashed. Put secrets here.
+# Hashed into every test unit's inputs. Set to the same values locally and in CI.
+global = ["TZ", "CGO_ENABLED"]
 pass_through = []
+
+[[projects]]
+name = "py"
+path = "demo/pytest-app"
+adapter = "pytest"
+
+[[projects]]
+name = "go"
+path = "demo/go-app"
+adapter = "go"
+
+[[projects]]
+name = "rust"
+path = "demo/cargo-app"
+adapter = "cargo"

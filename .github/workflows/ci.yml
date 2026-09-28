@@ -1,5 +1,5 @@
-# Demo and self-test of the vci action: run only the pytest files of
-# demo/pytest-app that no trusted signer has already attested.
+# Demo and self-test of the vci action: run only the pytest files, Go packages
+# and cargo test targets of demo/ that no trusted signer has already attested.
 #
 # This repository uses the action from its own checkout (`uses: ./`). Other
 # repositories pin a commit instead, so a pull request cannot change the
@@ -16,9 +16,11 @@ permissions:
 
 env:
   UV_PYTHON_PREFERENCE: only-managed
+  CGO_ENABLED: "0"
+  TZ: UTC
 
 jobs:
-  pytest:
+  demo:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,9 +31,20 @@ jobs:
         with:
           version: "0.11.7"
 
-      - name: Set up the project environment from uv.lock
-        working-directory: demo/pytest-app
-        run: uv sync --locked
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2"
+          cache-dependency-path: demo/go-app/go.sum
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0" # same as demo/cargo-app/rust-toolchain.toml
+
+      - name: Set up project dependencies
+        run: |
+          (cd demo/pytest-app && uv sync --locked)
+          (cd demo/go-app && go mod download)
+          (cd demo/cargo-app && cargo fetch --locked)
 
       - uses: ./
 

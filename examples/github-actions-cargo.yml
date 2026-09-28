@@ -36,7 +36,7 @@ jobs:
 
       - name: Install vci
         run: |
-          git clone --depth 1 https://github.com/OWNER/cryptographically-verifiable-ci "$RUNNER_TEMP/vci"
+          git clone --depth 1 https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
           cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
 
       - name: Fetch crates
