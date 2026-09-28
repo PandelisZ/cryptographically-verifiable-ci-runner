@@ -120,6 +120,8 @@ Replace `<commit-sha>` with a full commit SHA of this repository.
 | `remote` | `origin` | Remote that holds `refs/attest/v1/*` |
 | `audit-log` | `vci-audit.json` | JSON record of what was skipped, by whom, and what ran |
 | `working-directory` | `.` | Directory to run `vci` from |
+| `prebuilt` | `true` | Download the release binary instead of compiling; `false` always builds from source |
+| `token` | `github.token` | Token used to download the release binary |
 
 | Output | Meaning |
 |---|---|
@@ -127,6 +129,32 @@ Replace `<commit-sha>` with a full commit SHA of this repository.
 | `run` | Number of test units that ran |
 
 The plan is also written to the job summary.
+
+## Prebuilt binaries
+
+The action downloads a release binary instead of compiling `vci`, which takes a few seconds instead of about two
+minutes. It does so only when all of these hold:
+
+- `release/manifest.txt` in the pinned action names a release that was built from exactly the action's own sources;
+- a binary exists for the runner (Linux and macOS, x86_64 and arm64);
+- the download's SHA-256 equals the checksum in `release/manifest.txt`.
+
+Otherwise it builds from source and caches the result. The checksums are part of the pinned action, so replacing
+a release asset cannot change what runs.
+
+While this repository is private, the default token of another repository cannot read its releases. Pass a token
+with read access as `token`, or accept the source build.
+
+### Cutting a release
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0      # the release workflow builds and publishes the binaries
+scripts/update-release-manifest.sh v0.2.0     # after it finishes: records tag, source fingerprint and checksums
+git add release/manifest.txt && git commit -m "Record release v0.2.0" && git push
+```
+
+Pin the action to that last commit. Any later change under `crates/`, `Cargo.toml` or `Cargo.lock` makes the action
+build from source again until the next release.
 
 ## Security rules
 
