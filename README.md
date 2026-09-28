@@ -16,6 +16,28 @@ The core rule is **fail open**: the default verdict is RUN. Any error, doubt or 
 Status: v1, Vitest `>=3.2 <6` (tested on 5.0.2 and 4.1.11), Node 22.15+; pytest 9 (tested on 9.1.1) on CPython
 3.11-3.14 through `uv`; macOS and Linux.
 
+## Install
+
+```sh
+git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.git ~/.local/share/vci
+~/.local/share/vci/scripts/install.sh
+export VCI_PY_PLUGIN="$HOME/.local/share/vci/py/pytest-plugin"
+export VCI_JS_PLUGIN="$HOME/.local/share/vci/js/vitest-plugin"
+```
+
+Full guide: [docs/INSTALL.md](docs/INSTALL.md).
+
+## GitHub Actions
+
+After your toolchain setup steps, add:
+
+```yaml
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+```
+
+It builds `vci`, fetches attestations, and runs only what is not already attested. Setup, inputs and security rules:
+[docs/GITHUB_ACTIONS.md](docs/GITHUB_ACTIONS.md).
+
 ## Quick start (Vitest)
 
 Prerequisites: `git`, `node`, `ssh-keygen` (OpenSSH 8.1+), a Rust toolchain to build the CLI.
