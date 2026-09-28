@@ -1,0 +1,45 @@
+# .github/workflows/test.yml: run only the Vitest files that no trusted
+# developer has already attested for these exact inputs.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  vitest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be available to read policy from
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # the Node major version must match the attestations
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install vci
+        run: cargo install --locked --git https://github.com/OWNER/cryptographically-verifiable-ci vci-cli
+
+      - name: Fetch attestations
+        run: vci fetch --remote origin
+
+      # Policy (vci.toml) and trust (.vci/allowed_signers) are read from the
+      # BASE commit, so a pull request cannot add its own signer. On pushes to
+      # main, list refs/heads/main in policy.no_skip_refs to always run everything.
+      - name: Plan, then run what is not attested
+        run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
+
+      - name: Upload the audit log of skipped tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vci-audit
+          path: vci-audit.json

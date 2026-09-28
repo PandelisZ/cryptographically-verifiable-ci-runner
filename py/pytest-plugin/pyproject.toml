@@ -1,0 +1,11 @@
+[project]
+name = "vci-pytest"
+version = "0.1.0"
+description = "vci dependency collector for pytest. Pure stdlib; load with PYTHONPATH=<this dir> VCI_OUT=<dir> pytest -p vci_pytest <file>"
+requires-python = ">=3.10"
+dependencies = []
+
+# The plugin's own tests run the fixture project through the plugin in subprocesses:
+#   uv run --project fixtures/pytest-abcd pytest py/pytest-plugin/tests
+[tool.pytest.ini_options]
+testpaths = ["tests"]

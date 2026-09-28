@@ -1,0 +1,10 @@
+[package]
+name = "vci-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+camino = "1.2.6"
+tempfile = "3.27.0"
+thiserror = "2.0.21"

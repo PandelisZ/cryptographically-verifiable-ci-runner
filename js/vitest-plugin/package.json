@@ -1,0 +1,30 @@
+{
+  "name": "@vci/vitest",
+  "version": "0.1.0",
+  "description": "Records per-test-file runtime dependencies for Vitest (vci collectors)",
+  "type": "module",
+  "license": "MIT",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./wrapper": "./src/wrapper.js",
+    "./reporter": "./src/reporter.js",
+    "./setup": "./src/worker/setup.js",
+    "./preload": "./src/worker/preload.js",
+    "./main-preload": "./src/main/preload.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
+  "peerDependencies": {
+    "vitest": ">=3.2 <6"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/",
+    "test:vitest4": "VCI_TEST_VITEST4=1 node --test --test-concurrency=1 test/vitest4.test.js"
+  }
+}

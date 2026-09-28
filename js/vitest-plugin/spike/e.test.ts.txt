@@ -1,0 +1,6 @@
+import { expect, test } from "vitest";
+import { loadImplOpaque } from "./e";
+test("opaque computed import", async () => {
+  const impl = await loadImplOpaque(["x"].join(""));
+  expect(impl.name).toBe("x");
+});

@@ -1,0 +1,16 @@
+[package]
+name = "vci-attest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+camino = "1.2.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ssh-key = { version = "0.6", features = ["crypto", "std", "alloc"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tempfile = "3.27.0"

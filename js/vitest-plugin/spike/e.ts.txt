@@ -1,0 +1,4 @@
+export const loadImplOpaque = async (name: string) => {
+  const spec = "./impl-" + name + ".ts";
+  return import(/* @vite-ignore */ spec);
+};
