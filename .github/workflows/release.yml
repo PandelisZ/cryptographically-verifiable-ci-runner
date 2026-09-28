@@ -1,0 +1,58 @@
+# Build the vci binary for each supported platform and publish it as a GitHub
+# release. Triggered by pushing a tag such as v0.1.0.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release and record what it is built from
+        run: |
+          scripts/source-fingerprint.sh > source-fingerprint.txt
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "vci $TAG" --notes "Prebuilt vci binaries. Built from commit $GITHUB_SHA."
+          gh release upload "$TAG" source-fingerprint.txt --clobber
+
+  build:
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { runner: macos-latest,     target: aarch64-apple-darwin }
+          - { runner: macos-latest,     target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+
+      - name: Build
+        run: cargo build --release --locked -p vci-cli --target ${{ matrix.target }}
+
+      - name: Package and upload
+        run: |
+          asset="vci-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$asset" vci
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum "$asset"; else shasum -a 256 "$asset"; fi > "SHA256SUMS-${{ matrix.target }}"
+          cat "SHA256SUMS-${{ matrix.target }}"
+          gh release upload "$TAG" "$asset" "SHA256SUMS-${{ matrix.target }}" --clobber

@@ -25,6 +25,15 @@ inputs:
   working-directory:
     description: Directory inside the repository to run vci from.
     default: .
+  prebuilt:
+    description: >
+      Download the release binary recorded in the action's dist/release.txt
+      when it was built from the action's own sources. `false` always builds
+      from source.
+    default: "true"
+  token:
+    description: Token used to download the release binary.
+    default: ${{ github.token }}
 
 outputs:
   skipped:
@@ -42,19 +51,57 @@ runs:
       shell: bash
       working-directory: ${{ github.action_path }}
       run: |
-        h=$(find Cargo.toml Cargo.lock crates -type f -not -path '*/target/*' | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-32)
-        echo "hash=$h" >> "$GITHUB_OUTPUT"
+        echo "hash=$(scripts/source-fingerprint.sh)" >> "$GITHUB_OUTPUT"
         mkdir -p "$RUNNER_TEMP/vci-bin"
 
-    - name: Restore vci binary
+    # Fast path: a published release binary built from exactly these sources.
+    # dist/release.txt is part of the pinned action, so the checksum the
+    # download is verified against cannot be changed by the release itself.
+    - name: Download the release binary
+      id: release
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        SOURCE: ${{ steps.src.outputs.hash }}
+        PREBUILT: ${{ inputs.prebuilt }}
+      run: |
+        ok=false
+        try() {
+          [ "$PREBUILT" = "true" ] || { echo "prebuilt binaries are turned off"; return 1; }
+          [ -f dist/release.txt ] || { echo "no dist/release.txt"; return 1; }
+          tag=$(sed -n 's/^tag=//p' dist/release.txt)
+          [ "$(sed -n 's/^source=//p' dist/release.txt)" = "$SOURCE" ] || { echo "release $tag was built from other sources"; return 1; }
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) target=x86_64-unknown-linux-musl ;;
+            Linux-ARM64) target=aarch64-unknown-linux-musl ;;
+            macOS-ARM64) target=aarch64-apple-darwin ;;
+            macOS-X64) target=x86_64-apple-darwin ;;
+            *) echo "no release binary for $RUNNER_OS-$RUNNER_ARCH"; return 1 ;;
+          esac
+          asset="vci-$target.tar.gz"
+          want=$(awk -v a="$asset" '$2 == a { print $1 }' dist/release.txt)
+          [ -n "$want" ] || { echo "no checksum recorded for $asset"; return 1; }
+          dir=$(mktemp -d)
+          gh release download "$tag" --repo "${{ github.action_repository || github.repository }}" --pattern "$asset" --dir "$dir" || { echo "could not download $asset"; return 1; }
+          if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$dir/$asset" | cut -d' ' -f1); else got=$(shasum -a 256 "$dir/$asset" | cut -d' ' -f1); fi
+          [ "$got" = "$want" ] || { echo "::warning::checksum mismatch for $asset: expected $want, got $got"; return 1; }
+          tar -C "$RUNNER_TEMP/vci-bin" -xzf "$dir/$asset" vci
+          echo "using vci $tag ($asset, sha256 $got)"
+        }
+        if try; then ok=true; else echo "falling back to building vci from source"; fi
+        echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+    - name: Restore a vci binary built from source
       id: cache
+      if: steps.release.outputs.ok != 'true'
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/vci-bin
         key: vci-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.src.outputs.hash }}
 
-    - name: Build vci
-      if: steps.cache.outputs.cache-hit != 'true'
+    - name: Build vci from source
+      if: steps.release.outputs.ok != 'true' && steps.cache.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ github.action_path }}
       env:
