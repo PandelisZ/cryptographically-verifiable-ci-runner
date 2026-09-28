@@ -10,7 +10,7 @@ use vci_adapter::Adapter;
 use vci_core::{Predicate, RepoPath};
 use vci_git::Repo;
 
-use crate::config::{CONFIG_FILE, Config, EnvConfig, Policy};
+use crate::config::{CONFIG_FILE, Config, EnvConfig, InputsConfig, Policy};
 use crate::envpolicy::{ChildEnvMap, FileEnv, build_child_env_with};
 
 /// The signed predicate: the `vci-core` [`Predicate`] plus vci-cli fields.
@@ -29,6 +29,31 @@ pub struct VciPredicate {
     /// single-project form, so those predicates serialise as before.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub project_name: String,
+    /// Go: repository files of the test whose inclusion in the build depends
+    /// on GOOS/GOARCH. When non-empty the attestation only holds on the
+    /// attested OS and architecture, whatever `policy.platform` says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platform_specific: Vec<String>,
+    /// Go: why the test's results may differ on another architecture
+    /// (floating-point code: the compiler fuses `x*y + z` on arm64 but not
+    /// on amd64). When non-empty the attestation only holds on the attested
+    /// architecture, whatever `policy.platform` says (the OS may differ).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arch_specific: Vec<String>,
+    /// Refusal reasons a policy waived when this attestation was made
+    /// (`go:net:` with `policy.go_allow_net`). `vci plan` accepts the
+    /// attestation only while the base commit's policy still waives them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waived: Vec<String>,
+    /// Cargo: target-dependent `cfg(...)` predicates in the unit's repository
+    /// code and manifests. On another host each must evaluate as it did on
+    /// the attesting host (`toolchain.rustCfg`), or the unit runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cfg_predicates: Vec<String>,
+    /// The `[[inputs]] extra` globs declared for this test id when it was
+    /// attested (they must still be exactly what the base config declares).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_inputs: Vec<String>,
 }
 
 /// Storage key for an attestation: everything that must match for two
@@ -58,13 +83,41 @@ pub fn storage_key(p: &VciPredicate) -> String {
     } else {
         vci_core::blake3_hex(tc.python_dists.join("\n").as_bytes())
     };
+    let go_env = if tc.go_env.is_empty() {
+        String::new()
+    } else {
+        vci_core::blake3_hex(tc.go_env.join("\n").as_bytes())
+    };
+    let platform_specific = p.platform_specific.join("\0");
+    let arch_specific = p.arch_specific.join("\0");
+    let waived = p.waived.join("\0");
+    let rust_cfg = if tc.rust_cfg.is_empty() {
+        String::new()
+    } else {
+        vci_core::blake3_hex(tc.rust_cfg.join("\n").as_bytes())
+    };
+    let cfg_predicates = p.cfg_predicates.join("\0");
+    let declared_inputs = p.declared_inputs.join("\0");
     let extra = [
         ("python", tc.python.as_str()),
         ("implementation", tc.implementation.as_str()),
         ("pytest", tc.pytest.as_str()),
         ("python_libs", tc.python_libs.as_str()),
         ("python_dists", &dists),
+        ("go", tc.go.as_str()),
+        ("go_env", &go_env),
+        ("go_arch_level", tc.go_arch_level.as_str()),
+        ("platform_specific", &platform_specific),
+        ("arch_specific", &arch_specific),
+        ("waived", &waived),
+        ("rust", tc.rust.as_str()),
+        ("cargo", tc.cargo.as_str()),
+        ("rust_host", tc.rust_host.as_str()),
+        ("rust_cfg", &rust_cfg),
+        ("cfg_predicates", &cfg_predicates),
+        ("declared_inputs", &declared_inputs),
         ("project", p.project_name.as_str()),
+        ("superuser", if tc.superuser { "1" } else { "" }),
         (
             "adapter",
             if p.core.adapter == "vitest" {
@@ -136,6 +189,8 @@ pub struct Project {
     pub dir: Utf8PathBuf,
     pub policy: Policy,
     pub env: EnvConfig,
+    /// `[[inputs]]` declarations of this project.
+    pub inputs: Vec<InputsConfig>,
     pub adapter: Box<dyn Adapter>,
 }
 
@@ -149,8 +204,21 @@ impl Project {
         }
     }
 
+    /// Repo-relative test id of a project-relative path (`.` names the
+    /// project dir itself: a Go module's root package). A Cargo unit
+    /// `<package dir>#<target>` keeps its `#<target>` suffix on the
+    /// repo-relative package dir (`crates/a#lib`, `.#lib` for a package at
+    /// the repository root).
     pub fn test_id(&self, project_rel: &str) -> Result<RepoPath> {
-        let joined = if self.rel == "." {
+        if self.adapter.name() == "cargo"
+            && let Some((dir, target)) = project_rel.rsplit_once('#')
+        {
+            let dir = self.test_id(if dir.is_empty() { "." } else { dir })?;
+            return Ok(RepoPath::new(&format!("{}#{target}", dir.as_str()))?);
+        }
+        let joined = if project_rel == "." || project_rel.is_empty() {
+            self.rel.clone()
+        } else if self.rel == "." {
             project_rel.to_owned()
         } else {
             format!("{}/{project_rel}", self.rel)
@@ -169,6 +237,12 @@ impl Project {
             .collect();
         FileEnv::for_file(&self.env, &inferred, project_rel)
             .with_builtin(self.adapter.builtin_pass_through())
+            .with_adapter(self.adapter.name())
+    }
+
+    /// `[[inputs]] extra` globs declared for a project-relative test id.
+    pub fn extra_inputs(&self, project_rel: &str) -> Vec<String> {
+        crate::config::extra_inputs(&self.inputs, project_rel)
     }
 
     /// The environment this project's test processes get.
@@ -191,12 +265,20 @@ impl Project {
     ) -> Result<Vec<TestFile>> {
         let mut by_id: BTreeMap<String, TestFile> = BTreeMap::new();
         for f in listed {
-            let rel = f
-                .abs
-                .strip_prefix(self.adapter.project_dir())
-                .with_context(|| format!("listed test {} is outside the project dir", f.abs))?
-                .as_str()
-                .to_owned();
+            // A Cargo unit is `<package dir>#<target>`; the package dir may be
+            // the project dir itself.
+            let rel = match f.abs.strip_prefix(self.adapter.project_dir()) {
+                Ok(r) => r.as_str().to_owned(),
+                Err(_) => f
+                    .abs
+                    .as_str()
+                    .strip_prefix(self.adapter.project_dir().as_str())
+                    .filter(|r| r.starts_with('#'))
+                    .map(|r| format!(".{r}"))
+                    .with_context(|| format!("listed test {} is outside the project dir", f.abs))?,
+            };
+            // A Go module's root package is the project dir itself.
+            let rel = if rel.is_empty() { ".".to_owned() } else { rel };
             let test_id = self.test_id(&rel)?;
             let key = test_id.as_str().to_owned();
             match by_id.get_mut(&key) {
@@ -270,6 +352,7 @@ impl Ctx {
                 dir,
                 policy: spec.policy,
                 env: spec.env,
+                inputs: spec.inputs,
                 adapter,
             });
         }

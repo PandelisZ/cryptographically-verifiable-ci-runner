@@ -74,12 +74,13 @@ pub fn observations_for(
     adapter: &str,
 ) -> Result<Vec<(RepoPath, Observation)>, String> {
     let mut out = Vec::new();
-    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 5] = [
+    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 6] = [
         (&o.modules, Observation::Read),
         (&o.reads, Observation::Read),
         (&o.probes, Observation::Probe),
         (&o.readdirs, Observation::ReadDir),
         (&o.stats, Observation::Stat),
+        (&o.excluded, Observation::Exclude),
     ];
     for (set, kind) in groups {
         for p in set {
@@ -99,11 +100,36 @@ pub fn observations_for(
     Ok(out)
 }
 
+/// Whether this process (and so the tests it starts) runs as the superuser:
+/// the owner of a file it creates is uid 0 (the effective, or on Linux the
+/// filesystem, uid). Permission checks do not apply to root, so a test's
+/// result can depend on it (GitHub `container:` jobs run as root). Any error
+/// counts as root, so that an attestation made or checked where this cannot
+/// be decided only matches another such run.
+pub fn running_as_root() -> bool {
+    static ROOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROOT.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            tempfile::NamedTempFile::new()
+                .and_then(|f| f.as_file().metadata())
+                .map(|m| m.uid() == 0)
+                .unwrap_or(true)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    })
+}
+
 /// The toolchain recorded for (and compared against) an attestation.
 pub fn toolchain_for(adapter: &str, v: &vci_adapter::ToolVersions) -> Toolchain {
     let mut t = Toolchain {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
+        superuser: running_as_root(),
         ..Default::default()
     };
     match adapter {
@@ -113,6 +139,17 @@ pub fn toolchain_for(adapter: &str, v: &vci_adapter::ToolVersions) -> Toolchain 
             t.pytest = v.runner.clone();
             t.python_libs = v.python_libs.clone();
             t.python_dists = v.python_dists.clone();
+        }
+        "go" => {
+            t.go = v.runner.clone();
+            t.go_env = v.go_env.clone();
+            t.go_arch_level = v.go_arch_level.clone();
+        }
+        "cargo" => {
+            t.rust = v.runner.clone();
+            t.cargo = v.cargo.clone();
+            t.rust_host = v.rust_host.clone();
+            t.rust_cfg = v.rust_cfg.clone();
         }
         _ => {
             t.node = v.node.clone();
@@ -148,6 +185,26 @@ fn collector_toolchain_mismatch(
                     v.runner
                 )
             }),
+        // The test binary reports runtime.Version(); `go env GOVERSION` is
+        // what the project resolves (after any GOTOOLCHAIN switch).
+        // Only the version token: with GOEXPERIMENT both may carry an
+        // ` X:...` suffix (the experiments are compared in the toolchain).
+        "go" => (o.runner_version.split_whitespace().next()
+            != v.runner.split_whitespace().next())
+        .then(|| {
+            format!(
+                "the test binary was built by {} but the project's go is {}",
+                o.runner_version, v.runner
+            )
+        }),
+        // The adapter records the rustc it probed; the build used the same
+        // one unless something changed it in between.
+        "cargo" => (o.runner_version != v.runner).then(|| {
+            format!(
+                "rustc changed during the run ({} -> {})",
+                v.runner, o.runner_version
+            )
+        }),
         _ => (o.node != v.node || o.runner_version != v.runner || o.bundler_version != v.bundler)
             .then(|| {
                 format!(
@@ -207,6 +264,7 @@ fn check_one(
     pre_global: &BTreeMap<String, Result<String, String>>,
     base: &PredicateBase,
     locked: &Result<Option<crate::externals::LockedPackages>, String>,
+    scratch: &[Utf8PathBuf],
 ) -> Result<Attestable, String> {
     let file = file.ok_or_else(|| "not in the runner's test file list".to_owned())?;
     if file.ambiguous {
@@ -227,8 +285,56 @@ fn check_one(
     {
         return Err(format!("collector root {} is not the project dir", o.root));
     }
-    if !o.taints.is_empty() {
-        return Err(format!("tainted: {}", o.taints.join(", ")));
+    // Go: `policy.go_allow_net` waives the `net` refusal (recorded in the
+    // attestation, which is then only accepted while the base policy agrees).
+    // Cargo: declaring inputs for the unit (`[[inputs]]`) waives the
+    // "may read outside its package" refusal (the declaration is recorded
+    // and must still be the base config's).
+    let declared = project.extra_inputs(&file.project_rel);
+    let (waived, taints): (Vec<&String>, Vec<&String>) = o.taints.iter().partition(|t| {
+        (adapter.name() == "go"
+            && project.policy.go_allow_net
+            && t.starts_with(vci_adapter::GO_NET_TAINT))
+            || (adapter.name() == "cargo"
+                && !declared.is_empty()
+                && t.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT))
+    });
+    if !taints.is_empty() {
+        return Err(format!(
+            "tainted: {}",
+            taints
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let waived: Vec<String> = waived.into_iter().cloned().collect();
+    if adapter.name() == "cargo" && project.env.mode == crate::config::EnvMode::Loose {
+        // What a Rust test reads from the environment cannot be observed;
+        // only strict mode (undeclared variables removed, so unset on both
+        // sides) makes that safe.
+        return Err(
+            "env mode \"loose\": the cargo adapter only attests in strict mode (a Rust test's environment reads are not observed)"
+                .into(),
+        );
+    }
+    if adapter.name() == "go" {
+        // A go.work outside the repository decides which module versions
+        // are built, but is not an input CI can re-hash.
+        let w = versions.go_work.as_str();
+        if !w.is_empty() && w != "off" {
+            let abs = Utf8Path::new(w);
+            let inside = abs.starts_with(&ctx.root)
+                || abs
+                    .canonicalize_utf8()
+                    .is_ok_and(|c| c.starts_with(&ctx.root));
+            if !inside {
+                return Err(format!(
+                    "go.work {w} is outside the repository (set GOWORK=off or move it into the repository)"
+                ));
+            }
+        }
     }
     // Files the test created, changed or deleted inside the repository are
     // outputs that later runs (or other test files) may read: not attestable.
@@ -245,6 +351,12 @@ fn check_one(
         ));
     }
     let result = o.result.clone().ok_or("no result")?;
+    if !result.is_pass() && matches!(result.state.as_str(), "no-tests" | "filtered") {
+        return Err(format!(
+            "result {} ({} tests; no test ran or some were filtered out, so the run cannot vouch for the unit)",
+            result.state, result.tests
+        ));
+    }
     if !result.is_pass() {
         return Err(format!(
             "result {} ({} failed, {} skipped or xfailed of {}; a skipped test did not run, so it cannot be vouched for elsewhere)",
@@ -275,7 +387,20 @@ fn check_one(
     if let Some(m) = collector_toolchain_mismatch(adapter.name(), o, versions) {
         return Err(m);
     }
-    let obs = observations_for(&ctx.root, o, adapter.name())?;
+    let mut obs = observations_for(&ctx.root, o, adapter.name())?;
+    obs.extend(expand_extra_inputs(
+        &ctx.root,
+        &project.dir,
+        &declared,
+        scratch,
+    )?);
+    let mut platform_specific: Vec<String> = Vec::new();
+    for p in &o.platform_files {
+        let rp = RepoPath::from_abs(&ctx.root, p)
+            .map_err(|_| format!("input outside the repository: {p}"))?;
+        platform_specific.push(rp.as_str().to_owned());
+    }
+    platform_specific.sort();
     let fenv = project.file_env(&file.project_rel);
     let keys = fenv.hashed_keys(child, &o.env_keys);
     let externals: Vec<External> = o
@@ -292,6 +417,19 @@ fn check_one(
     manifest
         .check_case_collisions()
         .map_err(|e| format!("inputs: {e}"))?;
+    // Paths the unit's source names outside its package directories must be
+    // recorded inputs (declared with `[[inputs]]`).
+    for (p, seen) in &o.path_refs {
+        let rp = RepoPath::from_abs(&ctx.root, p)
+            .map_err(|_| format!("its source refers to {p}, outside the repository ({seen})"))?;
+        if !covered(&ctx.root, &manifest, &rp) {
+            return Err(format!(
+                "its source refers to {} ({seen}), which is not an input; declare it in vci.toml ([[inputs]] match = [{:?}], extra = [...])",
+                rp.as_str(),
+                file.project_rel
+            ));
+        }
+    }
     let gm = global_manifest(ctx, project, child, &file.abs)
         .map_err(|e| format!("global inputs: {e:#}"))?;
     match pre_global.get(file.test_id.as_str()) {
@@ -300,7 +438,13 @@ fn check_one(
         Some(Err(e)) => return Err(format!("global inputs before the run: {e}")),
         None => return Err("no pre-run global snapshot".into()),
     }
-    for e in manifest.entries.iter().chain(gm.entries.iter()) {
+    let excluded = manifest.excluded_children();
+    for e in &manifest.entries {
+        pre_stat
+            .unchanged_excluding(e, excluded.get(&e.path))
+            .map_err(|r| format!("input changed during the run: {r}"))?;
+    }
+    for e in &gm.entries {
         pre_stat
             .unchanged(e)
             .map_err(|r| format!("input changed during the run: {r}"))?;
@@ -330,8 +474,179 @@ fn check_one(
             project_dir: project.rel.clone(),
             runner_project: file.runner_project.clone(),
             project_name: project.name.clone(),
+            platform_specific,
+            arch_specific: o.arch_specific.iter().cloned().collect(),
+            waived,
+            cfg_predicates: o.cfg_predicates.iter().cloned().collect(),
+            declared_inputs: declared,
         },
     })
+}
+
+/// Directory names never walked for declared inputs (the tree snapshot does
+/// not track them either).
+const EXTRA_SKIP: &[&str] = &[".git", "node_modules", ".venv"];
+
+/// Observations for `[[inputs]] extra` globs (relative to `project_dir`):
+/// a glob without wildcards names a file (read), a directory (walked) or a
+/// missing path (probe); otherwise the directory before the first wildcard
+/// is walked, every directory in it is a listing (so a new matching file is
+/// noticed) and every matching file a read.
+pub fn expand_extra_inputs(
+    root: &Utf8Path,
+    project_dir: &Utf8Path,
+    globs: &[String],
+    scratch: &[Utf8PathBuf],
+) -> Result<Vec<(RepoPath, Observation)>, String> {
+    let mut out: Vec<(Utf8PathBuf, Observation)> = Vec::new();
+    for g in globs {
+        let comps: Vec<&str> = g
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        let fixed: Vec<&str> = comps
+            .iter()
+            .take_while(|c| !c.contains(['*', '?', '[', '{']))
+            .copied()
+            .collect();
+        let base = fixed.iter().fold(project_dir.to_owned(), |p, c| p.join(c));
+        let literal = fixed.len() == comps.len();
+        let meta = std::fs::symlink_metadata(&base);
+        match meta {
+            Err(_) => out.push((base, Observation::Probe)),
+            Ok(m) if !m.is_dir() => out.push((base, Observation::Read)),
+            Ok(_) => {
+                let mut stack = vec![base.clone()];
+                while let Some(d) = stack.pop() {
+                    if scratch.iter().any(|s| d.starts_with(s)) {
+                        continue;
+                    }
+                    let inside = d.strip_prefix(root).unwrap_or(&d);
+                    if inside
+                        .components()
+                        .any(|c| EXTRA_SKIP.contains(&c.as_str()))
+                    {
+                        return Err(format!(
+                            "declared input {g:?} reaches {d}, which vci does not hash"
+                        ));
+                    }
+                    out.push((d.clone(), Observation::ReadDir));
+                    let rd = d
+                        .read_dir_utf8()
+                        .map_err(|e| format!("declared input {g:?}: listing {d}: {e}"))?;
+                    for ent in rd.flatten() {
+                        let p = ent.path().to_owned();
+                        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        if is_dir {
+                            if EXTRA_SKIP.contains(&ent.file_name()) {
+                                continue;
+                            }
+                            stack.push(p);
+                            continue;
+                        }
+                        let rel = p
+                            .strip_prefix(project_dir)
+                            .map(|r| r.as_str())
+                            .unwrap_or("");
+                        if literal || crate::util::glob_match(g, rel) {
+                            out.push((p, Observation::Read));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.into_iter()
+        .map(|(p, o)| {
+            RepoPath::from_abs(root, &p)
+                .map(|rp| (rp, o))
+                .map_err(|_| format!("declared input {p} is outside the repository"))
+        })
+        .collect()
+}
+
+/// Is `rp` covered by the manifest: recorded itself (a directory listing
+/// only when everything below it is recorded too), or absent with its
+/// parent's listing recorded (so creating it is noticed)?
+fn covered(root: &Utf8Path, m: &InputManifest, rp: &RepoPath) -> bool {
+    use vci_core::EntryKind;
+    let kinds: BTreeMap<&str, EntryKind> = m
+        .entries
+        .iter()
+        .map(|e| (e.path.as_str(), e.kind))
+        .collect();
+    let abs = rp.to_abs(root);
+    match kinds.get(rp.as_str()) {
+        Some(EntryKind::DirListing) => {
+            let mut stack = vec![abs];
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = d.read_dir_utf8() else {
+                    return false;
+                };
+                for ent in rd.flatten() {
+                    let Ok(r) = RepoPath::from_abs(root, ent.path()) else {
+                        return false;
+                    };
+                    let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    match kinds.get(r.as_str()) {
+                        Some(EntryKind::DirListing) if is_dir => stack.push(ent.path().to_owned()),
+                        Some(_) if !is_dir => {}
+                        _ => return false,
+                    }
+                }
+            }
+            true
+        }
+        // Build output is never an input.
+        Some(EntryKind::Excluded) => false,
+        Some(_) => true,
+        None => {
+            !abs.exists()
+                && rp
+                    .parent()
+                    .is_some_and(|p| kinds.get(p.as_str()) == Some(&EntryKind::DirListing))
+        }
+    }
+}
+
+/// Recorded inputs that git ignores: a fresh checkout (CI) does not have
+/// them, so the attestation will not match there.
+fn ignored_inputs(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
+    use std::io::Write as _;
+    let paths: Vec<&str> = m
+        .entries
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e.kind,
+                vci_core::EntryKind::Absent | vci_core::EntryKind::Excluded
+            ) && !e.path.is_root()
+        })
+        .map(|e| e.path.as_str())
+        .collect();
+    if paths.is_empty() {
+        return vec![];
+    }
+    let child = std::process::Command::new("git")
+        .args(["-C", root.as_str(), "check-ignore", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return vec![];
+    };
+    if let Some(mut i) = child.stdin.take() {
+        let _ = i.write_all(paths.join("\n").as_bytes());
+        let _ = i.write_all(b"\n");
+    }
+    let Ok(out) = child.wait_with_output() else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 struct PredicateBase {
@@ -348,16 +663,46 @@ fn resolve_files(args: &[String], files: &[TestFile]) -> Result<BTreeSet<usize>>
     let cwd = crate::ctx::cwd()?;
     let mut out = BTreeSet::new();
     for a in args {
-        let abs = cwd
-            .join(a)
-            .canonicalize_utf8()
-            .with_context(|| format!("test file {a}"))?;
-        let hits: Vec<usize> = files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.abs == abs)
-            .map(|(i, _)| i)
-            .collect();
+        // Cargo units: `<package dir>#<target>`, or a package dir for all of
+        // its units.
+        let hits: Vec<usize> = match cwd.join(a).canonicalize_utf8() {
+            Ok(abs) => {
+                let exact: Vec<usize> = files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.abs == abs)
+                    .map(|(i, _)| i)
+                    .collect();
+                if exact.is_empty() && abs.is_dir() {
+                    let prefix = format!("{abs}#");
+                    files
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| f.abs.as_str().starts_with(&prefix))
+                        .map(|(i, _)| i)
+                        .collect()
+                } else {
+                    exact
+                }
+            }
+            Err(e) => match a.rsplit_once('#') {
+                Some((dir, target)) => {
+                    let dir = if dir.is_empty() { "." } else { dir };
+                    let abs = cwd
+                        .join(dir)
+                        .canonicalize_utf8()
+                        .with_context(|| format!("test {a}"))?;
+                    let want = format!("{abs}#{target}");
+                    files
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| f.abs.as_str() == want)
+                        .map(|(i, _)| i)
+                        .collect()
+                }
+                None => return Err(e).with_context(|| format!("test file {a}")),
+            },
+        };
         if hits.is_empty() {
             bail!("{a} is not a test file of any project (not listed by the test runner)");
         }
@@ -444,8 +789,14 @@ pub fn run(args: RunArgs) -> Result<i32> {
         }
     }
 
-    // Before the run: tree metadata and global inputs.
-    let pre_stat = TreeStat::snapshot(&root)?;
+    // Before the run: tree metadata and global inputs (build output
+    // directories such as Cargo's target dir are not inputs).
+    let scratch: Vec<Utf8PathBuf> = involved
+        .iter()
+        .flat_map(|&pi| ctx.projects[pi].adapter.scratch_dirs())
+        .filter(|d| d.starts_with(&root))
+        .collect();
+    let pre_stat = TreeStat::snapshot_skipping(&root, &scratch)?;
     let mut pre_global = BTreeMap::new();
     for &i in &selected {
         let f = &files[i];
@@ -476,7 +827,27 @@ pub fn run(args: RunArgs) -> Result<i32> {
                 project.adapter.name()
             );
         }
+        // Go's test log does not report removals, renames or new
+        // directories: any change to the repository during the run refuses
+        // every package of the run (the change cannot be attributed).
+        let go_tree = if project.adapter.name() == "go" {
+            Some(TreeStat::snapshot(&root)?)
+        } else {
+            None
+        };
         let out = project.adapter.run_collect(&rels, &child.to_child_env())?;
+        let tree_changed: Option<String> = match &go_tree {
+            None => None,
+            Some(t) => match t.changes() {
+                Ok(c) if c.is_empty() => None,
+                Ok(c) => Some(format!(
+                    "the repository changed during the run: {}{}",
+                    c.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
+                    if c.len() > 10 { ", ..." } else { "" }
+                )),
+                Err(e) => Some(format!("checking the repository after the run: {e:#}")),
+            },
+        };
         match (exit, out.exit_code) {
             (Some(0), c) => exit = c,
             (Some(_), None) => exit = None,
@@ -493,6 +864,11 @@ pub fn run(args: RunArgs) -> Result<i32> {
             let file = id.as_ref().and_then(|id| by_id.get(id.as_str()).copied());
             let label = id.clone().unwrap_or_else(|| o.test_id.clone());
             seen.insert(label.clone());
+            if let Some(why) = &tree_changed {
+                refused += 1;
+                eprintln!("vci: not attesting {label}: {why}");
+                continue;
+            }
             match check_one(
                 &ctx,
                 project,
@@ -504,6 +880,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
                 &pre_global,
                 &base,
                 &locks[pi],
+                &scratch,
             ) {
                 Err(reason) => {
                     refused += 1;
@@ -513,6 +890,21 @@ pub fn run(args: RunArgs) -> Result<i32> {
                     let p = &a.predicate;
                     for w in junk_in_listings(&ctx.root, &p.core.manifest) {
                         eprintln!("vci: warning: {label}: {w}");
+                    }
+                    if project.adapter.name() == "cargo" {
+                        let ignored = ignored_inputs(&ctx.root, &p.core.manifest);
+                        if !ignored.is_empty() {
+                            eprintln!(
+                                "vci: warning: {label}: inputs ignored by git (a fresh checkout, e.g. in CI, will not have them, so this attestation will not match there; every file in a package directory is an input): {}{}",
+                                ignored
+                                    .iter()
+                                    .take(10)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                if ignored.len() > 10 { ", ..." } else { "" }
+                            );
+                        }
                     }
                     let skey = storage_key(p);
                     let value = serde_json::to_value(p)?;
@@ -560,6 +952,60 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, body).unwrap();
+    }
+
+    /// `[[inputs]] extra` globs: a literal file, a missing path, and a glob
+    /// whose fixed prefix is walked (listings for new files, matching files
+    /// read); coverage of paths a unit's source names.
+    #[test]
+    fn declared_inputs_expand_and_cover() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        write(&root, "rs/shared/x.json", "{}");
+        write(&root, "rs/data/a.txt", "a");
+        write(&root, "rs/data/sub/b.txt", "b");
+        write(&root, "rs/data/sub/c.bin", "c");
+        write(&root, "rs/target/debug/out.txt", "o");
+        let proj = root.join("rs");
+        let globs = [
+            "shared/x.json".to_owned(),
+            "missing.txt".to_owned(),
+            "data/**/*.txt".to_owned(),
+        ];
+        let obs = expand_extra_inputs(&root, &proj, &globs, &[proj.join("target")]).unwrap();
+        let get = |p: &str| obs.iter().find(|(rp, _)| rp.as_str() == p).map(|(_, o)| *o);
+        assert_eq!(get("rs/shared/x.json"), Some(Observation::Read));
+        assert_eq!(get("rs/missing.txt"), Some(Observation::Probe));
+        assert_eq!(get("rs/data"), Some(Observation::ReadDir));
+        assert_eq!(get("rs/data/sub"), Some(Observation::ReadDir));
+        assert_eq!(get("rs/data/a.txt"), Some(Observation::Read));
+        assert_eq!(get("rs/data/sub/b.txt"), Some(Observation::Read));
+        assert_eq!(get("rs/data/sub/c.bin"), None, "does not match the glob");
+        let all =
+            expand_extra_inputs(&root, &proj, &["**".to_owned()], &[proj.join("target")]).unwrap();
+        assert!(
+            !all.iter().any(|(p, _)| p.as_str().starts_with("rs/target")),
+            "{all:?}"
+        );
+        let m = InputManifest::capture(&root, &obs, vec![], &[]).unwrap();
+        let rp = |p: &str| RepoPath::new(p).unwrap();
+        assert!(covered(&root, &m, &rp("rs/shared/x.json")));
+        assert!(covered(&root, &m, &rp("rs/missing.txt")));
+        assert!(
+            covered(&root, &m, &rp("rs/data/new.txt")),
+            "absent, parent listed"
+        );
+        assert!(!covered(&root, &m, &rp("rs/data")), "c.bin is not recorded");
+        assert!(
+            !covered(&root, &m, &rp("rs/shared/other.json")),
+            "its directory is not listed"
+        );
+        assert!(!covered(&root, &m, &rp("elsewhere/x")));
+        std::fs::remove_file(root.join("rs/data/sub/c.bin")).unwrap();
+        assert!(
+            covered(&root, &m, &rp("rs/data")),
+            "everything below is recorded"
+        );
     }
 
     /// Regression: resolution driven by package.json (`imports`, a workspace

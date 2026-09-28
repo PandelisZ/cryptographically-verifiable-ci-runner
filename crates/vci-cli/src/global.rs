@@ -318,6 +318,77 @@ fn pytest_observations(
     Ok(())
 }
 
+/// Module and workspace files looked up from the project dir up to the repo
+/// root: the module that is built, its checksums, and a workspace that would
+/// change which modules are used.
+const GO_PROJECT_FILES: &[&str] = &["go.mod", "go.sum", "go.work", "go.work.sum"];
+
+/// Global observations for a Go package: `vci.toml`; `go.mod`, `go.sum`,
+/// `go.work`, `go.work.sum` from the project dir up to the repo root; and
+/// `vendor/modules.txt` in the project dir (its presence switches the build
+/// to the vendor directory). Present files are reads, missing ones probes.
+fn go_observations(c: &mut Collector, repo_root: &Utf8Path, project_dir: &Utf8Path) -> Result<()> {
+    let mut dir = Some(project_dir);
+    while let Some(d) = dir {
+        for n in GO_PROJECT_FILES {
+            c.observe(&d.join(n))?;
+        }
+        if d == repo_root || !d.starts_with(repo_root) {
+            break;
+        }
+        dir = d.parent();
+    }
+    c.observe(&project_dir.join("vendor/modules.txt"))?;
+    Ok(())
+}
+
+/// Files looked up from a Cargo project dir up to the repo root: the lock
+/// file (it must exist at the workspace root; a missing one elsewhere is
+/// recorded as absent), the toolchain rustup picks, and cargo config.
+const CARGO_PROJECT_FILES: &[&str] = &[
+    "Cargo.lock",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+    ".cargo/config",
+];
+
+/// Global observations for a Cargo unit (`<package dir>#<target>`):
+/// `vci.toml`; `Cargo.toml` in every directory from the package dir up to
+/// the repo root (cargo walks up to find the workspace); `Cargo.lock`,
+/// `rust-toolchain(.toml)` and `.cargo/config(.toml)` from the project dir
+/// up to the repo root. Present files are reads, missing ones probes.
+fn cargo_observations(
+    c: &mut Collector,
+    repo_root: &Utf8Path,
+    project_dir: &Utf8Path,
+    unit_abs: &Utf8Path,
+) -> Result<()> {
+    let pkg = vci_adapter::unit_package_dir(unit_abs);
+    if !pkg.starts_with(project_dir) {
+        bail!("package dir {pkg} is outside the project dir {project_dir}");
+    }
+    let mut dir = Some(pkg.as_path());
+    while let Some(d) = dir {
+        c.observe(&d.join("Cargo.toml"))?;
+        if d == repo_root || !d.starts_with(repo_root) {
+            break;
+        }
+        dir = d.parent();
+    }
+    let mut dir = Some(project_dir);
+    while let Some(d) = dir {
+        for n in CARGO_PROJECT_FILES {
+            c.observe(&d.join(n))?;
+        }
+        if d == repo_root || !d.starts_with(repo_root) {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
 /// Global observations for the test file at `test_abs`.
 pub fn observations(
     repo_root: &Utf8Path,
@@ -335,6 +406,14 @@ pub fn observations(
         "vitest" => {}
         "pytest" => {
             pytest_observations(&mut c, repo_root, project_dir, test_abs)?;
+            return Ok(c.out.into_iter().collect());
+        }
+        "go" => {
+            go_observations(&mut c, repo_root, project_dir)?;
+            return Ok(c.out.into_iter().collect());
+        }
+        "cargo" => {
+            cargo_observations(&mut c, repo_root, project_dir, test_abs)?;
             return Ok(c.out.into_iter().collect());
         }
         other => bail!("no global input rules for adapter {other:?}"),
@@ -498,6 +577,66 @@ mod tests {
         assert_eq!(find(&obs, "py/package.json"), None);
         assert_eq!(find(&obs, "py/tests/unit/tsconfig.json"), None);
         assert_eq!(find(&obs, "conftest.py"), None);
+    }
+
+    #[test]
+    fn go_global_inputs() {
+        let (_t, root) = tmp_repo();
+        write(&root, "go.work", "go 1.25.0\nuse ./svc\n");
+        write(&root, "svc/go.mod", "module example.com/svc\n");
+        write(&root, "svc/go.sum", "");
+        write(&root, "svc/b/b_test.go", "package b\n");
+        let adapter = vci_adapter::GoAdapter::new(&root.join("svc"));
+        let obs = observations(&root, &adapter, &root.join("svc/b")).unwrap();
+        for (p, want) in [
+            ("vci.toml", Observation::Probe),
+            ("svc/go.mod", Observation::Read),
+            ("svc/go.sum", Observation::Read),
+            ("svc/go.work", Observation::Probe),
+            ("svc/go.work.sum", Observation::Probe),
+            ("go.work", Observation::Read),
+            ("go.mod", Observation::Probe),
+            ("svc/vendor/modules.txt", Observation::Probe),
+        ] {
+            assert_eq!(find(&obs, p), Some(&want), "{p}: {obs:?}");
+        }
+        assert_eq!(find(&obs, "svc/package.json"), None);
+    }
+
+    #[test]
+    fn cargo_global_inputs() {
+        let (_t, root) = tmp_repo();
+        write(
+            &root,
+            "rs/Cargo.toml",
+            "[workspace]\nmembers = [\"crates/a\"]\n",
+        );
+        write(&root, "rs/Cargo.lock", "version = 4\n");
+        write(&root, "rs/crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+        write(&root, "rs/.cargo/config.toml", "[build]\n");
+        write(
+            &root,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.96.0\"\n",
+        );
+        let adapter = vci_adapter::CargoAdapter::new(&root.join("rs"));
+        let obs = observations(&root, &adapter, &root.join("rs/crates/a#lib")).unwrap();
+        for (p, want) in [
+            ("vci.toml", Observation::Probe),
+            ("rs/crates/a/Cargo.toml", Observation::Read),
+            ("rs/crates/Cargo.toml", Observation::Probe),
+            ("rs/Cargo.toml", Observation::Read),
+            ("Cargo.toml", Observation::Probe),
+            ("rs/Cargo.lock", Observation::Read),
+            ("Cargo.lock", Observation::Probe),
+            ("rs/.cargo/config.toml", Observation::Read),
+            ("rs/.cargo/config", Observation::Probe),
+            ("rust-toolchain.toml", Observation::Read),
+            ("rs/rust-toolchain", Observation::Probe),
+        ] {
+            assert_eq!(find(&obs, p), Some(&want), "{p}: {obs:?}");
+        }
+        assert_eq!(find(&obs, "rs/crates/a/Cargo.lock"), None);
     }
 
     #[test]

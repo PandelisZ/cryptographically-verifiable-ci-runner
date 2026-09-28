@@ -1105,3 +1105,46 @@ fn stat_of_a_file_hashes_it_and_a_listing_implies_the_type() {
     assert_ne!(dir_only.root(), listing.root());
     assert_eq!(entry(&dir_only, "d").hash, crate::manifest::dir_type_hash());
 }
+
+/// Regression (cargo, a package at the repository root): the root listing
+/// included the local `target/` directory, which a fresh checkout does not
+/// have, so the unit could never be skipped there. An excluded path is left
+/// out of its parent's listing (present or not), and nothing else changes.
+#[test]
+fn excluded_paths_are_left_out_of_their_parents_listing() {
+    let r = Repo::new();
+    r.write("src/lib.rs", "x");
+    r.mkdir("target/debug");
+    let obs = [
+        readdir("."),
+        readdir("src"),
+        read("src/lib.rs"),
+        (rp("target"), Observation::Exclude),
+    ];
+    let m = capture(&r.root, &obs);
+    assert_eq!(entry(&m, "target").kind, EntryKind::Excluded);
+    assert_eq!(entry(&m, ".").size, 1, "only src: {:?}", m.entries);
+    assert!(diff(&m, &r.root).is_empty());
+    // A fresh checkout without target/: still the same.
+    r.rm("target");
+    assert!(diff(&m, &r.root).is_empty());
+    assert_eq!(capture(&r.root, &obs).root(), m.root());
+    // Other new names at the same level are still noticed.
+    r.write("new.rs", "");
+    assert_eq!(whats(&diff(&m, &r.root)), ["entry:."]);
+    r.rm("new.rs");
+    // The kind is part of the root, and it round-trips through JSON.
+    let plain = capture(&r.root, &[readdir("."), readdir("src"), read("src/lib.rs")]);
+    assert_ne!(plain.root(), m.root());
+    let back: InputManifest = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+    assert_eq!(back.root(), m.root());
+    assert!(diff(&back, &r.root).is_empty());
+    // An excluded path cannot also be an input.
+    let both = InputManifest::capture(
+        &r.root,
+        &[read("src/lib.rs"), (rp("src/lib.rs"), Observation::Exclude)],
+        vec![],
+        &[],
+    );
+    assert!(both.is_err());
+}

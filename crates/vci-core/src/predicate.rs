@@ -46,6 +46,44 @@ pub struct Toolchain {
     /// marker) can change what an optional import finds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub python_dists: Vec<String>,
+    /// Go adapter: `go env GOVERSION` (`go1.26.2`), compared exactly.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub go: String,
+    /// Go adapter: effective (`go env`) build settings that are the same on
+    /// every platform, as sorted `KEY=value` (`CGO_ENABLED`, `GOEXPERIMENT`,
+    /// `GOFLAGS`, `GOFIPS140`, `GODEBUG`, `GOWORK` relative to the project
+    /// dir), compared exactly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub go_env: Vec<String>,
+    /// Go adapter: the architecture level of `GOARCH` (`GOAMD64=v1`,
+    /// `GOARM64=v8.0`). Compared only when `arch` is the same (with another
+    /// architecture the platform policy decides).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub go_arch_level: String,
+    /// Cargo adapter: `rustc -vV` as `<release> <commit-hash> LLVM <version>`,
+    /// compared exactly.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rust: String,
+    /// Cargo adapter: `cargo -vV` as `<release> <commit-hash>`, compared
+    /// exactly.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cargo: String,
+    /// Cargo adapter: the host triple (`aarch64-apple-darwin`). Compared only
+    /// when `os` and `arch` are the same (otherwise the platform policy
+    /// decides).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rust_host: String,
+    /// Cargo adapter: `rustc --print cfg` of the host, sorted. Used to decide
+    /// whether the attested code's `cfg(...)` predicates evaluate the same on
+    /// another platform; compared exactly when `rust_host` is the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_cfg: Vec<String>,
+    /// The tests ran as the superuser (effective uid 0 on Unix): permission
+    /// checks do not apply to it (a mode-000 file is readable), so a test's
+    /// result can depend on it. Compared exactly; omitted when false, so
+    /// attestations made without this field compare as non-root.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superuser: bool,
     pub os: String,
     pub arch: String,
 }
@@ -78,10 +116,50 @@ impl Toolchain {
             ),
             ("pytest", &self.pytest, &now.pytest),
             ("python libraries", &self.python_libs, &now.python_libs),
+            ("go", &self.go, &now.go),
+            ("rustc", &self.rust, &now.rust),
+            ("cargo", &self.cargo, &now.cargo),
         ] {
             if a != b {
                 out.push((what, a.clone(), b.clone()));
             }
+        }
+        // Another OS or architecture has another host triple and cfg set;
+        // whether that may match at all is the platform policy's decision
+        // (plus the cfg predicates the attestation lists). On the same OS and
+        // architecture both must match (gnu vs musl, target features).
+        if self.os == now.os && self.arch == now.arch && self.rust_host != now.rust_host {
+            out.push(("rust host", self.rust_host.clone(), now.rust_host.clone()));
+        }
+        if self.rust_host == now.rust_host && self.rust_cfg != now.rust_cfg {
+            out.push(("rust cfg", self.rust_cfg.join(" "), now.rust_cfg.join(" ")));
+        }
+        if self.superuser != now.superuser {
+            let who = |r: bool| {
+                if r {
+                    "root (effective uid 0)"
+                } else {
+                    "not root"
+                }
+            };
+            out.push((
+                "privileges",
+                who(self.superuser).to_owned(),
+                who(now.superuser).to_owned(),
+            ));
+        }
+        if self.go_env != now.go_env {
+            out.push(("go env", self.go_env.join(" "), now.go_env.join(" ")));
+        }
+        // Another architecture has another level variable (GOAMD64 vs
+        // GOARM64); whether that may match at all is the platform policy's
+        // decision. On the same architecture the level must match.
+        if self.arch == now.arch && self.go_arch_level != now.go_arch_level {
+            out.push((
+                "go arch level",
+                self.go_arch_level.clone(),
+                now.go_arch_level.clone(),
+            ));
         }
         if self.python_dists != now.python_dists {
             let a: std::collections::BTreeSet<&String> = self.python_dists.iter().collect();
@@ -335,6 +413,86 @@ mod tests {
         assert!(!old.diff(&py).is_empty());
     }
 
+    /// Go: the exact Go version and the effective build settings must match;
+    /// the architecture level only on the same architecture; a Go toolchain
+    /// never matches a Vitest or pytest one.
+    #[test]
+    fn go_toolchain_rules() {
+        let go = Toolchain {
+            go: "go1.26.2".into(),
+            go_env: vec!["CGO_ENABLED=1".into(), "GOFLAGS=".into()],
+            go_arch_level: "GOARM64=v8.0".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ..Default::default()
+        };
+        assert!(go.diff(&go.clone()).is_empty());
+        let json = serde_json::to_value(&go).unwrap();
+        assert_eq!(json["goEnv"][0], "CGO_ENABLED=1");
+        assert_eq!(json["goArchLevel"], "GOARM64=v8.0");
+        let mut other = go.clone();
+        other.go = "go1.26.1".into();
+        assert_eq!(go.diff(&other)[0].0, "go");
+        let mut other = go.clone();
+        other.go_env[1] = "GOFLAGS=-tags=integration".into();
+        assert_eq!(go.diff(&other)[0].0, "go env");
+        let mut other = go.clone();
+        other.go_arch_level = "GOARM64=v9.0".into();
+        assert_eq!(go.diff(&other)[0].0, "go arch level");
+        // CI on another architecture: the level is not comparable.
+        other.arch = "x86_64".into();
+        other.go_arch_level = "GOAMD64=v1".into();
+        assert!(go.diff(&other).is_empty(), "{:?}", go.diff(&other));
+        assert!(!go.diff(&sample().toolchain).is_empty());
+        assert!(!sample().toolchain.diff(&go).is_empty());
+    }
+
+    /// Cargo: rustc and cargo exactly; the host triple and cfg set only where
+    /// they are comparable; a Cargo toolchain never matches another adapter's.
+    #[test]
+    fn cargo_toolchain_rules() {
+        let rs = Toolchain {
+            rust: "1.96.0 ac68faa2 LLVM 22.1.6".into(),
+            cargo: "1.96.0 30a34c68".into(),
+            rust_host: "aarch64-apple-darwin".into(),
+            rust_cfg: vec!["target_os=\"macos\"".into(), "unix".into()],
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ..Default::default()
+        };
+        assert!(rs.diff(&rs.clone()).is_empty());
+        let json = serde_json::to_value(&rs).unwrap();
+        assert_eq!(json["rustHost"], "aarch64-apple-darwin");
+        assert_eq!(json["rustCfg"][1], "unix");
+        let mut other = rs.clone();
+        other.rust = "1.95.0 x LLVM 21".into();
+        assert_eq!(rs.diff(&other)[0].0, "rustc");
+        let mut other = rs.clone();
+        other.cargo = "1.95.0 y".into();
+        assert_eq!(rs.diff(&other)[0].0, "cargo");
+        // Same OS and arch, another triple (e.g. musl): mismatch.
+        let mut other = rs.clone();
+        other.rust_host = "aarch64-apple-darwin-other".into();
+        other.rust_cfg = vec!["unix".into()];
+        assert_eq!(rs.diff(&other)[0].0, "rust host");
+        // Same host, other cfg (target features from flags): mismatch.
+        let mut other = rs.clone();
+        other.rust_cfg.push("target_feature=\"sve\"".into());
+        assert_eq!(rs.diff(&other)[0].0, "rust cfg");
+        // Linux CI: host and cfg differ by definition; the platform policy
+        // and the attested cfg predicates decide.
+        let linux = Toolchain {
+            rust_host: "x86_64-unknown-linux-gnu".into(),
+            rust_cfg: vec!["target_os=\"linux\"".into(), "unix".into()],
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ..rs.clone()
+        };
+        assert!(rs.diff(&linux).is_empty(), "{:?}", rs.diff(&linux));
+        assert!(!rs.diff(&sample().toolchain).is_empty());
+        assert!(!sample().toolchain.diff(&rs).is_empty());
+    }
+
     #[test]
     fn is_pass() {
         let mut r = sample().result;
@@ -356,5 +514,22 @@ mod tests {
         r.tests = 2;
         r.skipped = 1;
         assert!(!r.is_pass());
+    }
+
+    /// Regression: a permission test (a mode-000 file must not be readable)
+    /// attested as a normal user fails as root (GitHub `container:` jobs run
+    /// as root). Running as root on one side only is a toolchain difference;
+    /// attestations without the field compare as non-root.
+    #[test]
+    fn superuser_must_match() {
+        let t = sample().toolchain;
+        let mut root = t.clone();
+        root.superuser = true;
+        assert_eq!(t.diff(&root)[0].0, "privileges");
+        assert_eq!(root.diff(&t)[0].0, "privileges");
+        assert!(root.diff(&root.clone()).is_empty());
+        let v = serde_json::to_value(&root).unwrap();
+        assert_eq!(v["superuser"], true);
+        assert!(serde_json::to_value(&t).unwrap().get("superuser").is_none());
     }
 }

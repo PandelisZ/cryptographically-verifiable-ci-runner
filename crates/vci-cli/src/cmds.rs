@@ -14,6 +14,8 @@ use crate::util::{now_unix, parse_rfc3339, rfc3339};
 
 pub const CI_SNIPPET: &str = include_str!("../../../examples/github-actions.yml");
 pub const CI_SNIPPET_PYTEST: &str = include_str!("../../../examples/github-actions-pytest.yml");
+pub const CI_SNIPPET_GO: &str = include_str!("../../../examples/github-actions-go.yml");
+pub const CI_SNIPPET_CARGO: &str = include_str!("../../../examples/github-actions-cargo.yml");
 
 pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i32> {
     let res = plan(&PlanOptions {
@@ -258,10 +260,49 @@ pub fn init(
             );
         }
     }
+    if specs.iter().any(|s| s.adapter == "go")
+        && std::process::Command::new(
+            std::env::var_os(vci_adapter::GO_BIN_ENV)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "go".into()),
+        )
+        .arg("version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "vci init: note: the go adapter runs `go test`; install Go or set {} to the go binary",
+            vci_adapter::GO_BIN_ENV
+        );
+    }
+    if specs.iter().any(|s| s.adapter == "cargo")
+        && std::process::Command::new(
+            std::env::var_os(vci_adapter::CARGO_BIN_ENV)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "cargo".into()),
+        )
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!(
+            "vci init: note: the cargo adapter runs `cargo test`; install Rust or set {} to the cargo binary",
+            vci_adapter::CARGO_BIN_ENV
+        );
+    }
     let vitest: Vec<_> = specs.iter().filter(|s| s.adapter == "vitest").collect();
     if vitest.is_empty() {
+        let snippet = if specs.iter().all(|s| s.adapter == "go") {
+            CI_SNIPPET_GO
+        } else if specs.iter().all(|s| s.adapter == "cargo") {
+            CI_SNIPPET_CARGO
+        } else {
+            CI_SNIPPET_PYTEST
+        };
         println!("Commit {CONFIG_FILE} and {ALLOWED_SIGNERS_FILE}. GitHub Actions example:\n");
-        println!("{CI_SNIPPET_PYTEST}");
+        println!("{snippet}");
         return Ok(0);
     }
     let project_dir = root.join(&vitest[0].rel);

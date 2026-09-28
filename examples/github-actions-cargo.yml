@@ -1,0 +1,68 @@
+# .github/workflows/test.yml: run only the cargo test targets that no trusted
+# developer has already attested for these exact inputs.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-test:
+    # Not in a `container:`: those run as root, and whether tests run as root
+    # is compared (an attestation made as a normal user never matches root).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be available to read policy from
+
+      # Attestations only match the exact rustc (release, commit hash and LLVM
+      # version from `rustc -vV`) and cargo they were made with: pin the same
+      # toolchain you attest with locally (a rust-toolchain.toml with an exact
+      # version, used through rustup on both sides; Homebrew's rustc reports
+      # another LLVM version than rustup's; on a Mac with both, put
+      # ~/.cargo/bin first on PATH or set VCI_CARGO=~/.cargo/bin/cargo when
+      # running `vci run`).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+
+      # Optional: vci builds into target/vci, so caching target/ keeps it warm.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install vci
+        run: |
+          git clone --depth 1 https://github.com/OWNER/cryptographically-verifiable-ci "$RUNNER_TEMP/vci"
+          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+
+      - name: Fetch crates
+        run: cargo fetch --locked
+
+      - name: Fetch attestations
+        run: vci fetch --remote origin
+
+      # Policy (vci.toml) and trust (.vci/allowed_signers) are read from the
+      # BASE commit, so a pull request cannot add its own signer. On pushes to
+      # main the base is the pushed commit itself: `vci init` lists
+      # refs/heads/main in policy.no_skip_refs, so everything runs there.
+      # `vci ci` runs each remaining unit with
+      # `cargo test --locked --manifest-path <pkg>/Cargo.toml --lib|--doc|--test <name>|...`
+      # and exits non-zero if any fails.
+      - name: Plan, then run what is not attested
+        run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
+
+      # `cargo test` also compiles examples that are not test targets; vci ci
+      # only builds the units it runs. Keep this if you rely on that check.
+      - name: Build examples
+        run: cargo build --locked --examples
+
+      - name: Upload the audit log of skipped units
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vci-audit
+          path: vci-audit.json

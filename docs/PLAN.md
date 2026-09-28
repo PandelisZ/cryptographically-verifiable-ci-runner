@@ -136,7 +136,15 @@ Automated as an `assert_cmd` integration test using throwaway SSH keys generated
 - Attestation refs grow; a `vci prune` for expired entries is a follow-up.
 - Spot-check re-runs and transparency logs are later work. The pytest adapter exists (`crates/vci-adapter/src/pytest.rs`,
   collector in `py/pytest-plugin`, findings in `docs/spike-pytest.md`); `vci.toml` can hold several projects
-  (`[[projects]]`), e.g. a Vitest and a pytest project in one repository.
+  (`[[projects]]`), e.g. a Vitest and a pytest project in one repository. The Go adapter
+  (`crates/vci-adapter/src/golang/`, findings in `docs/spike-go.md`) attests packages: `go list -deps -test` for
+  compile-time inputs, and package os's test log, installed from package initialisation on by overlaying a file
+  into the standard library's `internal/testlog`, for run-time inputs. The Cargo adapter (`crates/vci-adapter/src/cargo/`,
+  findings in `docs/spike-cargo.md`) attests cargo test targets (`<package dir>#lib|doc|bin:<n>|test:<n>`); Rust has
+  no run-time hook, so its inputs are every file of the package directories of the repository crates the unit builds,
+  rustc's dep-info, build script declarations, `Cargo.lock` entries and `[[inputs]]` declared in vci.toml, and static
+  source checks refuse processes, sockets, native code and undeclared reads (a weaker guarantee than the observed-input
+  adapters, documented in the README).
 
 ## Environment variables
 

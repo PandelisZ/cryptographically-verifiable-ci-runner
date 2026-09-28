@@ -42,6 +42,12 @@ pub enum EntryKind {
     /// its type (e.g. a path component `realpath()` walked through); `hash` is
     /// [`dir_type_hash`], `size` 0.
     Dir,
+    /// Build output or bookkeeping that is never an input (Cargo's target
+    /// directory, vci's `.vci/out`, the repository's `.git`), recorded so
+    /// that its name is left out of its parent directory's listing: a fresh
+    /// checkout has no `target/`, and the listing must still match. Whether
+    /// it exists is not compared; `hash` is [`excluded_hash`], `size` 0.
+    Excluded,
 }
 
 impl EntryKind {
@@ -53,8 +59,29 @@ impl EntryKind {
             EntryKind::Absent => "absent",
             EntryKind::DirListing => "dirListing",
             EntryKind::Dir => "dir",
+            EntryKind::Excluded => "excluded",
         }
     }
+}
+
+/// `hash` of an [`EntryKind::Excluded`] entry: BLAKE3 of the bytes `excluded`.
+pub fn excluded_hash() -> String {
+    blake3_hex(b"excluded")
+}
+
+/// Child names left out of directory listings: parent path -> names, from
+/// the [`EntryKind::Excluded`] entries (or [`Observation::Exclude`]
+/// observations) of one manifest.
+type Exclusions = BTreeMap<RepoPath, std::collections::BTreeSet<String>>;
+
+fn exclusions<'a>(paths: impl Iterator<Item = &'a RepoPath>) -> Exclusions {
+    let mut out = Exclusions::new();
+    for p in paths {
+        if let (Some(parent), Some(name)) = (p.parent(), p.components().last()) {
+            out.entry(parent).or_default().insert(name.to_owned());
+        }
+    }
+    out
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -94,6 +121,17 @@ impl InputEntry {
                 format!("dirListing entries={} blake3={}", self.size, self.hash)
             }
             EntryKind::Dir => "directory".to_owned(),
+            EntryKind::Excluded => "excluded (build output, not an input)".to_owned(),
+        }
+    }
+
+    fn excluded(path: RepoPath) -> Self {
+        InputEntry {
+            path,
+            kind: EntryKind::Excluded,
+            exec: false,
+            size: 0,
+            hash: excluded_hash(),
         }
     }
 
@@ -134,6 +172,10 @@ pub enum Observation {
     /// component). Must exist at capture time: a file is recorded like a
     /// `Read`, a directory as a type-only [`EntryKind::Dir`].
     Stat,
+    /// Not an input (build output such as Cargo's target directory): recorded
+    /// as [`EntryKind::Excluded`], whether it exists or not, and left out of
+    /// its parent directory's listing.
+    Exclude,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -236,7 +278,10 @@ fn hash_file(abs: &Utf8Path) -> Result<(String, u64), ManifestError> {
     Ok((h.finalize().to_hex().to_string(), n))
 }
 
-fn hash_dir(abs: &Utf8Path) -> Result<(String, u64), ManifestError> {
+fn hash_dir(
+    abs: &Utf8Path,
+    skip: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(String, u64), ManifestError> {
     let mut children = Vec::new();
     for ent in fs::read_dir(abs).map_err(|e| io_err(abs, e))? {
         let ent = ent.map_err(|e| io_err(abs, e))?;
@@ -244,6 +289,9 @@ fn hash_dir(abs: &Utf8Path) -> Result<(String, u64), ManifestError> {
             .file_name()
             .into_string()
             .map_err(|_| ManifestError::NonUtf8Name(abs.to_string()))?;
+        if skip.is_some_and(|s| s.contains(&name)) {
+            continue;
+        }
         let ft = ent.file_type().map_err(|e| io_err(abs, e))?;
         children.push((name, ChildType::from_file_type(ft)));
     }
@@ -258,6 +306,7 @@ fn observe_as(
     repo_root: &Utf8Path,
     path: &RepoPath,
     dir_type_only: bool,
+    excl: &Exclusions,
 ) -> Result<InputEntry, ManifestError> {
     let abs = path.to_abs(repo_root);
     let md = match lstat(&abs, path.is_root()) {
@@ -281,7 +330,7 @@ fn observe_as(
     } else if ft.is_dir() && dir_type_only {
         (EntryKind::Dir, false, 0, dir_type_hash())
     } else if ft.is_dir() {
-        let (h, n) = hash_dir(&abs)?;
+        let (h, n) = hash_dir(&abs, excl.get(path))?;
         (EntryKind::DirListing, false, n, h)
     } else {
         return Err(ManifestError::UnsupportedFileType(path.to_string()));
@@ -389,11 +438,21 @@ fn capture_one(
     repo_root: &Utf8Path,
     path: &RepoPath,
     obs: Observation,
+    excl: &Exclusions,
 ) -> Result<Vec<InputEntry>, ManifestError> {
+    if obs == Observation::Exclude {
+        if path.is_root() {
+            return Err(ManifestError::ConflictingEntries(path.to_string()));
+        }
+        return Ok(vec![InputEntry::excluded(path.clone())]);
+    }
     let mut out = Vec::new();
     let fin = resolve_chain(repo_root, path, &mut out)?;
-    let e = observe_as(repo_root, &fin, obs == Observation::Stat)?;
+    let e = observe_as(repo_root, &fin, obs == Observation::Stat, excl)?;
     match (obs, e.kind) {
+        (Observation::Exclude, _) | (_, EntryKind::Excluded) => {
+            return Err(ManifestError::ConflictingEntries(fin.to_string()));
+        }
         (Observation::Read | Observation::ReadDir | Observation::Stat, EntryKind::Absent) => {
             return Err(ManifestError::ReadMissing(path.to_string()));
         }
@@ -472,9 +531,15 @@ impl InputManifest {
     where
         F: Fn(&str) -> Option<OsString> + Sync,
     {
+        let excl = exclusions(
+            observed
+                .iter()
+                .filter(|(_, o)| *o == Observation::Exclude)
+                .map(|(p, _)| p),
+        );
         let per_obs: Vec<Vec<InputEntry>> = observed
             .par_iter()
-            .map(|(p, o)| capture_one(repo_root, p, *o))
+            .map(|(p, o)| capture_one(repo_root, p, *o, &excl))
             .collect::<Result<_, _>>()?;
         let mut entries: Vec<InputEntry> = per_obs.into_iter().flatten().collect();
         // A type-only `Dir` is implied by a listing of the same directory.
@@ -571,11 +636,16 @@ impl InputManifest {
     where
         F: Fn(&str) -> Option<OsString> + Sync,
     {
+        let excl = self.exclusions();
         let entry_results: Vec<Option<Mismatch>> = self
             .entries
             .par_iter()
             .map(|exp| {
-                let act = observe_as(repo_root, &exp.path, exp.kind == EntryKind::Dir)?;
+                if exp.kind == EntryKind::Excluded {
+                    // Not an input: only its parent's listing leaves it out.
+                    return Ok(None);
+                }
+                let act = observe_as(repo_root, &exp.path, exp.kind == EntryKind::Dir, &excl)?;
                 Ok(if exp.same_state(&act) {
                     None
                 } else {
@@ -608,6 +678,21 @@ impl InputManifest {
             }
         }
         Ok(out)
+    }
+
+    /// Child names each directory listing of this manifest leaves out (its
+    /// [`EntryKind::Excluded`] entries, by parent).
+    pub fn excluded_children(&self) -> BTreeMap<RepoPath, std::collections::BTreeSet<String>> {
+        self.exclusions()
+    }
+
+    fn exclusions(&self) -> Exclusions {
+        exclusions(
+            self.entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::Excluded)
+                .map(|e| &e.path),
+        )
     }
 
     /// Err if two distinct paths (or directory prefixes of paths) are equal

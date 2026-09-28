@@ -39,12 +39,48 @@ pub const BUILTIN_PASS_THROUGH: &[&str] = &[
     "LOCALAPPDATA",
 ];
 
-/// Built-in pass-through variables that stay unhashed even when read: vci's
+/// Built-in pass-through variables that stay unhashed even when read, when
+/// the adapter is not known (the union of [`never_hashed`]'s lists): vci's
 /// own plumbing (`VCI_*`; `PYTHONPATH`, which vci sets to its collector for
 /// pytest and `vci run` refuses to attest a read of), Vitest's per-worker
 /// variables, and `NODE_OPTIONS` (vci sets it for Vitest and hashes the
 /// user's value globally).
 pub const NEVER_HASHED: &[&str] = &["VCI_*", "VITEST*", "NODE_OPTIONS", "PYTHONPATH"];
+
+/// Variables vci sets itself for one run of the tests (where a collector
+/// writes its output): never inputs. Every other `VCI_*` variable
+/// (`VCI_BASE_REF`, `VCI_JOBS`, ...) is the user's and reaches the tests as
+/// built-in pass-through, so a test that reads one gets it hashed.
+const VCI_RUN_VARS: &[&str] = &["VCI_OUT", "VCI_WORKER", "VCI_LIST_OUT", "VCI_GO_TESTLOG"];
+
+/// Built-in pass-through variables an adapter's test process sees with
+/// values that are not inputs, so reads of them stay unhashed: vci's per-run
+/// plumbing for every adapter; for Vitest also its per-worker `VITEST*`
+/// variables and `NODE_OPTIONS` (vci sets it, and hashes the user's value as a
+/// global input); for pytest `PYTHONPATH` (vci sets it to its collector, and
+/// `vci run` refuses a test that reads it). `NODE_OPTIONS` read by a Go or
+/// Rust test, or `VCI_BASE_REF` read by any test, is hashed.
+pub fn never_hashed(adapter: &str) -> &'static [&'static str] {
+    match adapter {
+        "vitest" => &[
+            "VCI_OUT",
+            "VCI_WORKER",
+            "VCI_LIST_OUT",
+            "VCI_GO_TESTLOG",
+            "VITEST*",
+            "NODE_OPTIONS",
+        ],
+        "pytest" => &[
+            "VCI_OUT",
+            "VCI_WORKER",
+            "VCI_LIST_OUT",
+            "VCI_GO_TESTLOG",
+            "PYTHONPATH",
+        ],
+        "go" | "cargo" => VCI_RUN_VARS,
+        _ => NEVER_HASHED,
+    }
+}
 
 /// Hashed in loose mode even when no read of it is observed (see
 /// [`FileEnv::required_keys`]).
@@ -79,6 +115,9 @@ pub struct FileEnv {
     /// on top of [`BUILTIN_PASS_THROUGH`]. Fixed by the adapter, so not part
     /// of the digest (the adapter name is checked separately).
     pub builtin: Vec<String>,
+    /// The adapter's name (empty: unknown), which decides which read
+    /// variables stay unhashed ([`never_hashed`]). Not part of the digest.
+    pub adapter: String,
 }
 
 impl FileEnv {
@@ -101,7 +140,14 @@ impl FileEnv {
             pass_through: pass,
             inferred: inferred.iter().map(|s| s.to_string()).collect(),
             builtin: vec![],
+            adapter: String::new(),
         }
+    }
+
+    /// Set the adapter (see [`never_hashed`]).
+    pub fn with_adapter(mut self, adapter: &str) -> Self {
+        self.adapter = adapter.to_owned();
+        self
     }
 
     /// Add an adapter's built-in pass-through patterns.
@@ -140,11 +186,15 @@ impl FileEnv {
     }
 
     /// An observed read of `key` is hashed unless it is configured
-    /// pass-through (the user's decision) or in [`NEVER_HASHED`]. Built-in
+    /// pass-through (the user's decision) or in the adapter's
+    /// [`never_hashed`] list. Built-in
     /// pass-through variables that are read are hashed: they are visible to
     /// tests so that tooling works, not because their values do not matter.
     pub fn hashed_when_read(&self, key: &str) -> bool {
-        !list_matches(&self.pass_through, key) && !NEVER_HASHED.iter().any(|p| name_match(p, key))
+        !list_matches(&self.pass_through, key)
+            && !never_hashed(&self.adapter)
+                .iter()
+                .any(|p| name_match(p, key))
     }
 
     /// Keys that must be hashed regardless of observation: declared patterns
@@ -521,6 +571,65 @@ mod tests {
                 "{k} must not be hashed: {keys:?}"
             );
         }
+    }
+
+    /// Regression: `NODE_OPTIONS` and user `VCI_*` variables (`VCI_BASE_REF`)
+    /// are built-in pass-through, so they reach every test process; a Go test
+    /// that read one was attested without its value and skipped where the
+    /// value differs. Only vci's per-run plumbing, and for Vitest its own
+    /// worker variables and `NODE_OPTIONS` (hashed globally), stay unhashed.
+    #[test]
+    fn never_hashed_reads_are_per_adapter() {
+        let c = cfg(EnvMode::Strict);
+        let mut p = parent();
+        p.push(("NODE_OPTIONS".into(), "--max-old-space-size=4096".into()));
+        p.push(("VCI_BASE_REF".into(), "main".into()));
+        let child = build_child_env(&c, &[], p);
+        assert!(child.get("NODE_OPTIONS").is_some() && child.get("VCI_BASE_REF").is_some());
+        let observed: BTreeSet<String> = [
+            "NODE_OPTIONS",
+            "VCI_BASE_REF",
+            "VCI_OUT",
+            "VCI_GO_TESTLOG",
+            "VITEST_POOL_ID",
+            "PYTHONPATH",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let keys = |adapter: &str| {
+            FileEnv::for_file(&c, &[], "x")
+                .with_adapter(adapter)
+                .hashed_keys(&child, &observed)
+        };
+        for adapter in ["go", "cargo"] {
+            let k = keys(adapter);
+            for want in [
+                "NODE_OPTIONS",
+                "VCI_BASE_REF",
+                "VITEST_POOL_ID",
+                "PYTHONPATH",
+            ] {
+                assert!(k.contains(&want.to_string()), "{adapter}: {want}: {k:?}");
+            }
+            for not in ["VCI_OUT", "VCI_GO_TESTLOG"] {
+                assert!(!k.contains(&not.to_string()), "{adapter}: {not}: {k:?}");
+            }
+        }
+        let v = keys("vitest");
+        assert!(v.contains(&"VCI_BASE_REF".to_string()), "{v:?}");
+        for not in ["NODE_OPTIONS", "VITEST_POOL_ID", "VCI_OUT"] {
+            assert!(!v.contains(&not.to_string()), "vitest: {not}: {v:?}");
+        }
+        let py = keys("pytest");
+        assert!(py.contains(&"NODE_OPTIONS".to_string()), "{py:?}");
+        assert!(!py.contains(&"PYTHONPATH".to_string()), "{py:?}");
+        assert!(!py.contains(&"VCI_OUT".to_string()), "{py:?}");
+        // The digest does not depend on it.
+        assert_eq!(
+            FileEnv::for_file(&c, &[], "x").with_adapter("go").digest(),
+            FileEnv::for_file(&c, &[], "x").digest()
+        );
     }
 
     #[test]

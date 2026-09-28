@@ -164,7 +164,7 @@ def pytest_collection_finish(session):
 
 /// Outcome of one collecting pytest process: exit code, parsed collector
 /// output, and the process's combined output (for stderr).
-type OneRun = (Option<i32>, Vec<Observed>, Vec<u8>);
+pub(crate) type OneRun = (Option<i32>, Vec<Observed>, Vec<u8>);
 
 #[derive(Debug, Clone)]
 struct EnvProbe {
@@ -411,59 +411,6 @@ impl PytestAdapter {
         Ok((out.status.code(), vec![], log))
     }
 
-    /// Run `one` for every file, at most [`pytest_jobs`] at a time, writing
-    /// each process's output to stderr as one block when it ends. The exit
-    /// code is 0 only if every process exited 0.
-    fn per_file<F>(&self, files: &[String], one: F) -> Result<RunOutput, AdapterError>
-    where
-        F: Fn(&str) -> Result<OneRun, AdapterError> + Sync,
-    {
-        let jobs = pytest_jobs().min(files.len()).max(1);
-        let next = AtomicUsize::new(0);
-        let results: Mutex<Vec<(usize, Result<OneRun, AdapterError>)>> = Mutex::new(Vec::new());
-        let stderr_lock = Mutex::new(());
-        std::thread::scope(|s| {
-            for _ in 0..jobs {
-                s.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::SeqCst);
-                        let Some(file) = files.get(i) else { break };
-                        let r = one(file);
-                        if let Ok((_, _, log)) = &r {
-                            let _g = stderr_lock.lock().unwrap_or_else(|p| p.into_inner());
-                            let _ = std::io::stderr().write_all(log);
-                        }
-                        results
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push((i, r));
-                    }
-                });
-            }
-        });
-        let mut results = results.into_inner().unwrap_or_else(|p| p.into_inner());
-        results.sort_by_key(|(i, _)| *i);
-        let mut exit = Some(0);
-        let mut observed = Vec::new();
-        for (_, r) in results {
-            let (code, obs, _) = r?;
-            match code {
-                Some(0) => {}
-                None => exit = None,
-                Some(c) => {
-                    if exit == Some(0) {
-                        exit = Some(c);
-                    }
-                }
-            }
-            observed.extend(obs);
-        }
-        Ok(RunOutput {
-            exit_code: exit,
-            files: observed,
-        })
-    }
-
     /// Warnings about the interpreter (printed by `vci run`).
     fn interpreter_warnings(&self, env: &ChildEnv) -> Vec<String> {
         let Ok(p) = self.probe(env) else {
@@ -496,6 +443,59 @@ impl PytestAdapter {
             p.base_prefix, p.versions.python, p.versions.python_libs
         )]
     }
+}
+
+/// Run `one` for every file, at most [`pytest_jobs`] at a time, writing
+/// each process's output to stderr as one block when it ends. The exit
+/// code is 0 only if every process exited 0.
+pub(crate) fn per_file<F>(files: &[String], one: F) -> Result<RunOutput, AdapterError>
+where
+    F: Fn(&str) -> Result<OneRun, AdapterError> + Sync,
+{
+    let jobs = pytest_jobs().min(files.len()).max(1);
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, Result<OneRun, AdapterError>)>> = Mutex::new(Vec::new());
+    let stderr_lock = Mutex::new(());
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(file) = files.get(i) else { break };
+                    let r = one(file);
+                    if let Ok((_, _, log)) = &r {
+                        let _g = stderr_lock.lock().unwrap_or_else(|p| p.into_inner());
+                        let _ = std::io::stderr().write_all(log);
+                    }
+                    results
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((i, r));
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap_or_else(|p| p.into_inner());
+    results.sort_by_key(|(i, _)| *i);
+    let mut exit = Some(0);
+    let mut observed = Vec::new();
+    for (_, r) in results {
+        let (code, obs, _) = r?;
+        match code {
+            Some(0) => {}
+            None => exit = None,
+            Some(c) => {
+                if exit == Some(0) {
+                    exit = Some(c);
+                }
+            }
+        }
+        observed.extend(obs);
+    }
+    Ok(RunOutput {
+        exit_code: exit,
+        files: observed,
+    })
 }
 
 /// A test file argument that pytest cannot mistake for an option.
@@ -688,7 +688,7 @@ impl Adapter for PytestAdapter {
         let plugin = self.plugin_dir()?;
         let pyc = tempfile::Builder::new().prefix("vci-pyc-").tempdir()?;
         let pyc = utf8_tmp(&pyc)?;
-        self.per_file(files, |f| self.run_one(&plugin, f, env, &pyc))
+        per_file(files, |f| self.run_one(&plugin, f, env, &pyc))
     }
 
     /// With files: one `uv run pytest <file>` per file (in parallel, like
@@ -703,9 +703,7 @@ impl Adapter for PytestAdapter {
             cmd.arg("pytest").stdout(std::io::stderr());
             return Ok(cmd.status().map_err(|e| self.not_installed(e))?.code());
         }
-        Ok(self
-            .per_file(files, |f| self.run_one_plain(f, env, &pyc))?
-            .exit_code)
+        Ok(per_file(files, |f| self.run_one_plain(f, env, &pyc))?.exit_code)
     }
 }
 

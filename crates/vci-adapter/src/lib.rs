@@ -9,6 +9,8 @@
 //! the affected test file (which makes it non-attestable), never a silently
 //! dropped record.
 
+mod cargo;
+mod golang;
 mod jsonl;
 mod pytest;
 mod vitest;
@@ -18,6 +20,13 @@ use std::ffi::OsString;
 
 use camino::Utf8PathBuf;
 
+pub use cargo::{
+    CARGO_BIN_ENV, CARGO_HASHED_ENV, CARGO_PASS_THROUGH, CARGO_UNDECLARED_TAINT, CargoAdapter,
+    cfg_predicate_differs, unit_package_dir,
+};
+pub use golang::{
+    GO_ALWAYS_READ_ENV, GO_BIN_ENV, GO_HASHED_ENV, GO_NET_TAINT, GO_PASS_THROUGH, GoAdapter,
+};
 pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file};
 pub use pytest::{
     JOBS_ENV, PY_PLUGIN_ENV, PYTEST_CONFIG_NAMES, PYTEST_HASHED_ENV, PYTEST_PASS_THROUGH,
@@ -26,7 +35,7 @@ pub use pytest::{
 pub use vitest::{JS_PLUGIN_ENV, VitestAdapter, find_js_plugin};
 
 /// Adapter names accepted in `vci.toml`.
-pub const ADAPTERS: &[&str] = &["vitest", "pytest"];
+pub const ADAPTERS: &[&str] = &["vitest", "pytest", "go", "cargo"];
 
 /// Construct the adapter called `name` for `project_dir`.
 pub fn adapter_for(
@@ -36,6 +45,8 @@ pub fn adapter_for(
     match name {
         "vitest" => Ok(Box::new(VitestAdapter::new(project_dir))),
         "pytest" => Ok(Box::new(PytestAdapter::new(project_dir))),
+        "go" => Ok(Box::new(GoAdapter::new(project_dir))),
+        "cargo" => Ok(Box::new(CargoAdapter::new(project_dir))),
         other => Err(AdapterError::NotFound(format!(
             "unsupported adapter {other:?} (supported: {})",
             ADAPTERS.join(", ")
@@ -75,7 +86,8 @@ pub struct ListedFile {
 
 /// Versions of the tools that make up the toolchain digest. Fields an
 /// adapter does not use are empty (Vitest: `python`/`implementation`;
-/// pytest: `node`/`bundler`, and `runner` is the pytest version).
+/// pytest: `node`/`bundler`, and `runner` is the pytest version; Go: `runner`
+/// is `go env GOVERSION` and the `go_*` fields are set).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ToolVersions {
     pub node: String,
@@ -90,6 +102,21 @@ pub struct ToolVersions {
     pub python_libs: String,
     /// Every installed distribution as sorted `name==version` (pytest).
     pub python_dists: Vec<String>,
+    /// Go: effective platform-independent build settings, sorted `KEY=value`
+    /// (see `vci_core::Toolchain::go_env`).
+    pub go_env: Vec<String>,
+    /// Go: `GOAMD64=v1`, `GOARM64=v8.0`, ... for the target `GOARCH`.
+    pub go_arch_level: String,
+    /// Go: the absolute path of the `go.work` file in use (`go env GOWORK`),
+    /// empty or `off` when none is.
+    pub go_work: String,
+    /// Cargo: `cargo -vV` as `<release> <commit-hash>` (`runner` is rustc's).
+    pub cargo: String,
+    /// Cargo: the host triple from `rustc -vV`.
+    pub rust_host: String,
+    /// Cargo: `rustc --print cfg` of the host (with the flags the build
+    /// uses), sorted.
+    pub rust_cfg: Vec<String>,
 }
 
 /// External packages as the test process would resolve them now:
@@ -165,4 +192,10 @@ pub trait Adapter: Send + Sync {
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError>;
     /// Run `files` (project-relative; empty = everything) without collection.
     fn run_plain(&self, files: &[String], env: &ChildEnv) -> Result<Option<i32>, AdapterError>;
+    /// Directories inside the repository that the runner writes build output
+    /// to and that are never inputs (Cargo's target directory). `vci run`
+    /// does not snapshot them.
+    fn scratch_dirs(&self) -> Vec<Utf8PathBuf> {
+        vec![]
+    }
 }

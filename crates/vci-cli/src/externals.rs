@@ -151,6 +151,42 @@ pub fn python_installed(
     }
 }
 
+/// `Ok(())` if the Go module `path` is in the current build list
+/// (`go list -m all`) at exactly `version` (the same replacement included).
+/// Module paths are compared exactly (they are case-sensitive).
+pub fn go_installed(
+    build_list: &Result<InstalledExternals, String>,
+    path: &str,
+    version: &str,
+) -> Result<(), String> {
+    let list = build_list
+        .as_ref()
+        .map_err(|e| format!("cannot load the build list: {e}"))?;
+    match list.get(path).map(Vec::as_slice) {
+        None | Some([]) => Err("not in the build list".into()),
+        Some([v]) if v == version => Ok(()),
+        Some([v]) => Err(v.clone()),
+        Some(vs) => Err(format!("several versions: {}", vs.join(", "))),
+    }
+}
+
+/// `Ok(())` if Cargo.lock pins crate `name` as `version` (the recorded
+/// `version source checksum`). A crate can be locked in several versions.
+pub fn cargo_locked(
+    lock: &Result<InstalledExternals, String>,
+    name: &str,
+    version: &str,
+) -> Result<(), String> {
+    let lock = lock
+        .as_ref()
+        .map_err(|e| format!("cannot read Cargo.lock: {e}"))?;
+    match lock.get(name) {
+        None => Err("not in Cargo.lock".into()),
+        Some(vs) if vs.iter().any(|v| v == version) => Ok(()),
+        Some(vs) => Err(vs.join(", ")),
+    }
+}
+
 fn version_of(pkg_json: &Utf8Path) -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(pkg_json).ok()?).ok()?;
     v.get("version")?.as_str().map(str::to_owned)
@@ -290,6 +326,52 @@ source = { virtual = "." }
             python_installed(&inst, &Ok(None), "pytest", "9.1.1"),
             Ok(())
         );
+    }
+
+    #[test]
+    fn go_modules_must_be_in_the_build_list_exactly() {
+        let list: Result<InstalledExternals, String> = Ok([
+            ("golang.org/x/sync".to_owned(), vec!["v0.20.0".to_owned()]),
+            ("example.com/Up".to_owned(), vec!["v1.0.0".to_owned()]),
+            (
+                "example.com/lib".to_owned(),
+                vec!["local:../lib".to_owned()],
+            ),
+        ]
+        .into_iter()
+        .collect());
+        assert_eq!(go_installed(&list, "golang.org/x/sync", "v0.20.0"), Ok(()));
+        assert_eq!(
+            go_installed(&list, "golang.org/x/sync", "v0.22.0"),
+            Err("v0.20.0".into())
+        );
+        assert!(
+            go_installed(&list, "example.com/up", "v1.0.0").is_err(),
+            "case-sensitive"
+        );
+        assert!(go_installed(&list, "example.com/lib", "v1.0.0").is_err());
+        assert!(go_installed(&Err("boom".into()), "golang.org/x/sync", "v0.20.0").is_err());
+    }
+
+    #[test]
+    fn cargo_crates_must_be_locked_exactly() {
+        let lock: Result<InstalledExternals, String> = Ok([(
+            "syn".to_owned(),
+            vec![
+                "1.0.109 registry+x aa".to_owned(),
+                "2.0.1 registry+x bb".to_owned(),
+            ],
+        )]
+        .into_iter()
+        .collect());
+        assert_eq!(cargo_locked(&lock, "syn", "2.0.1 registry+x bb"), Ok(()));
+        assert_eq!(cargo_locked(&lock, "syn", "1.0.109 registry+x aa"), Ok(()));
+        assert!(
+            cargo_locked(&lock, "syn", "2.0.1 registry+x cc").is_err(),
+            "checksum"
+        );
+        assert!(cargo_locked(&lock, "hex", "0.4.3 registry+x dd").is_err());
+        assert!(cargo_locked(&Err("gone".into()), "syn", "2.0.1 registry+x bb").is_err());
     }
 
     /// Regression: a non-editable path dependency (`source = { directory =

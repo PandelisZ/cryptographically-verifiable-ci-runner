@@ -36,6 +36,23 @@ pub struct Config {
     /// Multi-project form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectConfig>,
+    /// Extra inputs declared for test ids (`[[inputs]]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputsConfig>,
+}
+
+/// `[[inputs]]`: files a test reads that its adapter cannot see (Cargo: reads
+/// outside the package directories). Every file matching an `extra` glob,
+/// and the listing of every directory below each glob's fixed prefix, is
+/// hashed into the attestation of every test id matching `match`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputsConfig {
+    /// Test ids relative to the project dir (globs), e.g. `crates/b#test:*`.
+    #[serde(rename = "match")]
+    pub match_: Vec<String>,
+    /// Globs relative to the project dir, e.g. `data/**`.
+    pub extra: Vec<String>,
 }
 
 fn default_project() -> String {
@@ -59,6 +76,9 @@ pub struct ProjectConfig {
     pub policy: Option<PolicyOverride>,
     #[serde(default)]
     pub env: Option<EnvOverride>,
+    /// Replaces the top-level `[[inputs]]` for this project when given.
+    #[serde(default)]
+    pub inputs: Option<Vec<InputsConfig>>,
 }
 
 /// Per-project policy keys; each one given replaces the top-level key.
@@ -71,6 +91,7 @@ pub struct PolicyOverride {
     pub allow_dirty: Option<bool>,
     pub no_skip_refs: Option<Vec<String>>,
     pub never_skip: Option<Vec<String>>,
+    pub go_allow_net: Option<bool>,
 }
 
 /// Per-project env keys; each one given replaces the top-level key.
@@ -93,6 +114,40 @@ pub struct ProjectSpec {
     pub adapter: String,
     pub policy: Policy,
     pub env: EnvConfig,
+    pub inputs: Vec<InputsConfig>,
+}
+
+impl InputsConfig {
+    fn check(&self) -> Result<()> {
+        if self.match_.is_empty() || self.extra.is_empty() {
+            bail!("[[inputs]] needs non-empty `match` and `extra` lists");
+        }
+        for g in &self.extra {
+            if g.is_empty()
+                || g.starts_with('/')
+                || g.contains('\\')
+                || g.split('/').any(|c| c == "..")
+            {
+                bail!(
+                    "[[inputs]] extra glob {g:?} must be relative to the project dir, without '..'"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The sorted, deduplicated `extra` globs declared for a project-relative
+/// test id.
+pub fn extra_inputs(inputs: &[InputsConfig], project_rel: &str) -> Vec<String> {
+    let mut out: Vec<String> = inputs
+        .iter()
+        .filter(|i| i.match_.iter().any(|g| glob_match(g, project_rel)))
+        .flat_map(|i| i.extra.iter().cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn normalise_rel(p: &str) -> String {
@@ -166,6 +221,13 @@ pub struct Policy {
     /// custom authorizer, a C library reading files).
     #[serde(default)]
     pub never_skip: Vec<String>,
+    /// Go: attest packages whose test links package `net` (for example
+    /// through testify's `net/http` import). vci cannot observe network I/O,
+    /// so this is the user's statement that these tests do none; it is read
+    /// from the base commit, and attestations that needed it are only
+    /// accepted while it is set there.
+    #[serde(default)]
+    pub go_allow_net: bool,
 }
 
 fn default_max_ttl() -> String {
@@ -184,6 +246,7 @@ impl Default for Policy {
             allow_dirty: true,
             no_skip_refs: vec![],
             never_skip: vec![],
+            go_allow_net: false,
         }
     }
 }
@@ -255,6 +318,14 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         self.policy.max_ttl_secs()?;
+        for i in &self.inputs {
+            i.check()?;
+        }
+        for p in &self.projects {
+            for i in p.inputs.iter().flatten() {
+                i.check()?;
+            }
+        }
         if self.projects.is_empty() {
             check_adapter(self.adapter.as_deref().unwrap_or("vitest"))?;
             check_rel("project", self.project.as_deref().unwrap_or("."))?;
@@ -319,6 +390,7 @@ impl Config {
                 adapter: self.adapter.clone().unwrap_or_else(default_adapter),
                 policy: self.policy.clone(),
                 env: self.env.clone(),
+                inputs: self.inputs.clone(),
             }];
         }
         self.projects
@@ -344,6 +416,9 @@ impl Config {
                     if let Some(v) = &o.never_skip {
                         policy.never_skip = v.clone();
                     }
+                    if let Some(v) = o.go_allow_net {
+                        policy.go_allow_net = v;
+                    }
                 }
                 let mut env = self.env.clone();
                 if let Some(o) = &p.env {
@@ -366,6 +441,7 @@ impl Config {
                     adapter: p.adapter.clone(),
                     policy,
                     env,
+                    inputs: p.inputs.clone().unwrap_or_else(|| self.inputs.clone()),
                 }
             })
             .collect()
@@ -436,10 +512,89 @@ global = ["TZ"]
 pass_through = []
 "#;
 
+/// Template written by `vci init --adapter go`.
+pub const GO_TEMPLATE: &str = r#"# vci configuration. Policy is read from the BASE commit in CI.
+
+# Project directory (the Go module root, where go.mod lives), relative to the repo root.
+project = "."
+adapter = "go"
+
+[policy]
+# "any" | "same-os" | "exact": which OS/arch may satisfy CI. The Go version
+# (go env GOVERSION) and build settings must always match. A package whose
+# own code (or a package of this repository it imports) has files for
+# specific platforms (_linux.go, //go:build darwin) is only ever skipped on
+# the OS and architecture it was attested on.
+platform = "any"
+# Longest accepted attestation lifetime.
+max_ttl = "30d"
+# Accept attestations made from a working tree with uncommitted changes.
+allow_dirty = true
+# Refs on which nothing is ever skipped (globs; "*" stays within a segment).
+# Pushes to the default branch and tags run everything.
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# Packages (project-relative directories, globs) that are never skipped.
+never_skip = []
+# Attest packages whose tests link package net (testify's assert imports
+# net/http). vci cannot see network I/O: set this only if the tests use none.
+go_allow_net = false
+
+[env]
+# "strict": only declared and pass-through variables reach tests.
+mode = "strict"
+# Hashed into every package's inputs.
+global = ["TZ"]
+# Visible to tests, never hashed. Put secrets here.
+pass_through = []
+"#;
+
+/// Template written by `vci init --adapter cargo`.
+pub const CARGO_TEMPLATE: &str = r#"# vci configuration. Policy is read from the BASE commit in CI.
+
+# Project directory (the Cargo workspace root, where Cargo.lock lives), relative to the repo root.
+project = "."
+adapter = "cargo"
+
+[policy]
+# "any" | "same-os" | "exact": which OS/arch may satisfy CI. rustc and cargo
+# must always match exactly. Under "any", code behind target cfgs
+# (cfg(target_os = "linux")) must evaluate the same on both platforms, and a
+# unit whose code checks the platform at run time is only skipped on the OS
+# and architecture it was attested on.
+platform = "any"
+# Longest accepted attestation lifetime.
+max_ttl = "30d"
+# Accept attestations made from a working tree with uncommitted changes.
+allow_dirty = true
+# Refs on which nothing is ever skipped (globs; "*" stays within a segment).
+# Pushes to the default branch and tags run everything.
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# Units (project-relative ids such as "crates/a#test:it", globs) that are never skipped.
+never_skip = []
+
+# Files a unit reads outside its package directory must be declared (vci
+# hashes every file in the package directories of the crates the unit
+# builds, but cannot see reads elsewhere):
+# [[inputs]]
+# match = ["crates/b#test:*"]
+# extra = ["testdata/**"]
+
+[env]
+# "strict" (required by the cargo adapter): only declared and pass-through
+# variables reach tests.
+mode = "strict"
+# Hashed into every unit's inputs.
+global = ["TZ"]
+# Visible to tests, never hashed. Put secrets here.
+pass_through = []
+"#;
+
 /// The `vci init` template for `adapter`.
 pub fn template_for(adapter: &str) -> &'static str {
     match adapter {
         "pytest" => PYTEST_TEMPLATE,
+        "go" => GO_TEMPLATE,
+        "cargo" => CARGO_TEMPLATE,
         _ => TEMPLATE,
     }
 }
@@ -453,7 +608,7 @@ mod tests {
     /// trusted that commit's own allowed_signers.
     #[test]
     fn templates_never_skip_on_main_and_tags() {
-        for t in [TEMPLATE, PYTEST_TEMPLATE] {
+        for t in [TEMPLATE, PYTEST_TEMPLATE, GO_TEMPLATE, CARGO_TEMPLATE] {
             let c = Config::parse(t).unwrap();
             let refs = &c.project_specs()[0].policy.no_skip_refs;
             assert!(
@@ -494,6 +649,52 @@ mod tests {
         assert_eq!(s[0].adapter, "pytest");
         assert_eq!(s[0].rel, ".");
         assert_eq!(s[0].name, "");
+    }
+
+    #[test]
+    fn go_template_and_go_allow_net_override() {
+        let c = Config::parse(GO_TEMPLATE).unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].adapter, "go");
+        assert!(!s[0].policy.go_allow_net);
+        let c = Config::parse(
+            "[policy]\ngo_allow_net = true\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"go\"\n[projects.policy]\ngo_allow_net = false\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert!(s[0].policy.go_allow_net);
+        assert!(!s[1].policy.go_allow_net);
+        assert!(Config::parse("adapter = \"go\"").is_ok());
+    }
+
+    #[test]
+    fn inputs_are_declared_per_test_id_and_validated() {
+        let c = Config::parse(
+            "adapter = \"cargo\"\n\n[[inputs]]\nmatch = [\"crates/b#test:*\"]\nextra = [\"testdata/**\", \"shared/x.json\"]\n\n[[inputs]]\nmatch = [\"**\"]\nextra = [\"shared/x.json\"]\n",
+        )
+        .unwrap();
+        let s = &c.project_specs()[0];
+        assert_eq!(s.adapter, "cargo");
+        assert_eq!(
+            extra_inputs(&s.inputs, "crates/b#test:it"),
+            ["shared/x.json", "testdata/**"]
+        );
+        assert_eq!(extra_inputs(&s.inputs, "crates/a#lib"), ["shared/x.json"]);
+        for bad in [
+            "[[inputs]]\nmatch = [\"x\"]\nextra = [\"../up\"]\n",
+            "[[inputs]]\nmatch = [\"x\"]\nextra = [\"/abs\"]\n",
+            "[[inputs]]\nmatch = []\nextra = [\"a\"]\n",
+            "[[inputs]]\nmatch = [\"x\"]\nextra = [\"a\"]\nother = 1\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        let c = Config::parse(
+            "[[inputs]]\nmatch = [\"**\"]\nextra = [\"top\"]\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"cargo\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"cargo\"\ninputs = [{ match = [\"**\"], extra = [\"own\"] }]\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(extra_inputs(&s[0].inputs, "x#lib"), ["top"]);
+        assert_eq!(extra_inputs(&s[1].inputs, "x#lib"), ["own"]);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! attest a file that wrote inside the repository); an `env` record with key
 //! `*` means the whole environment was enumerated, which is a taint.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::Value;
@@ -58,6 +58,31 @@ pub struct Observed {
     pub externals: BTreeSet<(String, String)>,
     /// Env var keys read.
     pub env_keys: BTreeSet<String>,
+    /// Go: source files inside the repository whose inclusion in the build
+    /// depends on GOOS/GOARCH (`_linux.go`, `//go:build darwin`), absolute.
+    /// An attestation of such a test only holds on the same OS and
+    /// architecture, whatever the platform policy says.
+    pub platform_files: BTreeSet<Utf8PathBuf>,
+    /// Go: why the test's results may differ on another architecture
+    /// (floating-point code, which the compiler may fuse differently per
+    /// architecture). An attestation of such a test only holds on the same
+    /// architecture, whatever the platform policy says.
+    pub arch_specific: BTreeSet<String>,
+    /// Cargo: `cfg(...)` predicates in the unit's repository sources and
+    /// manifests that depend on the target (`unix`, `target_os = "linux"`),
+    /// normalised. An attestation only holds on a platform where each one
+    /// evaluates as it did on the attesting host.
+    pub cfg_predicates: BTreeSet<String>,
+    /// Cargo: paths the unit's source names (string literals used with file
+    /// APIs that leave the package directory), absolute, with where they were
+    /// seen. Each must be covered by the recorded inputs, or the unit is not
+    /// attestable.
+    pub path_refs: BTreeMap<Utf8PathBuf, String>,
+    /// Cargo: build output and bookkeeping inside a walked package directory
+    /// (the target dir, the repository's `.git` and `.vci/out`), absolute:
+    /// never inputs, and left out of their parent directory's listing (a
+    /// fresh checkout has no `target/`).
+    pub excluded: BTreeSet<Utf8PathBuf>,
     /// Reasons this file is not attestable.
     pub taints: Vec<String>,
     pub result: Option<TestResult>,

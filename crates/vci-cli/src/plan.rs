@@ -255,6 +255,10 @@ struct Verifier<'a> {
     child: ChildEnvMap,
     /// pytest: installed distributions and the uv.lock pins.
     python_externals: Option<PythonExternals>,
+    /// Go: the build list (`go list -m -json all`).
+    go_modules: Option<Result<vci_adapter::InstalledExternals, String>>,
+    /// Cargo: the packages Cargo.lock pins.
+    cargo_lock: Option<Result<vci_adapter::InstalledExternals, String>>,
 }
 
 /// What CI resolves Python externals against: the distributions installed in
@@ -439,6 +443,17 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
                     } else {
                         None
                     };
+                    let listed = |name: &str| {
+                        (project.adapter.name() == name).then(|| {
+                            project
+                                .adapter
+                                .installed_externals(&env)
+                                .map_err(|e| e.to_string())
+                                .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned()))
+                        })
+                    };
+                    let go_modules = listed("go");
+                    let cargo_lock = listed("cargo");
                     Ok(Verifier {
                         ctx: &ctx,
                         project,
@@ -449,6 +464,8 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
                         versions,
                         child,
                         python_externals,
+                        go_modules,
+                        cargo_lock,
                     })
                 })()
                 .map_err(|e| format!("{e:#}"))
@@ -778,12 +795,37 @@ impl Verifier<'_> {
         let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
         let mut tdiff = tc.diff(&now_tc);
         let platform = self.project.policy.platform_for(&f.project_rel);
-        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-        if platform >= Platform::SameOs && tc.os != os {
-            tdiff.push(("os", tc.os.clone(), os.to_owned()));
+        tdiff.extend(platform_diff(
+            platform,
+            &tc.os,
+            &tc.arch,
+            &p.platform_specific,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ));
+        if p.core.adapter == "go" {
+            tdiff.extend(go_arch_diff(
+                platform,
+                &tc.arch,
+                &p.arch_specific,
+                std::env::consts::ARCH,
+            ));
         }
-        if platform >= Platform::Exact && tc.arch != arch {
-            tdiff.push(("arch", tc.arch.clone(), arch.to_owned()));
+        // Cargo: target-dependent cfg predicates of the unit's code must
+        // evaluate here as they did on the attesting host.
+        if !p.cfg_predicates.is_empty() && tc.rust_cfg != now_tc.rust_cfg {
+            for pred in &p.cfg_predicates {
+                let differs =
+                    vci_adapter::cfg_predicate_differs(pred, &tc.rust_cfg, &now_tc.rust_cfg)
+                        .unwrap_or(true);
+                if differs {
+                    tdiff.push((
+                        "cfg (code for another platform)",
+                        format!("cfg({pred}) as on {}", tc.rust_host),
+                        format!("evaluates differently on {}", now_tc.rust_host),
+                    ));
+                }
+            }
         }
         if !tdiff.is_empty() {
             return Err(Failure {
@@ -824,6 +866,36 @@ impl Verifier<'_> {
                 ),
                 "passed, untainted (required)",
             ));
+        }
+        // Declared inputs (`[[inputs]]`) must be exactly the base config's:
+        // a declaration added later names files the attestation never hashed.
+        let declared = self.project.extra_inputs(&f.project_rel);
+        if p.declared_inputs != declared {
+            return Err(Failure::one(
+                "inputs-config",
+                12,
+                "declared inputs ([[inputs]] extra)",
+                format!("{:?}", p.declared_inputs),
+                format!("{declared:?} (base vci.toml)"),
+            ));
+        }
+        // Refusals waived by policy when the attestation was made must still
+        // be waived by the base commit's policy.
+        for w in &p.waived {
+            let (allowed, why) = if w.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT) {
+                (
+                    !declared.is_empty(),
+                    "no [[inputs]] declared for this unit in the base vci.toml",
+                )
+            } else {
+                (
+                    w.starts_with(vci_adapter::GO_NET_TAINT) && self.project.policy.go_allow_net,
+                    "not waived by the base policy (policy.go_allow_net = false)",
+                )
+            };
+            if !allowed {
+                return Err(Failure::one("result", 12, "waived refusal", w.clone(), why));
+            }
         }
         if p.core.tree_dirty && !self.project.policy.allow_dirty {
             return Err(Failure::one(
@@ -938,11 +1010,17 @@ impl Verifier<'_> {
         // Externals: every attested package version must be what resolves now.
         let mut ext_diff = vec![];
         for e in &m.externals {
-            let found = match &self.python_externals {
-                Some((installed, locked)) => {
+            let found = match (&self.python_externals, &self.go_modules, &self.cargo_lock) {
+                (Some((installed, locked)), _, _) => {
                     crate::externals::python_installed(installed, locked, &e.name, &e.version)
                 }
-                None => crate::externals::installed(&self.project.dir, &e.name, &e.version),
+                (None, Some(list), _) => crate::externals::go_installed(list, &e.name, &e.version),
+                (None, None, Some(lock)) => {
+                    crate::externals::cargo_locked(lock, &e.name, &e.version)
+                }
+                (None, None, None) => {
+                    crate::externals::installed(&self.project.dir, &e.name, &e.version)
+                }
             };
             match found {
                 Ok(()) => {}
@@ -998,6 +1076,82 @@ impl Verifier<'_> {
         }
         Ok(())
     }
+}
+
+/// OS/arch differences the platform policy does not accept, as
+/// `(what, expected, actual)`. An attestation with platform-specific files
+/// (Go files built only for some GOOS/GOARCH) needs the same OS and
+/// architecture whatever the policy: another platform compiles other code.
+pub fn platform_diff(
+    platform: Platform,
+    attested_os: &str,
+    attested_arch: &str,
+    platform_specific: &[String],
+    os: &str,
+    arch: &str,
+) -> Vec<(&'static str, String, String)> {
+    let mut out = Vec::new();
+    let files = platform_specific.join(" ");
+    let specific = !platform_specific.is_empty();
+    if attested_os != os {
+        if platform >= Platform::SameOs {
+            out.push(("os", attested_os.to_owned(), os.to_owned()));
+        } else if specific {
+            out.push((
+                "os (platform-specific files)",
+                format!("{attested_os} ({files})"),
+                os.to_owned(),
+            ));
+        }
+    }
+    if attested_arch != arch {
+        if platform >= Platform::Exact {
+            out.push(("arch", attested_arch.to_owned(), arch.to_owned()));
+        } else if specific {
+            out.push((
+                "arch (platform-specific files)",
+                format!("{attested_arch} ({files})"),
+                arch.to_owned(),
+            ));
+        }
+    }
+    out
+}
+
+/// Architectures (Rust's names) with 64-bit pointers and `int` and
+/// little-endian byte order: a Go test's integer arithmetic, `unsafe`
+/// layouts and byte order are the same on each of them.
+const GO_LE64: &[&str] = &["x86_64", "aarch64", "riscv64", "loongarch64"];
+
+/// Go: architecture differences the policy would accept but that can change
+/// a test's result: another word size or byte order, or floating-point code
+/// in the test's closure (`arch_specific`), which the compiler may evaluate
+/// differently per architecture (arm64 fuses `x*y + z`, amd64 does not).
+pub fn go_arch_diff(
+    platform: Platform,
+    attested_arch: &str,
+    arch_specific: &[String],
+    arch: &str,
+) -> Vec<(&'static str, String, String)> {
+    if attested_arch == arch || platform >= Platform::Exact {
+        // Same architecture, or `platform_diff` already requires it.
+        return vec![];
+    }
+    if !(GO_LE64.contains(&attested_arch) && GO_LE64.contains(&arch)) {
+        return vec![(
+            "arch (Go: word size or byte order may differ)",
+            attested_arch.to_owned(),
+            arch.to_owned(),
+        )];
+    }
+    if !arch_specific.is_empty() {
+        return vec![(
+            "arch (floating-point code)",
+            format!("{attested_arch} ({})", arch_specific.join("; ")),
+            arch.to_owned(),
+        )];
+    }
+    vec![]
 }
 
 /// File name suffixes of native extension modules on any platform.
@@ -1153,14 +1307,42 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
                     f.reason
                 );
             }
-            println!(
-                "{} to skip, {} to run",
-                res.skipped().count(),
-                res.to_run().count()
-            );
+            println!("{}", summary_line(res));
         }
     }
     Ok(())
+}
+
+/// The last line of the text plan. When a project runs everything (its
+/// listing failed, a policy says so), the counts of listed files do not say
+/// what runs, so the summary says it: `0 to skip, 0 to run` after a failed
+/// listing would read as "nothing runs" although `vci ci` runs everything.
+fn summary_line(res: &PlanResult) -> String {
+    let skip = res.skipped().count();
+    let run = res.to_run().count();
+    if res.run_all.is_some() {
+        return format!("{skip} to skip, running everything ({run} test files listed)");
+    }
+    let all: Vec<&str> = res
+        .projects
+        .iter()
+        .filter(|p| p.run_all.is_some())
+        .map(|p| {
+            if p.name.is_empty() {
+                p.path.as_str()
+            } else {
+                p.name.as_str()
+            }
+        })
+        .collect();
+    if all.is_empty() {
+        format!("{skip} to skip, {run} to run")
+    } else {
+        format!(
+            "{skip} to skip, {run} to run, and everything in {}",
+            all.join(", ")
+        )
+    }
 }
 
 /// `vci explain`: every candidate and its first failed check.
@@ -1220,6 +1402,88 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
 mod tests {
     use super::*;
     use vci_core::{Observation, RepoPath};
+
+    /// Go: an attestation made on macOS arm64 is accepted on Linux x86_64
+    /// under `platform = "any"` only when none of the test's repository files
+    /// is built for specific platforms (`b_linux.go`, `//go:build darwin`).
+    #[test]
+    fn go_floating_point_and_word_size_need_the_same_architecture() {
+        let none: Vec<String> = vec![];
+        let fp = vec!["example.com/m/fm: floating point in fm.go".to_owned()];
+        // No floating point: macOS arm64 -> Linux x86_64 is accepted.
+        assert!(go_arch_diff(Platform::Any, "aarch64", &none, "x86_64").is_empty());
+        let x = go_arch_diff(Platform::Any, "aarch64", &fp, "x86_64");
+        assert_eq!(x.len(), 1, "{x:?}");
+        assert_eq!(x[0].0, "arch (floating-point code)");
+        assert!(x[0].1.contains("fm.go"), "{x:?}");
+        assert!(!go_arch_diff(Platform::SameOs, "aarch64", &fp, "x86_64").is_empty());
+        // Same architecture (another OS): fine.
+        assert!(go_arch_diff(Platform::Any, "aarch64", &fp, "aarch64").is_empty());
+        // Exact already demands the architecture (platform_diff reports it).
+        assert!(go_arch_diff(Platform::Exact, "aarch64", &fp, "x86_64").is_empty());
+        // 32-bit or big-endian on one side: never across architectures.
+        assert!(!go_arch_diff(Platform::Any, "aarch64", &none, "x86").is_empty());
+        assert!(!go_arch_diff(Platform::Any, "s390x", &none, "x86_64").is_empty());
+    }
+
+    #[test]
+    fn platform_specific_go_files_need_the_same_platform() {
+        let none: Vec<String> = vec![];
+        let files = vec!["b/b_linux.go".to_owned()];
+        let d = |p, f: &[String], os, arch| platform_diff(p, "macos", "aarch64", f, os, arch);
+        assert!(d(Platform::Any, &none, "linux", "x86_64").is_empty());
+        let x = d(Platform::Any, &files, "linux", "x86_64");
+        assert_eq!(x.len(), 2, "{x:?}");
+        assert_eq!(x[0].0, "os (platform-specific files)");
+        assert!(x[0].1.contains("b/b_linux.go"), "{x:?}");
+        assert_eq!(x[1].0, "arch (platform-specific files)");
+        assert!(d(Platform::Any, &files, "macos", "aarch64").is_empty());
+        // Same OS, other architecture: still refused for platform files.
+        assert_eq!(d(Platform::Any, &files, "macos", "x86_64").len(), 1);
+        assert!(d(Platform::Any, &none, "macos", "x86_64").is_empty());
+        // Policies that already demand it report it once, as before.
+        assert_eq!(d(Platform::SameOs, &files, "linux", "aarch64")[0].0, "os");
+        assert_eq!(d(Platform::Exact, &none, "macos", "x86_64")[0].0, "arch");
+        assert_eq!(d(Platform::SameOs, &none, "linux", "x86_64").len(), 1);
+    }
+
+    /// Regression: a failed listing (a broken member `Cargo.toml`) made the
+    /// text plan end with `0 to skip, 0 to run` although everything runs.
+    #[test]
+    fn summary_says_everything_runs_when_listing_failed() {
+        let project = |run_all: Option<&str>| ProjectPlan {
+            name: String::new(),
+            path: ".".into(),
+            adapter: "cargo".into(),
+            run_all: run_all.map(str::to_owned),
+            dir: camino::Utf8PathBuf::from("/r"),
+            child_env: None,
+        };
+        let mut res = PlanResult {
+            base_ref: Some("main".into()),
+            base_commit: Some("c".into()),
+            run_all: Some("listing test files failed: could not parse cargo workspace".into()),
+            warnings: vec![],
+            projects: vec![project(Some("listing test files failed"))],
+            files: vec![],
+            multi: false,
+        };
+        let line = summary_line(&res);
+        assert!(line.contains("running everything"), "{line}");
+        assert!(!line.contains("0 to run"), "{line}");
+        res.run_all = None;
+        res.projects = vec![project(None)];
+        assert_eq!(summary_line(&res), "0 to skip, 0 to run");
+        res.multi = true;
+        res.projects = vec![
+            project(None),
+            ProjectPlan {
+                name: "rs".into(),
+                ..project(Some("listing failed"))
+            },
+        ];
+        assert!(summary_line(&res).contains("everything in rs"));
+    }
 
     /// Regression: a macOS attestation probes `b.cpython-314-darwin.so`, but a
     /// Linux interpreter imports `b.cpython-314-x86_64-linux-gnu.so` before

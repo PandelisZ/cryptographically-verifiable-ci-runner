@@ -1,0 +1,63 @@
+# .github/workflows/test.yml: run only the Go packages that no trusted
+# developer has already attested for these exact inputs.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    # Attestations made on a Mac are accepted here (platform = "any") only if
+    # these match the attesting side: declare them in vci.toml
+    # ([env] global = ["CGO_ENABLED", "TZ"]) and set the same values when you
+    # run `vci run` locally. CGO_ENABLED=0 makes `go env` agree whether or not
+    # a C compiler is installed; a TZ makes tests that use the local time zone
+    # attestable (with TZ unset they are refused).
+    env:
+      CGO_ENABLED: "0"
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be available to read policy from
+
+      # Attestations only match the exact Go version (go env GOVERSION) and
+      # build settings (CGO_ENABLED, GOFLAGS, GOEXPERIMENT, ...) they were made
+      # with: pin the same version you attest with locally.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2"
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Install vci
+        run: |
+          git clone --depth 1 https://github.com/OWNER/cryptographically-verifiable-ci "$RUNNER_TEMP/vci"
+          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+
+      - name: Fetch attestations
+        run: vci fetch --remote origin
+
+      # Policy (vci.toml) and trust (.vci/allowed_signers) are read from the
+      # BASE commit, so a pull request cannot add its own signer. On pushes to
+      # main the base is the pushed commit itself: `vci init` lists
+      # refs/heads/main in policy.no_skip_refs, so everything runs there.
+      # `vci ci` runs the remaining packages with `go test -count=1 -json` and
+      # exits non-zero if any fails.
+      - name: Plan, then run what is not attested
+        run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
+
+      - name: Upload the audit log of skipped packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vci-audit
+          path: vci-audit.json
