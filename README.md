@@ -1074,3 +1074,7 @@ reason `vci run` refuses to attest.
   are `<package dir>#<target>`, so `vci run`/`explain` take unit ids or package directories, not files.
 - Only tested on macOS arm64 (Node 26, git 2.54, OpenSSH 10.3; CPython 3.14.7, uv 0.11.7; Go 1.26.2; Rust 1.96.0
   from Homebrew). Windows paths compile but are untested.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

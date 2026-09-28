@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Records per-test-file runtime dependencies for Vitest (vci collectors)",
   "type": "module",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
