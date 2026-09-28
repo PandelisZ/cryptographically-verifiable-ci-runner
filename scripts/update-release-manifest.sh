@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Record a published release in dist/release.txt so the action can download
+# Record a published release in release/manifest.txt so the action can download
 # its binaries: the tag, the source fingerprint it was built from, and the
 # SHA-256 of every asset. Run after the release workflow has finished, from a
 # checkout whose crates/ are identical to the tagged commit.
@@ -23,5 +23,5 @@ fi
   echo "tag=$tag"
   echo "source=$built_from"
   cat "$tmp"/SHA256SUMS-* | LC_ALL=C sort -k2
-} > dist/release.txt
-cat dist/release.txt
+} > release/manifest.txt
+cat release/manifest.txt

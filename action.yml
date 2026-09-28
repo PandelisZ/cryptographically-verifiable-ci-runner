@@ -27,7 +27,7 @@ inputs:
     default: .
   prebuilt:
     description: >
-      Download the release binary recorded in the action's dist/release.txt
+      Download the release binary recorded in the action's release/manifest.txt
       when it was built from the action's own sources. `false` always builds
       from source.
     default: "true"
@@ -55,7 +55,7 @@ runs:
         mkdir -p "$RUNNER_TEMP/vci-bin"
 
     # Fast path: a published release binary built from exactly these sources.
-    # dist/release.txt is part of the pinned action, so the checksum the
+    # release/manifest.txt is part of the pinned action, so the checksum the
     # download is verified against cannot be changed by the release itself.
     - name: Download the release binary
       id: release
@@ -69,9 +69,9 @@ runs:
         ok=false
         try() {
           [ "$PREBUILT" = "true" ] || { echo "prebuilt binaries are turned off"; return 1; }
-          [ -f dist/release.txt ] || { echo "no dist/release.txt"; return 1; }
-          tag=$(sed -n 's/^tag=//p' dist/release.txt)
-          [ "$(sed -n 's/^source=//p' dist/release.txt)" = "$SOURCE" ] || { echo "release $tag was built from other sources"; return 1; }
+          [ -f release/manifest.txt ] || { echo "no release/manifest.txt"; return 1; }
+          tag=$(sed -n 's/^tag=//p' release/manifest.txt)
+          [ "$(sed -n 's/^source=//p' release/manifest.txt)" = "$SOURCE" ] || { echo "release $tag was built from other sources"; return 1; }
           case "$RUNNER_OS-$RUNNER_ARCH" in
             Linux-X64) target=x86_64-unknown-linux-musl ;;
             Linux-ARM64) target=aarch64-unknown-linux-musl ;;
@@ -80,7 +80,7 @@ runs:
             *) echo "no release binary for $RUNNER_OS-$RUNNER_ARCH"; return 1 ;;
           esac
           asset="vci-$target.tar.gz"
-          want=$(awk -v a="$asset" '$2 == a { print $1 }' dist/release.txt)
+          want=$(awk -v a="$asset" '$2 == a { print $1 }' release/manifest.txt)
           [ -n "$want" ] || { echo "no checksum recorded for $asset"; return 1; }
           dir=$(mktemp -d)
           gh release download "$tag" --repo "${{ github.action_repository || github.repository }}" --pattern "$asset" --dir "$dir" || { echo "could not download $asset"; return 1; }
