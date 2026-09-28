@@ -93,7 +93,7 @@ that did not exist is recorded as a probe.
 
 **F3. Stack attribution is needed, and the console-script shim must count as tool code.** Without it the
 record contains pytest's own activity: first run (before the fix) for `tests/test_d.py` had 14 reads, 26 env
-keys and 2 writes, including reads of `/Users/pz/w/cryptographically-verifiable-ci/fixtures` (outside the root),
+keys and 2 writes, including reads of `<repo>/fixtures` (outside the root),
 `/var/folders/.../T` (tmp dir probing), every `tests/test_*.py`, and every `*.dist-info` (pytest's entry point
 scan, which also made every installed dist an `external`). Cause: `.venv/bin/pytest` is at the bottom of every
 stack and was classified as user code. Rule now: an fs/env event is recorded if any frame on the stack is outside
