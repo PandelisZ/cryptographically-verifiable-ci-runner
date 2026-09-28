@@ -7,9 +7,6 @@ tests that are not covered by a valid attestation.
 
 1. `vci.toml` and `.vci/allowed_signers` are merged to your default branch ([install guide](INSTALL.md)).
 2. Attestations are pushed with `vci push` before or together with the branch.
-3. While this repository is private, allow other repositories to use its action: in this repository go to
-   **Settings → Actions → General → Access** and choose *Accessible from repositories owned by the user*.
-   Public repositories cannot use an action from a private one.
 
 ## Workflow
 
@@ -142,9 +139,6 @@ minutes. It does so only when all of these hold:
 Otherwise it builds from source and caches the result. The checksums are part of the pinned action, so replacing
 a release asset cannot change what runs.
 
-While this repository is private, the default token of another repository cannot read its releases. Pass a token
-with read access as `token`, or accept the source build.
-
 ### Cutting a release
 
 ```sh
@@ -191,8 +185,6 @@ A repository ruleset on `refs/attest/**` can further restrict who may write them
 
       - run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
 ```
-
-Cloning a private repository from another repository's workflow needs a token with read access to it.
 
 ## Troubleshooting
 

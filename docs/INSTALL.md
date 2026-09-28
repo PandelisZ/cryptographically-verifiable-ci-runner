@@ -22,13 +22,6 @@ With the install script (clones to `~/.local/share/vci` and builds with cargo):
 curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh
 ```
 
-While the repository is private, the raw URL needs authentication, so clone and run the script instead:
-
-```sh
-gh repo clone PandelisZ/cryptographically-verifiable-ci-runner ~/.local/share/vci
-~/.local/share/vci/scripts/install.sh
-```
-
 Or by hand:
 
 ```sh
