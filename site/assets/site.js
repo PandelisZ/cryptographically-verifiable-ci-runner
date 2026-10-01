@@ -60,10 +60,15 @@
   var toc = document.querySelector(".toc");
   var heads = [].slice.call(main.querySelectorAll("h2, h3"));
   var links = [];
+  var section = "";
   heads.forEach(function (h) {
     if (!h.id) {
-      h.id = h.textContent.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      var id = h.textContent.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      // Repeated sub-headings ("What is recorded") get their section as a prefix.
+      if (document.getElementById(id)) id = section + "-" + id;
+      h.id = id;
     }
+    if (h.tagName === "H2") section = h.id;
     if (h.closest(".card, .tabs, .steps") && h.tagName === "H3") return;
     if (toc) {
       var a = document.createElement("a");
@@ -80,6 +85,11 @@
     anchor.setAttribute("aria-label", "Link to this section");
     h.appendChild(anchor);
   });
+  // Ids are assigned above, after the browser tried to scroll to the hash.
+  if (location.hash.length > 1) {
+    var target = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+    if (target) target.scrollIntoView();
+  }
   if (toc && links.length) {
     var spy = function () {
       var current = links[0];

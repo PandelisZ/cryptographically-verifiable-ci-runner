@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it works · vci</title>
+<meta name="description" content="What an attestation contains, where it lives, the checks vci plan makes, and the threat model.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="toc"><h2>On this page</h2></aside>
+<main>
+<h1>How it works</h1>
+<p class="lede">What is signed, where it is stored, what CI checks before it skips anything, and what vci does not protect against.</p>
+
+<h2 id="fail-open">The core rule: fail open</h2>
+<p>The default verdict for every test is <span class="badge run">RUN</span>. A test is skipped only when one attestation passes every check. Any error, doubt or unrecognised behaviour means the test runs. Each candidate is checked inside an error boundary, so even a crash while checking is a failed check and never a skip.</p>
+
+<h2 id="attestation">What an attestation is</h2>
+<p>When <code>vci run</code> finishes a unit that passed and did nothing unobservable, it builds an <a href="https://in-toto.io/">in-toto</a> statement and signs it with your SSH key (SSHSIG, namespace <code>vci-attest</code>) inside a DSSE envelope. The statement records:</p>
+<ul>
+<li><strong>inputs</strong>: every file (content hash), directory listing, symlink and probed-but-missing path the unit used;</li>
+<li><strong>global inputs</strong>: lockfiles, runner config and <code>vci.toml</code>;</li>
+<li><strong>externals</strong>: packages, modules, crates or gems, by name and version;</li>
+<li><strong>environment</strong>: a hash for each relevant variable, never its value;</li>
+<li><strong>toolchain</strong>: runner and language versions, OS and architecture;</li>
+<li><strong>identity</strong>: the repository (its root commit), the test id, the command line, the issue and expiry times.</li>
+</ul>
+<p>Attestations are content-addressed by unit and inputs, not tied to a commit. They survive rebases and apply on every branch.</p>
+
+<h2 id="storage">Where attestations live</h2>
+<p>vci keeps no storage format, database or server of its own. Each attestation is one <a href="https://git-meta.com/">git-meta</a> value attached to the unit's path:</p>
+<pre><code>git meta get path:src/b.test.ts</code></pre>
+<ul>
+<li>Locally, values sit in git-meta's SQLite store at <code>.git/git-meta.sqlite</code>. Your index, <code>HEAD</code> and work tree are never touched.</li>
+<li>They are exchanged on the remote's <code>refs/meta/main</code> by ordinary git push and fetch: <code>vci push</code> and <code>vci fetch</code>, or <code>git meta push</code> and <code>git meta pull</code>.</li>
+<li>Two signers never write the same key, and merges keep keys added on either side.</li>
+</ul>
+<div class="note">
+<p><strong>Nothing in the store is trusted.</strong> Anyone with push access can write or delete metadata, exactly as with any other ref. A value that is deleted, overwritten, pruned or never fetched only means the unit runs. Only a correctly signed envelope for exactly this unit, repository, toolchain and inputs skips anything.</p>
+</div>
+
+<h2 id="verification">What <code>vci plan</code> checks</h2>
+<p>A file matching <code>policy.never_skip</code> runs. Otherwise each stored candidate is checked in this order, and the first candidate to pass every check means <span class="badge skip">SKIP</span>:</p>
+<table>
+<tr><th>#</th><th>Check</th><th>Passes when</th></tr>
+<tr><td>1</td><td><strong>envelope</strong></td><td class="wrap">it parses as DSSE with the in-toto payload type</td></tr>
+<tr><td>2</td><td><strong>signature</strong></td><td class="wrap">the SSH signature covers the exact stored payload bytes</td></tr>
+<tr><td>3</td><td><strong>signer</strong></td><td class="wrap">the key is in the <em>base commit's</em> <code>allowed_signers</code>, within its validity dates</td></tr>
+<tr><td>4</td><td><strong>statement</strong></td><td class="wrap">predicate type and subject match</td></tr>
+<tr><td>5</td><td><strong>expiry</strong></td><td class="wrap">not expired, not issued in the future, lifetime within <code>max_ttl</code></td></tr>
+<tr><td>6</td><td><strong>repo, test id, adapter, argv</strong></td><td class="wrap">all match this repository and unit</td></tr>
+<tr><td>7</td><td><strong>toolchain</strong></td><td class="wrap">language and runner versions match, and OS and architecture satisfy <code>policy.platform</code></td></tr>
+<tr><td>8</td><td><strong>env-config</strong></td><td class="wrap">the <code>[env]</code> configuration at the base commit is the one attested under</td></tr>
+<tr><td>9</td><td><strong>result</strong></td><td class="wrap">the unit passed, untainted; declared inputs and waivers still match base policy</td></tr>
+<tr><td>10</td><td><strong>global inputs</strong></td><td class="wrap">every global entry re-hashes to the same value in this checkout</td></tr>
+<tr><td>11</td><td><strong>inputs</strong></td><td class="wrap">every file, symlink, directory listing and absence re-hashes to the same value</td></tr>
+<tr><td>12</td><td><strong>externals</strong></td><td class="wrap">every package is installed in exactly the attested version</td></tr>
+<tr><td>13</td><td><strong>env</strong></td><td class="wrap">every hashed variable has the same value</td></tr>
+</table>
+<p><code>vci explain</code> prints the first failed check for each candidate.</p>
+
+<h2 id="refusals">When <code>vci run</code> refuses to attest</h2>
+<p>A unit gets no attestation, and so runs in CI, when vci cannot vouch for it:</p>
+<ul>
+<li>it failed, or any of its tests was skipped;</li>
+<li>it did something a collector cannot follow: a child process, network access, native code, enumerating the whole environment;</li>
+<li>an input lies outside the repository;</li>
+<li>an input changed during the run.</li>
+</ul>
+<p>Each adapter has its own list; see <a href="adapters.html">test runners</a>.</p>
+
+<h2 id="threat-model">Threat model</h2>
+<h3>Protected against</h3>
+<ul>
+<li><strong>Forged or tampered attestations.</strong> The signature covers the exact payload bytes; one flipped byte fails.</li>
+<li><strong>Untrusted signers</strong>, including a pull request that adds its own key to <code>.vci/allowed_signers</code>. Trust and policy come only from the base commit.</li>
+<li><strong>Replay</strong> across repositories, test files, command lines, toolchains or env configurations, or after expiry.</li>
+<li><strong>Stale inputs.</strong> Every recorded input is re-hashed from CI's own checkout, including files that must still be absent.</li>
+</ul>
+<h3>Not protected against</h3>
+<ul>
+<li><strong>A trusted signer lying, or a stolen signing key.</strong> An attestation proves who made a claim, not that the test ran. A signer can also under-declare inputs. Keep <code>allowed_signers</code> short, use hardware-backed keys, and set <code>valid-before</code> on entries.</li>
+<li><strong>Inputs the collectors cannot see</strong>: native addons, time, locale, randomness, hardware.</li>
+<li><strong>Test code that deliberately evades the collectors.</strong></li>
+<li><strong>Malicious dependencies that match the lockfile.</strong> Packages are identified by version, not by file hashes.</li>
+<li><strong>A CI job whose base ref the pull request controls.</strong> Pass the base branch's commit, as the action does by default.</li>
+</ul>
+<div class="note">
+<p><strong>The backstop.</strong> Keep your default branch in <code>policy.no_skip_refs</code> (the <code>vci init</code> default). Every merge then gets a full run, which catches a false claim after the fact.</p>
+</div>
+
+<h2>Go deeper</h2>
+<p>The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/README.md">README</a> is the complete reference: every recorded input, every refusal, and the known limitations per adapter. Design notes are in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/docs">docs/</a>.</p>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

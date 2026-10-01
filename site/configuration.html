@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configuration · vci</title>
+<meta name="description" content="Reference for vci.toml: policy, environment variables, extra inputs, several projects, and allowed signers.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="toc"><h2>On this page</h2></aside>
+<main>
+<h1>Configuration</h1>
+<p class="lede">Two committed files control vci: <code>vci.toml</code> sets policy, and <code>.vci/allowed_signers</code> says whose attestations count.</p>
+
+<div class="note">
+<p><strong>CI reads both from the base commit.</strong> A change to either file in a pull request has no effect on that pull request. It takes effect once merged. If either file is missing or unreadable at the base commit, everything runs.</p>
+</div>
+
+<h2 id="vci-toml">vci.toml</h2>
+<p><code>vci init</code> writes a commented starting file. The full shape:</p>
+<pre><code>project = "."          <span class="c"># project dir, relative to the repo root</span>
+adapter = "vitest"     <span class="c"># or "pytest", "go", "cargo", "rails"</span>
+
+[policy]
+platform = "any"       <span class="c"># "any" | "same-os" | "exact"</span>
+max_ttl = "30d"
+allow_dirty = true
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+never_skip = ["tests/test_attach_db.py"]
+go_allow_net = false
+rails_allow_db = false
+
+[[policy.platform_overrides]]
+match = ["src/native/**"]
+platform = "exact"
+
+[env]
+mode = "strict"
+global = ["NODE_ENV", "TZ"]
+pass_through = ["GITHUB_TOKEN"]
+
+[[env.files]]
+match = ["src/db/**/*.test.ts"]
+env = ["DATABASE_URL"]
+
+[[inputs]]
+match = ["crates/b#test:*"]
+extra = ["testdata/**"]</code></pre>
+<p>Unknown keys are errors.</p>
+
+<h2 id="policy">[policy]</h2>
+<table>
+<tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>platform</code></td><td><code>"any"</code></td><td class="wrap">Which OS and architecture may satisfy CI. <code>"any"</code> accepts an attestation from another platform, <code>"same-os"</code> requires the same OS, <code>"exact"</code> requires the same OS and architecture.</td></tr>
+<tr><td><code>max_ttl</code></td><td><code>"30d"</code></td><td class="wrap">Longest accepted attestation lifetime. <code>vci run --ttl</code> sets the lifetime of a new attestation (14 days unless you say otherwise).</td></tr>
+<tr><td><code>allow_dirty</code></td><td><code>true</code></td><td class="wrap">Accept attestations made from a working tree with uncommitted changes. Inputs are hashed by content, not by commit.</td></tr>
+<tr><td><code>no_skip_refs</code></td><td><code>["refs/heads/main", "refs/tags/**"]</code></td><td class="wrap">Refs on which nothing is ever skipped. Keep your default branch here: that full run is the backstop against a false claim.</td></tr>
+<tr><td><code>never_skip</code></td><td><code>[]</code></td><td class="wrap">Project-relative globs of test files that always run. Use it for tests whose inputs no collector can see.</td></tr>
+<tr><td><code>go_allow_net</code></td><td><code>false</code></td><td class="wrap">Go: attest packages whose test links package <code>net</code>. See <a href="adapters.html#go">Go</a>.</td></tr>
+<tr><td><code>rails_allow_db</code></td><td><code>false</code></td><td class="wrap">Rails: attest files whose test database is a server. See <a href="adapters.html#rails">Rails</a>.</td></tr>
+</table>
+<h3>Platform overrides</h3>
+<p>Tighten the platform rule for some files while leaving the rest on <code>"any"</code>:</p>
+<pre><code>[[policy.platform_overrides]]
+match = ["src/native/**"]   <span class="c"># project-relative globs</span>
+platform = "exact"</code></pre>
+
+<h2 id="env">[env]: environment variables</h2>
+<p>Modeled on Turborepo's <code>env</code>, <code>globalEnv</code> and <code>passThroughEnv</code>, with one addition: vci also observes which variables each test actually reads.</p>
+<pre><code>[env]
+mode = "strict"                                   <span class="c"># "strict" (default) | "loose"</span>
+global = ["NODE_ENV", "TZ", "CI_*", "!CI_JOB_*"]  <span class="c"># hashed into every test's inputs</span>
+pass_through = ["GITHUB_TOKEN", "AWS_*"]          <span class="c"># visible to tests, never hashed</span>
+
+[[env.files]]                                     <span class="c"># additions for matching test files</span>
+match = ["src/db/**/*.test.ts"]
+env = ["DATABASE_URL"]
+pass_through = ["PG*"]</code></pre>
+<p>Patterns are exact names, <code>*</code> wildcards, and a leading <code>!</code> to exclude. Exclusions win. Matching is case-sensitive.</p>
+<table>
+<tr><th>Category</th><th>Visible to tests</th><th>Hashed</th></tr>
+<tr><td>Declared (<code>global</code>, per-file <code>env</code>)</td><td>yes</td><td>yes</td></tr>
+<tr><td>Pass-through (<code>pass_through</code>)</td><td>yes</td><td>no</td></tr>
+<tr><td class="wrap">Built-in pass-through (<code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>TMPDIR</code>, <code>LANG</code>, <code>CI</code>, ...)</td><td>yes</td><td class="wrap">only if the test was observed reading it</td></tr>
+<tr><td>Undeclared, strict mode</td><td><strong>no</strong> (removed)</td><td>recorded as absent if read</td></tr>
+<tr><td>Undeclared, loose mode</td><td>yes</td><td>yes, if the test was observed reading it</td></tr>
+</table>
+<h3>Strict mode</h3>
+<p>In strict mode only declared and pass-through variables reach the test process. Everything else is removed, both in <code>vci run</code> and in <code>vci ci</code>, so local and CI runs see the same environment shape. To set a variable for your tests, declare it in <code>global</code> and set the same value on both sides.</p>
+<div class="note warn">
+<p><strong>A test that reads <code>CI</code>, <code>HOME</code> or <code>TMPDIR</code> is never skipped on a runner</strong> when it was attested on a laptop. Those values differ by definition, and a variable a test reads is hashed.</p>
+</div>
+<p><code>NO_COLOR</code> and <code>FORCE_COLOR</code> are removed in strict mode too. Add them to <code>pass_through</code> if you need them.</p>
+<h3>Secrets</h3>
+<p>Values are never stored, only their BLAKE3 hashes. But the hash of a low-entropy value can be brute-forced by anyone who can read the attestations. <strong>Put secrets in <code>pass_through</code>, not in <code>global</code>.</strong> <code>vci run</code> warns when a declared name matches <code>*TOKEN*</code>, <code>*SECRET*</code>, <code>*PASSWORD*</code> or <code>*KEY*</code>.</p>
+<h3>Runner-specific variables</h3>
+<p>Each adapter adds pass-through variables its toolchain needs (uv's <code>UV_*</code>, Go's <code>GOPATH</code> and <code>GOCACHE</code>, Cargo's <code>CARGO_HOME</code>, Bundler's <code>BUNDLE_PATH</code>, ...), and hashes the ones that change behaviour whenever they are present (<code>PYTHON*</code>, <code>GOFLAGS</code>, <code>RUSTFLAGS</code>, <code>RAILS_*</code>, ...). The full table is in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/ENV.md">docs/ENV.md</a>.</p>
+
+<h2 id="inputs">[[inputs]]: extra inputs</h2>
+<p>Declare files a unit depends on that vci cannot find on its own. Any adapter accepts this; the cargo adapter needs it for tests that read outside their package directory.</p>
+<pre><code>[[inputs]]
+match = ["crates/b#test:*"]                     <span class="c"># unit ids (globs)</span>
+extra = ["testdata/**", "shared/config.json"]   <span class="c"># files, relative to the project dir (globs)</span></code></pre>
+<p>A glob without wildcards names a file, a directory (walked), or a path that must stay absent. With wildcards, every matching file is hashed and each directory walked is recorded as a listing, so a new matching file is noticed.</p>
+
+<h2 id="projects">Several projects in one repository</h2>
+<p>Replace <code>project</code> and <code>adapter</code> with a list. <code>[policy]</code> and <code>[env]</code> become shared defaults, and each key in a project's own table replaces the top-level key for that project:</p>
+<pre><code>[policy]
+max_ttl = "30d"
+
+[env]
+global = ["NODE_ENV"]
+
+[[projects]]
+name = "web"           <span class="c"># unique: letters, digits, '.', '_', '-'</span>
+path = "web"
+adapter = "vitest"
+
+[[projects]]
+name = "api"
+path = "services/api"
+adapter = "pytest"
+[projects.policy]
+platform = "same-os"
+[projects.env]
+global = ["TZ", "APP_*"]</code></pre>
+<p>Test ids stay repo-relative paths, so they are unambiguous across projects. <code>vci run</code>, <code>plan</code>, <code>ci</code> and <code>explain</code> work across all projects, and <code>vci run FILE</code> only needs the toolchain of the project that file belongs to.</p>
+
+<h2 id="allowed-signers">.vci/allowed_signers</h2>
+<p>The trust root, in OpenSSH's <code>allowed_signers</code> format. One line per person or agent:</p>
+<pre><code>alice@example.com namespaces="vci-attest" ssh-ed25519 AAAAC3Nza...
+build-agent namespaces="vci-attest",valid-before="20270101" ssh-ed25519 AAAAC3Nza...</code></pre>
+<ul>
+<li><code>namespaces="vci-attest"</code> limits the key to vci attestations.</li>
+<li><code>valid-after</code> and <code>valid-before</code> are honoured. Give agent keys an expiry.</li>
+<li><code>cert-authority</code> entries are rejected.</li>
+<li><strong>To revoke a signer, remove the line</strong> on the default branch. Attestations by that key stop being accepted at once.</li>
+</ul>
+
+<h2 id="git-meta">.git-meta</h2>
+<p>Names the remote that attestations are exchanged with. <code>vci init</code> writes <code>url:</code> with your origin's URL; pass <code>--meta-url URL</code> to keep metadata in a separate repository. See <a href="security.html#storage">where attestations live</a>.</p>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
