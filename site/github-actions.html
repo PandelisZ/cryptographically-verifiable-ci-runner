@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Actions · vci</title>
+<meta name="description" content="Add the vci action to a GitHub Actions workflow: per-runner examples, inputs, security rules and troubleshooting.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="toc"><h2>On this page</h2></aside>
+<main>
+<h1>GitHub Actions</h1>
+<p class="lede">The repository ships a composite action. It installs <code>vci</code>, fetches attestations, prints the plan, and runs only the tests no valid attestation covers.</p>
+
+<h2>Before you start</h2>
+<ol>
+<li><code>vci.toml</code> and <code>.vci/allowed_signers</code> are merged to your default branch (<a href="get-started.html#set-up-a-repository">setup guide</a>).</li>
+<li><code>.git-meta</code> is committed, and attestations are pushed with <code>vci push</code> before or together with the branch.</li>
+</ol>
+
+<h2>Workflow</h2>
+<p>Save as <code>.github/workflows/test.yml</code>. Set up your language toolchain first, then call the action. Replace <code>&lt;commit-sha&gt;</code> with a full commit SHA of the vci repository.</p>
+<div class="tabs" data-sync="adapter">
+<div class="tab-panel" data-tab="Vitest">
+<pre><code>name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            <span class="c"># the base commit must be available</span>
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22          <span class="c"># same Node major version as used locally</span>
+          cache: npm
+
+      - run: npm ci
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+</div>
+<div class="tab-panel" data-tab="pytest">
+<pre><code>name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  UV_PYTHON_PREFERENCE: only-managed
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            <span class="c"># the base commit must be available</span>
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.7"         <span class="c"># same uv version as used locally</span>
+
+      - run: uv sync --locked
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+</div>
+<div class="tab-panel" data-tab="Go">
+<pre><code>name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"              <span class="c"># same values as locally; both declared in vci.toml [env] global</span>
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2"      <span class="c"># exact version used locally</span>
+
+      - run: go mod download
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+</div>
+<div class="tab-panel" data-tab="Rust">
+<pre><code>name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"       <span class="c"># same release as rust-toolchain.toml</span>
+
+      - run: cargo fetch --locked
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+</div>
+<div class="tab-panel" data-tab="Rails">
+<pre><code>name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC                       <span class="c"># declared in vci.toml [env] global, set the same way locally</span>
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4.9"     <span class="c"># exactly the Ruby used locally</span>
+          bundler-cache: true
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+</div>
+</div>
+<p>For several languages in one job, set up every toolchain and call the action once.</p>
+<div class="note warn"><p><strong>Run on the hosted runner directly, not in a <code>container:</code> job.</strong> Attestations made as a normal user are not accepted by a verifier running as root.</p></div>
+
+<h2>What the action does</h2>
+<ol>
+<li>Downloads a prebuilt <code>vci</code> binary whose checksum is recorded in the pinned action, or builds from source and caches the result.</li>
+<li>Runs <code>vci fetch --remote origin</code> to fetch <code>refs/meta/main</code>. A read-only <code>contents: read</code> token is enough. If the fetch fails, it warns and everything runs.</li>
+<li>Runs <code>vci plan</code> and writes the plan to the job summary.</li>
+<li>Runs <code>vci ci</code>, which runs what was not skipped and writes an audit log.</li>
+</ol>
+
+<h2>Inputs and outputs</h2>
+<table>
+<tr><th>Input</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>base-ref</code></td><td class="wrap">PR base commit, or the pushed commit</td><td class="wrap">Commit that policy and trusted signers are read from</td></tr>
+<tr><td><code>command</code></td><td><code>ci</code></td><td class="wrap"><code>ci</code> plans and runs the rest; <code>plan</code> only decides</td></tr>
+<tr><td><code>remote</code></td><td><code>origin</code></td><td class="wrap">Git remote name or URL whose <code>refs/meta/main</code> holds the attestations</td></tr>
+<tr><td><code>audit-log</code></td><td><code>vci-audit.json</code></td><td class="wrap">JSON record of what was skipped, by whom, and what ran</td></tr>
+<tr><td><code>working-directory</code></td><td><code>.</code></td><td class="wrap">Directory to run <code>vci</code> from</td></tr>
+<tr><td><code>prebuilt</code></td><td><code>true</code></td><td class="wrap">Download the release binary instead of compiling; <code>false</code> always builds from source</td></tr>
+<tr><td><code>token</code></td><td><code>github.token</code></td><td class="wrap">Token used to download the release binary</td></tr>
+</table>
+<table>
+<tr><th>Output</th><th>Meaning</th></tr>
+<tr><td><code>skipped</code></td><td>Number of test units skipped</td></tr>
+<tr><td><code>run</code></td><td>Number of test units that ran</td></tr>
+</table>
+
+<h2>Security rules</h2>
+<ul>
+<li><strong>Pin the action to a commit SHA.</strong> The action is the verifier. A branch or tag reference can move.</li>
+<li><strong>Never build <code>vci</code> from the pull request's own checkout.</strong> A pull request could change the verifier that checks it.</li>
+<li><strong>Leave <code>base-ref</code> at its default</strong> unless you know the ref is outside the pull request's control.</li>
+<li><strong>Keep <code>refs/heads/main</code> in <code>policy.no_skip_refs</code></strong>, so pushes to the default branch run everything.</li>
+<li><strong>Use <code>pull_request</code>, not <code>pull_request_target</code>.</strong> Pull requests from forks cannot push attestations to your repository, so they get no skips and every test runs.</li>
+<li><strong>Revoke by removing the line</strong> from <code>.vci/allowed_signers</code> on the default branch.</li>
+<li><strong>Always pass <code>--remote</code></strong> to <code>vci fetch</code> when not using the action, so the checkout never chooses where attestations come from.</li>
+</ul>
+
+<h2>Who can push attestations</h2>
+<p><code>vci push</code> writes <code>refs/meta/main</code>. Anyone with push access to the repository can write, overwrite or delete metadata there. That is safe by design: an attestation only counts when its signature verifies against a key in the base commit's <code>.vci/allowed_signers</code> and it matches the unit, repository, toolchain and inputs exactly. A deleted or overwritten attestation only makes its unit run.</p>
+<p>A repository ruleset on <code>refs/meta/**</code> can further restrict who may write.</p>
+
+<h2>Prebuilt binaries</h2>
+<p>The action downloads a release binary instead of compiling, which takes a few seconds instead of about two minutes. It does so only when:</p>
+<ul>
+<li><code>release/manifest.txt</code> in the pinned action names a release built from exactly the action's own sources;</li>
+<li>a binary exists for the runner (Linux and macOS, x86_64 and arm64);</li>
+<li>the download's SHA-256 equals the checksum in <code>release/manifest.txt</code>.</li>
+</ul>
+<p>Otherwise it builds from source. The checksums are part of the pinned action, so replacing a release asset cannot change what runs.</p>
+
+<h2>Without the action</h2>
+<pre><code>      - name: Install vci
+        run: |
+          git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
+          git -C "$RUNNER_TEMP/vci" checkout &lt;commit-sha&gt;
+          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+          echo "VCI_PY_PLUGIN=$RUNNER_TEMP/vci/py/pytest-plugin" &gt;&gt; "$GITHUB_ENV"
+          echo "VCI_JS_PLUGIN=$RUNNER_TEMP/vci/js/vitest-plugin" &gt;&gt; "$GITHUB_ENV"
+          echo "VCI_RUBY_COLLECTOR=$RUNNER_TEMP/vci/ruby/vci-collector" &gt;&gt; "$GITHUB_ENV"
+
+      - run: vci fetch --remote origin
+
+      - run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json</code></pre>
+
+<h2>Troubleshooting</h2>
+<table>
+<tr><th>Symptom</th><th>Likely cause</th></tr>
+<tr><td class="wrap">Everything runs on a pull request</td><td class="wrap"><code>vci.toml</code> or <code>.vci/allowed_signers</code> is not on the base branch yet, or attestations were not pushed (<code>git ls-remote origin refs/meta/main</code> is empty)</td></tr>
+<tr><td class="wrap"><code>failed check: toolchain</code></td><td class="wrap">Python, Node, uv, Ruby, Bundler or package versions differ between the laptop and the runner</td></tr>
+<tr><td class="wrap"><code>failed check: inputs</code></td><td class="wrap">A file the test depends on changed after it was attested; <code>vci explain</code> names it</td></tr>
+<tr><td class="wrap"><code>failed check: signer</code></td><td class="wrap">The signing key is not in the base commit's <code>allowed_signers</code>, or it has expired</td></tr>
+<tr><td class="wrap">A Go package or cargo target never skips on the runner</td><td class="wrap">Its code depends on the platform (build tags, <code>cfg(target_os)</code>, <code>runtime.GOOS</code>, floating-point maths): such units are only accepted on the same OS and architecture</td></tr>
+<tr><td class="wrap">A test reads <code>CI</code>, <code>HOME</code> or <code>TMPDIR</code></td><td class="wrap">Those values differ on a runner, so that file always runs there</td></tr>
+<tr><td class="wrap">No Rails test file ever skips on the runner</td><td class="wrap">See <a href="adapters.html#getting-skips-on-a-linux-runner">getting skips on a Linux runner</a></td></tr>
+</table>
+<p>Run <code>vci explain &lt;file&gt; --base-ref origin/main</code> locally for the full reason.</p>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
