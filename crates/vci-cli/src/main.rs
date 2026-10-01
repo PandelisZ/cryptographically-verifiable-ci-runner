@@ -36,7 +36,7 @@ enum Format {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Write vci.toml and .vci/allowed_signers, install @vci/vitest (Vitest), print a CI snippet.
+    /// Write vci.toml, .vci/allowed_signers and .git-meta, configure the git-meta remote, install @vci/vitest (Vitest), print a CI snippet.
     Init {
         /// Add this public key (or private key with a .pub next to it) to allowed_signers.
         #[arg(long)]
@@ -47,12 +47,15 @@ enum Cmd {
         /// Project directory relative to the repo root.
         #[arg(long)]
         project: Option<String>,
-        /// Test runner adapter: vitest (default), pytest, go or cargo.
+        /// Test runner adapter: vitest (default), pytest, go, cargo or rails.
         #[arg(long)]
         adapter: Option<String>,
         /// Do not run npm install.
         #[arg(long)]
         no_install: bool,
+        /// git-meta metadata remote URL for .git-meta (default: origin's URL).
+        #[arg(long)]
+        meta_url: Option<String>,
     },
     /// Run tests, collect their inputs, sign and store attestations.
     Run {
@@ -88,15 +91,23 @@ enum Cmd {
         #[arg(long)]
         base_ref: Option<String>,
     },
-    /// Push attestation refs.
+    /// Publish local attestations: git-meta push (refs/meta/main) with merge and retry.
     Push {
-        #[arg(long, default_value = "origin")]
-        remote: String,
+        /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin).
+        #[arg(long)]
+        remote: Option<String>,
     },
-    /// Fetch attestation refs and merge them into the local ones.
+    /// Fetch attestations: git-meta pull (fetch refs/meta/main and materialize it locally).
     Fetch {
-        #[arg(long, default_value = "origin")]
-        remote: String,
+        /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin).
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Delete expired attestations from the local git-meta store (publish with `vci push`).
+    Prune {
+        /// Only list what would be deleted.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show each candidate attestation for a test file (Go: package directory; Cargo: `<package dir>#<target>`) and the first check it failed.
     Explain {
@@ -151,7 +162,15 @@ fn main() {
             project,
             adapter,
             no_install,
-        } => cmds::init(key.as_deref(), principal, project, adapter, !no_install),
+            meta_url,
+        } => cmds::init(
+            key.as_deref(),
+            principal,
+            project,
+            adapter,
+            !no_install,
+            meta_url,
+        ),
         Cmd::Run { files, key, ttl } => run::run(run::RunArgs { files, key, ttl }),
         Cmd::Plan { base_ref, format } => plan::plan(&plan::PlanOptions {
             base_ref,
@@ -177,8 +196,9 @@ fn main() {
             allowed_signers,
             base_ref,
         } => cmds::verify(&envelope, allowed_signers.as_deref(), base_ref.as_deref()),
-        Cmd::Push { remote } => cmds::push(&remote),
-        Cmd::Fetch { remote } => cmds::fetch(&remote),
+        Cmd::Push { remote } => cmds::push(remote.as_deref()),
+        Cmd::Fetch { remote } => cmds::fetch(remote.as_deref()),
+        Cmd::Prune { dry_run } => cmds::prune(dry_run),
         Cmd::Explain {
             test_file,
             base_ref,

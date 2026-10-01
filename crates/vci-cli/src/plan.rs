@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
-use vci_core::{InputManifest, PREDICATE_TYPE, test_key};
+use vci_core::{InputManifest, PREDICATE_TYPE};
 use vci_git::{AttestStore, Repo, StoredEnvelope};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Platform};
@@ -81,8 +81,10 @@ impl Failure {
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateInfo {
-    pub signer_ref: String,
-    pub storage_key: String,
+    /// git-meta target the envelope was read from (`path:<p>` or `project`).
+    pub target: String,
+    /// git-meta key it was stored under (unverified, like the target).
+    pub meta_key: String,
     pub principal: Option<String>,
     pub fingerprint: Option<String>,
     pub issued_at: Option<String>,
@@ -133,6 +135,9 @@ pub struct ProjectPlan {
     pub dir: camino::Utf8PathBuf,
     #[serde(skip)]
     pub child_env: Option<ChildEnvMap>,
+    /// Policy settings the adapter runs tests with (`vci ci`).
+    #[serde(skip)]
+    pub adapter_options: vci_adapter::AdapterOptions,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -259,6 +264,8 @@ struct Verifier<'a> {
     go_modules: Option<Result<vci_adapter::InstalledExternals, String>>,
     /// Cargo: the packages Cargo.lock pins.
     cargo_lock: Option<Result<vci_adapter::InstalledExternals, String>>,
+    /// Rails: the gems of the bundle Bundler resolves in this checkout.
+    rails_gems: Option<Result<vci_adapter::InstalledExternals, String>>,
 }
 
 /// What CI resolves Python externals against: the distributions installed in
@@ -389,6 +396,9 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             run_all,
             dir: p.dir.clone(),
             child_env: Some(child),
+            adapter_options: vci_adapter::AdapterOptions {
+                rails_allow_db: p.policy.rails_allow_db,
+            },
         });
     }
     mark_cross_project_ambiguity(&mut files);
@@ -396,25 +406,33 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
         files.retain(|f| f.test_id.as_str() == id);
     }
 
-    // 3. Stored candidates (shared), then per project: toolchain, repo
-    // identity, and the checks.
-    let stored = if res.projects.iter().all(|p| p.run_all.is_some()) {
-        Ok(vec![])
-    } else {
-        AttestStore::new(&ctx.repo)
-            .list(None)
-            .map_err(|e| format!("{e:#}"))
-    };
-    let mut by_key: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
-    match stored {
-        Ok(s) => {
-            for s in s {
-                by_key.entry(s.test_key.clone()).or_default().push(s);
+    // 3. Stored candidates from the local git-meta store (`vci fetch`
+    // materializes the remote's), looked up per unit, then per project:
+    // toolchain, repo identity, and the checks.
+    let mut by_id: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
+    if !res.projects.iter().all(|p| p.run_all.is_some()) {
+        let looked_up = AttestStore::new(&ctx.repo).reader().and_then(|r| {
+            if !r.has_store() {
+                let w = "no git-meta store in this repository: no attestations are available (run `vci fetch` first)".to_owned();
+                eprintln!("vci: warning: {w}");
+                res.warnings.push(w);
             }
-        }
-        Err(e) => {
-            for p in res.projects.iter_mut() {
-                p.run_all.get_or_insert_with(|| e.clone());
+            let mut m = BTreeMap::new();
+            for f in &files {
+                let id = f.test_id.as_str();
+                if !m.contains_key(id) {
+                    m.insert(id.to_owned(), r.candidates(id)?);
+                }
+            }
+            Ok(m)
+        });
+        match looked_up {
+            Ok(m) => by_id = m,
+            Err(e) => {
+                let e = format!("reading attestations from git-meta: {e:#}");
+                for p in res.projects.iter_mut() {
+                    p.run_all.get_or_insert_with(|| e.clone());
+                }
             }
         }
     }
@@ -454,6 +472,7 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
                     };
                     let go_modules = listed("go");
                     let cargo_lock = listed("cargo");
+                    let rails_gems = listed("rails");
                     Ok(Verifier {
                         ctx: &ctx,
                         project,
@@ -466,6 +485,7 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
                         python_externals,
                         go_modules,
                         cargo_lock,
+                        rails_gems,
                     })
                 })()
                 .map_err(|e| format!("{e:#}"))
@@ -480,15 +500,13 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             }
             Ok(v) => {
                 for f in mine {
-                    let cands = by_key
-                        .remove(&test_key(f.test_id.as_str()))
-                        .unwrap_or_default();
                     // A test id listed by two projects: both see the same
                     // candidates (they are ambiguous and run anyway).
-                    if !cands.is_empty() {
-                        by_key.insert(test_key(f.test_id.as_str()), cands.clone());
-                    }
-                    res.files.push(v.verdict(f, &cands));
+                    let cands = by_id
+                        .get(f.test_id.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    res.files.push(v.verdict(f, cands));
                 }
             }
         }
@@ -543,6 +561,9 @@ fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) 
                 run_all: Some(reason.clone()),
                 dir: p.dir.clone(),
                 child_env: Some(child),
+                adapter_options: vci_adapter::AdapterOptions {
+                    rails_allow_db: p.policy.rails_allow_db,
+                },
             });
         }
         res.files = files.iter().map(|f| verdict_run(f, &reason)).collect();
@@ -573,8 +594,8 @@ impl Verifier<'_> {
             .map_err(|e| format!("{e:#}"));
         for s in cands {
             let mut info = CandidateInfo {
-                signer_ref: s.signer_ref.clone(),
-                storage_key: s.input_root.clone(),
+                target: s.target.clone(),
+                meta_key: s.key.clone(),
                 ..Default::default()
             };
             // Catch panics too: a bug in a check must never become a skip.
@@ -619,6 +640,17 @@ impl Verifier<'_> {
         global_now: &Result<InputManifest, String>,
         info: &mut CandidateInfo,
     ) -> Result<(), Failure> {
+        // A value the store could not read (e.g. a blob missing from the
+        // object database) only fails its own candidate.
+        if let Some(e) = &s.error {
+            return Err(Failure::one(
+                "envelope",
+                1,
+                "value in the git-meta store",
+                format!("unreadable: {e}"),
+                "a readable DSSE envelope",
+            ));
+        }
         // Envelope shape.
         let env = Envelope::from_json(&s.bytes).map_err(|e| {
             Failure::one(
@@ -887,6 +919,11 @@ impl Verifier<'_> {
                     !declared.is_empty(),
                     "no [[inputs]] declared for this unit in the base vci.toml",
                 )
+            } else if w.starts_with(vci_adapter::RAILS_NETWORK_DB_TAINT) {
+                (
+                    p.core.adapter == "rails" && self.project.policy.rails_allow_db,
+                    "not waived by the base policy (policy.rails_allow_db = false)",
+                )
             } else {
                 (
                     w.starts_with(vci_adapter::GO_NET_TAINT) && self.project.policy.go_allow_net,
@@ -1010,15 +1047,25 @@ impl Verifier<'_> {
         // Externals: every attested package version must be what resolves now.
         let mut ext_diff = vec![];
         for e in &m.externals {
-            let found = match (&self.python_externals, &self.go_modules, &self.cargo_lock) {
-                (Some((installed, locked)), _, _) => {
+            let found = match (
+                &self.python_externals,
+                &self.go_modules,
+                &self.cargo_lock,
+                &self.rails_gems,
+            ) {
+                (Some((installed, locked)), _, _, _) => {
                     crate::externals::python_installed(installed, locked, &e.name, &e.version)
                 }
-                (None, Some(list), _) => crate::externals::go_installed(list, &e.name, &e.version),
-                (None, None, Some(lock)) => {
+                (None, Some(list), _, _) => {
+                    crate::externals::go_installed(list, &e.name, &e.version)
+                }
+                (None, None, Some(lock), _) => {
                     crate::externals::cargo_locked(lock, &e.name, &e.version)
                 }
-                (None, None, None) => {
+                (None, None, None, Some(bundle)) => {
+                    crate::externals::rails_bundled(bundle, &e.name, &e.version)
+                }
+                (None, None, None, None) => {
                     crate::externals::installed(&self.project.dir, &e.name, &e.version)
                 }
             };
@@ -1366,10 +1413,10 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
     );
     for (i, c) in f.candidates.iter().enumerate() {
         println!(
-            "candidate {}: {} key {}",
+            "candidate {}: git-meta {} {}",
             i + 1,
-            c.info.signer_ref,
-            c.info.storage_key
+            c.info.target,
+            c.info.meta_key
         );
         if let Some(p) = &c.info.principal {
             println!(
@@ -1458,6 +1505,7 @@ mod tests {
             run_all: run_all.map(str::to_owned),
             dir: camino::Utf8PathBuf::from("/r"),
             child_env: None,
+            adapter_options: Default::default(),
         };
         let mut res = PlanResult {
             base_ref: Some("main".into()),

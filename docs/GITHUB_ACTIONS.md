@@ -3,10 +3,19 @@
 The repository ships a composite action that builds `vci`, fetches attestations, prints the plan, and runs only the
 tests that are not covered by a valid attestation.
 
+Attestations are [git-meta](https://git-meta.com/) metadata on `refs/meta/main` of the repository (or of the metadata
+remote you choose). In the job, after `actions/checkout`, the action runs `vci fetch --remote origin`, which is all a
+fresh clone needs: it configures a git-meta remote named `meta` with origin's URL (so the checkout's credentials
+apply: `actions/checkout` scopes its token to the URL, and a read-only `contents: read` token is enough), fetches
+`refs/meta/main` into `refs/meta/remotes/main` with every blob (no partial clone), and materializes it into a new
+`.git/git-meta.sqlite`. `fetch-depth: 0` is needed for the base commit, not for the metadata (`refs/meta/main` is not
+a branch, so `actions/checkout` never fetches it). If the fetch fails, the action warns and everything runs.
+
 ## Before you start
 
 1. `vci.toml` and `.vci/allowed_signers` are merged to your default branch ([install guide](INSTALL.md)).
-2. Attestations are pushed with `vci push` before or together with the branch.
+2. `.git-meta` (written by `vci init`) is committed, and attestations are pushed with `vci push` (or `git meta push`)
+   before or together with the branch.
 
 ## Workflow
 
@@ -98,6 +107,30 @@ jobs:
       - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
 ```
 
+### Rails
+
+```yaml
+    env:
+      TZ: UTC                       # declared in vci.toml [env] global and set the same way locally
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4.9"     # exactly the Ruby (and patchlevel) used locally; or omit to use .ruby-version
+          bundler-cache: true       # bundle install of Gemfile.lock into vendor/bundle
+
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+```
+
+`Gemfile.lock` must list the runner's platform (`bundle lock --add-platform x86_64-linux`), and the Bundler version
+in its `BUNDLED WITH` is what `setup-ruby` installs (it is compared). The action exports `VCI_RUBY_COLLECTOR`; `vci
+ci` runs each remaining Minitest file in its own `bin/rails test <file>` with a fresh SQLite database loaded from
+`db/schema.rb`. A database server needs `policy.rails_allow_db = true` and a service container (see the README).
+Full example: [`examples/github-actions-rails.yml`](../examples/github-actions-rails.yml).
+
 Run the job on the hosted runner directly, not in a `container:` job: attestations made as a normal user are not
 accepted by a verifier running as root.
 
@@ -114,7 +147,7 @@ Replace `<commit-sha>` with a full commit SHA of this repository.
 |---|---|---|
 | `base-ref` | PR base commit, or the pushed commit | Commit that policy and trusted signers are read from |
 | `command` | `ci` | `ci` plans and runs the rest; `plan` only decides |
-| `remote` | `origin` | Remote that holds `refs/attest/v1/*` |
+| `remote` | `origin` | Git remote name or URL whose `refs/meta/main` holds the attestations (git-meta) |
 | `audit-log` | `vci-audit.json` | JSON record of what was skipped, by whom, and what ran |
 | `working-directory` | `.` | Directory to run `vci` from |
 | `prebuilt` | `true` | Download the release binary instead of compiling; `false` always builds from source |
@@ -159,16 +192,29 @@ build from source again until the next release.
   when the base commit is, or contains, the commit under test.
 - **Keep `refs/heads/main` in `policy.no_skip_refs`** (the `vci init` default), so pushes to the default branch run
   everything. That full run is the backstop against a trusted signer making a false claim.
-- **Use `pull_request`, not `pull_request_target`.** Pull requests from forks cannot push attestation refs to your
+- **Use `pull_request`, not `pull_request_target`.** Pull requests from forks cannot push attestations (`refs/meta/main`) to your
   repository, so they get no skips and every test runs.
 - **Revoke by removing the line** from `.vci/allowed_signers` on the default branch. Attestations by that key stop
   being accepted at once.
+- **Always pass `--remote`** to `vci fetch` when not using the action (the action passes `--remote origin`). Without
+  it, a clone with no git-meta remote takes the URL from `.git-meta` in the checked-out commit, which a pull request
+  controls (vci refuses remote-helper URLs such as `fd::3`, and a foreign remote can only make tests run, but the
+  checkout should not choose where attestations come from).
 
 ## Who can push attestations
 
-`vci push` writes to `refs/attest/v1/<signer>`. Anyone with push access to the repository can write those refs, but
-an attestation only counts when its signature verifies against a key in the base commit's `.vci/allowed_signers`.
-A repository ruleset on `refs/attest/**` can further restrict who may write them.
+`vci push` (like `git meta push`) writes `refs/meta/main`. Anyone with push access to the repository can write,
+overwrite or delete metadata there, but an attestation only counts when its signature verifies against a key in the
+base commit's `.vci/allowed_signers` and it matches the unit, repository, toolchain and inputs exactly; a deleted or
+overwritten attestation only makes its unit run. A repository ruleset on `refs/meta/**` can further restrict who may
+write. If your metadata lives in a separate repository (`.git-meta` names another URL), pass that URL as `remote` and
+make sure the job can read it.
+
+git-meta's auto-prune (`meta:prune:max-keys`, `meta:prune:max-size`) and filter rules (`meta:filter`) are themselves
+metadata on the `project` target, so anyone who can push metadata can turn them on for everyone; with auto-prune on,
+any `git meta push` drops the least recently written attestations from the remote (their units then run until
+attested again). `vci fetch` warns when such a setting is present (the warning shows in the action's log) and when a
+fetch removed attestations without a deletion record. A ruleset on `refs/meta/**` limits who can do this.
 
 ## Without the action
 
@@ -180,6 +226,7 @@ A repository ruleset on `refs/attest/**` can further restrict who may write them
           cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
           echo "VCI_PY_PLUGIN=$RUNNER_TEMP/vci/py/pytest-plugin" >> "$GITHUB_ENV"
           echo "VCI_JS_PLUGIN=$RUNNER_TEMP/vci/js/vitest-plugin" >> "$GITHUB_ENV"
+          echo "VCI_RUBY_COLLECTOR=$RUNNER_TEMP/vci/ruby/vci-collector" >> "$GITHUB_ENV"
 
       - run: vci fetch --remote origin
 
@@ -190,11 +237,12 @@ A repository ruleset on `refs/attest/**` can further restrict who may write them
 
 | Symptom | Likely cause |
 |---|---|
-| Everything runs on a pull request | `vci.toml` or `.vci/allowed_signers` is not on the base branch yet; or attestations were not pushed |
-| `failed check: toolchain` | Python, Node, uv or package versions differ between the laptop and the runner |
+| Everything runs on a pull request | `vci.toml` or `.vci/allowed_signers` is not on the base branch yet; or attestations were not pushed (`git ls-remote origin refs/meta/main` is empty) |
+| `failed check: toolchain` | Python, Node, uv, Ruby, Bundler or package versions differ between the laptop and the runner |
 | `failed check: inputs` | A file the test depends on changed after it was attested; `vci explain` names it |
 | `failed check: signer` | The signing key is not in the base commit's `allowed_signers`, or it has expired |
 | A Go package or cargo target never skips on the runner | Its code depends on the platform (build tags, `_linux.go` files, `cfg(target_os)`, `runtime.GOOS`, floating-point maths): such units are only accepted on the same OS and architecture |
 | A test reads `CI`, `HOME` or `TMPDIR` | Those values differ on a runner, so that file always runs there |
+| No Rails test file ever skips on the runner | `config/environments/test.rb` reads `ENV["CI"]` (the generator's `config.eager_load = ENV["CI"].present?`); the Ruby patchlevel, Bundler, SQLite library or time zone data differ (`failed check: toolchain`; use `gem "tzinfo-data"`); or `Gemfile.lock` lacks the runner's platform |
 
 Run `vci explain <file> --base-ref origin/main` locally for the full reason.

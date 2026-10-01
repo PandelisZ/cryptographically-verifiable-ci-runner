@@ -6,5 +6,16 @@ license.workspace = true
 
 [dependencies]
 camino = "1.2.6"
+# Attestations are git-meta metadata (https://git-meta.com/). Pinned exactly:
+# `internal` exposes the store's key listing, which is not a stable API.
+git-meta-lib = { version = "=0.1.13", features = ["internal"] }
+# The exact versions git-meta-lib resolves to: vci reads git-meta's SQLite
+# store read-only for `vci plan` (a read-only `.git` must work), repairs rows
+# git-meta cannot serialize, and names gix object ids for git-meta's tree
+# parser. Features come from git-meta-lib (rusqlite's bundled SQLite).
+gix = { version = "=0.87.1", default-features = false }
+rusqlite = { version = "=0.39.0", default-features = false }
+serde_json = "1.0.151"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+vci-core = { version = "0.1.0", path = "../vci-core" }

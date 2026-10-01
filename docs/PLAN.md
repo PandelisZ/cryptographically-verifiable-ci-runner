@@ -23,7 +23,7 @@ Empty directory today; `git init` first.
 Cargo.toml                 workspace
 crates/vci-core/           repo paths, input manifest, input root hashing
 crates/vci-attest/         in-toto Statement, DSSE + PAE, SSHSIG verify, allowed_signers parser, ssh-keygen signer
-crates/vci-git/            attestation ref storage, base-branch file reads, repo identity (shells out to git)
+crates/vci-git/            attestation storage on git-meta, base-branch file reads, repo identity (shells out to git)
 crates/vci-adapter/        Adapter trait + Vitest adapter (spawn, parse JSONL)
 crates/vci-cli/            binary `vci`
 js/vitest-plugin/          npm package @vci/vitest (collectors)
@@ -41,7 +41,7 @@ Key crates: `ssh-key 0.6.7`, `blake3`, `sha2`, `clap`, `serde`/`serde_json`, `ba
 | `vci plan [--base-ref R] [--format json\|text\|github]` | Emit `skip` and `run` lists |
 | `vci ci [--base-ref R]` | Plan, then run the remainder; write audit log of skips |
 | `vci verify <envelope>` | Verify one attestation |
-| `vci push` / `vci fetch` | Sync attestation refs |
+| `vci push` / `vci fetch` | git-meta push / pull of the attestations |
 | `vci explain <test-file>` | Show which check failed for each candidate |
 
 ## Dependency collection (JS package)
@@ -80,14 +80,22 @@ Supported Vitest: `>=3.2 <6`, developed against 5.0.x, 4.1.x in the test matrix.
 4. Per test file, per candidate envelope, check in order: envelope shape; SSHSIG and namespace; signer in base `allowed_signers` (honouring `namespaces=`, `valid-after`, `valid-before`; `cert-authority` rejected in v1); not expired and TTL within policy; repo id, test id, argv, toolchain match; result passed and untainted; every manifest entry rehashed from checkout and root matches; env hashes match.
 5. First fully passing candidate gives SKIP; otherwise RUN with the first failing check recorded for `explain`.
 
-## Git storage
+## Git storage (git-meta)
 
-Content-addressed, so attestations survive rebases and apply across branches.
+Content-addressed, so attestations survive rebases and apply across branches. Superseded the original
+`refs/attest/v1/<signer>` design: attestations are [git-meta](https://git-meta.com/) metadata, so vci has no storage
+format, database or ref layout of its own.
 
-- One ref per signer: `refs/attest/v1/<signer-fingerprint>`; no cross-signer conflicts.
-- Tree path: `<hash(test_id) prefix>/<hash(test_id)>/<input_root>.dsse.json`.
-- Same-signer races: fetch, union trees, retry push.
-- CI: `git fetch origin '+refs/attest/v1/*:refs/attest/v1/*'` plus the base SHA.
+- Target `path:<unit path>` (`project` for `.` and paths under 3 bytes); key
+  `vci:attestation:<blake3(test_id)>:<signer>:<storage_key>`; value the DSSE envelope.
+- Different signers and different inputs write different keys; git-meta's three-way (and baseless two-way) merge keeps
+  keys added on either side. The same signer re-attesting the same inputs rewrites one key.
+- `vci push` / `vci fetch` follow `git meta push` / `git meta pull` on `refs/meta/main`, and interoperate with them.
+  They first make the SQLite store cover the shared `refs/meta/local/main` (worktrees, lost stores), refuse any
+  serialization or push that drops a value without a deletion record, leave out tree entries git-meta cannot read, and
+  warn about shared auto-prune and filter settings (README, "What `vci fetch` and `vci push` guard against").
+- CI: `vci fetch --remote origin` (configures the git-meta remote and materializes `.git/git-meta.sqlite`) plus the
+  base SHA.
 
 ## Decision flagged for review: cross-platform skips
 
@@ -133,7 +141,7 @@ Automated as an `assert_cmd` integration test using throwaway SSH keys generated
 - `fs` patching can miss bindings captured before the setup file runs; the preload reduces but doesn't eliminate this.
 - `module.registerHooks()` is release-candidate and needs Node 22.15+.
 - Vitest 5 experimental module modes are treated as non-attestable until studied.
-- Attestation refs grow; a `vci prune` for expired entries is a follow-up.
+- Attestation metadata grows; `vci prune` tombstones expired entries.
 - Spot-check re-runs and transparency logs are later work. The pytest adapter exists (`crates/vci-adapter/src/pytest.rs`,
   collector in `py/pytest-plugin`, findings in `docs/spike-pytest.md`); `vci.toml` can hold several projects
   (`[[projects]]`), e.g. a Vitest and a pytest project in one repository. The Go adapter
@@ -144,7 +152,12 @@ Automated as an `assert_cmd` integration test using throwaway SSH keys generated
   no run-time hook, so its inputs are every file of the package directories of the repository crates the unit builds,
   rustc's dep-info, build script declarations, `Cargo.lock` entries and `[[inputs]]` declared in vci.toml, and static
   source checks refuse processes, sockets, native code and undeclared reads (a weaker guarantee than the observed-input
-  adapters, documented in the README).
+  adapters, documented in the README). The Rails adapter (`crates/vci-adapter/src/rails.rs`, collector in
+  `ruby/vci-collector`, findings in `docs/spike-rails.md`) attests Minitest test files, one `bin/rails test <file>`
+  process each: a plain-Ruby collector loaded through `RUBYOPT` wraps Ruby's file, directory, `ENV`, require and
+  process entry points (Ruby has no audit hook), records Zeitwerk's directory listings and the loaded gems (checked
+  against their cached archives), and redirects the test environment's SQLite databases to fresh files loaded from the
+  schema for every file; database servers need `policy.rails_allow_db`.
 
 ## Environment variables
 

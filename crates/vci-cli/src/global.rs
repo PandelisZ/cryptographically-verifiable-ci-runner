@@ -389,6 +389,49 @@ fn cargo_observations(
     Ok(())
 }
 
+/// Files that pick the Ruby version (rbenv, chruby, asdf and mise search
+/// from the working directory upward), recorded from the project dir up to
+/// the repo root.
+const RUBY_VERSION_FILES: &[&str] = &[
+    ".ruby-version",
+    ".tool-versions",
+    "mise.toml",
+    ".mise.toml",
+    "mise.local.toml",
+    ".mise.local.toml",
+    ".mise/config.toml",
+    ".config/mise.toml",
+    ".config/mise/config.toml",
+];
+
+/// Global observations for a Rails test file: `vci.toml`; in the project dir
+/// the files every test boots through (`Gemfile`, `Gemfile.lock`, `gems.rb`,
+/// `gems.locked`, `config/application.rb`, `config/boot.rb`,
+/// `config/environment.rb`, `config/environments/test.rb`, `config.ru`,
+/// `bin/rails`, `test/test_helper.rb`, `Rakefile`); and the Ruby version
+/// files from the project dir up to the repo root. Present files are reads,
+/// missing ones probes.
+fn rails_observations(
+    c: &mut Collector,
+    repo_root: &Utf8Path,
+    project_dir: &Utf8Path,
+) -> Result<()> {
+    for n in vci_adapter::RAILS_GLOBAL_FILES {
+        c.observe(&project_dir.join(n))?;
+    }
+    let mut dir = Some(project_dir);
+    while let Some(d) = dir {
+        for n in RUBY_VERSION_FILES {
+            c.observe(&d.join(n))?;
+        }
+        if d == repo_root || !d.starts_with(repo_root) {
+            break;
+        }
+        dir = d.parent();
+    }
+    Ok(())
+}
+
 /// Global observations for the test file at `test_abs`.
 pub fn observations(
     repo_root: &Utf8Path,
@@ -414,6 +457,10 @@ pub fn observations(
         }
         "cargo" => {
             cargo_observations(&mut c, repo_root, project_dir, test_abs)?;
+            return Ok(c.out.into_iter().collect());
+        }
+        "rails" => {
+            rails_observations(&mut c, repo_root, project_dir)?;
             return Ok(c.out.into_iter().collect());
         }
         other => bail!("no global input rules for adapter {other:?}"),
@@ -637,6 +684,42 @@ mod tests {
             assert_eq!(find(&obs, p), Some(&want), "{p}: {obs:?}");
         }
         assert_eq!(find(&obs, "rs/crates/a/Cargo.lock"), None);
+    }
+
+    #[test]
+    fn rails_global_inputs() {
+        let (_t, root) = tmp_repo();
+        write(&root, ".tool-versions", "ruby 3.4.9\n");
+        write(&root, "app/Gemfile", "source \"https://rubygems.org\"\n");
+        write(&root, "app/Gemfile.lock", "GEM\n");
+        write(&root, "app/.ruby-version", "3.4.9\n");
+        write(&root, "app/bin/rails", "");
+        write(&root, "app/config/application.rb", "");
+        write(&root, "app/test/test_helper.rb", "");
+        write(&root, "app/test/models/b_test.rb", "");
+        let adapter = vci_adapter::RailsAdapter::new(&root.join("app"));
+        let obs = observations(&root, &adapter, &root.join("app/test/models/b_test.rb")).unwrap();
+        for (p, want) in [
+            ("vci.toml", Observation::Probe),
+            ("app/Gemfile", Observation::Read),
+            ("app/Gemfile.lock", Observation::Read),
+            ("app/gems.rb", Observation::Probe),
+            ("app/.ruby-version", Observation::Read),
+            ("app/bin/rails", Observation::Read),
+            ("app/config/application.rb", Observation::Read),
+            ("app/config/environments/test.rb", Observation::Probe),
+            ("app/test/test_helper.rb", Observation::Read),
+            (".tool-versions", Observation::Read),
+            (".ruby-version", Observation::Probe),
+            ("app/mise.toml", Observation::Probe),
+        ] {
+            assert_eq!(find(&obs, p), Some(&want), "{p}: {obs:?}");
+        }
+        assert_eq!(
+            find(&obs, "Gemfile.lock"),
+            None,
+            "only the project's bundle"
+        );
     }
 
     #[test]

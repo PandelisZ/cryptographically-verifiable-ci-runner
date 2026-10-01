@@ -1,5 +1,5 @@
-# Demo and self-test of the vci action: run only the pytest files, Go packages
-# and cargo test targets of demo/ that no trusted signer has already attested.
+# Demo and self-test of the vci action: run only the pytest files, Go packages,
+# cargo test targets and Rails test files of demo/ that no trusted signer has already attested.
 #
 # This repository uses the action from its own checkout (`uses: ./`). Other
 # repositories pin a commit instead, so a pull request cannot change the
@@ -40,12 +40,20 @@ jobs:
         with:
           toolchain: "1.95.0" # same as demo/cargo-app/rust-toolchain.toml
 
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4.9" # same as demo/rails-app/.ruby-version
+          bundler-cache: true
+          working-directory: demo/rails-app
+
       - name: Set up project dependencies
         run: |
           (cd demo/pytest-app && uv sync --locked)
           (cd demo/go-app && go mod download)
           (cd demo/cargo-app && cargo fetch --locked)
 
+      # Fetches the attestations (git-meta metadata on refs/meta/main of this
+      # repository, pushed with `vci push`), plans, and runs the rest.
       - uses: ./
 
       - name: Show the audit log

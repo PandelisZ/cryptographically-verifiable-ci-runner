@@ -1,4 +1,5 @@
-//! Parser for the collector JSONL output (`@vci/vitest` and `vci_pytest`).
+//! Parser for the collector JSONL output (`@vci/vitest`, `vci_pytest` and the
+//! Rails `vci_collector`).
 //!
 //! Anything unexpected (unknown record kinds, missing meta or result, bad
 //! JSON) is turned into a taint so the file is never attested.
@@ -83,6 +84,12 @@ pub struct Observed {
     /// never inputs, and left out of their parent directory's listing (a
     /// fresh checkout has no `target/`).
     pub excluded: BTreeSet<Utf8PathBuf>,
+    /// Rails collector: Ruby version with patchlevel, engine, Rails and
+    /// Bundler versions (`runner_version` is the test framework's).
+    pub ruby: String,
+    pub ruby_engine: String,
+    pub rails: String,
+    pub ruby_bundler: String,
     /// Reasons this file is not attestable.
     pub taints: Vec<String>,
     pub result: Option<TestResult>,
@@ -133,11 +140,15 @@ pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
                 o.root = str_field(&v, "root").unwrap_or_default();
                 o.node = str_field(&v, "node").unwrap_or_default();
                 o.adapter = str_field(&v, "adapter").unwrap_or_else(|| "vitest".into());
-                o.runner_version = if o.adapter == "pytest" {
-                    str_field(&v, "pytest").unwrap_or_default()
-                } else {
-                    str_field(&v, "vitest").unwrap_or_default()
+                o.runner_version = match o.adapter.as_str() {
+                    "pytest" => str_field(&v, "pytest").unwrap_or_default(),
+                    "rails" => str_field(&v, "runner").unwrap_or_default(),
+                    _ => str_field(&v, "vitest").unwrap_or_default(),
                 };
+                o.ruby = str_field(&v, "ruby").unwrap_or_default();
+                o.ruby_engine = str_field(&v, "engine").unwrap_or_default();
+                o.rails = str_field(&v, "rails").unwrap_or_default();
+                o.ruby_bundler = str_field(&v, "bundler").unwrap_or_default();
                 o.bundler_version = str_field(&v, "vite").unwrap_or_default();
                 o.collector = str_field(&v, "collector").unwrap_or_default();
                 o.python = str_field(&v, "python").unwrap_or_default();
@@ -332,6 +343,33 @@ mod tests {
         assert!(o.modules.contains(Utf8Path::new("/R/tests/conftest.py")));
         assert!(o.env_keys.contains("PYTEST_ADDOPTS"));
         assert!(o.stats.contains(Utf8Path::new("/R/fixtures")));
+        assert!(o.result.unwrap().is_pass());
+    }
+
+    #[test]
+    fn parses_rails_records() {
+        let (_t, d) = tmp();
+        let body = r#"{"v":1,"kind":"meta","testId":"test/models/b_test.rb","adapter":"rails","ruby":"3.4.9p82","engine":"ruby 3.4.9","rails":"8.1.3.1","bundler":"4.0.9","runner":"minitest 6.0.6","root":"/R","platform":"arm64-darwin25","collector":"vci_collector@0.1.0","db":"sqlite3","tz":"tzinfo-data"}
+{"kind":"module","path":"/R/app/models/widget.rb"}
+{"kind":"read","path":"/R/test/fixtures/widgets.yml"}
+{"kind":"readdir","path":"/R/app/models"}
+{"kind":"stat","path":"/R/log"}
+{"kind":"write","path":"/R/log/test.log"}
+{"kind":"external","name":"nokogiri","version":"1.19.4","platform":"arm64-darwin"}
+{"kind":"env","key":"DATABASE_URL","where":"/gems/activerecord/x.rb"}
+{"kind":"result","state":"passed","tests":2,"failed":0,"skipped":0,"assertions":4,"noAssertions":0,"durationMs":80,"exitStatus":0}
+"#;
+        let p = write(&d, "test/models/b_test.rb", body);
+        let o = parse_jsonl_file(&p).unwrap();
+        assert!(o.taints.is_empty(), "{:?}", o.taints);
+        assert_eq!(o.adapter, "rails");
+        assert_eq!(o.runner_version, "minitest 6.0.6");
+        assert_eq!(o.ruby, "3.4.9p82");
+        assert_eq!(o.rails, "8.1.3.1");
+        assert_eq!(o.ruby_bundler, "4.0.9");
+        assert!(o.externals.contains(&("nokogiri".into(), "1.19.4".into())));
+        assert!(o.writes.contains(Utf8Path::new("/R/log/test.log")));
+        assert!(o.env_keys.contains("DATABASE_URL"));
         assert!(o.result.unwrap().is_pass());
     }
 

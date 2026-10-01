@@ -41,7 +41,8 @@ pub struct VciPredicate {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch_specific: Vec<String>,
     /// Refusal reasons a policy waived when this attestation was made
-    /// (`go:net:` with `policy.go_allow_net`). `vci plan` accepts the
+    /// (`go:net:` with `policy.go_allow_net`, `rails:network-db:` with
+    /// `policy.rails_allow_db`). `vci plan` accepts the
     /// attestation only while the base commit's policy still waives them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waived: Vec<String>,
@@ -97,6 +98,11 @@ pub fn storage_key(p: &VciPredicate) -> String {
         vci_core::blake3_hex(tc.rust_cfg.join("\n").as_bytes())
     };
     let cfg_predicates = p.cfg_predicates.join("\0");
+    let ruby_gems = if tc.ruby_gems.is_empty() {
+        String::new()
+    } else {
+        vci_core::blake3_hex(tc.ruby_gems.join("\n").as_bytes())
+    };
     let declared_inputs = p.declared_inputs.join("\0");
     let extra = [
         ("python", tc.python.as_str()),
@@ -116,6 +122,14 @@ pub fn storage_key(p: &VciPredicate) -> String {
         ("rust_cfg", &rust_cfg),
         ("cfg_predicates", &cfg_predicates),
         ("declared_inputs", &declared_inputs),
+        ("ruby", tc.ruby.as_str()),
+        ("ruby_engine", tc.ruby_engine.as_str()),
+        ("rails", tc.rails.as_str()),
+        ("bundler", tc.bundler.as_str()),
+        ("ruby_test", tc.ruby_test.as_str()),
+        ("ruby_libs", tc.ruby_libs.as_str()),
+        ("ruby_db", tc.ruby_db.as_str()),
+        ("ruby_gems", &ruby_gems),
         ("project", p.project_name.as_str()),
         ("superuser", if tc.superuser { "1" } else { "" }),
         (
@@ -345,7 +359,13 @@ impl Ctx {
             if !dir.starts_with(&root) {
                 bail!("{what} {dir} is outside the repository {root}");
             }
-            let adapter = vci_adapter::adapter_for(&spec.adapter, &dir)?;
+            let adapter = vci_adapter::adapter_for_with(
+                &spec.adapter,
+                &dir,
+                &vci_adapter::AdapterOptions {
+                    rails_allow_db: spec.policy.rails_allow_db,
+                },
+            )?;
             projects.push(Project {
                 name: spec.name,
                 rel: spec.rel,

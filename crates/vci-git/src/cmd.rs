@@ -1,6 +1,6 @@
 //! Running `git` with a controlled environment.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 
 use camino::Utf8Path;
@@ -23,8 +23,8 @@ const SCRUBBED_ENV: &[&str] = &[
     "GIT_QUARANTINE_PATH",
 ];
 
-/// Identity used for attestation-ref commits, so storage works where no git
-/// user is configured.
+/// Identity used for the metadata commit vci rewrites for push, so pushing
+/// works where no git user is configured.
 pub(crate) const IDENTITY: &[(&str, &str)] = &[
     ("GIT_AUTHOR_NAME", "vci"),
     ("GIT_AUTHOR_EMAIL", "vci@localhost"),
@@ -42,7 +42,6 @@ pub(crate) struct Output {
 pub(crate) struct Git {
     cmd: Command,
     display: Vec<String>,
-    stdin: Option<Vec<u8>>,
 }
 
 impl Git {
@@ -64,7 +63,6 @@ impl Git {
         Git {
             cmd,
             display: Vec::new(),
-            stdin: None,
         }
     }
 
@@ -91,11 +89,6 @@ impl Git {
         self
     }
 
-    pub fn stdin(mut self, bytes: Vec<u8>) -> Self {
-        self.stdin = Some(bytes);
-        self
-    }
-
     fn describe(&self) -> String {
         self.display.join(" ")
     }
@@ -105,19 +98,8 @@ impl Git {
         self.cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(if self.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            });
+            .stdin(Stdio::null());
         let mut child = self.cmd.spawn()?;
-        let writer = match (self.stdin.take(), child.stdin.take()) {
-            (Some(bytes), Some(mut pipe)) => Some(std::thread::spawn(move || {
-                // A broken pipe here means git exited early; its status says why.
-                let _ = pipe.write_all(&bytes);
-            })),
-            _ => None,
-        };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut out_pipe = child.stdout.take().expect("stdout piped");
@@ -129,9 +111,6 @@ impl Git {
         });
         out_pipe.read_to_end(&mut stdout)?;
         stderr.extend(err_reader.join().unwrap_or_default());
-        if let Some(w) = writer {
-            let _ = w.join();
-        }
         let status = child.wait()?;
         Ok(Output {
             status,
@@ -162,6 +141,42 @@ impl Git {
     pub fn output_described(self) -> Result<(String, Output), GitError> {
         let describe = self.describe();
         Ok((describe, self.output()?))
+    }
+
+    /// Run with `input` on stdin and require success; returns stdout bytes.
+    pub fn run_with_stdin(mut self, input: &[u8]) -> Result<Vec<u8>, GitError> {
+        use std::io::Write as _;
+        let describe = self.describe();
+        self.cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = self.cmd.spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let out = child.wait_with_output()?;
+        let _ = writer.join();
+        let out = Output {
+            status: out.status,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        };
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(command_error(&describe, &out))
+        }
+    }
+
+    /// Start a long-running command with piped stdin and stdout (stderr
+    /// discarded), such as `cat-file --batch`.
+    pub fn spawn_piped(mut self) -> Result<std::process::Child, GitError> {
+        self.cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        Ok(self.cmd.spawn()?)
     }
 }
 

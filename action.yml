@@ -1,7 +1,8 @@
 name: "vci: skip tests already attested"
 description: >
-  Builds vci from this action's pinned sources, fetches attestations, and runs
-  only the tests that no trusted signer has already run against identical inputs.
+  Builds vci from this action's pinned sources, fetches attestations (git-meta
+  metadata on refs/meta/main), and runs only the tests that no trusted signer
+  has already run against identical inputs.
 branding:
   icon: check-circle
   color: green
@@ -17,7 +18,9 @@ inputs:
     description: "`ci` (plan, then run what is left) or `plan` (decide only)."
     default: ci
   remote:
-    description: Git remote to fetch attestation refs from.
+    description: >
+      Where to fetch attestations (git-meta, refs/meta/main) from: a git remote
+      name or URL. The default uses the checkout's own origin and credentials.
     default: origin
   audit-log:
     description: Where `vci ci` writes the JSON audit log of skipped and run tests.
@@ -116,11 +119,21 @@ runs:
         echo "$RUNNER_TEMP/vci-bin" >> "$GITHUB_PATH"
         echo "VCI_PY_PLUGIN=${{ github.action_path }}/py/pytest-plugin" >> "$GITHUB_ENV"
         echo "VCI_JS_PLUGIN=${{ github.action_path }}/js/vitest-plugin" >> "$GITHUB_ENV"
+        echo "VCI_RUBY_COLLECTOR=${{ github.action_path }}/ruby/vci-collector" >> "$GITHUB_ENV"
 
+    # git-meta pull: configures a git-meta remote (`meta`) with the remote's
+    # URL, fetches refs/meta/main into refs/meta/remotes/main and materializes
+    # it into .git/git-meta.sqlite. Needs read access only. If it fails, no
+    # attestation is available and everything runs (fail open).
     - name: Fetch attestations
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: vci fetch --remote "${{ inputs.remote }}"
+      env:
+        REMOTE: ${{ inputs.remote }}
+      run: |
+        if ! vci fetch --remote "$REMOTE"; then
+          echo "::warning title=vci::could not fetch attestations from $REMOTE; every test will run"
+        fi
 
     - name: Plan
       id: plan

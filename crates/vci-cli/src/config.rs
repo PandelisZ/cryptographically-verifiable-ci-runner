@@ -92,6 +92,7 @@ pub struct PolicyOverride {
     pub no_skip_refs: Option<Vec<String>>,
     pub never_skip: Option<Vec<String>>,
     pub go_allow_net: Option<bool>,
+    pub rails_allow_db: Option<bool>,
 }
 
 /// Per-project env keys; each one given replaces the top-level key.
@@ -228,6 +229,15 @@ pub struct Policy {
     /// accepted while it is set there.
     #[serde(default)]
     pub go_allow_net: bool,
+    /// Rails: attest test files whose test environment uses a database
+    /// server (PostgreSQL, MySQL, ...) rather than a SQLite file. vci cannot
+    /// see what the server holds: this is the user's statement that the test
+    /// database holds nothing but what vci loads (the schema, purged and
+    /// loaded fresh for every file, then the fixtures). Read from the base
+    /// commit; attestations that needed it are only accepted while it is set
+    /// there, and the server's version is part of the toolchain.
+    #[serde(default)]
+    pub rails_allow_db: bool,
 }
 
 fn default_max_ttl() -> String {
@@ -247,6 +257,7 @@ impl Default for Policy {
             no_skip_refs: vec![],
             never_skip: vec![],
             go_allow_net: false,
+            rails_allow_db: false,
         }
     }
 }
@@ -419,6 +430,9 @@ impl Config {
                     if let Some(v) = o.go_allow_net {
                         policy.go_allow_net = v;
                     }
+                    if let Some(v) = o.rails_allow_db {
+                        policy.rails_allow_db = v;
+                    }
                 }
                 let mut env = self.env.clone();
                 if let Some(o) = &p.env {
@@ -589,12 +603,53 @@ global = ["TZ"]
 pass_through = []
 "#;
 
+/// Template written by `vci init --adapter rails`.
+pub const RAILS_TEMPLATE: &str = r#"# vci configuration. Policy is read from the BASE commit in CI.
+
+# Project directory (the Rails application root, where Gemfile and bin/rails
+# live), relative to the repo root.
+project = "."
+adapter = "rails"
+
+[policy]
+# "any" | "same-os" | "exact": which OS/arch may satisfy CI. Ruby (version and
+# patchlevel), Rails, Bundler, Minitest, the bundle's gem versions, the SQLite
+# library and the time zone data must always match. Native gems (nokogiri,
+# sqlite3) are matched by version under "any": their macOS and Linux builds
+# are accepted as the same gem.
+platform = "any"
+# Longest accepted attestation lifetime.
+max_ttl = "30d"
+# Accept attestations made from a working tree with uncommitted changes.
+allow_dirty = true
+# Refs on which nothing is ever skipped (globs; "*" stays within a segment).
+# Pushes to the default branch and tags run everything.
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# Test files (project-relative globs) that are never skipped.
+never_skip = []
+# Attest files whose test database is a server (PostgreSQL, MySQL) instead of
+# a SQLite file. vci purges it and loads the schema before every file, but
+# cannot see what else the server holds or does: set this only if the test
+# database is used by nothing but these tests.
+rails_allow_db = false
+
+[env]
+# "strict": only declared and pass-through variables reach tests.
+mode = "strict"
+# Hashed into every test file's inputs. Declare TZ and set it (TZ=UTC) on
+# both sides: Ruby's local time zone otherwise comes from the machine.
+global = ["TZ"]
+# Visible to tests, never hashed. Put secrets here.
+pass_through = []
+"#;
+
 /// The `vci init` template for `adapter`.
 pub fn template_for(adapter: &str) -> &'static str {
     match adapter {
         "pytest" => PYTEST_TEMPLATE,
         "go" => GO_TEMPLATE,
         "cargo" => CARGO_TEMPLATE,
+        "rails" => RAILS_TEMPLATE,
         _ => TEMPLATE,
     }
 }
@@ -608,7 +663,13 @@ mod tests {
     /// trusted that commit's own allowed_signers.
     #[test]
     fn templates_never_skip_on_main_and_tags() {
-        for t in [TEMPLATE, PYTEST_TEMPLATE, GO_TEMPLATE, CARGO_TEMPLATE] {
+        for t in [
+            TEMPLATE,
+            PYTEST_TEMPLATE,
+            GO_TEMPLATE,
+            CARGO_TEMPLATE,
+            RAILS_TEMPLATE,
+        ] {
             let c = Config::parse(t).unwrap();
             let refs = &c.project_specs()[0].policy.no_skip_refs;
             assert!(
@@ -665,6 +726,22 @@ mod tests {
         assert!(s[0].policy.go_allow_net);
         assert!(!s[1].policy.go_allow_net);
         assert!(Config::parse("adapter = \"go\"").is_ok());
+    }
+
+    #[test]
+    fn rails_template_and_rails_allow_db_override() {
+        let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].adapter, "rails");
+        assert!(!s[0].policy.rails_allow_db);
+        assert_eq!(s[0].env.global, ["TZ"]);
+        let c = Config::parse(
+            "[policy]\nrails_allow_db = true\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n[projects.policy]\nrails_allow_db = false\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert!(s[0].policy.rails_allow_db);
+        assert!(!s[1].policy.rails_allow_db);
     }
 
     #[test]

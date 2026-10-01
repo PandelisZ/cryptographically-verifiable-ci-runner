@@ -484,8 +484,7 @@ fn pytest_end_to_end_verification_steps() {
     // Step 7: flip a byte in B's payload -> rejected at the signature check.
     let repo = store_for(&work);
     let store = AttestStore::new(&repo);
-    let tk = vci_core::test_key(B);
-    let stored = store.list(Some(&tk)).unwrap();
+    let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
     let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
@@ -498,8 +497,9 @@ fn pytest_end_to_end_verification_steps() {
     payload[pos + 8] = b'2';
     env["payload"] = Value::String(b64.encode(&payload));
     let tampered = serde_json::to_vec(&env).unwrap();
-    let signer = good.signer_ref.strip_prefix(vci_git::REF_PREFIX).unwrap();
-    store.put(signer, &tk, &good.input_root, &tampered).unwrap();
+    store
+        .put(B, &good.signer, &good.storage_key, &tampered)
+        .unwrap();
     let p = w.plan(&work, "main");
     assert!(
         p.run.contains(B),
@@ -510,7 +510,7 @@ fn pytest_end_to_end_verification_steps() {
             .contains("failed check: signature")
     );
     store
-        .put(signer, &tk, &good.input_root, &good.bytes)
+        .put(B, &good.signer, &good.storage_key, &good.bytes)
         .unwrap();
     assert!(w.plan(&work, "main").skip.contains(B), "step 7: restored");
 
@@ -925,6 +925,23 @@ fn multi_project_vitest_and_pytest() {
         .map(|s| s["testId"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(skipped, set(&[pb, wb]));
+
+    // `vci run FILE` lists only the projects that can hold FILE, so the
+    // Vitest project's missing node_modules does not stop attesting a pytest
+    // file (it did: "listing the test files of web: vitest is not
+    // installed").
+    let nm = work.join("web/node_modules");
+    let aside = w.base.join("node_modules-aside");
+    std::fs::rename(&nm, &aside).unwrap();
+    let key = w.trusted.to_str().unwrap();
+    let out = w.vci(&work, &["run", pa, "--key", key]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let failed_web = w.vci(&work, &["run", wa, "--key", key]);
+    std::fs::rename(&aside, &nm).unwrap();
+    assert!(out.status.success(), "{err}");
+    assert!(!failed_web.status.success(), "web still needs vitest");
+    let p = w.plan(&work, "main");
+    assert!(p.skip.contains(pa), "{p:?}");
 }
 
 /// uv's variables are pass-through (not hashed), so a CI that selects another

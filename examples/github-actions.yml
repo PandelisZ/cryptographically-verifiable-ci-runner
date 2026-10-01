@@ -25,9 +25,13 @@ jobs:
 
       - run: npm ci
 
+      # Pinned to a commit of vci (replace <commit-sha> with a full SHA): the
+      # verifier must not change under you, and a branch or tag can move.
       - name: Install vci
-        run: cargo install --locked --git https://github.com/PandelisZ/cryptographically-verifiable-ci-runner vci-cli
+        run: cargo install --locked --git https://github.com/PandelisZ/cryptographically-verifiable-ci-runner --rev <commit-sha> vci-cli
 
+      # git-meta pull of refs/meta/main (attestations pushed with `vci push`
+      # or `git meta push`) into .git/git-meta.sqlite; read access is enough.
       - name: Fetch attestations
         run: vci fetch --remote origin
 

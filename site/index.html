@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vci: skip the tests someone already ran, with proof</title>
+<meta name="description" content="vci signs what each test actually depended on, so CI can skip tests a trusted developer or agent already ran against identical inputs.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body class="home">
+<div class="layout">
+<main>
+
+<div class="hero">
+  <div>
+    <div class="eyebrow">cryptographically verifiable CI</div>
+    <h1>Skip the tests someone <em>already ran</em>. With proof.</h1>
+    <p>If a developer or an agent already ran a test against exactly the files it depends on, CI should not run it again. <code>vci</code> makes that safe with signed, per-test attestations.</p>
+    <div class="cta">
+      <a class="btn primary" href="get-started.html">Get started</a>
+      <a class="btn" href="github-actions.html">Add to GitHub Actions</a>
+    </div>
+  </div>
+  <pre class="term" data-nocopy><div class="term-bar"><i></i><i></i><i></i></div><span class="c">$</span> vci run src/b.test.ts
+<span class="c">  ran, collected inputs, signed, stored</span>
+<span class="c">$</span> vci push
+
+<span class="c"># later, in CI</span>
+<span class="c">$</span> vci plan --base-ref origin/main
+<span class="g">SKIP</span> src/b.test.ts  <span class="c">(attested by alice@example.com)</span>
+<span class="a">RUN </span> src/a.test.ts  <span class="c">(no attestation)</span>
+<span class="a">RUN </span> src/c.test.ts  <span class="c">(no valid attestation; inputs changed)</span>
+1 to skip, 2 to run</pre>
+</div>
+
+<section>
+  <h2>How it works</h2>
+  <p class="sub">Three steps. The default verdict is always <span class="badge run">RUN</span>: any error or doubt means the test runs.</p>
+  <div class="flow">
+    <div class="card">
+      <span class="num">1 · attest</span>
+      <h3>Run and sign locally</h3>
+      <p><code>vci run</code> runs your tests with a collector that records every file, directory listing, missing-file probe, package version and env var each test used, then signs that record with your SSH key.</p>
+    </div>
+    <div class="card">
+      <span class="num">2 · share</span>
+      <h3>Push through git</h3>
+      <p>Attestations travel as <a href="https://git-meta.com/">git-meta</a> metadata on <code>refs/meta/main</code>. No server, no database: <code>vci push</code> and <code>vci fetch</code> are git push and fetch.</p>
+    </div>
+    <div class="card">
+      <span class="num">3 · verify</span>
+      <h3>CI re-checks everything</h3>
+      <p><code>vci plan</code> verifies the signature against the <strong>base commit's</strong> trusted signers, re-hashes every recorded input from its own checkout, and skips only on an exact match.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Works with your test runner</h2>
+  <p class="sub">One repository can mix several. Each has its own unit of skipping.</p>
+  <div class="cards">
+    <a class="card" href="adapters.html#vitest"><span class="tag">vitest</span><h3>Vitest</h3><p>Per test file. Vitest 3.2 to 5, Node 22.15+.</p></a>
+    <a class="card" href="adapters.html#pytest"><span class="tag">pytest</span><h3>pytest</h3><p>Per test file. pytest 9 on CPython 3.11 to 3.14, through uv.</p></a>
+    <a class="card" href="adapters.html#go"><span class="tag">go</span><h3>Go</h3><p>Per package. Go modules, Go 1.26.</p></a>
+    <a class="card" href="adapters.html#cargo"><span class="tag">cargo</span><h3>Rust</h3><p>Per cargo test target. Inputs decided conservatively.</p></a>
+    <a class="card" href="adapters.html#rails"><span class="tag">rails</span><h3>Rails</h3><p>Per Minitest file. Rails 8, Ruby 3.4, fresh SQLite database per file.</p></a>
+  </div>
+</section>
+
+<section>
+  <h2>What you can rely on</h2>
+  <div class="cards">
+    <div class="card"><h3>Fail open</h3><p>A missing, expired, tampered or unreadable attestation only ever makes a test run. Nothing in the store is trusted on its own.</p></div>
+    <div class="card"><h3>Trust comes from the base branch</h3><p>Allowed signers and policy are read from the base commit, so a pull request cannot add its own key or loosen the rules.</p></div>
+    <div class="card"><h3>Observed inputs, not guesses</h3><p>Collectors record what each test really read at run time, including files that were probed and found missing.</p></div>
+    <div class="card"><h3>Laptop to runner</h3><p>An attestation made on macOS arm64 can be accepted on a Linux x86_64 runner when the toolchain and inputs match.</p></div>
+  </div>
+  <div class="note warn">
+    <p><strong>Know the limit.</strong> An attestation proves <em>who</em> made a claim, not that the test ran. A trusted signer can lie and a stolen key can sign. Keep the signer list short and keep full runs on your default branch. See the <a href="security.html#threat-model">threat model</a>.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Try it in five minutes</h2>
+  <pre><code><span class="c"># install</span>
+curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh
+
+<span class="c"># in your repository</span>
+vci init --adapter pytest --key ~/.ssh/id_ed25519.pub
+git add vci.toml .vci/allowed_signers .git-meta &amp;&amp; git commit -m "Enable vci"
+
+vci run tests/test_b.py --key ~/.ssh/id_ed25519
+vci plan --base-ref origin/main
+vci push</code></pre>
+  <div class="cta">
+    <a class="btn primary" href="get-started.html">Read the full setup guide</a>
+    <a class="btn" href="security.html">How verification works</a>
+  </div>
+</section>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

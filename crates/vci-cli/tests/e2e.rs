@@ -229,6 +229,18 @@ impl World {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Publish `dir`'s attestations (`vci push`) to a new bare repository,
+    /// returned for `vci fetch --remote`.
+    fn publish(&self, dir: &Path, name: &str) -> PathBuf {
+        let bare = self.base.join(format!("{name}.git"));
+        self.git(
+            &self.base,
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+        self.vci_ok(dir, &["push", "--remote", bare.to_str().unwrap()]);
+        bare
+    }
+
     fn run(&self, dir: &Path, file: &str, key: &Path) {
         let out = self.vci_ok(dir, &["run", file, "--key", key.to_str().unwrap()]);
         let _ = out;
@@ -377,8 +389,7 @@ fn end_to_end_verification_steps() {
     // Step 4: flip a byte in B's payload -> rejected at the signature check.
     let repo = store_for(&work);
     let store = AttestStore::new(&repo);
-    let tk = vci_core::test_key(B);
-    let stored = store.list(Some(&tk)).unwrap();
+    let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
     let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
@@ -391,8 +402,9 @@ fn end_to_end_verification_steps() {
     payload[pos + 8] = b'2';
     env["payload"] = Value::String(b64.encode(&payload));
     let tampered = serde_json::to_vec(&env).unwrap();
-    let signer = good.signer_ref.strip_prefix(vci_git::REF_PREFIX).unwrap();
-    store.put(signer, &tk, &good.input_root, &tampered).unwrap();
+    store
+        .put(B, &good.signer, &good.storage_key, &tampered)
+        .unwrap();
     let p = w.plan(&work, "main");
     assert!(
         p.run.contains(B),
@@ -424,7 +436,7 @@ fn end_to_end_verification_steps() {
         "{out}"
     );
     store
-        .put(signer, &tk, &good.input_root, &good.bytes)
+        .put(B, &good.signer, &good.storage_key, &good.bytes)
         .unwrap();
     assert!(w.plan(&work, "main").skip.contains(B), "step 4: restored");
 
@@ -567,10 +579,11 @@ fn expired_and_foreign_repo_attestations_are_rejected() {
     w.run(&other, B, &w.trusted);
     // Sanity: the attestation is valid in its own repo.
     assert!(w.plan(&other, "main").skip.contains(B));
-    w.vci_ok(&work, &["fetch", "--remote", other.to_str().unwrap()]);
+    let published = w.publish(&other, "other");
+    w.vci_ok(&work, &["fetch", "--remote", published.to_str().unwrap()]);
     assert_eq!(
         AttestStore::new(&store_for(&work))
-            .list(Some(&vci_core::test_key(B)))
+            .list(Some(B))
             .unwrap()
             .len(),
         1,
@@ -1441,7 +1454,8 @@ fn explain_shows_attested_as_expected_and_checkout_as_actual() {
     let other = w.base.join("other");
     w.make_project(&other, "an unrelated root commit");
     w.run(&other, C, &w.trusted);
-    w.vci_ok(&work, &["fetch", "--remote", other.to_str().unwrap()]);
+    let published = w.publish(&other, "other");
+    w.vci_ok(&work, &["fetch", "--remote", published.to_str().unwrap()]);
     let ex = w.explain(&work, C, "main");
     let other_root = w.git(&other, &["rev-list", "--max-parents=0", "HEAD"]);
     let work_root = w.git(&work, &["rev-list", "--max-parents=0", "HEAD"]);
@@ -1472,4 +1486,421 @@ fn plan_warns_when_the_base_is_the_commit_under_test() {
     };
     assert!(warned("HEAD"), "--base-ref HEAD must warn");
     assert!(!warned("main"), "a real base must not warn");
+}
+
+// ---------------------------------------------------------------------------
+// The git-meta store holds hints only: whatever ends up under a unit's keys
+// (garbage, another unit's envelope, a tombstone), the unit runs unless a
+// valid envelope for exactly this unit is there; and a valid envelope counts
+// however it got there.
+
+/// The `git-meta` CLI, when installed (`$VCI_TEST_GIT_META` or on PATH).
+fn git_meta_bin() -> Option<String> {
+    let bin = std::env::var("VCI_TEST_GIT_META")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "git-meta".to_owned());
+    Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        .then_some(bin)
+}
+
+#[test]
+fn git_meta_values_are_hints_only() {
+    let w = World::new();
+    let work = w.work.clone();
+    w.run(&work, B, &w.trusted);
+    w.run(&work, C, &w.trusted);
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, C]));
+    let repo = store_for(&work);
+    let store = AttestStore::new(&repo);
+    let b = store.list(Some(B)).unwrap().remove(0);
+    let c = store.list(Some(C)).unwrap().remove(0);
+    assert_eq!(b.target, format!("path:{B}"));
+
+    // Overwritten with garbage: B runs.
+    store
+        .put(B, &b.signer, &b.storage_key, b"{\"not\":\"an envelope\"}")
+        .unwrap();
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(B) && p.skip.contains(C), "{p:?}");
+    assert!(
+        w.explain(&work, B, "main")
+            .contains("failed check: envelope")
+    );
+    // Overwritten with another unit's valid envelope: B runs.
+    store.put(B, &b.signer, &b.storage_key, &c.bytes).unwrap();
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(B) && p.skip.contains(C), "{p:?}");
+    assert!(
+        w.explain(&work, B, "main")
+            .contains("failed check: test-id")
+    );
+    store.put(B, &b.signer, &b.storage_key, &b.bytes).unwrap();
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, C]), "restored");
+
+    // Published, then fetched into a fresh clone: same plan.
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push"]);
+    let fresh = w.base.join("fresh");
+    w.git(
+        &w.base,
+        &[
+            "clone",
+            "-q",
+            w.remote.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    w.install_node_modules(&fresh);
+    w.git(&fresh, &["checkout", "-q", "feature"]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert_eq!(w.plan(&fresh, "main").skip, set(&[B, C]));
+
+    // Tombstoned by another user (here: a deletion in the first clone,
+    // pushed): B runs everywhere once fetched; C is untouched.
+    assert!(store.remove(&b).unwrap());
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(B) && p.skip.contains(C), "{p:?}");
+    w.vci_ok(&work, &["push"]);
+    w.vci_ok(&fresh, &["fetch"]);
+    let p = w.plan(&fresh, "main");
+    assert!(p.run.contains(B) && p.skip.contains(C), "{p:?}");
+    let ex = w.explain(&fresh, B, "main");
+    assert!(ex.contains("no attestation"), "{ex}");
+
+    // A valid envelope written by hand with git-meta itself, under a key vci
+    // never wrote (another storage key): accepted.
+    let tk = vci_core::test_key(B);
+    let key = format!("vci:attestation:{tk}:{}:{}", b.signer, "ab".repeat(32));
+    let envelope = String::from_utf8(b.bytes.clone()).unwrap();
+    let session = git_meta_lib::Session::open(&work).unwrap();
+    session
+        .target(&git_meta_lib::Target::path(B))
+        .set(&key, envelope.as_str())
+        .unwrap();
+    drop(session);
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, C]), "library-written");
+
+    // The same with the stock CLI in the fresh clone, when it is installed.
+    match git_meta_bin() {
+        None => eprintln!("skipping the git meta CLI part: not installed"),
+        Some(bin) => {
+            let key = format!("vci:attestation:{tk}:{}:{}", b.signer, "cd".repeat(32));
+            let out = Command::new(&bin)
+                .current_dir(&fresh)
+                .args(["set", &format!("path:{B}"), &key, &envelope])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(w.plan(&fresh, "main").skip, set(&[B, C]), "git meta set");
+            // And `git meta rm` (a tombstone) makes it run again.
+            let out = Command::new(&bin)
+                .current_dir(&fresh)
+                .args(["rm", &format!("path:{B}"), &key])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(w.plan(&fresh, "main").run.contains(B), "git meta rm");
+        }
+    }
+}
+
+#[test]
+fn prune_removes_expired_attestations() {
+    let w = World::new();
+    let work = w.work.clone();
+    let key = w.trusted.to_str().unwrap();
+    w.vci_ok(&work, &["run", A, "--key", key, "--ttl", "1s"]);
+    w.run(&work, B, &w.trusted);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let store_repo = store_for(&work);
+    let store = AttestStore::new(&store_repo);
+    assert_eq!(store.list(None).unwrap().len(), 2);
+    let dry = w.vci_ok(&work, &["prune", "--dry-run"]);
+    assert!(dry.contains("would remove path:src/a.test.ts"), "{dry}");
+    assert_eq!(
+        store.list(None).unwrap().len(),
+        2,
+        "dry run removes nothing"
+    );
+    let out = w.vci_ok(&work, &["prune"]);
+    assert!(out.contains("removed path:src/a.test.ts"), "{out}");
+    let left = store.list(None).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].target, format!("path:{B}"));
+    assert!(w.plan(&work, "main").skip.contains(B));
+    // The deletion is published by push.
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let tree = w.git(
+        &w.remote,
+        &["ls-tree", "-r", "--name-only", "refs/meta/main"],
+    );
+    assert!(
+        !tree.contains("path/src/a.test.ts/__target__/vci"),
+        "{tree}"
+    );
+    assert!(
+        tree.contains("path/src/a.test.ts/__target__/__tombstones/vci"),
+        "{tree}"
+    );
+    assert!(
+        tree.contains("path/src/b.test.ts/__target__/vci/attestation"),
+        "{tree}"
+    );
+}
+
+#[test]
+fn init_configures_git_meta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let repo = base.join("repo");
+    let git = |args: &[&str]| {
+        let st = Command::new("git")
+            .current_dir(&base)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    git(&["init", "-q", "--bare", "remote.git"]);
+    git(&["init", "-q", "repo"]);
+    git(&[
+        "-C",
+        "repo",
+        "remote",
+        "add",
+        "origin",
+        base.join("remote.git").to_str().unwrap(),
+    ]);
+    let out = Command::cargo_bin("vci")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["init", "--no-install", "--adapter", "pytest"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains(".git-meta"));
+    let file = std::fs::read_to_string(repo.join(".git-meta")).unwrap();
+    assert_eq!(
+        file,
+        format!("url: {}\n", base.join("remote.git").display())
+    );
+    let cfg = |k: &str| {
+        let o = Command::new("git")
+            .current_dir(&repo)
+            .args(["config", "--get", k])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_owned()
+    };
+    assert_eq!(cfg("remote.meta.meta"), "true");
+    assert_eq!(
+        cfg("remote.meta.url"),
+        base.join("remote.git").to_str().unwrap()
+    );
+    assert_eq!(
+        cfg("remote.meta.fetch"),
+        "+refs/meta/main:refs/meta/remotes/main"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for adversarial findings against the git-meta exchange.
+
+impl World {
+    fn fresh_clone(&self, name: &str) -> PathBuf {
+        let dir = self.base.join(name);
+        self.git(
+            &self.base,
+            &[
+                "clone",
+                "-q",
+                self.remote.to_str().unwrap(),
+                dir.to_str().unwrap(),
+            ],
+        );
+        self.install_node_modules(&dir);
+        self.git(&dir, &["checkout", "-q", "feature"]);
+        dir
+    }
+
+    fn stderr_of(&self, dir: &Path, args: &[&str]) -> String {
+        let out = self.vci(dir, args);
+        assert!(
+            out.status.success(),
+            "vci {args:?} exited {:?}",
+            out.status.code()
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+}
+
+/// A linked worktree, or a clone whose `.git/git-meta.sqlite` was deleted,
+/// starts with a store that does not hold what the shared
+/// `refs/meta/local/main` holds. Fetching sees the published attestations,
+/// and attesting and pushing from there never deletes them for everyone.
+#[test]
+fn worktrees_and_lost_stores_keep_published_attestations() {
+    let w = World::new();
+    let work = w.work.clone();
+    for f in [B, C, D] {
+        w.run(&work, f, &w.trusted);
+    }
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+
+    let wt = w.base.join("wt2");
+    w.git(
+        &work,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt-branch",
+            wt.to_str().unwrap(),
+        ],
+    );
+    w.install_node_modules(&wt);
+    let err = w.stderr_of(&wt, &["fetch"]);
+    assert!(err.contains("(3 attestations stored locally)"), "{err}");
+    assert_eq!(w.plan(&wt, "main").skip, set(&[B, C, D]));
+    w.run(&wt, A, &w.trusted);
+    let err = w.stderr_of(&wt, &["push"]);
+    assert!(err.contains("vci: pushed"), "{err}");
+
+    let fresh = w.fresh_clone("fresh");
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert_eq!(w.plan(&fresh, "main").skip, set(&[A, B, C, D]));
+
+    // The main worktree's store is deleted; `vci run` makes a new one and
+    // `vci push` publishes it without deleting anything.
+    for s in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(work.join(format!(".git/git-meta.sqlite{s}")));
+    }
+    w.run(&work, A, &w.trusted);
+    w.vci_ok(&work, &["push"]);
+    w.vci_ok(&fresh, &["fetch"]);
+    assert_eq!(w.plan(&fresh, "main").skip, set(&[A, B, C, D]));
+    assert_eq!(w.plan(&work, "main").skip, set(&[A, B, C, D]));
+}
+
+/// One value whose blob is missing makes only its own unit run, and `vci
+/// plan` reads the store from a read-only `.git`.
+#[test]
+fn an_unreadable_value_runs_only_its_unit_and_plan_reads_a_read_only_git_dir() {
+    let w = World::new();
+    let work = w.work.clone();
+    w.run(&work, B, &w.trusted);
+    w.run(&work, C, &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let fresh = w.fresh_clone("fresh");
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert_eq!(w.plan(&fresh, "main").skip, set(&[B, C]));
+
+    // Values over 1 KiB are blob references in a fetched store. Keep C's
+    // blob, lose B's.
+    let tree = w.git(&fresh, &["ls-tree", "-r", "refs/meta/remotes/main"]);
+    let blob_for = |unit: &str| {
+        tree.lines()
+            .find(|l| l.contains(&format!("path/{unit}/__target__/")))
+            .and_then(|l| l.split_whitespace().nth(2))
+            .unwrap()
+            .to_owned()
+    };
+    let c_blob = blob_for(C);
+    let _ = blob_for(B);
+    for r in w
+        .git(
+            &fresh,
+            &["for-each-ref", "--format=%(refname)", "refs/meta"],
+        )
+        .lines()
+    {
+        w.git(&fresh, &["update-ref", "-d", r]);
+    }
+    w.git(&fresh, &["update-ref", "refs/keep/c", &c_blob]);
+    w.git(&fresh, &["reflog", "expire", "--expire=now", "--all"]);
+    w.git(&fresh, &["gc", "-q", "--prune=now"]);
+    let out = w.vci(&fresh, &["plan", "--base-ref", "main"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("running everything"), "{err}");
+    let p = w.plan(&fresh, "main");
+    assert_eq!(p.skip, set(&[C]), "{p:?}");
+    assert!(!p.run_all);
+    let ex = w.explain(&fresh, B, "main");
+    assert!(ex.contains("unreadable") && ex.contains("missing"), "{ex}");
+
+    // A read-only .git (and a lock file left behind) do not stop `vci plan`.
+    let chmod = |mode: &str| {
+        let st = Command::new("chmod")
+            .args(["-R", mode])
+            .arg(fresh.join(".git"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    chmod("a-w");
+    let out = w.vci(&fresh, &["plan", "--base-ref", "main", "--format", "json"]);
+    chmod("u+w");
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["runAll"].is_null(), "{v}");
+    let skipped: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["skip"].as_bool().unwrap())
+        .map(|f| f["testId"].as_str().unwrap())
+        .collect();
+    assert_eq!(skipped, [C]);
+}
+
+/// `vci push` says when nothing was sent; a `.git-meta` URL that names a
+/// remote helper (`fd::`, `ext::`) is refused instead of used.
+#[test]
+fn push_reports_no_ops_and_fetch_refuses_remote_helper_urls() {
+    let w = World::new();
+    let work = w.work.clone();
+    let err = w.stderr_of(&work, &["push", "--remote", "origin"]);
+    assert!(err.contains("nothing to push: no attestations"), "{err}");
+    w.run(&work, B, &w.trusted);
+    let err = w.stderr_of(&work, &["push"]);
+    assert!(err.contains("vci: pushed"), "{err}");
+    let err = w.stderr_of(&work, &["push"]);
+    assert!(
+        err.contains("nothing to push") && !err.contains("vci: pushed"),
+        "{err}"
+    );
+
+    // A pull request sets `.git-meta` to read a file descriptor.
+    std::fs::write(work.join(".git-meta"), "url: fd::3\n").unwrap();
+    w.git(&work, &["add", ".git-meta"]);
+    w.git(&work, &["commit", "-q", "-m", "metadata elsewhere"]);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    let fresh = w.fresh_clone("fresh");
+    let out = w.vci(&fresh, &["fetch"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("remote helpers"), "{err}");
+    // `--remote origin` (what the action runs) ignores the file.
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert_eq!(w.plan(&fresh, "main").skip, set(&[B]));
 }

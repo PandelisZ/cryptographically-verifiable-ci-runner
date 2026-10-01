@@ -2,21 +2,27 @@
 //!
 //! * [`Repo`] answers repository questions (root, identity, HEAD, dirtiness,
 //!   revision resolution) and reads files at a revision.
-//! * [`AttestStore`] keeps content-addressed attestation envelopes on one ref
-//!   per signer under [`REF_PREFIX`], using plumbing commands only. It never
-//!   touches the user's index, `HEAD` or working tree.
+//! * [`AttestStore`] keeps attestation envelopes as [git-meta] metadata (see
+//!   [`meta`] for the layout), exchanged on `refs/meta/main` by ordinary git
+//!   push and fetch. It never touches the user's index, `HEAD` or working
+//!   tree.
 //!
-//! Every identifier that ends up in a ref name or tree path (signer id, test
-//! key, input root) is validated as lowercase hex first, so callers cannot
-//! inject paths or ref names.
+//! Every identifier that ends up in a git-meta key (signer id, storage key)
+//! is validated as lowercase hex first, so callers cannot inject key
+//! segments.
+//!
+//! [git-meta]: https://git-meta.com/
 
 mod cmd;
+pub mod meta;
 mod repo;
-mod store;
 mod validate;
 
+pub use meta::{
+    AttestStore, FetchOutcome, KEY_PREFIX, PushOutcome, PushStatus, Reader, SETUP_FILE,
+    StoredEnvelope,
+};
 pub use repo::Repo;
-pub use store::{AttestStore, REF_PREFIX, REMOTE_REF_PREFIX, StoredEnvelope};
 
 /// Errors from git operations.
 #[derive(Debug, thiserror::Error)]
@@ -63,15 +69,16 @@ pub enum GitError {
     /// Output that must be UTF-8 (paths, object ids) was not.
     #[error("git output was not valid UTF-8")]
     NonUtf8,
-    /// A local ref kept changing under us and the compare-and-swap never won.
-    #[error(
-        "ref {refname} kept changing concurrently; gave up after {attempts} attempts: {detail}"
-    )]
-    Contention {
-        refname: String,
-        attempts: u32,
-        detail: String,
-    },
+    /// git-meta (the metadata store or its merge) failed.
+    #[error("git-meta: {0}")]
+    Meta(String),
+    /// The local git-meta store (`.git/git-meta.sqlite`) or a lock file next
+    /// to it could not be opened, read or written.
+    #[error("git-meta store: {0}")]
+    Store(String),
+    /// No metadata remote could be found or configured.
+    #[error("{0}")]
+    NoMetaRemote(String),
     /// The remote kept rejecting the push after retries.
     #[error("push to {remote:?} still rejected after {attempts} attempts: {detail}")]
     PushRejected {

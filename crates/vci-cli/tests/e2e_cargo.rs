@@ -403,7 +403,7 @@ impl World {
         let repo = store_for(&self.work);
         let b64 = base64::engine::general_purpose::STANDARD;
         AttestStore::new(&repo)
-            .list(Some(&vci_core::test_key(test_id)))
+            .list(Some(test_id))
             .unwrap()
             .iter()
             .map(|s| {
@@ -690,8 +690,7 @@ fn cargo_end_to_end_verification_steps() {
     // Step 8: flip a byte in b's payload -> rejected at the signature check.
     let repo = store_for(&work);
     let store = AttestStore::new(&repo);
-    let tk = vci_core::test_key(B);
-    let stored = store.list(Some(&tk)).unwrap();
+    let stored = store.list(Some(B)).unwrap();
     assert!(!stored.is_empty());
     for s in &stored {
         let mut env: Value = serde_json::from_slice(&s.bytes).unwrap();
@@ -703,12 +702,11 @@ fn cargo_end_to_end_verification_steps() {
             .expect("payload contains the test count");
         payload[pos + 8] = b'2';
         env["payload"] = Value::String(b64.encode(&payload));
-        let signer = s.signer_ref.strip_prefix(vci_git::REF_PREFIX).unwrap();
         store
             .put(
-                signer,
-                &tk,
-                &s.input_root,
+                B,
+                &s.signer,
+                &s.storage_key,
                 &serde_json::to_vec(&env).unwrap(),
             )
             .unwrap();
@@ -719,8 +717,7 @@ fn cargo_end_to_end_verification_steps() {
             .contains("failed check: signature")
     );
     for s in &stored {
-        let signer = s.signer_ref.strip_prefix(vci_git::REF_PREFIX).unwrap();
-        store.put(signer, &tk, &s.input_root, &s.bytes).unwrap();
+        store.put(B, &s.signer, &s.storage_key, &s.bytes).unwrap();
     }
     assert!(w.plan(&work, "main").skip.contains(B), "step 8: restored");
 

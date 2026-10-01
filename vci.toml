@@ -31,3 +31,8 @@ adapter = "go"
 name = "rust"
 path = "demo/cargo-app"
 adapter = "cargo"
+
+[[projects]]
+name = "rails"
+path = "demo/rails-app"
+adapter = "rails"

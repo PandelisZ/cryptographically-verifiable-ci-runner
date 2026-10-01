@@ -47,10 +47,16 @@ pub struct Toolchain {                  // adapter-specific; unused fields are e
     pub cargo: String,                // Cargo: cargo -vV "<release> <commit-hash>"
     pub rust_host: String,            // Cargo: host triple; compared only when os and arch are equal
     pub rust_cfg: Vec<String>,        // Cargo: sorted `rustc --print cfg` (with the build's rustflags); compared only when rust_host is equal
+    pub ruby: String, pub ruby_engine: String,   // Rails: "3.4.9p82", "ruby 3.4.9"
+    pub rails: String, pub bundler: String,      // Rails: Rails and Bundler versions
+    pub ruby_test: String,            // Rails: "minitest 6.0.6"
+    pub ruby_libs: String,            // Rails: "sqlite=<ver>;yaml=<ver>;tz=<tzinfo-data|zoneinfo ver>;encoding=<ext>/<int>"
+    pub ruby_db: String,              // Rails: "sqlite3", or "<adapter> <server version>" with policy.rails_allow_db
+    pub ruby_gems: Vec<String>,       // Rails: the resolved bundle, sorted "name==version" (no platform)
     pub superuser: bool,              // every adapter: the tests ran as root (effective uid 0); compared exactly; omitted when false
     pub os: String, pub arch: String,
 }
-impl Toolchain { pub fn diff(&self, now: &Toolchain) -> Vec<(&'static str, String, String)>; } // node by major, go_arch_level on the same arch, rust_host/rust_cfg on the same platform, rest exact
+impl Toolchain { pub fn diff(&self, now: &Toolchain) -> Vec<(&'static str, String, String)>; } // node by major, go_arch_level on the same arch, rust_host/rust_cfg on the same platform, rest exact (Rails fields all exact)
 pub struct TestResult { pub state: String /* "passed" | "failed" */, pub tests: u32, pub failed: u32, pub skipped: u32, pub duration_ms: u64 }
 // is_pass(): state == "passed" && failed == 0 && skipped == 0 (a skipped or xfailed test did not run)
 pub struct Predicate {
@@ -106,20 +112,55 @@ impl Repo {
     pub fn show_file(&self, rev: &str, path: &str) -> Result<Option<Vec<u8>>, GitError>;
 }
 
-pub const REF_PREFIX: &str = "refs/attest/v1/";
-pub struct StoredEnvelope { pub signer_ref: String, pub test_key: String, pub input_root: String, pub bytes: Vec<u8> }
+pub struct StoredEnvelope {
+    pub target: String,       // git-meta target: "path:<unit path>" or "project"
+    pub key: String,          // "vci:attestation:<test_key>:<signer>:<storage_key>"
+    pub test_key: String, pub signer: String, pub storage_key: String,
+    pub bytes: Vec<u8>,       // the DSSE envelope, exactly as stored (empty when `error` is set)
+    pub error: Option<String>,// the value could not be read (missing blob, unfetched value): fails only this candidate
+}
+pub struct FetchOutcome { pub remote: String, pub found: bool, pub warnings: Vec<String>, pub notes: Vec<String> }
+pub enum PushStatus { Pushed, UpToDate, NothingStored }
+pub struct PushOutcome { pub remote: String, pub status: PushStatus, pub warnings: Vec<String>, pub notes: Vec<String> }
 pub struct AttestStore<'a> { /* &Repo */ }
 impl<'a> AttestStore<'a> {
     pub fn new(repo: &'a Repo) -> Self;
-    /// Adds `<test_key[0..2]>/<test_key>/<input_root>.dsse.json` to refs/attest/v1/<signer_id> as a new commit, without touching the index or working tree.
-    pub fn put(&self, signer_id: &str, test_key: &str, input_root: &str, bytes: &[u8]) -> Result<(), GitError>;
-    pub fn list(&self, test_key: Option<&str>) -> Result<Vec<StoredEnvelope>, GitError>;   // across all signer refs
-    pub fn fetch(&self, remote: &str) -> Result<(), GitError>;   // into refs/attest-remote/v1/*, then union-merge into local refs
-    pub fn push(&self, remote: &str) -> Result<(), GitError>;    // fetch+merge+push, retry on rejection
+    /// Sets the git-meta string value in the local store (.git/git-meta.sqlite); no serialize, no push,
+    /// never touches the index or working tree. Identical bytes: no write.
+    pub fn put(&self, test_id: &str, signer: &str, storage_key: &str, bytes: &[u8]) -> Result<StoredEnvelope, GitError>;
+    pub fn list(&self, test_id: Option<&str>) -> Result<Vec<StoredEnvelope>, GitError>;
+    pub fn reader(&self) -> Result<Reader, GitError>;      // many per-unit lookups; read-only SQLite, no lock, creates nothing
+    pub fn remove(&self, e: &StoredEnvelope) -> Result<bool, GitError>;   // git-meta tombstone
+    pub fn ensure_remote(&self, spec: Option<&str>) -> Result<String, GitError>;
+    pub fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, GitError>; // git-meta pull
+    pub fn push(&self, remote: Option<&str>) -> Result<PushOutcome, GitError>;   // git-meta push, retried
 }
 ```
 
-`signer_id` is 16 lowercase hex chars derived by the caller. Use plumbing (`hash-object -w`, `mktree`/temporary index via `GIT_INDEX_FILE`, `commit-tree`, `update-ref`). Set committer identity explicitly via env so it works where no git user is configured.
+Exchange invariants (`fetch`, `push`; both hold one lock per repository, shared by its worktrees, and retry when
+another git process wins a ref lock):
+
+- Before serializing, the store is made to cover `refs/<ns>/local/main`: values of that ref the store has no row and
+  no deletion record for are copied in, and its deletion records newer than the store's row are applied. (git-meta
+  serializes the store alone as a commit on top of that ref; a new, emptied or replaced `.git/git-meta.sqlite`, or a
+  linked worktree, whose store is its own while the refs are shared, would otherwise publish deletions.)
+- A serialization that drops a value the previous local commit held, without a deletion record in the store, is
+  undone and is an error (a `meta:filter` rule excluding or routing the key). A push that drops a value of the remote
+  tip that this store did not delete is refused.
+- Tree entries git-meta cannot read (names that are not UTF-8, targets it cannot serialize such as a path target
+  under 3 bytes) are left out: the fetched tip is replaced by a deterministic commit on top of it without them, which
+  a later push publishes. Store rows git-meta cannot serialize are deleted.
+- `fetch` and `push` report shared settings that affect attestations (`meta:prune:*`, filter rules) and values the
+  remote dropped without a deletion record.
+- A `.git-meta` URL (from the checkout) must be an https/http/ssh/git/file URL, an scp-like address or a path; remote
+  helpers (`fd::`, `ext::`, `<x>::`) are refused.
+
+Storage is [git-meta](https://git-meta.com/) (`git-meta-lib` 0.1.13, embedded): target `path:<unit path>` (the test id
+up to `#`; `project` when git-meta cannot hold it as a path target: `.` or shorter than 3 bytes), key
+`vci:attestation:<blake3(test_id)>:<signer>:<storage_key>`, value the envelope. `signer` is 16 lowercase hex chars and
+`storage_key` lowercase hex, both validated. Exchange is on `refs/<meta.namespace or meta>/main` with git-meta's merge;
+transport is the git CLI with a scrubbed environment; the metadata commit vci rewrites for push uses a fixed
+committer identity, so it works where no git user is configured.
 
 ## js/vitest-plugin (`@vci/vitest`)
 
@@ -148,7 +189,10 @@ pub struct ListedFile { pub abs: Utf8PathBuf, pub project: String }
 pub struct ToolVersions { pub node: String, pub runner: String, pub bundler: String, pub python: String, pub implementation: String,
                          pub python_libs: String, pub python_dists: Vec<String>,
                          pub go_env: Vec<String>, pub go_arch_level: String, pub go_work: String /* abs go.work, "" or "off" */,
-                         pub cargo: String, pub rust_host: String, pub rust_cfg: Vec<String> /* Cargo; runner = rustc */ }
+                         pub cargo: String, pub rust_host: String, pub rust_cfg: Vec<String> /* Cargo; runner = rustc */,
+                         pub ruby: String, pub ruby_engine: String, pub rails: String, pub ruby_bundler: String,
+                         pub ruby_libs: String, pub ruby_db: String, pub ruby_gems: Vec<String> /* Rails; runner = "minitest <ver>" */ }
+pub struct AdapterOptions { pub rails_allow_db: bool }   // policy settings that change how an adapter runs tests
 pub type InstalledExternals = BTreeMap<String, Vec<String>>;   // PEP 503 name -> installed versions
 pub struct Observed {            // one per collector JSONL file; anything unexpected becomes a taint
     pub test_id: String, pub project: String, pub root: String, pub node: String,
@@ -161,6 +205,7 @@ pub struct Observed {            // one per collector JSONL file; anything unexp
     pub cfg_predicates: BTreeSet<String>,        // Cargo: normalised target-dependent cfg predicates of repository code/manifests
     pub path_refs: BTreeMap<Utf8PathBuf, String>, // Cargo: paths the source opens outside the package dirs -> where; must be recorded inputs
     pub excluded: BTreeSet<Utf8PathBuf>,          // Cargo: target dir, repo .git and .vci/out met in a walked dir (Observation::Exclude)
+    pub ruby: String, pub ruby_engine: String, pub rails: String, pub ruby_bundler: String,   // Rails collector meta
     pub externals: BTreeSet<(String, String)>, pub env_keys: BTreeSet<String>,
     pub taints: Vec<String>, pub result: Option<vci_core::TestResult>,
 }
@@ -189,7 +234,10 @@ pub struct PytestAdapter;  // PytestAdapter::new(project_dir).with_py_plugin(dir
 pub fn find_py_plugin(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_PY_PLUGIN, else py/pytest-plugin near the exe / build checkout / project
 pub struct GoAdapter;      // GoAdapter::new(project_dir); `go` from $VCI_GO
 pub struct CargoAdapter;   // CargoAdapter::new(project_dir); `cargo` from $VCI_CARGO
-pub fn adapter_for(name: &str, project_dir: &Utf8Path) -> Result<Box<dyn Adapter>, AdapterError>; // "vitest" | "pytest" | "go" | "cargo"
+pub fn adapter_for(name: &str, project_dir: &Utf8Path) -> Result<Box<dyn Adapter>, AdapterError>; // "vitest" | "pytest" | "go" | "cargo" | "rails"
+pub fn adapter_for_with(name: &str, project_dir: &Utf8Path, opts: &AdapterOptions) -> Result<Box<dyn Adapter>, AdapterError>;
+pub struct RailsAdapter;   // RailsAdapter::new(project_dir).with_collector(dir).with_allow_db(bool); `ruby` from $VCI_RUBY
+pub fn find_ruby_collector(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_RUBY_COLLECTOR, else ruby/vci-collector near the exe / build checkout / project
 pub const PYTEST_CONFIG_NAMES: &[&str];   // pytest.toml, .pytest.toml, pytest.ini, .pytest.ini, pyproject.toml, tox.ini, setup.cfg
 pub const PYTEST_PASS_THROUGH: &[&str];   // UV, UV_*, VIRTUAL_ENV, PYTHONPATH, XDG_*_HOME, SSL_CERT_*, *_PROXY
 pub const GO_PASS_THROUGH: &[&str];      // GOPATH, GOROOT, GOCACHE, GOMODCACHE, GOENV, GOPROXY, ..., XDG_*, SSL_CERT_*, *_PROXY
@@ -199,6 +247,12 @@ pub const GO_NET_TAINT: &str;            // "go:net:" (the only taint policy.go_
 pub const CARGO_PASS_THROUGH: &[&str];   // CARGO_HOME, RUSTUP_*, CARGO_TARGET_DIR, CARGO_NET_*, CARGO_HTTP_*, RUSTC_WRAPPER, SCCACHE_*, ...
 pub const CARGO_HASHED_ENV: &[&str];     // RUST*, CARGO*, CC, CFLAGS, ..., minus the pass-through names
 pub const CARGO_UNDECLARED_TAINT: &str;  // "cargo:undeclared-reads" (waived by declaring [[inputs]] for the unit)
+pub const RAILS_PASS_THROUGH: &[&str];   // GEM_HOME, GEM_PATH, BUNDLE_PATH and Bundler's location/install settings, MISE_*, RBENV_*, ...
+pub const RAILS_HASHED_ENV: &[&str];     // RUBY*, RAILS_*, RACK_*, BUNDLE_*, BUNDLER_*, GEM_*, DATABASE_URL, MT_*, ... minus pass-through and vci-set
+pub const RAILS_RUN_VARS: &[&str];       // RUBYOPT, RAILS_ENV, RACK_ENV, BUNDLE_GEMFILE, PARALLEL_WORKERS, DISABLE_SPRING, DISABLE_BOOTSNAP
+pub const RAILS_NETWORK_DB_TAINT: &str;  // "rails:network-db:" (the only taint policy.rails_allow_db waives)
+pub const RAILS_SCRATCH_DIRS: &[&str];   // log, tmp, storage, coverage (git-ignored writes there are allowed)
+pub const RAILS_GLOBAL_FILES: &[&str];   // Gemfile, Gemfile.lock, gems.rb, gems.locked, .ruby-version, ..., config/application.rb, bin/rails, test/test_helper.rb
 pub fn cfg_predicate_differs(pred: &str, attested_cfg: &[String], current_cfg: &[String]) -> Result<bool, String>;
 pub fn unit_package_dir(unit: &Utf8Path) -> Utf8PathBuf;   // "<dir>#<target>" -> "<dir>"
 pub fn parse_jsonl_file(path) / parse_jsonl_dir(dir);  // top-level *.jsonl only
@@ -298,6 +352,37 @@ metadata` `workspace_root`) and hold `Cargo.lock`. All commands run with cwd = p
   `config_candidates`: `Cargo.toml`, `Cargo.lock`; built-in pass-through `CARGO_PASS_THROUGH`; hashed patterns
   `CARGO_HASHED_ENV`; `scratch_dirs`: the target dir.
 
+### Rails adapter
+
+The unit is a Minitest test file (`test/**/*_test.rb` without `test/{system,dummy,fixtures}/**`, listed in Rust); the
+project dir is the application root (it must hold `bin/rails`). A project whose only tests are RSpec files
+(`spec/**/*_spec.rb`) is an error for `list_test_files` and `run_plain(&[])`; beside Minitest files they are a
+warning. Every Ruby process runs `ruby <args>` (`$VCI_RUBY`, default `ruby`) with cwd = project dir, the child env
+applied, `RUBYLIB` removed, and `RUBYOPT=-r<collector>/vci_collector.rb`, `VCI_RAILS_MODE`, `VCI_ROOT` (project),
+`VCI_REPO` (nearest ancestor with `.git`), `VCI_DB_DIR` and `TMPDIR` (fresh dirs), `RAILS_ENV=test`, `RACK_ENV=test`,
+`PARALLEL_WORKERS=1`, `DISABLE_SPRING=1`, `DISABLE_BOOTSNAP=1`, `BUNDLE_GEMFILE=<project>/Gemfile` (or `gems.rb`),
+`VCI_RAILS_ALLOW_DB=0|1`:
+
+- `tool_versions_with_env` / `installed_externals` (cached): `ruby -e 'require File.expand_path("config/environment")'`
+  in mode `probe`; the collector prints `VCI-PROBE {ruby, engine, rails, bundler, runner, platform, libs, db, gems:
+  [{name, version, platform, source}], gemfile, taints}` at exit. Taints (Bootsnap/Spring active, another Gemfile,
+  load path entries outside the repository/bundle/Ruby) or a Gemfile other than the project's are errors.
+- `run_collect`: per file (`$VCI_JOBS` at a time, default CPUs up to 8, 1 with `rails_allow_db`), mode `collect`,
+  `VCI_OUT=<fresh>`, `VCI_TEST_ID=<project-relative file>`: `ruby bin/rails test <file> --seed 0`.
+- `run_plain`: the same per file in mode `plain` (no output); without files `ruby bin/rails test --seed 0`.
+- `canonical_argv`: `["rails", "test", "--root", <project dir>, "--seed", "0", <file>]`; `config_candidates`:
+  `RAILS_GLOBAL_FILES` in the project dir; built-in pass-through `RAILS_PASS_THROUGH`; hashed patterns
+  `RAILS_HASHED_ENV`; `scratch_dirs`: `<project>/vendor/bundle`.
+
+Collector records (`docs/spike-rails.md`): `meta` has `adapter: "rails"`, `ruby`, `engine`, `rails`, `bundler`,
+`runner`, `platform`, `db`, `tz`, `collector`; `module` (every Ruby file compiled from disk, loaded native extensions),
+`read`, `probe`, `stat`, `readdir`, `write` (inside the repository), `external` (`name`, `version` incl. `git <rev>`
+for git sources, plus `platform` and `source`, which the parser ignores), `env` (`where` is informational; key `*` =
+enumerated), `taint`, `result` (`state` is `passed` only with exit status 0, at least one test, no failure, error or
+skip and at least one assertion in every test; also `no-tests`, `no-assertions`, `failed`; extra `assertions`,
+`noAssertions`, `exitStatus`). The CLI allows `write` records only for git-ignored paths under the project's
+`RAILS_SCRATCH_DIRS`, and waives `rails:network-db:` taints when `policy.rails_allow_db` (recorded in `waived`).
+
 ## vci-cli predicate and storage
 
 The signed predicate is `vci_core::Predicate` flattened, plus `envConfigDigest` (docs/ENV.md), `projectDir` (repo
@@ -305,8 +390,8 @@ relative), `runnerProject` (Vitest project name), `projectName` (the `[[projects
 single-project form), and for Go `platformSpecific` (repository files built only for some GOOS/GOARCH, or whose
 code refers to `GOOS`/`GOARCH`: the attestation then needs the same OS and architecture), `archSpecific` (why the
 results may differ on another architecture, i.e. floating-point code in a non-standard package of the closure: the
-attestation then needs the same architecture) and `waived` (refusals waived by `policy.go_allow_net`, which
-the base policy must still waive), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
+attestation then needs the same architecture) and `waived` (refusals waived by `policy.go_allow_net`, or for Rails by
+`policy.rails_allow_db`, which the base policy must still waive), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
 host's cfg set), and for every adapter `declaredInputs` (the `[[inputs]] extra` globs of the test id, which must equal
 the base config's); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
 `input_root` is the per-file manifest root; `global_input_root` is the per-file global manifest root (lockfiles,
@@ -316,9 +401,10 @@ snapshot file, and the `NODE_OPTIONS` env hash; for pytest: `vci.toml`, `pyproje
 directory up to the project dir; for Go: `vci.toml`, `go.mod`/`go.sum`/`go.work`/`go.work.sum` from the project dir
 up to the repo root and `vendor/modules.txt` in the project dir; for Cargo: `vci.toml`, `Cargo.toml` from the package dir
 up to the repo root, `Cargo.lock`/`rust-toolchain(.toml)`/`.cargo/config(.toml)` from the project dir up to the repo
-root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
+root; for Rails: `vci.toml`, `RAILS_GLOBAL_FILES` in the project dir, and `.ruby-version`/`.tool-versions`/`mise.toml`
+variants from the project dir up to the repo root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
 test id, input root, global input root, env config digest, toolchain and argv (plus the pytest toolchain fields, the
-project name, the Go and Rust toolchain fields, `platformSpecific`, `archSpecific`, `waived`, `cfgPredicates`, `declaredInputs` and a
+project name, the Go, Rust and Rails toolchain fields, `platformSpecific`, `archSpecific`, `waived`, `cfgPredicates`, `declaredInputs` and a
 non-Vitest adapter name when set), so re-running with identical inputs replaces (renews) the
 stored envelope.
 

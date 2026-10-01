@@ -58,6 +58,25 @@ impl Repo {
         Git::at(&self.root)
     }
 
+    /// The repository's git directory (for a linked worktree, its own).
+    pub fn git_dir(&self) -> Result<Utf8PathBuf, GitError> {
+        let dir = self
+            .git()
+            .args(["rev-parse", "--absolute-git-dir"])
+            .run_str()?;
+        Ok(Utf8PathBuf::from(dir))
+    }
+
+    /// The work tree root, or `None` for a bare repository.
+    pub fn work_tree(&self) -> Option<Utf8PathBuf> {
+        let out = self
+            .git()
+            .args(["rev-parse", "--is-bare-repository"])
+            .run_str()
+            .ok()?;
+        (out.trim() != "true").then(|| self.root.clone())
+    }
+
     /// Stable repository identity: the lexicographically smallest root commit
     /// reachable from HEAD.
     pub fn repo_id(&self) -> Result<String, GitError> {

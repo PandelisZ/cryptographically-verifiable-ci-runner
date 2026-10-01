@@ -78,9 +78,36 @@ pub fn never_hashed(adapter: &str) -> &'static [&'static str] {
             "PYTHONPATH",
         ],
         "go" | "cargo" => VCI_RUN_VARS,
+        // vci sets RUBYOPT (the collector), RAILS_ENV, BUNDLE_GEMFILE,
+        // PARALLEL_WORKERS, ... for every Rails test process.
+        "rails" => RAILS_NEVER_HASHED,
         _ => NEVER_HASHED,
     }
 }
+
+/// vci's per-run plumbing plus the variables it sets for every Rails test
+/// process ([`vci_adapter::RAILS_RUN_VARS`]).
+const RAILS_NEVER_HASHED: &[&str] = &[
+    "VCI_OUT",
+    "VCI_WORKER",
+    "VCI_LIST_OUT",
+    "VCI_GO_TESTLOG",
+    "VCI_TEST_ID",
+    "VCI_DB_DIR",
+    "VCI_ROOT",
+    "VCI_REPO",
+    "VCI_RAILS_MODE",
+    "VCI_RAILS_ALLOW_DB",
+    "RUBYOPT",
+    "RAILS_ENV",
+    "RACK_ENV",
+    "BUNDLE_GEMFILE",
+    "PARALLEL_WORKERS",
+    "DISABLE_SPRING",
+    "DISABLE_BOOTSNAP",
+    // A fresh empty directory for every process (like Go's).
+    "TMPDIR",
+];
 
 /// Hashed in loose mode even when no read of it is observed (see
 /// [`FileEnv::required_keys`]).
@@ -630,6 +657,31 @@ mod tests {
             FileEnv::for_file(&c, &[], "x").with_adapter("go").digest(),
             FileEnv::for_file(&c, &[], "x").digest()
         );
+    }
+
+    /// Rails: what vci sets for every test process (RUBYOPT with the
+    /// collector, RAILS_ENV, a fresh TMPDIR, ...) is never an input, so a
+    /// read of it is not hashed; other built-in pass-through reads are.
+    #[test]
+    fn rails_run_variables_are_never_hashed() {
+        let c = cfg(EnvMode::Strict);
+        let mut p = parent();
+        p.push(("TMPDIR".into(), "/var/folders/x".into()));
+        p.push(("HOME".into(), "/Users/me".into()));
+        let child = build_child_env_with(&c, &[], vci_adapter::RAILS_PASS_THROUGH, p);
+        let mut observed: BTreeSet<String> = vci_adapter::RAILS_RUN_VARS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        observed.insert("TMPDIR".into());
+        observed.insert("HOME".into());
+        let keys = FileEnv::for_file(&c, &[], "test/a_test.rb")
+            .with_adapter("rails")
+            .hashed_keys(&child, &observed);
+        for k in vci_adapter::RAILS_RUN_VARS.iter().chain(&["TMPDIR"]) {
+            assert!(!keys.contains(&k.to_string()), "{k}: {keys:?}");
+        }
+        assert!(keys.contains(&"HOME".to_string()), "{keys:?}");
     }
 
     #[test]

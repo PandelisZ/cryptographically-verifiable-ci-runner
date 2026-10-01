@@ -8,7 +8,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use vci_adapter::Observed;
 use vci_attest::{Statement, Subject, sign_statement};
 use vci_core::{
-    External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain, test_key,
+    External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain,
 };
 use vci_git::AttestStore;
 
@@ -151,6 +151,16 @@ pub fn toolchain_for(adapter: &str, v: &vci_adapter::ToolVersions) -> Toolchain 
             t.rust_host = v.rust_host.clone();
             t.rust_cfg = v.rust_cfg.clone();
         }
+        "rails" => {
+            t.ruby = v.ruby.clone();
+            t.ruby_engine = v.ruby_engine.clone();
+            t.rails = v.rails.clone();
+            t.bundler = v.ruby_bundler.clone();
+            t.ruby_test = v.runner.clone();
+            t.ruby_libs = v.ruby_libs.clone();
+            t.ruby_db = v.ruby_db.clone();
+            t.ruby_gems = v.ruby_gems.clone();
+        }
         _ => {
             t.node = v.node.clone();
             t.vitest = v.runner.clone();
@@ -205,6 +215,26 @@ fn collector_toolchain_mismatch(
                 v.runner, o.runner_version
             )
         }),
+        "rails" => (o.ruby != v.ruby
+            || o.ruby_engine != v.ruby_engine
+            || o.rails != v.rails
+            || o.ruby_bundler != v.ruby_bundler
+            || o.runner_version != v.runner)
+            .then(|| {
+                format!(
+                    "toolchain seen by the collector ({} {}, rails {}, bundler {}, {}) differs from the project's ({} {}, rails {}, bundler {}, {})",
+                    o.ruby_engine,
+                    o.ruby,
+                    o.rails,
+                    o.ruby_bundler,
+                    o.runner_version,
+                    v.ruby_engine,
+                    v.ruby,
+                    v.rails,
+                    v.ruby_bundler,
+                    v.runner
+                )
+            }),
         _ => (o.node != v.node || o.runner_version != v.runner || o.bundler_version != v.bundler)
             .then(|| {
                 format!(
@@ -298,6 +328,9 @@ fn check_one(
             || (adapter.name() == "cargo"
                 && !declared.is_empty()
                 && t.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT))
+            || (adapter.name() == "rails"
+                && project.policy.rails_allow_db
+                && t.starts_with(vci_adapter::RAILS_NETWORK_DB_TAINT))
     });
     if !taints.is_empty() {
         return Err(format!(
@@ -338,12 +371,32 @@ fn check_one(
     }
     // Files the test created, changed or deleted inside the repository are
     // outputs that later runs (or other test files) may read: not attestable.
-    let written: Vec<String> = o
+    // Rails: writes to git-ignored paths in the project's log/, tmp/,
+    // storage/ and coverage/ are allowed (derived state no checkout has; a
+    // later read of such a file that existed before the reading process
+    // started is an input, and will not match a fresh checkout).
+    let mut written: Vec<String> = o
         .writes
         .iter()
         .filter_map(|p| RepoPath::from_abs(&ctx.root, p).ok())
         .map(|p| p.as_str().to_owned())
         .collect();
+    if adapter.name() == "rails" && !written.is_empty() {
+        let scratch: Vec<Utf8PathBuf> = vci_adapter::RAILS_SCRATCH_DIRS
+            .iter()
+            .map(|d| project.dir.join(d))
+            .collect();
+        let candidates: Vec<String> = written
+            .iter()
+            .filter(|w| {
+                let abs = ctx.root.join(w);
+                scratch.iter().any(|d| abs.starts_with(d) && abs != *d)
+            })
+            .cloned()
+            .collect();
+        let ignored: BTreeSet<String> = git_ignored(&ctx.root, &candidates).into_iter().collect();
+        written.retain(|w| !ignored.contains(w));
+    }
     if !written.is_empty() {
         return Err(format!(
             "wrote inside the repository: {}",
@@ -355,6 +408,12 @@ fn check_one(
         return Err(format!(
             "result {} ({} tests; no test ran or some were filtered out, so the run cannot vouch for the unit)",
             result.state, result.tests
+        ));
+    }
+    if result.state == "no-assertions" {
+        return Err(format!(
+            "result no-assertions ({} tests; a test that makes no assertion vouches for nothing)",
+            result.tests
         ));
     }
     if !result.is_pass() {
@@ -611,9 +670,20 @@ fn covered(root: &Utf8Path, m: &InputManifest, rp: &RepoPath) -> bool {
 
 /// Recorded inputs that git ignores: a fresh checkout (CI) does not have
 /// them, so the attestation will not match there.
+/// A Rails credentials key file (`config/master.key`,
+/// `config/credentials/<env>.key`), relative to the repository root.
+fn is_rails_key_file(p: &str) -> bool {
+    let in_config =
+        |rest: &str| p == format!("config/{rest}") || p.ends_with(&format!("/config/{rest}"));
+    in_config("master.key")
+        || p.rsplit_once("/").is_some_and(|(dir, f)| {
+            f.ends_with(".key")
+                && (dir == "config/credentials" || dir.ends_with("/config/credentials"))
+        })
+}
+
 fn ignored_inputs(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
-    use std::io::Write as _;
-    let paths: Vec<&str> = m
+    let paths: Vec<String> = m
         .entries
         .iter()
         .filter(|e| {
@@ -622,8 +692,15 @@ fn ignored_inputs(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
                 vci_core::EntryKind::Absent | vci_core::EntryKind::Excluded
             ) && !e.path.is_root()
         })
-        .map(|e| e.path.as_str())
+        .map(|e| e.path.as_str().to_owned())
         .collect();
+    git_ignored(root, &paths)
+}
+
+/// The repo-relative `paths` git ignores (`git check-ignore`); any error
+/// means none (so nothing is treated as ignored).
+fn git_ignored(root: &Utf8Path, paths: &[String]) -> Vec<String> {
+    use std::io::Write as _;
     if paths.is_empty() {
         return vec![];
     }
@@ -655,6 +732,22 @@ struct PredicateBase {
     dirty: bool,
     issued: i64,
     ttl: i64,
+}
+
+/// The absolute paths CLI unit arguments name (a cargo `<dir>#<target>`
+/// names `<dir>`), or `None` when one cannot be resolved (then every project
+/// is listed and [`resolve_files`] reports the problem).
+fn unit_paths(args: &[String]) -> Option<Vec<camino::Utf8PathBuf>> {
+    let cwd = crate::ctx::cwd().ok()?;
+    args.iter()
+        .map(|a| {
+            cwd.join(a).canonicalize_utf8().ok().or_else(|| {
+                let (dir, _) = a.rsplit_once('#')?;
+                let dir = if dir.is_empty() { "." } else { dir };
+                cwd.join(dir).canonicalize_utf8().ok()
+            })
+        })
+        .collect()
 }
 
 /// Resolve CLI file arguments (relative to cwd) to indexes into `files`
@@ -735,8 +828,28 @@ pub fn run(args: RunArgs) -> Result<i32> {
         .iter()
         .map(|p| crate::externals::uv_lock_packages(&p.dir, &ctx.root))
         .collect();
+    // With explicit units, only projects whose directory can hold one of
+    // them are listed (a project only ever lists units below its own
+    // directory), so another project's missing toolchain does not matter.
+    // Projects nested in each other are all listed, so a unit two projects
+    // list is still found ambiguous.
+    let wanted = if args.files.is_empty() {
+        None
+    } else {
+        unit_paths(&args.files)
+    };
     let mut files: Vec<TestFile> = Vec::new();
     for (i, p) in ctx.projects.iter().enumerate() {
+        if let Some(paths) = &wanted {
+            let dir = p
+                .adapter
+                .project_dir()
+                .canonicalize_utf8()
+                .unwrap_or_else(|_| p.adapter.project_dir().to_owned());
+            if !paths.iter().any(|a| a.starts_with(&dir)) {
+                continue;
+            }
+        }
         let listed = p
             .adapter
             .list_test_files(&children[i].to_child_env())
@@ -891,11 +1004,26 @@ pub fn run(args: RunArgs) -> Result<i32> {
                     for w in junk_in_listings(&ctx.root, &p.core.manifest) {
                         eprintln!("vci: warning: {label}: {w}");
                     }
-                    if project.adapter.name() == "cargo" {
+                    if p.core.manifest.env.iter().any(|e| e.key == "CI") {
+                        eprintln!(
+                            "vci: warning: {label}: it reads CI, which CI runners set (to \"true\"): unless it had that value here, this attestation will not match on a runner{}",
+                            if project.adapter.name() == "rails" {
+                                "; Rails' generated config/environments/test.rb reads it (config.eager_load = ENV[\"CI\"].present?)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    if matches!(project.adapter.name(), "cargo" | "rails") {
                         let ignored = ignored_inputs(&ctx.root, &p.core.manifest);
                         if !ignored.is_empty() {
+                            let why = if project.adapter.name() == "cargo" {
+                                "every file in a package directory is an input"
+                            } else {
+                                "the test read them; delete them before attesting if they are leftovers"
+                            };
                             eprintln!(
-                                "vci: warning: {label}: inputs ignored by git (a fresh checkout, e.g. in CI, will not have them, so this attestation will not match there; every file in a package directory is an input): {}{}",
+                                "vci: warning: {label}: inputs ignored by git (a fresh checkout, e.g. in CI, will not have them, so this attestation will not match there; {why}): {}{}",
                                 ignored
                                     .iter()
                                     .take(10)
@@ -904,6 +1032,13 @@ pub fn run(args: RunArgs) -> Result<i32> {
                                     .join(", "),
                                 if ignored.len() > 10 { ", ..." } else { "" }
                             );
+                            if project.adapter.name() == "rails"
+                                && let Some(key) = ignored.iter().find(|p| is_rails_key_file(p))
+                            {
+                                eprintln!(
+                                    "vci: warning: {label}: it read {key}, Rails' credentials key (git-ignored, so never in CI): in an app generated with credentials, Active Record reads it at boot, so no test that boots Rails is skipped in CI. Give the test environment its own credentials with a committed key (`bin/rails credentials:edit --environment test`, then commit config/credentials/test.key and test.yml.enc), or remove config/master.key and the credentials file if the tests need none, or declare RAILS_MASTER_KEY in vci.toml and set it to the same value here and in CI"
+                                );
+                            }
                         }
                     }
                     let skey = storage_key(p);
@@ -920,12 +1055,14 @@ pub fn run(args: RunArgs) -> Result<i32> {
                     );
                     let env = sign_statement(&stmt, &key.path)
                         .with_context(|| format!("signing with {}", key.path))?;
-                    store.put(&signer, &test_key(&p.core.test_id), &skey, &env.to_json())?;
+                    let stored = store.put(&p.core.test_id, &signer, &skey, &env.to_json())?;
                     attested += 1;
                     eprintln!(
-                        "vci: attested {label} ({} inputs, root {}) on refs/attest/v1/{signer}",
+                        "vci: attested {label} ({} inputs, root {}) as git-meta {} {}",
                         p.core.manifest.entries.len(),
-                        &p.core.input_root[..16]
+                        &p.core.input_root[..16],
+                        stored.target,
+                        stored.key
                     );
                 }
             }
@@ -952,6 +1089,27 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn rails_key_files() {
+        for p in [
+            "config/master.key",
+            "app/config/master.key",
+            "config/credentials/test.key",
+            "shop/config/credentials/production.key",
+        ] {
+            assert!(is_rails_key_file(p), "{p}");
+        }
+        for p in [
+            "config/master.key.bak",
+            "lib/config/credentials/x/test.key",
+            "config/credentials/test.yml.enc",
+            "notconfig/master.key",
+            "master.key",
+        ] {
+            assert!(!is_rails_key_file(p), "{p}");
+        }
     }
 
     /// `[[inputs]] extra` globs: a literal file, a missing path, and a glob

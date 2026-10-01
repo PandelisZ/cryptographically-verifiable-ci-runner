@@ -37,4 +37,5 @@ Add these to your shell profile so vci can find its collectors:
 
   export VCI_PY_PLUGIN="$VCI_HOME/py/pytest-plugin"
   export VCI_JS_PLUGIN="$VCI_HOME/js/vitest-plugin"
+  export VCI_RUBY_COLLECTOR="$VCI_HOME/ruby/vci-collector"
 MSG

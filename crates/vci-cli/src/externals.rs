@@ -187,6 +187,25 @@ pub fn cargo_locked(
     }
 }
 
+/// `Ok(())` if the gem `name` is in the bundle Bundler resolves now in
+/// exactly `version` (a git source's locked revision included). The
+/// platform of a native gem's build is not compared (see README, "Rails").
+pub fn rails_bundled(
+    bundle: &Result<InstalledExternals, String>,
+    name: &str,
+    version: &str,
+) -> Result<(), String> {
+    let bundle = bundle
+        .as_ref()
+        .map_err(|e| format!("cannot resolve the bundle: {e}"))?;
+    match bundle.get(name).map(Vec::as_slice) {
+        None | Some([]) => Err("not in the bundle".into()),
+        Some([v]) if v == version => Ok(()),
+        Some([v]) => Err(v.clone()),
+        Some(vs) => Err(format!("several versions: {}", vs.join(", "))),
+    }
+}
+
 fn version_of(pkg_json: &Utf8Path) -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(pkg_json).ok()?).ok()?;
     v.get("version")?.as_str().map(str::to_owned)
@@ -372,6 +391,21 @@ source = { virtual = "." }
         );
         assert!(cargo_locked(&lock, "hex", "0.4.3 registry+x dd").is_err());
         assert!(cargo_locked(&Err("gone".into()), "syn", "2.0.1 registry+x bb").is_err());
+    }
+
+    #[test]
+    fn rails_gems_must_be_in_the_bundle_exactly() {
+        let b: Result<InstalledExternals, String> = Ok([
+            ("rack".to_owned(), vec!["3.2.7".to_owned()]),
+            ("mygem".to_owned(), vec!["0.1.0 git abc123".to_owned()]),
+        ]
+        .into_iter()
+        .collect());
+        assert_eq!(rails_bundled(&b, "rack", "3.2.7"), Ok(()));
+        assert_eq!(rails_bundled(&b, "rack", "3.2.6"), Err("3.2.7".into()));
+        assert!(rails_bundled(&b, "pg", "1.0").is_err());
+        assert!(rails_bundled(&b, "mygem", "0.1.0 git def456").is_err());
+        assert!(rails_bundled(&Err("boom".into()), "rack", "3.2.7").is_err());
     }
 
     /// Regression: a non-editable path dependency (`source = { directory =

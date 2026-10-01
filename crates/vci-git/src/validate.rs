@@ -110,9 +110,74 @@ pub(crate) fn remote(s: &str) -> Result<(), GitError> {
     Ok(())
 }
 
+/// URL schemes a metadata remote read from a committed file (`.git-meta`)
+/// may use.
+const SETUP_SCHEMES: &[&str] = &["https", "http", "ssh", "git", "file", "git+ssh", "ssh+git"];
+
+/// A metadata remote URL taken from a file in the checkout (`.git-meta`),
+/// which a pull request can change: everything [`remote`] checks, and no
+/// remote helper (`<transport>::<address>`, such as `fd::3` or `ext::<cmd>`)
+/// or unknown `<scheme>://`. scp-like (`user@host:path`) and local paths are
+/// fine.
+pub(crate) fn setup_url(s: &str) -> Result<(), GitError> {
+    remote(s)?;
+    let what = "metadata remote URL";
+    if s.chars().any(char::is_whitespace) {
+        return Err(invalid(what, s, "must not contain whitespace"));
+    }
+    if let Some((helper, _)) = s.split_once("::")
+        && !helper.contains('/')
+    {
+        return Err(invalid(
+            what,
+            s,
+            "remote helpers (`<transport>::<address>`, e.g. fd:: or ext::) are not allowed",
+        ));
+    }
+    if let Some((scheme, _)) = s.split_once("://")
+        && !scheme.contains('/')
+        && !SETUP_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str())
+    {
+        return Err(invalid(
+            what,
+            s,
+            "only https, http, ssh, git and file URLs, scp-like addresses and paths are allowed",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_urls() {
+        for ok in [
+            "https://github.com/o/r.git",
+            "git@github.com:o/r.git",
+            "ssh://git@example.com/o/r.git",
+            "file:///srv/meta.git",
+            "/srv/meta.git",
+            "../meta.git",
+            "C:/meta.git",
+        ] {
+            assert!(setup_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "fd::3",
+            "ext::sh -c touch% /tmp/x",
+            "foo::bar",
+            "-oProxyCommand=x",
+            "--upload-pack=x",
+            "https://a b",
+            "gopher://example.com/r",
+            "",
+            "a\nb",
+        ] {
+            assert!(setup_url(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn signer_ids() {

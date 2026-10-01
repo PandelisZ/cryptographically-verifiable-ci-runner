@@ -205,6 +205,8 @@ fn stale_bytecode_is_never_used_by_the_collecting_run() {
         .args(["run", "--locked", "pytest", "-q", "tests/test_a.py"])
         .current_dir(&dir)
         .env_remove("PYTHONPYCACHEPREFIX")
+        // The setup needs the plain run to write bytecode.
+        .env_remove("PYTHONDONTWRITEBYTECODE")
         .env_remove("VIRTUAL_ENV")
         .output()
         .unwrap();

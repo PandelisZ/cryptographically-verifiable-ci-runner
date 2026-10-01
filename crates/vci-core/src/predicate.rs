@@ -78,6 +78,37 @@ pub struct Toolchain {
     /// another platform; compared exactly when `rust_host` is the same.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rust_cfg: Vec<String>,
+    /// Rails adapter: Ruby version and patchlevel (`3.4.9p82`), compared
+    /// exactly.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ruby: String,
+    /// Rails adapter: `RUBY_ENGINE RUBY_ENGINE_VERSION` (`ruby 3.4.9`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ruby_engine: String,
+    /// Rails adapter: the Rails version.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rails: String,
+    /// Rails adapter: the Bundler version.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bundler: String,
+    /// Rails adapter: the test framework and its version (`minitest 6.0.6`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ruby_test: String,
+    /// Rails adapter: libraries tests commonly depend on whose version the gem
+    /// versions do not fix (`sqlite=<SQLite library>;yaml=<libyaml>;tz=<time
+    /// zone data: tzinfo-data, or the system zoneinfo version>;encoding=<default
+    /// external/internal>`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ruby_libs: String,
+    /// Rails adapter: the database software of the test environment
+    /// (`sqlite3`; `postgresql <server version>` under policy.rails_allow_db).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ruby_db: String,
+    /// Rails adapter: every gem of the resolved bundle as sorted
+    /// `name==version` (no platform: a native gem's builds of one version are
+    /// the same gem on every platform).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ruby_gems: Vec<String>,
     /// The tests ran as the superuser (effective uid 0 on Unix): permission
     /// checks do not apply to it (a mode-000 file is readable), so a test's
     /// result can depend on it. Compared exactly; omitted when false, so
@@ -119,6 +150,13 @@ impl Toolchain {
             ("go", &self.go, &now.go),
             ("rustc", &self.rust, &now.rust),
             ("cargo", &self.cargo, &now.cargo),
+            ("ruby", &self.ruby, &now.ruby),
+            ("ruby engine", &self.ruby_engine, &now.ruby_engine),
+            ("rails", &self.rails, &now.rails),
+            ("bundler", &self.bundler, &now.bundler),
+            ("ruby test framework", &self.ruby_test, &now.ruby_test),
+            ("ruby libraries", &self.ruby_libs, &now.ruby_libs),
+            ("database", &self.ruby_db, &now.ruby_db),
         ] {
             if a != b {
                 out.push((what, a.clone(), b.clone()));
@@ -161,6 +199,9 @@ impl Toolchain {
                 now.go_arch_level.clone(),
             ));
         }
+        if self.ruby_gems != now.ruby_gems {
+            out.push(set_diff("gems (bundle)", &self.ruby_gems, &now.ruby_gems));
+        }
         if self.python_dists != now.python_dists {
             let a: std::collections::BTreeSet<&String> = self.python_dists.iter().collect();
             let b: std::collections::BTreeSet<&String> = now.python_dists.iter().collect();
@@ -181,6 +222,26 @@ impl Toolchain {
         }
         out
     }
+}
+
+/// `(what, "only attested: ...", "only installed now: ...")` for two lists.
+fn set_diff(what: &'static str, a: &[String], b: &[String]) -> (&'static str, String, String) {
+    let a: std::collections::BTreeSet<&String> = a.iter().collect();
+    let b: std::collections::BTreeSet<&String> = b.iter().collect();
+    let only = |x: &std::collections::BTreeSet<&String>,
+                y: &std::collections::BTreeSet<&String>| {
+        let v: Vec<&str> = x.difference(y).map(|s| s.as_str()).collect();
+        if v.is_empty() {
+            "-".to_owned()
+        } else {
+            v.join(" ")
+        }
+    };
+    (
+        what,
+        format!("only attested: {}", only(&a, &b)),
+        format!("only installed now: {}", only(&b, &a)),
+    )
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -491,6 +552,56 @@ mod tests {
         assert!(rs.diff(&linux).is_empty(), "{:?}", rs.diff(&linux));
         assert!(!rs.diff(&sample().toolchain).is_empty());
         assert!(!sample().toolchain.diff(&rs).is_empty());
+    }
+
+    /// Rails: Ruby (with patchlevel), engine, Rails, Bundler, the test
+    /// framework, the libraries, the database and the bundle exactly; a Rails
+    /// toolchain never matches another adapter's.
+    #[test]
+    fn rails_toolchain_rules() {
+        let rb = Toolchain {
+            ruby: "3.4.9p82".into(),
+            ruby_engine: "ruby 3.4.9".into(),
+            rails: "8.1.3.1".into(),
+            bundler: "4.0.9".into(),
+            ruby_test: "minitest 6.0.6".into(),
+            ruby_libs: "sqlite=3.53.2;yaml=0.2.5;tz=tzinfo-data;encoding=UTF-8/UTF-8".into(),
+            ruby_db: "sqlite3".into(),
+            ruby_gems: vec!["nokogiri==1.19.4".into(), "rack==3.2.7".into()],
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ..Default::default()
+        };
+        assert!(rb.diff(&rb.clone()).is_empty());
+        // Linux CI with the same versions: only the platform policy decides.
+        let linux = Toolchain {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ..rb.clone()
+        };
+        assert!(rb.diff(&linux).is_empty());
+        for (what, f) in [
+            (
+                "ruby",
+                (|t: &mut Toolchain| t.ruby = "3.4.8p72".into()) as fn(&mut Toolchain),
+            ),
+            ("rails", |t| t.rails = "8.1.3".into()),
+            ("bundler", |t| t.bundler = "2.6.9".into()),
+            ("ruby test framework", |t| {
+                t.ruby_test = "minitest 5.25.4".into()
+            }),
+            ("ruby libraries", |t| t.ruby_libs = "sqlite=3.45.1".into()),
+            ("database", |t| t.ruby_db = "postgresql 16.4".into()),
+            ("gems (bundle)", |t| t.ruby_gems.push("pg==1.6.0".into())),
+        ] {
+            let mut other = rb.clone();
+            f(&mut other);
+            assert_eq!(rb.diff(&other)[0].0, what);
+        }
+        let v = serde_json::to_value(&rb).unwrap();
+        assert_eq!(v["rubyGems"][0], "nokogiri==1.19.4");
+        assert!(!rb.diff(&sample().toolchain).is_empty());
+        assert!(!sample().toolchain.diff(&rb).is_empty());
     }
 
     #[test]

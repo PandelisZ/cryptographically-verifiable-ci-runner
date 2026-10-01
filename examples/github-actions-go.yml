@@ -38,11 +38,16 @@ jobs:
       - name: Download modules
         run: go mod download
 
+      # Pinned to a commit of vci (replace <commit-sha> with a full SHA): the
+      # verifier must not change under you, and a branch or tag can move.
       - name: Install vci
         run: |
-          git clone --depth 1 https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
+          git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
+          git -C "$RUNNER_TEMP/vci" checkout --detach <commit-sha>
           cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
 
+      # git-meta pull of refs/meta/main (attestations pushed with `vci push`
+      # or `git meta push`) into .git/git-meta.sqlite; read access is enough.
       - name: Fetch attestations
         run: vci fetch --remote origin
 

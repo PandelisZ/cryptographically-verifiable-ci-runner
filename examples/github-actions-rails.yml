@@ -1,0 +1,71 @@
+# .github/workflows/test.yml: run only the Rails test files that no trusted
+# developer has already attested for these exact inputs.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rails:
+    runs-on: ubuntu-latest
+    env:
+      # Declared in vci.toml ([env] global = ["TZ"]) and set to the same value
+      # where tests are attested: Ruby's local time zone otherwise comes from
+      # the machine.
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be available to read policy from
+
+      # Attestations only match the exact Ruby version and patchlevel they
+      # were made with (and the same Rails, Bundler, Minitest, gem versions,
+      # SQLite library and time zone data). Pin the version in .ruby-version
+      # (or here) and attest with the same one locally. bundler-cache installs
+      # the Gemfile.lock bundle into vendor/bundle (Gemfile.lock must list the
+      # x86_64-linux platform: `bundle lock --add-platform x86_64-linux`).
+      # Nothing attested is skipped here if the tests read the git-ignored
+      # config/master.key (a generated app's Active Record does at boot; see
+      # "Credentials" in vci's README) or run under a Bootsnap compile cache.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4.9"
+          bundler-cache: true
+
+      # The CLI and its Ruby collector (ruby/vci-collector) come from the same
+      # vci checkout; VCI_RUBY_COLLECTOR tells vci where the collector lives.
+      # Pinned to a commit of vci (replace <commit-sha> with a full SHA): the
+      # verifier must not change under you, and a branch or tag can move.
+      - name: Install vci
+        run: |
+          git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
+          git -C "$RUNNER_TEMP/vci" checkout --detach <commit-sha>
+          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+          echo "VCI_RUBY_COLLECTOR=$RUNNER_TEMP/vci/ruby/vci-collector" >> "$GITHUB_ENV"
+
+      # git-meta pull of refs/meta/main (attestations pushed with `vci push`
+      # or `git meta push`) into .git/git-meta.sqlite; read access is enough.
+      - name: Fetch attestations
+        run: vci fetch --remote origin
+
+      # Policy (vci.toml) and trust (.vci/allowed_signers) are read from the
+      # BASE commit, so a pull request cannot add its own signer. On pushes to
+      # main the base is the pushed commit itself: `vci init` lists
+      # refs/heads/main in policy.no_skip_refs, so everything runs there.
+      # `vci ci` runs each remaining file in its own `bin/rails test <file>`
+      # (fresh SQLite databases loaded from db/schema.rb, one process, the
+      # fixed seed attestations are made with) and exits non-zero if any fails.
+      - name: Plan, then run what is not attested
+        run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
+
+      - name: Upload the audit log of skipped tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vci-audit
+          path: vci-audit.json

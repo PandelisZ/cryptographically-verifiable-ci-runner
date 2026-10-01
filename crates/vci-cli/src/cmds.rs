@@ -1,11 +1,11 @@
-//! `ci`, `verify`, `init`, `push`, `fetch`.
+//! `ci`, `verify`, `init`, `push`, `fetch`, `prune`.
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::json;
 use vci_adapter::Adapter;
 use vci_attest::{AllowedSigners, Envelope, verify_envelope};
-use vci_git::AttestStore;
+use vci_git::{AttestStore, SETUP_FILE};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, template_for};
 use crate::ctx::{VciPredicate, open_repo};
@@ -16,6 +16,7 @@ pub const CI_SNIPPET: &str = include_str!("../../../examples/github-actions.yml"
 pub const CI_SNIPPET_PYTEST: &str = include_str!("../../../examples/github-actions-pytest.yml");
 pub const CI_SNIPPET_GO: &str = include_str!("../../../examples/github-actions-go.yml");
 pub const CI_SNIPPET_CARGO: &str = include_str!("../../../examples/github-actions-cargo.yml");
+pub const CI_SNIPPET_RAILS: &str = include_str!("../../../examples/github-actions-rails.yml");
 
 pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i32> {
     let res = plan(&PlanOptions {
@@ -39,7 +40,7 @@ pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i3
         jobs.push(("default project".into(), adapter, None, None));
     }
     for (i, p) in res.projects.iter().enumerate() {
-        let adapter = vci_adapter::adapter_for(&p.adapter, &p.dir)?;
+        let adapter = vci_adapter::adapter_for_with(&p.adapter, &p.dir, &p.adapter_options)?;
         let env = p.child_env.as_ref().and_then(|c| c.to_child_env());
         let label = if p.name.is_empty() {
             p.path.clone()
@@ -195,8 +196,9 @@ pub fn init(
     project: Option<String>,
     adapter_name: Option<String>,
     install: bool,
+    meta_url: Option<String>,
 ) -> Result<i32> {
-    let (_repo, root) = open_repo()?;
+    let (repo, root) = open_repo()?;
     let cfg_path = root.join(CONFIG_FILE);
     let adapter_name = adapter_name.unwrap_or_else(|| "vitest".into());
     if !vci_adapter::ADAPTERS.contains(&adapter_name.as_str()) {
@@ -239,6 +241,7 @@ pub fn init(
         }
     }
     std::fs::write(&signers, existing)?;
+    setup_git_meta(&repo, &root, meta_url.as_deref())?;
 
     let config = crate::ctx::working_tree_config(&root)?;
     let specs = config.project_specs();
@@ -292,16 +295,47 @@ pub fn init(
             vci_adapter::CARGO_BIN_ENV
         );
     }
+    if specs.iter().any(|s| s.adapter == "rails") {
+        for s in specs.iter().filter(|s| s.adapter == "rails") {
+            let dir = root.join(&s.rel);
+            if let Err(e) = vci_adapter::find_ruby_collector(&dir) {
+                eprintln!("vci init: note: {e}");
+            }
+            if !dir.join("bin/rails").is_file() {
+                eprintln!(
+                    "vci init: note: {} has no bin/rails; the rails adapter's project must be the Rails application root",
+                    dir
+                );
+            }
+        }
+        if std::process::Command::new(
+            std::env::var_os(vci_adapter::RUBY_BIN_ENV)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "ruby".into()),
+        )
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+        {
+            eprintln!(
+                "vci init: note: the rails adapter runs `ruby bin/rails test`; install the Ruby in .ruby-version or set {} to the ruby binary",
+                vci_adapter::RUBY_BIN_ENV
+            );
+        }
+    }
     let vitest: Vec<_> = specs.iter().filter(|s| s.adapter == "vitest").collect();
     if vitest.is_empty() {
         let snippet = if specs.iter().all(|s| s.adapter == "go") {
             CI_SNIPPET_GO
         } else if specs.iter().all(|s| s.adapter == "cargo") {
             CI_SNIPPET_CARGO
+        } else if specs.iter().all(|s| s.adapter == "rails") {
+            CI_SNIPPET_RAILS
         } else {
             CI_SNIPPET_PYTEST
         };
-        println!("Commit {CONFIG_FILE} and {ALLOWED_SIGNERS_FILE}. GitHub Actions example:\n");
+        println!("{COMMIT_HINT} GitHub Actions example:\n");
         println!("{snippet}");
         return Ok(0);
     }
@@ -333,9 +367,49 @@ pub fn init(
             vci_adapter::JS_PLUGIN_ENV
         );
     }
-    println!("Commit {CONFIG_FILE} and {ALLOWED_SIGNERS_FILE}. GitHub Actions example:\n");
+    println!("{COMMIT_HINT} GitHub Actions example:\n");
     println!("{CI_SNIPPET}");
     Ok(0)
+}
+
+const COMMIT_HINT: &str = "Commit vci.toml, .vci/allowed_signers and .git-meta.";
+
+/// Point git-meta at the metadata remote: write `.git-meta` (the file
+/// `git meta setup` reads) if there is none, and configure the local
+/// metadata remote. Attestations are exchanged there on `refs/meta/main`.
+fn setup_git_meta(repo: &vci_git::Repo, root: &Utf8Path, meta_url: Option<&str>) -> Result<()> {
+    let file = root.join(SETUP_FILE);
+    let existing = vci_git::meta::read_setup_url(&file)?;
+    let origin = std::process::Command::new("git")
+        .args(["-C", root.as_str(), "config", "--get", "remote.origin.url"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty());
+    match (
+        &existing,
+        meta_url.map(str::to_owned).or_else(|| origin.clone()),
+    ) {
+        (Some(u), _) => eprintln!("vci init: {file} exists (url: {u}), leaving it alone"),
+        (None, Some(u)) => {
+            std::fs::write(&file, format!("url: {u}\n"))?;
+            eprintln!("vci init: wrote {file} (git-meta metadata remote: {u})");
+        }
+        (None, None) => {
+            eprintln!(
+                "vci init: note: no origin remote and no --meta-url; attestations stay local until a git-meta remote is configured (`git meta remote add <url>`)"
+            );
+            return Ok(());
+        }
+    }
+    match AttestStore::new(repo).ensure_remote(meta_url) {
+        Ok(name) => eprintln!(
+            "vci init: git-meta remote {name:?} configured; `vci push` / `vci fetch` (or `git meta push` / `git meta pull`) exchange attestations on refs/meta/main"
+        ),
+        Err(e) => eprintln!("vci init: note: could not configure a git-meta remote: {e}"),
+    }
+    Ok(())
 }
 
 fn toml_str(s: &str) -> String {
@@ -351,17 +425,181 @@ fn git_email(root: &Utf8Path) -> Option<String> {
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
-pub fn push(remote: &str) -> Result<i32> {
+fn print_exchange_messages(warnings: &[String], notes: &[String]) {
+    for n in notes {
+        eprintln!("vci: note: {n}");
+    }
+    for w in warnings {
+        eprintln!("vci: warning: {w}");
+    }
+}
+
+/// Say which URL a metadata remote resolved without `--remote` points at:
+/// it may come from `.git-meta` in the checkout.
+fn print_default_remote(store: &AttestStore, remote: Option<&str>, name: &str) {
+    if remote.is_none()
+        && let Ok(Some(url)) = store.remote_url(name)
+    {
+        eprintln!("vci: git-meta remote {name} is {}", redact_userinfo(&url));
+    }
+}
+
+/// `scheme://user:secret@host/...` without the credentials.
+fn redact_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..host_end].rfind('@') {
+        Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
+        None => url.to_owned(),
+    }
+}
+
+pub fn push(remote: Option<&str>) -> Result<i32> {
     let (repo, _) = open_repo()?;
-    AttestStore::new(&repo).push(remote)?;
-    eprintln!("vci: pushed attestation refs to {remote}");
+    let store = AttestStore::new(&repo);
+    let out = store.push(remote)?;
+    print_default_remote(&store, remote, &out.remote);
+    print_exchange_messages(&out.warnings, &out.notes);
+    match out.status {
+        vci_git::PushStatus::Pushed => {
+            eprintln!(
+                "vci: pushed git-meta metadata (refs/meta/main) to {}",
+                out.remote
+            )
+        }
+        vci_git::PushStatus::UpToDate => eprintln!(
+            "vci: nothing to push: {}'s refs/meta/main already has every local attestation",
+            out.remote
+        ),
+        vci_git::PushStatus::NothingStored => eprintln!(
+            "vci: nothing to push: no attestations are stored locally (run `vci run` first)"
+        ),
+    }
     Ok(0)
 }
 
-pub fn fetch(remote: &str) -> Result<i32> {
+pub fn fetch(remote: Option<&str>) -> Result<i32> {
     let (repo, _) = open_repo()?;
-    AttestStore::new(&repo).fetch(remote)?;
-    let n = AttestStore::new(&repo).list(None)?.len();
-    eprintln!("vci: fetched attestation refs from {remote} ({n} envelopes stored locally)");
+    let store = AttestStore::new(&repo);
+    let out = store.fetch(remote)?;
+    print_default_remote(&store, remote, &out.remote);
+    print_exchange_messages(&out.warnings, &out.notes);
+    let n = store.list(None)?.len();
+    if out.found {
+        eprintln!(
+            "vci: fetched git-meta metadata from {} ({n} attestations stored locally)",
+            out.remote
+        );
+    } else {
+        eprintln!(
+            "vci: {} has no git-meta metadata yet (refs/meta/main); {n} attestations stored locally",
+            out.remote
+        );
+    }
     Ok(0)
+}
+
+/// `vci prune`: delete attestations that have expired (git-meta tombstones,
+/// published by the next `vci push`). Only the claimed expiry is read; an
+/// envelope that cannot be parsed is left alone.
+pub fn prune(dry_run: bool) -> Result<i32> {
+    let (repo, _) = open_repo()?;
+    let store = AttestStore::new(&repo);
+    let now = now_unix();
+    let (mut expired, mut kept, mut unreadable) = (0usize, 0usize, 0usize);
+    for e in store.list(None)? {
+        match envelope_expiry(&e.bytes) {
+            Some(t) if t <= now => {
+                expired += 1;
+                if dry_run {
+                    println!("would remove {} {}", e.target, e.key);
+                } else {
+                    store.remove(&e)?;
+                    println!("removed {} {}", e.target, e.key);
+                }
+            }
+            Some(_) => kept += 1,
+            None => unreadable += 1,
+        }
+    }
+    eprintln!(
+        "vci prune: {expired} expired{}, {kept} current, {unreadable} unreadable (left alone)",
+        if dry_run { " (dry run)" } else { "" }
+    );
+    if expired > 0 && !dry_run {
+        eprintln!("vci prune: run `vci push` (or `git meta push`) to publish the deletions");
+    }
+    Ok(0)
+}
+
+/// The `expiresAt` an envelope claims (unverified), as Unix seconds.
+fn envelope_expiry(bytes: &[u8]) -> Option<i64> {
+    use base64::Engine as _;
+    let env = Envelope::from_json(bytes).ok()?;
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(&env.payload)
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    parse_rfc3339(v["predicate"]["expiresAt"].as_str()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls_are_printed_without_credentials() {
+        assert_eq!(
+            redact_userinfo("https://x-access-token:ghs_secret@github.com/o/r.git"),
+            "https://***@github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_userinfo("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            redact_userinfo("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
+
+    /// Every CI snippet `vci init` prints installs a vci pinned to a commit
+    /// (the verifier must not move under a workflow), never a branch head.
+    #[test]
+    fn ci_snippets_pin_vci_to_a_commit() {
+        for (name, s) in [
+            ("vitest", CI_SNIPPET),
+            ("pytest", CI_SNIPPET_PYTEST),
+            ("go", CI_SNIPPET_GO),
+            ("cargo", CI_SNIPPET_CARGO),
+            ("rails", CI_SNIPPET_RAILS),
+        ] {
+            let install: Vec<&str> = s
+                .lines()
+                .filter(|l| {
+                    l.contains("cryptographically-verifiable-ci-runner")
+                        && !l.trim_start().starts_with('#')
+                })
+                .collect();
+            assert!(!install.is_empty(), "{name}: no vci install step");
+            for l in &install {
+                assert!(
+                    !l.contains("--depth"),
+                    "{name}: shallow clone of a branch: {l}"
+                );
+                if l.contains("cargo install") {
+                    assert!(l.contains("--rev <commit-sha>"), "{name}: {l}");
+                } else if l.contains("git clone") {
+                    assert!(
+                        s.contains("checkout --detach <commit-sha>"),
+                        "{name}: clone without a pinned checkout"
+                    );
+                } else if l.contains("uses:") {
+                    assert!(l.contains("@<commit-sha>"), "{name}: {l}");
+                }
+            }
+        }
+    }
 }

@@ -13,6 +13,7 @@ mod cargo;
 mod golang;
 mod jsonl;
 mod pytest;
+mod rails;
 mod vitest;
 
 use std::collections::BTreeMap;
@@ -32,21 +33,46 @@ pub use pytest::{
     JOBS_ENV, PY_PLUGIN_ENV, PYTEST_CONFIG_NAMES, PYTEST_HASHED_ENV, PYTEST_PASS_THROUGH,
     PytestAdapter, UV_ENV, UV_RUN_ARGS, find_py_plugin, pytest_jobs,
 };
+pub use rails::{
+    RAILS_GLOBAL_FILES, RAILS_HASHED_ENV, RAILS_NETWORK_DB_TAINT, RAILS_PASS_THROUGH,
+    RAILS_RUN_VARS, RAILS_SCRATCH_DIRS, RAILS_SEED, RUBY_BIN_ENV, RUBY_COLLECTOR_ENV, RailsAdapter,
+    find_ruby_collector,
+};
 pub use vitest::{JS_PLUGIN_ENV, VitestAdapter, find_js_plugin};
 
 /// Adapter names accepted in `vci.toml`.
-pub const ADAPTERS: &[&str] = &["vitest", "pytest", "go", "cargo"];
+pub const ADAPTERS: &[&str] = &["vitest", "pytest", "go", "cargo", "rails"];
+
+/// Policy settings that change how an adapter runs tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdapterOptions {
+    /// `policy.rails_allow_db`: database servers are prepared fresh from the
+    /// schema for every test file (and their refusal is waived).
+    pub rails_allow_db: bool,
+}
 
 /// Construct the adapter called `name` for `project_dir`.
 pub fn adapter_for(
     name: &str,
     project_dir: &camino::Utf8Path,
 ) -> Result<Box<dyn Adapter>, AdapterError> {
+    adapter_for_with(name, project_dir, &AdapterOptions::default())
+}
+
+/// [`adapter_for`] with policy settings.
+pub fn adapter_for_with(
+    name: &str,
+    project_dir: &camino::Utf8Path,
+    opts: &AdapterOptions,
+) -> Result<Box<dyn Adapter>, AdapterError> {
     match name {
         "vitest" => Ok(Box::new(VitestAdapter::new(project_dir))),
         "pytest" => Ok(Box::new(PytestAdapter::new(project_dir))),
         "go" => Ok(Box::new(GoAdapter::new(project_dir))),
         "cargo" => Ok(Box::new(CargoAdapter::new(project_dir))),
+        "rails" => Ok(Box::new(
+            RailsAdapter::new(project_dir).with_allow_db(opts.rails_allow_db),
+        )),
         other => Err(AdapterError::NotFound(format!(
             "unsupported adapter {other:?} (supported: {})",
             ADAPTERS.join(", ")
@@ -117,6 +143,22 @@ pub struct ToolVersions {
     /// Cargo: `rustc --print cfg` of the host (with the flags the build
     /// uses), sorted.
     pub rust_cfg: Vec<String>,
+    /// Rails: `RUBY_VERSION` + patchlevel (`3.4.9p82`); `runner` is the test
+    /// framework (`minitest 6.0.6`).
+    pub ruby: String,
+    /// Rails: `RUBY_ENGINE RUBY_ENGINE_VERSION`.
+    pub ruby_engine: String,
+    /// Rails: `Rails::VERSION::STRING`.
+    pub rails: String,
+    /// Rails: `Bundler::VERSION`.
+    pub ruby_bundler: String,
+    /// Rails: libraries tests depend on (`sqlite=...;yaml=...;tz=...;encoding=...`).
+    pub ruby_libs: String,
+    /// Rails: database adapters of the test environment (`sqlite3`, or
+    /// `postgresql <server version>` with `policy.rails_allow_db`).
+    pub ruby_db: String,
+    /// Rails: every gem of the resolved bundle, sorted `name==version`.
+    pub ruby_gems: Vec<String>,
 }
 
 /// External packages as the test process would resolve them now:

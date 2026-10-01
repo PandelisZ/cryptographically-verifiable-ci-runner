@@ -34,6 +34,10 @@ Patterns: exact names, `*` wildcards, and a leading `!` to exclude. Exclusions w
 | Cargo hashed-if-present: every other `RUST*` and `CARGO*` (`RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `RUST_TEST_THREADS`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_MIN_STACK`, `RUSTC`, `RUSTC_BOOTSTRAP`, ...) and the C toolchain variables build scripts read (`CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, `CC_*`, `CXX_*`, `AR_*`, `CFLAGS_*`, `CXXFLAGS_*`, `TARGET_CC`, `HOST_CC`, ..., `PKG_CONFIG*`, `MACOSX_DEPLOYMENT_TARGET`, `SDKROOT`) | only if declared (strict) | **yes, whenever present** |
 | Cargo compile-time and declared reads: the `env!`/`option_env!` variables rustc lists in its dep-info, every build script's `rerun-if-env-changed` variables, and variables named literally in `env::var("X")`/`env::var_os("X")` in the unit's repository sources (cargo's own `CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `TARGET`, ... and `TMPDIR`/`PWD` excepted) | only if declared or pass-through (strict) | **yes** |
 | Go run-specific: `PWD` (go test sets it to the package directory), `TMPDIR` (vci's fresh directory) | yes (set per run) | never (like the checkout location) |
+| Adapter built-in pass-through, Rails: `GEM_HOME`, `GEM_PATH`, `GEM_SPEC_CACHE`, Bundler's location and install settings (`BUNDLE_PATH`, `BUNDLE_APP_CONFIG`, `BUNDLE_USER_*`, `BUNDLE_CACHE_PATH`, `BUNDLE_GLOBAL_GEM_CACHE`, `BUNDLE_BIN`, `BUNDLE_JOBS`, `BUNDLE_RETRY`, `BUNDLE_DEPLOYMENT`, `BUNDLE_FROZEN`, `BUNDLE_SILENCE_ROOT_WARNING`), `MISE_*`, `__MISE_*`, `RBENV_*`, `ASDF_*`, `XDG_{CACHE,CONFIG,DATA,STATE}_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, the `*_PROXY` variables | yes | **only if the test was observed reading it** (reads by RubyGems' and Bundler's own code of their variables, `HOME` and `PATH`, while setting up the bundle, are not observations: the bundle they produce is checked instead) |
+| Rails hashed-if-present: every other `RUBY*` (not `RUBYOPT`), `BUNDLE_*` (`BUNDLE_WITHOUT`, `BUNDLE_WITH`, `BUNDLE_FORCE_RUBY_PLATFORM`, ...), `BUNDLER_*`, `GEM_*`, `RAILS_*` (not `RAILS_ENV`), `RACK_*` (not `RACK_ENV`), `MT_*`, `MINITEST_*`, `BOOTSNAP_*`, `SPRING_*`, `DATABASE_URL`, `*_DATABASE_URL`, `SECRET_KEY_BASE`, `SECRET_KEY_BASE_DUMMY`, `SEED`, `TESTOPTS`, `TEST`, `TESTS`, `N`, `DEFAULT_TEST`, `DEFAULT_TEST_EXCLUDE`, `SCHEMA` | only if declared (strict) | **yes, whenever present** |
+| Rails always-read: `TZ`, `RUBYLIB`, `RUBY_YJIT_ENABLE`, `RUBY_GC_HEAP_INIT_SLOTS`, `RUBY_THREAD_VM_STACK_SIZE`, `RUBY_FREE_AT_EXIT`, `RUBY_CRASH_REPORT`, `RUBYGEMS_GEMDEPS`, `RUBY_BOX`, `RUBY_PAGER` (Ruby reads them in C, at startup or for every local time) | only if declared (strict) | **yes** (reported as read by every file) |
+| Rails run-specific, set by vci: `RUBYOPT` (the collector), `RAILS_ENV`/`RACK_ENV` (`test`), `BUNDLE_GEMFILE` (the project's), `PARALLEL_WORKERS` (`1`), `DISABLE_SPRING`, `DISABLE_BOOTSNAP`, `TMPDIR` (a fresh directory), `VCI_*` | yes (set per run) | never |
 | pytest always-read: `PYTEST_ADDOPTS`, `PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTHONHASHSEED`, `PYTHONWARNINGS`, `PYTHONOPTIMIZE`, `PYTHONDEVMODE`, `PYTHONUTF8`, `PYTHONSAFEPATH`, `PYTHONNOUSERSITE`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONINTMAXSTRDIGITS`, `PYTHONIOENCODING`, `TZ` | only if declared (strict) | **yes** (reported as read by every file) |
 | pytest hashed-if-present: every `PYTHON*` and `PYTEST_*` except `PYTHONPATH` (the interpreter reads many in C: `PYTHON_CPU_COUNT`, `PYTHONBREAKPOINT`, `PYTHON_GIL`, ...) | only if declared (strict) | **yes, whenever present** (loose mode, or declared) |
 | Undeclared, strict mode | **no** (removed from the child environment) | recorded as absent if read |
@@ -87,6 +91,18 @@ works, but any other wrapper refuses every unit of `vci run` (the program is not
 `CARGO_TARGET_<TRIPLE>_RUNNER` or `_LINKER` refuses them too.
 Environment reads by external crates are not seen (as with C `getenv` for pytest).
 
+Rails: the collector wraps `ENV` (`[]`, `fetch`, `key?`, `values_at`, `slice`, `assoc`, ...) and records each key
+read, with the reading code's file. Reading the whole environment (`to_h`, `each`, `keys`, `inspect`, `select`, any
+`Enumerable` method, `replace`, ...) is recorded as key `*` and refuses the file, except two call sites in Bundler
+that run while it sets up the bundle: `environment_preserver.rb` (a copy of the environment kept to restore it for
+child processes, and `ENV.replace` adding its `BUNDLER_ORIG_*` copies) and `settings.rb` (selecting its `BUNDLE_*`
+settings, which are hashed whenever present). Reads RubyGems and Bundler make of their own variables (`HOME`, `PATH`,
+`USER`, `TMPDIR`, `GEM_*`, `BUNDLE_*`, `BUNDLER_*`, `RUBYOPT`, `RUBYLIB`, `XDG_*`, ...) are not recorded either: what
+they decide (which Ruby, which gems, from where) is part of the toolchain and externals. Reads in C (`getenv` in a C
+extension, `TZ` for local time, the locale for Ruby's default encoding, which the toolchain records) are not observed;
+`TZ` and the variables Ruby reads at startup are reported as read by every file. `RAILS_MASTER_KEY` is hashed when
+present (strict mode removes it unless declared): a 128-bit random key's hash does not reveal it.
+
 With `[[projects]]` in vci.toml, each project's `env` table replaces the given top-level `[env]` keys for that
 project; the digest is computed from the project's effective configuration.
 
@@ -117,7 +133,7 @@ The predicate also records `envConfigDigest`: BLAKE3 over the mode and the sorte
 
 ## Secrets
 
-A hash of a low-entropy value can be brute-forced by anyone who can read the attestation refs. Put secrets in `pass_through`, not in `env`. `vci run` warns when a declared variable's name matches `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`.
+A hash of a low-entropy value can be brute-forced by anyone who can read the attestations (git-meta metadata on `refs/meta/main`). Put secrets in `pass_through`, not in `env`. `vci run` warns when a declared variable's name matches `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`.
 
 ## Implementation notes
 

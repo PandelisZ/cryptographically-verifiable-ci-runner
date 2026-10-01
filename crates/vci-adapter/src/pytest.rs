@@ -452,7 +452,19 @@ pub(crate) fn per_file<F>(files: &[String], one: F) -> Result<RunOutput, Adapter
 where
     F: Fn(&str) -> Result<OneRun, AdapterError> + Sync,
 {
-    let jobs = pytest_jobs().min(files.len()).max(1);
+    per_file_jobs(files, pytest_jobs(), one)
+}
+
+/// [`per_file`] with at most `jobs` processes at a time.
+pub(crate) fn per_file_jobs<F>(
+    files: &[String],
+    jobs: usize,
+    one: F,
+) -> Result<RunOutput, AdapterError>
+where
+    F: Fn(&str) -> Result<OneRun, AdapterError> + Sync,
+{
+    let jobs = jobs.min(files.len()).max(1);
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, Result<OneRun, AdapterError>)>> = Mutex::new(Vec::new());
     let stderr_lock = Mutex::new(());

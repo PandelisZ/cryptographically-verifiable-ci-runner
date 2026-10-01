@@ -42,9 +42,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # git-meta's store is SQLite, compiled from C (rusqlite's bundled
+      # copy): the static musl builds need a musl C compiler, which
+      # musl-tools provides as musl-gcc. Naming it explicitly is a guard,
+      # not a known requirement: in an ubuntu:24.04 container with
+      # musl-tools and Rust stable, both musl targets also built without
+      # these variables (each on its native architecture). Not yet checked
+      # on the GitHub-hosted ubuntu-latest / ubuntu-24.04-arm runners.
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
-        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --locked -p vci-cli --target ${{ matrix.target }}
