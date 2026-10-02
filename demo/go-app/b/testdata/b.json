@@ -1,1 +1,1 @@
-{ "greeting": "hello" }
+{ "greeting": "hello", "language": "en", "note": "changed after attestation" }
