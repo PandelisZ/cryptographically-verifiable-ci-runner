@@ -1,10 +1,10 @@
 # vci: cryptographically verifiable CI test selection
 
-If a developer (or an agent) already ran test file `b.test.ts` (or `test_b.py`, `test/models/b_test.rb` of a Rails
-app, Go package `./b`, or the cargo test target `b#test:b`) against exactly the files it depends on, CI should not have
+If a developer (or an agent) already ran test file `b.test.ts` (or `test_b.py`, `test/models/b_test.rb` or
+`spec/models/b_spec.rb` of a Rails app, Go package `./b`, or the cargo test target `b#test:b`) against exactly the files it depends on, CI should not have
 to run it again. `vci` makes that safe:
 
-1. `vci run` runs Vitest, pytest, `go test` or Rails' `bin/rails test` with runtime dependency collectors, hashes
+1. `vci run` runs Vitest, pytest, `go test`, Rails' `bin/rails test` or RSpec with runtime dependency collectors, hashes
    every file, directory listing, missing-file probe, package version and env var each test file actually used, and
    signs an in-toto attestation with your SSH key. For Rust (`cargo test`), which has no hook for run-time reads, the inputs are decided conservatively
    instead (see [Quick start (Cargo)](#quick-start-cargo)).
@@ -20,8 +20,8 @@ The core rule is **fail open**: the default verdict is RUN. Any error, doubt or 
 
 Status: v1, Vitest `>=3.2 <6` (tested on 5.0.2 and 4.1.11), Node 22.15+; pytest 9 (tested on 9.1.1) on CPython
 3.11-3.14 through `uv`; Go modules with Go 1.26 (tested on 1.26.2); Cargo workspaces (tested with Rust and cargo
-1.96.0); Rails 8 with Minitest on Ruby 3.4 (tested with Rails 8.1.3.1, Minitest 6.0.6, Ruby 3.4.9, SQLite); macOS and
-Linux.
+1.96.0); Rails 8 with Minitest or RSpec on Ruby 3.4 (tested with Rails 8.1.3.1, Minitest 6.0.6, rspec-core 3.13.6 with
+rspec-rails 8.0.4 and factory_bot_rails 6.5.1, Ruby 3.4.9, SQLite), and RSpec in plain Ruby projects; macOS and Linux.
 
 ## Install
 
@@ -335,16 +335,18 @@ Prerequisites: `git`, `ssh-keygen` (OpenSSH 8.1+), a Rust toolchain, and the pro
 (tested with Ruby 3.4.9 through [mise](https://mise.jdx.dev/), Bundler 4.0.9, Rails 8.1.3.1, Minitest 6.0.6, SQLite
 through the `sqlite3` gem 2.9.6). The project is a Rails application (`project` is the directory holding `Gemfile` and
 `bin/rails`); the unit is a **Minitest test file**, the files `bin/rails test` runs by default (`test/**/*_test.rb`
-without `test/system`, `test/dummy` and `test/fixtures`). Test ids are repo-relative paths. **RSpec is not supported
-yet** (see the limitations below).
+without `test/system`, `test/dummy` and `test/fixtures`), or an **RSpec spec file** (see
+[Quick start (RSpec)](#quick-start-rspec)). Test ids are repo-relative paths.
 
 ```sh
 cargo install --path crates/vci-cli            # the collector (ruby/vci-collector) is found in this checkout,
                                                # or set VCI_RUBY_COLLECTOR=/path/to/ruby/vci-collector
-cd your-app                                    # a git repo with at least one commit
+cd your-app                                    # a git repo with at least one commit and an origin remote
 bundle lock --add-platform x86_64-linux        # so the CI runner can install the same bundle
-vci init --adapter rails --key ~/.ssh/id_ed25519.pub   # writes vci.toml (adapter = "rails") and allowed_signers
+vci init --adapter rails --key ~/.ssh/id_ed25519.pub   # writes vci.toml (adapter = "rails"), allowed_signers, .git-meta
 git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock && git commit -m "Enable vci"
+# .git-meta is written only when the repository has an origin remote (or with --meta-url <url>); without one,
+# leave it out of `git add`. The trust root is read from the base branch: push or merge this commit to main first.
 
 TZ=UTC vci run test/models/b_test.rb --key ~/.ssh/id_ed25519   # one Ruby process per file, collect, sign, store
 TZ=UTC vci plan --base-ref origin/main                          # SKIP test/models/b_test.rb, RUN the rest
@@ -388,8 +390,14 @@ Ruby has no audit hook. The collector wraps the Ruby entry points instead (`File
 including `Dir.open`, `File::Stat`, `Pathname` through them, `Kernel#open`/`require`/`load`/`test` and their
 `Kernel.require`/`Kernel.load` copies, which every plain `require` goes through under Bundler on Ruby 3.4, `ENV`,
 `Process`, sockets), and records per file. Libraries with C entry points it must hook (`PTY`, `Fiddle`, FFI, SQLite,
-database clients, Nokogiri, `Zlib`) are hooked when their constants are defined, however they were loaded; one loaded
-but never hooked refuses the file (`vci:not-hooked:`).
+database clients, Nokogiri, `Zlib`, Prism's `parse_file`/`lex_file`/... and `RubyVM::InstructionSequence.compile_file`,
+which read a source file in C) are hooked when their constants are defined, however they were loaded; one loaded but
+never hooked refuses the file (`vci:not-hooked:`).
+
+Paths under the fresh temp dirs vci gives the process are not inputs. The collector fixes them when it loads: a test
+that sets `ENV["TMPDIR"]` (to `/tmp`, `HOME`, `/`) moves its own temp files, not what the collector ignores, so its
+reads there are still recorded (outside the repository: refused). `/etc/resolv.conf`, read by Ruby's `resolv` while
+it loads (`require "net/http"` does that), is not an input; any other read of it is.
 
 - **code**: every Ruby file compiled from disk (`require`, `require_relative`, `load`, `autoload`, Zeitwerk), and for
   every `require` of a feature name, each repository `$LOAD_PATH` entry Ruby searched before the one that held it
@@ -458,6 +466,16 @@ config/master.key, Rails' credentials key`). Nothing is wrong (it fails open), b
 - or declare `RAILS_MASTER_KEY` (`[env] global = ["RAILS_MASTER_KEY"]`) and set it to the same value where you attest
   and in CI (a secret there): Rails then reads the key from the environment, not the file.
 
+**Active Storage and libvips.** Active Storage's engine loads `ruby-vips` at boot whenever it is in the bundle
+(`image_processing`, which `rails new` adds, depends on it). On a machine with libvips installed (Homebrew's `vips`),
+`ruby-vips` opens it through FFI and attaches its C functions; vci cannot see what that C code reads, so **every test
+that boots Rails is refused** there (`native:FFI ffi_lib(["vips.42"]), ... (+130 more like it)`). `require: false`
+does not help (Active Storage requires `ruby-vips` itself). It fails open (nothing is skipped); to get skips, remove
+`image_processing` (and `ruby-vips`) from the Gemfile if the app does not process images, or do not load Active
+Storage (`require "active_storage/engine"` in `config/application.rb`) if it does not use it. Checked locally on
+macOS with Rails 8.1, image_processing 1.14.0, ruby-vips 2.3.0 and Homebrew libvips; a runner without libvips is not
+affected (CI only verifies; this matters where you attest).
+
 ### Databases (read this)
 
 The test database is a hidden input of almost every Rails test: its contents are whatever the last run left. vci
@@ -521,11 +539,202 @@ Under `platform = "any"` a file attested on macOS arm64 is skipped on an ubuntu-
 Checked locally (not on a GitHub runner): `fixtures/rails-abcd` attested on macOS arm64 (mise Ruby 3.4.9) was
 skipped entirely by the static Linux `vci` in a `linux/amd64` `ruby:3.4.9` container (as a non-root user, gems
 installed into `vendor/bundle` like `bundler-cache` does); editing the view template there ran only the file that
-renders it, and another `TZ` ran everything.
+renders it, and another `TZ` ran everything. The same holds for `fixtures/rails-rspec-abcd`'s spec files, and `vci
+ci` there ran the remaining spec files with RSpec (a `~/.rspec` in the container changed nothing).
 
 **OpenSSL is not compared**: Ruby links the platform's OpenSSL (Homebrew's 3.6 on a Mac, a 3.0 or 3.5 build on Linux),
 so comparing it would rule out every cross-platform skip. Algorithms give the same results across these versions; what
 differs (which legacy ciphers exist, default security levels) is accepted under `platform = "any"`.
+
+## Quick start (RSpec)
+
+RSpec runs under the Rails adapter (`adapter = "rails"`), with the same collector, run conditions and checks as
+Minitest files (everything in [Quick start (Rails)](#quick-start-rails) applies) plus what this section adds. Tested
+with rspec-core 3.13.6, rspec-expectations 3.13.5, rspec-mocks 3.13.8, rspec-rails 8.0.4, factory_bot_rails 6.5.1,
+Rails 8.1.3.1 and Ruby 3.4.9 through mise; the fixture is `fixtures/rails-rspec-abcd`.
+
+```sh
+cd your-app                                    # Gemfile.lock has rspec-core (through rspec-rails), and spec/;
+                                               # a git repo with an origin remote
+bundle lock --add-platform x86_64-linux
+vci init --adapter rails --key ~/.ssh/id_ed25519.pub   # writes vci.toml (adapter = "rails"; runner is detected)
+git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock && git commit -m "Enable vci"
+# .git-meta is written only with an origin remote (or --meta-url <url>); without one, leave it out of `git add`.
+# The trust root is read from the base branch: push or merge this commit to main first.
+
+TZ=UTC vci run spec/models/b_spec.rb --key ~/.ssh/id_ed25519   # one RSpec process per spec file
+TZ=UTC vci plan --base-ref origin/main                          # SKIP spec/models/b_spec.rb, RUN the rest
+vci push
+```
+
+**A stock `rails new` app with rspec-rails** needs these edits before anything is skipped (all but the pending specs
+apply to Minitest too; each is explained under [Quick start (Rails)](#quick-start-rails)):
+
+- replace the generator's `pending "add some examples to (or delete) ..."` specs with real examples (or delete them):
+  a pending example refuses its file;
+- `config.eager_load = false` in `config/environments/test.rb` (the generator's `ENV["CI"].present?` makes every file
+  depend on `CI`);
+- credentials: commit test-environment credentials and their key, drop `config/master.key` and
+  `config/credentials.yml.enc`, or declare `RAILS_MASTER_KEY` (otherwise every file reads `config/master.key`);
+- `gem "tzinfo-data"` for every platform (not `platforms: %i[ windows jruby ]`), and `TZ` declared and set (`TZ=UTC`);
+- `image_processing` on a machine with libvips installed refuses every file that boots Rails (see "Active Storage
+  and libvips" under the Rails section): remove the gem if the app does not process images;
+- `vendor/.keep` committed (the generator creates it).
+
+Capybara in the `:test` group is fine: `rack_test` feature specs are attested; specs that drive a browser are refused.
+
+**Which runner.** `runner = "minitest"` or `runner = "rspec"` in `vci.toml` (top level next to `adapter`, or in the
+project's `[[projects]]` entry; like all policy, `vci plan` reads it from the base commit). Without it vci detects:
+
+| The project has | Runner |
+|---|---|
+| `rspec-core` in `Gemfile.lock` (rspec-rails brings it), a `spec/` directory (or `.rspec`), no `test/**/*_test.rb` | RSpec |
+| both that and Minitest files | both: a file under the Minitest rule (`test/**/*_test.rb`, not `test/system`, ...) runs with `bin/rails test`, every other file RSpec lists runs with RSpec. If RSpec's own pattern also lists a Minitest file, the project's files are not listed (`vci plan` runs everything, `vci ci` fails) until `runner` decides |
+| anything else | Minitest (as before; RSpec files are reported, and a project with only RSpec files and no `rspec-core` in the lockfile is an error) |
+
+With `runner` set while the project also has the other runner's files, those files are **not run by vci at all**
+(neither `vci run` nor `vci ci`, broken or not): `vci run`, `vci plan` and `vci ci` print a warning (`N Minitest
+file(s) in test/ are not run by vci`), and `vci ci` records it under `warnings` in the audit log. Run them some other
+way in CI, or remove the setting so each file runs with its own runner.
+
+The runner of a file is part of its attestation: its argv (`rails rspec --root . --options .rspec --default-seed 0
+spec/models/b_spec.rb`) and the toolchain's test framework field (`minitest 6.0.6; rspec-core 3.13.6, rspec-expectations
+3.13.5, rspec-mocks 3.13.8, rspec-rails 8.0.4, rspec-support 3.13.7`) are compared by `vci plan`. The RSpec gems are
+also part of the bundle, which is compared exactly, and are externals of every spec that loaded them: bumping
+`rspec-core` in `Gemfile.lock` runs everything.
+
+**What vci runs.** The unit is a spec file: the files `rspec` with no argument would run, **as RSpec's own
+configuration lists them** (`default_path`, `pattern`, `exclude_pattern` from `.rspec` and `SPEC_OPTS`; a custom
+pattern is honoured). Shared examples, support files and factories are not units. Every file runs in its own process
+(`$VCI_JOBS` at a time):
+
+```
+RUBYOPT=-r<abs>/ruby/vci-collector/vci_collector.rb VCI_RAILS_RUNNER=rspec VCI_RAILS_MODE=collect ... \
+  ruby -e 'require "bundler/setup"; require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke' \
+  -- --options .rspec spec/models/b_spec.rb
+```
+
+(what `bundle exec rspec` does, without a `bin/rspec` binstub or Spring, which stay disabled). `vci ci` runs every
+remaining file the same way (`VCI_RAILS_MODE=plain`) and exits non-zero if any fails; with nothing attestable at all
+(`no_skip_refs`, an unreadable base policy) it runs the whole suite in one `rspec` process.
+
+**Option sources.** RSpec reads options from several places; each one is either an input or never read, on both
+sides:
+
+| Source | Under vci |
+|---|---|
+| `.rspec` in the project | read (vci passes `--options .rspec`), and a **global input** of every spec file: any edit runs everything |
+| `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` (`~/.config/rspec/options`) | **never read**: `--options` replaces every options file, so the laptop's and the runner's are both ignored (nothing to configure in CI) |
+| `.rspec-local` | **never read**, for the same reason: it is usually git-ignored, so CI could not have the same one. Put options vci should use in `.rspec` |
+| `SPEC_OPTS` | the env policy: hashed whenever present; strict mode removes it unless declared (`[env] global = ["SPEC_OPTS"]`, then its value must match) |
+| the command line | vci's: `--options .rspec <file>` and nothing else |
+
+A plain `bundle exec rspec` still reads all of them; only vci's runs do not.
+
+**Run conditions** (installed by the collector in `vci run` and `vci ci` alike):
+
+- **the seed**: RSpec's default seed is random; under vci it is 0, so `config.order = :random` and `Kernel.srand
+  config.seed` give the same order where the file was attested and in CI (the counterpart of Minitest's `--seed 0`).
+  Defined order stays defined; a seed you set (`--seed` in `.rspec` or `SPEC_OPTS`, `config.seed =`) is used and is
+  an input like the rest of the file;
+- **the example status file** (`config.example_status_persistence_file_path`, typically `spec/examples.txt`): RSpec
+  reads it at start (for `--only-failures`, `--next-failure` and `example.metadata[:last_run_status]`) and rewrites it
+  at exit. vci points it at a fresh file in the process's temp dir: nothing is written in the repository and no earlier
+  run's statuses are read, so `--only-failures` runs nothing (refused) and `last_run_status` is always `"unknown"`;
+- **the database**: as for Minitest, every SQLite database of the test environment is a fresh file with the schema
+  loaded after Rails initialises, so `rails_helper`'s `ActiveRecord::Migration.maintain_test_schema!` finds it current
+  and never runs `bin/rails db:test:prepare` (a child process, which would refuse the file); a pending migration makes
+  it abort (the file is refused), and `db/` is never written. `config.use_transactional_fixtures` works as usual;
+- **SimpleCov**: in an RSpec process its results (and the earlier results it would merge, `.last_run.json`) are
+  written to the process's temp dir instead of `coverage/`, and its configuration files outside the repository
+  (`~/.simplecov`, `.simplecov` in directories above the repository, which its upward search would try) look absent.
+  A `.simplecov` in the project is read (an input). So a coverage run of your own is not affected, and vci's runs
+  neither leave reports nor read old ones. `SimpleCov.minimum_coverage` is checked per file: a file whose own run is
+  below it exits 2 and is refused (`vci:process-exit:2`, see "Results"). (Minitest processes keep SimpleCov's own
+  directory: writes to the git-ignored `coverage/` are allowed there.)
+
+**What is recorded** for a spec file, on top of the Rails list: `.rspec` (global), `spec/spec_helper.rb` and
+`spec/rails_helper.rb` when loaded (with their `require`/`require_relative` lookups); the **listing** of every
+directory `rails_helper`'s `Rails.root.glob("spec/support/**/*.rb")` reads and every file it loads (a new support file
+runs every spec that loads `rails_helper`, not those that only load `spec_helper`); shared examples, shared contexts and
+custom matchers as the files that define them; FactoryBot's definitions (factory_bot_rails loads them at boot by
+scanning `spec/factories`, `test/factories` and `factories`: those listings and files are inputs of every spec that
+boots Rails, so a new factory file runs them); fixtures (`config.fixture_paths`, `fixtures :all` lists the directory);
+files read through `file_fixture`; templates rendered by view and request specs. rspec-rails 8 globs
+`spec/**/*_spec.rb` at boot to register `bin/rails stats` directories: that listing is **not** an input (otherwise every
+new spec file would run every spec that boots Rails); a spec that reads `Rails::CodeStatistics`' directories is
+refused instead.
+
+**Results.** A reporter hook (independent of your formatters) counts the examples. A file is attested only when
+the **process** exits 0, at least one example ran, none failed, none is pending or skipped (`pending`, `skip`, `xit`,
+`xdescribe`, `skip: true`), no error happened outside an example (a load error, an error in `before(:suite)`,
+`after(:suite)` or `after(:context)`), and **every example the file declares ran**: a run filtered by
+`filter_run_when_matching :focus` with `fit`/`fdescribe`, by a tag filter (`--tag`, `filter_run`,
+`filter_run_excluding`), by `--only-failures` or `--example`, or stopped by `--fail-fast`, is refused (`rspec:filtered`).
+A failing `aggregate_failures` block is one failed example. Unlike Minitest, an example without expectations passes
+(RSpec does not count expectations; vci does not either).
+
+The exit code is checked after every `at_exit` handler ran, not only RSpec's: SimpleCov's `minimum_coverage` check
+(exit 2), `minitest/autorun` loaded into the RSpec process (its handler rejects RSpec's arguments and exits 1), or a
+test's own `at_exit { exit 1 }` fail a plain `rspec` run, so they refuse the file (`vci:process-exit:N`), however
+cleanly RSpec reported. Every example's failure is tracked where RSpec records it (`Example#set_exception`): one that
+is cleared before the example finishes and then reported as passed is refused (`rspec:failure-cleared`): a home-grown
+retry (an `around` hook that clears `@exception` and runs the example again, which is also how rspec-retry works; the
+gem itself was not tried), a prepended `Example#finish` that drops the exception, and a reporter override that reports
+a failure as a pass. The reporter's counts are also checked against RSpec's per-example statuses
+(`rspec:status-mismatch`). Support code that swallows a failure before RSpec records it (rescuing it inside the
+example, or prepending over `Example#set_exception` itself) is not detected; a plain `rspec` run passes too.
+
+**Refused** (on top of the Rails refusals: child processes, sockets, writes, ...):
+
+- `--bisect`, `--drb`, `--init`, `--version`, `--help` (from `.rspec` or `SPEC_OPTS`; `rspec:invocation`), `--dry-run`
+  (`rspec:dry-run`), a run without vci's `--options` (`rspec:option-files`);
+- **rspec-retry** (and rspec-rebound) loaded: a flaky example that failed and then passed is reported as passed
+  (`rspec:retry`); a retry without those gems is caught by the failure that was cleared (`rspec:failure-cleared`,
+  above);
+- **parallel_tests / turbo_tests** loaded (`rspec:parallel-tests`; vci runs one file per process itself). Loading them
+  through `Bundler.require` counts: use `require: false` in the Gemfile;
+- **Spring** (`spring-commands-rspec`, a `bin/rspec` binstub): vci never runs binstubs and sets `DISABLE_SPRING=1`; Spring
+  loaded anyway is refused;
+- **system and feature specs that drive a browser** (Capybara with Selenium or Cuprite): the browser and its driver are
+  child processes and sockets, refused like Minitest system tests. Unlike Minitest's `test/system`, RSpec's
+  `spec/system` and `spec/features` files are listed (RSpec runs them); a feature spec on Capybara's `rack_test`
+  driver that opens no socket and starts no process is attested like any other spec (checked locally, not in the e2e
+  tests: a stock `rails new` app with capybara 3.40.0 and selenium-webdriver 4.50.0 in its `:test` group, a model
+  spec and a `type: :feature` spec visiting `/up` were both attested and then skipped). With Capybara in the bundle
+  rspec-rails requires `capybara/rspec` at boot, which loads `net/http` and Ruby's `resolv`; `resolv` reads
+  `/etc/resolv.conf` while it loads. That one read is not an input (the DNS settings only matter to lookups, which
+  open sockets and are refused); a test that reads the file itself (`Resolv::DNS::Config`) still refuses;
+- Minitest tests that also ran in the RSpec process (`rspec:minitest-also-ran`).
+
+**Mocks and time helpers.** rspec-mocks needs nothing special: `allow(File).to receive(:read)` (or `ENV`'s `[]`,
+`Kernel.require`, `File.exist?`, `File.directory?`, `Dir.children`, `File.expand_path`) changes what the spec sees, not
+what vci records. A stubbed call that returns a canned value reads nothing; `and_call_original` reaches vci's hooks;
+real reads elsewhere in the process (through `File.open`, an unstubbed key, a `Dir.glob`) are recorded; and the
+collector's own file system checks use the methods captured before anything could stub them (a stubbed
+`File.directory?` would otherwise hide a real glob's listing). `travel_to` and other time helpers do not affect
+recording. (The e2e tests prove each of these with a changed input that then runs the spec.)
+
+**Plain Ruby projects.** The same code path works without Rails: a project with a `Gemfile`, `Gemfile.lock` (with
+`rspec-core`) and `spec/`, but no `config/environment.rb`, is a plain Ruby project. `adapter = "rails"` (the name is
+historical) with `runner = "rspec"` or detection; the probe only sets up the bundle, the Rails version is empty, and
+everything else (the bundle as toolchain, option sources, results, refusals) is the same. Tested with a small project
+of `rspec-core` and `rspec-expectations` (`rspec_plain_ruby_project` in the e2e tests).
+
+**RSpec limitations** (on top of the Rails ones):
+
+- `.rspec-local`, `~/.rspec` and the XDG options file are ignored under vci, so a `vci run` can differ from your plain
+  `rspec` run (fail open: a spec that needs them fails under vci and is not attested);
+- every example must run: a deliberately excluded tag (`filter_run_excluding :slow`) refuses every file with such an
+  example. Run those files without vci, or move the examples;
+- `rails_helper`'s support glob and FactoryBot's definitions are loaded by every spec that boots Rails, so editing any
+  support file or factory runs all of them; whether a spec actually used a factory or shared example is not modelled;
+- an example's expectations are not counted (see "Results"): `it("does nothing") { }` is attested. It passes in
+  every run, so this is not a wrong skip, but it vouches for nothing (Minitest refuses a test with no assertion);
+- **per-file isolation**: one spec file per process, as in CI; a spec that passes only after another file ran first
+  (in a full `rspec` run) is not reproduced; neither is the random seed of a plain run;
+- SimpleCov's reports from vci processes are not kept (they live in the process's temp dir); collect coverage with a
+  plain `rspec` run.
 
 When something is not skipped and you expected it to be:
 
@@ -553,7 +762,7 @@ checkout, clock, policy and environment.
 | Command | Purpose |
 |---|---|
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest), print a CI snippet |
-| `vci run [FILES…] [--key PATH] [--ttl 14d]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test` or `bin/rails test` process failed) |
+| `vci run [FILES…] [--key PATH] [--ttl 14d]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed) |
 | `vci plan [--base-ref R] [--format text\|json\|github]` | Print which test files can be skipped and why the others run |
 | `vci ci [--base-ref R] [--audit-log PATH]` | Plan, run the remainder, write a JSON audit log of every skip |
 | `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R]` | Verify one DSSE envelope and print its claims |
@@ -622,8 +831,8 @@ Rails adds what Ruby, RubyGems, Bundler and version managers need to find things
 are checked directly. Every other `RUBY*`, `BUNDLE_*` (`BUNDLE_WITHOUT`, `BUNDLE_FORCE_RUBY_PLATFORM`, ...),
 `BUNDLER_*`, `GEM_*`, `RAILS_*` (`RAILS_MASTER_KEY`, ...), `RACK_*`, `MT_*`, `MINITEST_*`, `BOOTSNAP_*` and `SPRING_*`
 variable, `DATABASE_URL`, `*_DATABASE_URL`, `SECRET_KEY_BASE`, `SEED`, `TESTOPTS`, `TEST`, `TESTS`, `N`,
-`DEFAULT_TEST`, `DEFAULT_TEST_EXCLUDE` and `SCHEMA` is **hashed whenever present** and removed in strict mode unless
-declared. vci sets `RUBYOPT` (the collector; your value never reaches the tests), `RAILS_ENV`/`RACK_ENV` (`test`),
+`DEFAULT_TEST`, `DEFAULT_TEST_EXCLUDE`, `SCHEMA` and `SPEC_OPTS` (RSpec's options) is **hashed whenever present** and
+removed in strict mode unless declared. vci sets `RUBYOPT` (the collector; your value never reaches the tests), `RAILS_ENV`/`RACK_ENV` (`test`),
 `BUNDLE_GEMFILE` (the project's), `PARALLEL_WORKERS=1`, `DISABLE_SPRING=1`, `DISABLE_BOOTSNAP=1` and a fresh
 `TMPDIR`: none of them is an input. Reads through `ENV` are observed; reading the whole environment (`ENV.to_h`,
 `ENV.each`, `ENV.inspect`, ...) refuses the file, except Bundler's own copy it keeps for child processes and its
@@ -729,6 +938,7 @@ readable with `git meta pull` + `git meta get`; values set (`git meta set`) or d
 ```toml
 project = "."          # project dir (Vitest root / pytest rootdir / Go module root / Cargo workspace root / Rails app root), relative to the repo root
 adapter = "vitest"     # or "pytest", "go", "cargo", "rails"
+# runner = "rspec"     # rails only: "minitest" or "rspec" (unset: detected, see Quick start (RSpec)); in [[projects]] per project
 
 [policy]
 platform = "any"       # "any" | "same-os" | "exact": which OS/arch may satisfy CI
@@ -989,8 +1199,10 @@ See [What the Rails adapter records](#what-the-rails-adapter-records) and [Datab
 Quick start (Rails): every Ruby file compiled from disk with the shadowing candidates of each `require`, Zeitwerk's
 directory listings, every file read, checked, globbed or listed (fixtures, templates, configuration, the schema), the
 loaded gems by version (their installed files checked against their archives when attested), `ENV` reads, and
-global inputs (`Gemfile`, `Gemfile.lock`, the boot files, `test/test_helper.rb`, the Ruby version files). Every file
-runs against a fresh database loaded from the schema.
+global inputs (`Gemfile`, `Gemfile.lock`, the boot files, `test/test_helper.rb` for Minitest files and `.rspec` for
+RSpec files, the Ruby version files). Every file runs against a fresh database loaded from the schema. RSpec files
+also record `spec_helper`/`rails_helper`, the `spec/support` glob's listings, FactoryBot's definition directories and
+everything else under [Quick start (RSpec)](#quick-start-rspec).
 
 ## When `vci run` refuses to attest
 
@@ -1152,9 +1364,17 @@ Rails specifics (collector taints and checks; see [Quick start (Rails)](#quick-s
 - **caches and preloaders**: a compiled-code cache (`RubyVM::InstructionSequence.load_iseq` defined, as Bootsnap's
   compile cache does), Bootsnap's YAML or JSON compile cache (`YAML.load_file` answered from `tmp/cache/bootsnap`, read
   in C, not from the file vci hashes), Bootsnap's load-path cache, Spring; `Dir.for_fd`;
-- not every test passed (a failure, an error, **a skip**), no test ran, **a test made no assertion**, the process
-  exited non-zero, or the collector wrote nothing (a crash, `exit!`); the collector's Ruby, Rails, Bundler or Minitest
-  version differs from the project's; reads outside the repository other than the bundle's gems, Ruby's own files,
+- not every test passed (a failure, an error, **a skip**), no test ran, **a test made no assertion** (Minitest), the
+  process exited non-zero (also after the framework reported a pass: an `at_exit` handler such as SimpleCov's
+  `minimum_coverage`, `vci:process-exit:N`), or the collector wrote nothing (a crash, `exit!`); the collector's Ruby, Rails, Bundler or
+  test framework versions differ from the project's;
+- **RSpec**: a failed, pending or skipped example, an error outside an example (a load error, a `before`/`after(:suite)`
+  or `after(:context)` error: `rspec:error-outside-examples`), no example, an example the file declares that did not run (`fit`/`fdescribe` with
+  `filter_run_when_matching :focus`, tag filters, `--only-failures`, `--example`, `--fail-fast`), `--dry-run`,
+  `--bisect`/`--drb`/`--init` (`rspec:invocation`), rspec-retry or parallel_tests/turbo_tests loaded, an example
+  whose failure was cleared or reported as a pass (`rspec:failure-cleared`, `rspec:status-mismatch`), a run without
+  vci's `--options .rspec`, a spec reading `Rails::CodeStatistics`' directories (see
+  [Quick start (RSpec)](#quick-start-rspec)); reads outside the repository other than the bundle's gems, Ruby's own files,
   vci's temp dirs, `/dev/null`/`/dev/urandom` and the time zone data (the toolchain records which).
 
 ## Verification (`vci plan`)
@@ -1176,8 +1396,9 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
    other users), and OS/arch per policy (Go and Cargo: the same OS
    and architecture when the attestation lists platform-specific files; Go: the same architecture when it lists
    arch-specific reasons, and otherwise another architecture only between 64-bit little-endian ones; Rails: Ruby
-   version and patchlevel, engine, Rails, Bundler, Minitest, SQLite library, libyaml, time zone data, encodings,
-   collector version, database software and the whole bundle, exactly);
+   version and patchlevel, engine, Rails, Bundler, the test frameworks (Minitest, and rspec-core, -expectations,
+   -mocks, -rails, -support), SQLite library, libyaml, time zone data, encodings, collector version, database software
+   and the whole bundle, exactly);
 8. **env-config**: digest of the effective env configuration (from the base `vci.toml`) matches;
 9. **result**: passed and untainted; **inputs-config**: the `[[inputs]]` globs recorded equal the base config's for
    the test id; every waived refusal still waived by the base policy; **dirty** only if `allow_dirty = false`;
@@ -1352,10 +1573,10 @@ Rails limitations (details and the verified mechanisms in [`docs/spike-rails.md`
   collector writes its output at exit.
 - **OpenSSL** is not compared (see "Attesting on macOS, verifying on Linux (Rails)"), and neither is the C compiler of
   gems built at install time.
-- **RSpec is not supported yet**: the adapter runs Minitest files. A project whose tests are all RSpec files is an
-  error (`vci plan` runs everything, `vci ci` fails rather than run nothing); beside Minitest files they are reported
-  and left to you (`bundle exec rspec`). Supporting it needs a reporter for RSpec's results and expectation counts,
-  and handling the options RSpec reads from `~/.rspec` and `$XDG_CONFIG_HOME` (outside the repository).
+- **RSpec**: supported (see [Quick start (RSpec)](#quick-start-rspec) and its limitations). A project with RSpec files
+  but no `rspec-core` in `Gemfile.lock`, or with `runner = "minitest"`, runs its Minitest files only: an RSpec-only
+  one is an error (`vci plan` runs everything, `vci ci` fails rather than run nothing), beside Minitest files the RSpec
+  files are reported and left to you.
 - **System tests** (`test/system`, driving a browser) are not listed, as `bin/rails test` does not run them; run them
   with `bin/rails test:system`. A test that starts a browser anyway is refused (a child process and sockets).
 - Assets: what a test reads from `public/assets`, `app/assets/builds` or `node_modules` is recorded (a fresh checkout
@@ -1372,7 +1593,7 @@ crates/vci-git        attestation storage on git-meta (git-meta-lib), base-commi
 crates/vci-adapter    Adapter trait + Vitest, pytest, Go, Cargo and Rails adapters (list, run, JSONL / go test log
                       parsing; src/golang/vci_testlog.go is the logger overlaid into Go's internal/testlog; src/cargo/
                       reads cargo's JSON messages, rustc dep-info and build script output, and scans sources;
-                      src/rails.rs runs bin/rails test with the Ruby collector)
+                      src/rails.rs runs bin/rails test and RSpec with the Ruby collector)
 crates/vci-cli        the `vci` binary
 js/vitest-plugin      @vci/vitest collectors
 py/pytest-plugin      vci_pytest collector (pure stdlib pytest plugin)
@@ -1383,6 +1604,9 @@ fixtures/go-abcd      Go end-to-end fixture (module using golang.org/x/sync)
 fixtures/cargo-abcd   Cargo end-to-end fixture (workspace a, b, c, d; d uses the hex crate)
 fixtures/rails-abcd   Rails 8 end-to-end fixture (SQLite; a: lib, b: models and fixtures, c: a view, d: a route
                       using the hashids gem)
+fixtures/rails-rspec-abcd  the same app with rspec-rails and factory_bot_rails (a: lib spec with spec_helper only,
+                      b: model spec with a factory, a fixture and a shared example, c: view spec with file_fixture,
+                      d: request spec)
 docs/                 PLAN.md (design), CONTRACTS.md (interfaces), ENV.md (env vars), spike.md (Vitest findings),
                       spike-pytest.md (pytest findings), spike-go.md (Go findings), spike-cargo.md (Cargo findings),
                       spike-rails.md (Rails findings)
@@ -1398,6 +1622,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 uv run --project fixtures/pytest-abcd pytest py/pytest-plugin/tests   # pytest collector tests
 (cd fixtures/go-abcd && go mod download)   # the Go fixture's module, used by the Go tests
 (cd fixtures/rails-abcd && bundle install) # the Rails fixture's bundle, with its Ruby (.ruby-version, e.g. through mise)
+(cd fixtures/rails-rspec-abcd && bundle install) # the RSpec fixture's bundle (rspec-rails, factory_bot_rails)
 ruby ruby/vci-collector/test/collector_test.rb   # Ruby collector tests (also run by cargo test)
 ```
 
@@ -1414,6 +1639,32 @@ signers and PR-only `allowed_signers` are rejected; a declared env var with anot
 a socket) while writing to `tmp/` is attested; a database server (SQLite registered under another adapter name) is
 refused, attested with `rails_allow_db`, and skipped only while the base policy allows it; push/fetch into a fresh
 clone, `vci ci` running only the rest with exit codes and the audit log, `no_skip_refs`; `vci init --adapter rails`.
+
+The RSpec end-to-end tests (`crates/vci-cli/tests/e2e_rspec.rs`) copy `fixtures/rails-rspec-abcd` the same way (and
+print `SKIPPED:` the same way, also when `bundle check` fails for it). They prove: attesting b skips only b (argv and
+toolchain name RSpec and its gem versions), with the database prepared outside `db/` and no `spec/examples.txt`
+written; editing b's factory runs b and `explain` names it, and so does its fixture yml; a new file in `spec/support`
+runs every spec that loads `rails_helper` while a (`spec_helper` only) stays skipped; a new factory file runs b; the
+shared example runs b; `.rspec` runs everything; the view runs c alone (and only the `file_fixture` it read matters);
+`config/routes.rb` runs d; a new spec file elsewhere in `spec/` runs only itself; an `rspec-core` bump in
+`Gemfile.lock` and `SPEC_OPTS` (declared) with another value run everything; tampered payloads, unknown signers and
+PR-only `allowed_signers` are rejected. `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` and `.rspec-local` filter or break
+a plain run but change nothing under vci (`vci run`, `plan`, `ci`). Each refusal: pending, `xit`, `xdescribe`, `fit`
+and `fdescribe` with `filter_run_when_matching :focus`, an excluded tag, a failing example, a failing
+`aggregate_failures` block, a load error, `before(:suite)` and `after(:context)` errors, no examples, backticks,
+`system`, rspec-retry, parallel_tests, reading `Rails::CodeStatistics`, a write into `app/`, `--dry-run` and `--bisect`
+from `SPEC_OPTS`; a pending migration is refused without a `db:test:prepare` child and without writing `db/`; a
+non-zero exit after RSpec's report (`at_exit { exit 1 }`, an `exit 2` like SimpleCov's, `minitest/autorun`); a retry
+in an `around` hook, a prepended `Example#finish` and a reporter override that turn a failure into a pass. A spec that
+sets `ENV["TMPDIR"]` still has its reads outside the repository refused, and Prism's `parse_file`,
+`parse_file_success?` and `lex_file` reads are inputs (editing each file runs the spec). The
+example status file is never written or read (`--only-failures` is refused). A spec stubbing `File.read`, `ENV[]`,
+`Kernel.require`, `File.directory?`, `File.exist?` and `Dir.children` (and using `travel_to`) is attested with its
+real reads, each of which then runs it. Push/fetch into a fresh clone and `vci ci` (only the rest, one RSpec process
+per file, non-zero on a failure, the whole suite on `no_skip_refs`); a Minitest app and an RSpec app in one
+`vci.toml`; Minitest and RSpec files in one app (each with its own runner; a pattern overlap runs everything; `runner =
+"rspec"` from the base commit lists only spec files, and `vci plan`/`ci` warn that the Minitest files are not run, also
+in the audit log); a plain Ruby project with RSpec; `vci init --adapter rails`.
 
 The pytest end-to-end tests (`crates/vci-cli/tests/e2e_pytest.rs`, `crates/vci-adapter/tests/pytest_fixture.rs`)
 copy `fixtures/pytest-abcd` the same way and print `SKIPPED:` (and pass) when `uv` is not installed or cannot set up
@@ -1531,11 +1782,15 @@ repository does not need the other projects' toolchains (`e2e_pytest.rs`).
   like the other collectors. Test ids are package directories, so `vci run`/`explain` take directories, not files.
 - Cargo: the adapter decides inputs conservatively and refuses from source text (see "Cargo limitations"); test ids
   are `<package dir>#<target>`, so `vci run`/`explain` take unit ids or package directories, not files.
-- Rails: Minitest only (RSpec is not supported yet); the unit is a test file, so `vci run`/`explain` take files. The
-  collector's source is not part of the attestation, like the other collectors.
+- Rails: Minitest and RSpec; the unit is a test or spec file, so `vci run`/`explain` take files (not directories). The
+  collector's source is not part of the attestation, like the other collectors (its version is). RSpec under vci
+  never reads `.rspec-local`, `~/.rspec` or the XDG options file, and requires every declared example of a file to
+  run (see "RSpec limitations"); an RSpec example without expectations is attested. An explicit `runner` leaves the
+  other runner's files unrun by vci (`vci run`, `plan` and `ci` warn). C code a test calls that opens files itself is
+  not seen, apart from the libraries the collector hooks (and refuses when it cannot).
 - Only tested on macOS arm64 (Node 26, git 2.54, OpenSSH 10.3; CPython 3.14.7, uv 0.11.7; Go 1.26.2; Rust 1.96.0
-  from Homebrew; Ruby 3.4.9 through mise), plus a `linux/amd64` container check of Rails attestations. Windows paths
-  compile but are untested.
+  from Homebrew; Ruby 3.4.9 through mise), plus a `linux/amd64` container check of Rails attestations (Minitest and
+  RSpec: `docs/spike-rails.md` F14, R14). Not run on a GitHub Actions runner. Windows paths compile but are untested.
 
 ## License
 

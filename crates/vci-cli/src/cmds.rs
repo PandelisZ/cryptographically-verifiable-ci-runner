@@ -98,6 +98,7 @@ pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i3
         "baseRef": res.base_ref,
         "baseCommit": res.base_commit,
         "runAll": res.run_all,
+        "warnings": res.warnings,
         "projects": res.projects,
         "skipped": res.skipped().map(|f| json!({
             "testId": f.test_id,
@@ -301,12 +302,28 @@ pub fn init(
             if let Err(e) = vci_adapter::find_ruby_collector(&dir) {
                 eprintln!("vci init: note: {e}");
             }
-            if !dir.join("bin/rails").is_file() {
+            if !dir.join("bin/rails").is_file() && !dir.join("spec").is_dir() {
                 eprintln!(
-                    "vci init: note: {} has no bin/rails; the rails adapter's project must be the Rails application root",
+                    "vci init: note: {} has no bin/rails; the rails adapter's project must be the Rails application root (or a Ruby project with RSpec and a spec/ directory)",
                     dir
                 );
             }
+            // Which runner: the setting, else detected (see the template).
+            let opts = s.adapter_options();
+            let adapter = vci_adapter::RailsAdapter::new(&dir).with_runner(opts.rails_runner);
+            let has = |p: &str| adapter.runner_of(p);
+            let runners = match (has("test/x_test.rb"), has("spec/x_spec.rb")) {
+                (
+                    Some(vci_adapter::RailsRunner::Minitest),
+                    Some(vci_adapter::RailsRunner::Rspec),
+                ) => "Minitest (test/**/*_test.rb) and RSpec (every other file RSpec lists)",
+                (_, Some(vci_adapter::RailsRunner::Rspec)) => "RSpec",
+                _ => "Minitest",
+            };
+            eprintln!(
+                "vci init: {}: the rails adapter will run {runners} (set runner = \"minitest\" or \"rspec\" in vci.toml to choose)",
+                s.rel
+            );
         }
         if std::process::Command::new(
             std::env::var_os(vci_adapter::RUBY_BIN_ENV)
@@ -319,7 +336,7 @@ pub fn init(
         .unwrap_or(true)
         {
             eprintln!(
-                "vci init: note: the rails adapter runs `ruby bin/rails test`; install the Ruby in .ruby-version or set {} to the ruby binary",
+                "vci init: note: the rails adapter runs `ruby bin/rails test` and RSpec with Ruby; install the Ruby in .ruby-version or set {} to the ruby binary",
                 vci_adapter::RUBY_BIN_ENV
             );
         }

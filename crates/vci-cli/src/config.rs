@@ -29,6 +29,10 @@ pub struct Config {
     /// Adapter (single-project form); default `"vitest"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
+    /// Rails adapter (single-project form): the test framework, `"minitest"`
+    /// or `"rspec"`; unset: detected (see [`ProjectConfig::runner`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
@@ -72,6 +76,12 @@ pub struct ProjectConfig {
     #[serde(default = "default_project")]
     pub path: String,
     pub adapter: String,
+    /// Rails adapter: the test framework, `"minitest"` (`bin/rails test`) or
+    /// `"rspec"`. Unset: RSpec when `Gemfile.lock` has `rspec-core` and
+    /// there is a `spec/` (or `.rspec`) but no Minitest file, both when both
+    /// are present, Minitest otherwise. Read from the base commit in CI.
+    #[serde(default)]
+    pub runner: Option<String>,
     #[serde(default)]
     pub policy: Option<PolicyOverride>,
     #[serde(default)]
@@ -113,9 +123,24 @@ pub struct ProjectSpec {
     /// Normalised project dir relative to the repo root ("." for the root).
     pub rel: String,
     pub adapter: String,
+    /// Rails: the `runner` setting (`None`: detected).
+    pub runner: Option<String>,
     pub policy: Policy,
     pub env: EnvConfig,
     pub inputs: Vec<InputsConfig>,
+}
+
+impl ProjectSpec {
+    /// The adapter options this project's settings give.
+    pub fn adapter_options(&self) -> vci_adapter::AdapterOptions {
+        vci_adapter::AdapterOptions {
+            rails_allow_db: self.policy.rails_allow_db,
+            rails_runner: self
+                .runner
+                .as_deref()
+                .and_then(vci_adapter::RailsRunner::parse),
+        }
+    }
 }
 
 impl InputsConfig {
@@ -166,6 +191,18 @@ fn normalise_rel(p: &str) -> String {
 fn check_rel(what: &str, p: &str) -> Result<()> {
     if p.is_empty() || p.starts_with('/') || p.contains('\\') || p.split('/').any(|c| c == "..") {
         bail!("{what} must be a relative path inside the repo, got {p:?}");
+    }
+    Ok(())
+}
+
+/// `runner` is only for the Rails adapter, and is "minitest" or "rspec".
+fn check_runner(what: &str, adapter: &str, runner: Option<&str>) -> Result<()> {
+    let Some(r) = runner else { return Ok(()) };
+    if adapter != "rails" {
+        bail!("{what}: `runner` is a setting of the rails adapter, not {adapter:?}");
+    }
+    if vci_adapter::RailsRunner::parse(r).is_none() {
+        bail!("{what}: runner must be \"minitest\" or \"rspec\", got {r:?}");
     }
     Ok(())
 }
@@ -338,13 +375,15 @@ impl Config {
             }
         }
         if self.projects.is_empty() {
-            check_adapter(self.adapter.as_deref().unwrap_or("vitest"))?;
+            let adapter = self.adapter.as_deref().unwrap_or("vitest");
+            check_adapter(adapter)?;
+            check_runner("vci.toml", adapter, self.runner.as_deref())?;
             check_rel("project", self.project.as_deref().unwrap_or("."))?;
             return Ok(());
         }
-        if self.project.is_some() || self.adapter.is_some() {
+        if self.project.is_some() || self.adapter.is_some() || self.runner.is_some() {
             bail!(
-                "top-level `project`/`adapter` cannot be combined with [[projects]]; give each project a path and adapter"
+                "top-level `project`/`adapter`/`runner` cannot be combined with [[projects]]; give each project a path and adapter (and runner)"
             );
         }
         let mut names = std::collections::BTreeSet::new();
@@ -366,6 +405,11 @@ impl Config {
             }
             check_rel(&format!("project {:?} path", p.name), &p.path)?;
             check_adapter(&p.adapter)?;
+            check_runner(
+                &format!("project {:?}", p.name),
+                &p.adapter,
+                p.runner.as_deref(),
+            )?;
             if !dirs.insert((normalise_rel(&p.path), p.adapter.clone())) {
                 bail!(
                     "two projects use adapter {:?} in {:?}; they would list the same test files",
@@ -399,6 +443,7 @@ impl Config {
                 name: String::new(),
                 rel: self.project_rel(),
                 adapter: self.adapter.clone().unwrap_or_else(default_adapter),
+                runner: self.runner.clone(),
                 policy: self.policy.clone(),
                 env: self.env.clone(),
                 inputs: self.inputs.clone(),
@@ -453,6 +498,7 @@ impl Config {
                     name: p.name.clone(),
                     rel: normalise_rel(&p.path),
                     adapter: p.adapter.clone(),
+                    runner: p.runner.clone(),
                     policy,
                     env,
                     inputs: p.inputs.clone().unwrap_or_else(|| self.inputs.clone()),
@@ -610,10 +656,17 @@ pub const RAILS_TEMPLATE: &str = r#"# vci configuration. Policy is read from the
 # live), relative to the repo root.
 project = "."
 adapter = "rails"
+# The test framework: "minitest" (bin/rails test, test/**/*_test.rb) or
+# "rspec" (the files RSpec's own configuration lists, run with
+# `--options .rspec`: ~/.rspec, $XDG_CONFIG_HOME/rspec/options and
+# .rspec-local are never read). Unset: RSpec when Gemfile.lock has
+# rspec-core and there is a spec/ directory but no Minitest file, both when
+# both are present, Minitest otherwise.
+# runner = "rspec"
 
 [policy]
 # "any" | "same-os" | "exact": which OS/arch may satisfy CI. Ruby (version and
-# patchlevel), Rails, Bundler, Minitest, the bundle's gem versions, the SQLite
+# patchlevel), Rails, Bundler, Minitest/RSpec, the bundle's gem versions, the SQLite
 # library and the time zone data must always match. Native gems (nokogiri,
 # sqlite3) are matched by version under "any": their macOS and Linux builds
 # are accepted as the same gem.
@@ -638,6 +691,8 @@ rails_allow_db = false
 mode = "strict"
 # Hashed into every test file's inputs. Declare TZ and set it (TZ=UTC) on
 # both sides: Ruby's local time zone otherwise comes from the machine.
+# RSpec reads SPEC_OPTS: strict mode removes it unless you add "SPEC_OPTS"
+# here (it is then hashed).
 global = ["TZ"]
 # Visible to tests, never hashed. Put secrets here.
 pass_through = []
@@ -742,6 +797,38 @@ mod tests {
         let s = c.project_specs();
         assert!(s[0].policy.rails_allow_db);
         assert!(!s[1].policy.rails_allow_db);
+    }
+
+    /// `runner` (rails only): top level in the single-project form, per
+    /// project otherwise; unset means detected.
+    #[test]
+    fn rails_runner_setting() {
+        use vci_adapter::RailsRunner;
+        let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        assert_eq!(c.project_specs()[0].adapter_options().rails_runner, None);
+        let c = Config::parse("adapter = \"rails\"\nrunner = \"rspec\"\n").unwrap();
+        let s = &c.project_specs()[0];
+        assert_eq!(s.runner.as_deref(), Some("rspec"));
+        assert_eq!(s.adapter_options().rails_runner, Some(RailsRunner::Rspec));
+        let c = Config::parse(
+            "[[projects]]\nname = \"mt\"\npath = \"mt\"\nadapter = \"rails\"\nrunner = \"minitest\"\n\n[[projects]]\nname = \"rs\"\npath = \"rs\"\nadapter = \"rails\"\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(
+            s[0].adapter_options().rails_runner,
+            Some(RailsRunner::Minitest)
+        );
+        assert_eq!(s[1].adapter_options().rails_runner, None);
+        for bad in [
+            "adapter = \"rails\"\nrunner = \"cucumber\"\n",
+            "adapter = \"pytest\"\nrunner = \"rspec\"\n",
+            "runner = \"rspec\"\n",
+            "runner = \"rspec\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nrunner = \"minitest\"\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

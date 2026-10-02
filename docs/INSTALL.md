@@ -11,7 +11,7 @@
 | [`uv`](https://docs.astral.sh/uv/) and pytest 9 | pytest projects |
 | Go (tested with 1.26.2) | Go projects |
 | `cargo`/`rustc` installed through `rustup` | Rust projects |
-| Ruby (the exact version in `.ruby-version`; tested with 3.4.9 through mise), Bundler, Rails 8 with Minitest | Rails projects |
+| Ruby (the exact version in `.ruby-version`; tested with 3.4.9 through mise), Bundler, Rails 8 with Minitest or RSpec (rspec-core 3.13, rspec-rails 8) | Rails projects (and plain Ruby projects with RSpec) |
 
 macOS and Linux are supported.
 
@@ -82,7 +82,7 @@ Run these in the repository you want to speed up.
    | Vitest | Node major version, `package-lock.json` |
    | Go | exact Go version (`go version` must print the same on both sides), `go.sum`, `CGO_ENABLED=0` and `TZ=UTC` declared in `[env] global` and set on both sides |
    | Rust | exact release in `rust-toolchain.toml` (a `rustup` build, not Homebrew's), `Cargo.lock`, `[env] mode = "strict"` |
-   | Rails | exact Ruby in `.ruby-version` (and `ruby-version:` in `ruby/setup-ruby`), `Gemfile.lock` with the `x86_64-linux` platform (`bundle lock --add-platform x86_64-linux`), `gem "tzinfo-data"` for time zone data, `config.eager_load = false` (not `ENV["CI"].present?`) in `config/environments/test.rb`, `TZ=UTC` declared in `[env] global` and set on both sides |
+   | Rails | exact Ruby in `.ruby-version` (and `ruby-version:` in `ruby/setup-ruby`), `Gemfile.lock` with the `x86_64-linux` platform (`bundle lock --add-platform x86_64-linux`), `gem "tzinfo-data"` for time zone data, `config.eager_load = false` (not `ENV["CI"].present?`) in `config/environments/test.rb`, `TZ=UTC` declared in `[env] global` and set on both sides; RSpec: options in `.rspec` (vci never reads `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` or `.rspec-local`), `SPEC_OPTS` declared in `[env] global` if you set it |
 
    One repository can hold several projects with different adapters: see "Several projects in one repository" in
    the README, and this repository's own [`vci.toml`](../vci.toml).
@@ -95,14 +95,14 @@ Run these in the repository you want to speed up.
 | `pytest` | test file | `tests/test_b.py` |
 | `go` | package | `./b` (package directory) |
 | `cargo` | test target | `crates/b#lib`, `crates/b#test:name`, `crates/b#doc` |
-| `rails` | Minitest test file (one `bin/rails test <file>` process) | `test/models/b_test.rb` |
+| `rails` | Minitest test file (one `bin/rails test <file>` process) or RSpec spec file (one `rspec --options .rspec <file>` process); `runner = "minitest" \| "rspec"` in `vci.toml`, or detected | `test/models/b_test.rb`, `spec/models/b_spec.rb` |
 
 How inputs are found differs by adapter. Vitest, pytest and Go record what each unit actually read while it ran.
 Rust has no such hook, so the cargo adapter treats every file in the package directory and its in-repo dependencies
 as an input; files read from elsewhere in the repository must be declared. See "What the cargo adapter can and
 cannot see" in the README. Ruby has no audit hook either: the Rails adapter's collector wraps Ruby's file, directory,
 environment, require and process entry points, and prepares a fresh database from the schema for every file; see
-"Quick start (Rails)" in the README for what that covers and what it refuses.
+"Quick start (Rails)" and "Quick start (RSpec)" in the README for what that covers and what it refuses.
 
 ## Daily use
 

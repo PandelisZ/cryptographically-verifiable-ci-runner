@@ -35,8 +35,8 @@ pub use pytest::{
 };
 pub use rails::{
     RAILS_GLOBAL_FILES, RAILS_HASHED_ENV, RAILS_NETWORK_DB_TAINT, RAILS_PASS_THROUGH,
-    RAILS_RUN_VARS, RAILS_SCRATCH_DIRS, RAILS_SEED, RUBY_BIN_ENV, RUBY_COLLECTOR_ENV, RailsAdapter,
-    find_ruby_collector,
+    RAILS_RUN_VARS, RAILS_SCRATCH_DIRS, RAILS_SEED, RSPEC_GLOBAL_FILES, RUBY_BIN_ENV,
+    RUBY_COLLECTOR_ENV, RailsAdapter, RailsRunner, find_ruby_collector,
 };
 pub use vitest::{JS_PLUGIN_ENV, VitestAdapter, find_js_plugin};
 
@@ -49,6 +49,9 @@ pub struct AdapterOptions {
     /// `policy.rails_allow_db`: database servers are prepared fresh from the
     /// schema for every test file (and their refusal is waived).
     pub rails_allow_db: bool,
+    /// Rails: the project's `runner` setting (`None`: detected from the
+    /// project, see `RailsAdapter`).
+    pub rails_runner: Option<RailsRunner>,
 }
 
 /// Construct the adapter called `name` for `project_dir`.
@@ -71,7 +74,9 @@ pub fn adapter_for_with(
         "go" => Ok(Box::new(GoAdapter::new(project_dir))),
         "cargo" => Ok(Box::new(CargoAdapter::new(project_dir))),
         "rails" => Ok(Box::new(
-            RailsAdapter::new(project_dir).with_allow_db(opts.rails_allow_db),
+            RailsAdapter::new(project_dir)
+                .with_allow_db(opts.rails_allow_db)
+                .with_runner(opts.rails_runner),
         )),
         other => Err(AdapterError::NotFound(format!(
             "unsupported adapter {other:?} (supported: {})",
@@ -143,8 +148,10 @@ pub struct ToolVersions {
     /// Cargo: `rustc --print cfg` of the host (with the flags the build
     /// uses), sorted.
     pub rust_cfg: Vec<String>,
-    /// Rails: `RUBY_VERSION` + patchlevel (`3.4.9p82`); `runner` is the test
-    /// framework (`minitest 6.0.6`).
+    /// Rails: `RUBY_VERSION` + patchlevel (`3.4.9p82`); `runner` names the
+    /// bundle's test frameworks (`minitest 6.0.6`, plus `; rspec-core 3.13.6,
+    /// rspec-expectations ..., rspec-mocks ..., rspec-rails ..., rspec-support
+    /// ...` when the bundle has RSpec).
     pub ruby: String,
     /// Rails: `RUBY_ENGINE RUBY_ENGINE_VERSION`.
     pub ruby_engine: String,
@@ -226,6 +233,12 @@ pub trait Adapter: Send + Sync {
     /// Config files that are global inputs (absolute; existing or not, every
     /// candidate the runner would consider).
     fn config_candidates(&self) -> Vec<Utf8PathBuf>;
+    /// [`Adapter::config_candidates`] of one test file, for adapters whose
+    /// files run under different runners (Rails: Minitest and RSpec files).
+    fn config_candidates_for(&self, test_abs: &camino::Utf8Path) -> Vec<Utf8PathBuf> {
+        let _ = test_abs;
+        self.config_candidates()
+    }
     /// Snapshot files belonging to a test file (absolute; may not exist).
     fn snapshot_candidates(&self, test_abs: &camino::Utf8Path) -> Vec<Utf8PathBuf>;
     /// Env var patterns the runner exposes implicitly (hashed if present).

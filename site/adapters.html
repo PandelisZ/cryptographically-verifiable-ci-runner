@@ -143,7 +143,7 @@ extra = ["testdata/**", "shared/config.json"]</code></pre>
 </ul>
 
 <h2 id="rails">Rails</h2>
-<p>Needs Rails 8 with Minitest and the project's Ruby with its bundle installed (tested with Ruby 3.4.9, SQLite). The unit is a <strong>Minitest test file</strong>, one of those <code>bin/rails test</code> runs by default. RSpec is not supported yet.</p>
+<p>Needs Rails 8 with Minitest or RSpec and the project's Ruby with its bundle installed (tested with Ruby 3.4.9, SQLite, rspec-core 3.13 and rspec-rails 8). The unit is a <strong>Minitest test file</strong>, one of those <code>bin/rails test</code> runs by default, or an <strong>RSpec spec file</strong>, one of those RSpec's own configuration lists. Set <code>runner = "minitest"</code> or <code>"rspec"</code> in <code>vci.toml</code>, or let vci detect it. Each RSpec file runs as <code>rspec --options .rspec &lt;file&gt;</code>: <code>.rspec</code> is an input, while <code>~/.rspec</code>, <code>$XDG_CONFIG_HOME/rspec/options</code> and <code>.rspec-local</code> are never read. Pending, skipped and focused-away examples are refused. Plain Ruby projects with RSpec work the same way. Details: "Quick start (RSpec)" in the README.</p>
 <pre><code>cd your-app
 bundle lock --add-platform x86_64-linux   <span class="c"># so the CI runner can install the same bundle</span>
 vci init --adapter rails --key ~/.ssh/id_ed25519.pub

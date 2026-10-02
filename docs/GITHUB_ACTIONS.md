@@ -127,8 +127,12 @@ jobs:
 
 `Gemfile.lock` must list the runner's platform (`bundle lock --add-platform x86_64-linux`), and the Bundler version
 in its `BUNDLED WITH` is what `setup-ruby` installs (it is compared). The action exports `VCI_RUBY_COLLECTOR`; `vci
-ci` runs each remaining Minitest file in its own `bin/rails test <file>` with a fresh SQLite database loaded from
-`db/schema.rb`. A database server needs `policy.rails_allow_db = true` and a service container (see the README).
+ci` runs each remaining Minitest file in its own `bin/rails test <file>`, and each remaining RSpec file in its own
+`rspec --options .rspec <file>`, with a fresh SQLite database loaded from `db/schema.rb`. RSpec reads only the
+repository's `.rspec` there, as where the files were attested: a `~/.rspec` or `$XDG_CONFIG_HOME/rspec/options` on the
+runner (or the laptop) and `.rspec-local` are never read, so there is nothing to set up for them. `SPEC_OPTS` reaches
+RSpec only if declared in `[env] global` (then set it to the same value on both sides). A database server needs
+`policy.rails_allow_db = true` and a service container (see the README).
 Full example: [`examples/github-actions-rails.yml`](../examples/github-actions-rails.yml).
 
 Run the job on the hosted runner directly, not in a `container:` job: attestations made as a normal user are not
@@ -244,5 +248,8 @@ fetch removed attestations without a deletion record. A ruleset on `refs/meta/**
 | A Go package or cargo target never skips on the runner | Its code depends on the platform (build tags, `_linux.go` files, `cfg(target_os)`, `runtime.GOOS`, floating-point maths): such units are only accepted on the same OS and architecture |
 | A test reads `CI`, `HOME` or `TMPDIR` | Those values differ on a runner, so that file always runs there |
 | No Rails test file ever skips on the runner | `config/environments/test.rb` reads `ENV["CI"]` (the generator's `config.eager_load = ENV["CI"].present?`); the Ruby patchlevel, Bundler, SQLite library or time zone data differ (`failed check: toolchain`; use `gem "tzinfo-data"`); or `Gemfile.lock` lacks the runner's platform |
+| An RSpec file is never attested | An example is pending, skipped or filtered out (`fit` with `filter_run_when_matching :focus`, an excluded tag), rspec-retry / parallel_tests is loaded, a failure was retried away (`rspec:failure-cleared`), or the process exited non-zero after RSpec's report (SimpleCov's `minimum_coverage`: `vci:process-exit:2`): `vci run` prints the reason (`rspec:filtered:...`, `rspec:retry`, ...) |
+| Every Rails test is refused on a Mac with `/etc/resolv.conf`, `native:FFI ffi_lib(["vips.42"])` or `config/master.key` | An older collector (`resolv.conf`, read when Capybara loads `net/http`), `image_processing`/`ruby-vips` with Homebrew libvips (remove the gem if unused), or the generator's credentials: see README "Quick start (RSpec)", the stock-app checklist |
+| Minitest files never run with `runner = "rspec"` | An explicit runner leaves the other runner's files to you: `vci plan`/`ci` warn and the audit log lists it under `warnings` |
 
 Run `vci explain <file> --base-ref origin/main` locally for the full reason.

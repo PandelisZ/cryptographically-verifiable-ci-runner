@@ -25,7 +25,7 @@
 <tr><td><a href="https://docs.astral.sh/uv/"><code>uv</code></a> and pytest 9</td><td>pytest projects</td></tr>
 <tr><td>Go (tested with 1.26.2)</td><td>Go projects</td></tr>
 <tr><td><code>cargo</code>/<code>rustc</code> installed through <code>rustup</code></td><td>Rust projects</td></tr>
-<tr><td>Ruby (the exact version in <code>.ruby-version</code>), Bundler, Rails 8 with Minitest</td><td>Rails projects</td></tr>
+<tr><td>Ruby (the exact version in <code>.ruby-version</code>), Bundler, Rails 8 with Minitest or RSpec</td><td>Rails projects</td></tr>
 </table>
 <p>macOS and Linux are supported.</p>
 
@@ -108,7 +108,7 @@ git push</code></pre>
 <tr><td><code>pytest</code></td><td>test file</td><td><code>tests/test_b.py</code></td></tr>
 <tr><td><code>go</code></td><td>package</td><td><code>./b</code></td></tr>
 <tr><td><code>cargo</code></td><td>test target</td><td><code>crates/b#lib</code>, <code>crates/b#test:name</code>, <code>crates/b#doc</code></td></tr>
-<tr><td><code>rails</code></td><td>Minitest file</td><td><code>test/models/b_test.rb</code></td></tr>
+<tr><td><code>rails</code></td><td>Minitest or RSpec file</td><td><code>test/models/b_test.rb</code>, <code>spec/models/b_spec.rb</code></td></tr>
 </table>
 <p>Set <code>VCI_SIGNING_KEY=/path/to/key</code> to leave out <code>--key</code>. A <code>.pub</code> path works when the private half is in <code>ssh-agent</code>, hardware keys included.</p>
 

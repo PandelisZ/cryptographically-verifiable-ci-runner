@@ -49,7 +49,7 @@ pub struct Toolchain {                  // adapter-specific; unused fields are e
     pub rust_cfg: Vec<String>,        // Cargo: sorted `rustc --print cfg` (with the build's rustflags); compared only when rust_host is equal
     pub ruby: String, pub ruby_engine: String,   // Rails: "3.4.9p82", "ruby 3.4.9"
     pub rails: String, pub bundler: String,      // Rails: Rails and Bundler versions
-    pub ruby_test: String,            // Rails: "minitest 6.0.6"
+    pub ruby_test: String,            // Rails: "minitest 6.0.6" (+ "; rspec-core 3.13.6, rspec-expectations ..., rspec-mocks ..., rspec-rails ..., rspec-support ..." when the bundle has RSpec)
     pub ruby_libs: String,            // Rails: "sqlite=<ver>;yaml=<ver>;tz=<tzinfo-data|zoneinfo ver>;encoding=<ext>/<int>"
     pub ruby_db: String,              // Rails: "sqlite3", or "<adapter> <server version>" with policy.rails_allow_db
     pub ruby_gems: Vec<String>,       // Rails: the resolved bundle, sorted "name==version" (no platform)
@@ -191,8 +191,9 @@ pub struct ToolVersions { pub node: String, pub runner: String, pub bundler: Str
                          pub go_env: Vec<String>, pub go_arch_level: String, pub go_work: String /* abs go.work, "" or "off" */,
                          pub cargo: String, pub rust_host: String, pub rust_cfg: Vec<String> /* Cargo; runner = rustc */,
                          pub ruby: String, pub ruby_engine: String, pub rails: String, pub ruby_bundler: String,
-                         pub ruby_libs: String, pub ruby_db: String, pub ruby_gems: Vec<String> /* Rails; runner = "minitest <ver>" */ }
-pub struct AdapterOptions { pub rails_allow_db: bool }   // policy settings that change how an adapter runs tests
+                         pub ruby_libs: String, pub ruby_db: String, pub ruby_gems: Vec<String> /* Rails; runner = "minitest <ver>[; rspec-core <ver>, ...]" */ }
+pub struct AdapterOptions { pub rails_allow_db: bool, pub rails_runner: Option<RailsRunner> }   // settings that change how an adapter runs tests
+pub enum RailsRunner { Minitest, Rspec }   // vci.toml `runner` ("minitest" | "rspec") of a rails project
 pub type InstalledExternals = BTreeMap<String, Vec<String>>;   // PEP 503 name -> installed versions
 pub struct Observed {            // one per collector JSONL file; anything unexpected becomes a taint
     pub test_id: String, pub project: String, pub root: String, pub node: String,
@@ -236,7 +237,7 @@ pub struct GoAdapter;      // GoAdapter::new(project_dir); `go` from $VCI_GO
 pub struct CargoAdapter;   // CargoAdapter::new(project_dir); `cargo` from $VCI_CARGO
 pub fn adapter_for(name: &str, project_dir: &Utf8Path) -> Result<Box<dyn Adapter>, AdapterError>; // "vitest" | "pytest" | "go" | "cargo" | "rails"
 pub fn adapter_for_with(name: &str, project_dir: &Utf8Path, opts: &AdapterOptions) -> Result<Box<dyn Adapter>, AdapterError>;
-pub struct RailsAdapter;   // RailsAdapter::new(project_dir).with_collector(dir).with_allow_db(bool); `ruby` from $VCI_RUBY
+pub struct RailsAdapter;   // RailsAdapter::new(project_dir).with_collector(dir).with_allow_db(bool).with_runner(Option<RailsRunner>); `ruby` from $VCI_RUBY
 pub fn find_ruby_collector(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_RUBY_COLLECTOR, else ruby/vci-collector near the exe / build checkout / project
 pub const PYTEST_CONFIG_NAMES: &[&str];   // pytest.toml, .pytest.toml, pytest.ini, .pytest.ini, pyproject.toml, tox.ini, setup.cfg
 pub const PYTEST_PASS_THROUGH: &[&str];   // UV, UV_*, VIRTUAL_ENV, PYTHONPATH, XDG_*_HOME, SSL_CERT_*, *_PROXY
@@ -253,6 +254,7 @@ pub const RAILS_RUN_VARS: &[&str];       // RUBYOPT, RAILS_ENV, RACK_ENV, BUNDLE
 pub const RAILS_NETWORK_DB_TAINT: &str;  // "rails:network-db:" (the only taint policy.rails_allow_db waives)
 pub const RAILS_SCRATCH_DIRS: &[&str];   // log, tmp, storage, coverage (git-ignored writes there are allowed)
 pub const RAILS_GLOBAL_FILES: &[&str];   // Gemfile, Gemfile.lock, gems.rb, gems.locked, .ruby-version, ..., config/application.rb, bin/rails, test/test_helper.rb
+pub const RSPEC_GLOBAL_FILES: &[&str];   // .rspec (RSpec files: RAILS_GLOBAL_FILES without test/test_helper.rb, plus these)
 pub fn cfg_predicate_differs(pred: &str, attested_cfg: &[String], current_cfg: &[String]) -> Result<bool, String>;
 pub fn unit_package_dir(unit: &Utf8Path) -> Utf8PathBuf;   // "<dir>#<target>" -> "<dir>"
 pub fn parse_jsonl_file(path) / parse_jsonl_dir(dir);  // top-level *.jsonl only
@@ -354,34 +356,68 @@ metadata` `workspace_root`) and hold `Cargo.lock`. All commands run with cwd = p
 
 ### Rails adapter
 
-The unit is a Minitest test file (`test/**/*_test.rb` without `test/{system,dummy,fixtures}/**`, listed in Rust); the
-project dir is the application root (it must hold `bin/rails`). A project whose only tests are RSpec files
-(`spec/**/*_spec.rb`) is an error for `list_test_files` and `run_plain(&[])`; beside Minitest files they are a
-warning. Every Ruby process runs `ruby <args>` (`$VCI_RUBY`, default `ruby`) with cwd = project dir, the child env
-applied, `RUBYLIB` removed, and `RUBYOPT=-r<collector>/vci_collector.rb`, `VCI_RAILS_MODE`, `VCI_ROOT` (project),
-`VCI_REPO` (nearest ancestor with `.git`), `VCI_DB_DIR` and `TMPDIR` (fresh dirs), `RAILS_ENV=test`, `RACK_ENV=test`,
-`PARALLEL_WORKERS=1`, `DISABLE_SPRING=1`, `DISABLE_BOOTSNAP=1`, `BUNDLE_GEMFILE=<project>/Gemfile` (or `gems.rb`),
-`VCI_RAILS_ALLOW_DB=0|1`:
+The unit is a test file of one of two runners. **Minitest**: `test/**/*_test.rb` without
+`test/{system,dummy,fixtures}/**`, listed in Rust; the project dir is the application root (it must hold `bin/rails`).
+**RSpec**: the files `rspec` would run with no file argument, listed by RSpec itself (see below). Which runner a
+project uses: `runner = "minitest" | "rspec"` (top level in the single-project form, or in its `[[projects]]` entry;
+read from the base commit in `vci plan`), else detected: RSpec when the lockfile has a `rspec-core` spec and `spec/`
+(or `.rspec`) exists with no Minitest file; both when both are present (a file under the Minitest rule is a Minitest
+file, every other listed file an RSpec file; if RSpec's listing contains a Minitest file, `list_test_files` is an error
+that asks for the setting); Minitest otherwise. With Minitest only, RSpec files (`spec/**/*_spec.rb`) are an error for
+`list_test_files` and `run_plain(&[])` when there is no Minitest file, else a warning (likewise Minitest files under
+`runner = "rspec"`: a warning). An RSpec project without `config/environment.rb` (a gem) is a plain Ruby project: the
+probe only sets up the bundle and the Rails version may be empty.
+
+Every Ruby process runs `ruby <args>` (`$VCI_RUBY`, default `ruby`) with cwd = project dir, the child env applied,
+`RUBYLIB` removed, and `RUBYOPT=-r<collector>/vci_collector.rb`, `VCI_RAILS_MODE`, `VCI_RAILS_RUNNER=minitest|rspec`,
+`VCI_ROOT` (project), `VCI_REPO` (nearest ancestor with `.git`), `VCI_DB_DIR` and `TMPDIR` (fresh dirs),
+`RAILS_ENV=test`, `RACK_ENV=test`, `PARALLEL_WORKERS=1`, `DISABLE_SPRING=1`, `DISABLE_BOOTSNAP=1`,
+`BUNDLE_GEMFILE=<project>/Gemfile` (or `gems.rb`), `VCI_RAILS_ALLOW_DB=0|1`:
 
 - `tool_versions_with_env` / `installed_externals` (cached): `ruby -e 'require File.expand_path("config/environment")'`
-  in mode `probe`; the collector prints `VCI-PROBE {ruby, engine, rails, bundler, runner, platform, libs, db, gems:
-  [{name, version, platform, source}], gemfile, taints}` at exit. Taints (Bootsnap/Spring active, another Gemfile,
-  load path entries outside the repository/bundle/Ruby) or a Gemfile other than the project's are errors.
+  (plain Ruby: `require "bundler/setup"`) in mode `probe`; the collector prints `VCI-PROBE {ruby, engine, rails,
+  bundler, runner, platform, libs, db, gems: [{name, version, platform, source}], gemfile, taints}` at exit. Taints
+  (Bootsnap/Spring active, another Gemfile, load path entries outside the repository/bundle/Ruby) or a Gemfile other
+  than the project's are errors. `runner` names the bundle's test frameworks from its specs (`minitest <ver>`, and
+  `rspec-core <ver>, rspec-expectations <ver>, ...` when RSpec is in the bundle), the same in every process.
+- RSpec listing (`list_test_files`): mode `plain`, `VCI_RAILS_RUNNER=rspec`, `ruby -e 'require "bundler/setup";
+  require "rspec/core"; $0 = "rspec"; VciCollector::RSpecSupport.list!(ARGV)' -- --options .rspec`: RSpec's
+  `ConfigurationOptions` configure `RSpec.configuration` (default path, pattern, exclude pattern; `.rspec`'s
+  `--require`s are loaded) and the collector prints `VCI-RSPEC-LIST {files: [<abs>...], defaultPath, pattern,
+  excludePattern}`. A file outside the project dir, or a load error, is an error.
 - `run_collect`: per file (`$VCI_JOBS` at a time, default CPUs up to 8, 1 with `rails_allow_db`), mode `collect`,
-  `VCI_OUT=<fresh>`, `VCI_TEST_ID=<project-relative file>`: `ruby bin/rails test <file> --seed 0`.
-- `run_plain`: the same per file in mode `plain` (no output); without files `ruby bin/rails test --seed 0`.
-- `canonical_argv`: `["rails", "test", "--root", <project dir>, "--seed", "0", <file>]`; `config_candidates`:
-  `RAILS_GLOBAL_FILES` in the project dir; built-in pass-through `RAILS_PASS_THROUGH`; hashed patterns
-  `RAILS_HASHED_ENV`; `scratch_dirs`: `<project>/vendor/bundle`.
+  `VCI_OUT=<fresh>`, `VCI_TEST_ID=<project-relative file>`: Minitest `ruby bin/rails test <file> --seed 0`; RSpec
+  `ruby -e 'require "bundler/setup"; require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke' -- --options
+  .rspec <file>` (`RSPEC_RUN_SCRIPT`, `RSPEC_ARGS`).
+- `run_plain`: the same per file in mode `plain` (no output); without files the whole suite, one process per runner
+  (`ruby bin/rails test --seed 0`, the RSpec command without a file).
+- `canonical_argv`: Minitest `["rails", "test", "--root", <project dir>, "--seed", "0", <file>]`; RSpec `["rails",
+  "rspec", "--root", <project dir>, "--options", ".rspec", "--default-seed", "0", <file>]` (a file whose runner cannot
+  be decided gets `["rails", "undecided-runner", ...]`, which no attestation has); `config_candidates`:
+  `RAILS_GLOBAL_FILES` in the project dir, and `config_candidates_for(<RSpec file>)` the same without
+  `test/test_helper.rb` plus `RSPEC_GLOBAL_FILES`; built-in pass-through `RAILS_PASS_THROUGH`; hashed patterns
+  `RAILS_HASHED_ENV` (includes `SPEC_OPTS`); `scratch_dirs`: `<project>/vendor/bundle`.
 
 Collector records (`docs/spike-rails.md`): `meta` has `adapter: "rails"`, `ruby`, `engine`, `rails`, `bundler`,
 `runner`, `platform`, `db`, `tz`, `collector`; `module` (every Ruby file compiled from disk, loaded native extensions),
 `read`, `probe`, `stat`, `readdir`, `write` (inside the repository), `external` (`name`, `version` incl. `git <rev>`
 for git sources, plus `platform` and `source`, which the parser ignores), `env` (`where` is informational; key `*` =
-enumerated), `taint`, `result` (`state` is `passed` only with exit status 0, at least one test, no failure, error or
-skip and at least one assertion in every test; also `no-tests`, `no-assertions`, `failed`; extra `assertions`,
-`noAssertions`, `exitStatus`). The CLI allows `write` records only for git-ignored paths under the project's
-`RAILS_SCRATCH_DIRS`, and waives `rails:network-db:` taints when `policy.rails_allow_db` (recorded in `waived`).
+enumerated), `taint`, `result`. Minitest `result`: `state` is `passed` only with exit status 0, at least one test, no
+failure, error or skip and at least one assertion in every test; also `no-tests`, `no-assertions`, `failed`; extra
+`assertions`, `noAssertions`, `exitStatus`. RSpec `result` (from a hook on `RSpec::Core::Reporter`): `tests` = examples
+run, `failed` = failed examples plus errors outside examples (load errors, `before`/`after(:suite)` and
+`after(:context)` errors), `skipped` = pending and skipped examples; `state` is `passed` only with exit status 0, at
+least one example run, none failed, pending or skipped and every declared example run (`filtered` otherwise; also
+`no-tests`, `failed`); extra `declared`, `errorsOutsideExamples`, `exitStatus`. RSpec taints: `rspec:option-files`,
+`rspec:invocation:<class>` (`--bisect`, `--drb`, `--init`, ...), `rspec:drb`, `rspec:dry-run`, `rspec:error-outside-examples:<context>`, `rspec:filtered:...`,
+`rspec:quit-early`, `rspec:retry`, `rspec:failure-cleared:<locations>` (an example's failure, recorded through
+`Example#display_exception=`, was later reported as a pass), `rspec:status-mismatch` (more failed or pending
+`execution_result` statuses than the reporter heard of), `rspec:parallel-tests`, `rspec:minitest-also-ran`,
+`rails:code-statistics:...`. `exitStatus` is the status the process leaves with, read from `$!` as the collector's
+`at_exit` handler (the last one to run) starts; a non-zero one after a clean framework report adds the taint
+`vci:process-exit:<status>`, and `RailsAdapter::run_one` adds the same taint to a `passed` result whenever the child's
+exit code is not 0 (or it died from a signal). The CLI allows `write` records only for git-ignored paths under the project's `RAILS_SCRATCH_DIRS`, and waives
+`rails:network-db:` taints when `policy.rails_allow_db` (recorded in `waived`).
 
 ## vci-cli predicate and storage
 
@@ -401,8 +437,8 @@ snapshot file, and the `NODE_OPTIONS` env hash; for pytest: `vci.toml`, `pyproje
 directory up to the project dir; for Go: `vci.toml`, `go.mod`/`go.sum`/`go.work`/`go.work.sum` from the project dir
 up to the repo root and `vendor/modules.txt` in the project dir; for Cargo: `vci.toml`, `Cargo.toml` from the package dir
 up to the repo root, `Cargo.lock`/`rust-toolchain(.toml)`/`.cargo/config(.toml)` from the project dir up to the repo
-root; for Rails: `vci.toml`, `RAILS_GLOBAL_FILES` in the project dir, and `.ruby-version`/`.tool-versions`/`mise.toml`
-variants from the project dir up to the repo root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
+root; for Rails: `vci.toml`, `RAILS_GLOBAL_FILES` in the project dir (RSpec files: without `test/test_helper.rb`,
+with `.rspec`), and `.ruby-version`/`.tool-versions`/`mise.toml` variants from the project dir up to the repo root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
 test id, input root, global input root, env config digest, toolchain and argv (plus the pytest toolchain fields, the
 project name, the Go, Rust and Rails toolchain fields, `platformSpecific`, `archSpecific`, `waived`, `cfgPredicates`, `declaredInputs` and a
 non-Vitest adapter name when set), so re-running with identical inputs replaces (renews) the

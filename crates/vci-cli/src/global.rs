@@ -408,16 +408,19 @@ const RUBY_VERSION_FILES: &[&str] = &[
 /// the files every test boots through (`Gemfile`, `Gemfile.lock`, `gems.rb`,
 /// `gems.locked`, `config/application.rb`, `config/boot.rb`,
 /// `config/environment.rb`, `config/environments/test.rb`, `config.ru`,
-/// `bin/rails`, `test/test_helper.rb`, `Rakefile`); and the Ruby version
-/// files from the project dir up to the repo root. Present files are reads,
-/// missing ones probes.
+/// `bin/rails`, `test/test_helper.rb`, `Rakefile`; for an RSpec file `.rspec`
+/// instead of `test/test_helper.rb`); and the Ruby version files from the
+/// project dir up to the repo root. Present files are reads, missing ones
+/// probes.
 fn rails_observations(
     c: &mut Collector,
     repo_root: &Utf8Path,
-    project_dir: &Utf8Path,
+    adapter: &dyn Adapter,
+    test_abs: &Utf8Path,
 ) -> Result<()> {
-    for n in vci_adapter::RAILS_GLOBAL_FILES {
-        c.observe(&project_dir.join(n))?;
+    let project_dir = adapter.project_dir();
+    for p in adapter.config_candidates_for(test_abs) {
+        c.observe(&p)?;
     }
     let mut dir = Some(project_dir);
     while let Some(d) = dir {
@@ -460,7 +463,7 @@ pub fn observations(
             return Ok(c.out.into_iter().collect());
         }
         "rails" => {
-            rails_observations(&mut c, repo_root, project_dir)?;
+            rails_observations(&mut c, repo_root, adapter, test_abs)?;
             return Ok(c.out.into_iter().collect());
         }
         other => bail!("no global input rules for adapter {other:?}"),

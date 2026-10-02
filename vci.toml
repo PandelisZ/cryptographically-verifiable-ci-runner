@@ -36,3 +36,9 @@ adapter = "cargo"
 name = "rails"
 path = "demo/rails-app"
 adapter = "rails"
+
+[[projects]]
+name = "rspec"
+path = "demo/rspec-app"
+adapter = "rails"
+runner = "rspec"

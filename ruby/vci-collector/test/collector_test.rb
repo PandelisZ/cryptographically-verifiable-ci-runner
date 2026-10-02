@@ -547,6 +547,229 @@ class CollectorTest < Minitest::Test
     assert_includes taints(net).join("\n"), "network:Socket.ip_address_list"
   end
 
+  # A test that replaces File.directory?, File.exist?, Dir.children or
+  # File.expand_path (rspec-mocks' allow(File).to receive, Minitest's
+  # File.stub) changes what the test sees, never what the collector records:
+  # it uses the methods captured when it loaded.
+  def test_stubbed_file_methods_do_not_hide_real_reads
+    put("data/g/1.txt", "1")
+    put("data/g/2.txt", "2")
+    put("data/real.txt", "real")
+    recs = collect(<<~RUBY)
+      # Stubs as rspec-mocks makes them over methods a prepended module
+      # defines (a module prepended in front, its methods removed when the
+      # "example" ends).
+      stubs = {
+        File => { directory?: ->(*) { false }, exist?: ->(*) { false },
+                  expand_path: ->(p, *) { "/nonexistent/" + p.to_s } },
+        Dir => { children: ->(*) { [] } }
+      }
+      mods = stubs.map do |k, ms|
+        m = Module.new { ms.each { |name, body| define_method(name, &body) } }
+        k.singleton_class.prepend(m)
+        [m, ms.keys]
+      end
+      begin
+        raise "glob" unless Dir.glob("data/g/*.txt").size == 2
+        raise "read" unless File.read("data/real.txt") == "real"
+        raise "stub" if File.exist?("data/real.txt")
+      ensure
+        mods.each { |m, names| names.each { |n| m.send(:remove_method, n) } }
+      end
+    RUBY
+    assert_includes paths(recs, "readdir"), "data/g"
+    assert_includes paths(recs, "read"), "data/real.txt"
+    refute(recs.any? { |r| r["path"].to_s.start_with?("/nonexistent/") }, "a stubbed expand_path is not used")
+    assert_empty taints(recs)
+  end
+
+  # RSpec (VCI_RAILS_RUNNER=rspec): examples are counted by the reporter
+  # hook, the default seed is 0, the example status file lives in vci's
+  # temp dir, and a focused run that skipped examples is refused.
+  def test_rspec_results_seed_and_status_file
+    skip "the rspec-core gem is not installed for #{RUBY_VERSION}" unless installed?("rspec-core") && installed?("rspec-expectations")
+    put(".rspec", "--require spec_helper\n")
+    put("spec/spec_helper.rb", <<~RUBY)
+      RSpec.configure do |c|
+        c.example_status_persistence_file_path = "spec/examples.txt"
+        c.filter_run_when_matching :focus
+        c.order = :random
+        File.write(File.join(ENV["TMPDIR"], "seed"), c.seed.to_s)
+      end
+    RUBY
+    put("spec/a_spec.rb", <<~RUBY)
+      RSpec.describe "a" do
+        it("one") { expect(1).to eq(1) }
+        it("two") { expect(2).to eq(2) }
+      end
+    RUBY
+    put("spec/pending_spec.rb", <<~RUBY)
+      RSpec.describe "p" do
+        it("passes") { expect(1).to eq(1) }
+        xit("skipped") { expect(1).to eq(1) }
+      end
+    RUBY
+    put("spec/focus_spec.rb", <<~RUBY)
+      RSpec.describe "f" do
+        fit("focused") { expect(1).to eq(1) }
+        it("not run") { expect(1).to eq(1) }
+      end
+    RUBY
+    script = %(require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke\n)
+    run = lambda do |file|
+      collect(script, env: { "VCI_RAILS_RUNNER" => "rspec" }, args: ["--options", ".rspec", file])
+    end
+    recs = run.call("spec/a_spec.rb")
+    result = recs.find { |r| r["kind"] == "result" }
+    assert_equal "passed", result["state"], result.inspect
+    assert_equal 2, result["tests"]
+    assert_equal "0", File.read(File.join(@tmpdir, "seed"))
+    refute File.exist?(File.join(@repo, "spec/examples.txt")), "the status file is not written in the repository"
+    assert File.file?(File.join(@tmpdir, "vci-rspec-example-statuses.txt"))
+    assert_includes paths(recs, "read"), ".rspec"
+    assert_includes paths(recs, "module"), "spec/spec_helper.rb"
+    assert_empty taints(recs)
+    meta = recs.find { |r| r["kind"] == "meta" }
+    assert_match(/rspec-core \d/, meta["runner"])
+
+    recs = run.call("spec/pending_spec.rb")
+    result = recs.find { |r| r["kind"] == "result" }
+    assert_equal ["failed", 1, 1], [result["state"], result["skipped"], result["tests"] - 1], result.inspect
+
+    recs = run.call("spec/focus_spec.rb")
+    assert(taints(recs).any? { |t| t.start_with?("rspec:filtered:1 of 2 examples did not run") }, taints(recs).inspect)
+    assert_equal "filtered", recs.find { |r| r["kind"] == "result" }["state"]
+
+    # Without --options, RSpec reads ~/.rspec and friends: refused.
+    recs = collect(script, env: { "VCI_RAILS_RUNNER" => "rspec", "HOME" => @tmpdir }, args: ["spec/a_spec.rb"])
+    assert(taints(recs).any? { |t| t.start_with?("rspec:option-files") }, taints(recs).inspect)
+  end
+
+  # SimpleCov in an RSpec process: its output (and the earlier results it
+  # would merge) lives in vci's temp dir, and its configuration files outside
+  # the repository (~/.simplecov, .simplecov above the project) look absent.
+  def test_rspec_simplecov_is_kept_out_of_the_repository
+    skip "simplecov and rspec-core are not installed for #{RUBY_VERSION}" unless installed?("simplecov") && installed?("rspec-core")
+    put("spec/a_spec.rb", "RSpec.describe('a') { it('one') { expect(1).to eq(1) } }\n")
+    home = File.join(@tmp, "home").tap { |d| FileUtils.mkdir_p(d) }
+    File.write(File.join(home, ".simplecov"), "raise 'the global SimpleCov config was loaded'\n")
+    File.write(File.join(@tmp, ".simplecov"), "raise 'a .simplecov above the repository was loaded'\n")
+    script = %(require "simplecov"; SimpleCov.start; require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke\n)
+    recs = collect(script, env: { "VCI_RAILS_RUNNER" => "rspec", "HOME" => home },
+                           args: ["--options", ".rspec", "spec/a_spec.rb"])
+    assert_equal "passed", recs.find { |r| r["kind"] == "result" }["state"]
+    refute File.exist?(File.join(@repo, "coverage")), "nothing written in the repository"
+    assert File.file?(File.join(@tmpdir, "vci-coverage", ".resultset.json"))
+    assert_includes paths(recs, "probe"), ".simplecov"
+    outside = recs.select { |r| r["path"].to_s.end_with?("/.simplecov") && !r["path"].start_with?(@repo) }
+    assert_empty outside
+    assert_empty taints(recs)
+  end
+
+  # An at_exit handler that changes the exit code after RSpec reported its
+  # results (SimpleCov's minimum_coverage exits 2, minitest/autorun's handler,
+  # a test's own `at_exit { exit 1 }`): the recorded exit status is the
+  # process's, so the file is not reported as passed.
+  def test_rspec_exit_status_changed_after_the_run_is_recorded
+    skip "the rspec-core gem is not installed for #{RUBY_VERSION}" unless installed?("rspec-core") && installed?("rspec-expectations")
+    put("spec/exit_spec.rb", <<~RUBY)
+      at_exit { exit 2 }
+      RSpec.describe("a") { it("one") { expect(1).to eq(1) } }
+    RUBY
+    script = %(require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke\n)
+    recs = collect(script, env: { "VCI_RAILS_RUNNER" => "rspec" }, args: ["--options", ".rspec", "spec/exit_spec.rb"])
+    result = recs.find { |r| r["kind"] == "result" }
+    assert_equal ["failed", 2], [result["state"], result["exitStatus"]], result.inspect
+    assert(taints(recs).any? { |t| t.start_with?("vci:process-exit:2 ") }, taints(recs).inspect)
+  end
+
+  # A test that sets ENV["TMPDIR"] does not move the collector's notion of
+  # its own temp dir: reads under the new value are still recorded.
+  def test_tmpdir_set_by_the_test_does_not_hide_reads
+    tmp = File.realpath(@tmp)
+    outside = File.join(tmp, "outside.txt")
+    File.write(outside, "o")
+    ["/", tmp].each do |dir|
+      recs = collect(<<~RUBY)
+        ENV["TMPDIR"] = #{dir.inspect}
+        File.read(#{outside.inspect})
+      RUBY
+      assert_includes recs.select { |r| r["kind"] == "read" }.map { |r| r["path"] }, outside, "TMPDIR=#{dir}"
+    end
+  end
+
+  # Prism's *_file APIs read the source in C.
+  def test_prism_file_apis_are_reads
+    skip "prism is not installed for #{RUBY_VERSION}" unless installed?("prism")
+    %w[p1 p2 p3 p4 p5 p6 p7].each { |n| put("data/#{n}.rb", "X = 1\n") }
+    recs = collect(<<~RUBY)
+      require "prism"
+      Prism.parse_file("data/p1.rb")
+      Prism.parse_file_success?("data/p2.rb")
+      Prism.parse_file_failure?("data/p3.rb")
+      Prism.lex_file("data/p4.rb")
+      Prism.parse_lex_file("data/p5.rb")
+      Prism.parse_file_comments("data/p6.rb")
+      Prism.dump_file("data/p7.rb") if Prism.respond_to?(:dump_file)
+    RUBY
+    reads = paths(recs, "read")
+    %w[p1 p2 p3 p4 p5 p6].each { |n| assert_includes reads, "data/#{n}.rb" }
+  end
+
+  # Ruby's resolv.rb reads /etc/resolv.conf while it loads (DefaultResolver =
+  # Resolv.new), which `require "net/http"` (Capybara, rspec-rails' Capybara
+  # integration) does at boot. That read is not an input: the DNS settings
+  # only matter for lookups, which open sockets (refused). A read the test
+  # itself makes through Resolv afterwards is recorded.
+  def test_resolv_conf_read_while_resolv_loads_is_not_an_input
+    skip "no /etc/resolv.conf here" unless File.file?("/etc/resolv.conf")
+    recs = collect(%(require "resolv"\n))
+    conf = recs.select { |r| r["path"].to_s.end_with?("/resolv.conf") }
+    assert_empty conf
+    recs = collect(%(require "resolv"; Resolv::DNS::Config.default_config_hash\n))
+    assert(recs.any? { |r| r["kind"] == "read" && r["path"].to_s.end_with?("/resolv.conf") }, recs.inspect)
+  end
+
+  # An example whose failure was cleared before it finished (a retry in an
+  # around hook, a prepended Example#finish) or reported as passed by an
+  # overridden reporter is refused.
+  def test_rspec_cleared_or_swallowed_failures_are_refused
+    skip "the rspec-core gem is not installed for #{RUBY_VERSION}" unless installed?("rspec-core") && installed?("rspec-expectations")
+    put("spec/retry_spec.rb", <<~RUBY)
+      $attempt = 0
+      RSpec.configure do |c|
+        c.around(:each) do |ex|
+          3.times do
+            ex.example.instance_variable_set(:@exception, nil)
+            ex.run
+            break unless ex.example.exception
+          end
+        end
+      end
+      RSpec.describe("r") { it("flaky") { $attempt += 1; expect($attempt).to eq(2) } }
+    RUBY
+    put("spec/reporter_spec.rb", <<~RUBY)
+      RSpec::Core::Reporter.prepend(Module.new { def example_failed(ex) = example_passed(ex) })
+      RSpec.describe("s") { it("fails") { expect(1).to eq(2) } }
+    RUBY
+    put("spec/finish_spec.rb", <<~RUBY)
+      RSpec::Core::Example.prepend(Module.new { def finish(reporter); @exception = nil; super; end })
+      RSpec.describe("f") { it("fails") { expect(1).to eq(2) } }
+    RUBY
+    script = %(require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke\n)
+    {
+      "spec/retry_spec.rb" => ["rspec:failure-cleared:"],
+      "spec/reporter_spec.rb" => ["rspec:failure-cleared:", "rspec:status-mismatch"],
+      "spec/finish_spec.rb" => ["rspec:failure-cleared:"]
+    }.each do |f, want|
+      recs = collect(script, env: { "VCI_RAILS_RUNNER" => "rspec" }, args: ["--options", ".rspec", f])
+      result = recs.find { |r| r["kind"] == "result" }
+      want.each do |w|
+        assert taints(recs).any? { |t| t.start_with?(w) }, "#{f}: #{w} in #{result.inspect} #{taints(recs).inspect}"
+      end
+    end
+  end
+
   def test_plain_mode_records_nothing
     put("script.rb", "File.read(__FILE__)\n")
     e = { "RUBYOPT" => "-r#{COLLECTOR}", "VCI_RAILS_MODE" => "plain", "VCI_OUT" => @out, "VCI_TEST_ID" => "script.rb" }

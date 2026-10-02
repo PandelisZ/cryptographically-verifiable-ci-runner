@@ -46,6 +46,12 @@ jobs:
           bundler-cache: true
           working-directory: demo/rails-app
 
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4.9" # same as demo/rspec-app/.ruby-version
+          bundler-cache: true
+          working-directory: demo/rspec-app
+
       - name: Set up project dependencies
         run: |
           (cd demo/pytest-app && uv sync --locked)
