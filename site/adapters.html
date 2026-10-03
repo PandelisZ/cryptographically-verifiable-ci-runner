@@ -21,8 +21,9 @@
 <tr><td><a href="#pytest"><code>pytest</code></a></td><td>test file</td><td>observed at run time (Python audit hooks, import system)</td></tr>
 <tr><td><a href="#go"><code>go</code></a></td><td>package</td><td>observed at run time (a logger overlaid into the standard library) plus <code>go list</code></td></tr>
 <tr><td><a href="#cargo"><code>cargo</code></a></td><td>test target</td><td>conservative: every file of the package and its in-repo dependencies</td></tr>
-<tr><td><a href="#rails"><code>rails</code></a></td><td>Minitest file</td><td>observed at run time (a collector wrapping Ruby's file, env and process entry points)</td></tr>
+<tr><td><a href="#rails"><code>rails</code></a></td><td>Minitest file, or <a href="#rspec">RSpec</a> spec file</td><td>observed at run time (a collector wrapping Ruby's file, env and process entry points)</td></tr>
 </table>
+<p>Copy-and-paste setups for each runner, with real output, are on the <a href="examples.html">Examples</a> page.</p>
 
 <div class="note">
 <p><strong>Common to every adapter.</strong> A unit is attested only when it passed, nothing it did was invisible to the collector, and every input is inside the repository. A unit with a <em>skipped</em> test is not attested (Rust's <code>#[ignore]</code> is the exception). An attestation vouches for the unit run on its own, in its own process.</p>
@@ -143,7 +144,13 @@ extra = ["testdata/**", "shared/config.json"]</code></pre>
 </ul>
 
 <h2 id="rails">Rails</h2>
-<p>Needs Rails 8 with Minitest or RSpec and the project's Ruby with its bundle installed (tested with Ruby 3.4.9, SQLite, rspec-core 3.13 and rspec-rails 8). The unit is a <strong>Minitest test file</strong>, one of those <code>bin/rails test</code> runs by default, or an <strong>RSpec spec file</strong>, one of those RSpec's own configuration lists. Set <code>runner = "minitest"</code> or <code>"rspec"</code> in <code>vci.toml</code>, or let vci detect it. Each RSpec file runs as <code>rspec --options .rspec &lt;file&gt;</code>: <code>.rspec</code> is an input, while <code>~/.rspec</code>, <code>$XDG_CONFIG_HOME/rspec/options</code> and <code>.rspec-local</code> are never read. Pending, skipped and focused-away examples are refused. Plain Ruby projects with RSpec work the same way. Details: "Quick start (RSpec)" in the README.</p>
+<p>Needs Rails 8 and the project's Ruby with its bundle installed (tested with Ruby 3.4.9 and SQLite). The unit is a <strong>test file</strong>, run in its own process. Two runners are supported:</p>
+<table>
+<tr><th><code>runner</code></th><th>Unit</th><th>Run as</th></tr>
+<tr><td><code>"minitest"</code></td><td>a file <code>bin/rails test</code> runs by default</td><td><code>bin/rails test &lt;file&gt;</code></td></tr>
+<tr><td><code>"rspec"</code></td><td>a spec file RSpec's own configuration lists</td><td><code>rspec --options .rspec &lt;file&gt;</code></td></tr>
+</table>
+<p>Set <code>runner</code> in <code>vci.toml</code>, or leave it out and vci detects it from the lockfile and the directories present. This section covers Minitest and everything the two share; <a href="#rspec">RSpec</a> has its own section below.</p>
 <pre><code>cd your-app
 bundle lock --add-platform x86_64-linux   <span class="c"># so the CI runner can install the same bundle</span>
 vci init --adapter rails --key ~/.ssh/id_ed25519.pub
@@ -171,7 +178,51 @@ vci push</code></pre>
 <li><strong>Time zone data.</strong> Use <code>gem "tzinfo-data"</code> for every platform, and declare and set <code>TZ=UTC</code>.</li>
 <li><strong>Lockfile platforms.</strong> <code>Gemfile.lock</code> must list both <code>arm64-darwin</code> and <code>x86_64-linux</code>.</li>
 <li>Keep <code>vendor/.keep</code> committed, and pin the exact Ruby in <code>.ruby-version</code>.</li>
+<li>Attest with a UTF-8 locale (<code>LANG=en_US.UTF-8</code>). Ruby's default encoding is compared, and runners use UTF-8.</li>
 </ul>
+
+<h2 id="rspec">RSpec</h2>
+<p>RSpec runs through the Rails adapter, so everything in the <a href="#rails">Rails</a> section applies: the fresh database, the single process, what is recorded, and the changes needed for a Linux runner. Tested with rspec-core 3.13 and rspec-rails 8. Plain Ruby projects that use RSpec without Rails work the same way.</p>
+<pre><code>cd your-app
+bundle lock --add-platform x86_64-linux
+vci init --adapter rails --key ~/.ssh/id_ed25519.pub
+git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock .rspec &amp;&amp; git commit -m "Enable vci"
+
+TZ=UTC vci run spec/models/order_spec.rb --key ~/.ssh/id_ed25519
+TZ=UTC vci plan --base-ref origin/main
+vci push</code></pre>
+<pre><code><span class="c"># vci.toml</span>
+project = "."
+adapter = "rails"
+runner = "rspec"</code></pre>
+<h3>Option files</h3>
+<p>RSpec reads options from several places, some outside the repository. vci makes local and CI runs behave the same:</p>
+<table>
+<tr><th>Source</th><th>Treatment</th></tr>
+<tr><td><code>.rspec</code></td><td>read, and an input of every spec file: editing it runs everything</td></tr>
+<tr><td><code>~/.rspec</code>, <code>$XDG_CONFIG_HOME/rspec/options</code></td><td>never read</td></tr>
+<tr><td><code>.rspec-local</code></td><td>never read (it is usually git-ignored, so CI could not match it)</td></tr>
+<tr><td><code>SPEC_OPTS</code></td><td>hashed when set; strict mode removes it unless declared in <code>[env]</code></td></tr>
+</table>
+<h3>What is recorded</h3>
+<ul>
+<li><code>spec_helper.rb</code>, <code>rails_helper.rb</code> and every file they load;</li>
+<li>the listing of directories loaded by a glob, such as <code>spec/support</code> and FactoryBot's <code>spec/factories</code>, so a <em>new</em> support or factory file invalidates the specs that load them;</li>
+<li>shared examples, custom matchers, fixtures and <code>file_fixture</code> files;</li>
+<li>the versions of rspec-core, rspec-rails, rspec-expectations and rspec-mocks.</li>
+</ul>
+<p>A spec that only requires <code>spec_helper</code> has far fewer inputs than one that loads <code>rails_helper</code>, and survives most changes to the app.</p>
+<h3>What is refused</h3>
+<ul>
+<li>a pending or skipped example: <code>pending</code>, <code>skip</code>, <code>xit</code>, <code>xdescribe</code>;</li>
+<li>a run where a filter left examples out: <code>:focus</code>, <code>fit</code>, tag filters, <code>--only-failures</code>, <code>--example</code>;</li>
+<li>errors outside examples, such as a load error or a failing <code>before(:suite)</code> hook;</li>
+<li>a process that exits non-zero after RSpec finished, for example SimpleCov's minimum coverage;</li>
+<li>retries that hide a failed first attempt (rspec-retry), and <code>parallel_tests</code> or <code>turbo_tests</code>;</li>
+<li>system specs that drive a browser.</li>
+</ul>
+<p>vci also fixes the conditions of every run: the seed defaults to 0, the example status file is redirected to a temp directory, and SimpleCov writes outside the repository.</p>
+<div class="note"><p><strong>Two things to know.</strong> A spec generated by <code>rails generate</code> contains a pending example, so it is refused until you replace it with real examples. And an example with no expectations is still attested: unlike Minitest, there is no check for that yet.</p></div>
 
 <h2>Full reference</h2>
 <p>This page is a summary. The complete lists of recorded inputs, refusals and known limitations for each adapter are in the <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/README.md">README</a>.</p>

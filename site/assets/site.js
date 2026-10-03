@@ -6,6 +6,7 @@
     ["index.html", "Overview"],
     ["get-started.html", "Get started"],
     ["adapters.html", "Test runners"],
+    ["examples.html", "Examples"],
     ["configuration.html", "Configuration"],
     ["github-actions.html", "GitHub Actions"],
     ["cli.html", "CLI"],
