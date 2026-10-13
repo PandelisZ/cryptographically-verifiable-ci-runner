@@ -560,7 +560,7 @@ allow_dirty = true
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 # Test files (project-relative globs) that are never skipped, e.g. files whose
-# inputs no collector can see (see "pytest limitations" in the README).
+# inputs no collector can see (see "pytest limitations" in docs/REFERENCE.md).
 never_skip = []
 
 [env]

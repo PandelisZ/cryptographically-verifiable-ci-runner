@@ -74,7 +74,7 @@ Run these in the repository you want to speed up.
 3. **Merge both files to your default branch.** CI reads them from the base commit, never from the pull request, so
    they have no effect until they are on `main`.
 
-4. **Pin toolchains** so local and CI runs match (see the README section "Attesting on macOS, verifying on Linux"):
+4. **Pin toolchains** so local and CI runs match (see "Attesting on macOS, verifying on Linux" in [the reference](REFERENCE.md)):
 
    | Runner | Pin |
    |---|---|
@@ -85,7 +85,7 @@ Run these in the repository you want to speed up.
    | Rails | exact Ruby in `.ruby-version` (and `ruby-version:` in `ruby/setup-ruby`), `Gemfile.lock` with the `x86_64-linux` platform (`bundle lock --add-platform x86_64-linux`), `gem "tzinfo-data"` for time zone data, `config.eager_load = false` (not `ENV["CI"].present?`) in `config/environments/test.rb`, `TZ=UTC` declared in `[env] global` and set on both sides; RSpec: options in `.rspec` (vci never reads `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` or `.rspec-local`), `SPEC_OPTS` declared in `[env] global` if you set it |
 
    One repository can hold several projects with different adapters: see "Several projects in one repository" in
-   the README, and this repository's own [`vci.toml`](../vci.toml).
+   [the reference](REFERENCE.md), and this repository's own [`vci.toml`](../vci.toml).
 
 ## What a test unit is
 
@@ -100,9 +100,9 @@ Run these in the repository you want to speed up.
 How inputs are found differs by adapter. Vitest, pytest and Go record what each unit actually read while it ran.
 Rust has no such hook, so the cargo adapter treats every file in the package directory and its in-repo dependencies
 as an input; files read from elsewhere in the repository must be declared. See "What the cargo adapter can and
-cannot see" in the README. Ruby has no audit hook either: the Rails adapter's collector wraps Ruby's file, directory,
+cannot see" in [the reference](REFERENCE.md). Ruby has no audit hook either: the Rails adapter's collector wraps Ruby's file, directory,
 environment, require and process entry points, and prepares a fresh database from the schema for every file; see
-"Quick start (Rails)" and "Quick start (RSpec)" in the README for what that covers and what it refuses.
+"Quick start (Rails)" and "Quick start (RSpec)" in [the reference](REFERENCE.md) for what that covers and what it refuses.
 
 ## Daily use
 

@@ -189,7 +189,7 @@ pub fn cargo_locked(
 
 /// `Ok(())` if the gem `name` is in the bundle Bundler resolves now in
 /// exactly `version` (a git source's locked revision included). The
-/// platform of a native gem's build is not compared (see README, "Rails").
+/// platform of a native gem's build is not compared (see docs/REFERENCE.md, "Rails").
 pub fn rails_bundled(
     bundle: &Result<InstalledExternals, String>,
     name: &str,

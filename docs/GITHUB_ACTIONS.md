@@ -132,7 +132,7 @@ ci` runs each remaining Minitest file in its own `bin/rails test <file>`, and ea
 repository's `.rspec` there, as where the files were attested: a `~/.rspec` or `$XDG_CONFIG_HOME/rspec/options` on the
 runner (or the laptop) and `.rspec-local` are never read, so there is nothing to set up for them. `SPEC_OPTS` reaches
 RSpec only if declared in `[env] global` (then set it to the same value on both sides). A database server needs
-`policy.rails_allow_db = true` and a service container (see the README).
+`policy.rails_allow_db = true` and a service container (see [the reference](REFERENCE.md)).
 Full example: [`examples/github-actions-rails.yml`](../examples/github-actions-rails.yml).
 
 Run the job on the hosted runner directly, not in a `container:` job: attestations made as a normal user are not

@@ -180,6 +180,6 @@
   var footer = document.createElement("footer");
   footer.innerHTML =
     '<div class="inner"><span>vci is licensed under Apache-2.0.</span>' +
-    '<span><a href="' + REPO + '">Source on GitHub</a> · <a href="' + REPO + '/blob/main/README.md">Full reference (README)</a></span></div>';
+    '<span><a href="' + REPO + '">Source on GitHub</a> · <a href="' + REPO + '/blob/main/docs/REFERENCE.md">Full reference</a></span></div>';
   document.body.appendChild(footer);
 })();
