@@ -5,7 +5,7 @@
 | Tool | Needed for |
 |---|---|
 | `git` | everything |
-| Rust toolchain (`cargo`, 1.85+) | building the `vci` binary |
+| Rust toolchain (`cargo`, 1.85+) | building the `vci` binary (not needed with Homebrew) |
 | `ssh-keygen` (OpenSSH 8.1+) and an Ed25519 SSH key | signing attestations |
 | Node 22.15+ and Vitest `>=3.2 <6` | Vitest projects |
 | [`uv`](https://docs.astral.sh/uv/) and pytest 9 | pytest projects |
@@ -17,7 +17,15 @@ macOS and Linux are supported.
 
 ## Install
 
-With the install script (clones to `~/.local/share/vci` and builds with cargo):
+With Homebrew (macOS and Linux; prebuilt binary with the collectors included, nothing else to set up):
+
+```sh
+brew install pandelisz/tap/vci
+```
+
+Upgrade with `brew upgrade vci`.
+
+Without Homebrew, use the install script (clones to `~/.local/share/vci` and builds with cargo):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh
@@ -30,7 +38,7 @@ git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.gi
 cargo install --locked --path ~/.local/share/vci/crates/vci-cli
 ```
 
-Then tell `vci` where its collectors live (add to your shell profile):
+Then tell `vci` where its collectors live (add to your shell profile; not needed with Homebrew):
 
 ```sh
 export VCI_PY_PLUGIN="$HOME/.local/share/vci/py/pytest-plugin"

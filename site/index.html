@@ -96,8 +96,8 @@
 
 <section>
   <h2>Try it in five minutes</h2>
-  <pre><code><span class="c"># install</span>
-curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh
+  <pre><code><span class="c"># install (or, without Homebrew: see Get started)</span>
+brew install pandelisz/tap/vci
 
 <span class="c"># in your repository</span>
 vci init --adapter pytest --key ~/.ssh/id_ed25519.pub

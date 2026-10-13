@@ -51,13 +51,45 @@ What vci does not do: it cannot tell whether a trusted signer lied. Keep the sig
 
 The saving is exactly the tests that were attested and still match; the cost is about ten seconds to fetch and verify. When nothing was attested, when the toolchain differs from CI, or on your default branch (where policy runs everything), the suite runs in full as before. Compute minutes follow the same proportions as time.
 
-## Quick start
+## Install
 
-Install (needs `git`, a Rust toolchain and `ssh-keygen`):
+vci runs on macOS and Linux and needs `git` and `ssh-keygen` (OpenSSH 8.1+). Pick one:
+
+**Homebrew** (macOS and Linux; prebuilt binary, collectors included, nothing else to set up):
+
+```sh
+brew install pandelisz/tap/vci
+```
+
+**Install script** (builds from source with cargo; needs a Rust toolchain 1.85+):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh
 ```
+
+It clones to `~/.local/share/vci` and installs `vci` to `~/.cargo/bin`. Set `VCI_REF` to a tag or commit to pin a version. Then add the collector paths it prints to your shell profile:
+
+```sh
+export VCI_PY_PLUGIN="$HOME/.local/share/vci/py/pytest-plugin"
+export VCI_JS_PLUGIN="$HOME/.local/share/vci/js/vitest-plugin"
+export VCI_RUBY_COLLECTOR="$HOME/.local/share/vci/ruby/vci-collector"
+```
+
+**From a checkout** (for working on vci itself):
+
+```sh
+git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.git
+cd cryptographically-verifiable-ci-runner
+cargo install --locked --path crates/vci-cli
+```
+
+A `vci` built this way finds the pytest and Ruby collectors in the checkout it was built from; for Vitest, set `VCI_JS_PLUGIN` to the checkout's `js/vitest-plugin`.
+
+Check it worked with `vci --version`. Upgrade with `brew upgrade vci`, or by re-running the install script. vci is not published to crates.io. Prebuilt binaries for each release are on the [releases page](https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases).
+
+You also need the toolchain for the test runner you use (Node and Vitest, uv and pytest, Go, rustup, or Ruby and Bundler): see [Install and run](docs/INSTALL.md) for versions.
+
+## Quick start
 
 In your repository, once:
 
@@ -127,7 +159,7 @@ This repository is also the demo: `demo/` holds a project for every adapter, and
 
 ## Status
 
-Version 0.3. Each adapter has an end-to-end test suite and has been verified against adversarial tests that try to produce a false skip; findings and remaining limits are listed under [Known gaps](docs/REFERENCE.md#known-gaps). Verification of a trusted signer's honesty (random re-runs in CI) is planned, not built.
+Version 1.0. Each adapter has an end-to-end test suite and has been verified against adversarial tests that try to produce a false skip; findings and remaining limits are listed under [Known gaps](docs/REFERENCE.md#known-gaps). Verification of a trusted signer's honesty (random re-runs in CI) is planned, not built.
 
 ## License
 

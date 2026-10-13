@@ -30,18 +30,20 @@
 <p>macOS and Linux are supported.</p>
 
 <h2>Install</h2>
-<p>The install script clones the repository to <code>~/.local/share/vci</code> and builds with cargo:</p>
+<p>With Homebrew (macOS and Linux). This installs a prebuilt binary with the collectors included, so there is nothing else to set up:</p>
+<pre><code>brew install pandelisz/tap/vci</code></pre>
+<p>Without Homebrew, the install script clones the repository to <code>~/.local/share/vci</code> and builds with cargo (needs a Rust toolchain):</p>
 <pre><code>curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh</code></pre>
 <p>Or by hand:</p>
 <pre><code>git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.git ~/.local/share/vci
 cargo install --locked --path ~/.local/share/vci/crates/vci-cli</code></pre>
-<p>Then tell <code>vci</code> where its collectors live. Add this to your shell profile:</p>
+<p>Then tell <code>vci</code> where its collectors live (not needed with Homebrew). Add this to your shell profile:</p>
 <pre><code>export VCI_PY_PLUGIN="$HOME/.local/share/vci/py/pytest-plugin"
 export VCI_JS_PLUGIN="$HOME/.local/share/vci/js/vitest-plugin"
 export VCI_RUBY_COLLECTOR="$HOME/.local/share/vci/ruby/vci-collector"</code></pre>
 <p>Check the install:</p>
 <pre><code>vci --version</code></pre>
-<p>To pin a version, set <code>VCI_REF</code> to a tag or commit before running the script.</p>
+<p>To pin a version, set <code>VCI_REF</code> to a tag or commit before running the script. With Homebrew, upgrade with <code>brew upgrade vci</code>.</p>
 
 <h2>Set up a repository</h2>
 <p>Do this once, in the repository you want to speed up.</p>
