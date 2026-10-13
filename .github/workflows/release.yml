@@ -66,3 +66,37 @@ jobs:
           if command -v sha256sum >/dev/null 2>&1; then sha256sum "$asset"; else shasum -a 256 "$asset"; fi > "SHA256SUMS-${{ matrix.target }}"
           cat "SHA256SUMS-${{ matrix.target }}"
           gh release upload "$TAG" "$asset" "SHA256SUMS-${{ matrix.target }}" --clobber
+
+  # Point the Homebrew formula (PandelisZ/homebrew-tap, Formula/vci.rb) at the
+  # binaries just uploaded. Pre-release tags such as v0.4.0-rc1 are skipped.
+  # Needs the HOMEBREW_TAP_DEPLOY_KEY secret: the private half of a deploy key
+  # with write access to the tap repository.
+  homebrew:
+    needs: build
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write the formula
+        run: scripts/homebrew-formula.sh "$TAG" > vci.rb
+
+      - name: Push it to the tap
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          key="$RUNNER_TEMP/tap_key"
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          # GitHub's published host key (https://api.github.com/meta).
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          git clone --depth 1 git@github.com:PandelisZ/homebrew-tap.git "$RUNNER_TEMP/tap"
+          cd "$RUNNER_TEMP/tap"
+          mkdir -p Formula
+          cp "$GITHUB_WORKSPACE/vci.rb" Formula/vci.rb
+          git add Formula/vci.rb
+          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "vci ${TAG#v}"
+          git push origin HEAD:main
