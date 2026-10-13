@@ -42,7 +42,7 @@ Full guide: [docs/INSTALL.md](INSTALL.md).
 After your toolchain setup steps, add:
 
 ```yaml
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
 ```
 
 It builds `vci`, fetches attestations, and runs only what is not already attested. Setup, inputs and security rules:

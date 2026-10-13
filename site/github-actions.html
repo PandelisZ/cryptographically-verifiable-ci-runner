@@ -22,7 +22,7 @@
 </ol>
 
 <h2>Workflow</h2>
-<p>Save as <code>.github/workflows/test.yml</code>. Set up your language toolchain first, then call the action. Replace <code>&lt;commit-sha&gt;</code> with a full commit SHA of the vci repository.</p>
+<p>Save as <code>.github/workflows/test.yml</code>. Set up your language toolchain first, then call the action. <code>@v1</code> follows the latest tested 1.x release; see <a href="#pinning">pinning</a> below.</p>
 <div class="tabs" data-sync="adapter">
 <div class="tab-panel" data-tab="Vitest">
 <pre><code>name: test
@@ -50,7 +50,7 @@ jobs:
 
       - run: npm ci
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 <div class="tab-panel" data-tab="pytest">
 <pre><code>name: test
@@ -80,7 +80,7 @@ jobs:
 
       - run: uv sync --locked
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 <div class="tab-panel" data-tab="Go">
 <pre><code>name: test
@@ -110,7 +110,7 @@ jobs:
 
       - run: go mod download
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 <div class="tab-panel" data-tab="Rust">
 <pre><code>name: test
@@ -137,7 +137,7 @@ jobs:
 
       - run: cargo fetch --locked
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 <div class="tab-panel" data-tab="Rails">
 <pre><code>name: test
@@ -165,7 +165,7 @@ jobs:
           ruby-version: "3.4.9"     <span class="c"># exactly the Ruby used locally</span>
           bundler-cache: true
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 </div>
 <p>For several languages in one job, set up every toolchain and call the action once.</p>
@@ -196,9 +196,18 @@ jobs:
 <tr><td><code>run</code></td><td>Number of test units that ran</td></tr>
 </table>
 
+<h2 id="pinning">Pinning</h2>
+<table>
+<tr><th>Reference</th><th>Moves?</th><th>Use when</th></tr>
+<tr><td><code>@v1</code></td><td>only to tested 1.x releases</td><td>the default</td></tr>
+<tr><td><code>@v1.0.0</code></td><td>never</td><td>you want a specific release</td></tr>
+<tr><td><code>@&lt;full commit SHA&gt;</code></td><td>never</td><td>strictest pinning; the SHA is on each release page</td></tr>
+</table>
+<p>Never reference a branch.</p>
+
 <h2>Security rules</h2>
 <ul>
-<li><strong>Pin the action to a commit SHA.</strong> The action is the verifier. A branch or tag reference can move.</li>
+<li><strong>Pin the action.</strong> The action is the verifier. <code>@v1</code> moves only to tested 1.x releases; <code>@v1.0.0</code> or a full commit SHA never moves. Never reference a branch.</li>
 <li><strong>Never build <code>vci</code> from the pull request's own checkout.</strong> A pull request could change the verifier that checks it.</li>
 <li><strong>Leave <code>base-ref</code> at its default</strong> unless you know the ref is outside the pull request's control.</li>
 <li><strong>Keep <code>refs/heads/main</code> in <code>policy.no_skip_refs</code></strong>, so pushes to the default branch run everything.</li>
@@ -224,7 +233,7 @@ jobs:
 <pre><code>      - name: Install vci
         run: |
           git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
-          git -C "$RUNNER_TEMP/vci" checkout &lt;commit-sha&gt;
+          git -C "$RUNNER_TEMP/vci" checkout v1.0.0
           cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
           echo "VCI_PY_PLUGIN=$RUNNER_TEMP/vci/py/pytest-plugin" &gt;&gt; "$GITHUB_ENV"
           echo "VCI_JS_PLUGIN=$RUNNER_TEMP/vci/js/vitest-plugin" &gt;&gt; "$GITHUB_ENV"

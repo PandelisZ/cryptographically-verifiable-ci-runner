@@ -51,7 +51,7 @@ jobs:
 
       - run: uv sync --locked
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
 ```
 
 ### Vitest
@@ -68,7 +68,7 @@ jobs:
 
       - run: npm ci
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
 ```
 
 ### Go
@@ -88,7 +88,7 @@ jobs:
 
       - run: go mod download
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
 ```
 
 ### Rust
@@ -104,7 +104,7 @@ jobs:
 
       - run: cargo fetch --locked
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
 ```
 
 ### Rails
@@ -122,7 +122,7 @@ jobs:
           ruby-version: "3.4.9"     # exactly the Ruby (and patchlevel) used locally; or omit to use .ruby-version
           bundler-cache: true       # bundle install of Gemfile.lock into vendor/bundle
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
 ```
 
 `Gemfile.lock` must list the runner's platform (`bundle lock --add-platform x86_64-linux`), and the Bundler version
@@ -143,7 +143,7 @@ accepted by a verifier running as root.
 Set up every toolchain, then call the action once. This repository's own
 [workflow](../.github/workflows/ci.yml) does that for Python, Go and Rust.
 
-Replace `<commit-sha>` with a full commit SHA of this repository.
+`@v1` follows the latest tested 1.x release and never a branch; `@v1.0.0` is that exact release. For the strictest pinning use the full commit SHA shown on the [release page](https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases): the action then cannot change without a change to your workflow.
 
 ## Inputs and outputs
 
@@ -179,17 +179,28 @@ a release asset cannot change what runs.
 ### Cutting a release
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0      # the release workflow builds and publishes the binaries
-scripts/update-release-manifest.sh v0.2.0     # after it finishes: records tag, source fingerprint and checksums
-git add release/manifest.txt && git commit -m "Record release v0.2.0" && git push
+git tag v1.1.0 && git push origin v1.1.0      # the release workflow builds and publishes the binaries
+scripts/update-release-manifest.sh v1.1.0     # after it finishes: records tag, source fingerprint and checksums
+git add release/manifest.txt && git commit -m "Record release v1.1.0" && git push
+git tag -f v1 && git push -f origin v1         # move the major tag to the commit that carries the manifest
 ```
 
-Pin the action to that last commit. Any later change under `crates/`, `Cargo.toml` or `Cargo.lock` makes the action
-build from source again until the next release.
+`@v1` therefore always points at a commit whose `release/manifest.txt` matches the published binaries. Any later change
+under `crates/`, `Cargo.toml` or `Cargo.lock` makes the action build from source again until the next release.
+
+## Pinning
+
+| Reference | Moves? | Use when |
+|---|---|---|
+| `@v1` | only to tested 1.x releases | the default |
+| `@v1.0.0` | never | you want a specific release |
+| `@<full commit SHA>` | never | strictest pinning; the SHA is shown on each release page |
+
+Never reference a branch.
 
 ## Security rules
 
-- **Pin the action to a commit SHA.** The action is the verifier. A branch or tag reference can move.
+- **Pin the action.** The action is the verifier. `@v1` moves only to tested 1.x releases; `@v1.0.0` or a full commit SHA never moves. Never reference a branch.
 - **Never build `vci` from the pull request's own checkout.** A pull request could change the verifier that checks
   it. This repository's own workflow does so only because it is the demo for the action itself.
 - **Leave `base-ref` at its default** unless you know the ref is outside the pull request's control. `vci` warns
@@ -226,7 +237,7 @@ fetch removed attestations without a deletion record. A ruleset on `refs/meta/**
       - name: Install vci
         run: |
           git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
-          git -C "$RUNNER_TEMP/vci" checkout <commit-sha>
+          git -C "$RUNNER_TEMP/vci" checkout v1.0.0
           cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
           echo "VCI_PY_PLUGIN=$RUNNER_TEMP/vci/py/pytest-plugin" >> "$GITHUB_ENV"
           echo "VCI_JS_PLUGIN=$RUNNER_TEMP/vci/js/vitest-plugin" >> "$GITHUB_ENV"

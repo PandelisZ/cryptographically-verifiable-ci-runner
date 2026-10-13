@@ -109,7 +109,7 @@ vci push</code></pre>
     node-version: 22          <span class="c"># same Node major version as locally</span>
     cache: npm
 - run: npm ci
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 
 <div class="tab-panel" data-tab="pytest">
@@ -140,7 +140,7 @@ steps:
     with:
       version: "0.11.7"       <span class="c"># same uv version as locally</span>
   - run: uv sync --locked
-  - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+  - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 
 <div class="tab-panel" data-tab="Go">
@@ -173,7 +173,7 @@ steps:
     with:
       go-version: "1.26.2"    <span class="c"># exact version used locally</span>
   - run: go mod download
-  - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+  - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 
 <div class="tab-panel" data-tab="Rust">
@@ -206,7 +206,7 @@ vci push</code></pre>
   with:
     toolchain: "1.95.0"       <span class="c"># same release as rust-toolchain.toml</span>
 - run: cargo fetch --locked
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 
 <div class="tab-panel" data-tab="Rails">
@@ -239,7 +239,7 @@ steps:
     with:
       ruby-version: "3.4.9"   <span class="c"># exact version in .ruby-version</span>
       bundler-cache: true
-  - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+  - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 
 <div class="tab-panel" data-tab="RSpec">
@@ -271,12 +271,12 @@ steps:
     with:
       ruby-version: "3.4.9"   <span class="c"># exact version in .ruby-version</span>
       bundler-cache: true
-  - uses: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</code></pre>
+  - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
 </div>
 
 </div>
 
-<p>Replace <code>&lt;commit-sha&gt;</code> with a full commit SHA of this repository. <a href="github-actions.html">GitHub Actions</a> explains why, and lists the action's inputs.</p>
+<p><code>@v1</code> follows the latest tested 1.x release and never a branch; <code>@v1.0.0</code> is that exact release. For the strictest pinning use the full commit SHA shown on the <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases">release page</a>: the action then cannot change without a change to your workflow.</p><p><a href="github-actions.html">GitHub Actions</a> explains why, and lists the action's inputs.</p>
 
 <h2 id="refusals">When vci refuses to attest</h2>
 <p>Some tests cannot be vouched for, and <code>vci run</code> says so instead of signing. Two spec files as an example:</p>
@@ -374,7 +374,7 @@ steps:
       (cd demo/pytest-app &amp;&amp; uv sync --locked)
       (cd demo/go-app &amp;&amp; go mod download)
       (cd demo/cargo-app &amp;&amp; cargo fetch --locked)
-  - uses: ./        <span class="c"># in your repository: PandelisZ/cryptographically-verifiable-ci-runner@&lt;commit-sha&gt;</span></code></pre>
+  - uses: ./        <span class="c"># in your repository: PandelisZ/cryptographically-verifiable-ci-runner@v1</span></code></pre>
 <p>The whole job, with 21 units across five projects, takes under a minute. The vci step itself takes about ten seconds.</p>
 
 <h2 id="git-meta">Looking at attestations in git</h2>

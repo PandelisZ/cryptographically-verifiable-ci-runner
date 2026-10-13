@@ -78,7 +78,7 @@ vci push && git push                                    # share the attestation 
 In GitHub Actions, after your toolchain setup steps:
 
 ```yaml
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@<commit-sha>
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
 ```
 
 The action downloads a prebuilt `vci`, fetches the attestations, prints the plan in the job summary, runs what is left, and fails the job if any of it fails. Setup and security notes: [docs/GITHUB_ACTIONS.md](docs/GITHUB_ACTIONS.md).

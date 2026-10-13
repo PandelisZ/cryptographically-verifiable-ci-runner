@@ -582,10 +582,10 @@ mod tests {
         );
     }
 
-    /// Every CI snippet `vci init` prints installs a vci pinned to a commit
+    /// Every CI snippet `vci init` prints installs a vci pinned to a release tag
     /// (the verifier must not move under a workflow), never a branch head.
     #[test]
-    fn ci_snippets_pin_vci_to_a_commit() {
+    fn ci_snippets_pin_vci_to_a_release() {
         for (name, s) in [
             ("vitest", CI_SNIPPET),
             ("pytest", CI_SNIPPET_PYTEST),
@@ -607,14 +607,14 @@ mod tests {
                     "{name}: shallow clone of a branch: {l}"
                 );
                 if l.contains("cargo install") {
-                    assert!(l.contains("--rev <commit-sha>"), "{name}: {l}");
+                    assert!(l.contains("--tag v1.0.0"), "{name}: {l}");
                 } else if l.contains("git clone") {
                     assert!(
-                        s.contains("checkout --detach <commit-sha>"),
+                        s.contains("checkout --detach v1.0.0"),
                         "{name}: clone without a pinned checkout"
                     );
                 } else if l.contains("uses:") {
-                    assert!(l.contains("@<commit-sha>"), "{name}: {l}");
+                    assert!(l.contains("@v1"), "{name}: {l}");
                 }
             }
         }
