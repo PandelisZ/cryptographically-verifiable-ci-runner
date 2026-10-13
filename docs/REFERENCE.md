@@ -1796,4 +1796,4 @@ repository does not need the other projects' toolchains (`e2e_pytest.rs`).
 
 ## License
 
-Apache License 2.0. See [LICENSE](../LICENSE).
+MIT License. See [LICENSE](../LICENSE).

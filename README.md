@@ -13,7 +13,7 @@ RUN  services/billing              (no valid attestation (1 candidates; best fai
 2 to skip, 2 to run
 ```
 
-Works with **Vitest, pytest, Go, Cargo, Rails (Minitest) and RSpec**, on macOS and Linux. Apache-2.0.
+Works with **Vitest, pytest, Go, Cargo, Rails (Minitest) and RSpec**, on macOS and Linux. MIT.
 
 ![A change made in an agent's sandbox is attested, pushed through git, verified and skipped by CI](site/assets/walkthrough.gif)
 
@@ -131,4 +131,4 @@ Version 0.3. Each adapter has an end-to-end test suite and has been verified aga
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
