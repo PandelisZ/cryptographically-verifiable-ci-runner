@@ -1,0 +1,90 @@
+/* Animated walkthrough: laptop, agent sandbox, git and CI. CSS animations
+   driven by data-step on the container; no build step. */
+.walkthrough { margin: 20px 0 8px; outline: none; }
+.walkthrough .wt-stage {
+  position: relative; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 16px;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.walkthrough .wt-stage::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image: radial-gradient(var(--border) 1px, transparent 1px); background-size: 22px 22px; opacity: .45;
+}
+.walkthrough svg { position: relative; display: block; width: 100%; height: auto; font-family: var(--sans); }
+.walkthrough .node { fill: var(--bg); stroke: var(--border); stroke-width: 1.3; transition: stroke .5s, filter .5s; }
+.walkthrough .node.sandbox { stroke-dasharray: 6 4; }
+.walkthrough .node.active { stroke: var(--accent); filter: drop-shadow(0 0 10px color-mix(in srgb, var(--accent) 35%, transparent)); }
+.walkthrough .icon { fill: none; stroke: var(--muted); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; transition: stroke .5s; }
+.walkthrough .active .icon, .walkthrough .icon.active { stroke: var(--accent); }
+.walkthrough .title { font-size: 13.5px; font-weight: 650; fill: var(--text); letter-spacing: -.01em; }
+.walkthrough .label { font-size: 11.5px; fill: var(--muted); }
+.walkthrough .mono { font-family: var(--mono); font-size: 11px; fill: var(--text); }
+.walkthrough .mono.muted { fill: var(--muted); }
+.walkthrough .accent { fill: var(--accent); }
+.walkthrough .warn { fill: var(--run); }
+.walkthrough .file { fill: var(--bg-sunken); stroke: var(--border); transition: fill .45s, stroke .45s; }
+.walkthrough .file.hot { fill: var(--accent-soft); stroke: var(--accent); }
+.walkthrough .file.changed { fill: var(--run-soft); stroke: var(--run); }
+.walkthrough .scan { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; }
+.walkthrough .scan.on { animation: wt-scan 1.6s ease-in-out 2; }
+@keyframes wt-scan { 0% { opacity: 0; transform: translateY(0); } 15% { opacity: .9; } 85% { opacity: .9; } 100% { opacity: 0; transform: translateY(104px); } }
+.walkthrough .badge text { font-family: var(--mono); font-size: 10.5px; font-weight: 700; }
+.walkthrough .badge rect { transition: fill .4s; }
+.walkthrough .badge.skip rect { fill: var(--accent-soft); } .walkthrough .badge.skip text { fill: var(--accent); }
+.walkthrough .badge.run rect { fill: var(--run-soft); } .walkthrough .badge.run text { fill: var(--run); }
+.walkthrough .badge.wait rect { fill: var(--bg-sunken); } .walkthrough .badge.wait text { fill: var(--muted); }
+.walkthrough .badge.pop { animation: wt-pop .45s cubic-bezier(.3, 1.6, .5, 1) both; transform-box: fill-box; transform-origin: center; }
+@keyframes wt-pop { from { transform: scale(.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.walkthrough .wire { stroke: var(--border); stroke-width: 1.6; fill: none; transition: stroke .4s; }
+.walkthrough .wire.live { stroke: var(--accent); }
+.walkthrough .packet { fill: var(--accent); opacity: 0; }
+.walkthrough .packet.go { animation: wt-packet 1.8s ease-in-out 2; }
+@keyframes wt-packet { 0% { opacity: 0; offset-distance: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { opacity: 0; offset-distance: 100%; } }
+.walkthrough .fade { opacity: 0; transition: opacity .45s ease, transform .45s ease; transform: translateY(6px); }
+.walkthrough .fade.on { opacity: 1; transform: none; }
+.walkthrough .stagger > * { opacity: 0; transform: translateX(-6px); transition: opacity .4s ease, transform .4s ease; }
+.walkthrough .stagger.on > * { opacity: 1; transform: none; }
+.walkthrough .stagger.on > :nth-child(2) { transition-delay: .35s; }
+.walkthrough .stagger.on > :nth-child(3) { transition-delay: .7s; }
+.walkthrough .stagger.on > :nth-child(4) { transition-delay: 1.05s; }
+.walkthrough .env { opacity: 0; transition: transform 1s cubic-bezier(.4, 0, .2, 1), opacity .4s; }
+.walkthrough .env.on { opacity: 1; }
+.walkthrough .env rect.card { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.6; filter: drop-shadow(0 4px 10px rgba(0,0,0,.15)); }
+.walkthrough .seal { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.6; }
+.walkthrough .ring { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; transform-box: fill-box; transform-origin: center; }
+.walkthrough .ring.on { animation: wt-ring 1.3s ease-out 2; }
+@keyframes wt-ring { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(2.4); } }
+.walkthrough .chip rect { fill: var(--bg-sunken); stroke: var(--border); transition: fill .4s, stroke .4s; }
+.walkthrough .chip text { font-family: var(--mono); font-size: 11.5px; fill: var(--muted); transition: fill .4s; }
+.walkthrough .chip.hot rect { fill: var(--accent-soft); stroke: var(--accent); }
+.walkthrough .chip.hot text { fill: var(--accent); font-weight: 650; }
+.walkthrough .chip.wave rect { animation: wt-wave .7s ease both; transform-box: fill-box; transform-origin: center; }
+@keyframes wt-wave { 40% { transform: translateY(-5px); } }
+.walkthrough .cursor { fill: var(--run); animation: wt-pulse 1.2s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+@keyframes wt-pulse { 50% { transform: scale(1.5); opacity: .5; } }
+.walkthrough .wt-bar { position: relative; padding: 14px 16px 12px; border-top: 1px solid var(--border); background: var(--bg-sunken); }
+.walkthrough .wt-progress { position: absolute; left: 0; top: -1px; height: 2px; width: 0; background: var(--accent); }
+.walkthrough .wt-progress.run { animation: wt-progress linear forwards; }
+@keyframes wt-progress { from { width: 0; } to { width: 100%; } }
+.walkthrough .wt-row { display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap; }
+.walkthrough .wt-num { flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font: 650 13px var(--mono); color: var(--accent); background: var(--accent-soft); }
+.walkthrough .wt-caption { flex: 1 1 280px; margin: 3px 0 0; font-size: 14.5px; line-height: 1.5; color: var(--text); min-height: 44px; }
+.walkthrough .wt-caption strong { color: var(--text); }
+.walkthrough .wt-caption .skip { color: var(--accent); font-weight: 650; }
+.walkthrough .wt-caption .run { color: var(--run); font-weight: 650; }
+.walkthrough .wt-controls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.walkthrough .wt-controls button {
+  font: 500 13px var(--sans); color: var(--text); background: var(--bg-raised);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer; transition: border-color .15s;
+}
+.walkthrough .wt-controls button:hover { border-color: var(--accent); }
+.walkthrough .wt-controls button[disabled] { opacity: .4; cursor: default; }
+.walkthrough .wt-controls button[data-play] { background: var(--accent); color: #fff; border-color: var(--accent); min-width: 68px; }
+.walkthrough .wt-dots { display: flex; gap: 5px; margin: 0 6px; }
+.walkthrough .wt-dots button { width: 8px; height: 8px; padding: 0; border-radius: 50%; border: 1px solid var(--border); background: var(--bg-raised); transition: transform .2s, background .2s; }
+.walkthrough .wt-dots button[aria-current="step"] { background: var(--accent); border-color: var(--accent); transform: scale(1.3); }
+@media (prefers-reduced-motion: reduce) {
+  .walkthrough * { animation: none !important; transition: none !important; }
+}
+.walkthrough.static * { animation: none !important; transition: none !important; }
+.walkthrough.static .wt-controls, .walkthrough.static .wt-progress { display: none; }
+@media (max-width: 640px) { .walkthrough .wt-caption { min-height: 0; } .walkthrough .wt-controls { margin-left: 0; } }

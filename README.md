@@ -15,6 +15,10 @@ RUN  services/billing              (no valid attestation (1 candidates; best fai
 
 Works with **Vitest, pytest, Go, Cargo, Rails (Minitest) and RSpec**, on macOS and Linux. Apache-2.0.
 
+![A change made in an agent's sandbox is attested, pushed through git, verified and skipped by CI](site/assets/walkthrough.gif)
+
+<sub>The same animation, with controls, is on the <a href="https://pandelisz.github.io/cryptographically-verifiable-ci-runner/">docs site</a>.</sub>
+
 Docs: [pandelisz.github.io/cryptographically-verifiable-ci-runner](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/) · [Examples with real output](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/examples.html) · [Full reference](docs/REFERENCE.md)
 
 ## The problem
@@ -40,6 +44,12 @@ vci turns "I ran the tests" into something CI can check.
 - **Signed by identity, checked by content.** Each attestation names who signed it, and CI re-derives every hash itself. Nothing in the stored record is trusted on its own.
 
 What vci does not do: it cannot tell whether a trusted signer lied. Keep the signer list short, give agents their own keys with expiry dates, and keep full runs on your default branch. The [threat model](docs/REFERENCE.md#threat-model-v1) has the details.
+
+## What it saves
+
+![CI time for one pull request, full suite versus vci, in five cases](site/assets/savings.svg)
+
+The saving is exactly the tests that were attested and still match; the cost is about ten seconds to fetch and verify. When nothing was attested, when the toolchain differs from CI, or on your default branch (where policy runs everything), the suite runs in full as before. Compute minutes follow the same proportions as time.
 
 ## Quick start
 

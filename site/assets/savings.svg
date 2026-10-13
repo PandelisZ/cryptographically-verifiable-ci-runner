@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 538" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13">
+<style>.t{fill:#1b1d1a}.m{fill:#5d635b}.full{fill:#c9cbc4}.vci{fill:#15803d}.ovh{fill:#b45309}.v{fill:#15803d;font-weight:600}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.full{fill:#3a3f3c}.vci{fill:#4ade80}.v{fill:#4ade80}.g{stroke:#262b29}.ovh{fill:#fbbf63}}</style>
+<text class="t" x="0" y="18" font-size="16" font-weight="650">CI time for one pull request: full suite vs vci</text>
+<text class="m" x="0" y="38">Model: 40 units averaging 45 s (30 min of tests) plus 2 min of setup; vci adds about 12 s to fetch and verify. Compute minutes scale the same way.</text>
+<text class="t" x="0" y="76" font-weight="600">Agent attested only the units it touched</text>
+<text class="m" x="0" y="94">6 of 40 attested</text>
+<rect class="full" x="340.0" y="66" width="400.0" height="18" rx="4"/>
+<text class="m" x="748.0" y="80">32 min, full suite</text>
+<rect class="vci" x="340.0" y="90" width="343.8" height="18" rx="4"/>
+<rect class="ovh" x="683.8" y="90" width="2.5" height="18" rx="2"/>
+<text class="v" x="694.2" y="104">27.7 min with vci, 13% less</text>
+<line class="g" x1="0" x2="1000" y1="124" y2="124"/>
+<text class="t" x="0" y="154" font-weight="600">Several people or agents attested parts of a branch</text>
+<text class="m" x="0" y="172">28 of 40 attested</text>
+<rect class="full" x="340.0" y="144" width="400.0" height="18" rx="4"/>
+<text class="m" x="748.0" y="158">32 min, full suite</text>
+<rect class="vci" x="340.0" y="168" width="137.5" height="18" rx="4"/>
+<rect class="ovh" x="477.5" y="168" width="2.5" height="18" rx="2"/>
+<text class="v" x="488.0" y="182">11.2 min with vci, 65% less</text>
+<line class="g" x1="0" x2="1000" y1="202" y2="202"/>
+<text class="t" x="0" y="232" font-weight="600">Agent ran the whole suite locally before pushing</text>
+<text class="m" x="0" y="250">40 of 40 attested</text>
+<rect class="full" x="340.0" y="222" width="400.0" height="18" rx="4"/>
+<text class="m" x="748.0" y="236">32 min, full suite</text>
+<rect class="vci" x="340.0" y="246" width="25.0" height="18" rx="4"/>
+<rect class="ovh" x="365.0" y="246" width="2.5" height="18" rx="2"/>
+<text class="v" x="375.5" y="260">2.2 min with vci, 93% less</text>
+<line class="g" x1="0" x2="1000" y1="280" y2="280"/>
+<text class="t" x="0" y="310" font-weight="600">Nothing attested, or toolchain differs from CI</text>
+<text class="m" x="0" y="328">0 of 40 accepted</text>
+<rect class="full" x="340.0" y="300" width="400.0" height="18" rx="4"/>
+<text class="m" x="748.0" y="314">32 min, full suite</text>
+<rect class="vci" x="340.0" y="324" width="400.0" height="18" rx="4"/>
+<rect class="ovh" x="740.0" y="324" width="2.5" height="18" rx="2"/>
+<text class="v" x="750.5" y="338">32.2 min with vci, no saving (+12 s)</text>
+<line class="g" x1="0" x2="1000" y1="358" y2="358"/>
+<text class="t" x="0" y="388" font-weight="600">Push to the default branch (policy: always full)</text>
+<text class="m" x="0" y="406">skips disabled</text>
+<rect class="full" x="340.0" y="378" width="400.0" height="18" rx="4"/>
+<text class="m" x="748.0" y="392">32 min, full suite</text>
+<rect class="vci" x="340.0" y="402" width="400.0" height="18" rx="4"/>
+<rect class="ovh" x="740.0" y="402" width="2.5" height="18" rx="2"/>
+<text class="v" x="750.5" y="416">32.2 min with vci, no saving (+12 s)</text>
+<rect class="full" x="0" y="460" width="12" height="12" rx="2"/><text class="m" x="18" y="471">full suite</text>
+<rect class="vci" x="100" y="460" width="12" height="12" rx="2"/><text class="m" x="118" y="471">tests vci still runs</text>
+<rect class="ovh" x="260" y="460" width="12" height="12" rx="2"/><text class="m" x="278" y="471">vci overhead (fetch, verify, re-hash)</text>
+<text class="m" x="0" y="496">What is skipped depends only on what was attested and still matches. vci never speeds up a test it has to run;</text>
+<text class="m" x="0" y="514">it removes the ones it can prove were already run against the same inputs.</text>
+</svg>

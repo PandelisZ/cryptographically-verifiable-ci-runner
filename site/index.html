@@ -7,6 +7,7 @@
 <meta name="description" content="vci signs what each test actually depended on, so CI can skip tests a trusted developer or agent already ran against identical inputs.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/walkthrough.css">
 </head>
 <body class="home">
 <div class="layout">
@@ -33,6 +34,18 @@
 <span class="a">RUN </span> src/c.test.ts  <span class="c">(inputs changed)</span>
 1 to skip, 2 to run</pre>
 </div>
+
+<section>
+  <h2>See it in motion</h2>
+  <p class="sub">A change made in an agent's sandbox, attested, pushed through git, and skipped by CI. Press play, or step through with the arrows.</p>
+  <div class="walkthrough"></div>
+</section>
+
+<section>
+  <h2>What it saves</h2>
+  <p class="sub">Only attested tests that still match are skipped; everything else runs as before, plus about ten seconds of verification.</p>
+  <img src="assets/savings.svg" alt="CI time for one pull request, full suite versus vci, in five cases" style="width:100%;height:auto;display:block;margin:16px 0 4px">
+</section>
 
 <section>
   <h2>How it works</h2>
@@ -103,5 +116,6 @@ vci push</code></pre>
 </main>
 </div>
 <script src="assets/site.js"></script>
+<script src="assets/walkthrough.js"></script>
 </body>
 </html>
