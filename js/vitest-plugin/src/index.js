@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { SCAN_PLUGIN_NAME, VciReporter, setupProject } from "./reporter.js";
 import { scanSource } from "./scan.js";
 import { getState } from "./state.js";
-import { PACKAGE_DIR, idToFsPath, isInNodeModules, resolutionCandidates, toSlash } from "./util.js";
+import { idToFsPath, isInNodeModules, isOwnPath, resolutionCandidates, toSlash } from "./util.js";
 
 export { VciReporter, setupProject, MAIN_PRELOAD_URL } from "./reporter.js";
 export { writeWrapperConfig, findUserConfig } from "./wrapper.js";
@@ -70,7 +70,7 @@ export default function vci(options = {}) {
         const importerFile = idToFsPath(importer);
         if (!importerFile) return null;
         const imp = toSlash(importerFile);
-        if (isInNodeModules(imp) || imp.startsWith(toSlash(PACKAGE_DIR) + "/")) return null;
+        if (isInNodeModules(imp) || isOwnPath(imp)) return null;
         const base = specBase(source, importerFile, root);
         if (!base) return null;
         let set = state.resolves.get(importerFile);

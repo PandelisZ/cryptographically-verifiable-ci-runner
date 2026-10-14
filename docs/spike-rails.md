@@ -44,7 +44,7 @@ or the fixture runs):
 | `ENV` | its singleton class prepended: key reads, and every method that walks it |
 | processes | `Kernel#system`/`spawn`/`exec`/`` ` ``/`open("\|cmd")` (and `Kernel.`'s copies), `Process.spawn`/`exec`/`daemon`, `Process._fork` (every fork, Ruby 3.1+), `IO.popen`, `PTY.spawn` |
 | network | `TCPSocket`, `TCPServer`, `UDPSocket`, `UNIXSocket`, `UNIXServer`, `Socket` constructors, `Socket.tcp`/`getaddrinfo`/..., `Addrinfo.getaddrinfo`/... |
-| native code | `Fiddle::Handle` and `Fiddle::Function` (so `Fiddle.dlopen(nil)` too), FFI `ffi_lib`/`attach_function`/`DynamicLibrary.open`/`Function`, libxml2 options and APIs that read files, a `.so`/`.bundle` inside the repository in `$LOADED_FEATURES` |
+| native code | `Fiddle::Handle` and `Fiddle::Function` (so `Fiddle.dlopen(nil)` too); FFI: `DynamicLibrary.open` records the library it opened (all modes), calls of what `attach_function`/`attach_variable` attached (FFI's methods on the module and its singleton class replaced in place by a checking wrapper, F18), `Function#call`, `Function#attach`, `VariadicInvoker#invoke`, and ruby-vips' `Vips::Operation.call` (F16); libxml2 options and APIs that read files, a `.so`/`.bundle` inside the repository in `$LOADED_FEATURES` |
 | file descriptors | `IO.for_fd`/`IO.new(fd)`/`File.new(fd)`: accepted when `fstat` gives the dev/inode of a file a hook saw opened |
 | SQLite | `SQLite3::Database#initialize`: a file outside `VCI_DB_DIR`/`TMPDIR` taints; an authorizer taints `ATTACH`; extension loading taints |
 
@@ -195,6 +195,92 @@ matched without changes.
 only with exit status 0, at least one test, no failure, error or skip, and at least one assertion in every test
 (Rails prints "Test is missing assertions" but passes such a test). `--seed 0` reaches Minitest through the Rails
 runner (`Run options: --seed 0`).
+
+**F16. FFI: loading is not reading; ruby-vips is hooked (collector 0.4.0).** A Rails 8.1 application with
+`image_processing` in the bundle refused every test on a machine with libvips: Active Storage's engine requires
+`ruby-vips` at boot, which runs `ffi_lib` and attaches about 130 functions, and the collector tainted `ffi_lib`,
+`attach_function` and `FFI::Function` themselves. It also tainted `ffi_lib` *before* calling it, so an optional
+library whose load failed (a rescued `LoadError`) still refused the file. The rule now:
+
+1. **A load is recorded, not refused.** `FFI::DynamicLibrary.open` (which `ffi_lib` calls for every candidate name)
+   records the library that opened as the external `native:<file name>`, version `sha256:<hex>` of the file it
+   resolved to (computed when the records are written, so no gem is required while the tests run). The probe records
+   the same while the application boots and reports `natives`; `vci plan` resolves a test's `native:` externals
+   against them like gems. A failed open records nothing. FFI's search for the file (`LD_LIBRARY_PATH`, `File.exist?`
+   over its library directories) runs quietly: what it found is recorded instead.
+2. **A call is refused, unless the library has hooks.** `attach_function` is wrapped after it succeeds: the methods
+   FFI defined (on the module and its singleton class) get a wrapper that taints the file when called
+   (`native:FFI call <Module>.<function> (C code of <library>: ...)`). The same for `attach_variable`'s accessors,
+   `Function#attach` used by hand, and `Function#call`/`VariadicInvoker#invoke` on anything not attached through a
+   wrapped method (the `FFI::Function` `attach_function` returned is called through the same policy: ruby-vips keeps
+   `g_free`'s as `GLib::G_FREE` and FFI's `AutoPointer` calls it during GC).
+3. **ruby-vips' policy.** Functions attached by the modules `Vips`, `GLib` and `GObject`, from files inside the
+   installed `ruby-vips` gem, over libvips/GLib/GObject, follow `Native::Vips`: the ~130 functions ruby-vips 2.3.0
+   attaches are classified (memory only; `vips_foreign_find_load` and file sources record a read, file targets a
+   write; descriptor sources and targets are refused; an unknown function is refused). `vips_cache_operation_build`
+   is the one that runs an operation: the operation's nickname comes from the `vips_operation_new` call that made
+   the pointer (type names such as `VipsForeignLoadPngFile`, which `vips_foreign_find_load` answers, are resolved to
+   nicknames), and a file loader or saver is only built inside `Vips::Operation.call` for that operation, once.
+   `Vips::Operation.call` itself classifies the operation and its arguments before it runs: single-file loaders and
+   savers of `jpeg`, `png`, `webp`, `gif`, `tiff`, `heif`, `jp2k`, `jxl`, `rad`, `ppm`, `csv`, `matrix` and
+   `thumbnail` record the file; their buffer, source, target and mime variants, `thumbnail_image` and every other
+   operation are allowed; other loaders and savers, `text`, `system`, ICC profiles that are files and file options
+   (also inside option strings such as `"x.jpg[profile=x.icc]"`) are refused.
+4. **Active Storage.** The analyzer copies the blob to a temp file and calls `Vips::Image.new_from_file` on it: the
+   copy is the process's own (vci's temp dir), the original is the fixture the test read through Ruby. So a model test
+   that never touches storage and a test that attaches and analyses an image are both attested, the image being an
+   input of the second (`fixtures/rails-vips`, `rails_active_storage_with_libvips`). Previewers run external
+   programs and stay refused.
+
+Accepted, and documented in the reference: libvips' own dependencies (GLib, libjpeg, libpng, its modules) are
+identified only by libvips' file hash; `VIPS_*` and `G_*` are hashed whenever present, since libvips and GLib read
+them in C. What vci records for a library is its file, so another platform's libvips (or none) runs the file there.
+
+**F17. Minitest files that never load Rails.** A Minitest file under `test/lib` that requires only `minitest` and a
+plain Ruby file never defines `Rails::VERSION`. The collector fell back to the bundle's `railties` version only for
+RSpec files, so such a Minitest file reported `rails ""` and was refused ("toolchain seen by the collector ... rails ,
+... differs from the project's (... rails 8.1.3.1 ...)"). Both runners now report `Rails::VERSION` when Rails is loaded
+and the bundle's `railties` otherwise, which is what the probe (which boots Rails) reports; without `railties` both
+sides report `""`.
+
+**F18. Names, links and C readers the hooks missed (collector 0.4.1).** An adversarial pass on `fixtures/rails-vips`
+found false skips, each now a regression test (`collector_test.rb`, `rails_files_named_oddly_read_in_c_or_through_links`,
+`collector_dir_symlinks_out_of_it_are_kept` in `jsonl.rs`):
+
+1. **`~` and `|`.** `File.read("~note.txt")`, `File.open("|pipe.txt")` and `Vips::Image.new_from_file("~pic.png")`
+   open those names literally, relative to the working directory, but the collector expanded paths with
+   `File.expand_path` (which raises for `~note.txt`: no such user) and skipped `|...` as a command, recording nothing.
+   Names are now resolved as the file system entry points use them (`~` literally; `|` is a command only for
+   `Kernel#open` and `IO.read`/`binread`/`readlines`/`foreach`/`write`/`binwrite` called on `IO` itself, all of which
+   taint, `IO.write("|cmd")` newly so). A name the collector cannot resolve after the operation succeeded taints
+   (`vci:unresolvable-path:`).
+2. **libvips resolves operation names without regard to case.** `vips_operation_new` finds an operation with
+   `vips_type_find("VipsOperation", name)`, which compares nicknames and class names with `strcasecmp`, so
+   `Operation.call("PNGLOAD", ...)`, `"PngLoad"`, `"VIPSFOREIGNLOADPNGFILE"` loaded a file the case-sensitive
+   classification took for a memory operation, and `"SYSTEM"` ran a shell. The collector now asks libvips the same
+   way (`Vips.type_find`, then `Vips.nickname_find`) and classifies the real nickname; a name libvips does not resolve
+   is refused.
+3. **OpenSSL reads in C.** `X509::Store#add_file` is recorded; a store given `set_default_paths` (as
+   `SSLContext::DEFAULT_CERT_STORE` is when `openssl/ssl` loads) or `add_path` is marked, and verifying with it
+   (`Store#verify`, `StoreContext.new`, a TLS handshake) refuses the file: what it reads (the system CA bundle,
+   `SSL_CERT_FILE`, a hashed directory read on demand) is not seen. `SSLContext`'s `ca_file` is recorded, `ca_path`
+   refused; `Config.new(file)` and `Random.load_random_file` are recorded; loading a provider or engine is refused.
+   `OPENSSL_*` variables are hashed whenever present.
+4. **Symlinks out of exempt directories.** Reads in vci's temp dirs, Ruby's own library directories and the zone
+   database are not inputs, and the CLI drops reads of the collector's own directory; each was decided by how the
+   path was spelt. A directory symlink there into the repository (made, read through and removed by the test) hid
+   the repository files read through it. Paths outside the repository are now resolved when they are used (the link
+   may be gone at exit): one that leads into the repository is recorded as that file, and an exemption holds only for
+   where a path really leads (elsewhere it is a read outside the repository, refused). `drop_collector_paths` drops a
+   path only when its real path is in the collector directory.
+5. **Who the process runs as.** `Process.uid`/`euid`/`gid`/`egid`/`groups`, `Process::UID`/`GID`/`Sys` and
+   `Etc.getpwuid`/`getlogin`/`getpwnam`/... were not observed, so a test asserting the user name was attested as
+   `pz` and skipped in a root CI container (`policy.allow_superuser_mismatch`) or under another uid. Reading them
+   refuses the file (`ruby:process-identity:`), except from RubyGems, Bundler and Ruby's standard library.
+6. **`super_method` past the FFI check.** The check on an attached function was a module prepended to the module and
+   its singleton class, so `m.method(:fopen).super_method.call(...)` called C unchecked (with a library the probe
+   also opens, such as libvips, the read was a false skip). The wrapper now replaces FFI's method in place and holds
+   the original only inside itself.
 
 ## Output (as emitted)
 

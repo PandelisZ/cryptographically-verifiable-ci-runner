@@ -67,6 +67,31 @@ impl Repo {
         Ok(Utf8PathBuf::from(dir))
     }
 
+    /// For a linked worktree (`git worktree add`), the repository's common
+    /// git directory, whose `config` every worktree shares; `None` in the
+    /// main worktree (or when git cannot say).
+    pub fn linked_worktree_common_dir(&self) -> Option<Utf8PathBuf> {
+        let out = self
+            .git()
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+            ])
+            .run_str()
+            .ok()?;
+        let mut lines = out.lines();
+        let (git_dir, common) = (lines.next()?.trim(), lines.next()?.trim());
+        let canon = |p: &str| {
+            Utf8Path::new(p)
+                .canonicalize_utf8()
+                .unwrap_or_else(|_| Utf8PathBuf::from(p))
+        };
+        (!git_dir.is_empty() && !common.is_empty() && canon(git_dir) != canon(common))
+            .then(|| canon(common))
+    }
+
     /// The work tree root, or `None` for a bare repository.
     pub fn work_tree(&self) -> Option<Utf8PathBuf> {
         let out = self

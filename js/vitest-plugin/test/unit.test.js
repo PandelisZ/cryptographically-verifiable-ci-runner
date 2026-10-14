@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 
 import { scanSource, staticDirOf } from "../src/scan.js";
-import { idToFsPath, packageOf } from "../src/util.js";
+import { PACKAGE_DIR, idToFsPath, isOwnPath, packageOf } from "../src/util.js";
 import { FIXTURE, tmpDir } from "./helpers.js";
 
 test("staticDirOf", () => {
@@ -53,4 +53,23 @@ test("idToFsPath", () => {
   assert.equal(idToFsPath("file:///a/b.ts"), "/a/b.ts");
   assert.equal(idToFsPath("/@fs/a/b.ts"), "/a/b.ts");
   assert.equal(idToFsPath("fs"), null);
+});
+
+// Regression: through a symlinked install prefix (Homebrew's opt/vci -> Cellar/vci/<version>) the
+// collector's own files have two paths, and the one Node did not load them by was recorded as an
+// input outside the repository.
+test("isOwnPath recognises the collector's files through any symlink", () => {
+  const dir = tmpDir("vci-own-");
+  const link = path.join(dir, "opt-vci");
+  fs.symlinkSync(PACKAGE_DIR, link);
+  assert.equal(isOwnPath(path.join(PACKAGE_DIR, "src/node-test/late.js")), true);
+  assert.equal(isOwnPath(path.join(link, "src/node-test/late.js")), true);
+  assert.equal(isOwnPath(path.join(link, "src/node-test/no-such-file.ts")), true, "a probe next to a collector file");
+  const fileLink = path.join(dir, "late-link.js");
+  fs.symlinkSync(path.join(PACKAGE_DIR, "src/node-test/late.js"), fileLink);
+  assert.equal(isOwnPath(fileLink), true);
+  fs.writeFileSync(path.join(dir, "mine.js"), "");
+  assert.equal(isOwnPath(path.join(dir, "mine.js")), false);
+  assert.equal(isOwnPath(path.join(dir, "absent.js")), false);
+  assert.equal(isOwnPath(PACKAGE_DIR + "-other/x.js"), false);
 });

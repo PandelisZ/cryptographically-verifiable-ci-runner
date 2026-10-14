@@ -605,9 +605,11 @@ fn run_refuses_unattestable_test_files() {
     }
     let outside = w.base.join("outside.txt");
     std::fs::write(&outside, "outside the repository").unwrap();
+    let summary = w.base.join("summary.json");
     let mut args = vec!["run"];
     args.extend(files.iter().map(|(rel, _)| *rel));
     args.extend(["--key", w.trusted.to_str().unwrap()]);
+    args.extend(["--summary", summary.to_str().unwrap()]);
     let out = w.vci_env(
         &work,
         &args,
@@ -634,6 +636,47 @@ fn run_refuses_unattestable_test_files() {
     assert!(
         stderr.contains("vci: 0 attested, 10 not attested"),
         "{stderr}"
+    );
+    // The reasons, counted per file, and `--summary` with every unit.
+    assert!(
+        stderr.contains("vci: why not attested (files per reason; a file can have several):"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(" input outside the repository\n"),
+        "{stderr}"
+    );
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+    assert_eq!(v["attested"], 0);
+    assert_eq!(v["notAttested"], 10);
+    let units = v["units"].as_array().unwrap();
+    assert_eq!(units.len(), 10, "{v}");
+    let reasons_of = |id: &str| -> Vec<String> {
+        let u = units.iter().find(|u| u["testId"] == id).unwrap();
+        assert_eq!(u["attested"], false);
+        u["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        reasons_of("src/outside.test.mjs"),
+        ["input outside the repository"]
+    );
+    assert_eq!(reasons_of("src/fail.test.mjs"), ["result failed"]);
+    assert_eq!(
+        reasons_of("src/write.test.mjs"),
+        ["wrote inside the repository"]
+    );
+    assert!(
+        v["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["reason"] == "input outside the repository" && r["files"] == 1),
+        "{v}"
     );
     assert!(
         AttestStore::new(&store_for(&work))
@@ -1099,5 +1142,50 @@ fn environment_reaching_node_is_checked() {
             .list(None)
             .unwrap()
             .is_empty()
+    );
+}
+
+/// The collector installed the way Homebrew installs it: the files live in
+/// `Cellar/vci/<version>/share/vci/vitest-plugin` and are reached through
+/// the `opt/vci` symlink (the formula sets `VCI_JS_PLUGIN` to that path).
+/// Regression: the collector's own `late.js` was recorded by its symlinked
+/// path and every file was refused ("input outside the repository:
+/// .../opt/vci/share/vci/vitest-plugin/src/node-test/late.js").
+#[test]
+fn collector_behind_a_symlinked_install_prefix() {
+    let w = World::new();
+    let work = w.work.clone();
+    let cellar = w.base.join("Cellar/vci/1.1.0/share/vci/vitest-plugin");
+    std::fs::create_dir_all(&cellar).unwrap();
+    let js = workspace_root().join("js/vitest-plugin");
+    cp(&js.join("src"), &cellar.join("src"));
+    cp(&js.join("package.json"), &cellar.join("package.json"));
+    std::fs::create_dir_all(w.base.join("opt")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/vci/1.1.0", w.base.join("opt/vci")).unwrap();
+    let linked = w.base.join("opt/vci/share/vci/vitest-plugin");
+    assert_ne!(linked.canonicalize().unwrap(), linked);
+    let env = [("VCI_JS_PLUGIN", Some(linked.to_str().unwrap()))];
+    let args = ["run", A, B, C, D, "--key", w.trusted.to_str().unwrap()];
+    let out = w.vci_env(&work, &args, &env);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("vci: 4 attested, 0 not attested"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("outside the repository"), "{stderr}");
+    assert_eq!(w.plan_env(&work, "main", &env).skip, set(&[A, B, C, D]));
+    // The plugin found next to the project (a symlinked node_modules entry,
+    // as pnpm lays it out) works the same way.
+    std::fs::create_dir_all(work.join("node_modules/@vci")).unwrap();
+    std::os::unix::fs::symlink(&linked, work.join("node_modules/@vci/vitest")).unwrap();
+    let out = w.vci_env(
+        &work,
+        &["run", B, "--key", w.trusted.to_str().unwrap()],
+        &[("VCI_JS_PLUGIN", None)],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("vci: 1 attested, 0 not attested"),
+        "{stderr}"
     );
 }

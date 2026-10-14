@@ -478,7 +478,8 @@ Under `platform = "any"` a unit attested on macOS arm64 is skipped on an ubuntu-
   case differs from the file on disk (`"tests/Data/B.json"` for `tests/data/b.json`) refuses the unit; a path built at
   run time with the wrong case is not detected;
 - **the same privileges**: the tests run as root on one side only (a GitHub `container:` job) is a toolchain
-  difference (`superuser`), for every adapter;
+  difference (`superuser`), for every adapter, unless the base branch sets `policy.allow_superuser_mismatch = true`
+  (see [`vci.toml`](#vcitoml));
 - the environment matches (strict mode removes `RUSTFLAGS`, `CARGO_*`, `RUST*` unless declared; declared values must
   be equal) and no input is missing in the checkout (`.DS_Store` in a package directory breaks that).
 
@@ -555,7 +556,14 @@ never hooked refuses the file (`vci:not-hooked:`).
 
 Paths under the fresh temp dirs vci gives the process are not inputs. The collector fixes them when it loads: a test
 that sets `ENV["TMPDIR"]` (to `/tmp`, `HOME`, `/`) moves its own temp files, not what the collector ignores, so its
-reads there are still recorded (outside the repository: refused). `/etc/resolv.conf`, read by Ruby's `resolv` while
+reads there are still recorded (outside the repository: refused). This and every other exemption (Ruby's own library
+directories, the zone database, vci's collector directory) holds for where a path really leads, not how it is spelt:
+a path outside the repository is resolved when it is used (a symlink may be gone when the process exits), so a read
+through a symlink there into the repository is a read of that repository file, and one leading anywhere else is a
+read outside the repository (refused). File names are taken as Ruby's `File`, `Dir` and `IO` entry points take them:
+`File.read("~note.txt")` and `File.open("|x")` open files of those names in the working directory (only `Kernel#open`
+and `IO.read`/`readlines`/`foreach`/`write` called on `IO` run a command for `"|cmd"`, which is refused); a name the
+collector cannot resolve refuses the file (`vci:unresolvable-path:`). `/etc/resolv.conf`, read by Ruby's `resolv` while
 it loads (`require "net/http"` does that), is not an input; any other read of it is.
 
 - **code**: every Ruby file compiled from disk (`require`, `require_relative`, `load`, `autoload`, Zeitwerk), and for
@@ -588,12 +596,16 @@ Global inputs of every file: `vci.toml`; in the project dir `Gemfile`, `Gemfile.
 variants) from the project dir up to the repository root. Missing ones are recorded as absent. **Any `Gemfile.lock`
 change runs everything.**
 
-Toolchain: Ruby's version and patchlevel (`3.4.9p82`) and engine, Rails, Bundler and Minitest versions, the SQLite
+Toolchain: Ruby's version and patchlevel (`3.4.9p82`) and engine, Rails (`Rails::VERSION`, or the bundle's `railties`
+for a test file that never loads Rails, such as a Minitest file under `test/lib` that requires only `minitest` and
+plain Ruby, or a spec that loads only `spec_helper`: both runners report what the probe, which boots the application,
+reports), Bundler and Minitest versions, the SQLite
 library the `sqlite3` gem loaded, libyaml, the time zone data (the `tzinfo-data` gem, or the system zoneinfo directory
 and its version), the default external/internal encodings, the collector's version (`vci_collector.rb`'s
 `VERSION`, bumped whenever what it records or refuses changes, so CI must run the same collector: pin the action or
 the vci checkout to the commit you attest with), the database (`sqlite3`; a server's name and version with
-`policy.rails_allow_db`), the full bundle, and whether the tests ran as root; OS/arch per `policy.platform`.
+`policy.rails_allow_db`), the full bundle, and whether the tests ran as root (unless `policy.allow_superuser_mismatch`);
+OS/arch per `policy.platform`.
 
 Test results: a file is attested only when the process exits 0 and every test passed: **any failure, error or skip,
 no test at all, or a test that made no assertion** refuses it.
@@ -625,15 +637,82 @@ config/master.key, Rails' credentials key`). Nothing is wrong (it fails open), b
 - or declare `RAILS_MASTER_KEY` (`[env] global = ["RAILS_MASTER_KEY"]`) and set it to the same value where you attest
   and in CI (a secret there): Rails then reads the key from the environment, not the file.
 
-**Active Storage and libvips.** Active Storage's engine loads `ruby-vips` at boot whenever it is in the bundle
-(`image_processing`, which `rails new` adds, depends on it). On a machine with libvips installed (Homebrew's `vips`),
-`ruby-vips` opens it through FFI and attaches its C functions; vci cannot see what that C code reads, so **every test
-that boots Rails is refused** there (`native:FFI ffi_lib(["vips.42"]), ... (+130 more like it)`). `require: false`
-does not help (Active Storage requires `ruby-vips` itself). It fails open (nothing is skipped); to get skips, remove
-`image_processing` (and `ruby-vips`) from the Gemfile if the app does not process images, or do not load Active
-Storage (`require "active_storage/engine"` in `config/application.rb`) if it does not use it. Checked locally on
-macOS with Rails 8.1, image_processing 1.14.0, ruby-vips 2.3.0 and Homebrew libvips; a runner without libvips is not
-affected (CI only verifies; this matters where you attest).
+**Native libraries (FFI) and Active Storage's libvips.** Opening a library through FFI (`ffi_lib`,
+`FFI::DynamicLibrary.open`) is not a read of test inputs: the collector records the library as an external,
+`native:<file name>` (`native:libvips.42.dylib`), whose version is the sha256 of the file FFI resolved it to (or
+`unresolved` when FFI gave no path, such as a system library in macOS's shared cache). `vci plan` compares it with
+the library the probe's process (which boots the application) opens where the attestation is checked, like a gem: a
+different libvips build, another platform's, or none at all runs the file. Finding the library (FFI's search of
+`LD_LIBRARY_PATH`, its library directories) is not an input; the file it found is. A failed `ffi_lib` (an optional
+library that is not installed, a `LoadError` the caller rescues) records nothing and refuses nothing. (Opening a
+library also runs its initialisers, C code vci does not see; that is accepted as part of loading the library, which is
+identified by its file.) What the library's C code may read is reached by **calling** it, so:
+
+- **every call of a function attached with `attach_function`** (and `attach_variable`'s accessors, an
+  `FFI::Function` called directly, a `VariadicInvoker` invoked directly, a function attached by hand with
+  `Function#attach`)
+  **refuses the file** (`native:FFI call Libc.getpid (C code of libc.dylib: ...)`), unless the library has explicit
+  hooks. Loading a gem that attaches functions without calling them is attestable; SQLite through `ffi`, libxml
+  through `ffi` or any other FFI binding stays refused as soon as it is used;
+- **ruby-vips has explicit hooks** (the modules `Vips`, `GLib` and `GObject`, attached in ruby-vips' own installed
+  files over libvips, GLib or GObject). libvips reads and writes files only through operations whose file names
+  ruby-vips passes from Ruby, so the collector hooks `Vips::Operation.call` (which `Vips::Image.new_from_file`,
+  `.thumbnail`, `.new_from_buffer`, `.new_from_source`, `#write_to_file`, `#write_to_buffer`, `#write_to_target`
+  and every image method go through) and the libvips functions ruby-vips attaches:
+
+  | What | Under vci |
+  |---|---|
+  | loaders and savers of a file of a single-file format: `jpeg`, `png`, `webp`, `gif`, `tiff`, `heif`, `jp2k`, `jxl`, `rad`, `ppm`, `csv`, `matrix` (`pngload`, `jpegsave`, ...), and `thumbnail` | the file is recorded: a read (an input, like any file a test reads), or a write (refused inside the repository except in the git-ignored `log/`, `tmp/`, `storage/`, `coverage/`) |
+  | `vips_foreign_find_load` (the format sniffer `new_from_file` calls; it reads the file's header), `Vips::Source.new_from_file`, `Vips::Target.new_to_file` | a read / a write of that file |
+  | the same formats' `_buffer`, `_source`, `_target` and `_mime` variants, `thumbnail_buffer`, `thumbnail_source`, `thumbnail_image`; memory sources and targets; custom sources and targets (their data passes through Ruby, which the collector sees) | allowed |
+  | every other operation (`resize`, `crop`, `autorot`, `avg`, ...) and the libvips/GLib functions that only work on memory (`vips_init`, `vips_image_get`, `g_object_set_property`, ...) | allowed |
+  | loaders and savers of other formats (PDF, SVG, ImageMagick, OpenSlide, FITS, `vipsload`, `dzsave`, ...: they may read further files), `text` (fonts), `system` | refused (`native:vips:<operation>`) |
+  | an ICC profile that is a file (`icc_transform("x.icc")`, `input_profile:`, `import_profile:`, `export_profile:`, a saver's `profile=`) or a `filename`/`font` option, in arguments or an option string (`"x.jpg[...]"`) | refused; the built-in profiles `srgb`, `cmyk`, `p3` (and `none`) are fine |
+  | a file loader or saver built anywhere but inside `Vips::Operation.call` for itself (`Vips::Operation.new("pngload")` then `#build`, a direct `Vips.vips_cache_operation_build`), descriptor sources and targets, a libvips function this list does not name (a newer ruby-vips attaching something new) | refused |
+
+  An operation is classified by the nickname of the operation libvips builds for the name given: libvips finds it
+  with `vips_type_find`, which compares nicknames and class names without regard to case, so `"PNGLOAD"`, `"PngLoad"`
+  and `"VipsForeignLoadPngFile"` are `pngload` and `"SYSTEM"` is `system` (the collector asks libvips the same way);
+  a name libvips does not resolve is refused.
+
+  `VIPS_*` and `G_*` variables (read by libvips and GLib in C) are hashed whenever present (strict mode removes
+  them unless declared).
+
+**Active Storage** loads ruby-vips at boot whenever it is in the bundle (`image_processing`, which `rails new` adds,
+depends on it). With these rules, on a machine with libvips installed:
+
+- a test that never touches storage (a model test) is attested; libvips is an external of it;
+- a test that attaches an image and analyses it (`blob.analyze`, which runs the Vips analyzer:
+  `Vips::Image.new_from_file` of a copy of the blob in the process's temp dir) is attested with the image as an
+  input: the fixture file is read by Ruby (`file_fixture("x.png").open`), its copies in `tmp/storage` and the temp dir
+  are the process's own output, and editing the fixture runs the test. Variants (`image_processing`'s `thumbnail`,
+  `#write_to_file`) are recorded the same way;
+- previewers (PDF and video) run `mutool`, `pdftoppm` or `ffmpeg`, child processes: refused;
+- a test that calls a C function through FFI itself is refused.
+
+The check on an attached function replaces FFI's method in place (it is not a prepended module), so
+`method(:f).super_method` cannot reach the C function past it. The collector runs inside the test process, so a test
+that sets out to defeat it (calling `VciCollector.quiet`, removing its hooks, reaching FFI's internals through
+`ObjectSpace`) is outside what it defends against: vci attests honest tests, it does not sandbox hostile ones (see
+"Threat model").
+
+**OpenSSL** (Ruby's `openssl` extension) reads certificates and its configuration in C. `X509::Store#add_file` and an
+`SSLContext`'s `ca_file` are recorded as reads of the file named, `OpenSSL::Config.new(file)` and
+`Random.load_random_file` too (a configuration with `.include` directives is refused). A store given
+`set_default_paths` (as `SSLContext::DEFAULT_CERT_STORE` is when `openssl/ssl` loads) or `add_path` reads the system
+CA certificates, `SSL_CERT_FILE` and `SSL_CERT_DIR` (a directory by certificate hash, on demand): verifying with such a
+store (`Store#verify`, `StoreContext.new`, a TLS handshake that verifies) refuses the file, as does an `SSLContext`
+with `ca_path` and loading an OpenSSL provider or engine. `OPENSSL_*` variables (`OPENSSL_CONF`, read when the library
+loads) are hashed whenever present.
+
+What is accepted by this rule (stated here so it can be judged): the libraries libvips links (GLib, libjpeg, libpng,
+libheif, its loadable modules) are identified only through libvips' own file hash, so a Homebrew upgrade of libjpeg
+alone does not run the tests that decoded a JPEG; and libvips' operation cache keeps an image loaded within one
+process. Checked locally on macOS with Rails 8.1.3.1, image_processing 1.14.0, ruby-vips 2.3.0, ffi 1.17.4 and Homebrew
+libvips 8.18 (`fixtures/rails-vips`, `rails_active_storage_with_libvips` in the e2e tests, skipped where libvips is not
+installed). A runner without libvips runs every file that recorded it (Active Storage then sets `VIPS_AVAILABLE` to
+false, which a test could observe), and so does a runner whose libvips is another build: to skip there, attest where
+the same libvips file is installed (or remove `image_processing` and `ruby-vips` if the app does not process images).
 
 ### Databases (read this)
 
@@ -736,8 +815,9 @@ apply to Minitest too; each is explained under [Quick start (Rails)](#quick-star
 - credentials: commit test-environment credentials and their key, drop `config/master.key` and
   `config/credentials.yml.enc`, or declare `RAILS_MASTER_KEY` (otherwise every file reads `config/master.key`);
 - `gem "tzinfo-data"` for every platform (not `platforms: %i[ windows jruby ]`), and `TZ` declared and set (`TZ=UTC`);
-- `image_processing` on a machine with libvips installed refuses every file that boots Rails (see "Active Storage
-  and libvips" under the Rails section): remove the gem if the app does not process images;
+- `image_processing` on a machine with libvips installed: attested, with libvips recorded by its file hash (see
+  "Native libraries (FFI) and Active Storage's libvips" under the Rails section), so CI skips only where the same
+  libvips file is installed;
 - `vendor/.keep` committed (the generator creates it).
 
 Capybara in the `:test` group is fine: `rack_test` feature specs are attested; specs that drive a browser are refused.
@@ -921,7 +1001,7 @@ checkout, clock, policy and environment.
 | Command | Purpose |
 |---|---|
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet |
-| `vci run [FILES…] [--key PATH] [--ttl 14d]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed) |
+| `vci run [FILES…] [--key PATH] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON |
 | `vci plan [--base-ref R] [--format text\|json\|github]` | Print which test files can be skipped and why the others run |
 | `vci ci [--base-ref R] [--audit-log PATH]` | Plan, run the remainder, write a JSON audit log of every skip |
 | `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R]` | Verify one DSSE envelope and print its claims |
@@ -940,12 +1020,56 @@ trust boundary: `vci plan` prints a warning (and `--format json` lists it under 
 HEAD or contains it, because then `allowed_signers` and policy come from the commit under test.
 
 Environment: `VCI_JS_PLUGIN` (path of the `@vci/vitest` package; default `node_modules/@vci/vitest` above the
-project), `VCI_NODE` (node binary), `VCI_PY_PLUGIN` (the `py/pytest-plugin` directory holding `vci_pytest`; default:
+project; for node:test, then `js/vitest-plugin` or `share/vci/vitest-plugin` above the `vci` executable), `VCI_NODE` (node binary), `VCI_PY_PLUGIN` (the `py/pytest-plugin` directory holding `vci_pytest`; default:
 `py/pytest-plugin` or `share/vci/pytest-plugin` above the `vci` executable, then the source checkout `vci` was built
 from, then `py/pytest-plugin` above the project; a clear error names the variable when none is found), `VCI_UV` (uv
 binary), `VCI_JOBS` (parallel pytest, `go test` or Rails processes in `vci run`), `VCI_GO` (go binary), `VCI_CARGO` (cargo
 binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_RUBY` (ruby binary, default `ruby` on PATH),
 `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`).
+
+Every collector directory is resolved to its real path before use, and what a test process reads of vci's own
+collector files is never an input, whichever path reached them: Homebrew installs them in
+`Cellar/vci/<version>/share/vci` and its formula passes `opt/vci/share/vci/vitest-plugin` (a symlink) as
+`VCI_JS_PLUGIN`, and pnpm links `node_modules/@vci/vitest`. (Each adapter drops reads, listings and module loads
+outside the repository whose real path lies in its collector directory; inside the repository they are hashed like any
+file. The Go adapter's standard library hooks are compiled into `vci` and written to a fresh temp dir for each run.)
+The collectors are vci's tooling: the Ruby collector's `VERSION` is part of the Rails toolchain; the versions of the
+JavaScript and Python collectors are not compared by `vci plan`, so pin the vci you attest with in CI (the action's
+`@v1`, the same Homebrew version).
+
+**Refusal summary.** After the per-unit lines (`vci: not attesting <unit>: <why>`, unchanged), `vci run` prints how
+many files each reason refused, most first, every reason listed:
+
+```
+vci: 3 attested, 5 not attested
+vci: why not attested (files per reason; a file can have several):
+vci:   4 native:FFI
+vci:   1 process:system
+vci:   1 result failed
+```
+
+A reason is a stable key: for a taint, its category (the text up to the first `:`, space or `(`, plus the name after
+a single `:`: `native:FFI attach_function(...)` -> `native:FFI`, `cargo:process: Command::new in ...` ->
+`cargo:process`, `go:source: ...` -> `go:source`, `vci:not-hooked:ffi (...)` -> `vci:not-hooked`); for any other
+refusal, its text up to the first `:` or `(` (`input outside the repository`, `result failed`, `wrote inside the
+repository`). On a unit's line, taints that share a key are shown once, as the first of them with the number of the
+others (`native:FFI call Vips.vips_init (...) (+129 more native:FFI)`), most frequent first. `--summary FILE` writes:
+
+```json
+{
+  "version": 1,
+  "attested": 3,
+  "notAttested": 5,
+  "reasons": [{ "reason": "native:FFI", "files": 4 }, { "reason": "process:system", "files": 1 }],
+  "units": [
+    { "testId": "test/models/b_test.rb", "project": null, "adapter": "rails", "attested": false,
+      "reasons": ["native:FFI", "process:system"], "detail": "tainted: ...", "taints": ["native:FFI call ...", "..."] }
+  ]
+}
+```
+
+(`project` is the `[[projects]]` name, `null` in the single-project form; `taints` lists every refusing taint as the
+collector reported it.)
 
 Strict env mode removes every variable that is not declared or pass-through from the test process, including
 `NO_COLOR` and `FORCE_COLOR`, so `NO_COLOR=1 vci ci` still prints Vitest's colours. Add them to `pass_through` (seen
@@ -988,7 +1112,8 @@ Rails adds what Ruby, RubyGems, Bundler and version managers need to find things
 `BUNDLE_CACHE_PATH`, `BUNDLE_BIN`, `BUNDLE_JOBS`, `BUNDLE_RETRY`, `BUNDLE_DEPLOYMENT`, `BUNDLE_FROZEN`, ...), `MISE_*`,
 `RBENV_*`, `ASDF_*`, `XDG_*_HOME`, `SSL_CERT_*` and the `*_PROXY` variables. The Ruby, gems and bundle they lead to
 are checked directly. Every other `RUBY*`, `BUNDLE_*` (`BUNDLE_WITHOUT`, `BUNDLE_FORCE_RUBY_PLATFORM`, ...),
-`BUNDLER_*`, `GEM_*`, `RAILS_*` (`RAILS_MASTER_KEY`, ...), `RACK_*`, `MT_*`, `MINITEST_*`, `BOOTSNAP_*` and `SPRING_*`
+`BUNDLER_*`, `GEM_*`, `RAILS_*` (`RAILS_MASTER_KEY`, ...), `RACK_*`, `MT_*`, `MINITEST_*`, `BOOTSNAP_*`, `SPRING_*`,
+`VIPS_*` and `G_*` (libvips and GLib, read in C when ruby-vips loads)
 variable, `DATABASE_URL`, `*_DATABASE_URL`, `SECRET_KEY_BASE`, `SEED`, `TESTOPTS`, `TEST`, `TESTS`, `N`,
 `DEFAULT_TEST`, `DEFAULT_TEST_EXCLUDE`, `SCHEMA` and `SPEC_OPTS` (RSpec's options) is **hashed whenever present** and
 removed in strict mode unless declared. vci sets `RUBYOPT` (the collector; your value never reaches the tests), `RAILS_ENV`/`RACK_ENV` (`test`),
@@ -1041,7 +1166,9 @@ index, `HEAD` and work tree are never touched) and is exchanged on the remote's 
   for a second URL) is read from, as git-meta does;
 - the git-meta remote is the one `git meta remote add` / `git meta setup` configure (`remote.<name>.meta = true`,
   fetch `+refs/meta/main:refs/meta/remotes/main`). `vci init` writes `.git-meta` (`url: <origin's URL>` unless
-  `--meta-url`), the file `git meta setup` reads, and configures a remote named `meta`; `vci fetch --remote origin`
+  `--meta-url`), the file `git meta setup` reads, and configures a remote named `meta` (in a linked worktree,
+  `git worktree add`, git writes remotes to the repository's shared `.git/config`, so the main checkout and every
+  other worktree get it too; `vci init` prints a note saying so); `vci fetch --remote origin`
   (what the GitHub Action runs) configures one with origin's URL in a fresh clone. With a remote already configured
   under the name `meta`, `git meta setup` refuses ("remote 'meta' already exists"); `git meta pull` and `git meta push`
   work as they are. A plain `vci fetch`/`vci push` with no git-meta remote configured yet takes the URL from
@@ -1111,6 +1238,7 @@ never_skip = ["tests/test_attach_db.py"]             # never skip these files (p
 go_allow_net = false   # Go: attest packages whose test links package net (see "When vci run refuses")
 rails_allow_db = false # Rails: attest files whose test database is a server (see "Databases" under Rails)
 node_exact = false     # Vitest and node-test: require the exact Node version (default: the same major)
+allow_superuser_mismatch = false # accept attestations made as root where CI is not, or the other way round (risky: see below)
 
 [[policy.platform_overrides]]
 match = ["src/native/**"]   # project-relative globs
@@ -1129,6 +1257,19 @@ env = ["DATABASE_URL"]
 match = ["crates/b#test:*"]
 extra = ["testdata/**"]
 ```
+
+**`policy.allow_superuser_mismatch`** (default `false`). Every toolchain records whether the tests ran as root
+(`superuser`), and `vci plan` normally requires the same: a CI job that runs as root (a GitHub `container:` job, many
+self-hosted runners) never accepts an attestation made on a laptop, and fails the toolchain check with `privileges`.
+Setting this key in the **base branch's** `vci.toml` (top level or a project's `policy`) stops comparing that one
+field; every other toolchain field is still compared. `vci plan` and `vci explain` name the key when the check fails
+on it. **Why it is risky:** permission checks do not apply to root, and root is another user. A test whose outcome
+depends on file permissions (it expects a mode-000 file to be unreadable, a read-only directory to refuse a write,
+`File.writable?` to be false, `EACCES` from an `open`) or on who runs it (the uid, the user name, the home directory
+from the password database) can pass as one user and fail as the other, and the attestation then vouches for a result
+CI would not reproduce. Set it only when no test depends on permissions or identity (or such tests are in
+`never_skip`). The Rails collector refuses a test that reads the uid or the user's identity whatever this key says
+(`ruby:process-identity:`); the other adapters do not observe it.
 
 `[[inputs]]` globs are relative to the project dir. A glob without wildcards names a file, a directory (walked) or a
 path that must stay absent; otherwise the directory before the first wildcard is walked, every directory in it is a
@@ -1524,11 +1665,20 @@ Rails specifics (collector taints and checks; see [Quick start (Rails)](#quick-s
   refusal a policy waives; see "Databases"); a SQLite file vci did not prepare fresh, an in-memory test database,
   `ATTACH`, SQLite extensions;
 - **native code**: a native extension (`.so`/`.bundle`) inside the repository; Fiddle (`Fiddle.dlopen`, also of
-  `nil`, and any `Fiddle::Function`); FFI (`ffi_lib`, `attach_function`, `attach_variable`, `FFI::DynamicLibrary.open`,
-  `FFI::Function`); libxml2 (Nokogiri) reading files in C: parse options `NOENT`, `DTDLOAD`, `DTDATTR` or `XINCLUDE`
+  `nil`, and any `Fiddle::Function`); FFI: a **call** of an attached function or variable, an `FFI::Function` or
+  `VariadicInvoker` invoked directly (`native:FFI`; opening a library is recorded, not refused, and a failed `ffi_lib`
+  is nothing), and for ruby-vips the operations and functions its hooks cannot see through (`native:vips:`, see
+  "Native libraries (FFI) and Active Storage's libvips" under Quick start (Rails)); libxml2 (Nokogiri) reading files in C: parse options `NOENT`, `DTDLOAD`, `DTDATTR` or `XINCLUDE`
   (external entities and DTDs), `do_xinclude`, an XSD or RelaxNG schema with includes or imports, `validate` of a file
   by name, any XSLT stylesheet, a SAX parser with `replace_entities` (a SAX `parse_file` records the file it parses);
-  a library vci hooks that was loaded but never hooked (`vci:not-hooked:`);
+  OpenSSL verifying with a store that holds its default paths or a certificate directory, an `SSLContext` with
+  `ca_path`, a configuration file with `.include`, loading a provider or engine (`native:openssl:`, see "OpenSSL"
+  under Quick start (Rails)); a library vci hooks that was loaded but never hooked (`vci:not-hooked:`);
+- **who the process runs as** (`ruby:process-identity:`): `Process.uid`/`euid`/`gid`/`egid`/`groups`,
+  `Process::UID`, `Process::GID`, `Process::Sys`, `Etc.getlogin`/`getpwuid`/`getpwnam`/`getgrgid`/`getgrnam`/
+  `passwd`/`group`, read by the test (not by RubyGems, Bundler or Ruby's standard library for itself): the user a laptop
+  runs as is not CI's, and nothing records it;
+- a file name the collector cannot resolve (`vci:unresolvable-path:`);
 - **file metadata git does not keep** (`ruby:file-metadata:`): a test reading the times of a repository file
   (`File.mtime`/`atime`/`ctime`/`birthtime`, `File#mtime`, `File::Stat#mtime` and friends, comparing `File::Stat`s),
   its permission bits other than the executable bit (`File::Stat#mode`, `world_readable?`, `readable?`,
@@ -1579,7 +1729,8 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
 6. **repo** (root commit), **test-id**, **adapter**, **argv** (including project dir) match;
 7. **toolchain**: Node major, Vitest, Vite (pytest: exact Python version, implementation, pytest; Go: exact Go
    version, effective build settings, architecture level; Cargo: exact rustc and cargo, host triple and cfg set on the
-   same platform, attested cfg predicates evaluated for this host), whether the tests ran as root (effective uid 0:
+   same platform, attested cfg predicates evaluated for this host), whether the tests ran as root (unless the base
+   policy sets `allow_superuser_mismatch`; effective uid 0:
    permission checks do not apply to root, so a test that expects a mode-000 file to be unreadable passes only for
    other users), and OS/arch per policy (Go and Cargo: the same OS
    and architecture when the attestation lists platform-specific files; Go: the same architecture when it lists
@@ -1627,8 +1778,10 @@ Not protected against:
   protected refs are possible follow-ups.
 - Inputs the collectors cannot see: native addons, time, locale, randomness, network (network use taints the file,
   but only through the patched Node APIs), data captured before the collectors were installed, and the user and group
-  the tests run as beyond root versus non-root (which is recorded): file ownership, group membership, capabilities.
-- Test code deliberately evading the collectors.
+  the tests run as beyond root versus non-root (which is recorded; the Rails collector refuses a test that reads the
+  uid or the user's identity): file ownership, group membership, capabilities.
+- Test code deliberately evading the collectors (the collectors run inside the test process: code that undoes their
+  hooks, calls their own quiet paths or reaches the original methods through reflection is not defended against).
 - Malicious `node_modules` that match the lockfile and package versions (packages are identified by version, not by
   file hashes).
 - A CI job whose `--base-ref` points at a ref the pull request controls (its head or merge commit, or `HEAD`). Pass
@@ -1802,6 +1955,8 @@ fixtures/rails-abcd   Rails 8 end-to-end fixture (SQLite; a: lib, b: models and 
 fixtures/rails-rspec-abcd  the same app with rspec-rails and factory_bot_rails (a: lib spec with spec_helper only,
                       b: model spec with a factory, a fixture and a shared example, c: view spec with file_fixture,
                       d: request spec)
+fixtures/rails-vips   Rails 8.1 with Active Storage, image_processing and ruby-vips (a model test that never touches
+                      storage, one that attaches and analyses test/fixtures/files/pixel.png, one that calls C through FFI)
 docs/                 PLAN.md (design), CONTRACTS.md (interfaces), ENV.md (env vars), spike.md (Vitest findings),
                       spike-pytest.md (pytest findings), spike-go.md (Go findings), spike-cargo.md (Cargo findings),
                       spike-rails.md (Rails findings)
@@ -1818,6 +1973,7 @@ uv run --project fixtures/pytest-abcd pytest py/pytest-plugin/tests   # pytest c
 (cd fixtures/go-abcd && go mod download)   # the Go fixture's module, used by the Go tests
 (cd fixtures/rails-abcd && bundle install) # the Rails fixture's bundle, with its Ruby (.ruby-version, e.g. through mise)
 (cd fixtures/rails-rspec-abcd && bundle install) # the RSpec fixture's bundle (rspec-rails, factory_bot_rails)
+(cd fixtures/rails-vips && bundle install) # Active Storage with image_processing/ruby-vips (libvips: brew install vips)
 ruby ruby/vci-collector/test/collector_test.rb   # Ruby collector tests (also run by cargo test)
 ```
 
@@ -2010,7 +2166,12 @@ repository does not need the other projects' toolchains (`e2e_pytest.rs`).
   never reads `.rspec-local`, `~/.rspec` or the XDG options file, and requires every declared example of a file to
   run (see "RSpec limitations"); an RSpec example without expectations is attested. An explicit `runner` leaves the
   other runner's files unrun by vci (`vci run`, `plan` and `ci` warn). C code a test calls that opens files itself is
-  not seen, apart from the libraries the collector hooks (and refuses when it cannot).
+  not seen, apart from the libraries the collector hooks (and refuses when it cannot): of Ruby's own extensions,
+  `openssl`, `zlib`, `etc`, `pty`, `fiddle`, `socket` and `RubyVM::InstructionSequence.compile_file` are hooked;
+  `io/console` (`IO.console` opens the terminal) and `Etc.uname`/`Etc.sysconf` (the machine) are not.
+- Other adapters' collectors (Vitest, node:test, pytest) report paths as spelt; vci drops their reads of its own
+  collector directory only when the real path is there, but a symlink in that directory created and removed by a test
+  can no longer be resolved after the run (the Rails collector resolves paths when they are used).
 - Only tested on macOS arm64 (Node 26, git 2.54, OpenSSH 10.3; CPython 3.14.7, uv 0.11.7; Go 1.26.2; Rust 1.96.0
   from Homebrew; Ruby 3.4.9 through mise), plus a `linux/amd64` container check of Rails attestations (Minitest and
   RSpec: `docs/spike-rails.md` F14, R14). Not run on a GitHub Actions runner. Windows paths compile but are untested.

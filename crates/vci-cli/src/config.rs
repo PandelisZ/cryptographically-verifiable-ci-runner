@@ -122,6 +122,7 @@ pub struct PolicyOverride {
     pub go_allow_net: Option<bool>,
     pub rails_allow_db: Option<bool>,
     pub node_exact: Option<bool>,
+    pub allow_superuser_mismatch: Option<bool>,
 }
 
 /// Per-project env keys; each one given replaces the top-level key.
@@ -343,6 +344,16 @@ pub struct Policy {
     /// was made with (default: the same major version).
     #[serde(default)]
     pub node_exact: bool,
+    /// Accept an attestation made as root where the tests now run as another
+    /// user, or the other way round (the toolchain's `superuser` field is
+    /// not compared). Risky: permission checks do not apply to root, so a
+    /// test whose outcome depends on file permissions (a mode-000 file that
+    /// must be unreadable, a read-only directory that must refuse a write)
+    /// can pass on one side and fail on the other. For CI runners that run
+    /// as root (`container:` jobs) accepting attestations made on laptops.
+    /// Read from the base commit.
+    #[serde(default)]
+    pub allow_superuser_mismatch: bool,
 }
 
 fn default_max_ttl() -> String {
@@ -364,6 +375,7 @@ impl Default for Policy {
             go_allow_net: false,
             rails_allow_db: false,
             node_exact: false,
+            allow_superuser_mismatch: false,
         }
     }
 }
@@ -573,6 +585,9 @@ impl Config {
                     }
                     if let Some(v) = o.node_exact {
                         policy.node_exact = v;
+                    }
+                    if let Some(v) = o.allow_superuser_mismatch {
+                        policy.allow_superuser_mismatch = v;
                     }
                 }
                 let mut env = self.env.clone();
@@ -944,6 +959,19 @@ mod tests {
         let s = c.project_specs();
         assert!(s[0].policy.rails_allow_db);
         assert!(!s[1].policy.rails_allow_db);
+    }
+
+    #[test]
+    fn allow_superuser_mismatch_defaults_off_and_overrides_per_project() {
+        let c = Config::parse("adapter = \"rails\"").unwrap();
+        assert!(!c.project_specs()[0].policy.allow_superuser_mismatch);
+        let c = Config::parse(
+            "[policy]\nallow_superuser_mismatch = true\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"go\"\n[projects.policy]\nallow_superuser_mismatch = false\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert!(s[0].policy.allow_superuser_mismatch);
+        assert!(!s[1].policy.allow_superuser_mismatch);
     }
 
     /// `runner` (rails only): top level in the single-project form, per

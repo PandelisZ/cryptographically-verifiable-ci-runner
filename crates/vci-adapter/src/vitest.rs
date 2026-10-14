@@ -113,7 +113,12 @@ pub fn find_js_plugin(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterErro
             "{pj} is not the {JS_PACKAGE_NAME} package (name {name:?})"
         )));
     }
-    Ok(dir)
+    // Its real path: an install reached through a symlinked prefix
+    // (Homebrew's `opt/vci` -> `Cellar/vci/<version>`, which the formula
+    // puts in VCI_JS_PLUGIN; a pnpm link) would otherwise give Node one
+    // spelling of the collector's files and the collector another, and its
+    // own files would look like inputs outside the repository.
+    Ok(dir.canonicalize_utf8()?)
 }
 
 fn wrapper_module(plugin_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError> {
@@ -379,6 +384,13 @@ impl Adapter for VitestAdapter {
         }
     }
 
+    fn collector_dirs(&self) -> Vec<Utf8PathBuf> {
+        match &self.js_plugin {
+            Some(p) => p.canonicalize_utf8().ok().into_iter().collect(),
+            None => find_js_plugin(&self.project_dir).ok().into_iter().collect(),
+        }
+    }
+
     fn inferred_env_patterns(&self) -> &'static [&'static str] {
         &["VITE_*"]
     }
@@ -386,7 +398,7 @@ impl Adapter for VitestAdapter {
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {
         let bin = self.vitest_bin()?;
         let plugin = match &self.js_plugin {
-            Some(p) => p.clone(),
+            Some(p) => p.canonicalize_utf8().unwrap_or_else(|_| p.clone()),
             None => find_js_plugin(&self.project_dir)?,
         };
         let wrapper_dir = tempfile::Builder::new().prefix("vci-wrapper-").tempdir()?;

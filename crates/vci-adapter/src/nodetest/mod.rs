@@ -1085,7 +1085,7 @@ impl NodeTestAdapter {
 
     fn plugin(&self) -> Result<Utf8PathBuf, AdapterError> {
         match &self.js_plugin {
-            Some(p) => Ok(p.clone()),
+            Some(p) => Ok(p.canonicalize_utf8().unwrap_or_else(|_| p.clone())),
             None => find_node_test_collector(&self.project_dir),
         }
     }
@@ -1354,6 +1354,14 @@ impl Adapter for NodeTestAdapter {
 
     fn snapshot_candidates(&self, test_abs: &Utf8Path) -> Vec<Utf8PathBuf> {
         vec![Utf8PathBuf::from(format!("{test_abs}.snapshot"))]
+    }
+
+    fn collector_dirs(&self) -> Vec<Utf8PathBuf> {
+        self.plugin()
+            .ok()
+            .and_then(|p| p.canonicalize_utf8().ok())
+            .into_iter()
+            .collect()
     }
 
     fn inferred_env_patterns(&self) -> &'static [&'static str] {

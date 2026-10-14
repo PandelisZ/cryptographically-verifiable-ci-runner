@@ -448,13 +448,35 @@ fn setup_git_meta(repo: &vci_git::Repo, root: &Utf8Path, meta_url: Option<&str>)
             return Ok(());
         }
     }
-    match AttestStore::new(repo).ensure_remote(meta_url) {
-        Ok(name) => eprintln!(
-            "vci init: git-meta remote {name:?} configured; `vci push` / `vci fetch` (or `git meta push` / `git meta pull`) exchange attestations on refs/meta/main"
-        ),
+    let store = AttestStore::new(repo);
+    let before = store.remote_names().unwrap_or_default();
+    match store.ensure_remote(meta_url) {
+        Ok(name) => {
+            eprintln!(
+                "vci init: git-meta remote {name:?} configured; `vci push` / `vci fetch` (or `git meta push` / `git meta pull`) exchange attestations on refs/meta/main"
+            );
+            if !before.contains(&name)
+                && let Some(note) = shared_config_note(repo, &name)
+            {
+                eprintln!("{note}");
+            }
+        }
         Err(e) => eprintln!("vci init: note: could not configure a git-meta remote: {e}"),
     }
     Ok(())
+}
+
+/// In a linked git worktree, a remote is written to the repository's shared
+/// config (git keeps one `config` for all worktrees of a repository unless
+/// `extensions.worktreeConfig` is used, and remotes are never per-worktree).
+/// That is git's behaviour, but `vci init` run in a worktree then changes
+/// the main checkout too: say so.
+fn shared_config_note(repo: &vci_git::Repo, name: &str) -> Option<String> {
+    let common = repo.linked_worktree_common_dir()?;
+    Some(format!(
+        "vci init: note: this is a linked git worktree: the remote {name:?} was added to the repository's shared config ({}), so every worktree of this repository (the main checkout included) now has it",
+        common.join("config")
+    ))
 }
 
 fn toml_str(s: &str) -> String {

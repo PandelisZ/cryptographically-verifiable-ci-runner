@@ -239,7 +239,8 @@ class CollectorTest < Minitest::Test
     outside = File.join(@tmp, "outside.txt")
     File.write(outside, "o")
     recs = collect("File.read(#{outside.inspect})\n")
-    assert_includes recs.select { |r| r["kind"] == "read" }.map { |r| r["path"] }, outside
+    # Reported as the file it is (its real path: /var -> /private/var).
+    assert_includes recs.select { |r| r["kind"] == "read" }.map { |r| r["path"] }, File.realpath(outside)
   end
 
   def test_minitest_results
@@ -272,6 +273,32 @@ class CollectorTest < Minitest::Test
     assert_equal "no-assertions", empty.find { |x| x["kind"] == "result" }["state"]
     none = collect("1 + 1\n")
     assert_equal "failed", none.find { |x| x["kind"] == "result" }["state"]
+  end
+
+  # A test file that never loads Rails (a Minitest file under test/lib
+  # requiring only minitest and plain Ruby) reports the bundle's railties
+  # version, as the probe (which boots Rails) does, for both runners.
+  # Regression: Minitest files reported "" and were refused ("toolchain seen
+  # by the collector (... rails , ...) differs from the project's").
+  def test_rails_version_without_loading_rails
+    skip "railties is not installed for #{RUBY_VERSION}" unless installed?("railties")
+    want = Gem::Specification.find_by_name("railties").version.to_s
+    script = <<~RUBY
+      gem "railties", "#{want}"
+      raise "Rails was loaded" if defined?(::Rails::VERSION)
+      require "minitest/autorun"
+      class T < Minitest::Test
+        def test_a = assert_equal(2, 1 + 1)
+      end
+    RUBY
+    meta = collect(script).find { |r| r["kind"] == "meta" }
+    assert_equal want, meta["rails"]
+    meta = collect(script, env: { "VCI_RAILS_RUNNER" => "rspec" }).find { |r| r["kind"] == "meta" }
+    assert_equal want, meta["rails"]
+    # No railties at all: "" (a project without Rails), as the probe says.
+    meta = collect("require 'minitest/autorun'\nclass T < Minitest::Test; def test_a = assert(true); end\n")
+           .find { |r| r["kind"] == "meta" }
+    assert_equal "", meta["rails"]
   end
 
   def test_sqlite_files_vci_did_not_prepare_taint
@@ -359,11 +386,179 @@ class CollectorTest < Minitest::Test
       require "ffi"
       module L
         extend FFI::Library
+        ffi_lib FFI::Library::LIBC
         attach_function :getpid, [], :int
       end
       L.getpid
     RUBY
-    assert_includes taints(recs).join("\n"), "native:FFI attach_function"
+    assert_includes taints(recs).join("\n"), "native:FFI call L.getpid"
+    # attach_function without ffi_lib (the process's own symbols), a
+    # Function called directly, a function attached by hand.
+    recs = collect(<<~RUBY)
+      require "ffi"
+      module M
+        extend FFI::Library
+        ffi_lib FFI::CURRENT_PROCESS
+        attach_function :getpid, [], :int
+      end
+      M.getpid
+      fn = FFI::Function.new(:int, [], FFI::DynamicLibrary.open(nil, 0).find_function("getpid"))
+      fn.call
+      module N; end
+      FFI::Function.new(:int, [], FFI::DynamicLibrary.open(nil, 0).find_function("getppid")).attach(N, "pp")
+      N.pp
+    RUBY
+    t = taints(recs).join("\n")
+    assert_includes t, "native:FFI call M.getpid"
+    assert_includes t, "native:FFI FFI::Function#call"
+    assert_includes t, "native:FFI call N.pp"
+    # A variadic function: its call is the attached method's, not a direct one.
+    recs = collect(<<~RUBY)
+      require "ffi"
+      module V
+        extend FFI::Library
+        ffi_lib FFI::Library::LIBC
+        attach_function :snprintf, [:pointer, :size_t, :string, :varargs], :int
+      end
+      buf = FFI::MemoryPointer.new(:char, 8)
+      V.snprintf(buf, 8, "%d", :int, 42)
+    RUBY
+    t = taints(recs)
+    assert_includes t.join("\n"), "native:FFI call V.snprintf"
+    assert_empty t.grep(/VariadicInvoker/), t.join("\n")
+  end
+
+  # Loading a library is not a read of test inputs: it is recorded (an
+  # external "native:<file name>" hashed by content), and only calling into
+  # it refuses the file. A failed ffi_lib records and refuses nothing.
+  # Regression: ffi_lib tainted before calling super, so a LoadError (an
+  # optional library that is not installed) still refused the file.
+  def test_ffi_library_loads_are_recorded_and_failed_loads_are_nothing
+    skip "the ffi gem is not installed for #{RUBY_VERSION}" unless installed?("ffi")
+    recs = collect(<<~RUBY)
+      require "ffi"
+      module Optional
+        extend FFI::Library
+        begin
+          ffi_lib "vci_no_such_library_#{Process.pid}"
+          attach_function :nothing, [], :int
+        rescue LoadError
+        end
+      end
+      module L
+        extend FFI::Library
+        ffi_lib FFI::Library::LIBC
+        attach_function :getpid, [], :int
+      end
+    RUBY
+    assert_empty taints(recs).grep(/FFI|native/), taints(recs).join("\n")
+    natives = recs.select { |r| r["kind"] == "external" && r["name"].start_with?("native:") }
+    refute_empty natives
+    refute natives.any? { |r| r["name"].include?("vci_no_such_library") }, natives.inspect
+  end
+
+  def vips_available?
+    installed?("ruby-vips") && installed?("ffi") &&
+      system(RbConfig.ruby, "-e", "require 'vips'", out: File::NULL, err: File::NULL)
+  end
+
+  PNG_3x2 = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAAAAAC4HznGAAAAtGVYSWZJSSoACAAAAAYAEgEDAAEAAAABAAAAGgEFAAEAAABWAAAAGwEFAAEAAABeAAAAKAEDAAEAAAACAAAAEwIDAAEAAAABAAAAaYcEAAEAAABmAAAAAAAAADhjAADoAwAAOGMAAOgDAAAGAACQBwAEAAAAMDIxMAGRBwAEAAAAAQIDAACgBwAEAAAAMDEwMAGgAwABAAAA//8AAAKgBAABAAAAAwAAAAOgBAABAAAAAgAAAAAAAABtADtDAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAC0lEQVQImWNggAAAAAgAAa9T6iIAAAAASUVORK5CYII="
+
+  def put_png(rel)
+    require "base64"
+    put(rel, Base64.strict_decode64(PNG_3x2))
+  end
+
+  # ruby-vips over libvips: loading it and working on images in memory is
+  # attestable; the files libvips reads and writes through ruby-vips' entry
+  # points are recorded; everything else that could touch a file refuses.
+  def test_vips_loads_and_records_its_file_entry_points
+    skip "ruby-vips with libvips is not available" unless vips_available?
+    put_png("img/a.png")
+    put("out/.keep")
+    recs = collect(<<~RUBY)
+      require "vips"
+      Vips.block_untrusted(true)
+      raise "version" unless Vips.at_least_libvips?(8, 0)
+    RUBY
+    assert_empty taints(recs), taints(recs).join("\n")
+    lib = recs.find { |r| r["kind"] == "external" && r["name"].match?(/\Anative:(lib)?vips/) }
+    assert lib, recs.select { |r| r["kind"] == "external" }.inspect
+    assert_match(/\Asha256:[0-9a-f]{64}\z/, lib["version"])
+
+    recs = collect(<<~RUBY)
+      require "vips"
+      im = Vips::Image.new_from_file("img/a.png", access: :sequential)
+      raise "size" unless [im.width, im.height] == [3, 2]
+      raise "avg" unless im.avg.zero?
+      t = Vips::Image.thumbnail("img/a.png", 2)
+      (im + 1).write_to_file("out/b.png")
+      buf = File.binread("img/a.png")
+      Vips::Image.new_from_buffer(buf, "").write_to_buffer(".png")
+      Vips::Image.new_from_source(Vips::Source.new_from_file("img/a.png"), "").avg
+      Vips::Image.black(2, 2).embed(1, 1, 4, 4).write_to_buffer(".jpg[Q=90,profile=srgb]")
+      Vips::Image.thumbnail("img/a.png", 2, export_profile: "srgb")
+    RUBY
+    assert_empty taints(recs), taints(recs).join("\n")
+    assert_includes paths(recs, "read"), "img/a.png"
+    assert_includes paths(recs, "write"), "out/b.png"
+  end
+
+  def test_vips_file_access_vci_cannot_see_refuses
+    skip "ruby-vips with libvips is not available" unless vips_available?
+    put_png("img/a.png")
+    {
+      # libvips functions called directly: an operation built outside
+      # Operation.call, a descriptor source, a function vci does not know.
+      <<~RUBY => "native:vips:pngload built outside Vips::Operation.call",
+        require "vips"
+        op = Vips::Operation.new("pngload")
+        op.set("filename", "img/a.png", nil, 0, GObject::GSTR_TYPE, false)
+        op.build
+      RUBY
+      <<~RUBY => "native:vips:vips_source_new_from_descriptor",
+        require "vips"
+        Vips::Source.new_from_descriptor(File.open("img/a.png").fileno)
+      RUBY
+      <<~RUBY => "native:vips:text",
+        require "vips"
+        Vips::Image.text("hello")
+      RUBY
+      <<~RUBY => "native:vips:svgload",
+        require "vips"
+        File.write("img/x.svg", "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>")
+        Vips::Image.svgload("img/x.svg") rescue nil
+      RUBY
+      <<~RUBY => "native:vips:icc_transform with the ICC profile",
+        require "vips"
+        Vips::Image.black(2, 2).icc_transform("/tmp/vci-no-such.icc") rescue nil
+      RUBY
+      <<~RUBY => "native:vips:option string \"[filename=/etc/hosts]\" names a file",
+        require "vips"
+        Vips::Image.new_from_file("img/a.png[filename=/etc/hosts]") rescue nil
+      RUBY
+      <<~RUBY => "native:vips:thumbnail with the ICC profile \"/tmp/vci-no-such.icc\"",
+        require "vips"
+        Vips::Image.thumbnail("img/a.png", 2, import_profile: "/tmp/vci-no-such.icc") rescue nil
+      RUBY
+      <<~RUBY => "names an ICC profile file",
+        require "vips"
+        Vips::Image.black(2, 2).write_to_buffer(".jpg[profile=/tmp/vci-no-such.icc]") rescue nil
+      RUBY
+      # A function of libvips attached by the test itself is not ruby-vips'.
+      <<~RUBY => "native:FFI call Mine.vips_version",
+        require "vips"
+        module Mine
+          extend FFI::Library
+          ffi_lib Vips.ffi_libraries.first.name
+          attach_function :vips_version, [:int], :int
+        end
+        Mine.vips_version(0)
+      RUBY
+    }.each do |script, want|
+      t = taints(collect(script)).join("\n")
+      assert_includes t, want, script
+    end
   end
 
   def test_dir_open_and_opendir
@@ -768,6 +963,211 @@ class CollectorTest < Minitest::Test
         assert taints(recs).any? { |t| t.start_with?(w) }, "#{f}: #{w} in #{result.inspect} #{taints(recs).inspect}"
       end
     end
+  end
+
+  # Regression: a name starting with "~" or "|" was never recorded (expand
+  # returned nil: File.expand_path("~note.txt") raises, and "|" was taken
+  # for a command), while File, Dir and File::Stat open such names
+  # literally, relative to the working directory.
+  def test_names_starting_with_tilde_or_pipe_are_files
+    put("~note.txt", "hello")
+    put("|pipe.txt", "p")
+    put("~dir/a.txt", "a")
+    recs = collect(<<~'RUBY')
+      raise "read" unless File.read("~note.txt") == "hello"
+      raise "open" unless File.open("|pipe.txt", &:read) == "p"
+      raise "File.read" unless File.read("|pipe.txt") == "p"
+      raise "exist" unless File.exist?("~dir/a.txt")
+      raise "absent" if File.exist?("~gone.txt")
+      Dir.children("~dir")
+      File.realpath("~note.txt")
+      File.symlink("~note.txt", "tmp_link") rescue nil
+    RUBY
+    reads = paths(recs, "read")
+    %w[~note.txt |pipe.txt].each { |p| assert_includes reads, p }
+    assert_includes paths(recs, "stat"), "~dir/a.txt"
+    assert_includes paths(recs, "probe"), "~gone.txt"
+    assert_includes paths(recs, "readdir"), "~dir"
+    assert_empty taints(recs)
+    # IO.read("|cmd") runs a command: refused, as before.
+    recs = collect(<<~'RUBY')
+      IO.read("|echo hi")
+      IO.write("|cat > /dev/null", "x")
+    RUBY
+    t = taints(recs).join("\n")
+    assert_includes t, "process:IO.read(|cmd)"
+    assert_includes t, "process:IO.write(|cmd)"
+  end
+
+  # Regression: an exemption (vci's temp dir, Ruby's own directories) was
+  # decided by how a path was spelt. A directory symlink there into the
+  # repository (made and removed by the test) hid the repository files read
+  # through it; one to a file elsewhere hid that read too.
+  def test_symlinks_in_exempt_directories_are_resolved
+    put("fx/x.png", "x")
+    outside = File.join(@tmp, "elsewhere").tap { |d| FileUtils.mkdir_p(d) }
+    File.write(File.join(outside, "o.txt"), "o")
+    fake_lib = File.join(@tmp, "fakerubylib").tap { |d| FileUtils.mkdir_p(d) }
+    recs = collect(<<~RUBY)
+      # Ruby's own directory, as the collector knows it (a stand-in for a
+      # writable rubylibdir).
+      RbConfig::CONFIG["rubyhdrdir"] = #{fake_lib.inspect}
+      [ENV["TMPDIR"], #{fake_lib.inspect}].each_with_index do |dir, i|
+        link = File.join(dir, "fx\#{i}")
+        File.symlink(File.expand_path("fx"), link)
+        File.read(File.join(link, "x.png"))
+        File.unlink(link)
+        out = File.join(dir, "out\#{i}")
+        File.symlink(#{outside.inspect}, out)
+        File.read(File.join(out, "o.txt"))
+        File.unlink(out)
+      end
+    RUBY
+    assert_includes paths(recs, "read"), "fx/x.png"
+    reads = recs.select { |r| r["kind"] == "read" }.map { |r| r["path"] }
+    assert_includes reads, File.realpath(File.join(outside, "o.txt"))
+  end
+
+  def test_vips_operation_names_resolve_as_libvips_resolves_them
+    skip "ruby-vips with libvips is not available" unless vips_available?
+    put_png("img/a.png")
+    put_png("~pic.png")
+    put("img/b.txt", "hello")
+    # Regression: names were classified case-sensitively, but libvips finds
+    # an operation by nickname or class name without regard to case.
+    recs = collect(<<~RUBY)
+      require "vips"
+      raise "PNGLOAD" unless Vips::Operation.call("PNGLOAD", ["img/a.png"]).width == 3
+      raise "PngLoad" unless Vips::Operation.call("PngLoad", ["img/a.png"]).width == 3
+      raise "class" unless Vips::Operation.call("VIPSFOREIGNLOADPNGFILE", ["img/a.png"]).width == 3
+      Vips::Operation.call("THUMBNAIL", ["img/a.png", 2], { size: :down })
+      raise "tilde" unless Vips::Image.new_from_file("~pic.png").width == 3
+    RUBY
+    assert_empty taints(recs), taints(recs).join("\n")
+    assert_includes paths(recs, "read"), "img/a.png"
+    assert_includes paths(recs, "read"), "~pic.png", "libvips opens \"~pic.png\" literally"
+    {
+      <<~RUBY => "native:vips:system",
+        require "vips"
+        Vips::Operation.call("SYSTEM", ["cat img/b.txt"], { log: true }) rescue nil
+      RUBY
+      <<~RUBY => "native:vips:pngload built outside Vips::Operation.call",
+        require "vips"
+        op = Vips::Operation.new("PNGLOAD")
+        op.set("filename", "img/a.png", nil, 0, GObject::GSTR_TYPE, false)
+        op.build
+      RUBY
+      <<~RUBY => 'native:vips:"no_such_op"',
+        require "vips"
+        Vips::Operation.call("no_such_op", []) rescue nil
+      RUBY
+    }.each do |script, want|
+      t = taints(collect(script)).join("\n")
+      assert_includes t, want, script
+    end
+  end
+
+  # Regression: OpenSSL reads certificate files and its default paths in C.
+  def test_openssl_certificate_files
+    recs = collect(<<~'RUBY')
+      require "openssl"
+      key = OpenSSL::PKey::EC.generate("prime256v1")
+      cert = OpenSSL::X509::Certificate.new
+      cert.version = 2
+      cert.serial = 1
+      cert.subject = cert.issuer = OpenSSL::X509::Name.parse("/CN=vci test CA")
+      cert.public_key = key
+      cert.not_before = Time.now - 60
+      cert.not_after = Time.now + 3600
+      ef = OpenSSL::X509::ExtensionFactory.new
+      ef.subject_certificate = ef.issuer_certificate = cert
+      cert.add_extension(ef.create_extension("basicConstraints", "CA:TRUE", true))
+      cert.add_extension(ef.create_extension("keyUsage", "keyCertSign, cRLSign", true))
+      cert.sign(key, OpenSSL::Digest.new("SHA256"))
+      VciCollector.quiet { File.write("ca.pem", cert.to_pem) }
+      st = OpenSSL::X509::Store.new
+      st.add_file("ca.pem")
+      raise "verify" unless st.verify(cert)
+      ctx = OpenSSL::SSL::SSLContext.new
+      ctx.ca_file = "ca.pem"
+      ctx.setup
+      OpenSSL::Config.new("ssl.cnf") rescue nil
+    RUBY
+    assert_empty taints(recs), taints(recs).join("\n")
+    assert_includes paths(recs, "read"), "ca.pem"
+    assert_includes paths(recs, "probe"), "ssl.cnf"
+    {
+      <<~'RUBY' => "native:openssl:X509::Store#verify with a certificate store that loaded OpenSSL's default paths",
+        require "openssl"
+        st = OpenSSL::X509::Store.new
+        st.set_default_paths
+        st.verify(OpenSSL::X509::Certificate.new)
+      RUBY
+      <<~'RUBY' => "native:openssl:X509::StoreContext.new with a certificate store that loaded",
+        require "openssl"
+        OpenSSL::X509::StoreContext.new(OpenSSL::SSL::SSLContext::DEFAULT_CERT_STORE, OpenSSL::X509::Certificate.new)
+      RUBY
+      <<~'RUBY' => "native:openssl:X509::Store#verify with a certificate store that has a certificate directory",
+        require "openssl"
+        st = OpenSSL::X509::Store.new
+        st.add_path("certs")
+        st.verify(OpenSSL::X509::Certificate.new)
+      RUBY
+      <<~'RUBY' => "native:openssl:SSLContext#setup with ca_path",
+        require "openssl"
+        ctx = OpenSSL::SSL::SSLContext.new
+        ctx.ca_path = "certs"
+        ctx.setup rescue nil
+      RUBY
+    }.each do |script, want|
+      t = taints(collect(script)).join("\n")
+      assert_includes t, want, script
+    end
+  end
+
+  # Regression: who the process runs as was never observed (a laptop's
+  # user is not a root CI container's).
+  def test_process_identity_reads_taint
+    recs = collect(<<~'RUBY')
+      require "etc"
+      require "fileutils"
+      d = File.join(ENV["TMPDIR"], "x")
+      FileUtils.mkdir_p(d)
+      FileUtils.remove_entry_secure(d)
+    RUBY
+    assert_empty taints(recs).grep(/process-identity/), taints(recs).join("\n")
+    %w[Process.uid Process.euid Process::UID.rid Process::Sys.getuid Etc.getlogin Etc.getpwuid].each do |call|
+      args = call == "Etc.getpwuid" ? "(Process::Sys.getuid)" : ""
+      t = taints(collect("require 'etc'\n#{call}#{args}\n")).join("\n")
+      assert_includes t, "ruby:process-identity:#{call} at", call
+    end
+  end
+
+  # Regression: the check on an attached FFI function was a prepended
+  # module, so `method(:f).super_method.call` called C past it.
+  def test_ffi_wrapper_cannot_be_skipped
+    skip "the ffi gem is not installed for #{RUBY_VERSION}" unless installed?("ffi")
+    recs = collect(<<~RUBY)
+      require "ffi"
+      module L
+        extend FFI::Library
+        ffi_lib FFI::Library::LIBC
+        attach_function :getpid, [], :int
+      end
+      raise "super_method" unless L.method(:getpid).super_method.nil?
+    RUBY
+    assert_empty taints(recs).grep(/FFI call/), "not called: #{taints(recs).inspect}"
+    recs = collect(<<~RUBY)
+      require "ffi"
+      module L
+        extend FFI::Library
+        ffi_lib FFI::Library::LIBC
+        attach_function :getpid, [], :int
+      end
+      m = L.method(:getpid)
+      (m.super_method || m).call
+    RUBY
+    assert_includes taints(recs).join("\n"), "native:FFI call L.getpid"
   end
 
   def test_plain_mode_records_nothing

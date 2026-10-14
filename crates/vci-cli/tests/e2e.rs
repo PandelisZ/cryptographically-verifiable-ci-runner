@@ -191,10 +191,24 @@ impl World {
     }
 
     fn vci(&self, dir: &Path, args: &[&str]) -> Output {
+        self.vci_with(dir, args, &[])
+    }
+
+    /// [`World::vci`] with extra variables set.
+    fn vci_with(&self, dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Output {
         let mut cmd = Command::cargo_bin("vci").unwrap();
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         cmd.current_dir(dir)
             .args(args)
-            .env("VCI_JS_PLUGIN", workspace_root().join("js/vitest-plugin"))
+            .env(
+                "VCI_JS_PLUGIN",
+                env.iter().find(|(k, _)| *k == "VCI_JS_PLUGIN").map_or_else(
+                    || workspace_root().join("js/vitest-plugin"),
+                    |(_, v)| v.to_path_buf(),
+                ),
+            )
             .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("NO_COLOR", "1");
@@ -1903,4 +1917,133 @@ fn push_reports_no_ops_and_fetch_refuses_remote_helper_urls() {
     // `--remote origin` (what the action runs) ignores the file.
     w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
     assert_eq!(w.plan(&fresh, "main").skip, set(&[B]));
+}
+
+/// The `@vci/vitest` package reached through a symlinked install prefix
+/// (Homebrew's `opt/vci` -> `Cellar/vci/<version>`, which its formula puts
+/// in `VCI_JS_PLUGIN`): the collector's own files are not inputs, whichever
+/// spelling of their path the worker or main process saw.
+#[test]
+fn collector_behind_a_symlinked_install_prefix() {
+    let w = World::new();
+    let work = w.work.clone();
+    let cellar = w.base.join("Cellar/vci/1.1.0/share/vci/vitest-plugin");
+    std::fs::create_dir_all(&cellar).unwrap();
+    let js = workspace_root().join("js/vitest-plugin");
+    cp(&js.join("src"), &cellar.join("src"));
+    cp(&js.join("package.json"), &cellar.join("package.json"));
+    std::fs::create_dir_all(w.base.join("opt")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/vci/1.1.0", w.base.join("opt/vci")).unwrap();
+    let linked = w.base.join("opt/vci/share/vci/vitest-plugin");
+    let env = [("VCI_JS_PLUGIN", linked.as_path())];
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let out = w.vci_with(&work, &["run", A, B, C, D, "--key", &key], &env);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("vci: 4 attested, 0 not attested"), "{err}");
+    let out = w.vci_with(
+        &work,
+        &["plan", "--base-ref", "main", "--format", "json"],
+        &env,
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    for f in v["files"].as_array().unwrap() {
+        assert_eq!(f["skip"], true, "{f}");
+    }
+}
+
+/// `vci init` in a linked worktree adds the git-meta remote to the
+/// repository's shared config (git's behaviour: remotes are not per
+/// worktree) and says so; in the main worktree it says nothing about it.
+#[test]
+fn init_in_a_linked_worktree_notes_the_shared_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let repo = base.join("repo");
+    let git = |dir: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    git(&base, &["init", "-q", "--bare", "remote.git"]);
+    git(&base, &["init", "-q", "repo"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "root"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            base.join("remote.git").to_str().unwrap(),
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            base.join("wt").to_str().unwrap(),
+        ],
+    );
+    let init = |dir: &Path| {
+        let out = Command::cargo_bin("vci")
+            .unwrap()
+            .current_dir(dir)
+            .args(["init", "--no-install", "--adapter", "pytest"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let err = init(&base.join("wt"));
+    assert!(
+        err.contains("linked git worktree")
+            && err.contains(&format!("{}", repo.join(".git/config").display())),
+        "{err}"
+    );
+    // The main checkout sees the remote too.
+    assert_eq!(
+        git(&repo, &["config", "--get", "remote.meta.url"]),
+        base.join("remote.git").to_str().unwrap()
+    );
+    // In the main worktree: no such note (and the remote exists already).
+    let other = base.join("other");
+    git(&base, &["init", "-q", "other"]);
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "root"]);
+    git(
+        &other,
+        &[
+            "remote",
+            "add",
+            "origin",
+            base.join("remote.git").to_str().unwrap(),
+        ],
+    );
+    let err = init(&other);
+    assert!(err.contains("git-meta remote \"meta\" configured"), "{err}");
+    assert!(!err.contains("linked git worktree"), "{err}");
 }

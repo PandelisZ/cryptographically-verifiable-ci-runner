@@ -14,6 +14,57 @@ const realpathSync = fs.realpathSync;
 /** Directory of this package (…/vitest-plugin), used to recognise our own stack frames. */
 export const PACKAGE_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
+/**
+ * Every spelling of this package's directory: as Node loaded it and its real path. An install
+ * reached through a symlinked prefix (Homebrew's `opt/vci` -> `Cellar/vci/<version>`, a pnpm
+ * link) has two, and module URLs or a module-hook resolution may name either.
+ */
+export const PACKAGE_DIRS = (() => {
+  const dirs = [toSlash(PACKAGE_DIR)];
+  try {
+    const real = toSlash(realpathSync(PACKAGE_DIR));
+    if (!dirs.includes(real)) dirs.push(real);
+  } catch {
+    // keep the one spelling
+  }
+  return dirs;
+})();
+
+/** @type {Map<string, boolean>} */
+const ownCache = new Map();
+/** The directory the test process started in (the project dir vci runs it in). */
+const PROJECT_DIR = toSlash(process.cwd());
+
+/**
+ * Whether `p` is one of vci's own collector files (this package), however it is spelt: under
+ * one of `PACKAGE_DIRS`, or a path whose real path is (a symlink to the package, or a path
+ * through a symlinked directory). These files are vci's tooling, not inputs of a test.
+ * @param {string} p absolute path
+ */
+export function isOwnPath(p) {
+  const s = toSlash(p);
+  if (isUnder(s, PACKAGE_DIRS)) return true;
+  // A path in the project (outside node_modules) is the project's, even when it is a symlink into
+  // this package: it is recorded like any other file there.
+  if (isUnder(s, [PROJECT_DIR]) && !isInNodeModules(s)) return false;
+  let hit = ownCache.get(s);
+  if (hit === undefined) {
+    hit = false;
+    try {
+      hit = isUnder(toSlash(realpathSync(s)), PACKAGE_DIRS);
+    } catch {
+      // absent: its directory decides (a probe of a candidate next to a collector file)
+      try {
+        hit = isUnder(toSlash(path.join(realpathSync(path.dirname(s)), path.basename(s))), PACKAGE_DIRS);
+      } catch {
+        hit = false;
+      }
+    }
+    ownCache.set(s, hit);
+  }
+  return hit;
+}
+
 /** Name of the env var the main process uses to hand configuration to workers. */
 export const WORKER_ENV = "VCI_WORKER";
 

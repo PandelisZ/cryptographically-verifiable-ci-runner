@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { getState } from "./state.js";
-import { PACKAGE_DIR, WORKER_ENV, candidateKind, idToFsPath, packageOf, sha256, toSlash } from "./util.js";
+import { PACKAGE_DIR, WORKER_ENV, candidateKind, idToFsPath, isOwnPath, packageOf, sha256, toSlash } from "./util.js";
 import { currentMain } from "./worker/collector.js";
 
 export const SETUP_FILE = fileURLToPath(new URL("./worker/setup.js", import.meta.url));
@@ -339,7 +339,7 @@ export class VciReporter {
     const p = idToFsPath(idOrFile);
     if (!p) return;
     const sp = toSlash(p);
-    if (sp.startsWith(toSlash(PACKAGE_DIR) + "/")) return;
+    if (isOwnPath(sp)) return;
     const pkg = packageOf(p);
     if (pkg === undefined) {
       addRecord(entry, { kind: "module", path: p, via });

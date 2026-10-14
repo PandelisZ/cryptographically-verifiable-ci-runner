@@ -688,6 +688,10 @@ impl Adapter for PytestAdapter {
         vec![]
     }
 
+    fn collector_dirs(&self) -> Vec<Utf8PathBuf> {
+        self.plugin_dir().ok().into_iter().collect()
+    }
+
     fn inferred_env_patterns(&self) -> &'static [&'static str] {
         &[]
     }

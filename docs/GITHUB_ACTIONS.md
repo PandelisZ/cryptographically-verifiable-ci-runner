@@ -63,7 +63,8 @@ jobs:
 ```
 
 Run the job on the hosted runner directly, not in a `container:` job: attestations made as a normal user are not
-accepted by a verifier running as root.
+accepted by a verifier running as root (unless the base branch sets `policy.allow_superuser_mismatch = true`, which is
+risky for tests that depend on file permissions: see the [reference](REFERENCE.md#vcitoml)).
 
 ## Setup steps for each runner
 
@@ -247,7 +248,7 @@ Run `vci explain <file> --base-ref origin/main` locally for the full reason a un
 | A test reads `CI`, `HOME` or `USER` | Those values differ on a runner, so that file always runs there |
 | No Rails test file ever skips on the runner | `config/environments/test.rb` reads `ENV["CI"]` (the generator's `config.eager_load = ENV["CI"].present?`); the Ruby patchlevel, Bundler, SQLite library or time zone data differ (`failed check: toolchain`; use `gem "tzinfo-data"`); or `Gemfile.lock` lacks the runner's platform |
 | An RSpec file is never attested | An example is pending, skipped or filtered out (`fit` with `filter_run_when_matching :focus`, an excluded tag), rspec-retry / parallel_tests is loaded, a failure was retried away (`rspec:failure-cleared`), or the process exited non-zero after RSpec's report (SimpleCov's `minimum_coverage`: `vci:process-exit:2`). `vci run` prints the reason (`rspec:filtered:...`, `rspec:retry`, ...) |
-| Every Rails test is refused on a Mac with `/etc/resolv.conf`, `native:FFI ffi_lib(["vips.42"])` or `config/master.key` | An older collector (`resolv.conf`, read when Capybara loads `net/http`), `image_processing`/`ruby-vips` with Homebrew libvips (remove the gem if unused), or the generator's credentials: see "What the Rails adapter records" in [the reference](REFERENCE.md#what-the-rails-adapter-records) |
+| Every Rails test is refused on a Mac with `/etc/resolv.conf`, `native:FFI ffi_lib(["vips.42"])` or `config/master.key` | An older collector (`resolv.conf`, read when Capybara loads `net/http`; `ffi_lib`, which collector 0.4.0 records instead of refusing, so `image_processing`/`ruby-vips` with Homebrew libvips is attested), or the generator's credentials: see "What the Rails adapter records" in [the reference](REFERENCE.md#what-the-rails-adapter-records) |
 | Minitest files never run with `runner = "rspec"` | An explicit runner leaves the other runner's files to you: `vci plan`/`ci` warn and the audit log lists it under `warnings` |
 
 ## For maintainers: cutting a release

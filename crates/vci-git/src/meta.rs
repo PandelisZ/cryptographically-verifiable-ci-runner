@@ -838,6 +838,11 @@ impl<'a> AttestStore<'a> {
         self.add_remote(&url, &remotes)
     }
 
+    /// The names of the configured git remotes (metadata remotes or not).
+    pub fn remote_names(&self) -> Result<Vec<String>, GitError> {
+        Ok(self.remotes()?.into_iter().map(|r| r.0).collect())
+    }
+
     /// The URL of a configured remote.
     pub fn remote_url(&self, name: &str) -> Result<Option<String>, GitError> {
         Ok(self

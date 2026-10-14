@@ -1115,3 +1115,54 @@ fn pytest_never_skip_policy() {
     let ex = w.explain(&work, B, "main");
     assert!(ex.contains("policy.never_skip"), "{ex}");
 }
+
+/// vci installed the way Homebrew installs it: the binary and
+/// `share/vci/pytest-plugin` live in `Cellar/vci/<version>` and are reached
+/// through the `opt/vci` symlink. The collector is found next to the
+/// executable (and, given as `VCI_PY_PLUGIN`, through the symlink), and its
+/// own files are never inputs.
+#[test]
+fn collector_behind_a_symlinked_install_prefix() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let prefix = w.base.join("Cellar/vci/1.1.0");
+    let share = prefix.join("share/vci/pytest-plugin");
+    std::fs::create_dir_all(&share).unwrap();
+    let py = workspace_root().join("py/pytest-plugin");
+    for f in [
+        "vci_pytest/__init__.py",
+        "vci_pytest/_collector.py",
+        "pyproject.toml",
+    ] {
+        std::fs::create_dir_all(share.join(f).parent().unwrap()).unwrap();
+        std::fs::copy(py.join(f), share.join(f)).unwrap();
+    }
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::fs::copy(assert_cmd::cargo::cargo_bin("vci"), prefix.join("bin/vci")).unwrap();
+    std::fs::create_dir_all(w.base.join("opt")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/vci/1.1.0", w.base.join("opt/vci")).unwrap();
+    let linked = w.base.join("opt/vci/share/vci/pytest-plugin");
+    let env = [("VCI_PY_PLUGIN", linked.to_str().unwrap())];
+    let out = w.vci_env(
+        &work,
+        &["run", B, "--key", w.trusted.to_str().unwrap()],
+        &env,
+    );
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("vci: 1 attested, 0 not attested"), "{err}");
+    assert!(w.plan_env(&work, "main", &env).skip.contains(B));
+
+    // The binary run through the symlinked prefix finds share/vci/pytest-plugin itself.
+    let mut cmd = Command::new(w.base.join("opt/vci/bin/vci"));
+    cmd.current_dir(&work)
+        .args(["run", C, "--key", w.trusted.to_str().unwrap()])
+        .env("GIT_CONFIG_GLOBAL", &w.gitconfig)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("VCI_PY_PLUGIN");
+    for k in SCRUB {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("vci: 1 attested, 0 not attested"), "{err}");
+}

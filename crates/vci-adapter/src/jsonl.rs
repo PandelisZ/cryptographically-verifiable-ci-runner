@@ -95,6 +95,79 @@ pub struct Observed {
     pub result: Option<TestResult>,
 }
 
+impl Observed {
+    /// Drop reads, probes, listings and module loads of vci's own collector
+    /// files (`collector_dirs`, real paths) that lie outside `repo_root`,
+    /// however the collector spelt them: through a symlinked install prefix
+    /// (Homebrew's `opt/vci` -> `Cellar/vci/<version>`) a collector file has
+    /// two paths, and only one of them starts with the directory vci
+    /// resolved. They are vci's tooling, identified by the collector
+    /// version, never inputs of a test. Paths inside the repository are
+    /// kept (they are hashed like any other input). Returns how many were
+    /// dropped.
+    ///
+    /// A path is judged by where it really leads (its real path, or its
+    /// nearest existing ancestor's for an absent path), never by its
+    /// spelling: a symlink in the collector directory to a repository
+    /// directory (or to anywhere else) reads that file, which is kept (a
+    /// repository file the collector reported through the link, or a read
+    /// outside the repository, which refuses the file).
+    pub fn drop_collector_paths(
+        &mut self,
+        repo_root: &Utf8Path,
+        collector_dirs: &[Utf8PathBuf],
+    ) -> usize {
+        if collector_dirs.is_empty() {
+            return 0;
+        }
+        let dirs: Vec<Utf8PathBuf> = collector_dirs
+            .iter()
+            .flat_map(|d| {
+                let real = d.canonicalize_utf8().ok();
+                std::iter::once(d.clone()).chain(real)
+            })
+            .collect();
+        let own = |p: &Utf8PathBuf| -> bool {
+            if p.starts_with(repo_root) {
+                return false;
+            }
+            let r = real_path(p);
+            !r.starts_with(repo_root) && dirs.iter().any(|d| r.starts_with(d))
+        };
+        let mut n = 0;
+        for set in [
+            &mut self.modules,
+            &mut self.reads,
+            &mut self.probes,
+            &mut self.readdirs,
+            &mut self.stats,
+        ] {
+            let before = set.len();
+            set.retain(|p| !own(p));
+            n += before - set.len();
+        }
+        n
+    }
+}
+
+/// The real path of `p`, or of its nearest existing ancestor joined with
+/// the rest (an absent path); `p` itself when nothing resolves.
+fn real_path(p: &Utf8Path) -> Utf8PathBuf {
+    let mut rest: Vec<&str> = Vec::new();
+    let mut cur = Some(p);
+    while let Some(c) = cur {
+        if let Ok(r) = c.canonicalize_utf8() {
+            return rest.iter().rev().fold(r, |acc, x| acc.join(x));
+        }
+        match c.file_name() {
+            Some(name) => rest.push(name),
+            None => break,
+        }
+        cur = c.parent();
+    }
+    p.to_owned()
+}
+
 fn str_field(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(Value::as_str).map(str::to_owned)
 }
@@ -263,6 +336,100 @@ pub fn parse_jsonl_dir(dir: &Utf8Path) -> Result<Vec<Observed>, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A collector file reached through a symlinked install prefix is
+    /// dropped whichever spelling the collector used; repository files (and
+    /// a repository symlink into the collector) are kept.
+    #[test]
+    fn collector_paths_are_dropped_through_symlinks() {
+        let t = tempfile::tempdir().unwrap();
+        let base = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        let cellar = base.join("Cellar/vci/1.1.0/share/vci/plugin");
+        std::fs::create_dir_all(cellar.join("src")).unwrap();
+        std::fs::write(cellar.join("src/late.js"), "").unwrap();
+        std::fs::create_dir_all(base.join("opt")).unwrap();
+        std::os::unix::fs::symlink(base.join("Cellar/vci/1.1.0"), base.join("opt/vci")).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.js"), "").unwrap();
+        std::os::unix::fs::symlink(cellar.join("src/late.js"), repo.join("src/link.js")).unwrap();
+        let linked = base.join("opt/vci/share/vci/plugin");
+        let mut o = Observed {
+            modules: [
+                linked.join("src/late.js"),
+                cellar.join("src/late.js"),
+                repo.join("src/a.js"),
+                repo.join("src/link.js"),
+            ]
+            .into_iter()
+            .collect(),
+            probes: [linked.join("src/late.ts"), base.join("elsewhere.js")]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            o.drop_collector_paths(&repo, std::slice::from_ref(&cellar)),
+            3
+        );
+        assert_eq!(
+            o.modules,
+            [repo.join("src/a.js"), repo.join("src/link.js")]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(o.probes, [base.join("elsewhere.js")].into_iter().collect());
+        assert_eq!(o.drop_collector_paths(&repo, &[]), 0);
+    }
+
+    /// Regression: a path that merely starts with the collector directory
+    /// was dropped without being resolved, so a directory symlink there
+    /// into the repository (or anywhere else) hid the files read through
+    /// it. Only paths that really are in the collector directory go.
+    #[test]
+    fn collector_dir_symlinks_out_of_it_are_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let base = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        let coll = base.join("share/vci/ruby-collector");
+        std::fs::create_dir_all(&coll).unwrap();
+        std::fs::write(coll.join("vci_collector.rb"), "").unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("test/fixtures/dirx")).unwrap();
+        std::fs::write(repo.join("test/fixtures/dirx/x.png"), "x").unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        std::fs::write(base.join("elsewhere/o.txt"), "o").unwrap();
+        std::os::unix::fs::symlink(repo.join("test/fixtures/dirx"), coll.join("fx1")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), coll.join("out1")).unwrap();
+        let mut o = Observed {
+            reads: [
+                coll.join("vci_collector.rb"),
+                coll.join("fx1/x.png"),
+                coll.join("out1/o.txt"),
+            ]
+            .into_iter()
+            .collect(),
+            probes: [coll.join("fx1/absent.png"), coll.join("absent.rb")]
+                .into_iter()
+                .collect(),
+            readdirs: [coll.join("fx1")].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            o.drop_collector_paths(&repo, std::slice::from_ref(&coll)),
+            2
+        );
+        assert_eq!(
+            o.reads,
+            [coll.join("fx1/x.png"), coll.join("out1/o.txt")]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            o.probes,
+            [coll.join("fx1/absent.png")].into_iter().collect()
+        );
+        assert_eq!(o.readdirs, [coll.join("fx1")].into_iter().collect());
+    }
 
     fn write(dir: &Utf8Path, test_id: &str, body: &str) -> Utf8PathBuf {
         let name = hex::encode(Sha256::digest(test_id.as_bytes()));

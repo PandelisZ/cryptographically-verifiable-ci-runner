@@ -120,6 +120,9 @@ pub struct Toolchain {
     pub arch: String,
 }
 
+/// The `what` of a [`Toolchain::diff`] entry for a superuser difference.
+pub const PRIVILEGES_DIFF: &str = "privileges";
+
 fn major(v: &str) -> &str {
     v.split('.').next().unwrap_or(v)
 }
@@ -182,7 +185,7 @@ impl Toolchain {
                 }
             };
             out.push((
-                "privileges",
+                PRIVILEGES_DIFF,
                 who(self.superuser).to_owned(),
                 who(now.superuser).to_owned(),
             ));

@@ -30,7 +30,7 @@ module VciCollector
   # Part of the toolchain (Probe.libs): bumped whenever what the collector
   # records or refuses changes, so an attestation made by an older collector
   # (which may have missed an input) is not accepted where a newer one runs.
-  VERSION = "0.3.1"
+  VERSION = "0.4.1"
   MODE = ENV.fetch("VCI_RAILS_MODE", "collect")
   # The test framework vci started this process for: "minitest" (default,
   # `bin/rails test <file>`) or "rspec" (`rspec <file>`, see RSpecSupport).
@@ -107,12 +107,15 @@ module VciCollector
   # checks of it from then on are not inputs; earlier ones are.
   @produced = {}
   @inodes = {}       # [dev, ino] => abs of files opened through File
+  # abs => real path, for paths outside the repository that led elsewhere
+  # (through a symlink) when they were used: the link may be gone by exit.
+  @reals = {}
   @enumerations = [] # [where, method]
   @lp_memo = {}
   @hooks_done = {}
 
   class << self
-    attr_reader :records, :taints, :written, :produced, :env_keys, :enumerations
+    attr_reader :records, :taints, :written, :produced, :env_keys, :enumerations, :reals
 
     def collect?
       MODE == "collect"
@@ -161,11 +164,29 @@ module VciCollector
       nil
     end
 
+    # The absolute path a File, IO, Dir or File::Stat entry point opens for
+    # `p`. They take every name literally, relative to the working
+    # directory: "~note.txt" and "~/x" are not expanded (only
+    # File.expand_path and require do that), and "|x" is a file named "|x"
+    # (only Kernel#open and IO.read/readlines/foreach/write run a command for
+    # it, and those taint). A name the collector cannot resolve when the
+    # operation it was given to succeeded would be a read vci did not
+    # record: it refuses the file (fail closed). A name with a NUL byte is
+    # rejected by Ruby before it reaches the file system.
     def expand(p)
-      return nil unless p.is_a?(String) && !p.empty? && !p.start_with?("|")
-      quiet { Real.expand_path(p) }
-    rescue StandardError
+      return nil unless p.is_a?(String) && !p.empty?
+      return nil if p.include?("\0")
+      quiet { literal_path(p) }
+    rescue StandardError => e
+      taint("vci:unresolvable-path:#{p.inspect} (#{e.class}: vci could not tell which file this names)")
       nil
+    end
+
+    # File.expand_path without its "~" expansion: what the file system entry
+    # points open for `p` (relative to `dir`, default the working directory).
+    def literal_path(p, dir = nil)
+      p = "./#{p}" if p.start_with?("~")
+      dir ? Real.expand_path(p, dir) : Real.expand_path(p)
     end
 
     def inside?(abs, dir)
@@ -191,6 +212,7 @@ module VciCollector
     # (one made before the process replaced it is).
     def add(kind, abs)
       return unless abs
+      abs = resolve(abs)
       return if %i[read stat readdir].include?(kind) && @produced[abs]
       unless inside?(abs, repo)
         return if RESOLV_CONF.include?(abs) && resolv_loading?
@@ -201,6 +223,49 @@ module VciCollector
         end
       end
       @records[[kind, abs]] = true
+    end
+
+    # The real path of `abs`, or of its nearest existing ancestor joined
+    # with the rest (an absent path).
+    def real_of(abs)
+      rest = []
+      cur = abs
+      quiet do
+        until cur == "/" || cur.empty?
+          begin
+            return File.join(Real.realpath(cur), *rest.reverse)
+          rescue SystemCallError
+            rest << Real.basename(cur)
+            cur = Real.dirname(cur)
+          end
+        end
+      end
+      abs
+    end
+
+    # A path outside the repository is resolved when it is used: through a
+    # symlink (in a temp dir, Ruby's own or a gem's directory, the
+    # collector's), it can name a repository file, which is then what is
+    # recorded. The link may be gone by the time the records are written
+    # (a test that makes one and removes it), so this cannot wait until
+    # then. Where it led otherwise is kept for Output.classify.
+    def resolve(abs)
+      return abs if inside?(abs, repo)
+      real = real_of(abs)
+      return abs if real == abs
+      return real if inside?(real, repo)
+      @reals[abs] ||= real
+      abs
+    rescue StandardError
+      abs
+    end
+
+    # resolve for the directory holding `abs`, not `abs` itself.
+    def resolve_parent(abs)
+      return abs if inside?(abs, repo)
+      dir = quiet { Real.dirname(abs) }
+      r = resolve(dir)
+      r == dir ? abs : File.join(r, quiet { Real.basename(abs) })
     end
 
     # Ruby's resolv.rb (Ruby's own library or the resolv gem) creating its
@@ -253,10 +318,13 @@ module VciCollector
 
     # A write to `path`. produced: its content is now wholly this
     # process's output; gone: it no longer exists.
-    def wrote(path, produced: false, gone: false)
+    # follow: false for an operation on the path itself (unlink, rename,
+    # lchmod, creating a link): a symlink there is not followed.
+    def wrote(path, produced: false, gone: false, follow: true)
       return unless collect? && !busy?
       abs = expand(pathify(path))
       return unless abs
+      abs = follow ? resolve(abs) : resolve_parent(abs)
       @records[[:write, abs]] = true
       @written[abs] = true
       if produced
@@ -324,6 +392,7 @@ module VciCollector
       return unless collect? && !busy?
       abs = expand(pathify(path))
       return unless abs
+      abs = resolve(abs)
       reads, writes, trunc, creat = mode_info(mode, flags)
       unless ok
         add(:probe, abs) if reads || !creat
@@ -480,7 +549,7 @@ module VciCollector
       return unless collect? && !busy?
       return if GLOB_NOT_INPUT.match?(quiet { frame })
       quiet do
-        start_base = base ? Real.expand_path(pathify(base) || base.to_s) : Real.dir_pwd
+        start_base = base ? literal_path(pathify(base) || base.to_s) : Real.dir_pwd
         Array(patterns).each do |raw|
           pat = pathify(raw)
           next unless pat
@@ -547,7 +616,7 @@ module VciCollector
       return unless collect? && !busy?
       p = pathify(path)
       return unless p
-      abs = quiet { dir ? Real.expand_path(p, pathify(dir) || dir.to_s) : Real.expand_path(p) }
+      abs = quiet { literal_path(p, dir && (pathify(dir) || dir.to_s)) }
       cur = ""
       abs.split("/").reject(&:empty?).each do |c|
         cur = "#{cur}/#{c}"
@@ -708,6 +777,9 @@ end
 # ---------------------------------------------------------------------------
 if VciCollector.collect?
   module VciCollector
+    # Process methods answering who the process runs as.
+    IDENTITY_METHODS = %i[uid gid euid egid groups].freeze
+
     STAT_METHODS = %i[
       exist? file? directory? readable? readable_real? world_readable? writable? writable_real?
       world_writable? executable? executable_real? size? size zero? empty? symlink? pipe? socket?
@@ -791,7 +863,7 @@ if VciCollector.collect?
           return super(*paths) if VciCollector.busy?
           paths.each { |p| VciCollector.before_change(p) }
           r = super(*paths)
-          paths.each { |p| VciCollector.wrote(p, gone: true) }
+          paths.each { |p| VciCollector.wrote(p, gone: true, follow: false) }
           r
         end
       end
@@ -801,7 +873,7 @@ if VciCollector.collect?
           return super(mode, *paths) if VciCollector.busy?
           paths.each { |p| VciCollector.before_change(p) }
           r = super(mode, *paths)
-          paths.each { |p| VciCollector.wrote(p) }
+          paths.each { |p| VciCollector.wrote(p, follow: m == :chmod) }
           r
         end
       end
@@ -811,7 +883,7 @@ if VciCollector.collect?
           return super(a, b, *paths) if VciCollector.busy?
           paths.each { |p| VciCollector.before_change(p) }
           r = super(a, b, *paths)
-          paths.each { |p| VciCollector.wrote(p) }
+          paths.each { |p| VciCollector.wrote(p, follow: !m.start_with?("l")) }
           r
         end
       end
@@ -821,7 +893,7 @@ if VciCollector.collect?
           return super(path, *rest) if VciCollector.busy?
           VciCollector.before_change(path)
           r = super(path, *rest)
-          VciCollector.wrote(path)
+          VciCollector.wrote(path, follow: m == :truncate)
           r
         end
       end
@@ -831,13 +903,13 @@ if VciCollector.collect?
       def rename(from, to)
         return super if VciCollector.busy?
         f = VciCollector.expand(VciCollector.pathify(from))
-        produced = f && VciCollector.self_produced?(f)
+        produced = f && VciCollector.self_produced?(VciCollector.resolve(f))
         VciCollector.before_change(from)
         r = super
-        VciCollector.wrote(from, gone: true)
-        VciCollector.wrote(to, produced: produced, gone: !produced)
+        VciCollector.wrote(from, gone: true, follow: false)
+        VciCollector.wrote(to, produced: produced, gone: !produced, follow: false)
         t = VciCollector.expand(VciCollector.pathify(to))
-        VciCollector.parent_observed(t) if t
+        VciCollector.parent_observed(VciCollector.resolve(t)) if t
         r
       end
 
@@ -846,8 +918,8 @@ if VciCollector.collect?
           # Reading through the link reads the target.
           t = VciCollector.pathify(target)
           l = VciCollector.expand(VciCollector.pathify(link))
-          VciCollector.rec(:read, VciCollector.quiet { Real.expand_path(t, Real.dirname(l)) }) if t && l
-          VciCollector.wrote(link)
+          VciCollector.rec(:read, VciCollector.quiet { VciCollector.literal_path(t, Real.dirname(l)) }) if t && l
+          VciCollector.wrote(link, follow: false)
         end
         super
       end
@@ -855,18 +927,28 @@ if VciCollector.collect?
       def link(src, dst)
         unless VciCollector.busy?
           VciCollector.rec(:read, src)
-          VciCollector.wrote(dst)
+          VciCollector.wrote(dst, follow: false)
         end
         super
       end
     end
 
+    # IO.read/binread/readlines/foreach/write/binwrite("|cmd") run a command
+    # when called on IO itself (not on File or another subclass, which open
+    # a file named "|cmd" like every other entry point).
     module IOHooks
+      def self.command?(klass, p)
+        p&.start_with?("|") && klass.equal?(::IO)
+      end
+
       %i[read binread readlines].each do |m|
         define_method(m) do |*args, **kw, &blk|
           return super(*args, **kw, &blk) if VciCollector.busy?
           p = VciCollector.pathify(args[0])
-          VciCollector.taint("process:IO.#{m}(|cmd)") if p&.start_with?("|")
+          if IOHooks.command?(self, p)
+            VciCollector.taint("process:IO.#{m}(|cmd)")
+            return super(*args, **kw, &blk)
+          end
           begin
             r = super(*args, **kw, &blk)
           rescue Errno::ENOENT, Errno::ENOTDIR
@@ -881,8 +963,9 @@ if VciCollector.collect?
       def foreach(*args, **kw, &blk)
         unless VciCollector.busy?
           p = VciCollector.pathify(args[0])
-          VciCollector.taint("process:IO.foreach(|cmd)") if p&.start_with?("|")
-          if p
+          if IOHooks.command?(self, p)
+            VciCollector.taint("process:IO.foreach(|cmd)")
+          elsif p
             VciCollector.exists_quietly?(p) ? VciCollector.read_path(p) : VciCollector.rec(:probe, p)
           end
         end
@@ -893,6 +976,10 @@ if VciCollector.collect?
         define_method(m) do |*args, **kw, &blk|
           return super(*args, **kw, &blk) if VciCollector.busy?
           p = VciCollector.pathify(args[0])
+          if IOHooks.command?(self, p)
+            VciCollector.taint("process:IO.#{m}(|cmd)")
+            return super(*args, **kw, &blk)
+          end
           existed = p && VciCollector.exists_quietly?(p)
           r = super(*args, **kw, &blk)
           if p
@@ -1159,7 +1246,7 @@ if VciCollector.collect?
         end
         VciCollector.wrote(path, produced: true)
         a = VciCollector.expand(VciCollector.pathify(path))
-        VciCollector.parent_observed(a) if a
+        VciCollector.parent_observed(VciCollector.resolve(a)) if a
         r
       end
 
@@ -1168,7 +1255,7 @@ if VciCollector.collect?
           return super(path) if VciCollector.busy?
           VciCollector.before_change(path)
           r = super(path)
-          VciCollector.wrote(path, gone: true)
+          VciCollector.wrote(path, gone: true, follow: false)
           r
         end
       end
@@ -1219,6 +1306,26 @@ if VciCollector.collect?
       def daemon(*args)
         VciCollector.taint("process:daemon")
         super
+      end
+
+      IDENTITY_METHODS.each do |m|
+        define_method(m) do |*args, **kw, &blk|
+          VciCollector.identity_read("Process.#{m}") unless VciCollector.busy?
+          super(*args, **kw, &blk)
+        end
+      end
+    end
+
+    # Who the process runs as: Process::UID/GID and Process::Sys, and Etc
+    # (install_etc). See VciCollector.identity_read.
+    def self.identity_hook(prefix, methods)
+      Module.new do
+        methods.each do |m|
+          define_method(m) do |*args, **kw, &blk|
+            VciCollector.identity_read("#{prefix}.#{m}") unless VciCollector.busy?
+            super(*args, **kw, &blk)
+          end
+        end
       end
     end
 
@@ -1276,6 +1383,7 @@ if VciCollector.collect?
       def tag_stat(st, path)
         return unless collect?
         abs = expand(pathify(path))
+        abs = resolve(abs) if abs
         st.instance_variable_set(:@__vci_path, abs) if abs && !@produced[abs]
       rescue StandardError
         nil
@@ -1286,9 +1394,23 @@ if VciCollector.collect?
         metadata_read(abs, what, kind) if abs
       end
 
+      # The user or group the process runs as (Process.uid, Etc.getpwuid,
+      # Etc.getlogin, ...): a laptop's user is not CI's (a root container
+      # job, a runner's uid 1001), and nothing records it, so a test reading
+      # it is refused. Not refused: RubyGems and Bundler, and Ruby's standard
+      # library asking for itself (FileUtils.remove_entry_secure's owner
+      # check, pp printing a File::Stat), like permission bits.
+      def identity_read(what)
+        return unless collect? && !busy?
+        where = quiet { frame }
+        return if tooling?(where) || where.start_with?("#{RUBYLIBDIR}/") || STDLIB_PERM.match?(where)
+        taint("ruby:process-identity:#{what} at #{where} (the user and groups the tests run as differ between machines; vci does not record them)")
+      end
+
       def metadata_read(path, what, kind)
         return unless collect? && !busy?
         abs = expand(pathify(path))
+        abs = resolve(abs) if abs
         return unless abs && inside?(abs, repo) && !@produced[abs]
         where = quiet { frame }
         return if METADATA_ALLOWED.match?(where) || tooling?(where)
@@ -1311,6 +1433,9 @@ if VciCollector.collect?
   Dir.singleton_class.prepend(VciCollector::DirHooks)
   Dir.prepend(VciCollector::DirInitHook)
   Process.singleton_class.prepend(VciCollector::ProcessHooks)
+  Process::UID.singleton_class.prepend(VciCollector.identity_hook("Process::UID", %i[rid eid]))
+  Process::GID.singleton_class.prepend(VciCollector.identity_hook("Process::GID", %i[rid eid]))
+  Process::Sys.singleton_class.prepend(VciCollector.identity_hook("Process::Sys", %i[getuid geteuid getgid getegid]))
   ENV.singleton_class.prepend(VciCollector::EnvHooks)
   RubyVM::InstructionSequence.singleton_class.prepend(VciCollector::ISeqHooks)
   ARGF.singleton_class.prepend(VciCollector::ArgfHooks)
@@ -1364,7 +1489,19 @@ module VciCollector
     pty: -> { defined?(::PTY) && install_pty },
     fiddle: -> { defined?(::Fiddle::Function) && defined?(::Fiddle::Handle) && install_fiddle },
     ffi: -> { defined?(::FFI::Library) && defined?(::FFI::DynamicLibrary) && install_ffi },
+    ffi_variadic: -> { defined?(::FFI::VariadicInvoker) && install_ffi_variadic },
+    vips: lambda {
+      defined?(::Vips::Operation) && ::Vips::Operation.respond_to?(:call) && defined?(::Vips::Image) && install_vips
+    },
     zlib: -> { defined?(::Zlib::GzipReader) && install_zlib },
+    etc: -> { defined?(::Etc) && ::Etc.respond_to?(:getpwuid) && ::Etc.respond_to?(:getlogin) && install_etc },
+    openssl: lambda {
+      defined?(::OpenSSL::X509::Store) && defined?(::OpenSSL::X509::StoreContext) &&
+        defined?(::OpenSSL::SSL::SSLContext) && defined?(::OpenSSL::SSL::SSLSocket) && defined?(::OpenSSL::Config) &&
+        ::OpenSSL::X509::Store.method_defined?(:add_file) && install_openssl
+    },
+    openssl_provider: -> { defined?(::OpenSSL::Provider) && ::OpenSSL::Provider.respond_to?(:load) && install_openssl_modules(::OpenSSL::Provider) },
+    openssl_engine: -> { defined?(::OpenSSL::Engine) && ::OpenSSL::Engine.respond_to?(:by_id) && install_openssl_modules(::OpenSSL::Engine) },
     prism: -> { defined?(::Prism) && ::Prism.respond_to?(:parse_file) && install_prism },
     sqlite3: -> { defined?(::SQLite3::Database) && install_sqlite3 },
     nokogiri: lambda {
@@ -1381,7 +1518,11 @@ module VciCollector
     pty: -> { defined?(::PTY) },
     fiddle: -> { defined?(::Fiddle) },
     ffi: -> { defined?(::FFI::Library) },
+    ffi_variadic: -> { defined?(::FFI::VariadicInvoker) },
+    vips: -> { defined?(::Vips::Operation) && ::Vips::Operation.respond_to?(:call) },
     zlib: -> { defined?(::Zlib::GzipReader) },
+    etc: -> { defined?(::Etc) && ::Etc.respond_to?(:getpwuid) },
+    openssl: -> { defined?(::OpenSSL::X509::Store) && ::OpenSSL::X509::Store.method_defined?(:add_file) },
     prism: -> { defined?(::Prism) && ::Prism.respond_to?(:parse_file) },
     sqlite3: -> { defined?(::SQLite3::Database) },
     nokogiri: -> { defined?(::Nokogiri::XML::Document) }
@@ -1398,6 +1539,8 @@ module VciCollector
     Zlib GzipReader SQLite3 Database PG Connection Mysql2 Client Trilogy Nokogiri XML Document Node Reader Schema
     RelaxNG SAX ParserContext XSLT Stylesheet ParseOptions
     RSpec Runner Reporter ConfigurationOptions ConfigurationManager World SimpleCov CodeStatistics Prism Example
+    VariadicInvoker Vips Operation Image Etc OpenSSL X509 Store StoreContext SSL SSLContext SSLSocket Config
+    Provider Engine
   ].each_with_object({}) { |n, h| h[n] = true }.freeze
 
   class << self
@@ -1556,33 +1699,37 @@ module VciCollector
       true
     end
 
-    # FFI: a library opened (ffi_lib, DynamicLibrary.open), a function or
-    # variable attached (attach_function without ffi_lib uses the process's
-    # own symbols), or a function pointer called.
+    # FFI. Opening a library (ffi_lib, DynamicLibrary.open) is not a read of
+    # test inputs: the library is recorded (Native.loaded) as an external
+    # "native:<file name>" whose version is the sha256 of the file it
+    # resolved to, in every mode (the probe reports what the application
+    # loads at boot). A failed open records nothing. Calling into a library
+    # is what can read files vci cannot see: every function attached with
+    # attach_function (and attach_variable's accessors, an FFI::Function or
+    # VariadicInvoker called directly) refuses the file when it is called,
+    # unless the library has a policy that sees its file inputs at the Ruby
+    # level (Native::Vips, for ruby-vips).
     def install_ffi
+      return true if MODE == "plain"
+      ::FFI::DynamicLibrary.singleton_class.prepend(Native::OpenHook)
       return true unless collect?
-      ::FFI::Library.prepend(Module.new do
-        %i[ffi_lib attach_function attach_variable].each do |m|
-          define_method(m) do |*args, **kw, &blk|
-            VciCollector.taint("native:FFI #{m}(#{args.first(2).inspect})")
-            super(*args, **kw, &blk)
-          end
-        end
-      end)
-      ::FFI::DynamicLibrary.singleton_class.prepend(Module.new do
-        def open(*args, **kw, &blk)
-          VciCollector.taint("native:FFI::DynamicLibrary.open(#{args[0].inspect})")
-          super
-        end
-      end)
-      if defined?(::FFI::Function)
-        ::FFI::Function.prepend(Module.new do
-          def initialize(*args, **kw, &blk)
-            VciCollector.taint("native:FFI::Function")
-            super
-          end
-        end)
-      end
+      ::FFI::Library.prepend(Native::LibraryHook)
+      ::FFI::Function.prepend(Native::FunctionHook) if defined?(::FFI::Function)
+      true
+    end
+
+    def install_ffi_variadic
+      return true unless collect?
+      ::FFI::VariadicInvoker.prepend(Native::VariadicHook)
+      true
+    end
+
+    # ruby-vips' Ruby entry point to libvips operations (Image.new_from_file,
+    # #write_to_file, .thumbnail, .new_from_buffer, every image method):
+    # see Native::Vips.
+    def install_vips
+      return true unless collect?
+      ::Vips::Operation.singleton_class.prepend(Native::VipsOperationCall)
       true
     end
 
@@ -1737,6 +1884,57 @@ module VciCollector
       end
     end
 
+    # Etc answers who the process runs as (see VciCollector.identity_read).
+    def install_etc
+      return true unless collect?
+      ms = %i[getlogin getpwuid getpwnam getgrgid getgrnam passwd group getpwent getgrent].select { |m| ::Etc.respond_to?(m) }
+      ::Etc.singleton_class.prepend(VciCollector.identity_hook("Etc", ms))
+      true
+    end
+
+    # OpenSSL (Ruby's openssl extension) reads certificates and its
+    # configuration in C:
+    # - X509::Store#add_file reads the file it names: recorded;
+    # - X509::Store#set_default_paths (which openssl/ssl.rb calls for
+    #   DEFAULT_CERT_STORE when it loads) and #add_path make the store read
+    #   the system CA bundle, SSL_CERT_FILE and SSL_CERT_DIR, the directory
+    #   lazily by certificate hash: the store is marked, and verifying with
+    #   it (Store#verify, StoreContext.new, a TLS handshake) refuses the file;
+    # - SSLContext's ca_file (read when the context is set up: recorded) and
+    #   ca_path (a hashed directory, refused);
+    # - Config.new/load of a file (recorded; refused when it has .include
+    #   directives), Random.load_random_file (recorded) and
+    #   write_random_file (a write).
+    # OPENSSL_* variables (OPENSSL_CONF, read when the library loads) are
+    # hashed whenever present (RAILS_HASHED_ENV).
+    def install_openssl
+      return true unless collect?
+      ::OpenSSL::X509::Store.prepend(OpenSSLHooks::Store)
+      ::OpenSSL::X509::StoreContext.prepend(OpenSSLHooks::StoreContext)
+      ::OpenSSL::SSL::SSLContext.prepend(OpenSSLHooks::SSLContext)
+      ::OpenSSL::SSL::SSLSocket.prepend(OpenSSLHooks::SSLSocket)
+      ::OpenSSL::Config.prepend(OpenSSLHooks::Config)
+      ::OpenSSL::Random.singleton_class.prepend(OpenSSLHooks::Random) if defined?(::OpenSSL::Random)
+      true
+    end
+
+    # Loading an OpenSSL provider or engine loads a module (native code)
+    # from OpenSSL's directories.
+    def install_openssl_modules(mod)
+      return true unless collect?
+      name = mod.name
+      ms = %i[load by_id load_private_key load_public_key].select { |m| mod.respond_to?(m) }
+      mod.singleton_class.prepend(Module.new do
+        ms.each do |m|
+          define_method(m) do |*args, **kw, &blk|
+            VciCollector.taint("native:#{name}.#{m} (loads OpenSSL module code vci does not see)") unless VciCollector.busy?
+            super(*args, **kw, &blk)
+          end
+        end
+      end)
+      true
+    end
+
     # Zlib::GzipReader.open/GzipWriter.open open their file in C.
     def install_zlib
       return true unless collect?
@@ -1753,6 +1951,629 @@ module VciCollector
         end
       end)
       true
+    end
+  end
+
+  # Native libraries reached through FFI (see install_ffi).
+  module Native
+    @libs = {}     # "native:<file name>" => real path, or nil when unresolved
+    # FFI::Function objects attach_function returned => [policy, owner,
+    # C name, library names]: ruby-vips keeps g_free's as a free function
+    # (FFI::AutoPointer.new(ptr, GLib::G_FREE)) and calls it directly.
+    @functions = {}.compare_by_identity
+    FFI_OK = :__vci_ffi_variadic_ok
+
+    class << self
+      attr_reader :libs
+
+      # A library FFI opened: recorded by the file it resolved to (hashed
+      # when the records are written, so no gem is required now).
+      def loaded(lib, requested)
+        name = (lib.name rescue nil) || requested
+        # nil: the process's own symbols (Ruby and what it links), which
+        # the Ruby version identifies.
+        return if name.nil?
+        VciCollector.quiet do
+          n = name.to_s
+          real = n.start_with?("/") ? (Real.realpath(n) rescue nil) : nil
+          key = "native:#{Real.basename(real || n)}"
+          if real && @libs[key] && @libs[key] != real
+            VciCollector.taint("native:FFI two libraries named #{Real.basename(real)} (#{@libs[key]}, #{real})")
+          end
+          @libs[key] = real if real || !@libs.key?(key)
+        end
+      rescue StandardError => e
+        VciCollector.taint("vci:hook-failed:ffi-open:#{e.class}: #{e.message}")
+      end
+
+      # "sha256:<hex>" of each recorded library file ("unresolved" when FFI
+      # gave no path, such as a system library in the dyld shared cache).
+      def versions
+        require "digest/sha2"
+        @libs.to_h do |key, real|
+          v = real && Real.file?(real) ? "sha256:#{Digest::SHA256.file(real).hexdigest}" : "unresolved"
+          [key, v]
+        end
+      end
+
+      def lib_names(mod)
+        (mod.ffi_libraries.map { |l| Real.basename(l.name.to_s) } rescue [])
+      end
+
+      # The policy for functions `mod` attaches, called from `where`: Vips
+      # for the modules ruby-vips defines (Vips, GLib, GObject) in its own
+      # files, over libvips (or GLib and GObject); nil (every call refuses
+      # the file) for everything else.
+      def policy_for(mod, where)
+        n = (mod.name rescue nil).to_s
+        return nil unless %w[Vips GLib GObject].include?(n) || n.start_with?("Vips::")
+        spec = ::Gem.loaded_specs["ruby-vips"]
+        return nil unless spec&.full_gem_path
+        dirs = [Real.expand_path(spec.full_gem_path)]
+        dirs << (Real.realpath(dirs[0]) rescue dirs[0])
+        return nil unless dirs.any? { |d| VciCollector.inside?(where, File.join(d, "lib")) }
+        return nil if VciCollector.inside?(where, VciCollector.repo)
+        libs = lib_names(mod)
+        return nil if libs.empty?
+        return nil unless libs.all? { |b| b.match?(/\A(lib)?(vips|glib-2\.0|gobject-2\.0)[.-]/) }
+        Vips
+      rescue StandardError
+        nil
+      end
+
+      def remember(invoker, mod, cname, policy)
+        return unless defined?(::FFI::Function) && invoker.is_a?(::FFI::Function)
+        @functions[invoker] = [policy, ((mod.name rescue nil) || mod.inspect), cname, lib_names(mod)]
+      rescue StandardError => e
+        VciCollector.taint("vci:hook-failed:ffi-remember:#{cname}:#{e.class}: #{e.message}")
+      end
+
+      def function(fn)
+        @functions[fn]
+      end
+
+      # Wrap the methods FFI defined for an attached function or variable
+      # (on the module and its singleton class) so that a call is checked.
+      # A variadic function's method calls VariadicInvoker#call (and so
+      # #invoke), which is then not a direct call. The wrapper replaces
+      # FFI's method in place (with its visibility) rather than being
+      # prepended: FFI's method is then reachable only from inside the
+      # wrapper, so `method(:f).super_method.call` (or an alias made after
+      # attach_function) cannot call the C function past the check.
+      def wrap(mod, mname, cname, policy, names = [mname], variadic: false)
+        owner = (mod.name rescue nil) || mod.inspect
+        libs = lib_names(mod)
+        [mod.singleton_class, mod].each do |target|
+          names.each do |n|
+            vis = if target.private_method_defined?(n) then :private
+                  elsif target.protected_method_defined?(n) then :protected
+                  elsif target.method_defined?(n) then :public
+                  end
+            next unless vis
+            orig = target.instance_method(n)
+            target.send(:remove_method, n) if orig.owner == target
+            target.send(:define_method, n) do |*a, &b|
+              VciCollector::Native.called(policy, owner, cname, libs, a, variadic) { orig.bind_call(self, *a, &b) }
+            end
+            target.send(vis, n)
+          end
+        end
+      rescue StandardError => e
+        VciCollector.taint("vci:hook-failed:ffi-wrap:#{mname}:#{e.class}: #{e.message}")
+      end
+
+      def called(policy, owner, cname, libs, args, variadic = false)
+        if !VciCollector.collect? || VciCollector.busy?
+          Thread.current[FFI_OK] = variadic
+          return yield
+        end
+        why = begin
+          policy ? policy.check(cname, args) : :refuse
+        rescue StandardError => e
+          "vci:hook-failed:ffi-policy:#{cname}:#{e.class}: #{e.message}"
+        end
+        if why == :refuse
+          VciCollector.taint("native:FFI call #{owner}.#{cname} (C code of #{libs.join(", ")}: vci cannot see what it reads)")
+        elsif why
+          VciCollector.taint(why)
+        end
+        Thread.current[FFI_OK] = variadic
+        r = yield
+        begin
+          policy&.after(cname, args, r)
+        rescue StandardError => e
+          VciCollector.taint("vci:hook-failed:ffi-policy:#{cname}:#{e.class}: #{e.message}")
+        end
+        r
+      ensure
+        Thread.current[FFI_OK] = false
+      end
+
+      # A C function called without going through an attached method.
+      def direct_call(what)
+        if Thread.current[FFI_OK]
+          Thread.current[FFI_OK] = false
+          return
+        end
+        return if !VciCollector.collect? || VciCollector.busy?
+        VciCollector.taint("native:FFI #{what} (a C function called directly: vci cannot see what it reads)")
+      end
+    end
+
+    module OpenHook
+      def open(*args, **kw, &blk)
+        lib = super
+        VciCollector::Native.loaded(lib, args[0])
+        lib
+      end
+    end
+
+    module LibraryHook
+      def attach_function(*args, **kw, &blk)
+        mname = args[0].to_s
+        cname = args[3] && (args[1].is_a?(String) || args[1].is_a?(Symbol)) ? args[1].to_s : mname
+        policy = VciCollector::Native.policy_for(self, VciCollector.quiet { VciCollector.frame })
+        was = Thread.current[:__vci_ffi_attaching]
+        Thread.current[:__vci_ffi_attaching] = true
+        begin
+          invoker = super
+        ensure
+          Thread.current[:__vci_ffi_attaching] = was
+        end
+        VciCollector::Native.wrap(self, mname, cname, policy,
+                                  variadic: defined?(::FFI::VariadicInvoker) && invoker.is_a?(::FFI::VariadicInvoker))
+        VciCollector::Native.remember(invoker, self, cname, policy)
+        invoker
+      end
+
+      # Finding the library (FFI's search of LD_LIBRARY_PATH, its library
+      # directories, ...) is not an input: the file it found is recorded.
+      def ffi_lib(*args, **kw, &blk)
+        VciCollector.quiet { super }
+      end
+
+      def attach_variable(*args, **kw, &blk)
+        r = super
+        mname = args[0].to_s
+        VciCollector::Native.wrap(self, mname, "variable #{mname}", nil, [mname, "#{mname}="])
+        r
+      end
+    end
+
+    module FunctionHook
+      # Function#attach outside attach_function (a Function made from a
+      # pointer and attached by hand) is wrapped like attach_function's.
+      def attach(mod, name)
+        r = super
+        unless Thread.current[:__vci_ffi_attaching]
+          VciCollector::Native.wrap(mod, name.to_s, "#{name} (FFI::Function#attach)", nil)
+        end
+        r
+      end
+
+      def call(*args, &blk)
+        f = VciCollector::Native.function(self)
+        if f
+          policy, owner, cname, libs = f
+          return VciCollector::Native.called(policy, owner, cname, libs, args) { super }
+        end
+        VciCollector::Native.direct_call("FFI::Function#call")
+        super
+      end
+    end
+
+    # VariadicInvoker#invoke is the C entry point (#call, and the methods
+    # VariadicInvoker#attach defines, go through it).
+    module VariadicHook
+      def invoke(*args, &blk)
+        VciCollector::Native.direct_call("VariadicInvoker#invoke")
+        super
+      end
+    end
+
+    # ruby-vips over libvips. libvips reads and writes files in C, but only
+    # through a few entry points whose file names the Ruby side passes: the
+    # file loaders and savers, thumbnail, file sources and targets, and the
+    # format sniffer. Those are recorded (a read of the file named, a write
+    # of the file saved); everything else ruby-vips calls works on memory
+    # (images, buffers, GObject properties). What is refused: a loader or
+    # saver vci does not know reads only the file it is given (PDF, SVG,
+    # ImageMagick, OpenSlide, ...), `system`, `text` (fonts), ICC profiles
+    # that are files, descriptor sources and targets, a file operation built
+    # anywhere but through Vips::Operation.call (where its file name is
+    # seen), and any libvips function this list does not name.
+    module Vips
+      FMT = "(?:jpeg|png|webp|gif|tiff|heif|jp2k|jxl|rad|ppm|csv|matrix)"
+      FILE_OPS = /\A#{FMT}(?:load|save)\z/
+      STREAM_OPS = /\A#{FMT}(?:load_(?:buffer|source)|save_(?:buffer|target|mime))\z/
+      THUMBNAIL_STREAM = %w[thumbnail_buffer thumbnail_source thumbnail_image].freeze
+      ICC_OPS = %w[icc_import icc_export icc_transform profile_load].freeze
+      DENY_OPS = %w[system text].freeze
+      # ICC profiles compiled into libvips.
+      BUILTIN_PROFILES = %w[srgb cmyk p3 none].freeze
+      # Option names whose value is a file: always refused (FILE_OPTION), or
+      # an ICC profile, a built-in name or a file (PROFILE_OPTION).
+      FILE_OPTION = /\A(?:filename|fontfile|font)\z/
+      PROFILE_OPTION = /\A(?:profile|input_profile|output_profile|import_profile|export_profile)\z/
+      # libvips/GLib functions that never touch a file.
+      SAFE = %w[
+        g_free g_log_remove_handler g_log_set_handler g_malloc g_object_get_property g_object_ref
+        g_object_set_property g_object_unref g_param_spec_get_blurb g_signal_connect_data g_type_from_name
+        g_type_fundamental g_type_init g_type_name g_value_get_boolean g_value_get_double g_value_get_enum
+        g_value_get_flags g_value_get_int g_value_get_object g_value_get_string g_value_get_uint64 g_value_init
+        g_value_set_boolean g_value_set_double g_value_set_enum g_value_set_flags g_value_set_int
+        g_value_set_object g_value_set_string g_value_set_uint64 g_value_unset
+        vips_addalpha vips_argument_map vips_band_format_get_type vips_band_format_iscomplex
+        vips_band_format_isfloat vips_blend_mode_get_type vips_block_untrusted_set vips_cache_drop_all
+        vips_cache_get_max vips_cache_get_max_files vips_cache_get_max_mem vips_cache_print vips_cache_set_max
+        vips_cache_set_max_files vips_cache_set_max_mem vips_coding_get_type vips_concurrency_get
+        vips_concurrency_set vips_connection_filename vips_connection_nick vips_enum_from_nick vips_enum_nick
+        vips_error_buffer vips_error_clear vips_error_freeze vips_error_thaw vips_filename_get_filename
+        vips_filename_get_options vips_flags_from_nick vips_foreign_find_load_buffer
+        vips_foreign_find_load_source vips_foreign_find_save vips_foreign_find_save_buffer
+        vips_foreign_find_save_target vips_foreign_get_suffixes vips_image_copy_memory vips_image_get
+        vips_image_get_bands vips_image_get_fields vips_image_get_gainmap vips_image_get_height
+        vips_image_get_typeof vips_image_get_width vips_image_hasalpha vips_image_new_from_memory
+        vips_image_new_from_memory_copy vips_image_new_matrix_from_array vips_image_remove vips_image_set
+        vips_image_set_kill vips_image_set_progress vips_image_write_to_memory vips_init vips_interpolate_new
+        vips_interpretation_get_type vips_leak_set vips_nickname_find vips_object_get_argument
+        vips_object_get_description vips_object_print_all vips_object_unref_outputs vips_operation_block_set
+        vips_operation_get_flags vips_operation_new vips_region_fetch vips_region_height vips_region_new
+        vips_region_width vips_source_custom_new vips_source_new_from_memory vips_target_custom_new
+        vips_target_new_to_memory vips_tracked_get_allocs vips_tracked_get_files vips_tracked_get_mem
+        vips_tracked_get_mem_highwater vips_type_find vips_type_map vips_value_get_array_double
+        vips_value_get_array_image vips_value_get_array_int vips_value_get_blob vips_value_get_ref_string
+        vips_value_set_array_double vips_value_set_array_image vips_value_set_array_int vips_value_set_blob
+        vips_value_set_ref_string vips_vector_isenabled vips_vector_set_enabled vips_version
+        vips_version_string
+      ].to_h { |n| [n, true] }.freeze
+      PERMITS = :__vci_vips_permits
+
+      @ops = {} # operation pointer address => nickname (vips_operation_new)
+
+      class << self
+        # :file (reads or writes the file it names: recorded), :stream
+        # (buffers, sources, targets), :icc (a profile may be a file),
+        # :deny, :memory.
+        def classify(name)
+          return :deny unless name.is_a?(String)
+          return :file if FILE_OPS.match?(name) || name == "thumbnail"
+          return :stream if STREAM_OPS.match?(name) || THUMBNAIL_STREAM.include?(name)
+          return :icc if ICC_OPS.include?(name)
+          return :deny if DENY_OPS.include?(name) || name.match?(/load|save/)
+          :memory
+        end
+
+        # [nickname, built] per Vips::Operation.call in progress.
+        def permits
+          Thread.current[PERMITS] ||= []
+        end
+
+        # An option given as a string ("x.jpg[shrink=2]", "[Q=90,strip]"):
+        # nil, or why it is refused (a file name or an ICC profile file).
+        def option_string_problem(str)
+          s = str.to_s.strip
+          return nil if s.empty?
+          s = s[1...-1] if s.start_with?("[") && s.end_with?("]")
+          s.split(",").each do |pair|
+            k, v = pair.split("=", 2).map(&:strip)
+            next unless k
+            if PROFILE_OPTION.match?(k)
+              next if v && BUILTIN_PROFILES.include?(v.downcase)
+              return "native:vips:option string #{str.inspect} names an ICC profile file"
+            end
+            if FILE_OPTION.match?(k) || k.match?(/file|font/)
+              return "native:vips:option string #{str.inspect} names a file"
+            end
+          end
+          nil
+        end
+
+        # Options that are files: nil, or why the call is refused.
+        def options_problem(name, opts)
+          opts.each do |k, v|
+            key = k.to_s
+            return "native:vips:#{name} option #{key} names a file" if FILE_OPTION.match?(key)
+            next unless PROFILE_OPTION.match?(key) && !v.nil?
+            unless v.is_a?(String) && BUILTIN_PROFILES.include?(v.downcase)
+              return "native:vips:#{name} with the ICC profile #{v.inspect} (a file lcms reads in C)"
+            end
+          end
+          nil
+        end
+
+        # The nickname of the operation libvips builds for `name`, which is
+        # what is classified. vips_operation_new finds it with
+        # vips_type_find("VipsOperation", name), comparing every
+        # operation's nickname and class name without regard to case:
+        # "PNGLOAD", "PngLoad", "VipsForeignLoadPngFile" and
+        # "VIPSFOREIGNLOADPNGFILE" all build pngload (vips_foreign_find_load
+        # answers class names). The same lookup is made here. nil when
+        # libvips has no such operation, or vci could not ask: refused.
+        def nickname(name)
+          n = name.to_s
+          @nicks ||= {}
+          return @nicks[n] if @nicks.key?(n)
+          @nicks[n] = VciCollector.quiet do
+            t = ::Vips.type_find("VipsOperation", n)
+            nick = t.to_i.zero? ? nil : ::Vips.nickname_find(t)
+            nick.is_a?(String) && !nick.empty? ? nick : nil
+          end
+        rescue StandardError
+          nil
+        end
+
+        def unresolved(name)
+          "native:vips:#{name.to_s.inspect} (not an operation name vci could resolve the way libvips does)"
+        end
+
+        def addr(x)
+          p = x.respond_to?(:to_ptr) ? x.to_ptr : x
+          p.respond_to?(:address) ? p.address : nil
+        rescue StandardError
+          nil
+        end
+
+        def strip_options(name)
+          s = name.to_s
+          i = s.rindex("[")
+          s.end_with?("]") && i ? s[0...i] : s
+        end
+
+        # nil: allowed; a String: the taint; :refuse: the generic one.
+        def check(cname, args)
+          case cname
+          when "vips_foreign_find_load", "vips_source_new_from_file"
+            # The sniffer opens the file and reads its header; a file
+            # source is read later, by the loader given it.
+            path = VciCollector.pathify(args[0])
+            return "native:vips:#{cname} without a file name" unless path
+            # libvips strips "[options]" from a name here; a file whose
+            # name ends in brackets is read as given: record both.
+            VciCollector.rec(:read, path)
+            VciCollector.rec(:read, strip_options(path)) if strip_options(path) != path
+            nil
+          when "vips_target_new_to_file"
+            nil
+          when "vips_source_new_from_descriptor", "vips_target_new_to_descriptor"
+            "native:vips:#{cname} (a file descriptor libvips reads or writes in C)"
+          when "vips_object_set_from_string"
+            option_string_problem(args[1].to_s)
+          when "vips_cache_operation_build"
+            build(args[0])
+          else
+            SAFE.key?(cname) ? nil : :refuse
+          end
+        end
+
+        def after(cname, args, result)
+          case cname
+          when "vips_operation_new"
+            a = addr(result)
+            @ops[a] = nickname(args[0]) || :unresolved if a && a != 0
+          when "vips_target_new_to_file"
+            wrote(args[0])
+          end
+        end
+
+        def wrote(path)
+          p = VciCollector.pathify(path)
+          return unless p
+          abs = VciCollector.expand(p)
+          return unless abs
+          existed = VciCollector.quiet { Real.exist?(abs) }
+          VciCollector.opened(abs, "w", nil, existed, true)
+        end
+
+        # Building (running) an operation: a file operation only through
+        # Operation.call, which recorded its file.
+        def build(op)
+          name = @ops[addr(op)]
+          return "native:vips:build of an operation vci did not see created" unless name
+          case classify(name)
+          when :memory, :stream then nil
+          when :deny then deny(name)
+          else
+            # Once per call: the operation Operation.call made for the
+            # arguments it recorded.
+            top = permits.last
+            if top && top[0] == name && !top[1]
+              top[1] = true
+              nil
+            else
+              "native:vips:#{name} built outside Vips::Operation.call (vci did not see its file arguments)"
+            end
+          end
+        end
+
+        def deny(name)
+          "native:vips:#{name} (libvips reads files, fonts or processes there that vci does not see)"
+        end
+
+        # Vips::Operation.call(name, supplied, optional, option_string):
+        # nil when allowed (its file recorded), else the taint.
+        def check_call(name, supplied, optional, option_string)
+          kind = classify(name)
+          return deny(name) if kind == :deny
+          why = option_string_problem(option_string)
+          return why if why
+          opts = optional.is_a?(Hash) ? optional : {}
+          why = options_problem(name, opts)
+          return why if why
+          case kind
+          when :file
+            path = VciCollector.pathify(name.include?("save") ? Array(supplied)[1] : Array(supplied)[0])
+            return "native:vips:#{name} without a file name" unless path
+            VciCollector.rec(:read, path) unless name.include?("save")
+          when :icc
+            # Profiles given as required arguments (icc_transform's output
+            # profile, profile_load's name): a built-in name or a file.
+            given = Array(supplied).select { |v| v.is_a?(String) || v.respond_to?(:to_path) }
+            bad = given.reject { |v| v.is_a?(String) && BUILTIN_PROFILES.include?(v.downcase) }
+            return "native:vips:#{name} with the ICC profile #{bad.first.inspect} (a file lcms reads in C)" unless bad.empty?
+          end
+          nil
+        end
+
+        def after_call(name, supplied)
+          wrote(Array(supplied)[1]) if classify(name) == :file && name.include?("save")
+        end
+      end
+    end
+
+    module VipsOperationCall
+      def call(name, supplied, optional = {}, option_string = "")
+        return super if !VciCollector.collect? || VciCollector.busy?
+        v = VciCollector::Native::Vips
+        n = v.nickname(name)
+        why = n ? v.check_call(n, supplied, optional, option_string) : v.unresolved(name)
+        VciCollector.taint(why) if why
+        v.permits.push(why ? nil : [n, false])
+        begin
+          super
+        ensure
+          v.permits.pop
+          v.after_call(n, supplied) unless why
+        end
+      end
+    end
+  end
+
+  # OpenSSL entry points that read files in C (see install_openssl).
+  module OpenSSLHooks
+    # Certificate stores whose contents OpenSSL reads where vci cannot see
+    # it => why (weak keys: identity, and a frozen store can be marked).
+    @unseen = ObjectSpace::WeakMap.new
+
+    class << self
+      # Marked whatever the caller (also inside the collector's own quiet
+      # blocks): what the store holds is a fact about it, not a record.
+      def mark(store, why)
+        @unseen[store] = why
+      rescue StandardError => e
+        VciCollector.taint("vci:hook-failed:openssl-store:#{e.class}: #{e.message}")
+      end
+
+      # Verifying with a store reads what it holds.
+      def check(store, where)
+        return if VciCollector.busy? || store.nil?
+        why = @unseen[store]
+        VciCollector.taint("native:openssl:#{where} with a certificate store that #{why} (OpenSSL reads those certificates in C)") if why
+      rescue StandardError => e
+        VciCollector.taint("vci:hook-failed:openssl-check:#{e.class}: #{e.message}")
+      end
+
+      # A file OpenSSL reads whole, by name, now.
+      def read_file(path, what)
+        return if VciCollector.busy?
+        p = VciCollector.pathify(path)
+        return VciCollector.taint("native:openssl:#{what} of #{path.class} (not a file name vci can record)") unless p
+        if VciCollector.exists_quietly?(p)
+          VciCollector.read_path(p)
+        else
+          VciCollector.rec(:probe, p)
+        end
+        p
+      end
+
+      # SSLContext#setup (also run by SSLSocket.new in C): ca_file is read,
+      # ca_path is a directory read by certificate hash on demand.
+      def context(ctx, where)
+        return if VciCollector.busy? || ctx.nil?
+        f = VciCollector.quiet { ctx.ca_file }
+        read_file(f, "#{where} ca_file") if f
+        d = VciCollector.quiet { ctx.ca_path }
+        VciCollector.taint("native:openssl:#{where} with ca_path #{d.to_s.inspect} (a certificate directory OpenSSL reads by hash in C)") if d
+      rescue StandardError => e
+        VciCollector.taint("vci:hook-failed:openssl-context:#{e.class}: #{e.message}")
+      end
+
+      def handshake(sock, where)
+        return if VciCollector.busy?
+        ctx = VciCollector.quiet { sock.context }
+        return if ctx.nil? || VciCollector.quiet { ctx.verify_mode.to_i }.zero?
+        check(VciCollector.quiet { ctx.cert_store }, where)
+      rescue StandardError => e
+        VciCollector.taint("vci:hook-failed:openssl-handshake:#{e.class}: #{e.message}")
+      end
+    end
+
+    module Store
+      def set_default_paths(*args, **kw, &blk)
+        OpenSSLHooks.mark(self, "loaded OpenSSL's default paths (the system CA certificates, SSL_CERT_FILE, SSL_CERT_DIR)")
+        super
+      end
+
+      def add_path(*args, **kw, &blk)
+        OpenSSLHooks.mark(self, "has a certificate directory (add_path #{args[0].to_s.inspect}, read by hash on demand)")
+        super
+      end
+
+      def add_file(path, *rest, **kw, &blk)
+        OpenSSLHooks.read_file(path, "X509::Store#add_file")
+        super
+      end
+
+      def verify(*args, **kw, &blk)
+        OpenSSLHooks.check(self, "X509::Store#verify")
+        super
+      end
+    end
+
+    module StoreContext
+      def initialize(*args, **kw, &blk)
+        OpenSSLHooks.check(args[0], "X509::StoreContext.new")
+        super
+      end
+    end
+
+    module SSLContext
+      def setup(*args, **kw, &blk)
+        OpenSSLHooks.context(self, "SSLContext#setup")
+        super
+      end
+    end
+
+    module SSLSocket
+      def initialize(*args, **kw, &blk)
+        super
+        OpenSSLHooks.context(VciCollector.quiet { context }, "SSLSocket.new")
+      end
+
+      %i[connect accept connect_nonblock accept_nonblock].each do |m|
+        define_method(m) do |*args, **kw, &blk|
+          OpenSSLHooks.handshake(self, "SSLSocket##{m}")
+          super(*args, **kw, &blk)
+        end
+      end
+    end
+
+    module Config
+      def initialize(*args, **kw, &blk)
+        if args[0] && !VciCollector.busy?
+          p = OpenSSLHooks.read_file(args[0], "Config.new")
+          text = p && VciCollector.quiet { File.binread(p) rescue "" }
+          if text&.match?(/^\s*\.include/)
+            VciCollector.taint("native:openssl:Config.new(#{p.inspect}) with .include directives (files OpenSSL reads in C)")
+          end
+        end
+        super
+      end
+    end
+
+    module Random
+      def load_random_file(path, *rest, **kw, &blk)
+        OpenSSLHooks.read_file(path, "Random.load_random_file")
+        super
+      end
+
+      def write_random_file(path, *rest, **kw, &blk)
+        p = VciCollector.busy? ? nil : VciCollector.pathify(path)
+        existed = p && VciCollector.exists_quietly?(p)
+        r = super
+        VciCollector.opened(p, "w", nil, existed, true) if p
+        r
+      end
     end
   end
 
@@ -1812,8 +2633,11 @@ module VciCollector
         return if f.empty? || f == ":memory:" || f.start_with?("file::memory:")
         path = f.start_with?("file:") ? f.sub(/\Afile:/, "").split("?").first : f
         abs = VciCollector.expand(path)
-        ok = abs && [DB_DIR, TMP].compact.reject(&:empty?).any? do |d|
-          VciCollector.inside?(abs, (Real.realpath(d) rescue Real.expand_path(d)))
+        # Where the file really is: a symlink in the temp dir to a database
+        # in the repository is that database.
+        real = abs && VciCollector.real_of(abs)
+        ok = real && [DB_DIR, TMP].compact.reject(&:empty?).any? do |d|
+          VciCollector.inside?(real, (Real.realpath(d) rescue Real.expand_path(d)))
         end
         VciCollector.taint("rails:sqlite-file:#{abs || f} (a SQLite database vci did not prepare fresh; SQLite reads and writes it in C)") unless ok
         db.authorizer = proc do |action, *|
@@ -2239,7 +3063,7 @@ module VciCollector
         p = VciCollector.pathify(path)
         return false unless p && Real.basename(p) == ".simplecov"
         abs = VciCollector.expand(p)
-        return false if abs.nil? || VciCollector.inside?(abs, VciCollector.repo)
+        return false if abs.nil? || VciCollector.inside?(VciCollector.resolve(abs), VciCollector.repo)
         SIMPLECOV_CONFIG_FRAME.match?(VciCollector.quiet { VciCollector.frame })
       rescue StandardError
         false
@@ -2516,12 +3340,18 @@ module VciCollector
   module Output
     module_function
 
+    # vci's temp dirs, as given and as real paths.
     def ignored_prefixes
-      @ignored_prefixes ||= [TMP, OUT, DB_DIR].compact.reject(&:empty?).map do |p|
-        File.realpath(p)
-      rescue StandardError
-        File.expand_path(p)
+      @ignored_prefixes ||= [TMP, OUT, DB_DIR].compact.reject(&:empty?).flat_map do |p|
+        both(p)
       end.uniq
+    end
+
+    # A directory as given (expanded) and as its real path: a path the
+    # process used may be spelt either way.
+    def both(dir)
+      d = File.expand_path(dir)
+      [d, (File.realpath(d) rescue d)].uniq
     end
 
     # Ruby's own library directories, covered by the Ruby version. Not
@@ -2529,7 +3359,11 @@ module VciCollector
     def ruby_dirs
       @ruby_dirs ||= %w[rubylibdir rubyarchdir rubyhdrdir].map do |k|
         RbConfig::CONFIG[k]
-      end.compact.reject(&:empty?).map { |d| File.expand_path(d) }.uniq
+      end.compact.reject(&:empty?).flat_map { |d| both(d) }.uniq
+    end
+
+    def tz_dirs
+      @tz_dirs ||= Tz.dirs.flat_map { |d| both(d) }.uniq
     end
 
     # Standard $LOAD_PATH entries (site_ruby and vendor_ruby included: they
@@ -2562,48 +3396,50 @@ module VciCollector
         (ENV["BUNDLE_APP_CONFIG"] && VciCollector.inside?(abs, File.expand_path(ENV["BUNDLE_APP_CONFIG"])))
     end
 
+    def device?(abs)
+      DEVICES.include?(abs) || abs.start_with?("/dev/fd/")
+    end
+
     # nil (not an input), [:external, spec], [:outside_bundle, nil], [:path, abs]
-    def classify(abs)
-      return nil if DEVICES.include?(abs) || abs.start_with?("/dev/fd/")
-      if ignored_prefixes.any? { |p| VciCollector.inside?(abs, p) }
-        # vci's temp dirs; but a symlink there into the repository reads the
-        # repository file.
-        real = (File.realpath(abs) rescue nil)
-        return real && VciCollector.inside?(real, VciCollector.repo) ? [:path, real] : nil
+    #
+    # Every exemption (vci's temp dirs, the zone database, Ruby's own
+    # directories) holds for where the path really leads, not for how it is
+    # spelt: through a symlink there, a path naming a repository file is
+    # that file (VciCollector.resolve recorded it so when it was used, as
+    # the link may be gone now), and one leading anywhere else is classified
+    # as what it leads to (a read outside the repository: refused).
+    def classify(abs, depth = 0)
+      return nil if device?(abs)
+      vc = VciCollector
+      inside = vc.inside?(abs, vc.repo)
+      real = inside ? abs : (vc.reals[abs] || real_of(abs))
+      return [:path, real] if !inside && real != abs && vc.inside?(real, vc.repo)
+      leads = -> { real == abs || depth.positive? ? nil : classify(real, depth + 1) }
+      if ignored_prefixes.any? { |p| vc.inside?(abs, p) }
+        return inside ? [:path, abs] : leads.call
       end
       return nil if bundler_config?(abs)
       # RubyGems resolves symlinks in its directories (GEM_PATH through
       # /var -> /private/var): compare the real path too.
-      real = real_of(abs)
       s = Gems.spec_for(abs) || (real != abs && Gems.spec_for(real))
       if s
         # A path gem inside the repository is repository code: hash it.
-        local = Gems.source_of(s).start_with?("path ") && VciCollector.inside?(abs, VciCollector.repo)
+        local = Gems.source_of(s).start_with?("path ") && inside
         return [:external, s] unless local
       end
       return [:outside_bundle, nil] if Gems.under_root?(abs) || (real != abs && Gems.under_root?(real))
       # The system zone database, when TZInfo uses it: its version is part of
       # the toolchain (Tz.source). With tzinfo-data it is not, so a read
       # there is an input outside the repository.
-      return nil if Tz.source.start_with?("zoneinfo ") && Tz.dirs.any? { |d| VciCollector.inside?(abs, d) }
-      return nil if !VciCollector.inside?(abs, VciCollector.repo) && ruby_dirs.any? { |d| VciCollector.inside?(abs, d) }
-      [:path, abs]
+      return leads.call if Tz.source.start_with?("zoneinfo ") && tz_dirs.any? { |d| vc.inside?(abs, d) }
+      return leads.call if !inside && ruby_dirs.any? { |d| vc.inside?(abs, d) }
+      [:path, inside ? abs : real]
     end
 
     # The real path of `abs`, or of its nearest existing ancestor joined
     # with the rest (an absent path).
     def real_of(abs)
-      rest = []
-      cur = abs
-      until cur == "/" || cur.empty?
-        begin
-          return File.join(File.realpath(cur), *rest.reverse)
-        rescue SystemCallError
-          rest << File.basename(cur)
-          cur = File.dirname(cur)
-        end
-      end
-      abs
+      VciCollector.real_of(abs)
     end
 
     def write!(status)
@@ -2681,6 +3517,9 @@ module VciCollector
         rec[:source] = src unless src.empty?
         lines << rec
       end
+      # Native libraries FFI opened (see install_ffi): compared with what the
+      # probe's process opens where the attestation is checked.
+      Native.versions.each { |name, version| lines << { kind: "external", name: name, version: version } }
       keys = vc.env_keys.dup
       Env::ALWAYS_READ.each { |k| keys[k] ||= { "ruby" => true } }
       keys.each { |k, w| lines << { kind: "env", key: k, where: w.keys.first(3).join(" | ") } }
@@ -2920,11 +3759,14 @@ module VciCollector
       "#{RUBY_ENGINE} #{RUBY_ENGINE_VERSION}"
     end
 
-    # A spec file that loads only spec_helper never loads Rails: its version
-    # is then the bundle's railties (what the probe reports).
+    # The Rails version: Rails::VERSION once Rails is loaded, else the
+    # bundle's railties (whose version Rails::VERSION is). A file that never
+    # loads Rails (a spec loading only spec_helper, a Minitest file under
+    # test/lib requiring only minitest and plain Ruby) reports the same
+    # version as the probe, which boots the application; with neither
+    # (a project without Rails) it is "", on both sides.
     def rails_version
       return ::Rails::VERSION::STRING if defined?(::Rails::VERSION::STRING)
-      return "" unless RUNNER == "rspec"
       spec_version("railties") || ""
     end
 
@@ -2982,7 +3824,8 @@ module VciCollector
         out = {
           ruby: ruby_version, engine: engine, rails: rails_version, bundler: bundler_version,
           runner: runner_version, platform: RUBY_PLATFORM, libs: libs, db: DB.adapters.uniq.join(";"),
-          gems: gems, gemfile: (::Bundler.default_gemfile.to_s rescue ""), taints: Checks.run
+          gems: gems, gemfile: (::Bundler.default_gemfile.to_s rescue ""), taints: Checks.run,
+          natives: Native.versions.map { |name, version| { name: name, version: version } }
         }
         $stdout.puts "VCI-PROBE #{Json.dump(out)}"
       end

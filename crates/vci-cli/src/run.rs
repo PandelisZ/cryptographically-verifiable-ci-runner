@@ -25,6 +25,78 @@ pub struct RunArgs {
     pub files: Vec<String>,
     pub key: Option<Utf8PathBuf>,
     pub ttl: String,
+    /// Write a JSON summary of every unit (attested or not, with its
+    /// reasons) to this file.
+    pub summary: Option<Utf8PathBuf>,
+}
+
+/// What `vci run` decided for one unit (for the refusal summary and
+/// `--summary`).
+struct UnitOutcome {
+    test_id: String,
+    project: Option<String>,
+    adapter: &'static str,
+    attested: bool,
+    /// Stable reason keys ([`taint_key`], [`refusal_key`]), most frequent
+    /// taint first.
+    reasons: Vec<String>,
+    /// The refusal line's text.
+    detail: Option<String>,
+    /// Every refusing taint, as the collector reported it.
+    taints: Vec<String>,
+}
+
+impl UnitOutcome {
+    fn refused(test_id: &str, project: &Project, detail: String, reasons: Vec<String>) -> Self {
+        Self {
+            test_id: test_id.to_owned(),
+            project: (!project.name.is_empty()).then(|| project.name.clone()),
+            adapter: project.adapter.name(),
+            attested: false,
+            reasons,
+            detail: Some(detail),
+            taints: vec![],
+        }
+    }
+}
+
+/// `vci: why not attested` lines: files per reason key, most first.
+fn reason_counts(outcomes: &[UnitOutcome]) -> Vec<(String, usize)> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for o in outcomes.iter().filter(|o| !o.attested) {
+        for r in &o.reasons {
+            *counts.entry(r.as_str()).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().map(|(k, n)| (k.to_owned(), n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+/// The `--summary` document.
+fn summary_json(outcomes: &[UnitOutcome]) -> serde_json::Value {
+    let attested = outcomes.iter().filter(|o| o.attested).count();
+    serde_json::json!({
+        "version": 1,
+        "attested": attested,
+        "notAttested": outcomes.len() - attested,
+        "reasons": reason_counts(outcomes)
+            .into_iter()
+            .map(|(reason, files)| serde_json::json!({"reason": reason, "files": files}))
+            .collect::<Vec<_>>(),
+        "units": outcomes
+            .iter()
+            .map(|o| serde_json::json!({
+                "testId": o.test_id,
+                "project": o.project,
+                "adapter": o.adapter,
+                "attested": o.attested,
+                "reasons": o.reasons,
+                "detail": o.detail,
+                "taints": o.taints,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -299,38 +371,126 @@ fn junk_in_listings(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
     out
 }
 
-/// Taints for the refusal line, readable when a library makes hundreds of
-/// similar calls (FFI's `attach_function` for every function of libvips):
-/// taints that agree up to their first `(` are shown once with a count, and
-/// at most [`MAX_TAINT_GROUPS`] groups are listed.
-fn summarize_taints(taints: &[&String]) -> String {
-    let mut groups: Vec<(&str, &str, usize)> = Vec::new();
+/// The stable reason key of a taint: its category, without the paths,
+/// arguments and explanations that vary between files. The first segment
+/// (up to `:`, a space or `(`), and when it ends in a single `:`, the name
+/// that follows (letters, digits, `_`, `-`): `native:FFI attach_function(...)`
+/// -> `native:FFI`, `cargo:process: Command::new in ...` -> `cargo:process`,
+/// `go:source: a.go uses Environ` -> `go:source`, `vci:not-hooked:ffi (...)` ->
+/// `vci:not-hooked`, `external-without-version:/x` ->
+/// `external-without-version`, `process:backtick` -> `process:backtick`.
+pub fn taint_key(t: &str) -> String {
+    let t = t.trim();
+    let end = t.find([':', ' ', '(']).unwrap_or(t.len());
+    let head = &t[..end];
+    let rest = &t[end..];
+    let Some(after) = rest.strip_prefix(':') else {
+        return head.to_owned();
+    };
+    if after.starts_with(':') {
+        return head.to_owned();
+    }
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if name.is_empty() {
+        head.to_owned()
+    } else {
+        format!("{head}:{name}")
+    }
+}
+
+/// The stable reason key of a refusal message that is not a list of taints
+/// (those are keyed by [`taint_key`]): the text before the first `:` or
+/// `(`, or a fixed key for messages that start with a varying part.
+pub fn refusal_key(msg: &str) -> String {
+    const FIXED: &[(&str, &str)] = &[
+        (
+            "collector output is for adapter",
+            "collector output is for another adapter",
+        ),
+        ("collector root ", "collector root is not the project dir"),
+        ("go.work ", "go.work outside the repository"),
+        (
+            "its source refers to ",
+            "source refers to a path that is not an input",
+        ),
+        ("declared input ", "declared input"),
+        (
+            "listed under more than one",
+            "listed by more than one project",
+        ),
+    ];
+    for (prefix, key) in FIXED {
+        if msg.starts_with(prefix) {
+            return (*key).to_owned();
+        }
+    }
+    if msg.starts_with("result ") && msg.contains(" skipped or xfailed of ") {
+        return "result has skipped tests".into();
+    }
+    if msg.contains(" is built from a local directory") {
+        return "external built from a local directory".into();
+    }
+    let end = msg.find([':', '(']).unwrap_or(msg.len());
+    msg[..end].trim().to_owned()
+}
+
+/// Taints grouped by [`taint_key`], most frequent first (ties in order of
+/// first appearance): `(key, first taint of the group, count)`.
+fn group_taints<'a>(taints: &[&'a String]) -> Vec<(String, &'a str, usize)> {
+    let mut groups: Vec<(String, &str, usize)> = Vec::new();
     for t in taints {
-        let key = t.split_once('(').map_or(t.as_str(), |(k, _)| k);
+        let key = taint_key(t);
         match groups.iter_mut().find(|(k, _, _)| *k == key) {
             Some(g) => g.2 += 1,
             None => groups.push((key, t.as_str(), 1)),
         }
     }
-    let n = groups.len();
-    let mut parts: Vec<String> = groups
+    // A stable sort keeps first-appearance order among equal counts.
+    groups.sort_by_key(|g| std::cmp::Reverse(g.2));
+    groups
+}
+
+/// Taints for the refusal line, readable when a library makes hundreds of
+/// similar calls (FFI's `attach_function` for every function of libvips):
+/// taints with the same [`taint_key`] are shown once, as the first of them
+/// with the count of the others, most frequent reason first. Every reason
+/// is listed.
+fn summarize_taints(taints: &[&String]) -> String {
+    group_taints(taints)
         .into_iter()
-        .take(MAX_TAINT_GROUPS)
-        .map(|(_, first, count)| {
+        .map(|(key, first, count)| {
             if count > 1 {
-                format!("{first} (+{} more like it)", count - 1)
+                format!("{first} (+{} more {key})", count - 1)
             } else {
                 first.to_owned()
             }
         })
-        .collect();
-    if n > MAX_TAINT_GROUPS {
-        parts.push(format!("and {} more", n - MAX_TAINT_GROUPS));
-    }
-    parts.join(", ")
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-const MAX_TAINT_GROUPS: usize = 12;
+/// The taints of `o` that refuse it, and those a base policy waives (Go's
+/// `policy.go_allow_net`, Cargo's declared inputs, Rails'
+/// `policy.rails_allow_db`).
+fn split_waived<'a>(
+    project: &Project,
+    declared: &[String],
+    o: &'a Observed,
+) -> (Vec<&'a String>, Vec<&'a String>) {
+    let name = project.adapter.name();
+    o.taints.iter().partition(|t| {
+        (name == "go" && project.policy.go_allow_net && t.starts_with(vci_adapter::GO_NET_TAINT))
+            || (name == "cargo"
+                && !declared.is_empty()
+                && t.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT))
+            || (name == "rails"
+                && project.policy.rails_allow_db
+                && t.starts_with(vci_adapter::RAILS_NETWORK_DB_TAINT))
+    })
+}
 
 #[allow(clippy::too_many_arguments)]
 fn check_one(
@@ -371,17 +531,7 @@ fn check_one(
     // "may read outside its package" refusal (the declaration is recorded
     // and must still be the base config's).
     let declared = project.extra_inputs(&file.project_rel);
-    let (waived, taints): (Vec<&String>, Vec<&String>) = o.taints.iter().partition(|t| {
-        (adapter.name() == "go"
-            && project.policy.go_allow_net
-            && t.starts_with(vci_adapter::GO_NET_TAINT))
-            || (adapter.name() == "cargo"
-                && !declared.is_empty()
-                && t.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT))
-            || (adapter.name() == "rails"
-                && project.policy.rails_allow_db
-                && t.starts_with(vci_adapter::RAILS_NETWORK_DB_TAINT))
-    });
+    let (waived, taints) = split_waived(project, &declared, o);
     if !taints.is_empty() {
         return Err(format!("tainted: {}", summarize_taints(&taints)));
     }
@@ -972,6 +1122,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
     let store = AttestStore::new(&ctx.repo);
     let mut attested = 0;
     let mut refused = 0;
+    let mut outcomes: Vec<UnitOutcome> = Vec::new();
     let mut exit: Option<i32> = Some(0);
     for &pi in &involved {
         let project = &ctx.projects[pi];
@@ -1019,7 +1170,19 @@ pub fn run(args: RunArgs) -> Result<i32> {
         let by_id: BTreeMap<&str, &TestFile> =
             mine.iter().map(|f| (f.test_id.as_str(), *f)).collect();
         let mut seen = BTreeSet::new();
+        // vci's own collector files are tooling, not inputs, however the
+        // process reached them (a symlinked install prefix).
+        let collector_dirs = project.adapter.collector_dirs();
         for o in &out.files {
+            let filtered;
+            let o = if collector_dirs.is_empty() {
+                o
+            } else {
+                let mut c = o.clone();
+                c.drop_collector_paths(&ctx.root, &collector_dirs);
+                filtered = c;
+                &filtered
+            };
             let id = project
                 .test_id(&o.test_id)
                 .map(|p| p.as_str().to_owned())
@@ -1030,6 +1193,12 @@ pub fn run(args: RunArgs) -> Result<i32> {
             if let Some(why) = &tree_changed {
                 refused += 1;
                 eprintln!("vci: not attesting {label}: {why}");
+                outcomes.push(UnitOutcome::refused(
+                    &label,
+                    project,
+                    why.clone(),
+                    vec![refusal_key(why)],
+                ));
                 continue;
             }
             match check_one(
@@ -1048,6 +1217,17 @@ pub fn run(args: RunArgs) -> Result<i32> {
                 Err(reason) => {
                     refused += 1;
                     eprintln!("vci: not attesting {label}: {reason}");
+                    let mut out = UnitOutcome::refused(&label, project, reason.clone(), vec![]);
+                    match file {
+                        Some(f) if reason.starts_with("tainted: ") => {
+                            let declared = project.extra_inputs(&f.project_rel);
+                            let (_, taints) = split_waived(project, &declared, o);
+                            out.reasons = group_taints(&taints).into_iter().map(|g| g.0).collect();
+                            out.taints = taints.into_iter().cloned().collect();
+                        }
+                        _ => out.reasons = vec![refusal_key(&reason)],
+                    }
+                    outcomes.push(out);
                 }
                 Ok(a) => {
                     let p = &a.predicate;
@@ -1107,6 +1287,15 @@ pub fn run(args: RunArgs) -> Result<i32> {
                         .with_context(|| format!("signing with {}", key.path))?;
                     let stored = store.put(&p.core.test_id, &signer, &skey, &env.to_json())?;
                     attested += 1;
+                    outcomes.push(UnitOutcome {
+                        test_id: label.clone(),
+                        project: (!project.name.is_empty()).then(|| project.name.clone()),
+                        adapter: project.adapter.name(),
+                        attested: true,
+                        reasons: vec![],
+                        detail: None,
+                        taints: vec![],
+                    });
                     eprintln!(
                         "vci: attested {label} ({} inputs, root {}) as git-meta {} {}",
                         p.core.manifest.entries.len(),
@@ -1120,14 +1309,31 @@ pub fn run(args: RunArgs) -> Result<i32> {
         for f in &mine {
             if !seen.contains(f.test_id.as_str()) {
                 refused += 1;
-                eprintln!(
-                    "vci: not attesting {}: the collector produced no output for it",
-                    f.test_id
-                );
+                let why = "the collector produced no output for it";
+                eprintln!("vci: not attesting {}: {why}", f.test_id);
+                outcomes.push(UnitOutcome::refused(
+                    f.test_id.as_str(),
+                    project,
+                    why.to_owned(),
+                    vec![why.to_owned()],
+                ));
             }
         }
     }
     eprintln!("vci: {attested} attested, {refused} not attested");
+    let counts = reason_counts(&outcomes);
+    if !counts.is_empty() {
+        eprintln!("vci: why not attested (files per reason; a file can have several):");
+        let w = counts.first().map_or(1, |c| c.1.to_string().len());
+        for (reason, n) in &counts {
+            eprintln!("vci:   {n:>w$} {reason}");
+        }
+    }
+    if let Some(path) = &args.summary {
+        let mut text = serde_json::to_string_pretty(&summary_json(&outcomes))?;
+        text.push('\n');
+        std::fs::write(path, text).with_context(|| format!("writing --summary {path}"))?;
+    }
     Ok(exit.unwrap_or(1))
 }
 
@@ -1150,14 +1356,137 @@ mod tests {
             ));
         }
         t.push("process:backtick".into());
+        t.push("process:system".into());
+        t.push("process:system".into());
         let refs: Vec<&String> = t.iter().collect();
         assert_eq!(
             summarize_taints(&refs),
-            r#"native:FFI ffi_lib(["vips.42"]), native:FFI attach_function([:vips_f0, [:pointer]]) (+299 more like it), process:backtick"#
+            r#"native:FFI ffi_lib(["vips.42"]) (+300 more native:FFI), process:system (+1 more process:system), process:backtick"#
         );
-        let many: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+        // Every reason is listed (no cap), most frequent first.
+        let mut many: Vec<String> = (0..20).map(|i| format!("cat{i}:x {i}")).collect();
+        many.push("cat19:x again".into());
         let refs: Vec<&String> = many.iter().collect();
-        assert!(summarize_taints(&refs).ends_with("t11, and 8 more"));
+        let s = summarize_taints(&refs);
+        assert!(
+            s.starts_with("cat19:x 19 (+1 more cat19:x), cat0:x 0, "),
+            "{s}"
+        );
+        for i in 0..19 {
+            assert!(s.contains(&format!("cat{i}:x {i}")), "{s}");
+        }
+    }
+
+    #[test]
+    fn taint_and_refusal_keys_are_stable_categories() {
+        for (t, k) in [
+            (
+                r#"native:FFI attach_function([:vips_f0, [:pointer]])"#,
+                "native:FFI",
+            ),
+            (r#"native:FFI::DynamicLibrary.open("x")"#, "native:FFI"),
+            (
+                "native:Fiddle::Function (C code called through Fiddle)",
+                "native:Fiddle",
+            ),
+            ("native:libxml2:XSLT (xsl:include)", "native:libxml2"),
+            ("cargo:process: Command::new in src/lib.rs", "cargo:process"),
+            ("go:source: a.go uses Environ", "go:source"),
+            ("go:net: net/http in the closure", "go:net"),
+            (
+                "vci:not-hooked:ffi (loaded where vci could not hook it)",
+                "vci:not-hooked",
+            ),
+            (
+                "vci:process-exit:2 (the process exited 2)",
+                "vci:process-exit",
+            ),
+            (
+                "external-without-version:/abs/x.js",
+                "external-without-version",
+            ),
+            ("process:backtick", "process:backtick"),
+            (
+                "ruby:read-outside-bundle:stat /x (under a gem directory)",
+                "ruby:read-outside-bundle",
+            ),
+            (
+                "pytest:random-order(pytest-randomly)",
+                "pytest:random-order",
+            ),
+            ("fs.readdir.recursive", "fs.readdir.recursive"),
+            ("cargo: cannot list /x", "cargo"),
+            ("exec: /bin/sh", "exec"),
+        ] {
+            assert_eq!(taint_key(t), k, "{t}");
+        }
+        for (m, k) in [
+            (
+                "input outside the repository: /etc/hosts",
+                "input outside the repository",
+            ),
+            ("result failed (1 failed of 3)", "result failed"),
+            (
+                "result passed (0 failed, 1 skipped or xfailed of 2; a skipped test did not run)",
+                "result has skipped tests",
+            ),
+            (
+                "wrote inside the repository: out.txt",
+                "wrote inside the repository",
+            ),
+            (
+                "collector root /x is not the project dir",
+                "collector root is not the project dir",
+            ),
+            (
+                "its source refers to /x, outside the repository (seen)",
+                "source refers to a path that is not an input",
+            ),
+            (
+                "the collector produced no output for it",
+                "the collector produced no output for it",
+            ),
+            (
+                "foo is built from a local directory or file (uv.lock)",
+                "external built from a local directory",
+            ),
+        ] {
+            assert_eq!(refusal_key(m), k, "{m}");
+        }
+    }
+
+    #[test]
+    fn summary_lists_every_unit_and_counts_files_per_reason() {
+        let unit = |id: &str, attested: bool, reasons: &[&str]| UnitOutcome {
+            test_id: id.into(),
+            project: None,
+            adapter: "rails",
+            attested,
+            reasons: reasons.iter().map(|r| (*r).to_owned()).collect(),
+            detail: (!attested).then(|| "tainted: ...".to_owned()),
+            taints: vec![],
+        };
+        let outcomes = [
+            unit("a", true, &[]),
+            unit("b", false, &["native:FFI", "process:system"]),
+            unit("c", false, &["native:FFI"]),
+            unit("d", false, &["result failed"]),
+        ];
+        assert_eq!(
+            reason_counts(&outcomes),
+            [
+                ("native:FFI".to_owned(), 2),
+                ("process:system".to_owned(), 1),
+                ("result failed".to_owned(), 1)
+            ]
+        );
+        let v = summary_json(&outcomes);
+        assert_eq!(v["attested"], 1);
+        assert_eq!(v["notAttested"], 3);
+        assert_eq!(v["units"].as_array().unwrap().len(), 4);
+        assert_eq!(v["units"][1]["reasons"][1], "process:system");
+        assert_eq!(v["reasons"][0]["reason"], "native:FFI");
+        assert_eq!(v["reasons"][0]["files"], 2);
     }
 
     #[test]

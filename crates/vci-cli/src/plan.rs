@@ -832,15 +832,7 @@ impl Verifier<'_> {
         // Toolchain (adapter-specific tools; see Toolchain::diff).
         let tc = &p.core.toolchain;
         let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
-        let mut tdiff = tc.diff(&now_tc);
-        // policy.node_exact: the exact Node version, not only its major.
-        if self.project.policy.node_exact && !tc.node.is_empty() && tc.node != now_tc.node {
-            tdiff.push((
-                "node (policy.node_exact)",
-                tc.node.clone(),
-                now_tc.node.clone(),
-            ));
-        }
+        let mut tdiff = toolchain_diff(&self.project.policy, tc, &now_tc);
         let platform = self.project.policy.platform_for(&f.project_rel);
         tdiff.extend(platform_diff(
             platform,
@@ -1460,10 +1452,73 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// What the toolchain check compares, under the base `policy`: the tool
+/// fields of [`vci_core::Toolchain::diff`], the exact Node version with
+/// `policy.node_exact`, and the tests' privileges unless
+/// `policy.allow_superuser_mismatch` (a privileges difference names that
+/// key, so `vci plan` and `vci explain` say how it could be accepted).
+pub(crate) fn toolchain_diff(
+    policy: &crate::config::Policy,
+    tc: &vci_core::Toolchain,
+    now_tc: &vci_core::Toolchain,
+) -> Vec<(&'static str, String, String)> {
+    let mut tdiff = tc.diff(now_tc);
+    for d in &mut tdiff {
+        if d.0 == vci_core::PRIVILEGES_DIFF {
+            d.0 = "privileges (policy.allow_superuser_mismatch = true in the base branch's vci.toml accepts this; risky for tests that depend on file permissions)";
+        }
+    }
+    if policy.allow_superuser_mismatch {
+        tdiff.retain(|d| !d.0.starts_with(vci_core::PRIVILEGES_DIFF));
+    }
+    // policy.node_exact: the exact Node version, not only its major.
+    if policy.node_exact && !tc.node.is_empty() && tc.node != now_tc.node {
+        tdiff.push((
+            "node (policy.node_exact)",
+            tc.node.clone(),
+            now_tc.node.clone(),
+        ));
+    }
+    tdiff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use vci_core::{Observation, RepoPath};
+
+    /// A CI runner that runs as root never accepted a laptop's attestation
+    /// (`toolchain: privileges`); `policy.allow_superuser_mismatch` in the
+    /// base vci.toml accepts that one difference and nothing else, and the
+    /// failure names the key.
+    #[test]
+    fn superuser_mismatch_is_accepted_only_by_the_policy_key() {
+        let laptop = vci_core::Toolchain {
+            ruby: "3.4.9p82".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ..Default::default()
+        };
+        let mut runner = laptop.clone();
+        runner.superuser = true;
+        let mut policy = crate::config::Policy::default();
+        let d = toolchain_diff(&policy, &laptop, &runner);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].0.contains("policy.allow_superuser_mismatch = true"),
+            "{d:?}"
+        );
+        assert_eq!(d[0].1, "not root");
+        assert_eq!(d[0].2, "root (effective uid 0)");
+        policy.allow_superuser_mismatch = true;
+        assert!(toolchain_diff(&policy, &laptop, &runner).is_empty());
+        assert!(toolchain_diff(&policy, &runner, &laptop).is_empty());
+        // Every other field is still compared.
+        runner.ruby = "3.4.8p1".into();
+        let d = toolchain_diff(&policy, &laptop, &runner);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].0, "ruby");
+    }
 
     /// Go: an attestation made on macOS arm64 is accepted on Linux x86_64
     /// under `platform = "any"` only when none of the test's repository files

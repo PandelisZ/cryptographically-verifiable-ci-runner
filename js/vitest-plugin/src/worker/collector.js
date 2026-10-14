@@ -39,11 +39,12 @@ import workerThreads from "node:worker_threads";
 import {
   OWN_ENV_KEYS,
   candidateKind,
-  PACKAGE_DIR,
+  PACKAGE_DIRS,
   WORKER_ENV,
   idToFsPath,
   isInNodeModules,
   isInternalPath,
+  isOwnPath,
   isUnder,
   linkedPackagePath,
   localCopyPackage,
@@ -60,7 +61,6 @@ const MAIN_KEY = Symbol.for("vci.vitest.main-collector");
 const CONFIG_BUNDLE_RE = /\.timestamp-\d+(?:-[0-9a-f]+)?\.[cm]?js$/;
 /** Largest directory tree recorded for one `fs.cp` source. */
 const MAX_TREE_ENTRIES = 10000;
-const PKG_DIR = toSlash(PACKAGE_DIR);
 const STACK_LIMIT = 400;
 
 // Originals captured before any patching.
@@ -233,7 +233,7 @@ class Collector {
         }
       }
       f = toSlash(f);
-      if (f.startsWith(PKG_DIR + "/")) continue; // our own frames
+      if (isUnder(f, PACKAGE_DIRS)) continue; // our own frames
       nearest = false;
       if (this.isInternalFrame(f)) {
         internal = true;
@@ -295,14 +295,14 @@ class Collector {
   shouldRecordFs(abs, kind) {
     if (this.isSelfProduced(abs)) return false;
     // node-test: Node's loader reading vci's own preloads.
-    if (this.mode === "node-test" && toSlash(abs).startsWith(PKG_DIR + "/")) return false;
+    if (this.mode === "node-test" && isOwnPath(abs)) return false;
     if (kind !== "readdir" && this.isSelfDirAncestor(abs)) return false;
     const s = this.stack();
     // Node's fs.cp stats and reads while copying; the patched cp records the source tree.
     if (s.cp) return false;
     if (this.mode === "main") {
       if (s.loader) return false;
-      if (toSlash(abs).startsWith(PKG_DIR + "/")) return false;
+      if (isOwnPath(abs)) return false;
       return s.syncUser || s.asyncUser;
     }
     if (s.snapshot) return true;
@@ -413,7 +413,7 @@ class Collector {
           }
         }
         f = toSlash(f);
-        if (f.startsWith(PKG_DIR + "/")) continue;
+        if (isUnder(f, PACKAGE_DIRS)) continue;
         return f;
       }
       return null;
@@ -637,7 +637,7 @@ class Collector {
     try {
       for (const cand of resolutionCandidates(base)) {
         const sp = toSlash(cand);
-        if (isInNodeModules(sp) || sp.startsWith(PKG_DIR + "/") || this.isSelfProduced(cand)) continue;
+        if (isInNodeModules(sp) || isOwnPath(sp) || this.isSelfProduced(cand)) continue;
         const kind = candidateKind(cand);
         if (kind) this.emit({ kind, path: cand });
       }
@@ -651,7 +651,7 @@ class Collector {
     const p = idToFsPath(idOrFile);
     if (!p) return;
     const sp = toSlash(p);
-    if (sp.startsWith(PKG_DIR + "/") || isInternalPath(sp)) return;
+    if (isOwnPath(sp) || isInternalPath(sp)) return;
     const wasBusy = this.busy;
     this.busy = true;
     try {
@@ -678,7 +678,7 @@ class Collector {
       }
     }
     p = toSlash(p);
-    return p.startsWith(PKG_DIR + "/") || isInternalPath(p);
+    return isOwnPath(p) || isInternalPath(p);
   }
 
   /** @param {string} url @param {string | undefined} parentURL @param {string} [spec] */
@@ -704,7 +704,7 @@ class Collector {
     }
     if (this.isSelfProduced(p)) return;
     const sp = toSlash(p);
-    if (sp.startsWith(PKG_DIR + "/") || isInternalPath(sp)) return;
+    if (isOwnPath(sp) || isInternalPath(sp)) return;
     this.busy = true;
     try {
       const pkg = packageOf(p);
@@ -866,7 +866,7 @@ class Collector {
     try {
       for (const b of bases) {
         const sp = toSlash(b);
-        if (isInNodeModules(sp) || sp.startsWith(PKG_DIR + "/")) continue;
+        if (isInNodeModules(sp) || isOwnPath(sp)) continue;
         for (const c of resolutionCandidates(b)) this.emit({ kind: "probe", path: c });
       }
     } finally {

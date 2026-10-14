@@ -278,6 +278,15 @@ pub trait Adapter: Send + Sync {
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError>;
     /// Run `files` (project-relative; empty = everything) without collection.
     fn run_plain(&self, files: &[String], env: &ChildEnv) -> Result<Option<i32>, AdapterError>;
+    /// Directories holding vci's own collector files for this adapter (real
+    /// paths): the `@vci/vitest` package, `vci_pytest`, `vci_collector.rb`.
+    /// What a test process reads there is vci's tooling (identified by the
+    /// collector version), never an input, whichever path (a symlinked
+    /// install prefix) reached it. Empty when there is none or it cannot be
+    /// found (then nothing is dropped).
+    fn collector_dirs(&self) -> Vec<Utf8PathBuf> {
+        vec![]
+    }
     /// Directories inside the repository that the runner writes build output
     /// to and that are never inputs (Cargo's target directory). `vci run`
     /// does not snapshot them.

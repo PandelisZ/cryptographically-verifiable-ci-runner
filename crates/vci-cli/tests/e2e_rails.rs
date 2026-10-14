@@ -1102,6 +1102,150 @@ fn rails_inputs_that_used_to_be_missed() {
     );
 }
 
+/// Two self-signed CA certificates (valid until 2126).
+const CA_0: &str = "-----BEGIN CERTIFICATE-----
+MIIBYTCCAQegAwIBAgIBATAKBggqhkjOPQQDAjAXMRUwEwYDVQQDDAx2Y2kgZTJl
+IENBIDAwIBcNMjYwMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMBcxFTATBgNV
+BAMMDHZjaSBlMmUgQ0EgMDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEPN+Ma3
+XiBRJma9xCZvozbHL3JPkG2ihfRcVzucNCT1hWSkkY/sxswA7vWmjfmGugzi4tzd
+eezmovCDu1BKhHCjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEG
+MB0GA1UdDgQWBBRwmR0IRySHH6Ew44dNXqIrxfrI/DAKBggqhkjOPQQDAgNIADBF
+AiA4YDPVwBaEgX3f+SWIhCwT2agy8+jSOD3f7bg/5E+ntgIhALj9KRZxIGw2wnoe
+g7LxE+voXybAqPVCTb1XrkTk+bB2
+-----END CERTIFICATE-----
+";
+const CA_1: &str = "-----BEGIN CERTIFICATE-----
+MIIBYjCCAQegAwIBAgIBAjAKBggqhkjOPQQDAjAXMRUwEwYDVQQDDAx2Y2kgZTJl
+IENBIDEwIBcNMjYwMTAxMDAwMDAwWhgPMjEyNjAxMDEwMDAwMDBaMBcxFTATBgNV
+BAMMDHZjaSBlMmUgQ0EgMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJ6URxhu
+momt+7WLZTfwFuMPQLBSSibmYklkV5m5VW765r4kJJI9lnmunUcXuld21QXQ9Ybs
+B+l2GITnYEBTtbWjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEG
+MB0GA1UdDgQWBBRnlRC7OGj3WChzscKRdlsHX7CJtzAKBggqhkjOPQQDAgNJADBG
+AiEAmfymMNZTvFZDmGxdu2JShhmeRD+IcuNVRTsSzoQDYywCIQCz5LDvTQMD+aHK
+7am63QbWXz8PjOM2IU1U2wNe+YVuJw==
+-----END CERTIFICATE-----
+";
+
+/// Regressions (false skips): files named "~note.txt" or "|pipe.txt" read
+/// with File (opened literally, never recorded); a certificate file
+/// OpenSSL reads in C (`X509::Store#add_file`); a repository directory read
+/// through a symlink in vci's temp dir that the test removes. Each is
+/// attested with its file as an input, and changing the file runs it.
+/// Verifying against OpenSSL's default paths and reading the uid are
+/// refused.
+#[test]
+fn rails_files_named_oddly_read_in_c_or_through_links() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let t = |name: &str, body: &str| {
+        format!(
+            "require \"test_helper\"\n\nclass {name}Test < ActiveSupport::TestCase\n  test \"it\" do\n{body}  end\nend\n"
+        )
+    };
+    const TILDE: &str = "test/odd/tilde_test.rb";
+    const PIPE: &str = "test/odd/pipe_test.rb";
+    const OSSL: &str = "test/odd/ossl_store_test.rb";
+    const LINK: &str = "test/odd/tmp_link_test.rb";
+    w.put("~note.txt", "hello");
+    w.put("|pipe.txt", "p");
+    w.put("certs/ca.pem", CA_0);
+    w.put("certs/ca_copy.pem", CA_0);
+    w.put("data/dirx/x.txt", "x");
+    w.put(
+        TILDE,
+        &t(
+            "Tilde",
+            "    assert_equal \"hello\", File.read(\"~note.txt\")\n",
+        ),
+    );
+    w.put(
+        PIPE,
+        &t(
+            "Pipe",
+            "    assert_equal \"p\", File.open(\"|pipe.txt\", &:read)\n",
+        ),
+    );
+    w.put(
+        OSSL,
+        &t(
+            "OsslStore",
+            "    require \"openssl\"\n    st = OpenSSL::X509::Store.new\n    st.add_file(\"certs/ca.pem\")\n    assert st.verify(OpenSSL::X509::Certificate.new(File.binread(\"certs/ca_copy.pem\")))\n",
+        ),
+    );
+    // VciCollector::TMP: the temp dir vci gave the process (ENV["TMPDIR"]
+    // would be an env input whose value differs per run).
+    w.put(
+        LINK,
+        &t(
+            "TmpLink",
+            "    link = File.join(VciCollector::TMP, \"fx\")\n    File.symlink(Rails.root.join(\"data/dirx\").to_s, link)\n    body = File.read(File.join(link, \"x.txt\"))\n    File.unlink(link)\n    assert_equal \"x\", body\n",
+        ),
+    );
+    let refused_files = [
+        (
+            "test/odd/ossl_default_test.rb",
+            t(
+                "OsslDefault",
+                "    require \"openssl\"\n    st = OpenSSL::X509::Store.new\n    st.set_default_paths\n    refute st.verify(OpenSSL::X509::Certificate.new(File.binread(\"certs/ca_copy.pem\")))\n",
+            ),
+            "native:openssl:X509::Store#verify",
+        ),
+        (
+            "test/odd/identity_test.rb",
+            t("Identity", "    assert Process.uid >= 0\n"),
+            "ruby:process-identity:Process.uid",
+        ),
+    ];
+    for (rel, body, _) in &refused_files {
+        w.put(rel, body);
+    }
+    let mut files = vec![TILDE, PIPE, OSSL, LINK];
+    files.extend(refused_files.iter().map(|(rel, _, _)| *rel));
+    let stderr = strip_ansi(&w.run(&work, &files, &w.trusted));
+    assert!(
+        stderr.contains("vci: 4 attested, 2 not attested"),
+        "{stderr}"
+    );
+    for (rel, _, why) in &refused_files {
+        let line = stderr
+            .lines()
+            .find(|l| l.starts_with(&format!("vci: not attesting {rel}:")))
+            .unwrap_or_else(|| panic!("{rel} was not refused:\n{stderr}"));
+        assert!(line.contains(why), "{rel}: expected {why:?} in {line:?}");
+    }
+    for (id, input) in [
+        (TILDE, "~note.txt"),
+        (PIPE, "|pipe.txt"),
+        (OSSL, "certs/ca.pem"),
+        (LINK, "data/dirx/x.txt"),
+    ] {
+        let entries = stored_predicate(&work, id)["manifest"]["entries"].clone();
+        assert!(
+            entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["path"] == input),
+            "{id}: {input} not in {entries}"
+        );
+    }
+    let p = w.plan(&work, "main");
+    for id in [TILDE, PIPE, OSSL, LINK] {
+        assert!(p.skip.contains(id), "{id}: {p:?}");
+    }
+    w.put("~note.txt", "CHANGED");
+    w.put("|pipe.txt", "CHANGED");
+    w.put("certs/ca.pem", CA_1);
+    w.put("data/dirx/x.txt", "CHANGED");
+    let p = w.plan(&work, "main");
+    for id in [TILDE, PIPE, OSSL, LINK] {
+        assert!(
+            p.run.contains(id),
+            "{id} must run once its input changed: {p:?}"
+        );
+    }
+}
+
 #[test]
 fn rails_init_writes_the_rails_template() {
     let Some(w) = World::new() else { return };
@@ -1124,4 +1268,212 @@ fn rails_init_writes_the_rails_template() {
     assert!(toml.contains("rails_allow_db = false"), "{toml}");
     let signers = std::fs::read_to_string(dir.join(".vci/allowed_signers")).unwrap();
     assert!(signers.contains(&pubkey(&w.trusted)), "{signers}");
+}
+
+/// The predicate stored for `id` (the newest one).
+fn stored_predicate(work: &Path, id: &str) -> Value {
+    let stored = AttestStore::new(&store_for(work)).list(Some(id)).unwrap();
+    let env: Value = serde_json::from_slice(&stored.last().unwrap().bytes).unwrap();
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(env["payload"].as_str().unwrap())
+        .unwrap();
+    let st: Value = serde_json::from_slice(&payload).unwrap();
+    st["predicate"].clone()
+}
+
+/// A Minitest file that never loads Rails (it requires only minitest and a
+/// plain Ruby file) is attested and skipped. Regression: its collector
+/// reported the Rails version as "" and the file was refused ("toolchain
+/// seen by the collector (... rails , ...) differs from the project's").
+#[test]
+fn rails_minitest_file_that_never_loads_rails() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let plain = "test/lib/plain_test.rb";
+    w.put(
+        plain,
+        "require \"minitest\"\nrequire_relative \"../../lib/calc\"\n\nclass PlainTest < Minitest::Test\n  def test_add\n    assert_equal 3, Calc.add(1, 2)\n  end\nend\n",
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "plain test"]);
+    let stderr = w.run(&work, &[plain], &w.trusted);
+    assert!(
+        stderr.contains("vci: 1 attested, 0 not attested"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stored_predicate(&work, plain)["toolchain"]["rails"],
+        "8.1.3.1",
+        "the bundle's railties"
+    );
+    assert!(w.plan(&work, "main").skip.contains(plain));
+    w.put(
+        "lib/calc.rb",
+        &format!("{}# edited\n", w.read("lib/calc.rb")),
+    );
+    assert!(w.plan(&work, "main").run.contains(plain));
+}
+
+/// The Ruby collector reached through a symlinked install prefix (Homebrew's
+/// `opt/vci` -> `Cellar/vci/<version>`), given as `VCI_RUBY_COLLECTOR` and
+/// found next to the executable: its own file is never an input.
+#[test]
+fn rails_collector_behind_a_symlinked_install_prefix() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let prefix = w.base.join("Cellar/vci/1.1.0");
+    let share = prefix.join("share/vci/ruby-collector");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::copy(
+        workspace_root().join("ruby/vci-collector/vci_collector.rb"),
+        share.join("vci_collector.rb"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::fs::copy(assert_cmd::cargo::cargo_bin("vci"), prefix.join("bin/vci")).unwrap();
+    std::fs::create_dir_all(w.base.join("opt")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/vci/1.1.0", w.base.join("opt/vci")).unwrap();
+    let linked = w.base.join("opt/vci/share/vci/ruby-collector");
+    let out = w.vci_env(
+        &work,
+        &["run", A, "--key", w.trusted.to_str().unwrap()],
+        &[("VCI_RUBY_COLLECTOR", linked.to_str().unwrap())],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("vci: 1 attested, 0 not attested"), "{err}");
+    let mut cmd = Command::new(w.base.join("opt/vci/bin/vci"));
+    cmd.current_dir(&work)
+        .args(["run", B, "--key", w.trusted.to_str().unwrap()])
+        .env("PATH", w.path_env())
+        .env("GIT_CONFIG_GLOBAL", &w.gitconfig)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("VCI_RUBY_COLLECTOR");
+    for k in SCRUB {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("vci: 1 attested, 0 not attested"), "{err}");
+}
+
+/// Copy `fixtures/rails-vips` (Active Storage with image_processing and
+/// ruby-vips in the bundle) into `dir`.
+fn copy_vips_fixture(dir: &Path) {
+    let fx = workspace_root().join("fixtures/rails-vips");
+    std::fs::create_dir_all(dir).unwrap();
+    for name in [
+        ".gitignore",
+        ".ruby-version",
+        "Gemfile",
+        "Gemfile.lock",
+        "Rakefile",
+        "config.ru",
+        "app",
+        "bin",
+        "config",
+        "db",
+        "lib",
+        "test",
+    ] {
+        cp(&fx.join(name), &dir.join(name));
+    }
+    for d in ["log", "tmp", "storage", "vendor"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+        std::fs::write(dir.join(d).join(".keep"), "").unwrap();
+    }
+}
+
+/// A 5x4 PNG (the fixture image is 3x2).
+const PNG_5X4: &str = "iVBORw0KGgoAAAANSUhEUgAAAAUAAAAECAAAAABjWKqcAAAAtGVYSWZJSSoACAAAAAYAEgEDAAEAAAABAAAAGgEFAAEAAABWAAAAGwEFAAEAAABeAAAAKAEDAAEAAAACAAAAEwIDAAEAAAABAAAAaYcEAAEAAABmAAAAAAAAADhjAADoAwAAOGMAAOgDAAAGAACQBwAEAAAAMDIxMAGRBwAEAAAAAQIDAACgBwAEAAAAMDEwMAGgAwABAAAA//8AAAKgBAABAAAABQAAAAOgBAABAAAABAAAAAAAAAAvTK8RAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADklEQVQImWNgBAEGDBIAAQgAFaqiGn4AAAAASUVORK5CYII=";
+
+/// Active Storage loads ruby-vips at boot, and ruby-vips opens libvips
+/// through FFI. Loading a library is not a read of test inputs (the library
+/// is recorded as a `native:` external, hashed); calling into it is, unless
+/// the collector sees the files at the Ruby level, as it does for ruby-vips:
+/// (a) a model test that never touches storage is attested; (b) a test that
+/// attaches a fixture image and analyses it through Active Storage is
+/// attested with the image as an input, and editing the image runs it;
+/// (c) a test that calls a C function through FFI is refused.
+/// Regression: every test that booted Rails was refused (`native:FFI
+/// ffi_lib(["vips.42"]) ...`). Skipped where libvips is not installed.
+#[test]
+fn rails_active_storage_with_libvips() {
+    let Some(w) = World::build(VCI_TOML, copy_vips_fixture) else {
+        return;
+    };
+    let vips = Command::new(w.ruby_bin.join("bundle"))
+        .args(["exec", "ruby", "-e", "require 'vips'"])
+        .current_dir(&w.work)
+        .env("PATH", w.path_env())
+        .env_remove("RUBYOPT")
+        .output()
+        .unwrap();
+    if !vips.status.success() {
+        eprintln!(
+            "SKIPPED: libvips is not installed (`brew install vips`): {}",
+            String::from_utf8_lossy(&vips.stderr)
+        );
+        return;
+    }
+    let work = w.work.clone();
+    const CAPTION: &str = "test/models/caption_test.rb";
+    const IMAGE: &str = "test/models/image_test.rb";
+    const FFI_CALL: &str = "test/lib/ffi_call_test.rb";
+    let stderr = w.run(&work, &[CAPTION, IMAGE, FFI_CALL], &w.trusted);
+    assert!(
+        stderr.contains("vci: 2 attested, 1 not attested"),
+        "{stderr}"
+    );
+    let refused = stderr
+        .lines()
+        .find(|l| l.starts_with(&format!("vci: not attesting {FFI_CALL}:")))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(refused.contains("native:FFI call Libc.getpid"), "{refused}");
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[CAPTION, IMAGE]));
+    assert_eq!(p.run, set(&[FFI_CALL]));
+
+    // Both attestations record libvips (by content) as an external.
+    for id in [CAPTION, IMAGE] {
+        let pred = stored_predicate(&work, id);
+        let externals = pred["manifest"]["externals"].as_array().unwrap();
+        assert!(
+            externals.iter().any(|e| {
+                e["name"].as_str().unwrap().starts_with("native:libvips")
+                    && e["version"].as_str().unwrap().starts_with("sha256:")
+            }),
+            "{id}: {externals:?}"
+        );
+    }
+    // (b): the fixture image is an input of the test that analyses it.
+    let image = "test/fixtures/files/pixel.png";
+    let entries = stored_predicate(&work, IMAGE)["manifest"]["entries"].clone();
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == image),
+        "{entries}"
+    );
+    let original = std::fs::read(work.join(image)).unwrap();
+    std::fs::write(
+        work.join(image),
+        base64::engine::general_purpose::STANDARD
+            .decode(PNG_5X4)
+            .unwrap(),
+    )
+    .unwrap();
+    let p = w.plan(&work, "main");
+    assert_eq!(
+        p.run,
+        set(&[IMAGE, FFI_CALL]),
+        "editing the image runs (b) only"
+    );
+    assert!(
+        w.explain(&work, IMAGE, "main")
+            .contains(&format!("entry:{image}"))
+    );
+    std::fs::write(work.join(image), original).unwrap();
+    assert_eq!(w.plan(&work, "main").skip, set(&[CAPTION, IMAGE]));
 }

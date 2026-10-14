@@ -67,6 +67,9 @@ enum Cmd {
         /// Attestation lifetime.
         #[arg(long, default_value = "14d")]
         ttl: String,
+        /// Write a JSON summary of every unit (attested or not, with its reason keys) to this file.
+        #[arg(long)]
+        summary: Option<Utf8PathBuf>,
     },
     /// Decide which test files can be skipped.
     Plan {
@@ -171,7 +174,17 @@ fn main() {
             !no_install,
             meta_url,
         ),
-        Cmd::Run { files, key, ttl } => run::run(run::RunArgs { files, key, ttl }),
+        Cmd::Run {
+            files,
+            key,
+            ttl,
+            summary,
+        } => run::run(run::RunArgs {
+            files,
+            key,
+            ttl,
+            summary,
+        }),
         Cmd::Plan { base_ref, format } => plan::plan(&plan::PlanOptions {
             base_ref,
             only: None,

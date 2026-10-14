@@ -216,8 +216,17 @@ pub const RAILS_HASHED_ENV: &[&str] = &[
     "SCHEMA",
     "BOOTSNAP_*",
     "SPRING_*",
+    // libvips and GLib read theirs in C when ruby-vips loads (VIPS_CONCURRENCY,
+    // VIPS_BLOCK_UNTRUSTED, G_DEBUG, ...).
+    "VIPS_*",
+    "G_*",
     // RSpec reads its options from SPEC_OPTS too.
     "SPEC_OPTS",
+    // OpenSSL reads its configuration file (OPENSSL_CONF), module directory
+    // (OPENSSL_MODULES) and the like in C when Ruby's openssl loads.
+    // SSL_CERT_FILE and SSL_CERT_DIR are not here: the collector refuses a
+    // file that verifies with a store holding OpenSSL's default paths.
+    "OPENSSL_*",
 ];
 
 /// Variables vci sets for every Rails test process (never inputs).
@@ -797,6 +806,23 @@ fn parse_probe(line: &str, gemfile: &Utf8Path, rails_app: bool) -> Result<Probe,
         .flat_map(|(n, vs)| vs.iter().map(move |v| format!("{n}=={v}")))
         .collect();
     ruby_gems.sort();
+    // Native libraries the application opened through FFI while it booted
+    // (`native:<file name>` -> `sha256:<hex>`): a test file that recorded one
+    // is checked against what this process opens, like a gem. Not part of
+    // the toolchain's bundle list.
+    if let Some(natives) = v.get("natives").and_then(Value::as_array) {
+        for n in natives {
+            let name = n.get("name").and_then(Value::as_str).unwrap_or_default();
+            let ver = n.get("version").and_then(Value::as_str).unwrap_or_default();
+            if !name.starts_with("native:") || ver.is_empty() {
+                return Err(bad(format!("bad native library entry {n}")));
+            }
+            let vs = gems.entry(name.to_owned()).or_default();
+            if !vs.iter().any(|x| x == ver) {
+                vs.push(ver.to_owned());
+            }
+        }
+    }
     Ok(Probe {
         versions: ToolVersions {
             runner: s("runner"),
@@ -1149,6 +1175,14 @@ impl Adapter for RailsAdapter {
         vec![]
     }
 
+    fn collector_dirs(&self) -> Vec<Utf8PathBuf> {
+        self.collector_file()
+            .ok()
+            .and_then(|f| f.parent().map(Utf8Path::to_owned))
+            .into_iter()
+            .collect()
+    }
+
     fn inferred_env_patterns(&self) -> &'static [&'static str] {
         &[]
     }
@@ -1227,6 +1261,8 @@ mod tests {
         assert!(a.builtin_pass_through().contains(&"GEM_HOME"));
         assert!(a.hashed_env_patterns().contains(&"RUBY*"));
         assert!(a.hashed_env_patterns().contains(&"!RUBYOPT"));
+        // Read by OpenSSL in C when Ruby's openssl loads.
+        assert!(a.hashed_env_patterns().contains(&"OPENSSL_*"));
         assert!(
             a.config_candidates()
                 .iter()
@@ -1450,5 +1486,17 @@ mod tests {
         let plain = r#"{"ruby":"3","engine":"r","rails":"","bundler":"4","runner":"rspec-core 3.13.6","gems":[],"gemfile":"/app/Gemfile","taints":[]}"#;
         assert!(parse_probe(plain, gf, true).is_err());
         assert_eq!(parse_probe(plain, gf, false).unwrap().versions.rails, "");
+        // Native libraries opened through FFI at boot are installed
+        // externals (a file that loaded one is checked against them), not
+        // part of the toolchain's bundle.
+        let natives = r#"{"ruby":"3","engine":"r","rails":"8","bundler":"4","runner":"m","gems":[{"name":"ruby-vips","version":"2.3.0","platform":"ruby","source":""}],"gemfile":"/app/Gemfile","taints":[],"natives":[{"name":"native:libvips.42.dylib","version":"sha256:ab"}]}"#;
+        let p = parse_probe(natives, gf, true).unwrap();
+        assert_eq!(p.gems["native:libvips.42.dylib"], ["sha256:ab"]);
+        assert_eq!(p.versions.ruby_gems, ["ruby-vips==2.3.0"]);
+        let bad = r#"{"ruby":"3","engine":"r","rails":"8","bundler":"4","runner":"m","gems":[],"gemfile":"/app/Gemfile","taints":[],"natives":[{"name":"rack","version":"1"}]}"#;
+        assert!(
+            parse_probe(bad, gf, true).is_err(),
+            "a native entry must be native:"
+        );
     }
 }

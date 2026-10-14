@@ -53,7 +53,7 @@ pub struct Toolchain {                  // adapter-specific; unused fields are e
     pub ruby_libs: String,            // Rails: "sqlite=<ver>;yaml=<ver>;tz=<tzinfo-data|zoneinfo ver>;encoding=<ext>/<int>"
     pub ruby_db: String,              // Rails: "sqlite3", or "<adapter> <server version>" with policy.rails_allow_db
     pub ruby_gems: Vec<String>,       // Rails: the resolved bundle, sorted "name==version" (no platform)
-    pub superuser: bool,              // every adapter: the tests ran as root (effective uid 0); compared exactly; omitted when false
+    pub superuser: bool,              // every adapter: the tests ran as root (effective uid 0); compared exactly unless the base policy sets allow_superuser_mismatch; omitted when false
     pub os: String, pub arch: String,
 }
 impl Toolchain { pub fn diff(&self, now: &Toolchain) -> Vec<(&'static str, String, String)>; } // node by major, go_arch_level on the same arch, rust_host/rust_cfg on the same platform, rest exact (Rails fields all exact)
