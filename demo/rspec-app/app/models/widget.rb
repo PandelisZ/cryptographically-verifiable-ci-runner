@@ -5,5 +5,3 @@ class Widget < ApplicationRecord
     "#{name} (#{size})"
   end
 end
-
-# Touched by the local agent.

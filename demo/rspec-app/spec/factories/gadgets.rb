@@ -3,5 +3,3 @@ FactoryBot.define do
     name { "bolt" }
   end
 end
-
-# changed after attestation
