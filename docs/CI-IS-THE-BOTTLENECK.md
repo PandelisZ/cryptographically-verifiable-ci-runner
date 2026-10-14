@@ -152,9 +152,8 @@ runner, and re-running when an input changes.
 ## Status and what it costs
 
 v1.0.0, MIT. Six runners. Each has an end-to-end suite that drives the real CLI against a bare git remote. The
-verification step on a GitHub runner takes about ten seconds. The "up to 90% less CI time" figure on the site is a
-model of the case where the whole suite was attested before the push, not a benchmark; the chart that goes with it
-shows three cases with no saving at all.
+verification step on a GitHub runner takes about ten seconds; what you save beyond that is the tests you had
+already run.
 
 There is no company behind this. It is a tool for a problem that the people with the most agents hit first and that
 the rest of us are about to.
