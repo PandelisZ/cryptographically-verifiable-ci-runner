@@ -242,6 +242,18 @@ impl Project {
         Ok(RepoPath::new(&joined)?)
     }
 
+    /// The `[env]` configuration plus the variables the adapter declares
+    /// itself (node-test: `NODE_ENV` and the test script's assignments).
+    pub fn effective_env(&self) -> EnvConfig {
+        let mut env = self.env.clone();
+        for k in self.adapter.declared_env() {
+            if !env.global.contains(&k) {
+                env.global.push(k);
+            }
+        }
+        env
+    }
+
     /// Effective env configuration for a test file of this project.
     pub fn file_env(&self, project_rel: &str) -> FileEnv {
         let inferred: Vec<&str> = self
@@ -251,7 +263,7 @@ impl Project {
             .chain(self.adapter.hashed_env_patterns())
             .copied()
             .collect();
-        FileEnv::for_file(&self.env, &inferred, project_rel)
+        FileEnv::for_file(&self.effective_env(), &inferred, project_rel)
             .with_builtin(self.adapter.builtin_pass_through())
             .with_adapter(self.adapter.name())
     }
@@ -263,12 +275,18 @@ impl Project {
 
     /// The environment this project's test processes get.
     pub fn child_env(&self) -> ChildEnvMap {
-        build_child_env_with(
-            &self.env,
+        let mut child = build_child_env_with(
+            &self.effective_env(),
             self.adapter.inferred_env_patterns(),
             self.adapter.builtin_pass_through(),
             std::env::vars_os(),
-        )
+        );
+        // What the adapter sets for every test process is what the tests
+        // see, so it is what is hashed.
+        for (k, v) in self.adapter.forced_env() {
+            child.set(&k, v.into());
+        }
+        child
     }
 
     /// Turn the runner's listing into test files of this project (project

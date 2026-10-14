@@ -1,0 +1,11 @@
+{
+  "name": "node-test-abcd",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "NODE_ENV=test node --experimental-strip-types --import ./test/register-hooks.mjs --test ${TEST_CONCURRENCY:+--test-concurrency=$TEST_CONCURRENCY} 'src/**/*.test.ts' 'src/**/*.test.mjs'"
+  },
+  "dependencies": {
+    "ms": "2.1.3"
+  }
+}

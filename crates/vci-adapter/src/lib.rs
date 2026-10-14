@@ -12,6 +12,7 @@
 mod cargo;
 mod golang;
 mod jsonl;
+mod nodetest;
 mod pytest;
 mod rails;
 mod vitest;
@@ -29,6 +30,12 @@ pub use golang::{
     GO_ALWAYS_READ_ENV, GO_BIN_ENV, GO_HASHED_ENV, GO_NET_TAINT, GO_PASS_THROUGH, GoAdapter,
 };
 pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file};
+pub use nodetest::{
+    Invocation as NodeTestInvocation, NODE_TEST_HASHED_ENV, NODE_TEST_RUN_VARS,
+    NODE_TEST_TS_LOADERS, NodeTestAdapter, NodeTestOptions, Preload as NodeTestPreload,
+    find_node_test_collector, glob_escape as node_test_glob_escape,
+    package_manager as node_package_manager, parse_script as parse_node_test_script,
+};
 pub use pytest::{
     JOBS_ENV, PY_PLUGIN_ENV, PYTEST_CONFIG_NAMES, PYTEST_HASHED_ENV, PYTEST_PASS_THROUGH,
     PytestAdapter, UV_ENV, UV_RUN_ARGS, find_py_plugin, pytest_jobs,
@@ -41,10 +48,10 @@ pub use rails::{
 pub use vitest::{JS_PLUGIN_ENV, VitestAdapter, find_js_plugin};
 
 /// Adapter names accepted in `vci.toml`.
-pub const ADAPTERS: &[&str] = &["vitest", "pytest", "go", "cargo", "rails"];
+pub const ADAPTERS: &[&str] = &["vitest", "pytest", "go", "cargo", "rails", "node-test"];
 
 /// Policy settings that change how an adapter runs tests.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdapterOptions {
     /// `policy.rails_allow_db`: database servers are prepared fresh from the
     /// schema for every test file (and their refusal is waived).
@@ -52,6 +59,9 @@ pub struct AdapterOptions {
     /// Rails: the project's `runner` setting (`None`: detected from the
     /// project, see `RailsAdapter`).
     pub rails_runner: Option<RailsRunner>,
+    /// node-test: the test command settings (`test_script`, or `test_globs`
+    /// with `node_args`).
+    pub node_test: NodeTestOptions,
 }
 
 /// Construct the adapter called `name` for `project_dir`.
@@ -77,6 +87,9 @@ pub fn adapter_for_with(
             RailsAdapter::new(project_dir)
                 .with_allow_db(opts.rails_allow_db)
                 .with_runner(opts.rails_runner),
+        )),
+        "node-test" => Ok(Box::new(
+            NodeTestAdapter::new(project_dir).with_options(opts.node_test.clone()),
         )),
         other => Err(AdapterError::NotFound(format!(
             "unsupported adapter {other:?} (supported: {})",
@@ -210,6 +223,24 @@ pub trait Adapter: Send + Sync {
     /// no collector can see it.
     fn hashed_env_patterns(&self) -> &'static [&'static str] {
         &[]
+    }
+    /// Env var names declared (hashed, and kept in the child in strict mode)
+    /// by the adapter itself, on top of the user's `[env]` (node-test:
+    /// `NODE_ENV` and the variables the test script assigns).
+    fn declared_env(&self) -> Vec<String> {
+        vec![]
+    }
+    /// Variables the adapter sets for every test process, with their values
+    /// (node-test: the test script's leading `NAME=value` assignments). They
+    /// are in [`Adapter::declared_env`], so hashed.
+    fn forced_env(&self) -> Vec<(String, String)> {
+        vec![]
+    }
+    /// Whether the `tsconfig.json` chain of modules is an input (it decides
+    /// how they are transformed). Vitest: always; node-test: only with a
+    /// TypeScript loader (Node's own type stripping reads no tsconfig).
+    fn tsconfig_is_input(&self) -> bool {
+        true
     }
     /// Warnings for `vci run` about the environment the tests run in (e.g. an
     /// interpreter CI cannot reproduce).

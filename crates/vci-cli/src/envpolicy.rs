@@ -78,6 +78,17 @@ pub fn never_hashed(adapter: &str) -> &'static [&'static str] {
             "PYTHONPATH",
         ],
         "go" | "cargo" => VCI_RUN_VARS,
+        // vci sets VCI_TEST_FILE/VCI_ROOT for its node:test collector;
+        // NODE_OPTIONS is hashed as a global input.
+        "node-test" => &[
+            "VCI_OUT",
+            "VCI_WORKER",
+            "VCI_LIST_OUT",
+            "VCI_GO_TESTLOG",
+            "VCI_TEST_FILE",
+            "VCI_ROOT",
+            "NODE_OPTIONS",
+        ],
         // vci sets RUBYOPT (the collector), RAILS_ENV, BUNDLE_GEMFILE,
         // PARALLEL_WORKERS, ... for every Rails test process.
         "rails" => RAILS_NEVER_HASHED,
@@ -302,6 +313,11 @@ impl ChildEnvMap {
 
     pub fn get(&self, k: &str) -> Option<OsString> {
         self.vars.get(k).cloned()
+    }
+
+    /// Set a variable the adapter sets for every test process.
+    pub fn set(&mut self, k: &str, v: OsString) {
+        self.vars.insert(k.to_owned(), v);
     }
 
     /// For the adapter: `None` = inherit, `Some` = exactly these vars.

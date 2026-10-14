@@ -1,6 +1,6 @@
 [project]
 name = "vci-pytest"
-version = "1.0.0"
+version = "1.1.0"
 description = "vci dependency collector for pytest. Pure stdlib; load with PYTHONPATH=<this dir> VCI_OUT=<dir> pytest -p vci_pytest <file>"
 requires-python = ">=3.10"
 dependencies = []

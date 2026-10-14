@@ -65,6 +65,10 @@ Patterns: exact names, `*` wildcards, and a leading `!` to exclude. Exclusions w
 | Rails run-specific, set by vci: `RUBYOPT` (the collector), `RAILS_ENV`/`RACK_ENV` (`test`), `BUNDLE_GEMFILE` (the project's), `PARALLEL_WORKERS` (`1`), `DISABLE_SPRING`, `DISABLE_BOOTSNAP`, `TMPDIR` (a fresh directory), `VCI_*` (`VCI_RAILS_MODE`, `VCI_RAILS_RUNNER`, ...) | yes (set per run) | never |
 | pytest always-read: `PYTEST_ADDOPTS`, `PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTHONHASHSEED`, `PYTHONWARNINGS`, `PYTHONOPTIMIZE`, `PYTHONDEVMODE`, `PYTHONUTF8`, `PYTHONSAFEPATH`, `PYTHONNOUSERSITE`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONINTMAXSTRDIGITS`, `PYTHONIOENCODING`, `TZ` | only if declared (strict) | **yes** (reported as read by every file) |
 | pytest hashed-if-present: every `PYTHON*` and `PYTEST_*` except `PYTHONPATH` (the interpreter reads many in C: `PYTHON_CPU_COUNT`, `PYTHONBREAKPOINT`, `PYTHON_GIL`, ...) | only if declared (strict) | **yes, whenever present** (loose mode, or declared) |
+| node:test, declared automatically: `NODE_ENV` and every variable the test script assigns (`NODE_ENV=test node --test ...`; the script's value is set for the test processes) | yes | yes |
+| node:test hashed-if-present: every other `NODE_*` (Node reads `NODE_PATH`, `NODE_PRESERVE_SYMLINKS`, `NODE_EXTRA_CA_CERTS`, `NODE_ICU_DATA`, ... natively) except `NODE_OPTIONS` (hashed as a global input), and `UV_THREADPOOL_SIZE` | only if declared (strict) | **yes, whenever present** |
+| node:test always-read: `TZ`, `LANG`, `LC_ALL`, `LC_MESSAGES` (ICU reads them natively for the local time zone and the default locale; `de_DE` formats `1234.5` as `1.234,5`). An unset `TZ` refuses every file (the machine's zone is not an input), so set `TZ` the same on both sides (`TZ=UTC`, declared in `global` as the template does); `LANG` is built-in pass-through, so a laptop's `en_US.UTF-8` and a runner's `C.UTF-8` differ: set the same value on both sides (`LANG=C.UTF-8`) for files to skip there | only if declared or pass-through (strict) | **yes** (reported as read by every file) |
+| node:test run-specific, set by vci: `VCI_OUT`, `VCI_TEST_FILE`, `VCI_ROOT` (`NODE_TEST_CONTEXT` and `NODE_TEST_WORKER_ID` are node:test's own and are removed from vci's environment) | yes (set per run) | never |
 | Undeclared, strict mode | **no** (removed from the child environment) | recorded as absent if read |
 | Undeclared, loose mode | yes | yes, **if the test file was observed reading it** |
 | `TZ`, loose mode | yes | **always** (set or not): ICU reads it natively, never through the `process.env` proxy |
@@ -76,6 +80,13 @@ example in `define`), an inline plugin or a globalSetup file counts as read by e
 mode removes them: add them to `pass_through` or `global` to keep them.
 
 `NODE_OPTIONS` is pass-through because vci sets it, but if the user's value is non-empty it is hashed as part of the toolchain digest.
+For node:test it is hashed as a global input too, and a value with anything but memory, warning and stack-trace
+options refuses every file (it reaches every process before vci's collector); the collector checks the value each
+process actually has as well, so `NODE_OPTIONS` from an `--env-file`, or set by a `--require` preload of the `node
+--test` process for the file's process, is held to the same rule. `.npmrc` `node-options` (which `npm run` hands the
+script as `NODE_OPTIONS`) with anything else refuses the whole project. Variables a node:test script only
+expands in its options (`${TEST_CONCURRENCY:+--test-concurrency=$TEST_CONCURRENCY}`) are not hashed: their effect is
+the option list recorded in the attestation's argv (and `--test-concurrency` is dropped, as each file runs alone).
 
 Built-in pass-through variables are visible so that tooling works, not because their values cannot matter: `CI`,
 `HOME`, `USER`, `TMPDIR`, `LANG` differ between a laptop and a CI runner by definition. A test file observed reading

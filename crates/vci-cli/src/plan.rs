@@ -407,7 +407,7 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             run_all,
             dir: p.dir.clone(),
             child_env: Some(child),
-            adapter_options: p.adapter_options,
+            adapter_options: p.adapter_options.clone(),
         });
     }
     mark_cross_project_ambiguity(&mut files);
@@ -570,7 +570,7 @@ fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) 
                 run_all: Some(reason.clone()),
                 dir: p.dir.clone(),
                 child_env: Some(child),
-                adapter_options: p.adapter_options,
+                adapter_options: p.adapter_options.clone(),
             });
         }
         res.files = files.iter().map(|f| verdict_run(f, &reason)).collect();
@@ -833,6 +833,14 @@ impl Verifier<'_> {
         let tc = &p.core.toolchain;
         let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
         let mut tdiff = tc.diff(&now_tc);
+        // policy.node_exact: the exact Node version, not only its major.
+        if self.project.policy.node_exact && !tc.node.is_empty() && tc.node != now_tc.node {
+            tdiff.push((
+                "node (policy.node_exact)",
+                tc.node.clone(),
+                now_tc.node.clone(),
+            ));
+        }
         let platform = self.project.policy.platform_for(&f.project_rel);
         tdiff.extend(platform_diff(
             platform,

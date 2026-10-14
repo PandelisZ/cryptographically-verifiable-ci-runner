@@ -1,0 +1,12 @@
+{
+  "name": "@fx/web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@fx/lib": "workspace:*",
+    "ms": "2.1.3"
+  }
+}

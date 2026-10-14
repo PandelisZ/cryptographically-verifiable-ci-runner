@@ -36,7 +36,7 @@ enum Format {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Write vci.toml, .vci/allowed_signers and .git-meta, configure the git-meta remote, install @vci/vitest (Vitest), print a CI snippet.
+    /// Write vci.toml, .vci/allowed_signers and .git-meta, configure the git-meta remote, install @vci/vitest (Vitest), print a CI snippet (node-test: no install).
     Init {
         /// Add this public key (or private key with a .pub next to it) to allowed_signers.
         #[arg(long)]
@@ -47,7 +47,7 @@ enum Cmd {
         /// Project directory relative to the repo root.
         #[arg(long)]
         project: Option<String>,
-        /// Test runner adapter: vitest (default), pytest, go, cargo or rails.
+        /// Test runner adapter: vitest (default), pytest, go, cargo, rails or node-test.
         #[arg(long)]
         adapter: Option<String>,
         /// Do not run npm install.

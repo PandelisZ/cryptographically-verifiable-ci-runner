@@ -13,7 +13,7 @@ RUN  services/billing              (no valid attestation (1 candidates; best fai
 2 to skip, 2 to run
 ```
 
-Works with **Vitest, pytest, Go, Cargo, Rails (Minitest) and RSpec**, on macOS and Linux. MIT.
+Works with **Vitest, node:test (`node --test`), pytest, Go, Cargo, Rails (Minitest) and RSpec**, on macOS and Linux. MIT.
 
 ![A change made in an agent's sandbox is attested, pushed through git, verified and skipped by CI](site/assets/walkthrough.gif)
 
@@ -103,7 +103,7 @@ You also need the toolchain for the test runner you use (Node and Vitest, uv and
 In your repository, once:
 
 ```sh
-vci init --adapter pytest --key ~/.ssh/id_ed25519.pub   # or vitest, go, cargo, rails
+vci init --adapter pytest --key ~/.ssh/id_ed25519.pub   # or vitest, node-test, go, cargo, rails
 git add vci.toml .vci/allowed_signers .git-meta && git commit -m "Enable vci"
 # Merge this to your default branch: trust is read from there.
 ```
@@ -129,6 +129,7 @@ The action downloads a prebuilt `vci`, fetches the attestations, prints the plan
 | Adapter | Unit that can be skipped | Inputs found by |
 |---|---|---|
 | `vitest` | test file | observing the module graph, file and env reads |
+| `node-test` | test file (`node --test`, options read from the package.json script) | Node's module hooks, file and env reads |
 | `pytest` | test file | Python audit hooks and the import system |
 | `go` | package | `go list` plus a logger built into the test binary |
 | `cargo` | test target (`crates/x#lib`, `#test:name`) | conservative: every file of the crate and its in-repo dependencies |

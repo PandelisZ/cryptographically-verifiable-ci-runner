@@ -4,7 +4,7 @@
 //! files. Present files are recorded as reads, missing ones as probes, so that
 //! creating one later also changes the global input root.
 //!
-//! Also the per-module context ([`module_context`]): the nearest
+//! Also the per-module context ([`module_context_with`]): the nearest
 //! `package.json` and `tsconfig.json` of every module a test loaded, which
 //! drive how its imports resolve (`imports`, `exports`, `main`, `type`) and
 //! how it is transformed.
@@ -54,6 +54,34 @@ impl Collector<'_> {
         };
         self.out.insert(rp, obs);
         Ok(exists)
+    }
+
+    /// A whole directory tree: the directory listings and every file (a
+    /// missing directory is a probe). Symlinks are recorded as reads.
+    fn observe_tree(&mut self, dir: &Utf8Path) -> Result<()> {
+        let mut stack = vec![dir.to_owned()];
+        let mut n = 0usize;
+        while let Some(d) = stack.pop() {
+            n += 1;
+            if n > 10_000 {
+                bail!("{dir} has more than 10000 entries");
+            }
+            let meta = std::fs::symlink_metadata(&d);
+            if !meta.as_ref().is_ok_and(|m| m.is_dir()) {
+                self.observe(&d)?;
+                continue;
+            }
+            let rp = RepoPath::from_abs(self.repo_root, &d)
+                .with_context(|| format!("global input {d} is outside the repository"))?;
+            self.out.insert(rp, Observation::ReadDir);
+            for e in std::fs::read_dir(&d).with_context(|| format!("listing {d}"))? {
+                let e = e?;
+                let p = Utf8PathBuf::from_path_buf(e.path())
+                    .map_err(|p| anyhow::anyhow!("non-UTF-8 path {}", p.display()))?;
+                stack.push(p);
+            }
+        }
+        Ok(())
     }
 
     fn tsconfig(&mut self, file: &Utf8Path, depth: usize) -> Result<()> {
@@ -228,9 +256,12 @@ fn relative_literals(src: &str) -> Vec<String> {
 /// The nearest `package.json` and `tsconfig.json` (with its `extends` chain)
 /// of every module under `repo_root` (outside node_modules). Missing files
 /// between a module and the nearest one are probes, so adding one is noticed.
-pub fn module_context<'a>(
+/// The tsconfig.json chains are recorded only when `tsconfig` (Vitest; node-test with a
+/// TypeScript loader: Node's type stripping reads no tsconfig).
+pub fn module_context_with<'a>(
     repo_root: &Utf8Path,
     modules: impl IntoIterator<Item = &'a Utf8Path>,
+    tsconfig: bool,
 ) -> Result<Vec<(RepoPath, Observation)>> {
     let mut c = Collector {
         repo_root,
@@ -252,6 +283,9 @@ pub fn module_context<'a>(
             ("package.json", &mut pj_done),
             ("tsconfig.json", &mut ts_done),
         ] {
+            if name == "tsconfig.json" && !tsconfig {
+                continue;
+            }
             let mut dir = m.parent();
             while let Some(d) = dir {
                 if !d.starts_with(repo_root) || !done.insert(d.to_owned()) {
@@ -435,6 +469,58 @@ fn rails_observations(
     Ok(())
 }
 
+/// Global observations for a node:test file: `vci.toml`; `package.json`,
+/// lockfiles, `pnpm-workspace.yaml`, `.npmrc` and the `patches/` tree
+/// (patch-package, pnpm patches) from the project dir up to the repo root;
+/// the files the test command preloads (`--import`,
+/// `--require`) with the files they name by relative path, and its
+/// `--env-file`s; with a TypeScript loader the `tsconfig.json` chain from the
+/// test's directory up; and the test's default snapshot file
+/// (`<file>.snapshot`). Present files are reads, missing ones probes.
+fn node_test_observations(
+    c: &mut Collector,
+    repo_root: &Utf8Path,
+    adapter: &dyn Adapter,
+    test_abs: &Utf8Path,
+) -> Result<()> {
+    let project_dir = adapter.project_dir();
+    let mut dir = Some(project_dir);
+    while let Some(d) = dir {
+        for n in PACKAGE_FILES {
+            c.observe(&d.join(n))?;
+        }
+        // What patch-package (an accepted install script) applies to
+        // node_modules, whose packages are identified only by version.
+        c.observe_tree(&d.join("patches"))?;
+        if d == repo_root || !d.starts_with(repo_root) {
+            break;
+        }
+        dir = d.parent();
+    }
+    for p in adapter.config_candidates() {
+        if c.observe(&p)? {
+            c.config_refs(&p, 0)?;
+        }
+    }
+    if adapter.tsconfig_is_input() {
+        let mut dir = test_abs.parent();
+        while let Some(d) = dir {
+            let ts = d.join("tsconfig.json");
+            if c.observe(&ts)? {
+                c.tsconfig(&ts, 0)?;
+            }
+            if d == repo_root || !d.starts_with(repo_root) {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    for s in adapter.snapshot_candidates(test_abs) {
+        c.observe(&s)?;
+    }
+    Ok(())
+}
+
 /// Global observations for the test file at `test_abs`.
 pub fn observations(
     repo_root: &Utf8Path,
@@ -450,6 +536,10 @@ pub fn observations(
     c.observe(&repo_root.join(CONFIG_FILE))?;
     match adapter.name() {
         "vitest" => {}
+        "node-test" => {
+            node_test_observations(&mut c, repo_root, adapter, test_abs)?;
+            return Ok(c.out.into_iter().collect());
+        }
         "pytest" => {
             pytest_observations(&mut c, repo_root, project_dir, test_abs)?;
             return Ok(c.out.into_iter().collect());
@@ -723,6 +813,37 @@ mod tests {
             None,
             "only the project's bundle"
         );
+    }
+
+    /// Regression: a postinstall (patch-package) that changes an installed
+    /// package's code from `patches/` is identified by version only, so the
+    /// patches are a global input of every node:test file.
+    #[test]
+    fn node_test_patches_are_global_inputs() {
+        let (_t, root) = tmp_repo();
+        write(
+            &root,
+            "package.json",
+            r#"{"scripts":{"postinstall":"patch-package"}}"#,
+        );
+        write(&root, "patches/ms+2.1.3.patch", "--- a\n+++ b\n");
+        write(
+            &root,
+            "web/package.json",
+            r#"{"scripts":{"test":"node --test"}}"#,
+        );
+        let adapter = vci_adapter::NodeTestAdapter::new(&root.join("web"));
+        let obs = observations(&root, &adapter, &root.join("web/a.test.mjs")).unwrap();
+        assert_eq!(
+            find(&obs, "patches"),
+            Some(&Observation::ReadDir),
+            "{obs:?}"
+        );
+        assert_eq!(
+            find(&obs, "patches/ms+2.1.3.patch"),
+            Some(&Observation::Read)
+        );
+        assert_eq!(find(&obs, "web/patches"), Some(&Observation::Probe));
     }
 
     #[test]

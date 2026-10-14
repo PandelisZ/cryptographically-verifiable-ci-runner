@@ -192,7 +192,8 @@ pub struct ToolVersions { pub node: String, pub runner: String, pub bundler: Str
                          pub cargo: String, pub rust_host: String, pub rust_cfg: Vec<String> /* Cargo; runner = rustc */,
                          pub ruby: String, pub ruby_engine: String, pub rails: String, pub ruby_bundler: String,
                          pub ruby_libs: String, pub ruby_db: String, pub ruby_gems: Vec<String> /* Rails; runner = "minitest <ver>[; rspec-core <ver>, ...]" */ }
-pub struct AdapterOptions { pub rails_allow_db: bool, pub rails_runner: Option<RailsRunner> }   // settings that change how an adapter runs tests
+pub struct AdapterOptions { pub rails_allow_db: bool, pub rails_runner: Option<RailsRunner>, pub node_test: NodeTestOptions }   // settings that change how an adapter runs tests (Clone, not Copy)
+pub struct NodeTestOptions { pub test_script: Option<String>, pub test_globs: Option<Vec<String>>, pub node_args: Option<Vec<String>> }   // vci.toml keys of a node-test project
 pub enum RailsRunner { Minitest, Rspec }   // vci.toml `runner` ("minitest" | "rspec") of a rails project
 pub type InstalledExternals = BTreeMap<String, Vec<String>>;   // PEP 503 name -> installed versions
 pub struct Observed {            // one per collector JSONL file; anything unexpected becomes a taint
@@ -228,6 +229,9 @@ pub trait Adapter: Send + Sync {
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError>;
     fn run_plain(&self, files: &[String], env: &ChildEnv) -> Result<Option<i32>, AdapterError>;
     fn scratch_dirs(&self) -> Vec<Utf8PathBuf>;   // default: []; Cargo: the target dir (not snapshotted by `vci run`)
+    fn declared_env(&self) -> Vec<String>;        // default: []; node-test: NODE_ENV + the test script's assignments (added to [env] global)
+    fn forced_env(&self) -> Vec<(String, String)>; // default: []; node-test: the script's assignments, set in every test process and in the hashed child env
+    fn tsconfig_is_input(&self) -> bool;          // default: true; node-test: only with a TypeScript loader preloaded
 }
 pub struct VitestAdapter;  // VitestAdapter::new(project_dir).with_js_plugin(dir)
 pub fn find_js_plugin(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_JS_PLUGIN, else node_modules/@vci/vitest
@@ -235,7 +239,7 @@ pub struct PytestAdapter;  // PytestAdapter::new(project_dir).with_py_plugin(dir
 pub fn find_py_plugin(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_PY_PLUGIN, else py/pytest-plugin near the exe / build checkout / project
 pub struct GoAdapter;      // GoAdapter::new(project_dir); `go` from $VCI_GO
 pub struct CargoAdapter;   // CargoAdapter::new(project_dir); `cargo` from $VCI_CARGO
-pub fn adapter_for(name: &str, project_dir: &Utf8Path) -> Result<Box<dyn Adapter>, AdapterError>; // "vitest" | "pytest" | "go" | "cargo" | "rails"
+pub fn adapter_for(name: &str, project_dir: &Utf8Path) -> Result<Box<dyn Adapter>, AdapterError>; // "vitest" | "pytest" | "go" | "cargo" | "rails" | "node-test"
 pub fn adapter_for_with(name: &str, project_dir: &Utf8Path, opts: &AdapterOptions) -> Result<Box<dyn Adapter>, AdapterError>;
 pub struct RailsAdapter;   // RailsAdapter::new(project_dir).with_collector(dir).with_allow_db(bool).with_runner(Option<RailsRunner>); `ruby` from $VCI_RUBY
 pub fn find_ruby_collector(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_RUBY_COLLECTOR, else ruby/vci-collector near the exe / build checkout / project
@@ -353,6 +357,38 @@ metadata` `workspace_root`) and hold `Cargo.lock`. All commands run with cwd = p
 - `canonical_argv`: `["cargo", "test", "--locked", "--manifest-path", "<pkg>/Cargo.toml", <selector>...]`;
   `config_candidates`: `Cargo.toml`, `Cargo.lock`; built-in pass-through `CARGO_PASS_THROUGH`; hashed patterns
   `CARGO_HASHED_ENV`; `scratch_dirs`: the target dir.
+
+### node:test adapter
+
+The unit is a test file of a package that runs `node --test` (`adapter = "node-test"`; `NodeTestAdapter::new(project_dir)
+.with_options(NodeTestOptions)`, `node` from `$VCI_NODE`). The test command (`Invocation`: assignments, kept node
+options, patterns, preloads, env files) comes from the package.json script `test_script` (default `"test"`), read
+with a strict `sh` subset (`parse_node_test_script`), or from `test_globs` + `node_args`; anything not understood is
+an error of `list_test_files` (so `vci plan` runs everything) and of `run_collect`. All commands run with cwd = project
+dir, the child env applied and the script's assignments set:
+
+- `list_test_files`: `node <type-stripping options> --no-warnings --input-type=module -e <list.js> -- <project dir>
+  <patterns…>` (`js/vitest-plugin/src/node-test/list.js`, embedded): Node's `fs.globSync` with node:test's exclusion
+  of `node_modules` and its default pattern (TypeScript extensions when `process.features.typescript`). A pattern that
+  is a directory, a match that is not a file, or node:test's "Could not find" is an error.
+- `tool_versions_with_env`: `node --version`; `runner` = `node` = that version.
+- `run_collect`: per file (`$VCI_JOBS` at a time), `VCI_OUT=<fresh dir> VCI_TEST_FILE=<abs> VCI_ROOT=<project dir>
+  node --require <plugin>/src/node-test/preload.cjs <options> --import <plugin>/src/node-test/late.js
+  --test-reporter=<plugin>/src/node-test/reporter.js --test-reporter-destination=<dir>/reporter.out
+  --test-reporter=spec --test-reporter-destination=stderr --test <file, glob-escaped>` (`NODE_TEST_CONTEXT` and
+  `NODE_TEST_WORKER_ID` removed). The reporter writes the file's JSONL; a `passed` result of a process that exited
+  non-zero gets the taint `vci:process-exit:<code>`, and `NODE_OPTIONS` with options other than memory, warning and
+  stack-trace ones taints every file.
+- `run_plain`: with files, `node <options> --test-reporter=spec --test <file>` per file; without, the package manager's
+  `run <script>` (`packageManager`, else the nearest lockfile; npm by default), or `node <node_args> --test <globs>`.
+- `canonical_argv`: `["node", <kept options, normalised as --name=value>..., "--test", <file>]` (an unusable command:
+  `["node", "--vci-unsupported-command", <file>]`); `config_candidates`: the preloaded files and `--env-file`s;
+  `snapshot_candidates`: `<file>.snapshot`; hashed patterns `NODE_*`, `!NODE_OPTIONS`, `UV_THREADPOOL_SIZE`.
+
+Collector records (`js/vitest-plugin/src/node-test/`): `meta` has `adapter: "node-test"` and `node`; records as for
+Vitest (`module` via `node-hooks`, `external`, `read`, `probe`, `readdir`, `env`, `taint`) plus `write` (paths the
+test created, changed or removed, as for pytest); `result` has `state` (`passed`, `failed`, `no-tests`), `tests`,
+`failed`, `skipped` (skipped and todo tests and suites) and `todo`.
 
 ### Rails adapter
 

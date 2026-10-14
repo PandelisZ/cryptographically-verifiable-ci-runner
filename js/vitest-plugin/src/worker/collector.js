@@ -15,6 +15,12 @@
 // file (bundled by Vite into a `*.timestamp-*` module), inline plugins, globalSetup files and
 // anything else outside node_modules. Those records are kept in memory and attributed to every
 // test file of the run by the reporter.
+//
+// Mode "node-test" (installed by src/node-test/preload.js in the child process `node --test`
+// starts for one test file): every record belongs to that one file (VCI_TEST_FILE). It also
+// reports writes (`write` records), `module.register` calls, `process.exit` calls, and resolves
+// modules reached through a linked workspace package (node_modules symlink into the repository)
+// to their real path, so in-repository code is never identified by a package version.
 
 import fs from "node:fs";
 import module from "node:module";
@@ -39,6 +45,9 @@ import {
   isInNodeModules,
   isInternalPath,
   isUnder,
+  linkedPackagePath,
+  localCopyPackage,
+  nodeOptionsProblems,
   packageOf,
   resolutionCandidates,
   sha256,
@@ -67,10 +76,11 @@ const orig = {
  * @property {string} partsDir
  * @property {string[]} ignoreDirs
  * @property {string} root
+ * @property {string} [file] node-test mode: the absolute path of the one test file
  */
 
 class Collector {
-  /** @param {WorkerConfig} cfg @param {{preload: boolean, mode?: "worker" | "main"}} opts */
+  /** @param {WorkerConfig} cfg @param {{preload: boolean, mode?: "worker" | "main" | "node-test"}} opts */
   constructor(cfg, opts) {
     this.cfg = cfg;
     this.mode = opts.mode || "worker";
@@ -92,9 +102,11 @@ class Collector {
     this.selfDirs = [];
     this.runnerAttached = false;
     this.hooks = false;
+    /** node-test: the `node --test` process (main mode, every non-node: frame is user code). */
+    this.nodeTestParent = false;
     /** @type {any} */
     this.rpcWrapped = null;
-    if (this.mode === "worker") {
+    if (this.mode !== "main") {
       try {
         orig.mkdirSync(this.partsDir, { recursive: true });
       } catch {
@@ -104,6 +116,7 @@ class Collector {
   }
 
   currentFile() {
+    if (this.mode === "node-test") return this.cfg.file || null;
     const st = /** @type {any} */ (globalThis).__vitest_worker__;
     const f = st && st.filepath;
     return typeof f === "string" && f ? f : null;
@@ -246,6 +259,9 @@ class Collector {
    * @param {string} f '/'-normalised file of a stack frame
    */
   isInternalFrame(f) {
+    // node:test runs entirely in node: internals; every other frame is user code (test files,
+    // their imports, --import hooks, packages).
+    if (this.mode === "node-test" || this.nodeTestParent) return false;
     if (this.mode === "main") {
       if (CONFIG_BUNDLE_RE.test(f)) return false;
       return isInNodeModules(f);
@@ -278,6 +294,8 @@ class Collector {
    */
   shouldRecordFs(abs, kind) {
     if (this.isSelfProduced(abs)) return false;
+    // node-test: Node's loader reading vci's own preloads.
+    if (this.mode === "node-test" && toSlash(abs).startsWith(PKG_DIR + "/")) return false;
     if (kind !== "readdir" && this.isSelfDirAncestor(abs)) return false;
     const s = this.stack();
     // Node's fs.cp stats and reads while copying; the patched cp records the source tree.
@@ -297,19 +315,113 @@ class Collector {
   }
 
   /**
+   * An installed package: `name@version`, unless it is a copy of a repository directory (its
+   * version does not change with that directory's content).
+   * @param {string} abs a file of the package
+   * @param {{name: string, version: string}} pkg
+   */
+  emitExternal(abs, pkg) {
+    let local = null;
+    try {
+      local = localCopyPackage(abs);
+    } catch {
+      local = null;
+    }
+    if (local) {
+      this.emit({ kind: "taint", reason: `external-local-directory:${local} (a copy of a repository directory, identified only by its version)` });
+    } else {
+      this.emit({ kind: "external", name: pkg.name, version: pkg.version });
+    }
+  }
+
+  /**
    * @param {"read" | "probe" | "readdir"} kind
    * @param {string} abs
    */
   recordPath(kind, abs) {
+    abs = this.unlinked(abs);
     const pkg = packageOf(abs);
     if (pkg === undefined) {
       this.emit({ kind, path: abs });
     } else if (pkg) {
-      this.emit({ kind: "external", name: pkg.name, version: pkg.version });
+      this.emitExternal(abs, pkg);
     } else if (kind === "probe") {
       this.emit({ kind, path: abs });
     } else {
       this.emit({ kind: "taint", reason: `external-without-version:${abs}` });
+    }
+  }
+
+  /**
+   * node-test: a path below a linked workspace package's `node_modules` entry, as the real path
+   * (repository content, not an external). Other modes: unchanged.
+   * @param {string} abs
+   */
+  unlinked(abs) {
+    if (this.mode !== "node-test") return abs;
+    const wasBusy = this.busy;
+    this.busy = true;
+    try {
+      return linkedPackagePath(abs) || abs;
+    } catch {
+      return abs;
+    } finally {
+      this.busy = wasBusy;
+    }
+  }
+
+  /**
+   * node-test: a path the test created, changed or removed (`write` record). The Rust side
+   * refuses a file that wrote inside the repository.
+   * @param {any} p
+   */
+  onWrite(p) {
+    if (this.mode !== "node-test" || this.busy) return;
+    const abs = argPath(p);
+    if (!abs) return;
+    this.busy = true;
+    try {
+      this.emit({ kind: "write", path: linkedPackagePath(abs) || abs });
+    } catch {
+      // never break the test because of the collector
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /**
+   * The file of the nearest stack frame that is neither Node-internal nor ours.
+   * @returns {string | null}
+   */
+  nearestFrameFile() {
+    const E = /** @type {any} */ (Error);
+    const prevLimit = E.stackTraceLimit;
+    const prevPrep = E.prepareStackTrace;
+    try {
+      E.stackTraceLimit = STACK_LIMIT;
+      E.prepareStackTrace = (/** @type {any} */ _e, /** @type {any[]} */ s) => s;
+      const holder = /** @type {any} */ ({});
+      E.captureStackTrace(holder);
+      for (const cs of holder.stack || []) {
+        let f = cs.getFileName() || cs.getScriptNameOrSourceURL?.();
+        if (!f || f.startsWith("node:")) continue;
+        if (f.startsWith("file://")) {
+          try {
+            f = fileURLToPath(f);
+          } catch {
+            // keep the URL
+          }
+        }
+        f = toSlash(f);
+        if (f.startsWith(PKG_DIR + "/")) continue;
+        return f;
+      }
+      return null;
+    } catch {
+      return null;
+    } finally {
+      E.stackTraceLimit = prevLimit;
+      E.prepareStackTrace = prevPrep;
     }
   }
 
@@ -320,7 +432,7 @@ class Collector {
     try {
       const s = this.stack();
       const user = s.syncUser || s.asyncUser;
-      if (user || (this.mode === "worker" && !s.internal)) this.emit({ kind: "taint", reason });
+      if (user || (this.mode !== "main" && !s.internal)) this.emit({ kind: "taint", reason });
     } finally {
       this.busy = false;
     }
@@ -416,6 +528,7 @@ class Collector {
   /** @param {any} dir */
   markTempDir(dir) {
     if (typeof dir !== "string" || !dir) return;
+    this.onWrite(dir);
     const abs = toSlash(path.resolve(dir));
     this.selfDirs.push(abs);
     // Also the canonical form (os.tmpdir() is /var/... -> /private/var/... on macOS).
@@ -544,7 +657,7 @@ class Collector {
     try {
       const pkg = packageOf(p);
       if (pkg === undefined) this.emit({ kind: "module", path: p, via: "runner" });
-      else if (pkg) this.emit({ kind: "external", name: pkg.name, version: pkg.version });
+      else if (pkg) this.emitExternal(p, pkg);
       else this.emit({ kind: "taint", reason: `external-without-version:${p}` });
     } finally {
       this.busy = wasBusy;
@@ -575,7 +688,7 @@ class Collector {
     if (typeof spec === "string" && parentURL && parentURL.startsWith("file:") && !isInNodeModules(toSlash(parentURL))) {
       let base = null;
       try {
-        if (spec.startsWith("./") || spec.startsWith("../")) base = path.resolve(path.dirname(fileURLToPath(parentURL)), spec);
+        if (spec.startsWith("./") || spec.startsWith("../")) base = path.resolve(parentDir(parentURL), spec);
         else if (spec.startsWith("file:")) base = fileURLToPath(spec);
         else if (path.isAbsolute(spec)) base = spec;
       } catch {
@@ -585,7 +698,7 @@ class Collector {
     }
     let p;
     try {
-      p = fileURLToPath(url);
+      p = this.unlinked(fileURLToPath(url));
     } catch {
       return;
     }
@@ -595,12 +708,28 @@ class Collector {
     this.busy = true;
     try {
       const pkg = packageOf(p);
-      if (pkg === undefined) this.emit({ kind: "module", path: p, via: "node-hooks" });
-      else if (pkg) this.emit({ kind: "external", name: pkg.name, version: pkg.version });
+      if (pkg === undefined) {
+        this.emit({ kind: "module", path: p, via: "node-hooks" });
+        if (typeof spec === "string" && isBareSpecifier(spec)) this.recordProbedBy(p);
+      } else if (pkg) this.emitExternal(p, pkg);
       else this.emit({ kind: "taint", reason: `external-without-version:${p}` });
     } finally {
       this.busy = false;
     }
+  }
+
+  /**
+   * A bare or aliased specifier (a workspace package without `exports`, a legacy `main`, an alias
+   * resolver calling Node's own resolution) that resolved to `file` in the repository: Node may
+   * have probed other files first (`X`, `X.js`, ... before `X/index.js`; the other extensions of an
+   * extensionless request). Record those candidates, so that creating one is noticed.
+   * @param {string} file
+   */
+  recordProbedBy(file) {
+    const ext = path.extname(file);
+    const stem = ext ? file.slice(0, -ext.length) : file;
+    this.recordCandidates(stem);
+    if (path.basename(stem) === "index") this.recordCandidates(path.dirname(stem));
   }
 
   /** @param {string} spec @param {string | undefined} parentURL */
@@ -612,8 +741,7 @@ class Collector {
       if (spec.startsWith("file:")) base = fileURLToPath(spec);
       else if (path.isAbsolute(spec)) base = spec;
       else if (spec.startsWith("./") || spec.startsWith("../") || spec === "." || spec === "..") {
-        const parent = parentURL && parentURL.startsWith("file:") ? fileURLToPath(parentURL) : path.join(process.cwd(), "x");
-        base = path.resolve(path.dirname(parent), spec);
+        base = path.resolve(parentURL && parentURL.startsWith("file:") ? parentDir(parentURL) : process.cwd(), spec);
       }
     } catch {
       base = null;
@@ -621,7 +749,13 @@ class Collector {
     if (!base) return; // bare specifiers: covered by the lockfile / package.json global inputs
     this.busy = true;
     try {
-      for (const c of resolutionCandidates(base)) this.emit({ kind: "probe", path: c });
+      // A candidate that exists although this resolution failed (a hook retrying with a suffix,
+      // Node not trying extensions) is recorded as a read, not a probe.
+      for (const c of resolutionCandidates(base)) {
+        if (this.isSelfProduced(c)) continue;
+        const kind = candidateKind(c);
+        if (kind) this.emit({ kind, path: this.unlinked(c) });
+      }
     } finally {
       this.busy = false;
     }
@@ -748,6 +882,33 @@ class Collector {
       if (node && (node.evaluated || node.promise || node.exports)) this.onRunnerModule(node.file || id);
     }
   }
+}
+
+/**
+ * The directory a relative specifier is resolved against: the importing module's directory, or
+ * the URL itself when it names a directory (`--import ./x.mjs` is resolved against
+ * `file:///<cwd>/`).
+ * @param {string} parentURL a file: URL
+ */
+function parentDir(parentURL) {
+  const p = fileURLToPath(parentURL);
+  return parentURL.endsWith("/") ? p : path.dirname(p);
+}
+
+/**
+ * A specifier Node resolves through packages, `imports` or a custom resolver (not a path, a URL
+ * or a builtin).
+ * @param {string} spec
+ */
+function isBareSpecifier(spec) {
+  return !(
+    spec.startsWith("./") ||
+    spec.startsWith("../") ||
+    spec === "." ||
+    spec === ".." ||
+    path.isAbsolute(spec) ||
+    /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(spec)
+  );
 }
 
 /** @param {any} p */
@@ -1178,6 +1339,15 @@ function patchNativeReaders(c) {
       return res;
     },
   );
+  // process.binding('fs') (deprecated) reads files natively, beside every fs patch.
+  for (const n of ["binding", "_linkedBinding"]) {
+    patch(process, n, (o) =>
+      function (/** @type {any[]} */ ...args) {
+        c.taint(`process.${n}:${String(args[0])}`);
+        return Reflect.apply(o, this, args);
+      },
+    );
+  }
   // node:sqlite is patched when it is first loaded (loading it early would print its
   // experimental warning on older Node versions): see registerResolveHooks and getBuiltinModule.
   patch(process, "getBuiltinModule", (o) =>
@@ -1201,10 +1371,11 @@ function patchSqlite(c) {
     const sqlite = getBuiltin && (getBuiltin.__vciOrig || getBuiltin)("node:sqlite");
     if (!sqlite) return;
     for (const name of ["DatabaseSync", "Database"]) {
+      patchSqlStatements(c, sqlite[name] && sqlite[name].prototype);
       patch(sqlite, name, (o) => {
         const w = function (/** @type {any[]} */ ...args) {
-          const p = args[0];
-          if (p != null && p !== ":memory:" && p !== "") {
+          const p = sqliteFile(args[0]);
+          if (p != null) {
             const ctx = c.pre("read", p);
             c.post(ctx, true, true);
           }
@@ -1227,6 +1398,93 @@ function patchSqlite(c) {
   } finally {
     c.busy = wasBusy;
   }
+}
+
+/** SQL that makes SQLite open another file natively (or load code). */
+const SQL_FILE_RE = /\b(attach|load_extension)\b|\bvacuum\b[\s\S]*\binto\b/i;
+
+/**
+ * The file a node:sqlite database name opens, or null for an in-memory database. SQLite reads a
+ * `file:` name as a URI relative to the working directory (`file:data/db.sqlite?mode=ro`).
+ * @param {any} name
+ * @returns {any}
+ */
+function sqliteFile(name) {
+  if (name == null || name === "" || name === ":memory:") return null;
+  if (typeof name !== "string" || !name.startsWith("file:")) return name;
+  const q = name.indexOf("?");
+  const query = q < 0 ? "" : name.slice(q + 1).replace(/#.*$/, "");
+  if (/(^|&)mode=memory(&|$)/.test(query)) return null;
+  let rest = name.slice(5).replace(/[?#].*$/, "");
+  if (rest.startsWith("//")) {
+    const i = rest.indexOf("/", 2);
+    const host = rest.slice(2, i < 0 ? undefined : i);
+    // Another host: never a file of the repository (recorded as given, outside it).
+    if (host && host !== "localhost") return `//${host}/`;
+    rest = i < 0 ? "/" : rest.slice(i);
+  }
+  try {
+    rest = decodeURIComponent(rest);
+  } catch {
+    // keep it as written
+  }
+  if (rest === "" || rest === ":memory:") return null;
+  return path.resolve(rest);
+}
+
+/**
+ * node:sqlite statements: SQL that attaches another database (`ATTACH`), writes one (`VACUUM
+ * INTO`) or loads an extension is read natively, where vci sees nothing: taint.
+ * @param {Collector} c
+ * @param {any} proto DatabaseSync.prototype (or Database.prototype)
+ */
+function patchSqlStatements(c, proto) {
+  if (!proto) return;
+  /** @param {any} sql */
+  const check = (sql) => {
+    const text = Array.isArray(sql) ? sql.join(" ") : typeof sql === "string" ? sql : "";
+    const m = SQL_FILE_RE.exec(text);
+    if (m) c.taint(`sqlite:${m[1] ? m[1].toLowerCase() : "vacuum-into"} (SQLite opens files the SQL names natively)`);
+  };
+  for (const n of ["exec", "prepare"]) {
+    patch(proto, n, (o) =>
+      function (/** @type {any[]} */ ...args) {
+        check(args[0]);
+        return Reflect.apply(o, this, args);
+      },
+    );
+  }
+  patch(proto, "loadExtension", (o) =>
+    function (/** @type {any[]} */ ...args) {
+      c.taint("sqlite.loadExtension");
+      return Reflect.apply(o, this, args);
+    },
+  );
+  patch(proto, "enableLoadExtension", (o) =>
+    function (/** @type {any[]} */ ...args) {
+      if (args[0]) c.taint("sqlite.enableLoadExtension");
+      return Reflect.apply(o, this, args);
+    },
+  );
+  patch(proto, "createTagStore", (o) =>
+    function (/** @type {any[]} */ ...args) {
+      const store = Reflect.apply(o, this, args);
+      try {
+        const sp = store && Object.getPrototypeOf(store);
+        for (const n of ["get", "all", "iterate", "run"]) {
+          patch(sp, n, (f) =>
+            function (/** @type {any[]} */ ...a) {
+              check(a[0]);
+              return Reflect.apply(f, this, a);
+            },
+          );
+        }
+      } catch {
+        c.taint("vci:sqlite-tag-store-unpatched");
+      }
+      return store;
+    },
+  );
 }
 
 /** @param {any[]} args */
@@ -1329,12 +1587,28 @@ function proxyEnv(c) {
   }
 }
 
-/** @param {Collector} c */
-function registerResolveHooks(c) {
+/**
+ * @param {Collector} c
+ * @param {{load?: boolean}} [opts] also follow `load` (node-test: every URL a module is loaded from)
+ */
+function registerResolveHooks(c, opts = {}) {
   const reg = /** @type {any} */ (module).registerHooks;
   if (typeof reg !== "function") return false;
+  /** @type {any} */
+  const extra = {};
+  if (opts.load) {
+    extra.load = function (/** @type {string} */ url, /** @type {any} */ ctx, /** @type {Function} */ next) {
+      try {
+        c.onResolved(url, undefined);
+      } catch {
+        // ignore
+      }
+      return next(url, ctx);
+    };
+  }
   try {
     reg({
+      ...extra,
       resolve(/** @type {string} */ spec, /** @type {any} */ ctx, /** @type {Function} */ next) {
         if (spec === "node:sqlite" || spec === "sqlite") patchSqlite(c);
         let r;
@@ -1426,6 +1700,260 @@ export function installMain() {
   }
   c.emit({ kind: "vci-main" });
   return c;
+}
+
+/**
+ * node-test: every call that creates, changes or removes a path records a `write` (the paths at
+ * the given argument indexes; for `open`, only with a write flag).
+ * @param {Collector} c
+ */
+function patchWrites(c) {
+  const fsp = fs.promises;
+  /** @type {Array<[any, string, number[], number?]>} */
+  const specs = [];
+  /** @param {string} name @param {number[]} idx @param {number} [flagIdx] */
+  const all = (name, idx, flagIdx) => {
+    specs.push([fs, `${name}Sync`, idx, flagIdx], [fs, name, idx, flagIdx], [fsp, name, idx, flagIdx]);
+  };
+  all("appendFile", [0]);
+  all("writeFile", [0]);
+  all("mkdir", [0]);
+  all("rm", [0]);
+  all("rmdir", [0]);
+  all("unlink", [0]);
+  all("rename", [0, 1]);
+  all("copyFile", [1]);
+  all("cp", [1]);
+  all("link", [1]);
+  all("symlink", [1]);
+  all("truncate", [0]);
+  all("chmod", [0]);
+  all("lchmod", [0]);
+  all("chown", [0]);
+  all("lchown", [0]);
+  all("utimes", [0]);
+  all("lutimes", [0]);
+  all("open", [0], 1);
+  specs.push([fs, "createWriteStream", [0]]);
+  for (const [obj, name, idx, flagIdx] of specs) {
+    if (!obj) continue;
+    const o = obj[name];
+    if (typeof o !== "function" || o.__vciW) continue;
+    const w = function (/** @type {any[]} */ ...args) {
+      try {
+        if (flagIdx === undefined || (typeof args[flagIdx] !== "function" && isWriteFlag(args[flagIdx]))) {
+          for (const i of idx) c.onWrite(args[i]);
+        }
+      } catch {
+        // never break the test because of the collector
+      }
+      return Reflect.apply(o, this, args);
+    };
+    try {
+      Object.defineProperty(w, "name", { value: o.name });
+      Object.defineProperty(w, "length", { value: o.length });
+    } catch {
+      // ignore
+    }
+    for (const k of Object.keys(o)) {
+      if (!(k in w)) /** @type {any} */ (w)[k] = o[k];
+    }
+    /** @type {any} */ (w).__vciW = true;
+    try {
+      obj[name] = w;
+    } catch {
+      // non-writable: leave it
+    }
+  }
+}
+
+/**
+ * Packages whose `module.register` hooks are accepted (their configuration is a global input):
+ * those that only strip types or map extensions. tsx, @swc-node/register and
+ * @esbuild-kit/esm-loader resolve tsconfig `paths` on the hooks thread, trying targets in order
+ * where vci sees no probe, so their `module.register` is refused.
+ */
+const LOADER_PACKAGES = new Set(["ts-node", "amaro"]);
+
+/**
+ * node-test specifics: `process.exit` from user code (the rest of the file never runs, and node:test
+ * reports the file as one passing test), and `module.register` hooks, which run on another thread
+ * where nothing is observed (accepted only from known TypeScript loaders).
+ * @param {Collector} c
+ */
+function patchNodeTest(c) {
+  patch(process, "exit", (o) =>
+    function (/** @type {any[]} */ ...args) {
+      try {
+        if (!c.busy) {
+          c.busy = true;
+          try {
+            const s = c.stack();
+            if (s.syncUser || s.asyncUser) c.emit({ kind: "taint", reason: "process.exit" });
+          } finally {
+            c.busy = false;
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return Reflect.apply(o, this, args);
+    },
+  );
+  patch(module, "register", (o) =>
+    function (/** @type {any[]} */ ...args) {
+      try {
+        const wasBusy = c.busy;
+        c.busy = true;
+        try {
+          const from = c.nearestFrameFile();
+          const pkg = from ? packageOf(from) : undefined;
+          if (pkg && LOADER_PACKAGES.has(pkg.name)) {
+            c.emit({ kind: "external", name: pkg.name, version: pkg.version });
+          } else {
+            const spec = args[0] instanceof URL ? args[0].href : String(args[0]);
+            c.emit({ kind: "taint", reason: `module.register:${spec}` });
+          }
+        } finally {
+          c.busy = wasBusy;
+        }
+      } catch {
+        c.emit({ kind: "taint", reason: "module.register" });
+      }
+      return Reflect.apply(o, this, args);
+    },
+  );
+}
+
+/**
+ * Install the collector in the process `node --test` starts for one test file (from
+ * src/node-test/preload.js, loaded with `--require` before the user's preloads). Inert unless
+ * VCI_OUT and VCI_TEST_FILE are set and this is a node:test child process.
+ * @returns {Collector | null}
+ */
+export function installNodeTest() {
+  const g = /** @type {any} */ (globalThis);
+  if (g[KEY] !== undefined) return g[KEY];
+  const out = process.env.VCI_OUT;
+  const file = process.env.VCI_TEST_FILE;
+  if (!out || !file || process.env.NODE_TEST_CONTEXT === undefined || !workerThreads.isMainThread) {
+    g[KEY] = null;
+    return null;
+  }
+  const c = new Collector(
+    {
+      partsDir: path.join(out, ".vci-parts"),
+      ignoreDirs: [toSlash(out)],
+      root: process.env.VCI_ROOT || process.cwd(),
+      file: path.resolve(file),
+    },
+    { preload: true, mode: "node-test" },
+  );
+  g[KEY] = c;
+  c.busy = true;
+  try {
+    patchFs(c);
+    patchWrites(c);
+    patchNativeReaders(c);
+    patchTaints(c);
+    patchNodeTest(c);
+    c.hooks = registerResolveHooks(c);
+    module.syncBuiltinESMExports();
+    proxyEnv(c);
+  } finally {
+    c.busy = false;
+  }
+  c.emit({ kind: "vci-node-test", hooks: c.hooks, pid: process.pid });
+  checkNodeTestEnv(c, true);
+  return c;
+}
+
+/**
+ * node-test: what reached this process through the environment rather than the command line.
+ *  - NODE_OPTIONS as it is here (from vci's environment, an `--env-file`, or set by a `--require`
+ *    preload of the `node --test` process): it applies before the collector, so only memory,
+ *    warning and stack-trace options are accepted;
+ *  - (test process) TZ: unset, ICU takes the machine's zone, which is not an input; LANG, LC_ALL
+ *    and LC_MESSAGES (ICU's default locale) are recorded as read.
+ * @param {Collector} c
+ * @param {boolean} child
+ */
+function checkNodeTestEnv(c, child) {
+  const env = process.env; // read while busy: not recorded as the test's reads
+  const wasBusy = c.busy;
+  c.busy = true;
+  try {
+    for (const tok of nodeOptionsProblems(env.NODE_OPTIONS)) {
+      c.emit({
+        kind: "taint",
+        reason: `node-test:NODE_OPTIONS:${tok} (NODE_OPTIONS, from the environment, an --env-file or a preload, reaches every process before vci's collector; only memory, warning and stack-trace options are accepted there)`,
+      });
+    }
+    if (!child) return;
+    const tz = env.TZ;
+    if (tz === undefined || tz === "") {
+      c.emit({ kind: "taint", reason: "node-test:TZ-unset (the local time zone comes from the machine, which is not an input: set TZ, e.g. TZ=UTC, where vci runs and in CI)" });
+    } else if (tz.startsWith(":") || tz.startsWith("/")) {
+      c.emit({ kind: "taint", reason: `node-test:TZ-file:${tz} (a zoneinfo file is not an input)` });
+    }
+    for (const k of ["TZ", "LANG", "LC_ALL", "LC_MESSAGES"]) c.emit({ kind: "env", key: k });
+  } finally {
+    c.busy = wasBusy;
+  }
+}
+
+/**
+ * node-test: the `node --test` process itself also loads `--require` preloads (not `--import`
+ * ones), so the user's `--require` modules run there too, before it starts the child process
+ * for the test file (which inherits its environment). This records what user code does there,
+ * like the Vitest main-process collector; the node:test reporter adds the records to the file.
+ * @returns {Collector | null}
+ */
+export function installNodeTestParent() {
+  const g = /** @type {any} */ (globalThis);
+  if (g[MAIN_KEY] !== undefined) return g[MAIN_KEY];
+  if (
+    !process.env.VCI_OUT ||
+    !process.env.VCI_TEST_FILE ||
+    process.env.NODE_TEST_CONTEXT !== undefined ||
+    !workerThreads.isMainThread
+  ) {
+    g[MAIN_KEY] = null;
+    return null;
+  }
+  const c = new Collector({ partsDir: "", ignoreDirs: [], root: process.cwd() }, { preload: true, mode: "main" });
+  c.nodeTestParent = true;
+  g[MAIN_KEY] = c;
+  c.busy = true;
+  try {
+    patchFs(c);
+    patchNativeReaders(c);
+    patchTaints(c);
+    // Every module the user's preloads load here (a computed `require(path.join(...))` too).
+    c.hooks = registerResolveHooks(c, { load: true });
+    module.syncBuiltinESMExports();
+    proxyEnv(c);
+  } finally {
+    c.busy = false;
+  }
+  c.emit({ kind: "vci-main" });
+  if (!c.hooks) c.emit({ kind: "taint", reason: "vci:module-hooks-unavailable (Node 22.15 or later is needed)" });
+  checkNodeTestEnv(c, false);
+  return c;
+}
+
+/**
+ * node-test: register a second set of hooks after the user's preloads (src/node-test/late.js).
+ * Hooks registered last run first, so these see every specifier and the final result of the
+ * whole chain, including resolutions and loads the user's hooks answer themselves.
+ * @returns {boolean}
+ */
+export function installLateHooks() {
+  const c = /** @type {Collector | null | undefined} */ (/** @type {any} */ (globalThis)[KEY]);
+  if (!c || c.mode !== "node-test") return false;
+  const ok = registerResolveHooks(c, { load: true });
+  c.emit({ kind: "vci-late-hooks", ok });
+  return ok;
 }
 
 /** @returns {Collector | null | undefined} the main-process collector */

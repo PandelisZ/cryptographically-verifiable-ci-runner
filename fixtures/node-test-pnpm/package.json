@@ -1,0 +1,5 @@
+{
+  "name": "node-test-pnpm",
+  "private": true,
+  "packageManager": "pnpm@9.15.9"
+}

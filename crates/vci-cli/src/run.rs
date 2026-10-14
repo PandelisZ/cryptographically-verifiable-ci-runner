@@ -33,7 +33,7 @@ pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn global_env_keys(adapter: &str) -> Vec<String> {
     match adapter {
         // vci sets NODE_OPTIONS itself; a non-empty user value still matters.
-        "vitest" => vec!["NODE_OPTIONS".to_owned()],
+        "vitest" | "node-test" => vec!["NODE_OPTIONS".to_owned()],
         // PYTEST_*/PYTHON* are reported per file by the collector.
         _ => vec![],
     }
@@ -63,15 +63,18 @@ pub fn global_manifest(
 /// first path outside the repository.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn observations(root: &Utf8Path, o: &Observed) -> Result<Vec<(RepoPath, Observation)>, String> {
-    observations_for(root, o, "vitest")
+    observations_for(root, o, "vitest", true)
 }
 
 /// Observations of one test file for `adapter`: the collector's paths, plus
-/// (Vitest only) the package.json/tsconfig.json context of every module.
+/// (Vitest and node-test) the package.json context of every module and,
+/// when `tsconfig` (Vitest; node-test with a TypeScript loader), its
+/// tsconfig.json chain.
 pub fn observations_for(
     root: &Utf8Path,
     o: &Observed,
     adapter: &str,
+    tsconfig: bool,
 ) -> Result<Vec<(RepoPath, Observation)>, String> {
     let mut out = Vec::new();
     let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 6] = [
@@ -92,9 +95,13 @@ pub fn observations_for(
     }
     // package.json / tsconfig.json that decide how each module resolves its
     // imports and is transformed.
-    if adapter == "vitest" {
-        let ctx = global::module_context(root, o.modules.iter().map(|p| p.as_path()))
-            .map_err(|e| format!("module context: {e:#}"))?;
+    if adapter == "vitest" || adapter == "node-test" {
+        let ctx = global::module_context_with(
+            root,
+            o.modules.iter().map(|p| p.as_path()),
+            adapter == "vitest" || tsconfig,
+        )
+        .map_err(|e| format!("module context: {e:#}"))?;
         out.extend(ctx);
     }
     Ok(out)
@@ -150,6 +157,10 @@ pub fn toolchain_for(adapter: &str, v: &vci_adapter::ToolVersions) -> Toolchain 
             t.cargo = v.cargo.clone();
             t.rust_host = v.rust_host.clone();
             t.rust_cfg = v.rust_cfg.clone();
+        }
+        // node:test is part of Node: the Node version is the runner's.
+        "node-test" => {
+            t.node = v.node.clone();
         }
         "rails" => {
             t.ruby = v.ruby.clone();
@@ -235,6 +246,12 @@ fn collector_toolchain_mismatch(
                     v.runner
                 )
             }),
+        "node-test" => (o.node != v.node).then(|| {
+            format!(
+                "the test ran on node {} but the project's node is {}",
+                o.node, v.node
+            )
+        }),
         _ => (o.node != v.node || o.runner_version != v.runner || o.bundler_version != v.bundler)
             .then(|| {
                 format!(
@@ -443,10 +460,17 @@ fn check_one(
         ));
     }
     if !result.is_pass() {
-        return Err(format!(
-            "result {} ({} failed, {} skipped or xfailed of {}; a skipped test did not run, so it cannot be vouched for elsewhere)",
-            result.state, result.failed, result.skipped, result.tests
-        ));
+        return Err(if result.skipped > 0 {
+            format!(
+                "result {} ({} failed, {} skipped or xfailed of {}; a skipped test did not run, so it cannot be vouched for elsewhere)",
+                result.state, result.failed, result.skipped, result.tests
+            )
+        } else {
+            format!(
+                "result {} ({} failed of {})",
+                result.state, result.failed, result.tests
+            )
+        });
     }
     if adapter.name() == "pytest" {
         // The test saw vci's own PYTHONPATH (the collector directory), which
@@ -472,7 +496,7 @@ fn check_one(
     if let Some(m) = collector_toolchain_mismatch(adapter.name(), o, versions) {
         return Err(m);
     }
-    let mut obs = observations_for(&ctx.root, o, adapter.name())?;
+    let mut obs = observations_for(&ctx.root, o, adapter.name(), adapter.tsconfig_is_input())?;
     obs.extend(expand_extra_inputs(
         &ctx.root,
         &project.dir,
@@ -1040,7 +1064,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
                             }
                         );
                     }
-                    if matches!(project.adapter.name(), "cargo" | "rails") {
+                    if matches!(project.adapter.name(), "cargo" | "rails" | "node-test") {
                         let ignored = ignored_inputs(&ctx.root, &p.core.manifest);
                         if !ignored.is_empty() {
                             let why = if project.adapter.name() == "cargo" {

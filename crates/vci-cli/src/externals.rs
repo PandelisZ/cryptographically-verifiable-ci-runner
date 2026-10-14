@@ -1,6 +1,7 @@
 //! Check that an attested external package version is what is installed now.
 //!
-//! npm (Vitest): looked up in `node_modules` from the project dir.
+//! npm (Vitest, node:test): looked up in `node_modules` from the project dir,
+//! npm's hidden lockfile, or pnpm's virtual store (`node_modules/.pnpm`).
 //! Python (pytest): the adapter enumerates the distributions installed in the
 //! environment `uv run --locked` uses, and the version must also be the one
 //! `uv.lock` pins. A package that is not installed, installed in more than
@@ -257,12 +258,72 @@ pub fn installed(project_dir: &Utf8Path, name: &str, version: &str) -> Result<()
         }
         dir = d.parent();
     }
+    // pnpm: every installed package is in the virtual store, as
+    // node_modules/.pnpm/<name, '/' as '+'>@<version>[_<peers>|(<peers>)]/node_modules/<name>.
+    let mut dir = Some(project_dir);
+    while let Some(d) = dir {
+        let store = d.join("node_modules/.pnpm");
+        if store.is_dir() {
+            let prefix = format!("{}@{version}", name.replace('/', "+"));
+            if let Ok(rd) = store.read_dir_utf8() {
+                for ent in rd.flatten() {
+                    let Some(rest) = ent.file_name().strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if (rest.is_empty() || rest.starts_with('_') || rest.starts_with('('))
+                        && version_of(
+                            &ent.path()
+                                .join("node_modules")
+                                .join(name)
+                                .join("package.json"),
+                        )
+                        .as_deref()
+                            == Some(version)
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            break;
+        }
+        dir = d.parent();
+    }
     Err(found.unwrap_or_else(|| "not installed".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pnpm: a package that is not linked at the top of node_modules is
+    /// found in the virtual store (with a peer-dependency suffix too).
+    #[test]
+    fn pnpm_virtual_store() {
+        let t = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        let app = root.join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        for (dir, name, ver) in [
+            ("ms@2.1.3", "ms", "2.1.3"),
+            ("@scope+pkg@1.0.0_react@19.0.0", "@scope/pkg", "1.0.0"),
+        ] {
+            let p = root
+                .join("node_modules/.pnpm")
+                .join(dir)
+                .join("node_modules")
+                .join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(
+                p.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{ver}"}}"#),
+            )
+            .unwrap();
+        }
+        assert_eq!(super::installed(&app, "ms", "2.1.3"), Ok(()));
+        assert_eq!(super::installed(&app, "@scope/pkg", "1.0.0"), Ok(()));
+        assert!(super::installed(&app, "ms", "2.1.4").is_err());
+        assert!(super::installed(&app, "m", "2.1.3").is_err());
+    }
 
     const LOCK: &str = r#"version = 1
 revision = 3

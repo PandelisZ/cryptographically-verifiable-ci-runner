@@ -33,6 +33,16 @@ pub struct Config {
     /// or `"rspec"`; unset: detected (see [`ProjectConfig::runner`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<String>,
+    /// node-test adapter (single-project form): the package.json script
+    /// that runs the tests (default `"test"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_script: Option<String>,
+    /// node-test adapter: test file globs instead of a script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_globs: Option<Vec<String>>,
+    /// node-test adapter: node options with `test_globs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_args: Option<Vec<String>>,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
@@ -82,6 +92,14 @@ pub struct ProjectConfig {
     /// are present, Minitest otherwise. Read from the base commit in CI.
     #[serde(default)]
     pub runner: Option<String>,
+    /// node-test adapter: the package.json script that runs the tests
+    /// (default `"test"`); or `test_globs` (+ `node_args`) instead.
+    #[serde(default)]
+    pub test_script: Option<String>,
+    #[serde(default)]
+    pub test_globs: Option<Vec<String>>,
+    #[serde(default)]
+    pub node_args: Option<Vec<String>>,
     #[serde(default)]
     pub policy: Option<PolicyOverride>,
     #[serde(default)]
@@ -103,6 +121,7 @@ pub struct PolicyOverride {
     pub never_skip: Option<Vec<String>>,
     pub go_allow_net: Option<bool>,
     pub rails_allow_db: Option<bool>,
+    pub node_exact: Option<bool>,
 }
 
 /// Per-project env keys; each one given replaces the top-level key.
@@ -125,6 +144,8 @@ pub struct ProjectSpec {
     pub adapter: String,
     /// Rails: the `runner` setting (`None`: detected).
     pub runner: Option<String>,
+    /// node-test: the test command settings.
+    pub node_test: vci_adapter::NodeTestOptions,
     pub policy: Policy,
     pub env: EnvConfig,
     pub inputs: Vec<InputsConfig>,
@@ -139,6 +160,7 @@ impl ProjectSpec {
                 .runner
                 .as_deref()
                 .and_then(vci_adapter::RailsRunner::parse),
+            node_test: self.node_test.clone(),
         }
     }
 }
@@ -203,6 +225,48 @@ fn check_runner(what: &str, adapter: &str, runner: Option<&str>) -> Result<()> {
     }
     if vci_adapter::RailsRunner::parse(r).is_none() {
         bail!("{what}: runner must be \"minitest\" or \"rspec\", got {r:?}");
+    }
+    Ok(())
+}
+
+/// `test_script`, `test_globs` and `node_args` are settings of the
+/// node-test adapter; `test_script` and `test_globs` exclude each other, and
+/// `node_args` needs `test_globs`.
+fn check_node_test(what: &str, adapter: &str, o: &vci_adapter::NodeTestOptions) -> Result<()> {
+    if o == &vci_adapter::NodeTestOptions::default() {
+        return Ok(());
+    }
+    if adapter != "node-test" {
+        bail!(
+            "{what}: `test_script`, `test_globs` and `node_args` are settings of the node-test adapter, not {adapter:?}"
+        );
+    }
+    if o.test_script.is_some() && o.test_globs.is_some() {
+        bail!("{what}: set either `test_script` or `test_globs`, not both");
+    }
+    if o.node_args.is_some() && o.test_globs.is_none() {
+        bail!(
+            "{what}: `node_args` needs `test_globs` (with a script, its own node options are used)"
+        );
+    }
+    if let Some(sc) = &o.test_script
+        && sc.trim().is_empty()
+    {
+        bail!("{what}: `test_script` is empty");
+    }
+    if let Some(g) = &o.test_globs {
+        if g.is_empty() {
+            bail!("{what}: `test_globs` is empty");
+        }
+        for p in g {
+            if p.is_empty()
+                || p.starts_with('-')
+                || p.starts_with('/')
+                || p.split('/').any(|c| c == "..")
+            {
+                bail!("{what}: test glob {p:?} must be relative to the project dir, without '..'");
+            }
+        }
     }
     Ok(())
 }
@@ -275,6 +339,10 @@ pub struct Policy {
     /// there, and the server's version is part of the toolchain.
     #[serde(default)]
     pub rails_allow_db: bool,
+    /// Vitest and node-test: require the exact Node version the attestation
+    /// was made with (default: the same major version).
+    #[serde(default)]
+    pub node_exact: bool,
 }
 
 fn default_max_ttl() -> String {
@@ -295,6 +363,7 @@ impl Default for Policy {
             never_skip: vec![],
             go_allow_net: false,
             rails_allow_db: false,
+            node_exact: false,
         }
     }
 }
@@ -378,12 +447,17 @@ impl Config {
             let adapter = self.adapter.as_deref().unwrap_or("vitest");
             check_adapter(adapter)?;
             check_runner("vci.toml", adapter, self.runner.as_deref())?;
+            check_node_test("vci.toml", adapter, &self.node_test_options())?;
             check_rel("project", self.project.as_deref().unwrap_or("."))?;
             return Ok(());
         }
-        if self.project.is_some() || self.adapter.is_some() || self.runner.is_some() {
+        if self.project.is_some()
+            || self.adapter.is_some()
+            || self.runner.is_some()
+            || self.node_test_options() != vci_adapter::NodeTestOptions::default()
+        {
             bail!(
-                "top-level `project`/`adapter`/`runner` cannot be combined with [[projects]]; give each project a path and adapter (and runner)"
+                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args` cannot be combined with [[projects]]; give each project its own"
             );
         }
         let mut names = std::collections::BTreeSet::new();
@@ -410,6 +484,15 @@ impl Config {
                 &p.adapter,
                 p.runner.as_deref(),
             )?;
+            check_node_test(
+                &format!("project {:?}", p.name),
+                &p.adapter,
+                &vci_adapter::NodeTestOptions {
+                    test_script: p.test_script.clone(),
+                    test_globs: p.test_globs.clone(),
+                    node_args: p.node_args.clone(),
+                },
+            )?;
             if !dirs.insert((normalise_rel(&p.path), p.adapter.clone())) {
                 bail!(
                     "two projects use adapter {:?} in {:?}; they would list the same test files",
@@ -424,6 +507,15 @@ impl Config {
                 .with_context(|| format!("project {:?}", s.name))?;
         }
         Ok(())
+    }
+
+    /// node-test settings of the single-project form.
+    fn node_test_options(&self) -> vci_adapter::NodeTestOptions {
+        vci_adapter::NodeTestOptions {
+            test_script: self.test_script.clone(),
+            test_globs: self.test_globs.clone(),
+            node_args: self.node_args.clone(),
+        }
     }
 
     /// Normalised project dir of the single-project form ("." for the root).
@@ -444,6 +536,7 @@ impl Config {
                 rel: self.project_rel(),
                 adapter: self.adapter.clone().unwrap_or_else(default_adapter),
                 runner: self.runner.clone(),
+                node_test: self.node_test_options(),
                 policy: self.policy.clone(),
                 env: self.env.clone(),
                 inputs: self.inputs.clone(),
@@ -478,6 +571,9 @@ impl Config {
                     if let Some(v) = o.rails_allow_db {
                         policy.rails_allow_db = v;
                     }
+                    if let Some(v) = o.node_exact {
+                        policy.node_exact = v;
+                    }
                 }
                 let mut env = self.env.clone();
                 if let Some(o) = &p.env {
@@ -499,6 +595,11 @@ impl Config {
                     rel: normalise_rel(&p.path),
                     adapter: p.adapter.clone(),
                     runner: p.runner.clone(),
+                    node_test: vci_adapter::NodeTestOptions {
+                        test_script: p.test_script.clone(),
+                        test_globs: p.test_globs.clone(),
+                        node_args: p.node_args.clone(),
+                    },
                     policy,
                     env,
                     inputs: p.inputs.clone().unwrap_or_else(|| self.inputs.clone()),
@@ -698,6 +799,50 @@ global = ["TZ"]
 pass_through = []
 "#;
 
+/// Template written by `vci init --adapter node-test`.
+pub const NODE_TEST_TEMPLATE: &str = r#"# vci configuration. Policy is read from the BASE commit in CI.
+
+# Project directory (the package whose package.json script runs `node --test`),
+# relative to the repo root.
+project = "."
+adapter = "node-test"
+# The package.json script that runs the tests (default "test"). vci reads its
+# command (leading NAME=value assignments, then `node [options] --test
+# [patterns]`), lists the files with node:test's own globbing, runs each file
+# in its own `node --test` process with the same options, and refuses options
+# it cannot vouch for (--test-only, --test-name-pattern, --watch, --loader,
+# --test-isolation=none, ...). Or give the command here instead of a script:
+# test_script = "test"
+# test_globs = ["src/**/*.test.ts"]
+# node_args = ["--import", "./test/register-hooks.mjs"]
+
+[policy]
+# "any" | "same-os" | "exact": which OS/arch may satisfy CI. The Node major
+# version must always match; node_exact = true requires the exact version.
+platform = "any"
+# Longest accepted attestation lifetime.
+max_ttl = "30d"
+# Accept attestations made from a working tree with uncommitted changes.
+allow_dirty = true
+# Refs on which nothing is ever skipped (globs; "*" stays within a segment).
+# Pushes to the default branch and tags run everything.
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# Test files (project-relative globs) that are never skipped.
+never_skip = []
+node_exact = false
+
+[env]
+# "strict": only declared and pass-through variables reach tests.
+mode = "strict"
+# Hashed into every test file's inputs. NODE_ENV and every variable the test
+# script assigns (NODE_ENV=test node --test ...) are declared automatically.
+# Set TZ (TZ=UTC) where vci runs and in CI: with TZ unset every file is
+# refused (the machine's zone is not an input). LANG/LC_ALL are inputs too.
+global = ["TZ"]
+# Visible to tests, never hashed. Put secrets here.
+pass_through = []
+"#;
+
 /// The `vci init` template for `adapter`.
 pub fn template_for(adapter: &str) -> &'static str {
     match adapter {
@@ -705,6 +850,7 @@ pub fn template_for(adapter: &str) -> &'static str {
         "go" => GO_TEMPLATE,
         "cargo" => CARGO_TEMPLATE,
         "rails" => RAILS_TEMPLATE,
+        "node-test" => NODE_TEST_TEMPLATE,
         _ => TEMPLATE,
     }
 }
@@ -724,6 +870,7 @@ mod tests {
             GO_TEMPLATE,
             CARGO_TEMPLATE,
             RAILS_TEMPLATE,
+            NODE_TEST_TEMPLATE,
         ] {
             let c = Config::parse(t).unwrap();
             let refs = &c.project_specs()[0].policy.no_skip_refs;
@@ -826,6 +973,45 @@ mod tests {
             "runner = \"rspec\"\n",
             "runner = \"rspec\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
             "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nrunner = \"minitest\"\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// node-test settings: top level in the single-project form, per
+    /// project otherwise; only for the node-test adapter.
+    #[test]
+    fn node_test_settings() {
+        let c = Config::parse(NODE_TEST_TEMPLATE).unwrap();
+        let s = &c.project_specs()[0];
+        assert_eq!(s.adapter, "node-test");
+        assert_eq!(s.node_test, vci_adapter::NodeTestOptions::default());
+        assert!(!s.policy.node_exact);
+        let c = Config::parse(
+            "adapter = \"node-test\"\ntest_globs = [\"src/**/*.test.ts\"]\nnode_args = [\"--import\", \"./h.mjs\"]\n[policy]\nnode_exact = true\n",
+        )
+        .unwrap();
+        let s = &c.project_specs()[0];
+        assert_eq!(
+            s.adapter_options().node_test.test_globs.as_deref(),
+            Some(&["src/**/*.test.ts".to_owned()][..])
+        );
+        assert!(s.policy.node_exact);
+        let c = Config::parse(
+            "[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"node-test\"\ntest_script = \"test:unit\"\n[projects.policy]\nnode_exact = true\n",
+        )
+        .unwrap();
+        let s = &c.project_specs()[0];
+        assert_eq!(s.node_test.test_script.as_deref(), Some("test:unit"));
+        assert!(s.policy.node_exact);
+        for bad in [
+            "adapter = \"vitest\"\ntest_script = \"test\"\n",
+            "adapter = \"node-test\"\ntest_script = \"t\"\ntest_globs = [\"a\"]\n",
+            "adapter = \"node-test\"\nnode_args = [\"--import\", \"x\"]\n",
+            "adapter = \"node-test\"\ntest_globs = []\n",
+            "adapter = \"node-test\"\ntest_globs = [\"../x/*.test.js\"]\n",
+            "test_script = \"t\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"node-test\"\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"pytest\"\ntest_globs = [\"x\"]\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

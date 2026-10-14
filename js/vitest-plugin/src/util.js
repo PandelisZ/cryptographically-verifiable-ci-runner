@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 // Captured at module load, before the worker collector patches `fs`.
 const readFileSync = fs.readFileSync;
 const lstatSync = fs.lstatSync;
+const realpathSync = fs.realpathSync;
 
 /** Directory of this package (…/vitest-plugin), used to recognise our own stack frames. */
 export const PACKAGE_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -17,7 +18,7 @@ export const PACKAGE_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.u
 export const WORKER_ENV = "VCI_WORKER";
 
 /** Env keys that belong to vci itself and are never reported as dependencies. */
-export const OWN_ENV_KEYS = new Set([WORKER_ENV, "VCI_OUT"]);
+export const OWN_ENV_KEYS = new Set([WORKER_ENV, "VCI_OUT", "VCI_TEST_FILE", "VCI_ROOT"]);
 
 /**
  * @param {string} s
@@ -119,6 +120,121 @@ export function packageOf(file) {
   }
   pkgCache.set(pkgRoot + "|" + path.dirname(p), result);
   return result;
+}
+
+/**
+ * For a path below `node_modules/<pkg>` where `<pkg>` is a link to a directory outside every
+ * `node_modules` (a linked workspace package: pnpm, npm and yarn workspaces link them), the same
+ * path below the link's real target. That code is repository content: it must be hashed, never
+ * identified by the package's version. Otherwise null.
+ * @param {string} file absolute path
+ * @returns {string | null}
+ */
+export function linkedPackagePath(file) {
+  const p = toSlash(file);
+  const marker = "/node_modules/";
+  const idx = p.lastIndexOf(marker);
+  if (idx < 0) return null;
+  const rest = p.slice(idx + marker.length).split("/");
+  if (!rest[0] || rest[0].startsWith(".")) return null;
+  const n = rest[0].startsWith("@") ? 2 : 1;
+  if (rest.length < n) return null;
+  const pkgRoot = p.slice(0, idx + marker.length) + rest.slice(0, n).join("/");
+  let real;
+  try {
+    real = toSlash(realpathSync(pkgRoot));
+  } catch {
+    return null;
+  }
+  if (real === pkgRoot || real.includes(marker)) return null;
+  const tail = rest.slice(n).join("/");
+  return tail ? `${real}/${tail}` : real;
+}
+
+/** @type {Map<string, string | null>} */
+const localCopyCache = new Map();
+
+/**
+ * For a file of an installed package that is a copy of a directory of the repository, the
+ * package's name; otherwise null. Such a package is identified by the version in its
+ * package.json, which does not change when its source in the repository does, so it must never be
+ * accepted as an external:
+ *  - pnpm's virtual store entry of a `file:` dependency (`node_modules/.pnpm/lib@file+lib/...`),
+ *    also used for injected workspace packages;
+ *  - a real directory `node_modules/<name>` (npm with install-links, yarn 1) that the
+ *    package.json beside that `node_modules` declares as `file:<directory>`.
+ * @param {string} file absolute path
+ * @returns {string | null}
+ */
+export function localCopyPackage(file) {
+  const p = toSlash(file);
+  const marker = "/node_modules/";
+  const idx = p.lastIndexOf(marker);
+  if (idx < 0) return null;
+  const rest = p.slice(idx + marker.length).split("/");
+  if (!rest[0] || rest[0].startsWith(".")) return null;
+  const n = rest[0].startsWith("@") ? 2 : 1;
+  const name = rest.slice(0, n).join("/");
+  const pkgRoot = p.slice(0, idx + marker.length) + name;
+  const cached = localCopyCache.get(pkgRoot);
+  if (cached !== undefined) return cached;
+  let out = null;
+  const store = /\/node_modules\/\.pnpm\/([^/]+)\/node_modules\/$/.exec(p.slice(0, idx + marker.length));
+  if (store && /@file\+/.test(store[1])) {
+    out = name;
+  } else if (!store) {
+    try {
+      if (!lstatSync(pkgRoot).isSymbolicLink()) {
+        const owner = JSON.parse(readFileSync(path.join(p.slice(0, idx), "package.json"), "utf8"));
+        for (const k of ["dependencies", "devDependencies", "optionalDependencies"]) {
+          const spec = owner && owner[k] && owner[k][name];
+          if (typeof spec === "string" && spec.startsWith("file:") && !/\.(tgz|tar\.gz|tar)$/.test(spec)) out = name;
+        }
+      }
+    } catch {
+      // no owner package.json: an ordinary install
+    }
+  }
+  localCopyCache.set(pkgRoot, out);
+  return out;
+}
+
+/** Node options accepted in NODE_OPTIONS (as in the Rust adapter): memory, warning, stack-trace. */
+const NODE_OPTIONS_OK = new Set([
+  "--max-old-space-size",
+  "--max-semi-space-size",
+  "--stack-trace-limit",
+  "--stack-size",
+  "--test-concurrency",
+  "--test-reporter",
+  "--test-reporter-destination",
+  "--enable-source-maps",
+  "--no-warnings",
+  "--trace-warnings",
+  "--no-deprecation",
+  "--trace-deprecation",
+  "--disable-warning",
+  "--unhandled-rejections",
+  "--trace-uncaught",
+]);
+
+/**
+ * The NODE_OPTIONS tokens vci does not accept (anything but memory, warning and stack-trace
+ * options; a quoted value is never accepted).
+ * @param {string | undefined} value
+ * @returns {string[]}
+ */
+export function nodeOptionsProblems(value) {
+  if (!value) return [];
+  /** @type {string[]} */
+  const out = [];
+  for (const tok of value.split(/\s+/)) {
+    if (!tok) continue;
+    const raw = tok.includes("=") ? tok.slice(0, tok.indexOf("=")) : tok;
+    const name = raw.startsWith("--") ? `--${raw.slice(2).replace(/_/g, "-")}` : raw;
+    if (!NODE_OPTIONS_OK.has(name) || /["'\\]/.test(tok)) out.push(tok);
+  }
+  return out;
 }
 
 /**

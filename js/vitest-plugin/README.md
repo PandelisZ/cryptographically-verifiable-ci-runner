@@ -113,10 +113,54 @@ Semantics that matter to the Rust side:
 
 Worker activity is attributed using structured V8 stacks, sync and async. The rules are in `docs/spike.md`.
 
+## node:test (`src/node-test/`)
+
+The same package holds the collector of vci's `node-test` adapter (Node's built-in test runner). The adapter runs one
+`node --test` process per test file:
+
+```
+VCI_OUT=<dir> VCI_TEST_FILE=<abs file> VCI_ROOT=<project dir> \
+  node --require <pkg>/src/node-test/preload.cjs <the script's node options> \
+       --import <pkg>/src/node-test/late.js \
+       --test-reporter=<pkg>/src/node-test/reporter.js --test-reporter-destination=<dir>/reporter.out \
+       --test-reporter=spec --test-reporter-destination=stderr --test <file>
+```
+
+- `preload.cjs` → `preload.js` (loaded with `--require`, so before every `--require`/`--import` preload of the user's;
+  CommonJS so that it does nothing in the thread of `module.register` hooks, where Node also runs it): in the child
+  process node:test starts for the file (`NODE_TEST_CONTEXT` set) it installs the worker collector in mode
+  `node-test` (every record belongs to `VCI_TEST_FILE`; the fs, env, process and network patches above, plus `write`
+  records for paths the test creates, changes or removes, a taint for `process.exit` from user code and for
+  `module.register` outside `ts-node` and `amaro`, and `module.registerHooks` resolution hooks). It also checks the
+  environment the process actually has: `NODE_OPTIONS` (from vci's environment, an `--env-file`, or a preload of the
+  `node --test` process) with anything but memory, warning and stack-trace options, and an unset `TZ`, are taints;
+  `TZ`, `LANG`, `LC_ALL` and `LC_MESSAGES` are recorded as read. In the `node --test` process itself, which also runs
+  `--require` preloads, it installs the main-process collector, with module hooks (every module those preloads load
+  there is an input) and the same `NODE_OPTIONS` check.
+- `late.js` (loaded with `--import` after the user's preloads): a second set of module hooks. Hooks registered last
+  run first, so these see every specifier and the final resolution and load of the chain, including what the user's
+  hooks answer themselves.
+- `reporter.js` (a node:test reporter, in the `node --test` process): counts the file's tests from node:test's events
+  (`test:pass`/`test:fail` with `skip`/`todo`, the per-file `test:summary`), merges the child's records and the
+  main-process collector's, and writes `$VCI_OUT/<sha256(testId)>.jsonl` with `meta.adapter = "node-test"`. A file
+  without a per-file summary (no tests, or a process that ended early) never passes.
+- `list.js`: lists the files `node --test [patterns]` would run (Node's `fs.globSync`, node:test's default pattern
+  and `node_modules` exclusion); the adapter embeds it and runs it with `node -e`.
+
+Paths under a linked workspace package (`node_modules/@acme/lib` -> `packages/lib`) are reported at their real path,
+never as an external, in this mode. A bare or aliased specifier that resolves into the repository also records the
+candidates Node tries before its result (`util.js` before `util/index.js`).
+
+In every mode, a package copied from a repository directory (a pnpm `<name>@file+...` store entry, or a real
+`node_modules/<name>` directory its owner's package.json declares as `file:<dir>`) is the taint
+`external-local-directory:<name>`, never an external; `process.binding` is a taint; node:sqlite SQL with `ATTACH`,
+`VACUUM INTO` or `load_extension`, and loading extensions, are taints, and a `file:` URI database name is recorded as
+the file it names.
+
 ## Tests
 
 ```
-npm test                   # node --test --test-concurrency=1 test/
+npm test                   # node --test --test-concurrency=1 test/ (Vitest and node:test collectors)
 npm run test:vitest4       # also runs against Vitest 4.1.11 (npm install into a temp dir)
 ```
 

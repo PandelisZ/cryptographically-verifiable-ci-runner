@@ -1,7 +1,7 @@
 {
   "name": "@vci/vitest",
-  "version": "1.0.0",
-  "description": "Records per-test-file runtime dependencies for Vitest (vci collectors)",
+  "version": "1.1.0",
+  "description": "Records per-test-file runtime dependencies for Vitest and node:test (vci collectors)",
   "type": "module",
   "license": "MIT",
   "main": "./src/index.js",
@@ -12,6 +12,10 @@
     "./setup": "./src/worker/setup.js",
     "./preload": "./src/worker/preload.js",
     "./main-preload": "./src/main/preload.js",
+    "./node-test/preload": "./src/node-test/preload.cjs",
+    "./node-test/late": "./src/node-test/late.js",
+    "./node-test/reporter": "./src/node-test/reporter.js",
+    "./node-test/list": "./src/node-test/list.js",
     "./package.json": "./package.json"
   },
   "files": [

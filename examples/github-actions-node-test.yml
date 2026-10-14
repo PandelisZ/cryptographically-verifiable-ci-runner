@@ -1,0 +1,60 @@
+# .github/workflows/test.yml: run only the node:test files (`node --test`)
+# that no trusted developer has already attested for these exact inputs.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  node-test:
+    runs-on: ubuntu-latest
+    env:
+      # The zone and locale are inputs of every node:test file: use the values
+      # the attestations were made with (an unset TZ refuses every file).
+      TZ: UTC
+      LANG: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be available to read policy from
+
+      # pnpm shown; with npm drop this step and use `cache: npm` and `npm ci`.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # the Node major version must match the attestations (policy.node_exact: the exact version)
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Pinned to a vci release (v1.0.0; for strict pinning use the full SHA from the release page): the
+      # verifier must not change under you; v1 moves only to tested 1.x releases. `vci ci` needs no
+      # collector: it lists the test files with node itself and runs the rest with plain `node --test`.
+      - name: Install vci
+        run: cargo install --locked --git https://github.com/PandelisZ/cryptographically-verifiable-ci-runner --tag v1.0.0 vci-cli
+
+      # git-meta pull of refs/meta/main (attestations pushed with `vci push`
+      # or `git meta push`) into .git/git-meta.sqlite; read access is enough.
+      - name: Fetch attestations
+        run: vci fetch --remote origin
+
+      # Policy (vci.toml) and trust (.vci/allowed_signers) are read from the
+      # BASE commit, so a pull request cannot add its own signer. The test
+      # files that are not skipped run one `node --test` process each, with
+      # the options of the package.json test script; when nothing can be
+      # skipped, the script itself runs (`pnpm run test`).
+      - name: Plan, then run what is not attested
+        run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
+
+      - name: Upload the audit log of skipped tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vci-audit
+          path: vci-audit.json

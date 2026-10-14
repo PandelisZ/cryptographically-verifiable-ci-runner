@@ -6,7 +6,7 @@ If a developer (or an agent) already ran test file `b.test.ts` (or `test_b.py`, 
 `spec/models/b_spec.rb` of a Rails app, Go package `./b`, or the cargo test target `b#test:b`) against exactly the files it depends on, CI should not have
 to run it again. `vci` makes that safe:
 
-1. `vci run` runs Vitest, pytest, `go test`, Rails' `bin/rails test` or RSpec with runtime dependency collectors, hashes
+1. `vci run` runs Vitest, `node --test`, pytest, `go test`, Rails' `bin/rails test` or RSpec with runtime dependency collectors, hashes
    every file, directory listing, missing-file probe, package version and env var each test file actually used, and
    signs an in-toto attestation with your SSH key. For Rust (`cargo test`), which has no hook for run-time reads, the inputs are decided conservatively
    instead (see [Quick start (Cargo)](#quick-start-cargo)).
@@ -20,7 +20,8 @@ to run it again. `vci` makes that safe:
 
 The core rule is **fail open**: the default verdict is RUN. Any error, doubt or unrecognised behaviour means the test runs.
 
-Status: v1, Vitest `>=3.2 <6` (tested on 5.0.2 and 4.1.11), Node 22.15+; pytest 9 (tested on 9.1.1) on CPython
+Status: v1, Vitest `>=3.2 <6` (tested on 5.0.2 and 4.1.11), Node 22.15+; Node's built-in test runner
+(`node --test`, tested on Node 22.23, 24.13 and 26.9); pytest 9 (tested on 9.1.1) on CPython
 3.11-3.14 through `uv`; Go modules with Go 1.26 (tested on 1.26.2); Cargo workspaces (tested with Rust and cargo
 1.96.0); Rails 8 with Minitest or RSpec on Ruby 3.4 (tested with Rails 8.1.3.1, Minitest 6.0.6, rspec-core 3.13.6 with
 rspec-rails 8.0.4 and factory_bot_rails 6.5.1, Ruby 3.4.9, SQLite), and RSpec in plain Ruby projects; macOS and Linux.
@@ -52,19 +53,22 @@ It builds `vci`, fetches attestations, and runs only what is not already atteste
 
 ## Quick start (Vitest)
 
-Prerequisites: `git`, `node`, `ssh-keygen` (OpenSSH 8.1+), a Rust toolchain to build the CLI.
+Prerequisites: `git`, `node`, `ssh-keygen` (OpenSSH 8.1+), a Rust toolchain to build the CLI, and an `origin` remote
+(where attestations are pushed; without one pass `vci init --meta-url URL`, or `.git-meta` is not written).
 
 ```sh
 cargo install --path crates/vci-cli            # installs the `vci` binary
 
-cd your-project                                # a git repo with at least one commit
+cd your-project                                # a git repo with at least one commit and an origin remote
 npm install --save-dev /path/to/js/vitest-plugin   # the @vci/vitest collectors
 #   (or leave it out and set VCI_JS_PLUGIN=/path/to/js/vitest-plugin)
 
 vci init --key ~/.ssh/id_ed25519.pub --no-install  # writes vci.toml, .vci/allowed_signers, .git-meta
 git add vci.toml .vci/allowed_signers .git-meta && git commit -m "Enable vci"
+git push origin main
 # The trust root is read from the base branch, so merge this commit to main first.
 
+git checkout -b my-change                       # main itself never skips (no_skip_refs in vci.toml)
 vci run src/b.test.ts --key ~/.ssh/id_ed25519   # run, collect, sign, store
 vci plan --base-ref origin/main                 # SKIP src/b.test.ts, RUN the rest
 vci push                                        # publish attestations (git-meta, refs/meta/main)
@@ -76,6 +80,157 @@ In CI (see [`examples/github-actions.yml`](../examples/github-actions.yml)):
 vci fetch --remote origin                       # git-meta pull: fetch refs/meta/main, materialize it
 vci ci --base-ref "$BASE_SHA" --audit-log vci-audit.json
 ```
+
+## Quick start (node:test)
+
+For projects whose tests run with Node's built-in test runner, `node --test`, usually through a package.json script:
+
+```json
+"scripts": {
+  "test": "NODE_ENV=test node --import ./test/register-hooks.mjs --test 'src/**/*.test.ts' 'server/**/*.test.ts'"
+}
+```
+
+Prerequisites: `git`, `node` 22.15 or later (`module.registerHooks`), `ssh-keygen` (OpenSSH 8.1+), a Rust toolchain,
+and an `origin` remote (without one pass `vci init --meta-url URL`, or `.git-meta` is not written). The project dir is
+the package whose `package.json` holds the script (in a pnpm/npm workspace, one `[[projects]]` entry per package).
+`TZ` must be set where vci runs and in CI (the template declares it; `TZ=UTC` on both sides): with `TZ` unset every
+file is refused, since the machine's own zone is not an input. `LANG`/`LC_ALL`/`LC_MESSAGES` (ICU's default locale)
+are inputs of every file: use the same value on both sides (`LANG=C.UTF-8`, a runner's default) for files to skip in
+CI.
+
+```sh
+cargo install --path crates/vci-cli            # the collector (js/vitest-plugin/src/node-test) is found in this
+                                               # checkout, or set VCI_JS_PLUGIN=/path/to/js/vitest-plugin
+cd your-project                                # a git repo with at least one commit and an origin remote
+vci init --adapter node-test --key ~/.ssh/id_ed25519.pub   # writes vci.toml (adapter = "node-test"), allowed_signers,
+                                               # .git-meta; prints the test command it read from the script
+git add vci.toml .vci/allowed_signers .git-meta && git commit -m "Enable vci"
+git push origin main                           # the trust root is read from the base branch
+
+git checkout -b my-change                      # main itself never skips (no_skip_refs in vci.toml)
+export TZ=UTC LANG=C.UTF-8                     # the same zone and locale as CI
+vci run src/b.test.ts --key ~/.ssh/id_ed25519  # one `node --test` process per file, collect, sign, store
+vci plan --base-ref origin/main                # SKIP src/b.test.ts, RUN the rest
+vci push
+```
+
+**The command.** `vci.toml` names the script (`test_script`, default `"test"`), or gives the command itself
+(`test_globs = ["src/**/*.test.ts"]`, `node_args = ["--import", "./test/register-hooks.mjs"]`). vci reads the script
+as `sh -c` would, with a strict subset of `sh`: quotes, `$VAR`/`${VAR}`/`${VAR:-word}`/`${VAR:+word}` (expanded from
+vci's own environment, as `npm run` would), field splitting and `sh` globbing of unquoted words (`src/*.test.ts`; no
+`**` globstar), leading `NAME=value` assignments, and a `cross-env`/`env` prefix. Pipes, `&&`, redirections, command
+substitution, brace and tilde expansion are refused. Every node option is classified:
+
+- **kept** and recorded in the attestation's argv (compared exactly in CI): `--import`, `--require`/`-r`,
+  `--conditions`/`-C`, `--env-file`, `--env-file-if-exists`, `--experimental-strip-types` (and `--no-` / transform
+  variants), `--experimental-test-module-mocks`, `--experimental-test-snapshots`, `--experimental-vm-modules`, other
+  module-format switches, `--test-timeout`, `--test-force-exit`, `--enable-source-maps`, warning and deprecation
+  switches, `--preserve-symlinks`, and the V8 memory/stack options (`--max-old-space-size=N`, `--stack-trace-limit=N`);
+- **dropped** (per-run plumbing): `--test-concurrency` (each file has its own process; its value still bounds how
+  many files vci runs at once, so a suite that needs `--test-concurrency=1` keeps running one file at a time), `--test-reporter`,
+  `--test-reporter-destination`, `--test-isolation=process` (the default);
+- **refused** (nothing is attested; CI runs everything): `--test-only`, `--test-name-pattern`, `--test-skip-pattern`,
+  `--experimental-test-tag-filter`, `--test-shard` (a filtered run cannot vouch for the file),
+  `--test-isolation=none`, `--watch`, `--test-update-snapshots`, `--test-randomize`, `--test-rerun-failures`,
+  coverage options, `--experimental-config-file`/`--experimental-default-config-file`, `--loader` (off-thread hooks:
+  use `--import` with `module.registerHooks`), `--test-global-setup`, `--inspect*`, the permission model, and every
+  option vci does not know.
+
+What `npm run`/`pnpm run` do besides the script is not something vci's per-file runs reproduce, so these projects are
+refused as a whole (nothing is attested, `vci plan` runs everything, `vci ci` runs the script with the package
+manager): a `pre<script>`/`post<script>` script (`pretest`, `posttest`); `node-options` other than memory, warning and
+stack-trace options in an `.npmrc` (from the project dir up to the repository root, the user's `~/.npmrc` or
+`$NPM_CONFIG_USERCONFIG`, npm's global `<prefix>/etc/npmrc` or `$NPM_CONFIG_GLOBALCONFIG`, pnpm's `rc` files) or in
+`npm_config_node_options`, which npm hands the script as `NODE_OPTIONS`; and **install lifecycle scripts**
+(`preinstall`, `install`, `postinstall`, `prepare`, ...) in the package.json files from the project dir up to the
+repository root or in a workspace package linked into their `node_modules`, since what they change in `node_modules`
+(packages are identified by version) or in the repository is not an input. Accepted install scripts: git hook
+installers (`husky`, `husky install [dir]`, `is-ci || husky`, `simple-git-hooks`, `lefthook install`) and
+`patch-package` (every `patches/` directory from the project dir up to the repository root is a global input). A
+listing that matches no file (a build step may create the test files) runs the script too, never "nothing to run".
+
+`NODE_ENV` and every variable the script assigns (`NODE_ENV=test node ...`) are declared automatically: vci sets the
+script's value for the test processes and hashes it. The test files are listed with node:test's own rules (Node's
+glob from the project dir, `node_modules` excluded; without a pattern node:test's default pattern, with TypeScript
+extensions when type stripping is on) by the project's `node` with the script's type-stripping options. A pattern
+that names a directory is refused (Node 26 searches it, older versions do not).
+
+`vci run` runs `node --require <collector> <the script's options> --import <late hooks> --test-reporter=<vci reporter>
+--test-reporter=spec --test <file>` once per file (in parallel, `$VCI_JOBS` at a time, default: CPUs up to 8), with
+the script's assignments set. node:test starts a child process for the file, which inherits the options: the
+collector is installed there before any of your `--require`/`--import` preloads, and a second set of module hooks
+after them sees every resolution and load of the whole hook chain, including what your hooks answer themselves (an
+`@/` alias, extensionless imports, `?raw` loads). The reporter counts the file's tests from node:test's events.
+`vci ci` runs each remaining file the same way without the collector and exits non-zero if any fails; when
+everything must run it runs the script itself with the project's package manager (`pnpm run test`; detected from
+`packageManager`, then the nearest lockfile). CI example:
+[`examples/github-actions-node-test.yml`](../examples/github-actions-node-test.yml). **An attestation vouches for the
+file run on its own** (node:test's default process isolation already does that).
+
+### What the node:test adapter records
+
+Per test file, from the collector (`js/vitest-plugin/src/node-test/`, the `@vci/vitest` package's node:test
+entries): every module resolved or loaded through Node's module hooks (`import`, `require`, `import()` with a
+computed specifier, `import.meta.resolve`; your hook files and what they import), the candidates of every relative
+resolution (a missing candidate is a probe, so creating `src/c.ts` beside the `src/c.mjs` an extensionless import
+reached is noticed; an existing one is a read), files read, stat'ed, listed or probed through `node:fs` (sync,
+callback and promise APIs, by the test, your hooks or packages), packages under `node_modules` as `name@version` (a
+**linked workspace package**, `node_modules/@acme/lib -> packages/lib`, is repository content: its files are hashed,
+never identified by version, also with `--preserve-symlinks`), the nearest `package.json` of every module, env vars
+read, snapshot files node:test reads (`t.assert.snapshot`, custom `snapshot.setResolveSnapshotPath` paths,
+`t.assert.fileSnapshot`), `--env-file` contents (as a global input), `TZ`, `LANG`, `LC_ALL` and `LC_MESSAGES` (read
+natively by ICU) as env reads, and what your `--require` preloads do in the `node --test` process itself before it
+starts the file's process (files read and every module loaded there, through module hooks, so a computed
+`require(path.join(__dirname, ...))` is an input). A bare or aliased specifier that Node resolves to a file of the
+repository (a workspace package without `exports`, a legacy `main` naming a directory, a `Module._resolveFilename`
+alias) also records the candidates Node would have tried first (`util`, `util.js`, ... before `util/index.js`), so
+creating one of them is noticed. A package that is a **copy of a repository directory** (pnpm's
+`node_modules/.pnpm/<name>@file+...` store entries of `file:` and injected dependencies, or a real
+`node_modules/<name>` directory that the package.json beside it declares as `file:<dir>`, as npm with
+`install-links` and yarn 1 install them) is not identified by its version: the file is refused
+(`external-local-directory:<name>`).
+
+Global inputs of every file: `vci.toml`; `package.json`, lockfiles (`package-lock.json`, `pnpm-lock.yaml`,
+`yarn.lock`, `bun.lock`), `pnpm-workspace.yaml`, `.npmrc` and every `patches/` directory (its listing and files:
+what patch-package applies to installed packages) from the project dir up to the repository root; the
+`--import`/`--require` files of the command, with the files they name by relative path; the `--env-file`s; the test's
+default snapshot file (`<file>.snapshot`, absent recorded as absent); with a TypeScript loader preloaded (`tsx`,
+`ts-node`, `@swc-node/register`, `amaro`, `@esbuild-kit/esm-loader`, `esbuild-register`) the `tsconfig.json` chain
+from the test's directory up (Node's own type stripping reads no tsconfig, so without a loader tsconfig is not an
+input); and `NODE_OPTIONS`.
+
+Toolchain: the Node version, compared by major version (`policy.node_exact = true`: the exact version). node:test is
+part of Node, so a minor Node release can change its behaviour: set `node_exact` if you pin Node exactly on both sides.
+External packages are checked as installed now: `node_modules/<name>/package.json` from the project dir up, npm's
+hidden lockfile, or pnpm's virtual store (`node_modules/.pnpm/<name>@<version>.../node_modules/<name>`).
+
+Refusals specific to node:test (on top of those of every adapter, see below): a skipped or todo test or suite
+(`{ skip }`, `t.skip()`, `describe.skip`, `test.todo`); a test that uses `only`; a failing test, a failure outside tests (a load error,
+`process.exitCode`, asynchronous activity after a test ended, a cancelled test); **no per-file summary** (node:test
+reports none for a file without tests, `no-tests`, or when the process ended early: `process.exit()` in a test is
+also tainted `process.exit`); counts that disagree with node:test's summary; a non-zero exit of the `node --test`
+process (`vci:process-exit:<code>`); writes inside the repository (`write` records, as for pytest); child processes,
+network, `worker_threads`, `fetch`, enumerating `process.env`, recursive readdir and `fs.glob` (as for Vitest);
+`process.binding`/`process._linkedBinding` (`process.binding:<name>`: `process.binding('fs')` reads files natively);
+node:sqlite SQL that opens or writes another file natively, `ATTACH`, `VACUUM INTO`, `load_extension()`
+(`sqlite:<what>`, through `exec`, `prepare` and tag stores), and `loadExtension`/`enableLoadExtension(true)` (a
+database the constructor opens, also as a `file:` URI relative to the working directory, is recorded as read);
+`module.register` hooks (they run on another thread where reads are not seen) except from `ts-node` and `amaro`,
+which only map extensions and strip types (`module.register:<specifier>`; tsx, `@swc-node/register` and
+`@esbuild-kit/esm-loader` resolve tsconfig `paths` on that thread, trying targets in an order vci cannot see);
+`NODE_OPTIONS` with anything but memory, warning and stack-trace options, as vci's environment holds it and as each
+process sees it (`node-test:NODE_OPTIONS:<option>`: from an `--env-file`, or set by a `--require` preload of the `node
+--test` process for the file's process, it reaches the process before the collector); **`TZ` unset** in the test
+process (`node-test:TZ-unset`: ICU then takes the machine's zone, which is not an input; macOS laptops are rarely on
+UTC, runners are) or naming a zoneinfo file (`node-test:TZ-file`); a package copied from a repository directory
+(`external-local-directory:<name>`); a missing collector (`vci:collector-missing`, `vci:late-hooks-missing`,
+`vci:parent-collector-missing`, Node older than 22.15: `vci:module-hooks-unavailable`).
+
+A test that uses `only` (`test.only`, `{ only: true }`) taints its file (`node-test:only`): without `--test-only`
+(refused) Node 22 to 26 still run every test, but the file asks for a filtered run, which a later Node or a
+`--test-only` run would honour. Set the time zone where vci runs and in CI (`TZ=UTC`, declared in `[env] global` as the
+`vci init` template does), or in the script (`TZ=UTC node --test ...`: an assignment there is declared and hashed).
 
 ## Quick start (pytest)
 
@@ -765,7 +920,7 @@ checkout, clock, policy and environment.
 
 | Command | Purpose |
 |---|---|
-| `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest), print a CI snippet |
+| `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet |
 | `vci run [FILES…] [--key PATH] [--ttl 14d]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed) |
 | `vci plan [--base-ref R] [--format text\|json\|github]` | Print which test files can be skipped and why the others run |
 | `vci ci [--base-ref R] [--audit-log PATH]` | Plan, run the remainder, write a JSON audit log of every skip |
@@ -941,8 +1096,11 @@ readable with `git meta pull` + `git meta get`; values set (`git meta set`) or d
 
 ```toml
 project = "."          # project dir (Vitest root / pytest rootdir / Go module root / Cargo workspace root / Rails app root), relative to the repo root
-adapter = "vitest"     # or "pytest", "go", "cargo", "rails"
+adapter = "vitest"     # or "pytest", "go", "cargo", "rails", "node-test"
 # runner = "rspec"     # rails only: "minitest" or "rspec" (unset: detected, see Quick start (RSpec)); in [[projects]] per project
+# test_script = "test" # node-test only: the package.json script that runs `node --test` (default "test"); or instead:
+# test_globs = ["src/**/*.test.ts"]                  # node-test only: test file globs (node:test's glob syntax)
+# node_args = ["--import", "./test/hooks.mjs"]       # node-test only, with test_globs: node options
 
 [policy]
 platform = "any"       # "any" | "same-os" | "exact": which OS/arch may satisfy CI
@@ -952,6 +1110,7 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]   # never skip on these refs 
 never_skip = ["tests/test_attach_db.py"]             # never skip these files (project-relative globs)
 go_allow_net = false   # Go: attest packages whose test links package net (see "When vci run refuses")
 rails_allow_db = false # Rails: attest files whose test database is a server (see "Databases" under Rails)
+node_exact = false     # Vitest and node-test: require the exact Node version (default: the same major)
 
 [[policy.platform_overrides]]
 match = ["src/native/**"]   # project-relative globs
@@ -1042,6 +1201,16 @@ every Vitest config candidate plus files it references by relative path (directo
 `__snapshots__/<file>.snap`, and `NODE_OPTIONS`. Missing candidates are recorded as absent.
 
 Toolchain: Node major version, Vitest version and Vite version must match; OS/arch per `policy.platform`.
+
+### node:test
+
+See [What the node:test adapter records](#what-the-nodetest-adapter-records): per file the modules resolved or loaded
+through Node's module hooks with the candidates of relative resolutions, `node:fs` reads, stats, listings and probes,
+packages as `name@version` (linked workspace packages as files), each module's `package.json`, env vars read and
+snapshot files; globally `package.json`, lockfiles and `.npmrc` up to the repository root, the preloaded files and
+`--env-file`s of the command, `<file>.snapshot`, the tsconfig chain only with a TypeScript loader, and `NODE_OPTIONS`.
+Toolchain: the Node major version (`policy.node_exact`: the exact version), and the command's node options in the
+attestation's argv.
 
 ### pytest
 
@@ -1247,6 +1416,21 @@ pytest specifics:
   back is an input outside the repository and refused;
 - pytest's rootdir is not the project dir, or the collector's Python/pytest version differs from the one
   `uv run --locked` resolves.
+
+node:test specifics (details in [What the node:test adapter records](#what-the-nodetest-adapter-records)):
+
+- a skipped or todo test or suite, a test that uses `only`, a failure anywhere in the file (load errors, `process.exitCode`, asynchronous
+  activity after a test ended, cancelled tests), no per-file summary from node:test (no tests, or the process ended
+  early: `process.exit()` in a test is tainted `process.exit`), counts that disagree with that summary, or a non-zero
+  exit of the `node --test` process;
+- a write inside the repository; `module.register` hooks other than `ts-node`'s and `amaro`'s; `NODE_OPTIONS` with
+  anything but memory, warning and stack-trace options (from the environment, an `--env-file`, or a preload of the
+  `node --test` process); `TZ` unset; `process.binding`; SQLite `ATTACH`/`VACUUM INTO`/extensions; a package copied
+  from a repository directory;
+- a test command vci does not accept (a filtering, watching, coverage, config-file or loader option, an unknown
+  option, `--test-isolation=none`, shell operators in the script), a `pre`/`post` script around it, `.npmrc`
+  `node-options`, an install lifecycle script other than a git hook installer or `patch-package`, or a listing that
+  matches no file: nothing of the project is attested, `vci plan` runs everything.
 
 Go specifics (the log only sees what package os reports; everything else that could reach an input refuses the
 package, decided from the import closure of the test and the source of every non-standard package in it):
@@ -1454,7 +1638,8 @@ Not protected against:
   is an input. Reads by the config file itself, inline plugins and globalSetup files are recorded.
 - Timezone and locale in strict mode: `TZ` reaches tests only if declared (then hashed); the system timezone and
   `LANG`/`LC_*` (built-in pass-through) are not hashed. In loose mode `TZ` is always hashed. (Go refuses a package
-  that uses the system timezone, see "Go specifics".)
+  that uses the system timezone, see "Go specifics"; node:test refuses every file when `TZ` is unset and records
+  `LANG`, `LC_ALL` and `LC_MESSAGES` as read by every file.)
 
 Use `no_skip_refs` to run everything on the default branch and release refs.
 
@@ -1594,15 +1779,21 @@ Rails limitations (details and the verified mechanisms in [`docs/spike-rails.md`
 crates/vci-core       repo paths, input manifests, input roots, predicate types
 crates/vci-attest     in-toto Statement, DSSE + PAE, SSHSIG verification, allowed_signers, ssh-keygen signing
 crates/vci-git        attestation storage on git-meta (git-meta-lib), base-commit file reads, repo identity
-crates/vci-adapter    Adapter trait + Vitest, pytest, Go, Cargo and Rails adapters (list, run, JSONL / go test log
+crates/vci-adapter    Adapter trait + Vitest, node:test, pytest, Go, Cargo and Rails adapters (list, run, JSONL / go test log
                       parsing; src/golang/vci_testlog.go is the logger overlaid into Go's internal/testlog; src/cargo/
                       reads cargo's JSON messages, rustc dep-info and build script output, and scans sources;
-                      src/rails.rs runs bin/rails test and RSpec with the Ruby collector)
+                      src/rails.rs runs bin/rails test and RSpec with the Ruby collector; src/nodetest/ reads
+                      package.json test scripts and runs `node --test` per file)
 crates/vci-cli        the `vci` binary
-js/vitest-plugin      @vci/vitest collectors
+js/vitest-plugin      @vci/vitest collectors (Vitest; src/node-test/ for node:test)
 py/pytest-plugin      vci_pytest collector (pure stdlib pytest plugin)
 ruby/vci-collector    vci_collector.rb, the Rails collector (plain Ruby, loaded through RUBYOPT), and its tests
 fixtures/vitest-abcd  Vitest end-to-end fixture
+fixtures/node-test-abcd  node:test end-to-end fixture (the shape of a real script: NODE_ENV=test, an --import hooks
+                      file with an `@/` alias and extensionless imports, --experimental-strip-types, quoted globs;
+                      a: TypeScript, b: reads fixtures/b.json, c: computed import(), d: the ms package)
+fixtures/node-test-pnpm  a pnpm workspace: apps/web (unquoted `src/*.test.ts`) uses the workspace package
+                      packages/lib and ms from pnpm's virtual store (node_modules is made by the test)
 fixtures/pytest-abcd  pytest end-to-end fixture (uv project)
 fixtures/go-abcd      Go end-to-end fixture (module using golang.org/x/sync)
 fixtures/cargo-abcd   Cargo end-to-end fixture (workspace a, b, c, d; d uses the hex crate)
@@ -1622,7 +1813,7 @@ docs/                 PLAN.md (design), CONTRACTS.md (interfaces), ENV.md (env v
 cargo test --workspace                     # unit + integration + end-to-end (needs node, git, ssh-keygen; uv, go, cargo)
 cargo clippy --workspace --all-targets -- -D warnings
 (cd fixtures/vitest-abcd && npm ci)        # the fixture's node_modules, used by the e2e tests
-(cd js/vitest-plugin && npm test)          # collector tests
+(cd js/vitest-plugin && npm test)          # collector tests (Vitest and node:test)
 uv run --project fixtures/pytest-abcd pytest py/pytest-plugin/tests   # pytest collector tests
 (cd fixtures/go-abcd && go mod download)   # the Go fixture's module, used by the Go tests
 (cd fixtures/rails-abcd && bundle install) # the Rails fixture's bundle, with its Ruby (.ruby-version, e.g. through mise)
@@ -1643,6 +1834,27 @@ signers and PR-only `allowed_signers` are rejected; a declared env var with anot
 a socket) while writing to `tmp/` is attested; a database server (SQLite registered under another adapter name) is
 refused, attested with `rails_allow_db`, and skipped only while the base policy allows it; push/fetch into a fresh
 clone, `vci ci` running only the rest with exit codes and the audit log, `no_skip_refs`; `vci init --adapter rails`.
+
+The node:test end-to-end tests (`crates/vci-cli/tests/e2e_node_test.rs`) copy `fixtures/node-test-abcd` (with `ms` from
+`fixtures/vitest-abcd/node_modules`) and `fixtures/node-test-pnpm` into temporary repositories. They prove: attesting b
+skips only b; editing `fixtures/b.json` runs b and `explain` names it with both hashes; creating the
+`fixtures/b.local.json` b probed runs b; editing the computed import's target runs c alone, and so does creating the
+`src/c.ts` the hook would resolve first; `src/a.ts` (reached through the hook's `@/` alias) runs a alone; the `--import`
+hooks file, an option added to the script and the lockfile run everything; another installed `ms` version runs d; a
+declared variable with another value and `NODE_OPTIONS` run everything, while the environment's `NODE_ENV` (the script
+sets it) and `TEST_CONCURRENCY` (it only sets a dropped option) skip as before, and a `TEST_CONCURRENCY` that smuggles
+in `--test-only` runs everything; tampered payloads, unknown signers and PR-only `allowed_signers` are rejected; each
+refusal (a skipped or todo test, `describe.skip`, `test.only`, a failure, a child process, `process.exit`, no tests, a
+write inside the repository, a read outside it) and each refused script (`--test-only`, `--test-name-pattern`,
+`--test-isolation=none`, `--loader`, `--watch`, `&&`) attests nothing, and a script that is not `node --test` makes `vci
+ci` run it with the package manager; push/fetch into a fresh clone gives the same plan, `vci ci` runs only the rest (and
+fails when it fails), `no_skip_refs`; in the pnpm workspace, editing the workspace package's source or `package.json`
+runs the file that uses it, the root `pnpm-lock.yaml` runs everything, and a new file matching the script's shell glob
+is listed; `test_globs`/`node_args` in vci.toml replace the script; `vci init --adapter node-test` (printing the
+command as `sh` reads it); a `pretest` that builds the test files, a listing without files, `.npmrc` `node-options` and
+a `postinstall` script run everything (`vci ci` runs the script), while `patch-package` is accepted and a new file in
+`patches/` runs the attested file; an unset `TZ` and an `--env-file` setting `NODE_OPTIONS=--test-name-pattern=...`
+refuse the file.
 
 The RSpec end-to-end tests (`crates/vci-cli/tests/e2e_rspec.rs`) copy `fixtures/rails-rspec-abcd` the same way (and
 print `SKIPPED:` the same way, also when `bundle check` fails for it). They prove: attesting b skips only b (argv and
@@ -1752,8 +1964,15 @@ repository does not need the other projects' toolchains (`e2e_pytest.rs`).
 - `DirListing` includes ignored files, so listings of directories with build output differ between machines (those
   tests run; never a false skip). Only the cargo adapter leaves build output (its target dir, `.vci/out`, the
   repository's `.git`) out of a listing, as `excluded` entries.
-- The externals check understands npm layouts (`node_modules` lookup plus npm's hidden lockfile); other layouts make
-  tests with nested externals run.
+- The externals check understands npm layouts (`node_modules` lookup plus npm's hidden lockfile) and pnpm's virtual
+  store (`node_modules/.pnpm`); other layouts (Yarn Plug'n'Play) make tests with nested externals run.
+- node:test: vci reads the test script with a subset of `sh` and refuses the rest (`&&`, pipes, substitutions): such
+  projects set `test_globs`/`node_args`. What the collector cannot see: reads by the `module.register` hooks of
+  `ts-node` and `amaro` (their configuration, `tsconfig.json`, is a global input instead), and native addons that open
+  files themselves. Node's ICU takes the default locale from `LANG`/`LC_ALL`/`LC_MESSAGES` (recorded as env reads, so
+  hashed) and nothing else; an unset `TZ` is refused. npm's builtin config file (`<npm dir>/npmrc`) is not read for
+  `node-options`, and yarn Plug'n'Play layouts are not supported. Each file runs in its own `node --test` process, as node:test's default process isolation does; the
+  `@vci/vitest` version is not part of the attestation (like the other collectors).
 - Attestation metadata grows; `vci prune` deletes expired attestations (tombstones), and git-meta's own auto-prune
   (`meta:prune:max-keys`) may drop the least recently written keys (those units then run). No spot-check re-runs or
   transparency log.

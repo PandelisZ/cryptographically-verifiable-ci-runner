@@ -143,6 +143,8 @@ pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
                 o.runner_version = match o.adapter.as_str() {
                     "pytest" => str_field(&v, "pytest").unwrap_or_default(),
                     "rails" => str_field(&v, "runner").unwrap_or_default(),
+                    // node:test is part of Node.
+                    "node-test" => str_field(&v, "node").unwrap_or_default(),
                     _ => str_field(&v, "vitest").unwrap_or_default(),
                 };
                 o.ruby = str_field(&v, "ruby").unwrap_or_default();

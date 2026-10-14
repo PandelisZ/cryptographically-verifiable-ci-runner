@@ -17,6 +17,8 @@ pub const CI_SNIPPET_PYTEST: &str = include_str!("../../../examples/github-actio
 pub const CI_SNIPPET_GO: &str = include_str!("../../../examples/github-actions-go.yml");
 pub const CI_SNIPPET_CARGO: &str = include_str!("../../../examples/github-actions-cargo.yml");
 pub const CI_SNIPPET_RAILS: &str = include_str!("../../../examples/github-actions-rails.yml");
+pub const CI_SNIPPET_NODE_TEST: &str =
+    include_str!("../../../examples/github-actions-node-test.yml");
 
 pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i32> {
     let res = plan(&PlanOptions {
@@ -341,9 +343,35 @@ pub fn init(
             );
         }
     }
+    for s in specs.iter().filter(|s| s.adapter == "node-test") {
+        let dir = root.join(&s.rel);
+        if let Err(e) = vci_adapter::find_node_test_collector(&dir) {
+            eprintln!("vci init: note: {e} (needed by `vci run`, not by `vci ci`)");
+        }
+        let adapter = vci_adapter::NodeTestAdapter::new(&dir).with_options(s.node_test.clone());
+        match adapter.invocation() {
+            Ok(inv) => eprintln!(
+                "vci init: {}: tests from {}: {}{}",
+                s.rel,
+                inv.source,
+                inv.command_line(),
+                if inv.patterns.is_empty() {
+                    " (node:test's default patterns)"
+                } else {
+                    ""
+                }
+            ),
+            Err(e) => eprintln!(
+                "vci init: warning: {}: {e}; set test_script, or test_globs and node_args, in vci.toml",
+                s.rel
+            ),
+        }
+    }
     let vitest: Vec<_> = specs.iter().filter(|s| s.adapter == "vitest").collect();
     if vitest.is_empty() {
-        let snippet = if specs.iter().all(|s| s.adapter == "go") {
+        let snippet = if specs.iter().all(|s| s.adapter == "node-test") {
+            CI_SNIPPET_NODE_TEST
+        } else if specs.iter().all(|s| s.adapter == "go") {
             CI_SNIPPET_GO
         } else if specs.iter().all(|s| s.adapter == "cargo") {
             CI_SNIPPET_CARGO
@@ -592,6 +620,7 @@ mod tests {
             ("go", CI_SNIPPET_GO),
             ("cargo", CI_SNIPPET_CARGO),
             ("rails", CI_SNIPPET_RAILS),
+            ("node-test", CI_SNIPPET_NODE_TEST),
         ] {
             let install: Vec<&str> = s
                 .lines()

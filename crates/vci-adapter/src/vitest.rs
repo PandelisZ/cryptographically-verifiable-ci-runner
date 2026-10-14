@@ -151,7 +151,7 @@ fn main_preload_module(plugin_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterErro
     Ok(p)
 }
 
-fn file_url(p: &Utf8Path) -> String {
+pub(crate) fn file_url(p: &Utf8Path) -> String {
     // Percent-encode everything outside the unreserved set (plus '/').
     let mut s = String::from("file://");
     for b in p.as_str().bytes() {

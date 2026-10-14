@@ -200,7 +200,13 @@ impl TreeStat {
                     Err(format!("{rel}: modified during the run"))
                 }
             }
-            (_, None, _) => Err(format!("{rel}: did not exist before the run")),
+            // Present now under this spelling but not in the snapshot: on a
+            // case-insensitive file system, a path spelled with another letter
+            // case than the file on disk (or a file created during the run).
+            (_, None, Some(_)) => Err(format!(
+                "{rel}: not found under this spelling before the run (its letter case differs from the file on disk, or it was created during the run)"
+            )),
+            (_, None, None) => Err(format!("{rel}: did not exist before the run")),
             _ => Err(format!("{rel}: modified during the run")),
         }
     }
@@ -292,5 +298,31 @@ mod tests {
         // Another new name in the same directory is still a change.
         std::fs::write(root.join("new.rs"), "").unwrap();
         assert!(before.unchanged_excluding(&listing, Some(&x)).is_err());
+    }
+
+    /// Regression: an import spelled with another letter case than the file
+    /// (it resolves on a case-insensitive file system) was reported as "did
+    /// not exist before the run".
+    #[test]
+    fn a_path_missing_from_the_snapshot_but_present_names_the_likely_cause() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        std::fs::write(root.join("Foo.mjs"), "x").unwrap();
+        let before = TreeStat::snapshot(&root).unwrap();
+        std::fs::write(root.join("new.mjs"), "x").unwrap();
+        let entry = |p: &str| InputEntry {
+            path: vci_core::RepoPath::from_abs(&root, &root.join(p)).unwrap(),
+            kind: EntryKind::File,
+            exec: false,
+            size: 1,
+            hash: String::new(),
+        };
+        let e = before.unchanged(&entry("new.mjs")).unwrap_err();
+        assert!(
+            e.contains("letter case") && !e.contains("did not exist"),
+            "{e}"
+        );
+        let e = before.unchanged(&entry("gone.mjs")).unwrap_err();
+        assert!(e.contains("did not exist before the run"), "{e}");
     }
 }
