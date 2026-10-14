@@ -5,15 +5,15 @@
 (function () {
   var RUNNERS = ["Vitest", "pytest", "Go", "Cargo", "Rails", "RSpec"];
   var STEPS = [
-    { t: 4200, h: "<strong>Three places, one repository.</strong> A developer's laptop, an AI agent in a sandbox and the CI runner all push to and fetch from the same git remote. vci adds no server and no database." },
-    { t: 4200, h: "<strong>A change is made.</strong> The agent edits <code>app/models/order.rb</code> on a branch. A developer on a laptop goes through exactly the same steps." },
-    { t: 6000, h: "<strong>Run with the collector.</strong> <code>vci run spec/models/order_spec.rb</code> runs the test with a collector attached. Every file it read or looked for, every package and every env var is recorded and hashed: 318 inputs, one root hash." },
-    { t: 5200, h: "<strong>Sign.</strong> What ran, against which hashes, with which toolchain, by whom: signed with the agent's own SSH key as an in-toto attestation." },
-    { t: 5200, h: "<strong>Push through git.</strong> <code>vci push</code> stores the attestation as git-meta metadata on <code>refs/meta/main</code>, next to the branch. If you can <code>git push</code>, you can share it." },
-    { t: 5200, h: "<strong>CI fetches, and trusts only the base branch.</strong> On the pull request the action fetches the metadata and reads the accepted keys and the policy from <code>main</code>, never from the PR." },
-    { t: 6400, h: "<strong>Verify, then skip.</strong> Signature from an accepted key? Same toolchain? All 318 inputs re-hashed here: same root? All yes, so <span class=\"skip\">SKIP</span>. Everything without a valid attestation <span class=\"run\">runs</span>." },
-    { t: 6000, h: "<strong>Any change runs it again.</strong> A later commit edits <code>config/rates.json</code>, which the test had read. The root no longer matches, so CI <span class=\"run\">runs</span> that test. A skip has to be earned every time." },
-    { t: 5000, h: "<strong>Same flow for every runner.</strong> Vitest, pytest, Go, Cargo, Rails and RSpec each have an adapter that knows what a unit is and how to observe its inputs. One repository can mix them." }
+    { t: 2600, h: "<strong>Three places, one repository.</strong> A developer's laptop, an AI agent in a sandbox and the CI runner all push to and fetch from the same git remote. vci adds no server and no database." },
+    { t: 2600, h: "<strong>A change is made.</strong> The agent edits <code>app/models/order.rb</code> on a branch. A developer on a laptop goes through exactly the same steps." },
+    { t: 3600, h: "<strong>Run with the collector.</strong> <code>vci run spec/models/order_spec.rb</code> runs the test with a collector attached. Every file it read or looked for, every package and every env var is recorded and hashed: 318 inputs, one root hash." },
+    { t: 3200, h: "<strong>Sign.</strong> What ran, against which hashes, with which toolchain, by whom: signed with the agent's own SSH key as an in-toto attestation." },
+    { t: 3200, h: "<strong>Push through git.</strong> <code>vci push</code> stores the attestation as git-meta metadata on <code>refs/meta/main</code>, next to the branch. If you can <code>git push</code>, you can share it." },
+    { t: 3200, h: "<strong>CI fetches, and trusts only the base branch.</strong> On the pull request the action fetches the metadata and reads the accepted keys and the policy from <code>main</code>, never from the PR." },
+    { t: 3800, h: "<strong>Verify, then skip.</strong> Signature from an accepted key? Same toolchain? All 318 inputs re-hashed here: same root? All yes, so <span class=\"skip\">SKIP</span>. Everything without a valid attestation <span class=\"run\">runs</span>." },
+    { t: 3600, h: "<strong>Any change runs it again.</strong> A later commit edits <code>config/rates.json</code>, which the test had read. The root no longer matches, so CI <span class=\"run\">runs</span> that test. A skip has to be earned every time." },
+    { t: 3000, h: "<strong>Same flow for every runner.</strong> Vitest, pytest, Go, Cargo, Rails and RSpec each have an adapter that knows what a unit is and how to observe its inputs. One repository can mix them." }
   ];
 
   var ICON = {
@@ -173,7 +173,7 @@
         var was = b.getAttribute("class");
         b.setAttribute("class", "badge " + cls);
         b.querySelector("text").textContent = txt;
-        if (was.indexOf(cls) < 0 && cls !== "wait") { b.style.animationDelay = (0.9 + i * 0.18) + "s"; restart(b, "pop"); }
+        if (was.indexOf(cls) < 0 && cls !== "wait") { b.style.animationDelay = (0.5 + i * 0.12) + "s"; restart(b, "pop"); }
       });
       var chk = root.querySelector("[data-check]"), chkText = root.querySelector("[data-checktext]");
       chk.textContent = step === 7 ? "✗" : "✓";

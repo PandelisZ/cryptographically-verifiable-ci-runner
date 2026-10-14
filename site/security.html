@@ -59,7 +59,7 @@
 
 <h2 id="verification">How CI decides</h2>
 <p><code>vci plan</code> asks the same questions of every unit, and skips it only when every answer is yes:</p>
-<img src="assets/diagrams/decision.svg" alt="Five checks for every test unit: signed by a key in main's allowed_signers; not expired and within max_ttl; same project, runner and toolchain versions; every recorded input re-hashed to the same root; declared environment variables with the same hashes. All yes means SKIP, recorded in the audit log with who vouched. Any no means RUN, which is also the verdict on any error, a missing store, a refused unit, or a ref in no_skip_refs." width="716" height="350" loading="lazy" style="width:100%;height:auto">
+<img src="assets/diagrams/decision.svg" alt="Five checks for every test unit: signed by a key in main's allowed_signers; not expired and within max_ttl; same project, runner and toolchain versions; every recorded input re-hashed to the same root; declared environment variables with the same hashes. All yes means SKIP, recorded in the audit log with who vouched. Any no means RUN, which is also the verdict on any error, a missing store, a refused unit, or a ref in no_skip_refs." width="776" height="486" loading="lazy" style="width:100%;height:auto">
 
 <h3 id="fail-open">The core rule: fail open</h3>
 <p>The default verdict for every unit is <span class="badge run">RUN</span>. A unit gets <span class="badge skip">SKIP</span> only when one attestation passes every check. Any error, doubt or unrecognised behaviour means it runs. Each candidate is checked inside an error boundary, so even a crash while checking is a failed check, never a skip.</p>

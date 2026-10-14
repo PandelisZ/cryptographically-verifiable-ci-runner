@@ -25,7 +25,7 @@
 .walkthrough .file.hot { fill: var(--accent-soft); stroke: var(--accent); }
 .walkthrough .file.changed { fill: var(--run-soft); stroke: var(--run); }
 .walkthrough .scan { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; }
-.walkthrough .scan.on { animation: wt-scan 1.6s ease-in-out 2; }
+.walkthrough .scan.on { animation: wt-scan 1.1s ease-in-out 2; }
 @keyframes wt-scan { 0% { opacity: 0; transform: translateY(0); } 15% { opacity: .9; } 85% { opacity: .9; } 100% { opacity: 0; transform: translateY(104px); } }
 .walkthrough .badge text { font-family: var(--mono); font-size: 10.5px; font-weight: 700; }
 .walkthrough .badge rect { transition: fill .4s; }
@@ -37,21 +37,21 @@
 .walkthrough .wire { stroke: var(--border); stroke-width: 1.6; fill: none; transition: stroke .4s; }
 .walkthrough .wire.live { stroke: var(--accent); }
 .walkthrough .packet { fill: var(--accent); opacity: 0; }
-.walkthrough .packet.go { animation: wt-packet 1.8s ease-in-out 2; }
+.walkthrough .packet.go { animation: wt-packet 1.3s ease-in-out 2; }
 @keyframes wt-packet { 0% { opacity: 0; offset-distance: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { opacity: 0; offset-distance: 100%; } }
-.walkthrough .fade { opacity: 0; transition: opacity .45s ease, transform .45s ease; transform: translateY(6px); }
+.walkthrough .fade { opacity: 0; transition: opacity .3s ease, transform .3s ease; transform: translateY(6px); }
 .walkthrough .fade.on { opacity: 1; transform: none; }
-.walkthrough .stagger > * { opacity: 0; transform: translateX(-6px); transition: opacity .4s ease, transform .4s ease; }
+.walkthrough .stagger > * { opacity: 0; transform: translateX(-6px); transition: opacity .3s ease, transform .3s ease; }
 .walkthrough .stagger.on > * { opacity: 1; transform: none; }
-.walkthrough .stagger.on > :nth-child(2) { transition-delay: .35s; }
-.walkthrough .stagger.on > :nth-child(3) { transition-delay: .7s; }
-.walkthrough .stagger.on > :nth-child(4) { transition-delay: 1.05s; }
-.walkthrough .env { opacity: 0; transition: transform 1s cubic-bezier(.4, 0, .2, 1), opacity .4s; }
+.walkthrough .stagger.on > :nth-child(2) { transition-delay: .2s; }
+.walkthrough .stagger.on > :nth-child(3) { transition-delay: .4s; }
+.walkthrough .stagger.on > :nth-child(4) { transition-delay: .6s; }
+.walkthrough .env { opacity: 0; transition: transform .7s cubic-bezier(.4, 0, .2, 1), opacity .3s; }
 .walkthrough .env.on { opacity: 1; }
 .walkthrough .env rect.card { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.6; filter: drop-shadow(0 4px 10px rgba(0,0,0,.15)); }
 .walkthrough .seal { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.6; }
 .walkthrough .ring { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; transform-box: fill-box; transform-origin: center; }
-.walkthrough .ring.on { animation: wt-ring 1.3s ease-out 2; }
+.walkthrough .ring.on { animation: wt-ring 1s ease-out 2; }
 @keyframes wt-ring { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(2.4); } }
 .walkthrough .chip rect { fill: var(--bg-sunken); stroke: var(--border); transition: fill .4s, stroke .4s; }
 .walkthrough .chip text { font-family: var(--mono); font-size: 11.5px; fill: var(--muted); transition: fill .4s; }

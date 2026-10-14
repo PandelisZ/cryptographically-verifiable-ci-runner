@@ -98,7 +98,7 @@
     <div class="card"><h3>Laptop to runner</h3><p>An attestation made on macOS arm64 can be accepted on a Linux x86_64 runner when the toolchain and inputs match.</p></div>
   </div>
   <p>In CI, every unit goes through these checks, and a single "no" means it runs:</p>
-  <img src="assets/diagrams/decision.svg" alt="The five checks a unit must pass to be skipped: signed by a key in main's allowed_signers, not expired, same project, runner and toolchain, every recorded input re-hashes to the same root, and declared env vars hash the same. Any no, or any error, means RUN." width="716" height="350" loading="lazy" style="width:100%;height:auto;display:block;margin:8px 0 20px">
+  <img src="assets/diagrams/decision.svg" alt="The five checks a unit must pass to be skipped: signed by a key in main's allowed_signers, not expired, same project, runner and toolchain, every recorded input re-hashes to the same root, and declared env vars hash the same. Any no, or any error, means RUN." width="776" height="486" loading="lazy" style="width:100%;height:auto;display:block;margin:8px 0 20px">
   <div class="note warn">
     <p><strong>Know the limit.</strong> An attestation proves <em>who</em> made a claim, not that the test ran. A trusted signer can lie and a stolen key can sign. Keep the signer list short and keep full runs on your default branch. See the <a href="security.html#threat-model">threat model</a>.</p>
   </div>
