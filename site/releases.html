@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Releases · vci</title>
+<meta name="description" content="vci release notes: what each version added, fixed and changed, and how to upgrade.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="toc"><h2>On this page</h2></aside>
+<main>
+<h1>Releases</h1>
+<p class="lede">What changed in each version. Binaries for every release are on <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases">GitHub</a>; <code>brew upgrade vci</code> or the install script gets the latest. The GitHub Action's <code>@v1</code> follows the newest 1.x release.</p>
+
+<table>
+<tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-2-0">1.2.0</a></td><td>14 Oct 2026</td><td>Rails apps with Active Storage can attest; fixes from the first large monorepo deployment</td></tr>
+<tr><td><a href="#v1-1-0">1.1.0</a></td><td>14 Oct 2026</td><td>New <code>node-test</code> adapter for Node's built-in test runner</td></tr>
+<tr><td><a href="#v1-0-0">1.0.0</a></td><td>13 Oct 2026</td><td>First stable release: six runners, the GitHub Action, prebuilt binaries</td></tr>
+<tr><td><a href="#v0-3-0">0.3.0</a></td><td>2 Oct 2026</td><td>RSpec support</td></tr>
+<tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
+<tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
+</table>
+
+<h2 id="v1-2-0">1.2.0</h2>
+<p><em>14 October 2026.</em> Everything in this release came out of setting vci up in a large Rails + Rust + Go + TypeScript monorepo and measuring what refused to attest.</p>
+<h3>Rails apps with Active Storage can attest</h3>
+<p>Rails 8.1 loads <a href="https://github.com/libvips/ruby-vips">ruby-vips</a> at boot through Active Storage, and its FFI load tainted every test file, so a whole app attested nothing. Now a native library <em>load</em> is recorded as a hashed external (<code>native:libvips</code>) instead of a refusal; only <em>calls</em> into attached functions refuse. ruby-vips gets Ruby-level hooks: image loaders, savers and thumbnails record the image file as an input, while unknown vips operations, descriptors, text rendering and file-typed options still refuse. In the new fixture a model test attests, a test that attaches and analyses an image attests with the PNG as an input (editing the PNG re-runs only that test), and an arbitrary FFI call is refused.</p>
+<h3>Also fixed</h3>
+<ul>
+<li>Collector files reached through a symlinked install prefix (Homebrew's <code>opt/</code>) were recorded as inputs outside the repository, which blocked every <code>node-test</code> file on Homebrew installs.</li>
+<li>Minitest files that never load Rails were refused with a spurious toolchain mismatch (<code>rails ""</code>).</li>
+<li>A failed <code>ffi_lib</code> load no longer taints.</li>
+<li>OpenSSL certificate files and <code>SSL_CERT_FILE</code> / <code>SSL_CERT_DIR</code>, read in C, are now inputs.</li>
+<li>Found by the adversarial pass over the new rules and closed before release: paths starting with <code>~</code> or <code>|</code>, case-insensitive vips operation names, directory symlinks into exempt locations, <code>Method#super_method</code> around FFI wrappers, and uid/identity reads.</li>
+</ul>
+<h3>New</h3>
+<ul>
+<li><code>policy.allow_superuser_mismatch</code> (default off) lets CI runners that run as root accept attestations made as a normal user. <code>vci explain</code> names the key when the check fails. Read the warning in the <a href="configuration.html">configuration</a> page before turning it on.</li>
+<li><code>vci run</code> groups refusals by a stable reason with full counts instead of capping at twelve groups, and <code>vci run --summary FILE</code> writes a JSON summary of every unit and its reasons for scripted coverage measurement.</li>
+<li><code>vci init</code> in a linked git worktree says that the metadata remote went into the shared <code>.git/config</code>.</li>
+</ul>
+<p><strong>Upgrade note.</strong> The Ruby collector is now 0.4.1, so existing Rails attestations run once more in CI.</p>
+
+<h2 id="v1-1-0">1.1.0</h2>
+<p><em>14 October 2026.</em></p>
+<h3>New adapter: <code>node-test</code></h3>
+<p>For projects that run Node's built-in test runner (<code>node --test</code>). It parses the package.json test script, including leading env assignments, <code>--import</code> hooks, <code>--experimental-strip-types</code>, quoted globs and <code>${VAR:+…}</code> expansions, and supports pnpm workspaces. Each file runs in its own process with a collector preloaded ahead of the user's hooks; a reporter counts results so skipped, todo, <code>only</code>-filtered, load-error and early-exit files are never attested. Works on Node 22, 24 and 26.</p>
+<h3>From adversarial testing of the new adapter</h3>
+<ul>
+<li><code>pretest</code> and <code>posttest</code> scripts and <code>.npmrc</code> <code>node-options</code> are inputs or refusals.</li>
+<li><code>NODE_OPTIONS</code> set in an <code>--env-file</code> follows the environment policy.</li>
+<li>The <code>node --test</code> orchestrator process is observed, not only the per-file children.</li>
+<li>pnpm <code>file:</code> dependencies are hashed by content, not identified by version.</li>
+<li>The host time zone is an input when <code>TZ</code> is unset.</li>
+</ul>
+
+<h2 id="v1-0-0">1.0.0</h2>
+<p><em>13 October 2026.</em> First stable release.</p>
+<ul>
+<li>Six runners: Vitest, pytest (uv), Go, Cargo, Rails (Minitest) and RSpec, on macOS and Linux.</li>
+<li>Attestations signed with your SSH key and stored as <a href="https://git-meta.com/">git-meta</a> metadata on <code>refs/meta/main</code>.</li>
+<li>The GitHub Action, used as <code>uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code>, downloads a checksum-verified prebuilt binary and falls back to a source build.</li>
+<li>An agent skill (<code>npx skills add PandelisZ/cryptographically-verifiable-ci-runner</code>) and a Claude Code plugin.</li>
+<li>Licensed MIT; installable with <code>brew install pandelisz/tap/vci</code>.</li>
+</ul>
+
+<h2 id="v0-3-0">0.3.0</h2>
+<p><em>2 October 2026.</em> RSpec support in the Rails adapter: spec files run one per process through <code>rspec --options .rspec</code>, with the repository's <code>.rspec</code> as an input and <code>~/.rspec</code>, the XDG options file and <code>.rspec-local</code> never read. Pending, skipped and focus-filtered examples are refused. Fifteen issues from the adversarial pass were fixed, including a non-zero exit after RSpec finished being ignored and a stub of <code>File.directory?</code> blinding the collector.</p>
+
+<h2 id="v0-2-0">0.2.0</h2>
+<p><em>1 October 2026.</em> Attestation storage moved from custom <code>refs/attest/*</code> refs to <a href="https://git-meta.com/">git-meta</a> metadata on <code>refs/meta/main</code>, attached to the path of the test unit and readable with <code>git meta get</code>; the git-meta library is built into vci, so CI needs nothing extra. The Rails (Minitest) adapter arrived with a Ruby collector, a fresh SQLite database per file, and the <code>rails_allow_db</code> waiver for database servers.</p>
+
+<h2 id="v0-1-x">0.1.0 and 0.1.1</h2>
+<p><em>28 September 2026.</em> The first releases: Vitest, pytest, Go and Cargo adapters, each adversarially tested; the composite GitHub Action with prebuilt, checksum-pinned binaries for Linux and macOS on x86_64 and arm64; Turborepo-style environment policy. 0.1.1 relicensed the project and bumped the binaries.</p>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

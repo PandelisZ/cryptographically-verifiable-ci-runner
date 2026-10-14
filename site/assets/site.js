@@ -11,6 +11,7 @@
     ["github-actions.html", "GitHub Actions"],
     ["cli.html", "CLI"],
     ["security.html", "How it works"],
+    ["releases.html", "Releases"],
   ];
   var here = location.pathname.split("/").pop() || "index.html";
   var root = document.documentElement;
