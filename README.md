@@ -1,6 +1,6 @@
 # vci
 
-**Run a test once, prove it, and let CI skip it.**
+**Stop paying CI to re-run tests you already ran.** Up to 90% less CI time per pull request, with a signed proof behind every skipped test.
 
 vci is a command-line tool and a GitHub Action. A developer or an AI agent runs some tests on their own machine; vci records exactly what those tests depended on, signs that record, and stores it in git. When the pull request reaches CI, vci checks each record and runs only the tests nobody has already run against the same inputs.
 

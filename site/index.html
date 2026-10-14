@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vci: skip the tests someone already ran, with proof</title>
+<title>vci: stop paying CI to re-run tests you already ran</title>
 <meta name="description" content="vci signs what each test actually depended on, so CI can skip tests a trusted developer or agent already ran against identical inputs.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
@@ -16,8 +16,14 @@
 <div class="hero">
   <div>
     <div class="eyebrow">cryptographically verifiable CI</div>
-    <h1>Skip the tests someone <em>already ran</em>. With proof.</h1>
-    <p>If a developer or an agent already ran a test against exactly the files it depends on, CI should not run it again. <code>vci</code> makes that safe with signed, per-test attestations.</p>
+    <h1>Stop paying CI to re-run tests you <em>already ran</em>.</h1>
+    <p>Every push re-runs the whole suite, even the tests a developer or an AI agent just ran on the same code. <code>vci</code> proves which tests passed, so CI skips them: <strong>up to 90% less CI time per pull request</strong>, with a signed record for every skip and never a false one.</p>
+    <ul class="proof">
+      <li><strong>up to 90%</strong><span>less CI time when the suite was run locally first<sup><a href="#what-it-saves">*</a></sup></span></li>
+      <li><strong>0</strong><span>known false skips after adversarial testing of every adapter</span></li>
+      <li><strong>~10 s</strong><span>to verify and plan a pull request on a GitHub runner</span></li>
+      <li><strong>6</strong><span>test runners: Vitest, pytest, Go, Cargo, Rails, RSpec</span></li>
+    </ul>
     <div class="cta">
       <a class="btn primary" href="get-started.html">Get started</a>
       <a class="btn" href="github-actions.html">Add to GitHub Actions</a>
@@ -33,8 +39,8 @@
 </section>
 
 <section>
-  <h2>What it saves</h2>
-  <p class="sub">Only attested tests that still match are skipped; everything else runs as before, plus about ten seconds of verification.</p>
+  <h2 id="what-it-saves">What it saves</h2>
+  <p class="sub">Only attested tests that still match are skipped; everything else runs as before, plus about ten seconds of verification. <sup>*</sup>The 90% figure is the modelled case where the whole suite was attested before the push (93% in the chart); the ten seconds is measured on this repository's own Actions runs.</p>
   <img src="assets/savings.svg" alt="CI time for one pull request, full suite versus vci, in five cases" width="1000" height="538" style="width:100%;height:auto;display:block;margin:16px 0 4px">
 </section>
 
