@@ -144,6 +144,16 @@ vci push  ──── refs/meta/main ────▶             not expired, s
 
 If a test is not skipped and you expected it to be, `vci explain <unit> --base-ref origin/main` names the first check that failed and, for inputs, the file and both hashes.
 
+## Use vci from an AI agent
+
+[`skills/vci`](skills/vci/SKILL.md) is an agent skill that teaches Claude Code, Codex, Cursor and other agents the vci workflow: after a change, find the units that cover it, `vci run` them with the agent's own key, read what was attested or refused, check `vci plan`, and `vci push`. It also covers setup and `vci explain`, and forbids touching `allowed_signers`, weakening policy or attesting failing tests.
+
+```sh
+npx skills add PandelisZ/cryptographically-verifiable-ci-runner   # any agent, via the skills CLI
+```
+
+In Claude Code you can install it as a plugin instead: `/plugin marketplace add PandelisZ/cryptographically-verifiable-ci-runner`, then `/plugin install vci@pandelisz`. Every route, and what was tested: [docs/SKILL.md](docs/SKILL.md).
+
 ## Learn more
 
 | | |

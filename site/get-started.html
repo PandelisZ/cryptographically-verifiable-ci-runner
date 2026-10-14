@@ -13,14 +13,34 @@
 <aside class="toc"><h2>On this page</h2></aside>
 <main>
 <h1>Get started</h1>
-<p class="lede">Install the <code>vci</code> binary, enable it in a repository, attest a test and watch the plan skip it.</p>
+<p class="lede">Install <code>vci</code>, enable it in one repository, sign your first test run and see the plan skip it.</p>
+
+<p>vci lets CI skip a test that a trusted person or agent already ran against exactly the same inputs. You will:</p>
+<ol>
+<li>install the <code>vci</code> binary;</li>
+<li>set up your repository, once;</li>
+<li>run and sign tests as you work;</li>
+<li>let CI skip what is already signed (<a href="github-actions.html">GitHub Actions</a>).</li>
+</ol>
+
+<h2>Key ideas</h2>
+<p>These four words come up throughout the docs:</p>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>unit</td><td class="wrap">The smallest piece of your test suite vci can skip, such as one test file or one Go package.</td></tr>
+<tr><td>attestation</td><td class="wrap">A signed record of one unit's run: what ran, a hash of every input it used, the result, and who signed it.</td></tr>
+<tr><td>collector</td><td class="wrap">The plugin vci loads into your test runner to record what each unit reads while it runs.</td></tr>
+<tr><td>base branch</td><td class="wrap">The branch a pull request merges into, usually <code>main</code>. CI takes its trusted signers and policy from there, never from the pull request.</td></tr>
+</table>
+<p>What counts as a unit depends on the test runner:</p>
+<img src="assets/diagrams/units.svg" alt="The skippable unit per runner: Vitest and pytest a test file, Go a package, Cargo a test target such as crates/api#test:orders, Rails a Minitest file, RSpec a spec file." width="756" height="278" loading="lazy" style="width:100%;height:auto;display:block;margin:16px 0">
 
 <h2>Requirements</h2>
 <table>
 <tr><th>Tool</th><th>Needed for</th></tr>
 <tr><td><code>git</code></td><td>everything</td></tr>
-<tr><td>Rust toolchain (<code>cargo</code>, 1.85+)</td><td>building the <code>vci</code> binary</td></tr>
 <tr><td><code>ssh-keygen</code> (OpenSSH 8.1+) and an Ed25519 SSH key</td><td>signing attestations</td></tr>
+<tr><td>Rust toolchain (<code>cargo</code>, 1.85+)</td><td>building the <code>vci</code> binary (not needed with Homebrew)</td></tr>
 <tr><td>Node 22.15+ and Vitest <code>&gt;=3.2 &lt;6</code></td><td>Vitest projects</td></tr>
 <tr><td><a href="https://docs.astral.sh/uv/"><code>uv</code></a> and pytest 9</td><td>pytest projects</td></tr>
 <tr><td>Go (tested with 1.26.2)</td><td>Go projects</td></tr>
@@ -32,21 +52,28 @@
 <h2>Install</h2>
 <p>With Homebrew (macOS and Linux). This installs a prebuilt binary with the collectors included, so there is nothing else to set up:</p>
 <pre><code>brew install pandelisz/tap/vci</code></pre>
-<p>Without Homebrew, the install script clones the repository to <code>~/.local/share/vci</code> and builds with cargo (needs a Rust toolchain):</p>
-<pre><code>curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh</code></pre>
-<p>Or by hand:</p>
-<pre><code>git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.git ~/.local/share/vci
+<p>Upgrade later with <code>brew upgrade vci</code>.</p>
+
+<h3>Without Homebrew</h3>
+<p>The install script clones the repository to <code>~/.local/share/vci</code> and builds it with cargo, so it needs a Rust toolchain:</p>
+<pre><code>curl -fsSL \
+  https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh \
+  | sh</code></pre>
+<p>To pin a version, set <code>VCI_REF</code> to a tag or commit before running the script. Or build by hand:</p>
+<pre><code>git clone \
+  https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.git \
+  ~/.local/share/vci
 cargo install --locked --path ~/.local/share/vci/crates/vci-cli</code></pre>
-<p>Then tell <code>vci</code> where its collectors live (not needed with Homebrew). Add this to your shell profile:</p>
+<p>Then tell <code>vci</code> where its collectors live. Add this to your shell profile:</p>
 <pre><code>export VCI_PY_PLUGIN="$HOME/.local/share/vci/py/pytest-plugin"
 export VCI_JS_PLUGIN="$HOME/.local/share/vci/js/vitest-plugin"
 export VCI_RUBY_COLLECTOR="$HOME/.local/share/vci/ruby/vci-collector"</code></pre>
-<p>Check the install:</p>
+
+<h3>Check the install</h3>
 <pre><code>vci --version</code></pre>
-<p>To pin a version, set <code>VCI_REF</code> to a tag or commit before running the script. With Homebrew, upgrade with <code>brew upgrade vci</code>.</p>
 
 <h2>Set up a repository</h2>
-<p>Do this once, in the repository you want to speed up.</p>
+<p>Do this once, in the repository you want to speed up. Pick your test runner in the first step; the other tabs on these pages follow your choice.</p>
 <ol class="steps">
 <li>
   <h3>Create the config and trust file</h3>
@@ -56,21 +83,24 @@ export VCI_RUBY_COLLECTOR="$HOME/.local/share/vci/ruby/vci-collector"</code></pr
     <div class="tab-panel" data-tab="Go"><pre><code>vci init --adapter go --key ~/.ssh/id_ed25519.pub</code></pre></div>
     <div class="tab-panel" data-tab="Rust"><pre><code>vci init --adapter cargo --key ~/.ssh/id_ed25519.pub</code></pre></div>
     <div class="tab-panel" data-tab="Rails"><pre><code>vci init --adapter rails --key ~/.ssh/id_ed25519.pub</code></pre></div>
+    <div class="tab-panel" data-tab="RSpec"><pre><code><span class="c"># RSpec runs under the Rails adapter; the runner is detected</span>
+vci init --adapter rails --key ~/.ssh/id_ed25519.pub</code></pre></div>
   </div>
   <p>This writes three files:</p>
-  <ul>
-    <li><code>vci.toml</code>: policy and environment configuration (<a href="configuration.html">reference</a>);</li>
-    <li><code>.vci/allowed_signers</code>: who may attest, with your key as the first entry;</li>
-    <li><code>.git-meta</code>: where attestations are exchanged (your origin, unless you pass <code>--meta-url</code>).</li>
-  </ul>
-  <p>Add <code>--project DIR</code> when the project is not at the repository root, and <code>--principal you@example.com</code> to name the key's owner.</p>
+  <table>
+  <tr><th>File</th><th>What it is for</th></tr>
+  <tr><td><code>vci.toml</code></td><td class="wrap">Policy and environment settings (<a href="configuration.html">reference</a>).</td></tr>
+  <tr><td><code>.vci/allowed_signers</code></td><td class="wrap">Who may sign attestations. Your key is the first entry.</td></tr>
+  <tr><td><code>.git-meta</code></td><td class="wrap">Where attestations are exchanged: your <code>origin</code> remote, or the URL you pass with <code>--meta-url</code>. Without either, it is not written.</td></tr>
+  </table>
+  <p>Add <code>--project DIR</code> when the project is not at the repository root, and <code>--principal you@example.com</code> to name the key's owner. For Vitest, <code>--no-install</code> stops <code>vci init</code> from running <code>npm install</code> for the <code>@vci/vitest</code> collector.</p>
 </li>
 <li>
   <h3>Add every person or agent who may attest</h3>
   <p>One line each in <code>.vci/allowed_signers</code>:</p>
   <pre><code>alice@example.com namespaces="vci-attest" ssh-ed25519 AAAAC3Nza...
 build-agent namespaces="vci-attest",valid-before="20270101" ssh-ed25519 AAAAC3Nza...</code></pre>
-  <p>Give agents their own key, not a person's key, and an expiry.</p>
+  <p>Give agents their own key, not a person's key, and an expiry (<code>valid-before</code>).</p>
 </li>
 <li>
   <h3>Merge the files to your default branch</h3>
@@ -85,15 +115,17 @@ git commit -m "Enable vci"</code></pre>
   <tr><th>Runner</th><th>Pin</th></tr>
   <tr><td>Vitest</td><td class="wrap">Node major version, <code>package-lock.json</code></td></tr>
   <tr><td>pytest</td><td class="wrap">full Python version in <code>.python-version</code> (a uv-managed build such as <code>3.14.4</code>), <code>uv.lock</code>, the uv version, <code>UV_PYTHON_PREFERENCE=only-managed</code></td></tr>
-  <tr><td>Go</td><td class="wrap">exact Go version, <code>go.sum</code>, <code>CGO_ENABLED=0</code> and <code>TZ=UTC</code> declared in <code>[env] global</code> and set on both sides</td></tr>
+  <tr><td>Go</td><td class="wrap">exact Go version (<code>go version</code> must print the same on both sides), <code>go.sum</code>, <code>CGO_ENABLED=0</code> and <code>TZ=UTC</code> declared in <code>[env] global</code> and set on both sides</td></tr>
   <tr><td>Rust</td><td class="wrap">exact release in <code>rust-toolchain.toml</code> (a <code>rustup</code> build, not Homebrew's), <code>Cargo.lock</code>, <code>[env] mode = "strict"</code></td></tr>
-  <tr><td>Rails</td><td class="wrap">exact Ruby in <code>.ruby-version</code>, <code>Gemfile.lock</code> with the <code>x86_64-linux</code> platform, <code>gem "tzinfo-data"</code>, <code>config.eager_load = false</code> in <code>config/environments/test.rb</code>, <code>TZ=UTC</code> declared and set on both sides</td></tr>
+  <tr><td>Rails</td><td class="wrap">exact Ruby in <code>.ruby-version</code> (and <code>ruby-version:</code> in <code>ruby/setup-ruby</code>), <code>Gemfile.lock</code> with the <code>x86_64-linux</code> platform (<code>bundle lock --add-platform x86_64-linux</code>), <code>gem "tzinfo-data"</code>, <code>config.eager_load = false</code> in <code>config/environments/test.rb</code>, <code>TZ=UTC</code> declared in <code>[env] global</code> and set on both sides</td></tr>
+  <tr><td>RSpec</td><td class="wrap">everything in the Rails row, plus options in <code>.rspec</code> (vci never reads <code>~/.rspec</code>, <code>$XDG_CONFIG_HOME/rspec/options</code> or <code>.rspec-local</code>), and <code>SPEC_OPTS</code> declared in <code>[env] global</code> if you set it</td></tr>
   </table>
-  <p>Details per runner are on the <a href="adapters.html">test runners</a> page.</p>
+  <p><strong>Strict mode</strong> (<code>[env] mode = "strict"</code>) removes every environment variable you have not declared before the tests run; the cargo adapter only attests in strict mode. Details per runner are on the <a href="adapters.html">test runners</a> page.</p>
 </li>
 </ol>
 
 <h2>Daily use</h2>
+<p>Three commands cover the daily loop:</p>
 <pre><code><span class="c"># Run some tests locally and sign what was run.</span>
 vci run tests/test_b.py tests/test_c.py --key ~/.ssh/id_ed25519
 
@@ -103,7 +135,7 @@ vci plan --base-ref origin/main
 <span class="c"># Share the attestations, then push your branch as usual.</span>
 vci push
 git push</code></pre>
-<p><code>vci run</code> with no paths runs and attests every unit. What you pass depends on the runner:</p>
+<p><code>vci run</code> with no paths runs and attests every unit. Paths are relative to the current directory, and what you pass depends on the runner:</p>
 <table>
 <tr><th>Adapter</th><th>Unit</th><th>Written as</th></tr>
 <tr><td><code>vitest</code></td><td>test file</td><td><code>src/b.test.ts</code></td></tr>
@@ -127,12 +159,12 @@ candidate 1: git-meta path:src/b.test.ts vci:attestation:3b9f…:b6c35e2a042def4
       actual:   file exec=false size=25 blake3=342a1f57…</code></pre>
 <p><code>expected</code> is what the attestation recorded. <code>actual</code> is what this checkout has now. Here a fixture changed after the test was attested, so the test must run again.</p>
 
-<h2>Setting up an agent</h2>
-<p>An agent uses the same commands. Give it:</p>
+<h2 id="setting-up-an-agent">For agents</h2>
+<p>An agent uses the same commands as a person. Give it:</p>
 <ul>
 <li>its own Ed25519 key, listed in <code>.vci/allowed_signers</code> on the default branch;</li>
-<li><code>VCI_PY_PLUGIN</code>, <code>VCI_JS_PLUGIN</code> or <code>VCI_RUBY_COLLECTOR</code> in its environment;</li>
-<li><code>VCI_SIGNING_KEY</code> pointing at its key;</li>
+<li><code>VCI_SIGNING_KEY</code> pointing at that key;</li>
+<li><code>VCI_PY_PLUGIN</code>, <code>VCI_JS_PLUGIN</code> or <code>VCI_RUBY_COLLECTOR</code> in its environment (not needed with Homebrew);</li>
 <li>push access to <code>refs/meta/main</code> on the metadata remote (usually the repository itself).</li>
 </ul>
 

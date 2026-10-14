@@ -111,6 +111,14 @@
     w.appendChild(t);
   });
 
+  // Diagrams keep a readable size on a phone and scroll sideways on their own.
+  [].forEach.call(main.querySelectorAll('img[src^="assets/diagrams/"]'), function (img) {
+    var w = document.createElement("div");
+    w.className = "diagram-wrap";
+    img.parentNode.insertBefore(w, img);
+    w.appendChild(img);
+  });
+
   // Copy buttons.
   [].forEach.call(document.querySelectorAll("pre"), function (pre) {
     if (pre.dataset.nocopy !== undefined) return;

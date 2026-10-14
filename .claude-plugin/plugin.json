@@ -1,0 +1,13 @@
+{
+  "name": "vci",
+  "displayName": "vci (verifiable CI)",
+  "description": "Skill for vci: run tests locally, sign an attestation of exactly what they read, push it through git, and let CI skip those tests. Vitest, pytest, Go, Cargo, Rails Minitest and RSpec.",
+  "author": {
+    "name": "Pandelis Zembashis",
+    "url": "https://github.com/PandelisZ"
+  },
+  "homepage": "https://pandelisz.github.io/cryptographically-verifiable-ci-runner/",
+  "repository": "https://github.com/PandelisZ/cryptographically-verifiable-ci-runner",
+  "license": "MIT",
+  "keywords": ["testing", "ci", "attestation", "github-actions", "vitest", "pytest", "go", "cargo", "rails", "rspec"]
+}

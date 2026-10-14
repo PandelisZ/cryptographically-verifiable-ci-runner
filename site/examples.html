@@ -13,13 +13,15 @@
 <aside class="toc"><h2>On this page</h2></aside>
 <main>
 <h1>Examples</h1>
-<p class="lede">Worked examples you can copy. The output shown is real: it comes from this project's own <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/demo">demo apps</a> and their GitHub Actions runs.</p>
+<p class="lede">Worked examples you can copy. All output is real: it comes from this project's <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/demo">demo apps</a> and their GitHub Actions runs.</p>
 
 <h2 id="round-trip">A full round trip</h2>
-<p>An agent on a laptop (macOS arm64) changes a Rails model, runs the spec that covers it, and opens a pull request. CI (Ubuntu x86_64) skips what the agent already ran. This is <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/4">pull request 4</a> of this repository.</p>
+<p>An agent on a laptop (macOS arm64) changes a Rails model, runs the spec that covers it, and opens a pull request. CI (Ubuntu x86_64) then skips what the agent already ran. This is <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/4">pull request 4</a> of this repository.</p>
+<p>Two terms first. A <strong>unit</strong> is what vci can skip; here, one spec file. An <strong>attestation</strong> is a signed record that a unit passed against exactly the inputs it read.</p>
 
 <h3>1. Run and sign locally</h3>
-<pre><code>TZ=UTC vci run spec/models/b_spec.rb spec/lib/a_spec.rb --key ~/.ssh/id_ed25519</code></pre>
+<pre><code>TZ=UTC vci run spec/models/b_spec.rb spec/lib/a_spec.rb \
+  --key ~/.ssh/id_ed25519</code></pre>
 <pre data-nocopy><code>3 examples, 0 failures
 
 vci: attested demo/rspec-app/spec/lib/a_spec.rb (65 inputs, root 2cbdcb32a9721b03)
@@ -27,7 +29,7 @@ vci: attested demo/rspec-app/spec/lib/a_spec.rb (65 inputs, root 2cbdcb32a9721b0
 vci: attested demo/rspec-app/spec/models/b_spec.rb (7517 inputs, root 9b40ad198ee598ce)
      as git-meta path:demo/rspec-app/spec/models/b_spec.rb vci:attestation:…
 vci: 2 attested, 0 not attested</code></pre>
-<p>The input counts differ for a reason. <code>a_spec.rb</code> only loads <code>spec_helper.rb</code> and one library file. <code>b_spec.rb</code> boots Rails, so its inputs include every file Rails loaded or looked for.</p>
+<p>Why the input counts differ: <code>a_spec.rb</code> loads only <code>spec_helper.rb</code> and one library file. <code>b_spec.rb</code> boots Rails, so its inputs include every file Rails loaded or looked for.</p>
 
 <h3>2. See what CI will do</h3>
 <pre><code>TZ=UTC vci plan --base-ref origin/main</code></pre>
@@ -41,7 +43,7 @@ vci: 2 attested, 0 not attested</code></pre>
 git push        <span class="c"># your branch, as usual</span></code></pre>
 
 <h3>4. CI skips what was attested</h3>
-<p>From the <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/37059766996">Actions log</a> of that pull request, which also covers the repository's Python, Go, Rust and Minitest demo projects:</p>
+<p>From the <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/37059766996">Actions log</a> of that pull request. The same job also covers the repository's Python, Go, Rust and Minitest demo projects.</p>
 <pre data-nocopy><code>using vci v0.3.0 (vci-x86_64-unknown-linux-musl.tar.gz, sha256 fdf03d19…)
 vci: fetched git-meta metadata from meta (9 attestations stored locally)
 <span class="g">SKIP</span> demo/go-app/b [go]                              (attested …)
@@ -54,7 +56,7 @@ vci: fetched git-meta metadata from meta (9 attestations stored locally)
 4 to skip, 17 to run</code></pre>
 
 <h3>5. A later change invalidates only what it touches</h3>
-<p>A second commit edits a FactoryBot factory and does not re-run anything locally. <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/37059953008">CI</a> runs the spec that uses the factory again, and still skips the one that does not load it:</p>
+<p>A second commit edits a FactoryBot factory, without re-running anything locally. <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/37059953008">CI</a> runs the spec that uses the factory again, and still skips the one that does not load it:</p>
 <pre data-nocopy><code><span class="g">SKIP</span> demo/rspec-app/spec/lib/a_spec.rb [rspec]     (attested …)
 <span class="a">RUN </span> demo/rspec-app/spec/models/b_spec.rb [rspec]  (no valid attestation (1 candidates;
      best failed inputs: entry:demo/rspec-app/spec/factories/gadgets.rb))</code></pre>
@@ -70,7 +72,7 @@ candidate 1: git-meta path:demo/rspec-app/spec/models/b_spec.rb vci:attestation:
     entry:demo/rspec-app/spec/factories/gadgets.rb
       expected: file exec=false size=72 blake3=52e17ed94130e310…
       actual:   file exec=false size=80 blake3=e756de105a350d6a…</code></pre>
-<p>Each candidate attestation is listed with the first check it failed. The common ones:</p>
+<p>Each candidate attestation is listed with the first check it failed. <code>expected</code> is what the attestation recorded; <code>actual</code> is this checkout now. The common failed checks:</p>
 <table>
 <tr><th>Failed check</th><th>Meaning</th><th>What to do</th></tr>
 <tr><td><code>inputs</code></td><td>A file, directory listing or env var the test used has changed</td><td>Run the test again with <code>vci run</code></td></tr>
@@ -80,7 +82,12 @@ candidate 1: git-meta path:demo/rspec-app/spec/models/b_spec.rb vci:attestation:
 </table>
 
 <h2 id="per-runner">Setup for each runner</h2>
-<p>Each example is a complete starting point: the config, the local commands, and the CI steps. Run the local commands in the project directory.</p>
+<p>Each tab is a complete starting point: <code>vci.toml</code>, the commands to run locally (in the project directory), and the CI steps. What you pass to <code>vci run</code> depends on the runner: see <a href="adapters.html">Test runners</a>.</p>
+<p>Two settings recur in every <code>vci.toml</code> below:</p>
+<ul>
+<li><code>platform = "any"</code>: an attestation made on one OS and architecture (a Mac laptop) may count on another (a Linux runner), as long as the toolchain matches.</li>
+<li><code>mode = "strict"</code>: <strong>strict mode</strong>. Environment variables you have not declared are removed from the test's environment (apart from a few built-in ones such as <code>PATH</code> and <code>HOME</code>), so they cannot change its result. <code>global</code> lists the ones you declare; their values are hashed.</li>
+</ul>
 
 <div class="tabs" data-sync="adapter">
 
@@ -156,7 +163,7 @@ go_allow_net = false          <span class="c"># true if tests only link package 
 [env]
 mode = "strict"
 global = ["TZ", "CGO_ENABLED"]</code></pre>
-<p>Locally. The unit is a package, so pass package directories.</p>
+<p>Locally. The unit is a package, so pass package directories:</p>
 <pre><code>export CGO_ENABLED=0 TZ=UTC
 vci run ./orders ./pricing --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
@@ -193,9 +200,9 @@ global = ["TZ"]
 [[inputs]]
 match = ["crates/api#test:*"]
 extra = ["testdata/**"]</code></pre>
-<p>Locally. The unit is a test target: <code>&lt;package dir&gt;#lib</code>, <code>#test:&lt;name&gt;</code>, <code>#doc</code>.</p>
+<p>Locally. The unit is a test target: <code>&lt;package dir&gt;#lib</code>, <code>#test:&lt;name&gt;</code> or <code>#doc</code>. A package directory means all its targets.</p>
 <pre><code>vci run 'crates/api#test:orders' --key ~/.ssh/id_ed25519   <span class="c"># one target</span>
-vci run crates/core --key ~/.ssh/id_ed25519                <span class="c"># every target of a package</span>
+vci run crates/core --key ~/.ssh/id_ed25519                <span class="c"># every target</span>
 vci plan --base-ref origin/main
 vci push</code></pre>
 <p>CI steps</p>
@@ -276,10 +283,10 @@ steps:
 
 </div>
 
-<p><code>@v1</code> follows the latest tested 1.x release and never a branch; <code>@v1.0.0</code> is that exact release. For the strictest pinning use the full commit SHA shown on the <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases">release page</a>: the action then cannot change without a change to your workflow.</p><p><a href="github-actions.html">GitHub Actions</a> explains why, and lists the action's inputs.</p>
+<p><code>@v1</code> follows the latest tested 1.x release. For a release that never moves, or a full commit SHA, see <a href="github-actions.html#pinning">pinning</a>. <a href="github-actions.html">GitHub Actions</a> also lists the action's inputs.</p>
 
 <h2 id="refusals">When vci refuses to attest</h2>
-<p>Some tests cannot be vouched for, and <code>vci run</code> says so instead of signing. Two spec files as an example:</p>
+<p>Some tests cannot be vouched for. <code>vci run</code> then says why, instead of signing. Two spec files:</p>
 <pre><code><span class="c"># spec/lib/shell_spec.rb</span>
 it "asks git for its version" do
   expect(`git --version`).to include("git")
@@ -295,10 +302,10 @@ xit "subtracts"</code></pre>
      xfailed of 2; a skipped test did not run, so it cannot be vouched for elsewhere)
 vci: not attesting demo/rspec-app/spec/lib/shell_spec.rb: tainted: process:backtick
 vci: 0 attested, 2 not attested</code></pre>
-<p>Both files passed. They are refused because:</p>
+<p>Both files passed, but neither is attested:</p>
 <ul>
-<li>the first starts a child process, and what that process reads is invisible to the collector;</li>
-<li>the second has an example that did not run, so nobody has checked it.</li>
+<li><code>shell_spec.rb</code> starts a child process. What that process reads is invisible to the <strong>collector</strong> (the part of vci that records each file and variable a test reads).</li>
+<li><code>pending_spec.rb</code> has an example that did not run, so nobody has checked it.</li>
 </ul>
 <p>A refused test is not an error. It runs in CI as it always did.</p>
 <table>
@@ -311,7 +318,7 @@ vci: 0 attested, 2 not attested</code></pre>
 <tr><td><code>input outside the repository: &lt;path&gt;</code></td><td>The test read a file CI will not have</td></tr>
 <tr><td><code>env:enumerated</code></td><td>The test read the whole environment, not named variables</td></tr>
 </table>
-<p>Tests you know depend on something vci cannot see belong under <code>never_skip</code> in <code>vci.toml</code>.</p>
+<p>If you know a test depends on something vci cannot see, list it under <code>never_skip</code> in <code>vci.toml</code>.</p>
 
 <h2 id="monorepo">Several runners in one repository</h2>
 <p>This repository's own <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/vci.toml"><code>vci.toml</code></a> holds five projects with four adapters:</p>
@@ -350,8 +357,10 @@ path = "demo/rspec-app"
 adapter = "rails"
 runner = "rspec"</code></pre>
 <p>From the repository root, one command takes units of any project. vci finds the project each belongs to:</p>
-<pre><code>vci run demo/rspec-app/spec/models/b_spec.rb demo/go-app/b 'demo/cargo-app/a#lib' --key ~/.ssh/id_ed25519</code></pre>
-<p>In CI, set up every toolchain and call the action once. The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/.github/workflows/ci.yml">workflow</a>:</p>
+<pre><code>vci run demo/rspec-app/spec/models/b_spec.rb \
+  demo/go-app/b 'demo/cargo-app/a#lib' \
+  --key ~/.ssh/id_ed25519</code></pre>
+<p>In CI, set up every toolchain and call the action once. Adapted from this repository's <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/.github/workflows/ci.yml">workflow</a>:</p>
 <pre><code>env:
   UV_PYTHON_PREFERENCE: only-managed
   CGO_ENABLED: "0"
@@ -374,25 +383,32 @@ steps:
       (cd demo/pytest-app &amp;&amp; uv sync --locked)
       (cd demo/go-app &amp;&amp; go mod download)
       (cd demo/cargo-app &amp;&amp; cargo fetch --locked)
-  - uses: ./        <span class="c"># in your repository: PandelisZ/cryptographically-verifiable-ci-runner@v1</span></code></pre>
-<p>The whole job, with 21 units across five projects, takes under a minute. The vci step itself takes about ten seconds.</p>
+  <span class="c"># (this repository itself uses ./, to test the action from its own checkout)</span>
+  - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1</code></pre>
+<p>The whole job, 21 units across five projects, takes under a minute. The vci step takes about ten seconds.</p>
 
 <h2 id="git-meta">Looking at attestations in git</h2>
-<p>Attestations are <a href="https://git-meta.com/">git-meta</a> metadata. There is no server and no separate database: they live on <code>refs/meta/main</code> of your repository and travel with <code>git push</code> and <code>git fetch</code>.</p>
+<p>Attestations are <a href="https://git-meta.com/">git-meta</a> metadata. There is no server and no separate database. They live on <code>refs/meta/main</code> of your repository and travel with <code>git push</code> and <code>git fetch</code>.</p>
 <pre><code>git ls-remote origin 'refs/meta/*'</code></pre>
 <pre data-nocopy><code>d413f4b9835da1961068518613a00524f0034690	refs/meta/main</code></pre>
 <p>Each attestation is attached to the path of the unit it covers. With the <code>git meta</code> CLI installed (<code>cargo install git-meta-cli</code>) you can read them directly:</p>
 <pre><code>git meta get path:demo/go-app/b</code></pre>
 <pre data-nocopy><code>demo/go-app/b;vci:attestation:a2ad9aa8…:4404876773660987:61dfaf94…  {"payloadType":"application/vnd.in-toto+json", …}
 demo/go-app/b;vci:attestation:a2ad9aa8…:4404876773660987:74cca9cb…  {"payloadType":"application/vnd.in-toto+json", …}</code></pre>
-<p>The key has three parts after <code>vci:attestation</code>: a hash of the unit's id, the signer's id, and a hash of everything the attestation covers. The value is the signed envelope. Two entries here mean the same signer attested the package against two different sets of inputs.</p>
+<p>The key has three parts after <code>vci:attestation</code>:</p>
+<ol>
+<li>a hash of the unit's id;</li>
+<li>the signer's id;</li>
+<li>a hash of everything the attestation covers.</li>
+</ol>
+<p>The value is the signed envelope. The two entries here mean the same signer attested the package against two different sets of inputs.</p>
 <div class="note"><p><strong>Metadata is not trusted on its own.</strong> Anyone who can push to the repository can write or delete these values. A value only leads to a skip when its signature verifies against a key in the base branch's <code>.vci/allowed_signers</code>, and every input still matches. Deleting one only makes that test run.</p></div>
 <p>To drop expired attestations:</p>
 <pre><code>vci prune --dry-run
 vci prune &amp;&amp; vci push</code></pre>
 
 <h2 id="agent">An agent's loop</h2>
-<p>An agent uses the same commands as a person. Give it its own key, listed in <code>.vci/allowed_signers</code> on the default branch with an expiry:</p>
+<p>An agent uses the same commands as a person. Give it its own key, listed with an expiry in <code>.vci/allowed_signers</code> on the default branch:</p>
 <pre><code>build-agent namespaces="vci-attest",valid-before="20270101" ssh-ed25519 AAAAC3Nza…</code></pre>
 <p>Then, after each change it makes:</p>
 <pre><code>export VCI_SIGNING_KEY=~/.config/vci/agent_ed25519   <span class="c"># so --key can be left out</span>

@@ -2,6 +2,31 @@
 
 Modeled on Turborepo's `env` / `globalEnv` / `passThroughEnv` and strict mode, with one addition: vci also observes which variables a test file actually reads at runtime.
 
+## In one minute
+
+Environment variables can change a test's result, so vci treats the ones a test depends on as inputs. It stores a hash of each value (never the value) in the attestation, and CI skips the test only if its own values hash the same.
+
+**Strict mode**, the default, removes every undeclared variable from the test process, in `vci run` and in `vci ci` alike. Local and CI runs therefore see the same environment shape: only the variables you allowed. (Loose mode leaves them in place; the cargo adapter only attests in strict mode.)
+
+Every variable is one of three kinds:
+
+| Kind | Where you list it | Reaches the test | Hashed |
+|---|---|---|---|
+| Declared | `global`, or `env` under `[[env.files]]` | yes | yes |
+| Pass-through | `pass_through` (put secrets here) | yes | no |
+| Undeclared | nowhere | strict: no (removed); loose: yes | if the test reads it: strict records it as absent, loose hashes its value |
+
+A few built-in pass-through variables (`PATH`, `HOME`, `CI`, `TMPDIR`, ...) always reach the test so that tooling works; they are hashed only if the test reads them.
+
+```toml
+[env]
+mode = "strict"
+global = ["NODE_ENV", "TZ"]      # set the same values locally and in CI
+pass_through = ["GITHUB_TOKEN"]  # visible to tests, never hashed
+```
+
+Each runner adds its own built-in pass-through and hashed-if-present variables (`PYTHON*`, `GO*`, `RUSTFLAGS`, `RAILS_*`, ...). The [Categories](#categories) table below gives the exact rules per runner.
+
 ## Config (`vci.toml`)
 
 ```toml

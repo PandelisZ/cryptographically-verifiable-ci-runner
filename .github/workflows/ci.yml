@@ -2,8 +2,7 @@
 # cargo test targets and Rails test files of demo/ that no trusted signer has already attested.
 #
 # This repository uses the action from its own checkout (`uses: ./`). Other
-# repositories pin a commit instead, so a pull request cannot change the
-# verifier it is checked by: see docs/GITHUB_ACTIONS.md.
+# repositories use `@v1` (or a release tag / full SHA): see docs/GITHUB_ACTIONS.md.
 name: ci
 
 on:

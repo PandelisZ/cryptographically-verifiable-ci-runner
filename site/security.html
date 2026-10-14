@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How it works · vci</title>
-<meta name="description" content="What an attestation contains, where it lives, the checks vci plan makes, and the threat model.">
+<meta name="description" content="What an attestation contains, where it lives, how CI decides to skip a test, where trust comes from, and the threat model.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -13,13 +13,16 @@
 <aside class="toc"><h2>On this page</h2></aside>
 <main>
 <h1>How it works</h1>
-<p class="lede">What is signed, where it is stored, what CI checks before it skips anything, and what vci does not protect against.</p>
+<p class="lede">vci lets CI skip a test that a trusted person or agent already ran on exactly the same code. Everything else runs.</p>
 
-<h2 id="fail-open">The core rule: fail open</h2>
-<p>The default verdict for every test is <span class="badge run">RUN</span>. A test is skipped only when one attestation passes every check. Any error, doubt or unrecognised behaviour means the test runs. Each candidate is checked inside an error boundary, so even a crash while checking is a failed check and never a skip.</p>
+<p>When a test passes on your machine, <code>vci run</code> records every file, package and environment variable it used, and signs that record with your SSH key. The signed record is an <strong>attestation</strong>. In CI, <code>vci plan</code> checks the signature, re-hashes every recorded input from CI's own checkout, and skips the test only if the signer is trusted and nothing has changed. In every other case the test runs.</p>
+<p>vci skips or runs whole <strong>units</strong>: a test file for Vitest, pytest, Rails and RSpec, a package for Go, a test target for Cargo.</p>
 
 <h2 id="attestation">What an attestation is</h2>
-<p>When <code>vci run</code> finishes a unit that passed and did nothing unobservable, it builds an <a href="https://in-toto.io/">in-toto</a> statement and signs it with your SSH key (SSHSIG, namespace <code>vci-attest</code>) inside a DSSE envelope. The statement records:</p>
+<p>An attestation is a signed list of everything one unit depended on when it passed, stored as hashes rather than contents:</p>
+<img src="assets/diagrams/attestation.svg" alt="The fields of one attestation: unit, project and runner, repository root commit, toolchain versions, an input root over hundreds of files, listings and probes, hashed environment variables, the result, issue and expiry dates, and the SSH signature. Each input is a BLAKE3 hash or 'absent', so CI can hash the same paths in its own checkout: the same root means skip, any difference means run." width="776" height="376" loading="lazy" style="width:100%;height:auto">
+<p>vci finds a unit's inputs with <strong>collectors</strong>: hooks loaded into the test runner that record each file, directory, package and variable the test touches. (Rust has no such hook, so for Cargo the inputs are decided conservatively from the source instead.)</p>
+<p>When a unit passes and did nothing vci cannot observe, <code>vci run</code> builds an <a href="https://in-toto.io/">in-toto</a> statement and signs it with your SSH key (SSHSIG, namespace <code>vci-attest</code>) inside a DSSE envelope. The statement records:</p>
 <ul>
 <li><strong>inputs</strong>: every file (content hash), directory listing, symlink and probed-but-missing path the unit used;</li>
 <li><strong>global inputs</strong>: lockfiles, runner config and <code>vci.toml</code>;</li>
@@ -28,10 +31,22 @@
 <li><strong>toolchain</strong>: runner and language versions, OS and architecture;</li>
 <li><strong>identity</strong>: the repository (its root commit), the test id, the command line, the issue and expiry times.</li>
 </ul>
-<p>Attestations are content-addressed by unit and inputs, not tied to a commit. They survive rebases and apply on every branch.</p>
+<p>Attestations are keyed by unit and inputs, not by commit. So they survive rebases and apply on every branch.</p>
+
+<h3 id="refusals">When <code>vci run</code> refuses to attest</h3>
+<p>If vci cannot vouch for a unit, it signs nothing, and the unit runs in CI. That happens when:</p>
+<ul>
+<li>it failed, or any of its tests was skipped;</li>
+<li>it did something a collector cannot follow: a child process, network access, native code, enumerating the whole environment;</li>
+<li>an input lies outside the repository;</li>
+<li>an input changed during the run.</li>
+</ul>
+<p>Each adapter has its own list; see <a href="adapters.html">test runners</a>.</p>
 
 <h2 id="storage">Where attestations live</h2>
-<p>vci keeps no storage format, database or server of its own. Each attestation is one <a href="https://git-meta.com/">git-meta</a> value attached to the unit's path:</p>
+<p>vci has no database, server or storage format of its own. Attestations are git metadata, pushed and fetched like any other ref:</p>
+<img src="assets/diagrams/storage.svg" alt="Your git remote holds ordinary branches plus refs/meta/main, managed by git-meta. Inside refs/meta/main each unit's path, such as path:spec/models/order_spec.rb, holds keys of the form vci:attestation:unit:signer:inputs whose value is the signed envelope. One value per unit, signer and inputs. Metadata is not trusted on its own: a value causes a skip only if its signature verifies and every input matches, and deleting one only makes a test run." width="756" height="354" loading="lazy" style="width:100%;height:auto">
+<p>Each attestation is one <a href="https://git-meta.com/">git-meta</a> value attached to the unit's path:</p>
 <pre><code>git meta get path:src/b.test.ts</code></pre>
 <ul>
 <li>Locally, values sit in git-meta's SQLite store at <code>.git/git-meta.sqlite</code>. Your index, <code>HEAD</code> and work tree are never touched.</li>
@@ -42,8 +57,15 @@
 <p><strong>Nothing in the store is trusted.</strong> Anyone with push access can write or delete metadata, exactly as with any other ref. A value that is deleted, overwritten, pruned or never fetched only means the unit runs. Only a correctly signed envelope for exactly this unit, repository, toolchain and inputs skips anything.</p>
 </div>
 
-<h2 id="verification">What <code>vci plan</code> checks</h2>
-<p>A file matching <code>policy.never_skip</code> runs. Otherwise each stored candidate is checked in this order, and the first candidate to pass every check means <span class="badge skip">SKIP</span>:</p>
+<h2 id="verification">How CI decides</h2>
+<p><code>vci plan</code> asks the same questions of every unit, and skips it only when every answer is yes:</p>
+<img src="assets/diagrams/decision.svg" alt="Five checks for every test unit: signed by a key in main's allowed_signers; not expired and within max_ttl; same project, runner and toolchain versions; every recorded input re-hashed to the same root; declared environment variables with the same hashes. All yes means SKIP, recorded in the audit log with who vouched. Any no means RUN, which is also the verdict on any error, a missing store, a refused unit, or a ref in no_skip_refs." width="716" height="350" loading="lazy" style="width:100%;height:auto">
+
+<h3 id="fail-open">The core rule: fail open</h3>
+<p>The default verdict for every unit is <span class="badge run">RUN</span>. A unit gets <span class="badge skip">SKIP</span> only when one attestation passes every check. Any error, doubt or unrecognised behaviour means it runs. Each candidate is checked inside an error boundary, so even a crash while checking is a failed check, never a skip.</p>
+
+<h3 id="checks">Every check, in order</h3>
+<p>A file matching <code>policy.never_skip</code> always runs. Otherwise each stored candidate is checked in this order, and the first candidate to pass every check means skip:</p>
 <table>
 <tr><th>#</th><th>Check</th><th>Passes when</th></tr>
 <tr><td>1</td><td><strong>envelope</strong></td><td class="wrap">it parses as DSSE with the in-toto payload type</td></tr>
@@ -62,38 +84,48 @@
 </table>
 <p><code>vci explain</code> prints the first failed check for each candidate.</p>
 
-<h2 id="refusals">When <code>vci run</code> refuses to attest</h2>
-<p>A unit gets no attestation, and so runs in CI, when vci cannot vouch for it:</p>
+<h2 id="trust">Trust comes from the base branch</h2>
+<p>The <strong>base branch</strong> is the branch a pull request merges into, usually <code>main</code>. CI takes its rules only from the <strong>base commit</strong>, the tip of that branch, never from the pull request:</p>
+<img src="assets/diagrams/trust.svg" alt="The CI runner takes keys and policy, .vci/allowed_signers and vci.toml, only from main, the base branch, where changes need review. From the pull request branch it takes only code and attestations; a key or a loosened vci.toml added in the pull request is ignored for trust decisions." width="656" height="346" loading="lazy" style="width:100%;height:auto">
 <ul>
-<li>it failed, or any of its tests was skipped;</li>
-<li>it did something a collector cannot follow: a child process, network access, native code, enumerating the whole environment;</li>
-<li>an input lies outside the repository;</li>
-<li>an input changed during the run.</li>
+<li><code>.vci/allowed_signers</code> (whose signatures count) and <code>vci.toml</code> (policy) are read from the base commit.</li>
+<li>A pull request that adds its own key or loosens policy changes nothing for itself. The change counts only once it is reviewed and merged.</li>
+<li>If either file is missing or unreadable at the base commit, everything runs.</li>
+<li>To revoke a signer, remove its line from <code>.vci/allowed_signers</code> on the base branch.</li>
 </ul>
-<p>Each adapter has its own list; see <a href="adapters.html">test runners</a>.</p>
+<div class="note warn">
+<p><strong>The base ref must be the base branch's commit.</strong> If CI passes a ref the pull request controls (its head, its merge commit or <code>HEAD</code>), keys and policy come from the code under test. The action passes <code>github.event.pull_request.base.sha</code> by default, and <code>vci plan</code> warns when the base commit is <code>HEAD</code> or contains it.</p>
+</div>
 
 <h2 id="threat-model">Threat model</h2>
 <h3>Protected against</h3>
 <ul>
-<li><strong>Forged or tampered attestations.</strong> The signature covers the exact payload bytes; one flipped byte fails.</li>
-<li><strong>Untrusted signers</strong>, including a pull request that adds its own key to <code>.vci/allowed_signers</code>. Trust and policy come only from the base commit.</li>
+<li><strong>Forged or tampered attestations</strong>: one flipped byte in the signed payload fails the signature.</li>
+<li><strong>Untrusted signers</strong>, including a pull request that adds its own key to <code>.vci/allowed_signers</code>.</li>
 <li><strong>Replay</strong> across repositories, test files, command lines, toolchains or env configurations, or after expiry.</li>
-<li><strong>Stale inputs.</strong> Every recorded input is re-hashed from CI's own checkout, including files that must still be absent.</li>
+<li><strong>Stale inputs</strong>: every recorded input is re-hashed from CI's checkout, including files that must still be absent.</li>
 </ul>
 <h3>Not protected against</h3>
 <ul>
-<li><strong>A trusted signer lying, or a stolen signing key.</strong> An attestation proves who made a claim, not that the test ran. A signer can also under-declare inputs. Keep <code>allowed_signers</code> short, use hardware-backed keys, and set <code>valid-before</code> on entries.</li>
-<li><strong>Inputs the collectors cannot see</strong>: native addons, time, locale, randomness, hardware.</li>
+<li><strong>A trusted signer lying, or a stolen signing key</strong>: an attestation proves who made a claim, not that the test ran.</li>
+<li><strong>A signer under-declaring inputs</strong>: CI re-hashes only the inputs the attestation lists.</li>
+<li><strong>Inputs the collectors cannot see</strong>: native addons, time, locale, randomness, hardware, network use outside the patched Node APIs.</li>
+<li><strong>Data captured before the collectors loaded</strong>, and the user and groups tests run as (only root or not is recorded).</li>
 <li><strong>Test code that deliberately evades the collectors.</strong></li>
-<li><strong>Malicious dependencies that match the lockfile.</strong> Packages are identified by version, not by file hashes.</li>
-<li><strong>A CI job whose base ref the pull request controls.</strong> Pass the base branch's commit, as the action does by default.</li>
+<li><strong>Malicious dependencies that match the lockfile</strong>: packages are identified by version, not by file hashes.</li>
+<li><strong>Third-party Vite plugins reading files</strong> in the main process: only their package version is an input.</li>
+<li><strong>Time zone and locale in strict mode</strong>: <code>TZ</code> counts only if declared; the system zone and <code>LANG</code>/<code>LC_*</code> are not hashed.</li>
+<li><strong>A CI job whose base ref the pull request controls</strong>: pass the base branch's commit, as the action does by default.</li>
 </ul>
+<div class="note">
+<p><strong>Limit what a signer can get wrong.</strong> Keep <code>allowed_signers</code> short, use hardware-backed keys, and set <code>valid-before</code> on entries. List tests whose inputs no collector can see in <code>policy.never_skip</code>.</p>
+</div>
 <div class="note">
 <p><strong>The backstop.</strong> Keep your default branch in <code>policy.no_skip_refs</code> (the <code>vci init</code> default). Every merge then gets a full run, which catches a false claim after the fact.</p>
 </div>
 
-<h2>Go deeper</h2>
-<p>The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md">reference</a> is the complete reference: every recorded input, every refusal, and the known limitations per adapter. Design notes are in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/docs">docs/</a>.</p>
+<h2 id="go-deeper">Go deeper</h2>
+<p>The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md">reference</a> has every recorded input, every refusal, and the known limitations per adapter. Design notes are in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/docs">docs/</a>.</p>
 </main>
 </div>
 <script src="assets/site.js"></script>

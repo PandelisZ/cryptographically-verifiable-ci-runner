@@ -28,14 +28,16 @@ rspec-rails 8.0.4 and factory_bot_rails 6.5.1, Ruby 3.4.9, SQLite), and RSpec in
 ## Install
 
 ```sh
-git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.git ~/.local/share/vci
-~/.local/share/vci/scripts/install.sh
-export VCI_PY_PLUGIN="$HOME/.local/share/vci/py/pytest-plugin"
-export VCI_JS_PLUGIN="$HOME/.local/share/vci/js/vitest-plugin"
-export VCI_RUBY_COLLECTOR="$HOME/.local/share/vci/ruby/vci-collector"
+brew install pandelisz/tap/vci                   # macOS and Linux: prebuilt binary, collectors included
 ```
 
-Full guide: [docs/INSTALL.md](INSTALL.md).
+Or, without Homebrew, the install script clones the repository to `~/.local/share/vci` and builds with cargo:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/PandelisZ/cryptographically-verifiable-ci-runner/main/scripts/install.sh | sh
+```
+
+Full guide: [INSTALL.md](INSTALL.md).
 
 ## GitHub Actions
 

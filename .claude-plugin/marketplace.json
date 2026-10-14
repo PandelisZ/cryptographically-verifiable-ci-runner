@@ -1,0 +1,17 @@
+{
+  "name": "pandelisz",
+  "description": "Plugins from PandelisZ: vci, run tests with proof and let CI skip them.",
+  "owner": {
+    "name": "Pandelis Zembashis",
+    "url": "https://github.com/PandelisZ"
+  },
+  "plugins": [
+    {
+      "name": "vci",
+      "source": "./",
+      "description": "Run tests locally with vci, attest what they depended on, and let CI skip them.",
+      "category": "testing",
+      "tags": ["testing", "ci", "attestation", "github-actions"]
+    }
+  ]
+}

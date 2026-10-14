@@ -4,16 +4,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Test runners · vci</title>
-<meta name="description" content="How vci works with Vitest, pytest, Go, Cargo and Rails: quick start, what is recorded and what is refused.">
+<meta name="description" content="How vci works with Vitest, pytest, Go, Cargo, Rails and RSpec: set up, what is recorded, what is refused, and what to pin to skip on a Linux runner.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
+<style>
+main details.more { margin: 12px 0 20px; border: 1px solid var(--border); border-radius: 10px; padding: 0 14px; background: var(--bg-raised); }
+main details.more > summary { cursor: pointer; padding: 10px 0; font-weight: 600; }
+main details.more[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+@media (max-width: 480px) { main td code { white-space: normal; overflow-wrap: anywhere; } }
+</style>
 </head>
 <body>
 <div class="layout">
 <aside class="toc"><h2>On this page</h2></aside>
 <main>
 <h1>Test runners</h1>
-<p class="lede">vci has one adapter per test runner. Each decides what a "unit" is, how its inputs are found, and when it refuses to attest.</p>
+<img src="assets/img/runners.webp" alt="Six cubes, one per supported test runner, in a row above one line that ends in a check mark" width="1200" height="800" loading="lazy" style="width:100%;height:auto;aspect-ratio:12/5;object-fit:cover;border-radius:12px;display:block;margin:0 0 20px">
+<p class="lede">vci works with six test runners: Vitest, pytest, Go, Cargo, Rails (Minitest) and RSpec. This page shows, for each one, how to set it up, what vci records, what it refuses, and what to pin so a test passed on your laptop is skipped on a Linux CI runner.</p>
+
+<p>Each runner has an <strong>adapter</strong>: the part of vci that runs your tests and records what they read. The adapter decides what a <strong>unit</strong> is: the smallest piece of your suite that vci can skip. The diagram shows the unit for each runner.</p>
+<img src="assets/diagrams/units.svg" alt="The unit that can be skipped, per runner: a test file for Vitest and pytest, a package for Go, a test target for Cargo, a Minitest file for Rails and a spec file for RSpec. Each unit runs in its own process, and one repository can mix runners." width="756" height="278" loading="lazy" style="width:100%;height:auto">
+
+<p><strong>What every adapter shares.</strong> Each unit runs in its own process, so nothing leaks in from another unit. While it runs, a <strong>collector</strong> (code vci loads into the test process) records every file, package and environment variable the test actually used. (Rust has no such hook, so the cargo adapter uses a conservative rule instead: see the table below.) When the unit passes, vci signs an <strong>attestation</strong>: a record that says "this unit passed with exactly these inputs". If the collector cannot see something the test did, or an input lies outside the repository, vci refuses to attest. The unit then simply runs in CI, as it would without vci.</p>
 
 <table>
 <tr><th>Adapter</th><th>Unit</th><th>How inputs are found</th></tr>
@@ -23,19 +35,37 @@
 <tr><td><a href="#cargo"><code>cargo</code></a></td><td>test target</td><td>conservative: every file of the package and its in-repo dependencies</td></tr>
 <tr><td><a href="#rails"><code>rails</code></a></td><td>Minitest file, or <a href="#rspec">RSpec</a> spec file</td><td>observed at run time (a collector wrapping Ruby's file, env and process entry points)</td></tr>
 </table>
-<p>Copy-and-paste setups for each runner, with real output, are on the <a href="examples.html">Examples</a> page.</p>
 
 <div class="note">
-<p><strong>Common to every adapter.</strong> A unit is attested only when it passed, nothing it did was invisible to the collector, and every input is inside the repository. A unit with a <em>skipped</em> test is not attested (Rust's <code>#[ignore]</code> is the exception). An attestation vouches for the unit run on its own, in its own process.</p>
+<p><strong>The rules for every adapter.</strong></p>
+<ul>
+<li>A unit is attested only when it passed, nothing it did was invisible to the collector, and every input is inside the repository.</li>
+<li>A unit with a <em>skipped</em> test is not attested. Rust's <code>#[ignore]</code> is the exception.</li>
+<li>An attestation vouches for the unit run on its own, in its own process.</li>
+</ul>
 </div>
 
-<h2 id="vitest">Vitest</h2>
+<p><strong>The commands in every set-up block</strong> are the same five steps:</p>
+<table>
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td><code>vci init</code></td><td>writes <code>vci.toml</code> (settings), <code>.vci/allowed_signers</code> (your public key) and, when the repository has an origin remote, <code>.git-meta</code> (where attestations are published)</td></tr>
+<tr><td><code>git commit</code></td><td>commits them. CI reads keys and policy from the <strong>base branch</strong> (the branch a pull request merges into), so merge this commit to <code>main</code> first.</td></tr>
+<tr><td><code>vci run</code></td><td>runs tests, records inputs, signs an attestation for each unit that passed</td></tr>
+<tr><td><code>vci plan</code></td><td>lists which units would be skipped (SKIP) and which would run (RUN)</td></tr>
+<tr><td><code>vci push</code></td><td>publishes the attestations to <code>refs/meta/main</code></td></tr>
+</table>
+<p>Copy-and-paste setups for each runner, with real output, are on the <a href="examples.html">Examples</a> page.</p>
+
+<h2 id="vitest"><img class="h-logo" src="assets/logos/vitest.svg" alt="" aria-hidden="true"> Vitest</h2>
 <p>Needs Node 22.15+ and Vitest <code>&gt;=3.2 &lt;6</code>. The unit is a test file.</p>
+<h3>Set up</h3>
 <pre><code>cd your-project
-npm install --save-dev /path/to/vci/js/vitest-plugin   <span class="c"># or set VCI_JS_PLUGIN instead</span>
+<span class="c"># or set VCI_JS_PLUGIN instead</span>
+npm install --save-dev /path/to/vci/js/vitest-plugin
 
 vci init --key ~/.ssh/id_ed25519.pub --no-install
-git add vci.toml .vci/allowed_signers .git-meta &amp;&amp; git commit -m "Enable vci"
+git add vci.toml .vci/allowed_signers .git-meta \
+  &amp;&amp; git commit -m "Enable vci"
 
 vci run src/b.test.ts --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
@@ -45,23 +75,40 @@ vci push</code></pre>
 <li>every module in the Vite graph and every module the worker evaluated, including computed <code>import()</code>;</li>
 <li>every file or directory read or stat'ed, and every failed lookup, so creating a file that was probed as absent invalidates the attestation;</li>
 <li>external packages as <code>name@version</code>;</li>
-<li>env vars: declared patterns, <code>VITE_*</code>, and anything the test read;</li>
-<li>global inputs: <code>package.json</code>, lockfiles, <code>.npmrc</code>, the Vitest config, the <code>tsconfig.json</code> chain, <code>vci.toml</code> and the test's snapshot file.</li>
+<li>env vars: declared patterns, <code>VITE_*</code>, and anything the test read.</li>
 </ul>
+<details class="more">
+<summary>Inputs of every test file</summary>
+<p>Besides what the test used, every test file also records these global inputs: <code>package.json</code>, lockfiles, <code>.npmrc</code>, the Vitest config, the <code>tsconfig.json</code> chain, <code>vci.toml</code> and the test's snapshot file.</p>
+</details>
 <h3>What is refused</h3>
-<p>Child processes, network, <code>worker_threads</code>, <code>fetch</code>, enumerating <code>process.env</code>, snapshot writes, <code>isolate: false</code>, vm or browser pools, and typecheck mode.</p>
-<p><strong>Pin:</strong> Node major version and <code>package-lock.json</code>. Vitest and Vite versions must match.</p>
+<ul>
+<li><strong>Work the collector cannot see:</strong> child processes, network, <code>worker_threads</code>, <code>fetch</code>.</li>
+<li><strong>Reading the whole environment:</strong> enumerating <code>process.env</code>.</li>
+<li><strong>Writing:</strong> snapshot writes.</li>
+<li><strong>Vitest modes:</strong> <code>isolate: false</code>, vm or browser pools, and typecheck mode.</li>
+</ul>
+<h3 id="vitest-laptop-to-linux-runner">Laptop to Linux runner</h3>
+<ul>
+<li>Pin the Node major version and <code>package-lock.json</code>.</li>
+<li>The Vitest and Vite versions must match on both sides.</li>
+</ul>
 
-<h2 id="pytest">pytest</h2>
+<h2 id="pytest"><img class="h-logo" src="assets/logos/pytest.svg" alt="" aria-hidden="true"> pytest</h2>
 <p>Needs <a href="https://docs.astral.sh/uv/">uv</a> and pytest 9. The project must be a uv project with a committed <code>uv.lock</code> and a pytest config file in the project directory. The unit is a test file, run in its own process.</p>
+<h3>Set up</h3>
 <pre><code>cd your-project
-uv python install 3.14.4                  <span class="c"># a uv-managed build that also exists for the CI platform</span>
-echo 3.14.4 &gt; .python-version             <span class="c"># pin the full version</span>
-export UV_PYTHON_PREFERENCE=only-managed  <span class="c"># never pick up the system Python</span>
+<span class="c"># a uv-managed build that also exists for the CI platform</span>
+uv python install 3.14.4
+<span class="c"># pin the full version</span>
+echo 3.14.4 &gt; .python-version
+<span class="c"># never pick up the system Python</span>
+export UV_PYTHON_PREFERENCE=only-managed
 uv lock
 
 vci init --adapter pytest --key ~/.ssh/id_ed25519.pub
-git add vci.toml .vci/allowed_signers .git-meta uv.lock .python-version &amp;&amp; git commit -m "Enable vci"
+git add vci.toml .vci/allowed_signers .git-meta uv.lock \
+  .python-version &amp;&amp; git commit -m "Enable vci"
 
 vci run tests/test_b.py --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
@@ -75,8 +122,13 @@ vci push</code></pre>
 </ul>
 <p>Any change to <code>uv.lock</code> runs everything.</p>
 <h3>What is refused</h3>
-<p><code>subprocess</code> and friends, sockets and HTTP clients, <code>ctypes.dlopen</code>, xdist, reruns, unseeded random ordering, writing inside the repository, enumerating the environment (<code>dict(os.environ)</code>), and SQLite databases inside the repository.</p>
-<h3>Laptop to Linux runner</h3>
+<ul>
+<li><strong>Work the collector cannot see:</strong> <code>subprocess</code> and friends, sockets and HTTP clients, <code>ctypes.dlopen</code>, and SQLite databases inside the repository.</li>
+<li><strong>Runs that are not repeatable:</strong> xdist, reruns, and unseeded random ordering.</li>
+<li><strong>Writing</strong> inside the repository.</li>
+<li><strong>Reading the whole environment</strong> (<code>dict(os.environ)</code>).</li>
+</ul>
+<h3 id="laptop-to-linux-runner">Laptop to Linux runner</h3>
 <ul>
 <li>Use a uv-managed Python whose exact patch version uv also ships for Linux (check with <code>uv python list --all-platforms</code>). Homebrew's Python will not match.</li>
 <li>Pin the same uv version locally and in <code>astral-sh/setup-uv</code>.</li>
@@ -84,23 +136,33 @@ vci push</code></pre>
 <li>Delete <code>.DS_Store</code> and <code>__pycache__</code> from directories your tests list. <code>vci run</code> warns about them.</li>
 </ul>
 
-<h2 id="go">Go</h2>
+<h2 id="go"><img class="h-logo" src="assets/logos/go.svg" alt="" aria-hidden="true"> Go</h2>
 <p>Needs a Go module and Go 1.26. The unit is a <strong>package</strong>: every directory with <code>_test.go</code> files. Test ids are package directories relative to the repository root.</p>
+<h3>Set up</h3>
 <pre><code>cd your-module
 vci init --adapter go --key ~/.ssh/id_ed25519.pub
-git add vci.toml .vci/allowed_signers .git-meta &amp;&amp; git commit -m "Enable vci"
+git add vci.toml .vci/allowed_signers .git-meta \
+  &amp;&amp; git commit -m "Enable vci"
 
-vci run ./b --key ~/.ssh/id_ed25519   <span class="c"># default: every package with tests</span>
+<span class="c"># default: every package with tests</span>
+vci run ./b --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
 vci push</code></pre>
 <h3>What is recorded</h3>
 <ul>
-<li>compile-time inputs from <code>go list</code>: every file of each in-repo package in the import closure, its directory listing, <code>go:embed</code> targets, and files excluded by build constraints;</li>
-<li>run-time inputs from a logger overlaid into the standard library for this build only: every file opened or stat'ed, every failed lookup, every env var looked up. This includes package initialisation and <code>TestMain</code>;</li>
-<li>external modules as <code>path@version</code>, verified against <code>go.sum</code>.</li>
+<li><strong>Compile-time inputs</strong>, from <code>go list</code>: every file of each in-repo package in the import closure, its directory listing, <code>go:embed</code> targets, and files excluded by build constraints.</li>
+<li><strong>Run-time inputs</strong>, from a logger overlaid into the standard library for this build only: every file opened or stat'ed, every failed lookup, every env var looked up. This includes package initialisation and <code>TestMain</code>.</li>
+<li><strong>External modules</strong> as <code>path@version</code>, verified against <code>go.sum</code>.</li>
 </ul>
 <h3>What is refused</h3>
-<p>Starting a child process, package <code>net</code> anywhere in the import closure, cgo and <code>syscall</code> in non-standard packages, <code>os.Environ</code>, a skipped test, and using the local time zone with <code>TZ</code> unset.</p>
+<ul>
+<li>starting a child process;</li>
+<li>package <code>net</code> anywhere in the import closure (see the waiver below);</li>
+<li>cgo and <code>syscall</code> in non-standard packages;</li>
+<li><code>os.Environ</code>;</li>
+<li>a skipped test;</li>
+<li>using the local time zone with <code>TZ</code> unset.</li>
+</ul>
 <div class="note"><p><strong>Network waiver.</strong> Many test helpers import <code>net/http</code> without using it (testify's <code>assert</code> does). Set <code>go_allow_net = true</code> under <code>[policy]</code> to state that these tests do no network I/O. The waiver is recorded in the attestation and only accepted while the base commit's policy still sets it.</p></div>
 <h3>Laptop to Linux runner</h3>
 <ul>
@@ -110,8 +172,10 @@ vci push</code></pre>
 <li>A package with floating-point code is only accepted on the same architecture.</li>
 </ul>
 
-<h2 id="cargo">Rust (Cargo)</h2>
+<h2 id="cargo"><img class="h-logo" src="assets/logos/rust.svg" alt="" aria-hidden="true"> Rust (Cargo)</h2>
 <p>Needs a Cargo workspace or package with a committed <code>Cargo.lock</code>. The unit is a <strong>cargo test target</strong> of a workspace member.</p>
+<h3>Set up</h3>
+<p>A unit's test id is its package directory, <code>#</code>, and the target:</p>
 <table>
 <tr><th>Test id</th><th>What <code>cargo test</code> runs</th></tr>
 <tr><td><code>&lt;package dir&gt;#lib</code></td><td>the library's unit tests</td></tr>
@@ -121,21 +185,34 @@ vci push</code></pre>
 </table>
 <pre><code>cd your-workspace
 vci init --adapter cargo --key ~/.ssh/id_ed25519.pub
-git add vci.toml .vci/allowed_signers .git-meta Cargo.lock &amp;&amp; git commit -m "Enable vci"
+git add vci.toml .vci/allowed_signers .git-meta Cargo.lock \
+  &amp;&amp; git commit -m "Enable vci"
 
-vci run 'crates/b#test:b' --key ~/.ssh/id_ed25519   <span class="c"># one unit</span>
-vci run crates/b --key ~/.ssh/id_ed25519            <span class="c"># every unit of that package</span>
+<span class="c"># one unit</span>
+vci run 'crates/b#test:b' --key ~/.ssh/id_ed25519
+<span class="c"># every unit of that package</span>
+vci run crates/b --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
 vci push</code></pre>
+<h3>What is recorded</h3>
 <div class="note warn">
-<p><strong>A weaker guarantee than the other adapters.</strong> Rust has no hook for what a test reads at run time. Instead, every file in the package directory of the unit, and of every in-repo crate it builds, is an input. A test that reads files elsewhere in the repository must declare them:</p>
+<p><strong>A weaker guarantee than the other adapters.</strong> Rust has no hook for what a test reads at run time. Instead, every file in the package directory of the unit, and of every in-repo crate it builds, is an input.</p>
+<p>A test that reads files elsewhere in the repository must declare them in <code>vci.toml</code>:</p>
 <pre><code>[[inputs]]
 match = ["crates/b#test:*"]
 extra = ["testdata/**", "shared/config.json"]</code></pre>
 <p>vci scans the source for undeclared paths and refuses the unit when it finds one, but a path built at run time is not seen.</p>
 </div>
 <h3>What is refused</h3>
-<p>Decided by scanning the source text: child processes (<code>Command::new</code>), sockets and network crates, FFI and <code>libc</code>, <code>env::vars()</code>, a unit where no test ran, and env mode <code>"loose"</code>. The cargo adapter only attests in strict mode.</p>
+<p>Decided by scanning the source text, not by watching the test run:</p>
+<ul>
+<li>child processes (<code>Command::new</code>);</li>
+<li>sockets and network crates;</li>
+<li>FFI and <code>libc</code>;</li>
+<li><code>env::vars()</code>;</li>
+<li>a unit where no test ran;</li>
+<li>env mode <code>"loose"</code>. The cargo adapter only attests in <strong>strict mode</strong> (<code>[env] mode = "strict"</code>: variables you have not declared are removed from the test's environment).</li>
+</ul>
 <h3>Laptop to Linux runner</h3>
 <ul>
 <li><code>rustc</code> and <code>cargo</code> must be identical, including the LLVM version. Use rustup with <code>rust-toolchain.toml</code> on both sides. Homebrew's rustc can report a different LLVM and then never matches.</li>
@@ -143,18 +220,21 @@ extra = ["testdata/**", "shared/config.json"]</code></pre>
 <li>Code using <code>std::env::consts::OS</code> or platform math functions pins the unit to the attesting OS and architecture.</li>
 </ul>
 
-<h2 id="rails">Rails</h2>
+<h2 id="rails"><img class="h-logo" src="assets/logos/rails.svg" alt="" aria-hidden="true"> Rails</h2>
 <p>Needs Rails 8 and the project's Ruby with its bundle installed (tested with Ruby 3.4.9 and SQLite). The unit is a <strong>test file</strong>, run in its own process. Two runners are supported:</p>
 <table>
-<tr><th><code>runner</code></th><th>Unit</th><th>Run as</th></tr>
-<tr><td><code>"minitest"</code></td><td>a file <code>bin/rails test</code> runs by default</td><td><code>bin/rails test &lt;file&gt;</code></td></tr>
-<tr><td><code>"rspec"</code></td><td>a spec file RSpec's own configuration lists</td><td><code>rspec --options .rspec &lt;file&gt;</code></td></tr>
+<tr><th><code>runner</code></th><th>Unit, and how vci runs it</th></tr>
+<tr><td><code>"minitest"</code></td><td>a file <code>bin/rails test</code> runs by default;<br>run as <code>bin/rails test &lt;file&gt;</code></td></tr>
+<tr><td><code>"rspec"</code></td><td>a spec file RSpec's own configuration lists;<br>run as <code>rspec --options .rspec &lt;file&gt;</code></td></tr>
 </table>
 <p>Set <code>runner</code> in <code>vci.toml</code>, or leave it out and vci detects it from the lockfile and the directories present. This section covers Minitest and everything the two share; <a href="#rspec">RSpec</a> has its own section below.</p>
+<h3>Set up</h3>
 <pre><code>cd your-app
-bundle lock --add-platform x86_64-linux   <span class="c"># so the CI runner can install the same bundle</span>
+<span class="c"># so the CI runner can install the same bundle</span>
+bundle lock --add-platform x86_64-linux
 vci init --adapter rails --key ~/.ssh/id_ed25519.pub
-git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock &amp;&amp; git commit -m "Enable vci"
+git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock \
+  &amp;&amp; git commit -m "Enable vci"
 
 TZ=UTC vci run test/models/b_test.rb --key ~/.ssh/id_ed25519
 TZ=UTC vci plan --base-ref origin/main
@@ -166,29 +246,45 @@ vci push</code></pre>
 <li><strong>a fixed Minitest seed</strong> (<code>--seed 0</code>).</li>
 </ul>
 <h3>What is recorded</h3>
-<p>Every Ruby file loaded, Zeitwerk's directory listings, every file read or checked (fixtures, templates, config, the schema), the gems used by version, and every variable read through <code>ENV</code>. Any change to <code>Gemfile.lock</code> runs everything.</p>
+<ul>
+<li>every Ruby file loaded, and Zeitwerk's directory listings;</li>
+<li>every file read or checked: fixtures, templates, config, the schema;</li>
+<li>the gems used, by version;</li>
+<li>every variable read through <code>ENV</code>.</li>
+</ul>
+<p>Any change to <code>Gemfile.lock</code> runs everything.</p>
 <h3>What is refused</h3>
-<p>Child processes and forks, sockets, a database server (unless waived), writes inside the repository outside <code>log/</code>, <code>tmp/</code>, <code>storage/</code> and <code>coverage/</code>, enumerating <code>ENV</code>, any failure, error or skip, and a test that made no assertion.</p>
+<ul>
+<li>child processes and forks;</li>
+<li>sockets;</li>
+<li>a database server (unless waived, see below);</li>
+<li>writes inside the repository outside <code>log/</code>, <code>tmp/</code>, <code>storage/</code> and <code>coverage/</code>;</li>
+<li>enumerating <code>ENV</code>;</li>
+<li>any failure, error or skip, and a test that made no assertion.</li>
+</ul>
 <div class="note"><p><strong>Database servers.</strong> PostgreSQL and MySQL test databases are refused by default. <code>rails_allow_db = true</code> under <code>[policy]</code> waives that: vci then purges each database and loads the schema before every file. With the waiver you state that the test database holds nothing but what vci loads.</p></div>
-<h3>Getting skips on a Linux runner</h3>
+<h3 id="getting-skips-on-a-linux-runner">Laptop to Linux runner</h3>
 <p>A generated Rails app needs a few changes before anything is skipped across machines:</p>
 <ul>
 <li><strong>Credentials.</strong> Active Record reads <code>config/master.key</code> at boot. That file is git-ignored, so CI never matches. Give the test environment its own committed credentials (<code>bin/rails credentials:edit --environment test</code>), remove the credentials, or declare <code>RAILS_MASTER_KEY</code>.</li>
 <li><strong><code>CI</code>.</strong> Change the generator's <code>config.eager_load = ENV["CI"].present?</code> to <code>config.eager_load = false</code> in <code>config/environments/test.rb</code>.</li>
 <li><strong>Time zone data.</strong> Use <code>gem "tzinfo-data"</code> for every platform, and declare and set <code>TZ=UTC</code>.</li>
 <li><strong>Lockfile platforms.</strong> <code>Gemfile.lock</code> must list both <code>arm64-darwin</code> and <code>x86_64-linux</code>.</li>
-<li>Keep <code>vendor/.keep</code> committed, and pin the exact Ruby in <code>.ruby-version</code>.</li>
-<li>Attest with a UTF-8 locale (<code>LANG=en_US.UTF-8</code>). Ruby's default encoding is compared, and runners use UTF-8.</li>
+<li><strong>Ruby and <code>vendor/</code>.</strong> Pin the exact Ruby in <code>.ruby-version</code>, and keep <code>vendor/.keep</code> committed.</li>
+<li><strong>Locale.</strong> Attest with a UTF-8 locale (<code>LANG=en_US.UTF-8</code>). Ruby's default encoding is compared, and runners use UTF-8.</li>
 </ul>
 
-<h2 id="rspec">RSpec</h2>
+<h2 id="rspec"><img class="h-logo" src="assets/logos/rspec.png" alt="" aria-hidden="true"> RSpec</h2>
 <p>RSpec runs through the Rails adapter, so everything in the <a href="#rails">Rails</a> section applies: the fresh database, the single process, what is recorded, and the changes needed for a Linux runner. Tested with rspec-core 3.13 and rspec-rails 8. Plain Ruby projects that use RSpec without Rails work the same way.</p>
+<h3>Set up</h3>
 <pre><code>cd your-app
 bundle lock --add-platform x86_64-linux
 vci init --adapter rails --key ~/.ssh/id_ed25519.pub
-git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock .rspec &amp;&amp; git commit -m "Enable vci"
+git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock \
+  .rspec &amp;&amp; git commit -m "Enable vci"
 
-TZ=UTC vci run spec/models/order_spec.rb --key ~/.ssh/id_ed25519
+TZ=UTC vci run spec/models/order_spec.rb \
+  --key ~/.ssh/id_ed25519
 TZ=UTC vci plan --base-ref origin/main
 vci push</code></pre>
 <pre><code><span class="c"># vci.toml</span>
@@ -205,13 +301,14 @@ runner = "rspec"</code></pre>
 <tr><td><code>SPEC_OPTS</code></td><td>hashed when set; strict mode removes it unless declared in <code>[env]</code></td></tr>
 </table>
 <h3>What is recorded</h3>
+<p>On top of the Rails list:</p>
 <ul>
 <li><code>spec_helper.rb</code>, <code>rails_helper.rb</code> and every file they load;</li>
 <li>the listing of directories loaded by a glob, such as <code>spec/support</code> and FactoryBot's <code>spec/factories</code>, so a <em>new</em> support or factory file invalidates the specs that load them;</li>
 <li>shared examples, custom matchers, fixtures and <code>file_fixture</code> files;</li>
 <li>the versions of rspec-core, rspec-rails, rspec-expectations and rspec-mocks.</li>
 </ul>
-<p>A spec that only requires <code>spec_helper</code> has far fewer inputs than one that loads <code>rails_helper</code>, and survives most changes to the app.</p>
+<p><strong>Tip:</strong> a spec that only requires <code>spec_helper</code> has far fewer inputs than one that loads <code>rails_helper</code>, and survives most changes to the app.</p>
 <h3>What is refused</h3>
 <ul>
 <li>a pending or skipped example: <code>pending</code>, <code>skip</code>, <code>xit</code>, <code>xdescribe</code>;</li>
@@ -221,8 +318,13 @@ runner = "rspec"</code></pre>
 <li>retries that hide a failed first attempt (rspec-retry), and <code>parallel_tests</code> or <code>turbo_tests</code>;</li>
 <li>system specs that drive a browser.</li>
 </ul>
-<p>vci also fixes the conditions of every run: the seed defaults to 0, the example status file is redirected to a temp directory, and SimpleCov writes outside the repository.</p>
 <div class="note"><p><strong>Two things to know.</strong> A spec generated by <code>rails generate</code> contains a pending example, so it is refused until you replace it with real examples. And an example with no expectations is still attested: unlike Minitest, there is no check for that yet.</p></div>
+<details class="more">
+<summary>Run conditions vci sets for every spec file</summary>
+<p>vci also fixes the conditions of every run: the seed defaults to 0, the example status file is redirected to a temp directory, and SimpleCov writes outside the repository.</p>
+</details>
+<h3>Laptop to Linux runner</h3>
+<p>Make the same changes as for a Rails app: see <a href="#getting-skips-on-a-linux-runner">Laptop to Linux runner</a> under Rails. The personal option files (<code>~/.rspec</code>, <code>.rspec-local</code>) are never read, so they cannot make your laptop and the runner differ.</p>
 
 <h2>Full reference</h2>
 <p>This page is a summary. The complete lists of recorded inputs, refusals and known limitations for each adapter are in the <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md">reference</a>.</p>
