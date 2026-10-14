@@ -159,6 +159,12 @@ tr:last-child td { border-bottom: 0; }
 td code { white-space: nowrap; }
 td.wrap code { white-space: normal; }
 
+/* Diagrams (SVG) and illustrations (webp) */
+.diagram-wrap { overflow-x: auto; }
+@media (max-width: 640px) { .diagram-wrap > img { min-width: 600px; } }
+:root[data-theme="dark"] main img[src$=".webp"] { filter: brightness(.86); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) main img[src$=".webp"] { filter: brightness(.86); } }
+
 /* Callouts */
 .note {
   border: 1px solid var(--border); border-left: 3px solid var(--accent);
@@ -264,3 +270,27 @@ footer .inner { max-width: 1120px; margin: 0 auto; padding: 24px 20px; display: 
   main > h1 { font-size: 30px; }
   .site-header { padding: 0 16px; gap: 8px; }
 }
+
+/* Runner logos: always on a light tile so the black marks (Rust, Rails) stay visible in dark mode. */
+.card .logo { display: inline-flex; align-items: center; justify-content: center; height: 46px; padding: 0 12px; margin-bottom: 10px; background: #fff; border: 1px solid var(--border); border-radius: 8px; }
+.card .logo img { height: 26px; width: auto; max-width: 120px; display: block; }
+h2 .h-logo { height: 28px; width: auto; max-width: 90px; vertical-align: -7px; margin-right: 6px; padding: 3px 6px; background: #fff; border: 1px solid var(--border); border-radius: 6px; }
+
+/* Prism tokens, on the site's own palette (dark code blocks in both themes). */
+pre code .token.comment, pre code .token.prolog, pre code .token.doctype, pre code .token.cdata { color: var(--code-muted); }
+pre code .token.string, pre code .token.attr-value, pre code .token.char, pre code .token.inserted { color: var(--code-green); }
+pre code .token.number, pre code .token.boolean, pre code .token.constant, pre code .token.symbol, pre code .token.deleted { color: var(--code-amber); }
+pre code .token.keyword, pre code .token.atrule, pre code .token.key, pre code .token.property, pre code .token.tag, pre code .token.selector, pre code .token.table, pre code .token.class-name { color: var(--code-blue); }
+pre code .token.function, pre code .token.builtin, pre code .token.function-name { color: #c7b4ff; }
+pre code .token.operator, pre code .token.punctuation, pre code .token.entity, pre code .token.url { color: var(--code-text); opacity: .8; }
+pre code .token.important, pre code .token.bold { font-weight: 600; }
+pre code .token.parameter, pre code .token.variable { color: var(--code-text); }
+pre code .token.shebang { color: var(--code-muted); }
+
+/* Hero proof points. */
+.proof { list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; padding: 0; margin: 0 0 26px; }
+.proof li { display: flex; flex-direction: column; gap: 2px; }
+.proof strong { font-size: 24px; letter-spacing: -.02em; color: var(--accent); line-height: 1.1; }
+.proof span { font-size: 13px; color: var(--muted); line-height: 1.4; }
+.proof sup a { text-decoration: none; color: var(--muted); }
+.hero p strong { color: var(--text); }

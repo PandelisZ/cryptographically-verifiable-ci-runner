@@ -16,6 +16,11 @@
 #            used by `vci ci` so CI runs each file the way it was attested
 #   probe    print one "VCI-PROBE <json>" line with the toolchain at exit
 #
+# VCI_RAILS_RUNNER=rspec: the process runs RSpec (`rspec <file>`) instead of
+# `bin/rails test`; see RSpecSupport for what is neutralised (option files
+# outside the repository, the example status file, a random seed, SimpleCov's
+# output directory) and refused.
+#
 # Ruby has no audit hook: file access is observed by wrapping the Ruby entry
 # points (File, FileTest, IO, Dir, File::Stat, Kernel#open/require/load,
 # ENV). C extensions that open files themselves are not seen. Anything the
@@ -25,12 +30,20 @@ module VciCollector
   # Part of the toolchain (Probe.libs): bumped whenever what the collector
   # records or refuses changes, so an attestation made by an older collector
   # (which may have missed an input) is not accepted where a newer one runs.
-  VERSION = "0.2.0"
+  VERSION = "0.3.1"
   MODE = ENV.fetch("VCI_RAILS_MODE", "collect")
+  # The test framework vci started this process for: "minitest" (default,
+  # `bin/rails test <file>`) or "rspec" (`rspec <file>`, see RSpecSupport).
+  RUNNER = ENV["VCI_RAILS_RUNNER"] == "rspec" ? "rspec" : "minitest"
   OUT = ENV["VCI_OUT"]
   TEST_ID = ENV["VCI_TEST_ID"]
   # Fresh directory for this process's SQLite databases.
   DB_DIR = ENV["VCI_DB_DIR"]
+  # The fresh temp dir vci gave this process (TMPDIR), read once here: a test
+  # that later sets ENV["TMPDIR"] (to "/tmp", HOME, "/") changes where its
+  # own temp files go, never which reads the collector treats as vci's
+  # scratch space (it would otherwise hide every read under that directory).
+  TMP = ENV["TMPDIR"]
   # policy.rails_allow_db: network databases are prepared fresh as well.
   ALLOW_DB = ENV["VCI_RAILS_ALLOW_DB"] == "1"
   DLEXTS = %w[.so .bundle].freeze
@@ -47,6 +60,39 @@ module VciCollector
   TOOLING_DIRS = ["#{RUBYLIBDIR}/rubygems/", "#{RUBYLIBDIR}/bundler/"].freeze
   TOOLING_GEM = %r{/gems/bundler-\d[^/]*/(lib|exe)/}
   TOOLING_ENV = /\A(HOME|PATH|USER|LOGNAME|SHELL|TMPDIR|TMP|TEMP|MANPATH|RB_USER_INSTALL|SOURCE_DATE_EPOCH|DEBUG|NO_COLOR|TERM|GEM_[A-Z0-9_]*|BUNDLE_[A-Z0-9_]*|BUNDLER_[A-Z0-9_]*|RUBYOPT|RUBYLIB|RUBYGEMS_[A-Z0-9_]*|THOR_[A-Z0-9_]*|XDG_[A-Z0-9_]*)\z/
+  # Globs whose result reaches no test, made at boot by: rspec-rails 8's
+  # "rspec_rails.code_statistics" initializer, which globs
+  # spec/**/*_spec.rb to register `bin/rails stats` directories
+  # (Rails::CodeStatistics). Recorded, its listings would make every new spec
+  # file anywhere in spec/ run every spec that boots Rails. A test that reads
+  # Rails::CodeStatistics' directories is refused instead (install_code_stats).
+  GLOB_NOT_INPUT = %r{/rspec-rails-[^/]+/lib/rspec-rails\.rb\z}
+  # See VciCollector.resolv_loading?.
+  RESOLV_CONF = %w[/etc/resolv.conf /private/etc/resolv.conf].freeze
+
+  # The file system primitives the collector itself uses, captured before
+  # anything (its own hooks, a test's stubs) can replace them: a test that
+  # stubs File.exist?, File.directory?, Dir.children or File.expand_path
+  # (rspec-mocks' `allow(File).to receive(...)`, Minitest's `File.stub`)
+  # changes what the test sees, never what the collector records about the
+  # real file system (a stubbed File.directory? would otherwise hide the
+  # listings of a real Dir.glob).
+  module Real
+    FS = ::File.singleton_class
+    DS = ::Dir.singleton_class
+    FILE = %i[exist? directory? symlink? file? expand_path realpath stat lstat join dirname basename extname
+              fnmatch].to_h { |m| [m, FS.instance_method(m)] }.freeze
+    DIR = %i[children pwd].to_h { |m| [m, DS.instance_method(m)] }.freeze
+
+    class << self
+      FILE.each_key do |m|
+        define_method(m) { |*args| FILE[m].bind_call(::File, *args) }
+      end
+      DIR.each_key do |m|
+        define_method(:"dir_#{m}") { |*args| DIR[m].bind_call(::Dir, *args) }
+      end
+    end
+  end
 
   # Only the process vci started writes output (a forked child inherits the
   # collector, and its "process:fork" taint).
@@ -86,11 +132,11 @@ module VciCollector
     end
 
     def root
-      @root ||= quiet { File.realpath(ENV["VCI_ROOT"] || Dir.pwd) }
+      @root ||= quiet { Real.realpath(ENV["VCI_ROOT"] || Real.dir_pwd) }
     end
 
     def repo
-      @repo ||= quiet { File.realpath(ENV["VCI_REPO"] || root) }
+      @repo ||= quiet { Real.realpath(ENV["VCI_REPO"] || root) }
     end
 
     def taint(reason)
@@ -117,7 +163,7 @@ module VciCollector
 
     def expand(p)
       return nil unless p.is_a?(String) && !p.empty? && !p.start_with?("|")
-      quiet { File.expand_path(p) }
+      quiet { Real.expand_path(p) }
     rescue StandardError
       nil
     end
@@ -147,6 +193,7 @@ module VciCollector
       return unless abs
       return if %i[read stat readdir].include?(kind) && @produced[abs]
       unless inside?(abs, repo)
+        return if RESOLV_CONF.include?(abs) && resolv_loading?
         if %i[stat probe readdir read].include?(kind) && quiet { tooling?(frame) }
           return unless kind == :read
           @records[[kind, abs]] ||= :tooling
@@ -154,6 +201,24 @@ module VciCollector
         end
       end
       @records[[kind, abs]] = true
+    end
+
+    # Ruby's resolv.rb (Ruby's own library or the resolv gem) creating its
+    # DefaultResolver while it loads (`DefaultResolver = self.new` in the
+    # body of class Resolv), which reads /etc/resolv.conf: `require
+    # "net/http"` does this at boot (Capybara, which rspec-rails loads
+    # whenever it is in the bundle). Not an input: those DNS settings are
+    # only used by lookups, which open sockets (refused). Any other read of
+    # the file (Resolv::DNS::Config called by a test) is recorded.
+    def resolv_loading?
+      quiet do
+        caller_locations(2, 40).to_a.any? do |l|
+          p = (l.absolute_path || l.path).to_s
+          l.label == "<class:Resolv>" && p.end_with?("/resolv.rb") && !inside?(p, repo)
+        end
+      end
+    rescue StandardError
+      false
     end
 
     def rec(kind, path)
@@ -166,7 +231,7 @@ module VciCollector
       return unless collect? && !busy?
       abs = expand(pathify(path))
       return unless abs
-      exists = quiet { File.exist?(abs) || File.symlink?(abs) }
+      exists = quiet { Real.exist?(abs) || Real.symlink?(abs) }
       add(exists ? :stat : :probe, abs)
     end
 
@@ -214,7 +279,7 @@ module VciCollector
 
     # A file was created or opened for writing: its directory had to exist.
     def parent_observed(abs)
-      dir = quiet { File.dirname(abs) }
+      dir = quiet { Real.dirname(abs) }
       add(:stat, dir) if inside?(dir, repo) && dir != abs
     end
 
@@ -277,7 +342,7 @@ module VciCollector
     end
 
     def remember_inode(abs)
-      st = quiet { File.stat(abs) }
+      st = quiet { Real.stat(abs) }
       @inodes[[st.dev, st.ino]] = abs
     rescue StandardError
       nil
@@ -297,7 +362,7 @@ module VciCollector
     end
 
     def exists_quietly?(p)
-      quiet { File.exist?(p) }
+      quiet { Real.exist?(p) }
     rescue StandardError
       false
     end
@@ -310,20 +375,20 @@ module VciCollector
 
     # The files Ruby tries for `feature` in one load path entry, in order.
     def candidates(base, feature)
-      ext = File.extname(feature)
+      ext = Real.extname(feature)
       case ext
-      when ".rb" then [File.join(base, feature)]
+      when ".rb" then [Real.join(base, feature)]
       when ".so", ".bundle", ".o", ".dll"
         stem = feature.delete_suffix(ext)
-        ([File.join(base, feature)] + DLEXTS.map { |x| File.join(base, stem + x) }).uniq
-      else RBEXTS.map { |x| File.join(base, feature + x) }
+        ([Real.join(base, feature)] + DLEXTS.map { |x| Real.join(base, stem + x) }).uniq
+      else RBEXTS.map { |x| Real.join(base, feature + x) }
       end
     end
 
     def expanded_load_path
       $LOAD_PATH.map do |e|
         s = e.respond_to?(:to_path) ? e.to_path : e.to_s
-        @lp_memo[s] ||= quiet { File.expand_path(s) }
+        @lp_memo[s] ||= quiet { Real.expand_path(s) }
       end
     rescue StandardError
       []
@@ -360,11 +425,11 @@ module VciCollector
           candidates(e, path).each { |c| @records[[:probe, c]] = true unless exists_quietly?(c) }
         end
         # `load "x"` falls back to the working directory.
-        c = File.expand_path(path)
+        c = Real.expand_path(path)
         @records[[:probe, c]] = true if inside?(c, repo) && !exists_quietly?(c)
       else
-        abs = File.expand_path(path)
-        candidates(File.dirname(abs), File.basename(abs)).each do |c|
+        abs = Real.expand_path(path)
+        candidates(Real.dirname(abs), Real.basename(abs)).each do |c|
           add(:probe, c) unless exists_quietly?(c)
         end
       end
@@ -413,8 +478,9 @@ module VciCollector
     # directory it reads, and every literal path it checks.
     def glob_record(patterns, base, flags)
       return unless collect? && !busy?
+      return if GLOB_NOT_INPUT.match?(quiet { frame })
       quiet do
-        start_base = base ? File.expand_path(pathify(base) || base.to_s) : Dir.pwd
+        start_base = base ? Real.expand_path(pathify(base) || base.to_s) : Real.dir_pwd
         Array(patterns).each do |raw|
           pat = pathify(raw)
           next unless pat
@@ -435,42 +501,42 @@ module VciCollector
       rest = comps[1..]
       dotmatch = (flags & File::FNM_DOTMATCH) != 0
       if c == "**"
-        return unless File.directory?(dir)
+        return unless Real.directory?(dir)
         add(:readdir, dir)
         glob_walk(dir, rest, flags, depth + 1)
         children(dir).each do |n|
           next if n.start_with?(".") && !dotmatch
-          p = File.join(dir, n)
-          next if File.symlink?(p) || !File.directory?(p)
+          p = Real.join(dir, n)
+          next if Real.symlink?(p) || !Real.directory?(p)
           glob_walk(p, comps, flags, depth + 1)
         end
       elsif wild?(c)
-        unless File.directory?(dir)
-          add(:probe, dir) unless File.exist?(dir)
+        unless Real.directory?(dir)
+          add(:probe, dir) unless Real.exist?(dir)
           return
         end
         add(:readdir, dir)
         return if rest.empty?
         fl = File::FNM_PATHNAME | File::FNM_EXTGLOB | (dotmatch ? File::FNM_DOTMATCH : 0)
         children(dir).each do |n|
-          next unless File.fnmatch(c, n, fl)
-          p = File.join(dir, n)
-          glob_walk(p, rest, flags, depth + 1) if File.directory?(p)
+          next unless Real.fnmatch(c, n, fl)
+          p = Real.join(dir, n)
+          glob_walk(p, rest, flags, depth + 1) if Real.directory?(p)
         end
       else
-        p = File.join(dir, c.gsub(/\\(.)/, '\1'))
+        p = Real.join(dir, c.gsub(/\\(.)/, '\1'))
         if rest.empty?
-          add(File.exist?(p) || File.symlink?(p) ? :stat : :probe, p)
-        elsif File.directory?(p)
+          add(Real.exist?(p) || Real.symlink?(p) ? :stat : :probe, p)
+        elsif Real.directory?(p)
           glob_walk(p, rest, flags, depth + 1)
         else
-          add(:probe, p) unless File.exist?(p)
+          add(:probe, p) unless Real.exist?(p)
         end
       end
     end
 
     def children(dir)
-      Dir.children(dir)
+      Real.dir_children(dir)
     rescue StandardError
       []
     end
@@ -481,7 +547,7 @@ module VciCollector
       return unless collect? && !busy?
       p = pathify(path)
       return unless p
-      abs = quiet { dir ? File.expand_path(p, pathify(dir) || dir.to_s) : File.expand_path(p) }
+      abs = quiet { dir ? Real.expand_path(p, pathify(dir) || dir.to_s) : Real.expand_path(p) }
       cur = ""
       abs.split("/").reject(&:empty?).each do |c|
         cur = "#{cur}/#{c}"
@@ -489,8 +555,14 @@ module VciCollector
       end
     end
 
-    def exit_status
-      e = $!
+    # The exit status the process is leaving with, from `$!` as this (the
+    # last) at_exit handler starts: every handler registered after the
+    # collector (RSpec's, minitest/autorun's, SimpleCov's minimum_coverage
+    # check, a test's own `at_exit { exit 1 }`) has run and set it. Read it
+    # first thing: Ruby resets `$!` inside some of the collector's own calls
+    # (`defined?` on a constant, rescued exceptions), so a later read would
+    # see nil and report 0. `vci run` also checks the exit code it gets.
+    def exit_status(e = $!)
       if e.is_a?(SystemExit)
         e.status
       elsif e
@@ -774,7 +846,7 @@ if VciCollector.collect?
           # Reading through the link reads the target.
           t = VciCollector.pathify(target)
           l = VciCollector.expand(VciCollector.pathify(link))
-          VciCollector.rec(:read, VciCollector.quiet { File.expand_path(t, File.dirname(l)) }) if t && l
+          VciCollector.rec(:read, VciCollector.quiet { Real.expand_path(t, Real.dirname(l)) }) if t && l
           VciCollector.wrote(link)
         end
         super
@@ -1066,7 +1138,7 @@ if VciCollector.collect?
         r = super
         unless VciCollector.busy?
           p = VciCollector.pathify(path)
-          if p && VciCollector.quiet { File.directory?(p) }
+          if p && VciCollector.quiet { Real.directory?(p) }
             VciCollector.rec(:readdir, p)
           else
             VciCollector.observe_stat(path)
@@ -1278,6 +1350,14 @@ module VciCollector
   # where no require hook sees it, such as from C).
   HOOKS = {
     minitest: -> { defined?(::Minitest) && ::Minitest.respond_to?(:register_plugin) && install_minitest },
+    rspec: lambda {
+      defined?(::RSpec::Core::Runner) && defined?(::RSpec::Core::Reporter) &&
+        defined?(::RSpec::Core::ConfigurationOptions) && defined?(::RSpec::Core::Configuration) &&
+        defined?(::RSpec::Core::Ordering::ConfigurationManager) && defined?(::RSpec::Core::World) &&
+        defined?(::RSpec::Core::Example) && RSpecSupport.install
+    },
+    simplecov: -> { defined?(::SimpleCov) && ::SimpleCov.respond_to?(:coverage_path) && RSpecSupport.install_simplecov },
+    code_stats: -> { defined?(::Rails::CodeStatistics) && ::Rails::CodeStatistics.respond_to?(:directories) && install_code_stats },
     rails_config: -> { defined?(::Rails::Application::Configuration) && install_rails_config },
     on_load: -> { defined?(::ActiveSupport) && ::ActiveSupport.respond_to?(:on_load) && install_on_load },
     socket: -> { defined?(::BasicSocket) && install_socket },
@@ -1285,6 +1365,7 @@ module VciCollector
     fiddle: -> { defined?(::Fiddle::Function) && defined?(::Fiddle::Handle) && install_fiddle },
     ffi: -> { defined?(::FFI::Library) && defined?(::FFI::DynamicLibrary) && install_ffi },
     zlib: -> { defined?(::Zlib::GzipReader) && install_zlib },
+    prism: -> { defined?(::Prism) && ::Prism.respond_to?(:parse_file) && install_prism },
     sqlite3: -> { defined?(::SQLite3::Database) && install_sqlite3 },
     nokogiri: lambda {
       defined?(::Nokogiri::XML::Document) && defined?(::Nokogiri::XML::Node) && defined?(::Nokogiri::XML::Reader) &&
@@ -1301,6 +1382,7 @@ module VciCollector
     fiddle: -> { defined?(::Fiddle) },
     ffi: -> { defined?(::FFI::Library) },
     zlib: -> { defined?(::Zlib::GzipReader) },
+    prism: -> { defined?(::Prism) && ::Prism.respond_to?(:parse_file) },
     sqlite3: -> { defined?(::SQLite3::Database) },
     nokogiri: -> { defined?(::Nokogiri::XML::Document) }
   }.freeze
@@ -1315,6 +1397,7 @@ module VciCollector
     Minitest Configuration ActiveSupport BasicSocket Socket PTY Fiddle Function Handle FFI Library DynamicLibrary
     Zlib GzipReader SQLite3 Database PG Connection Mysql2 Client Trilogy Nokogiri XML Document Node Reader Schema
     RelaxNG SAX ParserContext XSLT Stylesheet ParseOptions
+    RSpec Runner Reporter ConfigurationOptions ConfigurationManager World SimpleCov CodeStatistics Prism Example
   ].each_with_object({}) { |n, h| h[n] = true }.freeze
 
   class << self
@@ -1374,6 +1457,7 @@ module VciCollector
       LOADED.each do |name, cond|
         out << "vci:not-hooked:#{name} (loaded where vci could not hook it)" if !@hooks_done[name] && cond.call
       end
+      out.concat(prism_unhooked) if collect?
       if collect?
         DB_CLIENTS.each do |path, name|
           klass = const_path(path)
@@ -1396,6 +1480,27 @@ module VciCollector
 
     def install_rails_config
       ::Rails::Application::Configuration.prepend(RailsConfigHooks)
+      true
+    end
+
+    # Rails::CodeStatistics' directory list includes what rspec-rails found
+    # with a glob vci does not record (GLOB_NOT_INPUT): reading it anywhere
+    # but in Rails::CodeStatistics itself refuses the file.
+    def install_code_stats
+      return true unless collect?
+      ::Rails::CodeStatistics.singleton_class.prepend(Module.new do
+        %i[directories test_types].each do |m|
+          define_method(m) do |*args, **kw, &blk|
+            unless VciCollector.busy?
+              where = VciCollector.quiet { VciCollector.frame }
+              unless where.end_with?("/lib/rails/code_statistics.rb")
+                VciCollector.taint("rails:code-statistics:#{m} at #{where} (its directories come from a listing of spec/ vci does not record)")
+              end
+            end
+            super(*args, **kw, &blk)
+          end
+        end
+      end)
       true
     end
 
@@ -1603,6 +1708,35 @@ module VciCollector
       end
     end
 
+    # Prism's file entry points (parse_file, parse_file_success?,
+    # parse_file_failure?, parse_file_comments, lex_file, parse_lex_file,
+    # dump_file, profile_file, and any other `*_file*` method) read the
+    # source in C, like RubyVM::InstructionSequence.compile_file (ISeqHooks).
+    # The first argument is the path.
+    def install_prism
+      return true unless collect?
+      names = ::Prism.singleton_methods.select { |m| m.to_s.include?("_file") }
+      ::Prism.singleton_class.prepend(Module.new do
+        names.each do |m|
+          define_method(m) do |path, *rest, **kw, &blk|
+            VciCollector.read_path(VciCollector.pathify(path)) unless VciCollector.busy?
+            super(path, *rest, **kw, &blk)
+          end
+        end
+      end)
+      @prism_hooked = names
+      true
+    end
+
+    # A Prism `*_file*` method defined after the hook was installed (another
+    # Prism backend loaded later) is not hooked.
+    def prism_unhooked
+      return [] unless defined?(::Prism) && ::Prism.respond_to?(:parse_file) && @prism_hooked
+      (::Prism.singleton_methods.select { |m| m.to_s.include?("_file") } - @prism_hooked).map do |m|
+        "vci:not-hooked:Prism.#{m} (reads a file in C)"
+      end
+    end
+
     # Zlib::GzipReader.open/GzipWriter.open open their file in C.
     def install_zlib
       return true unless collect?
@@ -1678,8 +1812,8 @@ module VciCollector
         return if f.empty? || f == ":memory:" || f.start_with?("file::memory:")
         path = f.start_with?("file:") ? f.sub(/\Afile:/, "").split("?").first : f
         abs = VciCollector.expand(path)
-        ok = abs && [DB_DIR, ENV["TMPDIR"]].compact.any? do |d|
-          VciCollector.inside?(abs, (File.realpath(d) rescue File.expand_path(d)))
+        ok = abs && [DB_DIR, TMP].compact.reject(&:empty?).any? do |d|
+          VciCollector.inside?(abs, (Real.realpath(d) rescue Real.expand_path(d)))
         end
         VciCollector.taint("rails:sqlite-file:#{abs || f} (a SQLite database vci did not prepare fresh; SQLite reads and writes it in C)") unless ok
         db.authorizer = proc do |action, *|
@@ -1853,14 +1987,357 @@ module VciCollector
       end
     end
   end
+
+  # RSpec (VCI_RAILS_RUNNER=rspec). vci runs one spec file per process:
+  #
+  #   ruby -e 'require "bundler/setup"; require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke' \
+  #     -- --options .rspec <file>
+  #
+  # `--options .rspec` makes RSpec read the project's .rspec and nothing
+  # else: not ~/.rspec, $XDG_CONFIG_HOME/rspec/options (outside the
+  # repository) or .rspec-local (usually git-ignored). SPEC_OPTS is still
+  # read (an environment variable, hashed whenever present).
+  #
+  # Installed in every mode (`vci ci` runs files the way they were attested):
+  # - the example status file (`config.example_status_persistence_file_path`,
+  #   which RSpec reads at start and rewrites at exit) is a fresh file in
+  #   vci's temp dir: no earlier run's state is read, nothing is written in
+  #   the repository;
+  # - the default seed is 0 instead of a random one, so `config.order =
+  #   :random` (and `Kernel.srand config.seed`) give the same order where the
+  #   file was attested and in CI; defined order stays defined, and a seed
+  #   given in .rspec, SPEC_OPTS or `config.seed =` is honoured;
+  # - SimpleCov writes (and merges earlier results from) a directory in vci's
+  #   temp dir instead of coverage/.
+  # In collect mode the reporter is hooked to count examples, and what makes
+  # a run unattestable is refused (see `taints`).
+  module RSpecSupport
+    STATUS_FILE = "vci-rspec-example-statuses.txt"
+    COUNTS = %i[passed failed pending errors started finished].freeze
+    @counts = COUNTS.to_h { |k| [k, 0] }
+    # Examples that recorded a failure (Example#display_exception=), and
+    # those of them later reported as passed: the failure was cleared before
+    # the example finished (a retry in an around hook, rspec-retry, a
+    # prepended Example#finish) or a reporter override turned it into a pass.
+    @failed_examples = {}.compare_by_identity
+    @cleared = []
+    @errors = []
+    @declared = 0
+    @options = nil
+
+    class << self
+      attr_reader :counts, :errors, :options
+      attr_accessor :declared
+
+      def rspec?
+        RUNNER == "rspec"
+      end
+
+      def tmpdir
+        d = TMP.to_s
+        d.empty? ? "/tmp" : d
+      end
+
+      def status_file
+        File.join(tmpdir, STATUS_FILE)
+      end
+
+      def coverage_dir
+        VciCollector.quiet do
+          d = File.join(tmpdir, "vci-coverage")
+          Dir.mkdir(d) unless File.directory?(d)
+          d
+        end
+      end
+
+      def count(k)
+        @counts[k] += 1
+      end
+
+      def example_failed!(example)
+        @failed_examples[example] = true
+      end
+
+      def reported_passed(example)
+        return unless @failed_examples.key?(example)
+        @cleared << (example.respond_to?(:location) ? example.location.to_s : example.inspect)
+      rescue StandardError => e
+        @cleared << e.class.name
+      end
+
+      # What RSpec recorded per example (execution_result.status) against what
+      # the reporter was told: a failed or pending status the reporter heard
+      # about as something else (an overridden Reporter#example_failed).
+      def status_mismatch
+        statuses = ::RSpec.world.all_examples.map { |e| e.execution_result.status }
+        failed = statuses.count(:failed)
+        pending = statuses.count(:pending)
+        return nil if failed <= @counts[:failed] && pending <= @counts[:pending]
+        "rspec:status-mismatch (#{failed} examples failed and #{pending} are pending per RSpec, but the reporter " \
+          "was told of #{@counts[:failed]} failures and #{@counts[:pending]} pending: a reporter override)"
+      rescue StandardError => e
+        "rspec:status-check-failed:#{e.class}: #{e.message}"
+      end
+
+      def install
+        ::RSpec::Core::ConfigurationOptions.prepend(OptionsHook)
+        ::RSpec::Core::Ordering::ConfigurationManager.prepend(SeedHook)
+        ::RSpec::Core::Configuration.prepend(ConfigHook)
+        ::RSpec::Core::Reporter.prepend(ReporterHook)
+        ::RSpec::Core::World.prepend(WorldHook)
+        ::RSpec::Core::Example.prepend(ExampleHook)
+        # A configuration created before the hooks were installed gets the
+        # same defaults.
+        if ::RSpec.instance_variable_defined?(:@configuration) && (c = ::RSpec.instance_variable_get(:@configuration))
+          SeedHook.default!(c.ordering_manager)
+          path = c.instance_variable_get(:@example_status_persistence_file_path)
+          c.example_status_persistence_file_path = path if path
+        end
+        true
+      end
+
+      # SimpleCov in an RSpec process: its results (and the earlier results
+      # it merges, and .last_run.json) live in vci's temp dir. Minitest
+      # processes are left as they were (coverage/ is a git-ignored scratch
+      # directory there).
+      def install_simplecov
+        return true unless rspec?
+        ::SimpleCov.singleton_class.prepend(Module.new do
+          def coverage_path
+            VciCollector::RSpecSupport.coverage_dir
+          end
+        end)
+        true
+      end
+
+      # `vci plan`/`vci run` listing: the files `rspec` with no file
+      # arguments would run, from RSpec's own configuration (default_path,
+      # pattern, exclude_pattern, as .rspec and SPEC_OPTS set them; files
+      # .rspec requires are loaded, as they would be).
+      def list!(args)
+        opts = ::RSpec::Core::ConfigurationOptions.new(args)
+        config = ::RSpec.configuration
+        opts.configure(config)
+        world = ::RSpec.world
+        if world.wants_to_quit || world.non_example_failure
+          $stderr.puts "vci_collector: RSpec could not load its configuration (see above)"
+          exit 1
+        end
+        files = config.files_to_run.map { |f| File.expand_path(f) }
+        out = {
+          files: files, defaultPath: config.default_path.to_s, pattern: config.pattern.to_s,
+          excludePattern: config.exclude_pattern.to_s
+        }
+        $stdout.puts "VCI-RSPEC-LIST #{Json.dump(out)}"
+      end
+
+      def filters
+        fm = ::RSpec.configuration.filter_manager
+        parts = []
+        parts << "inclusion filter #{fm.inclusions.description}" unless fm.inclusions.empty?
+        parts << "exclusion filter #{fm.exclusions.description}" unless fm.exclusions.empty?
+        parts << "only_failures" if ::RSpec.configuration.only_failures?
+        parts << "fail_fast" if ::RSpec.configuration.fail_fast
+        parts.empty? ? "" : " (#{parts.join("; ")})"
+      rescue StandardError => e
+        " (#{e.class})"
+      end
+
+      def declared_now
+        [@declared.to_i, (::RSpec.world.all_examples.size rescue 0)].max
+      end
+
+      # Why this RSpec run cannot be attested (collect mode).
+      def taints
+        out = []
+        o = @options
+        if o.nil?
+          out << "rspec:no-configuration (RSpec never read its options)" if @counts[:started].positive?
+        else
+          custom = (o.send(:custom_options_file) rescue nil)
+          unless custom
+            out << "rspec:option-files (RSpec was not given --options .rspec, so it read ~/.rspec, $XDG_CONFIG_HOME/rspec/options or .rspec-local)"
+          end
+          h = o.options
+          out << "rspec:invocation:#{h[:runner].class.name} (--bisect, --drb, --init, --version or --help: no example of the file ran as such)" if h[:runner]
+          out << "rspec:drb (examples run in another process)" if h[:drb]
+        end
+        if defined?(::RSpec) && ::RSpec.respond_to?(:configuration) && @counts[:started].positive?
+          cfg = ::RSpec.configuration
+          out << "rspec:dry-run (examples were reported without running)" if cfg.respond_to?(:dry_run?) && cfg.dry_run?
+          run = @counts[:passed] + @counts[:failed] + @counts[:pending]
+          declared = declared_now
+          if @counts[:errors].positive?
+            # A load error or a suite hook error stops RSpec early: that is
+            # why examples did not run.
+            out << "rspec:error-outside-examples:#{@errors.map { |e| e.lines.first.to_s.strip }.uniq.join("; ")}"
+          elsif run < declared
+            out << "rspec:filtered:#{declared - run} of #{declared} examples did not run#{filters} (a focused or filtered run vouches only for what ran)"
+            out << "rspec:quit-early (RSpec stopped before running every example)" if ::RSpec.world.wants_to_quit
+          end
+        end
+        unless @cleared.empty?
+          out << "rspec:failure-cleared:#{@cleared.uniq.first(5).join(", ")} (an example failed and was then reported as passed: a retry, or code that clears or swallows the failure)"
+        end
+        if @counts[:started].positive? && (m = status_mismatch)
+          out << m
+        end
+        if defined?(::RSpec::Retry) || defined?(::RSpec::Rebound)
+          out << "rspec:retry (rspec-retry reports an example that failed and then passed as passed)"
+        end
+        if defined?(::ParallelTests) || defined?(::TurboTests)
+          out << "rspec:parallel-tests (parallel_tests/turbo_tests split the suite across processes; vci runs one file per process itself)"
+        end
+        mt = VciCollector.instance_variable_get(:@minitest)
+        out << "rspec:minitest-also-ran (#{mt.count} Minitest tests ran in the RSpec process)" if mt&.count.to_i.positive?
+        out
+      rescue StandardError => e
+        ["rspec:check-failed:#{e.class}: #{e.message}"]
+      end
+
+      def result(status)
+        c = @counts
+        unless c[:started].positive?
+          return { kind: "result", state: "failed", tests: 0, failed: 1, skipped: 0, durationMs: 0,
+                   exitStatus: status, why: "no RSpec results (not a spec file, it failed to load, or RSpec never ran)" }
+        end
+        run = c[:passed] + c[:failed] + c[:pending]
+        declared = declared_now
+        failed = c[:failed] + c[:errors]
+        state = if failed.positive? || status != 0 then "failed"
+                elsif run.zero? then declared.positive? ? "filtered" : "no-tests"
+                elsif run < declared then "filtered"
+                elsif c[:pending].positive? then "failed"
+                else "passed"
+                end
+        { kind: "result", state: state, tests: run, failed: failed.positive? || status.zero? ? failed : 1,
+          skipped: c[:pending], declared: declared, errorsOutsideExamples: c[:errors],
+          durationMs: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - STARTED) * 1000).round,
+          exitStatus: status }
+      end
+    end
+
+    STARTED = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    # SimpleCov's configuration files outside the repository: ~/.simplecov
+    # (simplecov/load_global_config.rb) and .simplecov in the directories
+    # above the project that its upward search (simplecov/defaults.rb) tries
+    # after the repository. Like ~/.rspec, never read in a vci RSpec process
+    # (every mode): they look absent, on both sides.
+    SIMPLECOV_CONFIG_FRAME = %r{/simplecov-[^/]+/lib/simplecov/(defaults|load_global_config)\.rb\z}
+
+    module SimpleCovConfigGuard
+      def exist?(path, *rest)
+        return false if VciCollector::RSpecSupport.outside_simplecov_config?(path)
+        super
+      end
+    end
+
+    class << self
+      def outside_simplecov_config?(path)
+        return false if VciCollector.busy?
+        p = VciCollector.pathify(path)
+        return false unless p && Real.basename(p) == ".simplecov"
+        abs = VciCollector.expand(p)
+        return false if abs.nil? || VciCollector.inside?(abs, VciCollector.repo)
+        SIMPLECOV_CONFIG_FRAME.match?(VciCollector.quiet { VciCollector.frame })
+      rescue StandardError
+        false
+      end
+    end
+
+    module OptionsHook
+      def initialize(*args, **kw, &blk)
+        super
+        VciCollector::RSpecSupport.instance_variable_set(:@options, self)
+      end
+    end
+
+    module SeedHook
+      def self.default!(manager)
+        return unless manager
+        manager.instance_variable_set(:@seed, 0) unless manager.instance_variable_get(:@seed_forced)
+      end
+
+      def initialize(*args, **kw, &blk)
+        super
+        SeedHook.default!(self)
+      end
+    end
+
+    module ConfigHook
+      def example_status_persistence_file_path=(value)
+        super(value.nil? ? nil : VciCollector::RSpecSupport.status_file)
+      end
+    end
+
+    module ReporterHook
+      def start(*args, **kw, &blk)
+        VciCollector::RSpecSupport.count(:started)
+        super
+      end
+
+      def example_passed(example)
+        VciCollector::RSpecSupport.count(:passed)
+        VciCollector::RSpecSupport.reported_passed(example)
+        super
+      end
+
+      def example_failed(example)
+        VciCollector::RSpecSupport.count(:failed)
+        super
+      end
+
+      def example_pending(example)
+        VciCollector::RSpecSupport.count(:pending)
+        super
+      end
+
+      def notify_non_example_exception(exception, context_description)
+        VciCollector::RSpecSupport.count(:errors)
+        VciCollector::RSpecSupport.errors << context_description.to_s
+        super
+      end
+
+      def finish(*args, **kw, &blk)
+        VciCollector::RSpecSupport.count(:finished)
+        super
+      end
+    end
+
+    # Example#set_exception and set_aggregate_failures_exception both store
+    # the failure through display_exception=; for a pending example it goes
+    # to execution_result.pending_exception instead (@exception stays nil).
+    module ExampleHook
+      def display_exception=(ex)
+        super
+        VciCollector::RSpecSupport.example_failed!(self) if ex && instance_variable_get(:@exception)
+      end
+    end
+
+    # Every example the loaded files declare, before filtering (RSpec
+    # clears its groups when every example was filtered out).
+    module WorldHook
+      def announce_filters(*args, **kw, &blk)
+        begin
+          n = all_examples.size
+          VciCollector::RSpecSupport.declared = n if n > VciCollector::RSpecSupport.declared.to_i
+        rescue StandardError
+          nil
+        end
+        super
+      end
+    end
+  end
 end
 
 # The first at_exit handler registered runs last: after Minitest's.
 at_exit do
+  status = VciCollector.exit_status($!)
   begin
     next unless Process.pid == VciCollector::PID
     case VciCollector::MODE
-    when "collect" then VciCollector::Output.write!
+    when "collect" then VciCollector::Output.write!(status)
     when "probe" then VciCollector::Probe.print!
     end
   rescue Exception => e # rubocop:disable Lint/RescueException
@@ -2040,7 +2517,7 @@ module VciCollector
     module_function
 
     def ignored_prefixes
-      @ignored_prefixes ||= [ENV["TMPDIR"], OUT, DB_DIR].compact.reject(&:empty?).map do |p|
+      @ignored_prefixes ||= [TMP, OUT, DB_DIR].compact.reject(&:empty?).map do |p|
         File.realpath(p)
       rescue StandardError
         File.expand_path(p)
@@ -2065,6 +2542,18 @@ module VciCollector
     end
 
     DEVICES = %w[/dev/null /dev/urandom /dev/random /dev/zero /dev/tty /dev/stdin /dev/stdout /dev/stderr].freeze
+
+    # A directory above one of vci's temp dirs, outside the repository
+    # (`/`, `/private/var/...`): creating a path in the temp dir component
+    # by component (rspec-support's DirectoryMaker.mkdir_p, used for the
+    # example status file) checks that each one is a directory. That is
+    # not an input (dropped in RSpec processes, which always create that
+    # file; Minitest processes are unchanged).
+    def temp_ancestor?(abs)
+      return false if VciCollector.inside?(abs, VciCollector.repo)
+      prefix = abs == "/" ? "/" : "#{abs}/"
+      ignored_prefixes.any? { |p| p.start_with?(prefix) }
+    end
 
     # Bundler's settings files (their effect, the resolved bundle, is
     # recorded instead).
@@ -2117,7 +2606,7 @@ module VciCollector
       abs
     end
 
-    def write!
+    def write!(status)
       unless OUT && TEST_ID
         $stderr.puts "vci_collector: VCI_OUT or VCI_TEST_ID not set; nothing written"
         return
@@ -2126,7 +2615,6 @@ module VciCollector
       unhooked = VciCollector.unhooked
       TP_COMPILED.disable
       TP_RAISE.disable
-      status = VciCollector.exit_status
       VciCollector.quiet { write_records(status, unhooked) }
     end
 
@@ -2149,6 +2637,7 @@ module VciCollector
       end
       records.each do |(kind, abs), by|
         next if kind == :write
+        next if kind == :stat && RUNNER == "rspec" && temp_ancestor?(abs)
         c = classify(abs)
         next unless c
         case c[0]
@@ -2196,8 +2685,14 @@ module VciCollector
       Env::ALWAYS_READ.each { |k| keys[k] ||= { "ruby" => true } }
       keys.each { |k, w| lines << { kind: "env", key: k, where: w.keys.first(3).join(" | ") } }
       taints.concat(Checks.run)
+      taints.concat(RSpecSupport.taints) if RUNNER == "rspec"
+      res = result(status)
+      if status != 0 && framework_clean?
+        taints << "vci:process-exit:#{status} (the process exited #{status} after the test framework reported a pass: " \
+                  "an at_exit handler such as SimpleCov's minimum_coverage failed the run)"
+      end
       taints.uniq.each { |t| lines << { kind: "taint", reason: t } }
-      lines << result(status)
+      lines << res
       require "digest/sha2"
       File.open(File.join(OUT, "#{Digest::SHA256.hexdigest(TEST_ID)}.jsonl"), "w") do |f|
         lines.each { |l| f.write(Json.dump(l), "\n") }
@@ -2214,7 +2709,20 @@ module VciCollector
       }
     end
 
+    # The test framework reported results and no failure or error among
+    # them (what a non-zero exit then came from is something else).
+    def framework_clean?
+      if RUNNER == "rspec"
+        c = RSpecSupport.counts
+        c[:started].positive? && (c[:failed] + c[:errors]).zero?
+      else
+        mt = VciCollector.instance_variable_get(:@minitest)
+        !mt.nil? && (mt.failures + mt.errors).zero?
+      end
+    end
+
     def result(status)
+      return RSpecSupport.result(status) if RUNNER == "rspec"
       mt = VciCollector.instance_variable_get(:@minitest)
       unless mt
         return { kind: "result", state: "failed", tests: 0, failed: 1, skipped: 0, durationMs: 0,
@@ -2412,19 +2920,39 @@ module VciCollector
       "#{RUBY_ENGINE} #{RUBY_ENGINE_VERSION}"
     end
 
+    # A spec file that loads only spec_helper never loads Rails: its version
+    # is then the bundle's railties (what the probe reports).
     def rails_version
-      defined?(::Rails::VERSION::STRING) ? ::Rails::VERSION::STRING : ""
+      return ::Rails::VERSION::STRING if defined?(::Rails::VERSION::STRING)
+      return "" unless RUNNER == "rspec"
+      spec_version("railties") || ""
     end
 
     def bundler_version
       defined?(::Bundler::VERSION) ? ::Bundler::VERSION : ""
     end
 
+    RSPEC_GEMS = %w[rspec-core rspec-expectations rspec-mocks rspec-rails rspec-support].freeze
+
+    def spec_version(name)
+      s = ::Gem.loaded_specs[name]
+      s&.version&.to_s
+    rescue StandardError
+      nil
+    end
+
+    # The test frameworks of the bundle: "minitest 6.0.6", and when the
+    # bundle has RSpec, "; rspec-core 3.13.6, rspec-expectations ..., ...".
+    # The same in every process of a project (probe, Minitest and RSpec
+    # files): taken from the bundle's specs, not from what a file loaded.
     def runner_version
-      if defined?(::Minitest::VERSION) then "minitest #{::Minitest::VERSION}"
-      elsif defined?(::RSpec::Core::Version::STRING) then "rspec #{::RSpec::Core::Version::STRING}"
-      else ""
-      end
+      parts = []
+      mt = defined?(::Minitest::VERSION) ? ::Minitest::VERSION : spec_version("minitest")
+      parts << "minitest #{mt}" if mt
+      rs = RSPEC_GEMS.filter_map { |n| (v = spec_version(n)) && "#{n} #{v}" }
+      rs << "rspec-core #{::RSpec::Core::Version::STRING}" if rs.empty? && defined?(::RSpec::Core::Version::STRING)
+      parts << rs.join(", ") unless rs.empty?
+      parts.join("; ")
     end
 
     # Libraries whose version the gem versions do not fix. Not OpenSSL: Ruby
@@ -2460,6 +2988,15 @@ module VciCollector
       end
     end
   end
+end
+
+# RSpec processes: SimpleCov's configuration files outside the repository
+# look absent (every mode; prepended last, so in front of the collect-mode
+# hooks, which therefore record nothing for them).
+if VciCollector::RUNNER == "rspec"
+  # Pathname#exist? asks FileTest, load_global_config.rb asks File.
+  File.singleton_class.prepend(VciCollector::RSpecSupport::SimpleCovConfigGuard)
+  FileTest.singleton_class.prepend(VciCollector::RSpecSupport::SimpleCovConfigGuard)
 end
 
 # Whenever a constant one of the hooked libraries defines is set (from Ruby

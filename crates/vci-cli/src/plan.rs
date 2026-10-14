@@ -389,6 +389,17 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             Ok(f) => files.extend(f),
             Err(e) => run_all = Some(format!("listing test files failed: {e:#}")),
         }
+        // What the project's configuration leaves out (Rails: test files of
+        // the runner `runner` does not select), as `vci run` prints it.
+        for w in p.adapter.warnings(&child.to_child_env()) {
+            let w = if ctx.projects.len() > 1 {
+                format!("{}: {w}", p.label())
+            } else {
+                w
+            };
+            eprintln!("vci: warning: {w}");
+            res.warnings.push(w);
+        }
         res.projects.push(ProjectPlan {
             name: p.name.clone(),
             path: p.rel.clone(),
@@ -396,9 +407,7 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             run_all,
             dir: p.dir.clone(),
             child_env: Some(child),
-            adapter_options: vci_adapter::AdapterOptions {
-                rails_allow_db: p.policy.rails_allow_db,
-            },
+            adapter_options: p.adapter_options,
         });
     }
     mark_cross_project_ambiguity(&mut files);
@@ -561,9 +570,7 @@ fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) 
                 run_all: Some(reason.clone()),
                 dir: p.dir.clone(),
                 child_env: Some(child),
-                adapter_options: vci_adapter::AdapterOptions {
-                    rails_allow_db: p.policy.rails_allow_db,
-                },
+                adapter_options: p.adapter_options,
             });
         }
         res.files = files.iter().map(|f| verdict_run(f, &reason)).collect();

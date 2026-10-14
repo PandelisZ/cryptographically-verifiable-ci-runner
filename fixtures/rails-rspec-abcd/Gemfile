@@ -1,0 +1,19 @@
+source "https://rubygems.org"
+
+ruby file: ".ruby-version"
+
+gem "railties", "8.1.3.1"
+gem "activerecord", "8.1.3.1"
+gem "actionpack", "8.1.3.1"
+gem "actionview", "8.1.3.1"
+gem "sqlite3", ">= 2.1"
+# Used by d (app/controllers/codes_controller.rb).
+gem "hashids", "1.0.6"
+# Time zone data from a pinned gem rather than the system's zoneinfo, whose
+# version differs between macOS and Linux (vci compares it).
+gem "tzinfo-data"
+
+group :development, :test do
+  gem "rspec-rails", "8.0.4"
+  gem "factory_bot_rails", "6.5.1"
+end

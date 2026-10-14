@@ -91,7 +91,8 @@ pub struct Toolchain {
     /// Rails adapter: the Bundler version.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bundler: String,
-    /// Rails adapter: the test framework and its version (`minitest 6.0.6`).
+    /// Rails adapter: the bundle's test frameworks and their versions
+    /// (`minitest 6.0.6`, or `minitest 6.0.6; rspec-core 3.13.6, ...`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ruby_test: String,
     /// Rails adapter: libraries tests commonly depend on whose version the gem

@@ -1,0 +1,12 @@
+# Derived state: never in a checkout.
+/.bundle
+/vendor/bundle
+/log/*
+!/log/.keep
+/tmp/*
+!/tmp/.keep
+/storage/*
+!/storage/.keep
+/db/*.sqlite3*
+/config/master.key
+/spec/examples.txt

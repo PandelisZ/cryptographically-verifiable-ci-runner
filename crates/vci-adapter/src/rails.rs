@@ -1,20 +1,30 @@
-//! Rails adapter (Minitest): one `bin/rails test <file>` process per test
-//! file, with the `vci_collector` Ruby collector (`ruby/vci-collector`)
-//! loaded through `RUBYOPT` before Bundler and Rails boot.
+//! Rails adapter (Minitest and RSpec): one process per test file, with the
+//! `vci_collector` Ruby collector (`ruby/vci-collector`) loaded through
+//! `RUBYOPT` before Bundler and Rails boot.
 //!
 //! ```text
 //! RUBYOPT=-r<abs>/vci_collector.rb VCI_RAILS_MODE=collect VCI_OUT=<fresh dir> \
 //!   VCI_DB_DIR=<fresh dir> TMPDIR=<fresh dir> RAILS_ENV=test PARALLEL_WORKERS=1 \
 //!   DISABLE_SPRING=1 DISABLE_BOOTSNAP=1 BUNDLE_GEMFILE=<project>/Gemfile \
 //!   ruby bin/rails test test/models/b_test.rb --seed 0
+//! # an RSpec file (VCI_RAILS_RUNNER=rspec):
+//!   ruby -e '<RSPEC_RUN_SCRIPT>' -- --options .rspec spec/models/b_spec.rb
 //! ```
 //!
 //! The collector redirects the test environment's SQLite databases to fresh
 //! files in `VCI_DB_DIR` and loads the schema into them before
-//! `rails/test_help` runs, so every file runs against a database built from
-//! `db/schema.rb` (or `structure.sql`) and the fixtures, never against data a
-//! previous run left behind. `vci ci` runs the remaining files the same way
+//! `rails/test_help` (or `rails_helper`'s `maintain_test_schema!`) runs, so
+//! every file runs against a database built from `db/schema.rb` (or
+//! `structure.sql`) and the fixtures, never against data a previous run left
+//! behind. `vci ci` runs the remaining files the same way
 //! (`VCI_RAILS_MODE=plain`: no recording). Findings: `docs/spike-rails.md`.
+//!
+//! Which runner a project uses: the `runner` setting of its `vci.toml`
+//! entry (from the base commit in `vci plan`), else detected: RSpec when
+//! `Gemfile.lock` has `rspec-core` and there is a `spec/` directory (or a
+//! `.rspec`) but no Minitest file, Minitest when there is no such RSpec
+//! setup, and both when both are present (each file runs with its own
+//! runner, as long as RSpec's file pattern lists no Minitest file).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -27,8 +37,8 @@ use serde_json::Value;
 use crate::pytest::{OneRun, per_file_jobs};
 use crate::vitest::{apply_env, describe};
 use crate::{
-    Adapter, AdapterError, ChildEnv, InstalledExternals, ListedFile, RunOutput, ToolVersions,
-    parse_jsonl_dir,
+    Adapter, AdapterError, ChildEnv, InstalledExternals, ListedFile, Observed, RunOutput,
+    ToolVersions, parse_jsonl_dir,
 };
 
 /// Env var naming the `ruby` binary (default: `ruby` on PATH).
@@ -48,6 +58,65 @@ pub const RAILS_SEED: &str = "0";
 /// Taint prefix for a database server (PostgreSQL, MySQL, ...), the one
 /// refusal `policy.rails_allow_db` waives.
 pub const RAILS_NETWORK_DB_TAINT: &str = "rails:network-db:";
+
+/// A test framework of the Rails adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailsRunner {
+    /// `bin/rails test <file>` (`test/**/*_test.rb`).
+    Minitest,
+    /// `rspec <file>` (the files RSpec's own configuration lists).
+    Rspec,
+}
+
+impl RailsRunner {
+    /// The `runner` value in `vci.toml`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "minitest" => Some(Self::Minitest),
+            "rspec" => Some(Self::Rspec),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minitest => "minitest",
+            Self::Rspec => "rspec",
+        }
+    }
+}
+
+/// The runners of a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Minitest,
+    Rspec,
+    /// Minitest files (`test/**/*_test.rb`) with `bin/rails test`, every
+    /// other listed file with RSpec.
+    Both,
+}
+
+/// `rspec` as vci runs it: Bundler first (what `bundle exec` does), then
+/// RSpec's own runner with `$0 = "rspec"` (RSpec adds its default path only
+/// for that command name). The arguments follow `--`.
+pub const RSPEC_RUN_SCRIPT: &str =
+    "require \"bundler/setup\"; require \"rspec/core\"; $0 = \"rspec\"; RSpec::Core::Runner.invoke";
+
+/// Lists the files `rspec` would run (`VciCollector::RSpecSupport.list!`).
+const RSPEC_LIST_SCRIPT: &str = "require \"bundler/setup\"; require \"rspec/core\"; $0 = \"rspec\"; VciCollector::RSpecSupport.list!(ARGV)";
+
+/// Arguments every RSpec process gets: read the project's `.rspec` and no
+/// other options file (`~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` and
+/// `.rspec-local` are never read).
+pub const RSPEC_ARGS: &[&str] = &["--options", ".rspec"];
+
+/// The seed RSpec defaults to under vci (the collector sets it; RSpec's own
+/// default is random). Recorded in the canonical argv.
+pub const RSPEC_DEFAULT_SEED: &str = "0";
+
+/// Global inputs of an RSpec file on top of [`RAILS_GLOBAL_FILES`] (without
+/// `test/test_helper.rb`): the options file RSpec reads.
+pub const RSPEC_GLOBAL_FILES: &[&str] = &[".rspec"];
 
 /// Directories of a Rails project (relative to it) that tests may write to:
 /// a write there is allowed when git ignores the path (derived state that is
@@ -147,6 +216,8 @@ pub const RAILS_HASHED_ENV: &[&str] = &[
     "SCHEMA",
     "BOOTSNAP_*",
     "SPRING_*",
+    // RSpec reads its options from SPEC_OPTS too.
+    "SPEC_OPTS",
 ];
 
 /// Variables vci sets for every Rails test process (never inputs).
@@ -200,6 +271,9 @@ pub struct RailsAdapter {
     ruby: OsString,
     collector: Option<Utf8PathBuf>,
     allow_db: bool,
+    /// The `runner` setting; `None`: detected (see [`RailsAdapter::mode`]).
+    runner: Option<RailsRunner>,
+    mode: OnceLock<Result<Mode, String>>,
     probe: OnceLock<Result<Probe, String>>,
 }
 
@@ -304,8 +378,64 @@ impl RailsAdapter {
             ruby,
             collector: None,
             allow_db: false,
+            runner: None,
+            mode: OnceLock::new(),
             probe: OnceLock::new(),
         }
+    }
+
+    /// The project's `runner` setting (`None`: detect it).
+    pub fn with_runner(mut self, runner: Option<RailsRunner>) -> Self {
+        self.runner = runner;
+        self
+    }
+
+    /// Which runners the project uses: the setting, else detected from the
+    /// checkout (see the module docs).
+    fn mode(&self) -> Result<Mode, AdapterError> {
+        self.mode
+            .get_or_init(|| Ok(self.detect_mode()))
+            .clone()
+            .map_err(AdapterError::NotFound)
+    }
+
+    fn detect_mode(&self) -> Mode {
+        match self.runner {
+            Some(RailsRunner::Minitest) => Mode::Minitest,
+            Some(RailsRunner::Rspec) => Mode::Rspec,
+            None => {
+                if !self.rspec_set_up() {
+                    Mode::Minitest
+                } else if list_minitest(&self.project_dir).is_ok_and(|f| f.is_empty()) {
+                    Mode::Rspec
+                } else {
+                    Mode::Both
+                }
+            }
+        }
+    }
+
+    /// RSpec is set up: `rspec-core` is in the lockfile and there is a
+    /// `spec/` directory or a `.rspec`.
+    fn rspec_set_up(&self) -> bool {
+        rspec_in_lockfile(&self.project_dir)
+            && (self.project_dir.join("spec").is_dir() || self.project_dir.join(".rspec").is_file())
+    }
+
+    /// The runner of a project-relative test file (`None`: the project's
+    /// runners could not be decided).
+    pub fn runner_of(&self, project_rel: &str) -> Option<RailsRunner> {
+        match self.mode().ok()? {
+            Mode::Minitest => Some(RailsRunner::Minitest),
+            Mode::Rspec => Some(RailsRunner::Rspec),
+            Mode::Both if is_minitest_path(project_rel) => Some(RailsRunner::Minitest),
+            Mode::Both => Some(RailsRunner::Rspec),
+        }
+    }
+
+    fn runner_of_abs(&self, abs: &Utf8Path) -> Option<RailsRunner> {
+        let rel = abs.strip_prefix(&self.project_dir).ok()?;
+        self.runner_of(rel.as_str())
     }
 
     /// Use this collector directory instead of looking it up.
@@ -363,6 +493,18 @@ impl RailsAdapter {
         dirs: &RunDirs,
         collector: &Utf8Path,
     ) -> Command {
+        self.ruby_cmd_for(env, mode, dirs, collector, RailsRunner::Minitest)
+    }
+
+    /// [`RailsAdapter::ruby_cmd`] for a process of `runner`.
+    fn ruby_cmd_for(
+        &self,
+        env: &ChildEnv,
+        mode: &str,
+        dirs: &RunDirs,
+        collector: &Utf8Path,
+        runner: RailsRunner,
+    ) -> Command {
         let mut c = Command::new(&self.ruby);
         c.current_dir(&self.project_dir).stdin(Stdio::null());
         apply_env(&mut c, env);
@@ -371,6 +513,7 @@ impl RailsAdapter {
         }
         c.env("RUBYOPT", format!("-r{collector}"))
             .env("VCI_RAILS_MODE", mode)
+            .env("VCI_RAILS_RUNNER", runner.as_str())
             .env("VCI_ROOT", self.project_dir.as_str())
             .env("VCI_REPO", self.repo_root().as_str())
             .env("VCI_DB_DIR", dirs.db.as_str())
@@ -412,7 +555,14 @@ impl RailsAdapter {
         let collector = self.collector_file()?;
         let dirs = RunDirs::new()?;
         let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
-        cmd.args(["-e", "require File.expand_path(\"config/environment\")"]);
+        // A plain Ruby project (RSpec without Rails) has no application to
+        // boot: its bundle is the toolchain.
+        let rails_app = !self.plain_ruby();
+        if rails_app {
+            cmd.args(["-e", "require File.expand_path(\"config/environment\")"]);
+        } else {
+            cmd.args(["-e", "require \"bundler/setup\""]);
+        }
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         if !out.status.success() {
             return Err(AdapterError::Command {
@@ -439,22 +589,68 @@ impl RailsAdapter {
                     String::from_utf8_lossy(&out.stderr)
                 ),
             })?;
-        parse_probe(line, &self.gemfile())
+        parse_probe(line, &self.gemfile(), rails_app)
     }
 
-    /// `bin/rails test <file> --seed 0` with the collector on.
+    /// An RSpec project without Rails (no `config/environment.rb`): a gem
+    /// or plain Ruby code with a Gemfile.
+    fn plain_ruby(&self) -> bool {
+        matches!(self.mode(), Ok(Mode::Rspec))
+            && !self.project_dir.join("config/environment.rb").is_file()
+    }
+
+    /// The command running one test file (`None`: the whole suite) with
+    /// `runner`: `bin/rails test <file> --seed 0`, or `rspec --options .rspec
+    /// <file>`.
+    fn test_cmd(
+        &self,
+        env: &ChildEnv,
+        mode: &str,
+        dirs: &RunDirs,
+        collector: &Utf8Path,
+        runner: RailsRunner,
+        file: Option<&str>,
+    ) -> Command {
+        let mut cmd = self.ruby_cmd_for(env, mode, dirs, collector, runner);
+        match runner {
+            RailsRunner::Minitest => {
+                cmd.args(["bin/rails", "test"]);
+                if let Some(f) = file {
+                    cmd.arg(file_arg(f));
+                }
+                cmd.args(["--seed", RAILS_SEED]);
+            }
+            RailsRunner::Rspec => {
+                cmd.args(["-e", RSPEC_RUN_SCRIPT, "--"]).args(RSPEC_ARGS);
+                if let Some(f) = file {
+                    cmd.arg(file_arg(f));
+                }
+            }
+        }
+        cmd
+    }
+
+    /// The runner of `file`, or an error naming why it cannot be decided.
+    fn runner_for_run(&self, file: &str) -> Result<RailsRunner, AdapterError> {
+        self.runner_of(file).ok_or_else(|| {
+            AdapterError::NotFound(format!(
+                "cannot decide whether {file} is a Minitest or an RSpec file"
+            ))
+        })
+    }
+
+    /// One test file with the collector on: `bin/rails test <file> --seed
+    /// 0`, or `rspec --options .rspec <file>`.
     fn run_one(
         &self,
         collector: &Utf8Path,
         file: &str,
         env: &ChildEnv,
     ) -> Result<OneRun, AdapterError> {
+        let runner = self.runner_for_run(file)?;
         let dirs = RunDirs::new()?;
-        let mut cmd = self.ruby_cmd(env, "collect", &dirs, collector);
-        cmd.args(["bin/rails", "test"])
-            .arg(file_arg(file))
-            .args(["--seed", RAILS_SEED])
-            .env("VCI_OUT", dirs.out.as_str())
+        let mut cmd = self.test_cmd(env, "collect", &dirs, collector, runner, Some(file));
+        cmd.env("VCI_OUT", dirs.out.as_str())
             .env("VCI_TEST_ID", file);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         let mut log = format!(
@@ -467,23 +663,20 @@ impl RailsAdapter {
         .into_bytes();
         log.extend_from_slice(&out.stdout);
         log.extend_from_slice(&out.stderr);
-        let files = parse_jsonl_dir(&dirs.out)?;
+        let mut files = parse_jsonl_dir(&dirs.out)?;
+        exit_code_must_agree(&mut files, out.status.code());
         Ok((out.status.code(), files, log))
     }
 
     fn run_one_plain(
         &self,
         collector: &Utf8Path,
+        runner: RailsRunner,
         file: Option<&str>,
         env: &ChildEnv,
     ) -> Result<OneRun, AdapterError> {
         let dirs = RunDirs::new()?;
-        let mut cmd = self.ruby_cmd(env, "plain", &dirs, collector);
-        cmd.args(["bin/rails", "test"]);
-        if let Some(f) = file {
-            cmd.arg(file_arg(f));
-        }
-        cmd.args(["--seed", RAILS_SEED]);
+        let mut cmd = self.test_cmd(env, "plain", &dirs, collector, runner, file);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         let mut log = format!(
             "vci: {} (exit {})\n",
@@ -510,6 +703,33 @@ impl RailsAdapter {
     }
 }
 
+/// Taint (prefix of) a passing result whose process did not exit 0.
+const RAILS_EXIT_TAINT: &str = "vci:process-exit:";
+
+/// A file whose test framework reported a pass is still refused when its
+/// process did not exit 0 (or died from a signal): an `at_exit` handler that
+/// ran after the results were reported (SimpleCov's `minimum_coverage`,
+/// minitest/autorun loaded into an RSpec process, a test's own `at_exit {
+/// exit 1 }`) failed the run, as it fails a plain run. Independent of the
+/// exit status the collector records.
+fn exit_code_must_agree(files: &mut [Observed], code: Option<i32>) {
+    if code == Some(0) {
+        return;
+    }
+    let how = code.map_or_else(
+        || "was killed by a signal".to_owned(),
+        |c| format!("exited {c}"),
+    );
+    for o in files.iter_mut() {
+        if o.result.as_ref().is_some_and(|r| r.is_pass()) {
+            o.taints.push(format!(
+                "{RAILS_EXIT_TAINT}{} (the process {how} after the test framework reported a pass: an at_exit handler such as SimpleCov's minimum_coverage failed the run)",
+                code.map_or_else(|| "signal".to_owned(), |c| c.to_string())
+            ));
+        }
+    }
+}
+
 /// A test file argument that cannot be mistaken for an option.
 fn file_arg(file: &str) -> String {
     if file.starts_with('-') {
@@ -519,7 +739,7 @@ fn file_arg(file: &str) -> String {
     }
 }
 
-fn parse_probe(line: &str, gemfile: &Utf8Path) -> Result<Probe, AdapterError> {
+fn parse_probe(line: &str, gemfile: &Utf8Path, rails_app: bool) -> Result<Probe, AdapterError> {
     let bad = |d: String| AdapterError::Parse {
         what: "Rails application probe".into(),
         detail: d,
@@ -532,9 +752,12 @@ fn parse_probe(line: &str, gemfile: &Utf8Path) -> Result<Probe, AdapterError> {
             .to_owned()
     };
     for k in ["ruby", "engine", "rails", "bundler", "runner"] {
+        if k == "rails" && !rails_app {
+            continue;
+        }
         if s(k).is_empty() {
             return Err(bad(format!(
-                "missing {k} (is this a Rails application with Minitest?)"
+                "missing {k} (is this a Rails application, or a Ruby project with a Gemfile?)"
             )));
         }
     }
@@ -628,7 +851,29 @@ fn list_minitest(project_dir: &Utf8Path) -> Result<Vec<ListedFile>, AdapterError
     Ok(out)
 }
 
-/// RSpec files (`spec/**/*_spec.rb`), which the adapter does not run.
+/// Is a project-relative path one `bin/rails test` runs by default
+/// ([`list_minitest`]'s rule: `test/**/*_test.rb` outside
+/// `test/{system,dummy,fixtures}` and dot directories)?
+fn is_minitest_path(rel: &str) -> bool {
+    let comps: Vec<&str> = rel.split('/').collect();
+    comps.len() >= 2
+        && comps[0] == "test"
+        && !matches!(comps[1], "system" | "dummy" | "fixtures")
+        && comps.iter().all(|c| !c.is_empty() && !c.starts_with('.'))
+        && comps.last().is_some_and(|f| f.ends_with("_test.rb"))
+}
+
+/// `rspec-core` is a spec of the project's lockfile (`Gemfile.lock`, or
+/// `gems.locked` beside `gems.rb`).
+fn rspec_in_lockfile(project_dir: &Utf8Path) -> bool {
+    ["Gemfile.lock", "gems.locked"].iter().any(|n| {
+        std::fs::read_to_string(project_dir.join(n))
+            .is_ok_and(|t| t.lines().any(|l| l.starts_with("    rspec-core (")))
+    })
+}
+
+/// Files named like RSpec files (`spec/**/*_spec.rb`), counted for the
+/// message when the project runs Minitest only.
 fn rspec_files(project_dir: &Utf8Path) -> usize {
     let spec = project_dir.join("spec");
     let mut n = 0;
@@ -648,22 +893,130 @@ fn rspec_files(project_dir: &Utf8Path) -> usize {
 }
 
 impl RailsAdapter {
-    /// Not yet supported: RSpec (see README). A project whose only tests are
-    /// RSpec files is an error (so `vci ci` fails instead of running no
-    /// test); beside Minitest files they are reported and left to the user.
+    /// RSpec files in a project that runs Minitest only (the `runner =
+    /// "minitest"` setting, or RSpec is not in the lockfile): a project
+    /// whose only tests are RSpec files is an error (so `vci ci` fails
+    /// instead of running no test); beside Minitest files they are reported
+    /// and left to the user.
     fn check_rspec(&self, minitest_files: usize) -> Result<Option<String>, AdapterError> {
         let n = rspec_files(&self.project_dir);
         if n == 0 {
             return Ok(None);
         }
+        let why = if self.runner == Some(RailsRunner::Minitest) {
+            "the project's runner is \"minitest\" in vci.toml (set runner = \"rspec\", or remove the setting to run both)"
+        } else {
+            "rspec-core is not in Gemfile.lock, so vci does not run RSpec (add rspec-rails or rspec-core to the Gemfile)"
+        };
         let msg = format!(
-            "{n} RSpec file(s) in spec/: the rails adapter runs Minitest files (test/**/*_test.rb) only; RSpec is not supported yet, so run `bundle exec rspec` yourself"
+            "{n} RSpec file(s) in spec/ are not run by vci: {why}; run `bundle exec rspec` yourself"
         );
         if minitest_files == 0 {
             return Err(AdapterError::NotFound(msg));
         }
         Ok(Some(msg))
     }
+
+    fn require_bin_rails(&self) -> Result<(), AdapterError> {
+        if !self.project_dir.join("bin/rails").is_file() {
+            return Err(AdapterError::NotFound(format!(
+                "{} has no bin/rails: the rails adapter's project dir must be the Rails application root",
+                self.project_dir
+            )));
+        }
+        Ok(())
+    }
+
+    /// The files `rspec` (no file arguments) would run, as RSpec's own
+    /// configuration lists them: `.rspec` (only that options file, as in
+    /// every run) and `SPEC_OPTS` decide `default_path`, `pattern` and
+    /// `exclude_pattern`; files `.rspec` requires are loaded.
+    fn list_rspec(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError> {
+        let collector = self.collector_file()?;
+        let dirs = RunDirs::new()?;
+        let mut cmd = self.ruby_cmd_for(env, "plain", &dirs, &collector, RailsRunner::Rspec);
+        cmd.args(["-e", RSPEC_LIST_SCRIPT, "--"]).args(RSPEC_ARGS);
+        let out = cmd.output().map_err(|e| self.not_installed(e))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let fail = |detail: String| AdapterError::Command {
+            cmd: describe(&cmd),
+            status: out.status.to_string(),
+            stderr: detail,
+        };
+        if !out.status.success() {
+            return Err(fail(
+                format!("{stdout}{}", String::from_utf8_lossy(&out.stderr))
+                    .trim_end()
+                    .to_owned(),
+            ));
+        }
+        let line = stdout
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("VCI-RSPEC-LIST "))
+            .ok_or_else(|| {
+                fail(format!(
+                    "no VCI-RSPEC-LIST line in {stdout:?} (stderr: {})",
+                    String::from_utf8_lossy(&out.stderr)
+                ))
+            })?;
+        parse_rspec_list(line, &self.project_dir)
+    }
+
+    /// Minitest and RSpec files of a project that runs both: every listed
+    /// file must belong to exactly one runner.
+    fn list_both(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError> {
+        let mut files = list_minitest(&self.project_dir)?;
+        let rspec = self.list_rspec(env)?;
+        let clash: Vec<String> = rspec
+            .iter()
+            .filter_map(|f| f.abs.strip_prefix(&self.project_dir).ok())
+            .filter(|r| is_minitest_path(r.as_str()))
+            .map(|r| r.to_string())
+            .collect();
+        if !clash.is_empty() {
+            return Err(AdapterError::NotFound(format!(
+                "this project has Minitest files (test/**/*_test.rb) and RSpec files, and RSpec's file pattern also lists Minitest files ({}): set runner = \"minitest\" or runner = \"rspec\" for it in vci.toml",
+                clash.join(", ")
+            )));
+        }
+        files.extend(rspec);
+        files.sort_by(|a, b| a.abs.cmp(&b.abs));
+        Ok(files)
+    }
+}
+
+/// Parse the `VCI-RSPEC-LIST` line: every file must be inside the project.
+fn parse_rspec_list(line: &str, project_dir: &Utf8Path) -> Result<Vec<ListedFile>, AdapterError> {
+    let bad = |d: String| AdapterError::Parse {
+        what: "RSpec file list".into(),
+        detail: d,
+    };
+    let v: Value = serde_json::from_str(line).map_err(|e| bad(e.to_string()))?;
+    let files = v
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad(format!("no files in {line}")))?;
+    let mut out = Vec::new();
+    for f in files {
+        let p = f
+            .as_str()
+            .ok_or_else(|| bad(format!("bad file entry {f}")))?;
+        let abs = Utf8PathBuf::from(p);
+        let abs = abs.canonicalize_utf8().unwrap_or(abs);
+        if !abs.is_absolute() || !abs.starts_with(project_dir) {
+            return Err(bad(format!(
+                "RSpec lists {p}, outside the project dir {project_dir} (check pattern and default_path in .rspec)"
+            )));
+        }
+        out.push(ListedFile {
+            abs,
+            project: String::new(),
+        });
+    }
+    out.sort_by(|a, b| a.abs.cmp(&b.abs));
+    out.dedup_by(|a, b| a.abs == b.abs);
+    Ok(out)
 }
 
 impl Adapter for RailsAdapter {
@@ -675,26 +1028,36 @@ impl Adapter for RailsAdapter {
         &self.project_dir
     }
 
-    fn list_test_files(&self, _env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError> {
-        if !self.project_dir.join("bin/rails").is_file() {
-            return Err(AdapterError::NotFound(format!(
-                "{} has no bin/rails: the rails adapter's project dir must be the Rails application root",
-                self.project_dir
-            )));
+    fn list_test_files(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError> {
+        match self.mode()? {
+            Mode::Minitest => {
+                self.require_bin_rails()?;
+                let files = list_minitest(&self.project_dir)?;
+                self.check_rspec(files.len())?;
+                Ok(files)
+            }
+            Mode::Rspec => self.list_rspec(env),
+            Mode::Both => {
+                self.require_bin_rails()?;
+                self.list_both(env)
+            }
         }
-        let files = list_minitest(&self.project_dir)?;
-        self.check_rspec(files.len())?;
-        Ok(files)
     }
 
     fn warnings(&self, _env: &ChildEnv) -> Vec<String> {
-        let n = list_minitest(&self.project_dir)
+        let minitest = list_minitest(&self.project_dir)
             .map(|f| f.len())
             .unwrap_or(0);
-        match self.check_rspec(n) {
-            Ok(Some(w)) => vec![w],
-            Ok(None) => vec![],
-            Err(e) => vec![e.to_string()],
+        match self.mode() {
+            Ok(Mode::Minitest) => match self.check_rspec(minitest) {
+                Ok(Some(w)) => vec![w],
+                Ok(None) => vec![],
+                Err(e) => vec![e.to_string()],
+            },
+            Ok(Mode::Rspec) if minitest > 0 => vec![format!(
+                "{minitest} Minitest file(s) in test/ are not run by vci: the project's runner is \"rspec\" in vci.toml (remove the setting to run both)"
+            )],
+            _ => vec![],
         }
     }
 
@@ -721,16 +1084,43 @@ impl Adapter for RailsAdapter {
         Ok(Some(self.probe(env)?.gems))
     }
 
+    /// Minitest: `rails test --root <dir> --seed 0 <file>`; RSpec: `rails
+    /// rspec --root <dir> --options .rspec --default-seed 0 <file>`. A file
+    /// whose runner cannot be decided gets an argv no attestation has.
     fn canonical_argv(&self, project_dir_rel_to_repo: &str, project_rel: &str) -> Vec<String> {
-        vec![
-            "rails".into(),
-            "test".into(),
-            "--root".into(),
-            project_dir_rel_to_repo.into(),
-            "--seed".into(),
-            RAILS_SEED.into(),
-            project_rel.into(),
-        ]
+        match self.runner_of(project_rel) {
+            Some(RailsRunner::Minitest) => vec![
+                "rails".into(),
+                "test".into(),
+                "--root".into(),
+                project_dir_rel_to_repo.into(),
+                "--seed".into(),
+                RAILS_SEED.into(),
+                project_rel.into(),
+            ],
+            Some(RailsRunner::Rspec) => {
+                let mut v: Vec<String> = vec![
+                    "rails".into(),
+                    "rspec".into(),
+                    "--root".into(),
+                    project_dir_rel_to_repo.into(),
+                ];
+                v.extend(RSPEC_ARGS.iter().map(|s| s.to_string()));
+                v.extend([
+                    "--default-seed".into(),
+                    RSPEC_DEFAULT_SEED.into(),
+                    project_rel.into(),
+                ]);
+                v
+            }
+            None => vec![
+                "rails".into(),
+                "undecided-runner".into(),
+                "--root".into(),
+                project_dir_rel_to_repo.into(),
+                project_rel.into(),
+            ],
+        }
     }
 
     fn config_candidates(&self) -> Vec<Utf8PathBuf> {
@@ -738,6 +1128,21 @@ impl Adapter for RailsAdapter {
             .iter()
             .map(|n| self.project_dir.join(n))
             .collect()
+    }
+
+    /// Minitest files: [`RAILS_GLOBAL_FILES`]. RSpec files: the same without
+    /// `test/test_helper.rb`, plus [`RSPEC_GLOBAL_FILES`] (`.rspec`).
+    fn config_candidates_for(&self, test_abs: &Utf8Path) -> Vec<Utf8PathBuf> {
+        if self.runner_of_abs(test_abs) == Some(RailsRunner::Rspec) {
+            RAILS_GLOBAL_FILES
+                .iter()
+                .filter(|n| **n != "test/test_helper.rb")
+                .chain(RSPEC_GLOBAL_FILES)
+                .map(|n| self.project_dir.join(n))
+                .collect()
+        } else {
+            self.config_candidates()
+        }
     }
 
     fn snapshot_candidates(&self, _test_abs: &Utf8Path) -> Vec<Utf8PathBuf> {
@@ -753,24 +1158,42 @@ impl Adapter for RailsAdapter {
         per_file_jobs(files, self.jobs(), |f| self.run_one(&collector, f, env))
     }
 
-    /// With files: one `bin/rails test <file>` process per file, with the run
-    /// conditions the attestations were made with (fresh databases loaded
-    /// from the schema, one process, the fixed seed). Without: the whole
-    /// suite in one process.
+    /// With files: one process per file (`bin/rails test <file>` or `rspec
+    /// <file>`), with the run conditions the attestations were made with
+    /// (fresh databases loaded from the schema, one process, the fixed
+    /// seed, RSpec's options from `.rspec` only). Without: the whole suite,
+    /// one process per runner (`bin/rails test`, `rspec`).
     fn run_plain(&self, files: &[String], env: &ChildEnv) -> Result<Option<i32>, AdapterError> {
         let collector = self.collector_file()?;
         if files.is_empty() {
-            let n = list_minitest(&self.project_dir)?.len();
-            if let Some(w) = self.check_rspec(n)? {
-                eprintln!("vci: warning: {w}");
+            let mode = self.mode()?;
+            let runners: &[RailsRunner] = match mode {
+                Mode::Minitest => {
+                    let n = list_minitest(&self.project_dir)?.len();
+                    if let Some(w) = self.check_rspec(n)? {
+                        eprintln!("vci: warning: {w}");
+                    }
+                    &[RailsRunner::Minitest]
+                }
+                Mode::Rspec => &[RailsRunner::Rspec],
+                Mode::Both => &[RailsRunner::Minitest, RailsRunner::Rspec],
+            };
+            let mut code = Some(0);
+            for r in runners {
+                let (c, _, log) = self.run_one_plain(&collector, *r, None, env)?;
+                use std::io::Write as _;
+                let _ = std::io::stderr().write_all(&log);
+                match (code, c) {
+                    (Some(0), c) => code = c,
+                    (Some(_), None) => code = None,
+                    _ => {}
+                }
             }
-            let (code, _, log) = self.run_one_plain(&collector, None, env)?;
-            use std::io::Write as _;
-            let _ = std::io::stderr().write_all(&log);
             return Ok(code);
         }
         Ok(per_file_jobs(files, self.jobs(), |f| {
-            self.run_one_plain(&collector, Some(f), env)
+            let runner = self.runner_for_run(f)?;
+            self.run_one_plain(&collector, runner, Some(f), env)
         })?
         .exit_code)
     }
@@ -845,9 +1268,10 @@ mod tests {
         );
     }
 
-    /// RSpec is not supported: a project with only RSpec files is an error
-    /// (so `vci plan` runs everything and `vci ci` fails rather than running
-    /// no test), and beside Minitest files they are a warning.
+    /// RSpec files the adapter does not run (rspec-core is not in the
+    /// lockfile): a project with only such files is an error (so `vci plan`
+    /// runs everything and `vci ci` fails rather than running no test), and
+    /// beside Minitest files they are a warning.
     #[test]
     fn rspec_only_projects_are_an_error() {
         let t = tempfile::tempdir().unwrap();
@@ -858,12 +1282,149 @@ mod tests {
         std::fs::write(d.join("spec/models/b_spec.rb"), "").unwrap();
         let a = RailsAdapter::new(&d);
         let e = a.list_test_files(&None).unwrap_err().to_string();
-        assert!(e.contains("RSpec is not supported yet"), "{e}");
+        assert!(e.contains("rspec-core is not in Gemfile.lock"), "{e}");
         assert!(a.run_plain(&[], &None).is_err());
         std::fs::create_dir_all(d.join("test")).unwrap();
         std::fs::write(d.join("test/a_test.rb"), "").unwrap();
         assert_eq!(a.list_test_files(&None).unwrap().len(), 1);
         assert!(a.warnings(&None)[0].contains("1 RSpec file(s)"));
+        // `runner = "minitest"` keeps RSpec files out even with rspec-core
+        // in the lockfile.
+        std::fs::write(d.join("Gemfile.lock"), LOCK_WITH_RSPEC).unwrap();
+        let a = RailsAdapter::new(&d).with_runner(Some(RailsRunner::Minitest));
+        assert_eq!(a.list_test_files(&None).unwrap().len(), 1);
+        assert!(
+            a.warnings(&None)[0].contains("runner is \"minitest\""),
+            "{:?}",
+            a.warnings(&None)
+        );
+    }
+
+    const LOCK_WITH_RSPEC: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rspec-core (3.13.6)\n      rspec-support (~> 3.13.0)\n    rspec-support (3.13.7)\n\nPLATFORMS\n  ruby\n";
+
+    /// The runner setting, else detection: RSpec when rspec-core is locked
+    /// and spec/ (or .rspec) exists with no Minitest file; both when both
+    /// are present (by path); Minitest otherwise.
+    #[test]
+    fn runner_detection_and_per_file_runner() {
+        let t = tempfile::tempdir().unwrap();
+        let d = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        let mode = |r: Option<RailsRunner>| RailsAdapter::new(&d).with_runner(r).mode().unwrap();
+        assert_eq!(mode(None), Mode::Minitest, "nothing at all");
+        std::fs::create_dir_all(d.join("spec")).unwrap();
+        assert_eq!(
+            mode(None),
+            Mode::Minitest,
+            "spec/ without rspec-core locked"
+        );
+        std::fs::write(d.join("Gemfile.lock"), LOCK_WITH_RSPEC).unwrap();
+        assert_eq!(mode(None), Mode::Rspec);
+        assert_eq!(mode(Some(RailsRunner::Minitest)), Mode::Minitest);
+        std::fs::create_dir_all(d.join("test/models")).unwrap();
+        std::fs::write(d.join("test/models/b_test.rb"), "").unwrap();
+        assert_eq!(mode(None), Mode::Both);
+        assert_eq!(mode(Some(RailsRunner::Rspec)), Mode::Rspec);
+        let a = RailsAdapter::new(&d);
+        assert_eq!(
+            a.runner_of("test/models/b_test.rb"),
+            Some(RailsRunner::Minitest)
+        );
+        assert_eq!(
+            a.runner_of("spec/models/b_spec.rb"),
+            Some(RailsRunner::Rspec)
+        );
+        assert_eq!(
+            a.runner_of("test/system/s_test.rb"),
+            Some(RailsRunner::Rspec)
+        );
+        assert_eq!(
+            a.canonical_argv(".", "test/models/b_test.rb"),
+            [
+                "rails",
+                "test",
+                "--root",
+                ".",
+                "--seed",
+                "0",
+                "test/models/b_test.rb"
+            ]
+        );
+        assert_eq!(
+            a.canonical_argv("app", "spec/models/b_spec.rb"),
+            [
+                "rails",
+                "rspec",
+                "--root",
+                "app",
+                "--options",
+                ".rspec",
+                "--default-seed",
+                "0",
+                "spec/models/b_spec.rb"
+            ]
+        );
+        let g = a.config_candidates_for(&d.join("spec/models/b_spec.rb"));
+        assert!(g.contains(&d.join(".rspec")), "{g:?}");
+        assert!(!g.contains(&d.join("test/test_helper.rb")), "{g:?}");
+        let g = a.config_candidates_for(&d.join("test/models/b_test.rb"));
+        assert_eq!(g, a.config_candidates(), "Minitest files are unchanged");
+        assert!(!g.contains(&d.join(".rspec")));
+        for (p, want) in [
+            ("test/a_test.rb", true),
+            ("test/lib/system/x_test.rb", true),
+            ("test/system/x_test.rb", false),
+            ("test/fixtures/x_test.rb", false),
+            ("test/.hidden/x_test.rb", false),
+            ("test/a_spec.rb", false),
+            ("spec/a_test.rb", false),
+            ("a_test.rb", false),
+        ] {
+            assert_eq!(is_minitest_path(p), want, "{p}");
+        }
+    }
+
+    #[test]
+    fn rspec_list_parses_and_stays_in_the_project() {
+        let t = tempfile::tempdir().unwrap();
+        let d = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        std::fs::create_dir_all(d.join("spec")).unwrap();
+        std::fs::write(d.join("spec/b_spec.rb"), "").unwrap();
+        std::fs::write(d.join("spec/a_spec.rb"), "").unwrap();
+        let line = format!(
+            r#"{{"files":["{0}/spec/b_spec.rb","{0}/spec/a_spec.rb"],"defaultPath":"spec","pattern":"**{{,/*/**}}/*_spec.rb","excludePattern":""}}"#,
+            d
+        );
+        let got: Vec<String> = parse_rspec_list(&line, &d)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.abs.strip_prefix(&d).unwrap().to_string())
+            .collect();
+        assert_eq!(got, ["spec/a_spec.rb", "spec/b_spec.rb"]);
+        assert!(parse_rspec_list(r#"{"files":["/elsewhere/x_spec.rb"]}"#, &d).is_err());
+        assert!(parse_rspec_list("nope", &d).is_err());
+    }
+
+    #[test]
+    fn a_pass_with_a_non_zero_exit_is_tainted() {
+        let pass = |state: &str| Observed {
+            result: Some(vci_core::TestResult {
+                state: state.into(),
+                tests: 1,
+                failed: 0,
+                skipped: 0,
+                duration_ms: 1,
+            }),
+            ..Default::default()
+        };
+        let mut files = vec![pass("passed"), pass("failed")];
+        exit_code_must_agree(&mut files, Some(0));
+        assert!(files.iter().all(|o| o.taints.is_empty()));
+        exit_code_must_agree(&mut files, Some(2));
+        assert!(files[0].taints[0].starts_with("vci:process-exit:2 (the process exited 2"));
+        assert!(files[1].taints.is_empty(), "a failure is reported as such");
+        let mut files = vec![pass("passed")];
+        exit_code_must_agree(&mut files, None);
+        assert!(files[0].taints[0].starts_with("vci:process-exit:signal"));
     }
 
     #[test]
@@ -872,17 +1433,22 @@ mod tests {
         let p = parse_probe(
             r#"{"ruby":"3.4.9p82","engine":"ruby 3.4.9","rails":"8.1.3.1","bundler":"4.0.9","runner":"minitest 6.0.6","platform":"arm64-darwin25","libs":"sqlite=3.53.2;tz=tzinfo-data","db":"sqlite3","gems":[{"name":"rack","version":"3.2.7","platform":"ruby","source":""},{"name":"nokogiri","version":"1.19.4","platform":"arm64-darwin","source":""}],"gemfile":"/app/Gemfile","taints":[]}"#,
             gf,
+            true,
         )
         .unwrap();
         assert_eq!(p.versions.ruby, "3.4.9p82");
         assert_eq!(p.versions.runner, "minitest 6.0.6");
         assert_eq!(p.versions.ruby_gems, ["nokogiri==1.19.4", "rack==3.2.7"]);
         assert_eq!(p.gems["rack"], ["3.2.7"]);
-        assert!(parse_probe(r#"{"ruby":"3.4.9p82"}"#, gf).is_err());
-        assert!(parse_probe("nope", gf).is_err());
+        assert!(parse_probe(r#"{"ruby":"3.4.9p82"}"#, gf, true).is_err());
+        assert!(parse_probe("nope", gf, true).is_err());
         let other = r#"{"ruby":"3","engine":"r","rails":"8","bundler":"4","runner":"m","gems":[],"gemfile":"/elsewhere/Gemfile","taints":[]}"#;
-        assert!(parse_probe(other, gf).is_err(), "another Gemfile");
+        assert!(parse_probe(other, gf, true).is_err(), "another Gemfile");
         let tainted = r#"{"ruby":"3","engine":"r","rails":"8","bundler":"4","runner":"m","gems":[],"gemfile":"/app/Gemfile","taints":["ruby:iseq-cache"]}"#;
-        assert!(parse_probe(tainted, gf).is_err());
+        assert!(parse_probe(tainted, gf, true).is_err());
+        // A plain Ruby project (RSpec without Rails) has no Rails version.
+        let plain = r#"{"ruby":"3","engine":"r","rails":"","bundler":"4","runner":"rspec-core 3.13.6","gems":[],"gemfile":"/app/Gemfile","taints":[]}"#;
+        assert!(parse_probe(plain, gf, true).is_err());
+        assert_eq!(parse_probe(plain, gf, false).unwrap().versions.rails, "");
     }
 }

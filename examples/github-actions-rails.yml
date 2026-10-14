@@ -1,5 +1,6 @@
-# .github/workflows/test.yml: run only the Rails test files that no trusted
-# developer has already attested for these exact inputs.
+# .github/workflows/test.yml: run only the Rails test files (Minitest or
+# RSpec) that no trusted developer has already attested for these exact
+# inputs.
 name: test
 
 on:
@@ -24,8 +25,8 @@ jobs:
           fetch-depth: 0 # the base commit must be available to read policy from
 
       # Attestations only match the exact Ruby version and patchlevel they
-      # were made with (and the same Rails, Bundler, Minitest, gem versions,
-      # SQLite library and time zone data). Pin the version in .ruby-version
+      # were made with (and the same Rails, Bundler, Minitest/RSpec, gem
+      # versions, SQLite library and time zone data). Pin the version in .ruby-version
       # (or here) and attest with the same one locally. bundler-cache installs
       # the Gemfile.lock bundle into vendor/bundle (Gemfile.lock must list the
       # x86_64-linux platform: `bundle lock --add-platform x86_64-linux`).
@@ -39,12 +40,12 @@ jobs:
 
       # The CLI and its Ruby collector (ruby/vci-collector) come from the same
       # vci checkout; VCI_RUBY_COLLECTOR tells vci where the collector lives.
-      # Pinned to a commit of vci (replace <commit-sha> with a full SHA): the
-      # verifier must not change under you, and a branch or tag can move.
+      # Pinned to a vci release (v1.0.0; for strict pinning use the full SHA from the release page): the
+      # verifier must not change under you; v1 moves only to tested 1.x releases.
       - name: Install vci
         run: |
           git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
-          git -C "$RUNNER_TEMP/vci" checkout --detach <commit-sha>
+          git -C "$RUNNER_TEMP/vci" checkout --detach v1.0.0
           cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
           echo "VCI_RUBY_COLLECTOR=$RUNNER_TEMP/vci/ruby/vci-collector" >> "$GITHUB_ENV"
 
@@ -58,8 +59,12 @@ jobs:
       # main the base is the pushed commit itself: `vci init` lists
       # refs/heads/main in policy.no_skip_refs, so everything runs there.
       # `vci ci` runs each remaining file in its own `bin/rails test <file>`
-      # (fresh SQLite databases loaded from db/schema.rb, one process, the
-      # fixed seed attestations are made with) and exits non-zero if any fails.
+      # or, for RSpec, `rspec --options .rspec <file>` (fresh SQLite databases
+      # loaded from db/schema.rb, one process, the fixed seed attestations are
+      # made with; RSpec reads .rspec only, never ~/.rspec,
+      # $XDG_CONFIG_HOME/rspec/options or .rspec-local, on both sides) and
+      # exits non-zero if any fails. SPEC_OPTS reaches RSpec only if declared
+      # in vci.toml ([env] global), and is then compared.
       - name: Plan, then run what is not attested
         run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
 

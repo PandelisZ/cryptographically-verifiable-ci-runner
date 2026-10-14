@@ -1,4 +1,4 @@
-# Spike: Rails dependency collection (`vci_collector.rb`)
+# Spike: Rails dependency collection (`vci_collector.rb`), Minitest and RSpec
 
 Date: 2026-10-01. macOS arm64 (Darwin 25.6). Ruby 3.4.9 (`3.4.9p82`, through mise), Bundler 4.0.9, RubyGems 3.6.9,
 Rails 8.1.3.1, Minitest 6.0.6, Zeitwerk 2.8.3, `sqlite3` 2.9.6 (SQLite 3.53.2), `tzinfo-data` 1.2026.5. Fixture:
@@ -220,11 +220,169 @@ env keys omitted):
 {"kind":"result","state":"passed","tests":2,"failed":0,"skipped":0,"assertions":4,"noAssertions":0,"durationMs":86,"exitStatus":0}
 ```
 
+## RSpec
+
+Date: 2026-10-02. Same machine and Ruby; rspec-core 3.13.6, rspec-expectations 3.13.5, rspec-mocks 3.13.8,
+rspec-support 3.13.7, rspec-rails 8.0.4, factory_bot 6.6.0 / factory_bot_rails 6.5.1, simplecov 0.22.0. Fixture:
+`fixtures/rails-rspec-abcd`; end-to-end tests: `crates/vci-cli/tests/e2e_rspec.rs`; collector tests:
+`test_rspec_*` and `test_stubbed_file_methods_do_not_hide_real_reads` in `collector_test.rb`.
+
+RSpec runs under the Rails adapter with the same collector, loaded the same way (`RUBYOPT=-r`), and
+`VCI_RAILS_RUNNER=rspec`:
+
+```
+ruby -e 'require "bundler/setup"; require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke' \
+  -- --options .rspec spec/models/b_spec.rb
+```
+
+**R1. `$0` matters.** `Configuration#files_or_directories_to_run=` adds `default_path` only when `command`
+(`$0`'s last component) is `rspec`. Under `ruby -e`, `$0` is `-e`, so a run with no file argument (the listing,
+`vci ci` on `no_skip_refs`) found no file until the script set `$0 = "rspec"`. `bundler/setup` comes first, as in
+`bundle exec`: `rspec/core` must be the bundle's.
+
+**R2. Option files.** `ConfigurationOptions#file_options` reads `[global_options, project_options, local_options]`
+(`$XDG_CONFIG_HOME/rspec/options` if it exists, else `~/.rspec`; `./.rspec`; `./.rspec-local`), **or only the file
+`--options` names** when the command line has one (`custom_options_file` comes from the command line only, not from
+`SPEC_OPTS`); `SPEC_OPTS` is parsed on top (`env_options`). A missing custom file reads as empty. vci therefore passes
+`--options .rspec`: `.rspec` is read (and made a global input), the files outside the repository and `.rspec-local`
+never are, in `vci run` and `vci ci` alike, so nothing has to be configured on the runner. Measured with the fixture:
+`~/.rspec` holding `--tag focus` makes a plain run of a print `Run options: include {focus: true}` and `0 examples`;
+`$XDG_CONFIG_HOME/rspec/options` holding `--require does_not_exist` makes it fail; `.rspec-local` holding `--tag slow`
+filters it; under vci all three change nothing (the same inputs, the same storage key). A run without `--options` is
+refused (`rspec:option-files`), and a read of `~/.rspec` would be a read outside the repository anyway.
+
+**R3. Listing.** `ConfigurationOptions.new(["--options", ".rspec"]).configure(RSpec.configuration)` then
+`files_to_run` gives what `rspec` would run: `default_path`, `pattern` and `exclude_pattern` from `.rspec` and
+`SPEC_OPTS`, `--require`d files loaded (the fixture's `spec_helper`), a pattern starting with the default path used
+as-is (`spec/**/*_spec.rb,test/**/*_test.rb` lists test files: in a project with both runners that is refused until
+`runner` decides). Shared examples and support files do not match the pattern.
+
+**R4. Results.** `RSpec::Core::Reporter` is prepended: `start`, `example_passed`, `example_failed` (also a fixed
+`pending`), `example_pending` (`pending`, `skip`, `xit`, `xdescribe`), `notify_non_example_exception` (load errors
+from `Configuration#load_file_handling_errors`, `before`/`after(:suite)` through `SuiteHookContext#set_exception`,
+`after(:context)` from `hooks.rb`). The declared examples are `World#all_examples`, counted in a prepended
+`World#announce_filters`, because it **clears `example_groups` when every example was filtered out**. A focused run
+(`fit` with `filter_run_when_matching :focus`) reported `1 of 2 examples did not run (inclusion filter {focus:
+true})`; `--only-failures` `(inclusion filter {last_run_status: "failed"}; only_failures)`; an excluded tag
+`(exclusion filter {slow: true})`. `--bisect` forks (`process:fork`) and is an `options[:runner]`
+(`Invocations::Bisect`), as are `--drb` (it also opens sockets), `--init`, `--version` and `--help`.
+
+**R5. Seed.** `Ordering::ConfigurationManager#initialize` sets `@seed = rand(0xFFFF)`; `--seed`/`--order rand:N`
+force it (`force`), `config.seed =` sets it unless forced, `config.order = :random` uses it. The collector sets the
+default to 0 after `initialize` (and on a configuration created before its hook): `Randomized with seed 0` in every
+run; the fixture's `Kernel.srand config.seed` gets 0.
+
+**R6. The example status file.** `config.example_status_persistence_file_path=` is prepended to point at
+`$TMPDIR/vci-rspec-example-statuses.txt` (vci's fresh dir). RSpec reads it lazily (`last_run_statuses`: for
+`--only-failures` and `metadata[:last_run_status]`) and writes it at the end (`ExampleStatusPersister`), creating its
+directory with rspec-support's `DirectoryMaker.mkdir_p`, which checks **every ancestor** of the temp dir: `/`,
+`/private`, `/private/var/...` were recorded as stats outside the repository and refused every file. In RSpec
+processes, type checks of directories above vci's temp dirs (outside the repository) are not inputs. A
+`spec/examples.txt` left by a plain run is never read: the fixture's attested files stay skipped when it is edited, and
+an example reading `last_run_status` sees `"unknown"`.
+
+**R7. rspec-rails lists the whole spec tree at boot.** rspec-rails 8's `rspec_rails.code_statistics` initializer (Rails
+>= 8.0) runs `Dir[Rails.root.join("spec", "**", "*_spec.rb")]` to register `bin/rails stats` directories. Recorded,
+that made the listing of `spec/` and every subdirectory an input of every spec that boots Rails: a new spec file
+anywhere ran all of them. The result only reaches `Rails::CodeStatistics` (`directories`, `test_types`), so the glob
+is not recorded (matched by its caller, `rspec-rails-*/lib/rspec-rails.rb`) and reading those directories outside
+`code_statistics.rb` refuses the file (`rails:code-statistics:`). Its `File.directory?` checks of the `spec/<type>`
+directories it found are still recorded.
+
+**R8. `maintain_test_schema!`.** The generated `rails_helper` calls it directly. With the schema loaded by the
+collector after initialisation (F6) it finds nothing to do: no `bin/rails db:test:prepare` child. A migration newer
+than the schema (`db/migrate/20261001120000_add_colour.rb`) makes `check_pending_migrations` raise
+`ActiveRecord::PendingMigrationError` and `rails_helper` abort: refused as a load error, `db/` unchanged (a timestamp in
+the future is rejected as `InvalidMigrationTimestampError`, also a load error).
+
+**R9. Loading.** b records `spec/spec_helper.rb` (through `.rspec`'s `--require`, with its load path probes in `spec/`
+and `lib/`, which RSpec adds to `$LOAD_PATH`), `spec/rails_helper.rb`, the listings `spec/support`,
+`spec/support/matchers`, `spec/support/shared_examples` (from `Rails.root.glob("spec/support/**/*.rb")`, a
+`Pathname#glob` that reaches `Dir.glob(..., base:)`), both support files, `spec/factories` (FactoryBot's
+`find_definitions`: `File.exist?("spec/factories.rb")`, `File.directory?`, `Dir["spec/factories/**/*.rb"]`; and
+`FactoryBotRails::Reloader`'s `FileUpdateChecker` glob) and `spec/factories/gadgets.rb`, `spec/fixtures/widgets.yml`,
+`db/schema.rb`. factory_bot_rails loads the definitions in `after_initialize`, so c and d record them too. c records
+`spec/fixtures/files/which.txt` and `alpha.txt` (not `beta.txt`) and the template. a records `.rspec`,
+`spec/spec_helper.rb`, `spec/lib/a_spec.rb` and `lib/calc.rb` (`require_relative`): 65 inputs against b's 7515.
+
+**R10. Toolchain.** a never loads Rails: the collector reported `rails ""` against the probe's `8.1.3.1` and every
+such file was refused (`toolchain seen by the collector ... differs`). In RSpec processes the Rails version falls back
+to the bundle's `railties` spec. The test framework string is built from the bundle's specs (`Gem.loaded_specs`, set up
+by Bundler for the whole bundle), not from what a file loaded: `minitest 6.0.6; rspec-core 3.13.6, rspec-expectations
+3.13.5, rspec-mocks 3.13.8, rspec-rails 8.0.4, rspec-support 3.13.7`, the same in the probe and every process. For the
+Minitest fixture (no RSpec in its bundle) it is unchanged: `minitest 6.0.6`.
+
+**R11. Stubs.** rspec-mocks' `allow(File).to receive(:read)` finds vci's prepended module defining `read` and
+prepends its own module in front (`MethodDouble#usable_rspec_prepended_module`); the original it calls for
+`and_call_original` is `File.method(:read)` taken before, i.e. vci's hook. `ENV`'s `[]` likewise. `Kernel.require`
+stubbed does not affect plain `require`, which Bundler routes through `Kernel.no_warning_require` (F2b). The weak spot
+was the collector itself: it checked the file system with `File.directory?`, `File.exist?`, `Dir.children` and
+`File.expand_path`, so a test stubbing `File.directory?` to `false` made a real `Dir.glob` record no listing (shown
+by running the new collector test against a copy using those methods: `Expected [] to include "data/g"`). The
+collector now calls the C methods it captured at load (`VciCollector::Real`). This also covers Minitest's `File.stub`.
+
+**R12. SimpleCov** (`require "simplecov"; SimpleCov.start` in `spec_helper`, tried in a copy of the fixture): every
+file was refused for `input outside the repository: /Users/pz/.simplecov` (`load_global_config.rb` checks
+`~/.simplecov`), then for `.simplecov` in every directory above the project (`defaults.rb` searches upward until it
+finds one; `Pathname#exist?` asks `FileTest`, not `File`). In RSpec processes those files look absent (a `.simplecov`
+in the repository is read and recorded), and `SimpleCov.coverage_path` is the process's `$TMPDIR/vci-coverage`, so the
+`.resultset.json` it merges and `.last_run.json` never come from (or go to) `coverage/`: two consecutive `vci run`s of
+the four files attested all four both times, and `vci ci` printed `Coverage report generated for RSpec to
+.../vci-coverage`. SimpleCov is not part of the fixture; `test_rspec_simplecov_is_kept_out_of_the_repository` covers it
+when the gem is installed.
+
+**R13. Plain Ruby.** A project with only `rspec-core` and `rspec-expectations`, locked with `bundle lock --local`, was
+refused for `wrote inside the repository: Gemfile.lock`: that lockfile (platform `arm64-darwin-25`, `CHECKSUMS` without
+digests) is rewritten by every `require "bundler/setup"` (its mtime changed on a plain `ruby -e`). A complete lockfile
+(the fixture's checksums, platforms `arm64-darwin`, `ruby`, `x86_64-linux-gnu`) is left alone, and the project is
+attested and invalidated like the Rails one.
+
+**R14. macOS to Linux.** The fixture's four spec files attested on macOS arm64 (`platform = "any"`, `TZ=UTC`) were
+checked as in F14: the static `x86_64-unknown-linux-musl` `vci` in the `ruby:3.4.9` image (`linux/amd64`, non-root,
+Bundler 4.0.9, gems in `vendor/bundle`). `vci plan` skipped all four with nothing changed; editing the view template ran
+c only; `TZ=Europe/London` ran everything; with `config/routes.rb` edited, `vci ci` ran b, c and d (one RSpec process
+each, `3 examples, 0 failures` in total, exit 0) and skipped a, with a `~/.rspec` holding an invalid option in the
+container user's home, and wrote neither `spec/examples.txt` nor `db/`. Nothing needed changing for RSpec (the RSpec
+gems are pure Ruby, matched by version like the rest of the bundle).
+
+**R15. Not verified.** A GitHub Actions runner, Capybara system specs that drive a browser, rspec-retry and
+parallel_tests as gems (their refusal is tested by defining their constants; a home-grown retry is tested as such,
+R18), and Spring with `spring-commands-rspec`.
+
+**R16. Exit code after the run.** The collector read the exit status from `$!` after calling `VciCollector.unhooked`,
+whose `defined?` checks reset `$!` to nil: a spec with `at_exit { exit 1 }` exited 1 but recorded `"state":"passed",
+"exitStatus":0` and was attested (and then skipped); so was a file below SimpleCov's `minimum_coverage` (exit 2) and
+one requiring `minitest/autorun` (its handler rejects `--options` and exits 1). The status is now read first thing in
+the collector's `at_exit` handler (the last to run, so every later-registered handler has set it), a clean framework
+report with a non-zero status adds `vci:process-exit:<n>`, and `RailsAdapter::run_one` independently taints a
+`passed` result whose process did not exit 0 (with only that Rust check and the old collector, the e2e test
+`rspec_exit_code_set_after_the_run_refuses` passes too). Checked with real SimpleCov 0.22.0 in a copy of the fixture:
+80% line coverage against `minimum_coverage 100` was refused with `vci:process-exit:2`, 100% was attested.
+
+**R17. `ENV["TMPDIR"]` and `resolv.conf`.** The paths the collector ignores (vci's temp dirs) were computed from the
+live `ENV["TMPDIR"]` at exit, so a spec that set it to `/` hid every read outside the repository. It is now read once
+when the collector loads. A stock `rails new` app with rspec-rails and Capybara refused every spec for `input outside
+the repository: /etc/resolv.conf`: rspec-rails requires `capybara/rspec`, Capybara requires `net/http`, which requires
+`resolv`, whose `DefaultResolver = self.new` (in `class Resolv`'s body) parses `/etc/resolv.conf`. That read (and
+existence check), made with a `<class:Resolv>` frame of a `resolv.rb` outside the repository on the stack, is not
+recorded; a test calling `Resolv::DNS::Config.default_config_hash` itself still records it. After the change the stock
+app's model spec and a `rack_test` feature spec (`visit "/up"`) were attested and skipped. Prism's `*_file` methods
+(`parse_file`, `parse_file_success?`, `lex_file`, ...) read in C and are now hooked like
+`InstructionSequence.compile_file`.
+
+**R18. Cleared failures.** rspec-retry's refusal relied on its constant. A retry in an `around` hook that clears
+`@exception` and calls `ex.run` again, a prepended `Example#finish` that drops `@exception`, and a prepended
+`Reporter#example_failed` calling `example_passed` were all attested. The collector now hooks
+`Example#display_exception=` (through which `set_exception` and `set_aggregate_failures_exception` store a failure; a
+pending example's goes to `pending_exception` instead) and refuses a file in which an example with a recorded failure
+is reported as passed (`rspec:failure-cleared`), and compares the reporter's counts with the examples'
+`execution_result.status` (`rspec:status-mismatch`).
+
 ## Not done
 
-- **RSpec**: needs a reporter for RSpec's results and its expectation counts, and handling the options RSpec reads
-  from `~/.rspec` and `$XDG_CONFIG_HOME/rspec/options` (outside the repository, so every file would be refused). The
-  adapter errors on RSpec-only projects rather than running nothing.
+- **RSpec expectation counts**: RSpec does not count expectations, and vci does not either; an example without one
+  passes (Minitest's no-assertion rule has no RSpec counterpart).
+- **RSpec on a GitHub runner**: checked in the Linux container only (R14).
 - **Precise Zeitwerk modelling**: a new file in an autoload root runs every test that boots Rails, whether or not a
   constant it defines is ever referenced.
 - **A type-only record for files**: `File.exist?(routes.rb)` records the file's content, so a routes change runs

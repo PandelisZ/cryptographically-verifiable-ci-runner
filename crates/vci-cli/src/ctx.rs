@@ -206,6 +206,8 @@ pub struct Project {
     /// `[[inputs]]` declarations of this project.
     pub inputs: Vec<InputsConfig>,
     pub adapter: Box<dyn Adapter>,
+    /// The settings the adapter was made with (`vci ci` makes it again).
+    pub adapter_options: vci_adapter::AdapterOptions,
 }
 
 impl Project {
@@ -359,14 +361,10 @@ impl Ctx {
             if !dir.starts_with(&root) {
                 bail!("{what} {dir} is outside the repository {root}");
             }
-            let adapter = vci_adapter::adapter_for_with(
-                &spec.adapter,
-                &dir,
-                &vci_adapter::AdapterOptions {
-                    rails_allow_db: spec.policy.rails_allow_db,
-                },
-            )?;
+            let options = spec.adapter_options();
+            let adapter = vci_adapter::adapter_for_with(&spec.adapter, &dir, &options)?;
             projects.push(Project {
+                adapter_options: options,
                 name: spec.name,
                 rel: spec.rel,
                 dir,

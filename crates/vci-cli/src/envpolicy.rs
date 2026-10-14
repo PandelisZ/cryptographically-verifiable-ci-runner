@@ -98,6 +98,7 @@ const RAILS_NEVER_HASHED: &[&str] = &[
     "VCI_REPO",
     "VCI_RAILS_MODE",
     "VCI_RAILS_ALLOW_DB",
+    "VCI_RAILS_RUNNER",
     "RUBYOPT",
     "RAILS_ENV",
     "RACK_ENV",

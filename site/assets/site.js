@@ -6,6 +6,7 @@
     ["index.html", "Overview"],
     ["get-started.html", "Get started"],
     ["adapters.html", "Test runners"],
+    ["examples.html", "Examples"],
     ["configuration.html", "Configuration"],
     ["github-actions.html", "GitHub Actions"],
     ["cli.html", "CLI"],
@@ -110,6 +111,53 @@
     w.appendChild(t);
   });
 
+  // Diagrams keep a readable size on a phone and scroll sideways on their own.
+  [].forEach.call(main.querySelectorAll('img[src^="assets/diagrams/"]'), function (img) {
+    var w = document.createElement("div");
+    w.className = "diagram-wrap";
+    img.parentNode.insertBefore(w, img);
+    w.appendChild(img);
+  });
+
+  // Syntax highlighting: Prism from cdnjs, language guessed from the content
+  // when a block has no language-* class. Output blocks (data-nocopy) and
+  // terminal mock-ups keep their hand-written colours.
+  (function () {
+    var blocks = [].filter.call(document.querySelectorAll("pre > code"), function (c) {
+      var pre = c.parentNode;
+      return pre.dataset.nocopy === undefined && !pre.closest(".term") && !/language-/.test(c.className);
+    });
+    if (!blocks.length) return;
+    var guess = function (t) {
+      if (/^\s*[\[{]/.test(t) && /[}\]]\s*$/.test(t) && /"\w+"\s*:/.test(t)) return "json";
+      if (/^\s*(- )?(uses|runs-on|steps|jobs|with|on|env|name|permissions|run):/m.test(t)) return "yaml";
+      if (/^\[\[?[\w.-]+\]\]?\s*$/m.test(t) || /^\w[\w.-]* = /m.test(t)) return "toml";
+      if (/RSpec\.|\bexpect\(|^\s*(it|describe|require|end)\b|\bdo\s*$/m.test(t)) return "ruby";
+      if (/^\s*(def|import|from|assert)\b|pytest\./m.test(t)) return "python";
+      if (/^(\$ |vci |brew |curl |git |cd |export |npm |npx |uv |go |cargo |bundle |mise |ssh-keygen |ln |cat |echo )/m.test(t)) return "bash";
+      return null;
+    };
+    var todo = [];
+    blocks.forEach(function (c) {
+      var lang = guess(c.textContent);
+      if (lang) { c.classList.add("language-" + lang); todo.push(c); }
+    });
+    if (!todo.length) return;
+    window.Prism = window.Prism || {};
+    window.Prism.manual = true;
+    var base = "https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/";
+    var load = function (src, cb) {
+      var el = document.createElement("script"); el.src = src; el.async = true; el.onload = cb; el.onerror = function () {};
+      document.head.appendChild(el);
+    };
+    load(base + "prism.min.js", function () {
+      load(base + "plugins/autoloader/prism-autoloader.min.js", function () {
+        Prism.plugins.autoloader.languages_path = base + "components/";
+        todo.forEach(function (c) { Prism.highlightElement(c); });
+      });
+    });
+  })();
+
   // Copy buttons.
   [].forEach.call(document.querySelectorAll("pre"), function (pre) {
     if (pre.dataset.nocopy !== undefined) return;
@@ -178,7 +226,7 @@
 
   var footer = document.createElement("footer");
   footer.innerHTML =
-    '<div class="inner"><span>vci is licensed under Apache-2.0.</span>' +
-    '<span><a href="' + REPO + '">Source on GitHub</a> · <a href="' + REPO + '/blob/main/README.md">Full reference (README)</a></span></div>';
+    '<div class="inner"><span>vci is licensed under MIT.</span>' +
+    '<span><a href="' + REPO + '">Source on GitHub</a> · <a href="' + REPO + '/blob/main/docs/REFERENCE.md">Full reference</a></span></div>';
   document.body.appendChild(footer);
 })();

@@ -282,6 +282,39 @@ fn junk_in_listings(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
     out
 }
 
+/// Taints for the refusal line, readable when a library makes hundreds of
+/// similar calls (FFI's `attach_function` for every function of libvips):
+/// taints that agree up to their first `(` are shown once with a count, and
+/// at most [`MAX_TAINT_GROUPS`] groups are listed.
+fn summarize_taints(taints: &[&String]) -> String {
+    let mut groups: Vec<(&str, &str, usize)> = Vec::new();
+    for t in taints {
+        let key = t.split_once('(').map_or(t.as_str(), |(k, _)| k);
+        match groups.iter_mut().find(|(k, _, _)| *k == key) {
+            Some(g) => g.2 += 1,
+            None => groups.push((key, t.as_str(), 1)),
+        }
+    }
+    let n = groups.len();
+    let mut parts: Vec<String> = groups
+        .into_iter()
+        .take(MAX_TAINT_GROUPS)
+        .map(|(_, first, count)| {
+            if count > 1 {
+                format!("{first} (+{} more like it)", count - 1)
+            } else {
+                first.to_owned()
+            }
+        })
+        .collect();
+    if n > MAX_TAINT_GROUPS {
+        parts.push(format!("and {} more", n - MAX_TAINT_GROUPS));
+    }
+    parts.join(", ")
+}
+
+const MAX_TAINT_GROUPS: usize = 12;
+
 #[allow(clippy::too_many_arguments)]
 fn check_one(
     ctx: &Ctx,
@@ -333,14 +366,7 @@ fn check_one(
                 && t.starts_with(vci_adapter::RAILS_NETWORK_DB_TAINT))
     });
     if !taints.is_empty() {
-        return Err(format!(
-            "tainted: {}",
-            taints
-                .iter()
-                .map(|t| t.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        return Err(format!("tainted: {}", summarize_taints(&taints)));
     }
     let waived: Vec<String> = waived.into_iter().cloned().collect();
     if adapter.name() == "cargo" && project.env.mode == crate::config::EnvMode::Loose {
@@ -1089,6 +1115,25 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn similar_taints_are_summarized() {
+        let mut t: Vec<String> = vec![r#"native:FFI ffi_lib(["vips.42"])"#.into()];
+        for i in 0..300 {
+            t.push(format!(
+                r#"native:FFI attach_function([:vips_f{i}, [:pointer]])"#
+            ));
+        }
+        t.push("process:backtick".into());
+        let refs: Vec<&String> = t.iter().collect();
+        assert_eq!(
+            summarize_taints(&refs),
+            r#"native:FFI ffi_lib(["vips.42"]), native:FFI attach_function([:vips_f0, [:pointer]]) (+299 more like it), process:backtick"#
+        );
+        let many: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&String> = many.iter().collect();
+        assert!(summarize_taints(&refs).ends_with("t11, and 8 more"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CLI reference · vci</title>
-<meta name="description" content="Every vci command, how the signing key and base ref are chosen, and the environment variables vci reads.">
+<meta name="description" content="Every vci command with its useful flags and an example, how the signing key and base ref are chosen, and the environment variables vci reads.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -13,82 +13,141 @@
 <aside class="toc"><h2>On this page</h2></aside>
 <main>
 <h1>CLI reference</h1>
-<p class="lede">Eight commands. Three you use daily (<code>run</code>, <code>plan</code>, <code>push</code>), one runs in CI (<code>ci</code>), and one answers "why did this run?" (<code>explain</code>).</p>
+<p class="lede">You use three commands every day (<code>run</code>, <code>plan</code>, <code>push</code>). One runs in CI (<code>ci</code>). One answers "why did this test run?" (<code>explain</code>).</p>
 
 <h2>Commands</h2>
+<p>A <strong>unit</strong> is what vci can skip: a test file, a Go package or a Cargo test target. An <strong>attestation</strong> is a signed record that a unit passed against exactly these inputs.</p>
+<table>
+<tr><th>Command</th><th>Purpose</th></tr>
+<tr><td><a href="#init"><code>vci init</code></a></td><td class="wrap">Set up a repository: config, trusted signers, metadata remote</td></tr>
+<tr><td><a href="#run"><code>vci run</code></a></td><td class="wrap">Run tests locally and sign an attestation for each unit that passed</td></tr>
+<tr><td><a href="#plan"><code>vci plan</code></a></td><td class="wrap">Show which units can be skipped and why the others run</td></tr>
+<tr><td><a href="#push-fetch"><code>vci push</code></a></td><td class="wrap">Publish your attestations to the remote</td></tr>
+<tr><td><a href="#push-fetch"><code>vci fetch</code></a></td><td class="wrap">Download attestations from the remote</td></tr>
+<tr><td><a href="#ci"><code>vci ci</code></a></td><td class="wrap">In CI: plan, run the rest, write an audit log</td></tr>
+<tr><td><a href="#explain"><code>vci explain</code></a></td><td class="wrap">Show why one unit was not skipped</td></tr>
+<tr><td><a href="#prune"><code>vci prune</code></a></td><td class="wrap">Delete expired attestations</td></tr>
+<tr><td><a href="#verify"><code>vci verify</code></a></td><td class="wrap">Verify one attestation envelope and print its claims</td></tr>
+</table>
 
 <h3 id="init">vci init</h3>
-<pre data-nocopy><code>vci init [--key K] [--principal P] [--project DIR]
-         [--adapter vitest|pytest|go|cargo|rails] [--no-install] [--meta-url URL]</code></pre>
-<p>Writes <code>vci.toml</code>, <code>.vci/allowed_signers</code> (adding key <code>K</code>) and <code>.git-meta</code>, configures the git-meta remote, and prints a CI snippet. For Vitest it also runs <code>npm install</code> for <code>@vci/vitest</code> unless you pass <code>--no-install</code>.</p>
+<pre data-nocopy><code>vci init [--adapter vitest|pytest|go|cargo|rails]
+         [--key K] [--principal P] [--project DIR]
+         [--no-install] [--meta-url URL]</code></pre>
+<p>Writes <code>vci.toml</code>, <code>.vci/allowed_signers</code> (adding key <code>K</code>) and <code>.git-meta</code>, configures the git-meta remote, and prints a CI snippet.</p>
+<ul>
+<li><code>--adapter</code>: the test runner. Default <code>vitest</code>.</li>
+<li><code>--key</code>: a public key, or a private key with its <code>.pub</code> next to it. <code>--principal</code> names its owner (default: <code>git config user.email</code>).</li>
+<li><code>--project DIR</code>: the project directory, relative to the repository root.</li>
+<li><code>--no-install</code>: for Vitest, skip the <code>npm install</code> of <code>@vci/vitest</code>.</li>
+<li><code>--meta-url</code>: where attestations are exchanged (default: origin's URL). Without an origin remote or this flag, no <code>.git-meta</code> is written.</li>
+</ul>
+<pre><code>vci init --adapter pytest --key ~/.ssh/id_ed25519.pub</code></pre>
 
 <h3 id="run">vci run</h3>
-<pre data-nocopy><code>vci run [FILES…] [--key PATH] [--ttl 14d]</code></pre>
-<p>Runs tests with collection on, then signs and stores an attestation for every attestable unit. With no arguments it runs every unit. The exit code is the test runner's.</p>
+<pre data-nocopy><code>vci run [UNITS…] [--key PATH] [--ttl 14d]</code></pre>
+<p>Runs tests with input collection on, then signs and stores an attestation for every unit that can be attested. With no arguments it runs every unit. The exit code is the test runner's.</p>
+<ul>
+<li>Units are test files, Go package directories (<code>./b</code>), or Cargo targets (<code>crates/b#test:name</code>; a package directory means all its targets).</li>
+<li><code>--key</code>: the SSH signing key (see <a href="#signing-key">signing key</a>).</li>
+<li><code>--ttl</code>: how long the attestation is valid. Default <code>14d</code>.</li>
+</ul>
+<pre><code>TZ=UTC vci run spec/models/b_spec.rb spec/lib/a_spec.rb --key ~/.ssh/id_ed25519</code></pre>
+<pre data-nocopy><code>3 examples, 0 failures
+
+vci: attested demo/rspec-app/spec/lib/a_spec.rb (65 inputs, root 2cbdcb32a9721b03)
+     as git-meta path:demo/rspec-app/spec/lib/a_spec.rb vci:attestation:…
+vci: attested demo/rspec-app/spec/models/b_spec.rb (7517 inputs, root 9b40ad198ee598ce)
+     as git-meta path:demo/rspec-app/spec/models/b_spec.rb vci:attestation:…
+vci: 2 attested, 0 not attested</code></pre>
 
 <h3 id="plan">vci plan</h3>
 <pre data-nocopy><code>vci plan [--base-ref R] [--format text|json|github]</code></pre>
 <p>Prints which units can be skipped and why the others run. Changes nothing.</p>
+<ul>
+<li><code>--base-ref</code>: the commit trust is read from (see <a href="#base-ref">base ref</a>).</li>
+<li><code>--format</code>: <code>text</code> (default), <code>json</code> or <code>github</code>.</li>
+</ul>
+<pre><code>vci plan --base-ref origin/main</code></pre>
 <pre data-nocopy><code><span class="g">SKIP</span> tests/test_b.py  (attested by alice@example.com (SHA256:tsNeKgQt…))
 <span class="a">RUN </span> tests/test_a.py  (no attestation)
 1 to skip, 1 to run</code></pre>
 
-<h3 id="ci">vci ci</h3>
-<pre data-nocopy><code>vci ci [--base-ref R] [--audit-log PATH]</code></pre>
-<p>Plans, runs the remainder, and writes a JSON audit log of every skip. Exits non-zero if any test fails.</p>
-
-<h3 id="explain">vci explain</h3>
-<pre data-nocopy><code>vci explain &lt;test&gt; [--base-ref R]</code></pre>
-<p>Shows every candidate attestation for one unit and the first check each failed, with expected and actual values.</p>
-
 <h3 id="push-fetch">vci push, vci fetch</h3>
 <pre data-nocopy><code>vci push [--remote R]
 vci fetch [--remote R]</code></pre>
-<p>Exchange attestations on <code>refs/meta/main</code>, like <code>git meta push</code> and <code>git meta pull</code>. <code>R</code> is a git-meta remote, or a git remote or URL to use as one. Default: the configured git-meta remote, else the <code>url:</code> in <code>.git-meta</code>, else origin. In CI, always pass <code>--remote</code>.</p>
+<p>Exchange attestations on <code>refs/meta/main</code>, like <code>git meta push</code> and <code>git meta pull</code>. Push your branch with <code>git push</code> as usual.</p>
+<ul>
+<li><code>--remote R</code>: a git-meta remote, or a git remote or URL to use as one. Default: the configured git-meta remote, else the <code>url:</code> in <code>.git-meta</code>, else origin.</li>
+<li>In CI, always pass <code>--remote</code>, so the checkout never chooses where attestations come from.</li>
+</ul>
+<pre><code>vci push &amp;&amp; git push              <span class="c"># on your laptop</span>
+vci fetch --remote origin         <span class="c"># in CI (the action does this)</span></code></pre>
+
+<h3 id="ci">vci ci</h3>
+<pre data-nocopy><code>vci ci [--base-ref R] [--audit-log PATH]</code></pre>
+<p>Plans, runs every unit that was not skipped, and exits non-zero if any test fails. The <a href="github-actions.html">GitHub Action</a> runs it for you.</p>
+<ul>
+<li><code>--audit-log PATH</code>: write a JSON record of every skip, by whom, and what ran.</li>
+</ul>
+<pre><code>vci ci --base-ref origin/main --audit-log vci-audit.json</code></pre>
+
+<h3 id="explain">vci explain</h3>
+<pre data-nocopy><code>vci explain &lt;unit&gt; [--base-ref R]</code></pre>
+<p>Lists every candidate attestation for one unit and the first check each failed, with expected and actual values.</p>
+<pre><code>vci explain spec/models/b_spec.rb --base-ref origin/main</code></pre>
+<p>Full output and what each failed check means: <a href="examples.html#explain">Examples</a>.</p>
 
 <h3 id="prune">vci prune</h3>
 <pre data-nocopy><code>vci prune [--dry-run]</code></pre>
-<p>Deletes expired attestations from the local store. <code>vci push</code> publishes the deletions.</p>
+<p>Deletes expired attestations from the local store. <code>vci push</code> publishes the deletions. <code>--dry-run</code> only lists them.</p>
+<pre><code>vci prune --dry-run
+vci prune &amp;&amp; vci push</code></pre>
 
 <h3 id="verify">vci verify</h3>
 <pre data-nocopy><code>vci verify &lt;envelope|-&gt; [--allowed-signers F] [--base-ref R]</code></pre>
-<p>Verifies one DSSE envelope and prints its claims.</p>
+<p>Verifies one DSSE envelope (a file, or <code>-</code> for stdin) and prints its claims.</p>
+<ul>
+<li><code>--allowed-signers F</code>: the trust file to check against. Default: <code>.vci/allowed_signers</code> at <code>--base-ref</code>, or at HEAD.</li>
+</ul>
 
 <h2>Signing key</h2>
-<p>vci looks for the key in this order:</p>
+<p>vci signs with an SSH key. It uses the first of:</p>
 <ol>
 <li><code>--key PATH</code></li>
 <li><code>$VCI_SIGNING_KEY</code></li>
 <li><code>git config user.signingkey</code>, when <code>gpg.format = ssh</code></li>
 </ol>
-<p>A GPG signing key is never used. A <code>.pub</code> path works when the private half is in <code>ssh-agent</code>, hardware keys included.</p>
+<p>A GPG key is never used. A <code>.pub</code> path works when the private half is in <code>ssh-agent</code>, hardware keys included.</p>
 
 <h2>Base ref</h2>
-<p>The base ref is the trust boundary: policy and allowed signers are read from it. vci picks it in this order:</p>
+<p>The base ref is the commit vci trusts: it reads the policy and the allowed signers from there, never from the code under test. vci uses the first of:</p>
 <ol>
 <li><code>--base-ref R</code></li>
 <li><code>$VCI_BASE_REF</code></li>
 <li><code>origin/$GITHUB_BASE_REF</code></li>
 <li>the first that exists of <code>origin/HEAD</code>, <code>origin/main</code>, <code>origin/master</code>, <code>main</code>, <code>master</code></li>
 </ol>
-<p>If none resolves, everything runs. <code>vci plan</code> warns when the base commit is HEAD or contains it, because then trust comes from the commit under test.</p>
+<p>If none resolves, everything runs. <code>vci plan</code> warns when the base commit is HEAD or contains it, because then trust would come from the commit under test.</p>
 
 <h2>Environment variables</h2>
 <table>
 <tr><th>Variable</th><th>Meaning</th></tr>
-<tr><td><code>VCI_SIGNING_KEY</code></td><td class="wrap">Signing key path, used when <code>--key</code> is not given</td></tr>
-<tr><td><code>VCI_BASE_REF</code></td><td class="wrap">Base ref, used when <code>--base-ref</code> is not given</td></tr>
+<tr><td><code>VCI_SIGNING_KEY</code></td><td class="wrap">Signing key path, when <code>--key</code> is not given</td></tr>
+<tr><td><code>VCI_BASE_REF</code></td><td class="wrap">Base ref, when <code>--base-ref</code> is not given</td></tr>
 <tr><td><code>VCI_JOBS</code></td><td class="wrap">Parallel pytest, <code>go test</code> or Rails processes in <code>vci run</code> (default: CPUs, up to 8)</td></tr>
 <tr><td><code>VCI_JS_PLUGIN</code></td><td class="wrap">Path of the <code>@vci/vitest</code> package (default: <code>node_modules/@vci/vitest</code> above the project)</td></tr>
 <tr><td><code>VCI_PY_PLUGIN</code></td><td class="wrap">The <code>py/pytest-plugin</code> directory</td></tr>
 <tr><td><code>VCI_RUBY_COLLECTOR</code></td><td class="wrap">The <code>ruby/vci-collector</code> directory</td></tr>
-<tr><td><code>VCI_NODE</code>, <code>VCI_UV</code>, <code>VCI_GO</code>, <code>VCI_CARGO</code>, <code>VCI_RUBY</code></td><td class="wrap">Which binary to use for each toolchain, instead of the one on <code>PATH</code></td></tr>
+<tr><td class="wrap"><code>VCI_NODE</code>, <code>VCI_UV</code>, <code>VCI_GO</code>, <code>VCI_CARGO</code>, <code>VCI_RUBY</code></td><td class="wrap">Binary to use for each toolchain, instead of the one on <code>PATH</code></td></tr>
 </table>
+<p>The three collector paths are not needed with Homebrew or the GitHub Action, which set them up for you.</p>
 
 <h2>Looking at attestations directly</h2>
-<p>Attestations are ordinary git-meta values, readable with the <code>git meta</code> CLI:</p>
+<p>Attestations are ordinary git-meta values, so the <code>git meta</code> CLI can read them:</p>
 <pre><code>git meta get path:src/b.test.ts
 git ls-remote origin refs/meta/main</code></pre>
+<p>More in <a href="examples.html#git-meta">Examples</a>.</p>
 </main>
 </div>
 <script src="assets/site.js"></script>
