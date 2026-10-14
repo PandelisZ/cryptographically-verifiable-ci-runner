@@ -16,7 +16,7 @@
 <p class="lede">Worked examples you can copy. All output is real: it comes from this project's <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/demo">demo apps</a> and their GitHub Actions runs.</p>
 
 <h2 id="round-trip">A full round trip</h2>
-<p>An agent on a laptop (macOS arm64) changes a Rails model, runs the spec that covers it, and opens a pull request. CI (Ubuntu x86_64) then skips what the agent already ran. This is <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/4">pull request 4</a> of this repository.</p>
+<p>An agent on a laptop (macOS arm64) changes a Rails model, runs the spec that covers it, and opens a pull request. CI (Ubuntu x86_64) then skips what the agent already ran. This is <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/9">pull request 9</a> of this repository.</p>
 <p>Two terms first. A <strong>unit</strong> is what vci can skip; here, one spec file. An <strong>attestation</strong> is a signed record that a unit passed against exactly the inputs it read.</p>
 
 <h3>1. Run and sign locally</h3>
@@ -421,8 +421,8 @@ vci push &amp;&amp; git push</code></pre>
 <h2 id="live">Live runs to look at</h2>
 <table>
 <tr><th>Pull request</th><th>Shows</th></tr>
-<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/4">4</a></td><td>RSpec, Minitest and Go units attested on macOS and skipped on Linux; a factory edit re-running one spec</td></tr>
-<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/3">3</a></td><td>Python, Go, Rust and Rails in one job; a fixture edit re-running the Rails tests</td></tr>
+<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/9">9</a></td><td>RSpec, Minitest and Go units attested on macOS and skipped on Linux; a factory edit re-running one spec</td></tr>
+<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/8">8</a></td><td>Python, Go, Rust and Rails in one job; a fixture edit re-running the Rails tests</td></tr>
 </table>
 </main>
 </div>

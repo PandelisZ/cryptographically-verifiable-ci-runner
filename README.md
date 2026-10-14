@@ -165,7 +165,7 @@ In Claude Code you can install it as a plugin instead: `/plugin marketplace add 
 | [Reference](docs/REFERENCE.md) | Everything, in one long document |
 | [Design notes](docs/PLAN.md) | The original plan and the research behind it |
 
-This repository is also the demo: `demo/` holds a project for every adapter, and [the CI workflow](.github/workflows/ci.yml) runs them through the action on each pull request. [Pull request 4](https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/4) shows units attested on a Mac being skipped on a Linux runner.
+This repository is also the demo: `demo/` holds a project for every adapter, and [the CI workflow](.github/workflows/ci.yml) runs them through the action on each pull request. [Pull request 9](https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/pull/9) shows units attested on a Mac being skipped on a Linux runner.
 
 ## Status
 
