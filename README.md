@@ -21,11 +21,20 @@ Works with **Vitest, pytest, Go, Cargo, Rails (Minitest) and RSpec**, on macOS a
 
 Docs: [pandelisz.github.io/cryptographically-verifiable-ci-runner](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/) · [Examples with real output](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/examples.html) · [Full reference](docs/REFERENCE.md)
 
-## The problem
+## The problem: CI is the bottleneck now
 
-CI runs the whole test suite on every push. Most of those tests were just run, with the same code, on the machine that made the change. With AI agents producing many small pull requests, that waste grows: an agent runs the tests that cover its change, pushes, and CI runs all of them again, plus everything else.
+For twenty years CI was sized for human output: a few pull requests per engineer per week, one pipeline run each. Coding agents broke that arithmetic, and the teams that hit it first have written it down.
 
-The obvious fix, "trust the pull request when it says the tests passed", is not safe. A claim is not a proof. The code may have changed since the run, a dependency may differ, the person or agent may be mistaken or malicious, and the CI machine is not the laptop.
+- Anthropic, September 2026: *"Writing code is no longer the constraint, and once PR review gets accelerated, CI starts feeling the pressure."* Engineers ship 8× as much code per quarter as in 2021–2025, Claude writes 80% of it, tests grew 10×, and CI jobs grew **25× in six months**. ([source](https://claude.com/blog/agentic-coding-is-straining-ci-heres-how-we-scaled-test-impact-analysis-at-anthropic))
+- Anthropic, October 2026: *"The bottleneck, now, is all of the developer infrastructure built for human scale: source control, builds, and CI."* ([source](https://www.anthropic.com/engineering/redesigning-source-control))
+- Linear: *"AI coding has made CI a bottleneck"*; their suite nearly quadrupled in a year and grows by ~2,000 tests a week. ([source](https://linear.app/now/ci-bottleneck-reworked))
+- CircleCI, 28 million workflows: throughput up 59%, main-branch success down to 70.8%, a five-year low. ([source](https://www.oreilly.com/radar/coding-was-never-a-bottleneck/))
+
+Agents removed the cost of producing a change. They did not remove the cost of knowing whether to trust it, so that cost lands on CI, all at once.
+
+And every one of those pipelines still re-runs tests the author ran minutes earlier on the same code. An agent edits a model, runs the three specs that cover it, sees them pass, opens a PR; CI runs those three again, plus everything else. The work was done and the result thrown away, because CI had no reason to believe it.
+
+The obvious fix, "trust the pull request when it says the tests passed", is not safe. A claim is not a proof: the code may have changed since the run, a dependency may differ, the agent may be wrong or malicious, and the CI machine is not the laptop. vci makes the claim checkable.
 
 ## What vci does
 
