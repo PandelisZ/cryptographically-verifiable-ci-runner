@@ -776,7 +776,18 @@ Under `platform = "any"` a file attested on macOS arm64 is skipped on an ubuntu-
   Write `config.eager_load = false` (or declare and set `CI` the same way on both sides);
 - **`vendor/` exists in the repository** (`vendor/.keep`, which `rails new` creates): `ruby/setup-ruby`'s
   `bundler-cache` installs gems into `vendor/bundle`, and Rails checks whether `vendor` exists; with it committed only
-  its type is recorded. Installed gems themselves are never inputs (they are externals);
+  its type is recorded. A bundle installed inside the repository this way (`BUNDLE_PATH=vendor/bundle`) is handled
+  like any other bundle: nothing under `vendor/bundle` is an input, the gems there are externals by version, and
+  RubyGems' and Bundler's own bookkeeping there (checks of its directories, the listing and the `.gemspec`s of its
+  `specifications/`) is not recorded, nor are the checks `realpath` makes of each directory above a gem of the bundle
+  when a gem resolves its own root (`Rails::Engine.find_root`). Collector 0.4.1 refused every file there with
+  `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0`; 0.4.2 attests them, and its new version fails the
+  `toolchain` check of every older Rails and RSpec attestation, so CI runs each file once more. Still refused,
+  wherever the bundle is installed: loading code from, reading, listing or evaluating a file there that belongs to no
+  gem of the bundle (another gem, another Ruby's `vendor/bundle/ruby/<abi>`: `ruby:gem-outside-bundle`,
+  `ruby:read-outside-bundle`), also through RubyGems' and Bundler's helpers (`Gem.read_binary`, `Bundler.read_file`,
+  `Gem::Util.glob_files_in_dir`, `Gem::Specification.load`), and a test's own check of where gems are installed
+  (`File.directory?("vendor/bundle")`, `File.realpath` of a gem's directory), which no input records;
 - the default external encoding is the same (`LANG=C.UTF-8` on runners, a UTF-8 locale on a Mac), and the tests do
   not read variables whose values differ (`HOME`, `CI`, `USER`, ...);
 - **the tests do not read `config/master.key`**, which a generated app's Active Record reads at boot (see
@@ -1870,12 +1881,13 @@ Rails specifics (collector taints and checks; see [Quick start (Rails)](#quick-s
   entry point opened), `ARGF`/`gets` reading the files named in `ARGV`;
 - **writes inside the repository** outside the git-ignored `log/`, `tmp/`, `storage/` and `coverage/` of the project;
 - **gems**: code loaded from an installed gem that is not in the bundle, and any read, existence or type check or
-  listing the test (not RubyGems or Bundler) makes under a gem directory outside the bundle (`GEM_PATH`, `Gem.dir`,
-  the user gem dir: what is installed there differs between machines), a gem whose installed files differ from its
-  cached archive or whose archive does not have `Gemfile.lock`'s checksum, a gem without a cached archive, a path gem
-  outside the repository, a git gem without a locked revision, a `$LOAD_PATH` entry outside the repository, the
-  bundle, Ruby and RubyGems' directories, a Bundler other than the project's `Gemfile` (`BUNDLE_GEMFILE`), not running
-  under Bundler at all;
+  listing the test makes under a gem directory of something that is not a gem of the bundle (`GEM_PATH`, `Gem.dir`,
+  the user gem dir, Bundler's install path such as `vendor/bundle`: what is installed there differs between machines),
+  also through RubyGems' and Bundler's helpers (only their own bookkeeping is not: their checks, and their reads of
+  `specifications/`), a gem whose installed files differ from its cached archive or whose archive does not have
+  `Gemfile.lock`'s checksum, a gem without a cached archive, a path gem outside the repository, a git gem without a
+  locked revision, a `$LOAD_PATH` entry outside the repository, the bundle, Ruby and RubyGems' directories, a Bundler
+  other than the project's `Gemfile` (`BUNDLE_GEMFILE`), not running under Bundler at all;
 - **caches and preloaders**: a compiled-code cache (`RubyVM::InstructionSequence.load_iseq` defined, as Bootsnap's
   compile cache does), Bootsnap's YAML or JSON compile cache (`YAML.load_file` answered from `tmp/cache/bootsnap`, read
   in C, not from the file vci hashes), Bootsnap's load-path cache, Spring; `Dir.for_fd`;
@@ -2178,6 +2190,12 @@ signers and PR-only `allowed_signers` are rejected; a declared env var with anot
 a socket) while writing to `tmp/` is attested; a database server (SQLite registered under another adapter name) is
 refused, attested with `rails_allow_db`, and skipped only while the base policy allows it; push/fetch into a fresh
 clone, `vci ci` running only the rest with exit codes and the audit log, `no_skip_refs`; `vci init --adapter rails`.
+With the bundle installed into `vendor/bundle` inside the copy (`bundle install --local` from the archives this Ruby
+already has, else from rubygems.org; `SKIPPED:` when neither works), every file attests and is skipped with nothing
+under `vendor/bundle` as an input and the gem it read as an external, a stray file there changes nothing, and code,
+reads, existence checks, `Gem.read_binary`, `Bundler.read_file`, a glob and `Gem::Specification.load` of what belongs
+to no gem of the bundle, another Ruby's gems, and a test's check of `vendor/bundle` or of a gem's real path are
+refused.
 
 The node:test end-to-end tests (`crates/vci-cli/tests/e2e_node_test.rs`) copy `fixtures/node-test-abcd` (with `ms` from
 `fixtures/vitest-abcd/node_modules`) and `fixtures/node-test-pnpm` into temporary repositories. They prove: attesting b
@@ -2224,7 +2242,9 @@ real reads, each of which then runs it. Push/fetch into a fresh clone and `vci c
 per file, non-zero on a failure, the whole suite on `no_skip_refs`); a Minitest app and an RSpec app in one
 `vci.toml`; Minitest and RSpec files in one app (each with its own runner; a pattern overlap runs everything; `runner =
 "rspec"` from the base commit lists only spec files, and `vci plan`/`ci` warn that the Minitest files are not run, also
-in the audit log); a plain Ruby project with RSpec; `vci init --adapter rails`.
+in the audit log); a plain Ruby project with RSpec; `vci init --adapter rails`; the bundle installed into
+`vendor/bundle` inside the copy (spec files attest and are skipped, nothing there is an input, and a stray file's
+code, content, `Gem.read_binary` and a spec's check of `vendor/bundle` are refused).
 
 The pytest end-to-end tests (`crates/vci-cli/tests/e2e_pytest.rs`, `crates/vci-adapter/tests/pytest_fixture.rs`)
 copy `fixtures/pytest-abcd` the same way and print `SKIPPED:` (and pass) when `uv` is not installed or cannot set up

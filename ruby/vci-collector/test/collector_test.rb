@@ -671,6 +671,63 @@ class CollectorTest < Minitest::Test
     refute(taints(quiet).any? { |x| x.start_with?("ruby:read-outside-bundle") }, taints(quiet).inspect)
   end
 
+  # RubyGems' helpers reading, listing or evaluating a file of a gem that
+  # is not in the bundle for a test do it for the test (they were exempt as
+  # RubyGems' own reads), and a test's check of a directory above a loaded
+  # gem's (where gems are installed) is the test's (it was dropped as
+  # leading to a gem of the bundle).
+  def test_gem_helpers_and_checks_under_gem_roots_are_the_tests
+    root = File.join(@tmp, "gemroot")
+    install = lambda do |name, code|
+      FileUtils.mkdir_p(File.join(root, "gems/#{name}-1.0/lib"))
+      File.write(File.join(root, "gems/#{name}-1.0/lib/#{name}.rb"), "$#{name}_lib = 1\n")
+      File.write(File.join(root, "gems/#{name}-1.0/data.txt"), "#{name}\n")
+      FileUtils.mkdir_p(File.join(root, "specifications"))
+      File.write(File.join(root, "specifications/#{name}-1.0.gemspec"), <<~SPEC)
+        # -*- encoding: utf-8 -*-
+        # stub: #{name} 1.0 ruby lib
+
+        #{code}
+        Gem::Specification.new do |s|
+          s.name = #{name.inspect}
+          s.version = "1.0"
+          s.summary = "x"
+          s.authors = ["x"]
+          s.require_paths = ["lib"]
+        end
+      SPEC
+    end
+    install.call("loadedfake", "")
+    install.call("otherfake", "$otherfake_spec = 1")
+    gem_path = ([root] + Gem.path).join(File::PATH_SEPARATOR)
+    other = File.join(root, "gems/otherfake-1.0")
+    recs = collect(<<~RUBY, env: { "GEM_PATH" => gem_path })
+      require "loadedfake"
+      raise "lib" unless $loadedfake_lib == 1
+      raise "read" unless Gem.read_binary(#{File.join(other, "data.txt").inspect}) == "otherfake\\n"
+      raise "glob" unless Gem::Util.glob_files_in_dir("*", #{other.inspect}).any? { |f| f.end_with?("/data.txt") }
+      Gem::Specification.load(#{File.join(other, "lib/otherfake.rb").inspect})
+      raise "eval" unless $otherfake_lib == 1
+      Gem::Specification.load(#{File.join(root, "specifications/otherfake-1.0.gemspec").inspect})
+      raise "spec" unless $otherfake_spec == 1
+      raise "dir" unless File.directory?(#{File.join(root, "gems").inspect})
+    RUBY
+    res = recs.find { |r| r["kind"] == "result" }
+    assert_equal 0, res["exitStatus"], res.inspect
+    t = taints(recs).join("\n")
+    assert_includes t, "ruby:read-outside-bundle:read #{other}/data.txt "
+    assert_includes t, "ruby:read-outside-bundle:readdir #{other} "
+    assert_includes t, "ruby:read-outside-bundle:read #{other}/lib/otherfake.rb "
+    assert_includes t, "ruby:read-outside-bundle:read #{root}/specifications/otherfake-1.0.gemspec "
+    assert_includes t, "ruby:read-outside-bundle:stat #{root}/gems "
+    # The loaded gem's files are its own (an external), and RubyGems' reads
+    # of every installed gemspec are its bookkeeping.
+    outside = t.lines.grep(/\Aruby:(read|gem)-outside-bundle:/).join
+    refute_includes outside, "loadedfake"
+    assert_equal 5, outside.lines.size, outside
+    assert(recs.any? { |r| r["kind"] == "external" && r["name"] == "loadedfake" }, recs.inspect)
+  end
+
   def test_libxml2_external_resources_taint
     skip "the nokogiri gem is not installed for #{RUBY_VERSION}" unless installed?("nokogiri")
     put("data/ent.txt", "e1")

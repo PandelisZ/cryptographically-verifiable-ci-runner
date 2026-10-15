@@ -111,6 +111,9 @@ locally), then:
 
 - `Gemfile.lock` must list the runner's platform (`bundle lock --add-platform x86_64-linux`). The Bundler version in
   its `BUNDLED WITH` is what `setup-ruby` installs, and it is compared.
+- `bundler-cache` installs the gems inside the repository (`vendor/bundle`). That bundle is handled like one installed
+  anywhere else: its gems are externals by version and nothing under `vendor/bundle` is an input. Collector 0.4.1
+  refused every file there with `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0`.
 - `vci ci` runs each remaining Minitest file in its own `bin/rails test <file>`, and each remaining RSpec file in its
   own `rspec --options .rspec <file>`, with a fresh SQLite database loaded from `db/schema.rb`.
 - RSpec reads only the repository's `.rspec`. `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` and `.rspec-local` are
@@ -408,6 +411,7 @@ Run `vci explain <file> --base-ref origin/main` locally for the full reason a un
 | No Rails test file ever skips on the runner | `config/environments/test.rb` reads `ENV["CI"]` (the generator's `config.eager_load = ENV["CI"].present?`); the Ruby patchlevel, Bundler, SQLite library or time zone data differ (`failed check: toolchain`; use `gem "tzinfo-data"`); or `Gemfile.lock` lacks the runner's platform |
 | An RSpec file is never attested | An example is pending, skipped or filtered out (`fit` with `filter_run_when_matching :focus`, an excluded tag), rspec-retry / parallel_tests is loaded, a failure was retried away (`rspec:failure-cleared`), or the process exited non-zero after RSpec's report (SimpleCov's `minimum_coverage`: `vci:process-exit:2`). `vci run` prints the reason (`rspec:filtered:...`, `rspec:retry`, ...) |
 | Every Rails test is refused on a Mac with `/etc/resolv.conf`, `native:FFI ffi_lib(["vips.42"])` or `config/master.key` | An older collector (`resolv.conf`, read when Capybara loads `net/http`; `ffi_lib`, which collector 0.4.0 records instead of refusing, so `image_processing`/`ruby-vips` with Homebrew libvips is attested), or the generator's credentials: see "What the Rails adapter records" in [the reference](REFERENCE.md#what-the-rails-adapter-records) |
+| Every Rails test is refused on the runner with `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0` | Collector 0.4.1, which took the bundle `bundler-cache` installs inside the repository for gems outside the bundle. Collector 0.4.2 attests these files; its new version makes existing Rails attestations run once more |
 | Minitest files never run with `runner = "rspec"` | An explicit runner leaves the other runner's files to you: `vci plan`/`ci` warn and the audit log lists it under `warnings` |
 
 ## For maintainers: cutting a release

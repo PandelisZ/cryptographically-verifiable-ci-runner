@@ -30,7 +30,7 @@ module VciCollector
   # Part of the toolchain (Probe.libs): bumped whenever what the collector
   # records or refuses changes, so an attestation made by an older collector
   # (which may have missed an input) is not accepted where a newer one runs.
-  VERSION = "0.4.1"
+  VERSION = "0.4.2"
   MODE = ENV.fetch("VCI_RAILS_MODE", "collect")
   # The test framework vci started this process for: "minitest" (default,
   # `bin/rails test <file>`) or "rspec" (`rspec <file>`, see RSpecSupport).
@@ -51,8 +51,10 @@ module VciCollector
   # Code of RubyGems and Bundler. What they look up decides which gems are
   # loaded and from where; that outcome is recorded (the resolved bundle,
   # every loaded gem's version), so their own bookkeeping is not an input:
-  # their reads of TOOLING_ENV variables, and their existence and type checks
-  # (never content reads) outside the repository (~/.gem, ~/.bundle, HOME).
+  # their reads of TOOLING_ENV variables, their existence and type checks
+  # and listings outside the repository (~/.gem, ~/.bundle, HOME), and under
+  # a gem root what Gems.bookkeeping? lists (never anything else they read,
+  # list or check there for a caller).
   RUBYLIBDIR = RbConfig::CONFIG["rubylibdir"].to_s
   TOOLING_FILES = [
     "#{RUBYLIBDIR}/rubygems.rb", "#{RUBYLIBDIR}/bundled_gems.rb", "#{RUBYLIBDIR}/bundler.rb"
@@ -204,25 +206,73 @@ module VciCollector
       TOOLING_FILES.include?(where) || TOOLING_DIRS.any? { |d| where.start_with?(d) } || TOOLING_GEM.match?(where)
     end
 
-    # Record an observation. Outside the repository, RubyGems' and
-    # Bundler's existence and type checks are dropped (see TOOLING_FILES),
-    # and their content reads are marked as theirs (:tooling): under a gem
-    # root outside the bundle only those are not inputs. A read or check of
-    # a path whose content is this process's own output is not an input
-    # (one made before the process replaced it is).
-    def add(kind, abs)
+    # Record an observation. RubyGems' and Bundler's own reads, existence
+    # and type checks and listings (see TOOLING_FILES) are marked as theirs
+    # (:tooling), inside the repository as outside it: whether a path is
+    # part of a bundle installed in the repository (BUNDLE_PATH=vendor/bundle,
+    # as ruby/setup-ruby's bundler-cache sets it) is only known once Bundler
+    # has set the bundle up, so Output.write_records decides at exit. Under
+    # a gem root only their bookkeeping (Gems.bookkeeping?) is not an input;
+    # anywhere else outside the repository their checks and listings are
+    # not, and their reads are; anywhere else in the repository (Gemfile, a
+    # path gem's gemspec) all of it is. A read of a .gemspec that
+    # Gem::Specification.load evaluates for code that is not theirs (a test)
+    # is marked :gemspec_load, which replaces an earlier :tooling (their
+    # read of the stub line at the top of the same file, made at boot):
+    # evaluating one is running its code (Output.bundle_bookkeeping?).
+    # realpath's checks of each component of a path (walk: the path) are
+    # marked with the path and who asked (walked, Output.bundle_bookkeeping?).
+    # A read or check of a path whose content is this process's own output
+    # is not an input (one made before the process replaced it is).
+    def add(kind, abs, walk: nil)
       return unless abs
       abs = resolve(abs)
       return if %i[read stat readdir].include?(kind) && @produced[abs]
-      unless inside?(abs, repo)
-        return if RESOLV_CONF.include?(abs) && resolv_loading?
-        if %i[stat probe readdir read].include?(kind) && quiet { tooling?(frame) }
-          return unless kind == :read
-          @records[[kind, abs]] ||= :tooling
+      return if !inside?(abs, repo) && RESOLV_CONF.include?(abs) && resolv_loading?
+      if %i[stat probe readdir read].include?(kind)
+        where = quiet { frame }
+        if quiet { tooling?(where) }
+          if kind == :read && abs.end_with?(".gemspec") && quiet { gemspec_load? }
+            @records[[kind, abs]] = :gemspec_load unless @records[[kind, abs]] == true
+          else
+            @records[[kind, abs]] ||= :tooling
+          end
+          return
+        end
+        if walk
+          walked(kind, abs, walk, where)
           return
         end
       end
       @records[[kind, abs]] = true
+    end
+
+    # A check realpath made of a component of `walk`, for code at `where`:
+    # kept with every other path and caller (one per file of code) that
+    # made the same check, unless the check is already an input (true).
+    # It replaces RubyGems' own (:tooling), which a check of a path's type
+    # under a gem root is not an input for.
+    def walked(kind, abs, walk, where)
+      cur = @records[[kind, abs]]
+      if cur.is_a?(Array) && cur[0] == :realpath
+        cur[1] << [walk, where] unless cur[1].size >= 64 || cur[1].any? { |_, w| w == where }
+      elsif cur.nil? || cur == :tooling
+        @records[[kind, abs]] = [:realpath, [[walk, where]]]
+      end
+    end
+
+    # Gem::Specification.load (which evaluates the file) is on the stack,
+    # called by code that is not RubyGems' or Bundler's (a test, a gem): not
+    # their own stub lookups (Gem::StubSpecification#to_spec, which
+    # Gem::Specification.find_all_by_name and Bundler's setup use).
+    def gemspec_load?
+      locs = caller_locations(3, 40).to_a
+      i = locs.index do |l|
+        l.base_label == "load" && (l.absolute_path || l.path).to_s.end_with?("/rubygems/specification.rb")
+      end
+      return false unless i
+      by = locs[(i + 1)..].find { |l| (l.absolute_path || l.path) != __FILE__ }
+      !by || !tooling?((by.absolute_path || by.path).to_s)
     end
 
     # The real path of `abs`, or of its nearest existing ancestor joined
@@ -292,12 +342,12 @@ module VciCollector
     end
 
     # Type (and, for a file, content) observed: absent -> probe, else stat.
-    def observe_stat(path)
+    def observe_stat(path, walk: nil)
       return unless collect? && !busy?
       abs = expand(pathify(path))
       return unless abs
       exists = quiet { Real.exist?(abs) || Real.symlink?(abs) }
-      add(exists ? :stat : :probe, abs)
+      add(exists ? :stat : :probe, abs, walk: walk)
     end
 
     def env_read(key)
@@ -463,6 +513,21 @@ module VciCollector
       []
     end
 
+    # A load path entry of the repository's own code: inside the
+    # repository, and not an installed gem's directory under a gem root
+    # there (a bundle installed in the repository, BUNDLE_PATH=vendor/bundle:
+    # its gems are externals, identified by version, as when the bundle is
+    # installed outside the repository, and probing every one of their
+    # directories for every require costs seconds per file). Gem.path holds
+    # the bundle's directory once Bundler has set it up; a path gem inside
+    # the repository is not under it and stays repository code.
+    def repo_entry?(e)
+      return false unless inside?(e, repo)
+      !(defined?(::Gem) && ::Gem.respond_to?(:path) && ::Gem.path.any? { |r| inside?(e, r.to_s) })
+    rescue StandardError
+      true
+    end
+
     # A relative feature was required and found at `hit` (nil: unknown).
     # Every repository load path entry Ruby searched before the one holding
     # it gets a probe per candidate, so a file created there later (which
@@ -475,11 +540,11 @@ module VciCollector
           if hit && cands.include?(hit)
             cands.each do |c|
               break if c == hit
-              @records[[:probe, c]] = true if inside?(e, repo)
+              @records[[:probe, c]] = true if repo_entry?(e)
             end
             return
           end
-          next unless inside?(e, repo)
+          next unless repo_entry?(e)
           cands.each { |c| @records[[exists_quietly?(c) ? :read : :probe, c]] = true }
         end
       end
@@ -490,7 +555,7 @@ module VciCollector
       return unless collect? && path.is_a?(String) && !path.empty?
       if relative_feature?(path)
         expanded_load_path.each do |e|
-          next unless inside?(e, repo)
+          next unless repo_entry?(e)
           candidates(e, path).each { |c| @records[[:probe, c]] = true unless exists_quietly?(c) }
         end
         # `load "x"` falls back to the working directory.
@@ -620,7 +685,7 @@ module VciCollector
       cur = ""
       abs.split("/").reject(&:empty?).each do |c|
         cur = "#{cur}/#{c}"
-        observe_stat(cur) if inside?(cur, repo)
+        observe_stat(cur, walk: abs) if inside?(cur, repo)
       end
     end
 
@@ -3233,7 +3298,11 @@ module VciCollector
       end.sort_by { |p, _| -p.length }
     end
 
-    # Directories RubyGems and Bundler install gems into, and their caches.
+    # Directories RubyGems and Bundler install gems into (with the
+    # directory of a bundle installed with a path, bundle_base), and their
+    # caches. Inside the repository too: a bundle installed there
+    # (vendor/bundle) is gems, identified by name and version, never
+    # repository files.
     def roots
       @roots ||= begin
         r = ::Gem.path.dup
@@ -3241,6 +3310,7 @@ module VciCollector
         r << ::Gem.user_dir if ::Gem.respond_to?(:user_dir)
         r << ::Gem.spec_cache_dir if ::Gem.respond_to?(:spec_cache_dir)
         r << ::Bundler.bundle_path.to_s if defined?(::Bundler) && ::Bundler.respond_to?(:bundle_path)
+        r << bundle_base
         r << ::Bundler.user_cache.to_s if defined?(::Bundler) && ::Bundler.respond_to?(:user_cache)
         r.compact.map { |x| File.expand_path(x) }.uniq
       rescue StandardError
@@ -3255,6 +3325,84 @@ module VciCollector
 
     def under_root?(abs)
       roots.any? { |r| VciCollector.inside?(abs, r) }
+    end
+
+    # Gem installation directories (GEM_HOME's layout: specifications/,
+    # gems/, extensions/, ...): the bundle's, and every one RubyGems knows.
+    def homes
+      @homes ||= begin
+        h = ::Gem.path.dup
+        h << ::Gem.default_dir
+        h << ::Gem.user_dir if ::Gem.respond_to?(:user_dir)
+        h << ::Bundler.bundle_path.to_s if defined?(::Bundler) && ::Bundler.respond_to?(:bundle_path)
+        h.compact.map { |x| File.expand_path(x) }.uniq
+      rescue StandardError
+        ::Gem.path
+      end
+    end
+
+    GEMSPEC = %r{\Aspecifications/(default/)?[^/]+\.gemspec\z}
+    BUILD_INFO = %r{\Abuild_info/[^/]+\.info\z}
+    LISTED = %w[specifications specifications/default].freeze
+
+    # What RubyGems and Bundler do under a gem root on their own account,
+    # whatever is installed there: check whether and what each path is
+    # (finding the gem that holds a required file, gem.build_complete
+    # markers, the directories of every installation), list each
+    # installation's specifications, and read every installed .gemspec
+    # (RubyGems reads the stub line at the top of each one to know what is
+    # installed) and build_info file. Not the content or the listing of
+    # anything in a gem's directory: a file of a gem of the bundle is that
+    # gem's (Output.classify), and one of any other gem is not RubyGems'
+    # bookkeeping, whichever of their helpers reads it (Gem.read_binary,
+    # Bundler.read_file, Gem::Util.glob_files_in_dir, Gem::Specification.load
+    # of a file that is not an installed .gemspec).
+    def bookkeeping?(kind, abs)
+      return true if kind == :stat || kind == :probe
+      vc = VciCollector
+      homes.any? do |h|
+        next false unless vc.inside?(abs, h) && abs != h
+        rel = abs[(h.length + 1)..].to_s
+        kind == :readdir ? LISTED.include?(rel) : GEMSPEC.match?(rel) || BUILD_INFO.match?(rel)
+      end
+    end
+
+    # A .gemspec that code other than RubyGems' and Bundler's own may have
+    # them evaluate (Gem::Specification.load runs its code): one of a gem of
+    # the bundle (pinned by its version), of Ruby's own default gems, or of
+    # Bundler itself (both part of the toolchain). Any other installed
+    # gemspec holds whatever this machine has installed.
+    def evaluated_gemspec?(abs)
+      vc = VciCollector
+      @gemspecs ||= specs.flat_map do |s|
+        next [] unless s.loaded_from
+        f = File.expand_path(s.loaded_from)
+        [f, vc.real_of(f)]
+      end
+      return true if @gemspecs.include?(abs) || @gemspecs.include?(vc.real_of(abs))
+      dd = ::Gem.respond_to?(:default_specifications_dir) ? File.expand_path(::Gem.default_specifications_dir) : nil
+      return true if dd && vc.inside?(abs, dd)
+      File.basename(abs).match?(/\Abundler-\d[^\/]*\.gemspec\z/)
+    rescue StandardError
+      false
+    end
+
+    # The directory Bundler installs a bundle with a path into
+    # (BUNDLE_PATH=vendor/bundle, `bundle config set path vendor/bundle`):
+    # it installs into <path>/ruby/<abi>, so everything there is installed
+    # gems (another Ruby's, a stale install), never repository files. nil
+    # for system gems, and for a path that holds the repository or the
+    # project (every file would be under it).
+    def bundle_base
+      return nil unless defined?(::Bundler) && ::Bundler.respond_to?(:configured_bundle_path)
+      cfg = ::Bundler.configured_bundle_path
+      return nil if cfg.respond_to?(:use_system_gems?) && cfg.use_system_gems?
+      base = File.expand_path(cfg.base_path.to_s, ::Bundler.root.to_s)
+      vc = VciCollector
+      return nil if vc.inside?(vc.repo, base) || vc.inside?(vc.root, base)
+      base
+    rescue StandardError
+      nil
     end
 
     def source_of(s)
@@ -3454,6 +3602,38 @@ module VciCollector
       VciCollector.quiet { write_records(status, unhooked) }
     end
 
+    # A record under a gem root (classify: :outside_bundle) that is not an
+    # input, wherever the bundle is installed (outside the repository, or in
+    # it: BUNDLE_PATH=vendor/bundle, which ruby/setup-ruby's bundler-cache
+    # sets). What is installed is recorded instead (the resolved bundle,
+    # every loaded gem's version, which Gemfile.lock pins):
+    # - RubyGems' and Bundler's own bookkeeping (VciCollector.add marked it
+    #   :tooling or :gemspec_load), as Gems.bookkeeping? and
+    #   Gems.evaluated_gemspec? narrow it. Not anything else they read, list
+    #   or check for a caller: Gem.read_binary, Bundler.read_file,
+    #   Gem::Util.glob_files_in_dir or Gem::Specification.load called by a
+    #   test on a file of a gem that is not in the bundle (refused, as when
+    #   the test reads it itself);
+    # - the type checks realpath makes of each directory above a gem of the
+    #   bundle (vendor/bundle, vendor/bundle/ruby/3.4.0, .../gems), when the
+    #   code asking is not the repository's (Rails::Engine.find_root, in
+    #   railties, does it for every engine). The same checks made by a test
+    #   (File.directory?("vendor/bundle"), File.realpath of a gem's
+    #   directory) are refused: where gems are installed differs between
+    #   machines, and Bundler's settings that decide it are not inputs.
+    def bundle_bookkeeping?(kind, by, abs)
+      return Gems.bookkeeping?(kind, abs) if by == :tooling
+      return Gems.bookkeeping?(kind, abs) && Gems.evaluated_gemspec?(abs) if by == :gemspec_load
+      return false unless by.is_a?(Array) && by[0] == :realpath && kind == :stat
+      vc = VciCollector
+      by[1].all? do |target, where|
+        next false unless Gems.spec_for(target) && vc.inside?(target, abs)
+        next true unless vc.inside?(where, vc.repo)
+        s = Gems.spec_for(where)
+        !s.nil? && !Gems.source_of(s).start_with?("path ")
+      end
+    end
+
     def write_records(status, unhooked = [])
       vc = VciCollector
       taints = vc.taints.dup + unhooked
@@ -3476,6 +3656,10 @@ module VciCollector
         next if kind == :stat && RUNNER == "rspec" && temp_ancestor?(abs)
         c = classify(abs)
         next unless c
+        # RubyGems' and Bundler's existence and type checks and listings
+        # outside the repository (anywhere but under a gem root) are not
+        # inputs (see TOOLING_FILES).
+        next if by == :tooling && kind != :read && c[0] != :outside_bundle && !vc.inside?(abs, vc.repo)
         case c[0]
         when :external
           s = c[1]
@@ -3491,7 +3675,7 @@ module VciCollector
           # depends on what happens to be installed on this machine.
           if kind == :module
             taints << "ruby:gem-outside-bundle:#{abs}"
-          elsif by != :tooling
+          elsif !bundle_bookkeeping?(kind, by, abs)
             taints << "ruby:read-outside-bundle:#{kind} #{abs} (under a gem directory, not a gem of the bundle: what is installed there differs between machines)"
           end
           next

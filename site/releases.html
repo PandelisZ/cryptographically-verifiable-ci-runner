@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-3-0">1.3.0</a></td><td>15 Oct 2026</td><td>CI attests its own runs, so unchanged tests are skipped from one commit of main to the next; macOS attestations count on Linux</td></tr>
 <tr><td><a href="#v1-2-0">1.2.0</a></td><td>14 Oct 2026</td><td>Rails apps with Active Storage can attest; fixes from the first large monorepo deployment</td></tr>
 <tr><td><a href="#v1-1-0">1.1.0</a></td><td>14 Oct 2026</td><td>New <code>node-test</code> adapter for Node's built-in test runner</td></tr>
 <tr><td><a href="#v1-0-0">1.0.0</a></td><td>13 Oct 2026</td><td>First stable release: six runners, the GitHub Action, prebuilt binaries</td></tr>
@@ -24,6 +25,23 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-3-0">1.3.0</h2>
+<p><em>15 October 2026.</em> Two things people asked for after the first deployments: CI should not re-run on commit B what it already ran on commit A, and an attestation made on a Mac should count on a Linux runner.</p>
+<h3>CI attests its own runs</h3>
+<p><code>vci ci</code> can now sign what it runs. With <code>--key</code>, the units the plan says to run go through the same path as <code>vci run</code>: inputs recorded, attestation signed and stored. <code>--push</code> publishes them, <code>--ttl</code> sets their lifetime and <code>--remote</code> the destination. On a ref where policy runs everything, such as main, every unit is attested, so the next commit skips each unit whose inputs did not change. A commit that only touches the docs plans everything as SKIP and <code>vci ci</code> finishes without starting a test runner.</p>
+<p>The new policy key <code>no_skip_refs_except = ["github-actions"]</code> names the <code>allowed_signers</code> principals whose attestations may still skip on a <code>no_skip_refs</code> ref. Any other signer is refused there by name, so a laptop attestation never skips on main; only the CI key does. Off those refs a key listed there attests nothing, so a pull request run cannot sign with the main key even if a workflow passes it.</p>
+<p>The GitHub Action gains <code>signing-key</code>, <code>ttl</code> and <code>push</code> inputs and an <code>attested</code> output. The key must come from a GitHub Environment restricted to the default branch, never a repository secret: every process of the job can read it, and a same-repository pull request runs its own copy of the workflow. The job needs <code>permissions: contents: write</code> to push. <a href="github-actions.html#attesting-in-ci">Attesting in CI</a> has the setup and the two-job workflow.</p>
+<p>The audit log gains <code>attested</code>, <code>pushed</code>, <code>notAttested</code> and <code>attestErrors</code>. A project that cannot run with the collectors runs alone without attesting; the others are still attested, nothing runs twice, and the exit code covers every test.</p>
+<p>Proven on this repository's own main branch: the first push attested 13 units, the next push, which changed one pytest module, ran only that test, and a docs-only push ran nothing for pytest, Go and Rust.</p>
+<h3>Attest on macOS, skip on Linux</h3>
+<p><code>policy.libraries = "any"</code> (default <code>"exact"</code>; per project, or per glob in <code>[[policy.platform_overrides]]</code>) makes an attestation made on one platform count on another when the libraries differ only by build. Native libraries opened through FFI, such as Active Storage's libvips, match by library name instead of file name and hash: <code>libvips.42.dylib</code> on a Mac matches <code>libvips.so.42</code> on Ubuntu, provided libvips is loaded on both sides. The SQLite, libyaml and time-zone data versions of the Rails toolchain, and SQLite and OpenSSL of the pytest toolchain, are not compared. Whether each is loaded still is, so a Python built without <code>_sqlite3</code> never satisfies an attestation that used it. Ruby and Python versions, the bundle, the environment and every input are compared exactly as before. <code>vci explain</code> prints the policy and each difference it accepted. Nothing changes on the attestation side, so existing attestations verify under the new policy.</p>
+<h3>Fixed</h3>
+<ul>
+<li>A bundle installed inside the repository, as ruby/setup-ruby's <code>bundler-cache: true</code> does at <code>vendor/bundle</code>, refused every Rails and RSpec file with <code>ruby:read-outside-bundle</code>. Bundler's install directory is now a gem root like any other: nothing under it is a repository input, its gems are externals by version, and RubyGems' and Bundler's own bookkeeping there is not recorded. Still refused, now for bundles anywhere: loading, reading, listing or evaluating anything under a gem root that is not a gem of the bundle, including through <code>Gem.read_binary</code>, <code>Bundler.read_file</code>, <code>Gem::Util.glob_files_in_dir</code> and <code>Gem::Specification.load</code>, and a test's own check of <code>vendor/bundle</code> or of a gem's real path. Require shadowing probes skip gem directories, which makes a Rails file about a third faster to attest.</li>
+<li>Under <code>libraries = "exact"</code>, a native library loaded under another file name is reported as such, with a note that <code>"any"</code> would match it by name.</li>
+</ul>
+<p><strong>Upgrade notes.</strong> The Ruby collector is now 0.4.2, so existing Rails and RSpec attestations run once more in CI. The <code>@v1</code> action before this version ignores the <code>signing-key</code> input and rejects <code>no_skip_refs_except</code> and <code>libraries</code> in a base policy, so everything runs; move to 1.3.0 before adding either key.</p>
 
 <h2 id="v1-2-0">1.2.0</h2>
 <p><em>14 October 2026.</em> Everything in this release came out of setting vci up in a large Rails + Rust + Go + TypeScript monorepo and measuring what refused to attest.</p>

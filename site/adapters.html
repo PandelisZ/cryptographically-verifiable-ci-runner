@@ -250,7 +250,7 @@ vci push</code></pre>
 <ul>
 <li>every Ruby file loaded, and Zeitwerk's directory listings;</li>
 <li>every file read or checked: fixtures, templates, config, the schema;</li>
-<li>the gems used, by version;</li>
+<li>the gems used, by version, wherever the bundle is installed. With <code>bundler-cache</code> it is in <code>vendor/bundle</code> inside the repository, and nothing there is an input;</li>
 <li>native libraries opened through FFI, such as Active Storage's libvips, by file name and hash;</li>
 <li>every variable read through <code>ENV</code>.</li>
 </ul>
@@ -262,6 +262,7 @@ vci push</code></pre>
 <li>a database server (unless waived, see below);</li>
 <li>writes inside the repository outside <code>log/</code>, <code>tmp/</code>, <code>storage/</code> and <code>coverage/</code>;</li>
 <li>enumerating <code>ENV</code>;</li>
+<li>loading or reading files of an installed gem that is not in the bundle (<code>ruby:gem-outside-bundle</code>, <code>ruby:read-outside-bundle</code>);</li>
 <li>any failure, error or skip, and a test that made no assertion.</li>
 </ul>
 <div class="note"><p><strong>Database servers.</strong> PostgreSQL and MySQL test databases are refused by default. <code>rails_allow_db = true</code> under <code>[policy]</code> waives that: vci then purges each database and loads the schema before every file. With the waiver you state that the test database holds nothing but what vci loads.</p></div>

@@ -279,6 +279,57 @@ impl World {
         out.status.success()
     }
 
+    /// A command of the fixture's Ruby (`ruby`, `bundle`) in `dir`, with the
+    /// scrubbed environment.
+    fn ruby_cmd(&self, dir: &Path, tool: &str, args: &[&str]) -> Output {
+        let mut cmd = Command::new(self.ruby_bin.join(tool));
+        cmd.args(args).current_dir(dir).env("PATH", self.path_env());
+        for k in SCRUB {
+            cmd.env_remove(k);
+        }
+        cmd.output().unwrap()
+    }
+
+    /// Install the bundle inside the repository copy, as ruby/setup-ruby's
+    /// `bundler-cache` does on GitHub Actions (`BUNDLE_PATH=vendor/bundle`):
+    /// `bundle config set --local path vendor/bundle` (in the git-ignored
+    /// `.bundle/config`), then `bundle install --local` from the `.gem`
+    /// archives this Ruby already has (copied into `vendor/cache`, removed
+    /// afterwards), else `bundle install` from rubygems.org. false (with a
+    /// SKIPPED message) when neither works (offline, no archives).
+    fn bundle_into_vendor(&self, dir: &Path) -> bool {
+        let out = self.ruby_cmd(
+            dir,
+            "bundle",
+            &["config", "set", "--local", "path", "vendor/bundle"],
+        );
+        assert!(out.status.success(), "{out:?}");
+        let copy = r##"require "fileutils"
+want = File.read("Gemfile.lock").scan(/^    (\S+) \(([^)]+)\)$/).map { |n, v| "#{n}-#{v}" }
+FileUtils.mkdir_p("vendor/cache")
+Gem.path.each do |p|
+  Dir[File.join(p, "cache", "*.gem")].each do |g|
+    b = File.basename(g, ".gem")
+    FileUtils.cp(g, "vendor/cache") if want.any? { |n| b == n || b.start_with?("#{n}-") }
+  end
+end"##;
+        let out = self.ruby_cmd(dir, "ruby", &["-e", copy]);
+        assert!(out.status.success(), "{out:?}");
+        let mut out = self.ruby_cmd(dir, "bundle", &["install", "--local"]);
+        if !out.status.success() {
+            out = self.ruby_cmd(dir, "bundle", &["install"]);
+        }
+        let _ = std::fs::remove_dir_all(dir.join("vendor/cache"));
+        if !out.status.success() {
+            eprintln!(
+                "SKIPPED: could not install the bundle into vendor/bundle (offline?): {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        out.status.success()
+    }
+
     fn git(&self, dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .current_dir(dir)
@@ -1570,4 +1621,241 @@ fn rails_libraries_any_with_libvips() {
     assert!(ex.contains("policy: libraries = \"any\""), "{ex}");
     w.put(model, &original);
     assert!(w.plan(&work, "main").skip.contains(CAPTION));
+}
+
+/// The bundle installed inside the repository, as ruby/setup-ruby's
+/// `bundler-cache: true` does on GitHub Actions (`BUNDLE_PATH=vendor/bundle`,
+/// gems under `vendor/bundle/ruby/<abi>`). Regression: every file was
+/// refused with `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0`
+/// (+50 more: RubyGems' and Bundler's checks of the bundle's directories and
+/// reads of its `.gemspec`s, and `realpath`'s checks of each directory above
+/// a gem, which Rails::Engine.find_root makes). The bundle's directories are
+/// not inputs and gems stay externals, so the files attest and are skipped;
+/// a file there that belongs to no gem of the bundle is still refused, also
+/// when a test has RubyGems or Bundler read, list or evaluate it for it
+/// (`Gem.read_binary`, `Bundler.read_file`, `Gem::Util.glob_files_in_dir`,
+/// `Gem::Specification.load`: they attested, and stayed skipped after the
+/// file changed), and so are a test's own checks of where the bundle is
+/// installed (`File.directory?("vendor/bundle")`, `File.realpath` of a gem's
+/// directory: they attested with no record of it).
+#[test]
+fn rails_bundle_installed_in_the_repository() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    if !w.bundle_into_vendor(&work) {
+        return;
+    }
+    let scopes: Vec<String> = std::fs::read_dir(work.join("vendor/bundle/ruby"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(scopes.len(), 1, "{scopes:?}");
+    let gems = format!("vendor/bundle/ruby/{}", scopes[0]);
+    assert!(work.join(&gems).join("gems/hashids-1.0.6").is_dir());
+    // Something installed there that is not in the bundle: a gem directory
+    // and its gemspec (RubyGems reads the stub line of every gemspec there
+    // at boot: that is its bookkeeping, not an input), and another Ruby's
+    // gems.
+    let stray = format!("{gems}/gems/notinbundle-1.0/lib/notinbundle_x.rb");
+    w.put(&stray, "NOTINBUNDLE_X = 1\n");
+    let stray_code = format!("{gems}/gems/notinbundle-1.0/lib/notinbundle_g.rb");
+    w.put(&stray_code, "$notinbundle_g = 1\n");
+    let stray_spec = format!("{gems}/specifications/notinbundle-1.0.gemspec");
+    w.put(
+        &stray_spec,
+        "# -*- encoding: utf-8 -*-\n# stub: notinbundle 1.0 ruby lib\n\n$notinbundle_spec = 1\nGem::Specification.new do |s|\n  s.name = \"notinbundle\"\n  s.version = \"1.0\"\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\"]\n  s.files = [\"lib/notinbundle_x.rb\"]\nend\n",
+    );
+    w.put("vendor/bundle/ruby/0.0.0/gems/old-1.0/README", "old\n");
+    let t = |name: &str, body: &str| {
+        format!(
+            "require \"test_helper\"\n\nclass {name}Test < ActiveSupport::TestCase\n  test \"x\" do\n{body}  end\nend\n"
+        )
+    };
+    let gem_read = "test/lib/gem_read_test.rb";
+    w.put(
+        gem_read,
+        &t(
+            "GemRead",
+            "    spec = Gem.loaded_specs.fetch(\"hashids\")\n    assert_includes spec.full_gem_path, \"/vendor/bundle/\"\n    assert_includes File.read(File.join(spec.full_gem_path, \"lib/hashids.rb\")), \"class Hashids\"\n",
+        ),
+    );
+    let stray_abs = format!("Rails.root.join(\"{stray}\").to_s");
+    let refused: Vec<(&str, String, &str)> = vec![
+        (
+            "test/refuse/require_stray_test.rb",
+            t(
+                "RequireStray",
+                &format!("    require {stray_abs}\n    assert_equal 1, NOTINBUNDLE_X\n"),
+            ),
+            "ruby:gem-outside-bundle:",
+        ),
+        (
+            "test/refuse/read_stray_test.rb",
+            t(
+                "ReadStray",
+                &format!("    assert_equal \"NOTINBUNDLE_X = 1\\n\", File.read({stray_abs})\n"),
+            ),
+            "ruby:read-outside-bundle:read ",
+        ),
+        (
+            "test/refuse/stat_stray_test.rb",
+            t(
+                "StatStray",
+                &format!("    assert File.exist?({stray_abs})\n"),
+            ),
+            "ruby:read-outside-bundle:stat ",
+        ),
+        (
+            "test/refuse/read_binary_test.rb",
+            t(
+                "ReadBinary",
+                &format!(
+                    "    assert_equal \"NOTINBUNDLE_X = 1\\n\", Gem.read_binary({stray_abs})\n"
+                ),
+            ),
+            "ruby:read-outside-bundle:read ",
+        ),
+        (
+            "test/refuse/bundler_read_test.rb",
+            t(
+                "BundlerRead",
+                &format!(
+                    "    assert_equal \"NOTINBUNDLE_X = 1\\n\", Bundler.read_file({stray_abs})\n"
+                ),
+            ),
+            "ruby:read-outside-bundle:read ",
+        ),
+        (
+            "test/refuse/glob_stray_test.rb",
+            t(
+                "GlobStray",
+                &format!(
+                    "    names = Gem::Util.glob_files_in_dir(\"**/*\", Rails.root.join(\"{gems}/gems/notinbundle-1.0\").to_s)\n    assert_includes names.map {{ |f| File.basename(f) }}, \"notinbundle_x.rb\"\n"
+                ),
+            ),
+            "ruby:read-outside-bundle:readdir ",
+        ),
+        (
+            "test/refuse/eval_stray_test.rb",
+            t(
+                "EvalStray",
+                &format!(
+                    "    Gem::Specification.load(Rails.root.join(\"{stray_code}\").to_s)\n    assert_equal 1, $notinbundle_g\n"
+                ),
+            ),
+            "ruby:read-outside-bundle:read ",
+        ),
+        (
+            "test/refuse/eval_stray_gemspec_test.rb",
+            t(
+                "EvalStrayGemspec",
+                &format!(
+                    "    Gem::Specification.load(Rails.root.join(\"{stray_spec}\").to_s)\n    assert_equal 1, $notinbundle_spec\n"
+                ),
+            ),
+            "ruby:read-outside-bundle:read ",
+        ),
+        (
+            "test/refuse/bundle_dir_test.rb",
+            t(
+                "BundleDir",
+                "    assert File.directory?(Rails.root.join(\"vendor/bundle\"))\n",
+            ),
+            "ruby:read-outside-bundle:stat ",
+        ),
+        (
+            "test/refuse/realpath_gem_test.rb",
+            t(
+                "RealpathGem",
+                "    assert_includes File.realpath(Gem.loaded_specs.fetch(\"hashids\").full_gem_path), \"/vendor/bundle/\"\n",
+            ),
+            "ruby:read-outside-bundle:stat ",
+        ),
+        (
+            "test/refuse/other_ruby_test.rb",
+            t(
+                "OtherRuby",
+                "    assert_includes File.read(Rails.root.join(\"vendor/bundle/ruby/0.0.0/gems/old-1.0/README\")), \"old\"\n",
+            ),
+            "ruby:read-outside-bundle:read ",
+        ),
+    ];
+    for (rel, body, _) in &refused {
+        w.put(rel, body);
+    }
+    w.git(&work, &["add", "test"]);
+    w.git(
+        &work,
+        &["commit", "-q", "-m", "tests of the in-repository bundle"],
+    );
+    assert_eq!(
+        w.git(&work, &["status", "--porcelain"]),
+        "",
+        "vendor/bundle and .bundle are git-ignored"
+    );
+
+    let mut files: Vec<&str> = ALL.to_vec();
+    files.push(gem_read);
+    let stderr = w.run(&work, &files, &w.trusted);
+    assert!(
+        stderr.contains("vci: 5 attested, 0 not attested"),
+        "{stderr}"
+    );
+    let p = w.plan(&work, "main");
+    for f in &files {
+        assert!(p.skip.contains(*f), "{f} must be skipped: {p:?}");
+    }
+
+    // Nothing under vendor/bundle is an input; gems of the bundle are
+    // externals (hashids: required by D, read by gem_read).
+    for id in [D, gem_read] {
+        let pred = stored_predicate(&work, id);
+        let entries = pred["manifest"]["entries"].as_array().unwrap().clone();
+        let inside: Vec<&Value> = entries
+            .iter()
+            .filter(|e| e["path"].as_str().unwrap().starts_with("vendor/bundle"))
+            .collect();
+        assert!(inside.is_empty(), "{id}: {inside:?}");
+        let externals = pred["manifest"]["externals"].as_array().unwrap();
+        assert!(
+            externals
+                .iter()
+                .any(|e| e["name"] == "hashids" && e["version"] == "1.0.6"),
+            "{id}: {externals:?}"
+        );
+    }
+    // What else is installed there is not an input either.
+    w.put(
+        &format!("{gems}/gems/notinbundle-1.0/lib/notinbundle_y.rb"),
+        "Y = 1\n",
+    );
+    w.put("vendor/bundle/ruby/0.0.0/gems/old-1.0/README", "older\n");
+    let p = w.plan(&work, "main");
+    for f in &files {
+        assert!(p.skip.contains(*f), "{f} must still be skipped: {p:?}");
+    }
+
+    // Code, content and checks of what is not in the bundle are refused.
+    let ids: Vec<&str> = refused.iter().map(|(rel, _, _)| *rel).collect();
+    let mut args = vec!["run"];
+    args.extend(&ids);
+    args.extend(["--key", w.trusted.to_str().unwrap()]);
+    let out = w.vci(&work, &args);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    for (rel, _, why) in &refused {
+        let line = stderr
+            .lines()
+            .find(|l| l.starts_with(&format!("vci: not attesting {rel}:")))
+            .unwrap_or_else(|| panic!("{rel} was not refused:\n{stderr}"));
+        assert!(line.contains(why), "{rel}: expected {why:?} in {line:?}");
+        assert!(line.contains("/vendor/bundle"), "{rel}: {line:?}");
+        assert!(
+            !line.contains("result "),
+            "{rel}: the test itself passes: {line:?}"
+        );
+    }
+    assert!(
+        stderr.contains(&format!("vci: 0 attested, {} not attested", refused.len())),
+        "{stderr}"
+    );
 }

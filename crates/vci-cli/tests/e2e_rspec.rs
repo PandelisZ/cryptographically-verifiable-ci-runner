@@ -305,6 +305,54 @@ impl World {
         out.status.success()
     }
 
+    /// A command of the fixture's Ruby (`ruby`, `bundle`) in `dir`, with the
+    /// scrubbed environment.
+    fn ruby_cmd(&self, dir: &Path, tool: &str, args: &[&str]) -> Output {
+        let mut cmd = Command::new(self.ruby_bin.join(tool));
+        cmd.args(args).current_dir(dir).env("PATH", self.path_env());
+        for k in SCRUB {
+            cmd.env_remove(k);
+        }
+        cmd.output().unwrap()
+    }
+
+    /// Install the bundle inside the repository copy, as ruby/setup-ruby's
+    /// `bundler-cache` does on GitHub Actions (`BUNDLE_PATH=vendor/bundle`):
+    /// see `bundle_into_vendor` in `e2e_rails.rs`. false (with a SKIPPED
+    /// message) when it cannot be installed (offline, no archives).
+    fn bundle_into_vendor(&self, dir: &Path) -> bool {
+        let out = self.ruby_cmd(
+            dir,
+            "bundle",
+            &["config", "set", "--local", "path", "vendor/bundle"],
+        );
+        assert!(out.status.success(), "{out:?}");
+        let copy = r##"require "fileutils"
+want = File.read("Gemfile.lock").scan(/^    (\S+) \(([^)]+)\)$/).map { |n, v| "#{n}-#{v}" }
+FileUtils.mkdir_p("vendor/cache")
+Gem.path.each do |p|
+  Dir[File.join(p, "cache", "*.gem")].each do |g|
+    b = File.basename(g, ".gem")
+    FileUtils.cp(g, "vendor/cache") if want.any? { |n| b == n || b.start_with?("#{n}-") }
+  end
+end"##;
+        let out = self.ruby_cmd(dir, "ruby", &["-e", copy]);
+        assert!(out.status.success(), "{out:?}");
+        let mut out = self.ruby_cmd(dir, "bundle", &["install", "--local"]);
+        if !out.status.success() {
+            out = self.ruby_cmd(dir, "bundle", &["install"]);
+        }
+        let _ = std::fs::remove_dir_all(dir.join("vendor/cache"));
+        if !out.status.success() {
+            eprintln!(
+                "SKIPPED: could not install the bundle into vendor/bundle (offline?): {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        out.status.success()
+    }
+
     fn git(&self, dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .current_dir(dir)
@@ -1783,5 +1831,132 @@ fn rspec_init_writes_the_rails_template() {
     assert!(
         !c.contains("\nrunner ="),
         "the setting is commented out: {c}"
+    );
+}
+
+/// The bundle installed inside the repository (`BUNDLE_PATH=vendor/bundle`,
+/// as ruby/setup-ruby's `bundler-cache: true` does): the spec files attest
+/// and are skipped, a gem's file is an external, nothing under vendor/bundle
+/// is an input, and code or content there that belongs to no gem of the
+/// bundle is refused, also read through RubyGems (`Gem.read_binary`), as is
+/// a spec's own check of where the bundle is installed (see
+/// `rails_bundle_installed_in_the_repository`).
+#[test]
+fn rspec_bundle_installed_in_the_repository() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    if !w.bundle_into_vendor(&work) {
+        return;
+    }
+    let stray = "vendor/bundle/ruby/0.0.0/gems/notinbundle-1.0/lib/notinbundle_x.rb";
+    w.put(stray, "NOTINBUNDLE_X = 1\n");
+    let gem_read = "spec/lib/gem_read_spec.rb";
+    w.put(
+        gem_read,
+        "require \"spec_helper\"\n\nRSpec.describe \"a gem of the bundle\" do\n  it \"is read from vendor/bundle\" do\n    spec = Gem.loaded_specs.fetch(\"hashids\")\n    expect(spec.full_gem_path).to include(\"/vendor/bundle/\")\n    expect(File.read(File.join(spec.full_gem_path, \"lib/hashids.rb\"))).to include(\"class Hashids\")\n  end\nend\n",
+    );
+    let stray_abs = format!("File.expand_path(\"../../{stray}\", __dir__)");
+    let require_stray = "spec/refuse/require_stray_spec.rb";
+    let read_stray = "spec/refuse/read_stray_spec.rb";
+    let read_binary = "spec/refuse/read_binary_spec.rb";
+    let bundle_dir = "spec/refuse/bundle_dir_spec.rb";
+    w.put(
+        read_binary,
+        &format!(
+            "require \"spec_helper\"\n\nRSpec.describe \"stray\" do\n  it \"reads through RubyGems\" do\n    expect(Gem.read_binary({stray_abs})).to include(\"NOTINBUNDLE_X\")\n  end\nend\n"
+        ),
+    );
+    w.put(
+        bundle_dir,
+        "require \"spec_helper\"\n\nRSpec.describe \"the bundle\" do\n  it \"is in vendor/bundle\" do\n    expect(File.directory?(File.expand_path(\"../../vendor/bundle\", __dir__))).to be(true)\n  end\nend\n",
+    );
+    w.put(
+        require_stray,
+        &format!(
+            "require \"spec_helper\"\n\nRSpec.describe \"stray\" do\n  it \"loads\" do\n    require {stray_abs}\n    expect(NOTINBUNDLE_X).to eq(1)\n  end\nend\n"
+        ),
+    );
+    w.put(
+        read_stray,
+        &format!(
+            "require \"spec_helper\"\n\nRSpec.describe \"stray\" do\n  it \"reads\" do\n    expect(File.read({stray_abs})).to include(\"NOTINBUNDLE_X\")\n  end\nend\n"
+        ),
+    );
+    w.git(&work, &["add", "spec"]);
+    w.git(
+        &work,
+        &["commit", "-q", "-m", "specs of the in-repository bundle"],
+    );
+    assert_eq!(w.git(&work, &["status", "--porcelain"]), "");
+
+    let mut files: Vec<&str> = ALL.to_vec();
+    files.push(gem_read);
+    let stderr = w.run(&work, &files, &w.trusted);
+    assert!(
+        stderr.contains("vci: 5 attested, 0 not attested"),
+        "{stderr}"
+    );
+    let p = w.plan(&work, "main");
+    for f in &files {
+        assert!(p.skip.contains(*f), "{f} must be skipped: {p:?}");
+    }
+    for id in [D, gem_read] {
+        let stored = AttestStore::new(&store_for(&work)).list(Some(id)).unwrap();
+        let env: Value = serde_json::from_slice(&stored.last().unwrap().bytes).unwrap();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(env["payload"].as_str().unwrap())
+            .unwrap();
+        let st: Value = serde_json::from_slice(&payload).unwrap();
+        let m = &st["predicate"]["manifest"];
+        let inside: Vec<&Value> = m["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["path"].as_str().unwrap().starts_with("vendor/bundle"))
+            .collect();
+        assert!(inside.is_empty(), "{id}: {inside:?}");
+        assert!(
+            m["externals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["name"] == "hashids" && e["version"] == "1.0.6"),
+            "{id}: {}",
+            m["externals"]
+        );
+    }
+
+    let out = w.vci(
+        &work,
+        &[
+            "run",
+            require_stray,
+            read_stray,
+            read_binary,
+            bundle_dir,
+            "--key",
+            w.trusted.to_str().unwrap(),
+        ],
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        refusal(&stderr, require_stray).contains("ruby:gem-outside-bundle:"),
+        "{stderr}"
+    );
+    assert!(
+        refusal(&stderr, read_stray).contains("ruby:read-outside-bundle:read "),
+        "{stderr}"
+    );
+    assert!(
+        refusal(&stderr, read_binary).contains("ruby:read-outside-bundle:read "),
+        "{stderr}"
+    );
+    assert!(
+        refusal(&stderr, bundle_dir).contains("ruby:read-outside-bundle:stat "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("vci: 0 attested, 4 not attested"),
+        "{stderr}"
     );
 }
