@@ -69,9 +69,9 @@ jobs:
 
       - name: "vci ci --key: one Rails test changed, re-attested"
         run: |
-          printf '\n# bench\n' >> demo/rails-app/app/models/b.rb
+          printf '\n# bench\n' >> demo/rails-app/app/models/widget.rb
           vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --audit-log "$RUNNER_TEMP/audit-rails.json"
-          git checkout -- demo/rails-app/app/models/b.rb
+          git checkout -- demo/rails-app/app/models/widget.rb
 
       - name: Remove the signing key
         if: always()
