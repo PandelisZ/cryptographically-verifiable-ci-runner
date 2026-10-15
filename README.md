@@ -52,13 +52,13 @@ vci turns "I ran the tests" into something CI can check.
 - **Trust comes from the base branch.** The list of accepted keys and the policy are read from the commit the pull request targets, so a pull request cannot add its own key or loosen the rules.
 - **Signed by identity, checked by content.** Each attestation names who signed it, and CI re-derives every hash itself. Nothing in the stored record is trusted on its own.
 
-What vci does not do: it cannot tell whether a trusted signer lied. Keep the signer list short, give agents their own keys with expiry dates, and keep full runs on your default branch. The [threat model](docs/REFERENCE.md#threat-model-v1) has the details.
+What vci does not do: it cannot tell whether a trusted signer lied. Keep the signer list short, give agents their own keys with expiry dates, and let only CI's own key skip anything on your default branch. The [threat model](docs/REFERENCE.md#threat-model-v1) has the details.
 
 ## What it saves
 
 ![CI time for one pull request, full suite versus vci, in five cases](site/assets/savings.svg)
 
-The saving is exactly the tests that were attested and still match; the cost is about ten seconds to fetch and verify. When nothing was attested, when the toolchain differs from CI, or on your default branch (where policy runs everything), the suite runs in full as before. Compute minutes follow the same proportions as time.
+The saving is exactly the tests that were attested and still match; the cost is about ten seconds to fetch and verify. When nothing was attested, when the toolchain differs from CI, or on your default branch when CI does not attest its own runs, the suite runs in full as before. Compute minutes follow the same proportions as time.
 
 ## Install
 
