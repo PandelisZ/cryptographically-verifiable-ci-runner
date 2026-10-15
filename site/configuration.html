@@ -55,8 +55,8 @@ pass_through = []              <span class="c"># visible, never hashed: secrets 
 <tr><td><code>no_skip_refs_except</code></td><td><code>[]</code></td><td class="wrap"><code>allowed_signers</code> principals whose attestations may still skip on a <code>no_skip_refs</code> ref, such as <code>["github-actions"]</code> for CI's own key (see <a href="github-actions.html#attesting-in-ci">attesting in CI</a>). There, every other signer's attestation fails the <code>signer</code> check. Empty: those refs run everything. List no developer or agent here.</td></tr>
 <tr><td><code>never_skip</code></td><td><code>[]</code></td><td class="wrap">Project-relative globs of test files that always run. Use it for tests whose inputs no collector can see.</td></tr>
 <tr><td><code>go_allow_net</code></td><td><code>false</code></td><td class="wrap">Go: attest packages whose test links package <code>net</code>. See <a href="adapters.html#go">Go</a>.</td></tr>
-<tr><td><code>rails_allow_db</code></td><td><code>false</code></td><td class="wrap">Rails: attest files whose test database is a server. See <a href="adapters.html#rails">Rails</a>.</td></tr>
 </table>
+<p><strong>Removed:</strong> <code>rails_allow_db</code> was removed in 1.4.0, because vci no longer manages the Rails test database: a database server configured for the test environment needs no policy (see <a href="adapters.html#rails">Rails</a>). The key is a deprecated no-op kept for compatibility. A <code>vci.toml</code> that still sets it, at the top level or in a project, parses, so a base commit that has it does not make every test run; it has no effect, and <code>vci run</code> and <code>vci plan</code> print one warning. Remove it.</p>
 <h3 id="platform-overrides">Platform overrides</h3>
 <p>Tighten the platform rule for some files and leave the rest on <code>"any"</code>. An entry sets <code>platform</code>, <code>libraries</code>, or both:</p>
 <pre><code>[[policy.platform_overrides]]

@@ -142,7 +142,7 @@ vci prune &amp;&amp; vci push</code></pre>
 <tr><th>Variable</th><th>Meaning</th></tr>
 <tr><td><code>VCI_SIGNING_KEY</code></td><td class="wrap">Signing key path, when <code>--key</code> is not given</td></tr>
 <tr><td><code>VCI_BASE_REF</code></td><td class="wrap">Base ref, when <code>--base-ref</code> is not given</td></tr>
-<tr><td><code>VCI_JOBS</code></td><td class="wrap">Parallel pytest, <code>go test</code> or Rails processes in <code>vci run</code> (default: CPUs, up to 8)</td></tr>
+<tr><td><code>VCI_JOBS</code></td><td class="wrap">Parallel pytest or <code>go test</code> processes in <code>vci run</code> (default: CPUs, up to 8). Rails files run one at a time: they share the test database.</td></tr>
 <tr><td><code>VCI_JS_PLUGIN</code></td><td class="wrap">Path of the <code>@vci/vitest</code> package (default: <code>node_modules/@vci/vitest</code> above the project)</td></tr>
 <tr><td><code>VCI_PY_PLUGIN</code></td><td class="wrap">The <code>py/pytest-plugin</code> directory</td></tr>
 <tr><td><code>VCI_RUBY_COLLECTOR</code></td><td class="wrap">The <code>ruby/vci-collector</code> directory</td></tr>

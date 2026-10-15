@@ -71,7 +71,7 @@ Options:
 - Exit code is the test runner's: non-zero if any test process failed. A refused unit with passing tests still exits 0, so read the lines.
 - Attestations go into the local git-meta store (`.git/git-meta.sqlite`); nothing is shared until `vci push`.
 - `--ttl` must not exceed the policy's `max_ttl` (default `30d`), or CI rejects the attestation (vci warns).
-- Parallelism: `$VCI_JOBS` (pytest, Go, Rails; default CPUs up to 8). Cargo runs one unit at a time.
+- Parallelism: `$VCI_JOBS` (pytest, Go; default CPUs up to 8). Cargo runs one unit at a time, and so does Rails (the files of a project share the test database, as in `bin/rails test`; vci does not manage that database, and its contents are not an input).
 
 ## vci plan
 
@@ -113,7 +113,7 @@ Options:
   -h, --help                   Print help
 ```
 
-- `vci plan`, then runs every unit not skipped (each in its own process, the same way `vci run` ran it) and exits non-zero if any fails. Writes a JSON audit log of every skip (signer, unit, reason) with `--audit-log`.
+- `vci plan`, then runs every unit not skipped (each in its own process, the same way `vci run` ran it; Rails: a project's remaining files in one `bin/rails test <files>` or `rspec <files>` process, the engine's own way) and exits non-zero if any fails. Writes a JSON audit log of every skip (signer, unit, reason) with `--audit-log`.
 - Normally only run in CI (the GitHub Action runs it). Locally it is a way to run exactly what CI would run.
 - When every unit is skipped it prints `vci ci: every test file is covered by a valid attestation; nothing to run` and does not start the test runner.
 - `--key PATH` (CI's own key, the action's `signing-key`): the units left run as `vci run --key` runs them and every one that passed and is attestable is attested; when the plan runs everything (`running everything: ...`), every unit is. Refused or failing units still run; only test failures make the exit code non-zero. The next commit's CI skips each attested unit whose inputs did not change. `--ttl` (default `14d`) only with `--key`.
@@ -213,7 +213,7 @@ Options:
 |---|---|
 | `VCI_SIGNING_KEY` | Default signing key for `vci run` |
 | `VCI_BASE_REF` | Default base ref for `plan`, `ci`, `explain` |
-| `VCI_JOBS` | Parallel test processes in `vci run` (pytest, Go, Rails) |
+| `VCI_JOBS` | Parallel test processes in `vci run` (pytest, Go; Rails files run one at a time) |
 | `VCI_PY_PLUGIN`, `VCI_JS_PLUGIN`, `VCI_RUBY_COLLECTOR` | Collector locations (not needed with Homebrew) |
 | `VCI_UV`, `VCI_NODE`, `VCI_GO`, `VCI_CARGO`, `VCI_RUBY` | Toolchain binaries to use |
 

@@ -517,23 +517,25 @@ TZ=UTC vci plan --base-ref origin/main                          # SKIP test/mode
 vci push
 ```
 
-`vci run` runs every file in its own process (`$VCI_JOBS` at a time, default: CPUs up to 8; one at a time with
-`policy.rails_allow_db`):
+`vci run` runs every file in its own process, one at a time (the files of a project share the test database, as in
+`bin/rails test`):
 
 ```
 RUBYOPT=-r<abs>/ruby/vci-collector/vci_collector.rb VCI_RAILS_MODE=collect VCI_OUT=<fresh dir> \
-  VCI_DB_DIR=<fresh dir> TMPDIR=<fresh dir> RAILS_ENV=test PARALLEL_WORKERS=1 DISABLE_SPRING=1 \
+  TMPDIR=<fresh dir> RAILS_ENV=test PARALLEL_WORKERS=1 DISABLE_SPRING=1 \
   DISABLE_BOOTSNAP=1 BUNDLE_GEMFILE=<project>/Gemfile ruby bin/rails test test/models/b_test.rb --seed 0
 ```
 
 The collector (`ruby/vci-collector/vci_collector.rb`, plain Ruby, nothing is installed into your project) is loaded
-through `RUBYOPT` before `bin/rails`, Bundler and Rails. It makes every run start from the same state:
+through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run conditions:
 
-- **a fresh database**: every SQLite database of the test environment (`config/database.yml`, each database of a
-  multi-database app) is redirected to a new file in a temp dir, and the schema (`db/schema.rb`, or `db/structure.sql`
-  loaded in-process) is loaded into it after Rails initialises and before `rails/test_help` checks it (Rails would
-  otherwise run `bin/rails db:test:prepare` as a child process). Fixtures are loaded by Rails as usual. Data left in
-  `db/test.sqlite3` by earlier runs is never used, and `db/` is never written;
+- **the database is the test engine's**: vci does not manage it. It uses the databases `config/database.yml`
+  configures for the test environment as they are (`db/test.sqlite3`, Rails 8's `storage/test.sqlite3`, a MySQL or
+  PostgreSQL server). Rails gives each test its starting state the way it does in a plain `bin/rails test`:
+  `rails/test_help`'s `maintain_test_schema!` loads the schema when it is not current (on a fresh checkout it creates
+  the database through `bin/rails db:test:prepare`, a child process of Active Record's that vci does not refuse), then
+  fixtures and transactional tests. What the database holds is **not an input** (see
+  [vci does not manage the database](#vci-does-not-manage-the-database-read-this));
 - **one process**: `PARALLEL_WORKERS=1` (Rails' `parallelize` then runs in-process; a fork is refused), no Spring, no
   Bootsnap caches (`DISABLE_BOOTSNAP=1`, which `bootsnap/setup` honours; a compile or load-path cache still in use,
   such as one an explicit `Bootsnap.setup(...)` in `config/boot.rb` installs whatever the variable says, is refused);
@@ -542,9 +544,10 @@ through `RUBYOPT` before `bin/rails`, Bundler and Rails. It makes every run star
 - **a fresh local secret**: the development/test `secret_key_base` Rails would keep in `tmp/local_secret.txt` is
   generated in memory for each process, as on a fresh checkout, so its random content is not an input.
 
-`vci ci` runs each remaining file the same way (`VCI_RAILS_MODE=plain`: the same database, process and seed, nothing
-recorded) and exits non-zero if any fails. **An attestation vouches for the file run on its own**, like the pytest
-adapter: a test that passes only after another file ran in the same process is not reproduced. CI example:
+`vci ci` runs the remaining files of a project the engine's own way, in **one process per runner**
+(`bin/rails test <files> --seed 0`, `rspec --options .rspec <files>`; `VCI_RAILS_MODE=plain`: the same run conditions,
+nothing recorded), and exits non-zero if any fails. **An attestation vouches for the file run on its own**, like the
+pytest adapter: a test that passes only after another file ran in the same process is not reproduced. CI example:
 [`examples/github-actions-rails.yml`](../examples/github-actions-rails.yml). Findings behind this design:
 [`docs/spike-rails.md`](spike-rails.md).
 
@@ -603,13 +606,15 @@ change runs everything.**
 Toolchain: Ruby's version and patchlevel (`3.4.9p82`) and engine, Rails (`Rails::VERSION`, or the bundle's `railties`
 for a test file that never loads Rails, such as a Minitest file under `test/lib` that requires only `minitest` and
 plain Ruby, or a spec that loads only `spec_helper`: both runners report what the probe, which boots the application,
-reports), Bundler and Minitest versions, the SQLite
-library the `sqlite3` gem loaded, libyaml, the time zone data (the `tzinfo-data` gem, or the system zoneinfo directory
-and its version), the default external/internal encodings, the collector's version (`vci_collector.rb`'s
-`VERSION`, bumped whenever what it records or refuses changes, so CI must run the same collector: pin the action or
-the vci checkout to the commit you attest with), the database (`sqlite3`; a server's name and version with
-`policy.rails_allow_db`), the full bundle, and whether the tests ran as root (unless `policy.allow_superuser_mismatch`);
-OS/arch per `policy.platform`. Under `policy.libraries = "any"` the versions of the SQLite library, libyaml and the
+reports), Bundler and Minitest versions, the SQLite library the `sqlite3` gem loaded, libyaml, the time zone data (the
+`tzinfo-data` gem, or the system zoneinfo directory and its version), the default external/internal encodings, the
+collector's version (`vci_collector.rb`'s `VERSION`, bumped whenever what it records or refuses changes, so CI must run
+the same collector: pin the action or the vci checkout to the commit you attest with; vci 1.4.0 ships 0.5.0), the
+database adapters of the test environment (`rubyDb`: the adapter names of Active Record's test configurations,
+`DATABASE_URL` included, such as `sqlite3`, `mysql2`, `trilogy` or `postgresql`; sorted and joined with `;` for
+several, such as `postgresql;sqlite3`; compared exactly, as a test that passes on SQLite may fail on MySQL; no server
+version), the full bundle, and whether the tests ran as root (unless `policy.allow_superuser_mismatch`); OS/arch per
+`policy.platform`. Under `policy.libraries = "any"` the versions of the SQLite library, libyaml and the
 time zone data are not compared (whether each is loaded still is).
 
 Test results: a file is attested only when the process exits 0 and every test passed: **any failure, error or skip,
@@ -722,34 +727,92 @@ false, which a test could observe), and so does a runner whose libvips is anothe
 the same libvips file is installed, set `policy.libraries = "any"` (the libvips of the runner's platform is then
 accepted by name), or remove `image_processing` and `ruby-vips` if the app does not process images.
 
-### Databases (read this)
+### vci does not manage the database (read this)
 
-The test database is a hidden input of almost every Rails test: its contents are whatever the last run left. vci
-therefore never uses an existing test database:
+The test database is **the test engine's business**, as it is when you run `bin/rails test` or `rspec` yourself. vci
+does not redirect, create, prepare, purge or load any database. It uses the databases `config/database.yml` configures
+for the test environment as they are: every entry of `test` (with `DATABASE_URL` merged in, as Rails reads it),
+including each database of a multi-database app such as Rails 8's `storage/test_cache.sqlite3`. Rails gives each test
+its starting state: `maintain_test_schema!` (`rails/test_help`, or rspec-rails' `rails_helper`) loads the schema when
+it is not current by running `bin/rails db:test:prepare` (on a fresh checkout, this creates `db/test.sqlite3`); then
+fixtures and transactional tests do the rest.
 
-- **SQLite** files are supported: each process gets a fresh file in a temp dir with the schema loaded (above). The
-  configured location (`db/test.sqlite3`, `storage/test.sqlite3`) is never opened. `db/schema.rb` (or
-  `structure.sql`), `config/database.yml` and every fixture file the test loads are inputs, and so is the SQLite
-  library version. A SQLite file opened anywhere else (`SQLite3::Database.new("db/other.sqlite3")`,
-  `establish_connection` to another file, a `DATABASE_URL` naming a file), an in-memory test database in
-  `database.yml`, `ATTACH`, and SQLite extensions refuse the file: SQLite reads and writes those files in C, where vci
-  cannot see them. (An in-memory database a test opens for itself is fine.)
-- **Database servers** (PostgreSQL, MySQL, Trilogy) of the test environment are refused by default; so is any
-  database client a test opens itself (`PG.connect`, `Mysql2::Client.new`, Redis or anything over a socket), always.
-  `policy.rails_allow_db = true` in the **base commit's** `vci.toml` waives the refusal for the databases
-  `config/database.yml` configures for the test environment (Active Record's connections): vci then purges each one and
-  loads the schema before every file (so files run one at a time), records the waiver in the attestation (`waived`)
-  and the server's name and version in the toolchain, and `vci plan` accepts the attestation only while the base
-  policy still sets it and the CI server reports the same version.
+**What is an input.** What the database holds is **never an input** and is never hashed: rows written into
+`db/test.sqlite3` (or into a MySQL or PostgreSQL test database) behind the tests' back, a database an earlier run left,
+or no database at all change no verdict and no attestation. vci records what it can see in Ruby: `config/database.yml`,
+every fixture file a test loads, and the code. The schema file of every database of the test environment
+(`db/schema.rb` or `db/structure.sql`, and in a multi-database app `db/cache_schema.rb`, `db/queue_schema.rb` and the
+like; none for a database with `schema_dump: false`) is an input of every test that loads Active Record, whether or not
+the test process read it (on a fresh database `bin/rails db:test:prepare` reads them, not the test process): a change to
+any of them runs those tests. The adapter names of the test environment are part of the toolchain (`sqlite3`, `mysql2`,
+`trilogy`, `postgresql`; sorted and joined with `;` for several), compared exactly: a test that passes on SQLite may
+fail on MySQL. No server version is recorded. The SQLite library version stays in `ruby libraries` (subject to
+`policy.libraries`).
 
-  **What the waiver means:** vci sees neither what the server holds nor what else talks to it. With the waiver you
-  state that the test database holds nothing but what vci loads (the schema, then fixtures and what the test itself
-  creates): no data loaded by other means (a `structure.sql` with `INSERT`s is fine: it is hashed; a database restored
-  from a dump, a shared staging database, triggers or extensions installed outside the schema, or another job writing
-  to the same database are not), and that server-side state outside the database (configuration, collations, the
-  server's time zone) does not change the tests' outcome. The server version is compared; its configuration is not.
-  In CI, run the server as a service container with the same major and minor version as locally.
+**What an attestation no longer promises.** Before vci 1.4.0 an attestation also meant "this test passed on a database
+built from the schema and nothing else". It no longer does: **vci promises what CI promises, that the test passed on a
+database the engine set up.** A test whose outcome depends on rows left behind (a test that commits outside its
+transaction, `use_transactional_tests = false` without cleanup, data loaded by hand, another process writing to a
+shared server) can pass where it was attested and fail on a fresh database, or the other way round, and vci will not
+notice. Keep tests independent of leftover data, as you would for `bin/rails test`.
 
+The rules:
+
+- **The test environment's SQLite files** (every SQLite database `config/database.yml` configures for `test`) and their
+  `-wal`, `-shm` and `-journal` files: no read, stat, existence check or write of them is recorded, and opening them is
+  accepted, although they are inside the repository, as long as what is there is a SQLite database (a file that starts
+  with SQLite's header; an absent or empty one is only exempt from existence checks, not from reads of its content).
+  Any other file an entry names (`database: data/ref.yml` under an entry with `database_tasks: false`, which Rails never
+  opens) is recorded like any file. A listing of the directory holding one (`Dir.children("db")`) is still an input,
+  without them (they are recorded as `excluded`), so a fresh checkout, which has no database, matches. No other
+  manifest entry names them.
+- **The working tree**: these files are written during every run. Keep them git-ignored, as Rails generates
+  (`/storage/*` in Rails 8; `/db/*.sqlite3*` for databases in `db/`): then they never make the tree dirty and are never
+  a written or modified input. A committed test database, or an untracked one that is not ignored, makes the working
+  tree dirty.
+- **An in-memory test database** in `database.yml` (`database: ":memory:"`) is accepted: there is nothing to hash. Only
+  `:memory:` (plain or as a `file:` URI's path) and a `file:` URI whose `mode` parameter is `memory` are in memory, as
+  SQLite reads them; any other name opens a file (`file::memory:x` is a file named `:memory:x`, and a name that merely
+  contains `mode=memory` is a file too).
+- **Database servers** (`mysql2`, `trilogy`, `postgresql`) configured for the test environment are accepted with no
+  policy: Active Record's own connections are the engine's when they reach one of the test environment's databases
+  (the same host, address, port, socket and database as an entry of `config/database.yml` for `test`, with
+  `DATABASE_URL` merged in as Rails read it at boot). Active Record connecting anywhere else is refused like a socket:
+  `establish_connection` to another host, port or database (another environment's, the server's `mysql` database), a
+  raw client made through an adapter's `new_client`, or a `DATABASE_URL` the test changes.
+- **Still refused**: a SQLite file that is not one of the test environment's configured databases
+  (`SQLite3::Database.new("db/other.sqlite3")`, `establish_connection` to another file, a `DATABASE_URL` naming another
+  file, another environment's database: `rails:sqlite-file:<path>`), `ATTACH`, SQLite extensions (SQLite reads and
+  writes those files in C, where vci cannot see them; an in-memory database or a file in vci's temp dir a test opens for
+  itself is fine), and any database client a test opens itself (`PG.connect`, `Mysql2::Client.new`, `Trilogy.new`:
+  `network:<adapter> client`; Redis, anything over a socket).
+- **Child processes**: the one Active Record's schema maintenance starts (`ActiveRecord::Migration.load_schema!` in the
+  bundle's activerecord gem, which `rails/test_help` and rspec-rails' `maintain_test_schema!` call, running exactly
+  `bin/rails db:test:prepare` from the project dir) is the engine's and is not refused: it runs with
+  `VCI_RAILS_MODE=engine`, in which the collector records nothing, and its only effect is the database's state. Every
+  other child process a test starts is refused, including the same command run by the test itself.
+- **One file at a time**: the files of a project share the database, as in `bin/rails test`, so `vci run` runs them
+  one after another (`VCI_JOBS` does not apply; `PARALLEL_WORKERS=1` as always). `vci ci` runs the remaining files of a
+  project the engine's own way, in one `bin/rails test <files> --seed 0` (or `rspec --options .rspec <files>`) process
+  per runner: the files share one process and one order, so a file that passes only on its own can fail there, the
+  verdict a plain `bin/rails test` gives. `vci ci --key` runs each file it attests on its own, as `vci run` does.
+
+**MySQL and PostgreSQL need nothing but the normal test database**: no policy and no vci setting. Run the same adapter
+where you attest and in CI (a service container; see [`docs/GITHUB_ACTIONS.md`](GITHUB_ACTIONS.md)), and create the
+test database before the tests as any Rails CI job does (`bin/rails db:test:prepare`; SQLite needs no step, the engine
+creates the file). The server's version and configuration are not compared. `config/database.yml` is an input, and so
+is `DATABASE_URL` (hashed whenever present, removed in strict mode unless declared): name the same host, port and
+database on both sides, and put a password `database.yml` reads from the environment in `pass_through`.
+
+**Collector 0.5.0.** The collector's version is part of the toolchain, and vci 1.4.0 changes it (0.4.2 to 0.5.0): every
+Rails and RSpec attestation made with an earlier vci runs once more in CI, and is skipped again once attested anew.
+
+`policy.rails_allow_db` was **removed in vci 1.4.0**. It is a deprecated no-op kept for compatibility: a `vci.toml`
+that still sets it (top level or in a project's `policy`) parses, so a base commit that has it does not make every file
+run; it has no effect, and `vci run` and `vci plan` print one warning (`vci: warning: policy.rails_allow_db in vci.toml
+is ignored: rails_allow_db was removed in vci 1.4.0 (...). Remove it from vci.toml`; `vci plan` names `vci.toml at the
+base commit`). An attestation made under it (its `waived` lists `rails:network-db:`) is not accepted
+(`policy.rails_allow_db was removed in vci 1.4.0: attest the file again`).
 ### Attesting on macOS, verifying on Linux (Rails)
 
 Under `platform = "any"` a file attested on macOS arm64 is skipped on an ubuntu-latest x86_64 runner when:
@@ -828,8 +891,8 @@ run` records, so attestations already made are accepted once the key is on the b
 
 **Still compared, exactly:** the Ruby release and patchlevel (pin it in `.ruby-version`, used by mise locally and by
 `ruby/setup-ruby` in CI), Rails, Bundler, the test frameworks and every gem of the bundle (through `Gemfile.lock`, with
-both platforms listed), the default encodings, the collector version, the database, root or not; every input file; the
-declared environment variables (`TZ`) and the `[env]` configuration. For pytest: the Python version and
+both platforms listed), the default encodings, the collector version, the database adapters, root or not; every input
+file; the declared environment variables (`TZ`) and the `[env]` configuration. For pytest: the Python version and
 implementation, pytest and the installed distributions. Whether each library is loaded at all is compared too: a
 Python without `_sqlite3`, or a Ruby process that loaded no SQLite where the attestation did, runs the file.
 
@@ -883,6 +946,9 @@ apply to Minitest too; each is explained under [Quick start (Rails)](#quick-star
   libvips file is installed, or any libvips under `policy.libraries = "any"` (see "Attest on macOS, skip on Linux");
 - `vendor/.keep` committed (the generator creates it).
 
+Nothing is needed for the database: the generator's `config/database.yml` (`storage/test.sqlite3`) and `.gitignore`
+(`/storage/*`) are what vci expects, and Rails creates the test database on the first run.
+
 Capybara in the `:test` group is fine: `rack_test` feature specs are attested; specs that drive a browser are refused.
 
 **Which runner.** `runner = "minitest"` or `runner = "rspec"` in `vci.toml` (top level next to `adapter`, or in the
@@ -907,8 +973,8 @@ also part of the bundle, which is compared exactly, and are externals of every s
 
 **What vci runs.** The unit is a spec file: the files `rspec` with no argument would run, **as RSpec's own
 configuration lists them** (`default_path`, `pattern`, `exclude_pattern` from `.rspec` and `SPEC_OPTS`; a custom
-pattern is honoured). Shared examples, support files and factories are not units. Every file runs in its own process
-(`$VCI_JOBS` at a time):
+pattern is honoured). Shared examples, support files and factories are not units. Every file runs in its own process,
+one at a time (they share the test database):
 
 ```
 RUBYOPT=-r<abs>/ruby/vci-collector/vci_collector.rb VCI_RAILS_RUNNER=rspec VCI_RAILS_MODE=collect ... \
@@ -916,9 +982,9 @@ RUBYOPT=-r<abs>/ruby/vci-collector/vci_collector.rb VCI_RAILS_RUNNER=rspec VCI_R
   -- --options .rspec spec/models/b_spec.rb
 ```
 
-(what `bundle exec rspec` does, without a `bin/rspec` binstub or Spring, which stay disabled). `vci ci` runs every
-remaining file the same way (`VCI_RAILS_MODE=plain`) and exits non-zero if any fails; with nothing attestable at all
-(`no_skip_refs`, an unreadable base policy) it runs the whole suite in one `rspec` process.
+(what `bundle exec rspec` does, without a `bin/rspec` binstub or Spring, which stay disabled). `vci ci` runs the
+remaining files in one `rspec ... <files>` process (`VCI_RAILS_MODE=plain`) and exits non-zero if any fails; with
+nothing attestable at all (`no_skip_refs`, an unreadable base policy) it runs the whole suite in one `rspec` process.
 
 **Option sources.** RSpec reads options from several places; each one is either an input or never read, on both
 sides:
@@ -943,10 +1009,11 @@ A plain `bundle exec rspec` still reads all of them; only vci's runs do not.
   reads it at start (for `--only-failures`, `--next-failure` and `example.metadata[:last_run_status]`) and rewrites it
   at exit. vci points it at a fresh file in the process's temp dir: nothing is written in the repository and no earlier
   run's statuses are read, so `--only-failures` runs nothing (refused) and `last_run_status` is always `"unknown"`;
-- **the database**: as for Minitest, every SQLite database of the test environment is a fresh file with the schema
-  loaded after Rails initialises, so `rails_helper`'s `ActiveRecord::Migration.maintain_test_schema!` finds it current
-  and never runs `bin/rails db:test:prepare` (a child process, which would refuse the file); a pending migration makes
-  it abort (the file is refused), and `db/` is never written. `config.use_transactional_fixtures` works as usual;
+- **the database**: as for Minitest, the test environment's configured database is used as it is:
+  `rails_helper`'s `ActiveRecord::Migration.maintain_test_schema!` loads the schema when it is not current (through
+  `bin/rails db:test:prepare`, Active Record's child process, which is not refused), and a pending migration makes it
+  abort (the file is refused as a failure). `config.use_transactional_fixtures` works as usual. Its contents are not an
+  input (see [vci does not manage the database](#vci-does-not-manage-the-database-read-this));
 - **SimpleCov**: in an RSpec process its results (and the earlier results it would merge, `.last_run.json`) are
   written to the process's temp dir instead of `coverage/`, and its configuration files outside the repository
   (`~/.simplecov`, `.simplecov` in directories above the repository, which its upward search would try) look absent.
@@ -1086,9 +1153,10 @@ Environment: `VCI_JS_PLUGIN` (path of the `@vci/vitest` package; default `node_m
 project; for node:test, then `js/vitest-plugin` or `share/vci/vitest-plugin` above the `vci` executable), `VCI_NODE` (node binary), `VCI_PY_PLUGIN` (the `py/pytest-plugin` directory holding `vci_pytest`; default:
 `py/pytest-plugin` or `share/vci/pytest-plugin` above the `vci` executable, then the source checkout `vci` was built
 from, then `py/pytest-plugin` above the project; a clear error names the variable when none is found), `VCI_UV` (uv
-binary), `VCI_JOBS` (parallel pytest, `go test` or Rails processes in `vci run`), `VCI_GO` (go binary), `VCI_CARGO` (cargo
-binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_RUBY` (ruby binary, default `ruby` on PATH),
-`VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`).
+binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`; Rails files run one at a time), `VCI_GO`
+(go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_RUBY` (ruby
+binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory holding `vci_collector.rb`;
+looked up like `VCI_PY_PLUGIN`).
 
 Every collector directory is resolved to its real path before use, and what a test process reads of vci's own
 collector files is never an input, whichever path reached them: Homebrew installs them in
@@ -1385,7 +1453,6 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]   # never skip on these refs 
 no_skip_refs_except = ["github-actions"]             # ...except attestations by these allowed_signers principals (default [])
 never_skip = ["tests/test_attach_db.py"]             # never skip these files (project-relative globs)
 go_allow_net = false   # Go: attest packages whose test links package net (see "When vci run refuses")
-rails_allow_db = false # Rails: attest files whose test database is a server (see "Databases" under Rails)
 node_exact = false     # Vitest and node-test: require the exact Node version (default: the same major)
 allow_superuser_mismatch = false # accept attestations made as root where CI is not, or the other way round (risky: see below)
 
@@ -1440,8 +1507,8 @@ libyaml, the time zone data; `python libraries`: SQLite, OpenSSL). Under `"exact
   empty `tz=`) does not match an attestation where it was loaded (`ruby libraries: sqlite, yaml, tz loaded or not`,
   `python libraries: sqlite, openssl loaded or not`), and the reverse. The other items of `ruby libraries` (the
   default encodings, the collector version: `ruby libraries except sqlite, yaml, tz`) and everything else in the
-  toolchain (Ruby, Rails, Bundler, the test frameworks, the database, the bundle; Python, its implementation, pytest,
-  the installed distributions; root or not) still are, exactly.
+  toolchain (Ruby, Rails, Bundler, the test frameworks, the database adapters, the bundle; Python, its implementation,
+  pytest, the installed distributions; root or not) still are, exactly.
 
 Like `platform` it is read from the **base commit**, decided per test file (a `[[policy.platform_overrides]]` entry
 may set `libraries`, and the strictest of the default and every matching entry applies, so an entry can only make a
@@ -1465,8 +1532,11 @@ listing (so a new matching file is noticed) and every matching file is hashed. T
 attestation (`declaredInputs`) and must equal the base commit's declaration for that test id. In the `[[projects]]`
 form a project's `inputs = [...]` replaces the top-level list.
 
-Unknown keys are errors. In `vci plan` an unreadable or missing `vci.toml` or `.vci/allowed_signers` at the base
-commit means everything runs.
+Unknown keys are errors, with one exception: `rails_allow_db` (top level or in a project's `policy`), removed in vci
+1.4.0, is a deprecated no-op kept for compatibility. It still parses, so a base `vci.toml` that sets it stays valid
+(an invalid one would run every file); it has no effect, and `vci run` and `vci plan` warn once (see "vci does not
+manage the database" under Quick start (Rails)). In `vci plan` an unreadable or missing `vci.toml` or
+`.vci/allowed_signers` at the base commit means everything runs.
 
 ### Several projects in one repository
 
@@ -1697,14 +1767,15 @@ module against the build list (`go list -m -json all`) of the checkout.
 
 ### Rails
 
-See [What the Rails adapter records](#what-the-rails-adapter-records) and [Databases](#databases-read-this) under
-Quick start (Rails): every Ruby file compiled from disk with the shadowing candidates of each `require`, Zeitwerk's
-directory listings, every file read, checked, globbed or listed (fixtures, templates, configuration, the schema), the
-loaded gems by version (their installed files checked against their archives when attested), `ENV` reads, and
-global inputs (`Gemfile`, `Gemfile.lock`, the boot files, `test/test_helper.rb` for Minitest files and `.rspec` for
-RSpec files, the Ruby version files). Every file runs against a fresh database loaded from the schema. RSpec files
-also record `spec_helper`/`rails_helper`, the `spec/support` glob's listings, FactoryBot's definition directories and
-everything else under [Quick start (RSpec)](#quick-start-rspec).
+See [What the Rails adapter records](#what-the-rails-adapter-records) and
+[vci does not manage the database](#vci-does-not-manage-the-database-read-this) under Quick start (Rails): every Ruby
+file compiled from disk with the shadowing candidates of each `require`, Zeitwerk's directory listings, every file read,
+checked, globbed or listed (fixtures, templates, configuration, the schema files of every test database), the loaded
+gems by version (their installed files checked against their archives when attested), `ENV` reads, and global inputs
+(`Gemfile`, `Gemfile.lock`, the boot files, `test/test_helper.rb` for Minitest files and `.rspec` for RSpec files, the
+Ruby version files). The test database is the engine's and its contents are not an input. RSpec files also record
+`spec_helper`/`rails_helper`, the `spec/support` glob's listings, FactoryBot's definition directories and everything
+else under [Quick start (RSpec)](#quick-start-rspec).
 
 ## When `vci run` refuses to attest
 
@@ -1843,15 +1914,19 @@ builds the call evades it):
 Rails specifics (collector taints and checks; see [Quick start (Rails)](#quick-start-rails)):
 
 - **child processes**: backticks and `%x`, `system`, `spawn`, `exec` (`Kernel`'s and `Process`'), `IO.popen`, `Open3`,
-  `PTY.spawn`, `Kernel#open("|cmd")`, and **any fork** (`fork`, `Process.fork`, `IO.popen("-")`: every one goes through
-  `Process._fork`), which is how Rails' parallel test workers would run (vci sets `PARALLEL_WORKERS=1`, so they do not);
+  `PTY.spawn`, `Kernel#open("|cmd")` (except the `bin/rails db:test:prepare` Active Record's schema maintenance runs,
+  see "vci does not manage the database"), and **any fork** (`fork`, `Process.fork`, `IO.popen("-")`: every one goes
+  through `Process._fork`), which is how Rails' parallel test workers would run (vci sets `PARALLEL_WORKERS=1`, so
+  they do not);
 - **network**: creating a `TCPSocket`, `UDPSocket`, `UNIXSocket`, a server socket or a `Socket`, `Socket.tcp`, DNS
   lookups (`Addrinfo.getaddrinfo`, `Socket.getaddrinfo`, ...), and therefore `Net::HTTP`, Redis, browsers of system
   tests (also a child process); a database client a test opens itself (`PG.connect`, `Mysql2::Client.new`,
-  `Trilogy.new`);
-- **the test environment's database is a server** (PostgreSQL, MySQL, ...) unless `policy.rails_allow_db` (the one
-  refusal a policy waives; see "Databases"); a SQLite file vci did not prepare fresh, an in-memory test database,
-  `ATTACH`, SQLite extensions;
+  `Trilogy.new`: `network:<adapter> client`), and Active Record connecting to a server or database that is not one of
+  the test environment's (`network:<adapter> (an Active Record connection to ...)`);
+- **a SQLite file that is not one of the test environment's databases** in `config/database.yml`
+  (`rails:sqlite-file:<path>`), `ATTACH` (`rails:sqlite-attach`), SQLite extensions (`rails:sqlite-load-extension`).
+  The test environment's configured databases (SQLite files, in-memory ones and servers) are accepted with no policy,
+  and their contents are not an input (see "vci does not manage the database"). No Rails refusal can be waived;
 - **native code**: a native extension (`.so`/`.bundle`) inside the repository; Fiddle (`Fiddle.dlopen`, also of
   `nil`, and any `Fiddle::Function`); FFI: a **call** of an attached function or variable, an `FFI::Function` or
   `VariadicInvoker` invoked directly (`native:FFI`; opening a library is recorded, not refused, and a failed `ffi_lib`
@@ -1925,12 +2000,13 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
    and architecture when the attestation lists platform-specific files; Go: the same architecture when it lists
    arch-specific reasons, and otherwise another architecture only between 64-bit little-endian ones; Rails: Ruby
    version and patchlevel, engine, Rails, Bundler, the test frameworks (Minitest, and rspec-core, -expectations,
-   -mocks, -rails, -support), SQLite library, libyaml, time zone data, encodings, collector version, database software
+   -mocks, -rails, -support), SQLite library, libyaml, time zone data, encodings, collector version, database adapters
    and the whole bundle, exactly; under the base policy's `libraries = "any"` for the file, the SQLite/libyaml/time
    zone data versions of Rails and the SQLite/OpenSSL versions of pytest are not compared, whether each is loaded is);
 8. **env-config**: digest of the effective env configuration (from the base `vci.toml`) matches;
 9. **result**: passed and untainted; **inputs-config**: the `[[inputs]]` globs recorded equal the base config's for
-   the test id; every waived refusal still waived by the base policy; **dirty** only if `allow_dirty = false`;
+   the test id; every waived refusal still waived by the base policy (one recorded under the removed
+   `rails_allow_db` never is); **dirty** only if `allow_dirty = false`;
 10. **global-inputs**: every attested global entry re-hashed from the checkout, and the current global input set
     has the same root;
 11. **inputs**: every attested per-file entry re-hashed (files, symlinks, directory listings, directory types,
@@ -1972,6 +2048,9 @@ Not protected against:
   but only through the patched Node APIs), data captured before the collectors were installed, and the user and group
   the tests run as beyond root versus non-root (which is recorded; the Rails collector refuses a test that reads the
   uid or the user's identity): file ownership, group membership, capabilities.
+- What a Rails test database holds: the database is the test engine's, and its contents are not an input (see "vci
+  does not manage the database"). A Rails attestation does not show that the test was independent of rows left
+  behind; it shows what CI shows, that the test passed on a database the engine set up.
 - Test code deliberately evading the collectors (the collectors run inside the test process: code that undoes their
   hooks, calls their own quiet paths or reaches the original methods through reflection is not defended against).
 - Malicious `node_modules` that match the lockfile and package versions (packages are identified by version, not by
@@ -2106,11 +2185,14 @@ Rails limitations (details and the verified mechanisms in [`docs/spike-rails.md`
   Rails checks `config/routes.rb` at boot, so a routes change runs every test that boots Rails, not only those that
   draw the routes (it never skips one that does). The same holds for `app/models` (any new file runs every test that
   boots Rails) and `test/fixtures` (`fixtures :all` loads every fixture into every `ActiveSupport::TestCase`).
-- **Database servers** are trusted under `policy.rails_allow_db` as described in "Databases": their contents beyond
-  the schema vci loads, their configuration and other clients are not inputs.
-- **Per-file isolation and order**: one file per process with a fixed seed, as in CI. A file that depends on another
-  having run first (in a full `bin/rails test`) is not reproduced; neither is a time-dependent test (time, randomness
-  other than `rand`, `SecureRandom`, the number of CPUs are not inputs, as for the other adapters).
+- **The test database's contents** are not inputs (see "vci does not manage the database"): a test whose outcome
+  depends on rows left behind (by earlier runs, by hand, by another process writing to a shared server) can pass where
+  it was attested and fail on a fresh database. vci promises what CI promises: the test passed on a database the engine
+  set up. Neither the server's version nor its configuration is compared.
+- **Per-file isolation and order**: `vci run` runs one file per process with a fixed seed; `vci ci` runs the remaining
+  files of a project together (`bin/rails test <files> --seed 0`). A file that depends on another having run first is
+  not reproduced; neither is a time-dependent test (time, randomness other than `rand`, `SecureRandom`, the number of
+  CPUs are not inputs, as for the other adapters).
 - **Background work after the tests** (threads still running when Minitest reports) is recorded only until the
   collector writes its output at exit.
 - **OpenSSL** is not compared (see "Attesting on macOS, verifying on Linux (Rails)"), and neither is the C compiler of
@@ -2180,16 +2262,25 @@ ruby ruby/vci-collector/test/collector_test.rb   # Ruby collector tests (also ru
 The Rails end-to-end tests (`crates/vci-cli/tests/e2e_rails.rs`) copy `fixtures/rails-abcd` into a temporary repository
 and print `SKIPPED:` (and pass) when the Ruby of its `.ruby-version` is not found (`$VCI_TEST_RUBY_BIN`, `mise where
 ruby@<version>`, or `ruby` on PATH) or `bundle check` fails for it; `crates/vci-adapter/tests/rails_collector.rs` runs
-the collector's own tests the same way. They prove: attesting b skips only b, and the database was prepared outside
-`db/`; editing the fixture yml runs b and `explain` names it; a model only b uses runs b alone; the view template runs
-c alone, and of the two files c could read only the one it read matters; `config/routes.rb` runs d; a new file in
+the collector's own tests the same way. They prove: attesting b skips only b, and Rails created the configured
+`db/test.sqlite3` itself (`bin/rails db:test:prepare`, not refused); editing the fixture yml runs b and `explain` names
+it; a model only b uses runs b alone; the view template runs c alone, and of the two files c could read only the one it
+read matters; `config/routes.rb` runs d; a new file in
 `app/models` that takes over a constant (`Calc`) runs a; `db/schema.rb`, a gem version in `Gemfile.lock` and
 `.ruby-version` (another version, and the same one spelled differently) run everything; tampered payloads, unknown
 signers and PR-only `allowed_signers` are rejected; a declared env var with another value runs b; each refusal
 (backticks, `system`, a failure, a skip, no assertions, `ENV.to_h`, a write into `app/`, a read outside the repository,
-a socket) while writing to `tmp/` is attested; a database server (SQLite registered under another adapter name) is
-refused, attested with `rails_allow_db`, and skipped only while the base policy allows it; push/fetch into a fresh
-clone, `vci ci` running only the rest with exit codes and the audit log, `no_skip_refs`; `vci init --adapter rails`.
+a socket) while writing to `tmp/` is attested; rows written into `db/test.sqlite3` directly, its journal files, a
+database in `storage/` and a fresh checkout without any database change no verdict, no manifest names them (a listing of
+`db/` leaves them out), and a base `vci.toml` that still sets `rails_allow_db` parses and warns once; another SQLite
+file, `ATTACH`, a `file:` name that merely contains `mode=memory`, and a database client a test opens itself
+(`Mysql2::Client`, `PG::Connection`) are refused; a database server (SQLite registered under another adapter name) is
+attested with no policy and `rubyDb` is its adapter name; in a multi-database app both schema files are inputs on a
+fresh database (`db/cache_schema.rb` runs the test that uses it) and a non-SQLite file an entry names is an input; with
+docker, a MySQL 8.0 test database (mysql2) is attested with no policy, `rubyDb` is `mysql2`, rows written into the
+server and removing the server change nothing, and `establish_connection` or `new_client` to another server or
+database is refused (`SKIPPED:` without docker); push/fetch into a fresh clone, `vci ci` running only the rest in one
+`bin/rails test` process with exit codes and the audit log, `no_skip_refs`; `vci init --adapter rails`.
 With the bundle installed into `vendor/bundle` inside the copy (`bundle install --local` from the archives this Ruby
 already has, else from rubygems.org; `SKIPPED:` when neither works), every file attests and is skipped with nothing
 under `vendor/bundle` as an input and the gem it read as an external, a stray file there changes nothing, and code,
@@ -2231,15 +2322,17 @@ a plain run but change nothing under vci (`vci run`, `plan`, `ci`). Each refusal
 and `fdescribe` with `filter_run_when_matching :focus`, an excluded tag, a failing example, a failing
 `aggregate_failures` block, a load error, `before(:suite)` and `after(:context)` errors, no examples, backticks,
 `system`, rspec-retry, parallel_tests, reading `Rails::CodeStatistics`, a write into `app/`, `--dry-run` and `--bisect`
-from `SPEC_OPTS`; a pending migration is refused without a `db:test:prepare` child and without writing `db/`; a
+from `SPEC_OPTS`; a pending migration is refused as a failure (the `db:test:prepare` child that loads the schema into
+the configured database is Active Record's, not refused), and nothing but the test database is written in `db/`; rows
+written into the test database directly change no verdict and no manifest names it; a
 non-zero exit after RSpec's report (`at_exit { exit 1 }`, an `exit 2` like SimpleCov's, `minitest/autorun`); a retry
 in an `around` hook, a prepended `Example#finish` and a reporter override that turn a failure into a pass. A spec that
 sets `ENV["TMPDIR"]` still has its reads outside the repository refused, and Prism's `parse_file`,
 `parse_file_success?` and `lex_file` reads are inputs (editing each file runs the spec). The
 example status file is never written or read (`--only-failures` is refused). A spec stubbing `File.read`, `ENV[]`,
 `Kernel.require`, `File.directory?`, `File.exist?` and `Dir.children` (and using `travel_to`) is attested with its
-real reads, each of which then runs it. Push/fetch into a fresh clone and `vci ci` (only the rest, one RSpec process
-per file, non-zero on a failure, the whole suite on `no_skip_refs`); a Minitest app and an RSpec app in one
+real reads, each of which then runs it. Push/fetch into a fresh clone and `vci ci` (only the rest, in one RSpec
+process, non-zero on a failure, the whole suite on `no_skip_refs`); a Minitest app and an RSpec app in one
 `vci.toml`; Minitest and RSpec files in one app (each with its own runner; a pattern overlap runs everything; `runner =
 "rspec"` from the base commit lists only spec files, and `vci plan`/`ci` warn that the Minitest files are not run, also
 in the audit log); a plain Ruby project with RSpec; `vci init --adapter rails`; the bundle installed into

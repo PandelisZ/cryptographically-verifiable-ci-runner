@@ -19,6 +19,22 @@ jobs:
       # where tests are attested: Ruby's local time zone otherwise comes from
       # the machine.
       TZ: UTC
+    # The test database is the test engine's, as in any Rails CI job: vci
+    # needs nothing of its own for it. SQLite needs no service (Rails creates
+    # db/test.sqlite3 on the first run). For MySQL or PostgreSQL, run the
+    # service this job would need without vci, on the host and port
+    # config/database.yml names for the test environment (the same as where
+    # you attest), and create the database before `vci ci` (the step below).
+    # What the database holds is never an input.
+    # services:
+    #   mysql:
+    #     image: mysql:8.0
+    #     env:
+    #       MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    #     ports: ["3306:3306"]
+    #     options: >-
+    #       --health-cmd "mysqladmin ping -h 127.0.0.1"
+    #       --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,6 +65,10 @@ jobs:
           cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
           echo "VCI_RUBY_COLLECTOR=$RUNNER_TEMP/vci/ruby/vci-collector" >> "$GITHUB_ENV"
 
+      # MySQL or PostgreSQL only (see services above): create and load the
+      # test database, as a plain Rails CI job does.
+      # - run: bin/rails db:test:prepare
+
       # git-meta pull of refs/meta/main (attestations pushed with `vci push`
       # or `git meta push`) into .git/git-meta.sqlite; read access is enough.
       - name: Fetch attestations
@@ -58,10 +78,11 @@ jobs:
       # BASE commit, so a pull request cannot add its own signer. On pushes to
       # main the base is the pushed commit itself: `vci init` lists
       # refs/heads/main in policy.no_skip_refs, so everything runs there.
-      # `vci ci` runs each remaining file in its own `bin/rails test <file>`
-      # or, for RSpec, `rspec --options .rspec <file>` (fresh SQLite databases
-      # loaded from db/schema.rb, one process, the fixed seed attestations are
-      # made with; RSpec reads .rspec only, never ~/.rspec,
+      # `vci ci` runs the remaining files in one `bin/rails test <files>`
+      # or, for RSpec, `rspec --options .rspec <files>` (the test database
+      # config/database.yml configures, set up by Rails as in a plain run; no
+      # parallel workers, the fixed seed attestations are made with; RSpec
+      # reads .rspec only, never ~/.rspec,
       # $XDG_CONFIG_HOME/rspec/options or .rspec-local, on both sides) and
       # exits non-zero if any fails. SPEC_OPTS reaches RSpec only if declared
       # in vci.toml ([env] global), and is then compared.

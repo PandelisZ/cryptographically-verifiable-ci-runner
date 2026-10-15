@@ -473,8 +473,7 @@ fn summarize_taints(taints: &[&String]) -> String {
 }
 
 /// The taints of `o` that refuse it, and those a base policy waives (Go's
-/// `policy.go_allow_net`, Cargo's declared inputs, Rails'
-/// `policy.rails_allow_db`).
+/// `policy.go_allow_net`, Cargo's declared inputs).
 fn split_waived<'a>(
     project: &Project,
     declared: &[String],
@@ -486,9 +485,6 @@ fn split_waived<'a>(
             || (name == "cargo"
                 && !declared.is_empty()
                 && t.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT))
-            || (name == "rails"
-                && project.policy.rails_allow_db
-                && t.starts_with(vci_adapter::RAILS_NETWORK_DB_TAINT))
     })
 }
 
@@ -1044,6 +1040,9 @@ pub struct RunOutcome {
 pub fn run(args: RunArgs) -> Result<i32> {
     let (repo, root) = open_repo()?;
     let config = working_tree_config(&root)?;
+    if let Some(w) = config.removed_keys_warning(crate::config::CONFIG_FILE) {
+        eprintln!("vci: warning: {w}");
+    }
     let out = run_units(
         repo,
         root,

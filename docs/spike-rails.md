@@ -12,7 +12,7 @@ The Rust adapter runs one process per test file:
 
 ```
 RUBYOPT=-r<abs>/ruby/vci-collector/vci_collector.rb VCI_RAILS_MODE=collect VCI_OUT=<dir> VCI_TEST_ID=<file> \
-  VCI_ROOT=<project> VCI_REPO=<repo> VCI_DB_DIR=<fresh dir> TMPDIR=<fresh dir> RAILS_ENV=test RACK_ENV=test \
+  VCI_ROOT=<project> VCI_REPO=<repo> TMPDIR=<fresh dir> RAILS_ENV=test RACK_ENV=test \
   PARALLEL_WORKERS=1 DISABLE_SPRING=1 DISABLE_BOOTSNAP=1 BUNDLE_GEMFILE=<project>/Gemfile \
   ruby bin/rails test test/models/b_test.rb --seed 0
 ```
@@ -46,7 +46,7 @@ or the fixture runs):
 | network | `TCPSocket`, `TCPServer`, `UDPSocket`, `UNIXSocket`, `UNIXServer`, `Socket` constructors, `Socket.tcp`/`getaddrinfo`/..., `Addrinfo.getaddrinfo`/... |
 | native code | `Fiddle::Handle` and `Fiddle::Function` (so `Fiddle.dlopen(nil)` too); FFI: `DynamicLibrary.open` records the library it opened (all modes), calls of what `attach_function`/`attach_variable` attached (FFI's methods on the module and its singleton class replaced in place by a checking wrapper, F18), `Function#call`, `Function#attach`, `VariadicInvoker#invoke`, and ruby-vips' `Vips::Operation.call` (F16); libxml2 options and APIs that read files, a `.so`/`.bundle` inside the repository in `$LOADED_FEATURES` |
 | file descriptors | `IO.for_fd`/`IO.new(fd)`/`File.new(fd)`: accepted when `fstat` gives the dev/inode of a file a hook saw opened |
-| SQLite | `SQLite3::Database#initialize`: a file outside `VCI_DB_DIR`/`TMPDIR` taints; an authorizer taints `ATTACH`; extension loading taints |
+| SQLite | `SQLite3::Database#initialize`: a file other than the test environment's configured databases (or one in `TMPDIR`) taints at exit; an authorizer taints `ATTACH`; extension loading taints |
 
 What is not seen (documented in the README): C code opening paths itself (libxml2 entity resolution, image
 libraries, `Etc.getpwuid` reading the user database), `getenv` in C, `/etc/localtime`, threads still running after the
@@ -128,6 +128,17 @@ process, and the database keeps whatever earlier runs left in it. The collector 
 A database server is purged (`DatabaseTasks.purge`) and loaded the same way with `policy.rails_allow_db`; a test of
 the waiver uses SQLite registered under another adapter name (`ActiveRecord::ConnectionAdapters.register("vcifake",
 ...)`), whose `database_version` gives the "server" version.
+
+**Superseded in vci 1.4.0 (collector 0.5.0).** By the user's decision the test database is now the test engine's
+business: the collector no longer redirects, prepares, purges or loads any database, and `policy.rails_allow_db` is
+gone. The configured databases are used as they are; `load_schema!`'s `bin/rails db:test:prepare` child is accepted
+(it is started with `VCI_RAILS_MODE=engine`, where the collector does nothing) when the `system` call comes from
+`ActiveRecord::Migration.load_schema!` in the bundle's activerecord gem; the test environment's SQLite files and their
+`-wal`/`-shm`/`-journal` siblings are never recorded (a listing of their directory leaves them out); Active Record's
+server connections are accepted; `ruby_db` is the adapter names only. Files of a project run one at a time, and
+`vci ci` runs the remainder in one process per runner. The database's contents are no longer an input: an attestation
+promises what CI promises, a pass on a database the engine set up (see "vci does not manage the database" in
+`docs/REFERENCE.md`).
 
 **F7. Rails keeps a random secret in `tmp/`.** Rails 8.1's `Configuration#secret_key_base` falls back to
 `generate_local_secret` in development and test, which writes a random `tmp/local_secret.txt` once and reads it

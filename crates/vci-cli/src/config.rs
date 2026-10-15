@@ -122,7 +122,10 @@ pub struct PolicyOverride {
     pub no_skip_refs_except: Option<Vec<String>>,
     pub never_skip: Option<Vec<String>>,
     pub go_allow_net: Option<bool>,
-    pub rails_allow_db: Option<bool>,
+    /// Removed in vci 1.4.0: parsed (so a `vci.toml` that still has it stays
+    /// valid) and otherwise ignored; see [`Policy::removed_rails_allow_db`].
+    #[serde(default, rename = "rails_allow_db", skip_serializing)]
+    pub removed_rails_allow_db: Option<bool>,
     pub node_exact: Option<bool>,
     pub allow_superuser_mismatch: Option<bool>,
 }
@@ -158,7 +161,6 @@ impl ProjectSpec {
     /// The adapter options this project's settings give.
     pub fn adapter_options(&self) -> vci_adapter::AdapterOptions {
         vci_adapter::AdapterOptions {
-            rails_allow_db: self.policy.rails_allow_db,
             rails_runner: self
                 .runner
                 .as_deref()
@@ -365,15 +367,15 @@ pub struct Policy {
     /// accepted while it is set there.
     #[serde(default)]
     pub go_allow_net: bool,
-    /// Rails: attest test files whose test environment uses a database
-    /// server (PostgreSQL, MySQL, ...) rather than a SQLite file. vci cannot
-    /// see what the server holds: this is the user's statement that the test
-    /// database holds nothing but what vci loads (the schema, purged and
-    /// loaded fresh for every file, then the fixtures). Read from the base
-    /// commit; attestations that needed it are only accepted while it is set
-    /// there, and the server's version is part of the toolchain.
-    #[serde(default)]
-    pub rails_allow_db: bool,
+    /// `rails_allow_db`, removed in vci 1.4.0 (the Rails test database is
+    /// the test engine's business: vci neither prepares nor refuses it, and
+    /// its contents are not an input). Still parsed, so that a base
+    /// `vci.toml` that sets it stays valid (an invalid one runs every test);
+    /// it has no effect, and `vci run` and `vci plan` warn about it
+    /// ([`Config::removed_keys`]). Never part of the effective policy
+    /// ([`Config::project_specs`] leaves it out).
+    #[serde(default, rename = "rails_allow_db", skip_serializing)]
+    pub removed_rails_allow_db: Option<bool>,
     /// Vitest and node-test: require the exact Node version the attestation
     /// was made with (default: the same major version).
     #[serde(default)]
@@ -409,7 +411,7 @@ impl Default for Policy {
             no_skip_refs_except: vec![],
             never_skip: vec![],
             go_allow_net: false,
-            rails_allow_db: false,
+            removed_rails_allow_db: None,
             node_exact: false,
             allow_superuser_mismatch: false,
         }
@@ -608,6 +610,38 @@ impl Config {
         }
     }
 
+    /// Keys this file sets that vci no longer uses (they parse, and have no
+    /// effect): `policy.rails_allow_db` (top level or in a project's
+    /// `[projects.policy]`), removed in vci 1.4.0.
+    pub fn removed_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.policy.removed_rails_allow_db.is_some() {
+            out.push("policy.rails_allow_db".to_owned());
+        }
+        for p in &self.projects {
+            if p.policy
+                .as_ref()
+                .is_some_and(|o| o.removed_rails_allow_db.is_some())
+            {
+                out.push(format!("projects.{}.policy.rails_allow_db", p.name));
+            }
+        }
+        out
+    }
+
+    /// The warning for [`Self::removed_keys`] (`None` when there are none),
+    /// for the `vci.toml` described by `which`.
+    pub fn removed_keys_warning(&self, which: &str) -> Option<String> {
+        let keys = self.removed_keys();
+        if keys.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} in {which} is ignored: rails_allow_db was removed in vci 1.4.0 (vci no longer prepares, purges or refuses the Rails test database; Active Record's configured databases are used as they are, and their contents are not an input). Remove it from vci.toml",
+            keys.join(", ")
+        ))
+    }
+
     /// Normalised project dir of the single-project form ("." for the root).
     pub fn project_rel(&self) -> String {
         normalise_rel(self.project.as_deref().unwrap_or("."))
@@ -627,7 +661,10 @@ impl Config {
                 adapter: self.adapter.clone().unwrap_or_else(default_adapter),
                 runner: self.runner.clone(),
                 node_test: self.node_test_options(),
-                policy: self.policy.clone(),
+                policy: Policy {
+                    removed_rails_allow_db: None,
+                    ..self.policy.clone()
+                },
                 env: self.env.clone(),
                 inputs: self.inputs.clone(),
             }];
@@ -635,7 +672,10 @@ impl Config {
         self.projects
             .iter()
             .map(|p| {
-                let mut policy = self.policy.clone();
+                let mut policy = Policy {
+                    removed_rails_allow_db: None,
+                    ..self.policy.clone()
+                };
                 if let Some(o) = &p.policy {
                     if let Some(v) = o.platform {
                         policy.platform = v;
@@ -663,9 +703,6 @@ impl Config {
                     }
                     if let Some(v) = o.go_allow_net {
                         policy.go_allow_net = v;
-                    }
-                    if let Some(v) = o.rails_allow_db {
-                        policy.rails_allow_db = v;
                     }
                     if let Some(v) = o.node_exact {
                         policy.node_exact = v;
@@ -916,11 +953,6 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 # no_skip_refs_except = ["github-actions"]
 # Test files (project-relative globs) that are never skipped.
 never_skip = []
-# Attest files whose test database is a server (PostgreSQL, MySQL) instead of
-# a SQLite file. vci purges it and loads the schema before every file, but
-# cannot see what else the server holds or does: set this only if the test
-# database is used by nothing but these tests.
-rails_allow_db = false
 
 [env]
 # "strict": only declared and pass-through variables reach tests.
@@ -1097,20 +1129,49 @@ mod tests {
         assert!(Config::parse("adapter = \"go\"").is_ok());
     }
 
+    /// `rails_allow_db` (removed in 1.4.0) still parses, top level and per
+    /// project, has no effect on the effective policy, and is reported.
     #[test]
-    fn rails_template_and_rails_allow_db_override() {
+    fn rails_template_and_removed_rails_allow_db() {
         let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        assert!(!RAILS_TEMPLATE.contains("rails_allow_db"));
+        assert!(c.removed_keys().is_empty());
+        assert!(c.removed_keys_warning("vci.toml").is_none());
         let s = c.project_specs();
         assert_eq!(s[0].adapter, "rails");
-        assert!(!s[0].policy.rails_allow_db);
         assert_eq!(s[0].env.global, ["TZ"]);
+        let plain = Config::parse("[policy]\nmax_ttl = \"30d\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n").unwrap();
         let c = Config::parse(
             "[policy]\nrails_allow_db = true\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n[projects.policy]\nrails_allow_db = false\n",
         )
         .unwrap();
+        assert_eq!(
+            c.removed_keys(),
+            ["policy.rails_allow_db", "projects.b.policy.rails_allow_db"]
+        );
+        let w = c.removed_keys_warning("vci.toml").unwrap();
+        assert!(w.contains("removed in vci 1.4.0"), "{w}");
         let s = c.project_specs();
-        assert!(s[0].policy.rails_allow_db);
-        assert!(!s[1].policy.rails_allow_db);
+        let p = plain.project_specs();
+        assert_eq!(s[0].policy, p[0].policy, "no effect on the policy");
+        assert_eq!(s[1].policy, p[1].policy, "no effect on the policy");
+        assert_eq!(
+            s[0].adapter_options(),
+            vci_adapter::AdapterOptions {
+                rails_runner: None,
+                node_test: Default::default(),
+            }
+        );
+        let single =
+            Config::parse("adapter = \"rails\"\n[policy]\nrails_allow_db = true\n").unwrap();
+        assert_eq!(single.removed_keys(), ["policy.rails_allow_db"]);
+        assert_eq!(
+            single.project_specs()[0].policy,
+            Config::parse("adapter = \"rails\"")
+                .unwrap()
+                .project_specs()[0]
+                .policy
+        );
     }
 
     #[test]

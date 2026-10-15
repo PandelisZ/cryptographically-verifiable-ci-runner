@@ -494,8 +494,10 @@ fn rails_end_to_end_verification_steps() {
     assert_eq!(p.skip, set(&[B]), "step 1");
     assert_eq!(p.run, set(&[A, C, D]), "step 1");
     assert!(!p.run_all);
-    // The test database was prepared fresh in a temp dir, not in db/.
-    assert!(!work.join("db/test.sqlite3").exists());
+    // The test database is the one config/database.yml configures: Rails'
+    // maintain_test_schema! created it (`bin/rails db:test:prepare`, a child
+    // process of Active Record's, not refused) and loaded the schema.
+    assert!(work.join("db/test.sqlite3").exists());
 
     // Step 2: edit a fixture yml -> B runs; explain names the file and both
     // hashes.
@@ -840,15 +842,295 @@ fn rails_run_refuses_unattestable_test_files() {
     );
 }
 
-/// A database server is refused unless `policy.rails_allow_db` is set at the
-/// base commit. The "server" here is SQLite registered under another adapter
-/// name (`vcifake`), which vci cannot tell from PostgreSQL or MySQL, with its
-/// file in the process's fresh temp dir (a SQLite file anywhere else would be
-/// refused as a database vci did not prepare).
+/// Every manifest entry (test and global) of a stored predicate, as
+/// (path, kind).
+fn manifest_entries(pred: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for m in ["manifest", "globalManifest"] {
+        for e in pred[m]["entries"].as_array().unwrap() {
+            out.push((
+                e["path"].as_str().unwrap().to_owned(),
+                e["kind"].as_str().unwrap().to_owned(),
+            ));
+        }
+    }
+    out
+}
+
+/// A path of the test database: a configured SQLite file, its `-wal`,
+/// `-shm` or `-journal` sibling, or a SQLite file under storage/.
+fn is_db_path(p: &str) -> bool {
+    p.starts_with("db/test.sqlite3") || (p.starts_with("storage/") && p.contains(".sqlite3"))
+}
+
+/// `bundle exec ruby -e <script>` in `dir`; panics if it fails.
+fn bundle_ruby(w: &World, dir: &Path, script: &str) {
+    let out = w.ruby_cmd(dir, "bundle", &["exec", "ruby", "-e", script]);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The test database is the test engine's (vci 1.4.0): its contents are
+/// never an input, so rows written into db/test.sqlite3 behind the tests'
+/// back change no verdict, and no manifest names the database file or its
+/// siblings (a listing of db/ leaves them out as `excluded` entries, so a
+/// fresh checkout, which has no database, still matches). A base vci.toml
+/// that still sets the removed `rails_allow_db` parses (no RUN of
+/// everything) and warns once.
 #[test]
-fn rails_database_server_needs_the_base_policy_waiver() {
+fn rails_database_contents_are_not_an_input() {
+    let toml = VCI_TOML.replace(
+        "platform = \"any\"",
+        "platform = \"any\"\nrails_allow_db = true",
+    );
+    let Some(w) = World::build(&toml, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    let dblist = "test/lib/dblist_test.rb";
+    w.put(
+        dblist,
+        "require \"test_helper\"\n\nclass DblistTest < ActiveSupport::TestCase\n  test \"lists db\" do\n    assert_includes Dir.children(Rails.root.join(\"db\")), \"schema.rb\"\n  end\nend\n",
+    );
+    assert!(!work.join("db/test.sqlite3").exists(), "a fresh checkout");
+    let out = w.vci(
+        &work,
+        &["run", B, dblist, "--key", w.trusted.to_str().unwrap()],
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("vci: 2 attested, 0 not attested"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("rails_allow_db was removed in vci 1.4.0")
+            .count(),
+        1,
+        "vci run warns once: {stderr}"
+    );
+    // Rails' maintain_test_schema! built the configured database (through
+    // `bin/rails db:test:prepare`, the engine's child process).
+    assert!(work.join("db/test.sqlite3").exists());
+    assert!(!stderr.contains("process:"), "{stderr}");
+
+    // The base policy still has rails_allow_db: it parses, warns once, and
+    // the plan does not run everything.
+    let out = w.vci(&work, &["plan", "--base-ref", "main", "--format", "json"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .matches("rails_allow_db was removed in vci 1.4.0")
+            .count(),
+        1,
+        "vci plan warns once: {stderr}"
+    );
+    let p = Plan::from_json(&serde_json::from_slice(&out.stdout).unwrap());
+    assert!(!p.run_all, "{p:?}");
+    assert_eq!(p.skip, set(&[B, dblist]));
+
+    for id in [B, dblist] {
+        let pred = stored_predicate(&work, id);
+        assert_eq!(pred["toolchain"]["rubyDb"], "sqlite3", "{id}");
+        assert!(
+            pred.get("waived").is_none(),
+            "nothing is waived: {}",
+            pred["waived"]
+        );
+        let db: Vec<(String, String)> = manifest_entries(&pred)
+            .into_iter()
+            .filter(|(p, _)| is_db_path(p))
+            .collect();
+        if id == B {
+            assert!(db.is_empty(), "{id}: {db:?}");
+        } else {
+            // The listing of db/ is an input; the database files are left
+            // out of it, never hashed.
+            assert!(
+                manifest_entries(&pred).contains(&("db".to_owned(), "dirListing".to_owned())),
+                "{id}"
+            );
+            let names: BTreeSet<String> = db
+                .iter()
+                .map(|(p, k)| {
+                    assert_eq!(k, "excluded", "{id}: {p}");
+                    p.clone()
+                })
+                .collect();
+            assert_eq!(
+                names,
+                set(&[
+                    "db/test.sqlite3",
+                    "db/test.sqlite3-journal",
+                    "db/test.sqlite3-shm",
+                    "db/test.sqlite3-wal"
+                ]),
+                "{id}"
+            );
+        }
+    }
+
+    // Rows written into the test database directly change nothing.
+    bundle_ruby(
+        &w,
+        &work,
+        "require \"sqlite3\"; db = SQLite3::Database.new(\"db/test.sqlite3\"); 3.times { |i| db.execute(\"INSERT INTO widgets (name, size, created_at, updated_at) VALUES (?, ?, ?, ?)\", [\"leftover#{i}\", i, \"2026-01-01 00:00:00\", \"2026-01-01 00:00:00\"]) }; db.close",
+    );
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, dblist]), "rows");
+    // Attesting B again on that database (fixtures replace the widgets)
+    // records the same inputs: the same attestation key.
+    let again = w.run(&work, &[B], &w.trusted);
+    assert!(again.contains("1 attested"), "{again}");
+    assert_eq!(
+        AttestStore::new(&store_for(&work))
+            .list(Some(B))
+            .unwrap()
+            .len(),
+        1,
+        "the database's contents are not part of the inputs"
+    );
+    // A row no fixture removes: still skipped (what the test database holds
+    // is the engine's business: a plain `bin/rails test` would see it too).
+    bundle_ruby(
+        &w,
+        &work,
+        "require \"sqlite3\"; db = SQLite3::Database.new(\"db/test.sqlite3\"); db.execute(\"INSERT INTO gadgets (name) VALUES ('stray')\"); db.close",
+    );
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, dblist]), "stray row");
+    // Journal files and a database in storage/ appear: nothing changes.
+    for f in [
+        "db/test.sqlite3-wal",
+        "db/test.sqlite3-shm",
+        "db/test.sqlite3-journal",
+    ] {
+        std::fs::write(work.join(f), "").unwrap();
+    }
+    std::fs::write(work.join("storage/test.sqlite3"), "x").unwrap();
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, dblist]), "siblings");
+    // No database at all (a fresh clone): still skipped.
+    for f in [
+        "db/test.sqlite3",
+        "db/test.sqlite3-wal",
+        "db/test.sqlite3-shm",
+        "db/test.sqlite3-journal",
+    ] {
+        std::fs::remove_file(work.join(f)).unwrap();
+    }
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, dblist]), "no database");
+    // Any other new name in db/ is still a change of the listing.
+    w.put("db/notes.txt", "x\n");
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[B]), "{p:?}");
+    assert!(p.run.contains(dblist), "{p:?}");
+    assert!(
+        w.explain(&work, dblist, "main").contains("entry:db"),
+        "the listing"
+    );
+}
+
+/// What is still refused (vci 1.4.0): a SQLite file that is not one of the
+/// test environment's databases (also under a name that contains
+/// "mode=memory" but opens a file), ATTACH, and a database client a test
+/// opens itself. A database server configured for the test environment is
+/// accepted with no policy, and its adapter name (no server version) is the
+/// toolchain's `rubyDb`. The "server" here is SQLite registered under
+/// another adapter name (`vcifake`), which vci cannot tell from PostgreSQL
+/// or MySQL; `rails_mysql_test_database` runs a real MySQL when docker is
+/// available.
+#[test]
+fn rails_database_server_and_other_database_files() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
+    let t = |name: &str, body: &str| {
+        format!(
+            "require \"test_helper\"\n\nclass {name}Test < ActiveSupport::TestCase\n  test \"x\" do\n{body}  end\nend\n"
+        )
+    };
+    let other = "test/refuse/other_sqlite_test.rb";
+    w.put(
+        other,
+        &t(
+            "OtherSqlite",
+            "    db = SQLite3::Database.new(Rails.root.join(\"db/other.sqlite3\").to_s)\n    assert_equal [[1]], db.execute(\"select 1\")\n    db.close\n    File.delete(Rails.root.join(\"db/other.sqlite3\"))\n",
+        ),
+    );
+    // A name that merely contains "mode=memory" opens a file on disk.
+    let memname = "test/refuse/memname_test.rb";
+    w.put(
+        memname,
+        &t(
+            "Memname",
+            "    path = Rails.root.join(\"db/mode=memory.sqlite3\").to_s\n    db = SQLite3::Database.new(\"file:#{path}?x=mode=memory\")\n    db.execute(\"create table t (x)\")\n    db.close\n    assert File.exist?(path)\n    File.delete(path)\n",
+        ),
+    );
+    let attach = "test/refuse/attach_test.rb";
+    w.put(
+        attach,
+        &t(
+            "Attach",
+            "    path = File.join(Dir.tmpdir, \"att.sqlite3\")\n    ActiveRecord::Base.connection.execute(\"ATTACH DATABASE '#{path}' AS other\") rescue nil\n    assert true\n",
+        ),
+    );
+    // A database client the test opens itself: the hooks wrap Mysql2::Client
+    // and PG::Connection whenever they appear (the fixture's bundle has
+    // neither gem: these stand-ins fail to connect, as a closed port does).
+    let client = "test/refuse/client_test.rb";
+    w.put(
+        client,
+        &t(
+            "Client",
+            "    m = Module.new\n    Object.const_set(:Mysql2, m)\n    m.const_set(:Client, Class.new { def self.new(*) = raise(IOError, \"closed port\") })\n    assert_raises(IOError) { Mysql2::Client.new(host: \"127.0.0.1\", port: 1) }\n",
+        ),
+    );
+    let pg = "test/refuse/pg_test.rb";
+    w.put(
+        pg,
+        &t(
+            "Pg",
+            "    m = Module.new\n    Object.const_set(:PG, m)\n    m.const_set(:Connection, Class.new { def self.connect(*) = raise(IOError, \"closed port\") })\n    assert_raises(IOError) { PG::Connection.connect(host: \"127.0.0.1\", port: 1) }\n",
+        ),
+    );
+    let out = w.vci(
+        &work,
+        &[
+            "run",
+            other,
+            memname,
+            attach,
+            client,
+            pg,
+            "--key",
+            w.trusted.to_str().unwrap(),
+        ],
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    let refused = |id: &str, why: &str| {
+        let line = stderr
+            .lines()
+            .find(|l| l.starts_with(&format!("vci: not attesting {id}:")))
+            .unwrap_or_else(|| panic!("{id} was not refused:\n{stderr}"));
+        assert!(line.contains(why), "{id}: expected {why:?} in {line:?}");
+    };
+    refused(other, "rails:sqlite-file:");
+    refused(memname, "rails:sqlite-file:");
+    refused(attach, "rails:sqlite-attach");
+    refused(client, "network:mysql2 client");
+    refused(pg, "network:postgresql client");
+    assert!(
+        stderr.contains("vci: 0 attested, 5 not attested"),
+        "{stderr}"
+    );
+    for f in [other, memname, attach, client, pg] {
+        std::fs::remove_file(work.join(f)).unwrap();
+    }
+
+    // A configured database "server": attested with no policy.
     w.put(
         "config/initializers/vcifake.rb",
         "require \"active_record/tasks/database_tasks\"\nActiveRecord::ConnectionAdapters.register(\"vcifake\", \"ActiveRecord::ConnectionAdapters::SQLite3Adapter\", \"active_record/connection_adapters/sqlite3_adapter\")\nActiveRecord::Tasks::DatabaseTasks.register_task(/vcifake/, \"ActiveRecord::Tasks::SQLiteDatabaseTasks\")\n",
@@ -861,59 +1143,316 @@ fn rails_database_server_needs_the_base_policy_waiver() {
             "test:\n  adapter: vcifake\n  database: <%= File.join(Dir.tmpdir, \"vcifake.sqlite3\") %>",
         ),
     );
-    let out = w.vci(&work, &["run", B, "--key", w.trusted.to_str().unwrap()]);
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        stderr.contains("rails:network-db:vcifake"),
-        "refused without the policy: {stderr}"
-    );
-    // With the policy in the working tree, the file is attested with the
-    // refusal waived and the server version in the toolchain...
-    let toml = w.read("vci.toml");
+    let stderr = w.run(&work, &[B], &w.trusted);
+    assert!(stderr.contains("1 attested, 0 not attested"), "{stderr}");
+    let pred = stored_predicate(&work, B);
+    assert_eq!(pred["toolchain"]["rubyDb"], "vcifake", "no server version");
+    assert!(pred.get("waived").is_none(), "{}", pred["waived"]);
+    assert_eq!(w.plan(&work, "main").skip, set(&[B]), "no policy needed");
+}
+
+/// A multi-database test environment (Rails 8's layout): every database's
+/// schema file is an input of a test attested on a fresh database, where
+/// `bin/rails db:test:prepare` (the engine's child) is what reads them, so
+/// changing db/cache_schema.rb runs a test that uses the cache database.
+/// An entry that names a file which is not a SQLite database (data/ref.yml,
+/// `database_tasks: false`, which Rails never opens) does not hide that
+/// file: a test reading it runs when it changes.
+#[test]
+fn rails_multi_database_schema_files_and_named_files() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let db = w.read("config/database.yml");
     w.put(
-        "vci.toml",
-        &toml.replace(
-            "platform = \"any\"",
-            "platform = \"any\"\nrails_allow_db = true",
+        "config/database.yml",
+        &db.replace(
+            "test:\n  <<: *default\n  database: db/test.sqlite3",
+            "test:\n  primary:\n    <<: *default\n    database: db/test.sqlite3\n  cache:\n    <<: *default\n    database: storage/test_cache.sqlite3\n    migrations_paths: db/cache_migrate\n  reference:\n    <<: *default\n    database: data/ref.yml\n    database_tasks: false",
         ),
     );
-    let stderr = w.run(&work, &[B], &w.trusted);
-    assert!(stderr.contains("1 attested"), "{stderr}");
-    let stored = AttestStore::new(&store_for(&work)).list(Some(B)).unwrap();
-    let env: Value = serde_json::from_slice(&stored[0].bytes).unwrap();
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(env["payload"].as_str().unwrap())
+    let cache_schema = "ActiveRecord::Schema[8.1].define(version: 1) do\n  create_table \"cache_entries\", force: :cascade do |t|\n    t.string \"key\", null: false\n  end\nend\n";
+    w.put("db/cache_schema.rb", cache_schema);
+    w.put(
+        "app/models/cache_record.rb",
+        "class CacheRecord < ActiveRecord::Base\n  self.abstract_class = true\n  connects_to database: { writing: :cache }\nend\n",
+    );
+    w.put(
+        "app/models/cache_entry.rb",
+        "class CacheEntry < CacheRecord\nend\n",
+    );
+    w.put("data/ref.yml", "flag: on\n");
+    let cache = "test/lib/cache_test.rb";
+    w.put(
+        cache,
+        "require \"test_helper\"\n\nclass CacheTest < ActiveSupport::TestCase\n  test \"cache entry\" do\n    CacheEntry.create!(key: \"k\")\n    assert_equal 1, CacheEntry.count\n  end\nend\n",
+    );
+    let refd = "test/lib/ref_test.rb";
+    w.put(
+        refd,
+        "require \"test_helper\"\n\nclass RefTest < ActiveSupport::TestCase\n  test \"reads data/ref.yml\" do\n    assert_includes File.read(Rails.root.join(\"data/ref.yml\")), \"flag: on\"\n  end\nend\n",
+    );
+    assert!(!work.join("storage/test_cache.sqlite3").exists(), "fresh");
+    let stderr = w.run(&work, &[cache, refd], &w.trusted);
+    assert!(stderr.contains("2 attested, 0 not attested"), "{stderr}");
+    assert!(work.join("storage/test_cache.sqlite3").exists());
+    assert_eq!(w.plan(&work, "main").skip, set(&[cache, refd]));
+
+    // The named file changes: the test reading it runs.
+    w.put("data/ref.yml", "flag: off\n");
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[cache]), "{p:?}");
+    assert!(
+        w.explain(&work, refd, "main")
+            .contains("entry:data/ref.yml"),
+        "data/ref.yml is an input"
+    );
+    w.put("data/ref.yml", "flag: on\n");
+
+    // The cache database's schema changes: the test using it runs (as does
+    // every test that loads Active Record, like a change of db/schema.rb).
+    w.put(
+        "db/cache_schema.rb",
+        &cache_schema.replace("\"key\"", "\"name\""),
+    );
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(cache), "{p:?}");
+    assert!(
+        w.explain(&work, cache, "main")
+            .contains("entry:db/cache_schema.rb"),
+        "db/cache_schema.rb is an input"
+    );
+}
+
+/// A Docker MySQL 8.0 started for this test (removed when dropped).
+struct MysqlContainer {
+    name: String,
+    port: u16,
+}
+
+impl Drop for MysqlContainer {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", "-v", &self.name])
+            .output();
+    }
+}
+
+const MYSQL_PASSWORD: &str = "vcitest";
+
+/// A throwaway MySQL 8.0 on a free port with a unique name, ready to
+/// accept connections, or `None` (with a SKIPPED message) when docker or
+/// the `mysql:8.0` image is not available.
+fn start_mysql() -> Option<MysqlContainer> {
+    let available = Command::new("docker")
+        .args(["image", "inspect", "mysql:8.0"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !available {
+        eprintln!("SKIPPED: docker with the mysql:8.0 image is not available");
+        return None;
+    }
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("vci-e2e-mysql-{}-{nanos}", std::process::id());
+    let out = Command::new("docker")
+        .args(["run", "-d", "--name", &name])
+        .args(["-e", &format!("MYSQL_ROOT_PASSWORD={MYSQL_PASSWORD}")])
+        .args(["-e", "MYSQL_DATABASE=vci_test"])
+        .args(["-p", &format!("127.0.0.1:{port}:3306"), "mysql:8.0"])
+        .output()
         .unwrap();
-    let st: Value = serde_json::from_slice(&payload).unwrap();
+    if !out.status.success() {
+        eprintln!(
+            "SKIPPED: docker could not start mysql:8.0: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        return None;
+    }
+    let c = MysqlContainer { name, port };
+    for _ in 0..240 {
+        // Over TCP: the entrypoint's temporary server listens on its socket
+        // only, so this answers once the real server is up.
+        let ok = Command::new("docker")
+            .args(["exec", &c.name, "mysql", "-h127.0.0.1", "-uroot"])
+            .arg(format!("-p{MYSQL_PASSWORD}"))
+            .args(["-e", "select 1", "vci_test"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if ok {
+            return Some(c);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("MySQL in container {} did not become ready", c.name);
+}
+
+/// `sql` run by the container's mysql client against the test database.
+fn mysql_exec(c: &MysqlContainer, sql: &str) -> String {
+    let out = Command::new("docker")
+        .args(["exec", &c.name, "mysql", "-h127.0.0.1", "-uroot"])
+        .arg(format!("-p{MYSQL_PASSWORD}"))
+        .args(["-N", "-e", sql, "vci_test"])
+        .output()
+        .unwrap();
     assert!(
-        st["predicate"]["waived"][0]
-            .as_str()
-            .unwrap()
-            .starts_with("rails:network-db:vcifake"),
+        out.status.success(),
         "{}",
-        st["predicate"]["waived"]
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        st["predicate"]["toolchain"]["rubyDb"]
-            .as_str()
-            .unwrap()
-            .starts_with("vcifake "),
-        "the server version is part of the toolchain"
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The fixture with the mysql2 gem in its bundle (`bundle lock --local
+/// --add-checksums`: from the gems this Ruby has) and, with `mysql`, its test environment's
+/// database on that server.
+fn copy_rails_fixture_with_mysql2(dir: &Path, mysql: Option<u16>) {
+    copy_rails_fixture(dir);
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).unwrap();
+    std::fs::write(
+        dir.join("Gemfile"),
+        format!("{gemfile}gem \"mysql2\", \"0.5.7\"\n"),
+    )
+    .unwrap();
+    if let Some(bin) = ruby_bin() {
+        let mut cmd = Command::new(bin.join("bundle"));
+        // With its checksum: Bundler otherwise rewrites (touches) the
+        // lockfile in every process, which refuses the file.
+        cmd.args(["lock", "--local", "--add-checksums"])
+            .current_dir(dir);
+        let mut paths = vec![bin.clone()];
+        if let Some(p) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&p));
+        }
+        cmd.env("PATH", std::env::join_paths(paths).unwrap());
+        for k in SCRUB {
+            cmd.env_remove(k);
+        }
+        let out = cmd.output().unwrap();
+        if !out.status.success() {
+            eprintln!(
+                "bundle lock --local with mysql2 failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    if let Some(port) = mysql {
+        let db = std::fs::read_to_string(dir.join("config/database.yml")).unwrap();
+        std::fs::write(
+            dir.join("config/database.yml"),
+            db.replace(
+                "test:\n  <<: *default\n  database: db/test.sqlite3",
+                &format!(
+                    "test:\n  adapter: mysql2\n  host: 127.0.0.1\n  port: {port}\n  username: root\n  password: {MYSQL_PASSWORD}\n  database: vci_test\n"
+                ),
+            ),
+        )
+        .unwrap();
+    }
+}
+
+/// A MySQL test database (mysql2): a test file is attested with no policy,
+/// `rubyDb` is `mysql2` (no server version), the plan skips it, and rows
+/// written into the server's database behind the tests' back change
+/// nothing. A test that opens a `Mysql2::Client` itself (to a closed port)
+/// is refused, with or without the server, and so is Active Record
+/// connecting to a database that is not the test environment's (another
+/// database on the same server, or a server when the test database is
+/// SQLite), through establish_connection or the adapter's new_client. The server part prints SKIPPED
+/// and passes when docker (with the mysql:8.0 image) is not available.
+#[test]
+fn rails_mysql_test_database() {
+    let mysql = start_mysql();
+    let port = mysql.as_ref().map(|c| c.port);
+    let Some(w) = World::build(VCI_TOML, |d| copy_rails_fixture_with_mysql2(d, port)) else {
+        return;
+    };
+    let work = w.work.clone();
+    let client = "test/refuse/mysql2_client_test.rb";
+    w.put(
+        client,
+        "require \"test_helper\"\nrequire \"mysql2\"\n\nclass Mysql2ClientTest < ActiveSupport::TestCase\n  test \"connects itself\" do\n    assert_raises(Mysql2::Error) { Mysql2::Client.new(host: \"127.0.0.1\", port: 1, connect_timeout: 2) }\n  end\nend\n",
     );
-    // ...but it is only accepted while the BASE commit's policy waives it.
-    w.git(&work, &["add", "-A"]);
-    w.git(
+    // Active Record connecting to a server that is not the test
+    // environment's database (here SQLite without the server, the
+    // configured MySQL with it): through establish_connection, and a raw
+    // client through the adapter's new_client.
+    let ar_other = "test/refuse/ar_other_test.rb";
+    let ar_new_client = "test/refuse/ar_new_client_test.rb";
+    let other_port = port.unwrap_or(1);
+    w.put(
+        ar_other,
+        &format!(
+            "require \"test_helper\"\nrequire \"mysql2\"\n\nclass OtherDb < ActiveRecord::Base\n  self.abstract_class = true\nend\n\nclass ArOtherTest < ActiveSupport::TestCase\n  test \"another database\" do\n    OtherDb.establish_connection(adapter: \"mysql2\", host: \"127.0.0.1\", port: {other_port}, username: \"root\", password: \"{MYSQL_PASSWORD}\", database: \"mysql\", connect_timeout: 2)\n    OtherDb.connection.select_value(\"select 1\") rescue nil\n    assert true\n  end\nend\n"
+        ),
+    );
+    w.put(
+        ar_new_client,
+        &format!(
+            "require \"test_helper\"\nrequire \"mysql2\"\nrequire \"active_record/connection_adapters/mysql2_adapter\"\n\nclass ArNewClientTest < ActiveSupport::TestCase\n  test \"raw client\" do\n    ActiveRecord::ConnectionAdapters::Mysql2Adapter.new_client(host: \"127.0.0.1\", port: {other_port}, username: \"root\", password: \"{MYSQL_PASSWORD}\", database: \"mysql\", connect_timeout: 2) rescue nil\n    assert true\n  end\nend\n"
+        ),
+    );
+    let out = w.vci(
         &work,
-        &["commit", "-q", "-m", "PR: allow the test database"],
+        &[
+            "run",
+            client,
+            ar_other,
+            ar_new_client,
+            "--key",
+            w.trusted.to_str().unwrap(),
+        ],
     );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    let refused = |id: &str, why: &str| {
+        let line = stderr
+            .lines()
+            .find(|l| l.starts_with(&format!("vci: not attesting {id}:")))
+            .unwrap_or_else(|| panic!("{id} was not refused:\n{stderr}"));
+        assert!(line.contains(why), "{id}: expected {why:?} in {line:?}");
+    };
+    refused(client, "network:mysql2 client");
+    let to = format!("network:mysql2 (an Active Record connection to 127.0.0.1:{other_port}/mysql");
+    refused(ar_other, &to);
+    refused(ar_new_client, &to);
     assert!(
-        w.plan(&work, "main").run.contains(B),
-        "main does not allow it"
+        stderr.contains("vci: 0 attested, 3 not attested"),
+        "{stderr}"
     );
+    for f in [client, ar_other, ar_new_client] {
+        std::fs::remove_file(work.join(f)).unwrap();
+    }
+    let Some(c) = mysql else { return };
+
+    let stderr = w.run(&work, &[B], &w.trusted);
+    assert!(stderr.contains("1 attested, 0 not attested"), "{stderr}");
+    let pred = stored_predicate(&work, B);
+    assert_eq!(pred["toolchain"]["rubyDb"], "mysql2", "adapter only");
+    assert!(pred.get("waived").is_none(), "{}", pred["waived"]);
     assert!(
-        w.plan(&work, "HEAD").skip.contains(B),
-        "control: a base that allows it"
+        !work.join("db/test.sqlite3").exists(),
+        "the test database is the server's"
     );
+    assert_eq!(w.plan(&work, "main").skip, set(&[B]));
+    // The engine loaded the schema (and the fixtures) into the server; the
+    // test's own rows were rolled back with its transaction.
+    assert_eq!(mysql_exec(&c, "select count(*) from widgets"), "1");
+    assert_eq!(mysql_exec(&c, "select count(*) from gadgets"), "0");
+    mysql_exec(
+        &c,
+        "insert into gadgets (name) values ('stray'); insert into widgets (name, size, created_at, updated_at) values ('leftover', 9, now(), now())",
+    );
+    assert_eq!(w.plan(&work, "main").skip, set(&[B]), "server rows");
+    drop(c);
+    // The server is gone: the plan does not connect to it.
+    assert_eq!(w.plan(&work, "main").skip, set(&[B]), "server gone");
 }
 
 #[test]
@@ -944,8 +1483,9 @@ fn rails_push_fetch_fresh_clone_and_ci() {
     w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
     assert_eq!(w.plan(&fresh, "main"), before, "same plan after fetch");
 
-    // `vci ci` runs only A and D, each in its own `bin/rails test` process
-    // with a fresh database, and writes an audit log of the skips.
+    // `vci ci` runs only A and D, in one `bin/rails test` process (the
+    // engine's own way: they share the test database), and writes an audit
+    // log of the skips.
     let audit = w.base.join("audit.json");
     let out = w.vci(
         &fresh,
@@ -960,18 +1500,25 @@ fn rails_push_fetch_fresh_clone_and_ci() {
     assert_eq!(out.status.code(), Some(0));
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     assert!(stderr.contains("running 2 test file(s)"), "{stderr}");
+    let procs: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("vci: ") && l.contains(" bin/rails test"))
+        .collect();
+    assert_eq!(procs.len(), 1, "one process for the project: {stderr}");
     assert!(
-        stderr.contains("bin/rails test test/lib/a_test.rb"),
+        procs[0].ends_with(
+            "bin/rails test test/controllers/d_test.rb test/lib/a_test.rb --seed 0 (exit 0)"
+        ),
         "{stderr}"
     );
     assert!(
-        stderr.contains("bin/rails test test/controllers/d_test.rb"),
-        "{stderr}"
+        stderr.contains("2 runs, "),
+        "both files ran in it: {stderr}"
     );
     assert!(!stderr.contains("b_test.rb"), "B must not run: {stderr}");
     assert!(
-        !fresh.join("db/test.sqlite3").exists(),
-        "the database is prepared in a temp dir"
+        fresh.join("db/test.sqlite3").exists(),
+        "the engine created the configured test database"
     );
     let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
     let skipped: BTreeSet<String> = log["skipped"]
@@ -1316,7 +1863,7 @@ fn rails_init_writes_the_rails_template() {
     );
     let toml = std::fs::read_to_string(dir.join("vci.toml")).unwrap();
     assert!(toml.contains("adapter = \"rails\""), "{toml}");
-    assert!(toml.contains("rails_allow_db = false"), "{toml}");
+    assert!(!toml.contains("rails_allow_db"), "removed in 1.4.0: {toml}");
     let signers = std::fs::read_to_string(dir.join(".vci/allowed_signers")).unwrap();
     assert!(signers.contains(&pubkey(&w.trusted)), "{signers}");
 }

@@ -301,7 +301,7 @@ class CollectorTest < Minitest::Test
     assert_equal "", meta["rails"]
   end
 
-  def test_sqlite_files_vci_did_not_prepare_taint
+  def test_sqlite_files_outside_the_test_database_taint
     begin
       require "sqlite3"
     rescue LoadError
@@ -321,6 +321,339 @@ class CollectorTest < Minitest::Test
     assert_includes t, "rails:sqlite-file:#{@repo}/data.sqlite3"
     refute_includes t, "ok.sqlite3"
     assert_includes t, "rails:sqlite-attach"
+  end
+
+  # config/database.yml as Rails reads it (Rails::Application::Configuration
+  # #database_configuration, which the collector hooks): the test
+  # environment's SQLite files are db/test.sqlite3 and, as in a Rails 8
+  # multi-database app, storage/test_cache.sqlite3.
+  RAILS_DB_CONFIG = <<~RUBY
+    module Rails
+      class Application
+        class Configuration
+          def database_configuration
+            { "test" => { "primary" => { "adapter" => "sqlite3", "database" => "db/test.sqlite3" },
+                          "cache" => { "adapter" => "sqlite3", "database" => "storage/test_cache.sqlite3" } },
+              "development" => { "adapter" => "sqlite3", "database" => "db/development.sqlite3" } }
+          end
+        end
+      end
+    end
+    Rails::Application::Configuration.new.database_configuration
+  RUBY
+
+  # The test environment's SQLite files and their -wal, -shm and -journal
+  # siblings are the test engine's database: no read, stat, probe or write
+  # of them is recorded and opening them is accepted; a listing of their
+  # directory leaves them out (exclude records). Any other SQLite file
+  # (another environment's, one elsewhere in the repository) is refused.
+  def test_test_database_files_are_not_inputs
+    begin
+      require "sqlite3"
+    rescue LoadError
+      skip "the sqlite3 gem is not installed for #{RUBY_VERSION}"
+    end
+    put("db/schema.rb", "# schema\n")
+    put("db/test.sqlite3-journal", "")
+    put("storage/.keep", "")
+    recs = collect(RAILS_DB_CONFIG + <<~RUBY, env: { "RAILS_ENV" => "test" })
+      require "sqlite3"
+      File.exist?("db/test.sqlite3")
+      File.exist?("storage/test_cache.sqlite3-wal")
+      db = SQLite3::Database.new("db/test.sqlite3")
+      db.execute("create table t (x)")
+      db.close
+      SQLite3::Database.new(File.expand_path("storage/test_cache.sqlite3")).close
+      File.size("db/test.sqlite3")
+      File.read("db/test.sqlite3")
+      File.exist?("db/test.sqlite3-journal")
+      File.write("db/test.sqlite3-wal", "")
+      File.delete("db/test.sqlite3-wal")
+      File.write("storage/test_cache.sqlite3-shm", "")
+      Dir.children("db")
+      Dir.children("storage")
+      File.read("db/schema.rb")
+      File.exist?("db/development.sqlite3")
+    RUBY
+    dbish = ->(p) { p.start_with?("db/test.sqlite3", "storage/test_cache.sqlite3") }
+    recs.each do |r|
+      next unless r["path"]
+      rel = r["path"].delete_prefix("#{@repo}/")
+      refute dbish.call(rel) && r["kind"] != "exclude", "recorded: #{r.inspect}"
+    end
+    excluded = paths(recs, "exclude").sort
+    want = %w[db/test.sqlite3 storage/test_cache.sqlite3].flat_map do |f|
+      ["", "-wal", "-shm", "-journal"].map { |x| "#{f}#{x}" }
+    end.sort
+    assert_equal want, excluded
+    assert_includes paths(recs, "readdir"), "db"
+    assert_includes paths(recs, "readdir"), "storage"
+    assert_includes paths(recs, "read"), "db/schema.rb"
+    assert_includes paths(recs, "probe"), "db/development.sqlite3", "not the test environment's"
+    assert_empty taints(recs).grep(/sqlite/)
+
+    # Any other SQLite file is still refused: another environment's, one
+    # elsewhere in the repository, and ATTACH.
+    recs = collect(RAILS_DB_CONFIG + <<~RUBY, env: { "RAILS_ENV" => "test" })
+      require "sqlite3"
+      SQLite3::Database.new("db/development.sqlite3").close
+      SQLite3::Database.new("db/other.sqlite3").close
+      db = SQLite3::Database.new("db/test.sqlite3")
+      begin
+        db.execute("ATTACH DATABASE 'db/other.sqlite3' AS o")
+      rescue SQLite3::Exception
+      end
+    RUBY
+    t = taints(recs).join("\n")
+    assert_includes t, "rails:sqlite-file:#{@repo}/db/development.sqlite3"
+    assert_includes t, "rails:sqlite-file:#{@repo}/db/other.sqlite3"
+    refute_includes t, "rails:sqlite-file:#{@repo}/db/test.sqlite3 "
+    assert_includes t, "rails:sqlite-attach"
+    # Without a test environment there is no configured database.
+    recs = collect(RAILS_DB_CONFIG + "require \"sqlite3\"\nSQLite3::Database.new(\"db/test.sqlite3\").close\n",
+                   env: { "RAILS_ENV" => "production" })
+    assert_includes taints(recs).join("\n"), "rails:sqlite-file:#{@repo}/db/test.sqlite3"
+  end
+
+  # Only ":memory:" (plain, or as a file: URI's path) and a file: URI whose
+  # last `mode` parameter is "memory" are in-memory databases (SQLite
+  # decodes %HH escapes first). Any other name opens a file, however much of
+  # it reads "mode=memory" or ":memory:": a file outside the test
+  # environment's databases is refused.
+  def test_sqlite_names_that_open_files_are_not_in_memory
+    begin
+      require "sqlite3"
+    rescue LoadError
+      skip "the sqlite3 gem is not installed for #{RUBY_VERSION}"
+    end
+    files = ["mode=memory.sqlite3", "data.sqlite3", "x.sqlite3", "y.sqlite3"]
+    recs = collect(<<~RUBY)
+      require "sqlite3"
+      #{files.inspect}.each { |f| SQLite3::Database.new(f).execute("create table t (x)") }
+      [
+        "mode=memory.sqlite3", "file:data.sqlite3?x=mode=memory", "file:x.sqlite3?mode=memory&mode=rw",
+        "file::memory:z", "file:da%74a.sqlite3", "file://localhost\#{Dir.pwd}/y.sqlite3",
+        ":memory:", "file::memory:", "file:w.sqlite3?mode=rw&mode=memory", "file:v.sqlite3?mode=%6Demory", ""
+      ].each { |n| SQLite3::Database.new(n).execute("select 1") }
+    RUBY
+    t = taints(recs)
+    [*files, ":memory:z"].each do |f|
+      assert t.any? { |x| x.start_with?("rails:sqlite-file:#{@repo}/#{f} ") }, "#{f} is a file: #{t.inspect}"
+    end
+    %w[w.sqlite3 v.sqlite3].each { |f| refute File.exist?(File.join(@repo, f)), "#{f} is in memory" }
+    assert_equal files.size + 1, t.grep(/rails:sqlite-file:/).size, t.inspect
+  end
+
+  # An entry of the test environment that is not a SQLite database (a YAML
+  # file under an entry Rails never opens, database_tasks: false): its reads
+  # and checks are recorded like any file's. A configured database that is
+  # absent or empty is SQLite's (nothing about it recorded but a read of its
+  # content).
+  def test_configured_files_that_are_not_sqlite_databases_are_inputs
+    put("data/ref.yml", "flag: on\n")
+    put("data/empty.sqlite3", "")
+    config = RAILS_DB_CONFIG.sub('"cache" => {', <<~RUBY.chomp)
+      "reference" => { "adapter" => "sqlite3", "database" => "data/ref.yml", "database_tasks" => false },
+                          "empty" => { "adapter" => "sqlite3", "database" => "data/empty.sqlite3" },
+                          "cache" => {
+    RUBY
+    recs = collect(config + <<~RUBY, env: { "RAILS_ENV" => "test" })
+      File.read("data/ref.yml")
+      File.exist?("data/ref.yml")
+      File.exist?("data/ref.yml-wal")
+      File.exist?("data/empty.sqlite3")
+      File.read("data/empty.sqlite3")
+      File.exist?("db/test.sqlite3")
+      File.read("db/test.sqlite3") rescue nil
+    RUBY
+    assert_includes paths(recs, "read"), "data/ref.yml"
+    assert_includes paths(recs, "stat"), "data/ref.yml"
+    assert_includes paths(recs, "probe"), "data/ref.yml-wal"
+    refute_includes paths(recs, "stat"), "data/empty.sqlite3"
+    assert_includes paths(recs, "read"), "data/empty.sqlite3", "a read of its content"
+    refute_includes paths(recs, "probe"), "db/test.sqlite3"
+  end
+
+  # Active Record connecting to a database server: accepted only for one of
+  # the test environment's databases (config/database.yml as Rails read it
+  # at boot). Another host, port or database through establish_connection,
+  # a raw client made through the adapter's new_client, and a client the
+  # test opens itself are refused. The servers here are closed ports: the
+  # check is made before connecting.
+  def test_active_record_server_connections_must_be_configured
+    skip "activerecord and mysql2 are not installed" unless installed?("activerecord") && installed?("mysql2")
+    db = <<~RUBY
+      module Rails
+        class Application
+          class Configuration
+            def database_configuration
+              { "test" => { "primary" => { "adapter" => "mysql2", "host" => "127.0.0.1", "port" => 1, "database" => "vci_test" },
+                            "replica" => { "adapter" => "mysql2", "host" => "127.0.0.1", "port" => 1, "database" => "vci_test", "replica" => true } },
+                "development" => { "adapter" => "mysql2", "host" => "127.0.0.1", "port" => 1, "database" => "vci_dev" } }
+            end
+          end
+        end
+      end
+      Rails::Application::Configuration.new.database_configuration
+      require "active_record"
+      require "mysql2"
+      class Other < ActiveRecord::Base
+        self.abstract_class = true
+      end
+      def try(config)
+        Other.establish_connection(config)
+        Other.connection.execute("select 1")
+      rescue ActiveRecord::ActiveRecordError, Mysql2::Error
+        nil
+      end
+    RUBY
+    run = lambda do |script|
+      taints(collect(db + script, env: { "RAILS_ENV" => "test" })).grep(/network:/)
+    end
+    assert_empty run.call("try(adapter: \"mysql2\", host: \"127.0.0.1\", port: 1, database: \"vci_test\")\n")
+    assert_empty run.call("try(ActiveRecord::DatabaseConfigurations.new(Rails::Application::Configuration.new.database_configuration)" \
+                          ".configs_for(env_name: \"test\").first)\n")
+    {
+      "try(adapter: \"mysql2\", host: \"127.0.0.1\", port: 1, database: \"other\")\n" => "127.0.0.1:1/other",
+      "try(adapter: \"mysql2\", host: \"127.0.0.1\", port: 2, database: \"vci_test\")\n" => "127.0.0.1:2/vci_test",
+      "try(adapter: \"mysql2\", host: \"127.0.0.1\", port: 1, database: \"vci_dev\")\n" => "127.0.0.1:1/vci_dev",
+      "ENV[\"DATABASE_URL\"] = \"mysql2://127.0.0.1:2/x\"\ntry(adapter: \"mysql2\", host: \"127.0.0.1\", port: 1, database: \"vci_test\")\n" =>
+        "DATABASE_URL",
+      "require \"active_record/connection_adapters/mysql2_adapter\"\n" \
+      "ActiveRecord::ConnectionAdapters::Mysql2Adapter.new_client(host: \"127.0.0.1\", port: 2) rescue nil\n" =>
+        "127.0.0.1:2/"
+    }.each do |script, where|
+      t = run.call(script)
+      assert t.any? { |x| x.start_with?("network:mysql2 (an Active Record connection to ") && x.include?(where) },
+             "#{script}: #{t.inspect}"
+    end
+    t = run.call("Mysql2::Client.new(host: \"127.0.0.1\", port: 1, database: \"vci_test\") rescue nil\n")
+    assert t.any? { |x| x.start_with?("network:mysql2 client") }, t.inspect
+    # A file of the repository under a path that reads like Active Record's.
+    put("lib/active_record/connection_adapters/sneaky.rb", "def sneaky = Mysql2::Client.new(host: \"127.0.0.1\", port: 2)\n")
+    t = run.call("require_relative \"lib/active_record/connection_adapters/sneaky\"\nsneaky rescue nil\n")
+    assert t.any? { |x| x.start_with?("network:mysql2 client") }, t.inspect
+  end
+
+  # PG: the target is what libpq would reach, from keywords, a connection
+  # string or URL alike; PG::Connection.new's own connect_start (with the
+  # addresses it resolved) is not checked again.
+  def test_active_record_postgresql_connections_must_be_configured
+    skip "activerecord and pg are not installed" unless installed?("activerecord") && installed?("pg")
+    db = <<~RUBY
+      module Rails
+        class Application
+          class Configuration
+            def database_configuration
+              { "test" => { "adapter" => "postgresql", "url" => "postgres://127.0.0.1:1/vci_test" } }
+            end
+          end
+        end
+      end
+      Rails::Application::Configuration.new.database_configuration
+      require "active_record"
+      require "pg"
+      def try(config)
+        ActiveRecord::Base.establish_connection(config)
+        ActiveRecord::Base.connection.execute("select 1")
+      rescue ActiveRecord::ActiveRecordError, PG::Error
+        nil
+      end
+    RUBY
+    run = ->(script) { taints(collect(db + script, env: { "RAILS_ENV" => "test" })).grep(/network:/) }
+    assert_empty run.call("try(:test)\n")
+    assert_empty run.call("try(adapter: \"postgresql\", host: \"127.0.0.1\", port: 1, database: \"vci_test\")\n")
+    t = run.call("try(adapter: \"postgresql\", url: \"postgres://127.0.0.1:1/other\")\n")
+    assert t.any? { |x| x.start_with?("network:postgresql (an Active Record connection to 127.0.0.1:1/other") }, t.inspect
+    t = run.call("PG.connect(\"postgres://127.0.0.1:1/vci_test\") rescue nil\n")
+    assert t.any? { |x| x.start_with?("network:postgresql client") }, t.inspect
+  end
+
+  # The schema files of every database of the test environment are inputs
+  # once Active Record is loaded, whether or not the process read them (on
+  # a fresh database `bin/rails db:test:prepare`, the engine's child, loads
+  # them): read when present, probed when absent. A database whose schema
+  # is not dumped (schema_dump: false) has none.
+  def test_schema_files_of_the_test_databases_are_inputs
+    skip "activerecord is not installed" unless installed?("activerecord")
+    put("db/schema.rb", "# schema\n")
+    config = RAILS_DB_CONFIG.sub('"cache" => {', <<~RUBY.chomp)
+      "queue" => { "adapter" => "sqlite3", "database" => "storage/test_queue.sqlite3", "schema_dump" => false },
+                          "cache" => {
+    RUBY
+    recs = collect(config + <<~RUBY, env: { "RAILS_ENV" => "test" })
+      require "active_record"
+      ActiveRecord::Base
+      ActiveRecord::Tasks::DatabaseTasks.db_dir = "db"
+    RUBY
+    assert_includes paths(recs, "read"), "db/schema.rb"
+    assert_includes paths(recs, "probe"), "db/cache_schema.rb"
+    refute recs.any? { |r| r["path"].to_s.include?("queue_schema") }, "schema_dump: false"
+    assert_empty taints(recs).grep(/schema-files/)
+    put("db/cache_schema.rb", "# cache\n")
+    recs = collect(config + "require \"active_record\"\nActiveRecord::Base\nActiveRecord::Tasks::DatabaseTasks.db_dir = \"db\"\n",
+                   env: { "RAILS_ENV" => "test" })
+    assert_includes paths(recs, "read"), "db/cache_schema.rb"
+    # Without Active Record: nothing.
+    recs = collect(config, env: { "RAILS_ENV" => "test" })
+    refute_includes paths(recs, "read"), "db/schema.rb"
+  end
+
+  # Active Record's schema maintenance (ActiveRecord::Migration.load_schema!,
+  # which maintain_test_schema! calls when the test database's schema is not
+  # current) runs `system("bin/rails db:test:prepare")` in Rails.root: that
+  # child is the engine's (not refused), and runs with VCI_RAILS_MODE=engine,
+  # where the collector does nothing. The same call from anywhere else (the
+  # test, a copy of migration.rb in the repository), another command, or the
+  # same command in another directory is refused.
+  def test_active_record_schema_maintenance_child_is_the_engines
+    gem_dir = File.join(@tmp, "gems", "activerecord-9.9.9")
+    migration = <<~RUBY
+      module ActiveRecord
+        class Migration
+          def self.load_schema!(root, cmd = "bin/rails db:test:prepare")
+            Dir.chdir(root) do
+              system(cmd)
+            end
+          end
+        end
+      end
+    RUBY
+    FileUtils.mkdir_p(File.join(gem_dir, "lib/active_record"))
+    File.write(File.join(gem_dir, "lib/active_record/migration.rb"), migration)
+    put("lib/active_record/migration.rb", migration.sub("module ActiveRecord", "module Fake"))
+    child = File.join(@tmpdir, "child.txt")
+    rails = "#!#{RbConfig.ruby}\nFile.write(ENV.fetch(\"VCI_TEST_CHILD_OUT\"), [ENV[\"VCI_RAILS_MODE\"], defined?(VciCollector).inspect].join(\" \"))\n"
+    elsewhere = File.join(@tmp, "elsewhere")
+    [@repo, elsewhere].each do |d|
+      FileUtils.mkdir_p(File.join(d, "bin"))
+      File.write(File.join(d, "bin/rails"), rails)
+      File.chmod(0o755, File.join(d, "bin/rails"))
+    end
+    setup = <<~RUBY
+      spec = Gem::Specification.new { |s| s.name = "activerecord"; s.version = "9.9.9" }
+      spec.instance_variable_set(:@full_gem_path, #{gem_dir.inspect})
+      Gem.loaded_specs["activerecord"] = spec
+      load #{File.join(gem_dir, "lib/active_record/migration.rb").inspect}
+    RUBY
+    env = { "VCI_TEST_CHILD_OUT" => child }
+    recs = collect(setup + "ActiveRecord::Migration.load_schema!(Dir.pwd)\n", env: env)
+    assert_equal "engine nil", File.read(child), "the child's collector did nothing"
+    refute_includes taints(recs).join("\n"), "process:"
+    assert recs.any? { |r| r["kind"] == "meta" }, "the parent's output is its own"
+
+    refused = lambda do |script, why|
+      File.delete(child) if File.exist?(child)
+      recs = collect(setup + script, env: env)
+      assert_includes taints(recs).join("\n"), "process:system", why
+      assert File.read(child).start_with?("collect "), "#{why}: the child runs with the collector as it is" if File.exist?(child)
+    end
+    refused.call("require_relative \"lib/active_record/migration\"\nFake::Migration.load_schema!(Dir.pwd)\n",
+                 "a copy of migration.rb that is not the activerecord gem's")
+    refused.call("ActiveRecord::Migration.load_schema!(#{elsewhere.inspect})\n", "another directory")
+    refused.call("ActiveRecord::Migration.load_schema!(Dir.pwd, \"bin/rails db:test:prepare; true\")\n",
+                 "another command")
+    refused.call("system(\"bin/rails db:test:prepare\")\n", "the test's own call")
   end
 
   # Under Bundler on Ruby 3.4, bundled_gems.rb redefines Kernel#require to

@@ -5,7 +5,7 @@ license: MIT
 compatibility: Needs the vci CLI (brew install pandelisz/tap/vci), git, ssh-keygen (OpenSSH 8.1+) and the project's test toolchain, on macOS or Linux.
 metadata:
   homepage: https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
-  vci-version: "1.3.0"
+  vci-version: "1.4.0"
 ---
 
 # vci: run tests once, prove it, let CI skip them
@@ -204,10 +204,10 @@ the base commit` (setup not merged yet), and the warning `no git-meta store ... 
 ## Refusals in one paragraph
 
 `vci run` will not attest a unit that failed, skipped, xfailed or filtered any test; started a child process; used
-the network or a database server; ran native code that can read files unseen; read the whole environment; wrote
-inside the repository; read outside the repository; or whose inputs changed during the run. These are by design:
-the unit simply runs in CI. Explain the reason to the user instead of working around it. Details and fixes per
-message: [references/refusals.md](references/refusals.md).
+the network or a database client of its own (the test environment's database is fine); ran native code that can read
+files unseen; read the whole environment; wrote inside the repository; read outside the repository; or whose inputs
+changed during the run. These are by design: the unit simply runs in CI. Explain the reason to the user instead of
+working around it. Details and fixes per message: [references/refusals.md](references/refusals.md).
 
 ## Per-runner notes
 
@@ -225,7 +225,9 @@ Short version (details in [references/runners.md](references/runners.md)):
   elsewhere must be declared under `[[inputs]]` (a vci.toml change for the user). Exact rustc/cargo via rustup and
   `rust-toolchain.toml` (Homebrew's rustc never matches a rustup runner). Each unit is rebuilt: slower than
   `cargo test`.
-- **Rails (Minitest/RSpec)**: files only; fresh SQLite database per file; exact Ruby patchlevel; `Gemfile.lock` with
+- **Rails (Minitest/RSpec)**: files only, run one at a time (`vci ci` runs the rest in one process); vci does not
+  manage the test database: Rails sets it up, its contents are not an input, and SQLite or a server needs no policy
+  (`rails_allow_db` was removed in 1.4.0; a leftover key only warns). Exact Ruby patchlevel; `Gemfile.lock` with
   `x86_64-linux`; `gem "tzinfo-data"`; `TZ=UTC` declared and set (`TZ=UTC vci run ...`); UTF-8 locale on both sides;
   `config.eager_load = false` (not `ENV["CI"].present?`). Changing `Gemfile.lock`, `config/**` or `spec/support`
   affects everything. libvips (Active Storage) is matched by file hash, so macOS attestations never skip on Linux
@@ -244,7 +246,7 @@ Short version (details in [references/runners.md](references/runners.md)):
    unless the user explicitly asks; changes there only take effect on the default branch, which the user merges.
 4. **Never weaken policy** without the user: do not change `platform`, `libraries`, `platform_overrides`,
    `never_skip`, `no_skip_refs`, `no_skip_refs_except` (never add your own principal), `max_ttl`, `allow_dirty`,
-   `go_allow_net`, `rails_allow_db`, `[env]` mode or declarations, or `[[inputs]]`. Propose the change and let the
+   `go_allow_net`, `[env]` mode or declarations, or `[[inputs]]`. Propose the change and let the
    user decide.
 5. **Never change the CI wiring to skip more**: do not alter `base-ref`, switch to `pull_request_target`, unpin the
    action, or build vci from the PR checkout.

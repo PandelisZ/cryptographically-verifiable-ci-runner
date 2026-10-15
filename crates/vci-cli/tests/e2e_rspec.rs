@@ -556,9 +556,11 @@ fn rspec_end_to_end_verification_steps() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
 
-    // Step 1: attest B, then plan: skip B; run A, C, D. The database was
-    // prepared fresh in a temp dir, and the example status file
-    // (spec_helper sets spec/examples.txt) was never written.
+    // Step 1: attest B, then plan: skip B; run A, C, D. The test database
+    // is the configured one (rails_helper's maintain_test_schema! created it
+    // through `bin/rails db:test:prepare`, Active Record's child process,
+    // which is not refused), and the example status file (spec_helper sets
+    // spec/examples.txt) was never written.
     let out = w.run(&work, &[B], &w.trusted);
     assert!(out.contains("3 examples, 0 failures"), "{out}");
     assert!(
@@ -569,7 +571,7 @@ fn rspec_end_to_end_verification_steps() {
     assert_eq!(p.skip, set(&[B]), "step 1");
     assert_eq!(p.run, set(&[A, C, D]), "step 1");
     assert!(!p.run_all);
-    assert!(!work.join("db/test.sqlite3").exists());
+    assert!(work.join("db/test.sqlite3").exists());
     assert!(!work.join("spec/examples.txt").exists());
     // The runner is in the attestation: argv and the toolchain.
     let stored = AttestStore::new(&store_for(&work)).list(Some(B)).unwrap();
@@ -612,6 +614,32 @@ fn rspec_end_to_end_verification_steps() {
         "{}",
         st["predicate"]["result"]
     );
+    // The database is not an input: no manifest entry names it, its
+    // siblings or a SQLite file in storage/, and rows written into it
+    // behind the tests' back change no verdict (vci 1.4.0).
+    assert_eq!(st["predicate"]["toolchain"]["rubyDb"], "sqlite3");
+    for m in ["manifest", "globalManifest"] {
+        for e in st["predicate"][m]["entries"].as_array().unwrap() {
+            let p = e["path"].as_str().unwrap();
+            assert!(
+                !(p.starts_with("db/test.sqlite3")
+                    || (p.starts_with("storage/") && p.contains(".sqlite3"))),
+                "{m}: {p}"
+            );
+        }
+    }
+    let out = w.ruby_cmd(
+        &work,
+        "bundle",
+        &[
+            "exec",
+            "ruby",
+            "-e",
+            "require \"sqlite3\"; db = SQLite3::Database.new(\"db/test.sqlite3\"); db.execute(\"INSERT INTO gadgets (name) VALUES ('stray')\"); db.execute(\"INSERT INTO widgets (name, size, created_at, updated_at) VALUES ('x', 1, '2026-01-01', '2026-01-01')\"); db.close",
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(w.plan(&work, "main").skip, set(&[B]), "step 1: rows");
 
     // Step 2: edit the factory -> B runs; explain names the file.
     let factory = w.read("spec/factories/gadgets.rb");
@@ -1255,10 +1283,11 @@ fn rspec_cleared_or_swallowed_failures_are_refused() {
     }
 }
 
-/// A pending migration: rails_helper's `maintain_test_schema!` finds it
-/// against the schema vci loaded (it never shells out to `bin/rails
-/// db:test:prepare`, which would refuse the file) and aborts; refused, and
-/// nothing is written in db/.
+/// A pending migration: rails_helper's `maintain_test_schema!` loads the
+/// schema into the configured database (`bin/rails db:test:prepare`, Active
+/// Record's own child process: not refused), finds the migration pending and
+/// aborts; refused as a failure. Nothing but the test database is written
+/// in db/.
 #[test]
 fn rspec_pending_migration_is_refused() {
     let Some(w) = World::new() else { return };
@@ -1272,19 +1301,21 @@ fn rspec_pending_migration_is_refused() {
     let line = refusal(&stderr, B);
     assert!(line.contains("result failed"), "{line}");
     assert!(
-        !line.contains("process:system"),
-        "no db:test:prepare child: {line}"
+        !line.contains("process:"),
+        "the db:test:prepare child is the engine's: {line}"
     );
     assert!(stderr.contains("Migrations are pending"), "{stderr}");
     let db: Vec<String> = std::fs::read_dir(work.join("db"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with("test.sqlite3"))
         .collect();
     assert_eq!(
         db.into_iter().collect::<BTreeSet<_>>(),
         set(&["migrate", "schema.rb"]),
-        "nothing written in db/"
+        "nothing but the test database written in db/"
     );
+    assert!(work.join("db/test.sqlite3").exists());
 }
 
 /// `config.example_status_persistence_file_path` (spec_helper sets
@@ -1462,8 +1493,9 @@ fn rspec_push_fetch_fresh_clone_and_ci() {
     w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
     assert_eq!(w.plan(&fresh, "main"), before, "same plan after fetch");
 
-    // `vci ci` runs only A and D, each in its own RSpec process with
-    // `--options .rspec` and a fresh database, and writes an audit log.
+    // `vci ci` runs only A and D, in one RSpec process (the engine's own
+    // way: they share the test database) with `--options .rspec`, and
+    // writes an audit log.
     let audit = w.base.join("audit.json");
     let home = w.base.join("cihome");
     std::fs::create_dir_all(&home).unwrap();
@@ -1483,16 +1515,17 @@ fn rspec_push_fetch_fresh_clone_and_ci() {
     assert_eq!(out.status.code(), Some(0));
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     assert!(stderr.contains("running 2 test file(s)"), "{stderr}");
+    let procs: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("vci: ") && l.contains("--options .rspec"))
+        .collect();
+    assert_eq!(procs.len(), 1, "one process for the project: {stderr}");
     assert!(
-        stderr.contains("--options .rspec spec/lib/a_spec.rb (exit 0)"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("--options .rspec spec/requests/d_spec.rb (exit 0)"),
+        procs[0].ends_with("--options .rspec spec/lib/a_spec.rb spec/requests/d_spec.rb (exit 0)"),
         "{stderr}"
     );
     assert!(!stderr.contains("b_spec.rb"), "B must not run: {stderr}");
-    assert!(!fresh.join("db/test.sqlite3").exists());
+    assert!(fresh.join("db/test.sqlite3").exists());
     assert!(!fresh.join("spec/examples.txt").exists());
     let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
     let skipped: BTreeSet<String> = log["skipped"]
@@ -1593,12 +1626,13 @@ fn rails_minitest_and_rspec_projects_in_one_repository() {
     let out = w.vci(&work, &["ci", "--base-ref", "main"]);
     assert_eq!(out.status.code(), Some(0));
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    // One process per project, each with its project's remainder.
     assert!(
-        stderr.contains("bin/rails test test/lib/a_test.rb"),
+        stderr.contains("bin/rails test test/controllers/d_test.rb test/lib/a_test.rb --seed 0"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("--options .rspec spec/lib/a_spec.rb"),
+        stderr.contains("--options .rspec spec/lib/a_spec.rb spec/requests/d_spec.rb"),
         "{stderr}"
     );
     assert!(

@@ -112,6 +112,7 @@
 <li><strong>A signer under-declaring inputs</strong>: CI re-hashes only the inputs the attestation lists.</li>
 <li><strong>Inputs the collectors cannot see</strong>: native addons, time, locale, randomness, hardware, network use outside the patched Node APIs.</li>
 <li><strong>Data captured before the collectors loaded</strong>, and the user and groups tests run as (only root or not is recorded).</li>
+<li><strong>What a Rails test database holds</strong>: the database is the test engine's, and its contents are not an input. A Rails attestation does not show that the test was independent of rows left behind; it shows what CI shows, that the test passed on a database the engine set up.</li>
 <li><strong>Test code that deliberately evades the collectors.</strong></li>
 <li><strong>Malicious dependencies that match the lockfile</strong>: packages are identified by version, not by file hashes.</li>
 <li><strong>Third-party Vite plugins reading files</strong> in the main process: only their package version is an input.</li>

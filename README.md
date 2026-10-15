@@ -137,7 +137,7 @@ CI can attest its own runs too. Give the action a signing key of its own, kept a
 | `cargo` | test target (`crates/x#lib`, `#test:name`) | conservative: every file of the crate and its in-repo dependencies |
 | `rails` | Minitest or RSpec file | a Ruby collector wrapping file, env and process entry points |
 
-Each adapter runs every unit in its own process, prepares fresh state (for Rails, a fresh database from the schema), and refuses to attest a unit whose test was skipped, failed, or did something the collector cannot follow. Toolchain versions must match between the machine that attested and CI; the docs say what to pin for each runner.
+Each adapter runs every unit in its own process, prepares fresh state (vci does not manage a Rails test database: Rails sets it up as in a plain `bin/rails test`, and what it holds is not an input), and refuses to attest a unit whose test was skipped, failed, or did something the collector cannot follow. Toolchain versions must match between the machine that attested and CI; the docs say what to pin for each runner.
 
 ## How a skip is decided
 

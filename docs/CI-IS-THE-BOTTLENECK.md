@@ -97,7 +97,7 @@ vci records what a test *did*. The adapters hook the runner at run time:
 | pytest | test file | `sys.addaudithook` plus the import system; one process per file |
 | Go | package | a logger overlaid into the standard library for the test build, so it sees package init too |
 | Cargo | test target | no runtime hook exists, so every file of the crate and its in-repo deps counts (weaker, and documented) |
-| Rails, RSpec | test file | a Ruby collector wrapping file, env and process entry points; a fresh SQLite database per file |
+| Rails, RSpec | test file | a Ruby collector wrapping file, env and process entry points; the test database is the engine's |
 
 A fixture read with `open()`, a template rendered on demand, a module loaded by name, a file that was looked for and
 not found: all recorded, all hashed. Each unit runs in its own process. Anything the collector cannot follow (a child

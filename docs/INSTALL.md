@@ -157,7 +157,8 @@ How inputs are found differs by adapter:
   dependencies as an input; files read from elsewhere in the repository must be declared. See "What the cargo
   adapter can and cannot see" in [the reference](REFERENCE.md).
 - **Ruby** has no audit hook either. The Rails adapter's collector wraps Ruby's file, directory, environment, require
-  and process entry points, and prepares a fresh database from the schema for every file. See "Quick start (Rails)"
+  and process entry points; the test database is the engine's (Rails sets it up as in a plain `bin/rails test`, and its
+  contents are not an input). See "Quick start (Rails)"
   and "Quick start (RSpec)" in [the reference](REFERENCE.md) for what that covers and what it refuses.
 
 ## Daily use

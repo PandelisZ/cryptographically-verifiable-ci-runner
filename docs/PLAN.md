@@ -154,10 +154,10 @@ Automated as an `assert_cmd` integration test using throwaway SSH keys generated
   source checks refuse processes, sockets, native code and undeclared reads (a weaker guarantee than the observed-input
   adapters, documented in the README). The Rails adapter (`crates/vci-adapter/src/rails.rs`, collector in
   `ruby/vci-collector`, findings in `docs/spike-rails.md`) attests Minitest test files, one `bin/rails test <file>`
-  process each: a plain-Ruby collector loaded through `RUBYOPT` wraps Ruby's file, directory, `ENV`, require and
+  process each, one at a time: a plain-Ruby collector loaded through `RUBYOPT` wraps Ruby's file, directory, `ENV`, require and
   process entry points (Ruby has no audit hook), records Zeitwerk's directory listings and the loaded gems (checked
-  against their cached archives), and redirects the test environment's SQLite databases to fresh files loaded from the
-  schema for every file; database servers need `policy.rails_allow_db`.
+  against their cached archives), and leaves the test database to the engine (since 1.4.0: the configured databases are
+  used as they are, their contents are not an input, and `policy.rails_allow_db` is gone).
 
 ## Environment variables
 

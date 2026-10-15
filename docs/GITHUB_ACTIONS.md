@@ -114,12 +114,20 @@ locally), then:
 - `bundler-cache` installs the gems inside the repository (`vendor/bundle`). That bundle is handled like one installed
   anywhere else: its gems are externals by version and nothing under `vendor/bundle` is an input. Collector 0.4.1
   refused every file there with `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0`.
-- `vci ci` runs each remaining Minitest file in its own `bin/rails test <file>`, and each remaining RSpec file in its
-  own `rspec --options .rspec <file>`, with a fresh SQLite database loaded from `db/schema.rb`.
+- `vci ci` runs the remaining Minitest files in one `bin/rails test <files> --seed 0`, and the remaining RSpec files in
+  one `rspec --options .rspec <files>`, on the database `config/database.yml` configures for the test environment (the
+  engine sets it up: `maintain_test_schema!` creates `db/test.sqlite3` on a fresh checkout). Its contents are never an
+  input.
 - RSpec reads only the repository's `.rspec`. `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` and `.rspec-local` are
   never read, on the runner or the laptop. `SPEC_OPTS` reaches RSpec only if declared in `[env] global` (then set it
   to the same value on both sides).
-- A database server needs `policy.rails_allow_db = true` and a service container (see [the reference](REFERENCE.md)).
+- The job needs the same database service it always needed, and nothing vci-specific. SQLite needs no step. A
+  database server (MySQL, PostgreSQL) needs no policy: run the same adapter as a service container, with the host, port
+  and database `config/database.yml` names for the test environment (the same as where you attest), and create the
+  test database before the tests as a plain Rails CI job does (`bin/rails db:test:prepare`). vci never prepares,
+  purges or reads what the database holds; its contents are not an input. `policy.rails_allow_db` was removed in
+  1.4.0: a base `vci.toml` that still sets it parses, with a warning (see "vci does not manage the database" in
+  [the reference](REFERENCE.md#vci-does-not-manage-the-database-read-this)).
 - Full example: [`examples/github-actions-rails.yml`](../examples/github-actions-rails.yml).
 
 **Several languages in one job.** Set up every toolchain, then call the action once. This repository's own

@@ -41,9 +41,9 @@ pub use pytest::{
     PytestAdapter, UV_ENV, UV_RUN_ARGS, find_py_plugin, pytest_jobs,
 };
 pub use rails::{
-    RAILS_GLOBAL_FILES, RAILS_HASHED_ENV, RAILS_NETWORK_DB_TAINT, RAILS_PASS_THROUGH,
-    RAILS_RUN_VARS, RAILS_SCRATCH_DIRS, RAILS_SEED, RSPEC_GLOBAL_FILES, RUBY_BIN_ENV,
-    RUBY_COLLECTOR_ENV, RailsAdapter, RailsRunner, find_ruby_collector,
+    RAILS_GLOBAL_FILES, RAILS_HASHED_ENV, RAILS_PASS_THROUGH, RAILS_RUN_VARS, RAILS_SCRATCH_DIRS,
+    RAILS_SEED, RSPEC_GLOBAL_FILES, RUBY_BIN_ENV, RUBY_COLLECTOR_ENV, RailsAdapter, RailsRunner,
+    find_ruby_collector,
 };
 pub use vitest::{JS_PLUGIN_ENV, VitestAdapter, find_js_plugin};
 
@@ -53,9 +53,6 @@ pub const ADAPTERS: &[&str] = &["vitest", "pytest", "go", "cargo", "rails", "nod
 /// Policy settings that change how an adapter runs tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdapterOptions {
-    /// `policy.rails_allow_db`: database servers are prepared fresh from the
-    /// schema for every test file (and their refusal is waived).
-    pub rails_allow_db: bool,
     /// Rails: the project's `runner` setting (`None`: detected from the
     /// project, see `RailsAdapter`).
     pub rails_runner: Option<RailsRunner>,
@@ -84,9 +81,7 @@ pub fn adapter_for_with(
         "go" => Ok(Box::new(GoAdapter::new(project_dir))),
         "cargo" => Ok(Box::new(CargoAdapter::new(project_dir))),
         "rails" => Ok(Box::new(
-            RailsAdapter::new(project_dir)
-                .with_allow_db(opts.rails_allow_db)
-                .with_runner(opts.rails_runner),
+            RailsAdapter::new(project_dir).with_runner(opts.rails_runner),
         )),
         "node-test" => Ok(Box::new(
             NodeTestAdapter::new(project_dir).with_options(opts.node_test.clone()),
@@ -174,8 +169,9 @@ pub struct ToolVersions {
     pub ruby_bundler: String,
     /// Rails: libraries tests depend on (`sqlite=...;yaml=...;tz=...;encoding=...`).
     pub ruby_libs: String,
-    /// Rails: database adapters of the test environment (`sqlite3`, or
-    /// `postgresql <server version>` with `policy.rails_allow_db`).
+    /// Rails: the adapter names of the test environment's databases, sorted
+    /// and joined with `;` (`sqlite3`, `mysql2`, `postgresql;sqlite3`); no
+    /// server version.
     pub ruby_db: String,
     /// Rails: every gem of the resolved bundle, sorted `name==version`.
     pub ruby_gems: Vec<String>,

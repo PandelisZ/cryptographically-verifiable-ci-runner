@@ -51,7 +51,7 @@ pub struct Toolchain {                  // adapter-specific; unused fields are e
     pub rails: String, pub bundler: String,      // Rails: Rails and Bundler versions
     pub ruby_test: String,            // Rails: "minitest 6.0.6" (+ "; rspec-core 3.13.6, rspec-expectations ..., rspec-mocks ..., rspec-rails ..., rspec-support ..." when the bundle has RSpec)
     pub ruby_libs: String,            // Rails: "sqlite=<ver>;yaml=<ver>;tz=<tzinfo-data|zoneinfo ver>;encoding=<ext>/<int>;collector=<ver>" (under the base policy's libraries = "any", vci plan drops the sqlite, yaml and tz items before comparing)
-    pub ruby_db: String,              // Rails: "sqlite3", or "<adapter> <server version>" with policy.rails_allow_db
+    pub ruby_db: String,              // Rails: the test environment's adapter names, sorted, ";"-joined ("sqlite3", "mysql2", "postgresql;sqlite3"); no server version (before 1.4.0 also "<adapter> <server version>")
     pub ruby_gems: Vec<String>,       // Rails: the resolved bundle, sorted "name==version" (no platform)
     pub superuser: bool,              // every adapter: the tests ran as root (effective uid 0); compared exactly unless the base policy sets allow_superuser_mismatch; omitted when false
     pub os: String, pub arch: String,
@@ -192,7 +192,7 @@ pub struct ToolVersions { pub node: String, pub runner: String, pub bundler: Str
                          pub cargo: String, pub rust_host: String, pub rust_cfg: Vec<String> /* Cargo; runner = rustc */,
                          pub ruby: String, pub ruby_engine: String, pub rails: String, pub ruby_bundler: String,
                          pub ruby_libs: String, pub ruby_db: String, pub ruby_gems: Vec<String> /* Rails; runner = "minitest <ver>[; rspec-core <ver>, ...]" */ }
-pub struct AdapterOptions { pub rails_allow_db: bool, pub rails_runner: Option<RailsRunner>, pub node_test: NodeTestOptions }   // settings that change how an adapter runs tests (Clone, not Copy)
+pub struct AdapterOptions { pub rails_runner: Option<RailsRunner>, pub node_test: NodeTestOptions }   // settings that change how an adapter runs tests (Clone, not Copy)
 pub struct NodeTestOptions { pub test_script: Option<String>, pub test_globs: Option<Vec<String>>, pub node_args: Option<Vec<String>> }   // vci.toml keys of a node-test project
 pub enum RailsRunner { Minitest, Rspec }   // vci.toml `runner` ("minitest" | "rspec") of a rails project
 pub type InstalledExternals = BTreeMap<String, Vec<String>>;   // PEP 503 name -> installed versions
@@ -241,7 +241,7 @@ pub struct GoAdapter;      // GoAdapter::new(project_dir); `go` from $VCI_GO
 pub struct CargoAdapter;   // CargoAdapter::new(project_dir); `cargo` from $VCI_CARGO
 pub fn adapter_for(name: &str, project_dir: &Utf8Path) -> Result<Box<dyn Adapter>, AdapterError>; // "vitest" | "pytest" | "go" | "cargo" | "rails" | "node-test"
 pub fn adapter_for_with(name: &str, project_dir: &Utf8Path, opts: &AdapterOptions) -> Result<Box<dyn Adapter>, AdapterError>;
-pub struct RailsAdapter;   // RailsAdapter::new(project_dir).with_collector(dir).with_allow_db(bool).with_runner(Option<RailsRunner>); `ruby` from $VCI_RUBY
+pub struct RailsAdapter;   // RailsAdapter::new(project_dir).with_collector(dir).with_runner(Option<RailsRunner>); `ruby` from $VCI_RUBY
 pub fn find_ruby_collector(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_RUBY_COLLECTOR, else ruby/vci-collector near the exe / build checkout / project
 pub const PYTEST_CONFIG_NAMES: &[&str];   // pytest.toml, .pytest.toml, pytest.ini, .pytest.ini, pyproject.toml, tox.ini, setup.cfg
 pub const PYTEST_PASS_THROUGH: &[&str];   // UV, UV_*, VIRTUAL_ENV, PYTHONPATH, XDG_*_HOME, SSL_CERT_*, *_PROXY
@@ -255,7 +255,6 @@ pub const CARGO_UNDECLARED_TAINT: &str;  // "cargo:undeclared-reads" (waived by 
 pub const RAILS_PASS_THROUGH: &[&str];   // GEM_HOME, GEM_PATH, BUNDLE_PATH and Bundler's location/install settings, MISE_*, RBENV_*, ...
 pub const RAILS_HASHED_ENV: &[&str];     // RUBY*, RAILS_*, RACK_*, BUNDLE_*, BUNDLER_*, GEM_*, DATABASE_URL, MT_*, ... minus pass-through and vci-set
 pub const RAILS_RUN_VARS: &[&str];       // RUBYOPT, RAILS_ENV, RACK_ENV, BUNDLE_GEMFILE, PARALLEL_WORKERS, DISABLE_SPRING, DISABLE_BOOTSNAP
-pub const RAILS_NETWORK_DB_TAINT: &str;  // "rails:network-db:" (the only taint policy.rails_allow_db waives)
 pub const RAILS_SCRATCH_DIRS: &[&str];   // log, tmp, storage, coverage (git-ignored writes there are allowed)
 pub const RAILS_GLOBAL_FILES: &[&str];   // Gemfile, Gemfile.lock, gems.rb, gems.locked, .ruby-version, ..., config/application.rb, bin/rails, test/test_helper.rb
 pub const RSPEC_GLOBAL_FILES: &[&str];   // .rspec (RSpec files: RAILS_GLOBAL_FILES without test/test_helper.rb, plus these)
@@ -406,13 +405,17 @@ probe only sets up the bundle and the Rails version may be empty.
 
 Every Ruby process runs `ruby <args>` (`$VCI_RUBY`, default `ruby`) with cwd = project dir, the child env applied,
 `RUBYLIB` removed, and `RUBYOPT=-r<collector>/vci_collector.rb`, `VCI_RAILS_MODE`, `VCI_RAILS_RUNNER=minitest|rspec`,
-`VCI_ROOT` (project), `VCI_REPO` (nearest ancestor with `.git`), `VCI_DB_DIR` and `TMPDIR` (fresh dirs),
+`VCI_ROOT` (project), `VCI_REPO` (nearest ancestor with `.git`), `TMPDIR` (a fresh dir),
 `RAILS_ENV=test`, `RACK_ENV=test`, `PARALLEL_WORKERS=1`, `DISABLE_SPRING=1`, `DISABLE_BOOTSNAP=1`,
-`BUNDLE_GEMFILE=<project>/Gemfile` (or `gems.rb`), `VCI_RAILS_ALLOW_DB=0|1`:
+`BUNDLE_GEMFILE=<project>/Gemfile` (or `gems.rb`). The test database is the one `config/database.yml` configures,
+used as it is (vci neither redirects nor prepares it; since 1.4.0). A child process of Active Record's schema
+maintenance (`ActiveRecord::Migration.load_schema!` in the bundle's activerecord gem running `bin/rails
+db:test:prepare`) is started with `VCI_RAILS_MODE=engine`, in which the collector does nothing:
 
 - `tool_versions_with_env` / `installed_externals` (cached): `ruby -e 'require File.expand_path("config/environment")'`
   (plain Ruby: `require "bundler/setup"`) in mode `probe`; the collector prints `VCI-PROBE {ruby, engine, rails,
-  bundler, runner, platform, libs, db, gems: [{name, version, platform, source}], gemfile, taints}` at exit. Taints
+  bundler, runner, platform, libs, db, gems: [{name, version, platform, source}], gemfile, taints}` at exit (`db`: the
+  adapter names of Active Record's test configurations, sorted and `;`-joined; it becomes `ruby_db`). Taints
   (Bootsnap/Spring active, another Gemfile, load path entries outside the repository/bundle/Ruby) or a Gemfile other
   than the project's are errors. `runner` names the bundle's test frameworks from its specs (`minitest <ver>`, and
   `rspec-core <ver>, rspec-expectations <ver>, ...` when RSpec is in the bundle), the same in every process.
@@ -421,12 +424,13 @@ Every Ruby process runs `ruby <args>` (`$VCI_RUBY`, default `ruby`) with cwd = p
   `ConfigurationOptions` configure `RSpec.configuration` (default path, pattern, exclude pattern; `.rspec`'s
   `--require`s are loaded) and the collector prints `VCI-RSPEC-LIST {files: [<abs>...], defaultPath, pattern,
   excludePattern}`. A file outside the project dir, or a load error, is an error.
-- `run_collect`: per file (`$VCI_JOBS` at a time, default CPUs up to 8, 1 with `rails_allow_db`), mode `collect`,
+- `run_collect`: per file, one at a time (the files share the test database), mode `collect`,
   `VCI_OUT=<fresh>`, `VCI_TEST_ID=<project-relative file>`: Minitest `ruby bin/rails test <file> --seed 0`; RSpec
   `ruby -e 'require "bundler/setup"; require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke' -- --options
   .rspec <file>` (`RSPEC_RUN_SCRIPT`, `RSPEC_ARGS`).
-- `run_plain`: the same per file in mode `plain` (no output); without files the whole suite, one process per runner
-  (`ruby bin/rails test --seed 0`, the RSpec command without a file).
+- `run_plain`: mode `plain` (no output), one process per runner for all the given files, one after the other
+  (`ruby bin/rails test <files> --seed 0`, the RSpec command with `<files>`); without files the whole suite, one
+  process per runner (`ruby bin/rails test --seed 0`, the RSpec command without a file).
 - `canonical_argv`: Minitest `["rails", "test", "--root", <project dir>, "--seed", "0", <file>]`; RSpec `["rails",
   "rspec", "--root", <project dir>, "--options", ".rspec", "--default-seed", "0", <file>]` (a file whose runner cannot
   be decided gets `["rails", "undecided-runner", ...]`, which no attestation has); `config_candidates`:
@@ -436,7 +440,9 @@ Every Ruby process runs `ruby <args>` (`$VCI_RUBY`, default `ruby`) with cwd = p
 
 Collector records (`docs/spike-rails.md`): `meta` has `adapter: "rails"`, `ruby`, `engine`, `rails`, `bundler`,
 `runner`, `platform`, `db`, `tz`, `collector`; `module` (every Ruby file compiled from disk, loaded native extensions),
-`read`, `probe`, `stat`, `readdir`, `write` (inside the repository), `external` (`name`, `version` incl. `git <rev>`
+`read`, `probe`, `stat`, `readdir`, `write` (inside the repository), `exclude` (a test environment's SQLite file or its
+`-wal`/`-shm`/`-journal` sibling in a directory whose listing is recorded: never an input, left out of that listing;
+no other record ever names those files), `external` (`name`, `version` incl. `git <rev>`
 for git sources, plus `platform` and `source`, which the parser ignores), `env` (`where` is informational; key `*` =
 enumerated), `taint`, `result`. Minitest `result`: `state` is `passed` only with exit status 0, at least one test, no
 failure, error or skip and at least one assertion in every test; also `no-tests`, `no-assertions`, `failed`; extra
@@ -452,8 +458,11 @@ least one example run, none failed, pending or skipped and every declared exampl
 `rails:code-statistics:...`. `exitStatus` is the status the process leaves with, read from `$!` as the collector's
 `at_exit` handler (the last one to run) starts; a non-zero one after a clean framework report adds the taint
 `vci:process-exit:<status>`, and `RailsAdapter::run_one` adds the same taint to a `passed` result whenever the child's
-exit code is not 0 (or it died from a signal). The CLI allows `write` records only for git-ignored paths under the project's `RAILS_SCRATCH_DIRS`, and waives
-`rails:network-db:` taints when `policy.rails_allow_db` (recorded in `waived`).
+exit code is not 0 (or it died from a signal). The CLI allows `write` records only for git-ignored paths under the
+project's `RAILS_SCRATCH_DIRS`. Database taints: `rails:sqlite-file:<path>` (a SQLite file other than the test
+environment's configured ones or one in vci's temp dir), `rails:sqlite-attach`, `rails:sqlite-load-extension`,
+`network:<mysql2|postgresql|trilogy> client` (a client the test opened itself; Active Record's connections are
+accepted). No Rails taint is waivable (`policy.rails_allow_db`, removed in 1.4.0, still parses and has no effect).
 
 ## vci-cli predicate and storage
 
@@ -462,8 +471,10 @@ relative), `runnerProject` (Vitest project name), `projectName` (the `[[projects
 single-project form), and for Go `platformSpecific` (repository files built only for some GOOS/GOARCH, or whose
 code refers to `GOOS`/`GOARCH`: the attestation then needs the same OS and architecture), `archSpecific` (why the
 results may differ on another architecture, i.e. floating-point code in a non-standard package of the closure: the
-attestation then needs the same architecture) and `waived` (refusals waived by `policy.go_allow_net`, or for Rails by
-`policy.rails_allow_db`, which the base policy must still waive), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
+attestation then needs the same architecture) and `waived` (refusals waived by `policy.go_allow_net`, or for Cargo by
+declared `[[inputs]]`, which the base policy must still waive; Rails writes none since 1.4.0, and an old envelope's
+`rails:network-db:` entry, written under the removed `policy.rails_allow_db`, is still deserialised and never
+accepted), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
 host's cfg set), and for every adapter `declaredInputs` (the `[[inputs]] extra` globs of the test id, which must equal
 the base config's); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
 `input_root` is the per-file manifest root; `global_input_root` is the per-file global manifest root (lockfiles,

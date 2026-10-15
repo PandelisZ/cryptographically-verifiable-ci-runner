@@ -21,6 +21,11 @@ use crate::util::{glob_match, now_unix, parse_rfc3339};
 /// Allowed clock skew for `issued_at` in the future.
 const CLOCK_SKEW_SECS: i64 = 300;
 
+/// Prefix of the refusal `policy.rails_allow_db` waived before vci 1.4.0 (a
+/// Rails test database server), as recorded in an attestation's `waived`.
+/// Such an attestation is never accepted now.
+const LEGACY_RAILS_NETWORK_DB_WAIVER: &str = "rails:network-db:";
+
 /// One failed check, with expected vs actual for `explain`.
 ///
 /// Convention for every check: `expected` is what the attestation recorded or
@@ -376,6 +381,10 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             return Ok(fallback_listing(res, repo, root));
         }
     };
+    if let Some(w) = config.removed_keys_warning(&format!("{CONFIG_FILE} at the base commit")) {
+        eprintln!("vci: warning: {w}");
+        res.warnings.push(w);
+    }
     let allowed = match repo.show_file(&base, ALLOWED_SIGNERS_FILE) {
         Ok(Some(bytes)) => match std::str::from_utf8(&bytes)
             .map_err(|e| e.to_string())
@@ -1015,10 +1024,13 @@ impl Verifier<'_> {
                     !declared.is_empty(),
                     "no [[inputs]] declared for this unit in the base vci.toml",
                 )
-            } else if w.starts_with(vci_adapter::RAILS_NETWORK_DB_TAINT) {
+            } else if w.starts_with(LEGACY_RAILS_NETWORK_DB_WAIVER) {
+                // Written by vci before 1.4.0 under policy.rails_allow_db
+                // (and by a collector older than 0.5.0, whose version the
+                // toolchain no longer matches anyway).
                 (
-                    p.core.adapter == "rails" && self.project.policy.rails_allow_db,
-                    "not waived by the base policy (policy.rails_allow_db = false)",
+                    false,
+                    "policy.rails_allow_db was removed in vci 1.4.0: attest the file again",
                 )
             } else {
                 (
@@ -1848,7 +1860,7 @@ mod tests {
         // Rails, Bundler, the database, the bundle: still compared.
         let mut other = linux.clone();
         other.rails = "8.1.3".into();
-        other.ruby_db = "postgresql 16.4".into();
+        other.ruby_db = "postgresql".into();
         other.ruby_gems.push("pg==1.6.0".into());
         let whats: Vec<&str> = toolchain_diff(&policy, Libraries::Any, &mac, &other)
             .iter()

@@ -80,9 +80,11 @@ pub struct Observed {
     /// attestable.
     pub path_refs: BTreeMap<Utf8PathBuf, String>,
     /// Cargo: build output and bookkeeping inside a walked package directory
-    /// (the target dir, the repository's `.git` and `.vci/out`), absolute:
-    /// never inputs, and left out of their parent directory's listing (a
-    /// fresh checkout has no `target/`).
+    /// (the target dir, the repository's `.git` and `.vci/out`); Rails: the
+    /// test environment's SQLite database files (and their `-wal`, `-shm`,
+    /// `-journal` siblings) in a directory whose listing is an input.
+    /// Absolute: never inputs, and left out of their parent directory's
+    /// listing (a fresh checkout has no `target/` and no test database).
     pub excluded: BTreeSet<Utf8PathBuf>,
     /// Rails collector: Ruby version with patchlevel, engine, Rails and
     /// Bundler versions (`runner_version` is the test framework's).
@@ -259,6 +261,14 @@ pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
             "stat" => {
                 if let Some(p) = path_of(&mut o) {
                     o.stats.insert(p);
+                }
+            }
+            // Rails: a path that is never an input and is left out of its
+            // parent directory's listing (the test environment's SQLite
+            // database files).
+            "exclude" => {
+                if let Some(p) = path_of(&mut o) {
+                    o.excluded.insert(p);
                 }
             }
             "external" => match (str_field(&v, "name"), str_field(&v, "version")) {

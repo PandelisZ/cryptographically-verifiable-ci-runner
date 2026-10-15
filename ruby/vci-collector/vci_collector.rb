@@ -11,10 +11,17 @@
 #
 # Modes (VCI_RAILS_MODE):
 #   collect  record everything, write $VCI_OUT/<sha256(VCI_TEST_ID)>.jsonl at exit
-#   plain    no recording, only the run conditions `vci run` uses (fresh
-#            SQLite databases loaded from the schema, a fresh local secret);
-#            used by `vci ci` so CI runs each file the way it was attested
+#   plain    no recording, only the run conditions `vci run` uses (a fresh
+#            local secret, RSpec's seed and status file); used by `vci ci`
 #   probe    print one "VCI-PROBE <json>" line with the toolchain at exit
+#   engine   nothing at all: a child process Active Record's own schema
+#            maintenance starts (`bin/rails db:test:prepare`, see
+#            VciCollector.engine_child?), which only sets up the test database
+#
+# The test database is the test engine's business: vci neither redirects,
+# prepares, purges nor loads it. Rails' maintain_test_schema!, transactional
+# tests and fixtures give each test its starting state, as in a plain
+# `bin/rails test` or `rspec`. Its contents are not an input (see DB).
 #
 # VCI_RAILS_RUNNER=rspec: the process runs RSpec (`rspec <file>`) instead of
 # `bin/rails test`; see RSpecSupport for what is neutralised (option files
@@ -26,26 +33,26 @@
 # ENV). C extensions that open files themselves are not seen. Anything the
 # collector cannot attribute becomes a taint (the file is not attested).
 
+# A child process of Active Record's schema maintenance (VCI_RAILS_MODE=engine,
+# set by the collector of its parent): not the test's, nothing to record.
+return if ENV["VCI_RAILS_MODE"] == "engine"
+
 module VciCollector
   # Part of the toolchain (Probe.libs): bumped whenever what the collector
   # records or refuses changes, so an attestation made by an older collector
   # (which may have missed an input) is not accepted where a newer one runs.
-  VERSION = "0.4.2"
+  VERSION = "0.5.0"
   MODE = ENV.fetch("VCI_RAILS_MODE", "collect")
   # The test framework vci started this process for: "minitest" (default,
   # `bin/rails test <file>`) or "rspec" (`rspec <file>`, see RSpecSupport).
   RUNNER = ENV["VCI_RAILS_RUNNER"] == "rspec" ? "rspec" : "minitest"
   OUT = ENV["VCI_OUT"]
   TEST_ID = ENV["VCI_TEST_ID"]
-  # Fresh directory for this process's SQLite databases.
-  DB_DIR = ENV["VCI_DB_DIR"]
   # The fresh temp dir vci gave this process (TMPDIR), read once here: a test
   # that later sets ENV["TMPDIR"] (to "/tmp", HOME, "/") changes where its
   # own temp files go, never which reads the collector treats as vci's
   # scratch space (it would otherwise hide every read under that directory).
   TMP = ENV["TMPDIR"]
-  # policy.rails_allow_db: network databases are prepared fresh as well.
-  ALLOW_DB = ENV["VCI_RAILS_ALLOW_DB"] == "1"
   DLEXTS = %w[.so .bundle].freeze
   RBEXTS = %w[.rb .so .bundle].freeze
   # Code of RubyGems and Bundler. What they look up decides which gems are
@@ -83,7 +90,7 @@ module VciCollector
     FS = ::File.singleton_class
     DS = ::Dir.singleton_class
     FILE = %i[exist? directory? symlink? file? expand_path realpath stat lstat join dirname basename extname
-              fnmatch].to_h { |m| [m, FS.instance_method(m)] }.freeze
+              fnmatch binread].to_h { |m| [m, FS.instance_method(m)] }.freeze
     DIR = %i[children pwd].to_h { |m| [m, DS.instance_method(m)] }.freeze
 
     class << self
@@ -339,6 +346,14 @@ module VciCollector
     def rec(kind, path)
       return unless collect? && !busy?
       add(kind, expand(pathify(path)))
+    end
+
+    # A file that is an input whoever reads it (DB.schema_files): its
+    # content, or that it is absent.
+    def schema_input(abs)
+      abs = resolve(abs)
+      return if @produced[abs]
+      @records[[exists_quietly?(abs) ? :read : :probe, abs]] = true
     end
 
     # Type (and, for a file, content) observed: absent -> probe, else stat.
@@ -742,6 +757,53 @@ module VciCollector
       r
     end
 
+    # Active Record's own schema maintenance, which `rails/test_help` (and
+    # rspec-rails' `maintain_test_schema!` in rails_helper) runs before the
+    # tests: when the test database's schema is not the current one
+    # (`schema_up_to_date?`: a fresh checkout has no database yet, or
+    # db/schema.rb changed), ActiveRecord::Migration.load_schema! shells out
+    # to `bin/rails db:test:prepare`. That child is the engine's, not the
+    # test's: it only sets up the test database, whose contents are not an
+    # input. Only the `system("bin/rails db:test:prepare")` call made
+    # directly by that method of the activerecord gem the bundle loaded, in
+    # the project directory (where it changes to, Rails.root), is this child:
+    # a test's own child processes stay refused, and so does that command
+    # run anywhere else (a stubbed Rails.root would run another bin/rails).
+    ENGINE_LABELS = %w[load_schema! load_schema_if_pending!].freeze
+    ENGINE_COMMAND = ["bin/rails db:test:prepare"].freeze
+
+    def self.engine_child?(args = ENGINE_COMMAND, kw = {})
+      return false if busy?
+      return false unless args == ENGINE_COMMAND && kw.empty?
+      quiet do
+        next false unless Real.realpath(Real.dir_pwd) == root
+        me = __FILE__
+        loc = caller_locations(2, 12)&.find { |l| (l.absolute_path || l.path) != me }
+        path = loc && (loc.absolute_path || loc.path).to_s
+        next false unless path&.end_with?("/lib/active_record/migration.rb")
+        next false unless ENGINE_LABELS.include?(loc.base_label.to_s)
+        spec = defined?(::Gem) && ::Gem.respond_to?(:loaded_specs) ? ::Gem.loaded_specs["activerecord"] : nil
+        next false if spec.nil?
+        # Either spelling: a frame's path is the real one, a gem's directory
+        # may be spelt through a symlink (/var -> /private/var).
+        dir = Real.expand_path(spec.full_gem_path)
+        inside?(path, dir) || inside?(real_of(path), real_of(dir))
+      end
+    rescue StandardError
+      false
+    end
+
+    # The arguments of that child's `system` call with VCI_RAILS_MODE=engine
+    # in its environment: the collector its RUBYOPT loads does nothing there
+    # (no recording, no output file that would replace the parent's).
+    def self.engine_args(args)
+      if args[0].is_a?(Hash)
+        [args[0].merge("VCI_RAILS_MODE" => "engine"), *args[1..]]
+      else
+        [{ "VCI_RAILS_MODE" => "engine" }, *args]
+      end
+    end
+
     # Kernel is patched the way RubyGems, bundled_gems.rb and Zeitwerk patch
     # it (alias + redefine), not with prepend: they alias Kernel#require into
     # Kernel's singleton class, where a prepended method's `super` finds
@@ -775,6 +837,7 @@ module VciCollector
         end
 
         def system(*args, **kw)
+          return __vci_system(*VciCollector.engine_args(args), **kw) if VciCollector.engine_child?(args, kw)
           VciCollector.taint("process:system") unless VciCollector.busy?
           __vci_system(*args, **kw)
         end
@@ -825,6 +888,7 @@ module VciCollector
           orig = :"__vci_s_#{m == :` ? "backtick" : m}"
           alias_method orig, m
           define_method(m) do |*args, **kw, &blk|
+            return send(orig, *VciCollector.engine_args(args), **kw, &blk) if m == :system && VciCollector.engine_child?(args, kw)
             p = args[0].is_a?(String) ? args[0] : nil
             if m != :open || p&.start_with?("|")
               VciCollector.taint("process:Kernel.#{m}") unless VciCollector.busy?
@@ -1549,7 +1613,6 @@ module VciCollector
     simplecov: -> { defined?(::SimpleCov) && ::SimpleCov.respond_to?(:coverage_path) && RSpecSupport.install_simplecov },
     code_stats: -> { defined?(::Rails::CodeStatistics) && ::Rails::CodeStatistics.respond_to?(:directories) && install_code_stats },
     rails_config: -> { defined?(::Rails::Application::Configuration) && install_rails_config },
-    on_load: -> { defined?(::ActiveSupport) && ::ActiveSupport.respond_to?(:on_load) && install_on_load },
     socket: -> { defined?(::BasicSocket) && install_socket },
     pty: -> { defined?(::PTY) && install_pty },
     fiddle: -> { defined?(::Fiddle::Function) && defined?(::Fiddle::Handle) && install_fiddle },
@@ -1597,6 +1660,7 @@ module VciCollector
   # connection is wrapped as it appears (aliases may be defined later).
   DB_CLIENTS = [[%w[PG Connection], "postgresql"], [%w[Mysql2 Client], "mysql2"], [%w[Trilogy], "trilogy"]].freeze
   DB_OPENERS = %i[new connect open connect_start async_connect sync_connect setdb setdblogin].freeze
+  DB_OPENING = :__vci_db_opening
 
   # Constant names whose definition triggers after_require.
   WATCHED_CONSTANTS = %i[
@@ -1647,8 +1711,25 @@ module VciCollector
           @db_wrapped[[klass, m]] = true
           klass.singleton_class.prepend(Module.new do
             define_method(m) do |*args, **kw, &blk|
-              VciCollector.db_client_opened(name) unless VciCollector.busy?
-              super(*args, **kw, &blk)
+              # Only the outermost opener is checked: PG::Connection.new
+              # calls connect_start itself, with the options it resolved.
+              key = VciCollector::DB_OPENING
+              return super(*args, **kw, &blk) if VciCollector.busy? || Thread.current[key]
+              VciCollector.db_client_opened(name, args, kw)
+              # A block (PG::Connection.new { |conn| ... }) is the caller's
+              # code again: what it opens is checked.
+              inner = blk && proc do |*a|
+                Thread.current[key] = false
+                blk.call(*a)
+              ensure
+                Thread.current[key] = true
+              end
+              begin
+                Thread.current[key] = true
+                super(*args, **kw, &inner)
+              ensure
+                Thread.current[key] = false
+              end
             end
           end)
         end
@@ -1709,11 +1790,6 @@ module VciCollector
           end
         end
       end)
-      true
-    end
-
-    def install_on_load
-      ::ActiveSupport.on_load(:after_initialize) { VciCollector::DB.prepare! }
       true
     end
 
@@ -1881,9 +1957,9 @@ module VciCollector
     end
 
     # SQLite opens, writes and attaches database files in C. A database
-    # other than the fresh ones vci prepared (in VCI_DB_DIR) or one in a
-    # temp dir is not attestable, and so is ATTACH (an authorizer refuses it)
-    # and loading an extension.
+    # other than the test environment's (config/database.yml) or one in
+    # vci's temp dir is not attestable (DB.taints, at exit), and so is ATTACH
+    # (an authorizer refuses it) and loading an extension.
     def install_sqlite3
       return true unless collect?
       ::SQLite3::Database.prepend(Module.new do
@@ -1905,18 +1981,40 @@ module VciCollector
       true
     end
 
-    # A database server connection. Active Record's adapters connecting to
-    # a configured database are the test environment's database (refused
-    # unless policy.rails_allow_db, which DB.prepare! handles); a client a
-    # test opens itself is refused like any other socket.
-    def db_client_opened(name)
-      ar = quiet { caller_locations(2, 30).to_a }.any? do |l|
-        (l.absolute_path || l.path).to_s.include?("/active_record/connection_adapters/")
-      end
-      if ar
-        taint("#{DB::NETWORK_TAINT}#{name} (Active Record connection)")
-      else
+    # A database server connection (PG::Connection, Mysql2::Client,
+    # Trilogy). Accepted only when Active Record's own adapter code (in the
+    # activerecord gem the bundle loaded) opens it to one of the test
+    # environment's databases in config/database.yml (DB.configured_server?):
+    # what that server holds is not an input (see DB). Refused like any
+    # other socket: a client a test opens itself (PG.connect,
+    # Mysql2::Client.new, Trilogy.new), and an Active Record connection to
+    # any other server or database (establish_connection with another host,
+    # port or database, another environment's configuration).
+    def db_client_opened(name, args = [], kw = {})
+      unless quiet { active_record_adapter_frame? }
         taint("network:#{name} client (a database connection the test opened itself)")
+        return
+      end
+      why = quiet { DB.configured_server?(name, args, kw) }
+      return if why == true
+      taint("network:#{name} (an Active Record connection to #{why}, not one of the test environment's " \
+            "databases in config/database.yml)")
+    rescue StandardError => e
+      taint("network:#{name} (vci could not tell which server this connects to: #{e.class})")
+    end
+
+    # A frame of the 30 callers is in lib/active_record/connection_adapters/
+    # of the activerecord gem the bundle loaded (not a file of the
+    # repository or of another gem that happens to have such a path).
+    def active_record_adapter_frame?
+      spec = defined?(::Gem) && ::Gem.respond_to?(:loaded_specs) ? ::Gem.loaded_specs["activerecord"] : nil
+      return false if spec.nil?
+      dir = Real.expand_path(File.join(spec.full_gem_path, "lib/active_record/connection_adapters"))
+      rdir = real_of(dir)
+      me = __FILE__
+      caller_locations(1, 60).to_a.reject { |l| (l.absolute_path || l.path) == me }.first(30).any? do |l|
+        path = (l.absolute_path || l.path).to_s
+        path.start_with?("/") && (inside?(path, dir) || inside?(real_of(path), rdir))
       end
     end
 
@@ -2669,13 +2767,13 @@ module VciCollector
     end
   end
 
-  # SQLite databases of the test environment are redirected to fresh files
-  # in VCI_DB_DIR; the development/test local secret is generated fresh in
-  # memory, as on a fresh checkout, instead of being kept in
-  # tmp/local_secret.txt (whose random content would otherwise be an input).
+  # The development/test local secret is generated fresh in memory, as on a
+  # fresh checkout, instead of being kept in tmp/local_secret.txt (whose
+  # random content would otherwise be an input). The database configuration
+  # Rails reads from config/database.yml is remembered, never changed (DB).
   module RailsConfigHooks
     def database_configuration
-      VciCollector::DB.redirect(super)
+      VciCollector::DB.configured(super)
     end
 
     private
@@ -2685,34 +2783,37 @@ module VciCollector
     end
   end
 
+  # The test database is the test engine's business. vci does not redirect,
+  # prepare, purge or load it: Rails' maintain_test_schema! (which may shell
+  # out to `bin/rails db:test:prepare`, VciCollector.engine_child?),
+  # transactional tests and fixtures give each test its starting state, as
+  # in a plain `bin/rails test` or `rspec`. Its contents are never an input:
+  #
+  # - the SQLite files config/database.yml configures for the test
+  #   environment (every database of a multi-database app, Rails 8's
+  #   storage/*.sqlite3 included) and their -wal, -shm and -journal siblings:
+  #   opening them is accepted, and no read, stat, probe, listing entry or
+  #   write of them is recorded (Output.write_records), as long as what is
+  #   there is a SQLite database (DB.exempt): another file an entry names
+  #   (one Rails never opens) is recorded like any file;
+  # - a database server: Active Record's own connections to the test
+  #   environment's databases are accepted (VciCollector.db_client_opened).
+  #
+  # What the test sees is recorded where Ruby reads it, and the schema files
+  # every test database is loaded from (DB.schema_files) are inputs whether
+  # or not this process reads them: db/schema.rb or structure.sql,
+  # db/cache_schema.rb and the like, config/database.yml, the fixture files,
+  # the code. Still refused: a SQLite file that is not one of those (SQLite
+  # reads and writes it in C, where vci cannot see it), ATTACH, SQLite
+  # extensions, a database client a test opens itself, and an Active Record
+  # connection to any other server or database.
   module DB
-    NETWORK_TAINT = "rails:network-db:"
     SQLITE_ATTACH = 24
-    @adapters = []
+    SIBLINGS = ["", "-wal", "-shm", "-journal"].freeze
+    @yaml = nil
+    @opened = [] # [as given, real path or nil]: SQLite files opened
 
     class << self
-      attr_reader :adapters
-
-      def sqlite_opened(file, db)
-        f = file.to_s
-        return if f.empty? || f == ":memory:" || f.start_with?("file::memory:")
-        path = f.start_with?("file:") ? f.sub(/\Afile:/, "").split("?").first : f
-        abs = VciCollector.expand(path)
-        # Where the file really is: a symlink in the temp dir to a database
-        # in the repository is that database.
-        real = abs && VciCollector.real_of(abs)
-        ok = real && [DB_DIR, TMP].compact.reject(&:empty?).any? do |d|
-          VciCollector.inside?(real, (Real.realpath(d) rescue Real.expand_path(d)))
-        end
-        VciCollector.taint("rails:sqlite-file:#{abs || f} (a SQLite database vci did not prepare fresh; SQLite reads and writes it in C)") unless ok
-        db.authorizer = proc do |action, *|
-          VciCollector.taint("rails:sqlite-attach (ATTACH reads another database file in C)") if action == SQLITE_ATTACH
-          0
-        end
-      rescue StandardError => e
-        VciCollector.taint("rails:sqlite-hook:#{e.class}")
-      end
-
       def local_secret
         @local_secret ||= VciCollector.quiet { SecureRandom.hex(64) }
       end
@@ -2721,109 +2822,259 @@ module VciCollector
         ENV["RAILS_ENV"] || ENV["RACK_ENV"] || "development"
       end
 
-      def redirect(all)
-        return all unless DB_DIR && all.is_a?(Hash)
-        env = env_name
-        cfg = all[env]
-        return all unless cfg.is_a?(Hash)
-        out = all.dup
-        out[env] = if cfg.key?("adapter") || cfg.key?("database") || cfg.key?("url")
-                     redirect_one(cfg, "primary")
-                   else
-                     cfg.to_h { |name, c| [name, c.is_a?(Hash) ? redirect_one(c, name.to_s) : c] }
-                   end
-        out
+      # Rails' reading of config/database.yml (before DATABASE_URL is merged
+      # in): kept as it is. The first reading (Rails' own, at boot) is the
+      # one remembered, with the DATABASE_URL variables at that time.
+      def configured(all)
+        if all.is_a?(Hash) && @yaml.nil?
+          @yaml = all
+          @urls = VciCollector.quiet { url_env }
+        end
+        all
       end
 
-      def redirect_one(c, name)
-        return c unless c["adapter"].to_s.start_with?("sqlite") && c["url"].nil?
-        db = c["database"].to_s
-        return c if db.empty? || db.include?(":memory:") || db.start_with?("file:")
-        # One fresh file per configured file, so a replica of the primary
-        # (another config naming the same file) stays the same database.
-        @fresh ||= {}
-        key = File.expand_path(db, VciCollector.root)
-        @fresh[key] ||= File.join(DB_DIR, "#{@fresh.size}-#{File.basename(db).gsub(/[^A-Za-z0-9_.-]/, "_")}")
-        c.merge("database" => @fresh[key])
+      # DATABASE_URL and <NAME>_DATABASE_URL, which Active Record merges into
+      # the configurations.
+      def url_env
+        ENV.keys.grep(/DATABASE_URL\z/).sort.to_h { |k| [k, ENV[k]] }
       end
 
-      # After Rails initialised (before rails/test_help's
-      # maintain_test_schema!, which would shell out to `bin/rails
-      # db:test:prepare`): load the schema into every database of the test
-      # environment, fresh.
-      def prepare!
-        return unless env_name == "test" && defined?(::ActiveRecord::Base) && DB_DIR
-        require "active_record/tasks/database_tasks"
-        ::ActiveRecord::Base.configurations.configs_for(env_name: "test").each do |db_config|
-          if MODE == "probe"
-            probe(db_config)
-          elsif db_config.adapter.to_s.start_with?("sqlite")
-            prepare_sqlite(db_config)
-          else
-            prepare_network(db_config)
+      # The test environment's entries in config/database.yml.
+      def yaml_configs
+        cfg = @yaml && @yaml[env_name]
+        return [] unless cfg.is_a?(Hash)
+        return [cfg] if cfg.key?("adapter") || cfg.key?("database") || cfg.key?("url")
+        cfg.values.select { |c| c.is_a?(Hash) }
+      end
+
+      # The test environment's database configurations as Active Record
+      # resolves them (url, DATABASE_URL merged in; replicas and
+      # database_tasks: false entries included), from the remembered
+      # config/database.yml: what a test assigns to
+      # ActiveRecord::Base.configurations later changes nothing.
+      def server_configs
+        return @server_configs if @server_configs
+        return [] unless @yaml && defined?(::ActiveRecord::DatabaseConfigurations)
+        all = ::ActiveRecord::DatabaseConfigurations.new(@yaml)
+        list = begin
+          all.configs_for(env_name: env_name, include_hidden: true)
+        rescue ArgumentError
+          all.configs_for(env_name: env_name)
+        end
+        @server_configs = list.map { |c| c.configuration_hash.to_h.transform_keys(&:to_sym) }
+      end
+
+      TARGET_KEYS = %i[host hostaddr port socket database service default_file default_group].freeze
+
+      # What decides which server and database a client reaches.
+      def target(h)
+        h = h.to_h.transform_keys(&:to_sym)
+        t = TARGET_KEYS.to_h { |k| [k, h[k].to_s] }
+        t[:database] = (h[:database] || h[:dbname] || h[:db]).to_s
+        t
+      end
+
+      # The target of a client's arguments (PG's in every form it accepts:
+      # keywords, a hash, a connection string or URL, positional), or nil.
+      def client_target(name, args, kw)
+        if name == "postgresql"
+          str = ::PG::Connection.parse_connect_args(*args, *(kw.empty? ? [] : [kw]))
+          opts = ::PG::Connection.conninfo_parse(str).each_with_object({}) do |o, h|
+            h[o[:keyword].to_sym] = o[:val] if o[:val]
           end
+          return target(opts)
+        end
+        h = if args.empty?
+              kw
+            elsif args.size == 1 && args[0].is_a?(Hash) && kw.empty?
+              args[0]
+            end
+        h && target(h)
+      end
+
+      # A configuration's target as its adapter passes it to the client
+      # (TrilogyAdapter drops the host when a socket is given).
+      def config_target(name, c)
+        c = c.compact
+        c = c.except(:host) if name == "trilogy" && !c[:socket].to_s.empty?
+        target(c)
+      end
+
+      # true when a client opened with these arguments reaches one of the
+      # test environment's databases; otherwise what it reaches.
+      def configured_server?(name, args, kw)
+        return "a server named by a DATABASE_URL the process changed" if @urls && url_env != @urls
+        t = client_target(name, args, kw)
+        return "a server vci cannot tell from the arguments" unless t
+        return true if server_configs.any? { |c| config_target(name, c) == t }
+        where = [t[:socket], t[:host], t[:hostaddr]].reject(&:empty?).first || "localhost"
+        where = "#{where}:#{t[:port]}" unless t[:port].empty?
+        "#{where}/#{t[:database]}"
+      end
+
+      # A SQLite database name as SQLite opens it: [path, in_memory]. A
+      # `file:` URI is parsed as SQLite parses it (an authority of "" or
+      # "localhost", %HH escapes, the last `mode` parameter wins); only
+      # ":memory:" (plain or as a URI's path) and mode=memory are in memory.
+      # Anything else names a file ("file::memory:x" is a file named
+      # ":memory:x"). The empty name is a private temporary database.
+      def sqlite_name(f)
+        f = f.to_s
+        return [nil, true] if f.empty? || f == ":memory:"
+        return [f, false] unless f.start_with?("file:")
+        rest = f.delete_prefix("file:").split("#", 2).first.to_s
+        path, query = rest.split("?", 2)
+        path = path.to_s
+        if path.start_with?("//")
+          auth, slash, tail = path[2..].partition("/")
+          path = auth.empty? || auth == "localhost" ? "#{slash}#{tail}" : path
+        end
+        path = uri_decode(path)
+        mode = nil
+        query.to_s.split("&").each do |kv|
+          k, v = kv.split("=", 2)
+          mode = uri_decode(v.to_s) if uri_decode(k.to_s) == "mode"
+        end
+        return [nil, true] if path == ":memory:" || mode == "memory"
+        [path.empty? ? nil : path, path.empty?]
+      end
+
+      def uri_decode(s)
+        s.b.gsub(/%([0-9A-Fa-f]{2})/) { Regexp.last_match(1).hex.chr }.force_encoding(Encoding::UTF_8)
+      end
+
+      # A SQLite database name as a file path, or nil (in memory, empty).
+      def sqlite_path(f)
+        sqlite_name(f).first
+      end
+
+      # Absolute paths of the SQLite files config/database.yml configures
+      # for the test environment (relative to the application root, as
+      # Active Record resolves them). An in-memory database has none.
+      def sqlite_files
+        root = VciCollector.root
+        yaml_configs.filter_map do |c|
+          url = c["url"].to_s
+          db = if url.empty?
+                 c["adapter"].to_s.start_with?("sqlite") ? c["database"] : nil
+               elsif (m = url.match(/\Asqlite3?:(?:\/\/)?([^?]*)/))
+                 m[1]
+               end
+          path = sqlite_path(db)
+          path && VciCollector.quiet { Real.expand_path(path, root) }
+        end.uniq
+      end
+
+      SQLITE_HEADER = "SQLite format 3\0".b.freeze
+
+      # What about each configured file is not an input, by path (as given
+      # and as real path): :all, or :meta (everything but a read of its
+      # content). Only for what is a SQLite database at exit: a file that
+      # starts with SQLite's header (:all), or one that is absent or empty
+      # (:meta: SQLite has not written it yet). Anything else config/database.yml
+      # names (a YAML file under an entry Rails never opens) is recorded like
+      # any file. The -wal, -shm and -journal siblings of a database are
+      # :meta, unless the sibling is a symlink (to another file).
+      def exempt
+        @exempt ||= VciCollector.quiet do
+          out = {}
+          sqlite_files.each do |f|
+            real = VciCollector.real_of(f)
+            state = db_state(real)
+            next unless state
+            out[f] = out[real] = state
+            SIBLINGS.drop(1).each do |x|
+              given = "#{f}#{x}"
+              next if Real.symlink?(given)
+              out[given] = :meta
+              out[File.join(VciCollector.real_of(Real.dirname(given)), Real.basename(given))] = :meta
+            end
+          end
+          out
+        end
+      end
+
+      def db_state(real)
+        return :meta unless Real.exist?(real)
+        return nil unless Real.file?(real)
+        return :meta if Real.stat(real).size.zero?
+        Real.binread(real, SQLITE_HEADER.bytesize) == SQLITE_HEADER ? :all : nil
+      rescue StandardError
+        nil
+      end
+
+      # Whether a record of `kind` for `path` is exempt.
+      def exempt?(kind, path)
+        state = exempt[path]
+        state == :all || (state == :meta && kind != :read)
+      end
+
+      # The schema files Active Record loads into the test environment's
+      # databases (db/schema.rb or structure.sql, and db/cache_schema.rb and
+      # the like of a multi-database app), absolute: inputs whether or not
+      # this process read them. On a fresh database Rails reads none of them
+      # in the process (`bin/rails db:test:prepare`, the engine's child,
+      # loads them, and maintain_test_schema! only checks the first
+      # database's file exists), yet a test sees the tables they define.
+      def schema_files
+        return [] unless defined?(::ActiveRecord::Base) && ::ActiveRecord.autoload?(:Base).nil? && @yaml
+        require "active_record/tasks/database_tasks"
+        tasks = ::ActiveRecord::Tasks::DatabaseTasks
+        all = ::ActiveRecord::DatabaseConfigurations.new(@yaml)
+        root = VciCollector.root
+        all.configs_for(env_name: env_name).filter_map do |c|
+          f = tasks.schema_dump_path(c)
+          f && Real.expand_path(f.to_s, root)
+        end.uniq
+      rescue StandardError, LoadError => e
+        VciCollector.taint("rails:schema-files:#{e.class}: #{e.message} (vci could not tell which schema files " \
+                           "the test databases are loaded from)")
+        []
+      end
+
+      def sqlite_opened(file, db)
+        path = sqlite_path(file)
+        if path
+          abs = VciCollector.expand(path)
+          @opened << [path, abs && VciCollector.real_of(abs)]
+        end
+        db.authorizer = proc do |action, *|
+          VciCollector.taint("rails:sqlite-attach (ATTACH reads another database file in C)") if action == SQLITE_ATTACH
+          0
         end
       rescue StandardError => e
-        VciCollector.taint("rails:db-prepare:#{e.class}: #{e.message}")
-        raise
+        VciCollector.taint("rails:sqlite-hook:#{e.class}")
       end
 
-      def prepare_sqlite(db_config)
-        db = db_config.database.to_s
-        unless db.start_with?(File.join(DB_DIR, ""))
-          VciCollector.taint("rails:db:sqlite database #{db.inspect} is not a file vci prepared fresh (in-memory, a url, or DATABASE_URL)")
-          return
+      # At exit: SQLite files the process opened that are neither the test
+      # environment's databases nor in vci's temp dir.
+      def taints
+        ok = sqlite_files.flat_map { |f| [f, VciCollector.real_of(f)] }
+        tmp = TMP && !TMP.empty? ? Output.both(TMP) : []
+        @opened.filter_map do |given, real|
+          next if real && (ok.include?(real) || tmp.any? { |d| VciCollector.inside?(real, d) })
+          "rails:sqlite-file:#{real || given} (a SQLite database that is not one of the test environment's " \
+            "databases in config/database.yml; SQLite reads and writes it in C, where vci cannot see it)"
+        end.uniq
+      end
+
+      # The adapters of the test environment's databases (Active Record's
+      # configurations: config/database.yml with DATABASE_URL merged in),
+      # sorted and joined with ";": "sqlite3", "mysql2", "postgresql;sqlite3".
+      # No server version: what a server holds or runs is not an input.
+      # `load`: load Active Record for it (the probe, which boots the
+      # application); otherwise only when the process loaded it.
+      def adapters(load: false)
+        return "" unless defined?(::ActiveRecord::Base)
+        return "" unless load || ::ActiveRecord.autoload?(:Base).nil?
+        configs = begin
+          ::ActiveRecord::Base.configurations.configs_for(env_name: env_name, include_hidden: true)
+        rescue ArgumentError
+          ::ActiveRecord::Base.configurations.configs_for(env_name: env_name)
         end
-        @adapters << "sqlite3"
-        ::ActiveRecord::Tasks::DatabaseTasks.with_temporary_connection(db_config) { load_schema(db_config) }
-      end
-
-      # A database server: refused unless policy.rails_allow_db; then purged
-      # and loaded from the schema like a SQLite file.
-      def prepare_network(db_config)
-        adapter = db_config.adapter.to_s
-        VciCollector.taint("#{NETWORK_TAINT}#{adapter} (#{db_config.name})")
-        return unless ALLOW_DB
-        ::ActiveRecord::Tasks::DatabaseTasks.purge(db_config)
-        ::ActiveRecord::Tasks::DatabaseTasks.with_temporary_connection(db_config) do |conn|
-          @adapters << "#{adapter} #{server_version(conn)}"
-          load_schema(db_config)
-        end
-      end
-
-      # `vci plan`: the database software CI would use (a server's version
-      # only when policy.rails_allow_db lets such files be attested).
-      def probe(db_config)
-        adapter = db_config.adapter.to_s
-        if adapter.start_with?("sqlite") || !ALLOW_DB
-          @adapters << adapter
-        else
-          ::ActiveRecord::Tasks::DatabaseTasks.with_temporary_connection(db_config) do |conn|
-            @adapters << "#{adapter} #{server_version(conn)}"
-          end
-        end
-      end
-
-      def server_version(conn)
-        conn.respond_to?(:database_version) ? conn.database_version.to_s : conn.select_value("select version()").to_s
-      rescue StandardError
-        "unknown"
-      end
-
-      def load_schema(db_config)
-        tasks = ::ActiveRecord::Tasks::DatabaseTasks
-        format = db_config.respond_to?(:schema_format) ? db_config.schema_format : ::ActiveRecord.schema_format
-        file = tasks.schema_dump_path(db_config, format)
-        return unless file
-        if format.to_sym == :sql && db_config.adapter.to_s.start_with?("sqlite")
-          # Rails would run the sqlite3 command line tool: load it in-process.
-          tasks.migration_connection.raw_connection.execute_batch2(File.read(file))
-          tasks.migration_connection_pool.internal_metadata.create_table_and_set_flags(
-            db_config.env_name, tasks.send(:schema_sha1, file)
-          )
-        else
-          tasks.load_schema(db_config, format, file)
-        end
+        configs.map { |c| c.adapter.to_s }.reject(&:empty?).uniq.sort.join(";")
+      rescue StandardError, LoadError
+        ""
       end
     end
   end
@@ -3490,7 +3741,7 @@ module VciCollector
 
     # vci's temp dirs, as given and as real paths.
     def ignored_prefixes
-      @ignored_prefixes ||= [TMP, OUT, DB_DIR].compact.reject(&:empty?).flat_map do |p|
+      @ignored_prefixes ||= [TMP, OUT].compact.reject(&:empty?).flat_map do |p|
         both(p)
       end.uniq
     end
@@ -3595,6 +3846,8 @@ module VciCollector
         $stderr.puts "vci_collector: VCI_OUT or VCI_TEST_ID not set; nothing written"
         return
       end
+      # The schema files of the test databases (DB.schema_files).
+      VciCollector.quiet { DB.schema_files }.each { |f| VciCollector.schema_input(f) }
       # First: what is written below requires libraries (and would hook them).
       unhooked = VciCollector.unhooked
       TP_COMPILED.disable
@@ -3651,11 +3904,19 @@ module VciCollector
       $LOADED_FEATURES.each do |f|
         records << [[:module, f], true] if f.is_a?(String) && f.start_with?("/") && DLEXTS.any? { |x| f.end_with?(x) }
       end
+      # The test environment's SQLite files (and their -wal, -shm and
+      # -journal siblings) are the test engine's database: nothing about
+      # them is an input (see DB.exempt).
+      dbx = DB.exempt
+      listed = {}
       records.each do |(kind, abs), by|
         next if kind == :write
         next if kind == :stat && RUNNER == "rspec" && temp_ancestor?(abs)
+        # Not code: a Ruby file loaded from such a path is still an input.
+        next if kind != :module && DB.exempt?(kind, abs)
         c = classify(abs)
         next unless c
+        next if kind != :module && c[0] == :path && DB.exempt?(kind, c[1])
         # RubyGems' and Bundler's existence and type checks and listings
         # outside the repository (anywhere but under a gem root) are not
         # inputs (see TOOLING_FILES).
@@ -3691,9 +3952,18 @@ module VciCollector
         end
         next if seen[[kind, p]]
         seen[[kind, p]] = true
+        listed[p] = true if kind == :readdir
         lines << { kind: kind.to_s, path: p }
       end
-      written.each_key { |p| lines << { kind: "write", path: p } if vc.inside?(p, vc.repo) }
+      # A listing of the directory holding one leaves it out (it is not in
+      # a fresh checkout, and comes and goes with the database's journal).
+      dbx.each_key do |x|
+        next unless vc.inside?(x, vc.repo) && listed[File.dirname(x)] && !seen[[:exclude, x]]
+        seen[[:exclude, x]] = true
+        lines << { kind: "exclude", path: x }
+      end
+      written.each_key { |p| lines << { kind: "write", path: p } if vc.inside?(p, vc.repo) && !dbx.key?(p) }
+      taints.concat(DB.taints)
       taints.concat(GemVerify.check(externals.values.uniq, gem_files))
       externals.each do |(name, version), s|
         rec = { kind: "external", name: name, version: version, platform: s.platform.to_s }
@@ -3728,7 +3998,7 @@ module VciCollector
         ruby: Probe.ruby_version, engine: Probe.engine,
         rails: Probe.rails_version, bundler: Probe.bundler_version, runner: Probe.runner_version,
         root: VciCollector.root, platform: RUBY_PLATFORM, collector: "vci_collector@#{VERSION}",
-        db: DB.adapters.uniq.join(";"), tz: Tz.source
+        db: DB.adapters, tz: Tz.source
       }
     end
 
@@ -4007,7 +4277,7 @@ module VciCollector
         end
         out = {
           ruby: ruby_version, engine: engine, rails: rails_version, bundler: bundler_version,
-          runner: runner_version, platform: RUBY_PLATFORM, libs: libs, db: DB.adapters.uniq.join(";"),
+          runner: runner_version, platform: RUBY_PLATFORM, libs: libs, db: DB.adapters(load: true),
           gems: gems, gemfile: (::Bundler.default_gemfile.to_s rescue ""), taints: Checks.run,
           natives: Native.versions.map { |name, version| { name: name, version: version } }
         }

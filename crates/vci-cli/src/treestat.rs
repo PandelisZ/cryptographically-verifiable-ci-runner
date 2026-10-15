@@ -155,11 +155,13 @@ impl TreeStat {
 
     /// [`Self::unchanged`] for a manifest whose directory listings leave out
     /// `excluded` child names (`EntryKind::Excluded` entries, such as Cargo's
-    /// target directory, which the first build creates during the run). An
-    /// excluded entry itself is never an input. A listing of a directory that
-    /// directly holds a directory the snapshot skipped (the target dir) and
-    /// whose own metadata changed is compared by its children instead: the
-    /// same names and types, apart from the excluded ones, as before the run.
+    /// target directory, which the first build creates during the run, or a
+    /// Rails test database with its `-journal`/`-wal`/`-shm` files, which
+    /// SQLite creates and removes while the tests run). An excluded entry
+    /// itself is never an input. A listing that leaves out some of its
+    /// children and whose directory's own metadata changed is compared by
+    /// its children instead: the same names and types, apart from the
+    /// excluded ones, as before the run (what the listing's hash covers).
     pub fn unchanged_excluding(
         &self,
         e: &InputEntry,
@@ -188,8 +190,7 @@ impl TreeStat {
             (EntryKind::DirListing, Some(b), Some(n))
                 if b.kind == n.kind
                     && b.ino == n.ino
-                    && excluded.is_some_and(|x| !x.is_empty())
-                    && self.skip.iter().any(|s| s.parent() == Some(abs.as_path())) =>
+                    && excluded.is_some_and(|x| !x.is_empty()) =>
             {
                 let x = excluded.expect("checked");
                 let before = self.children_before(&abs, x);
@@ -297,6 +298,41 @@ mod tests {
         assert_eq!(before.unchanged_excluding(&listing, Some(&x)), Ok(()));
         // Another new name in the same directory is still a change.
         std::fs::write(root.join("new.rs"), "").unwrap();
+        assert!(before.unchanged_excluding(&listing, Some(&x)).is_err());
+    }
+
+    /// A Rails test database (not a skipped directory) created, journaled
+    /// and written during the run: a listing of db/ that leaves it and its
+    /// siblings out is unchanged; any other new name is a change.
+    #[test]
+    fn a_listing_without_the_test_database_survives_its_creation() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("db/schema.rb"), "x").unwrap();
+        let before = TreeStat::snapshot(&root).unwrap();
+        std::fs::write(root.join("db/test.sqlite3"), "db").unwrap();
+        std::fs::write(root.join("db/test.sqlite3-wal"), "").unwrap();
+        std::fs::write(root.join("db/test.sqlite3-shm"), "").unwrap();
+        let listing = InputEntry {
+            path: vci_core::RepoPath::new("db").unwrap(),
+            kind: EntryKind::DirListing,
+            exec: false,
+            size: 1,
+            hash: String::new(),
+        };
+        let x: std::collections::BTreeSet<String> = [
+            "test.sqlite3",
+            "test.sqlite3-wal",
+            "test.sqlite3-shm",
+            "test.sqlite3-journal",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert!(before.unchanged(&listing).is_err(), "plain check: modified");
+        assert_eq!(before.unchanged_excluding(&listing, Some(&x)), Ok(()));
+        std::fs::write(root.join("db/other.sqlite3"), "").unwrap();
         assert!(before.unchanged_excluding(&listing, Some(&x)).is_err());
     }
 

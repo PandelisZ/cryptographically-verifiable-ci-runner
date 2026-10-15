@@ -107,7 +107,16 @@ Toolchain steps per runner:
         with:
           ruby-version: "3.4.9"   # exact Ruby used locally; omit to use .ruby-version
           bundler-cache: true
+# Rails with MySQL or PostgreSQL only: the job's usual database service (same adapter, the host and port
+# config/database.yml names for the test environment), then create the test database as any Rails CI job does:
+#     - run: bin/rails db:test:prepare
 ```
+
+Rails databases: vci does not manage them. The test database is the engine's (Rails sets it up; SQLite needs no
+step), its contents are not an input, and no policy is needed for a database server. `vci ci` runs a project's
+remaining Rails files in one `bin/rails test` (or `rspec`) process. `rails_allow_db` was removed in 1.4.0: if the
+user's `vci.toml` still sets it, it is a no-op that warns; suggest removing it. The collector moved to 0.5.0 in
+1.4.0, so existing Rails attestations run once more in CI.
 
 What the action does: installs a prebuilt `vci` (checksum pinned in the action) or builds it, runs
 `vci fetch --remote origin`, writes `vci plan` to the job summary, then runs `vci ci` (runs every unit not skipped,

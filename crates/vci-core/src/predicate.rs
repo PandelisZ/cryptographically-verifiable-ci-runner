@@ -101,8 +101,12 @@ pub struct Toolchain {
     /// external/internal>`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ruby_libs: String,
-    /// Rails adapter: the database software of the test environment
-    /// (`sqlite3`; `postgresql <server version>` under policy.rails_allow_db).
+    /// Rails adapter: the adapter names of the test environment's databases
+    /// (Active Record's configurations), sorted and joined with `;`
+    /// (`sqlite3`, `mysql2`, `postgresql;sqlite3`), compared exactly: a test
+    /// that passes on SQLite may fail on MySQL. No server version (what a
+    /// server holds or runs is not an input). Attestations made before vci
+    /// 1.4.0 may hold `<adapter> <server version>`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ruby_db: String,
     /// Rails adapter: every gem of the resolved bundle as sorted
@@ -599,7 +603,7 @@ mod tests {
                 t.ruby_test = "minitest 5.25.4".into()
             }),
             ("ruby libraries", |t| t.ruby_libs = "sqlite=3.45.1".into()),
-            ("database", |t| t.ruby_db = "postgresql 16.4".into()),
+            ("database", |t| t.ruby_db = "mysql2".into()),
             ("gems (bundle)", |t| t.ruby_gems.push("pg==1.6.0".into())),
         ] {
             let mut other = rb.clone();

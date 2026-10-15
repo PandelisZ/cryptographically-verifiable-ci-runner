@@ -4,20 +4,24 @@
 //!
 //! ```text
 //! RUBYOPT=-r<abs>/vci_collector.rb VCI_RAILS_MODE=collect VCI_OUT=<fresh dir> \
-//!   VCI_DB_DIR=<fresh dir> TMPDIR=<fresh dir> RAILS_ENV=test PARALLEL_WORKERS=1 \
+//!   TMPDIR=<fresh dir> RAILS_ENV=test PARALLEL_WORKERS=1 \
 //!   DISABLE_SPRING=1 DISABLE_BOOTSNAP=1 BUNDLE_GEMFILE=<project>/Gemfile \
 //!   ruby bin/rails test test/models/b_test.rb --seed 0
 //! # an RSpec file (VCI_RAILS_RUNNER=rspec):
 //!   ruby -e '<RSPEC_RUN_SCRIPT>' -- --options .rspec spec/models/b_spec.rb
 //! ```
 //!
-//! The collector redirects the test environment's SQLite databases to fresh
-//! files in `VCI_DB_DIR` and loads the schema into them before
-//! `rails/test_help` (or `rails_helper`'s `maintain_test_schema!`) runs, so
-//! every file runs against a database built from `db/schema.rb` (or
-//! `structure.sql`) and the fixtures, never against data a previous run left
-//! behind. `vci ci` runs the remaining files the same way
-//! (`VCI_RAILS_MODE=plain`: no recording). Findings: `docs/spike-rails.md`.
+//! The test database is the test engine's business: vci uses the databases
+//! `config/database.yml` configures for the test environment as they are,
+//! and Rails' `maintain_test_schema!` (which may run `bin/rails
+//! db:test:prepare`), transactional tests and fixtures give each test its
+//! starting state, as in a plain `bin/rails test` or `rspec`. What the
+//! database holds is not an input (the collector records `db/schema.rb`,
+//! `config/database.yml`, the fixture files and the code where Ruby reads
+//! them). Because the files of a project share that database, they run one
+//! at a time. `vci ci` runs the remaining files of a project in one process
+//! per runner (`bin/rails test <files>`, `rspec <files>`;
+//! `VCI_RAILS_MODE=plain`: no recording). Findings: `docs/spike-rails.md`.
 //!
 //! Which runner a project uses: the `runner` setting of its `vci.toml`
 //! entry (from the base commit in `vci plan`), else detected: RSpec when
@@ -54,10 +58,6 @@ const COLLECTOR_FILE: &str = "vci_collector.rb";
 /// a file and `Kernel#rand` (Minitest seeds it) are the same where the file
 /// was attested and in `vci ci`.
 pub const RAILS_SEED: &str = "0";
-
-/// Taint prefix for a database server (PostgreSQL, MySQL, ...), the one
-/// refusal `policy.rails_allow_db` waives.
-pub const RAILS_NETWORK_DB_TAINT: &str = "rails:network-db:";
 
 /// A test framework of the Rails adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +279,6 @@ pub struct RailsAdapter {
     project_dir: Utf8PathBuf,
     ruby: OsString,
     collector: Option<Utf8PathBuf>,
-    allow_db: bool,
     /// The `runner` setting; `None`: detected (see [`RailsAdapter::mode`]).
     runner: Option<RailsRunner>,
     mode: OnceLock<Result<Mode, String>>,
@@ -352,7 +351,6 @@ fn utf8_tmp(t: &tempfile::TempDir) -> Result<Utf8PathBuf, AdapterError> {
 struct RunDirs {
     _tmp: tempfile::TempDir,
     tmpdir: Utf8PathBuf,
-    db: Utf8PathBuf,
     out: Utf8PathBuf,
 }
 
@@ -360,14 +358,13 @@ impl RunDirs {
     fn new() -> Result<Self, AdapterError> {
         let t = tempfile::Builder::new().prefix("vci-rails-").tempdir()?;
         let base = utf8_tmp(&t)?;
-        let (tmpdir, db, out) = (base.join("tmp"), base.join("db"), base.join("out"));
-        for d in [&tmpdir, &db, &out] {
+        let (tmpdir, out) = (base.join("tmp"), base.join("out"));
+        for d in [&tmpdir, &out] {
             std::fs::create_dir(d)?;
         }
         Ok(Self {
             _tmp: t,
             tmpdir,
-            db,
             out,
         })
     }
@@ -386,7 +383,6 @@ impl RailsAdapter {
             project_dir,
             ruby,
             collector: None,
-            allow_db: false,
             runner: None,
             mode: OnceLock::new(),
             probe: OnceLock::new(),
@@ -453,13 +449,6 @@ impl RailsAdapter {
         self
     }
 
-    /// `policy.rails_allow_db`: database servers are prepared fresh from the
-    /// schema too (their files are attested with the refusal waived).
-    pub fn with_allow_db(mut self, allow: bool) -> Self {
-        self.allow_db = allow;
-        self
-    }
-
     fn collector_file(&self) -> Result<Utf8PathBuf, AdapterError> {
         let dir = match &self.collector {
             Some(p) if collector_ok(p) => p.canonicalize_utf8()?,
@@ -494,7 +483,7 @@ impl RailsAdapter {
     /// `ruby <args>` in the project dir with `env` applied and vci's run
     /// conditions: the collector in `mode`, the test environment, one
     /// process (no parallel workers, no Spring, no Bootsnap caches), the
-    /// project's Gemfile, fresh temp and database directories.
+    /// project's Gemfile, a fresh temp directory.
     fn ruby_cmd(
         &self,
         env: &ChildEnv,
@@ -525,15 +514,13 @@ impl RailsAdapter {
             .env("VCI_RAILS_RUNNER", runner.as_str())
             .env("VCI_ROOT", self.project_dir.as_str())
             .env("VCI_REPO", self.repo_root().as_str())
-            .env("VCI_DB_DIR", dirs.db.as_str())
             .env("TMPDIR", dirs.tmpdir.as_str())
             .env("RAILS_ENV", "test")
             .env("RACK_ENV", "test")
             .env("PARALLEL_WORKERS", "1")
             .env("DISABLE_SPRING", "1")
             .env("DISABLE_BOOTSNAP", "1")
-            .env("BUNDLE_GEMFILE", self.gemfile().as_str())
-            .env("VCI_RAILS_ALLOW_DB", if self.allow_db { "1" } else { "0" });
+            .env("BUNDLE_GEMFILE", self.gemfile().as_str());
         c
     }
 
@@ -608,9 +595,9 @@ impl RailsAdapter {
             && !self.project_dir.join("config/environment.rb").is_file()
     }
 
-    /// The command running one test file (`None`: the whole suite) with
-    /// `runner`: `bin/rails test <file> --seed 0`, or `rspec --options .rspec
-    /// <file>`.
+    /// The command running test files (none: the whole suite) with
+    /// `runner`: `bin/rails test <files> --seed 0`, or `rspec --options
+    /// .rspec <files>`.
     fn test_cmd(
         &self,
         env: &ChildEnv,
@@ -618,22 +605,18 @@ impl RailsAdapter {
         dirs: &RunDirs,
         collector: &Utf8Path,
         runner: RailsRunner,
-        file: Option<&str>,
+        files: &[&str],
     ) -> Command {
         let mut cmd = self.ruby_cmd_for(env, mode, dirs, collector, runner);
         match runner {
             RailsRunner::Minitest => {
                 cmd.args(["bin/rails", "test"]);
-                if let Some(f) = file {
-                    cmd.arg(file_arg(f));
-                }
+                cmd.args(files.iter().map(|f| file_arg(f)));
                 cmd.args(["--seed", RAILS_SEED]);
             }
             RailsRunner::Rspec => {
                 cmd.args(["-e", RSPEC_RUN_SCRIPT, "--"]).args(RSPEC_ARGS);
-                if let Some(f) = file {
-                    cmd.arg(file_arg(f));
-                }
+                cmd.args(files.iter().map(|f| file_arg(f)));
             }
         }
         cmd
@@ -658,7 +641,7 @@ impl RailsAdapter {
     ) -> Result<OneRun, AdapterError> {
         let runner = self.runner_for_run(file)?;
         let dirs = RunDirs::new()?;
-        let mut cmd = self.test_cmd(env, "collect", &dirs, collector, runner, Some(file));
+        let mut cmd = self.test_cmd(env, "collect", &dirs, collector, runner, &[file]);
         cmd.env("VCI_OUT", dirs.out.as_str())
             .env("VCI_TEST_ID", file);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
@@ -677,15 +660,17 @@ impl RailsAdapter {
         Ok((out.status.code(), files, log))
     }
 
+    /// One plain process (no recording) of `runner` for `files` (none: the
+    /// whole suite).
     fn run_one_plain(
         &self,
         collector: &Utf8Path,
         runner: RailsRunner,
-        file: Option<&str>,
+        files: &[&str],
         env: &ChildEnv,
     ) -> Result<OneRun, AdapterError> {
         let dirs = RunDirs::new()?;
-        let mut cmd = self.test_cmd(env, "plain", &dirs, collector, runner, file);
+        let mut cmd = self.test_cmd(env, "plain", &dirs, collector, runner, files);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         let mut log = format!(
             "vci: {} (exit {})\n",
@@ -700,15 +685,35 @@ impl RailsAdapter {
         Ok((out.status.code(), vec![], log))
     }
 
-    /// Parallel processes for `vci run`: `$VCI_JOBS` (default: CPUs up to
-    /// 8); one at a time when database servers are attested (every process
-    /// purges and reloads the same database).
+    /// Processes at a time for `vci run`: one. The files of a project share
+    /// the test environment's database (as in `bin/rails test`, which runs
+    /// them in one process), and Rails' `maintain_test_schema!` may rebuild
+    /// it (`bin/rails db:test:prepare`) when it is not current.
     fn jobs(&self) -> usize {
-        if self.allow_db {
-            1
-        } else {
-            crate::pytest_jobs()
+        1
+    }
+
+    /// One plain process per `(runner, files)` group, one after the other
+    /// (they share the test database); its log goes to stderr. The exit
+    /// code: the first non-zero one (`None`: a process died from a signal).
+    fn run_plain_groups(
+        &self,
+        collector: &Utf8Path,
+        groups: &[(RailsRunner, Vec<&str>)],
+        env: &ChildEnv,
+    ) -> Result<Option<i32>, AdapterError> {
+        let mut code = Some(0);
+        for (r, files) in groups {
+            let (c, _, log) = self.run_one_plain(collector, *r, files, env)?;
+            use std::io::Write as _;
+            let _ = std::io::stderr().write_all(&log);
+            match (code, c) {
+                (Some(0), c) => code = c,
+                (Some(_), None) => code = None,
+                _ => {}
+            }
         }
+        Ok(code)
     }
 }
 
@@ -1192,11 +1197,12 @@ impl Adapter for RailsAdapter {
         per_file_jobs(files, self.jobs(), |f| self.run_one(&collector, f, env))
     }
 
-    /// With files: one process per file (`bin/rails test <file>` or `rspec
-    /// <file>`), with the run conditions the attestations were made with
-    /// (fresh databases loaded from the schema, one process, the fixed
-    /// seed, RSpec's options from `.rspec` only). Without: the whole suite,
-    /// one process per runner (`bin/rails test`, `rspec`).
+    /// With files: one process per runner for all of them (`bin/rails test
+    /// <files> --seed 0`, `rspec --options .rspec <files>`), the engine's own
+    /// way, with the run conditions the attestations were made with (no
+    /// parallel workers, the fixed seed, RSpec's options from `.rspec`
+    /// only). Without: the whole suite, one process per runner (`bin/rails
+    /// test`, `rspec`).
     fn run_plain(&self, files: &[String], env: &ChildEnv) -> Result<Option<i32>, AdapterError> {
         let collector = self.collector_file()?;
         if files.is_empty() {
@@ -1212,24 +1218,20 @@ impl Adapter for RailsAdapter {
                 Mode::Rspec => &[RailsRunner::Rspec],
                 Mode::Both => &[RailsRunner::Minitest, RailsRunner::Rspec],
             };
-            let mut code = Some(0);
-            for r in runners {
-                let (c, _, log) = self.run_one_plain(&collector, *r, None, env)?;
-                use std::io::Write as _;
-                let _ = std::io::stderr().write_all(&log);
-                match (code, c) {
-                    (Some(0), c) => code = c,
-                    (Some(_), None) => code = None,
-                    _ => {}
-                }
-            }
-            return Ok(code);
+            let groups: Vec<(RailsRunner, Vec<&str>)> =
+                runners.iter().map(|r| (*r, Vec::new())).collect();
+            return self.run_plain_groups(&collector, &groups, env);
         }
-        Ok(per_file_jobs(files, self.jobs(), |f| {
+        // The files of each runner, in the order given.
+        let mut groups: Vec<(RailsRunner, Vec<&str>)> = Vec::new();
+        for f in files {
             let runner = self.runner_for_run(f)?;
-            self.run_one_plain(&collector, runner, Some(f), env)
-        })?
-        .exit_code)
+            match groups.iter_mut().find(|(r, _)| *r == runner) {
+                Some((_, v)) => v.push(f.as_str()),
+                None => groups.push((runner, vec![f.as_str()])),
+            }
+        }
+        self.run_plain_groups(&collector, &groups, env)
     }
 
     /// An in-repository `vendor/bundle` (BUNDLE_PATH) holds installed gems,

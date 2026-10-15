@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-4-0">1.4.0</a></td><td>15 Oct 2026</td><td>The Rails test database is the test engine's: its contents are never an input, and database servers need no policy</td></tr>
 <tr><td><a href="#v1-3-0">1.3.0</a></td><td>15 Oct 2026</td><td>CI attests its own runs, so unchanged tests are skipped from one commit of main to the next; macOS attestations count on Linux</td></tr>
 <tr><td><a href="#v1-2-0">1.2.0</a></td><td>14 Oct 2026</td><td>Rails apps with Active Storage can attest; fixes from the first large monorepo deployment</td></tr>
 <tr><td><a href="#v1-1-0">1.1.0</a></td><td>14 Oct 2026</td><td>New <code>node-test</code> adapter for Node's built-in test runner</td></tr>
@@ -25,6 +26,19 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-4-0">1.4.0</h2>
+<p><em>15 October 2026.</em> vci stops controlling the Rails test database. It is the test engine's business, as it is when you run <code>bin/rails test</code> or <code>rspec</code>: <code>maintain_test_schema!</code>, fixtures and transactional tests give each test its starting state.</p>
+<ul>
+<li>The databases <code>config/database.yml</code> configures for the test environment are used as they are. vci no longer redirects SQLite files to fresh temp files or loads the schema itself. The <code>bin/rails db:test:prepare</code> child process Active Record starts when the schema is not current is accepted; a test's own child processes are still refused.</li>
+<li>What the database holds is never an input. Reads, checks and writes of the test environment's SQLite files and their <code>-wal</code>, <code>-shm</code> and <code>-journal</code> files are not recorded, and a listing of <code>db/</code> leaves them out, so rows written behind the tests' back, or a fresh checkout without any database, change no verdict. Another file an entry of <code>config/database.yml</code> names that is not a SQLite database is still recorded like any file.</li>
+<li>The schema file of every test database (<code>db/schema.rb</code>, <code>db/cache_schema.rb</code>, ...) is an input of every test that loads Active Record, even on a fresh database where only the <code>db:test:prepare</code> child reads it.</li>
+<li>MySQL, Trilogy and PostgreSQL test databases work with no policy. The toolchain's database is the adapter name only (<code>sqlite3</code>, <code>mysql2</code>, <code>postgresql</code>), compared exactly; no server version.</li>
+<li>Still refused: another SQLite file (including a name that merely contains <code>mode=memory</code>), <code>ATTACH</code>, SQLite extensions, a database client a test opens itself, and Active Record connecting to a server or database that is not one of the test environment's (<code>establish_connection</code> elsewhere, an adapter's <code>new_client</code>).</li>
+<li>Rails files of a project run one at a time in <code>vci run</code>, and <code>vci ci</code> runs the rest in one <code>bin/rails test</code> or <code>rspec</code> process per project.</li>
+</ul>
+<p><strong>What you give up.</strong> An attestation no longer promises that the test was independent of leftover database state. It promises what CI promises: the test passed on a database the engine set up.</p>
+<p><strong>Upgrade notes.</strong> <code>policy.rails_allow_db</code> is removed. A <code>vci.toml</code> that still sets it parses, the key has no effect, and <code>vci run</code> and <code>vci plan</code> warn once; remove it. The Ruby collector is now 0.5.0, so existing Rails and RSpec attestations run once more in CI.</p>
 
 <h2 id="v1-3-0">1.3.0</h2>
 <p><em>15 October 2026.</em> Two things people asked for after the first deployments: CI should not re-run on commit B what it already ran on commit A, and an attestation made on a Mac should count on a Linux runner.</p>

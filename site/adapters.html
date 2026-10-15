@@ -240,9 +240,9 @@ git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock \
 TZ=UTC vci run test/models/b_test.rb --key ~/.ssh/id_ed25519
 TZ=UTC vci plan --base-ref origin/main
 vci push</code></pre>
-<p>The collector is plain Ruby loaded through <code>RUBYOPT</code>; nothing is installed into your project. It makes every run start from the same state:</p>
+<p>The collector is plain Ruby loaded through <code>RUBYOPT</code>; nothing is installed into your project. It sets these run conditions:</p>
 <ul>
-<li><strong>a fresh database</strong>: each SQLite database of the test environment is redirected to a new temp file with the schema loaded. <code>db/test.sqlite3</code> is never used;</li>
+<li><strong>the database is the test engine's</strong>: the databases <code>config/database.yml</code> configures for the test environment are used as they are, and Rails sets them up as in a plain <code>bin/rails test</code> (<code>maintain_test_schema!</code>, fixtures, transactional tests). Their contents are not an input. Files of a project run one at a time, and <code>vci ci</code> runs the rest in one <code>bin/rails test</code> process;</li>
 <li><strong>one process</strong>: <code>PARALLEL_WORKERS=1</code>, no Spring, no Bootsnap caches;</li>
 <li><strong>a fixed Minitest seed</strong> (<code>--seed 0</code>).</li>
 </ul>
@@ -257,15 +257,16 @@ vci push</code></pre>
 <p>Any change to <code>Gemfile.lock</code> runs everything.</p>
 <h3>What is refused</h3>
 <ul>
-<li>child processes and forks;</li>
-<li>sockets;</li>
-<li>a database server (unless waived, see below);</li>
+<li>child processes and forks (except the <code>bin/rails db:test:prepare</code> that Active Record's own schema maintenance starts);</li>
+<li>sockets, and a database client a test opens itself;</li>
+<li>a SQLite file that is not one of the test environment's databases, <code>ATTACH</code> and SQLite extensions;</li>
 <li>writes inside the repository outside <code>log/</code>, <code>tmp/</code>, <code>storage/</code> and <code>coverage/</code>;</li>
 <li>enumerating <code>ENV</code>;</li>
 <li>loading or reading files of an installed gem that is not in the bundle (<code>ruby:gem-outside-bundle</code>, <code>ruby:read-outside-bundle</code>);</li>
 <li>any failure, error or skip, and a test that made no assertion.</li>
 </ul>
-<div class="note"><p><strong>Database servers.</strong> PostgreSQL and MySQL test databases are refused by default. <code>rails_allow_db = true</code> under <code>[policy]</code> waives that: vci then purges each database and loads the schema before every file. With the waiver you state that the test database holds nothing but what vci loads.</p></div>
+<div class="note"><p><strong>vci does not manage the database.</strong> The test database is the test engine's, as in a plain <code>bin/rails test</code>: vci never creates, prepares, purges or loads it, and Rails sets it up (<code>maintain_test_schema!</code>, fixtures, transactional tests). SQLite files, MySQL and PostgreSQL servers configured for the test environment all work with no policy. What the database holds is never an input, so rows left behind change no verdict. vci records the schema file of every test database (<code>db/schema.rb</code>, <code>db/cache_schema.rb</code>, ...), <code>config/database.yml</code>, the fixtures and the code, and the adapter names (<code>sqlite3</code>, <code>mysql2</code>, <code>trilogy</code>, <code>postgresql</code>) are compared; no server version is. It promises what CI promises: the test passed on a database the engine set up, not that it was independent of leftover data.</p>
+<p>A database server needs only what a Rails CI job always needs: the same adapter as a service container, and <code>bin/rails db:test:prepare</code> before the tests. Keep SQLite files git-ignored (<code>/storage/*</code>, or <code>/db/*.sqlite3*</code>). Still refused: another SQLite file, <code>ATTACH</code>, extensions, a database client a test opens itself, and Active Record connecting to a server or database that is not the test environment's. <code>rails_allow_db</code> was removed in 1.4.0: it still parses, has no effect, and <code>vci run</code> and <code>vci plan</code> warn. The collector is now 0.5.0, so existing Rails and RSpec attestations run once more in CI.</p></div>
 <h3 id="getting-skips-on-a-linux-runner">Laptop to Linux runner</h3>
 <p>A generated Rails app needs a few changes before anything is skipped across machines:</p>
 <ul>
@@ -279,7 +280,7 @@ vci push</code></pre>
 </ul>
 
 <h2 id="rspec"><img class="h-logo" src="assets/logos/rspec.png" alt="" aria-hidden="true"> RSpec</h2>
-<p>RSpec runs through the Rails adapter, so everything in the <a href="#rails">Rails</a> section applies: the fresh database, the single process, what is recorded, and the changes needed for a Linux runner. Tested with rspec-core 3.13 and rspec-rails 8. Plain Ruby projects that use RSpec without Rails work the same way.</p>
+<p>RSpec runs through the Rails adapter, so everything in the <a href="#rails">Rails</a> section applies: the engine's test database, the single process, what is recorded, and the changes needed for a Linux runner. Tested with rspec-core 3.13 and rspec-rails 8. Plain Ruby projects that use RSpec without Rails work the same way.</p>
 <h3>Set up</h3>
 <pre><code>cd your-app
 bundle lock --add-platform x86_64-linux
