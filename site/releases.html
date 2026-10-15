@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-5-0">1.5.0</a></td><td>16 Oct 2026</td><td>vci's fixed cost per CI job drops from 12 s to about a second</td></tr>
 <tr><td><a href="#v1-4-1">1.4.1</a></td><td>15 Oct 2026</td><td>The action never compiles vci in your CI; version tags carry their own binaries</td></tr>
 <tr><td><a href="#v1-4-0">1.4.0</a></td><td>15 Oct 2026</td><td>The Rails test database is the test engine's: its contents are never an input, and database servers need no policy</td></tr>
 <tr><td><a href="#v1-3-0">1.3.0</a></td><td>15 Oct 2026</td><td>CI attests its own runs, so unchanged tests are skipped from one commit of main to the next; macOS attestations count on Linux</td></tr>
@@ -27,6 +28,19 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-5-0">1.5.0</h2>
+<p><em>16 October 2026.</em> On the demo benchmark a job where nothing changed used to spend 12 seconds in vci before deciding there was nothing to run: a download with the gh CLI, a fetch, a plan, then <code>vci ci</code> planning again from scratch, every project probed one after another and each Rails project booted. Measured now on the same benchmark: <code>vci ci --fetch</code> with nothing changed takes 0.96 s, plus the binary download.</p>
+<ul>
+<li>The action plans once: for <code>command: ci</code> it runs a single <code>vci ci --fetch</code>, which prints the plan for the step summary and runs what is left; the counts come from the audit log.</li>
+<li><code>--fetch [REMOTE]</code> on <code>vci ci</code> and <code>vci plan</code> fetches attestations while the projects are probed, and the fetch itself is one git round trip instead of two. A failed fetch is still a warning and fails open.</li>
+<li>Projects are probed concurrently: test listing, toolchain and externals per project on their own threads, verdicts too. Output order is unchanged.</li>
+<li>The Rails toolchain is read without booting the application: one short Ruby process with the bundle set up reports Ruby, Bundler's resolved gems, the test frameworks, the libraries and <code>config/database.yml</code>, in the same format as before, so existing attestations still verify. The plan boots the app only when a candidate attestation records a native library, once per project. The attested run still boots and checks everything. What the plan no longer detects: an app that cannot boot on the verifier for a reason outside its recorded inputs and toolchain; the attested run already booted it, and full runs on <code>no_skip_refs</code> still do.</li>
+<li>pytest test files are listed without starting Python, following pytest's own rules for the config file, <code>testpaths</code>, <code>python_files</code>, <code>norecursedirs</code>, virtualenvs and the collection options in <code>addopts</code>; an end-to-end test proves the list equals <code>pytest --collect-only</code>. Files that <code>collect_ignore</code> or a plugin would exclude are listed and run on their own, and a file that collects no tests counts as passing, as in a whole-suite run.</li>
+<li>Lighter <code>go list</code> and <code>cargo metadata --no-deps --offline</code> on the plan side; the action downloads the binary with curl first.</li>
+<li><code>VCI_TIMING=1</code> prints per-phase timings of every plan on stderr; the benchmark workflow uses it.</li>
+</ul>
+<p><strong>Upgrade notes.</strong> Nothing changes in what is recorded, so existing attestations verify under 1.5.0. Pin <code>@v1</code> or <code>@v1.5.0</code>.</p>
 
 <h2 id="v1-4-1">1.4.1</h2>
 <p><em>15 October 2026.</em></p>
