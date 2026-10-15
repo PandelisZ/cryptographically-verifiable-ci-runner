@@ -419,7 +419,7 @@ vci push &amp;&amp; git push</code></pre>
 
 <h2 id="measured">Measured on this repository</h2>
 <p>These are seven consecutive runs of the main-branch job of this repository, the one that attests with the CI key. Five projects, 21 test units, about four seconds of tests when everything runs plainly, so the chart shows vci's floor rather than its savings: fetch and plan cost six to seven seconds, and a commit with nothing to run finishes the whole job in about 40 seconds against 47 for the plain full run. The two long bars are our own development runs compiling vci from sources that were not released yet; a workflow that uses <code>@v1</code> or a release tag downloads the binary in about a second and never compiles.</p>
-<img src="assets/measured.svg" alt="Seven consecutive main-branch runs of this repository, each split into GitHub setup, vci fetch and plan, tests, and compile time" width="1000" height="614" style="width:100%;height:auto;display:block;margin:16px 0 4px">
+<img src="assets/measured.svg" alt="Seven consecutive main-branch runs of this repository, each split into GitHub setup, vci fetch and plan, tests, and compile time" width="1000" height="630" style="width:100%;height:auto;display:block;margin:16px 0 4px">
 <table>
 <tr><th>Run</th><th>What happened</th></tr>
 <tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38677903509">38677903509</a></td><td>Commit A: the CI key attests all 21 units and pushes them</td></tr>
