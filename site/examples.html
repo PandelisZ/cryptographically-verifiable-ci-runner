@@ -418,19 +418,19 @@ vci push &amp;&amp; git push</code></pre>
 <p>Several agents can work on one branch. Each signs with its own key, their attestations never overwrite each other, and CI accepts any of them that is still valid.</p>
 
 <h2 id="measured">Measured on this repository</h2>
-<p>One run of this repository's <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/.github/workflows/bench.yml">benchmark workflow</a> on ubuntu-latest, with vci 1.4.1 downloaded as the release binary: every stage is its own step, so the job's step timings are the measurement. Five projects, 21 test units, about six seconds of tests when everything runs plainly, so this shows vci's costs rather than its savings on a real suite.</p>
-<img src="assets/measured.svg" alt="One benchmark run split into timed stages: GitHub setup, the plain suite, vci install fetch and plan, attesting every unit, push, nothing changed, one module changed, one Rails model changed" width="1000" height="604" style="width:100%;height:auto;display:block;margin:16px 0 4px">
+<p>Numbers from one run of this repository's <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/.github/workflows/bench.yml">benchmark workflow</a>, every stage its own timed step, with vci 1.4.1 downloaded as the release binary. The demo projects are five small suites with 21 test units and six seconds of tests: enough to measure what vci costs, too small to show what it saves.</p>
+<img src="assets/measured.svg" alt="How long a CI run takes with and without vci, and what attesting costs once, measured on the demo projects" width="1000" height="550" style="width:100%;height:auto;display:block;margin:16px 0 4px">
 <table>
 <tr><th>Stage</th><th>Seconds</th><th>What it tells you</th></tr>
 <tr><td>plain: full suite without vci</td><td>6</td><td>the suite itself</td></tr>
 <tr><td>vci: install, fetch, plan</td><td>8</td><td>the fixed cost of every job: a one-second download, a fetch, a plan over 21 units</td></tr>
-<tr><td>vci run: attest all 21 units</td><td>36</td><td>about 1.5 s per unit on top of the test: one process per unit with a collector, a Rails boot per file. pytest 6, Go 9, Cargo 1, Rails 9, RSpec 10</td></tr>
+<tr><td>vci run: attest all 21 units</td><td>36</td><td>about 1.5 s per test file or package on top of the tests in it, not per test case: each unit runs in its own process with a collector, and each Rails file boots the app. pytest 6, Go 9, Cargo 1, Rails 9, RSpec 10</td></tr>
 <tr><td>vci push</td><td>4</td><td>publishing 21 attestations through git-meta</td></tr>
 <tr><td>vci ci: nothing changed</td><td>4</td><td>21 skipped, no test runner started</td></tr>
 <tr><td>vci ci: one pytest module changed</td><td>6</td><td>one file ran, 20 skipped</td></tr>
 <tr><td>vci ci --key: one Rails model changed</td><td>16</td><td>the four Rails files that load the model ran and were re-attested</td></tr>
 </table>
-<p>So attesting is slower than running, by roughly a process start per unit, and it is paid once per change on one machine; every later run of an unchanged unit, on any machine, costs the plan. The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38786839799">run</a> took 120 seconds in all, 37 of them GitHub's own setup.</p>
+<p>So attesting is slower than running, by roughly a process start per test file or package, and it is paid once per change on one machine; every later run of an unchanged unit, on any machine, costs the plan. A unit is a file or package, so a file with forty tests pays the same 1.5 seconds as this demo's files with one or two. The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38786839799">run</a> took 120 seconds in all, 37 of them GitHub's own setup.</p>
 
 <h2 id="live">Live runs to look at</h2>
 <table>

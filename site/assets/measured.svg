@@ -1,34 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 604" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13">
-<style>.t{fill:#1b1d1a}.m{fill:#5d635b}.setup{fill:#c9cbc4}.ovh{fill:#b45309}.tests{fill:#15803d}.attest{fill:#2563eb}.v{fill:#1b1d1a;font-weight:600}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.setup{fill:#3a3f3c}.ovh{fill:#fbbf63}.tests{fill:#4ade80}.attest{fill:#60a5fa}.v{fill:#e6e9e4}.g{stroke:#262b29}}</style>
-<text class="t" x="0" y="18" font-size="16" font-weight="650">Measured: one benchmark run on this repository's demo projects (vci 1.4.1, release binary)</text>
-<text class="m" x="0" y="38">Each stage is a separately timed step of one GitHub job. Five projects (pytest, Go, Cargo, Rails, RSpec), 21 test units. Seconds.</text>
-<rect class="setup" x="0" y="53" width="14" height="14" rx="3"/><text class="m" x="20" y="64">GitHub, not vci</text>
-<rect class="tests" x="145.0" y="53" width="14" height="14" rx="3"/><text class="m" x="165.0" y="64">tests running</text>
-<rect class="ovh" x="276.8" y="53" width="14" height="14" rx="3"/><text class="m" x="296.8" y="64">vci bookkeeping</text>
-<rect class="attest" x="421.8" y="53" width="14" height="14" rx="3"/><text class="m" x="441.8" y="64">tests running with collectors, signed</text>
-<text class="t" x="0" y="108" font-weight="600">GitHub setup: checkout, toolchains, dependencies</text><text class="m" x="0" y="126" font-size="12">not vci; the same for every job</text>
-<rect class="setup" x="330" y="94" width="481.0" height="18" rx="3"/><text class="v" x="819.0" y="108">37 s</text>
-<line class="g" x1="0" x2="1000" y1="138" y2="138"/>
-<text class="t" x="0" y="166" font-weight="600">plain: full suite without vci</text><text class="m" x="0" y="184" font-size="12">pytest, go test, cargo test, rails test, rspec</text>
-<rect class="tests" x="330" y="152" width="78.0" height="18" rx="3"/><text class="v" x="416.0" y="166">6 s</text>
-<line class="g" x1="0" x2="1000" y1="196" y2="196"/>
-<text class="t" x="0" y="224" font-weight="600">vci: install the binary, fetch, plan</text><text class="m" x="0" y="242" font-size="12">download 1 s, fetch 1 s, plan 5 s</text>
-<rect class="ovh" x="330" y="210" width="104.0" height="18" rx="3"/><text class="v" x="442.0" y="224">8 s</text>
-<line class="g" x1="0" x2="1000" y1="254" y2="254"/>
-<text class="t" x="0" y="282" font-weight="600">vci run: attest all 21 units</text><text class="m" x="0" y="300" font-size="12">pytest 6 s · Go 9 s · Cargo 1 s · Rails 9 s · RSpec 10 s</text>
-<rect class="attest" x="330" y="268" width="468.0" height="18" rx="3"/><text class="v" x="806.0" y="282">36 s</text>
-<line class="g" x1="0" x2="1000" y1="312" y2="312"/>
-<text class="t" x="0" y="340" font-weight="600">vci push: publish the attestations</text><text class="m" x="0" y="358" font-size="12">git-meta, refs/meta/main</text>
-<rect class="ovh" x="330" y="326" width="52.0" height="18" rx="3"/><text class="v" x="390.0" y="340">4 s</text>
-<line class="g" x1="0" x2="1000" y1="370" y2="370"/>
-<text class="t" x="0" y="398" font-weight="600">vci ci: nothing changed</text><text class="m" x="0" y="416" font-size="12">21 of 21 skipped, no test runner started</text>
-<rect class="ovh" x="330" y="384" width="52.0" height="18" rx="3"/><text class="v" x="390.0" y="398">4 s</text>
-<line class="g" x1="0" x2="1000" y1="428" y2="428"/>
-<text class="t" x="0" y="456" font-weight="600">vci ci: one pytest module changed</text><text class="m" x="0" y="474" font-size="12">1 file ran, 20 skipped</text>
-<rect class="tests" x="330" y="442" width="78.0" height="18" rx="3"/><text class="v" x="416.0" y="456">6 s</text>
-<line class="g" x1="0" x2="1000" y1="486" y2="486"/>
-<text class="t" x="0" y="514" font-weight="600">vci ci --key: one Rails model changed</text><text class="m" x="0" y="532" font-size="12">4 Rails files ran and were re-attested</text>
-<rect class="attest" x="330" y="500" width="208.0" height="18" rx="3"/><text class="v" x="546.0" y="514">16 s</text>
-<line class="g" x1="0" x2="1000" y1="544" y2="544"/>
-<text class="m" x="0" y="580">Attesting costs about 1.5 s per unit on top of the test itself, almost all of it one process per unit (a Rails boot per file; Go and pytest per package or file).</text>
-<text class="m" x="0" y="596">A commit with nothing to run costs vci 12 s in all; the rest of its 40-second job is GitHub's setup. Run 38786839799.</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 550" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14">
+<style>.t{fill:#1b1d1a}.m{fill:#5d635b}.plain{fill:#15803d}.ovh{fill:#b45309}.attest{fill:#2563eb}.v{fill:#1b1d1a;font-weight:650}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.plain{fill:#4ade80}.ovh{fill:#fbbf63}.attest{fill:#60a5fa}.v{fill:#e6e9e4}.g{stroke:#262b29}}</style>
+<text class="t" x="0" y="20" font-size="17" font-weight="650">Measured on this repository's demo projects (vci 1.4.1 release binary, ubuntu-latest)</text>
+<text class="m" x="0" y="42">Five small projects, 21 test units, 6 seconds of tests. Big enough to measure vci's costs, too small to show its savings.</text>
+<text class="t" x="0" y="84" font-size="16" font-weight="650">How long does a CI run take?</text><text class="m" x="0" y="104">Same job, same runner. GitHub's own setup (37 s) left out of every bar.</text>
+<text class="t" x="0" y="150" font-weight="600">without vci</text><text class="m" x="0" y="168" font-size="12">the full suite runs: 6 s</text>
+<rect class="plain" x="300.0" y="136" width="72.0" height="20" rx="3"/>
+<text class="v" x="380.0" y="151">6 s</text>
+<text class="t" x="0" y="206" font-weight="600">with vci, nothing changed</text><text class="m" x="0" y="224" font-size="12">install, fetch, plan 8 s + decide 4 s = 12 s; 0 tests run</text>
+<rect class="ovh" x="300.0" y="192" width="144.0" height="20" rx="3"/>
+<text class="v" x="452.0" y="207">12 s</text>
+<text class="t" x="0" y="262" font-weight="600">with vci, one file changed</text><text class="m" x="0" y="280" font-size="12">12 s + the one test that depends on it</text>
+<rect class="ovh" x="300.0" y="248" width="144.0" height="20" rx="3"/>
+<rect class="plain" x="444.0" y="248" width="24.0" height="20" rx="3"/>
+<text class="v" x="476.0" y="263">14 s</text>
+<line class="g" x1="0" x2="1000" y1="298" y2="298"/>
+<text class="t" x="0" y="322" font-size="16" font-weight="650">What does attesting cost, once?</text><text class="m" x="0" y="342">Paid on the machine that attests, once per change. Every later run of an unchanged unit costs only the 12 s above.</text>
+<text class="t" x="0" y="388" font-weight="600">run the suite plainly</text><text class="m" x="0" y="406" font-size="12">21 units, 6 s</text>
+<rect class="plain" x="300.0" y="374" width="72.0" height="20" rx="3"/>
+<text class="v" x="380.0" y="389">6 s</text>
+<text class="t" x="0" y="444" font-weight="600">run it attesting</text><text class="m" x="0" y="462" font-size="12">same 21 units with a collector in each process, signed: 36 s</text>
+<rect class="attest" x="300.0" y="430" width="432.0" height="20" rx="3"/>
+<text class="v" x="740.0" y="445">36 s</text>
+<line class="g" x1="0" x2="1000" y1="480" y2="480"/>
+<rect class="plain" x="0" y="508" width="14" height="14" rx="3"/><text class="m" x="20" y="520">tests running</text>
+<rect class="ovh" x="136.39999999999998" y="508" width="14" height="14" rx="3"/><text class="m" x="156.39999999999998" y="520">vci: fetch, plan, decide</text>
+<rect class="attest" x="347.59999999999997" y="508" width="14" height="14" rx="3"/><text class="m" x="367.59999999999997" y="520">tests running with collectors, then signed</text>
+<text class="m" x="0" y="542">Fixed cost about 12 s per job, plus about 1.5 s per attested test file or package (a process start each, a Rails boot per file), not per test case. Run 38786839799.</text></svg>
