@@ -1,0 +1,85 @@
+# Benchmark of vci on this repository's demo projects, every stage as its own
+# step so the job's step timings are the measurement (the docs site's
+# "Measured on this repository" chart is drawn from one run of this workflow).
+# Runs on main by hand: gh workflow run bench.yml --ref main
+name: bench
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_PYTHON_PREFERENCE: only-managed
+  CGO_ENABLED: "0"
+  TZ: UTC
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    # The CI signing key: an environment secret, main only (see ci.yml).
+    environment: vci-attest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "setup: toolchains and dependencies"
+        uses: ./.github/actions/demo-setup
+
+      # Downloads the release binary, fetches the attestations, plans.
+      - name: "vci: install, fetch, plan"
+        uses: ./
+        with:
+          command: plan
+
+      - name: "plain: full suite without vci"
+        run: |
+          (cd demo/pytest-app && uv run --locked pytest -q)
+          (cd demo/go-app && go test ./...)
+          (cd demo/cargo-app && cargo test --locked)
+          (cd demo/rails-app && bin/rails test)
+          (cd demo/rspec-app && bundle exec rspec)
+
+      - name: Install the signing key
+        env:
+          KEY: ${{ secrets.VCI_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/vci-key"
+          chmod 600 "$RUNNER_TEMP/vci-key"
+
+      - name: "vci run: attest every unit"
+        run: vci run --key "$RUNNER_TEMP/vci-key"
+
+      - name: "vci push: publish the attestations"
+        run: vci push
+
+      - name: "vci ci: nothing changed"
+        run: vci ci --base-ref "$GITHUB_SHA" --audit-log "$RUNNER_TEMP/audit-unchanged.json"
+
+      - name: "vci ci: one pytest module changed"
+        run: |
+          printf '\n# bench\n' >> demo/pytest-app/src/b.py
+          vci ci --base-ref "$GITHUB_SHA" --audit-log "$RUNNER_TEMP/audit-one.json"
+          git checkout -- demo/pytest-app/src/b.py
+
+      - name: "vci ci --key: one Rails test changed, re-attested"
+        run: |
+          printf '\n# bench\n' >> demo/rails-app/app/models/b.rb
+          vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --audit-log "$RUNNER_TEMP/audit-rails.json"
+          git checkout -- demo/rails-app/app/models/b.rb
+
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/vci-key"
+
+      - name: Audit logs
+        if: always()
+        run: |
+          for f in unchanged one rails; do
+            echo "== $f"; python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("skipped", len(d["skipped"]), "ran", len(d["ran"]), "attested", len(d.get("attested") or []))' "$RUNNER_TEMP/audit-$f.json"
+          done
