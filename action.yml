@@ -1,9 +1,9 @@
 name: "vci: skip tests already attested"
 description: >
   Installs the published vci release binary pinned by this action (no
-  compiling), fetches attestations (git-meta metadata on refs/meta/main), and
-  runs only the tests that no trusted signer has already run against identical
-  inputs.
+  compiling), fetches attestations (git-meta metadata on refs/meta/main) while
+  it plans, and runs only the tests that no trusted signer has already run
+  against identical inputs.
 branding:
   icon: check-circle
   color: green
@@ -35,7 +35,7 @@ inputs:
       minutes cold, needs a Rust toolchain) when no published binary fits.
       With the default `false` the action never compiles: it downloads the
       release binary recorded in its release/manifest.txt (checksum verified;
-      with gh, or else curl or wget) and fails at once if this commit of the
+      with curl, or else wget, or gh) and fails at once if this commit of the
       action is not a release (use @v1, or the commit SHA v1 points to), the
       download fails, or the runner's platform has no binary.
     default: "false"
@@ -45,7 +45,7 @@ inputs:
       build-from-source `true` without trying the release binary first.
     default: "true"
   token:
-    description: Token `gh` uses to download the release binary (needs read access to the action's releases); without gh, or when gh fails, the public release URL is used.
+    description: Token `gh` uses to download the release binary (needs read access to the action's releases) when neither curl nor wget is installed, or they cannot download the public release URL.
     default: ${{ github.token }}
   signing-key:
     description: >
@@ -77,10 +77,10 @@ inputs:
 outputs:
   skipped:
     description: Number of test units skipped.
-    value: ${{ steps.plan.outputs.skipped }}
+    value: ${{ steps.ci.outputs.skipped || steps.plan.outputs.skipped }}
   run:
     description: Number of test units that had to run.
-    value: ${{ steps.plan.outputs.run }}
+    value: ${{ steps.ci.outputs.run || steps.plan.outputs.run }}
   attested:
     description: Number of test units attested with signing-key (0 without it).
     value: ${{ steps.ci.outputs.attested }}
@@ -191,34 +191,29 @@ runs:
         echo "VCI_JS_PLUGIN=${{ github.action_path }}/js/vitest-plugin" >> "$GITHUB_ENV"
         echo "VCI_RUBY_COLLECTOR=${{ github.action_path }}/ruby/vci-collector" >> "$GITHUB_ENV"
 
-    # git-meta pull: configures a git-meta remote (`meta`) with the remote's
-    # URL, fetches refs/meta/main into refs/meta/remotes/main and materializes
-    # it into .git/git-meta.sqlite. Needs read access only. If it fails, no
-    # attestation is available and everything runs (fail open).
-    - name: Fetch attestations
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      env:
-        REMOTE: ${{ inputs.remote }}
-      run: |
-        if ! vci fetch --remote "$REMOTE"; then
-          echo "::warning title=vci::could not fetch attestations from $REMOTE; every test will run"
-        fi
-
+    # `command: plan`: decide only. `--fetch` is git-meta pull (configures a
+    # git-meta remote (`meta`) with the remote's URL, fetches refs/meta/main
+    # into refs/meta/remotes/main and materializes it into
+    # .git/git-meta.sqlite; read access only) while the projects are probed.
+    # If it fails, only attestations already stored locally are used (fail
+    # open: in a fresh checkout everything runs).
     - name: Plan
       id: plan
+      if: inputs.command != 'ci'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         BASE: ${{ inputs.base-ref }}
+        REMOTE: ${{ inputs.remote }}
       run: |
-        vci plan --base-ref "$BASE" --format text | tee "$RUNNER_TEMP/vci-plan.txt"
+        set -o pipefail
+        vci plan --fetch "$REMOTE" --base-ref "$BASE" --format text | tee "$RUNNER_TEMP/vci-plan.txt"
         echo "skipped=$(grep -c '^SKIP ' "$RUNNER_TEMP/vci-plan.txt" || true)" >> "$GITHUB_OUTPUT"
         echo "run=$(grep -c '^RUN ' "$RUNNER_TEMP/vci-plan.txt" || true)" >> "$GITHUB_OUTPUT"
         {
           echo '### vci plan'
           echo '```'
-          cat "$RUNNER_TEMP/vci-plan.txt"
+          grep -v '^::' "$RUNNER_TEMP/vci-plan.txt"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
 
@@ -235,6 +230,10 @@ runs:
         printf '%s\n' "$KEY" > "$RUNNER_TEMP/vci-key"
         chmod 600 "$RUNNER_TEMP/vci-key"
 
+    # `command: ci`: one `vci ci` fetches attestations (`--fetch`, git-meta
+    # pull as above, fail open) while it probes the projects, plans once,
+    # prints the plan (first on stdout, ending with its "N to skip" line: the
+    # step summary) and runs what is left. The counts come from its audit log.
     - name: Run what is not attested
       id: ci
       if: inputs.command == 'ci'
@@ -248,19 +247,32 @@ runs:
         PUSH: ${{ inputs.push }}
         REMOTE: ${{ inputs.remote }}
       run: |
-        args=(--base-ref "$BASE" --audit-log "$AUDIT")
+        args=(--fetch "$REMOTE" --base-ref "$BASE" --audit-log "$AUDIT")
         if [ "$SIGN" = "true" ]; then
           args+=(--key "$RUNNER_TEMP/vci-key" --ttl "$TTL")
           if [ "$PUSH" = "true" ]; then
             args+=(--push --remote "$REMOTE")
           fi
         fi
+        out="$RUNNER_TEMP/vci-ci.txt"
         set +e
-        vci ci "${args[@]}"
-        code=$?
+        vci ci "${args[@]}" | tee "$out"
+        code=${PIPESTATUS[0]}
         set -e
-        attested=$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("attested") or []))' "$AUDIT" 2>/dev/null || echo 0)
-        echo "attested=$attested" >> "$GITHUB_OUTPUT"
+        counts=$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print(len(d.get("skipped") or []), len(d.get("ran") or []), len(d.get("attested") or []))' "$AUDIT" 2>/dev/null \
+          || echo "$(grep -c '^SKIP ' "$out" || true) $(grep -c '^RUN ' "$out" || true) 0")
+        read -r skipped run attested <<< "$counts"
+        {
+          echo "skipped=$skipped"
+          echo "run=$run"
+          echo "attested=$attested"
+        } >> "$GITHUB_OUTPUT"
+        {
+          echo '### vci plan'
+          echo '```'
+          sed -n '1,/^[0-9][0-9]* to skip, /p' "$out" | grep -v '^::'
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
         exit "$code"
 
     - name: Remove the signing key

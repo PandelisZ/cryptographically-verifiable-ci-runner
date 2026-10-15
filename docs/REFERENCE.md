@@ -605,8 +605,8 @@ change runs everything.**
 
 Toolchain: Ruby's version and patchlevel (`3.4.9p82`) and engine, Rails (`Rails::VERSION`, or the bundle's `railties`
 for a test file that never loads Rails, such as a Minitest file under `test/lib` that requires only `minitest` and
-plain Ruby, or a spec that loads only `spec_helper`: both runners report what the probe, which boots the application,
-reports), Bundler and Minitest versions, the SQLite library the `sqlite3` gem loaded, libyaml, the time zone data (the
+plain Ruby, or a spec that loads only `spec_helper`: both runners report what the probe reports), Bundler and Minitest
+versions, the SQLite library the `sqlite3` gem loaded, libyaml, the time zone data (the
 `tzinfo-data` gem, or the system zoneinfo directory and its version), the default external/internal encodings, the
 collector's version (`vci_collector.rb`'s `VERSION`, bumped whenever what it records or refuses changes, so CI must run
 the same collector: pin the action or the vci checkout to the commit you attest with; vci 1.4.0 ships 0.5.0), the
@@ -616,6 +616,18 @@ several, such as `postgresql;sqlite3`; compared exactly, as a test that passes o
 version), the full bundle, and whether the tests ran as root (unless `policy.allow_superuser_mismatch`); OS/arch per
 `policy.platform`. Under `policy.libraries = "any"` the versions of the SQLite library, libyaml and the
 time zone data are not compared (whether each is loaded still is).
+
+vci reads this toolchain without booting the application, in `vci plan` and in what `vci run` records alike: one
+Ruby process sets up the bundle (Bundler fails there, as every test process would, when the bundle is not installed),
+loads YAML and TZInfo as every booted Rails application does, `sqlite3` when `Bundler.require(*Rails.groups)` would
+require it, sets both default encodings to UTF-8 as Rails' `config.encoding` does, and reads the test environment's
+database adapters from `config/database.yml` as Rails reads it (ERB, `shared`, `DATABASE_URL`). Only when that file's
+ERB needs the application (`Rails.root`, credentials) is the application booted for it. `vci run` and `vci plan`
+also boot the application once (`vci plan` in the background, while it lists the test files, fetches and checks the
+attestations): `vci run` refuses to attest, and `vci plan` runs every test file of the project, when the application
+does not boot (a native extension of the bundle that fails to load), when the booted application reports anything
+else (a custom `config.encoding`, a gem that loads `sqlite3` itself), or when the boot finds a reason the application
+cannot be attested.
 
 Test results: a file is attested only when the process exits 0 and every test passed: **any failure, error or skip,
 no test at all, or a test that made no assertion** refuses it.
@@ -651,7 +663,8 @@ config/master.key, Rails' credentials key`). Nothing is wrong (it fails open), b
 `FFI::DynamicLibrary.open`) is not a read of test inputs: the collector records the library as an external,
 `native:<file name>` (`native:libvips.42.dylib`), whose version is the sha256 of the file FFI resolved it to (or
 `unresolved` when FFI gave no path, such as a system library in macOS's shared cache). `vci plan` compares it with
-the library the probe's process (which boots the application) opens where the attestation is checked, like a gem: a
+the library the booted application opens where the attestation is checked (the boot `vci plan` makes once per project,
+see above), like a gem: a
 different libvips build, another platform's, or none at all runs the file (with `policy.libraries = "any"` in the base
 `vci.toml`, a libvips of any file name and build is accepted, as long as one is loaded: see `policy.libraries` under
 "`vci.toml`" and "Attest on macOS, skip on Linux"). Finding the library (FFI's search of `LD_LIBRARY_PATH`, its
@@ -1132,8 +1145,8 @@ checkout, clock, policy and environment.
 |---|---|
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet |
 | `vci run [FILES…] [--key PATH] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON |
-| `vci plan [--base-ref R] [--format text\|json\|github]` | Print which test files can be skipped and why the others run |
-| `vci ci [--base-ref R] [--audit-log PATH] [--key PATH [--ttl 14d] [--push [--remote R]]]` | Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose) |
+| `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]]` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally |
+| `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--key PATH [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose) |
 | `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R]` | Verify one DSSE envelope and print its claims |
 | `vci push` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. See "What `vci fetch` and `vci push` guard against" |
 | `vci prune [--dry-run]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them) |

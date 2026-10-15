@@ -1109,28 +1109,55 @@ pub fn run_units(
     let mut files: Vec<TestFile> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut unrun: BTreeSet<usize> = BTreeSet::new();
-    for (i, p) in ctx.projects.iter().enumerate() {
-        if let Selection::Units(u) = &selection
-            && !u.contains_key(&i)
-        {
-            continue;
-        }
-        if let Some(paths) = &wanted {
-            let dir = p
-                .adapter
-                .project_dir()
-                .canonicalize_utf8()
-                .unwrap_or_else(|_| p.adapter.project_dir().to_owned());
-            if !paths.iter().any(|a| a.starts_with(&dir)) {
-                continue;
+    let listing: Vec<bool> = ctx
+        .projects
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if let Selection::Units(u) = &selection
+                && !u.contains_key(&i)
+            {
+                return false;
             }
-        }
-        let listed = p
-            .adapter
-            .list_test_files(&children[i].to_child_env())
-            .map_err(anyhow::Error::from)
-            .and_then(|l| p.test_files(i, l))
-            .with_context(|| format!("listing the test files of {}", p.label()));
+            if let Some(paths) = &wanted {
+                let dir = p
+                    .adapter
+                    .project_dir()
+                    .canonicalize_utf8()
+                    .unwrap_or_else(|_| p.adapter.project_dir().to_owned());
+                if !paths.iter().any(|a| a.starts_with(&dir)) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    // Every project is listed at once (listing shells out), in order after.
+    let listings: Vec<Option<Result<Vec<TestFile>>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = ctx
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (listing, children) = (&listing, &children);
+                s.spawn(move || {
+                    listing[i].then(|| {
+                        p.adapter
+                            .list_test_files(&children[i].to_child_env())
+                            .map_err(anyhow::Error::from)
+                            .and_then(|l| p.test_files(i, l))
+                            .with_context(|| format!("listing the test files of {}", p.label()))
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+    for (i, listed) in listings.into_iter().enumerate() {
+        let Some(listed) = listed else { continue };
         match listed {
             Ok(f) => files.extend(f),
             // `vci ci`: one project that cannot be listed does not stop the
@@ -1192,15 +1219,39 @@ pub fn run_units(
             );
         }
     }
+    // The toolchain of every involved project (probed at once; Rails also
+    // boots the application, which must report the toolchain read without
+    // booting it), checked and reported in order.
+    let probed: Vec<(usize, Result<vci_adapter::ToolVersions>, Vec<String>)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = involved
+                .iter()
+                .map(|&pi| {
+                    let (p, env) = (&ctx.projects[pi], children[pi].to_child_env());
+                    s.spawn(move || {
+                        let v = p
+                            .adapter
+                            .tool_versions_with_env(&env)
+                            .and_then(|v| p.adapter.check_run_environment(&env).map(|()| v))
+                            .with_context(|| format!("tool versions of {}", p.label()));
+                        let warnings = if v.is_ok() {
+                            p.adapter.warnings(&env)
+                        } else {
+                            vec![]
+                        };
+                        (pi, v, warnings)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
     let mut versions = BTreeMap::new();
-    for &pi in &involved {
-        let p = &ctx.projects[pi];
-        let v = p
-            .adapter
-            .tool_versions_with_env(&children[pi].to_child_env())
-            .with_context(|| format!("tool versions of {}", p.label()))?;
-        versions.insert(pi, v);
-        for w in p.adapter.warnings(&children[pi].to_child_env()) {
+    for (pi, v, warnings) in probed {
+        versions.insert(pi, v?);
+        for w in warnings {
             eprintln!("vci: warning: {w}");
         }
     }

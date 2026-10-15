@@ -659,6 +659,21 @@ fn unsupported_goflag(goflags: &str) -> Option<&'static str> {
     None
 }
 
+/// The `go list -json` fields listing the test packages reads. Naming them
+/// spares `go list` what no listed field needs (the staleness of every
+/// package, which hashes the build; VCS stamping); the embed fields keep
+/// `//go:embed` patterns resolved, so a broken one is still a package error.
+const LIST_FIELDS: &[&str] = &[
+    "Dir",
+    "ImportPath",
+    "Error",
+    "TestGoFiles",
+    "XTestGoFiles",
+    "EmbedFiles",
+    "TestEmbedFiles",
+    "XTestEmbedFiles",
+];
+
 /// Parse `go list -m -json all` into module path -> versions, in the form
 /// [`golist::module_id`] records them. A module replaced by a directory maps
 /// to `local:<dir>`, which never equals an attested version.
@@ -695,12 +710,12 @@ impl Adapter for GoAdapter {
         &self.project_dir
     }
 
-    /// Packages under the project dir with test files (`go list -json ./...`).
-    /// Any error (a broken package, no module) is an error, so `vci plan` runs
-    /// everything.
+    /// Packages under the project dir with test files (`go list -json ./...`,
+    /// only the fields listing needs: [`LIST_FIELDS`]). Any error (a broken
+    /// package, no module) is an error, so `vci plan` runs everything.
     fn list_test_files(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError> {
         let mut cmd = self.go_cmd(env);
-        cmd.args(["list", "-json", "./..."]);
+        cmd.args(["list", &format!("-json={}", LIST_FIELDS.join(",")), "./..."]);
         let out = self.output(&mut cmd)?;
         let pkgs = golist::parse_packages(&String::from_utf8_lossy(&out.stdout)).map_err(|e| {
             AdapterError::Parse {

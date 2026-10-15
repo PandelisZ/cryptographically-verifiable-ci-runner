@@ -834,3 +834,125 @@ fn a_project_that_cannot_run_attested_runs_alone_and_the_rest_is_kept() {
     assert_eq!(r.log["pushed"], true);
     assert_eq!(w.published("check"), p1);
 }
+
+/// `vci ci --fetch` and `vci plan --fetch` fetch the attestations themselves
+/// (what the action's separate `vci fetch` step did), while the projects are
+/// probed: a fresh clone skips what main attested. A remote that cannot be
+/// fetched is a warning, never a failure: only attestations already stored
+/// locally are used (none in a fresh clone, so everything runs).
+#[test]
+fn fetch_while_planning_and_fail_open() {
+    let w = World::new();
+    let all = set(&[A, B, C, D]);
+    let ci_a = w.ci_clone("fetch-a");
+    let r = w.ci(
+        &ci_a,
+        "fetch-a",
+        &["--fetch", "origin", "--push", "--remote", "origin"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("has no git-meta metadata yet"),
+        "fetched before anything was published: {}",
+        r.stderr
+    );
+    assert_eq!(r.attested(), all, "{}", r.stderr);
+
+    // A fresh clone: `vci ci --fetch` (bare: the default remote, origin's
+    // URL from .git-meta or origin) skips everything, as fetch + ci did.
+    let ci_b = w.ci_clone("fetch-b");
+    let r = w.ci(&ci_b, "fetch-b", &["--fetch"]);
+    assert_eq!(r.code, Some(0), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("vci: fetched git-meta metadata from "),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(ids(&r.log["skipped"]), all, "{}", r.stderr);
+    assert!(ids(&r.log["ran"]).is_empty());
+    assert!(r.stdout.contains("4 to skip, 0 to run"), "{}", r.stdout);
+
+    // `vci plan --fetch REMOTE`, JSON on stdout.
+    let ci_c = w.ci_clone("fetch-c");
+    let out = w.vci_ok(
+        &ci_c,
+        MAIN,
+        &[
+            "plan",
+            "--fetch",
+            "origin",
+            "--base-ref",
+            "HEAD",
+            "--format",
+            "json",
+        ],
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let skipped: BTreeSet<String> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["skip"] == true)
+        .map(|f| f["testId"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(skipped, all);
+
+    // An unreachable remote: a warning (stderr, an annotation on stdout,
+    // the audit log), and the plan goes on with what is stored locally.
+    let ci_d = w.ci_clone("fetch-d");
+    let missing = w.base.join("no-such-remote.git");
+    let missing = missing.to_str().unwrap();
+    let out = w.vci(
+        &ci_d,
+        MAIN,
+        &[
+            "plan",
+            "--fetch",
+            missing,
+            "--base-ref",
+            "HEAD",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "vci: warning: could not fetch attestations from {missing}: "
+        )),
+        "{stderr}"
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("stdout stays JSON");
+    assert!(
+        v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["skip"] == false)
+    );
+    let r = w.ci_at(
+        &ci_d,
+        "fetch-d",
+        MAIN,
+        "HEAD",
+        &w.ci_key,
+        &["--fetch", missing],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.stderr);
+    assert!(
+        r.stdout
+            .contains("::warning title=vci::could not fetch attestations from "),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.log["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .starts_with("could not fetch attestations")),
+        "{}",
+        r.log
+    );
+    assert_eq!(ids(&r.log["ran"]), all);
+}

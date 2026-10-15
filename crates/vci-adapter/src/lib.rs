@@ -254,6 +254,25 @@ pub trait Adapter: Send + Sync {
         let _ = env;
         Ok(None)
     }
+    /// Native libraries the project's test processes open when they start
+    /// (Rails: what the application opens through FFI when it boots), as the
+    /// `native:<file name>` externals the collector records. `vci plan` asks
+    /// only when an attestation records one. `None`: the adapter records
+    /// none.
+    fn native_externals(&self, env: &ChildEnv) -> Result<Option<InstalledExternals>, AdapterError> {
+        let _ = env;
+        Ok(None)
+    }
+    /// What `vci run` checks before running anything it attests, and
+    /// `vci plan` before it skips anything (in the background, joined before
+    /// the verdicts: a failure runs every file of the project), beyond
+    /// [`Adapter::tool_versions_with_env`] (Rails: the application boots
+    /// under vci's run conditions, passes the probe's checks and reports the
+    /// toolchain read without booting it).
+    fn check_run_environment(&self, env: &ChildEnv) -> Result<(), AdapterError> {
+        let _ = env;
+        Ok(())
+    }
     /// Canonical per-file argv recorded in (and compared against) attestations.
     /// `project_rel` is the test file relative to the project dir.
     fn canonical_argv(&self, project_dir_rel_to_repo: &str, project_rel: &str) -> Vec<String>;

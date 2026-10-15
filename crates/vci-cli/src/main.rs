@@ -77,6 +77,9 @@ enum Cmd {
         base_ref: Option<String>,
         #[arg(long, value_enum, default_value = "text")]
         format: Format,
+        /// Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`.
+        #[arg(long, value_name = "REMOTE", num_args = 0..=1, default_missing_value = "")]
+        fetch: Option<String>,
     },
     /// Plan, run the remaining tests, and write an audit log of the skips (with --key: attest what runs).
     Ci {
@@ -96,6 +99,9 @@ enum Cmd {
         /// git-meta remote, or a git remote / URL, to push to (as `vci push --remote`).
         #[arg(long, requires = "push")]
         remote: Option<String>,
+        /// Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`.
+        #[arg(long, value_name = "REMOTE", num_args = 0..=1, default_missing_value = "")]
+        fetch: Option<String>,
     },
     /// Verify one attestation envelope (file path or `-`).
     Verify {
@@ -168,6 +174,12 @@ fn explain_id(arg: &str) -> Result<String> {
     Ok(vci_core::RepoPath::new(arg)?.as_str().to_owned())
 }
 
+/// `--fetch [REMOTE]`: `Some(None)` (bare `--fetch`) fetches from the
+/// default remote, as `vci fetch` without `--remote` does.
+fn fetch_remote(arg: Option<String>) -> Option<Option<String>> {
+    arg.map(|r| Some(r).filter(|r| !r.is_empty()))
+}
+
 fn main() {
     let cli = Cli::parse();
     let r = match cli.cmd {
@@ -197,19 +209,28 @@ fn main() {
             ttl,
             summary,
         }),
-        Cmd::Plan { base_ref, format } => plan::plan(&plan::PlanOptions {
+        Cmd::Plan {
+            base_ref,
+            format,
+            fetch,
+        } => plan::plan(&plan::PlanOptions {
             base_ref,
             only: None,
+            fetch: fetch_remote(fetch),
         })
         .and_then(|res| {
-            plan::print(
-                &res,
-                match format {
-                    Format::Text => "text",
-                    Format::Json => "json",
-                    Format::Github => "github",
-                },
-            )
+            let format = match format {
+                Format::Text => "text",
+                Format::Json => "json",
+                Format::Github => "github",
+            };
+            // A workflow annotation, except where stdout is JSON.
+            if let Some(w) = &res.fetch_failed
+                && format != "json"
+            {
+                println!("::warning title=vci::{}", w.replace(['\r', '\n'], " "));
+            }
+            plan::print(&res, format)
         })
         .map(|()| 0),
         Cmd::Ci {
@@ -219,6 +240,7 @@ fn main() {
             ttl,
             push,
             remote,
+            fetch,
         } => cmds::ci(cmds::CiArgs {
             base_ref,
             audit_log,
@@ -226,6 +248,7 @@ fn main() {
             ttl,
             push,
             remote,
+            fetch: fetch_remote(fetch),
         }),
         Cmd::Verify {
             envelope,
@@ -242,6 +265,7 @@ fn main() {
             let res = plan::plan(&plan::PlanOptions {
                 base_ref,
                 only: Some(id.clone()),
+                fetch: None,
             })?;
             plan::explain(&res, &id)
         }),

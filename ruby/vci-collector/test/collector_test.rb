@@ -301,6 +301,72 @@ class CollectorTest < Minitest::Test
     assert_equal "", meta["rails"]
   end
 
+  # Run `script` in probe mode (no output file): its stdout.
+  def probe_run(script, env: {})
+    put("script.rb", script)
+    e = {
+      "RUBYOPT" => "-r#{COLLECTOR}", "VCI_RAILS_MODE" => "probe", "VCI_ROOT" => @repo, "VCI_REPO" => @repo,
+      "TMPDIR" => @tmpdir, "RUBYLIB" => nil, "BUNDLE_GEMFILE" => nil, "RAILS_ENV" => "test",
+      "DATABASE_URL" => nil, "RAILS_GROUPS" => nil
+    }.merge(env)
+    IO.popen(e, [RbConfig.ruby, "script.rb"], chdir: @repo, err: %i[child out], &:read)
+  end
+
+  # `vci plan` reads the test environment's database adapters without
+  # booting the application: config/database.yml as Rails reads it (ERB,
+  # YAML aliases, `shared`), DATABASE_URL merged in by Active Record, hidden
+  # configurations (replicas, database_tasks: false) included, as the probe
+  # of the booted application (DB.adapters) reports them.
+  def test_probe_without_booting_reads_the_database_adapters
+    skip "activerecord is not installed" unless installed?("activerecord")
+    script = "db = VciCollector::Probe.light_db\n" \
+             "puts \"DB=\#{db.inspect} \#{VciCollector::Probe.instance_variable_get(:@light_db_error)}\"\n"
+    db = lambda do |yml, env = {}|
+      FileUtils.rm_f(File.join(@repo, "config/database.yml"))
+      put("config/database.yml", yml) if yml
+      out = probe_run(script, env: env)
+      line = out.lines.find { |l| l.start_with?("DB=") }
+      assert line, out
+      line.delete_prefix("DB=").strip
+    end
+    default = "default: &default\n  adapter: sqlite3\n  pool: <%= ENV.fetch(\"RAILS_MAX_THREADS\") { 5 } %>\n"
+    assert_equal '"sqlite3"', db.call("#{default}test:\n  <<: *default\n  database: db/test.sqlite3\n")
+    assert_equal '""', db.call("#{default}development:\n  <<: *default\n"), "no test environment"
+    assert_equal '"mysql2"', db.call("test:\n  adapter: <%= ENV.fetch(\"DB\", \"sqlite3\") %>\n", "DB" => "mysql2")
+    assert_equal '"postgresql"', db.call("#{default}test:\n  <<: *default\n", "DATABASE_URL" => "postgres://h/d")
+    multi = "test:\n  primary:\n    adapter: sqlite3\n    database: db/a.sqlite3\n" \
+            "  replica:\n    adapter: sqlite3\n    database: db/a.sqlite3\n    replica: true\n" \
+            "  cache:\n    adapter: mysql2\n    database: c\n    database_tasks: false\n"
+    assert_equal '"mysql2;sqlite3"', db.call(multi)
+    assert_equal '"sqlite3"', db.call("shared:\n  adapter: sqlite3\ntest:\n  database: db/t.sqlite3\n")
+    # Without the file: DATABASE_URL alone, or no database at all.
+    assert_equal '"mysql2"', db.call(nil, "DATABASE_URL" => "mysql2://h/d")
+    assert_equal '""', db.call(nil)
+    # ERB that needs the application: not read (vci boots it for this).
+    got = db.call("test:\n  adapter: sqlite3\n  database: <%= Rails.root.join(\"db/t.sqlite3\") %>\n")
+    assert got.start_with?("nil NameError"), got
+  end
+
+  # SQLite3 is loaded without booting exactly when Bundler.require(*Rails.groups)
+  # (default, the environment, RAILS_GROUPS) would require it.
+  def test_probe_without_booting_requires_what_bundler_require_would
+    script = "require \"bundler\"\nputs \"AUTO=\#{VciCollector::Probe.autorequired?(\"sqlite3\")}\"\n"
+    auto = lambda do |gemfile, env = {}|
+      put("Gemfile", "source \"https://rubygems.org\"\n#{gemfile}")
+      out = probe_run(script, env: { "BUNDLE_GEMFILE" => File.join(@repo, "Gemfile") }.merge(env))
+      line = out.lines.find { |l| l.start_with?("AUTO=") }
+      assert line, out
+      line.delete_prefix("AUTO=").strip
+    end
+    assert_equal "true", auto.call("gem \"sqlite3\"\n")
+    assert_equal "false", auto.call("gem \"sqlite3\", require: false\n")
+    assert_equal "false", auto.call("group :development do\n  gem \"sqlite3\"\nend\n")
+    assert_equal "true", auto.call("group :development do\n  gem \"sqlite3\"\nend\n", "RAILS_GROUPS" => "development")
+    assert_equal "true", auto.call("group :test do\n  gem \"sqlite3\"\nend\n")
+    assert_equal "true", auto.call("gem \"litedb\", require: [\"x\", \"sqlite3\"]\n")
+    assert_equal "false", auto.call("gem \"rack\"\n")
+  end
+
   def test_sqlite_files_outside_the_test_database_taint
     begin
       require "sqlite3"

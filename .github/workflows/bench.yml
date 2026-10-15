@@ -30,11 +30,12 @@ jobs:
       - name: "setup: toolchains and dependencies"
         uses: ./.github/actions/demo-setup
 
-      # Downloads the release binary, fetches the attestations, plans.
+      # Installs the binary (built from these sources, cached), fetches, plans.
       - name: "vci: install, fetch, plan"
         uses: ./
         with:
           command: plan
+          build-from-source: "true"
 
       - name: "plain: full suite without vci"
         run: |
@@ -58,19 +59,25 @@ jobs:
       - name: "vci push: publish the attestations"
         run: vci push
 
-      - name: "vci ci: nothing changed"
-        run: vci ci --base-ref "$GITHUB_SHA" --audit-log "$RUNNER_TEMP/audit-unchanged.json"
+      # THE OVERHEAD METRIC: a whole CI job's vci cost when nothing changed,
+      # exactly as a user's workflow pays it (install, fetch, decide, run nothing).
+      - name: "vci overhead: the action, nothing changed"
+        uses: ./
+        with:
+          command: ci
+          build-from-source: "true"
+          audit-log: ${{ runner.temp }}/audit-unchanged.json
 
       - name: "vci ci: one pytest module changed"
         run: |
           printf '\n# bench\n' >> demo/pytest-app/src/b.py
-          vci ci --base-ref "$GITHUB_SHA" --audit-log "$RUNNER_TEMP/audit-one.json"
+          vci ci --fetch --base-ref "$GITHUB_SHA" --audit-log "$RUNNER_TEMP/audit-one.json"
           git checkout -- demo/pytest-app/src/b.py
 
-      - name: "vci ci --key: one Rails test changed, re-attested"
+      - name: "vci ci --key: one Rails model changed, re-attested"
         run: |
           printf '\n# bench\n' >> demo/rails-app/app/models/widget.rb
-          vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --audit-log "$RUNNER_TEMP/audit-rails.json"
+          vci ci --fetch --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --audit-log "$RUNNER_TEMP/audit-rails.json"
           git checkout -- demo/rails-app/app/models/widget.rb
 
       - name: Remove the signing key

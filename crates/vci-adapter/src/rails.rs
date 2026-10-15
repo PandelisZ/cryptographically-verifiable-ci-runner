@@ -265,12 +265,26 @@ pub const RAILS_GLOBAL_FILES: &[&str] = &[
     "Rakefile",
 ];
 
-/// What `vci plan` and `vci run` learn by booting the application once.
+/// What a probe process reports: the toolchain (`vci plan` and `vci run`
+/// read it without booting the application, see [`RailsAdapter::light_probe`])
+/// and, from a booted application, the native libraries it opened.
 #[derive(Debug, Clone)]
 struct Probe {
     versions: ToolVersions,
     /// gem name -> versions in the bundle.
     gems: InstalledExternals,
+    /// `native:<file name>` -> versions: the native libraries the process
+    /// opened through FFI (a booted application's, for the externals check).
+    natives: InstalledExternals,
+    /// Set when the probe without booting could not read the test
+    /// environment's database adapters (config/database.yml's ERB uses the
+    /// application): why.
+    db_error: Option<String>,
+}
+
+/// The `-e` script of the probe that does not boot the application.
+fn light_script(rails_app: bool) -> String {
+    format!("require \"bundler/setup\"; VciCollector::Probe.light!({rails_app})")
 }
 
 /// The Rails adapter.
@@ -282,6 +296,9 @@ pub struct RailsAdapter {
     /// The `runner` setting; `None`: detected (see [`RailsAdapter::mode`]).
     runner: Option<RailsRunner>,
     mode: OnceLock<Result<Mode, String>>,
+    /// The probe without booting the application (the toolchain).
+    light: OnceLock<Result<Probe, String>>,
+    /// The probe of the booted application.
     probe: OnceLock<Result<Probe, String>>,
 }
 
@@ -385,6 +402,7 @@ impl RailsAdapter {
             collector: None,
             runner: None,
             mode: OnceLock::new(),
+            light: OnceLock::new(),
             probe: OnceLock::new(),
         }
     }
@@ -535,6 +553,10 @@ impl RailsAdapter {
         }
     }
 
+    /// The probe of the booted application (once): `vci run` and `vci plan`
+    /// compare it with [`RailsAdapter::light_probe`]
+    /// ([`Adapter::check_run_environment`]), and `vci plan` reads the native
+    /// libraries from it when an attestation records one.
     fn probe(&self, env: &ChildEnv) -> Result<Probe, AdapterError> {
         self.probe
             .get_or_init(|| self.run_probe(env).map_err(|e| e.to_string()))
@@ -545,20 +567,62 @@ impl RailsAdapter {
             })
     }
 
+    /// The toolchain without booting the application (once): Bundler sets up
+    /// the bundle, and the collector loads what booting would load for the
+    /// toolchain (`VciCollector::Probe.light!`). Rails' own code reads
+    /// config/database.yml for the database adapters; only when that needs
+    /// the application (its ERB uses it) is the application booted for them.
+    /// A project without Rails is probed this way already (`require
+    /// "bundler/setup"`).
+    fn light_probe(&self, env: &ChildEnv) -> Result<Probe, AdapterError> {
+        self.light
+            .get_or_init(|| self.run_light(env).map_err(|e| e.to_string()))
+            .clone()
+            .map_err(|e| AdapterError::Parse {
+                what: "Rails toolchain probe".into(),
+                detail: e,
+            })
+    }
+
+    fn run_light(&self, env: &ChildEnv) -> Result<Probe, AdapterError> {
+        let rails_app = !self.plain_ruby();
+        let mut p = self.run_probe_script(env, &light_script(rails_app), rails_app)?;
+        if let Some(why) = p.db_error.take() {
+            let booted = self.probe(env).map_err(|e| AdapterError::NotFound(format!(
+                "config/database.yml could not be read without booting the application ({why}), and booting it failed: {e}"
+            )))?;
+            p.versions.ruby_db = booted.versions.ruby_db;
+        }
+        Ok(p)
+    }
+
     /// Boot the application (test environment) once with the collector in
-    /// probe mode: versions, the resolved bundle, the databases.
+    /// probe mode: versions, the resolved bundle, the databases, the native
+    /// libraries it opened.
     fn run_probe(&self, env: &ChildEnv) -> Result<Probe, AdapterError> {
-        let collector = self.collector_file()?;
-        let dirs = RunDirs::new()?;
-        let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
         // A plain Ruby project (RSpec without Rails) has no application to
         // boot: its bundle is the toolchain.
         let rails_app = !self.plain_ruby();
-        if rails_app {
-            cmd.args(["-e", "require File.expand_path(\"config/environment\")"]);
+        let script = if rails_app {
+            "require File.expand_path(\"config/environment\")"
         } else {
-            cmd.args(["-e", "require \"bundler/setup\""]);
-        }
+            "require \"bundler/setup\""
+        };
+        self.run_probe_script(env, script, rails_app)
+    }
+
+    /// A probe process: `ruby -e <script>` with the collector in probe mode,
+    /// which prints the `VCI-PROBE` line at exit.
+    fn run_probe_script(
+        &self,
+        env: &ChildEnv,
+        script: &str,
+        rails_app: bool,
+    ) -> Result<Probe, AdapterError> {
+        let collector = self.collector_file()?;
+        let dirs = RunDirs::new()?;
+        let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
+        cmd.args(["-e", script]);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         if !out.status.success() {
             return Err(AdapterError::Command {
@@ -586,6 +650,13 @@ impl RailsAdapter {
                 ),
             })?;
         parse_probe(line, &self.gemfile(), rails_app)
+    }
+
+    /// The toolchain of the booted application, as [`Adapter::tool_versions`]
+    /// reports it without booting it (what `vci run` compares, see
+    /// [`Adapter::check_run_environment`]).
+    pub fn booted_tool_versions(&self, env: &ChildEnv) -> Result<ToolVersions, AdapterError> {
+        Ok(self.probe(env)?.versions)
     }
 
     /// An RSpec project without Rails (no `config/environment.rb`): a gem
@@ -815,19 +886,31 @@ fn parse_probe(line: &str, gemfile: &Utf8Path, rails_app: bool) -> Result<Probe,
     // (`native:<file name>` -> `sha256:<hex>`): a test file that recorded one
     // is checked against what this process opens, like a gem. Not part of
     // the toolchain's bundle list.
-    if let Some(natives) = v.get("natives").and_then(Value::as_array) {
-        for n in natives {
+    let mut natives: InstalledExternals = BTreeMap::new();
+    if let Some(list) = v.get("natives").and_then(Value::as_array) {
+        for n in list {
             let name = n.get("name").and_then(Value::as_str).unwrap_or_default();
             let ver = n.get("version").and_then(Value::as_str).unwrap_or_default();
             if !name.starts_with("native:") || ver.is_empty() {
                 return Err(bad(format!("bad native library entry {n}")));
             }
-            let vs = gems.entry(name.to_owned()).or_default();
+            let vs = natives.entry(name.to_owned()).or_default();
             if !vs.iter().any(|x| x == ver) {
                 vs.push(ver.to_owned());
             }
         }
     }
+    // The probe without booting reports `"db": null` (and why) when it could
+    // not read config/database.yml without the application.
+    let db_error = match v.get("db") {
+        Some(Value::Null) => Some(
+            v.get("dbError")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        ),
+        _ => None,
+    };
     Ok(Probe {
         versions: ToolVersions {
             runner: s("runner"),
@@ -841,7 +924,41 @@ fn parse_probe(line: &str, gemfile: &Utf8Path, rails_app: bool) -> Result<Probe,
             ..Default::default()
         },
         gems,
+        natives,
+        db_error,
     })
+}
+
+/// Where the toolchain read without booting the application (`light`)
+/// differs from the booted application's (`booted`), as `what: without
+/// booting X, booted Y`.
+fn probe_differences(light: &Probe, booted: &Probe) -> Vec<String> {
+    let (l, b) = (&light.versions, &booted.versions);
+    let mut out = Vec::new();
+    for (what, x, y) in [
+        ("ruby", &l.ruby, &b.ruby),
+        ("ruby engine", &l.ruby_engine, &b.ruby_engine),
+        ("rails", &l.rails, &b.rails),
+        ("bundler", &l.ruby_bundler, &b.ruby_bundler),
+        ("test frameworks", &l.runner, &b.runner),
+        ("libraries", &l.ruby_libs, &b.ruby_libs),
+        ("database adapters", &l.ruby_db, &b.ruby_db),
+    ] {
+        if x != y {
+            out.push(format!("{what}: without booting {x:?}, booted {y:?}"));
+        }
+    }
+    if l.ruby_gems != b.ruby_gems || light.gems != booted.gems {
+        let only = |a: &[String], z: &[String]| -> Vec<String> {
+            a.iter().filter(|g| !z.contains(g)).cloned().collect()
+        };
+        out.push(format!(
+            "bundle: without booting only {:?}, booted only {:?}",
+            only(&l.ruby_gems, &b.ruby_gems),
+            only(&b.ruby_gems, &l.ruby_gems)
+        ));
+    }
+    out
 }
 
 /// Test files `bin/rails test` runs by default: `test/**/*_test.rb` without
@@ -1096,8 +1213,10 @@ impl Adapter for RailsAdapter {
         self.tool_versions_with_env(&None)
     }
 
+    /// Read without booting the application ([`RailsAdapter::light_probe`]),
+    /// in `vci plan` and in what `vci run` records alike.
     fn tool_versions_with_env(&self, env: &ChildEnv) -> Result<ToolVersions, AdapterError> {
-        Ok(self.probe(env)?.versions)
+        Ok(self.light_probe(env)?.versions)
     }
 
     fn builtin_pass_through(&self) -> &'static [&'static str] {
@@ -1108,11 +1227,45 @@ impl Adapter for RailsAdapter {
         RAILS_HASHED_ENV
     }
 
+    /// The gems of the bundle Bundler resolves (without booting).
     fn installed_externals(
         &self,
         env: &ChildEnv,
     ) -> Result<Option<InstalledExternals>, AdapterError> {
-        Ok(Some(self.probe(env)?.gems))
+        Ok(Some(self.light_probe(env)?.gems))
+    }
+
+    /// The native libraries the booted application opened through FFI (a
+    /// project without Rails: what `require "bundler/setup"` opened).
+    fn native_externals(&self, env: &ChildEnv) -> Result<Option<InstalledExternals>, AdapterError> {
+        let p = if self.plain_ruby() {
+            self.light_probe(env)?
+        } else {
+            self.probe(env)?
+        };
+        Ok(Some(p.natives))
+    }
+
+    /// Boot the application once: it must boot under vci's run conditions
+    /// with nothing that makes it unattestable (the probe's checks), and
+    /// report exactly the toolchain read without booting it, which is what
+    /// attestations record and `vci plan` compares. `vci run` attests
+    /// nothing, and `vci plan` skips nothing of the project, otherwise.
+    fn check_run_environment(&self, env: &ChildEnv) -> Result<(), AdapterError> {
+        if self.plain_ruby() {
+            // Probed the same way either way.
+            return Ok(());
+        }
+        let light = self.light_probe(env)?;
+        let booted = self.probe(env)?;
+        let diffs = probe_differences(&light, &booted);
+        if diffs.is_empty() {
+            return Ok(());
+        }
+        Err(AdapterError::NotFound(format!(
+            "the booted application reports another toolchain than vci reads without booting it (what attestations record and `vci plan` compares): {}",
+            diffs.join("; ")
+        )))
     }
 
     /// Minitest: `rails test --root <dir> --seed 0 <file>`; RSpec: `rails
@@ -1493,12 +1646,54 @@ mod tests {
         // part of the toolchain's bundle.
         let natives = r#"{"ruby":"3","engine":"r","rails":"8","bundler":"4","runner":"m","gems":[{"name":"ruby-vips","version":"2.3.0","platform":"ruby","source":""}],"gemfile":"/app/Gemfile","taints":[],"natives":[{"name":"native:libvips.42.dylib","version":"sha256:ab"}]}"#;
         let p = parse_probe(natives, gf, true).unwrap();
-        assert_eq!(p.gems["native:libvips.42.dylib"], ["sha256:ab"]);
+        assert_eq!(p.natives["native:libvips.42.dylib"], ["sha256:ab"]);
+        assert!(!p.gems.contains_key("native:libvips.42.dylib"));
         assert_eq!(p.versions.ruby_gems, ["ruby-vips==2.3.0"]);
+        assert_eq!(p.db_error, None);
         let bad = r#"{"ruby":"3","engine":"r","rails":"8","bundler":"4","runner":"m","gems":[],"gemfile":"/app/Gemfile","taints":[],"natives":[{"name":"rack","version":"1"}]}"#;
         assert!(
             parse_probe(bad, gf, true).is_err(),
             "a native entry must be native:"
+        );
+        // The probe without booting could not read config/database.yml.
+        let unknown = r#"{"ruby":"3","engine":"r","rails":"8","bundler":"4","runner":"m","gems":[],"gemfile":"/app/Gemfile","taints":[],"db":null,"dbError":"NameError: uninitialized constant Rails"}"#;
+        let p = parse_probe(unknown, gf, true).unwrap();
+        assert_eq!(
+            p.db_error.as_deref(),
+            Some("NameError: uninitialized constant Rails")
+        );
+        assert_eq!(p.versions.ruby_db, "");
+    }
+
+    /// `vci run` refuses to attest when the booted application reports
+    /// another toolchain than the one read without booting it.
+    #[test]
+    fn booted_and_boot_free_probes_are_compared_field_by_field() {
+        let gf = Utf8Path::new("/app/Gemfile");
+        let line = |libs: &str, db: &str, gems: &str| {
+            format!(
+                r#"{{"ruby":"3.4.9p82","engine":"ruby 3.4.9","rails":"8.1.3.1","bundler":"4.0.9","runner":"minitest 6.0.6","libs":"{libs}","db":"{db}","gems":[{gems}],"gemfile":"/app/Gemfile","taints":[]}}"#
+            )
+        };
+        let rack = r#"{"name":"rack","version":"3.2.7","platform":"ruby","source":""}"#;
+        let probe = |l: &str| parse_probe(l, gf, true).unwrap();
+        let light = probe(&line("yaml=0.2.5;tz=tzinfo-data", "sqlite3", rack));
+        assert!(probe_differences(&light, &light.clone()).is_empty());
+        let booted = probe(&line(
+            "sqlite=3.53.2;yaml=0.2.5;tz=tzinfo-data",
+            "sqlite3",
+            rack,
+        ));
+        let d = probe_differences(&light, &booted);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].starts_with("libraries: without booting "), "{d:?}");
+        let booted = probe(&line("yaml=0.2.5;tz=tzinfo-data", "postgresql", ""));
+        let d = probe_differences(&light, &booted);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d[0].starts_with("database adapters"), "{d:?}");
+        assert!(
+            d[1].contains("without booting only [\"rack==3.2.7\"]"),
+            "{d:?}"
         );
     }
 }

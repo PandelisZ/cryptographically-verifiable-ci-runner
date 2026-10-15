@@ -139,13 +139,14 @@ locally), then:
    checksum verified against that file. The action never compiles `vci` in your CI. When no published binary fits
    (the action is pinned to a commit that is not a release, or the download fails) it fails at once with an error
    that says what to do (see [Prebuilt binaries](#prebuilt-binaries)).
-2. Runs `vci fetch --remote origin`. Attestations are [git-meta](https://git-meta.com/) metadata on `refs/meta/main`.
-   The fetch configures a git-meta remote named `meta` with origin's URL, so the checkout's credentials apply and a
-   read-only `contents: read` token is enough. It fetches every blob (no partial clone) and builds a new
-   `.git/git-meta.sqlite`. If the fetch fails, the action warns and every test runs.
-3. Runs `vci plan` and writes the plan to the job summary.
-4. Runs `vci ci`: it runs every unit that was not skipped and writes an audit log. The job fails if any test fails.
-5. With `signing-key`: `vci ci --key` runs those units the way `vci run` does and attests every one that passed (on
+2. Runs `vci ci --fetch origin` once. It fetches the attestations as `vci fetch --remote origin` does while it probes
+   the projects (their toolchains and test files), plans, writes the plan to the job summary, runs every unit that was
+   not skipped and writes an audit log. The job fails if any test fails. Attestations are
+   [git-meta](https://git-meta.com/) metadata on `refs/meta/main`. The fetch configures a git-meta remote named `meta`
+   with origin's URL, so the checkout's credentials apply and a read-only `contents: read` token is enough. It fetches
+   every blob (no partial clone) and builds a new `.git/git-meta.sqlite`. If the fetch fails, vci warns and every test
+   runs. (`command: plan` runs `vci plan --fetch origin` instead, and runs nothing.)
+3. With `signing-key`: `vci ci --key` runs those units the way `vci run` does and attests every one that passed (on
    a push to main, which runs everything, every unit), then `--push` publishes them on `refs/meta/main`. The next
    commit's CI skips each unit whose inputs did not change. See [Attesting in CI](#attesting-in-ci).
 
@@ -359,9 +360,9 @@ refs/tags/v1). To compile vci in this job anyway, set build-from-source: true.
 Change the `uses:` line to `@v1` or that SHA (see [Pinning](#pinning)). The other errors are in
 [Troubleshooting](#troubleshooting).
 
-It downloads with `gh release download` (preinstalled on GitHub-hosted runners) and otherwise, or when `gh` fails,
-from the public release URL with `curl` or `wget`, so container jobs and self-hosted runners without `gh` need one of
-those two.
+It downloads the public release URL with `curl` (one request, no API call), or `wget` without `curl`, and only when
+neither is installed or they fail (a private copy of the action) with `gh release download` and the `token` input, so
+container jobs and self-hosted runners need one of those three.
 
 `build-from-source: true` is for working on vci itself, as this repository's own CI does to test sources that are not
 released yet. When no published binary fits, the action then compiles `vci` (`cargo build --release`, about two

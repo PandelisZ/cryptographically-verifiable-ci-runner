@@ -30,13 +30,20 @@ pub struct CiArgs {
     /// Publish the attestations afterwards (as `vci push`).
     pub push: bool,
     pub remote: Option<String>,
+    /// Fetch attestations first (`--fetch [REMOTE]`; `Some(None)`: the
+    /// default remote), while the projects are probed.
+    pub fetch: Option<Option<String>>,
 }
 
 pub fn ci(args: CiArgs) -> Result<i32> {
     let res = plan(&PlanOptions {
         base_ref: args.base_ref.clone(),
         only: None,
+        fetch: args.fetch.clone(),
     })?;
+    if let Some(w) = &res.fetch_failed {
+        github_warning(w);
+    }
     print(&res, "text")?;
     let (repo, root) = open_repo()?;
     let mut attested: Vec<crate::run::AttestedUnit> = Vec::new();
@@ -750,7 +757,7 @@ fn print_default_remote(store: &AttestStore, remote: Option<&str>, name: &str) {
 }
 
 /// `scheme://user:secret@host/...` without the credentials.
-fn redact_userinfo(url: &str) -> String {
+pub(crate) fn redact_userinfo(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_owned();
     };
@@ -787,23 +794,43 @@ pub fn push(remote: Option<&str>) -> Result<i32> {
 
 pub fn fetch(remote: Option<&str>) -> Result<i32> {
     let (repo, _) = open_repo()?;
-    let store = AttestStore::new(&repo);
-    let out = store.fetch(remote)?;
-    print_default_remote(&store, remote, &out.remote);
-    print_exchange_messages(&out.warnings, &out.notes);
-    let n = store.list(None)?.len();
-    if out.found {
-        eprintln!(
-            "vci: fetched git-meta metadata from {} ({n} attestations stored locally)",
-            out.remote
-        );
-    } else {
-        eprintln!(
-            "vci: {} has no git-meta metadata yet (refs/meta/main); {n} attestations stored locally",
-            out.remote
-        );
+    for l in fetch_messages(&repo, remote)? {
+        eprintln!("{l}");
     }
     Ok(0)
+}
+
+/// `vci fetch`'s work (also `vci plan --fetch` and `vci ci --fetch`): fetch
+/// and materialize the remote's attestations; what `vci fetch` prints, as
+/// lines for stderr.
+pub fn fetch_messages(repo: &vci_git::Repo, remote: Option<&str>) -> Result<Vec<String>> {
+    let store = AttestStore::new(repo);
+    let out = store.fetch(remote)?;
+    let mut lines = Vec::new();
+    if remote.is_none()
+        && let Ok(Some(url)) = store.remote_url(&out.remote)
+    {
+        lines.push(format!(
+            "vci: git-meta remote {} is {}",
+            out.remote,
+            redact_userinfo(&url)
+        ));
+    }
+    lines.extend(out.notes.iter().map(|n| format!("vci: note: {n}")));
+    lines.extend(out.warnings.iter().map(|w| format!("vci: warning: {w}")));
+    let n = store.list(None)?.len();
+    if out.found {
+        lines.push(format!(
+            "vci: fetched git-meta metadata from {} ({n} attestations stored locally)",
+            out.remote
+        ));
+    } else {
+        lines.push(format!(
+            "vci: {} has no git-meta metadata yet (refs/meta/main); {n} attestations stored locally",
+            out.remote
+        ));
+    }
+    Ok(lines)
 }
 
 /// `vci prune`: delete attestations that have expired (git-meta tombstones,
@@ -898,8 +925,10 @@ mod tests {
                 if l.contains("cargo install") {
                     assert!(l.contains("--tag v1.0.0"), "{name}: {l}");
                 } else if l.contains("git clone") {
+                    // A release tag: `v1` (moved only by scripts/publish-release.sh,
+                    // to a commit whose manifest names its own binaries) or `v1.x.y`.
                     assert!(
-                        s.contains("checkout --detach v1.0.0"),
+                        s.contains("--detach v1"),
                         "{name}: clone without a pinned checkout"
                     );
                 } else if l.contains("uses:") {

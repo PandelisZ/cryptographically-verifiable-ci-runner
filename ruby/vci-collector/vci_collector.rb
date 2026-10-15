@@ -4265,6 +4265,112 @@ module VciCollector
       l.join(";")
     end
 
+    # The probe without booting the application (`vci plan`, and the
+    # toolchain `vci run` records): called after `require "bundler/setup"`,
+    # which sets up the bundle as in every test process (and fails as they
+    # would when it is not installed). For a Rails application (`rails_app`)
+    # what booting it loads that the toolchain reports is loaded or read the
+    # way booting does: YAML and TZInfo (every Rails application loads both),
+    # SQLite3 when Bundler.require(*Rails.groups) requires it, both default
+    # encodings set to UTF-8 (Rails' config.encoding), and the adapters of
+    # the test environment's databases from config/database.yml as Rails
+    # reads it (ERB, `shared`, DATABASE_URL), never the application's code.
+    # When config/database.yml cannot be read that way (its ERB uses the
+    # application), "db" is null and dbError says why (vci then boots the
+    # application for it). `vci run` also boots the application and refuses
+    # to attest when the booted application reports anything else.
+    def light!(rails_app)
+      return unless rails_app
+      @light = true
+      VciCollector.quiet do
+        verbose = $VERBOSE
+        $VERBOSE = nil
+        Encoding.default_external = Encoding::UTF_8
+        Encoding.default_internal = Encoding::UTF_8
+        $VERBOSE = verbose
+        require "psych"
+        begin
+          require "tzinfo"
+        rescue LoadError
+          nil
+        end
+        @light_db = light_db
+        begin
+          require "sqlite3" if autorequired?("sqlite3")
+        rescue LoadError
+          nil
+        end
+      end
+    end
+
+    # The groups Rails' generated config/application.rb requires
+    # (Bundler.require(*Rails.groups)): default, the environment, and
+    # RAILS_GROUPS.
+    def rails_groups
+      g = [:default, DB.env_name.to_sym]
+      g.concat(ENV["RAILS_GROUPS"].to_s.split(",").map(&:to_sym))
+      g.uniq
+    end
+
+    # Whether Bundler.require(*Rails.groups) requires `file`: a dependency of
+    # those groups (on this platform) autorequires it, or is named so and
+    # does not say what to require (Bundler::Runtime#require).
+    def autorequired?(file)
+      ::Bundler.definition.dependencies_for(rails_groups).any? do |d|
+        Array(d.autorequire || d.name).map { |f| f == true ? d.name : f }.include?(file)
+      end
+    rescue StandardError
+      false
+    end
+
+    # The test environment's database adapters as DB.adapters reports them
+    # after booting: config/database.yml read as
+    # Rails::Application::Configuration#database_configuration reads it, with
+    # DATABASE_URL merged in by Active Record's DatabaseConfigurations. ""
+    # without Active Record in the bundle, or without config/database.yml
+    # and DATABASE_URL (an application that does not use Active Record).
+    def light_db
+      path = File.join(VciCollector.root, "config", "database.yml")
+      return "" unless File.exist?(path) || ENV["DATABASE_URL"]
+      begin
+        require "active_record"
+      rescue LoadError
+        return ""
+      end
+      require "active_support/configuration_file"
+      require "active_record/database_configurations"
+      config = File.exist?(path) ? database_configuration(path) : {}
+      configs = ::ActiveRecord::DatabaseConfigurations.new(config)
+      list = begin
+        configs.configs_for(env_name: DB.env_name, include_hidden: true)
+      rescue ArgumentError
+        configs.configs_for(env_name: DB.env_name)
+      end
+      list.map { |c| c.adapter.to_s }.reject(&:empty?).uniq.sort.join(";")
+    rescue StandardError, LoadError, SyntaxError => e
+      @light_db_error = "#{e.class}: #{e.message}"
+      nil
+    end
+
+    # Rails::Application::Configuration#database_configuration (Rails 8.1).
+    def database_configuration(path)
+      loaded = ::ActiveSupport::ConfigurationFile.parse(path)
+      if (shared = loaded.delete("shared"))
+        loaded.each do |_env, config|
+          if config.is_a?(Hash) && config.values.all?(Hash)
+            if shared.is_a?(Hash) && shared.values.all?(Hash)
+              config.map { |name, sub| sub.reverse_merge!(shared[name]) }
+            else
+              config.map { |_name, sub| sub.reverse_merge!(shared) }
+            end
+          else
+            config.reverse_merge!(shared)
+          end
+        end
+      end
+      Hash.new(shared).merge(loaded)
+    end
+
     def print!
       VciCollector.quiet do
         begin
@@ -4277,10 +4383,12 @@ module VciCollector
         end
         out = {
           ruby: ruby_version, engine: engine, rails: rails_version, bundler: bundler_version,
-          runner: runner_version, platform: RUBY_PLATFORM, libs: libs, db: DB.adapters(load: true),
+          runner: runner_version, platform: RUBY_PLATFORM, libs: libs,
+          db: @light ? @light_db : DB.adapters(load: true),
           gems: gems, gemfile: (::Bundler.default_gemfile.to_s rescue ""), taints: Checks.run,
           natives: Native.versions.map { |name, version| { name: name, version: version } }
         }
+        out[:dbError] = @light_db_error if @light && @light_db.nil?
         $stdout.puts "VCI-PROBE #{Json.dump(out)}"
       end
     end

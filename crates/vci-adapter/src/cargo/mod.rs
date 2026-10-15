@@ -1010,7 +1010,16 @@ impl CargoAdapter {
 
     fn metadata(&self, env: &ChildEnv) -> Result<Metadata, AdapterError> {
         let mut cmd = self.cargo_cmd(env);
-        cmd.args(["metadata", "--format-version", "1", "--locked", "--no-deps"]);
+        // The members only (`--no-deps`): no dependency is resolved, so
+        // nothing needs the network (`--offline`).
+        cmd.args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--no-deps",
+            "--offline",
+        ]);
         let out = self.output(&mut cmd, "cargo")?;
         serde_json::from_slice(&out.stdout).map_err(|e| AdapterError::Parse {
             what: "cargo metadata".into(),

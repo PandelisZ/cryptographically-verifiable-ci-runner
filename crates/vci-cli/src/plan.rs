@@ -191,6 +191,10 @@ pub struct PlanResult {
     /// `vci ci --key`'s key signs as.
     #[serde(skip)]
     pub allowed: Option<AllowedSigners>,
+    /// `--fetch` failed (the remote and why): only attestations already
+    /// stored locally were used.
+    #[serde(skip)]
+    pub fetch_failed: Option<String>,
 }
 
 impl PlanResult {
@@ -206,6 +210,9 @@ pub struct PlanOptions {
     pub base_ref: Option<String>,
     /// Only verify this test (explain).
     pub only: Option<String>,
+    /// Fetch attestations first, as `vci fetch` does (`Some(None)`: the
+    /// default remote), while the projects are probed; fail-open.
+    pub fetch: Option<Option<String>>,
 }
 
 /// Resolve the base ref: explicit, `$VCI_BASE_REF`, `$GITHUB_BASE_REF`
@@ -304,6 +311,23 @@ struct Verifier<'a> {
     cargo_lock: Option<Result<vci_adapter::InstalledExternals, String>>,
     /// Rails: the gems of the bundle Bundler resolves in this checkout.
     rails_gems: Option<Result<vci_adapter::InstalledExternals, String>>,
+    /// Rails: the native libraries the application opens through FFI when it
+    /// boots, resolved only when a candidate records one (from the one boot
+    /// of the project's environment check, waiting for it if needed).
+    natives: std::sync::OnceLock<Result<vci_adapter::InstalledExternals, String>>,
+}
+
+impl Verifier<'_> {
+    /// [`Verifier::natives`], from the booted application.
+    fn natives(&self) -> &Result<vci_adapter::InstalledExternals, String> {
+        self.natives.get_or_init(|| {
+            self.project
+                .adapter
+                .native_externals(&self.child.to_child_env())
+                .map_err(|e| e.to_string())
+                .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned()))
+        })
+    }
 }
 
 /// What CI resolves Python externals against: the distributions installed in
@@ -335,6 +359,14 @@ fn verdict_run(f: &TestFile, reason: &str) -> FileVerdict {
 /// or for one project).
 pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
     let (repo, root) = open_repo()?;
+    // `--fetch`: fetch attestations while the projects are probed; joined
+    // before the store is read (and before returning, whatever happens).
+    let mut fetch = opts.fetch.clone().map(|remote| {
+        let (repo, from) = (repo.clone(), remote.clone());
+        let handle =
+            std::thread::spawn(move || crate::cmds::fetch_messages(&repo, from.as_deref()));
+        (remote, handle)
+    });
     let mut res = PlanResult {
         base_ref: None,
         base_commit: None,
@@ -345,14 +377,168 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
         multi: false,
         config: None,
         allowed: None,
+        fetch_failed: None,
     };
+    let out = plan_with(opts, repo, root, &mut res, &mut fetch);
+    join_fetch(&mut fetch, &mut res);
+    out.map(|()| res)
+}
 
+/// A `--fetch` running in the background: the remote asked for and the
+/// thread fetching from it (its messages for stderr, or the error).
+type PendingFetch = Option<(Option<String>, std::thread::JoinHandle<Result<Vec<String>>>)>;
+
+/// Wait for a pending `--fetch` and report it as `vci fetch` does; a failure
+/// is a warning (only attestations already stored locally are used).
+fn join_fetch(fetch: &mut PendingFetch, res: &mut PlanResult) {
+    let Some((remote, handle)) = fetch.take() else {
+        return;
+    };
+    let outcome = handle
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p));
+    match outcome {
+        Ok(lines) => {
+            for l in lines {
+                eprintln!("{l}");
+            }
+        }
+        Err(e) => {
+            let from = remote
+                .as_deref()
+                .map(|r| format!(" from {}", crate::cmds::redact_userinfo(r)))
+                .unwrap_or_default();
+            let w = format!(
+                "could not fetch attestations{from}: {e:#}; only attestations already stored locally are used"
+            );
+            eprintln!("vci: warning: {w}");
+            res.warnings.push(w.clone());
+            res.fetch_failed = Some(w);
+        }
+    }
+}
+
+/// What one project needs before its files are verified, decided before the
+/// projects are probed.
+struct ProjectStart {
+    child: ChildEnvMap,
+    run_all: Option<String>,
+    no_skip_ref: Option<String>,
+    on_no_skip_ref: bool,
+    /// Lines for stderr, printed in project order.
+    notes: Vec<String>,
+}
+
+/// What probing one project found: its test files, its warnings, and (when
+/// its files are to be verified) the toolchain and externals CI resolves.
+struct Probed {
+    files: Result<Vec<TestFile>, String>,
+    warnings: Vec<String>,
+    resolved: Option<Result<Resolved, String>>,
+}
+
+/// The per-project part of a [`Verifier`] that shells out.
+struct Resolved {
+    repo_id: String,
+    versions: vci_adapter::ToolVersions,
+    max_ttl: i64,
+    python_externals: Option<PythonExternals>,
+    go_modules: Option<Result<vci_adapter::InstalledExternals, String>>,
+    cargo_lock: Option<Result<vci_adapter::InstalledExternals, String>>,
+    rails_gems: Option<Result<vci_adapter::InstalledExternals, String>>,
+}
+
+/// List a project's test files and, with `resolve`, resolve its toolchain
+/// and externals at the same time (both shell out: uv, go, cargo, ruby).
+fn probe_project(
+    ctx: &Ctx,
+    idx: usize,
+    project: &Project,
+    child: &ChildEnvMap,
+    resolve: bool,
+    repo_id: &Result<String, String>,
+) -> Probed {
+    let env = child.to_child_env();
+    std::thread::scope(|s| {
+        let resolving = resolve.then(|| s.spawn(|| resolve_project(ctx, project, &env, repo_id)));
+        let files = project
+            .adapter
+            .list_test_files(&env)
+            .map_err(anyhow::Error::from)
+            .and_then(|l| project.test_files(idx, l))
+            .map_err(|e| format!("listing test files failed: {e:#}"));
+        // What the project's configuration leaves out (Rails: test files of
+        // the runner `runner` does not select), as `vci run` prints it.
+        let warnings = project.adapter.warnings(&env);
+        let resolved = resolving.map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+        Probed {
+            files,
+            warnings,
+            resolved,
+        }
+    })
+}
+
+/// The toolchain and the installed externals of a project, as CI resolves
+/// them now.
+fn resolve_project(
+    ctx: &Ctx,
+    project: &Project,
+    env: &vci_adapter::ChildEnv,
+    repo_id: &Result<String, String>,
+) -> Result<Resolved, String> {
+    (|| -> Result<Resolved> {
+        let repo_id = repo_id.clone().map_err(anyhow::Error::msg)?;
+        let versions = project.adapter.tool_versions_with_env(env)?;
+        let max_ttl = project.policy.max_ttl_secs()?;
+        let python_externals = if project.adapter.name() == "pytest" {
+            Some((
+                project
+                    .adapter
+                    .installed_externals(env)
+                    .map_err(|e| e.to_string())
+                    .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned())),
+                crate::externals::uv_lock_packages(&project.dir, &ctx.root),
+            ))
+        } else {
+            None
+        };
+        let listed = |name: &str| {
+            (project.adapter.name() == name).then(|| {
+                project
+                    .adapter
+                    .installed_externals(env)
+                    .map_err(|e| e.to_string())
+                    .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned()))
+            })
+        };
+        Ok(Resolved {
+            repo_id,
+            versions,
+            max_ttl,
+            python_externals,
+            go_modules: listed("go"),
+            cargo_lock: listed("cargo"),
+            rails_gems: listed("rails"),
+        })
+    })()
+    .map_err(|e| format!("{e:#}"))
+}
+
+fn plan_with(
+    opts: &PlanOptions,
+    repo: Repo,
+    root: camino::Utf8PathBuf,
+    res: &mut PlanResult,
+    fetch: &mut PendingFetch,
+) -> Result<()> {
     // 1. Policy and trust roots from the BASE commit.
     let (base_ref, base) = match resolve_base(&repo, opts.base_ref.as_deref()) {
         Ok(x) => x,
         Err(e) => {
             res.run_all = Some(e);
-            return Ok(fallback_listing(res, repo, root));
+            fallback_listing(res, repo, root);
+            return Ok(());
         }
     };
     if let Some(w) = self_referential_base(&repo, &base_ref, &base) {
@@ -369,16 +555,19 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             Ok(c) => c,
             Err(e) => {
                 res.run_all = Some(format!("{CONFIG_FILE} at base is invalid: {e:#}"));
-                return Ok(fallback_listing(res, repo, root));
+                fallback_listing(res, repo, root);
+                return Ok(());
             }
         },
         Ok(None) => {
             res.run_all = Some(format!("{CONFIG_FILE} is missing at the base commit"));
-            return Ok(fallback_listing(res, repo, root));
+            fallback_listing(res, repo, root);
+            return Ok(());
         }
         Err(e) => {
             res.run_all = Some(format!("reading {CONFIG_FILE} at base: {e}"));
-            return Ok(fallback_listing(res, repo, root));
+            fallback_listing(res, repo, root);
+            return Ok(());
         }
     };
     if let Some(w) = config.removed_keys_warning(&format!("{CONFIG_FILE} at the base commit")) {
@@ -411,86 +600,143 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
     res.multi = config.is_multi();
     res.allowed = allowed.clone();
 
-    // 2. Projects (base config) and their test files.
+    // 2. Projects (base config), their test files and, for the projects
+    // whose files are verified, the toolchain and externals CI resolves now.
+    // Listing and resolving shell out (uv, go, cargo, ruby): every project is
+    // probed at once (listing and resolving at the same time), while
+    // `--fetch` runs; what they print is printed in project order.
     res.config = Some(config.clone());
     let ctx = match Ctx::new(repo, root.clone(), config) {
         Ok(c) => c,
         Err(e) => {
             res.run_all = Some(format!("{e:#}"));
-            return Ok(res);
+            return Ok(());
         }
     };
-    let mut files: Vec<TestFile> = Vec::new();
-    for (i, p) in ctx.projects.iter().enumerate() {
-        let child = p.child_env();
-        let mut run_all = res.run_all.clone();
-        let mut no_skip_ref = None;
-        let matched = refs
-            .iter()
-            .find(|r| p.policy.no_skip_refs.iter().any(|g| glob_match(g, r)));
-        let on_no_skip_ref = matched.is_some();
-        if run_all.is_none()
-            && let Some(r) = matched
-        {
-            if p.policy.no_skip_refs_except.is_empty() {
-                run_all = Some(format!("policy.no_skip_refs matches {r}"));
-            } else {
-                eprintln!(
-                    "vci: note: {}policy.no_skip_refs matches {r}: only attestations by {} (policy.no_skip_refs_except) can skip",
-                    if ctx.projects.len() > 1 {
-                        format!("{}: ", p.label())
-                    } else {
-                        String::new()
-                    },
-                    p.policy.no_skip_refs_except.join(", ")
-                );
-                no_skip_ref = Some(r.clone());
-            }
-        }
-        match p
-            .adapter
-            .list_test_files(&child.to_child_env())
-            .map_err(anyhow::Error::from)
-            .and_then(|l| p.test_files(i, l))
-        {
-            Ok(f) => files.extend(f),
-            Err(e) => run_all = Some(format!("listing test files failed: {e:#}")),
-        }
-        // What the project's configuration leaves out (Rails: test files of
-        // the runner `runner` does not select), as `vci run` prints it.
-        for w in p.adapter.warnings(&child.to_child_env()) {
-            let w = if ctx.projects.len() > 1 {
-                format!("{}: {w}", p.label())
-            } else {
-                w
+    let multi_project = ctx.projects.len() > 1;
+    let starts: Vec<ProjectStart> = ctx
+        .projects
+        .iter()
+        .map(|p| {
+            let mut start = ProjectStart {
+                child: p.child_env(),
+                run_all: res.run_all.clone(),
+                no_skip_ref: None,
+                on_no_skip_ref: false,
+                notes: vec![],
             };
-            eprintln!("vci: warning: {w}");
-            res.warnings.push(w);
-        }
-        res.projects.push(ProjectPlan {
-            name: p.name.clone(),
-            path: p.rel.clone(),
-            adapter: p.adapter.name().to_owned(),
-            run_all,
-            no_skip_ref,
-            on_no_skip_ref,
-            no_skip_refs_except: p.policy.no_skip_refs_except.clone(),
-            dir: p.dir.clone(),
-            child_env: Some(child),
-            adapter_options: p.adapter_options.clone(),
+            let matched = refs
+                .iter()
+                .find(|r| p.policy.no_skip_refs.iter().any(|g| glob_match(g, r)));
+            start.on_no_skip_ref = matched.is_some();
+            if start.run_all.is_none()
+                && let Some(r) = matched
+            {
+                if p.policy.no_skip_refs_except.is_empty() {
+                    start.run_all = Some(format!("policy.no_skip_refs matches {r}"));
+                } else {
+                    start.notes.push(format!(
+                        "vci: note: {}policy.no_skip_refs matches {r}: only attestations by {} (policy.no_skip_refs_except) can skip",
+                        if multi_project {
+                            format!("{}: ", p.label())
+                        } else {
+                            String::new()
+                        },
+                        p.policy.no_skip_refs_except.join(", ")
+                    ));
+                    start.no_skip_ref = Some(r.clone());
+                }
+            }
+            start
+        })
+        .collect();
+    let repo_id = ctx.repo.repo_id().map_err(|e| format!("{e:#}"));
+    // What a project checks of its environment before anything of it is
+    // skipped (Rails: the application boots under vci's run conditions,
+    // passes the probe's checks and reports the toolchain read without
+    // booting it, which is what the verdicts compare). It runs in the
+    // background while the projects are probed, attestations fetched and
+    // files checked, and is joined before the verdicts are final: a project
+    // whose check fails runs everything.
+    std::thread::scope(|outer| {
+        let env_checks: Vec<_> = ctx
+            .projects
+            .iter()
+            .zip(&starts)
+            .map(|(p, start)| {
+                (start.run_all.is_none() && allowed.is_some()).then(|| {
+                    let env = start.child.to_child_env();
+                    outer.spawn(move || {
+                        p.adapter
+                            .check_run_environment(&env)
+                            .map_err(|e| format!("{e:#}"))
+                    })
+                })
+            })
+            .collect();
+        let probed: Vec<Probed> = std::thread::scope(|s| {
+            let handles: Vec<_> = ctx
+                .projects
+                .iter()
+                .zip(&starts)
+                .enumerate()
+                .map(|(i, (p, start))| {
+                    let resolve = start.run_all.is_none() && allowed.is_some();
+                    let (ctx, repo_id) = (&ctx, &repo_id);
+                    s.spawn(move || probe_project(ctx, i, p, &start.child, resolve, repo_id))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
         });
-    }
-    mark_cross_project_ambiguity(&mut files);
-    if let Some(id) = &opts.only {
-        files.retain(|f| f.test_id.as_str() == id);
-    }
+        let mut files: Vec<TestFile> = Vec::new();
+        let mut resolved: Vec<Option<Result<Resolved, String>>> = Vec::new();
+        for ((p, start), probed) in ctx.projects.iter().zip(starts).zip(probed) {
+            for n in &start.notes {
+                eprintln!("{n}");
+            }
+            let mut run_all = start.run_all;
+            match probed.files {
+                Ok(f) => files.extend(f),
+                Err(e) => run_all = Some(e),
+            }
+            for w in probed.warnings {
+                let w = if multi_project {
+                    format!("{}: {w}", p.label())
+                } else {
+                    w
+                };
+                eprintln!("vci: warning: {w}");
+                res.warnings.push(w);
+            }
+            resolved.push(probed.resolved);
+            res.projects.push(ProjectPlan {
+                name: p.name.clone(),
+                path: p.rel.clone(),
+                adapter: p.adapter.name().to_owned(),
+                run_all,
+                no_skip_ref: start.no_skip_ref,
+                on_no_skip_ref: start.on_no_skip_ref,
+                no_skip_refs_except: p.policy.no_skip_refs_except.clone(),
+                dir: p.dir.clone(),
+                child_env: Some(start.child),
+                adapter_options: p.adapter_options.clone(),
+            });
+        }
+        mark_cross_project_ambiguity(&mut files);
+        if let Some(id) = &opts.only {
+            files.retain(|f| f.test_id.as_str() == id);
+        }
 
-    // 3. Stored candidates from the local git-meta store (`vci fetch`
-    // materializes the remote's), looked up per unit, then per project:
-    // toolchain, repo identity, and the checks.
-    let mut by_id: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
-    if !res.projects.iter().all(|p| p.run_all.is_some()) {
-        let looked_up = AttestStore::new(&ctx.repo).reader().and_then(|r| {
+        // 3. Stored candidates from the local git-meta store (`vci fetch`, or
+        // `--fetch` above, materializes the remote's), looked up per unit, then
+        // per project: toolchain, repo identity, and the checks.
+        join_fetch(fetch, res);
+        let mut by_id: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
+        if !res.projects.iter().all(|p| p.run_all.is_some()) {
+            let looked_up = AttestStore::new(&ctx.repo).reader().and_then(|r| {
             if !r.has_store() {
                 let w = "no git-meta store in this repository: no attestations are available (run `vci fetch` first)".to_owned();
                 eprintln!("vci: warning: {w}");
@@ -505,95 +751,110 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             }
             Ok(m)
         });
-        match looked_up {
-            Ok(m) => by_id = m,
-            Err(e) => {
-                let e = format!("reading attestations from git-meta: {e:#}");
-                for p in res.projects.iter_mut() {
-                    p.run_all.get_or_insert_with(|| e.clone());
+            match looked_up {
+                Ok(m) => by_id = m,
+                Err(e) => {
+                    let e = format!("reading attestations from git-meta: {e:#}");
+                    for p in res.projects.iter_mut() {
+                        p.run_all.get_or_insert_with(|| e.clone());
+                    }
                 }
             }
         }
-    }
-    let now = now_unix();
-    for (pi, project) in ctx.projects.iter().enumerate() {
-        let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
-        let verifier = match (&res.projects[pi].run_all, &allowed) {
-            (Some(r), _) => Err(r.clone()),
-            (None, None) => Err("no trusted signers".to_owned()),
-            (None, Some(allowed)) => {
-                let child = res.projects[pi].child_env.clone().unwrap_or_default();
-                let no_skip_ref = res.projects[pi].no_skip_ref.clone();
-                let env = child.to_child_env();
-                (|| -> Result<Verifier<'_>> {
-                    let repo_id = ctx.repo.repo_id()?;
-                    let versions = project.adapter.tool_versions_with_env(&env)?;
-                    let max_ttl = project.policy.max_ttl_secs()?;
-                    let python_externals = if project.adapter.name() == "pytest" {
-                        Some((
-                            project
-                                .adapter
-                                .installed_externals(&env)
-                                .map_err(|e| e.to_string())
-                                .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned())),
-                            crate::externals::uv_lock_packages(&project.dir, &ctx.root),
-                        ))
-                    } else {
-                        None
-                    };
-                    let listed = |name: &str| {
-                        (project.adapter.name() == name).then(|| {
-                            project
-                                .adapter
-                                .installed_externals(&env)
-                                .map_err(|e| e.to_string())
-                                .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned()))
-                        })
-                    };
-                    let go_modules = listed("go");
-                    let cargo_lock = listed("cargo");
-                    let rails_gems = listed("rails");
-                    Ok(Verifier {
+        let now = now_unix();
+        let verifiers: Vec<Result<Verifier<'_>, String>> = ctx
+            .projects
+            .iter()
+            .zip(resolved)
+            .enumerate()
+            .map(|(pi, (project, resolved))| {
+                match (&res.projects[pi].run_all, &allowed, resolved) {
+                    (Some(r), _, _) => Err(r.clone()),
+                    (None, None, _) => Err("no trusted signers".to_owned()),
+                    (None, Some(_), None) => {
+                        Err("internal: the project was not resolved".to_owned())
+                    }
+                    (None, Some(allowed), Some(r)) => r.map(|r| Verifier {
                         ctx: &ctx,
                         project,
                         allowed,
                         now,
-                        max_ttl,
-                        repo_id,
-                        versions,
-                        child,
-                        no_skip_ref,
-                        python_externals,
-                        go_modules,
-                        cargo_lock,
-                        rails_gems,
+                        max_ttl: r.max_ttl,
+                        repo_id: r.repo_id,
+                        versions: r.versions,
+                        child: res.projects[pi].child_env.clone().unwrap_or_default(),
+                        no_skip_ref: res.projects[pi].no_skip_ref.clone(),
+                        python_externals: r.python_externals,
+                        go_modules: r.go_modules,
+                        cargo_lock: r.cargo_lock,
+                        rails_gems: r.rails_gems,
+                        natives: std::sync::OnceLock::new(),
+                    }),
+                }
+            })
+            .collect();
+        // Every project's files at once (the checks rehash the checkout and may
+        // wait for a Rails application's boot for its native libraries), in
+        // project order.
+        let verdicts: Vec<Vec<FileVerdict>> = std::thread::scope(|s| {
+            let handles: Vec<_> = verifiers
+                .iter()
+                .enumerate()
+                .map(|(pi, verifier)| {
+                    let (files, by_id) = (&files, &by_id);
+                    s.spawn(move || {
+                        let mine = files.iter().filter(|f| f.project == pi);
+                        match verifier {
+                            Err(r) => mine.map(|f| verdict_run(f, r)).collect::<Vec<_>>(),
+                            Ok(v) => mine
+                                .map(|f| {
+                                    // A test id listed by two projects: both see
+                                    // the same candidates (they are ambiguous and
+                                    // run anyway).
+                                    let cands = by_id
+                                        .get(f.test_id.as_str())
+                                        .map(Vec::as_slice)
+                                        .unwrap_or_default();
+                                    v.verdict(f, cands)
+                                })
+                                .collect(),
+                        }
                     })
-                })()
-                .map_err(|e| format!("{e:#}"))
-            }
-        };
-        match verifier {
-            Err(r) => {
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        for (pi, (verifier, verdicts)) in verifiers.iter().zip(verdicts).enumerate() {
+            if let Err(r) = verifier {
                 res.projects[pi].run_all.get_or_insert_with(|| r.clone());
-                for f in mine {
-                    res.files.push(verdict_run(f, &r));
-                }
             }
-            Ok(v) => {
-                for f in mine {
-                    // A test id listed by two projects: both see the same
-                    // candidates (they are ambiguous and run anyway).
-                    let cands = by_id
-                        .get(f.test_id.as_str())
-                        .map(Vec::as_slice)
-                        .unwrap_or_default();
-                    res.files.push(v.verdict(f, cands));
+            res.files.extend(verdicts);
+        }
+        for (pi, check) in env_checks.into_iter().enumerate() {
+            let Some(handle) = check else { continue };
+            let checked = handle
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p));
+            if let Err(e) = checked
+                && res.projects[pi].run_all.is_none()
+            {
+                let reason = format!("checking the project's environment failed: {e}");
+                for v in res.files.iter_mut().filter(|v| v.project_idx == pi) {
+                    v.skip = false;
+                    v.reason = reason.clone();
+                    v.libraries = Libraries::Exact;
+                    v.by = None;
+                    v.candidates.clear();
                 }
+                res.projects[pi].run_all = Some(reason);
             }
         }
-    }
-    finish(&mut res);
-    Ok(res)
+    });
+    finish(res);
+    Ok(())
 }
 
 /// Fill in project names on verdicts; set the top-level `run_all` when every
@@ -619,7 +880,7 @@ fn finish(res: &mut PlanResult) {
 
 /// When policy can't be read, still try to list files so the output names
 /// them (everything runs).
-fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) -> PlanResult {
+fn fallback_listing(res: &mut PlanResult, repo: Repo, root: camino::Utf8PathBuf) {
     let reason = res.run_all.clone().unwrap_or_default();
     let config = crate::ctx::working_tree_config(&root).unwrap_or_default();
     res.multi = config.is_multi();
@@ -651,8 +912,7 @@ fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) 
         }
         res.files = files.iter().map(|f| verdict_run(f, &reason)).collect();
     }
-    finish(&mut res);
-    res
+    finish(res);
 }
 
 impl Verifier<'_> {
@@ -1170,17 +1430,16 @@ impl Verifier<'_> {
                 (None, None, Some(lock), _) => {
                     crate::externals::cargo_locked(lock, &e.name, &e.version)
                 }
-                (None, None, None, Some(bundle))
+                (None, None, None, Some(_))
                     if e.name.starts_with(crate::externals::NATIVE_PREFIX) =>
                 {
-                    crate::externals::rails_native(bundle, &e.name, &e.version, libraries).map(
-                        |note| {
+                    crate::externals::rails_native(self.natives(), &e.name, &e.version, libraries)
+                        .map(|note| {
                             if let Some(n) = note {
                                 info.accepted_by_policy
                                     .push(format!("external:{}: {n}", e.name));
                             }
-                        },
-                    )
+                        })
                 }
                 (None, None, None, Some(bundle)) => {
                     crate::externals::rails_bundled(bundle, &e.name, &e.version)
@@ -2067,6 +2326,7 @@ mod tests {
             multi: false,
             config: None,
             allowed: None,
+            fetch_failed: None,
         };
         let line = summary_line(&res);
         assert!(line.contains("running everything"), "{line}");

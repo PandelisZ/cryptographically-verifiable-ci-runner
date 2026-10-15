@@ -191,6 +191,178 @@ fn only_this_repositorys_demo_jobs_compile_vci() {
     assert!(!v1.contains("prebuilt"), "{v1}");
 }
 
+/// The `run: |` script of a step, unindented.
+fn run_script_of(step: &Step) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in step.body.lines() {
+        if line == "      run: |" {
+            inside = true;
+            continue;
+        }
+        if inside {
+            if !line.is_empty() && !line.starts_with("        ") {
+                break;
+            }
+            out.push_str(line.strip_prefix("        ").unwrap_or(line));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `command: ci` plans once: one `vci ci --fetch` fetches the attestations
+/// while it probes the projects, plans, prints the plan and runs what is
+/// left. No separate fetch or plan step runs; `command: plan` runs the one
+/// `vci plan --fetch`.
+#[test]
+fn the_action_plans_once_and_fetches_while_planning() {
+    let action = read("action.yml");
+    let steps = steps(&action);
+    for step in &steps {
+        assert!(
+            !step.body.contains("vci fetch"),
+            "a separate fetch step: {}",
+            step.body
+        );
+    }
+    let planning: Vec<&Step> = steps
+        .iter()
+        .filter(|s| s.body.contains("vci plan ") || s.body.contains("vci ci "))
+        .collect();
+    assert_eq!(planning.len(), 2, "one step per command");
+    let plan = planning.iter().find(|s| s.id == "plan").unwrap();
+    assert_eq!(plan.cond, "inputs.command != 'ci'");
+    assert!(
+        run_script_of(plan).contains("vci plan --fetch \"$REMOTE\" --base-ref \"$BASE\""),
+        "{}",
+        plan.body
+    );
+    let ci = planning.iter().find(|s| s.id == "ci").unwrap();
+    assert_eq!(ci.cond, "inputs.command == 'ci'");
+    let script = run_script_of(ci);
+    assert!(
+        script.contains("args=(--fetch \"$REMOTE\" --base-ref \"$BASE\""),
+        "{script}"
+    );
+    let calls: Vec<&str> = script
+        .lines()
+        .filter(|l| l.trim_start().starts_with("vci "))
+        .collect();
+    assert_eq!(calls, ["vci ci \"${args[@]}\" | tee \"$out\""], "{script}");
+    let outputs = section(&action, "outputs");
+    for (name, want) in [
+        (
+            "skipped",
+            "${{ steps.ci.outputs.skipped || steps.plan.outputs.skipped }}",
+        ),
+        (
+            "run",
+            "${{ steps.ci.outputs.run || steps.plan.outputs.run }}",
+        ),
+        ("attested", "${{ steps.ci.outputs.attested }}"),
+    ] {
+        let (_, body) = outputs.iter().find(|(n, _)| n == name).unwrap();
+        assert!(body.contains(&format!("value: {want}")), "{name}: {body}");
+    }
+}
+
+/// The `ci` step's script against a stub `vci`: it calls `vci ci` once
+/// (with `--fetch`), writes the plan (and nothing `vci ci` prints after it,
+/// nor workflow commands) to the step summary, takes the counts from the
+/// audit log (from the plan when there is none), and exits with vci's code.
+#[test]
+fn the_ci_step_reports_the_plan_and_the_counts_of_one_vci_ci() {
+    if Command::new("python3").arg("-V").output().is_err() {
+        eprintln!("SKIPPED: python3 is not installed");
+        return;
+    }
+    let action = read("action.yml");
+    let steps = steps(&action);
+    let ci = steps.iter().find(|s| s.id == "ci").unwrap();
+    let script = run_script_of(ci);
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::create_dir_all(d.join("bin")).unwrap();
+    std::fs::create_dir_all(d.join("temp")).unwrap();
+    write_exe(
+        &d.join("bin/vci"),
+        r#"#!/bin/sh
+echo "$*" >> "$STUB_LOG"
+echo "::warning title=vci::could not fetch attestations from origin"
+echo "base: base (0123)"
+echo "SKIP a/one_test.rb  (attested by ci (SHA256:x))"
+echo "SKIP a/two_test.rb  (attested by ci (SHA256:x))"
+echo "RUN  a/three_test.rb  (no attestation)"
+echo "2 to skip, 1 to run"
+echo "1 runs, 1 assertions"
+echo "::warning title=vci::not attesting: x"
+while [ $# -gt 0 ]; do
+  [ "$1" = "--audit-log" ] && audit=$2
+  shift
+done
+if [ -z "${STUB_NO_AUDIT:-}" ]; then
+  echo '{"skipped":[{"testId":"a/one_test.rb"},{"testId":"a/two_test.rb"}],"ran":[{"testId":"a/three_test.rb"}],"attested":[{"testId":"a/three_test.rb"}]}' > "$audit"
+fi
+exit 3
+"#,
+    );
+    let run = |extra: &[(&str, &str)]| {
+        for f in ["log", "output", "summary", "audit.json"] {
+            let _ = std::fs::remove_file(d.join(f));
+        }
+        let mut cmd = Command::new("bash");
+        cmd.args(["--noprofile", "--norc", "-eo", "pipefail", "-c", &script])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    d.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("STUB_LOG", d.join("log"))
+            .env("BASE", "base")
+            .env("AUDIT", d.join("audit.json"))
+            .env("SIGN", "false")
+            .env("TTL", "14d")
+            .env("PUSH", "true")
+            .env("REMOTE", "origin")
+            .env("RUNNER_TEMP", d.join("temp"))
+            .env("GITHUB_OUTPUT", d.join("output"))
+            .env("GITHUB_STEP_SUMMARY", d.join("summary"));
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let read = |f: &str| std::fs::read_to_string(d.join(f)).unwrap_or_default();
+        (
+            out.status.code(),
+            read("log"),
+            read("output"),
+            read("summary"),
+        )
+    };
+    let (code, log, output, summary) = run(&[]);
+    assert_eq!(code, Some(3), "vci's exit code");
+    assert_eq!(
+        log,
+        format!(
+            "ci --fetch origin --base-ref base --audit-log {}\n",
+            d.join("audit.json").display()
+        )
+    );
+    assert_eq!(output, "skipped=2\nrun=1\nattested=1\n");
+    assert_eq!(
+        summary,
+        "### vci plan\n```\nbase: base (0123)\nSKIP a/one_test.rb  (attested by ci (SHA256:x))\nSKIP a/two_test.rb  (attested by ci (SHA256:x))\nRUN  a/three_test.rb  (no attestation)\n2 to skip, 1 to run\n```\n"
+    );
+    // No audit log (vci failed before writing it): the plan's counts.
+    let (code, _, output, _) = run(&[("STUB_NO_AUDIT", "1")]);
+    assert_eq!(code, Some(3));
+    assert_eq!(output, "skipped=2\nrun=1\nattested=0\n");
+}
+
 #[test]
 fn the_manifest_has_a_binary_for_every_platform_the_script_maps() {
     let script = read("scripts/action-binary.sh");
@@ -564,12 +736,30 @@ fn a_released_commit_downloads_and_verifies_the_binary() {
     );
     assert!(r.outputs.contains("build=false\n"), "{}", r.outputs);
     assert!(r.outputs.contains("source="), "{}", r.outputs);
+    // One request to the public release URL with curl (no gh: it starts
+    // slower and asks the API first), even with gh installed.
     assert_eq!(
         r.calls.lines().count(),
         1,
-        "gh only, no fallback: {}",
+        "curl only, no fallback: {}",
         r.calls
     );
+    assert!(
+        r.calls.starts_with("curl -fsSL ")
+            && r.calls.ends_with(&format!(
+                " https://github.com/{REPO}/releases/download/v1.4.0/{ASSET}\n"
+            )),
+        "{}",
+        r.calls
+    );
+    assert!(installed(&fx));
+}
+
+#[test]
+fn without_curl_or_wget_gh_downloads_the_release() {
+    let fx = fixture(None, None);
+    let r = run_with(&fx, &["gh"], &[]);
+    assert!(r.ok, "{}", r.stdout);
     assert!(
         r.calls.starts_with(&format!(
             "gh release download v1.4.0 --repo {REPO} --pattern {ASSET} --dir "
@@ -577,6 +767,8 @@ fn a_released_commit_downloads_and_verifies_the_binary() {
         "{}",
         r.calls
     );
+    assert_eq!(r.calls.lines().count(), 1, "{}", r.calls);
+    assert!(r.outputs.contains("build=false\n"), "{}", r.outputs);
     assert!(installed(&fx));
 }
 
@@ -658,14 +850,16 @@ fn without_gh_the_checksum_is_still_checked() {
 }
 
 #[test]
-fn a_failed_gh_download_falls_back_to_the_public_url() {
+fn a_failed_curl_download_falls_back_to_gh() {
+    // A private action repository: the public URL is not readable, gh with
+    // the token input is.
     let fx = fixture(None, None);
-    let r = run(&fx, &[("STUB_FAIL", "1")]);
+    let r = run(&fx, &[("STUB_CURL_FAIL", "1")]);
     assert!(r.ok, "{}", r.stdout);
     let calls: Vec<&str> = r.calls.lines().collect();
     assert_eq!(calls.len(), 2, "{}", r.calls);
-    assert!(calls[0].starts_with("gh release download"), "{}", r.calls);
-    assert!(calls[1].starts_with("curl "), "{}", r.calls);
+    assert!(calls[0].starts_with("curl "), "{}", r.calls);
+    assert!(calls[1].starts_with("gh release download"), "{}", r.calls);
     assert!(installed(&fx));
 }
 
@@ -680,8 +874,8 @@ fn a_failed_download_fails_unless_build_from_source() {
         error.starts_with("::error title=vci::vci: could not download"),
         "{error}"
     );
-    assert!(error.contains("gh release download failed"), "{error}");
     assert!(error.contains("curl https://github.com/"), "{error}");
+    assert!(error.contains("gh release download failed"), "{error}");
     assert!(error.contains("build-from-source: true"), "{error}");
     assert!(!r.outputs.contains("build=true"), "{}", r.outputs);
     assert!(!installed(&fx));
@@ -695,7 +889,7 @@ fn a_failed_download_fails_unless_build_from_source() {
     let r = run_with(&fx, &["curl"], &[fail[1]]);
     assert!(!r.ok, "{}", r.stdout);
     let error = error_line(&r);
-    assert!(error.contains("gh is not installed; curl"), "{error}");
+    assert!(error.contains("failed, and gh is not installed"), "{error}");
     assert!(!error.contains("token"), "{error}");
 }
 

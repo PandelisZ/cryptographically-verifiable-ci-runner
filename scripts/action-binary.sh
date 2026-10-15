@@ -9,10 +9,11 @@
 # platform has no binary) it fails with an ::error, unless BUILD_FROM_SOURCE is
 # "true": then it writes build=true and the action's next steps compile vci.
 #
-# The download uses `gh release download` when gh is installed (GitHub-hosted
-# runners), and otherwise, or when gh fails, the public release URL with curl or
-# wget (container jobs and self-hosted runners rarely have gh). Either way the
-# file must match the checksum in the manifest.
+# The download fetches the public release URL with curl (one request, no API
+# call: what every GitHub-hosted runner has), or wget without curl. Only when
+# neither is installed, or they fail (a private action repository), is it
+# `gh release download` (gh starts slower and asks the API first). Whichever
+# downloads it, the file must match the checksum in the manifest.
 #
 # Environment:
 #   BUILD_FROM_SOURCE  "true" lets the action compile vci when no published binary fits
@@ -107,32 +108,33 @@ url="https://github.com/$repo/releases/download/$tag/$asset"
 # what was attempted.
 download() {
   tried=""
-  if command -v gh >/dev/null 2>&1; then
-    if gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$dir"; then
-      return 0
-    fi
-    rm -f "$dir/$asset"
-    tried="gh release download failed (the token input may not be able to read the releases of $repo)"
-    echo "vci: gh release download failed; trying $url"
-  else
-    tried="gh is not installed"
-  fi
   if command -v curl >/dev/null 2>&1; then
     if curl -fsSL --retry 3 -o "$dir/$asset" "$url"; then
       return 0
     fi
-    tried="$tried; curl $url failed"
+    rm -f "$dir/$asset"
+    tried="curl $url failed"
   elif command -v wget >/dev/null 2>&1; then
     if wget -q -O "$dir/$asset" "$url"; then
       return 0
     fi
-    tried="$tried; wget $url failed"
-  elif command -v gh >/dev/null 2>&1; then
-    tried="$tried, and neither curl nor wget is installed to try $url"
+    rm -f "$dir/$asset"
+    tried="wget $url failed"
   else
-    return 2
+    tried="neither curl nor wget is installed"
   fi
-  rm -f "$dir/$asset"
+  if command -v gh >/dev/null 2>&1; then
+    echo "vci: $tried; trying gh release download"
+    if gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$dir"; then
+      return 0
+    fi
+    rm -f "$dir/$asset"
+    tried="$tried; gh release download failed (the token input may not be able to read the releases of $repo)"
+  elif [ "$tried" = "neither curl nor wget is installed" ]; then
+    return 2
+  else
+    tried="$tried, and gh is not installed"
+  fi
   return 1
 }
 status=0

@@ -2406,3 +2406,332 @@ fn rails_bundle_installed_in_the_repository() {
         "{stderr}"
     );
 }
+
+/// Copy `fixtures/rails-rspec-abcd` (a Rails application tested with RSpec)
+/// into `dir`.
+fn copy_rspec_fixture(dir: &Path) {
+    let fx = workspace_root().join("fixtures/rails-rspec-abcd");
+    std::fs::create_dir_all(dir).unwrap();
+    for name in [
+        ".gitignore",
+        ".rspec",
+        ".ruby-version",
+        "Gemfile",
+        "Gemfile.lock",
+        "Rakefile",
+        "config.ru",
+        "app",
+        "bin",
+        "config",
+        "db",
+        "lib",
+        "spec",
+    ] {
+        cp(&fx.join(name), &dir.join(name));
+    }
+    for d in ["log", "tmp", "storage", "vendor"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+        std::fs::write(dir.join(d).join(".keep"), "").unwrap();
+    }
+    for junk in [
+        "db/test.sqlite3",
+        "db/development.sqlite3",
+        "spec/examples.txt",
+    ] {
+        let _ = std::fs::remove_file(dir.join(junk));
+    }
+}
+
+/// The toolchain the probe of the booted application reports (what vci
+/// recorded before it read the toolchain without booting), in the
+/// predicate's terms.
+fn booted_toolchain(w: &World, runner: &str) -> Value {
+    let tmp = w.base.join("probe-tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let collector = workspace_root().join("ruby/vci-collector/vci_collector.rb");
+    let mut cmd = Command::new(w.ruby_bin.join("ruby"));
+    cmd.args(["-e", "require File.expand_path(\"config/environment\")"])
+        .current_dir(&w.work)
+        .env("PATH", w.path_env());
+    for k in SCRUB {
+        cmd.env_remove(k);
+    }
+    cmd.env("RUBYOPT", format!("-r{}", collector.display()))
+        .env("VCI_RAILS_MODE", "probe")
+        .env("VCI_RAILS_RUNNER", runner)
+        .env("VCI_ROOT", &w.work)
+        .env("VCI_REPO", &w.work)
+        .env("TMPDIR", &tmp)
+        .env("RAILS_ENV", "test")
+        .env("RACK_ENV", "test")
+        .env("PARALLEL_WORKERS", "1")
+        .env("DISABLE_SPRING", "1")
+        .env("DISABLE_BOOTSNAP", "1")
+        .env("BUNDLE_GEMFILE", w.work.join("Gemfile"));
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("VCI-PROBE "))
+        .unwrap_or_else(|| panic!("{stdout}{}", String::from_utf8_lossy(&out.stderr)));
+    let p: Value = serde_json::from_str(line).unwrap();
+    let mut gems: Vec<String> = p["gems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            format!(
+                "{}=={}",
+                g["name"].as_str().unwrap(),
+                g["version"].as_str().unwrap()
+            )
+        })
+        .collect();
+    gems.sort();
+    gems.dedup();
+    serde_json::json!({
+        "ruby": p["ruby"],
+        "rubyEngine": p["engine"],
+        "rails": p["rails"],
+        "bundler": p["bundler"],
+        "rubyTest": p["runner"],
+        "rubyLibs": p["libs"],
+        "rubyDb": p["db"],
+        "rubyGems": gems,
+    })
+}
+
+/// `vci plan` reads the Rails toolchain without booting the application
+/// (Bundler sets up the bundle; Ruby's libraries, the database adapters
+/// from config/database.yml), and `vci run` records the same reading. On
+/// the Minitest, RSpec and Active Storage (libvips) fixtures it is exactly
+/// what the booted application reports, field by field: attestations made
+/// when the probe booted the application are still accepted. (`vci run`
+/// itself boots the application and refuses to attest when the two
+/// differ.)
+#[test]
+fn rails_toolchain_read_without_booting_is_the_booted_toolchain() {
+    type Layout = fn(&Path);
+    let cases: [(&str, Layout, &str, &str); 3] = [
+        (
+            "rails-abcd",
+            copy_rails_fixture,
+            "test/models/b_test.rb",
+            "minitest",
+        ),
+        (
+            "rails-rspec-abcd",
+            copy_rspec_fixture,
+            "spec/models/b_spec.rb",
+            "rspec",
+        ),
+        (
+            "rails-vips",
+            copy_vips_fixture,
+            "test/models/caption_test.rb",
+            "minitest",
+        ),
+    ];
+    for (name, layout, file, runner) in cases {
+        let Some(w) = World::build(VCI_TOML, layout) else {
+            eprintln!("SKIPPED: {name}");
+            continue;
+        };
+        let work = w.work.clone();
+        let stderr = w.run(&work, &[file], &w.trusted);
+        assert!(
+            stderr.contains("vci: 1 attested, 0 not attested"),
+            "{name}: {stderr}"
+        );
+        let recorded = stored_predicate(&work, file)["toolchain"].clone();
+        let booted = booted_toolchain(&w, runner);
+        for (k, v) in booted.as_object().unwrap() {
+            assert_eq!(&recorded[k], v, "{name}: {k}");
+        }
+        assert!(
+            recorded["rubyLibs"]
+                .as_str()
+                .unwrap()
+                .contains("encoding=UTF-8/UTF-8"),
+            "{name}: {recorded}"
+        );
+        assert_eq!(recorded["rubyDb"], "sqlite3", "{name}");
+        assert_eq!(w.plan(&work, "main").skip, set(&[file]), "{name}");
+    }
+}
+
+/// A `ruby` for VCI_RUBY that logs every invocation (one line of arguments
+/// to `<base>/ruby.log`) and runs the fixture's Ruby. With `<base>/no-boot`
+/// present, a probe that boots the application reads the toolchain without
+/// booting it instead (the same toolchain, no native library): an
+/// application that does not load libvips here. With
+/// `<base>/boot-fails` present, booting the application raises `LoadError`
+/// (as a corrupt native extension of the bundle does) while everything else
+/// works.
+fn logging_ruby(w: &World) -> PathBuf {
+    let path = w.base.join("ruby-wrapper");
+    let script = format!(
+        r#"#!/bin/sh
+echo "$*" >> '{log}'
+for a in "$@"; do
+  if [ "$a" = 'require File.expand_path("config/environment")' ]; then
+    if [ -e '{fails}' ]; then
+      exec '{ruby}' -e 'raise LoadError, "simulated: bigdecimal.bundle is not a valid extension"'
+    fi
+    if [ -e '{flag}' ]; then
+      exec '{ruby}' -e 'require "bundler/setup"; VciCollector::Probe.light!(true)'
+    fi
+  fi
+done
+exec '{ruby}' "$@"
+"#,
+        log = w.base.join("ruby.log").display(),
+        flag = w.base.join("no-boot").display(),
+        fails = w.base.join("boot-fails").display(),
+        ruby = w.ruby_bin.join("ruby").display(),
+    );
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// `vci plan` boots a Rails application once per project, in the
+/// background (the environment check, see
+/// `rails_plan_runs_everything_when_the_application_does_not_boot`), and
+/// checks the native libraries an attestation records (libvips, which Active
+/// Storage opens through FFI when the application boots) against that same
+/// boot. With libvips loaded here the file is skipped; where the application
+/// does not load it, it runs.
+#[test]
+fn rails_plan_boots_the_application_once() {
+    // No native library recorded: one boot, for the environment check.
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let files = ["test/models/b_test.rb", "test/views/c_test.rb"];
+    w.run(&work, &files, &w.trusted);
+    let ruby = logging_ruby(&w);
+    let ruby = ruby.to_str().unwrap();
+    let p = w.plan_env(&work, "main", &[("VCI_RUBY", ruby)]);
+    assert_eq!(p.skip, set(&files));
+    let log = std::fs::read_to_string(w.base.join("ruby.log")).unwrap();
+    assert!(!log.is_empty(), "the probes went through VCI_RUBY");
+    assert_eq!(log.matches("config/environment").count(), 1, "{log}");
+
+    // libvips recorded by both files: one boot for the project.
+    let Some(w) = World::build(VCI_TOML, copy_vips_fixture) else {
+        return;
+    };
+    let vips = w.ruby_cmd(&w.work, "bundle", &["exec", "ruby", "-e", "require 'vips'"]);
+    if !vips.status.success() {
+        eprintln!("SKIPPED: libvips is not installed (`brew install vips`)");
+        return;
+    }
+    let work = w.work.clone();
+    let files = ["test/models/caption_test.rb", "test/models/image_test.rb"];
+    w.run(&work, &files, &w.trusted);
+    let ruby = logging_ruby(&w);
+    let ruby = ruby.to_str().unwrap();
+    let p = w.plan_env(&work, "main", &[("VCI_RUBY", ruby)]);
+    assert_eq!(p.skip, set(&files));
+    let log = std::fs::read_to_string(w.base.join("ruby.log")).unwrap();
+    assert_eq!(log.matches("config/environment").count(), 1, "{log}");
+
+    // An application that does not load libvips here: both files run.
+    std::fs::write(w.base.join("no-boot"), "").unwrap();
+    let p = w.plan_env(&work, "main", &[("VCI_RUBY", ruby)]);
+    assert!(p.skip.is_empty(), "{p:?}");
+    assert!(p.run.is_superset(&set(&files)), "{p:?}");
+    let out = w.vci_env(
+        &work,
+        &["explain", files[0], "--base-ref", "main"],
+        &[("VCI_RUBY", ruby)],
+    );
+    let ex = String::from_utf8_lossy(&out.stdout);
+    assert!(ex.contains("failed check: externals"), "{ex}");
+    assert!(
+        ex.contains("native library libvips: not loaded here"),
+        "{ex}"
+    );
+}
+
+/// Regression: `vci plan` read the Rails toolchain without booting the
+/// application and booted it only for a recorded native library, so where
+/// the application could not boot (a native extension of the bundle that
+/// fails to load: same gem version, so Gemfile.lock, `bundle check` and every
+/// recorded input unchanged) it skipped every attested file and `vci ci`
+/// passed without running a test. Before, the plan booted the application,
+/// failed and ran everything, and `vci ci` failed. It boots it again (in the
+/// background) and runs every file of the project when the boot fails.
+#[test]
+fn rails_plan_runs_everything_when_the_application_does_not_boot() {
+    // Simulated: booting raises LoadError, everything else works.
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, ALL, &w.trusted);
+    let ruby = logging_ruby(&w);
+    let ruby = ruby.to_str().unwrap();
+    let env = [("VCI_RUBY", ruby)];
+    assert_eq!(w.plan_env(&work, "main", &env).skip, set(ALL));
+    std::fs::write(w.base.join("boot-fails"), "").unwrap();
+    let out = w.vci_env(
+        &work,
+        &["plan", "--base-ref", "main", "--format", "json"],
+        &env,
+    );
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let p = Plan::from_json(&v);
+    assert!(p.skip.is_empty(), "{p:?}");
+    assert!(p.run_all, "{p:?}");
+    assert!(p.run.is_superset(&set(ALL)), "{p:?}");
+    let why = v["runAll"].as_str().unwrap();
+    assert!(
+        why.contains("checking the project's environment failed")
+            && why.contains("simulated: bigdecimal.bundle is not a valid extension"),
+        "{why}"
+    );
+
+    // For real: the bundle in vendor/bundle (setup-ruby's bundler-cache
+    // layout) with bigdecimal's extension corrupted after attesting.
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    if !w.bundle_into_vendor(&work) {
+        return;
+    }
+    w.run(&work, ALL, &w.trusted);
+    assert_eq!(w.plan(&work, "main").skip, set(ALL));
+    let mut corrupted = 0;
+    let mut dirs = vec![work.join("vendor/bundle")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let (path, ty) = (e.path(), e.file_type().unwrap());
+            if ty.is_dir() {
+                dirs.push(path);
+            } else if ["bigdecimal.bundle", "bigdecimal.so"]
+                .contains(&e.file_name().to_str().unwrap_or_default())
+            {
+                std::fs::write(&path, "garbage\n").unwrap();
+                corrupted += 1;
+            }
+        }
+    }
+    if corrupted == 0 {
+        eprintln!("SKIPPED: no bigdecimal extension in vendor/bundle");
+        return;
+    }
+    assert!(w.bundle_check(&work), "the bundle still checks out");
+    let p = w.plan(&work, "main");
+    assert!(p.skip.is_empty(), "{p:?}");
+    assert!(p.run_all, "{p:?}");
+    let out = w.vci_env(
+        &work,
+        &["ci", "--base-ref", "main"],
+        &[("GITHUB_REF", "refs/pull/1/merge")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("vci ci: running all tests"), "{stderr}");
+    assert!(stderr.contains("bigdecimal.bundle") || stderr.contains("bigdecimal.so"));
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+}

@@ -17,7 +17,9 @@
 //! test modules (a `-p` in `addopts` comes earlier and taints).
 //! `PYTHONPYCACHEPREFIX` points at a fresh directory so every module is
 //! compiled from the source that is hashed: bytecode in `__pycache__` can be
-//! stale when a source was edited with its size and mtime preserved.
+//! stale when a source was edited with its size and mtime preserved. (The
+//! environment probe, which imports only the standard library, reads the
+//! bytecode the interpreter ships instead: see `PytestAdapter::probe_cmd`.)
 //!
 //! One pytest process per test file, for attestation (`run_collect`) and in
 //! CI (`run_plain` with files), so both see the same per-file isolation.
@@ -109,10 +111,14 @@ pub const UV_RUN_ARGS: &[&str] = &["run", "--locked", "--exact", "--no-env-file"
 
 /// Written to a temp dir and run with the project's interpreter: versions
 /// and installed distributions, the same way the collector sees them
-/// (`platform.python_version()`, `sys.implementation.name`,
-/// `pytest.__version__`, PEP 503 names).
+/// (`platform.python_version()`, `sys.implementation.name`, PEP 503 names).
+/// pytest's version is its distribution's (`importlib.metadata`), which is
+/// what `pytest.__version__` reports (setuptools-scm writes both from one
+/// version) without importing pytest: importing it compiled pytest and its
+/// dependencies from source in every probe, about 0.3 CPU-s. `vci run`
+/// still compares it with the `pytest.__version__` the collector reports
+/// and attests nothing when they differ.
 const PROBE_SCRIPT: &str = r#"import importlib.metadata as m, json, platform, re, sys
-import pytest
 libs = []
 try:
     import sqlite3
@@ -138,7 +144,7 @@ for d in m.distributions():
 print("VCI-PROBE " + json.dumps({
     "python": platform.python_version(),
     "implementation": sys.implementation.name,
-    "pytest": pytest.__version__,
+    "pytest": m.version("pytest"),
     "dists": dists,
     "libs": ";".join(libs),
     "basePrefix": sys.base_prefix,
@@ -333,12 +339,29 @@ impl PytestAdapter {
         })
     }
 
+    /// The probe's command: `uv run python <script>` like every other
+    /// command, except for bytecode. The probe imports only the standard
+    /// library (no project source, no pytest), so it reads the bytecode the
+    /// interpreter ships instead of compiling the standard library into a
+    /// fresh `PYTHONPYCACHEPREFIX` (most of its time when it did): no
+    /// prefix and nothing written (`PYTHONDONTWRITEBYTECODE`). Its output is
+    /// the same either way; the bytecode it reads belongs to the interpreter
+    /// and the environment uv manages, which the probe trusts like the
+    /// interpreter itself.
+    fn probe_cmd(&self, env: &ChildEnv, script: &Utf8Path) -> Command {
+        let mut cmd = self.uv_run(env, Utf8Path::new(""));
+        cmd.env_remove("PYTHONPYCACHEPREFIX")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .arg("python")
+            .arg(script.as_str());
+        cmd
+    }
+
     fn run_probe(&self, env: &ChildEnv) -> Result<EnvProbe, AdapterError> {
         let tmp = tempfile::Builder::new().prefix("vci-probe-").tempdir()?;
         let script = utf8_tmp(&tmp)?.join("vci_probe.py");
         std::fs::write(&script, PROBE_SCRIPT)?;
-        let mut cmd = self.uv_run(env, &utf8_tmp(&tmp)?.join("pycache"));
-        cmd.arg("python").arg(script.as_str());
+        let mut cmd = self.probe_cmd(env, &script);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         if !out.status.success() {
             return Err(AdapterError::Command {
@@ -781,6 +804,55 @@ mod tests {
         );
         assert_eq!(envs["UV_NO_ENV_FILE"].as_deref(), Some("1"));
         assert_eq!(envs["PYTHONPYCACHEPREFIX"].as_deref(), Some("/tmp/pyc"));
+    }
+
+    /// The environment probe imported pytest (only for its version) and
+    /// compiled the standard library and pytest into a fresh bytecode prefix:
+    /// about 0.5 s per plan. It now imports neither pytest nor any project
+    /// source and reads the interpreter's own bytecode, writing none.
+    #[test]
+    fn probe_reads_shipped_bytecode_and_does_not_import_pytest() {
+        assert!(
+            !PROBE_SCRIPT
+                .lines()
+                .any(|l| l.trim_start().starts_with("import pytest")
+                    || l.contains("import") && l.contains(" pytest")),
+            "{PROBE_SCRIPT}"
+        );
+        assert!(PROBE_SCRIPT.contains(r#""pytest": m.version("pytest")"#));
+        let a = PytestAdapter::new(Utf8Path::new("/nonexistent/proj"));
+        let env = Some(vec![("PYTHONPYCACHEPREFIX".into(), "/user/pyc".into())]);
+        let c = a.probe_cmd(&env, Utf8Path::new("/tmp/p/vci_probe.py"));
+        let args: Vec<String> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--locked",
+                "--exact",
+                "--no-env-file",
+                "python",
+                "/tmp/p/vci_probe.py"
+            ]
+        );
+        let envs: std::collections::BTreeMap<String, Option<String>> = c
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            !matches!(envs.get("PYTHONPYCACHEPREFIX"), Some(Some(_))),
+            "no bytecode prefix, not even the user's: {envs:?}"
+        );
+        assert_eq!(envs["PYTHONDONTWRITEBYTECODE"].as_deref(), Some("1"));
+        assert_eq!(envs["UV_NO_ENV_FILE"].as_deref(), Some("1"));
     }
 
     #[test]
