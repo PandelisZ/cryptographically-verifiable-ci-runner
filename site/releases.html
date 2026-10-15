@@ -35,7 +35,7 @@
 <h3>Version tags now carry their own binaries</h3>
 <p>Every version tag before this one, <code>v1.0.0</code> to <code>v1.4.0</code>, points at the commit the binaries were built from, whose manifest still names the previous release, so <code>@v1.4.0</code> would compile while <code>@v1</code> downloads. Use <code>@v1</code>, or <code>@v1.4.1</code> and later: releases are now built as drafts and published by <code>scripts/publish-release.sh</code>, which creates the version tag on the commit that records the manifest, checks that the commit's sources match the binaries it names, and moves <code>v1</code> there. The example workflows no longer <code>cargo install</code> vci either; they download the binary <code>v1</code> records.</p>
 <h3>Measured</h3>
-<p><a href="examples.html#measured">Measured on this repository</a>: seven consecutive main-branch runs, each split into GitHub's setup, vci's fetch and plan, and the tests. With nothing to run the job takes about 40 seconds, of which vci is 6 to 7.</p>
+<p><a href="examples.html#measured">Measured on this repository</a>: a benchmark workflow times every stage of vci on the demo projects as its own step, from the plain suite to attesting every unit to a commit with nothing to run.</p>
 
 <h2 id="v1-4-0">1.4.0</h2>
 <p><em>15 October 2026.</em> vci stops controlling the Rails test database. It is the test engine's business, as it is when you run <code>bin/rails test</code> or <code>rspec</code>: <code>maintain_test_schema!</code>, fixtures and transactional tests give each test its starting state.</p>

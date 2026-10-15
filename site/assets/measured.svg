@@ -1,60 +1,34 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 630" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13">
-<style>.t{fill:#1b1d1a}.m{fill:#5d635b}.setup{fill:#c9cbc4}.ovh{fill:#b45309}.tests{fill:#15803d}.build{fill:none;stroke:#8a8f88;stroke-width:1.2;stroke-dasharray:4 3}.v{fill:#1b1d1a;font-weight:600}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.setup{fill:#3a3f3c}.ovh{fill:#fbbf63}.tests{fill:#4ade80}.v{fill:#e6e9e4}.g{stroke:#262b29}.build{stroke:#6b716d}}</style>
-<text class="t" x="0" y="18" font-size="16" font-weight="650">Measured: seven consecutive main-branch runs of the vci repository's own CI</text>
-<text class="m" x="0" y="38">Whole GitHub job in seconds. Five projects (pytest, Go, Cargo, Rails, RSpec), 21 test units, about 4 s of tests when everything runs plainly.</text>
-<rect class="setup" x="0" y="53" width="14" height="14" rx="3"/><text class="m" x="20" y="64">checkout and toolchains (GitHub)</text>
-<rect class="ovh" x="252.8" y="53" width="14" height="14" rx="3"/><text class="m" x="272.8" y="64">vci: binary, fetch, plan</text>
-<rect class="tests" x="454.40000000000003" y="53" width="14" height="14" rx="3"/><text class="m" x="474.40000000000003" y="64">tests, attesting where noted</text>
-<rect class="build" x="0" y="75" width="14" height="14" rx="3"/><text class="m" x="20" y="86">compiling vci from unreleased sources: our own development runs; a workflow on @v1 downloads the binary in about 1 s</text>
-<text class="t" x="0" y="140" font-weight="600">Before vci attests: full plain run</text><text class="m" x="0" y="158">every unit runs (1.2.0, prebuilt binary)</text>
-<rect class="setup" x="320.0" y="126" width="73.3" height="18" rx="3"/>
-<rect class="ovh" x="393.3" y="126" width="7.5" height="18" rx="3"/>
-<rect class="tests" x="400.8" y="126" width="7.5" height="18" rx="3"/>
-<text class="v" x="416.4" y="140">47 s</text>
-<text class="m" x="320" y="158" font-size="11">vci 4 s · tests 4 s · run 38643779539</text>
-<line class="g" x1="0" x2="1000" y1="176" y2="176"/>
-<text class="t" x="0" y="206" font-weight="600">Commit A: attests all 21 units</text><text class="m" x="0" y="224">CI key on; vci compiled from source</text>
-<rect class="setup" x="320.0" y="192" width="65.8" height="18" rx="3"/>
-<rect class="ovh" x="385.8" y="192" width="13.2" height="18" rx="3"/>
-<rect class="tests" x="399.0" y="192" width="77.1" height="18" rx="3"/>
-<rect class="build" x="476.0" y="192" width="246.3" height="18" rx="3"/>
-<text class="v" x="730.3" y="206">214 s (83 s without the compile)</text>
-<text class="m" x="320" y="224" font-size="11">vci 7 s · tests 41 s · run 38677903509</text>
-<line class="g" x1="0" x2="1000" y1="242" y2="242"/>
-<text class="t" x="0" y="272" font-weight="600">Commit B: one pytest module changed</text><text class="m" x="0" y="290">test_b ran; Rails ran on a 1.3.0-fixed bug</text>
-<rect class="setup" x="320.0" y="258" width="58.3" height="18" rx="3"/>
-<rect class="ovh" x="378.3" y="258" width="13.2" height="18" rx="3"/>
-<rect class="tests" x="391.4" y="258" width="48.9" height="18" rx="3"/>
-<text class="v" x="448.3" y="272">64 s</text>
-<text class="m" x="320" y="290" font-size="11">vci 7 s · tests 26 s · run 38678397249</text>
-<line class="g" x1="0" x2="1000" y1="308" y2="308"/>
-<text class="t" x="0" y="338" font-weight="600">Commit C: docs only</text><text class="m" x="0" y="356">pytest, Go, Rust: nothing to run</text>
-<rect class="setup" x="320.0" y="324" width="52.6" height="18" rx="3"/>
-<rect class="ovh" x="372.6" y="324" width="13.2" height="18" rx="3"/>
-<rect class="tests" x="385.8" y="324" width="47.0" height="18" rx="3"/>
-<text class="v" x="440.8" y="338">60 s</text>
-<text class="m" x="320" y="356" font-size="11">vci 7 s · tests 25 s · run 38678562794</text>
-<line class="g" x1="0" x2="1000" y1="374" y2="374"/>
-<text class="t" x="0" y="404" font-weight="600">1.3.0 manifest commit</text><text class="m" x="0" y="422">nothing to run in any project</text>
-<rect class="setup" x="320.0" y="390" width="54.5" height="18" rx="3"/>
-<rect class="ovh" x="374.5" y="390" width="11.3" height="18" rx="3"/>
-<rect class="tests" x="385.8" y="390" width="9.4" height="18" rx="3"/>
-<text class="v" x="403.2" y="404">40 s</text>
-<text class="m" x="320" y="422" font-size="11">vci 6 s · tests 5 s · run 38689085904</text>
-<line class="g" x1="0" x2="1000" y1="440" y2="440"/>
-<text class="t" x="0" y="470" font-weight="600">1.4.0 release commit</text><text class="m" x="0" y="488">Rails, RSpec, Rust re-attested; compiled</text>
-<rect class="setup" x="320.0" y="456" width="56.4" height="18" rx="3"/>
-<rect class="ovh" x="376.4" y="456" width="13.2" height="18" rx="3"/>
-<rect class="tests" x="389.6" y="456" width="60.2" height="18" rx="3"/>
-<rect class="build" x="449.7" y="456" width="244.4" height="18" rx="3"/>
-<text class="v" x="702.1" y="470">199 s (69 s without the compile)</text>
-<text class="m" x="320" y="488" font-size="11">vci 7 s · tests 32 s · run 38765949660</text>
-<line class="g" x1="0" x2="1000" y1="506" y2="506"/>
-<text class="t" x="0" y="536" font-weight="600">1.4.0 manifest commit</text><text class="m" x="0" y="554">nothing to run in any project</text>
-<rect class="setup" x="320.0" y="522" width="62.0" height="18" rx="3"/>
-<rect class="ovh" x="382.0" y="522" width="11.3" height="18" rx="3"/>
-<rect class="tests" x="393.3" y="522" width="7.5" height="18" rx="3"/>
-<text class="v" x="408.8" y="536">43 s</text>
-<text class="m" x="320" y="554" font-size="11">vci 6 s · tests 4 s · run 38766523295</text>
-<line class="g" x1="0" x2="1000" y1="572" y2="572"/>
-<text class="m" x="0" y="622">The floor is GitHub's own setup. vci costs 6 to 7 s to fetch and plan; with nothing to run the job takes 40 to 43 s, against 47 s for this small suite's plain full run.</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 604" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13">
+<style>.t{fill:#1b1d1a}.m{fill:#5d635b}.setup{fill:#c9cbc4}.ovh{fill:#b45309}.tests{fill:#15803d}.attest{fill:#2563eb}.v{fill:#1b1d1a;font-weight:600}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.setup{fill:#3a3f3c}.ovh{fill:#fbbf63}.tests{fill:#4ade80}.attest{fill:#60a5fa}.v{fill:#e6e9e4}.g{stroke:#262b29}}</style>
+<text class="t" x="0" y="18" font-size="16" font-weight="650">Measured: one benchmark run on this repository's demo projects (vci 1.4.1, release binary)</text>
+<text class="m" x="0" y="38">Each stage is a separately timed step of one GitHub job. Five projects (pytest, Go, Cargo, Rails, RSpec), 21 test units. Seconds.</text>
+<rect class="setup" x="0" y="53" width="14" height="14" rx="3"/><text class="m" x="20" y="64">GitHub, not vci</text>
+<rect class="tests" x="145.0" y="53" width="14" height="14" rx="3"/><text class="m" x="165.0" y="64">tests running</text>
+<rect class="ovh" x="276.8" y="53" width="14" height="14" rx="3"/><text class="m" x="296.8" y="64">vci bookkeeping</text>
+<rect class="attest" x="421.8" y="53" width="14" height="14" rx="3"/><text class="m" x="441.8" y="64">tests running with collectors, signed</text>
+<text class="t" x="0" y="108" font-weight="600">GitHub setup: checkout, toolchains, dependencies</text><text class="m" x="0" y="126" font-size="12">not vci; the same for every job</text>
+<rect class="setup" x="330" y="94" width="481.0" height="18" rx="3"/><text class="v" x="819.0" y="108">37 s</text>
+<line class="g" x1="0" x2="1000" y1="138" y2="138"/>
+<text class="t" x="0" y="166" font-weight="600">plain: full suite without vci</text><text class="m" x="0" y="184" font-size="12">pytest, go test, cargo test, rails test, rspec</text>
+<rect class="tests" x="330" y="152" width="78.0" height="18" rx="3"/><text class="v" x="416.0" y="166">6 s</text>
+<line class="g" x1="0" x2="1000" y1="196" y2="196"/>
+<text class="t" x="0" y="224" font-weight="600">vci: install the binary, fetch, plan</text><text class="m" x="0" y="242" font-size="12">download 1 s, fetch 1 s, plan 5 s</text>
+<rect class="ovh" x="330" y="210" width="104.0" height="18" rx="3"/><text class="v" x="442.0" y="224">8 s</text>
+<line class="g" x1="0" x2="1000" y1="254" y2="254"/>
+<text class="t" x="0" y="282" font-weight="600">vci run: attest all 21 units</text><text class="m" x="0" y="300" font-size="12">pytest 6 s · Go 9 s · Cargo 1 s · Rails 9 s · RSpec 10 s</text>
+<rect class="attest" x="330" y="268" width="468.0" height="18" rx="3"/><text class="v" x="806.0" y="282">36 s</text>
+<line class="g" x1="0" x2="1000" y1="312" y2="312"/>
+<text class="t" x="0" y="340" font-weight="600">vci push: publish the attestations</text><text class="m" x="0" y="358" font-size="12">git-meta, refs/meta/main</text>
+<rect class="ovh" x="330" y="326" width="52.0" height="18" rx="3"/><text class="v" x="390.0" y="340">4 s</text>
+<line class="g" x1="0" x2="1000" y1="370" y2="370"/>
+<text class="t" x="0" y="398" font-weight="600">vci ci: nothing changed</text><text class="m" x="0" y="416" font-size="12">21 of 21 skipped, no test runner started</text>
+<rect class="ovh" x="330" y="384" width="52.0" height="18" rx="3"/><text class="v" x="390.0" y="398">4 s</text>
+<line class="g" x1="0" x2="1000" y1="428" y2="428"/>
+<text class="t" x="0" y="456" font-weight="600">vci ci: one pytest module changed</text><text class="m" x="0" y="474" font-size="12">1 file ran, 20 skipped</text>
+<rect class="tests" x="330" y="442" width="78.0" height="18" rx="3"/><text class="v" x="416.0" y="456">6 s</text>
+<line class="g" x1="0" x2="1000" y1="486" y2="486"/>
+<text class="t" x="0" y="514" font-weight="600">vci ci --key: one Rails model changed</text><text class="m" x="0" y="532" font-size="12">4 Rails files ran and were re-attested</text>
+<rect class="attest" x="330" y="500" width="208.0" height="18" rx="3"/><text class="v" x="546.0" y="514">16 s</text>
+<line class="g" x1="0" x2="1000" y1="544" y2="544"/>
+<text class="m" x="0" y="580">Attesting costs about 1.5 s per unit on top of the test itself, almost all of it one process per unit (a Rails boot per file; Go and pytest per package or file).</text>
+<text class="m" x="0" y="596">A commit with nothing to run costs vci 12 s in all; the rest of its 40-second job is GitHub's setup. Run 38786839799.</text></svg>

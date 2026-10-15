@@ -418,15 +418,19 @@ vci push &amp;&amp; git push</code></pre>
 <p>Several agents can work on one branch. Each signs with its own key, their attestations never overwrite each other, and CI accepts any of them that is still valid.</p>
 
 <h2 id="measured">Measured on this repository</h2>
-<p>These are seven consecutive runs of the main-branch job of this repository, the one that attests with the CI key. Five projects, 21 test units, about four seconds of tests when everything runs plainly, so the chart shows vci's floor rather than its savings: fetch and plan cost six to seven seconds, and a commit with nothing to run finishes the whole job in about 40 seconds against 47 for the plain full run. The two long bars are our own development runs compiling vci from sources that were not released yet; a workflow that uses <code>@v1</code> downloads the binary in about a second, and the action never compiles <code>vci</code> unless a job sets <code>build-from-source: true</code>.</p>
-<img src="assets/measured.svg" alt="Seven consecutive main-branch runs of this repository, each split into GitHub setup, vci fetch and plan, tests, and compile time" width="1000" height="630" style="width:100%;height:auto;display:block;margin:16px 0 4px">
+<p>One run of this repository's <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/.github/workflows/bench.yml">benchmark workflow</a> on ubuntu-latest, with vci 1.4.1 downloaded as the release binary: every stage is its own step, so the job's step timings are the measurement. Five projects, 21 test units, about six seconds of tests when everything runs plainly, so this shows vci's costs rather than its savings on a real suite.</p>
+<img src="assets/measured.svg" alt="One benchmark run split into timed stages: GitHub setup, the plain suite, vci install fetch and plan, attesting every unit, push, nothing changed, one module changed, one Rails model changed" width="1000" height="604" style="width:100%;height:auto;display:block;margin:16px 0 4px">
 <table>
-<tr><th>Run</th><th>What happened</th></tr>
-<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38677903509">38677903509</a></td><td>Commit A: the CI key attests all 21 units and pushes them</td></tr>
-<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38678397249">38678397249</a></td><td>Commit B changes one pytest module: only that test runs among the attested units</td></tr>
-<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38678562794">38678562794</a></td><td>Commit C changes only the README: pytest, Go and Rust have nothing to run</td></tr>
-<tr><td><a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38766523295">38766523295</a></td><td>The 1.4.0 manifest commit: nothing to run in any project, prebuilt binary, 43 s for the whole job</td></tr>
+<tr><th>Stage</th><th>Seconds</th><th>What it tells you</th></tr>
+<tr><td>plain: full suite without vci</td><td>6</td><td>the suite itself</td></tr>
+<tr><td>vci: install, fetch, plan</td><td>8</td><td>the fixed cost of every job: a one-second download, a fetch, a plan over 21 units</td></tr>
+<tr><td>vci run: attest all 21 units</td><td>36</td><td>about 1.5 s per unit on top of the test: one process per unit with a collector, a Rails boot per file. pytest 6, Go 9, Cargo 1, Rails 9, RSpec 10</td></tr>
+<tr><td>vci push</td><td>4</td><td>publishing 21 attestations through git-meta</td></tr>
+<tr><td>vci ci: nothing changed</td><td>4</td><td>21 skipped, no test runner started</td></tr>
+<tr><td>vci ci: one pytest module changed</td><td>6</td><td>one file ran, 20 skipped</td></tr>
+<tr><td>vci ci --key: one Rails model changed</td><td>16</td><td>the four Rails files that load the model ran and were re-attested</td></tr>
 </table>
+<p>So attesting is slower than running, by roughly a process start per unit, and it is paid once per change on one machine; every later run of an unchanged unit, on any machine, costs the plan. The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38786839799">run</a> took 120 seconds in all, 37 of them GitHub's own setup.</p>
 
 <h2 id="live">Live runs to look at</h2>
 <table>
