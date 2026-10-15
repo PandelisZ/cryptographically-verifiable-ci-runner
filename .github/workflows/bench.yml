@@ -14,6 +14,8 @@ env:
   UV_PYTHON_PREFERENCE: only-managed
   CGO_ENABLED: "0"
   TZ: UTC
+  # Per-phase timings of every vci plan, on stderr.
+  VCI_TIMING: "1"
 
 jobs:
   bench:

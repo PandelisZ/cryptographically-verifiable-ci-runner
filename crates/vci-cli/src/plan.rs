@@ -358,13 +358,24 @@ fn verdict_run(f: &TestFile, reason: &str) -> FileVerdict {
 /// Top-level plan. Never fails: problems become `run_all` (for everything,
 /// or for one project).
 pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
+    let t_plan = std::time::Instant::now();
+    let r = plan_timed(opts);
+    timing("plan total", t_plan);
+    r
+}
+
+fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
     let (repo, root) = open_repo()?;
     // `--fetch`: fetch attestations while the projects are probed; joined
     // before the store is read (and before returning, whatever happens).
     let mut fetch = opts.fetch.clone().map(|remote| {
         let (repo, from) = (repo.clone(), remote.clone());
-        let handle =
-            std::thread::spawn(move || crate::cmds::fetch_messages(&repo, from.as_deref()));
+        let handle = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let r = crate::cmds::fetch_messages(&repo, from.as_deref());
+            timing("fetch attestations (--fetch, in the background)", t);
+            r
+        });
         (remote, handle)
     });
     let mut res = PlanResult {
@@ -450,6 +461,14 @@ struct Resolved {
 
 /// List a project's test files and, with `resolve`, resolve its toolchain
 /// and externals at the same time (both shell out: uv, go, cargo, ruby).
+
+/// `VCI_TIMING=1`: print how long a phase of the plan took, on stderr.
+pub(crate) fn timing(what: &str, since: std::time::Instant) {
+    if std::env::var_os("VCI_TIMING").is_some() {
+        eprintln!("vci: timing: {what}: {:.2}s", since.elapsed().as_secs_f64());
+    }
+}
+
 fn probe_project(
     ctx: &Ctx,
     idx: usize,
@@ -460,13 +479,25 @@ fn probe_project(
 ) -> Probed {
     let env = child.to_child_env();
     std::thread::scope(|s| {
-        let resolving = resolve.then(|| s.spawn(|| resolve_project(ctx, project, &env, repo_id)));
+        let resolving = resolve.then(|| {
+            s.spawn(|| {
+                let t = std::time::Instant::now();
+                let r = resolve_project(ctx, project, &env, repo_id);
+                timing(
+                    &format!("{}: resolve toolchain and externals", project.name),
+                    t,
+                );
+                r
+            })
+        });
+        let t = std::time::Instant::now();
         let files = project
             .adapter
             .list_test_files(&env)
             .map_err(anyhow::Error::from)
             .and_then(|l| project.test_files(idx, l))
             .map_err(|e| format!("listing test files failed: {e:#}"));
+        timing(&format!("{}: list test files", project.name), t);
         // What the project's configuration leaves out (Rails: test files of
         // the runner `runner` does not select), as `vci run` prints it.
         let warnings = project.adapter.warnings(&env);
@@ -667,9 +698,13 @@ fn plan_with(
                 (start.run_all.is_none() && allowed.is_some()).then(|| {
                     let env = start.child.to_child_env();
                     outer.spawn(move || {
-                        p.adapter
+                        let t = std::time::Instant::now();
+                        let r = p
+                            .adapter
                             .check_run_environment(&env)
-                            .map_err(|e| format!("{e:#}"))
+                            .map_err(|e| format!("{e:#}"));
+                        timing(&format!("{}: environment check (boot)", p.name), t);
+                        r
                     })
                 })
             })
@@ -796,6 +831,7 @@ fn plan_with(
         // Every project's files at once (the checks rehash the checkout and may
         // wait for a Rails application's boot for its native libraries), in
         // project order.
+        let t_verdicts = std::time::Instant::now();
         let verdicts: Vec<Vec<FileVerdict>> = std::thread::scope(|s| {
             let handles: Vec<_> = verifiers
                 .iter()
@@ -827,6 +863,7 @@ fn plan_with(
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         });
+        timing("verdicts (rehash inputs, check candidates)", t_verdicts);
         for (pi, (verifier, verdicts)) in verifiers.iter().zip(verdicts).enumerate() {
             if let Err(r) = verifier {
                 res.projects[pi].run_all.get_or_insert_with(|| r.clone());
