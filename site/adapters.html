@@ -133,6 +133,7 @@ vci push</code></pre>
 <li>Use a uv-managed Python whose exact patch version uv also ships for Linux (check with <code>uv python list --all-platforms</code>). Homebrew's Python will not match.</li>
 <li>Pin the same uv version locally and in <code>astral-sh/setup-uv</code>.</li>
 <li>The full set of installed distributions must be equal. A dependency with a platform marker installs on one side only, so everything runs.</li>
+<li>The SQLite and OpenSSL versions the interpreter bundles are compared too. To accept other builds of them, set <code>libraries = "any"</code> under <code>[policy]</code> (see <a href="configuration.html#mac-to-linux">macOS to Linux</a>). The Python version and the distributions are still compared.</li>
 <li>Delete <code>.DS_Store</code> and <code>__pycache__</code> from directories your tests list. <code>vci run</code> warns about them.</li>
 </ul>
 
@@ -250,6 +251,7 @@ vci push</code></pre>
 <li>every Ruby file loaded, and Zeitwerk's directory listings;</li>
 <li>every file read or checked: fixtures, templates, config, the schema;</li>
 <li>the gems used, by version;</li>
+<li>native libraries opened through FFI, such as Active Storage's libvips, by file name and hash;</li>
 <li>every variable read through <code>ENV</code>.</li>
 </ul>
 <p>Any change to <code>Gemfile.lock</code> runs everything.</p>
@@ -272,6 +274,7 @@ vci push</code></pre>
 <li><strong>Lockfile platforms.</strong> <code>Gemfile.lock</code> must list both <code>arm64-darwin</code> and <code>x86_64-linux</code>.</li>
 <li><strong>Ruby and <code>vendor/</code>.</strong> Pin the exact Ruby in <code>.ruby-version</code>, and keep <code>vendor/.keep</code> committed.</li>
 <li><strong>Locale.</strong> Attest with a UTF-8 locale (<code>LANG=en_US.UTF-8</code>). Ruby's default encoding is compared, and runners use UTF-8.</li>
+<li><strong>libvips and library versions.</strong> Homebrew's libvips is a different file from the runner's, so every file that loaded it runs, and so does every file when the SQLite, libyaml or time zone data versions differ. Set <code>libraries = "any"</code> under <code>[policy]</code> to match libvips by name and ignore those versions, and install libvips on the runner. See <a href="configuration.html#mac-to-linux">macOS to Linux</a>.</li>
 </ul>
 
 <h2 id="rspec"><img class="h-logo" src="assets/logos/rspec.png" alt="" aria-hidden="true"> RSpec</h2>

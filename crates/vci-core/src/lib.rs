@@ -16,7 +16,10 @@ pub use manifest::{
     env_value_hash,
 };
 pub use path::{PathError, RepoPath};
-pub use predicate::{PREDICATE_TYPE, PRIVILEGES_DIFF, Predicate, TestResult, Toolchain, test_key};
+pub use predicate::{
+    PREDICATE_TYPE, PRIVILEGES_DIFF, PYTHON_LIBS_DIFF, Predicate, RUBY_LIBS_DIFF, TestResult,
+    Toolchain, test_key,
+};
 
 #[cfg(test)]
 mod manifest_tests;

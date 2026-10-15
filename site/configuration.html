@@ -48,6 +48,7 @@ pass_through = []              <span class="c"># visible, never hashed: secrets 
 <table>
 <tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>platform</code></td><td><code>"any"</code></td><td class="wrap">Which OS and architecture may satisfy CI. <code>"any"</code> accepts an attestation from another platform, <code>"same-os"</code> requires the same OS, <code>"exact"</code> requires the same OS and architecture.</td></tr>
+<tr><td><code>libraries</code></td><td><code>"exact"</code></td><td class="wrap">Rails and pytest: how native libraries and the interpreter's library versions are compared. <code>"exact"</code> matches a library opened through FFI (libvips) by file name and hash, and compares the SQLite, libyaml, time zone data and OpenSSL versions. <code>"any"</code> matches the library by name (<code>libvips.42.dylib</code> on macOS, <code>libvips.so.42</code> on Linux), which must still be loaded in CI, and ignores those versions. See <a href="#mac-to-linux">macOS to Linux</a>.</td></tr>
 <tr><td><code>max_ttl</code></td><td><code>"30d"</code></td><td class="wrap">Longest accepted attestation lifetime. <code>vci run --ttl</code> sets the lifetime of a new attestation (14 days unless you say otherwise).</td></tr>
 <tr><td><code>allow_dirty</code></td><td><code>true</code></td><td class="wrap">Accept attestations made from a working tree with uncommitted changes. Inputs are hashed by content, not by commit.</td></tr>
 <tr><td><code>no_skip_refs</code></td><td><code>[]</code></td><td class="wrap">Refs on which nothing is skipped, except what <code>no_skip_refs_except</code> allows. <code>vci init</code> writes <code>["refs/heads/main", "refs/tags/**"]</code>. Keep your default branch here: that full run is the backstop against a false claim.</td></tr>
@@ -57,10 +58,21 @@ pass_through = []              <span class="c"># visible, never hashed: secrets 
 <tr><td><code>rails_allow_db</code></td><td><code>false</code></td><td class="wrap">Rails: attest files whose test database is a server. See <a href="adapters.html#rails">Rails</a>.</td></tr>
 </table>
 <h3 id="platform-overrides">Platform overrides</h3>
-<p>Tighten the platform rule for some files and leave the rest on <code>"any"</code>:</p>
+<p>Tighten the platform rule for some files and leave the rest on <code>"any"</code>. An entry sets <code>platform</code>, <code>libraries</code>, or both:</p>
 <pre><code>[[policy.platform_overrides]]
 match = ["src/native/**"]   <span class="c"># project-relative globs</span>
-platform = "exact"</code></pre>
+platform = "exact"
+
+[[policy.platform_overrides]]
+match = ["test/images/**"]
+libraries = "exact"</code></pre>
+<p>Overrides only tighten: the strictest of <code>[policy]</code> and every matching entry applies.</p>
+<h3 id="mac-to-linux">macOS to Linux</h3>
+<p>Under <code>platform = "any"</code>, a Rails file that loaded libvips (any file that boots an app with Active Storage and <code>image_processing</code>) still runs on a Linux runner: Homebrew's libvips is a different file from apt's. The same happens when the SQLite, libyaml or time zone data versions differ, or, for pytest, the interpreter's SQLite or OpenSSL. To skip those files across platforms:</p>
+<pre><code>[policy]
+platform = "any"
+libraries = "any"</code></pre>
+<p>Install libvips on the runner as well; under <code>"any"</code> it is matched by name, but it must still be loaded there. Everything else is still compared exactly: the Ruby or Python version, every gem or distribution in the lockfile, the inputs and the declared environment. By setting it you state that these libraries behave the same on both platforms for your tests. <code>vci explain</code> lists every difference the policy accepted.</p>
 
 <h2 id="env">[env]: environment variables</h2>
 <p>Environment variables can change a test's result, so vci controls which ones a test sees and hashes the ones that matter. In <strong>strict mode</strong>, the default, a test sees only the variables you list in <code>[env]</code>, plus a few built-ins such as <code>PATH</code>. This holds both in <code>vci run</code> and in CI:</p>

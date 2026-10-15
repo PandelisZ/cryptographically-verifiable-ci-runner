@@ -279,7 +279,8 @@ toolchain check compares is identical there:
   also ships for `x86_64-linux-gnu` (`uv python list --all-platforms`; e.g. 3.14.4 with uv 0.11.7; Homebrew's 3.14.7
   has no Linux build), pinned in `.python-version`, with `UV_PYTHON_PREFERENCE=only-managed` on both sides. The
   bundled sqlite and OpenSSL versions are compared too (`python libraries`). `vci run` warns when the interpreter is
-  not uv-managed;
+  not uv-managed. Or set `policy.libraries = "any"` in the base `vci.toml`: the SQLite and OpenSSL versions are then
+  not compared (the Python version, implementation and installed distributions still are);
 - **uv**: pin the same uv version locally and in `astral-sh/setup-uv` (`version:`), so both resolve the same builds;
 - **the installed distributions**: the full `name==version` set must be equal (`python distributions`). A dependency
   with a platform marker (`sys_platform == 'linux'`) installs only on one side, so every file runs there;
@@ -608,7 +609,8 @@ and its version), the default external/internal encodings, the collector's versi
 `VERSION`, bumped whenever what it records or refuses changes, so CI must run the same collector: pin the action or
 the vci checkout to the commit you attest with), the database (`sqlite3`; a server's name and version with
 `policy.rails_allow_db`), the full bundle, and whether the tests ran as root (unless `policy.allow_superuser_mismatch`);
-OS/arch per `policy.platform`.
+OS/arch per `policy.platform`. Under `policy.libraries = "any"` the versions of the SQLite library, libyaml and the
+time zone data are not compared (whether each is loaded still is).
 
 Test results: a file is attested only when the process exits 0 and every test passed: **any failure, error or skip,
 no test at all, or a test that made no assertion** refuses it.
@@ -645,8 +647,10 @@ config/master.key, Rails' credentials key`). Nothing is wrong (it fails open), b
 `native:<file name>` (`native:libvips.42.dylib`), whose version is the sha256 of the file FFI resolved it to (or
 `unresolved` when FFI gave no path, such as a system library in macOS's shared cache). `vci plan` compares it with
 the library the probe's process (which boots the application) opens where the attestation is checked, like a gem: a
-different libvips build, another platform's, or none at all runs the file. Finding the library (FFI's search of
-`LD_LIBRARY_PATH`, its library directories) is not an input; the file it found is. A failed `ffi_lib` (an optional
+different libvips build, another platform's, or none at all runs the file (with `policy.libraries = "any"` in the base
+`vci.toml`, a libvips of any file name and build is accepted, as long as one is loaded: see `policy.libraries` under
+"`vci.toml`" and "Attest on macOS, skip on Linux"). Finding the library (FFI's search of `LD_LIBRARY_PATH`, its
+library directories) is not an input; the file it found is. A failed `ffi_lib` (an optional
 library that is not installed, a `LoadError` the caller rescues) records nothing and refuses nothing. (Opening a
 library also runs its initialisers, C code vci does not see; that is accepted as part of loading the library, which is
 identified by its file.) What the library's C code may read is reached by **calling** it, so:
@@ -715,7 +719,8 @@ process. Checked locally on macOS with Rails 8.1.3.1, image_processing 1.14.0, r
 libvips 8.18 (`fixtures/rails-vips`, `rails_active_storage_with_libvips` in the e2e tests, skipped where libvips is not
 installed). A runner without libvips runs every file that recorded it (Active Storage then sets `VIPS_AVAILABLE` to
 false, which a test could observe), and so does a runner whose libvips is another build: to skip there, attest where
-the same libvips file is installed (or remove `image_processing` and `ruby-vips` if the app does not process images).
+the same libvips file is installed, set `policy.libraries = "any"` (the libvips of the runner's platform is then
+accepted by name), or remove `image_processing` and `ruby-vips` if the app does not process images.
 
 ### Databases (read this)
 
@@ -755,13 +760,15 @@ Under `platform = "any"` a file attested on macOS arm64 is skipped on an ubuntu-
   `sqlite3` are then installed from their precompiled builds for each platform. vci matches a gem by name and version,
   not platform: **the macOS and Linux builds of one version are accepted as the same gem** (their contents differ;
   this is what `platform = "any"` accepts, as for the Python interpreter of the pytest adapter). The SQLite library
-  those builds bundle is compared (the `sqlite3` gem 2.9.6 bundles SQLite 3.53.2 in both), and so is libyaml. Gems
+  those builds bundle is compared (the `sqlite3` gem 2.9.6 bundles SQLite 3.53.2 in both), and so is libyaml (unless
+  `policy.libraries = "any"`: see "Attest on macOS, skip on Linux" below). Gems
   compiled at install time (`bigdecimal`, `json`, `racc`, ...) are matched by version; the compiler and system
   headers are not compared. Use `"same-os"` or `"exact"` (or `platform_overrides`) where a native gem's platform
   build matters;
 - **time zone data comes from the `tzinfo-data` gem** (`gem "tzinfo-data"` for every platform, not the generator's
   `platforms: %i[ windows jruby ]`): without it Rails reads the system's zoneinfo, whose version is compared (macOS
-  and Ubuntu rarely ship the same one), and nothing is skipped across them. `TZ` is declared and set to the same
+  and Ubuntu rarely ship the same one), and nothing is skipped across them (under `policy.libraries = "any"` the
+  version is not compared, but the zone rules then are those of each machine). `TZ` is declared and set to the same
   value on both sides (`TZ=UTC`): Ruby's local time zone otherwise comes from the machine (`/etc/localtime`, which
   is not an input);
 - **`config/environments/test.rb` does not read `CI`**: the generator writes `config.eager_load = ENV["CI"].present?`,
@@ -786,6 +793,48 @@ ci` there ran the remaining spec files with RSpec (a `~/.rspec` in the container
 **OpenSSL is not compared**: Ruby links the platform's OpenSSL (Homebrew's 3.6 on a Mac, a 3.0 or 3.5 build on Linux),
 so comparing it would rule out every cross-platform skip. Algorithms give the same results across these versions; what
 differs (which legacy ciphers exist, default security levels) is accepted under `platform = "any"`.
+
+### Attest on macOS, skip on Linux (`libraries = "any"`)
+
+Even with everything above in place, two things bind a file to the platform it was attested on: a native library
+opened through FFI is recorded by file name and hash (`native:libvips.42.dylib` from Homebrew on a Mac,
+`native:libvips.so.42` from apt on the runner), and the versions of the SQLite library, libyaml and the time zone data
+are compared (`ruby libraries`), which Homebrew and apt build differently. A file that loaded libvips (every file that
+boots an app with Active Storage and `image_processing`) then runs on every runner. To skip it there, set in the base
+`vci.toml`:
+
+```toml
+[policy]
+platform = "any"
+libraries = "any"   # native libraries by name, library versions not compared
+```
+
+and install the library on the runner too (`sudo apt-get install -y libvips-dev` pulls it in): under `"any"` libvips
+is matched by library name, but one must still be loaded where CI checks (otherwise `native library libvips:
+not loaded here (looked for a native library named libvips, policy.libraries = "any")`). The same key lets a pytest
+file through when the SQLite or OpenSSL of the interpreter differs (`python libraries`). Nothing changes in what `vci
+run` records, so attestations already made are accepted once the key is on the base branch.
+
+**Still compared, exactly:** the Ruby release and patchlevel (pin it in `.ruby-version`, used by mise locally and by
+`ruby/setup-ruby` in CI), Rails, Bundler, the test frameworks and every gem of the bundle (through `Gemfile.lock`, with
+both platforms listed), the default encodings, the collector version, the database, root or not; every input file; the
+declared environment variables (`TZ`) and the `[env]` configuration. For pytest: the Python version and
+implementation, pytest and the installed distributions. Whether each library is loaded at all is compared too: a
+Python without `_sqlite3`, or a Ruby process that loaded no SQLite where the attestation did, runs the file.
+
+**What you state by setting it:** that the library's behaviour is the same on both platforms for these tests, so a
+test that passed with Homebrew's libvips (or SQLite, libyaml, time zone data, OpenSSL) on a Mac would pass with the
+runner's build. vci does not check that; it shows what it accepted (`vci explain` prints `policy: libraries = "any"
+(base vci.toml): ...` and, under each candidate, `accepted by policy.libraries = "any": ...` for every difference let
+through), and the full run on the default branch (`no_skip_refs`) is where a difference would show. Keep the files
+where it does not hold (pixel-exact image comparisons, SQL that depends on the SQLite version, zone rules of a recent
+change) on `"exact"`:
+
+```toml
+[[policy.platform_overrides]]
+match = ["test/images/**"]
+libraries = "exact"
+```
 
 ## Quick start (RSpec)
 
@@ -820,7 +869,7 @@ apply to Minitest too; each is explained under [Quick start (Rails)](#quick-star
 - `gem "tzinfo-data"` for every platform (not `platforms: %i[ windows jruby ]`), and `TZ` declared and set (`TZ=UTC`);
 - `image_processing` on a machine with libvips installed: attested, with libvips recorded by its file hash (see
   "Native libraries (FFI) and Active Storage's libvips" under the Rails section), so CI skips only where the same
-  libvips file is installed;
+  libvips file is installed, or any libvips under `policy.libraries = "any"` (see "Attest on macOS, skip on Linux");
 - `vendor/.keep` committed (the generator creates it).
 
 Capybara in the `:test` group is fine: `rack_test` feature specs are attested; specs that drive a browser are refused.
@@ -1318,6 +1367,7 @@ adapter = "vitest"     # or "pytest", "go", "cargo", "rails", "node-test"
 
 [policy]
 platform = "any"       # "any" | "same-os" | "exact": which OS/arch may satisfy CI
+libraries = "exact"    # "exact" | "any": native libraries (FFI) by file and hash, interpreter library versions (see below)
 max_ttl = "30d"        # longest accepted attestation lifetime
 allow_dirty = true     # accept attestations made from an uncommitted working tree
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]   # never skip on these refs (the `vci init` default)
@@ -1330,7 +1380,8 @@ allow_superuser_mismatch = false # accept attestations made as root where CI is 
 
 [[policy.platform_overrides]]
 match = ["src/native/**"]   # project-relative globs
-platform = "exact"
+platform = "exact"          # an entry sets platform, libraries, or both
+# libraries = "exact"
 
 [env]                  # see docs/ENV.md
 mode = "strict"        # strict: undeclared variables are removed from the test environment
@@ -1358,6 +1409,44 @@ from the password database) can pass as one user and fail as the other, and the 
 CI would not reproduce. Set it only when no test depends on permissions or identity (or such tests are in
 `never_skip`). The Rails collector refuses a test that reads the uid or the user's identity whatever this key says
 (`ruby:process-identity:`); the other adapters do not observe it.
+
+**`policy.libraries`** (`"exact"` | `"any"`, default `"exact"`). Two things bind a Rails or pytest attestation to
+the platform it was made on even under `platform = "any"`: native libraries opened through FFI, recorded as
+`native:<file name>` with the file's sha256 (`native:libvips.42.dylib` on macOS, `native:libvips.so.42` on Linux;
+see "Native libraries (FFI) and Active Storage's libvips"), and the versions of the libraries the interpreter bundles
+or links, which Homebrew, apt and python-build-standalone build differently (`ruby libraries`: the SQLite library,
+libyaml, the time zone data; `python libraries`: SQLite, OpenSSL). Under `"exact"` both must be identical. Under
+`"any"`:
+
+- a `native:` external matches by **library name**: the file name up to its first `.` (`libvips.42.dylib`,
+  `libvips.so.42` and `libvips.so` are all `libvips`; `libglib-2.0.0.dylib` and `libglib-2.0.so.0` are both
+  `libglib-2`). A library of that name must still be among those the probe's process loads where the attestation is
+  checked (otherwise the file runs: `native library libvips: not loaded here (looked for a native library named
+  libvips, policy.libraries = "any")`); its file name and hash are not compared;
+- the versions in the `sqlite`, `yaml` and `tz` items of `ruby libraries` and the `sqlite` and `openssl` items of
+  `python libraries` are not compared. Whether each library is loaded still is: a Python without `_sqlite3` or `_ssl`
+  (`sqlite=none`, `openssl=none`), a Ruby process without SQLite3, Psych's libyaml or TZInfo (no `sqlite` item, an
+  empty `tz=`) does not match an attestation where it was loaded (`ruby libraries: sqlite, yaml, tz loaded or not`,
+  `python libraries: sqlite, openssl loaded or not`), and the reverse. The other items of `ruby libraries` (the
+  default encodings, the collector version: `ruby libraries except sqlite, yaml, tz`) and everything else in the
+  toolchain (Ruby, Rails, Bundler, the test frameworks, the database, the bundle; Python, its implementation, pytest,
+  the installed distributions; root or not) still are, exactly.
+
+Like `platform` it is read from the **base commit**, decided per test file (a `[[policy.platform_overrides]]` entry
+may set `libraries`, and the strictest of the default and every matching entry applies, so an entry can only make a
+file `"exact"`), and set per project in `[[projects]]`. Nothing changes in what `vci run` records, so attestations
+made before the key existed verify under it. `vci explain` prints `policy: libraries = "any" (base vci.toml): ...`
+for such a file, and under each candidate every difference the key accepted (`accepted by policy.libraries = "any":
+external:native:libvips.42.dylib: native library libvips: loaded here as native:libvips.so.42 sha256:...`); a skip
+that needed it says so in `vci plan` (`; policy.libraries = "any" accepted 1 difference(s)`; `--format json` gives the
+file `"libraries": "any"` and the candidate `acceptedByPolicy`, both left out under `"exact"`). Under `"exact"`, a
+native library loaded here under another file name is named in the failure (`not loaded here under this file name;
+loaded here: native:libvips.so.42 sha256:... (policy.libraries = "any" would match native library libvips by name)`).
+**What it accepts:** another build of the library (another version, other patches, other dependencies of its own:
+libvips' libjpeg, libpng, ...), and another SQLite, libyaml, OpenSSL or zoneinfo (not a missing one), whose behaviour
+can differ (SQLite's query planner and its JSON functions, the zone rules of a recent change). Use it where these
+differences do not reach the tests (or set `"exact"` for the files they reach with `platform_overrides`); the setup
+is in "Attest on macOS, skip on Linux" under Quick start (Rails).
 
 `[[inputs]]` globs are relative to the project dir. A glob without wildcards names a file, a directory (walked) or a
 path that must stay absent; otherwise the directory before the first wildcard is walked, every directory in it is a
@@ -1825,7 +1914,8 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
    arch-specific reasons, and otherwise another architecture only between 64-bit little-endian ones; Rails: Ruby
    version and patchlevel, engine, Rails, Bundler, the test frameworks (Minitest, and rspec-core, -expectations,
    -mocks, -rails, -support), SQLite library, libyaml, time zone data, encodings, collector version, database software
-   and the whole bundle, exactly);
+   and the whole bundle, exactly; under the base policy's `libraries = "any"` for the file, the SQLite/libyaml/time
+   zone data versions of Rails and the SQLite/OpenSSL versions of pytest are not compared, whether each is loaded is);
 8. **env-config**: digest of the effective env configuration (from the base `vci.toml`) matches;
 9. **result**: passed and untainted; **inputs-config**: the `[[inputs]]` globs recorded equal the base config's for
    the test id; every waived refusal still waived by the base policy; **dirty** only if `allow_dirty = false`;
@@ -1837,7 +1927,9 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
 12. **externals**: every `name@version` is what is installed now (pytest: in the `uv run --locked` environment, and
     pinned by `uv.lock`; Go: the module is in the build list in exactly that version and replacement; Cargo: the
     checkout's `Cargo.lock` pins that version, source and checksum; Rails: the gem is in the bundle Bundler resolves in
-   this checkout in exactly that version, a git source's revision included);
+   this checkout in exactly that version, a git source's revision included; a native library opened through FFI,
+   `native:<file name>`, must be loaded by the probe's process with the same file name and sha256, or under
+   `policy.libraries = "any"` one of the same library name);
 13. **env**: every hashed variable has the same value, and every variable that matches a declared pattern in CI is
     covered by the attestation.
 
@@ -1905,9 +1997,10 @@ pytest limitations (details and the measured audit-hook coverage in `docs/spike-
   `realpath()` of paths outside the repository.
 - **Per-file isolation**: attestations and `vci ci` run one file per process. A file whose module-level side effect
   breaks another file only in a shared process (a plain full-suite `pytest` run) is not caught.
-- **Interpreter builds**: the Python version, sqlite and OpenSSL versions are compared; other bundled or linked
-  libraries (zlib, expat, libffi, readline) and the compiler are not, so under `platform = "any"` a test that depends
-  on them is accepted from another build of the same version.
+- **Interpreter builds**: the Python version, sqlite and OpenSSL versions are compared (sqlite and OpenSSL only
+  whether they are loaded under `policy.libraries = "any"`); other bundled or linked libraries (zlib, expat, libffi,
+  readline) and the compiler are not, so under `platform = "any"` a test that depends on them is accepted from another
+  build of the same version.
 - **Time, randomness, locale and hostname** are not inputs (as on the Vitest side); random-order plugins taint unless
   seeded.
 - Platform-specific extension suffixes: attestations probe only the attesting interpreter's suffixes

@@ -1477,3 +1477,97 @@ fn rails_active_storage_with_libvips() {
     std::fs::write(work.join(image), original).unwrap();
     assert_eq!(w.plan(&work, "main").skip, set(&[CAPTION, IMAGE]));
 }
+
+/// `policy.libraries = "any"` at the base commit: a file that loads libvips
+/// through FFI (Active Storage boots ruby-vips) is attested exactly as under
+/// "exact" (libvips recorded as `native:<file name>` with its hash) and
+/// skipped where a libvips is loaded; `vci plan` and `vci explain` name the
+/// policy. Matching another file name and hash by library name (macOS
+/// `libvips.42.dylib` vs Linux `libvips.so.42`) is covered by the unit
+/// tests of `externals::rails_native`. Skipped where libvips is not
+/// installed.
+#[test]
+fn rails_libraries_any_with_libvips() {
+    let toml = VCI_TOML.replace(
+        "platform = \"any\"",
+        "platform = \"any\"\nlibraries = \"any\"",
+    );
+    assert!(toml.contains("libraries = \"any\""));
+    let Some(w) = World::build(&toml, copy_vips_fixture) else {
+        return;
+    };
+    let vips = Command::new(w.ruby_bin.join("bundle"))
+        .args(["exec", "ruby", "-e", "require 'vips'"])
+        .current_dir(&w.work)
+        .env("PATH", w.path_env())
+        .env_remove("RUBYOPT")
+        .output()
+        .unwrap();
+    if !vips.status.success() {
+        eprintln!(
+            "SKIPPED: libvips is not installed (`brew install vips`): {}",
+            String::from_utf8_lossy(&vips.stderr)
+        );
+        return;
+    }
+    let work = w.work.clone();
+    const CAPTION: &str = "test/models/caption_test.rb";
+    let stderr = w.run(&work, &[CAPTION], &w.trusted);
+    assert!(
+        stderr.contains("vci: 1 attested, 0 not attested"),
+        "{stderr}"
+    );
+    // What is recorded does not depend on the policy.
+    let pred = stored_predicate(&work, CAPTION);
+    let native = pred["manifest"]["externals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"].as_str().unwrap().starts_with("native:libvips"))
+        .unwrap_or_else(|| panic!("{pred}"))
+        .clone();
+    assert!(
+        native["version"].as_str().unwrap().starts_with("sha256:"),
+        "{native}"
+    );
+    assert!(!pred["toolchain"]["rubyLibs"].as_str().unwrap().is_empty());
+
+    let p = w.plan(&work, "main");
+    assert!(p.skip.contains(CAPTION), "{p:?}");
+    let out = w.vci_ok(&work, &["plan", "--base-ref", "main", "--format", "json"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let f = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["testId"] == CAPTION)
+        .unwrap();
+    assert_eq!(f["libraries"], "any", "{f}");
+    assert_eq!(f["skip"], true, "{f}");
+    let ex = w.explain(&work, CAPTION, "main");
+    assert!(
+        ex.contains(&format!("{CAPTION}: SKIP (attested by")),
+        "{ex}"
+    );
+    assert!(
+        ex.contains(
+            "policy: libraries = \"any\" (base vci.toml): native libraries match by library name"
+        ),
+        "{ex}"
+    );
+    assert!(ex.contains("all checks passed"), "{ex}");
+    // Same machine, same libvips: nothing needed the policy.
+    assert!(!ex.contains("accepted by policy.libraries"), "{ex}");
+
+    // An edited input of the file still runs it under "any".
+    let model = "app/models/photo.rb";
+    let original = w.read(model);
+    w.put(model, &format!("{original}\n# edited\n"));
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(CAPTION), "{p:?}");
+    let ex = w.explain(&work, CAPTION, "main");
+    assert!(ex.contains("failed check: inputs"), "{ex}");
+    assert!(ex.contains("policy: libraries = \"any\""), "{ex}");
+    w.put(model, &original);
+    assert!(w.plan(&work, "main").skip.contains(CAPTION));
+}

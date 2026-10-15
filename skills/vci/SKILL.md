@@ -216,7 +216,8 @@ Short version (details in [references/runners.md](references/runners.md)):
 - **Vitest**: Node major, Vitest and Vite versions must match CI; `package.json`, lockfiles, Vitest/Vite config and
   `tsconfig.json` changes invalidate every test file. Snapshot updates (`-u`) are refused.
 - **pytest**: uv project with `uv.lock`; uv-managed Python pinned to the full version in `.python-version`, the same
-  uv version in CI, `UV_PYTHON_PREFERENCE=only-managed` on both sides. Any skipped test refuses its file.
+  uv version in CI, `UV_PYTHON_PREFERENCE=only-managed` on both sides. Any skipped test refuses its file. The
+  interpreter's SQLite and OpenSSL versions are compared unless the user sets `policy.libraries = "any"`.
 - **Go**: units are package directories; exact Go version on both sides; `CGO_ENABLED=0` and `TZ=UTC` declared in
   `[env] global` and set on both sides. Package `net` in the closure (including testify) is refused unless the user
   sets `go_allow_net`. Platform-specific or floating-point code pins the unit to the attesting OS/arch.
@@ -227,7 +228,9 @@ Short version (details in [references/runners.md](references/runners.md)):
 - **Rails (Minitest/RSpec)**: files only; fresh SQLite database per file; exact Ruby patchlevel; `Gemfile.lock` with
   `x86_64-linux`; `gem "tzinfo-data"`; `TZ=UTC` declared and set (`TZ=UTC vci run ...`); UTF-8 locale on both sides;
   `config.eager_load = false` (not `ENV["CI"].present?`). Changing `Gemfile.lock`, `config/**` or `spec/support`
-  affects everything.
+  affects everything. libvips (Active Storage) is matched by file hash, so macOS attestations never skip on Linux
+  unless the user sets `policy.libraries = "any"` (by library name, with libvips installed in CI; it also ignores
+  the SQLite, libyaml and tz data versions).
 - **All**: `TZ=UTC` and `LANG` with UTF-8 the same locally and in CI; delete `.DS_Store`/`__pycache__` junk from
   directories tests list; run CI jobs on the hosted runner, not as root.
 
@@ -239,9 +242,10 @@ Short version (details in [references/runners.md](references/runners.md)):
    tests to get a unit attested or green.
 3. **Never touch trust**: do not add your key (or any key) to `.vci/allowed_signers`, on a PR branch or anywhere,
    unless the user explicitly asks; changes there only take effect on the default branch, which the user merges.
-4. **Never weaken policy** without the user: do not change `platform`, `platform_overrides`, `never_skip`,
-   `no_skip_refs`, `no_skip_refs_except` (never add your own principal), `max_ttl`, `allow_dirty`, `go_allow_net`,
-   `rails_allow_db`, `[env]` mode or declarations, or `[[inputs]]`. Propose the change and let the user decide.
+4. **Never weaken policy** without the user: do not change `platform`, `libraries`, `platform_overrides`,
+   `never_skip`, `no_skip_refs`, `no_skip_refs_except` (never add your own principal), `max_ttl`, `allow_dirty`,
+   `go_allow_net`, `rails_allow_db`, `[env]` mode or declarations, or `[[inputs]]`. Propose the change and let the
+   user decide.
 5. **Never change the CI wiring to skip more**: do not alter `base-ref`, switch to `pull_request_target`, unpin the
    action, or build vci from the PR checkout.
 6. **Use the key you were given.** Do not create keys or read other people's keys; do not print private key

@@ -190,4 +190,4 @@ Never print, copy or use the CI key yourself, and never add an agent's or person
 | `::warning title=vci::not attesting: the key signs as ...` | CI's key reached a non-main run (a pull request): pass it only from the main-only job with the environment |
 | A Go package or cargo target never skips on the runner | Platform-specific code (`_linux.go`, `cfg(target_os)`, `runtime.GOOS`, float maths): accepted only on the same OS/arch |
 | A test reads `CI`, `HOME` or `TMPDIR` | Values differ on a runner; that unit always runs there |
-| No Rails file ever skips | `config/environments/test.rb` reads `ENV["CI"]`; Ruby patchlevel, Bundler, SQLite or tz data differ; `Gemfile.lock` lacks `x86_64-linux` |
+| No Rails file ever skips | `config/environments/test.rb` reads `ENV["CI"]`; Ruby patchlevel, Bundler, SQLite or tz data differ; `Gemfile.lock` lacks `x86_64-linux`; the app loads libvips (Active Storage), whose Homebrew file never matches the runner's (`policy.libraries = "any"` matches it by name, with libvips installed on the runner; also stops comparing the SQLite, libyaml and tz data versions) |

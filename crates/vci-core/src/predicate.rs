@@ -122,6 +122,10 @@ pub struct Toolchain {
 
 /// The `what` of a [`Toolchain::diff`] entry for a superuser difference.
 pub const PRIVILEGES_DIFF: &str = "privileges";
+/// The `what` of a [`Toolchain::diff`] entry for a `ruby_libs` difference.
+pub const RUBY_LIBS_DIFF: &str = "ruby libraries";
+/// The `what` of a [`Toolchain::diff`] entry for a `python_libs` difference.
+pub const PYTHON_LIBS_DIFF: &str = "python libraries";
 
 fn major(v: &str) -> &str {
     v.split('.').next().unwrap_or(v)
@@ -150,7 +154,7 @@ impl Toolchain {
                 &now.implementation,
             ),
             ("pytest", &self.pytest, &now.pytest),
-            ("python libraries", &self.python_libs, &now.python_libs),
+            (PYTHON_LIBS_DIFF, &self.python_libs, &now.python_libs),
             ("go", &self.go, &now.go),
             ("rustc", &self.rust, &now.rust),
             ("cargo", &self.cargo, &now.cargo),
@@ -159,7 +163,7 @@ impl Toolchain {
             ("rails", &self.rails, &now.rails),
             ("bundler", &self.bundler, &now.bundler),
             ("ruby test framework", &self.ruby_test, &now.ruby_test),
-            ("ruby libraries", &self.ruby_libs, &now.ruby_libs),
+            (RUBY_LIBS_DIFF, &self.ruby_libs, &now.ruby_libs),
             ("database", &self.ruby_db, &now.ruby_db),
         ] {
             if a != b {

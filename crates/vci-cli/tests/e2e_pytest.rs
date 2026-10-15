@@ -1166,3 +1166,103 @@ fn collector_behind_a_symlinked_install_prefix() {
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(err.contains("vci: 1 attested, 0 not attested"), "{err}");
 }
+
+/// `policy.libraries = "any"` at the base commit only stops comparing the
+/// interpreter's library versions (and matches native libraries by name):
+/// it loosens nothing else. An edited input, another value of a declared
+/// variable, an untrusted signer and another Python version still run the
+/// file, and `vci explain` names the policy.
+#[test]
+fn pytest_libraries_any_loosens_nothing_else() {
+    let toml = VCI_TOML.replace(
+        "platform = \"any\"",
+        "platform = \"any\"\nlibraries = \"any\"",
+    );
+    assert!(toml.contains("libraries = \"any\""));
+    let Some(w) = World::build(&toml, copy_pytest_fixture, &["."]) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.run(&work, A, &w.trusted);
+    w.run(&work, B, &w.trusted);
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[A, B]), "{p:?}");
+    let out = w.vci_ok(&work, &["plan", "--base-ref", "main", "--format", "json"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    for f in v["files"].as_array().unwrap() {
+        assert_eq!(f["libraries"], "any", "{f}");
+    }
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains(&format!("{B}: SKIP (attested by")), "{ex}");
+    assert!(
+        ex.contains("policy: libraries = \"any\" (base vci.toml)"),
+        "{ex}"
+    );
+
+    // An edited input still runs the file.
+    let original = w.read("fixtures/b.json");
+    w.put("fixtures/b.json", "{ \"greeting\": \"hello, world\" }\n");
+    let p = w.plan(&work, "main");
+    assert_eq!(
+        (p.skip.clone(), p.run.contains(B)),
+        (set(&[A]), true),
+        "{p:?}"
+    );
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains(&format!("{B}: RUN")), "{ex}");
+    assert!(ex.contains("policy: libraries = \"any\""), "{ex}");
+    assert!(ex.contains("failed check: inputs"), "{ex}");
+    assert!(ex.contains("entry:fixtures/b.json"), "{ex}");
+    w.put("fixtures/b.json", &original);
+    assert_eq!(w.plan(&work, "main").skip, set(&[A, B]));
+
+    // Another value of a declared (global) variable still runs everything.
+    let p = w.plan_env(&work, "main", &[("APP_MODE", "ci")]);
+    assert!(p.skip.is_empty(), "{p:?}");
+
+    // An attestation by a key outside allowed_signers is still refused.
+    w.put("tests/test_e.py", "def test_e():\n    assert 1 + 1 == 2\n");
+    w.run(&work, "tests/test_e.py", &w.untrusted);
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains("tests/test_e.py"), "{p:?}");
+    assert!(
+        w.explain(&work, "tests/test_e.py", "main")
+            .contains("failed check: signer")
+    );
+    std::fs::remove_file(work.join("tests/test_e.py")).unwrap();
+
+    // Another Python version (when uv knows one): still a toolchain failure.
+    let found = Command::new("uv")
+        .args(["python", "find", "3.12"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !found {
+        eprintln!("SKIPPED (last step): no Python 3.12 interpreter known to uv");
+        return;
+    }
+    let venv = w.base.join("venv312");
+    let env = [
+        ("UV_PYTHON", "3.12"),
+        ("UV_PROJECT_ENVIRONMENT", venv.to_str().unwrap()),
+    ];
+    let p = w.plan_env(&work, "main", &env);
+    if p.run_all {
+        eprintln!("SKIPPED (last step): uv could not set up a 3.12 environment: {p:?}");
+        return;
+    }
+    assert!(p.skip.is_empty(), "another Python must not skip: {p:?}");
+    let out = w.vci_env(&work, &["explain", B, "--base-ref", "main"], &env);
+    let ex = String::from_utf8_lossy(&out.stdout);
+    assert!(ex.contains("failed check: toolchain"), "{ex}");
+    assert!(ex.contains("    python\n"), "{ex}");
+    assert!(!ex.contains("    python libraries\n"), "{ex}");
+    // Where the other interpreter bundles other SQLite/OpenSSL versions, the
+    // candidate lists them as accepted by the policy.
+    if let Some(l) = ex
+        .lines()
+        .find(|l| l.starts_with("  accepted by policy.libraries = \"any\": "))
+    {
+        assert!(l.contains("python libraries: attested sqlite="), "{ex}");
+    }
+}

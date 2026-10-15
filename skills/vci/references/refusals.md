@@ -68,12 +68,12 @@ attestation recorded) and `actual` (what this checkout and the base policy give)
 | `statement` | Predicate type or subject mismatch | Re-attest with the current vci |
 | `expiry` | Expired, issued in the future (clock skew > 5 min), or lifetime above `max_ttl` | Re-attest (`--ttl` within `max_ttl`) |
 | `repo`, `test-id`, `adapter`, `argv` | Attested in another repository, for another unit id, adapter, project dir or runner command | Attest in this repository and project |
-| `toolchain` | Node/Vitest/Vite, Python/pytest/distributions, Go version and settings, rustc/cargo, Ruby/Rails/bundle, root vs non-root, or OS/arch per `policy.platform` differ | Pin toolchains (runners.md). Locally, compare with what CI uses |
+| `toolchain` | Node/Vitest/Vite, Python/pytest/distributions, Go version and settings, rustc/cargo, Ruby/Rails/bundle, root vs non-root, or OS/arch per `policy.platform` differ; `ruby libraries` / `python libraries` (SQLite, libyaml, tz data, OpenSSL versions) differ under `policy.libraries = "exact"`, or one side lacks the library (`... loaded or not`, also under `"any"`) | Pin toolchains (runners.md). Locally, compare with what CI uses. For library versions between macOS and Linux, the user may set `libraries = "any"` on the default branch |
 | `env-config` | The effective `[env]` configuration differs from the base `vci.toml` | The PR changed `[env]` or the base did; re-attest after the base has the same config |
 | `result` / `inputs-config` / waived refusals / `dirty` | Not passed; `[[inputs]]` globs differ from the base config; a waiver (`go_allow_net`, `rails_allow_db`) no longer set on base; dirty tree with `allow_dirty = false` | Merge config changes to the default branch first; commit before attesting when `allow_dirty = false` |
 | `global-inputs` | A global input (lockfile, runner config, `vci.toml`, ...) differs | Re-attest after the change |
 | `inputs` | A recorded input differs: `entry:<path>` with both hashes (file edited after attesting, new file where an absent probe was, listing changed) | Re-run `vci run` on the unit after your last edit |
-| `externals` | An external package/module/crate/gem version differs | Re-attest with the lockfile CI uses |
+| `externals` | An external package/module/crate/gem version differs; or a native library opened through FFI (`external:native:libvips.42.dylib`) is another file or build where CI checks, or `native library libvips: not loaded here` | Re-attest with the lockfile CI uses. For native libraries: install the library in CI; across macOS and Linux the user may set `policy.libraries = "any"` (matches by library name) on the default branch |
 | `env` | A hashed variable's value differs (`TZ`, a declared variable, or `CI`/`HOME` the test read) | Set declared values the same on both sides; units reading `CI`/`HOME` never skip on runners |
 | `internal` | A check panicked | Report it as a vci bug |
 

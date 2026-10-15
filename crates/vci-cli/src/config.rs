@@ -114,6 +114,7 @@ pub struct ProjectConfig {
 #[serde(deny_unknown_fields)]
 pub struct PolicyOverride {
     pub platform: Option<Platform>,
+    pub libraries: Option<Libraries>,
     pub platform_overrides: Option<Vec<PlatformOverride>>,
     pub max_ttl: Option<String>,
     pub allow_dirty: Option<bool>,
@@ -296,12 +297,34 @@ pub enum Platform {
     Exact,
 }
 
+/// How native libraries and the interpreter's library versions are compared
+/// (`policy.libraries`). Ordered from the loosest to the strictest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Libraries {
+    /// Native libraries (`native:<file name>` externals) match by library
+    /// name ([`crate::externals::native_stem`]) when one of that name is
+    /// loaded where the attestation is checked; the library versions of the
+    /// toolchain (`ruby libraries`: sqlite, yaml, tz; `python libraries`:
+    /// sqlite, openssl) are not compared.
+    Any,
+    /// Native libraries by file name and content hash, library versions
+    /// exactly.
+    #[default]
+    Exact,
+}
+
+/// `[[policy.platform_overrides]]`: a stricter `platform` and/or
+/// `libraries` for the test files matching `match`. At least one is given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformOverride {
     #[serde(rename = "match")]
     pub match_: Vec<String>,
-    pub platform: Platform,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub libraries: Option<Libraries>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +332,10 @@ pub struct PlatformOverride {
 pub struct Policy {
     #[serde(default)]
     pub platform: Platform,
+    /// `"exact"` (default) or `"any"`: see [`Libraries`]. Read from the base
+    /// commit, per test file like `platform`.
+    #[serde(default)]
+    pub libraries: Libraries,
     #[serde(default)]
     pub platform_overrides: Vec<PlatformOverride>,
     /// Longest accepted `expires_at - issued_at`.
@@ -374,6 +401,7 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             platform: Platform::Any,
+            libraries: Libraries::Exact,
             platform_overrides: vec![],
             max_ttl: default_max_ttl(),
             allow_dirty: true,
@@ -395,6 +423,14 @@ impl Policy {
 
     fn check(&self) -> Result<()> {
         self.max_ttl_secs()?;
+        for o in &self.platform_overrides {
+            if o.platform.is_none() && o.libraries.is_none() {
+                bail!(
+                    "policy.platform_overrides: an entry (match = {:?}) sets neither `platform` nor `libraries`",
+                    o.match_
+                );
+            }
+        }
         for p in &self.no_skip_refs_except {
             if p.is_empty() || p.chars().any(char::is_whitespace) {
                 bail!(
@@ -424,11 +460,27 @@ impl Policy {
     pub fn platform_for(&self, project_rel: &str) -> Platform {
         let mut p = self.platform;
         for o in &self.platform_overrides {
-            if o.match_.iter().any(|g| glob_match(g, project_rel)) {
-                p = p.max(o.platform);
+            if let Some(v) = o.platform
+                && o.match_.iter().any(|g| glob_match(g, project_rel))
+            {
+                p = p.max(v);
             }
         }
         p
+    }
+
+    /// Effective libraries policy for a project-relative test path (the
+    /// strictest of the default and any matching override that sets it).
+    pub fn libraries_for(&self, project_rel: &str) -> Libraries {
+        let mut l = self.libraries;
+        for o in &self.platform_overrides {
+            if let Some(v) = o.libraries
+                && o.match_.iter().any(|g| glob_match(g, project_rel))
+            {
+                l = l.max(v);
+            }
+        }
+        l
     }
 }
 
@@ -588,6 +640,9 @@ impl Config {
                     if let Some(v) = o.platform {
                         policy.platform = v;
                     }
+                    if let Some(v) = o.libraries {
+                        policy.libraries = v;
+                    }
                     if let Some(v) = &o.platform_overrides {
                         policy.platform_overrides = v.clone();
                     }
@@ -663,6 +718,9 @@ adapter = "vitest"
 [policy]
 # "any" | "same-os" | "exact": which OS/arch may satisfy CI.
 platform = "any"
+# "exact" | "any": how native libraries and the interpreter's library versions
+# are compared (Rails and pytest; this adapter records none, so no effect here).
+# libraries = "any"
 # Longest accepted attestation lifetime.
 max_ttl = "30d"
 # Accept attestations made from a working tree with uncommitted changes.
@@ -678,7 +736,7 @@ never_skip = []
 
 # [[policy.platform_overrides]]
 # match = ["src/native/**"]
-# platform = "exact"
+# platform = "exact"     # and/or libraries = "exact"
 
 [env]
 # "strict": only declared and pass-through variables reach tests.
@@ -700,6 +758,10 @@ adapter = "pytest"
 # "any" | "same-os" | "exact": which OS/arch may satisfy CI. The Python
 # version (major.minor.patch) and implementation must always match.
 platform = "any"
+# "exact" | "any": "any" stops comparing the versions of the SQLite and OpenSSL
+# the interpreter bundles or links ("python libraries"), which differ between
+# builds of one Python version (Homebrew, apt, python-build-standalone).
+# libraries = "any"
 # Longest accepted attestation lifetime.
 max_ttl = "30d"
 # Accept attestations made from a working tree with uncommitted changes.
@@ -737,6 +799,9 @@ adapter = "go"
 # specific platforms (_linux.go, //go:build darwin) is only ever skipped on
 # the OS and architecture it was attested on.
 platform = "any"
+# "exact" | "any": how native libraries and the interpreter's library versions
+# are compared (Rails and pytest; this adapter records none, so no effect here).
+# libraries = "any"
 # Longest accepted attestation lifetime.
 max_ttl = "30d"
 # Accept attestations made from a working tree with uncommitted changes.
@@ -776,6 +841,9 @@ adapter = "cargo"
 # unit whose code checks the platform at run time is only skipped on the OS
 # and architecture it was attested on.
 platform = "any"
+# "exact" | "any": how native libraries and the interpreter's library versions
+# are compared (Rails and pytest; this adapter records none, so no effect here).
+# libraries = "any"
 # Longest accepted attestation lifetime.
 max_ttl = "30d"
 # Accept attestations made from a working tree with uncommitted changes.
@@ -828,6 +896,14 @@ adapter = "rails"
 # sqlite3) are matched by version under "any": their macOS and Linux builds
 # are accepted as the same gem.
 platform = "any"
+# "exact" | "any": "any" matches a native library opened through FFI (libvips,
+# for Active Storage) by its library name instead of its file name and hash
+# (native:libvips.42.dylib on macOS = native:libvips.so.42 on Linux; it must
+# still be loaded where CI checks), and stops comparing the SQLite library,
+# libyaml and time zone data versions ("ruby libraries"; the encoding and the
+# collector version are still compared). For files attested on macOS and
+# skipped on Linux, or the other way round.
+# libraries = "any"
 # Longest accepted attestation lifetime.
 max_ttl = "30d"
 # Accept attestations made from a working tree with uncommitted changes.
@@ -879,6 +955,9 @@ adapter = "node-test"
 # "any" | "same-os" | "exact": which OS/arch may satisfy CI. The Node major
 # version must always match; node_exact = true requires the exact version.
 platform = "any"
+# "exact" | "any": how native libraries and the interpreter's library versions
+# are compared (Rails and pytest; this adapter records none, so no effect here).
+# libraries = "any"
 # Longest accepted attestation lifetime.
 max_ttl = "30d"
 # Accept attestations made from a working tree with uncommitted changes.
@@ -1278,5 +1357,158 @@ global = ["TZ", "APP_*"]
             Config::parse("project = \"./web/\"").unwrap().project_rel(),
             "web"
         );
+    }
+
+    /// `policy.libraries`: "exact" by default, "any" or "exact" at the top
+    /// level, per project, and in `platform_overrides` entries (which may set
+    /// `platform`, `libraries` or both); anything else is a config error.
+    #[test]
+    fn libraries_policy_parses_defaults_and_overrides() {
+        let c = Config::parse("adapter = \"rails\"").unwrap();
+        assert_eq!(c.policy.libraries, Libraries::Exact);
+        assert_eq!(
+            c.project_specs()[0].policy.libraries_for("test/a_test.rb"),
+            Libraries::Exact
+        );
+        let c = Config::parse("adapter = \"rails\"\n[policy]\nlibraries = \"any\"\n").unwrap();
+        assert_eq!(c.policy.libraries, Libraries::Any);
+        assert_eq!(c.policy.platform, Platform::Any, "platform unchanged");
+        let c = Config::parse("[policy]\nlibraries = \"exact\"\n").unwrap();
+        assert_eq!(c.policy.libraries, Libraries::Exact);
+        for bad in [
+            "[policy]\nlibraries = \"loose\"\n",
+            "[policy]\nlibraries = \"same-os\"\n",
+            "[policy]\nlibraries = true\n",
+            "[[policy.platform_overrides]]\nmatch = [\"x\"]\nlibraries = \"none\"\n",
+            "[[policy.platform_overrides]]\nmatch = [\"x\"]\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n[projects.policy]\nlibraries = \"Any\"\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+        // Per project: replaces the top-level key; inherited otherwise.
+        let c = Config::parse(
+            "[policy]\nlibraries = \"any\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"pytest\"\n[projects.policy]\nlibraries = \"exact\"\n\n[[projects]]\nname = \"c\"\npath = \"c\"\nadapter = \"pytest\"\n[projects.policy]\nplatform = \"exact\"\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].policy.libraries, Libraries::Any);
+        assert_eq!(s[1].policy.libraries, Libraries::Exact);
+        assert_eq!(s[2].policy.libraries, Libraries::Any);
+        assert_eq!(s[2].policy.platform, Platform::Exact);
+        let c = Config::parse(
+            "[policy]\nlibraries = \"exact\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n[projects.policy]\nlibraries = \"any\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.project_specs()[0].policy.libraries, Libraries::Any);
+        // platform_overrides entries: libraries only, platform only, both.
+        let c = Config::parse(
+            r#"
+[policy]
+platform = "any"
+libraries = "any"
+
+[[policy.platform_overrides]]
+match = ["test/images/**"]
+libraries = "exact"
+
+[[policy.platform_overrides]]
+match = ["test/native/**"]
+platform = "exact"
+
+[[policy.platform_overrides]]
+match = ["test/both/**"]
+platform = "same-os"
+libraries = "exact"
+"#,
+        )
+        .unwrap();
+        let p = &c.policy;
+        assert_eq!(p.platform_overrides[0].platform, None);
+        assert_eq!(p.platform_overrides[0].libraries, Some(Libraries::Exact));
+        assert_eq!(p.platform_overrides[1].libraries, None);
+        assert_eq!(
+            (
+                p.platform_for("test/a_test.rb"),
+                p.libraries_for("test/a_test.rb")
+            ),
+            (Platform::Any, Libraries::Any)
+        );
+        assert_eq!(
+            (
+                p.platform_for("test/images/x_test.rb"),
+                p.libraries_for("test/images/x_test.rb")
+            ),
+            (Platform::Any, Libraries::Exact)
+        );
+        assert_eq!(
+            (
+                p.platform_for("test/native/x_test.rb"),
+                p.libraries_for("test/native/x_test.rb")
+            ),
+            (Platform::Exact, Libraries::Any)
+        );
+        assert_eq!(
+            (
+                p.platform_for("test/both/x_test.rb"),
+                p.libraries_for("test/both/x_test.rb")
+            ),
+            (Platform::SameOs, Libraries::Exact)
+        );
+        // Per-project platform_overrides with libraries.
+        let c = Config::parse(
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n[projects.policy]\nlibraries = \"any\"\nplatform_overrides = [{ match = [\"test/x/**\"], libraries = \"exact\" }]\n",
+        )
+        .unwrap();
+        let p = &c.project_specs()[0].policy;
+        assert_eq!(p.libraries_for("test/y_test.rb"), Libraries::Any);
+        assert_eq!(p.libraries_for("test/x/y_test.rb"), Libraries::Exact);
+    }
+
+    /// Like `platform_for`: the strictest of the default and every matching
+    /// override wins, so an override can only tighten.
+    #[test]
+    fn libraries_for_takes_the_strictest() {
+        let c = Config::parse(
+            "[policy]\nlibraries = \"exact\"\n[[policy.platform_overrides]]\nmatch = [\"test/models/**\"]\nlibraries = \"any\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.policy.libraries_for("test/models/a_test.rb"),
+            Libraries::Exact,
+            "an override cannot loosen the default"
+        );
+        let c = Config::parse(
+            "[policy]\nlibraries = \"any\"\n[[policy.platform_overrides]]\nmatch = [\"test/models/**\"]\nlibraries = \"any\"\n[[policy.platform_overrides]]\nmatch = [\"test/models/image*\"]\nlibraries = \"exact\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.policy.libraries_for("test/models/a_test.rb"),
+            Libraries::Any
+        );
+        assert_eq!(
+            c.policy.libraries_for("test/models/image_test.rb"),
+            Libraries::Exact
+        );
+        assert_eq!(c.policy.libraries_for("test/lib/a_test.rb"), Libraries::Any);
+        assert!(Libraries::Any < Libraries::Exact);
+    }
+
+    #[test]
+    fn every_template_shows_the_libraries_key() {
+        for t in [
+            TEMPLATE,
+            PYTEST_TEMPLATE,
+            GO_TEMPLATE,
+            CARGO_TEMPLATE,
+            RAILS_TEMPLATE,
+            NODE_TEST_TEMPLATE,
+        ] {
+            assert!(t.contains("\n# libraries = \"any\"\n"), "{t}");
+            let c = Config::parse(t).unwrap();
+            assert_eq!(c.policy.libraries, Libraries::Exact);
+            // Uncommented, it parses.
+            let on = t.replace("\n# libraries = \"any\"\n", "\nlibraries = \"any\"\n");
+            assert_eq!(Config::parse(&on).unwrap().policy.libraries, Libraries::Any);
+        }
     }
 }

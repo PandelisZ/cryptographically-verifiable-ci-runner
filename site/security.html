@@ -83,6 +83,7 @@
 <tr><td>13</td><td><strong>env</strong></td><td class="wrap">every hashed variable has the same value</td></tr>
 </table>
 <p><code>vci explain</code> prints the first failed check for each candidate.</p>
+<p>As <code>policy.platform</code> relaxes check 7, <code>policy.libraries = "any"</code> (Rails and pytest) relaxes two checks, on the base branch's say-so: check 12 matches a native library such as libvips by name instead of file hash, and check 7 stops comparing the SQLite, libyaml, time zone data and OpenSSL versions.</p>
 
 <h2 id="trust">Trust comes from the base branch</h2>
 <p>The <strong>base branch</strong> is the branch a pull request merges into, usually <code>main</code>. CI takes its rules only from the <strong>base commit</strong>, the tip of that branch, never from the pull request:</p>

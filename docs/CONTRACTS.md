@@ -38,7 +38,7 @@ pub struct Mismatch { pub what: String, pub expected: String, pub actual: String
 pub struct Toolchain {                  // adapter-specific; unused fields are empty and omitted from JSON
     pub node: String, pub vitest: String, pub vite: String,              // Vitest
     pub python: String, pub implementation: String, pub pytest: String,  // pytest (python = major.minor.patch)
-    pub python_libs: String,          // pytest: "sqlite=<ver>;openssl=<OPENSSL_VERSION>"
+    pub python_libs: String,          // pytest: "sqlite=<ver>;openssl=<OPENSSL_VERSION>" (not compared under the base policy's libraries = "any")
     pub python_dists: Vec<String>,    // pytest: every installed distribution, sorted "name==version"
     pub go: String,                   // Go: go env GOVERSION
     pub go_env: Vec<String>,          // Go: sorted "KEY=value" of effective CGO_ENABLED, GODEBUG, GOEXPERIMENT, GOFIPS140, GOFLAGS, GOWORK (project-relative)
@@ -50,7 +50,7 @@ pub struct Toolchain {                  // adapter-specific; unused fields are e
     pub ruby: String, pub ruby_engine: String,   // Rails: "3.4.9p82", "ruby 3.4.9"
     pub rails: String, pub bundler: String,      // Rails: Rails and Bundler versions
     pub ruby_test: String,            // Rails: "minitest 6.0.6" (+ "; rspec-core 3.13.6, rspec-expectations ..., rspec-mocks ..., rspec-rails ..., rspec-support ..." when the bundle has RSpec)
-    pub ruby_libs: String,            // Rails: "sqlite=<ver>;yaml=<ver>;tz=<tzinfo-data|zoneinfo ver>;encoding=<ext>/<int>"
+    pub ruby_libs: String,            // Rails: "sqlite=<ver>;yaml=<ver>;tz=<tzinfo-data|zoneinfo ver>;encoding=<ext>/<int>;collector=<ver>" (under the base policy's libraries = "any", vci plan drops the sqlite, yaml and tz items before comparing)
     pub ruby_db: String,              // Rails: "sqlite3", or "<adapter> <server version>" with policy.rails_allow_db
     pub ruby_gems: Vec<String>,       // Rails: the resolved bundle, sorted "name==version" (no platform)
     pub superuser: bool,              // every adapter: the tests ran as root (effective uid 0); compared exactly unless the base policy sets allow_superuser_mismatch; omitted when false

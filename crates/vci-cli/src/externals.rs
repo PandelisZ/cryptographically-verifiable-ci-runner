@@ -207,6 +207,85 @@ pub fn rails_bundled(
     }
 }
 
+/// Prefix of the externals the Ruby collector records for a native library
+/// opened through FFI: `native:<file name>` (`native:libvips.42.dylib`).
+pub const NATIVE_PREFIX: &str = "native:";
+
+/// The library stem of a native library file name: the name up to its first
+/// `.` (`libvips.42.dylib` and `libvips.so.42` are both `libvips`;
+/// `libglib-2.0.0.dylib` and `libglib-2.0.so.0` are both `libglib-2`). A
+/// `native:` prefix is ignored. Used on both sides of the comparison, so
+/// what matters is that it is the same function on both.
+pub fn native_stem(name: &str) -> &str {
+    let file = name.strip_prefix(NATIVE_PREFIX).unwrap_or(name);
+    file.split('.').next().unwrap_or(file)
+}
+
+/// Rails: check an attested native library external (`native:<file name>`
+/// -> `sha256:<hex>` or `unresolved`) against the natives the probe's
+/// process loaded here (folded into `bundle` under the same names).
+///
+/// * `exact`: the same file name with the same version (hash).
+/// * `any` (`policy.libraries = "any"`): a native library of the same
+///   [`native_stem`] is loaded here, whatever its file name and hash.
+///   `Ok(Some(note))` says what it was matched with when that is not the
+///   identical entry.
+///
+/// Under both, a library whose stem is not loaded here at all is
+/// `Err("native library <stem>: not loaded here ...")`.
+pub fn rails_native(
+    bundle: &Result<InstalledExternals, String>,
+    name: &str,
+    version: &str,
+    libraries: crate::config::Libraries,
+) -> Result<Option<String>, String> {
+    let b = bundle
+        .as_ref()
+        .map_err(|e| format!("cannot resolve the bundle: {e}"))?;
+    let stem = native_stem(name);
+    let same_stem: Vec<(&String, &Vec<String>)> = b
+        .iter()
+        .filter(|(n, _)| n.starts_with(NATIVE_PREFIX) && !stem.is_empty() && native_stem(n) == stem)
+        .collect();
+    let loaded = || {
+        same_stem
+            .iter()
+            .flat_map(|(n, vs)| vs.iter().map(move |v| format!("{n} {v}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if same_stem.is_empty() {
+        let how = match libraries {
+            crate::config::Libraries::Any => {
+                format!(" (looked for a native library named {stem}, policy.libraries = \"any\")")
+            }
+            crate::config::Libraries::Exact => String::new(),
+        };
+        return Err(format!("native library {stem}: not loaded here{how}"));
+    }
+    match libraries {
+        crate::config::Libraries::Exact => match b.get(name).map(Vec::as_slice) {
+            Some([v]) if v == version => Ok(None),
+            Some([v]) => Err(v.clone()),
+            Some(vs) if !vs.is_empty() => Err(format!("several versions: {}", vs.join(", "))),
+            _ => Err(format!(
+                "not loaded here under this file name; loaded here: {} (policy.libraries = \"any\" would match native library {stem} by name)",
+                loaded()
+            )),
+        },
+        crate::config::Libraries::Any => {
+            if b.get(name).map(Vec::as_slice) == Some(&[version.to_owned()][..]) {
+                Ok(None)
+            } else {
+                Ok(Some(format!(
+                    "native library {stem}: loaded here as {} (policy.libraries = \"any\": file name and hash not compared)",
+                    loaded()
+                )))
+            }
+        }
+    }
+}
+
 fn version_of(pkg_json: &Utf8Path) -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(pkg_json).ok()?).ok()?;
     v.get("version")?.as_str().map(str::to_owned)
@@ -467,6 +546,85 @@ source = { virtual = "." }
         assert!(rails_bundled(&b, "pg", "1.0").is_err());
         assert!(rails_bundled(&b, "mygem", "0.1.0 git def456").is_err());
         assert!(rails_bundled(&Err("boom".into()), "rack", "3.2.7").is_err());
+    }
+
+    #[test]
+    fn native_stem_is_the_name_up_to_the_first_dot() {
+        assert_eq!(native_stem("native:libvips.42.dylib"), "libvips");
+        assert_eq!(native_stem("native:libvips.so.42"), "libvips");
+        assert_eq!(native_stem("libvips.so"), "libvips");
+        assert_eq!(native_stem("native:libglib-2.0.0.dylib"), "libglib-2");
+        assert_eq!(native_stem("native:libglib-2.0.so.0"), "libglib-2");
+        assert_eq!(native_stem("native:libvips"), "libvips");
+        assert_eq!(native_stem("native:"), "");
+        assert_eq!(native_stem("native:.hidden.so"), "");
+        assert_ne!(native_stem("native:libvips-cpp.42.dylib"), "libvips");
+    }
+
+    fn natives(pairs: &[(&str, &str)]) -> Result<InstalledExternals, String> {
+        Ok(pairs
+            .iter()
+            .map(|(n, v)| (n.to_string(), vec![v.to_string()]))
+            .collect())
+    }
+
+    /// `policy.libraries = "any"`: the macOS build of libvips
+    /// (`libvips.42.dylib`, one hash) matches the Linux one
+    /// (`libvips.so.42`, another hash) by library name; under "exact" it
+    /// does not. A library not loaded here never matches.
+    #[test]
+    fn native_libraries_match_by_stem_only_under_any() {
+        use crate::config::Libraries::{Any, Exact};
+        let linux = natives(&[("native:libvips.so.42", "sha256:linux"), ("rack", "3.2.7")]);
+        let mac = "native:libvips.42.dylib";
+        // Same stem, other file name and hash.
+        let e = rails_native(&linux, mac, "sha256:mac", Exact).unwrap_err();
+        assert!(e.contains("native:libvips.so.42 sha256:linux"), "{e}");
+        assert!(e.contains("policy.libraries = \"any\""), "{e}");
+        let note = rails_native(&linux, mac, "sha256:mac", Any)
+            .unwrap()
+            .unwrap();
+        assert!(note.contains("native:libvips.so.42"), "{note}");
+        // "unresolved" (a library FFI gave no path for) too.
+        assert!(rails_native(&linux, mac, "unresolved", Any).is_ok());
+        // Same file name, other hash: only "any" accepts it.
+        assert_eq!(
+            rails_native(&linux, "native:libvips.so.42", "sha256:other", Exact),
+            Err("sha256:linux".into())
+        );
+        assert!(
+            rails_native(&linux, "native:libvips.so.42", "sha256:other", Any)
+                .unwrap()
+                .is_some()
+        );
+        // Identical: Ok under both, no note.
+        for l in [Exact, Any] {
+            assert_eq!(
+                rails_native(&linux, "native:libvips.so.42", "sha256:linux", l),
+                Ok(None)
+            );
+        }
+        // Stem not loaded here: Err under both, naming the stem.
+        let none = natives(&[("rack", "3.2.7"), ("native:libffi.8.dylib", "sha256:f")]);
+        for l in [Exact, Any] {
+            let e = rails_native(&none, mac, "sha256:mac", l).unwrap_err();
+            assert!(
+                e.starts_with("native library libvips: not loaded here"),
+                "{e}"
+            );
+        }
+        let e = rails_native(&none, mac, "sha256:mac", Any).unwrap_err();
+        assert!(
+            e.contains("looked for a native library named libvips"),
+            "{e}"
+        );
+        // A gem named like the stem is not a native library.
+        let gem = natives(&[("libvips", "1.0")]);
+        assert!(rails_native(&gem, mac, "sha256:mac", Any).is_err());
+        // libvips-cpp is another library.
+        let cpp = natives(&[("native:libvips-cpp.42.dylib", "sha256:c")]);
+        assert!(rails_native(&cpp, mac, "sha256:mac", Any).is_err());
+        assert!(rails_native(&Err("boom".into()), mac, "sha256:mac", Any).is_err());
     }
 
     /// Regression: a non-editable path dependency (`source = { directory =

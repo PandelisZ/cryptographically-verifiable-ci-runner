@@ -12,7 +12,7 @@ use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
 use vci_core::{InputManifest, PREDICATE_TYPE};
 use vci_git::{AttestStore, Repo, StoredEnvelope};
 
-use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Platform};
+use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
 use crate::ctx::{Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo};
 use crate::envpolicy::{ChildEnvMap, lookup};
 use crate::run::global_manifest;
@@ -89,6 +89,11 @@ pub struct CandidateInfo {
     pub fingerprint: Option<String>,
     pub issued_at: Option<String>,
     pub expires_at: Option<String>,
+    /// Differences the checks accepted only because of
+    /// `policy.libraries = "any"` (a native library matched by library name,
+    /// library versions not compared), for `explain`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accepted_by_policy: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +116,9 @@ pub struct FileVerdict {
     pub project: String,
     pub skip: bool,
     pub reason: String,
+    /// The base policy's `libraries` for this file (omitted when "exact").
+    #[serde(skip_serializing_if = "is_exact")]
+    pub libraries: Libraries,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<CandidateInfo>,
     #[serde(skip)]
@@ -300,6 +308,10 @@ type PythonExternals = (
     Result<Option<crate::externals::LockedPackages>, String>,
 );
 
+fn is_exact(l: &Libraries) -> bool {
+    *l == Libraries::Exact
+}
+
 fn verdict_run(f: &TestFile, reason: &str) -> FileVerdict {
     FileVerdict {
         test_id: f.test_id.as_str().to_owned(),
@@ -307,6 +319,7 @@ fn verdict_run(f: &TestFile, reason: &str) -> FileVerdict {
         project: String::new(),
         skip: false,
         reason: reason.to_owned(),
+        libraries: Libraries::Exact,
         by: None,
         candidates: vec![],
         project_idx: f.project,
@@ -636,6 +649,7 @@ fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) 
 impl Verifier<'_> {
     fn verdict(&self, f: &TestFile, cands: &[StoredEnvelope]) -> FileVerdict {
         let mut out = verdict_run(f, "");
+        out.libraries = self.project.policy.libraries_for(&f.project_rel);
         if f.ambiguous {
             out.reason =
                 "listed under more than one runner project (or by more than one vci project)"
@@ -676,6 +690,12 @@ impl Verifier<'_> {
                     info.principal.clone().unwrap_or_default(),
                     info.fingerprint.clone().unwrap_or_default()
                 );
+                if !info.accepted_by_policy.is_empty() {
+                    out.reason.push_str(&format!(
+                        "; policy.libraries = \"any\" accepted {} difference(s)",
+                        info.accepted_by_policy.len()
+                    ));
+                }
                 out.by = Some(info);
                 return out;
             }
@@ -898,7 +918,10 @@ impl Verifier<'_> {
         // Toolchain (adapter-specific tools; see Toolchain::diff).
         let tc = &p.core.toolchain;
         let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
-        let mut tdiff = toolchain_diff(&self.project.policy, tc, &now_tc);
+        let libraries = self.project.policy.libraries_for(&f.project_rel);
+        let mut tdiff = toolchain_diff(&self.project.policy, libraries, tc, &now_tc);
+        info.accepted_by_policy
+            .extend(libraries_accepted(libraries, tc, &now_tc));
         let platform = self.project.policy.platform_for(&f.project_rel);
         tdiff.extend(platform_diff(
             platform,
@@ -1134,6 +1157,18 @@ impl Verifier<'_> {
                 }
                 (None, None, Some(lock), _) => {
                     crate::externals::cargo_locked(lock, &e.name, &e.version)
+                }
+                (None, None, None, Some(bundle))
+                    if e.name.starts_with(crate::externals::NATIVE_PREFIX) =>
+                {
+                    crate::externals::rails_native(bundle, &e.name, &e.version, libraries).map(
+                        |note| {
+                            if let Some(n) = note {
+                                info.accepted_by_policy
+                                    .push(format!("external:{}: {n}", e.name));
+                            }
+                        },
+                    )
                 }
                 (None, None, None, Some(bundle)) => {
                     crate::externals::rails_bundled(bundle, &e.name, &e.version)
@@ -1502,6 +1537,9 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
         if f.skip { "SKIP" } else { "RUN" },
         f.reason
     );
+    if f.libraries == Libraries::Any {
+        println!("{LIBRARIES_ANY_POLICY_LINE}");
+    }
     for (i, c) in f.candidates.iter().enumerate() {
         println!(
             "candidate {}: git-meta {} {}",
@@ -1517,6 +1555,9 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
         }
         if let (Some(a), Some(b)) = (&c.info.issued_at, &c.info.expires_at) {
             println!("  issued {a}, expires {b}");
+        }
+        for a in &c.info.accepted_by_policy {
+            println!("  accepted by policy.libraries = \"any\": {a}");
         }
         match &c.failure {
             None => println!("  all checks passed"),
@@ -1536,17 +1577,165 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// The `vci explain` line for a test file whose base policy sets
+/// `libraries = "any"`.
+pub const LIBRARIES_ANY_POLICY_LINE: &str = "policy: libraries = \"any\" (base vci.toml): native libraries match by library name (it must be loaded here; file name and hash not compared), and the library versions of the toolchain (ruby: sqlite, yaml, tz; python: sqlite, openssl) are not compared (each must still be loaded on both sides or on neither)";
+
+/// `ruby_libs` items that are library versions (`policy.libraries = "any"`
+/// does not compare them). The others (`encoding`, `collector`, any new key)
+/// are always compared.
+const RUBY_LIBRARY_KEYS: &[&str] = &["sqlite", "yaml", "tz"];
+/// `python_libs` items that are library versions.
+const PYTHON_LIBRARY_KEYS: &[&str] = &["sqlite", "openssl"];
+
+/// The `;`-separated `key=value` items of a `ruby_libs`/`python_libs` value
+/// whose key is (`keep_library = true`) or is not in `keys`.
+fn lib_items(libs: &str, keys: &[&str], keep_library: bool) -> String {
+    libs.split(';')
+        .filter(|i| !i.is_empty())
+        .filter(|i| {
+            let k = i.split_once('=').map_or(*i, |(k, _)| k);
+            keys.contains(&k) == keep_library
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Each library key of `keys` in a `ruby_libs`/`python_libs` value, as
+/// `key=<version>` when the library is loaded, or `key not loaded` when the
+/// item is absent (Ruby: `SQLite3`/`Psych` not loaded), empty (Ruby's `tz=`
+/// without TZInfo) or `none` (the pytest probe's failed `import sqlite3` /
+/// `import ssl`). `policy.libraries = "any"` accepts another version, not a
+/// missing library: the presence part of this is compared under "any" too.
+fn lib_presence(libs: &str, keys: &[&str]) -> Vec<(bool, String)> {
+    keys.iter()
+        .map(|k| {
+            let v = libs
+                .split(';')
+                .find_map(|i| i.split_once('=').filter(|(ik, _)| ik == k).map(|(_, v)| v));
+            match v {
+                Some(v) if !v.is_empty() && v != "none" => (true, format!("{k}={v}")),
+                _ => (false, format!("{k} not loaded")),
+            }
+        })
+        .collect()
+}
+
+/// Whether the same libraries of `keys` are loaded in `a` and `b` (their
+/// versions aside).
+fn same_libs_loaded(a: &str, b: &str, keys: &[&str]) -> bool {
+    let (pa, pb) = (lib_presence(a, keys), lib_presence(b, keys));
+    pa.iter().map(|p| p.0).eq(pb.iter().map(|p| p.0))
+}
+
+fn presence_str(libs: &str, keys: &[&str]) -> String {
+    lib_presence(libs, keys)
+        .into_iter()
+        .map(|p| p.1)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// A toolchain row `policy.libraries = "any"` relaxes.
+struct LibRow<'a> {
+    /// The row of `Toolchain::diff`.
+    row: &'static str,
+    /// The row reported for the non-library items, which are still compared.
+    rest_row: &'static str,
+    /// The row reported for a library loaded on one side only.
+    loaded_row: &'static str,
+    /// The library keys.
+    keys: &'static [&'static str],
+    /// Attested value.
+    a: &'a str,
+    /// Current value.
+    b: &'a str,
+}
+
+/// The toolchain rows `policy.libraries = "any"` relaxes.
+fn library_rows<'a>(
+    tc: &'a vci_core::Toolchain,
+    now_tc: &'a vci_core::Toolchain,
+) -> [LibRow<'a>; 2] {
+    [
+        LibRow {
+            row: vci_core::RUBY_LIBS_DIFF,
+            rest_row: "ruby libraries except sqlite, yaml, tz (compared under policy.libraries = \"any\" too)",
+            loaded_row: "ruby libraries: sqlite, yaml, tz loaded or not (policy.libraries = \"any\" accepts another version, not a missing library)",
+            keys: RUBY_LIBRARY_KEYS,
+            a: &tc.ruby_libs,
+            b: &now_tc.ruby_libs,
+        },
+        LibRow {
+            row: vci_core::PYTHON_LIBS_DIFF,
+            rest_row: "python libraries except sqlite, openssl (compared under policy.libraries = \"any\" too)",
+            loaded_row: "python libraries: sqlite, openssl loaded or not (policy.libraries = \"any\" accepts another version, not a missing library)",
+            keys: PYTHON_LIBRARY_KEYS,
+            a: &tc.python_libs,
+            b: &now_tc.python_libs,
+        },
+    ]
+}
+
+/// Library version differences `policy.libraries = "any"` accepts, for
+/// `explain` (empty under "exact").
+pub(crate) fn libraries_accepted(
+    libraries: Libraries,
+    tc: &vci_core::Toolchain,
+    now_tc: &vci_core::Toolchain,
+) -> Vec<String> {
+    if libraries != Libraries::Any {
+        return vec![];
+    }
+    library_rows(tc, now_tc)
+        .into_iter()
+        .filter_map(|r| {
+            // A library loaded on one side only is refused, not accepted.
+            if !same_libs_loaded(r.a, r.b, r.keys) {
+                return None;
+            }
+            let (a, b) = (lib_items(r.a, r.keys, true), lib_items(r.b, r.keys, true));
+            (a != b).then(|| format!("{}: attested {a}, here {b} (versions not compared)", r.row))
+        })
+        .collect()
+}
+
 /// What the toolchain check compares, under the base `policy`: the tool
 /// fields of [`vci_core::Toolchain::diff`], the exact Node version with
 /// `policy.node_exact`, and the tests' privileges unless
 /// `policy.allow_superuser_mismatch` (a privileges difference names that
 /// key, so `vci plan` and `vci explain` say how it could be accepted).
+/// Under `libraries` = "any" (the base policy for the file) the library
+/// versions of `ruby libraries` and `python libraries` are not compared, but
+/// whether each library is loaded is; their other items (encoding, collector
+/// version) are compared exactly.
 pub(crate) fn toolchain_diff(
     policy: &crate::config::Policy,
+    libraries: Libraries,
     tc: &vci_core::Toolchain,
     now_tc: &vci_core::Toolchain,
 ) -> Vec<(&'static str, String, String)> {
     let mut tdiff = tc.diff(now_tc);
+    if libraries == Libraries::Any {
+        for r in library_rows(tc, now_tc) {
+            if let Some(i) = tdiff.iter().position(|d| d.0 == r.row) {
+                tdiff.remove(i);
+                // Another version is accepted; a library loaded on one side
+                // only (`sqlite=none`, a missing item, an empty `tz=`) is not.
+                if !same_libs_loaded(r.a, r.b, r.keys) {
+                    tdiff.push((
+                        r.loaded_row,
+                        presence_str(r.a, r.keys),
+                        presence_str(r.b, r.keys),
+                    ));
+                }
+                let (a, b) = (lib_items(r.a, r.keys, false), lib_items(r.b, r.keys, false));
+                if a != b {
+                    tdiff.push((r.rest_row, a, b));
+                }
+            }
+        }
+    }
     for d in &mut tdiff {
         if d.0 == vci_core::PRIVILEGES_DIFF {
             d.0 = "privileges (policy.allow_superuser_mismatch = true in the base branch's vci.toml accepts this; risky for tests that depend on file permissions)";
@@ -1586,7 +1775,7 @@ mod tests {
         let mut runner = laptop.clone();
         runner.superuser = true;
         let mut policy = crate::config::Policy::default();
-        let d = toolchain_diff(&policy, &laptop, &runner);
+        let d = toolchain_diff(&policy, Libraries::Exact, &laptop, &runner);
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(
             d[0].0.contains("policy.allow_superuser_mismatch = true"),
@@ -1595,13 +1784,205 @@ mod tests {
         assert_eq!(d[0].1, "not root");
         assert_eq!(d[0].2, "root (effective uid 0)");
         policy.allow_superuser_mismatch = true;
-        assert!(toolchain_diff(&policy, &laptop, &runner).is_empty());
-        assert!(toolchain_diff(&policy, &runner, &laptop).is_empty());
+        assert!(toolchain_diff(&policy, Libraries::Exact, &laptop, &runner).is_empty());
+        assert!(toolchain_diff(&policy, Libraries::Exact, &runner, &laptop).is_empty());
         // Every other field is still compared.
         runner.ruby = "3.4.8p1".into();
-        let d = toolchain_diff(&policy, &laptop, &runner);
+        let d = toolchain_diff(&policy, Libraries::Exact, &laptop, &runner);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].0, "ruby");
+    }
+
+    fn rails_tc(libs: &str) -> vci_core::Toolchain {
+        vci_core::Toolchain {
+            ruby: "3.4.9p82".into(),
+            ruby_engine: "ruby 3.4.9".into(),
+            rails: "8.1.3.1".into(),
+            bundler: "4.0.9".into(),
+            ruby_test: "minitest 6.0.6".into(),
+            ruby_libs: libs.into(),
+            ruby_db: "sqlite3".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ..Default::default()
+        }
+    }
+
+    /// `policy.libraries = "any"`: Homebrew's and apt's builds (other SQLite,
+    /// libyaml, zoneinfo) are accepted; everything else in the toolchain is
+    /// still compared, and so are the non-library items of `ruby_libs`.
+    #[test]
+    fn libraries_any_drops_only_the_library_versions_ruby() {
+        let policy = crate::config::Policy::default();
+        let mac =
+            rails_tc("sqlite=3.53.2;yaml=0.2.5;tz=zoneinfo 2025b;encoding=UTF-8/none;collector=42");
+        let linux = vci_core::Toolchain {
+            ruby_libs:
+                "sqlite=3.45.1;yaml=0.2.2;tz=zoneinfo 2024a;encoding=UTF-8/none;collector=42".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ..mac.clone()
+        };
+        let d = toolchain_diff(&policy, Libraries::Exact, &mac, &linux);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].0, "ruby libraries");
+        assert!(toolchain_diff(&policy, Libraries::Any, &mac, &linux).is_empty());
+        assert!(toolchain_diff(&policy, Libraries::Any, &linux, &mac).is_empty());
+        let acc = libraries_accepted(Libraries::Any, &mac, &linux);
+        assert_eq!(
+            acc,
+            [
+                "ruby libraries: attested sqlite=3.53.2;yaml=0.2.5;tz=zoneinfo 2025b, here sqlite=3.45.1;yaml=0.2.2;tz=zoneinfo 2024a (versions not compared)"
+            ]
+        );
+        assert!(libraries_accepted(Libraries::Exact, &mac, &linux).is_empty());
+        assert!(libraries_accepted(Libraries::Any, &mac, &mac).is_empty());
+        // Another Ruby: refused under both.
+        let mut other = mac.clone();
+        other.ruby = "3.4.8p72".into();
+        for l in [Libraries::Exact, Libraries::Any] {
+            let d = toolchain_diff(&policy, l, &mac, &other);
+            assert_eq!(d.len(), 1, "{d:?}");
+            assert_eq!(d[0].0, "ruby");
+        }
+        // Rails, Bundler, the database, the bundle: still compared.
+        let mut other = linux.clone();
+        other.rails = "8.1.3".into();
+        other.ruby_db = "postgresql 16.4".into();
+        other.ruby_gems.push("pg==1.6.0".into());
+        let whats: Vec<&str> = toolchain_diff(&policy, Libraries::Any, &mac, &other)
+            .iter()
+            .map(|d| d.0)
+            .collect();
+        assert_eq!(whats, ["rails", "database", "gems (bundle)"]);
+        // The encoding and the collector version are not libraries.
+        for (k, v) in [
+            ("encoding=UTF-8/none", "encoding=US-ASCII/none"),
+            ("collector=42", "collector=43"),
+        ] {
+            let other = vci_core::Toolchain {
+                ruby_libs: linux.ruby_libs.replace(k, v),
+                ..linux.clone()
+            };
+            let d = toolchain_diff(&policy, Libraries::Any, &mac, &other);
+            assert_eq!(d.len(), 1, "{d:?}");
+            assert!(
+                d[0].0.starts_with("ruby libraries except sqlite, yaml, tz"),
+                "{d:?}"
+            );
+            assert!(d[0].1.contains(k) && d[0].2.contains(v), "{d:?}");
+            assert!(!d[0].1.contains("sqlite"), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn libraries_any_drops_only_the_library_versions_python() {
+        let policy = crate::config::Policy::default();
+        let brew = vci_core::Toolchain {
+            python: "3.14.4".into(),
+            implementation: "cpython".into(),
+            pytest: "9.1.1".into(),
+            python_libs: "sqlite=3.50.4;openssl=OpenSSL 3.5.1".into(),
+            python_dists: vec!["pytest==9.1.1".into()],
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ..Default::default()
+        };
+        let apt = vci_core::Toolchain {
+            python_libs: "sqlite=3.45.1;openssl=OpenSSL 3.0.13".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ..brew.clone()
+        };
+        let d = toolchain_diff(&policy, Libraries::Exact, &brew, &apt);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].0, "python libraries");
+        assert!(toolchain_diff(&policy, Libraries::Any, &brew, &apt).is_empty());
+        assert_eq!(libraries_accepted(Libraries::Any, &brew, &apt).len(), 1);
+        // Another Python, another distribution set: refused under both.
+        let mut other = apt.clone();
+        other.python = "3.14.3".into();
+        for l in [Libraries::Exact, Libraries::Any] {
+            assert_eq!(toolchain_diff(&policy, l, &brew, &other)[0].0, "python");
+        }
+        let mut other = apt.clone();
+        other.python_dists.push("six==1.17.0".into());
+        let d = toolchain_diff(&policy, Libraries::Any, &brew, &other);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].0, "python distributions");
+    }
+
+    /// `policy.libraries = "any"` accepts another library version, not a
+    /// library that is missing on one side: a Python built without `_sqlite3`
+    /// or `_ssl` (`sqlite=none`, `openssl=none`), a Ruby process without
+    /// SQLite3 (no `sqlite` item) or TZInfo (`tz=`), in either direction.
+    #[test]
+    fn libraries_any_still_requires_the_same_libraries_loaded() {
+        let policy = crate::config::Policy::default();
+        let py = |libs: &str| vci_core::Toolchain {
+            python: "3.14.4".into(),
+            implementation: "cpython".into(),
+            pytest: "9.1.1".into(),
+            python_libs: libs.into(),
+            python_dists: vec!["pytest==9.1.1".into()],
+            ..Default::default()
+        };
+        let dev = py("sqlite=3.50.4;openssl=OpenSSL 3.5.1");
+        let ci = py("sqlite=none;openssl=none");
+        for (a, b) in [(&dev, &ci), (&ci, &dev)] {
+            let d = toolchain_diff(&policy, Libraries::Any, a, b);
+            assert_eq!(d.len(), 1, "{d:?}");
+            assert!(
+                d[0].0
+                    .starts_with("python libraries: sqlite, openssl loaded or not"),
+                "{d:?}"
+            );
+            assert!(libraries_accepted(Libraries::Any, a, b).is_empty());
+        }
+        let d = toolchain_diff(&policy, Libraries::Any, &dev, &ci);
+        assert_eq!(d[0].1, "sqlite=3.50.4;openssl=OpenSSL 3.5.1");
+        assert_eq!(d[0].2, "sqlite not loaded;openssl not loaded");
+        // Only one of them missing.
+        let half = py("sqlite=3.45.1;openssl=none");
+        let d = toolchain_diff(&policy, Libraries::Any, &dev, &half);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].2, "sqlite=3.45.1;openssl not loaded");
+        // Missing on both sides: nothing to compare.
+        assert!(toolchain_diff(&policy, Libraries::Any, &ci, &ci.clone()).is_empty());
+
+        let mac =
+            rails_tc("sqlite=3.53.2;yaml=0.2.5;tz=zoneinfo 2025b;encoding=UTF-8/none;collector=42");
+        for libs in [
+            // SQLite3 not loaded: no `sqlite` item; TZInfo not loaded: `tz=`.
+            "tz=;encoding=UTF-8/none;collector=42",
+            "yaml=0.2.2;tz=zoneinfo 2024a;encoding=UTF-8/none;collector=42",
+            "sqlite=3.45.1;yaml=0.2.2;tz=;encoding=UTF-8/none;collector=42",
+        ] {
+            let other = rails_tc(libs);
+            for (a, b) in [(&mac, &other), (&other, &mac)] {
+                let d = toolchain_diff(&policy, Libraries::Any, a, b);
+                assert_eq!(d.len(), 1, "{libs}: {d:?}");
+                assert!(
+                    d[0].0
+                        .starts_with("ruby libraries: sqlite, yaml, tz loaded or not"),
+                    "{d:?}"
+                );
+                assert!(libraries_accepted(Libraries::Any, a, b).is_empty());
+            }
+        }
+        let d = toolchain_diff(
+            &policy,
+            Libraries::Any,
+            &mac,
+            &rails_tc("tz=;encoding=UTF-8/none;collector=42"),
+        );
+        assert_eq!(d[0].1, "sqlite=3.53.2;yaml=0.2.5;tz=zoneinfo 2025b");
+        assert_eq!(d[0].2, "sqlite not loaded;yaml not loaded;tz not loaded");
+        // Not loaded on either side, other versions of the rest: accepted.
+        let a = rails_tc("yaml=0.2.5;tz=;encoding=UTF-8/none;collector=42");
+        let b = rails_tc("yaml=0.2.2;tz=;encoding=UTF-8/none;collector=42");
+        assert!(toolchain_diff(&policy, Libraries::Any, &a, &b).is_empty());
+        assert_eq!(libraries_accepted(Libraries::Any, &a, &b).len(), 1);
     }
 
     /// Go: an attestation made on macOS arm64 is accepted on Linux x86_64
