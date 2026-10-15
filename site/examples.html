@@ -431,6 +431,11 @@ vci push &amp;&amp; git push</code></pre>
 </table>
 <p>So attesting is slower than running, by roughly a process start per test file or package, and it is paid once per change on one machine; every later run of an unchanged unit, on any machine, costs the plan. A unit is a file or package, so a file with forty tests pays the same 1.5 seconds as this demo's files with one or two. The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38812905175">run</a> took about 95 seconds in all, 28 of them GitHub's own setup. <code>VCI_TIMING=1</code> in that workflow prints what the plan spent per phase: the attestation fetch (0.9 s, overlapped), the Ruby toolchain probes (0.5 s each), the verdicts (0.4 s).</p>
 
+<h2 id="measured-vex">Measured on a real suite: vex-web</h2>
+<p>The demo above shows vci's costs. This is a suite where it saves time: <a href="https://github.com/ComposalAI/vex">ComposalAI/vex</a>'s web package, 253 <code>node --test</code> files, measured by a <a href="https://github.com/ComposalAI/vex/pull/1327">benchmark workflow in the vci pull request</a> on the project's own CI runner, with vci 1.5.0 downloaded as the release binary. The plain run is the exact command vex's CI uses. Attesting all 253 files took 25 seconds against 17 for the plain run, because node:test already runs files in parallel; 242 attested and 11 refused by design, since they open sockets, spawn processes or enumerate the environment.</p>
+<img src="assets/measured-vex.svg" alt="vex-web benchmark: plain run 17 s, vci with nothing changed 8 s, one module changed 8 s, attesting everything once 25 s" width="1000" height="378" style="width:100%;height:auto;display:block;margin:16px 0 4px">
+<p>With nothing changed, the job runs the 11 files that can never be attested and nothing else: 8 seconds instead of 17, of which vci's own plan is 0.8. A change to a shared module adds the 5 files that depend on it. The 11 files are the floor; listing them in <code>never_skip</code> would make that explicit rather than cheaper.</p>
+
 <h2 id="live">Live runs to look at</h2>
 <table>
 <tr><th>Pull request</th><th>Shows</th></tr>

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 378" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14">
+<style>.t{fill:#1b1d1a}.m{fill:#5d635b}.plain{fill:#15803d}.ovh{fill:#b45309}.attest{fill:#2563eb}.v{fill:#1b1d1a;font-weight:650}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.plain{fill:#4ade80}.ovh{fill:#fbbf63}.attest{fill:#60a5fa}.v{fill:#e6e9e4}.g{stroke:#262b29}}</style>
+<text class="t" x="0" y="20" font-size="17" font-weight="650">Measured on a real suite: vex-web, 253 node:test files (vci 1.5.0, the project's own CI runner)</text>
+<text class="m" x="0" y="42">One benchmark job on the ComposalAI/vex repository, every stage its own timed step. Seconds.</text>
+<text class="t" x="0" y="82" font-weight="600">without vci: node --test as CI runs it</text><text class="m" x="0" y="100" font-size="12">253 files, TEST_CONCURRENCY=2</text>
+<rect class="plain" x="300" y="68" width="238.0" height="20" rx="3"/>
+<text class="v" x="546.0" y="83">17 s</text>
+<text class="t" x="0" y="140" font-weight="600">with vci, nothing changed</text><text class="m" x="0" y="158" font-size="12">plan 0.8 s, then the 11 files vci can never attest run (sockets, child processes, env enumeration)</text>
+<rect class="ovh" x="300" y="126" width="14.0" height="20" rx="3"/><rect class="plain" x="314.0" y="126" width="98.0" height="20" rx="3"/>
+<text class="v" x="420.0" y="141">8 s</text>
+<text class="t" x="0" y="198" font-weight="600">with vci, one module changed</text><text class="m" x="0" y="216" font-size="12">16 files ran: the 11 above and the 5 that depend on agent-handoff.ts</text>
+<rect class="ovh" x="300" y="184" width="14.0" height="20" rx="3"/><rect class="plain" x="314.0" y="184" width="98.0" height="20" rx="3"/>
+<text class="v" x="420.0" y="199">8 s</text>
+<text class="t" x="0" y="256" font-weight="600">attest all 253 files, once</text><text class="m" x="0" y="274" font-size="12">242 attested, one node process per file; vex's CI runs node:test in parallel too</text>
+<rect class="attest" x="300" y="242" width="350.0" height="20" rx="3"/>
+<text class="v" x="658.0" y="257">25 s</text>
+<line class="g" x1="0" x2="1000" y1="294" y2="294"/>
+<rect class="plain" x="0" y="336" width="14" height="14" rx="3"/><text class="m" x="20" y="348">tests running</text>
+<rect class="ovh" x="136.39999999999998" y="336" width="14" height="14" rx="3"/><text class="m" x="156.39999999999998" y="348">vci: fetch, plan, decide</text>
+<rect class="attest" x="347.59999999999997" y="336" width="14" height="14" rx="3"/><text class="m" x="367.59999999999997" y="348">tests running with collectors, then signed</text>
+<text class="m" x="0" y="370">A commit that touches nothing the tests depend on runs 11 of 253 files; one that touches a shared module runs 16. Run 38813834868 on ComposalAI/vex.</text></svg>
