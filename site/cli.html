@@ -24,7 +24,7 @@
 <tr><td><a href="#plan"><code>vci plan</code></a></td><td class="wrap">Show which units can be skipped and why the others run</td></tr>
 <tr><td><a href="#push-fetch"><code>vci push</code></a></td><td class="wrap">Publish your attestations to the remote</td></tr>
 <tr><td><a href="#push-fetch"><code>vci fetch</code></a></td><td class="wrap">Download attestations from the remote</td></tr>
-<tr><td><a href="#ci"><code>vci ci</code></a></td><td class="wrap">In CI: plan, run the rest, write an audit log</td></tr>
+<tr><td><a href="#ci"><code>vci ci</code></a></td><td class="wrap">In CI: plan, run the rest, write an audit log; with a key, attest what ran</td></tr>
 <tr><td><a href="#explain"><code>vci explain</code></a></td><td class="wrap">Show why one unit was not skipped</td></tr>
 <tr><td><a href="#prune"><code>vci prune</code></a></td><td class="wrap">Delete expired attestations</td></tr>
 <tr><td><a href="#verify"><code>vci verify</code></a></td><td class="wrap">Verify one attestation envelope and print its claims</td></tr>
@@ -85,12 +85,19 @@ vci fetch [--remote R]</code></pre>
 vci fetch --remote origin         <span class="c"># in CI (the action does this)</span></code></pre>
 
 <h3 id="ci">vci ci</h3>
-<pre data-nocopy><code>vci ci [--base-ref R] [--audit-log PATH]</code></pre>
-<p>Plans, runs every unit that was not skipped, and exits non-zero if any test fails. The <a href="github-actions.html">GitHub Action</a> runs it for you.</p>
+<pre data-nocopy><code>vci ci [--base-ref R] [--audit-log PATH]
+       [--key PATH [--ttl 14d] [--push [--remote R]]]</code></pre>
+<p>Plans, runs every unit that was not skipped, and exits non-zero if any test fails. The <a href="github-actions.html">GitHub Action</a> runs it for you. When every unit is skipped, it prints <code>nothing to run</code> and never starts the test runner.</p>
 <ul>
 <li><code>--audit-log PATH</code>: write a JSON record of every skip, by whom, and what ran.</li>
+<li><code>--key PATH</code>: run what is left the way <code>vci run --key</code> does, and attest every unit that passed. When the plan runs everything (for example on a <code>no_skip_refs</code> ref with an empty <code>no_skip_refs_except</code>), every unit is attested. The next commit's CI then skips each unit whose inputs did not change. See <a href="github-actions.html#attesting-in-ci">attesting in CI</a>.</li>
+<li><code>--ttl</code>: lifetime of those attestations. Default <code>14d</code>.</li>
+<li><code>--push</code>: afterwards, publish them as <code>vci push</code> does, whether or not the tests passed. A failed push prints a warning and does not change the exit code.</li>
+<li><code>--remote R</code>: where <code>--push</code> pushes, as for <code>vci push</code>.</li>
 </ul>
-<pre><code>vci ci --base-ref origin/main --audit-log vci-audit.json</code></pre>
+<p>With <code>--key</code>, the audit log also lists the <code>attested</code> units and whether they were <code>pushed</code>. A key whose principal is in <code>policy.no_skip_refs_except</code> attests nothing on other refs, such as a pull request's.</p>
+<pre><code>vci ci --base-ref origin/main --audit-log vci-audit.json
+vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --push --remote origin   <span class="c"># on main</span></code></pre>
 
 <h3 id="explain">vci explain</h3>
 <pre data-nocopy><code>vci explain &lt;unit&gt; [--base-ref R]</code></pre>

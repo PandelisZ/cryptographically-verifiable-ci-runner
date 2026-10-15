@@ -6,8 +6,10 @@
 platform = "any"
 max_ttl = "30d"
 allow_dirty = true
-# Pushes to the default branch and tags run everything.
+# Pushes to the default branch and tags run everything, except units the CI
+# key attested (the action's signing-key on the previous commit of main).
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+no_skip_refs_except = ["github-actions"]
 never_skip = []
 
 [env]

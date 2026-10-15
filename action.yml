@@ -37,6 +37,32 @@ inputs:
   token:
     description: Token used to download the release binary.
     default: ${{ github.token }}
+  signing-key:
+    description: >
+      Contents of an SSH private key (e.g. `secrets.VCI_SIGNING_KEY`). When
+      set, `vci ci` runs what is not attested the way `vci run` does and signs
+      an attestation for every unit that passed (on a run-everything ref such
+      as main, every unit), so the next commit's CI skips each unit whose
+      inputs did not change. The key's public half must be in
+      .vci/allowed_signers on the base branch, and for main-branch runs to be
+      reused on main its principal must be listed in
+      policy.no_skip_refs_except. Never printed, but every process of the
+      job (tests, their dependencies, other steps) can read it: pass it only
+      from a GitHub Environment restricted to the default branch, never to
+      pull_request runs (see "Attesting in CI" in docs/GITHUB_ACTIONS.md).
+      With a principal in no_skip_refs_except, vci ci attests nothing on a
+      ref that policy.no_skip_refs does not match.
+    default: ""
+  ttl:
+    description: Lifetime of the attestations made with signing-key (at most policy.max_ttl).
+    default: 14d
+  push:
+    description: >
+      With signing-key: publish the attestations afterwards (`vci ci --push`,
+      git-meta pushes refs/meta/main to `remote` with the checkout's
+      credentials, so the job needs `permissions: contents: write`). A failed
+      push is a warning and never fails the job.
+    default: "true"
 
 outputs:
   skipped:
@@ -45,6 +71,9 @@ outputs:
   run:
     description: Number of test units that had to run.
     value: ${{ steps.plan.outputs.run }}
+  attested:
+    description: Number of test units attested with signing-key (0 without it).
+    value: ${{ steps.ci.outputs.attested }}
 
 runs:
   using: composite
@@ -152,10 +181,48 @@ runs:
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
 
+    # With signing-key: the key goes to a file only this user can read
+    # (ssh-keygen refuses others), with a trailing newline (a secret pasted
+    # without one is not a valid key file).
+    - name: Install the signing key
+      if: inputs.command == 'ci' && inputs.signing-key != ''
+      shell: bash
+      env:
+        KEY: ${{ inputs.signing-key }}
+      run: |
+        umask 077
+        printf '%s\n' "$KEY" > "$RUNNER_TEMP/vci-key"
+        chmod 600 "$RUNNER_TEMP/vci-key"
+
     - name: Run what is not attested
+      id: ci
       if: inputs.command == 'ci'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         BASE: ${{ inputs.base-ref }}
-      run: vci ci --base-ref "$BASE" --audit-log "${{ inputs.audit-log }}"
+        AUDIT: ${{ inputs.audit-log }}
+        SIGN: ${{ inputs.signing-key != '' }}
+        TTL: ${{ inputs.ttl }}
+        PUSH: ${{ inputs.push }}
+        REMOTE: ${{ inputs.remote }}
+      run: |
+        args=(--base-ref "$BASE" --audit-log "$AUDIT")
+        if [ "$SIGN" = "true" ]; then
+          args+=(--key "$RUNNER_TEMP/vci-key" --ttl "$TTL")
+          if [ "$PUSH" = "true" ]; then
+            args+=(--push --remote "$REMOTE")
+          fi
+        fi
+        set +e
+        vci ci "${args[@]}"
+        code=$?
+        set -e
+        attested=$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1])).get("attested") or []))' "$AUDIT" 2>/dev/null || echo 0)
+        echo "attested=$attested" >> "$GITHUB_OUTPUT"
+        exit "$code"
+
+    - name: Remove the signing key
+      if: always() && inputs.signing-key != ''
+      shell: bash
+      run: rm -f "$RUNNER_TEMP/vci-key"

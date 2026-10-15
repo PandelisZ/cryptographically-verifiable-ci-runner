@@ -54,7 +54,8 @@ echo "${VCI_SIGNING_KEY:-unset}"                # signing key, or pass --key
   listed, attestations still work locally but CI will reject them (`failed check: signer`). Tell the user; do not
   edit `allowed_signers` yourself.
 - **Default branch**: `vci init` puts `refs/heads/main` in `policy.no_skip_refs`, so on `main` `vci plan` prints
-  `running everything: policy.no_skip_refs matches refs/heads/main`. Work on a feature branch.
+  `running everything: policy.no_skip_refs matches refs/heads/main` (or, when `policy.no_skip_refs_except` names
+  CI's own key, skips only what that key attested). Work on a feature branch.
 - **Declared environment**: strict env mode removes undeclared variables from tests. Every variable in `[env] global`
   (commonly `TZ`, `CGO_ENABLED`) must have the same value locally as in CI, e.g. `TZ=UTC vci run ...`.
 
@@ -170,6 +171,13 @@ Remind the user to: add each signer (agents with their own key and a `valid-befo
 ([runners](references/runners.md)); keep `refs/heads/main` in `no_skip_refs`; never use `pull_request_target` or a
 `container:` job for this.
 
+Optionally, CI can attest its own runs: with a key of its own (the action's `signing-key`, `vci ci --key K --push
+--remote origin`), each push to main attests what it ran and the next commit skips every unit whose inputs did not
+change. It needs a key the user creates, its line in `allowed_signers`, `no_skip_refs_except = ["<its principal>"]`
+in `vci.toml`, a GitHub Environment secret limited to the default branch, and a main-only job with
+`permissions: contents: write`. Steps: [references/ci-setup.md](references/ci-setup.md) ("Let CI attest its own
+runs"). Propose it; do not set it up unasked.
+
 ## Diagnose "not skipped"
 
 ```sh
@@ -184,7 +192,7 @@ vci explain <unit> --base-ref origin/main
 |---|---|---|
 | `inputs` | A file changed after attesting (`entry:<path>` names it) | Re-run `vci run <unit>` |
 | `toolchain` | Different Python/Node/Go/rustc/Ruby/bundle/package versions, or OS/arch under the policy | Pin versions (runners.md); report to the user |
-| `signer` | Key not in the base branch's `allowed_signers`, or expired | The user adds the key on the default branch |
+| `signer` | Key not in the base branch's `allowed_signers`, or expired; on main, a signer not in `no_skip_refs_except` | The user adds the key on the default branch; on main this is expected |
 | `expiry` | Attestation expired (default TTL 14 days, policy max 30) | Re-attest |
 | `global-inputs`, `externals` | Lockfile, runner config or dependency versions changed | Re-attest after the change |
 | `env` | A hashed variable differs (`TZ`, a declared variable, or `CI`/`HOME` the test read) | Match declared values; units that read `CI` never skip on runners |
@@ -232,12 +240,12 @@ Short version (details in [references/runners.md](references/runners.md)):
 3. **Never touch trust**: do not add your key (or any key) to `.vci/allowed_signers`, on a PR branch or anywhere,
    unless the user explicitly asks; changes there only take effect on the default branch, which the user merges.
 4. **Never weaken policy** without the user: do not change `platform`, `platform_overrides`, `never_skip`,
-   `no_skip_refs`, `max_ttl`, `allow_dirty`, `go_allow_net`, `rails_allow_db`, `[env]` mode or declarations, or
-   `[[inputs]]`. Propose the change and let the user decide.
+   `no_skip_refs`, `no_skip_refs_except` (never add your own principal), `max_ttl`, `allow_dirty`, `go_allow_net`,
+   `rails_allow_db`, `[env]` mode or declarations, or `[[inputs]]`. Propose the change and let the user decide.
 5. **Never change the CI wiring to skip more**: do not alter `base-ref`, switch to `pull_request_target`, unpin the
    action, or build vci from the PR checkout.
 6. **Use the key you were given.** Do not create keys or read other people's keys; do not print private key
-   material.
+   material. Never use CI's own key (the GitHub secret behind the action's `signing-key`): it skips on main.
 7. **Re-attest after editing**: if you change any file the tests read after `vci run`, run it again before pushing.
 8. **Report honestly**: list refused units and failed checks; never claim CI will skip something `vci plan` shows as
    `RUN`.

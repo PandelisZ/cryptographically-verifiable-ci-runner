@@ -131,6 +131,19 @@ pub struct ProjectPlan {
     pub adapter: String,
     /// Set when every test file of this project must run; the reason.
     pub run_all: Option<String>,
+    /// The current ref matched `policy.no_skip_refs` and the policy names
+    /// principals in `no_skip_refs_except`: only their attestations skip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_skip_ref: Option<String>,
+    /// The base policy's `no_skip_refs` match the current ref (whatever
+    /// `no_skip_refs_except` says); `false` when the base policy could not be
+    /// read. `vci ci --key` uses it to decide whether it may attest.
+    #[serde(skip)]
+    pub on_no_skip_ref: bool,
+    /// The base policy's `no_skip_refs_except` (empty when the base policy
+    /// could not be read).
+    #[serde(skip)]
+    pub no_skip_refs_except: Vec<String>,
     #[serde(skip)]
     pub dir: camino::Utf8PathBuf,
     #[serde(skip)]
@@ -156,6 +169,15 @@ pub struct PlanResult {
     /// The `[[projects]]` form is in use.
     #[serde(skip)]
     pub multi: bool,
+    /// The configuration [`PlanResult::projects`] were made from (the base
+    /// commit's, or the working tree's when the base policy could not be
+    /// read), in the same order: what `vci ci --key` runs and attests with.
+    #[serde(skip)]
+    pub config: Option<Config>,
+    /// The base commit's allowed_signers, when they could be read: whom
+    /// `vci ci --key`'s key signs as.
+    #[serde(skip)]
+    pub allowed: Option<AllowedSigners>,
 }
 
 impl PlanResult {
@@ -258,6 +280,9 @@ struct Verifier<'a> {
     repo_id: String,
     versions: vci_adapter::ToolVersions,
     child: ChildEnvMap,
+    /// The current ref matched `policy.no_skip_refs`: only principals in
+    /// `policy.no_skip_refs_except` are accepted.
+    no_skip_ref: Option<String>,
     /// pytest: installed distributions and the uv.lock pins.
     python_externals: Option<PythonExternals>,
     /// Go: the build list (`go list -m -json all`).
@@ -300,6 +325,8 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
         projects: vec![],
         files: vec![],
         multi: false,
+        config: None,
+        allowed: None,
     };
 
     // 1. Policy and trust roots from the BASE commit.
@@ -360,8 +387,10 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
     };
     let refs = current_refs(&repo);
     res.multi = config.is_multi();
+    res.allowed = allowed.clone();
 
     // 2. Projects (base config) and their test files.
+    res.config = Some(config.clone());
     let ctx = match Ctx::new(repo, root.clone(), config) {
         Ok(c) => c,
         Err(e) => {
@@ -373,12 +402,28 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
     for (i, p) in ctx.projects.iter().enumerate() {
         let child = p.child_env();
         let mut run_all = res.run_all.clone();
+        let mut no_skip_ref = None;
+        let matched = refs
+            .iter()
+            .find(|r| p.policy.no_skip_refs.iter().any(|g| glob_match(g, r)));
+        let on_no_skip_ref = matched.is_some();
         if run_all.is_none()
-            && let Some(r) = refs
-                .iter()
-                .find(|r| p.policy.no_skip_refs.iter().any(|g| glob_match(g, r)))
+            && let Some(r) = matched
         {
-            run_all = Some(format!("policy.no_skip_refs matches {r}"));
+            if p.policy.no_skip_refs_except.is_empty() {
+                run_all = Some(format!("policy.no_skip_refs matches {r}"));
+            } else {
+                eprintln!(
+                    "vci: note: {}policy.no_skip_refs matches {r}: only attestations by {} (policy.no_skip_refs_except) can skip",
+                    if ctx.projects.len() > 1 {
+                        format!("{}: ", p.label())
+                    } else {
+                        String::new()
+                    },
+                    p.policy.no_skip_refs_except.join(", ")
+                );
+                no_skip_ref = Some(r.clone());
+            }
         }
         match p
             .adapter
@@ -405,6 +450,9 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             path: p.rel.clone(),
             adapter: p.adapter.name().to_owned(),
             run_all,
+            no_skip_ref,
+            on_no_skip_ref,
+            no_skip_refs_except: p.policy.no_skip_refs_except.clone(),
             dir: p.dir.clone(),
             child_env: Some(child),
             adapter_options: p.adapter_options.clone(),
@@ -453,6 +501,7 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
             (None, None) => Err("no trusted signers".to_owned()),
             (None, Some(allowed)) => {
                 let child = res.projects[pi].child_env.clone().unwrap_or_default();
+                let no_skip_ref = res.projects[pi].no_skip_ref.clone();
                 let env = child.to_child_env();
                 (|| -> Result<Verifier<'_>> {
                     let repo_id = ctx.repo.repo_id()?;
@@ -491,6 +540,7 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
                         repo_id,
                         versions,
                         child,
+                        no_skip_ref,
                         python_externals,
                         go_modules,
                         cargo_lock,
@@ -551,6 +601,7 @@ fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) 
     let reason = res.run_all.clone().unwrap_or_default();
     let config = crate::ctx::working_tree_config(&root).unwrap_or_default();
     res.multi = config.is_multi();
+    res.config = Some(config.clone());
     if let Ok(ctx) = Ctx::new(repo, root, config) {
         let mut files = Vec::new();
         for (i, p) in ctx.projects.iter().enumerate() {
@@ -568,6 +619,9 @@ fn fallback_listing(mut res: PlanResult, repo: Repo, root: camino::Utf8PathBuf) 
                 path: p.rel.clone(),
                 adapter: p.adapter.name().to_owned(),
                 run_all: Some(reason.clone()),
+                no_skip_ref: None,
+                on_no_skip_ref: false,
+                no_skip_refs_except: vec![],
                 dir: p.dir.clone(),
                 child_env: Some(child),
                 adapter_options: p.adapter_options.clone(),
@@ -690,6 +744,18 @@ impl Verifier<'_> {
         })?;
         info.principal = Some(verified.principal.clone());
         info.fingerprint = Some(verified.fingerprint.clone());
+        if let Some(r) = &self.no_skip_ref
+            && !self
+                .project
+                .policy
+                .skips_on_no_skip_ref(&verified.principal)
+        {
+            return Err(no_skip_ref_failure(
+                r,
+                &verified.principal,
+                &self.project.policy.no_skip_refs_except,
+            ));
+        }
 
         // Statement / predicate shape.
         let st = &verified.statement;
@@ -1275,6 +1341,24 @@ pub fn foreign_extension_shadows(root: &camino::Utf8Path, m: &InputManifest) -> 
     out
 }
 
+/// A candidate signed by a trusted principal that the base policy does not
+/// accept on the current ref (`policy.no_skip_refs` matches it and the
+/// principal is not in `policy.no_skip_refs_except`).
+fn no_skip_ref_failure(r: &str, principal: &str, except: &[String]) -> Failure {
+    Failure::one(
+        "signer",
+        3,
+        format!(
+            "policy.no_skip_refs matches {r} and signer {principal} is not in no_skip_refs_except"
+        ),
+        format!("signed by {principal}"),
+        format!(
+            "on {r} only attestations by {} are accepted (policy.no_skip_refs_except in the base branch's vci.toml)",
+            except.join(", ")
+        ),
+    )
+}
+
 /// Load the plan and print it in `format`.
 pub fn print(res: &PlanResult, format: &str) -> Result<()> {
     match format {
@@ -1573,6 +1657,9 @@ mod tests {
             path: ".".into(),
             adapter: "cargo".into(),
             run_all: run_all.map(str::to_owned),
+            no_skip_ref: None,
+            on_no_skip_ref: false,
+            no_skip_refs_except: vec![],
             dir: camino::Utf8PathBuf::from("/r"),
             child_env: None,
             adapter_options: Default::default(),
@@ -1585,6 +1672,8 @@ mod tests {
             projects: vec![project(Some("listing test files failed"))],
             files: vec![],
             multi: false,
+            config: None,
+            allowed: None,
         };
         let line = summary_line(&res);
         assert!(line.contains("running everything"), "{line}");
@@ -1635,5 +1724,16 @@ mod tests {
                 "entry:src/pkg/__init__.cp314-win_amd64.pyd"
             ]
         );
+    }
+
+    #[test]
+    fn a_signer_outside_no_skip_refs_except_names_itself_and_the_key() {
+        let f = no_skip_ref_failure("refs/heads/main", "dev", &["github-actions".to_owned()]);
+        assert_eq!(f.check, "signer");
+        assert_eq!(
+            f.summary(),
+            "signer: policy.no_skip_refs matches refs/heads/main and signer dev is not in no_skip_refs_except"
+        );
+        assert!(f.details[0].actual.contains("github-actions"));
     }
 }

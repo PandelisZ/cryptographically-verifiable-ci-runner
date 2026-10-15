@@ -114,8 +114,52 @@ What the action does: installs a prebuilt `vci` (checksum pinned in the action) 
 fails the job if any fails, writes `vci-audit.json`).
 
 Inputs (all optional): `base-ref` (default: the PR base commit, or the pushed commit), `command` (`ci` or `plan`),
-`remote` (`origin`), `audit-log` (`vci-audit.json`), `working-directory` (`.`), `prebuilt` (`true`), `token`.
-Outputs: `skipped`, `run`.
+`remote` (`origin`), `audit-log` (`vci-audit.json`), `working-directory` (`.`), `prebuilt` (`true`), `token`,
+`signing-key` (`""`: contents of CI's own SSH private key; see below), `ttl` (`14d`), `push` (`true`; with
+`signing-key`, needs `permissions: contents: write`). Outputs: `skipped`, `run`, `attested`.
+
+## Let CI attest its own runs (optional)
+
+With a key of its own, CI attests what it runs on main and pushes it, so the next commit (main or a pull request)
+skips every unit whose inputs did not change; a README-only commit runs nothing CI already ran. Propose it; the key,
+`allowed_signers`, policy and secret are all the user's to create and merge. Full text: "Attesting in CI" in
+docs/GITHUB_ACTIONS.md.
+
+1. The user makes a key for CI (not in `~/.ssh`, never an agent's or person's key):
+   `ssh-keygen -t ed25519 -N "" -C vci-github-actions -f vci-github-actions`.
+2. Its public half goes in `.vci/allowed_signers` under its own principal:
+   `github-actions namespaces="vci-attest" ssh-ed25519 AAAA...`.
+3. `vci.toml` `[policy]` (or each project's `policy`): keep `no_skip_refs` and add
+   `no_skip_refs_except = ["github-actions"]`. Only that principal's attestations then skip on main; every other
+   signer fails `signer` there (`policy.no_skip_refs matches refs/heads/main and signer <p> is not in
+   no_skip_refs_except`). Default `[]`: main runs everything, as before.
+4. The user creates a GitHub Environment (e.g. `vci-attest`) limited to the default branch and stores the private key
+   as its secret: `gh secret set VCI_SIGNING_KEY --env vci-attest < vci-github-actions`, then deletes the local copy.
+   Never a repository secret: pull request runs can read those.
+5. Merge 2 and 3 to the default branch, then split the workflow: the pull request job unchanged (no key), plus a job
+   for pushes to main:
+
+   ```yaml
+     test-main:
+       runs-on: ubuntu-latest
+       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+       environment: vci-attest
+       permissions:
+         contents: write             # --push writes refs/meta/main
+       steps:
+         # ...the same checkout (fetch-depth: 0) and toolchain steps...
+         - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+           with:
+             signing-key: ${{ secrets.VCI_SIGNING_KEY }}
+   ```
+
+   and `if: github.event_name == 'pull_request'` on the existing job. The action runs `vci ci --key ... --ttl 14d
+   --push --remote origin`; a failed push is a `::warning`, only test failures fail the job, and the audit log lists
+   `attested` units and `pushed`. Without the action: `vci ci --base-ref <sha> --audit-log vci-audit.json --key <file>
+   --push --remote origin` in that job.
+
+Never print, copy or use the CI key yourself, and never add an agent's or person's principal to
+`no_skip_refs_except`.
 
 ## Security rules (do not relax them)
 
@@ -123,7 +167,10 @@ Outputs: `skipped`, `run`.
   own checkout.
 - Leave `base-ref` at its default. Use `pull_request`, not `pull_request_target`.
 - Keep `refs/heads/main` in `policy.no_skip_refs` (the `vci init` default): pushes to main run everything, the
-  backstop against a trusted signer's false claim.
+  backstop against a trusted signer's false claim. `no_skip_refs_except` names only CI's own principal, if anything.
+- CI's signing key lives only in an Environment limited to the default branch and reaches only the main-branch job;
+  one key per repository; rotate by replacing its `allowed_signers` line (then the secret). Whoever holds it can make
+  main skip anything.
 - Run on the hosted runner, not in a `container:` job (root on one side is a toolchain difference).
 - Revoke a signer by removing their line from `.vci/allowed_signers` on the default branch.
 - Without the action, always pass `--remote` to `vci fetch`, and pass
@@ -138,7 +185,9 @@ Outputs: `skipped`, `run`.
 | Everything runs on a pull request | `vci.toml` or `.vci/allowed_signers` not on the base branch; or attestations not pushed (`git ls-remote origin refs/meta/main` is empty) |
 | `failed check: toolchain` | Python, Node, uv, Go, Rust, Ruby, Bundler or package versions differ between laptop and runner |
 | `failed check: inputs` | A file changed after it was attested; `vci explain` names it |
-| `failed check: signer` | Key not in the base commit's `allowed_signers`, or expired |
+| `failed check: signer` | Key not in the base commit's `allowed_signers`, or expired; on main, a signer not in `no_skip_refs_except` |
+| Every push to main still runs everything | `no_skip_refs_except` empty or not merged; CI key not in main's `allowed_signers`; last push's attestations not published (`pushed` in the audit log; job lacks `contents: write`) |
+| `::warning title=vci::not attesting: the key signs as ...` | CI's key reached a non-main run (a pull request): pass it only from the main-only job with the environment |
 | A Go package or cargo target never skips on the runner | Platform-specific code (`_linux.go`, `cfg(target_os)`, `runtime.GOOS`, float maths): accepted only on the same OS/arch |
 | A test reads `CI`, `HOME` or `TMPDIR` | Values differ on a runner; that unit always runs there |
 | No Rails file ever skips | `config/environments/test.rb` reads `ENV["CI"]`; Ruby patchlevel, Bundler, SQLite or tz data differ; `Gemfile.lock` lacks `x86_64-linux` |

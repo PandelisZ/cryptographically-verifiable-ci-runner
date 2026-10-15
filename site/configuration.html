@@ -27,6 +27,8 @@ adapter = "vitest"     <span class="c"># or "pytest", "go", "cargo", "rails"</sp
 [policy]
 <span class="c"># Nothing is skipped on these refs: every merge gets a full run.</span>
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+<span class="c"># ...except what CI's own key attested (see GitHub Actions).</span>
+<span class="c"># no_skip_refs_except = ["github-actions"]</span>
 
 [env]
 mode = "strict"                <span class="c"># undeclared variables are removed</span>
@@ -48,7 +50,8 @@ pass_through = []              <span class="c"># visible, never hashed: secrets 
 <tr><td><code>platform</code></td><td><code>"any"</code></td><td class="wrap">Which OS and architecture may satisfy CI. <code>"any"</code> accepts an attestation from another platform, <code>"same-os"</code> requires the same OS, <code>"exact"</code> requires the same OS and architecture.</td></tr>
 <tr><td><code>max_ttl</code></td><td><code>"30d"</code></td><td class="wrap">Longest accepted attestation lifetime. <code>vci run --ttl</code> sets the lifetime of a new attestation (14 days unless you say otherwise).</td></tr>
 <tr><td><code>allow_dirty</code></td><td><code>true</code></td><td class="wrap">Accept attestations made from a working tree with uncommitted changes. Inputs are hashed by content, not by commit.</td></tr>
-<tr><td><code>no_skip_refs</code></td><td><code>[]</code></td><td class="wrap">Refs on which nothing is ever skipped. <code>vci init</code> writes <code>["refs/heads/main", "refs/tags/**"]</code>. Keep your default branch here: that full run is the backstop against a false claim.</td></tr>
+<tr><td><code>no_skip_refs</code></td><td><code>[]</code></td><td class="wrap">Refs on which nothing is skipped, except what <code>no_skip_refs_except</code> allows. <code>vci init</code> writes <code>["refs/heads/main", "refs/tags/**"]</code>. Keep your default branch here: that full run is the backstop against a false claim.</td></tr>
+<tr><td><code>no_skip_refs_except</code></td><td><code>[]</code></td><td class="wrap"><code>allowed_signers</code> principals whose attestations may still skip on a <code>no_skip_refs</code> ref, such as <code>["github-actions"]</code> for CI's own key (see <a href="github-actions.html#attesting-in-ci">attesting in CI</a>). There, every other signer's attestation fails the <code>signer</code> check. Empty: those refs run everything. List no developer or agent here.</td></tr>
 <tr><td><code>never_skip</code></td><td><code>[]</code></td><td class="wrap">Project-relative globs of test files that always run. Use it for tests whose inputs no collector can see.</td></tr>
 <tr><td><code>go_allow_net</code></td><td><code>false</code></td><td class="wrap">Go: attest packages whose test links package <code>net</code>. See <a href="adapters.html#go">Go</a>.</td></tr>
 <tr><td><code>rails_allow_db</code></td><td><code>false</code></td><td class="wrap">Rails: attest files whose test database is a server. See <a href="adapters.html#rails">Rails</a>.</td></tr>

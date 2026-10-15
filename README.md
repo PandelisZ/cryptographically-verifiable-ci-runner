@@ -124,6 +124,8 @@ In GitHub Actions, after your toolchain setup steps:
 
 The action downloads a prebuilt `vci`, fetches the attestations, prints the plan in the job summary, runs what is left, and fails the job if any of it fails. Setup and security notes: [docs/GITHUB_ACTIONS.md](docs/GITHUB_ACTIONS.md).
 
+CI can attest its own runs too. Give the action a signing key of its own, kept as a secret that only pushes to your default branch can read, and each push to main records what it ran and passed. The next commit then skips every test whose inputs did not change, on main as well as on pull requests, so a commit that only touches the docs runs nothing CI already ran. Setup, and what trusting that key means: [Attesting in CI](docs/GITHUB_ACTIONS.md#attesting-in-ci).
+
 ## Test runners
 
 | Adapter | Unit that can be skipped | Inputs found by |

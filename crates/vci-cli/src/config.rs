@@ -118,6 +118,7 @@ pub struct PolicyOverride {
     pub max_ttl: Option<String>,
     pub allow_dirty: Option<bool>,
     pub no_skip_refs: Option<Vec<String>>,
+    pub no_skip_refs_except: Option<Vec<String>>,
     pub never_skip: Option<Vec<String>>,
     pub go_allow_net: Option<bool>,
     pub rails_allow_db: Option<bool>,
@@ -319,6 +320,12 @@ pub struct Policy {
     /// Refs (globs) on which nothing is ever skipped.
     #[serde(default)]
     pub no_skip_refs: Vec<String>,
+    /// `allowed_signers` principals whose attestations may still produce a
+    /// SKIP on a ref matching `no_skip_refs` (typically the CI key that
+    /// attested the previous commit of the branch). Empty: nothing is
+    /// skipped on those refs.
+    #[serde(default)]
+    pub no_skip_refs_except: Vec<String>,
     /// Test files (project-relative globs) that are never skipped, e.g. files
     /// with dependencies no collector can see (SQLite `ATTACH` behind a
     /// custom authorizer, a C library reading files).
@@ -371,6 +378,7 @@ impl Default for Policy {
             max_ttl: default_max_ttl(),
             allow_dirty: true,
             no_skip_refs: vec![],
+            no_skip_refs_except: vec![],
             never_skip: vec![],
             go_allow_net: false,
             rails_allow_db: false,
@@ -383,6 +391,24 @@ impl Default for Policy {
 impl Policy {
     pub fn max_ttl_secs(&self) -> Result<i64> {
         parse_duration(&self.max_ttl).context("policy.max_ttl")
+    }
+
+    fn check(&self) -> Result<()> {
+        self.max_ttl_secs()?;
+        for p in &self.no_skip_refs_except {
+            if p.is_empty() || p.chars().any(char::is_whitespace) {
+                bail!(
+                    "policy.no_skip_refs_except: {p:?} is not an allowed_signers principal (non-empty, no whitespace)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// On a ref matching `no_skip_refs`, may an attestation by `principal`
+    /// still skip?
+    pub fn skips_on_no_skip_ref(&self, principal: &str) -> bool {
+        self.no_skip_refs_except.iter().any(|p| p == principal)
     }
 
     /// The `never_skip` glob matching a project-relative test path, if any.
@@ -446,7 +472,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        self.policy.max_ttl_secs()?;
+        self.policy.check()?;
         for i in &self.inputs {
             i.check()?;
         }
@@ -515,7 +541,7 @@ impl Config {
         }
         for s in self.project_specs() {
             s.policy
-                .max_ttl_secs()
+                .check()
                 .with_context(|| format!("project {:?}", s.name))?;
         }
         Ok(())
@@ -573,6 +599,9 @@ impl Config {
                     }
                     if let Some(v) = &o.no_skip_refs {
                         policy.no_skip_refs = v.clone();
+                    }
+                    if let Some(v) = &o.no_skip_refs_except {
+                        policy.no_skip_refs_except = v.clone();
                     }
                     if let Some(v) = &o.never_skip {
                         policy.never_skip = v.clone();
@@ -641,6 +670,9 @@ allow_dirty = true
 # Refs on which nothing is ever skipped (globs; "*" stays within a segment).
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# allowed_signers principals whose attestations still skip on those refs, e.g.
+# the CI key that attested the previous commit of main (`vci ci --key`).
+# no_skip_refs_except = ["github-actions"]
 # Test files (globs) that are never skipped.
 never_skip = []
 
@@ -675,6 +707,9 @@ allow_dirty = true
 # Refs on which nothing is ever skipped (globs; "*" stays within a segment).
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# allowed_signers principals whose attestations still skip on those refs, e.g.
+# the CI key that attested the previous commit of main (`vci ci --key`).
+# no_skip_refs_except = ["github-actions"]
 # Test files (project-relative globs) that are never skipped, e.g. files whose
 # inputs no collector can see (see "pytest limitations" in docs/REFERENCE.md).
 never_skip = []
@@ -709,6 +744,9 @@ allow_dirty = true
 # Refs on which nothing is ever skipped (globs; "*" stays within a segment).
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# allowed_signers principals whose attestations still skip on those refs, e.g.
+# the CI key that attested the previous commit of main (`vci ci --key`).
+# no_skip_refs_except = ["github-actions"]
 # Packages (project-relative directories, globs) that are never skipped.
 never_skip = []
 # Attest packages whose tests link package net (testify's assert imports
@@ -745,6 +783,9 @@ allow_dirty = true
 # Refs on which nothing is ever skipped (globs; "*" stays within a segment).
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# allowed_signers principals whose attestations still skip on those refs, e.g.
+# the CI key that attested the previous commit of main (`vci ci --key`).
+# no_skip_refs_except = ["github-actions"]
 # Units (project-relative ids such as "crates/a#test:it", globs) that are never skipped.
 never_skip = []
 
@@ -794,6 +835,9 @@ allow_dirty = true
 # Refs on which nothing is ever skipped (globs; "*" stays within a segment).
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# allowed_signers principals whose attestations still skip on those refs, e.g.
+# the CI key that attested the previous commit of main (`vci ci --key`).
+# no_skip_refs_except = ["github-actions"]
 # Test files (project-relative globs) that are never skipped.
 never_skip = []
 # Attest files whose test database is a server (PostgreSQL, MySQL) instead of
@@ -842,6 +886,9 @@ allow_dirty = true
 # Refs on which nothing is ever skipped (globs; "*" stays within a segment).
 # Pushes to the default branch and tags run everything.
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+# allowed_signers principals whose attestations still skip on those refs, e.g.
+# the CI key that attested the previous commit of main (`vci ci --key`).
+# no_skip_refs_except = ["github-actions"]
 # Test files (project-relative globs) that are never skipped.
 never_skip = []
 node_exact = false
@@ -898,7 +945,33 @@ mod tests {
                 "{refs:?}"
             );
             assert!(!refs.iter().any(|r| glob_match(r, "refs/heads/feature")));
+            // No exception unless the user names one (commented example).
+            assert!(c.project_specs()[0].policy.no_skip_refs_except.is_empty());
+            assert!(t.contains("# no_skip_refs_except = [\"github-actions\"]"));
         }
+    }
+
+    #[test]
+    fn no_skip_refs_except_names_principals_and_can_be_overridden() {
+        let c = Config::parse(
+            "[policy]\nno_skip_refs = [\"refs/heads/main\"]\nno_skip_refs_except = [\"github-actions\"]\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"pytest\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"pytest\"\n[projects.policy]\nno_skip_refs_except = []\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].policy.no_skip_refs_except, ["github-actions"]);
+        assert!(s[0].policy.skips_on_no_skip_ref("github-actions"));
+        assert!(!s[0].policy.skips_on_no_skip_ref("dev@example.com"));
+        assert!(s[1].policy.no_skip_refs_except.is_empty());
+        assert!(!s[1].policy.skips_on_no_skip_ref("github-actions"));
+        assert!(Config::parse("[policy]\nno_skip_refs_except = [\"a b\"]").is_err());
+        assert!(Config::parse("[policy]\nno_skip_refs_except = [\"\"]").is_err());
+        assert!(Config::parse("[policy]\nno_skip_ref_except = [\"a\"]").is_err());
+        assert!(
+            Config::parse(
+                "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"pytest\"\n[projects.policy]\nno_skip_refs_except = [\"a b\"]\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

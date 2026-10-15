@@ -41,6 +41,25 @@ jobs:
       - name: Plan, then run what is not attested
         run: vci ci --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" --audit-log vci-audit.json
 
+      # To have CI attest what it runs, so that the next commit skips every
+      # unit whose inputs did not change (docs/GITHUB_ACTIONS.md, "Attesting
+      # in CI"; needs a vci release that has `vci ci --key`): run this job
+      # only on pull requests (if: github.event_name == 'pull_request') and
+      # give pushes to main a copy of it with
+      #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      #   environment: vci-attest   # VCI_SIGNING_KEY exists only here
+      #   permissions:
+      #     contents: write         # --push writes refs/meta/main
+      # whose step above becomes:
+      # - name: Run what is not attested, attest it, publish it
+      #   env:
+      #     KEY: ${{ secrets.VCI_SIGNING_KEY }}
+      #   run: |
+      #     trap 'rm -f "$RUNNER_TEMP/vci-key"' EXIT
+      #     (umask 077 && printf '%s\n' "$KEY" > "$RUNNER_TEMP/vci-key")
+      #     vci ci --base-ref "${{ github.sha }}" --audit-log vci-audit.json \
+      #       --key "$RUNNER_TEMP/vci-key" --push --remote origin
+
       - name: Upload the audit log of skipped tests
         if: always()
         uses: actions/upload-artifact@v4

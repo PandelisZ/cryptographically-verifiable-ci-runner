@@ -1004,12 +1004,82 @@ fn resolve_files(args: &[String], files: &[TestFile]) -> Result<BTreeSet<usize>>
     Ok(out)
 }
 
+/// Which units [`run_units`] runs.
+pub enum Selection {
+    /// `vci run`'s arguments (paths relative to the current directory,
+    /// `<package dir>#<target>`); empty: every unit of every project.
+    Args(Vec<String>),
+    /// Per project (index into the configuration's projects): `None` runs
+    /// every unit of the project, `Some(ids)` the units with these test ids
+    /// (each must be listed by the project). Projects not named are not run.
+    Units(BTreeMap<usize, Option<BTreeSet<String>>>),
+}
+
+/// A unit [`run_units`] attested.
+#[derive(Debug, Clone)]
+pub struct AttestedUnit {
+    pub test_id: String,
+    /// `[[projects]]` name; empty in the single-project form.
+    pub project: String,
+}
+
+/// What [`run_units`] did.
+#[derive(Default)]
+pub struct RunOutcome {
+    /// Non-zero when a test failed (refusals to attest do not count).
+    pub exit: i32,
+    pub attested: Vec<AttestedUnit>,
+    /// Problems that did not stop the other projects or units (a project
+    /// that could not be listed or run, a unit that could not be signed or
+    /// stored), in order. Once a test has run, [`run_units`] reports a
+    /// problem here instead of failing, so what it already signed and
+    /// stored is always in [`RunOutcome::attested`].
+    pub errors: Vec<String>,
+    /// Projects (indexes into the configuration's projects) whose tests did
+    /// not run because listing or starting them failed: no verdict, nothing
+    /// attested. `vci ci` runs them without attesting.
+    pub unrun: BTreeSet<usize>,
+}
+
 pub fn run(args: RunArgs) -> Result<i32> {
     let (repo, root) = open_repo()?;
     let config = working_tree_config(&root)?;
-    let ttl = parse_duration(&args.ttl).context("--ttl")?;
+    let out = run_units(
+        repo,
+        root,
+        config,
+        Selection::Args(args.files),
+        args.key.as_deref(),
+        &args.ttl,
+        args.summary.as_deref(),
+    )?;
+    if !out.errors.is_empty() {
+        bail!(
+            "{} problem(s) during the run (the rest ran): {}",
+            out.errors.len(),
+            out.errors.join("; ")
+        );
+    }
+    Ok(out.exit)
+}
+
+/// `vci run`'s work, for `vci run` and `vci ci --key`: run `selection` with
+/// the collectors (one process per unit where the adapter does so), record
+/// each unit's inputs, and sign and store an attestation for every unit that
+/// passed and is provably attestable. `config` decides the projects (`vci
+/// run`: the working tree's; `vci ci`: the one its plan was made from).
+pub fn run_units(
+    repo: vci_git::Repo,
+    root: Utf8PathBuf,
+    config: crate::config::Config,
+    selection: Selection,
+    key: Option<&Utf8Path>,
+    ttl_arg: &str,
+    summary: Option<&Utf8Path>,
+) -> Result<RunOutcome> {
+    let ttl = parse_duration(ttl_arg).context("--ttl")?;
     let ctx = Ctx::new(repo, root.clone(), config)?;
-    let key = keys::discover(args.key.as_deref(), &root)?;
+    let key = keys::discover(key, &root)?;
     let signer = key.signer_id();
 
     let base = PredicateBase {
@@ -1033,13 +1103,19 @@ pub fn run(args: RunArgs) -> Result<i32> {
     // directory), so another project's missing toolchain does not matter.
     // Projects nested in each other are all listed, so a unit two projects
     // list is still found ambiguous.
-    let wanted = if args.files.is_empty() {
-        None
-    } else {
-        unit_paths(&args.files)
+    let wanted = match &selection {
+        Selection::Args(a) if !a.is_empty() => unit_paths(a),
+        _ => None,
     };
     let mut files: Vec<TestFile> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut unrun: BTreeSet<usize> = BTreeSet::new();
     for (i, p) in ctx.projects.iter().enumerate() {
+        if let Selection::Units(u) = &selection
+            && !u.contains_key(&i)
+        {
+            continue;
+        }
         if let Some(paths) = &wanted {
             let dir = p
                 .adapter
@@ -1053,16 +1129,44 @@ pub fn run(args: RunArgs) -> Result<i32> {
         let listed = p
             .adapter
             .list_test_files(&children[i].to_child_env())
-            .with_context(|| format!("listing the test files of {}", p.label()))?;
-        files.extend(p.test_files(i, listed)?);
+            .map_err(anyhow::Error::from)
+            .and_then(|l| p.test_files(i, l))
+            .with_context(|| format!("listing the test files of {}", p.label()));
+        match listed {
+            Ok(f) => files.extend(f),
+            // `vci ci`: one project that cannot be listed does not stop the
+            // others from being attested (it runs without attesting).
+            Err(e) if matches!(selection, Selection::Units(_)) => {
+                let msg = format!("{e:#}");
+                eprintln!("vci: error: {msg}");
+                errors.push(msg);
+                unrun.insert(i);
+            }
+            Err(e) => return Err(e),
+        }
     }
     mark_cross_project_ambiguity(&mut files);
-    let selected: BTreeSet<usize> = if args.files.is_empty() {
-        (0..files.len()).collect()
-    } else {
-        resolve_files(&args.files, &files)?
+    let selected: BTreeSet<usize> = match &selection {
+        Selection::Args(a) if a.is_empty() => (0..files.len()).collect(),
+        Selection::Args(a) => resolve_files(a, &files)?,
+        Selection::Units(u) => {
+            let listed: BTreeMap<usize, Option<BTreeSet<String>>> = u
+                .iter()
+                .filter(|(i, _)| !unrun.contains(i))
+                .map(|(i, ids)| (*i, ids.clone()))
+                .collect();
+            select_units(&ctx, &listed, &files)?
+        }
     };
     if selected.is_empty() {
+        if let Selection::Units(_) = selection {
+            return Ok(RunOutcome {
+                exit: 0,
+                attested: vec![],
+                errors,
+                unrun,
+            });
+        }
         bail!("no test files to run");
     }
     let involved: BTreeSet<usize> = selected.iter().map(|&i| files[i].project).collect();
@@ -1072,7 +1176,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         if ttl > max {
             bail!(
                 "--ttl {} exceeds policy.max_ttl {} of {}; such attestations would be rejected",
-                args.ttl,
+                ttl_arg,
                 p.policy.max_ttl,
                 p.label()
             );
@@ -1144,12 +1248,42 @@ pub fn run(args: RunArgs) -> Result<i32> {
         // Go's test log does not report removals, renames or new
         // directories: any change to the repository during the run refuses
         // every package of the run (the change cannot be attributed).
-        let go_tree = if project.adapter.name() == "go" {
-            Some(TreeStat::snapshot(&root)?)
-        } else {
-            None
+        let started = (|| -> Result<_> {
+            let go_tree = if project.adapter.name() == "go" {
+                Some(TreeStat::snapshot(&root)?)
+            } else {
+                None
+            };
+            let out = project.adapter.run_collect(&rels, &child.to_child_env())?;
+            Ok((go_tree, out))
+        })();
+        // A project whose run could not be started or collected has no
+        // verdict: the other projects still run and are attested (what was
+        // signed and stored is reported), and `vci ci` runs this one without
+        // attesting.
+        let (go_tree, out) = match started {
+            Ok(x) => x,
+            Err(e) => {
+                let msg = format!(
+                    "running the tests of {} with the collectors: {e:#}",
+                    project.label()
+                );
+                eprintln!("vci: error: {msg}");
+                errors.push(msg);
+                unrun.insert(pi);
+                let why = "the run with the collectors could not be started or collected";
+                for f in &mine {
+                    refused += 1;
+                    outcomes.push(UnitOutcome::refused(
+                        f.test_id.as_str(),
+                        project,
+                        why.to_owned(),
+                        vec![why.to_owned()],
+                    ));
+                }
+                continue;
+            }
         };
-        let out = project.adapter.run_collect(&rels, &child.to_child_env())?;
         let tree_changed: Option<String> = match &go_tree {
             None => None,
             Some(t) => match t.changes() {
@@ -1272,20 +1406,39 @@ pub fn run(args: RunArgs) -> Result<i32> {
                         }
                     }
                     let skey = storage_key(p);
-                    let value = serde_json::to_value(p)?;
-                    let mut digest = std::collections::BTreeMap::new();
-                    digest.insert("blake3".to_owned(), p.core.input_root.clone());
-                    let stmt = Statement::new(
-                        vec![Subject {
-                            name: p.core.test_id.clone(),
-                            digest,
-                        }],
-                        PREDICATE_TYPE,
-                        value,
-                    );
-                    let env = sign_statement(&stmt, &key.path)
-                        .with_context(|| format!("signing with {}", key.path))?;
-                    let stored = store.put(&p.core.test_id, &signer, &skey, &env.to_json())?;
+                    let signed = (|| -> Result<_> {
+                        let value = serde_json::to_value(p)?;
+                        let mut digest = std::collections::BTreeMap::new();
+                        digest.insert("blake3".to_owned(), p.core.input_root.clone());
+                        let stmt = Statement::new(
+                            vec![Subject {
+                                name: p.core.test_id.clone(),
+                                digest,
+                            }],
+                            PREDICATE_TYPE,
+                            value,
+                        );
+                        let env = sign_statement(&stmt, &key.path)
+                            .with_context(|| format!("signing with {}", key.path))?;
+                        Ok(store.put(&p.core.test_id, &signer, &skey, &env.to_json())?)
+                    })();
+                    let stored = match signed {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let msg = format!("{label}: {e:#}");
+                            eprintln!("vci: error: not attesting {msg}");
+                            errors.push(msg);
+                            refused += 1;
+                            let why = format!("signing or storing failed: {e:#}");
+                            outcomes.push(UnitOutcome::refused(
+                                &label,
+                                project,
+                                why,
+                                vec!["signing or storing failed".to_owned()],
+                            ));
+                            continue;
+                        }
+                    };
                     attested += 1;
                     outcomes.push(UnitOutcome {
                         test_id: label.clone(),
@@ -1329,12 +1482,60 @@ pub fn run(args: RunArgs) -> Result<i32> {
             eprintln!("vci:   {n:>w$} {reason}");
         }
     }
-    if let Some(path) = &args.summary {
+    if let Some(path) = summary {
         let mut text = serde_json::to_string_pretty(&summary_json(&outcomes))?;
         text.push('\n');
         std::fs::write(path, text).with_context(|| format!("writing --summary {path}"))?;
     }
-    Ok(exit.unwrap_or(1))
+    Ok(RunOutcome {
+        exit: exit.unwrap_or(1),
+        errors,
+        unrun,
+        attested: outcomes
+            .into_iter()
+            .filter(|o| o.attested)
+            .map(|o| AttestedUnit {
+                test_id: o.test_id,
+                project: o.project.unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
+/// The units [`Selection::Units`] names, as indexes into `files`. A test id
+/// the project does not list is an error: the caller planned to run it, and
+/// it must not silently go unrun.
+fn select_units(
+    ctx: &Ctx,
+    units: &BTreeMap<usize, Option<BTreeSet<String>>>,
+    files: &[TestFile],
+) -> Result<BTreeSet<usize>> {
+    let mut out = BTreeSet::new();
+    for (&pi, ids) in units {
+        let Some(project) = ctx.projects.get(pi) else {
+            bail!("no project #{pi} in the configuration");
+        };
+        let mine = files.iter().enumerate().filter(|(_, f)| f.project == pi);
+        match ids {
+            None => out.extend(mine.map(|(i, _)| i)),
+            Some(ids) => {
+                let hits: BTreeMap<&str, usize> =
+                    mine.map(|(i, f)| (f.test_id.as_str(), i)).collect();
+                for id in ids {
+                    match hits.get(id.as_str()) {
+                        Some(&i) => {
+                            out.insert(i);
+                        }
+                        None => bail!(
+                            "{id} is not a test unit of {} (not listed by the test runner)",
+                            project.label()
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

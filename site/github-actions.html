@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GitHub Actions · vci</title>
-<meta name="description" content="Add the vci action to a GitHub Actions workflow: one line, the setup steps per runner, inputs, pinning, security rules and troubleshooting.">
+<meta name="description" content="Add the vci action to a GitHub Actions workflow: one line, the setup steps per runner, inputs, attesting CI's own runs, pinning, security rules and troubleshooting.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -30,7 +30,7 @@
 <ol>
 <li><code>vci.toml</code> and <code>.vci/allowed_signers</code> are merged to your default branch (<a href="get-started.html#set-up-a-repository">setup guide</a>).</li>
 <li><code>.git-meta</code> (written by <code>vci init</code>) is committed.</li>
-<li>Attestations are pushed with <code>vci push</code> before, or together with, the branch.</li>
+<li>Attestations are pushed with <code>vci push</code> before, or together with, the branch. With a <code>signing-key</code>, CI also attests and pushes what it runs (see <a href="#attesting-in-ci">attesting in CI</a>).</li>
 </ol>
 
 <h2 id="workflow">A complete workflow</h2>
@@ -131,6 +131,7 @@ jobs:
 <li>Runs <code>vci fetch --remote origin</code>. This fetches <code>refs/meta/main</code>, the git ref where attestations live. A <code>contents: read</code> token is enough. If the fetch fails, it warns and every test runs.</li>
 <li>Runs <code>vci plan</code> and writes the plan to the job summary.</li>
 <li>Runs <code>vci ci</code>: it runs every unit that was not skipped and writes an audit log. The job fails if any test fails.</li>
+<li>With <code>signing-key</code>: it attests every unit that ran and passed, and pushes the attestations to <code>refs/meta/main</code>, so the next commit skips each unit whose inputs did not change. See <a href="#attesting-in-ci">attesting in CI</a>.</li>
 </ol>
 
 <h2>Inputs and outputs</h2>
@@ -144,12 +145,123 @@ jobs:
 <tr><td><code>working-directory</code></td><td><code>.</code></td><td class="wrap">Directory to run <code>vci</code> from</td></tr>
 <tr><td><code>prebuilt</code></td><td><code>true</code></td><td class="wrap">Download the release binary; <code>false</code> always builds from source</td></tr>
 <tr><td><code>token</code></td><td><code>github.token</code></td><td class="wrap">Token used to download the release binary</td></tr>
+<tr><td><code>signing-key</code></td><td><code>""</code></td><td class="wrap">Contents of an SSH private key, from an environment secret limited to the default branch. <code>vci ci</code> then attests what it runs. Its public half must be in <code>.vci/allowed_signers</code> on the base branch, under a principal listed in <code>policy.no_skip_refs_except</code> for main to skip on it. See <a href="#attesting-in-ci">attesting in CI</a></td></tr>
+<tr><td><code>ttl</code></td><td><code>14d</code></td><td class="wrap">Lifetime of those attestations (at most <code>policy.max_ttl</code>)</td></tr>
+<tr><td><code>push</code></td><td><code>true</code></td><td class="wrap">With <code>signing-key</code>: push the attestations to <code>remote</code>. Needs <code>permissions: contents: write</code>; a failed push is a warning</td></tr>
 </table>
 <table>
 <tr><th>Output</th><th>Meaning</th></tr>
 <tr><td><code>skipped</code></td><td>Number of test units skipped</td></tr>
 <tr><td><code>run</code></td><td>Number of test units that ran</td></tr>
+<tr><td><code>attested</code></td><td>Number of test units attested with <code>signing-key</code></td></tr>
 </table>
+
+<h2 id="attesting-in-ci">Attesting in CI</h2>
+<p>Without a key, CI only consumes attestations, and every push to main runs the whole suite. With one, CI leaves attestations of its own behind: a push to main runs what is not attested (the first time, everything) and attests every unit that passed, so the next commit, on main or on a pull request, skips each unit whose inputs did not change.</p>
+<ul>
+<li><strong>Commit A</strong> on main: nothing is attested yet, so every unit runs. CI attests them and pushes the attestations to <code>refs/meta/main</code>.</li>
+<li><strong>Commit B</strong> changes <code>src/b.ts</code>: only <code>src/b.test.ts</code> reads it, so only that file runs (and is attested). Everything else skips on A's attestations, which are keyed by inputs, not by commit.</li>
+<li><strong>Commit C</strong> changes only the README: every unit skips. <code>vci ci</code> prints <code>nothing to run</code> and the job never starts the test runner.</li>
+</ul>
+<p>Units that fail, or that <code>vci run</code> would refuse to attest, still run on every commit. Each attestation expires after <code>ttl</code>, and its unit then runs, and is attested, again.</p>
+
+<ol class="steps">
+<li>
+  <h3>Make a key for CI</h3>
+  <p>Outside <code>~/.ssh</code>: it is not yours. Trust it under its own principal:</p>
+<pre><code>ssh-keygen -t ed25519 -N "" -C vci-github-actions -f vci-github-actions
+echo "github-actions namespaces=\"vci-attest\" $(cut -d' ' -f1,2 vci-github-actions.pub)" &gt;&gt; .vci/allowed_signers</code></pre>
+</li>
+<li>
+  <h3>Let that principal skip on main</h3>
+  <p>Keep <code>no_skip_refs</code> and name the principal in <code>no_skip_refs_except</code>. Main then skips what CI attested and still runs everything any other signer claims.</p>
+<pre><code>[policy]
+no_skip_refs = ["refs/heads/main", "refs/tags/**"]
+no_skip_refs_except = ["github-actions"]</code></pre>
+</li>
+<li>
+  <h3>Store the key in an environment</h3>
+  <p>Create a GitHub Environment whose deployment branches are limited to the default branch, and store the private key as its secret <code>VCI_SIGNING_KEY</code>. In Settings → Environments, or:</p>
+<pre><code>gh api -X PUT 'repos/{owner}/{repo}/environments/vci-attest' \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST 'repos/{owner}/{repo}/environments/vci-attest/deployment-branch-policies' -f name=main
+gh secret set VCI_SIGNING_KEY --env vci-attest &lt; vci-github-actions
+rm vci-github-actions      <span class="c"># the secret is now the only copy; keep the .pub</span></code></pre>
+  <p>Not a repository secret (<code>gh secret set</code> without <code>--env</code>): every pull request run from a branch of the repository can read those.</p>
+</li>
+<li>
+  <h3>Merge steps 1 and 2 to the default branch</h3>
+  <p>Trust and policy come from the base commit. A push to main reads them from the pushed commit itself, so the push that adds them already runs, attests and publishes everything.</p>
+</li>
+<li>
+  <h3>Pass the key only on pushes to main</h3>
+  <p>From a job that names the environment and may write (<code>contents: write</code>: <code>vci ci --push</code> publishes <code>refs/meta/main</code> with the checkout's credentials). Pull requests run a job without the key and only consume attestations.</p>
+</li>
+</ol>
+
+<p>A complete workflow (Vitest; for other runners, swap the toolchain steps for <a href="#setup-steps-for-each-runner">the ones above</a>):</p>
+<pre><code>name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  <span class="c"># Pull requests: skip what is attested, run the rest. No key, read-only.</span>
+  test:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      <span class="c"># the base commit must be available</span>
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+
+  <span class="c"># Pushes to main: run what is not attested, attest it, publish it.</span>
+  test-main:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main'
+    environment: vci-attest   <span class="c"># the only place VCI_SIGNING_KEY exists</span>
+    permissions:
+      contents: write         <span class="c"># git-meta pushes refs/meta/main with the checkout's credentials</span>
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+        with:
+          signing-key: ${{ secrets.VCI_SIGNING_KEY }}
+          <span class="c"># ttl: 14d          # lifetime of CI's attestations (at most policy.max_ttl)</span>
+          <span class="c"># push: true        # publish them on refs/meta/main (a failed push is a warning)</span></code></pre>
+<p>With <code>signing-key</code>, the action writes the key to <code>$RUNNER_TEMP/vci-key</code> (mode 600, never printed), runs <code>vci ci --key ... --ttl 14d --push --remote origin</code>, removes the key file and sets the output <code>attested</code>. Only test failures fail the job; a failed push is a warning.</p>
+
+<h3 id="why-an-environment">Why an environment</h3>
+<p>A <code>pull_request</code> run uses the branch's own copy of the workflow, so no <code>if:</code> in the workflow can keep a repository secret from anyone who can push a branch. The environment's branch rule is enforced by GitHub, outside the workflow. Without it, a branch's run could sign as <code>github-actions</code>, and after a merge main would skip units whose code only that branch ran.</p>
+<p>As a second line, <code>vci ci --key</code> attests nothing (a warning; the tests still run and nothing is pushed) when the key's principal is in <code>no_skip_refs_except</code> and the current ref does not match <code>no_skip_refs</code>. That catches a misconfigured workflow, not a branch that changes it. To attest pull request runs too, give them a different key whose principal is not in <code>no_skip_refs_except</code>: main never skips on its word.</p>
+
+<h3 id="what-the-key-is-shared-with">What the key is shared with</h3>
+<p>Every process of the job runs as the same user, so the tests, every test dependency and every other step of that job can read the key file while it exists. Whoever copies it can make main skip any unit until its line is removed. Treat it as a credential your locked dependencies share:</p>
+<ul>
+<li>keep it in the restricted environment, one key per repository, never an organization secret;</li>
+<li>keep <code>ttl</code> short;</li>
+<li>rotate by replacing its line in <code>.vci/allowed_signers</code> on the default branch, then the secret, and do so whenever a dependency of the attested job is found compromised. Its attestations stop counting the moment the line is gone;</li>
+<li>list no developer or agent principal in <code>no_skip_refs_except</code>.</li>
+</ul>
 
 <h2 id="pinning">Pinning</h2>
 <p>The action is the verifier, so choose how far it may move:</p>
@@ -171,7 +283,7 @@ jobs:
 <li><strong>Pin the action.</strong> It is the verifier (see <a href="#pinning">pinning</a>).</li>
 <li><strong>Never build <code>vci</code> from the pull request's own checkout.</strong> The pull request could change the verifier that checks it.</li>
 <li><strong>Leave <code>base-ref</code> at its default</strong>, unless you know the ref is outside the pull request's control.</li>
-<li><strong>Keep <code>refs/heads/main</code> in <code>policy.no_skip_refs</code>.</strong> Pushes to the default branch then run everything.</li>
+<li><strong>Keep <code>refs/heads/main</code> in <code>policy.no_skip_refs</code>.</strong> Pushes to the default branch then run everything. <code>policy.no_skip_refs_except</code> lets only CI's own key skip there (see <a href="#attesting-in-ci">attesting in CI</a>); list no developer or agent principal in it.</li>
 <li><strong>Use <code>pull_request</code>, not <code>pull_request_target</code>.</strong> Fork pull requests cannot push attestations, so every test runs for them.</li>
 <li><strong>Revoke a signer</strong> by removing their line from <code>.vci/allowed_signers</code> on the default branch.</li>
 <li><strong>Without the action, always pass <code>--remote</code></strong> to <code>vci fetch</code>, so the checkout never chooses where attestations come from.</li>
@@ -181,7 +293,7 @@ jobs:
 <p><code>vci push</code> writes <code>refs/meta/main</code>. Anyone with push access to the repository can write, overwrite or delete metadata there.</p>
 <p>That is safe by design. An attestation only counts when its signature verifies against a key in the base commit's <code>.vci/allowed_signers</code>, and it matches the unit, repository, toolchain and inputs exactly. A deleted or overwritten attestation only makes its unit run.</p>
 <p>Anyone who can push metadata can also turn on git-meta's auto-prune or filter rules for everyone. Pruned attestations only make their units run, and <code>vci fetch</code> warns about such settings in the action's log.</p>
-<p>To limit who may write, add a repository ruleset on <code>refs/meta/**</code>.</p>
+<p>To limit who may write, add a repository ruleset on <code>refs/meta/**</code>. When CI attests its own runs, let the main-branch job's token through it.</p>
 
 <h2>Without the action</h2>
 <pre><code>      - name: Install vci
@@ -210,6 +322,9 @@ jobs:
 <tr><td class="wrap"><code>failed check: toolchain</code></td><td class="wrap">Python, Node, uv, Ruby, Bundler or package versions differ between the laptop and the runner</td></tr>
 <tr><td class="wrap"><code>failed check: inputs</code></td><td class="wrap">A file the test depends on changed after it was attested; <code>vci explain</code> names it</td></tr>
 <tr><td class="wrap"><code>failed check: signer</code></td><td class="wrap">The signing key is not in the base commit's <code>allowed_signers</code>, or it has expired</td></tr>
+<tr><td class="wrap"><code>failed check: signer</code> on main: <code>... is not in no_skip_refs_except</code></td><td class="wrap">Expected: on a ref in <code>no_skip_refs</code> only the principals in <code>no_skip_refs_except</code> (CI's key) can skip</td></tr>
+<tr><td class="wrap">Every push to main still runs everything</td><td class="wrap"><code>no_skip_refs_except</code> is empty or not on main yet, CI's key is not in main's <code>allowed_signers</code>, or the previous push's attestations were not published (<code>pushed</code> in the audit log; the job needs <code>contents: write</code>)</td></tr>
+<tr><td class="wrap"><code>not attesting: the key signs as github-actions ...</code></td><td class="wrap">CI's key reached a run on a ref outside <code>no_skip_refs</code>, such as a pull request: pass it only from the main-branch job with the environment</td></tr>
 <tr><td class="wrap">A Go package or cargo target never skips on the runner</td><td class="wrap">Its code depends on the platform (build tags, <code>_linux.go</code> files, <code>cfg(target_os)</code>, <code>runtime.GOOS</code>, floating-point maths); such units are only accepted on the same OS and architecture</td></tr>
 <tr><td class="wrap">A test reads <code>CI</code>, <code>HOME</code> or <code>USER</code></td><td class="wrap">Those values differ on a runner, so that file always runs there</td></tr>
 <tr><td class="wrap">No Rails test file ever skips on the runner</td><td class="wrap">See <a href="adapters.html#getting-skips-on-a-linux-runner">Rails: laptop to Linux runner</a></td></tr>

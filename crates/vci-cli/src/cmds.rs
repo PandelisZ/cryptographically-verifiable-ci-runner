@@ -20,13 +20,278 @@ pub const CI_SNIPPET_RAILS: &str = include_str!("../../../examples/github-action
 pub const CI_SNIPPET_NODE_TEST: &str =
     include_str!("../../../examples/github-actions-node-test.yml");
 
-pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i32> {
+/// `vci ci`'s options.
+pub struct CiArgs {
+    pub base_ref: Option<String>,
+    pub audit_log: Option<Utf8PathBuf>,
+    /// Attest what runs (as `vci run --key`).
+    pub key: Option<Utf8PathBuf>,
+    pub ttl: String,
+    /// Publish the attestations afterwards (as `vci push`).
+    pub push: bool,
+    pub remote: Option<String>,
+}
+
+pub fn ci(args: CiArgs) -> Result<i32> {
     let res = plan(&PlanOptions {
-        base_ref,
+        base_ref: args.base_ref.clone(),
         only: None,
     })?;
     print(&res, "text")?;
     let (repo, root) = open_repo()?;
+    let mut attested: Vec<crate::run::AttestedUnit> = Vec::new();
+    let mut attest_errors: Vec<String> = Vec::new();
+    // Why nothing was attested on purpose (and nothing is pushed).
+    let mut not_attested: Option<String> = None;
+    let code = match &args.key {
+        None => run_plain(&res, &root, None)?,
+        Some(key) => match run_attested(&res, key, &args.ttl) {
+            Ok(Attempt::Ran(out)) => {
+                for e in &out.errors {
+                    github_warning(&format!("attesting: {e}"));
+                }
+                let mut code = out.exit;
+                // Projects whose tests did not run with the collectors (no
+                // verdict yet): run them, and only them, without attesting.
+                // What already ran is neither run again nor forgotten.
+                if !out.unrun.is_empty() {
+                    let c = run_plain(&res, &root, Some(&out.unrun))?;
+                    if code == 0 {
+                        code = c;
+                    }
+                }
+                attested = out.attested;
+                attest_errors = out.errors;
+                code
+            }
+            Ok(Attempt::NotAttested(why)) => {
+                github_warning(&format!("not attesting: {why}"));
+                not_attested = Some(why);
+                run_plain(&res, &root, None)?
+            }
+            // Nothing has run yet (run_units reports what fails after a test
+            // ran in RunOutcome::errors instead).
+            Err(e) => {
+                let msg = format!(
+                    "could not run the tests with attestation ({e:#}); running them without attesting"
+                );
+                github_warning(&msg);
+                attest_errors.push(format!("{e:#}"));
+                not_attested = Some(msg);
+                run_plain(&res, &root, None)?
+            }
+        },
+    };
+    let push_wanted = args.push && not_attested.is_none();
+    if args.key.is_some() {
+        eprintln!(
+            "vci ci: {} unit(s) attested{}",
+            attested.len(),
+            if push_wanted {
+                ""
+            } else if args.push {
+                " (nothing to push)"
+            } else {
+                " (stored locally; publish with `vci push`)"
+            }
+        );
+    }
+    let pushed = if push_wanted {
+        // Best effort: CI's result is the tests', never the publication's.
+        match push(args.remote.as_deref()) {
+            Ok(_) => Some(true),
+            Err(e) => {
+                github_warning(&format!(
+                    "could not push attestations{}: {e:#}",
+                    args.remote
+                        .as_deref()
+                        .map(|r| format!(" to {}", redact_userinfo(r)))
+                        .unwrap_or_default()
+                ));
+                Some(false)
+            }
+        }
+    } else {
+        None
+    };
+
+    let now = now_unix();
+    let log = json!({
+        "time": rfc3339(now),
+        "head": repo.head_commit().ok(),
+        "baseRef": res.base_ref,
+        "baseCommit": res.base_commit,
+        "runAll": res.run_all,
+        "warnings": res.warnings,
+        "projects": res.projects,
+        "skipped": res.skipped().map(|f| json!({
+            "testId": f.test_id,
+            "project": f.project,
+            "reason": f.reason,
+            "by": f.by,
+        })).collect::<Vec<_>>(),
+        "ran": res.to_run().map(|f| json!({"testId": f.test_id, "project": f.project, "reason": f.reason})).collect::<Vec<_>>(),
+        "attested": attested.iter().map(|a| json!({"testId": a.test_id, "project": a.project})).collect::<Vec<_>>(),
+        "attestErrors": attest_errors,
+        "notAttested": not_attested,
+        "pushed": pushed,
+        "exitCode": code,
+    });
+    let path = args
+        .audit_log
+        .unwrap_or_else(|| root.join(format!(".vci/out/audit-{now}.json")));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&log)?)?;
+    eprintln!("vci ci: audit log written to {path}");
+    Ok(code)
+}
+
+/// A warning for the log and, on GitHub Actions, an annotation (a workflow
+/// command: one line, `%`, CR and LF escaped).
+fn github_warning(msg: &str) {
+    let escaped = msg
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    println!("::warning title=vci::{escaped}");
+}
+
+/// The label `vci ci` prints for a project of a multi-project plan.
+fn job_label(p: &crate::plan::ProjectPlan) -> String {
+    if p.name.is_empty() {
+        p.path.clone()
+    } else {
+        p.name.clone()
+    }
+}
+
+/// What [`run_attested`] did.
+enum Attempt {
+    /// The tests ran with the collectors (`RunOutcome::unrun`: those that
+    /// could not).
+    Ran(crate::run::RunOutcome),
+    /// Nothing ran: attesting is not possible or not allowed here (why).
+    NotAttested(String),
+}
+
+/// `vci ci --key`: run what the plan leaves through `vci run`'s code path
+/// (collectors on, inputs recorded, attestations signed and stored). Every
+/// unit of a project that runs everything (`run_all`) is attested: that is
+/// the run the next commit's plan reuses. An `Err` means nothing ran.
+fn run_attested(res: &crate::plan::PlanResult, key: &Utf8Path, ttl: &str) -> Result<Attempt> {
+    let Some(config) = res.config.clone().filter(|_| !res.projects.is_empty()) else {
+        return Ok(Attempt::NotAttested("no project could be read".into()));
+    };
+    // A key that cannot be read fails before anything runs.
+    let signing = crate::keys::load(key).with_context(|| format!("--key {key}"))?;
+    if let Some(why) = attest_refusal(res, &signing.blob) {
+        return Ok(Attempt::NotAttested(why));
+    }
+    let multi = res.projects.len() > 1;
+    let mut units: std::collections::BTreeMap<usize, Option<std::collections::BTreeSet<String>>> =
+        Default::default();
+    for (i, p) in res.projects.iter().enumerate() {
+        let what = if multi {
+            format!(" of {} ({})", job_label(p), p.adapter)
+        } else {
+            String::new()
+        };
+        if res.run_all.is_some() || p.run_all.is_some() {
+            eprintln!("vci ci: running all tests{what} (attesting)");
+            units.insert(i, None);
+            continue;
+        }
+        let ids: std::collections::BTreeSet<String> = res
+            .to_run()
+            .filter(|f| f.project_idx == i)
+            .map(|f| f.test_id.clone())
+            .collect();
+        if ids.is_empty() {
+            eprintln!(
+                "vci ci: every test file{what} is covered by a valid attestation; nothing to run"
+            );
+        } else {
+            eprintln!(
+                "vci ci: running {} test file(s){what} (attesting)",
+                ids.len()
+            );
+            units.insert(i, Some(ids));
+        }
+    }
+    if units.is_empty() {
+        return Ok(Attempt::Ran(Default::default()));
+    }
+    let (repo, root) = open_repo()?;
+    crate::run::run_units(
+        repo,
+        root,
+        config,
+        crate::run::Selection::Units(units),
+        Some(key),
+        ttl,
+        None,
+    )
+    .map(Attempt::Ran)
+}
+
+/// Why `vci ci --key` must not attest here, if it must not: the key signs as
+/// a principal that `policy.no_skip_refs_except` lets skip on
+/// `policy.no_skip_refs` (main), and the current ref does not match
+/// `no_skip_refs` (a pull request, a feature branch). Such a run executes
+/// code main never ran (the branch's tests, dependencies, workflow), and
+/// main would skip those units after a merge on the strength of it. Also
+/// refused off those refs when the base commit's allowed_signers cannot be
+/// read (whom the key signs as is unknown).
+///
+/// This is a guard against a misconfigured workflow, not a security
+/// boundary: a branch that can read the key can sign anything with it. The
+/// boundary is not handing the key to such runs (a secret of a GitHub
+/// Environment restricted to the default branch).
+fn attest_refusal(res: &crate::plan::PlanResult, key_blob: &[u8]) -> Option<String> {
+    let off: Vec<&crate::plan::ProjectPlan> =
+        res.projects.iter().filter(|p| !p.on_no_skip_ref).collect();
+    if off.is_empty() {
+        return None;
+    }
+    let Some(allowed) = &res.allowed else {
+        return Some(
+            "the current ref does not match policy.no_skip_refs and the base commit's allowed_signers could not be read, so whom the key signs as is unknown".into(),
+        );
+    };
+    let principals: Vec<&str> = allowed
+        .entries()
+        .iter()
+        .filter(|e| !e.cert_authority && e.key.to_bytes().is_ok_and(|b| b == key_blob))
+        .map(|e| e.principals.as_str())
+        .collect();
+    for p in off {
+        if let Some(principal) = principals
+            .iter()
+            .find(|pr| p.no_skip_refs_except.iter().any(|x| x == *pr))
+        {
+            return Some(format!(
+                "the key signs as {principal}, which policy.no_skip_refs_except{} lets skip on policy.no_skip_refs (e.g. main), but the current ref does not match policy.no_skip_refs: attestations made here would let main skip tests that never ran on main. Pass this key only to runs on main (a GitHub Environment secret restricted to the default branch), or give other refs a key whose principal is not in no_skip_refs_except",
+                if res.multi {
+                    format!(" of {}", job_label(p))
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
+    None
+}
+
+/// `vci ci` without `--key`: run what the plan leaves with the adapters'
+/// plain runs (no collectors, nothing signed); with `only`, of those
+/// projects only. Returns the exit code.
+fn run_plain(
+    res: &crate::plan::PlanResult,
+    root: &Utf8Path,
+    only: Option<&std::collections::BTreeSet<usize>>,
+) -> Result<i32> {
     // What to run, per project. With no project information at all (the
     // repository layout could not be read), run the default project.
     // (label, adapter, child env, files to run; None = everything)
@@ -37,18 +302,17 @@ pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i3
         Option<Vec<String>>,
     );
     let mut jobs: Vec<Job> = Vec::new();
-    if res.projects.is_empty() {
-        let adapter = vci_adapter::adapter_for("vitest", &root)?;
+    if res.projects.is_empty() && only.is_none() {
+        let adapter = vci_adapter::adapter_for("vitest", root)?;
         jobs.push(("default project".into(), adapter, None, None));
     }
     for (i, p) in res.projects.iter().enumerate() {
+        if only.is_some_and(|o| !o.contains(&i)) {
+            continue;
+        }
         let adapter = vci_adapter::adapter_for_with(&p.adapter, &p.dir, &p.adapter_options)?;
         let env = p.child_env.as_ref().and_then(|c| c.to_child_env());
-        let label = if p.name.is_empty() {
-            p.path.clone()
-        } else {
-            p.name.clone()
-        };
+        let label = job_label(p);
         let files = if res.run_all.is_some() || p.run_all.is_some() {
             None
         } else {
@@ -62,7 +326,7 @@ pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i3
         jobs.push((label, adapter, env, files));
     }
     let mut code: Option<i32> = Some(0);
-    let multi = jobs.len() > 1;
+    let multi = jobs.len() > 1 || res.projects.len() > 1;
     for (label, adapter, env, files) in &jobs {
         let what = if multi {
             format!(" of {label} ({})", adapter.name())
@@ -91,33 +355,7 @@ pub fn ci(base_ref: Option<String>, audit_log: Option<Utf8PathBuf>) -> Result<i3
             _ => {}
         }
     }
-    let code = code.unwrap_or(1);
-
-    let now = now_unix();
-    let log = json!({
-        "time": rfc3339(now),
-        "head": repo.head_commit().ok(),
-        "baseRef": res.base_ref,
-        "baseCommit": res.base_commit,
-        "runAll": res.run_all,
-        "warnings": res.warnings,
-        "projects": res.projects,
-        "skipped": res.skipped().map(|f| json!({
-            "testId": f.test_id,
-            "project": f.project,
-            "reason": f.reason,
-            "by": f.by,
-        })).collect::<Vec<_>>(),
-        "ran": res.to_run().map(|f| json!({"testId": f.test_id, "project": f.project, "reason": f.reason})).collect::<Vec<_>>(),
-        "exitCode": code,
-    });
-    let path = audit_log.unwrap_or_else(|| root.join(format!(".vci/out/audit-{now}.json")));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_vec_pretty(&log)?)?;
-    eprintln!("vci ci: audit log written to {path}");
-    Ok(code)
+    Ok(code.unwrap_or(1))
 }
 
 pub fn verify(

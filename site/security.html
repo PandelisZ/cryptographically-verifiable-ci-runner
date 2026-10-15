@@ -123,6 +123,7 @@
 <div class="note">
 <p><strong>The backstop.</strong> Keep your default branch in <code>policy.no_skip_refs</code> (the <code>vci init</code> default). Every merge then gets a full run, which catches a false claim after the fact.</p>
 </div>
+<p id="ci-key"><strong>CI as a trusted signer.</strong> CI can attest its own runs (<code>vci ci --key</code>, the action's <code>signing-key</code>), and <code>policy.no_skip_refs_except</code> lets that key's attestations skip on main too. Main then skips only what CI itself already ran on the same inputs, but whoever holds that key can make main skip anything until its line is removed. Keep it in a GitHub Environment limited to the default branch, use one key per repository, keep its <code>ttl</code> short, and rotate it by replacing its line in <code>.vci/allowed_signers</code>. See <a href="github-actions.html#attesting-in-ci">attesting in CI</a>.</p>
 
 <h2 id="go-deeper">Go deeper</h2>
 <p>The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md">reference</a> has every recorded input, every refusal, and the known limitations per adapter. Design notes are in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/docs">docs/</a>.</p>

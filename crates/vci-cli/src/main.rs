@@ -78,12 +78,24 @@ enum Cmd {
         #[arg(long, value_enum, default_value = "text")]
         format: Format,
     },
-    /// Plan, run the remaining tests, and write an audit log of the skips.
+    /// Plan, run the remaining tests, and write an audit log of the skips (with --key: attest what runs).
     Ci {
         #[arg(long)]
         base_ref: Option<String>,
         #[arg(long)]
         audit_log: Option<Utf8PathBuf>,
+        /// Run the remaining tests as `vci run --key` does and attest them with this SSH key (private key, or .pub with the key in ssh-agent); with run-all (e.g. policy.no_skip_refs), every unit is attested.
+        #[arg(long)]
+        key: Option<Utf8PathBuf>,
+        /// Attestation lifetime (with --key).
+        #[arg(long, default_value = "14d", requires = "key")]
+        ttl: String,
+        /// Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code).
+        #[arg(long, requires = "key")]
+        push: bool,
+        /// git-meta remote, or a git remote / URL, to push to (as `vci push --remote`).
+        #[arg(long, requires = "push")]
+        remote: Option<String>,
     },
     /// Verify one attestation envelope (file path or `-`).
     Verify {
@@ -203,7 +215,18 @@ fn main() {
         Cmd::Ci {
             base_ref,
             audit_log,
-        } => cmds::ci(base_ref, audit_log),
+            key,
+            ttl,
+            push,
+            remote,
+        } => cmds::ci(cmds::CiArgs {
+            base_ref,
+            audit_log,
+            key,
+            ttl,
+            push,
+            remote,
+        }),
         Cmd::Verify {
             envelope,
             allowed_signers,

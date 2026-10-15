@@ -19,47 +19,51 @@ env:
   TZ: UTC
 
 jobs:
+  # Pull requests (and pushes to other branches) consume attestations only:
+  # no signing key, read-only token. A pull_request run uses the branch's own
+  # copy of this file, so the key must not be reachable from here at all: it
+  # is a secret of the vci-attest environment, whose deployment branches are
+  # limited to main (Settings -> Environments), never a repository secret.
   demo:
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # the base commit must be available to read policy from
 
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.7"
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26.2"
-          cache-dependency-path: demo/go-app/go.sum
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0" # same as demo/cargo-app/rust-toolchain.toml
-
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.4.9" # same as demo/rails-app/.ruby-version
-          bundler-cache: true
-          working-directory: demo/rails-app
-
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.4.9" # same as demo/rspec-app/.ruby-version
-          bundler-cache: true
-          working-directory: demo/rspec-app
-
-      - name: Set up project dependencies
-        run: |
-          (cd demo/pytest-app && uv sync --locked)
-          (cd demo/go-app && go mod download)
-          (cd demo/cargo-app && cargo fetch --locked)
+      - uses: ./.github/actions/demo-setup
 
       # Fetches the attestations (git-meta metadata on refs/meta/main of this
       # repository, pushed with `vci push`), plans, and runs the rest.
       - uses: ./
+
+      - name: Show the audit log
+        if: always()
+        run: cat vci-audit.json
+
+  # Pushes to main also attest what they run with the CI key (principal
+  # github-actions in .vci/allowed_signers, listed in
+  # policy.no_skip_refs_except) and push the attestations, so the next commit
+  # of main skips every unit whose inputs did not change.
+  demo-main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: vci-attest
+    # `vci ci --push` publishes the attestations it makes (git-meta pushes
+    # refs/meta/main with the checkout's credentials).
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/demo-setup
+
+      - uses: ./
+        with:
+          signing-key: ${{ secrets.VCI_SIGNING_KEY }}
 
       - name: Show the audit log
         if: always()

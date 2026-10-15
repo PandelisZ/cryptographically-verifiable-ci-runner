@@ -51,6 +51,9 @@ After your toolchain setup steps, add:
 It builds `vci`, fetches attestations, and runs only what is not already attested. Setup, inputs and security rules:
 [docs/GITHUB_ACTIONS.md](GITHUB_ACTIONS.md).
 
+With a `signing-key`, CI attests what it runs too, so the next commit skips every unit whose inputs did not change:
+see [CI attests its own runs](#ci-attests-its-own-runs).
+
 ## Quick start (Vitest)
 
 Prerequisites: `git`, `node`, `ssh-keygen` (OpenSSH 8.1+), a Rust toolchain to build the CLI, and an `origin` remote
@@ -1003,7 +1006,7 @@ checkout, clock, policy and environment.
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet |
 | `vci run [FILES…] [--key PATH] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON |
 | `vci plan [--base-ref R] [--format text\|json\|github]` | Print which test files can be skipped and why the others run |
-| `vci ci [--base-ref R] [--audit-log PATH]` | Plan, run the remainder, write a JSON audit log of every skip |
+| `vci ci [--base-ref R] [--audit-log PATH] [--key PATH [--ttl 14d] [--push [--remote R]]]` | Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose) |
 | `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R]` | Verify one DSSE envelope and print its claims |
 | `vci push` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. See "What `vci fetch` and `vci push` guard against" |
 | `vci prune [--dry-run]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them) |
@@ -1219,6 +1222,90 @@ Interoperability, checked by the tests against `git-meta` 0.1.13 when it is inst
 readable with `git meta pull` + `git meta get`; values set (`git meta set`) or deleted (`git meta rm`) with the CLI and
 `git meta push`ed are what `vci fetch` + `vci plan` see.
 
+## CI attests its own runs
+
+Without a key, `vci ci` only consumes attestations, so a commit whose only change is a README still runs every unit
+nobody attested on a laptop, and every push to main runs the whole suite. With `--key`, CI leaves attestations of its
+own behind, and the next commit's CI skips every unit whose inputs did not change:
+
+1. **Commit A** is pushed to main. Nothing is attested yet, so every unit runs. `vci ci --key ci-key --push --remote
+   origin` runs them as `vci run --key` does (collectors on, inputs recorded, one process per unit), signs an
+   attestation for every unit that passed and is attestable, stores them locally and publishes them on
+   `refs/meta/main`.
+2. **Commit B** changes `src/b.ts`, which only `src/b.test.ts` reads. Its CI fetches A's attestations. They are keyed
+   by unit, signer and input root, not by commit (see [Where attestations live
+   (git-meta)](#where-attestations-live-git-meta)), so every unit whose recorded inputs hash the same in B's checkout
+   skips. `src/b.test.ts` fails the `inputs` check (`entry:src/b.ts`), runs, is attested and pushed.
+3. **Commit C** changes only `README.md`, which no test reads. Every unit skips: `vci ci` prints `vci ci: every test
+   file is covered by a valid attestation; nothing to run` and exits 0 without starting the test runner. The job
+   costs the fetch and the verification, about ten seconds. `--push` then finds `nothing to push`.
+
+Pull requests use the same attestations: a branch made from B skips every unit it did not change, whether or not
+anyone attested it locally.
+
+**What a run attests.** The units the plan says to RUN. When the plan runs everything (`running everything:
+policy.no_skip_refs matches ...` with an empty `no_skip_refs_except`, an unreadable base `vci.toml` or
+`allowed_signers`, a project that could not be listed), every unit of every project: that full run is the one the
+next commit reuses. A unit that fails or that `vci run` refuses (see [When `vci run` refuses to
+attest](#when-vci-run-refuses-to-attest)) still runs and is not attested, so it runs on the next commit too; only test
+failures make the exit code non-zero. The run uses the configuration the plan was made from (the base commit's
+`vci.toml`, or the working tree's when that cannot be read), so the attested test ids are the plan's. Attestations
+expire after `--ttl` (default `14d`, at most `policy.max_ttl`): a unit skipped for that long fails `expiry`, runs
+again and is attested again, so every unit still gets a real run at least once per `ttl`.
+
+**Flags** (`vci ci`; without `--key` nothing changes):
+
+| Flag | Meaning |
+|---|---|
+| `--key PATH` | Run the remainder as `vci run --key` does and attest it with this SSH key (a private key, or a `.pub` with the private half in `ssh-agent`) |
+| `--ttl DURATION` | Lifetime of those attestations, default `14d`; only with `--key` |
+| `--push` | After the run, whatever the tests did, publish as `vci push` does (only passing units have attestations, so pushing after a failure is right). A failed push prints `::warning title=vci::could not push attestations ...` and does not change the exit code; only with `--key` |
+| `--remote R` | Where `--push` pushes, as `vci push --remote R`; only with `--push`. CI should pass it (the action passes `origin`) |
+
+The audit log adds `attested` (`[{testId, project}]`), `attestErrors`, `notAttested` and `pushed` (`true`, `false`,
+or `null` without `--push` or when nothing was attested on purpose). When attesting cannot start (the key cannot be
+read, a collector is missing), `vci ci` prints a `::warning`, runs everything it would have run without attesting
+and pushes nothing; the Commands table above has the remaining cases.
+
+**On main: `policy.no_skip_refs_except`.** `no_skip_refs` makes main run everything, CI's attestations included, so
+on its own it would keep every push to main at full cost. `no_skip_refs_except = ["github-actions"]` (per project,
+default `[]`) names the `allowed_signers` principals whose attestations may still skip on a ref matching
+`no_skip_refs`; the principal is the one on the `allowed_signers` line that verified the signature. On such a ref
+`vci plan` prints `vci: note: policy.no_skip_refs matches refs/heads/main: only attestations by github-actions
+(policy.no_skip_refs_except) can skip`, and every other signer's candidate fails the `signer` check; `vci explain`
+shows `policy.no_skip_refs matches refs/heads/main and signer dev@example.com is not in no_skip_refs_except`. With the
+list empty, those refs run everything with `policy.no_skip_refs matches <ref>`, as before. On other refs (pull
+requests, feature branches) the list changes nothing. Like every policy key it is read from the base commit, and
+values are principals: non-empty, without whitespace.
+
+`vci ci --key` attests nothing (a `::warning`, recorded under `notAttested`; the tests still run and nothing is
+pushed) when the key signs as a principal in `no_skip_refs_except` and the current ref does not match `no_skip_refs`,
+or the base `allowed_signers` cannot be read there: attestations made by a pull request's run would let main skip
+code that only that branch ran. That is a guard against a misconfigured workflow. The boundary is not giving such
+runs the key at all (see [docs/GITHUB_ACTIONS.md](GITHUB_ACTIONS.md#attesting-in-ci)). To attest pull request runs
+too, give them a different key whose principal is not in the list: pull requests then skip on its word, main never
+does.
+
+**What trusting CI's key means.** Its attestations replace the full run on main that was the backstop against a
+trusted signer's false claim, so treat the key as the most powerful signer in `allowed_signers`:
+
+- **Whoever holds it can make main and every pull request skip any unit** until its line is removed. Keep it out of
+  every run but pushes to the default branch: a secret of a GitHub Environment restricted to that branch, never a
+  repository or organization secret, which a `pull_request` run (using the branch's own copy of the workflow) can
+  read. Every process of that job (the tests, their dependencies, other steps) can read the key file, so it is
+  shared with every locked dependency of the job.
+- **Scope it per repository**: one key and one principal per repository. Attestations name the repository's root
+  commit and never replay across repositories, but one key trusted in several repositories leaks from all of them
+  at once.
+- **Rotate** by replacing its line in `.vci/allowed_signers` on the default branch (a new key under the same
+  principal), then the secret. Attestations signed by the old key stop counting at once; the next push to main runs,
+  and attests, everything again. Keep `ttl` short, and rotate whenever a dependency of the attested job is found
+  compromised.
+- **List only CI's own principal in `no_skip_refs_except`.** Developers' and agents' attestations keep skipping on
+  pull requests; main runs whatever only they vouched for.
+- **Inputs no collector sees** (see [Threat model (v1)](#threat-model-v1)) now go untested on main for as long as the
+  recorded inputs do not change, up to `ttl`. List such tests in `policy.never_skip`.
+
 ## `vci.toml`
 
 ```toml
@@ -1234,6 +1321,7 @@ platform = "any"       # "any" | "same-os" | "exact": which OS/arch may satisfy 
 max_ttl = "30d"        # longest accepted attestation lifetime
 allow_dirty = true     # accept attestations made from an uncommitted working tree
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]   # never skip on these refs (the `vci init` default)
+no_skip_refs_except = ["github-actions"]             # ...except attestations by these allowed_signers principals (default [])
 never_skip = ["tests/test_attach_db.py"]             # never skip these files (project-relative globs)
 go_allow_net = false   # Go: attest packages whose test links package net (see "When vci run refuses")
 rails_allow_db = false # Rails: attest files whose test database is a server (see "Databases" under Rails)
@@ -1794,7 +1882,14 @@ Not protected against:
   that uses the system timezone, see "Go specifics"; node:test refuses every file when `TZ` is unset and records
   `LANG`, `LC_ALL` and `LC_MESSAGES` as read by every file.)
 
-Use `no_skip_refs` to run everything on the default branch and release refs.
+Use `no_skip_refs` to run everything on the default branch and release refs. To keep that backstop and still
+skip on main what CI itself already ran, give CI its own key (`vci ci --key`, the action's `signing-key`) and name
+its principal in `no_skip_refs_except`: on a ref matching `no_skip_refs`, only attestations whose signature
+verifies against an `allowed_signers` line of one of those principals can skip; every other signer's candidate
+fails the `signer` check (`vci explain`: `policy.no_skip_refs matches refs/heads/main and signer dev@example.com is
+not in no_skip_refs_except`). With the list empty (the default), those refs run everything, as before. Like every
+policy key it is read from the base commit, per project in `[[projects]]`. See [CI attests its own
+runs](#ci-attests-its-own-runs) for what trusting CI's key means.
 
 pytest limitations (details and the measured audit-hook coverage in `docs/spike-pytest.md`):
 
