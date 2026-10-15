@@ -38,13 +38,23 @@ jobs:
       - name: Download modules
         run: go mod download
 
-      # Pinned to a vci release (v1.0.0; for strict pinning use the full SHA from the release page): the
-      # verifier must not change under you; v1 moves only to tested 1.x releases.
+      # The vci release binary that v1 records in its release/manifest.txt, checked
+      # against that checksum: about a second, nothing is compiled. v1 moves only
+      # to tested 1.x releases; for a strict pin, check out the full commit SHA v1
+      # points to (git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v1)
+      # instead of v1: the verifier must not change under you.
       - name: Install vci
         run: |
-          git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
-          git -C "$RUNNER_TEMP/vci" checkout --detach v1.0.0
-          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+          git clone --quiet https://github.com/PandelisZ/cryptographically-verifiable-ci-runner "$RUNNER_TEMP/vci"
+          cd "$RUNNER_TEMP/vci"
+          git checkout --quiet --detach v1
+          asset=vci-x86_64-unknown-linux-musl.tar.gz # ubuntu-latest; release/manifest.txt lists the others
+          tag=$(sed -n 's/^tag=//p' release/manifest.txt)
+          curl -fsSL --retry 3 -o "$asset" "https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases/download/$tag/$asset"
+          grep "  $asset\$" release/manifest.txt > "$asset.sha256" # fails if not recorded
+          sha256sum -c "$asset.sha256"
+          mkdir bin && tar -C bin -xzf "$asset" vci
+          echo "$RUNNER_TEMP/vci/bin" >> "$GITHUB_PATH"
 
       # git-meta pull of refs/meta/main (attestations pushed with `vci push`
       # or `git meta push`) into .git/git-meta.sqlite; read access is enough.

@@ -127,7 +127,7 @@ jobs:
 
 <h2>What the action does</h2>
 <ol>
-<li>Installs <code>vci</code>: a prebuilt binary whose checksum is recorded in the pinned action, or a build from source (cached).</li>
+<li>Installs <code>vci</code> in about a second: the release binary recorded in the pinned action's <code>release/manifest.txt</code>, its checksum verified against that file. The action never compiles <code>vci</code> in your CI. When no published binary fits (the action is pinned to a commit that is not a release, or the download fails) it fails at once with an error that says what to do (see <a href="#prebuilt-binaries">prebuilt binaries</a>).</li>
 <li>Runs <code>vci fetch --remote origin</code>. This fetches <code>refs/meta/main</code>, the git ref where attestations live. A <code>contents: read</code> token is enough. If the fetch fails, it warns and every test runs.</li>
 <li>Runs <code>vci plan</code> and writes the plan to the job summary.</li>
 <li>Runs <code>vci ci</code>: it runs every unit that was not skipped and writes an audit log. The job fails if any test fails.</li>
@@ -143,8 +143,9 @@ jobs:
 <tr><td><code>remote</code></td><td><code>origin</code></td><td class="wrap">Git remote name or URL whose <code>refs/meta/main</code> holds the attestations</td></tr>
 <tr><td><code>audit-log</code></td><td><code>vci-audit.json</code></td><td class="wrap">JSON record of what was skipped, by whom, and what ran</td></tr>
 <tr><td><code>working-directory</code></td><td><code>.</code></td><td class="wrap">Directory to run <code>vci</code> from</td></tr>
-<tr><td><code>prebuilt</code></td><td><code>true</code></td><td class="wrap">Download the release binary; <code>false</code> always builds from source</td></tr>
-<tr><td><code>token</code></td><td><code>github.token</code></td><td class="wrap">Token used to download the release binary</td></tr>
+<tr><td><code>build-from-source</code></td><td><code>false</code></td><td class="wrap"><code>true</code> lets the action compile <code>vci</code> (about two minutes cold, needs a Rust toolchain) when no published binary fits; with <code>false</code> it never compiles and fails instead. For working on vci itself; see <a href="#prebuilt-binaries">prebuilt binaries</a></td></tr>
+<tr><td><code>prebuilt</code></td><td><code>true</code></td><td class="wrap">Deprecated alias: <code>false</code> means <code>build-from-source: true</code>, except that it compiles without trying the release binary first</td></tr>
+<tr><td><code>token</code></td><td><code>github.token</code></td><td class="wrap">Token <code>gh</code> uses to download the release binary; without <code>gh</code>, the public release URL is used</td></tr>
 <tr><td><code>signing-key</code></td><td><code>""</code></td><td class="wrap">Contents of an SSH private key, from an environment secret limited to the default branch. <code>vci ci</code> then attests what it runs. Its public half must be in <code>.vci/allowed_signers</code> on the base branch, under a principal listed in <code>policy.no_skip_refs_except</code> for main to skip on it. See <a href="#attesting-in-ci">attesting in CI</a></td></tr>
 <tr><td><code>ttl</code></td><td><code>14d</code></td><td class="wrap">Lifetime of those attestations (at most <code>policy.max_ttl</code>)</td></tr>
 <tr><td><code>push</code></td><td><code>true</code></td><td class="wrap">With <code>signing-key</code>: push the attestations to <code>remote</code>. Needs <code>permissions: contents: write</code>; a failed push is a warning</td></tr>
@@ -268,13 +269,26 @@ jobs:
 <table>
 <tr><th>Reference</th><th>Moves?</th><th>Use when</th></tr>
 <tr><td><code>@v1</code></td><td>only to tested 1.x releases</td><td>the default</td></tr>
-<tr><td><code>@v1.0.0</code></td><td>never</td><td>you want a specific release</td></tr>
-<tr><td><code>@&lt;full commit SHA&gt;</code></td><td>never</td><td class="wrap">strictest pinning; the SHA is on each <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases">release page</a></td></tr>
+<tr><td><code>@v1.x.y</code> (after 1.4.0)</td><td>never</td><td>you want a specific release</td></tr>
+<tr><td><code>@&lt;full commit SHA&gt;</code></td><td>never</td><td class="wrap">strictest pinning; it must be the commit of a release (the one <code>v1</code> points to, see below)</td></tr>
 </table>
-<p>Never reference a branch.</p>
+<p>A SHA pin must be the commit that records its release in <code>release/manifest.txt</code> (its message is "Record release vX.Y.Z for the action"). That is the commit <code>v1</code> points to after each release, and from the first release after 1.4.0 on, the one its version tag and <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases">release page</a> name. Any other commit of the repository has no published binary, so the action refuses it with an error instead of compiling. To find the SHA <code>v1</code> points to:</p>
+<pre><code>git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v1
+# or
+gh api repos/PandelisZ/cryptographically-verifiable-ci-runner/git/ref/tags/v1 --jq .object.sha</code></pre>
+<p>Never reference a branch: the newest commits of <code>main</code> are usually not released, and the action fails on them. The version tags <code>v1.0.0</code> to <code>v1.4.0</code> (and their release-page SHAs) point at the commit before their release was recorded in <code>release/manifest.txt</code>, so they run the action as it was then, which compiles <code>vci</code> (about two minutes) instead of downloading it. Use <code>@v1</code>, or the SHA it points to, instead.</p>
 
-<h2>Prebuilt binaries</h2>
-<p>By default the action downloads a release binary, which takes a few seconds instead of about two minutes of compiling. It uses the download only when the pinned action's <code>release/manifest.txt</code> names a release built from exactly the action's own sources, a binary exists for the runner (Linux or macOS, x86_64 or arm64), and its SHA-256 equals the checksum in that manifest. Otherwise it builds from source and caches the result; because the checksums are part of the pinned action, replacing a release asset cannot change what runs.</p>
+<h2 id="prebuilt-binaries">Prebuilt binaries</h2>
+<p>The action downloads a release binary, which takes about a second, and never compiles <code>vci</code> in your CI. It installs the binary only when the pinned action's <code>release/manifest.txt</code> names a release built from exactly the action's own sources, a binary exists for the runner (Linux or macOS, x86_64 or arm64), and its SHA-256 equals the checksum in that manifest; because the checksums are part of the pinned action, replacing a release asset cannot change what runs. The log shows which one it installed:</p>
+<pre><code>using vci v1.4.0 (vci-x86_64-unknown-linux-musl.tar.gz, sha256 c906f58b...)</code></pre>
+<p>Otherwise the job fails at its first step, before any other work, with an error saying why. Pinned to a branch or to a commit that is not a release, it shows:</p>
+<pre><code>vci: this commit of the action (&lt;ref&gt;, sources &lt;fingerprint&gt;) has no published binary (release/manifest.txt records
+v1.4.0 built from &lt;fingerprint&gt;). Use a release: uses: PandelisZ/cryptographically-verifiable-ci-runner@v1, or the
+full commit SHA v1 points to (git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
+refs/tags/v1). To compile vci in this job anyway, set build-from-source: true.</code></pre>
+<p>Change the <code>uses:</code> line to <code>@v1</code> or that SHA (see <a href="#pinning">pinning</a>). The other errors are in <a href="#troubleshooting">troubleshooting</a>.</p>
+<p>It downloads with <code>gh release download</code> (preinstalled on GitHub-hosted runners) and otherwise, or when <code>gh</code> fails, from the public release URL with <code>curl</code> or <code>wget</code>, so container jobs and self-hosted runners without <code>gh</code> need one of those two.</p>
+<p><code>build-from-source: true</code> is for working on vci itself, as this repository's own CI does to test sources that are not released yet. When no published binary fits, the action then compiles <code>vci</code> (<code>cargo build --release</code>, about two minutes on <code>ubuntu-latest</code> without a cache) instead of failing, and a failed download or checksum mismatch is a warning. It needs a Rust toolchain before the action (for example <code>dtolnay/rust-toolchain</code>). It caches the binary per source fingerprint, and cargo's registry and build directory per <code>Cargo.lock</code> and <code>rustc</code> version, so a commit that changes only vci's own crates does not compile the dependencies again.</p>
 
 <h2>Security rules</h2>
 <p>CI takes its rules from the base branch and only looks at code and attestations from the pull request:</p>
@@ -296,13 +310,24 @@ jobs:
 <p>To limit who may write, add a repository ruleset on <code>refs/meta/**</code>. When CI attests its own runs, let the main-branch job's token through it.</p>
 
 <h2>Without the action</h2>
-<pre><code>      - name: Install vci
+<pre><code>      # The release binary that v1 records in release/manifest.txt, checked
+      # against that checksum: about a second, nothing is compiled. For a
+      # strict pin, check out the commit SHA v1 points to instead of v1.
+      - name: Install vci
         run: |
-          git clone \
+          git clone --quiet \
             https://github.com/PandelisZ/cryptographically-verifiable-ci-runner \
             "$RUNNER_TEMP/vci"
-          git -C "$RUNNER_TEMP/vci" checkout v1.0.0
-          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+          cd "$RUNNER_TEMP/vci"
+          git checkout --quiet --detach v1
+          asset=vci-x86_64-unknown-linux-musl.tar.gz  # Linux x86_64; release/manifest.txt lists the others
+          tag=$(sed -n 's/^tag=//p' release/manifest.txt)
+          curl -fsSL --retry 3 -o "$asset" \
+            "https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases/download/$tag/$asset"
+          grep "  $asset\$" release/manifest.txt &gt; "$asset.sha256"  # fails if not recorded
+          sha256sum -c "$asset.sha256"
+          mkdir bin &amp;&amp; tar -C bin -xzf "$asset" vci
+          echo "$RUNNER_TEMP/vci/bin" &gt;&gt; "$GITHUB_PATH"
           echo "VCI_PY_PLUGIN=$RUNNER_TEMP/vci/py/pytest-plugin" &gt;&gt; "$GITHUB_ENV"
           echo "VCI_JS_PLUGIN=$RUNNER_TEMP/vci/js/vitest-plugin" &gt;&gt; "$GITHUB_ENV"
           echo "VCI_RUBY_COLLECTOR=$RUNNER_TEMP/vci/ruby/vci-collector" &gt;&gt; "$GITHUB_ENV"
@@ -314,7 +339,7 @@ jobs:
             --base-ref "${{ github.event.pull_request.base.sha || github.sha }}" \
             --audit-log vci-audit.json</code></pre>
 
-<h2>Troubleshooting</h2>
+<h2 id="troubleshooting">Troubleshooting</h2>
 <p>Run <code>vci explain &lt;file&gt; --base-ref origin/main</code> locally for the full reason a unit ran.</p>
 <table>
 <tr><th>Symptom</th><th>Likely cause</th></tr>
@@ -330,6 +355,13 @@ jobs:
 <tr><td class="wrap">No Rails test file ever skips on the runner</td><td class="wrap">See <a href="adapters.html#getting-skips-on-a-linux-runner">Rails: laptop to Linux runner</a></td></tr>
 <tr><td class="wrap">An RSpec file is never attested</td><td class="wrap">An example was pending, skipped, filtered out or retried, or the process exited non-zero after the report; <code>vci run</code> prints the reason (<code>rspec:filtered:...</code>, <code>rspec:retry</code>, ...)</td></tr>
 <tr><td class="wrap">Minitest files never run with <code>runner = "rspec"</code></td><td class="wrap">An explicit runner leaves the other runner's files to you; <code>vci plan</code> and <code>vci ci</code> warn, and the audit log lists it under <code>warnings</code></td></tr>
+<tr><td class="wrap"><code>vci: this commit of the action (...) has no published binary</code></td><td class="wrap">The action is pinned to a branch or to a commit that is not a release. Use <code>@v1</code> or the SHA <code>v1</code> points to (see <a href="#pinning">pinning</a>); only vci's own development needs <code>build-from-source: true</code></td></tr>
+<tr><td class="wrap">The action takes about two minutes and its log shows <code>Build vci from source</code></td><td class="wrap">It is pinned to <code>v1.0.0</code> to <code>v1.4.0</code> or their SHAs, which predate releases recorded on their own commit (see <a href="#pinning">pinning</a>): use <code>@v1</code></td></tr>
+<tr><td class="wrap"><code>vci: release ... has no binary for Windows-X64</code> (or another platform)</td><td class="wrap">Releases are built for Linux and macOS, x86_64 and arm64 only: run the job on one of those</td></tr>
+<tr><td class="wrap"><code>vci: could not download vci-....tar.gz of release ...</code></td><td class="wrap">A network failure (re-run the job), or the runner cannot reach github.com (a self-hosted runner behind a proxy). The message lists what was tried: <code>gh</code> with the <code>token</code> input, then <code>curl</code> or <code>wget</code> on the public release URL</td></tr>
+<tr><td class="wrap"><code>vci: cannot download ...: this job has none of gh, curl or wget</code></td><td class="wrap">A container image without them: install <code>curl</code> in the image</td></tr>
+<tr><td class="wrap"><code>vci: ... does not match the checksum in release/manifest.txt</code></td><td class="wrap">The downloaded file is not the one the pinned action records, so nothing was installed. Re-run; if it persists, report it</td></tr>
+<tr><td class="wrap"><code>build-from-source needs a Rust toolchain (cargo) on the PATH</code></td><td class="wrap"><code>build-from-source: true</code> without a toolchain step before the action. Remove the input (you should not need it), or add <code>dtolnay/rust-toolchain</code></td></tr>
 </table>
 </main>
 </div>

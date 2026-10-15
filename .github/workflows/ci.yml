@@ -2,7 +2,13 @@
 # cargo test targets and Rails test files of demo/ that no trusted signer has already attested.
 #
 # This repository uses the action from its own checkout (`uses: ./`). Other
-# repositories use `@v1` (or a release tag / full SHA): see docs/GITHUB_ACTIONS.md.
+# repositories use `@v1` (or the full SHA v1 points to): see docs/GITHUB_ACTIONS.md.
+#
+# The demo and demo-main jobs test the development version of vci, whose
+# sources usually have no published binary yet, so they pass
+# `build-from-source: true`. They are the only place vci is ever compiled in CI
+# (release.yml builds the published binaries): the action never compiles
+# unless asked to, and fails instead when it has no published binary.
 name: ci
 
 on:
@@ -35,8 +41,11 @@ jobs:
       - uses: ./.github/actions/demo-setup
 
       # Fetches the attestations (git-meta metadata on refs/meta/main of this
-      # repository, pushed with `vci push`), plans, and runs the rest.
+      # repository, pushed with `vci push`), plans, and runs the rest. Compiles
+      # this commit's vci (cached) unless it is a published release.
       - uses: ./
+        with:
+          build-from-source: true
 
       - name: Show the audit log
         if: always()
@@ -63,14 +72,48 @@ jobs:
 
       - uses: ./
         with:
+          build-from-source: true # this commit's vci, as in the demo job
           signing-key: ${{ secrets.VCI_SIGNING_KEY }}
 
       - name: Show the audit log
         if: always()
         run: cat vci-audit.json
 
+  # Proves on a real runner that a commit of the action with no published
+  # binary fails at once (scripts/action-binary.sh) instead of compiling vci.
+  # On a commit whose sources match release/manifest.txt the gate passes and
+  # action-v1 already proves the download, so the check is skipped there.
+  action-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Do these sources have a published binary?
+        id: src
+        run: |
+          here=$(scripts/source-fingerprint.sh)
+          recorded=$(sed -n 's/^source=//p' release/manifest.txt)
+          if [ "$here" = "$recorded" ]; then echo "released=true"; else echo "released=false"; fi >> "$GITHUB_OUTPUT"
+      - name: The action on unreleased sources (expected to fail fast)
+        id: gate
+        if: steps.src.outputs.released == 'false'
+        continue-on-error: true
+        uses: ./
+        with:
+          command: plan
+      - name: It failed before compiling
+        if: steps.src.outputs.released == 'false'
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::the action ran on unreleased sources instead of refusing (outcome: $OUTCOME)"
+            exit 1
+          fi
+          echo "the action refused to compile on unreleased sources, as intended"
+
   # The published action, as other repositories use it: resolves @v1, downloads
-  # the release binary and plans the pytest project only.
+  # the release binary (about a second, never a compile) and plans the pytest
+  # project only.
   action-v1:
     runs-on: ubuntu-latest
     steps:

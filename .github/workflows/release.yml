@@ -1,31 +1,60 @@
-# Build the vci binary for each supported platform and publish it as a GitHub
-# release. Triggered by pushing a tag such as v0.1.0.
+# Build the vci binary for each supported platform into a draft GitHub release.
+#
+#   gh workflow run release.yml -f tag=v1.5.0     # builds the draft from main
+#   scripts/publish-release.sh v1.5.0             # records the manifest, publishes
+#
+# The version tag is not pushed first: it is created when the draft is
+# published, on the commit that records the release in release/manifest.txt, so
+# `uses: ...@v1.5.0` (and the commit SHA on the release page) carries the
+# checksums of its own binaries. A tag pushed before the binaries existed would
+# point at the previous release's manifest, and the action would refuse it.
+# Publishing triggers the homebrew job.
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version to build, e.g. v1.5.0 (must not exist yet)
+        required: true
+  release:
+    types: [published]
 
 permissions:
   contents: write
 
 env:
   GH_TOKEN: ${{ github.token }}
-  TAG: ${{ github.ref_name }}
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
 
 jobs:
   create:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Create the release and record what it is built from
+      - name: Create the draft release and record what it is built from
         run: |
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::$TAG is not a version tag such as v1.5.0"; exit 1 ;;
+          esac
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "::error::$TAG already exists: it would not carry the manifest of these binaries (see scripts/publish-release.sh)"
+            exit 1
+          fi
           scripts/source-fingerprint.sh > source-fingerprint.txt
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "vci $TAG" --notes "Prebuilt vci binaries. Built from commit $GITHUB_SHA."
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            pre=""
+            case "$TAG" in *-*) pre="--prerelease" ;; esac
+            gh release create "$TAG" --draft $pre --target "$GITHUB_SHA" --title "vci $TAG" \
+              --notes "Prebuilt vci binaries. Built from commit $GITHUB_SHA."
+          fi
           gh release upload "$TAG" source-fingerprint.txt --clobber
 
   build:
     needs: create
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -68,12 +97,12 @@ jobs:
           gh release upload "$TAG" "$asset" "SHA256SUMS-${{ matrix.target }}" --clobber
 
   # Point the Homebrew formula (PandelisZ/homebrew-tap, Formula/vci.rb) at the
-  # binaries just uploaded. Pre-release tags such as v0.4.0-rc1 are skipped.
+  # binaries of the release just published (a draft's assets cannot be
+  # downloaded publicly). Pre-release tags such as v0.4.0-rc1 are skipped.
   # Needs the HOMEBREW_TAP_DEPLOY_KEY secret: the private half of a deploy key
   # with write access to the tap repository.
   homebrew:
-    needs: build
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: github.event_name == 'release' && !github.event.release.prerelease && !contains(github.event.release.tag_name, '-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,8 +1,9 @@
 name: "vci: skip tests already attested"
 description: >
-  Builds vci from this action's pinned sources, fetches attestations (git-meta
-  metadata on refs/meta/main), and runs only the tests that no trusted signer
-  has already run against identical inputs.
+  Installs the published vci release binary pinned by this action (no
+  compiling), fetches attestations (git-meta metadata on refs/meta/main), and
+  runs only the tests that no trusted signer has already run against identical
+  inputs.
 branding:
   icon: check-circle
   color: green
@@ -28,14 +29,23 @@ inputs:
   working-directory:
     description: Directory inside the repository to run vci from.
     default: .
+  build-from-source:
+    description: >
+      `true` lets the action compile vci (cargo build --release, about two
+      minutes cold, needs a Rust toolchain) when no published binary fits.
+      With the default `false` the action never compiles: it downloads the
+      release binary recorded in its release/manifest.txt (checksum verified;
+      with gh, or else curl or wget) and fails at once if this commit of the
+      action is not a release (use @v1, or the commit SHA v1 points to), the
+      download fails, or the runner's platform has no binary.
+    default: "false"
   prebuilt:
     description: >
-      Download the release binary recorded in the action's release/manifest.txt
-      when it was built from the action's own sources. `false` always builds
-      from source.
+      Deprecated: `false` skips the download and compiles vci, the same as
+      build-from-source `true` without trying the release binary first.
     default: "true"
   token:
-    description: Token used to download the release binary.
+    description: Token `gh` uses to download the release binary (needs read access to the action's releases); without gh, or when gh fails, the public release URL is used.
     default: ${{ github.token }}
   signing-key:
     description: >
@@ -78,62 +88,73 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Fingerprint vci sources
-      id: src
+    # The published release binary built from exactly these sources, checksum
+    # verified against release/manifest.txt (part of the pinned action, so the
+    # release cannot change what is trusted). Never compiles: when no published
+    # binary fits it fails right here, before any toolchain or cache work,
+    # unless build-from-source is true; then it outputs build=true and the
+    # steps below compile vci. See scripts/action-binary.sh.
+    - name: Install the vci release binary
+      id: binary
       shell: bash
-      working-directory: ${{ github.action_path }}
-      run: |
-        echo "hash=$(scripts/source-fingerprint.sh)" >> "$GITHUB_OUTPUT"
-        mkdir -p "$RUNNER_TEMP/vci-bin"
-
-    # Fast path: a published release binary built from exactly these sources.
-    # release/manifest.txt is part of the pinned action, so the checksum the
-    # download is verified against cannot be changed by the release itself.
-    - name: Download the release binary
-      id: release
-      shell: bash
-      working-directory: ${{ github.action_path }}
       env:
         GH_TOKEN: ${{ inputs.token }}
-        SOURCE: ${{ steps.src.outputs.hash }}
+        BUILD_FROM_SOURCE: ${{ inputs.build-from-source }}
         PREBUILT: ${{ inputs.prebuilt }}
-      run: |
-        ok=false
-        try() {
-          [ "$PREBUILT" = "true" ] || { echo "prebuilt binaries are turned off"; return 1; }
-          [ -f release/manifest.txt ] || { echo "no release/manifest.txt"; return 1; }
-          tag=$(sed -n 's/^tag=//p' release/manifest.txt)
-          [ "$(sed -n 's/^source=//p' release/manifest.txt)" = "$SOURCE" ] || { echo "release $tag was built from other sources"; return 1; }
-          case "$RUNNER_OS-$RUNNER_ARCH" in
-            Linux-X64) target=x86_64-unknown-linux-musl ;;
-            Linux-ARM64) target=aarch64-unknown-linux-musl ;;
-            macOS-ARM64) target=aarch64-apple-darwin ;;
-            macOS-X64) target=x86_64-apple-darwin ;;
-            *) echo "no release binary for $RUNNER_OS-$RUNNER_ARCH"; return 1 ;;
-          esac
-          asset="vci-$target.tar.gz"
-          want=$(awk -v a="$asset" '$2 == a { print $1 }' release/manifest.txt)
-          [ -n "$want" ] || { echo "no checksum recorded for $asset"; return 1; }
-          dir=$(mktemp -d)
-          gh release download "$tag" --repo "${{ github.action_repository || github.repository }}" --pattern "$asset" --dir "$dir" || { echo "could not download $asset"; return 1; }
-          if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$dir/$asset" | cut -d' ' -f1); else got=$(shasum -a 256 "$dir/$asset" | cut -d' ' -f1); fi
-          [ "$got" = "$want" ] || { echo "::warning::checksum mismatch for $asset: expected $want, got $got"; return 1; }
-          tar -C "$RUNNER_TEMP/vci-bin" -xzf "$dir/$asset" vci
-          echo "using vci $tag ($asset, sha256 $got)"
-        }
-        if try; then ok=true; else echo "falling back to building vci from source"; fi
-        echo "ok=$ok" >> "$GITHUB_OUTPUT"
+        ACTION_REPOSITORY: ${{ github.action_repository || github.repository }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/action-binary.sh"
 
-    - name: Restore a vci binary built from source
-      id: cache
-      if: steps.release.outputs.ok != 'true'
-      uses: actions/cache@v4
+    # Only with build-from-source: true (or the deprecated prebuilt: false),
+    # e.g. the vci repository's own CI. A binary already built from these
+    # sources is reused; otherwise cargo builds with its registry and the
+    # dependencies' build artifacts restored from a cache keyed on the action's
+    # Cargo.lock and the rustc version (computed here: hashFiles() only reads
+    # the workspace, not the action's directory), so only vci's own crates
+    # compile.
+    - name: Restore a vci binary built from these sources
+      id: bin-cache
+      if: steps.binary.outputs.build == 'true' && (inputs.build-from-source == 'true' || inputs.prebuilt == 'false')
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/vci-bin
-        key: vci-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.src.outputs.hash }}
+        key: vci-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.binary.outputs.source }}
+
+    - name: Key the cargo cache
+      id: cargo-key
+      if: steps.binary.outputs.build == 'true' && (inputs.build-from-source == 'true' || inputs.prebuilt == 'false') && steps.bin-cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        if ! command -v cargo >/dev/null 2>&1; then
+          echo "::error title=vci::build-from-source needs a Rust toolchain (cargo) on the PATH, e.g. dtolnay/rust-toolchain before this action"
+          exit 1
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then sum="sha256sum"; else sum="shasum -a 256"; fi
+        lock=$($sum < Cargo.lock | cut -c1-32)
+        rustc=$(rustc -vV | $sum | cut -c1-16)
+        prefix="vci-cargo-$RUNNER_OS-$RUNNER_ARCH-$rustc-"
+        {
+          echo "home=${CARGO_HOME:-$HOME/.cargo}"
+          echo "prefix=$prefix"
+          echo "key=$prefix$lock"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore the cargo cache
+      id: cargo-cache
+      if: steps.binary.outputs.build == 'true' && (inputs.build-from-source == 'true' || inputs.prebuilt == 'false') && steps.bin-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ${{ steps.cargo-key.outputs.home }}/registry/index
+          ${{ steps.cargo-key.outputs.home }}/registry/cache
+          ${{ steps.cargo-key.outputs.home }}/git/db
+          ${{ runner.temp }}/vci-target
+        key: ${{ steps.cargo-key.outputs.key }}
+        restore-keys: ${{ steps.cargo-key.outputs.prefix }}
 
     - name: Build vci from source
-      if: steps.release.outputs.ok != 'true' && steps.cache.outputs.cache-hit != 'true'
+      if: steps.binary.outputs.build == 'true' && (inputs.build-from-source == 'true' || inputs.prebuilt == 'false') && steps.bin-cache.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ github.action_path }}
       env:
@@ -141,6 +162,26 @@ runs:
       run: |
         cargo build --release --locked -p vci-cli
         cp "$CARGO_TARGET_DIR/release/vci" "$RUNNER_TEMP/vci-bin/vci"
+
+    # Saved right after the build (not at the end of the job), so a later
+    # failing test does not throw the build away.
+    - name: Save the cargo cache
+      if: steps.binary.outputs.build == 'true' && (inputs.build-from-source == 'true' || inputs.prebuilt == 'false') && steps.bin-cache.outputs.cache-hit != 'true' && steps.cargo-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ${{ steps.cargo-key.outputs.home }}/registry/index
+          ${{ steps.cargo-key.outputs.home }}/registry/cache
+          ${{ steps.cargo-key.outputs.home }}/git/db
+          ${{ runner.temp }}/vci-target
+        key: ${{ steps.cargo-key.outputs.key }}
+
+    - name: Save the vci binary built from these sources
+      if: steps.binary.outputs.build == 'true' && (inputs.build-from-source == 'true' || inputs.prebuilt == 'false') && steps.bin-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/vci-bin
+        key: vci-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.binary.outputs.source }}
 
     - name: Put vci and its collectors on the path
       shell: bash

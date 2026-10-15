@@ -118,14 +118,18 @@ remaining Rails files in one `bin/rails test` (or `rspec`) process. `rails_allow
 user's `vci.toml` still sets it, it is a no-op that warns; suggest removing it. The collector moved to 0.5.0 in
 1.4.0, so existing Rails attestations run once more in CI.
 
-What the action does: installs a prebuilt `vci` (checksum pinned in the action) or builds it, runs
-`vci fetch --remote origin`, writes `vci plan` to the job summary, then runs `vci ci` (runs every unit not skipped,
-fails the job if any fails, writes `vci-audit.json`).
+What the action does: installs the published `vci` release binary (about a second; checksum pinned in the action;
+it never compiles `vci`), runs `vci fetch --remote origin`, writes `vci plan` to the job summary, then runs `vci ci`
+(runs every unit not skipped, fails the job if any fails, writes `vci-audit.json`).
 
 Inputs (all optional): `base-ref` (default: the PR base commit, or the pushed commit), `command` (`ci` or `plan`),
-`remote` (`origin`), `audit-log` (`vci-audit.json`), `working-directory` (`.`), `prebuilt` (`true`), `token`,
+`remote` (`origin`), `audit-log` (`vci-audit.json`), `working-directory` (`.`), `build-from-source` (`false`), `token`,
 `signing-key` (`""`: contents of CI's own SSH private key; see below), `ttl` (`14d`), `push` (`true`; with
-`signing-key`, needs `permissions: contents: write`). Outputs: `skipped`, `run`, `attested`.
+`signing-key`, needs `permissions: contents: write`). Outputs: `skipped`, `run`, `attested`. `prebuilt` is a
+deprecated alias (`false` compiles). Never set `build-from-source: true` in a user's workflow: it exists for vci's
+own development. If the action fails with `this commit of the action (...) has no published binary`, the workflow
+pins a branch or a commit that is not a release: change it to `@v1` (or the full SHA `v1` points to, from
+`git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v1`).
 
 ## Let CI attest its own runs (optional)
 
@@ -172,8 +176,8 @@ Never print, copy or use the CI key yourself, and never add an agent's or person
 
 ## Security rules (do not relax them)
 
-- Pin the action (`@v1`, `@v1.0.0` or a full commit SHA); never a branch. Never build `vci` from the pull request's
-  own checkout.
+- Pin the action (`@v1`, or the full commit SHA `v1` points to); never a branch, and not `@v1.0.0` to `@v1.4.0`
+  (those tags compile `vci` instead of downloading it). Never build `vci` from the pull request's own checkout.
 - Leave `base-ref` at its default. Use `pull_request`, not `pull_request_target`.
 - Keep `refs/heads/main` in `policy.no_skip_refs` (the `vci init` default): pushes to main run everything, the
   backstop against a trusted signer's false claim. `no_skip_refs_except` names only CI's own principal, if anything.

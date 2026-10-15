@@ -5,7 +5,7 @@
 <rect class="setup" x="0" y="53" width="14" height="14" rx="3"/><text class="m" x="20" y="64">checkout and toolchains (GitHub)</text>
 <rect class="ovh" x="252.8" y="53" width="14" height="14" rx="3"/><text class="m" x="272.8" y="64">vci: binary, fetch, plan</text>
 <rect class="tests" x="454.40000000000003" y="53" width="14" height="14" rx="3"/><text class="m" x="474.40000000000003" y="64">tests, attesting where noted</text>
-<rect class="build" x="0" y="75" width="14" height="14" rx="3"/><text class="m" x="20" y="86">compiling vci from unreleased sources: our own development runs; a workflow on @v1 or a release tag downloads the binary in about 1 s</text>
+<rect class="build" x="0" y="75" width="14" height="14" rx="3"/><text class="m" x="20" y="86">compiling vci from unreleased sources: our own development runs; a workflow on @v1 downloads the binary in about 1 s</text>
 <text class="t" x="0" y="140" font-weight="600">Before vci attests: full plain run</text><text class="m" x="0" y="158">every unit runs (1.2.0, prebuilt binary)</text>
 <rect class="setup" x="320.0" y="126" width="73.3" height="18" rx="3"/>
 <rect class="ovh" x="393.3" y="126" width="7.5" height="18" rx="3"/>

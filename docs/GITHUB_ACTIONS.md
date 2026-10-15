@@ -135,7 +135,10 @@ locally), then:
 
 ## What the action does
 
-1. Installs `vci`: a prebuilt binary whose checksum is recorded in the pinned action, or a build from source (cached).
+1. Installs `vci` in about a second: the release binary recorded in the pinned action's `release/manifest.txt`, its
+   checksum verified against that file. The action never compiles `vci` in your CI. When no published binary fits
+   (the action is pinned to a commit that is not a release, or the download fails) it fails at once with an error
+   that says what to do (see [Prebuilt binaries](#prebuilt-binaries)).
 2. Runs `vci fetch --remote origin`. Attestations are [git-meta](https://git-meta.com/) metadata on `refs/meta/main`.
    The fetch configures a git-meta remote named `meta` with origin's URL, so the checkout's credentials apply and a
    read-only `contents: read` token is enough. It fetches every blob (no partial clone) and builds a new
@@ -160,8 +163,9 @@ Every input is optional.
 | `remote` | `origin` | Git remote name or URL whose `refs/meta/main` holds the attestations |
 | `audit-log` | `vci-audit.json` | JSON record of what was skipped, by whom, and what ran |
 | `working-directory` | `.` | Directory to run `vci` from |
-| `prebuilt` | `true` | Download the release binary; `false` always builds from source |
-| `token` | `github.token` | Token used to download the release binary |
+| `build-from-source` | `false` | `true` lets the action compile `vci` (about two minutes cold, needs a Rust toolchain) when no published binary fits; with `false` it never compiles and fails instead. For working on vci itself; see [Prebuilt binaries](#prebuilt-binaries) |
+| `prebuilt` | `true` | Deprecated alias: `false` means `build-from-source: true`, except that it compiles without trying the release binary first |
+| `token` | `github.token` | Token `gh` uses to download the release binary; without `gh`, the public release URL is used |
 | `signing-key` | `""` | Contents of an SSH private key, from an environment secret limited to the default branch. `vci ci` then attests what it runs. Its public half must be in `.vci/allowed_signers` on the base branch, under a principal listed in `policy.no_skip_refs_except` for main to skip on it. See [Attesting in CI](#attesting-in-ci) |
 | `ttl` | `14d` | Lifetime of those attestations (at most `policy.max_ttl`) |
 | `push` | `true` | With `signing-key`: push the attestations to `remote` (needs `permissions: contents: write`); a failed push is a warning. Nothing is pushed when `vci ci` attested nothing on purpose (see [Attesting in CI](#attesting-in-ci)) |
@@ -311,18 +315,60 @@ The action is the verifier, so choose how far it may move:
 | Reference | Moves? | Use when |
 |---|---|---|
 | `@v1` | only to tested 1.x releases | the default |
-| `@v1.0.0` | never | you want a specific release |
-| `@<full commit SHA>` | never | strictest pinning; the SHA is on each [release page](https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases) |
+| `@v1.x.y` (after 1.4.0) | never | you want a specific release |
+| `@<full commit SHA>` | never | strictest pinning; it must be the commit of a release (the one `v1` points to, see below) |
 
-Never reference a branch.
+A SHA pin must be the commit that records its release in `release/manifest.txt` (its message is "Record release
+vX.Y.Z for the action"). That is the commit `v1` points to after each release, and from the first release after 1.4.0
+on, the one its version tag and release page name. Any other commit of the repository has no published binary, so the
+action refuses it with an error instead of compiling. To find the SHA `v1` points to:
+
+```sh
+git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v1
+# or
+gh api repos/PandelisZ/cryptographically-verifiable-ci-runner/git/ref/tags/v1 --jq .object.sha
+```
+
+Never reference a branch: the newest commits of `main` are usually not released, and the action fails on them. The
+version tags `v1.0.0` to `v1.4.0` (and their release-page SHAs) point at the commit before their release was recorded
+in `release/manifest.txt`, so they run the action as it was then, which compiles `vci` (about two minutes) instead of
+downloading it. Use `@v1`, or the SHA it points to, instead.
 
 ## Prebuilt binaries
 
-By default the action downloads a release binary, which takes a few seconds instead of about two minutes of
-compiling. It uses the download only when the pinned action's `release/manifest.txt` names a release built from
-exactly the action's own sources, a binary exists for the runner (Linux or macOS, x86_64 or arm64), and its SHA-256
-equals the checksum in that manifest. Otherwise it builds from source and caches the result; because the checksums
-are part of the pinned action, replacing a release asset cannot change what runs.
+The action downloads a release binary, which takes about a second, and never compiles `vci` in your CI. It installs
+the binary only when the pinned action's `release/manifest.txt` names a release built from exactly the action's own
+sources, a binary exists for the runner (Linux or macOS, x86_64 or arm64), and its SHA-256 equals the checksum in that
+manifest; because the checksums are part of the pinned action, replacing a release asset cannot change what runs. The
+log shows which one it installed:
+
+```text
+using vci v1.4.0 (vci-x86_64-unknown-linux-musl.tar.gz, sha256 c906f58b...)
+```
+
+Otherwise the job fails at its first step, before any other work, with an error saying why. Pinned to a branch or to
+a commit that is not a release, it shows:
+
+```text
+vci: this commit of the action (<ref>, sources <fingerprint>) has no published binary (release/manifest.txt records
+v1.4.0 built from <fingerprint>). Use a release: uses: PandelisZ/cryptographically-verifiable-ci-runner@v1, or the
+full commit SHA v1 points to (git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
+refs/tags/v1). To compile vci in this job anyway, set build-from-source: true.
+```
+
+Change the `uses:` line to `@v1` or that SHA (see [Pinning](#pinning)). The other errors are in
+[Troubleshooting](#troubleshooting).
+
+It downloads with `gh release download` (preinstalled on GitHub-hosted runners) and otherwise, or when `gh` fails,
+from the public release URL with `curl` or `wget`, so container jobs and self-hosted runners without `gh` need one of
+those two.
+
+`build-from-source: true` is for working on vci itself, as this repository's own CI does to test sources that are not
+released yet. When no published binary fits, the action then compiles `vci` (`cargo build --release`, about two
+minutes on `ubuntu-latest` without a cache) instead of failing, and a failed download or checksum mismatch is a
+warning. It needs a Rust toolchain before the action (for example `dtolnay/rust-toolchain`). It caches the binary per
+source fingerprint, and cargo's registry and build directory per `Cargo.lock` and `rustc` version, so a commit that
+changes only vci's own crates does not compile the dependencies again.
 
 ## Security rules
 
@@ -368,13 +414,24 @@ URL as `remote` and make sure the job can read it (and, to push CI's attestation
 ## Without the action
 
 ```yaml
+      # The release binary that v1 records in release/manifest.txt, checked
+      # against that checksum: about a second, nothing is compiled. For a
+      # strict pin, check out the commit SHA v1 points to instead of v1.
       - name: Install vci
         run: |
-          git clone \
+          git clone --quiet \
             https://github.com/PandelisZ/cryptographically-verifiable-ci-runner \
             "$RUNNER_TEMP/vci"
-          git -C "$RUNNER_TEMP/vci" checkout v1.0.0
-          cargo install --locked --path "$RUNNER_TEMP/vci/crates/vci-cli"
+          cd "$RUNNER_TEMP/vci"
+          git checkout --quiet --detach v1
+          asset=vci-x86_64-unknown-linux-musl.tar.gz  # Linux x86_64; release/manifest.txt lists the others
+          tag=$(sed -n 's/^tag=//p' release/manifest.txt)
+          curl -fsSL --retry 3 -o "$asset" \
+            "https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases/download/$tag/$asset"
+          grep "  $asset\$" release/manifest.txt > "$asset.sha256"  # fails if not recorded
+          sha256sum -c "$asset.sha256"
+          mkdir bin && tar -C bin -xzf "$asset" vci
+          echo "$RUNNER_TEMP/vci/bin" >> "$GITHUB_PATH"
           echo "VCI_PY_PLUGIN=$RUNNER_TEMP/vci/py/pytest-plugin" >> "$GITHUB_ENV"
           echo "VCI_JS_PLUGIN=$RUNNER_TEMP/vci/js/vitest-plugin" >> "$GITHUB_ENV"
           echo "VCI_RUBY_COLLECTOR=$RUNNER_TEMP/vci/ruby/vci-collector" >> "$GITHUB_ENV"
@@ -421,15 +478,24 @@ Run `vci explain <file> --base-ref origin/main` locally for the full reason a un
 | Every Rails test is refused on a Mac with `/etc/resolv.conf`, `native:FFI ffi_lib(["vips.42"])` or `config/master.key` | An older collector (`resolv.conf`, read when Capybara loads `net/http`; `ffi_lib`, which collector 0.4.0 records instead of refusing, so `image_processing`/`ruby-vips` with Homebrew libvips is attested), or the generator's credentials: see "What the Rails adapter records" in [the reference](REFERENCE.md#what-the-rails-adapter-records) |
 | Every Rails test is refused on the runner with `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0` | Collector 0.4.1, which took the bundle `bundler-cache` installs inside the repository for gems outside the bundle. Collector 0.4.2 attests these files; its new version makes existing Rails attestations run once more |
 | Minitest files never run with `runner = "rspec"` | An explicit runner leaves the other runner's files to you: `vci plan`/`ci` warn and the audit log lists it under `warnings` |
+| `vci: this commit of the action (...) has no published binary` | The action is pinned to a branch or to a commit that is not a release. Use `@v1` or the SHA `v1` points to (see [Pinning](#pinning)); only vci's own development needs `build-from-source: true` |
+| The action takes about two minutes and its log shows `Build vci from source` | It is pinned to `v1.0.0` to `v1.4.0` or their SHAs, which predate releases recorded on their own commit (see [Pinning](#pinning)): use `@v1` |
+| `vci: release ... has no binary for Windows-X64` (or another platform) | Releases are built for Linux and macOS, x86_64 and arm64 only: run the job on one of those |
+| `vci: could not download vci-....tar.gz of release ...` | A network failure (re-run the job), or the runner cannot reach github.com (a self-hosted runner behind a proxy). The message lists what was tried: `gh` with the `token` input, then `curl` or `wget` on the public release URL |
+| `vci: cannot download ...: this job has none of gh, curl or wget` | A container image without them: install `curl` in the image |
+| `vci: ... does not match the checksum in release/manifest.txt` | The downloaded file is not the one the pinned action records, so nothing was installed. Re-run; if it persists, report it |
+| `build-from-source needs a Rust toolchain (cargo) on the PATH` | `build-from-source: true` without a toolchain step before the action. Remove the input (you should not need it), or add `dtolnay/rust-toolchain` |
 
 ## For maintainers: cutting a release
 
 ```sh
-git tag v1.1.0 && git push origin v1.1.0      # the release workflow builds and publishes the binaries
-scripts/update-release-manifest.sh v1.1.0     # after it finishes: records tag, source fingerprint and checksums
-git add release/manifest.txt && git commit -m "Record release v1.1.0" && git push
-git tag -f v1 && git push -f origin v1         # move the major tag to the commit that carries the manifest
+gh workflow run release.yml -f tag=v1.5.0     # builds the binaries from main into a draft release
+scripts/publish-release.sh v1.5.0             # after it finishes, from an up-to-date main
 ```
 
-`@v1` therefore always points at a commit whose `release/manifest.txt` matches the published binaries. Any later change
-under `crates/`, `Cargo.toml` or `Cargo.lock` makes the action build from source again until the next release.
+Do not push the version tag yourself. `publish-release.sh` records the draft's tag, source fingerprint and checksums
+in `release/manifest.txt`, commits that, checks the commit the way the action will, pushes it to main, and only then
+publishes the draft, which creates `v1.5.0` on that commit; it moves `v1` there too. Every version tag, its
+release-page SHA and `@v1` therefore point at a commit whose `release/manifest.txt` matches its own binaries. A tag
+pushed before the build (as up to 1.4.0) carries the previous release's manifest, and the action refuses it. Any
+later change under `crates/`, `Cargo.toml` or `Cargo.lock` has no published binary until the next release.

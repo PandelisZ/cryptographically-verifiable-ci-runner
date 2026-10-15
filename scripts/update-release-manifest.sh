@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 # Record a published release in release/manifest.txt so the action can download
 # its binaries: the tag, the source fingerprint it was built from, and the
-# SHA-256 of every asset. Run after the release workflow has finished, from a
-# checkout whose crates/ are identical to the tagged commit.
+# SHA-256 of every asset. scripts/publish-release.sh runs it after the release
+# workflow has built the draft, from a checkout whose crates/ are identical to
+# the commit the draft was built from, and commits the result.
 #
 #   scripts/update-release-manifest.sh v0.1.0
 set -eu
