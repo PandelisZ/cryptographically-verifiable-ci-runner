@@ -1,30 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 570" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 550" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14">
 <style>.t{fill:#1b1d1a}.m{fill:#5d635b}.plain{fill:#15803d}.ovh{fill:#b45309}.attest{fill:#2563eb}.v{fill:#1b1d1a;font-weight:650}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.plain{fill:#4ade80}.ovh{fill:#fbbf63}.attest{fill:#60a5fa}.v{fill:#e6e9e4}.g{stroke:#262b29}}</style>
-<text class="t" x="0" y="20" font-size="17" font-weight="650">Measured on this repository's demo projects (vci 1.4.1 release binary, ubuntu-latest)</text>
+<text class="t" x="0" y="20" font-size="17" font-weight="650">Measured on this repository's demo projects (vci 1.5.0 release binary, ubuntu-latest)</text>
 <text class="m" x="0" y="42">Five small projects, 21 test units, 6 seconds of tests. Big enough to measure vci's costs, too small to show its savings.</text>
-<text class="t" x="0" y="84" font-size="16" font-weight="650">How long does a CI run take?</text><text class="m" x="0" y="104">Same job, same runner. GitHub's own setup (37 s) left out of every bar.</text>
+<text class="t" x="0" y="84" font-size="16" font-weight="650">How long does a CI run take?</text><text class="m" x="0" y="104">Same job, same runner. GitHub's own setup (28 s) left out of every bar.</text>
 <text class="t" x="0" y="150" font-weight="600">without vci</text><text class="m" x="0" y="168" font-size="12">the full suite runs: 6 s</text>
 <rect class="plain" x="300.0" y="136" width="72.0" height="20" rx="3"/>
 <text class="v" x="380.0" y="151">6 s</text>
-<text class="t" x="0" y="206" font-weight="600">with vci, nothing changed</text><text class="m" x="0" y="224" font-size="12">install, fetch, plan 8 s + decide 4 s = 12 s; 0 tests run</text>
-<rect class="ovh" x="300.0" y="192" width="144.0" height="20" rx="3"/>
-<text class="v" x="452.0" y="207">12 s</text>
-<text class="t" x="0" y="262" font-weight="600">with vci, one file changed</text><text class="m" x="0" y="280" font-size="12">12 s + the one test that depends on it</text>
-<rect class="ovh" x="300.0" y="248" width="144.0" height="20" rx="3"/>
-<rect class="plain" x="444.0" y="248" width="24.0" height="20" rx="3"/>
-<text class="v" x="476.0" y="263">14 s</text>
+<text class="t" x="0" y="206" font-weight="600">with vci, nothing changed</text><text class="m" x="0" y="224" font-size="12">download the binary 0.6 s + fetch, plan, decide 1.5 s = 2 s; 0 tests run</text>
+<rect class="ovh" x="300.0" y="192" width="24.0" height="20" rx="3"/>
+<text class="v" x="332.0" y="207">2 s</text>
+<text class="t" x="0" y="262" font-weight="600">with vci, one file changed</text><text class="m" x="0" y="280" font-size="12">2 s + the one test that depends on it</text>
+<rect class="ovh" x="300.0" y="248" width="24.0" height="20" rx="3"/>
+<rect class="plain" x="324.0" y="248" width="12.0" height="20" rx="3"/>
+<text class="v" x="344.0" y="263">3 s</text>
 <line class="g" x1="0" x2="1000" y1="298" y2="298"/>
-<text class="t" x="0" y="322" font-size="16" font-weight="650">What does attesting cost, once?</text><text class="m" x="0" y="342">Paid on the machine that attests, once per change. Every later run of an unchanged unit costs only the 12 s above.</text>
+<text class="t" x="0" y="322" font-size="16" font-weight="650">What does attesting cost, once?</text><text class="m" x="0" y="342">Paid on the machine that attests, once per change. Every later run of an unchanged unit costs only the 2 s above.</text>
 <text class="t" x="0" y="388" font-weight="600">run the suite plainly</text><text class="m" x="0" y="406" font-size="12">21 units, 6 s</text>
 <rect class="plain" x="300.0" y="374" width="72.0" height="20" rx="3"/>
 <text class="v" x="380.0" y="389">6 s</text>
-<text class="t" x="0" y="444" font-weight="600">run it attesting</text><text class="m" x="0" y="462" font-size="12">same 21 units with a collector in each process, signed: 36 s</text>
-<rect class="attest" x="300.0" y="430" width="432.0" height="20" rx="3"/>
-<text class="v" x="740.0" y="445">36 s</text>
+<text class="t" x="0" y="444" font-weight="600">run it attesting</text><text class="m" x="0" y="462" font-size="12">same 21 units with a collector in each process, signed: 31 s</text>
+<rect class="attest" x="300.0" y="430" width="372.0" height="20" rx="3"/>
+<text class="v" x="680.0" y="445">31 s</text>
 <line class="g" x1="0" x2="1000" y1="480" y2="480"/>
 <rect class="plain" x="0" y="508" width="14" height="14" rx="3"/><text class="m" x="20" y="520">tests running</text>
-<rect class="ovh" x="136.39999999999998" y="508" width="14" height="14" rx="3"/><text class="m" x="156.39999999999998" y="520">vci: fetch, plan, decide</text>
-<rect class="attest" x="347.59999999999997" y="508" width="14" height="14" rx="3"/><text class="m" x="367.59999999999997" y="520">tests running with collectors, then signed</text>
-<text class="m" x="0" y="542">Fixed cost about 12 s per job, plus about 1.5 s per attested test file or package: a process start each, a Rails boot per file. Not per test case.</text>
-<text class="m" x="0" y="560">Run 38786839799.</text>
-</svg>
+<rect class="ovh" x="136.39999999999998" y="508" width="14" height="14" rx="3"/><text class="m" x="156.39999999999998" y="520">vci: download, fetch, plan, decide</text>
+<rect class="attest" x="415.59999999999997" y="508" width="14" height="14" rx="3"/><text class="m" x="435.59999999999997" y="520">tests running with collectors, then signed</text>
+<text class="m" x="0" y="542">Fixed cost about 2 s per job (12 s in 1.4.1), plus about 1.5 s per attested test file or package, not per test case. Run 38812905175.</text></svg>
