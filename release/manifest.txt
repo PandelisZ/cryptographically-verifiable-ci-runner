@@ -1,7 +1,7 @@
 # Written by scripts/update-release-manifest.sh. The action trusts only these checksums.
-tag=v1.2.0
-source=fd27d66903dd9770a65877e19309f2fd
-a171669474ccec2b04f98a55e94464d90827f8d72538d49e3e735d385571f3b5  vci-aarch64-apple-darwin.tar.gz
-fede717f09f1c29d07be9cca6a04af53a316a06a3193a8e0156a7bf229eeee90  vci-aarch64-unknown-linux-musl.tar.gz
-585ab4b8b4528de1638389b5df4895a2c3bc7303aa9dda54cc9cd34f10cc2038  vci-x86_64-apple-darwin.tar.gz
-43a7530deca3c79ea851c2f231a74d9e94fa1eefd06dee71def0fe7559411e2b  vci-x86_64-unknown-linux-musl.tar.gz
+tag=v1.3.0
+source=c8e8c315b950dedf1303f2ca91e65816
+b5df71926085701242da0ca3185e891df6f58af0ae57368a467aa988861de143  vci-aarch64-apple-darwin.tar.gz
+f6d501daba971b9d587c2b4583a8468ee24e973635daca3c7948996a982060e5  vci-aarch64-unknown-linux-musl.tar.gz
+5b3edbcc4a1e588ca96a284e31ae19e1b1db25115ca7ea309889fd852e1756dc  vci-x86_64-apple-darwin.tar.gz
+50dd08cf9730011ca7fb38f7ca92b0804155419f2740bbdbeb0f6709bcaffd7f  vci-x86_64-unknown-linux-musl.tar.gz
