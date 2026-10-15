@@ -553,10 +553,11 @@ impl RailsAdapter {
         }
     }
 
-    /// The probe of the booted application (once): `vci run` and `vci plan`
-    /// compare it with [`RailsAdapter::light_probe`]
+    /// The probe of the booted application (once): `vci run` compares it
+    /// with [`RailsAdapter::light_probe`]
     /// ([`Adapter::check_run_environment`]), and `vci plan` reads the native
-    /// libraries from it when an attestation records one.
+    /// libraries from it when an attestation records one (the only boot of
+    /// the plan).
     fn probe(&self, env: &ChildEnv) -> Result<Probe, AdapterError> {
         self.probe
             .get_or_init(|| self.run_probe(env).map_err(|e| e.to_string()))
@@ -1250,7 +1251,8 @@ impl Adapter for RailsAdapter {
     /// with nothing that makes it unattestable (the probe's checks), and
     /// report exactly the toolchain read without booting it, which is what
     /// attestations record and `vci plan` compares. `vci run` attests
-    /// nothing, and `vci plan` skips nothing of the project, otherwise.
+    /// nothing otherwise. (`vci plan` does not boot the application for
+    /// this.)
     fn check_run_environment(&self, env: &ChildEnv) -> Result<(), AdapterError> {
         if self.plain_ruby() {
             // Probed the same way either way.

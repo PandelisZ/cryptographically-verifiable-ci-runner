@@ -582,6 +582,13 @@ impl Report {
     }
 }
 
+/// `git fetch` of a ref the remote does not have: the remote has no metadata
+/// yet (git says "couldn't find remote ref", older versions capitalise it).
+fn is_missing_remote_ref(e: &GitError) -> bool {
+    let text = e.to_string().to_ascii_lowercase();
+    text.contains("couldn't find remote ref") || text.contains("could not find remote ref")
+}
+
 fn is_ref_race(e: &GitError) -> bool {
     let text = e.to_string();
     text.contains("cannot lock ref")
@@ -1316,29 +1323,28 @@ impl<'a> AttestStore<'a> {
         let remote_ref = format!("refs/{ns}/main");
         let local_ref = format!("refs/{ns}/local/main");
         let tracking = self.tracking_ref(name, &ns)?;
-        let listed = self
+        // One round trip: fetch the ref, and read "not there yet" from git's
+        // own error (an `ls-remote` first would be a second round trip, about
+        // half a second against GitHub).
+        let fetched = self
             .repo
             .git()
-            .args(["ls-remote", "--refs", name, &remote_ref])
-            .run_str()?;
-        let found = listed
-            .lines()
-            .any(|l| l.split('\t').nth(1) == Some(remote_ref.as_str()));
-        if found {
-            self.repo
-                .git()
-                .args([
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    "--no-write-fetch-head",
-                    "--recurse-submodules=no",
-                    "--no-filter",
-                    name,
-                ])
-                .arg(format!("+{remote_ref}:{tracking}"))
-                .run()?;
-        }
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--recurse-submodules=no",
+                "--no-filter",
+                name,
+            ])
+            .arg(format!("+{remote_ref}:{tracking}"))
+            .run();
+        let found = match fetched {
+            Ok(_) => true,
+            Err(e) if is_missing_remote_ref(&e) => false,
+            Err(e) => return Err(e),
+        };
         let purged = self.purge_unserializable_rows()?;
         if purged > 0 {
             report.warn(format!(

@@ -745,17 +745,25 @@ fn pytest_push_fetch_fresh_clone_and_ci() {
     assert_ne!(log["exitCode"], 0);
     std::fs::remove_file(fresh.join("tests/test_zfail.py")).unwrap();
 
-    // Policy: nothing is skipped on refs listed in no_skip_refs, and a
-    // collection error means everything runs.
+    // Policy: nothing is skipped on refs listed in no_skip_refs.
     w.git(&fresh, &["checkout", "-q", "-b", "release/1"]);
     let p = w.plan(&fresh, "main");
     assert!(p.run_all && p.skip.is_empty(), "{p:?}");
     w.git(&fresh, &["checkout", "-q", "feature"]);
+    // A test file that fails to import is listed (vci lists test files
+    // without importing them) and runs; the others are still skipped.
     std::fs::write(
         fresh.join("tests/test_broken.py"),
         "import does_not_exist\n",
     )
     .unwrap();
+    let p = w.plan(&fresh, "main");
+    assert!(!p.run_all, "{p:?}");
+    assert!(p.run.contains("tests/test_broken.py"), "{p:?}");
+    assert_eq!(p.skip, set(&[B, C]));
+    std::fs::remove_file(fresh.join("tests/test_broken.py")).unwrap();
+    // A configuration the listing cannot read: everything runs.
+    std::fs::write(fresh.join("pytest.ini"), "not an ini file\n").unwrap();
     let out = w.vci(&fresh, &["plan", "--base-ref", "main", "--format", "json"]);
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(
@@ -765,6 +773,82 @@ fn pytest_push_fetch_fresh_clone_and_ci() {
             .contains("listing test files failed"),
         "{v}"
     );
+}
+
+/// Regression: a listed file in which pytest collects no test (a helper
+/// module matching `python_files`, or a file whose every test `-m` in
+/// addopts deselects) is never attested (no test ran), so it runs on every
+/// plan; once everything else was attested it was all `vci ci` ran, every
+/// process exited 5 and `vci ci` exited 5, where a whole-suite `pytest`
+/// passes.
+#[test]
+fn pytest_ci_passes_when_only_files_without_tests_remain() {
+    let Some(w) = World::build(
+        VCI_TOML,
+        |dir| {
+            copy_pytest_fixture(dir);
+            let py = dir.join("pyproject.toml");
+            let mut t = std::fs::read_to_string(&py).unwrap();
+            t.push_str("addopts = \"-m 'not slow'\"\nmarkers = [\"slow: slow tests\"]\n");
+            std::fs::write(&py, t).unwrap();
+            std::fs::write(
+                dir.join("tests/test_helpers.py"),
+                "def make_user(n):\n    return {\"id\": n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("tests/test_slow.py"),
+                "import pytest\n\n\n@pytest.mark.slow\ndef test_slow():\n    assert True\n",
+            )
+            .unwrap();
+        },
+        &["."],
+    ) else {
+        return;
+    };
+    let work = w.work.clone();
+    let empty = ["tests/test_helpers.py", "tests/test_slow.py"];
+    let out = w.vci(&work, &["run", "--key", w.trusted.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    for f in empty {
+        assert!(
+            stderr.contains(&format!("vci: not attesting {f}:")),
+            "{f} has no test to vouch for: {stderr}"
+        );
+    }
+    let p = w.plan(&work, "main");
+    assert_eq!(p.run, set(&empty), "{p:?}");
+    assert_eq!(p.skip.len(), 4, "{p:?}");
+
+    // Only the files without tests are left: they run, collect nothing, and
+    // `vci ci` passes, as a whole-suite `pytest` does.
+    let out = w.vci(&work, &["ci", "--base-ref", "main"]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("running 2 test file(s)"), "{stderr}");
+    assert!(stderr.contains("(exit 5)"), "{stderr}");
+    // With the collectors too (`--key`).
+    let out = w.vci(
+        &work,
+        &[
+            "ci",
+            "--base-ref",
+            "main",
+            "--key",
+            w.trusted.to_str().unwrap(),
+        ],
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    // A failing test still fails `vci ci`.
+    w.put(
+        "tests/test_zfail.py",
+        "def test_fails():\n    assert False\n",
+    );
+    let out = w.vci(&work, &["ci", "--base-ref", "main"]);
+    assert_ne!(out.status.code(), Some(0));
 }
 
 #[test]
@@ -1264,5 +1348,225 @@ fn pytest_libraries_any_loosens_nothing_else() {
         .find(|l| l.starts_with("  accepted by policy.libraries = \"any\": "))
     {
         assert!(l.contains("python libraries: attested sqlite="), "{ex}");
+    }
+}
+
+/// The files `pytest --collect-only -q` collects in `dir` (canonical), by
+/// pytest itself in the project's environment.
+fn pytest_collected(dir: &Path) -> BTreeSet<PathBuf> {
+    let mut cmd = Command::new("uv");
+    cmd.args(vci_adapter::UV_RUN_ARGS)
+        .args(["pytest", "--collect-only", "-q", "-p", "no:cacheprovider"])
+        .current_dir(dir)
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+    for k in SCRUB {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+        .lines()
+        .filter_map(|l| l.split_once("::").map(|(f, _)| f))
+        .map(|f| dir.join(f).canonicalize().unwrap())
+        .collect()
+}
+
+/// A uv project in `dir` with the fixture's environment (pytest) and no
+/// pytest configuration; false when uv cannot set it up.
+fn bare_pytest_project(dir: &Path) -> bool {
+    let fx = workspace_root().join("fixtures/pytest-abcd");
+    std::fs::create_dir_all(dir).unwrap();
+    for name in ["uv.lock", ".python-version"] {
+        cp(&fx.join(name), &dir.join(name));
+    }
+    std::fs::write(dir.join("pyproject.toml"), bare_pyproject()).unwrap();
+    uv_sync(dir)
+}
+
+/// The fixture's pyproject.toml without its pytest configuration.
+fn bare_pyproject() -> String {
+    let fx = workspace_root().join("fixtures/pytest-abcd/pyproject.toml");
+    let t = std::fs::read_to_string(fx).unwrap();
+    t.split("[tool.pytest.ini_options]")
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+/// The files vci lists in `dir` (no `PYTEST_ADDOPTS`).
+fn vci_listed(dir: &Path) -> BTreeSet<PathBuf> {
+    use vci_adapter::Adapter as _;
+    let a = vci_adapter::PytestAdapter::new(Utf8Path::from_path(dir).unwrap());
+    let files = a.list_test_files(&Some(vec![])).unwrap();
+    let v: Vec<PathBuf> = files
+        .iter()
+        .map(|f| f.abs.clone().into_std_path_buf())
+        .collect();
+    let mut sorted = v.clone();
+    sorted.sort();
+    assert_eq!(v, sorted, "listed in path order");
+    v.into_iter().collect()
+}
+
+fn write(dir: &Path, rel: &str, content: &str) {
+    let p = dir.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, content).unwrap();
+}
+
+/// vci lists pytest's test files without starting Python, from pytest's
+/// collection rules. On `fixtures/pytest-abcd`, `demo/pytest-app` and a
+/// tree exercising every rule it follows (configuration files and their
+/// precedence, `testpaths` and its globs, `python_files`, `norecursedirs`
+/// default and configured, `--ignore`/`--ignore-glob`/`--doctest-modules`
+/// and paths in `addopts`, virtualenvs, hidden and nested directories,
+/// packages, symlinked directories, doctest text files), the listing is
+/// exactly the set of files `pytest --collect-only -q` collects.
+#[test]
+fn pytest_listing_is_what_pytest_collects() {
+    if !uv_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    // The fixture and the demo application, as they are.
+    let fx = base.join("fx");
+    copy_pytest_fixture(&fx);
+    let demo = base.join("demo");
+    std::fs::create_dir_all(&demo).unwrap();
+    let src = workspace_root().join("demo/pytest-app");
+    for name in [
+        "src",
+        "tests",
+        "fixtures",
+        "pyproject.toml",
+        "uv.lock",
+        ".python-version",
+    ] {
+        cp(&src.join(name), &demo.join(name));
+    }
+    for dir in [&fx, &demo] {
+        if !uv_sync(dir) {
+            return;
+        }
+        let want = pytest_collected(dir);
+        assert_eq!(want.len(), 4, "{want:?}");
+        assert_eq!(vci_listed(dir), want, "{}", dir.display());
+    }
+
+    // Every rule, in a project of its own (the fixture's environment, no
+    // pytest configuration but each case's).
+    let w = base.join("rules");
+    if !bare_pytest_project(&w) {
+        return;
+    }
+    let bare = bare_pyproject();
+    let t = "def test_it():\n    assert True\n";
+    for (rel, content) in [
+        ("tests/sub/deep/test_deep.py", t),
+        ("tests/sub/deep/deep_test.py", t),
+        ("tests/helper.py", t),
+        ("tests/check_custom.py", t),
+        ("tests/x_spec.py", t),
+        ("tests/pkg/__init__.py", ""),
+        ("tests/pkg/test_in_pkg.py", t),
+        ("tests/skipme_one.py", t),
+        ("tests/test_skipme_two.py", t),
+        (".hidden/test_hidden.py", t),
+        ("venv/test_venv.py", t),
+        ("myenv/pyvenv.cfg", "home = /usr\n"),
+        ("myenv/test_in_venv.py", t),
+        ("build/test_build.py", t),
+        ("dist/test_dist.py", t),
+        ("node_modules/test_nm.py", t),
+        ("thing.egg/test_egg.py", t),
+        ("CVS/test_cvs.py", t),
+        ("{arch}/test_arch.py", t),
+        ("top_test.py", t),
+        ("more1/test_more.py", t),
+        ("more2/test_more2.py", t),
+        ("docs/test_guide.txt", "Guide\n\n>>> 1 + 1\n2\n"),
+        ("docs/test_plain.txt", "no examples here\n"),
+        (
+            "src/doc_mod.py",
+            "def f():\n    \"\"\"\n    >>> f()\n    1\n    \"\"\"\n    return 1\n",
+        ),
+    ] {
+        write(&w, rel, content);
+    }
+    std::os::unix::fs::symlink(w.join("tests/sub"), w.join("tests/sub_link")).unwrap();
+    let cases: &[(&str, &str)] = &[
+        // No configuration at all: every directory from the project dir.
+        ("none", ""),
+        (
+            "pyproject.toml",
+            "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+        ),
+        // testpaths that match nothing: the project dir.
+        (
+            "pyproject.toml",
+            "[tool.pytest.ini_options]\ntestpaths = [\"nothing_here*\"]\n",
+        ),
+        (
+            "pyproject.toml",
+            "[tool.pytest.ini_options]\ntestpaths = [\"tests\", \"more*\", \"docs\"]\n",
+        ),
+        (
+            "pyproject.toml",
+            "[tool.pytest.ini_options]\npython_files = \"check_*.py *_spec.py\"\n",
+        ),
+        (
+            "pyproject.toml",
+            "[tool.pytest]\npython_files = [\"test_*.py\"]\nnorecursedirs = [\"build\", \"src\"]\n",
+        ),
+        (
+            "pytest.ini",
+            "[pytest]\n# a comment\nnorecursedirs = build\n  node_modules\naddopts = --ignore=tests/pkg --ignore=tests/sub --ignore-glob=*/test_skip*.py --tb short -rA\n",
+        ),
+        (
+            "pytest.ini",
+            "[pytest]\naddopts = -p no:cacheprovider --doctest-modules tests src\n",
+        ),
+        (
+            "tox.ini",
+            "[tox]\nenvlist = py\n\n[pytest]\ntestpaths = tests more1\n",
+        ),
+        (
+            "setup.cfg",
+            "[metadata]\nname = x\n\n[tool:pytest]\npython_files = *_test.py\n",
+        ),
+        // pytest.ini wins over tox.ini in the same directory.
+        ("pytest.ini+tox.ini", ""),
+    ];
+    for (file, content) in cases {
+        for f in ["pytest.ini", "tox.ini", "setup.cfg"] {
+            let _ = std::fs::remove_file(w.join(f));
+        }
+        std::fs::write(w.join("pyproject.toml"), &bare).unwrap();
+        match *file {
+            "none" => {}
+            "pyproject.toml" => {
+                std::fs::write(w.join("pyproject.toml"), format!("{bare}\n{content}")).unwrap()
+            }
+            "pytest.ini+tox.ini" => {
+                std::fs::write(w.join("pytest.ini"), "[pytest]\ntestpaths = more2\n").unwrap();
+                std::fs::write(w.join("tox.ini"), "[pytest]\ntestpaths = more1\n").unwrap();
+            }
+            f => std::fs::write(w.join(f), content).unwrap(),
+        }
+        let want = pytest_collected(&w);
+        assert!(!want.is_empty(), "{file}: {content}");
+        let rel: Vec<String> = want
+            .iter()
+            .map(|p| p.strip_prefix(&w).unwrap().display().to_string())
+            .collect();
+        eprintln!("{file}: {content:?}: {rel:?}");
+        assert_eq!(vci_listed(&w), want, "{file}: {content}");
     }
 }

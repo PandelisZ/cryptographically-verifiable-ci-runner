@@ -270,6 +270,27 @@ non-zero if any fails. **An attestation vouches for the file run on its own**: a
 file that breaks another only when both share a process is not reproduced by `vci run` or `vci ci` (it would be by a
 plain full-suite `pytest`). CI example: [`examples/github-actions-pytest.yml`](../examples/github-actions-pytest.yml).
 
+**Which files are test files.** `vci plan`, `vci ci` and `vci run` (without file arguments) list the files a plain
+`pytest` in the project dir collects without starting Python, by pytest's documented collection rules: the
+configuration file (the first of `pytest.toml`, `.pytest.toml`, `pytest.ini`, `.pytest.ini`, `pyproject.toml` with
+`[tool.pytest]` or `[tool.pytest.ini_options]`, `tox.ini` with `[pytest]`, `setup.cfg` with `[tool:pytest]`, in the
+project dir or the nearest parent holding one), `testpaths` (globs included; used only when that file is in the
+project dir, as pytest uses it only from its rootdir; default: the project dir), paths given in `addopts`,
+`python_files` (default `test_*.py *_test.py`), `norecursedirs` (default `*.egg .* _darcs build CVS dist node_modules
+venv {arch}`; a configured list replaces it), `__pycache__` and virtualenvs (a `pyvenv.cfg` or `conda-meta/history`,
+unless `--collect-in-virtualenv`), `--ignore` and `--ignore-glob` in `addopts` or `PYTEST_ADDOPTS`, `-o`/
+`--override-ini`, and doctest files (`test*.txt` or `--doctest-glob`, and every module with `--doctest-modules`) that
+hold a `>>>` example. Symlinked directories are followed, as pytest follows them (a file reached outside the project
+dir runs everything). `__init__.py` packages change nothing. **What conftest.py files and plugins decide is not
+seen**: `collect_ignore` and `collect_ignore_glob` are not honoured (such files are listed and each runs on its own:
+it fails open, so a file that only imports on another Python version fails its run), and neither are
+`pytest_ignore_collect`/`pytest_collect_file` hooks or files a plugin collects (pytest-mypy, pytest-ruff and the like:
+not listed, not run by `vci ci`). A listed file with no test, or whose tests `-k`/`-m` in `addopts` all deselect,
+collects nothing when it runs (pytest's exit code 5), which counts as passing as in a whole-suite run, also when it is
+the only file `vci ci` runs. No test ran, so `vci run` does not attest it: it runs (one short pytest process) on every
+`vci ci`. `--pyargs`, and `-c`/`--config-file`/`--rootdir` or paths in `PYTEST_ADDOPTS`, are not followed: the
+listing fails and the project runs everything, as does a configuration file pytest cannot read.
+
 ### Attesting on macOS, verifying on Linux (`platform = "any"`)
 
 Attestations made on a laptop can be accepted by a GitHub Actions `ubuntu-latest` runner when everything the
@@ -622,12 +643,16 @@ Ruby process sets up the bundle (Bundler fails there, as every test process woul
 loads YAML and TZInfo as every booted Rails application does, `sqlite3` when `Bundler.require(*Rails.groups)` would
 require it, sets both default encodings to UTF-8 as Rails' `config.encoding` does, and reads the test environment's
 database adapters from `config/database.yml` as Rails reads it (ERB, `shared`, `DATABASE_URL`). Only when that file's
-ERB needs the application (`Rails.root`, credentials) is the application booted for it. `vci run` and `vci plan`
-also boot the application once (`vci plan` in the background, while it lists the test files, fetches and checks the
-attestations): `vci run` refuses to attest, and `vci plan` runs every test file of the project, when the application
-does not boot (a native extension of the bundle that fails to load), when the booted application reports anything
-else (a custom `config.encoding`, a gem that loads `sqlite3` itself), or when the boot finds a reason the application
-cannot be attested.
+ERB needs the application (`Rails.root`, credentials) is the application booted for it. `vci run` also boots the
+application once and refuses to attest when it does not boot (a native extension of the bundle that fails to load),
+when the booted application reports anything else (a custom `config.encoding`, a gem that loads `sqlite3` itself), or
+when the boot finds a reason the application cannot be attested. `vci plan` does not: it compares the toolchain read
+without booting with what the attestation recorded, and boots the application only for the native libraries an
+attestation records (once per project, and only when a candidate attestation lists one: see "Native libraries" below).
+The trade-off: an application that cannot boot where the plan runs, for a reason outside its recorded inputs and
+toolchain (a corrupt native extension of an unchanged gem version, a system library removed from the runner), is not
+detected by the plan, which skips what was attested. The attested run booted it, and CI's own full runs (on
+`policy.no_skip_refs`) still boot it.
 
 Test results: a file is attested only when the process exits 0 and every test passed: **any failure, error or skip,
 no test at all, or a test that made no assertion** refuses it.
@@ -663,8 +688,8 @@ config/master.key, Rails' credentials key`). Nothing is wrong (it fails open), b
 `FFI::DynamicLibrary.open`) is not a read of test inputs: the collector records the library as an external,
 `native:<file name>` (`native:libvips.42.dylib`), whose version is the sha256 of the file FFI resolved it to (or
 `unresolved` when FFI gave no path, such as a system library in macOS's shared cache). `vci plan` compares it with
-the library the booted application opens where the attestation is checked (the boot `vci plan` makes once per project,
-see above), like a gem: a
+the library the booted application opens where the attestation is checked (`vci plan` boots the application for this
+once per project, only when a candidate attestation records a native library), like a gem: a
 different libvips build, another platform's, or none at all runs the file (with `policy.libraries = "any"` in the base
 `vci.toml`, a libvips of any file name and build is accepted, as long as one is loaded: see `policy.libraries` under
 "`vci.toml`" and "Attest on macOS, skip on Linux"). Finding the library (FFI's search of `LD_LIBRARY_PATH`, its
@@ -2210,6 +2235,11 @@ Rails limitations (details and the verified mechanisms in [`docs/spike-rails.md`
   collector writes its output at exit.
 - **OpenSSL** is not compared (see "Attesting on macOS, verifying on Linux (Rails)"), and neither is the C compiler of
   gems built at install time.
+- **Whether the application boots where `vci plan` runs** is not checked (unless an attestation records a native
+  library): the plan reads the toolchain without booting it. An application that boots where it was attested but not
+  on the verifier, for a reason outside its recorded inputs and toolchain (a corrupt native extension of an unchanged
+  gem version, a missing system library), has its attested files skipped there. `vci run` boots it before attesting
+  anything, and CI's own full runs (`policy.no_skip_refs`) boot it.
 - **RSpec**: supported (see [Quick start (RSpec)](#quick-start-rspec) and its limitations). A project with RSpec files
   but no `rspec-core` in `Gemfile.lock`, or with `runner = "minitest"`, runs its Minitest files only: an RSpec-only
   one is an error (`vci plan` runs everything, `vci ci` fails rather than run nothing), beside Minitest files the RSpec
@@ -2467,8 +2497,10 @@ repository does not need the other projects' toolchains (`e2e_pytest.rs`).
   project environment and syncs only the default dependency groups, so pytest must be in them); plain virtualenvs or
   Poetry are not supported yet. The `vci_pytest` version is not part of the attestation (as with `@vci/vitest`), so a
   collector fix does not by itself invalidate older attestations (the toolchain fields added with this version do:
-  older pytest attestations never match). `vci plan` imports every test module (`pytest --collect-only`) to list
-  files; a collection error runs everything.
+  older pytest attestations never match). `vci plan` lists the test files from pytest's collection rules without
+  starting Python (see "Which files are test files" under the pytest quick start): what conftest.py files and plugins
+  decide about collection is not seen, and a file that fails to import is listed and fails its own run (it no longer
+  makes the plan run everything).
 - Go: the adapter needs a module (GOPATH mode is not supported) and runs tests natively (`GOOS`/`GOARCH` must be
   the host's). The overlaid logger compiles for Unix only (it uses `syscall.Open` with an `int` descriptor): on
   Windows every package fails to build under `vci run` and is refused. Its source is not part of the attestation,

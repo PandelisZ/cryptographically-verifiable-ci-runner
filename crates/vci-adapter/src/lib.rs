@@ -14,6 +14,7 @@ mod golang;
 mod jsonl;
 mod nodetest;
 mod pytest;
+mod pytest_list;
 mod rails;
 mod vitest;
 
@@ -263,12 +264,11 @@ pub trait Adapter: Send + Sync {
         let _ = env;
         Ok(None)
     }
-    /// What `vci run` checks before running anything it attests, and
-    /// `vci plan` before it skips anything (in the background, joined before
-    /// the verdicts: a failure runs every file of the project), beyond
+    /// What `vci run` checks before running anything it attests, beyond
     /// [`Adapter::tool_versions_with_env`] (Rails: the application boots
     /// under vci's run conditions, passes the probe's checks and reports the
-    /// toolchain read without booting it).
+    /// toolchain read without booting it). `vci plan` does not call it: it
+    /// reads the toolchain as recorded (without booting) and compares that.
     fn check_run_environment(&self, env: &ChildEnv) -> Result<(), AdapterError> {
         let _ = env;
         Ok(())

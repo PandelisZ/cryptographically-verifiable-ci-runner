@@ -182,10 +182,64 @@ fn strict_env_writes_and_failures_are_reported() {
         .unwrap();
     assert!(w.writes.contains(&dir.join("tests/out.txt")), "{w:?}");
 
-    // A collection error makes the listing fail (vci plan then runs everything).
+    // The listing imports nothing: a file that fails to import is listed
+    // (its own run fails).
     std::fs::write(dir.join("tests/test_broken.py"), "import does_not_exist\n").unwrap();
+    let listed = a.list_test_files(&None).unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|f| f.abs.ends_with("tests/test_broken.py")),
+        "{listed:?}"
+    );
+    // A configuration file it cannot read makes it fail (vci plan then runs
+    // everything).
+    std::fs::write(dir.join("pytest.ini"), "not an ini file\n").unwrap();
     let err = a.list_test_files(&None).unwrap_err().to_string();
-    assert!(err.contains("collect"), "{err}");
+    assert!(err.contains("pytest.ini"), "{err}");
+}
+
+/// A listed file in which pytest collects no test (none defined, or all
+/// deselected by `-m` in addopts) exits 5 when run on its own; the per-file
+/// runs count it as passing, also when it is the only file run (it is never
+/// attested, so it is what `vci ci` runs once everything else is).
+#[test]
+fn a_file_without_tests_counts_as_passing() {
+    if !uv_available() {
+        return;
+    }
+    let Some((_t, dir)) = copy_fixture() else {
+        return;
+    };
+    std::fs::write(dir.join("tests/test_ok.py"), "def test_ok():\n    pass\n").unwrap();
+    std::fs::write(dir.join("tests/test_empty.py"), "X = 1\n").unwrap();
+    let a = adapter(&dir);
+    let both = [
+        "tests/test_ok.py".to_owned(),
+        "tests/test_empty.py".to_owned(),
+    ];
+    assert_eq!(a.run_plain(&both, &None).unwrap(), Some(0));
+    assert_eq!(a.run_collect(&both, &None).unwrap().exit_code, Some(0));
+    let empty = ["tests/test_empty.py".to_owned()];
+    assert_eq!(a.run_plain(&empty, &None).unwrap(), Some(0));
+    let run = a.run_collect(&empty, &None).unwrap();
+    assert_eq!(run.exit_code, Some(0));
+    // The collector still reports that no test ran (`vci run` refuses to
+    // attest it).
+    let r = run
+        .files
+        .iter()
+        .find(|o| o.test_id == "tests/test_empty.py")
+        .and_then(|o| o.result.clone())
+        .unwrap();
+    assert_eq!((r.state.as_str(), r.tests), ("failed", 0), "{r:?}");
+    // A failure still fails.
+    std::fs::write(
+        dir.join("tests/test_ok.py"),
+        "def test_ok():\n    assert False\n",
+    )
+    .unwrap();
+    assert_eq!(a.run_plain(&both, &None).unwrap(), Some(1));
 }
 
 /// Regression: stale `__pycache__` bytecode (source edited with its mtime and

@@ -151,23 +151,6 @@ print("VCI-PROBE " + json.dumps({
 }))
 "#;
 
-/// Listing helper plugin (loaded with `-p vci_list` from a temp dir): writes
-/// the files of the collected items as JSON, independent of the output
-/// verbosity the user configured.
-const LIST_PLUGIN: &str = r#"import json, os
-def pytest_collection_finish(session):
-    out = os.environ.get("VCI_LIST_OUT")
-    if not out:
-        return
-    files = set()
-    for item in session.items:
-        p = getattr(item, "path", None) or getattr(item, "fspath", None)
-        if p is not None:
-            files.add(os.path.abspath(str(p)))
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(sorted(files), f)
-"#;
-
 /// Outcome of one collecting pytest process: exit code, parsed collector
 /// output, and the process's combined output (for stderr).
 pub(crate) type OneRun = (Option<i32>, Vec<Observed>, Vec<u8>);
@@ -478,6 +461,29 @@ where
     per_file_jobs(files, pytest_jobs(), one)
 }
 
+/// pytest's exit code when it collected no test.
+const NO_TESTS_COLLECTED: i32 = 5;
+
+/// [`per_file`] for pytest processes: a process that collected no test (5:
+/// a listed file without a test, or whose tests `-k`/`-m` in addopts all
+/// deselect) counts as passing, as such a file does in a whole-suite
+/// `pytest` run that collects tests from other files. Always, even when no
+/// process collected a test: such a file is never attested (no test ran), so
+/// once every other file is attested it is all `vci ci` runs, and a run
+/// whose other files are attested is not one that collected nothing.
+fn per_file_pytest<F>(files: &[String], one: F) -> Result<RunOutput, AdapterError>
+where
+    F: Fn(&str) -> Result<OneRun, AdapterError> + Sync,
+{
+    per_file(files, |f| {
+        let (code, obs, log) = one(f)?;
+        if code == Some(NO_TESTS_COLLECTED) {
+            return Ok((Some(0), obs, log));
+        }
+        Ok((code, obs, log))
+    })
+}
+
 /// [`per_file`] with at most `jobs` processes at a time.
 pub(crate) fn per_file_jobs<F>(
     files: &[String],
@@ -601,67 +607,37 @@ impl Adapter for PytestAdapter {
         &self.project_dir
     }
 
-    /// `uv run --locked pytest --collect-only -q`, reduced to files by a
-    /// helper plugin. Any non-zero exit other than "no tests collected" (a
-    /// collection error, a bad config) is an error, which makes `vci plan`
-    /// run everything.
+    /// The files `pytest` (no file arguments, in the project dir) collects,
+    /// listed in Rust from pytest's collection rules without starting
+    /// Python (see `pytest_list`): the configuration file, `addopts` and
+    /// `PYTEST_ADDOPTS` (as the child sees it), `testpaths`, `python_files`,
+    /// `norecursedirs`, `--ignore`/`--ignore-glob`, virtualenvs and doctest
+    /// files. Sorted by path. What conftest.py files and plugins decide is
+    /// not seen: such files are listed (and run on their own) or not. A
+    /// configuration it cannot read (or does not follow, such as
+    /// `--pyargs`) is an error, which makes `vci plan` run everything.
     fn list_test_files(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError> {
-        let tmp = tempfile::Builder::new().prefix("vci-list-").tempdir()?;
-        let dir = utf8_tmp(&tmp)?;
-        std::fs::write(dir.join("vci_list.py"), LIST_PLUGIN)?;
-        let json_path = dir.join("files.json");
-        let mut cmd = self.uv_run(env, &dir.join("pycache"));
-        cmd.args(["pytest", "--collect-only", "-q", "-p", "vci_list"])
-            .env("PYTHONPATH", dir.as_str())
-            .env("VCI_LIST_OUT", json_path.as_str());
-        let out = cmd.output().map_err(|e| self.not_installed(e))?;
-        let code = out.status.code();
-        // 5 = no tests collected.
-        if code != Some(0) && code != Some(5) {
-            return Err(AdapterError::Command {
-                cmd: describe(&cmd),
-                status: out.status.to_string(),
-                stderr: format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                )
-                .trim_end()
-                .to_owned(),
-            });
-        }
-        let text = std::fs::read_to_string(&json_path).map_err(|e| AdapterError::Parse {
-            what: "pytest --collect-only".into(),
-            detail: format!("the listing plugin wrote nothing ({e})"),
-        })?;
-        let arr: Vec<String> = serde_json::from_str(&text).map_err(|e| AdapterError::Parse {
-            what: "pytest --collect-only".into(),
-            detail: e.to_string(),
-        })?;
-        let mut files = Vec::new();
-        for f in arr {
-            let p = Utf8PathBuf::from(&f);
-            let abs = p.canonicalize_utf8().map_err(|e| AdapterError::Parse {
-                what: "pytest --collect-only".into(),
-                detail: format!("collected file {f}: {e}"),
+        let addopts: Option<String> = match env {
+            Some(vars) => vars
+                .iter()
+                .find(|(k, _)| k == "PYTEST_ADDOPTS")
+                .map(|(_, v)| v.to_string_lossy().into_owned()),
+            None => std::env::var_os("PYTEST_ADDOPTS").map(|v| v.to_string_lossy().into_owned()),
+        };
+        let files =
+            crate::pytest_list::list(&self.project_dir, addopts.as_deref()).map_err(|detail| {
+                AdapterError::Parse {
+                    what: "pytest's test files".into(),
+                    detail,
+                }
             })?;
-            if !abs.starts_with(&self.project_dir) {
-                return Err(AdapterError::Parse {
-                    what: "pytest --collect-only".into(),
-                    detail: format!(
-                        "collected file {abs} is outside the project dir {}",
-                        self.project_dir
-                    ),
-                });
-            }
-            files.push(ListedFile {
+        Ok(files
+            .into_iter()
+            .map(|abs| ListedFile {
                 abs,
                 project: String::new(),
-            });
-        }
-        files.sort_by(|a, b| a.abs.cmp(&b.abs));
-        files.dedup();
-        Ok(files)
+            })
+            .collect())
     }
 
     fn tool_versions(&self) -> Result<ToolVersions, AdapterError> {
@@ -721,13 +697,13 @@ impl Adapter for PytestAdapter {
 
     /// One `pytest` process per file, at most [`pytest_jobs`] at a time,
     /// sharing one fresh bytecode directory. Each process's output is written
-    /// to stderr as one block when it ends. The exit code is 0 only if every
-    /// process exited 0.
+    /// to stderr as one block when it ends. The exit code is
+    /// [`per_file_pytest`]'s.
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {
         let plugin = self.plugin_dir()?;
         let pyc = tempfile::Builder::new().prefix("vci-pyc-").tempdir()?;
         let pyc = utf8_tmp(&pyc)?;
-        per_file(files, |f| self.run_one(&plugin, f, env, &pyc))
+        per_file_pytest(files, |f| self.run_one(&plugin, f, env, &pyc))
     }
 
     /// With files: one `uv run pytest <file>` per file (in parallel, like
@@ -742,7 +718,7 @@ impl Adapter for PytestAdapter {
             cmd.arg("pytest").stdout(std::io::stderr());
             return Ok(cmd.status().map_err(|e| self.not_installed(e))?.code());
         }
-        Ok(per_file(files, |f| self.run_one_plain(f, env, &pyc))?.exit_code)
+        Ok(per_file_pytest(files, |f| self.run_one_plain(f, env, &pyc))?.exit_code)
     }
 }
 
@@ -874,6 +850,28 @@ mod tests {
         assert_eq!(p.base_prefix, "/uv/python/cpython-3.14.4");
         assert!(parse_probe(r#"{"python":"3.14.7"}"#).is_err());
         assert!(parse_probe("nope").is_err());
+    }
+
+    /// Regression: when every process collected no test, the per-file run
+    /// exited 5. A listed file without a test is never attested, so once the
+    /// other files were attested `vci ci` ran only it and exited 5.
+    #[test]
+    fn a_process_that_collects_nothing_always_counts_as_passing() {
+        let code = |codes: &[(&str, Option<i32>)]| {
+            let files: Vec<String> = codes.iter().map(|(f, _)| (*f).to_owned()).collect();
+            per_file_pytest(&files, |f| {
+                let c = codes.iter().find(|(n, _)| *n == f).unwrap().1;
+                Ok((c, vec![], vec![]))
+            })
+            .unwrap()
+            .exit_code
+        };
+        assert_eq!(code(&[("e.py", Some(5))]), Some(0));
+        assert_eq!(code(&[("e.py", Some(5)), ("f.py", Some(5))]), Some(0));
+        assert_eq!(code(&[("e.py", Some(5)), ("ok.py", Some(0))]), Some(0));
+        assert_eq!(code(&[("e.py", Some(5)), ("bad.py", Some(1))]), Some(1));
+        assert_eq!(code(&[("e.py", Some(5)), ("x.py", None)]), None);
+        assert_eq!(code(&[("err.py", Some(2))]), Some(2));
     }
 
     #[test]

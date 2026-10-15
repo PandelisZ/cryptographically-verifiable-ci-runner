@@ -274,17 +274,23 @@ All commands run with cwd = project dir through `uv run --locked --exact --no-en
 `PYTHONPYCACHEPREFIX=<fresh temp dir>` (bytecode is always compiled from the hashed sources) and `PYTHONPATH` removed
 unless set below:
 
-- `list_test_files`: `uv run --locked pytest --collect-only -q -p vci_list` with `PYTHONPATH=<tmp>` holding a helper
-  plugin that writes the files of the collected items as JSON (independent of the configured verbosity). Exit codes
-  other than 0 and 5 (no tests) — e.g. a collection error — are errors, so `vci plan` runs everything.
+- `list_test_files`: no process. pytest's collection rules applied in Rust (`crates/vci-adapter/src/pytest_list.rs`):
+  the configuration file pytest would find from the project dir, `testpaths` (when that file is in the project dir),
+  paths, `--ignore`, `--ignore-glob`, `--collect-in-virtualenv`, `--doctest-modules`, `--doctest-glob`,
+  `-p no:doctest` and `-o` in `addopts` and the child's `PYTEST_ADDOPTS`, `python_files`, `norecursedirs`,
+  virtualenvs, `__pycache__`, doctest files with a `>>>` example; symlinked directories followed. conftest.py
+  (`collect_ignore`, hooks) and plugins are not consulted. Canonical paths, sorted; a file outside the project dir, a
+  configuration file that cannot be read, `--pyargs`, and `-c`/`--config-file`/`--rootdir` or paths in
+  `PYTEST_ADDOPTS` are errors, so `vci plan` runs everything.
 - `tool_versions_with_env` / `installed_externals`: one `uv run --locked python <tmp>/vci_probe.py` (cached per
   adapter) reporting `platform.python_version()`, `sys.implementation.name`, `pytest.__version__`, the bundled sqlite
   and OpenSSL versions, `sys.base_prefix` and every installed distribution (PEP 503 names).
 - `run_collect`: one process per file, `$VCI_JOBS` (default CPUs, max 8) at a time:
   `PYTHONPATH=<plugin dir> VCI_OUT=<fresh dir> uv run --locked pytest -p vci_pytest <file>`; each process's output is
-  written to stderr as one block; exit code 0 only if every process exited 0.
-- `run_plain`: with files, one `uv run pytest <file>` process per file (`$VCI_JOBS` at a time, output in blocks), the
-  isolation attestations are made with; without files, the whole suite in one process.
+  written to stderr as one block; exit code 0 only if every process exited 0 or 5 (no test collected), also when every
+  process exited 5 (a file without a test is never attested, so it is all `vci ci` runs once the rest is attested).
+- `run_plain`: with files, one `uv run pytest <file>` process per file (`$VCI_JOBS` at a time, output in blocks, exit
+  code as for `run_collect`), the isolation attestations are made with; without files, the whole suite in one process.
 - `canonical_argv`: `["pytest", "--rootdir", <project dir>, <file>]`; `config_candidates`: the pytest config names
   in the project dir; no snapshot candidates or inferred env patterns; hashed env patterns `PYTHON*`, `PYTEST_*`,
   `!PYTHONPATH`.
