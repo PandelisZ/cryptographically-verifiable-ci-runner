@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 550" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 570" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14">
 <style>.t{fill:#1b1d1a}.m{fill:#5d635b}.plain{fill:#15803d}.ovh{fill:#b45309}.attest{fill:#2563eb}.v{fill:#1b1d1a;font-weight:650}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.plain{fill:#4ade80}.ovh{fill:#fbbf63}.attest{fill:#60a5fa}.v{fill:#e6e9e4}.g{stroke:#262b29}}</style>
 <text class="t" x="0" y="20" font-size="17" font-weight="650">Measured on this repository's demo projects (vci 1.4.1 release binary, ubuntu-latest)</text>
 <text class="m" x="0" y="42">Five small projects, 21 test units, 6 seconds of tests. Big enough to measure vci's costs, too small to show its savings.</text>
@@ -25,4 +25,6 @@
 <rect class="plain" x="0" y="508" width="14" height="14" rx="3"/><text class="m" x="20" y="520">tests running</text>
 <rect class="ovh" x="136.39999999999998" y="508" width="14" height="14" rx="3"/><text class="m" x="156.39999999999998" y="520">vci: fetch, plan, decide</text>
 <rect class="attest" x="347.59999999999997" y="508" width="14" height="14" rx="3"/><text class="m" x="367.59999999999997" y="520">tests running with collectors, then signed</text>
-<text class="m" x="0" y="542">Fixed cost about 12 s per job, plus about 1.5 s per attested test file or package (a process start each, a Rails boot per file), not per test case. Run 38786839799.</text></svg>
+<text class="m" x="0" y="542">Fixed cost about 12 s per job, plus about 1.5 s per attested test file or package: a process start each, a Rails boot per file. Not per test case.</text>
+<text class="m" x="0" y="560">Run 38786839799.</text>
+</svg>
