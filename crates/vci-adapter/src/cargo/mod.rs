@@ -954,6 +954,20 @@ fn through_links(path: &Utf8Path, repo_root: &Utf8Path) -> (Vec<Utf8PathBuf>, Ut
     (links, cur)
 }
 
+/// `$CARGO_HOME` (the child's variable, else `~/.cargo`), canonical, when it
+/// lies inside `repo_root`; `None` otherwise.
+fn cargo_home_inside(
+    repo_root: &Utf8Path,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Option<Utf8PathBuf> {
+    let home = var("CARGO_HOME")
+        .filter(|v| !v.is_empty())
+        .map(Utf8PathBuf::from)
+        .or_else(|| var("HOME").map(|h| Utf8PathBuf::from(h).join(".cargo")))?;
+    let home = canonical(&home);
+    (home != *repo_root && home.starts_with(repo_root)).then_some(home)
+}
+
 /// The directory holding `.git` above (or at) `dir`; `dir` itself if none.
 fn repo_root_of(dir: &Utf8Path) -> Utf8PathBuf {
     dir.ancestors()
@@ -1532,13 +1546,17 @@ impl CargoAdapter {
         } else {
             vec![]
         };
+        let cargo_home = cargo_home_inside(&repo_root, &raw);
+        let mut excluded = vec![
+            ws.target_dir.clone(),
+            repo_root.join(".git"),
+            repo_root.join(".vci/out"),
+        ];
+        excluded.extend(cargo_home.clone());
         Ok(RunCtx {
             target_dir: ws.target_dir.join(VCI_TARGET_SUBDIR),
-            excluded: vec![
-                ws.target_dir.clone(),
-                repo_root.join(".git"),
-                repo_root.join(".vci/out"),
-            ],
+            excluded,
+            cargo_home,
             repo_root,
             config,
             config_env: exec::config_env(&cfg_files),
@@ -1604,7 +1622,7 @@ impl CargoAdapter {
             .filter(|a| {
                 a.manifest_path
                     .parent()
-                    .is_some_and(|d| ctx.canon(d).starts_with(&ctx.repo_root))
+                    .is_some_and(|d| ctx.in_repo(&ctx.canon(d)))
             })
             .filter_map(|a| parse_pkgid(&a.package_id))
             .map(|p| (p.name, p.version))
@@ -1648,7 +1666,7 @@ impl CargoAdapter {
             let dir = ctx.canon(manifest.parent().unwrap_or(Utf8Path::new("/")));
             match &p.source {
                 None => {
-                    if dir.starts_with(&ctx.repo_root) {
+                    if ctx.in_repo(&dir) {
                         in_repo.insert(id, dir);
                     } else {
                         problems.insert(format!(
@@ -1706,7 +1724,7 @@ impl CargoAdapter {
                             ));
                         }
                     }
-                    if dir.starts_with(&ctx.repo_root) {
+                    if ctx.in_repo(&dir) {
                         // Vendored into the repository (source replacement):
                         // its files are hashed, since the Cargo.lock
                         // checksum does not cover edits there.
@@ -1790,7 +1808,7 @@ impl CargoAdapter {
                     continue;
                 }
                 let generated = f.starts_with(target_dir) || ctx.canon(&f).starts_with(target_dir);
-                if !generated && !f.starts_with(&ctx.repo_root) {
+                if !generated && !ctx.in_repo(&f) {
                     let real = ctx.canon(&f);
                     if real.starts_with(&ctx.probe.sysroot)
                         || external_dirs.iter().any(|e| real.starts_with(e))
@@ -1864,7 +1882,7 @@ impl CargoAdapter {
                     if abs.starts_with(target_dir) {
                         continue;
                     }
-                    if !abs.starts_with(&ctx.repo_root) {
+                    if !ctx.in_repo(&abs) {
                         problems.insert(format!(
                             "cargo: build script of {} declares an input outside the repository: {abs}",
                             pkg
@@ -1928,7 +1946,7 @@ impl CargoAdapter {
             .platform_files
             .into_iter()
             .map(|f| {
-                if f.starts_with(&ctx.repo_root) {
+                if ctx.in_repo(&f) {
                     f
                 } else {
                     scanned_from
@@ -2105,8 +2123,12 @@ struct RunCtx {
     repo_root: Utf8PathBuf,
     target_dir: Utf8PathBuf,
     /// Never inputs (and left out of listings): the workspace target dir,
-    /// the repository's `.git` and `.vci/out`.
+    /// the repository's `.git` and `.vci/out`, and `cargo_home`.
     excluded: Vec<Utf8PathBuf>,
+    /// `$CARGO_HOME` when it lies inside the repository (CI mounting it under
+    /// the checkout): the registry's extracted crates and git checkouts
+    /// there are external packages, not the repository's, and never inputs.
+    cargo_home: Option<Utf8PathBuf>,
     /// The repository's cargo config and rustc wrappers, for every unit.
     config: config::ConfigFacts,
     /// The `[env]` table of the cargo configuration (test processes get it).
@@ -2129,6 +2151,13 @@ impl RunCtx {
     /// [`canonical`], once per path.
     fn canon(&self, p: &Utf8Path) -> Utf8PathBuf {
         self.caches.canonical.get(p, || canonical(p))
+    }
+
+    /// Whether `p` is part of the repository: under its root and not under a
+    /// `$CARGO_HOME` kept there.
+    fn in_repo(&self, p: &Utf8Path) -> bool {
+        p.starts_with(&self.repo_root)
+            && !self.cargo_home.as_ref().is_some_and(|h| p.starts_with(h))
     }
 
     /// The walk of `dir` (see [`Walker`]), once per directory.
@@ -2395,6 +2424,16 @@ impl Adapter for CargoAdapter {
             Some(Ok(ws)) => vec![ws.target_dir.clone()],
             _ => vec![],
         }
+    }
+
+    fn scratch_dirs_with_env(&self, env: &ChildEnv) -> Vec<Utf8PathBuf> {
+        let mut dirs = self.scratch_dirs();
+        let raw = |k: &str| Self::child_var_raw(env, k);
+        dirs.extend(cargo_home_inside(
+            &canonical(&repo_root_of(&self.project_dir)),
+            &raw,
+        ));
+        dirs
     }
 }
 

@@ -491,6 +491,10 @@ attested 13 of 242: integration tests of packages with a binary (107 units) were
 file, every unit building jj-lib for a glob pattern taken as a path, and every vex-cli unit for a file reached
 through a symlinked directory (`jj/cli/docs -> ../docs`), which 1.8.0 records at its real path.
 
+A `$CARGO_HOME` inside the repository (CI mounting `.cargo-home/` under the checkout) is not part of it: the
+registry crates and git checkouts there are external packages, verified against Cargo.lock, never walked or
+cleaned, and left out of the pre-run snapshot (since 1.8.1).
+
 `--manifest-path` selects the package the way `-p <name>` would (package names can be ambiguous; the path cannot). vci
 builds into `<target dir>/vci`, which only ever sees builds made with vci's environment policy, and **rebuilds the
 repository's crates in every `vci run`** (`cargo clean -p <every workspace member>` there first; a crate of the

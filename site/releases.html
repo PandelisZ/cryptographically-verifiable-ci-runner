@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-8-1">1.8.1</a></td><td>16 Oct 2026</td><td>A <code>CARGO_HOME</code> inside the checkout is not part of the repository</td></tr>
 <tr><td><a href="#v1-8-0">1.8.0</a></td><td>16 Oct 2026</td><td>Cargo: one build, then the test binaries run in parallel; integration tests of packages with binaries attest; undeclared paths can be waived</td></tr>
 <tr><td><a href="#v1-7-1">1.7.1</a></td><td>16 Oct 2026</td><td><code>ignore_taints</code> waives reads outside the repository, writes inside it and skipped tests; Vite's caches are not writes</td></tr>
 <tr><td><a href="#v1-7-0">1.7.0</a></td><td>16 Oct 2026</td><td><code>policy.ignore_taints</code>: attest through refusals, by pattern</td></tr>
@@ -34,6 +35,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-8-1">1.8.1</h2>
+<p><em>16 October 2026.</em> CI runners often keep <code>$CARGO_HOME</code> under the checkout (<code>.cargo-home/</code>, git-ignored, mounted as a cache). The cargo adapter took the registry's extracted crates and git checkouts there for crates of the repository: it cleaned and rebuilt them at every warm-up (each package's warm-up ran twice), hashed every file of theirs as an input (git-ignored paths an attestation then depended on), and refused units whose build touched one of them during the run (<code>input changed during the run: .cargo-home/registry/src/.../rustix-0.38.44</code>). A <code>$CARGO_HOME</code> inside the repository is now external everywhere: its crates are verified against Cargo.lock like any registry crate, never walked, never cleaned, and the pre-run snapshot leaves it out. First seen on a 242-unit workspace's first CI attest run: 11 units refused for it, and 14 of 26 warm-ups doubled.</p>
 
 <h2 id="v1-8-0">1.8.0</h2>
 <p><em>16 October 2026.</em> The cargo adapter no longer runs one <code>cargo test</code> per unit, one unit at a time. <code>vci run</code> now makes one warm-up build per package with a requested unit (<code>cargo test --no-run</code>, with cargo's full parallelism), then a single cargo lane builds each unit alone with <code>--no-run</code> (so its features, artifacts and executable are its own, as before, and after the warm-up that is mostly a freshness check) while a pool of <code>VCI_CARGO_JOBS</code> workers (default: the CPUs) runs the test binaries directly, with the environment and working directory <code>cargo test</code> gives them. Doctest units still run through cargo, in the lane. Analysis shares directory walks, dep-info and source scans across the units of a run. <code>vci ci</code> runs the remaining units the same way. Attestations are unchanged: the same unit ids, inputs, argv and refusals, so existing attestations stay valid.</p>

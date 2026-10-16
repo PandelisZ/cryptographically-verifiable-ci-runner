@@ -345,4 +345,10 @@ pub trait Adapter: Send + Sync {
     fn scratch_dirs(&self) -> Vec<Utf8PathBuf> {
         vec![]
     }
+    /// [`Adapter::scratch_dirs`] as seen with the child environment `env`
+    /// (Cargo: also a `$CARGO_HOME` kept inside the repository).
+    fn scratch_dirs_with_env(&self, env: &ChildEnv) -> Vec<Utf8PathBuf> {
+        let _ = env;
+        self.scratch_dirs()
+    }
 }

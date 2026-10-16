@@ -2310,3 +2310,41 @@ fn cargo_dep_info_through_a_symlinked_directory_is_attested() {
     w.git(&work, &["commit", "-qam", "edit through the target"]);
     assert!(w.plan(&work, "main").run.contains("sl#lib"));
 }
+
+/// A `$CARGO_HOME` inside the repository (CI mounting the registry under the
+/// checkout): its extracted crates are external packages, not repository
+/// crates to clean, rebuild and hash, and the snapshot leaves it alone.
+#[test]
+fn cargo_home_inside_the_repository_is_not_part_of_it() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let home = work.join(".cargo-home");
+    std::fs::create_dir_all(&home).unwrap();
+    w.put(".gitignore", ".vci/out/\ntarget/\n.cargo-home/\n");
+    w.git(&work, &["commit", "-qam", "ignore the cargo home"]);
+    let fetched = Command::new("cargo")
+        .current_dir(&work)
+        .env("CARGO_HOME", &home)
+        .args(["fetch", "--locked"])
+        .output()
+        .unwrap();
+    if !fetched.status.success() {
+        eprintln!(
+            "SKIPPED: cargo fetch into a fresh CARGO_HOME failed (offline?): {}",
+            String::from_utf8_lossy(&fetched.stderr)
+        );
+        return;
+    }
+    let (_, stderr) = w.run_env(&[D], &[("CARGO_HOME", home.to_str().unwrap())]);
+    assert!(stderr.contains("vci: attested d#lib"), "{stderr}");
+    assert!(
+        !stderr.contains("cargo reused"),
+        "registry crates are not repository crates to rebuild: {stderr}"
+    );
+    let entries = w.entries(D);
+    assert!(
+        !entries.iter().any(|e| e.starts_with(".cargo-home/")),
+        "{entries:?}"
+    );
+    assert!(entries.iter().any(|e| e == "d/src/lib.rs"), "{entries:?}");
+}

@@ -1460,7 +1460,11 @@ pub fn run_units(
     // directories such as Cargo's target dir are not inputs).
     let scratch: Vec<Utf8PathBuf> = involved
         .iter()
-        .flat_map(|&pi| ctx.projects[pi].adapter.scratch_dirs())
+        .flat_map(|&pi| {
+            ctx.projects[pi]
+                .adapter
+                .scratch_dirs_with_env(&children[pi].to_child_env())
+        })
         .filter(|d| d.starts_with(&root))
         .collect();
     let pre_stat = TreeStat::snapshot_skipping(&root, &scratch)?;
