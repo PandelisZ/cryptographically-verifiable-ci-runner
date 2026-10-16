@@ -1281,31 +1281,20 @@ impl Verifier<'_> {
                 format!("{declared:?} (base vci.toml)"),
             ));
         }
-        // Refusals waived by policy when the attestation was made must still
-        // be waived by the base commit's policy.
-        for w in &p.waived {
-            let (allowed, why) = if w.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT) {
-                (
-                    !declared.is_empty(),
-                    "no [[inputs]] declared for this unit in the base vci.toml",
-                )
-            } else if w.starts_with(LEGACY_RAILS_NETWORK_DB_WAIVER) {
-                // Written by vci before 1.4.0 under policy.rails_allow_db
-                // (and by a collector older than 0.5.0, whose version the
-                // toolchain no longer matches anyway).
-                (
-                    false,
-                    "policy.rails_allow_db was removed in vci 1.4.0: attest the file again",
-                )
-            } else {
-                (
-                    w.starts_with(vci_adapter::GO_NET_TAINT) && self.project.policy.go_allow_net,
-                    "not waived by the base policy (policy.go_allow_net = false)",
-                )
-            };
-            if !allowed {
-                return Err(Failure::one("result", 12, "waived refusal", w.clone(), why));
-            }
+        // Taints waived by policy when the attestation was made must all
+        // still be waived by the base commit's policy.
+        let not_waived = not_waived(
+            &self.project.policy,
+            self.project.adapter.name(),
+            &declared,
+            &p.waived,
+        );
+        if !not_waived.is_empty() {
+            return Err(Failure {
+                check: "waived",
+                rank: 12,
+                details: not_waived,
+            });
         }
         if p.core.tree_dirty && !self.project.policy.allow_dirty {
             return Err(Failure::one(
@@ -1858,6 +1847,53 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// The taints an attestation recorded as waived (`waived`) that the base
+/// policy no longer waives, one detail each: `policy.ignore_taints` (or Go's
+/// `policy.go_allow_net`) must match it, or for Cargo's
+/// `cargo:undeclared-reads` the unit must still declare `[[inputs]]`. One
+/// recorded under the removed `policy.rails_allow_db` never is.
+fn not_waived(
+    policy: &crate::config::Policy,
+    adapter: &str,
+    declared: &[String],
+    waived: &[String],
+) -> Vec<Detail> {
+    let mut out = Vec::new();
+    for w in waived {
+        let key = crate::run::taint_key(w);
+        let why = if w.starts_with(LEGACY_RAILS_NETWORK_DB_WAIVER) {
+            // Written by vci before 1.4.0 under policy.rails_allow_db (and by
+            // a collector older than 0.5.0, whose version the toolchain no
+            // longer matches anyway).
+            "policy.rails_allow_db was removed in vci 1.4.0: attest the file again".to_owned()
+        } else if (w.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT) && !declared.is_empty())
+            || policy.taint_waiver(adapter, w).is_some()
+        {
+            continue;
+        } else if key == "vci" || key.starts_with("vci:") {
+            format!("{key}: vci's own taints are never waived")
+        } else {
+            let mut why = format!(
+                "not waived by the base policy: no policy.ignore_taints pattern matches {key} (ignore_taints = {:?})",
+                policy.ignore_taints
+            );
+            if w.starts_with(vci_adapter::GO_NET_TAINT) {
+                why.push_str(", and policy.go_allow_net = false");
+            }
+            if w.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT) {
+                why.push_str(", and no [[inputs]] declared for this unit in the base vci.toml");
+            }
+            why
+        };
+        out.push(Detail {
+            what: format!("waived taint {key}"),
+            expected: w.clone(),
+            actual: why,
+        });
+    }
+    out
+}
+
 /// The `vci explain` line for a test file whose base policy sets
 /// `libraries = "any"`.
 pub const LIBRARIES_ANY_POLICY_LINE: &str = "policy: libraries = \"any\" (base vci.toml): native libraries match by library name (it must be loaded here; file name and hash not compared), and the library versions of the toolchain (ruby: sqlite, yaml, tz; python: sqlite, openssl) are not compared (each must still be loaded on both sides or on neither)";
@@ -2040,6 +2076,98 @@ pub(crate) fn toolchain_diff(
 mod tests {
     use super::*;
     use vci_core::{Observation, RepoPath};
+
+    fn policy(toml: &str) -> crate::config::Policy {
+        Config::parse(toml).unwrap().project_specs()[0]
+            .policy
+            .clone()
+    }
+
+    #[test]
+    fn waived_taints_need_the_base_policy() {
+        let waived: Vec<String> = ["child_process.execSync", "child_process.spawn", "fetch"]
+            .map(String::from)
+            .to_vec();
+        let p = policy(
+            "adapter = \"node-test\"\n[policy]\nignore_taints = [\"child_process.*\", \"fetch\"]\n",
+        );
+        assert!(not_waived(&p, "node-test", &[], &waived).is_empty());
+        let p = policy("adapter = \"node-test\"\n[policy]\nignore_taints = [\"*\"]\n");
+        assert!(not_waived(&p, "node-test", &[], &waived).is_empty());
+        // The base dropped one pattern: that taint is named.
+        let p =
+            policy("adapter = \"node-test\"\n[policy]\nignore_taints = [\"child_process.*\"]\n");
+        let d = not_waived(&p, "node-test", &[], &waived);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].what, "waived taint fetch");
+        assert_eq!(d[0].expected, "fetch");
+        assert!(
+            d[0].actual
+                .contains("no policy.ignore_taints pattern matches fetch"),
+            "{}",
+            d[0].actual
+        );
+        // No policy at all: every one.
+        assert_eq!(
+            not_waived(
+                &policy("adapter = \"node-test\"\n"),
+                "node-test",
+                &[],
+                &waived
+            )
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn go_net_is_waived_by_either_key_and_legacy_rails_never() {
+        let net = vec!["go:net: the test links package net (...)".to_owned()];
+        for toml in [
+            "adapter = \"go\"\n[policy]\ngo_allow_net = true\n",
+            "adapter = \"go\"\n[policy]\nignore_taints = [\"go:net\"]\n",
+            "adapter = \"go\"\n[policy]\nignore_taints = [\"go\"]\n",
+        ] {
+            assert!(
+                not_waived(&policy(toml), "go", &[], &net).is_empty(),
+                "{toml}"
+            );
+        }
+        let d = not_waived(&policy("adapter = \"go\"\n"), "go", &[], &net);
+        assert!(
+            d[0].actual.contains("policy.go_allow_net = false"),
+            "{}",
+            d[0].actual
+        );
+        let legacy = vec!["rails:network-db:postgresql".to_owned()];
+        let all = policy("adapter = \"rails\"\n[policy]\nignore_taints = [\"*\"]\n");
+        let d = not_waived(&all, "rails", &[], &legacy);
+        assert!(
+            d[0].actual.contains("rails_allow_db was removed"),
+            "{}",
+            d[0].actual
+        );
+        // vci's own taints are never waived (an attestation cannot carry one
+        // vci wrote, but the check does not trust that).
+        let d = not_waived(&all, "rails", &[], &["vci:missing-result".to_owned()]);
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn cargo_undeclared_reads_by_declaration_or_ignore_taints() {
+        let w = vec!["cargo:undeclared-reads (x)".to_owned()];
+        let none = policy("adapter = \"cargo\"\n");
+        assert!(not_waived(&none, "cargo", &["testdata/**".to_owned()], &w).is_empty());
+        let d = not_waived(&none, "cargo", &[], &w);
+        assert!(
+            d[0].actual.contains("no [[inputs]] declared"),
+            "{}",
+            d[0].actual
+        );
+        let ign =
+            policy("adapter = \"cargo\"\n[policy]\nignore_taints = [\"cargo:undeclared-reads\"]\n");
+        assert!(not_waived(&ign, "cargo", &[], &w).is_empty());
+    }
 
     /// A CI runner that runs as root never accepted a laptop's attestation
     /// (`toolchain: privileges`); `policy.allow_superuser_mismatch` in the

@@ -5,7 +5,7 @@ license: MIT
 compatibility: Needs the vci CLI (brew install pandelisz/tap/vci), git, ssh-keygen (OpenSSH 8.1+) and the project's test toolchain, on macOS or Linux.
 metadata:
   homepage: https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
-  vci-version: "1.6.2"
+  vci-version: "1.7.0"
 ---
 
 # vci: run tests once, prove it, let CI skip them
@@ -249,7 +249,7 @@ Short version (details in [references/runners.md](references/runners.md)):
    unless the user explicitly asks; changes there only take effect on the default branch, which the user merges.
 4. **Never weaken policy** without the user: do not change `platform`, `libraries`, `platform_overrides`,
    `never_skip`, `no_skip_refs`, `no_skip_refs_except` (never add your own principal), `max_ttl`, `allow_dirty`,
-   `go_allow_net`, `[env]` (`set`, `hash`, `ignore`, `mode`), or `[[inputs]]`. Propose the change and let the
+   `go_allow_net`, `ignore_taints`, `[env]` (`set`, `hash`, `ignore`, `mode`), or `[[inputs]]`. Propose the change and let the
    user decide.
 5. **Never change the CI wiring to skip more**: do not alter `base-ref`, switch to `pull_request_target`, unpin the
    action, or build vci from the PR checkout.

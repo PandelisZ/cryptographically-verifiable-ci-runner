@@ -655,6 +655,57 @@ fn pytest_run_refuses_unattestable_test_files() {
     }
 }
 
+/// `policy.ignore_taints = ["*"]`: a file that starts a subprocess is
+/// attested with its taints recorded as waived, and skipped only while the
+/// base commit's policy still waives every one of them.
+#[test]
+fn pytest_ignore_taints_star() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let spawn = "tests/test_spawn.py";
+    w.put(
+        spawn,
+        "import subprocess, sys\n\ndef test_spawn():\n    out = subprocess.run([sys.executable, '-c', 'print(1)'], capture_output=True, text=True)\n    assert out.stdout.strip() == '1'\n",
+    );
+    w.put(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"*\"]",
+        ),
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "ignore every taint"]);
+    let out = w.vci(&work, &["run", spawn, "--key", w.trusted.to_str().unwrap()]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with(&format!("vci: attested {spawn} (waived: ")))
+        .unwrap_or_else(|| panic!("{spawn} not attested with a waiver:\n{stderr}"));
+    assert!(line.contains("subprocess.Popen"), "{line}");
+    assert!(!stderr.contains("why not attested"), "{stderr}");
+    let here = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(w.plan(&work, &here).skip.contains(spawn));
+    assert!(w.plan(&work, "main").run.contains(spawn));
+    let ex = w.explain(&work, spawn, "main");
+    assert!(ex.contains("failed check: waived"), "{ex}");
+    assert!(ex.contains("waived taint subprocess.Popen"), "{ex}");
+    // A base whose patterns no longer cover subprocess.Popen runs it.
+    w.put(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"socket.*\"]",
+        ),
+    );
+    w.git(&work, &["commit", "-q", "-am", "sockets only"]);
+    let sockets = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(w.plan(&work, &sockets).run.contains(spawn));
+    let ex = w.explain(&work, spawn, &sockets);
+    assert!(ex.contains("waived taint subprocess.Popen"), "{ex}");
+}
+
 #[test]
 fn pytest_push_fetch_fresh_clone_and_ci() {
     let Some(w) = World::new() else { return };

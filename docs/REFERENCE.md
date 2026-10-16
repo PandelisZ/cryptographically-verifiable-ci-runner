@@ -1242,13 +1242,15 @@ others (`native:FFI call Vips.vips_init (...) (+129 more native:FFI)`), most fre
   "reasons": [{ "reason": "native:FFI", "files": 4 }, { "reason": "process:system", "files": 1 }],
   "units": [
     { "testId": "test/models/b_test.rb", "project": null, "adapter": "rails", "attested": false,
-      "reasons": ["native:FFI", "process:system"], "detail": "tainted: ...", "taints": ["native:FFI call ...", "..."] }
+      "reasons": ["native:FFI", "process:system"], "detail": "tainted: ...", "taints": ["native:FFI call ...", "..."],
+      "waived": [] }
   ]
 }
 ```
 
 (`project` is the `[[projects]]` name, `null` in the single-project form; `taints` lists every refusing taint as the
-collector reported it.)
+collector reported it; `waived`, for an attested unit, the taints `policy.ignore_taints` or `go_allow_net` waived,
+which the `attested` line summarises as `(waived: process:system, +2)`.)
 
 The environment policy is three lists in `[env]` (docs/ENV.md has the details and the built-in table per runner):
 `set` (vci sets the variable in every test process, on every machine, so it is the same everywhere), `hash` (taken
@@ -1467,7 +1469,8 @@ allow_dirty = true     # accept attestations made from an uncommitted working tr
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]   # never skip on these refs (the `vci init` default)
 no_skip_refs_except = ["github-actions"]             # ...except attestations by these allowed_signers principals (default [])
 never_skip = ["tests/test_attach_db.py"]             # never skip these files (project-relative globs)
-go_allow_net = false   # Go: attest packages whose test links package net (see "When vci run refuses")
+go_allow_net = false   # Go: attest packages whose test links package net (see "When vci run refuses"); = ignore_taints = ["go:net"]
+ignore_taints = []     # taints that do not refuse a unit (globs over reason keys, "*" = all; see "Waiving taints: policy.ignore_taints")
 node_exact = false     # Vitest and node-test: require the exact Node version (default: the same major)
 allow_superuser_mismatch = false # accept attestations made as root where CI is not, or the other way round (risky: see below)
 
@@ -1801,7 +1804,10 @@ else under [Quick start (RSpec)](#quick-start-rspec).
 
 ## When `vci run` refuses to attest
 
-A test file gets no attestation (and will run in CI) if any of these hold:
+A test file gets no attestation (and will run in CI) if any of these hold. The collector taints below (every reason
+`vci run` prints as `tainted: ...`) can be waived with `policy.ignore_taints` (see [Waiving taints](#waiving-taints-policyignore_taints)
+at the end of this section); the other refusals (a failed or skipped test, a write inside the repository, an input
+outside it or changed during the run, a toolchain mismatch, ...) cannot.
 
 - a collector tainted it: child processes, network (including `new net.Socket().connect()` and `dgram` sockets),
   `worker_threads`, `fetch`, enumerating `process.env`, recursive readdir/glob, snapshot writes, `isolate: false`,
@@ -1862,8 +1868,9 @@ package, decided from the import closure of the test and the source of every non
 - **network**: package `net` anywhere in the closure (`net/http`, database drivers, and testify's `assert`, which
   imports `net/http`). vci cannot observe connections, so this is refused by default. `policy.go_allow_net = true`
   is your statement that these tests do no network I/O: the refusal is waived, the attestation records the waiver
-  (`waived`), and `vci plan` accepts it only while the **base commit's** policy still sets it. It is the only
-  refusal that can be waived;
+  (`waived`), and `vci plan` accepts it only while the **base commit's** policy still sets it. It is the same as
+  `ignore_taints = ["go:net"]`, and either one in the base policy accepts an attestation made under the other; the
+  other Go refusals below are waived only by `ignore_taints` (`go:syscall`, `go:source`, `exec`, ...);
 - **system calls and native code**: a non-standard package that imports `syscall`, any `golang.org/x/sys` package
   other than `cpu`, cgo (`import "C"`, `runtime/cgo` linked, a standard package built with cgo), C/C++/Objective-C/
   Fortran/SWIG files or `.syso` objects; `os/user` (reads the user database outside package os) and `plugin`;
@@ -1949,7 +1956,8 @@ Rails specifics (collector taints and checks; see [Quick start (Rails)](#quick-s
 - **a SQLite file that is not one of the test environment's databases** in `config/database.yml`
   (`rails:sqlite-file:<path>`), `ATTACH` (`rails:sqlite-attach`), SQLite extensions (`rails:sqlite-load-extension`).
   The test environment's configured databases (SQLite files, in-memory ones and servers) are accepted with no policy,
-  and their contents are not an input (see "vci does not manage the database"). No Rails refusal can be waived;
+  and their contents are not an input (see "vci does not manage the database"). Only `policy.ignore_taints` waives a
+  Rails taint (`network:postgresql`, `rails:sqlite-file`, ...);
 - **native code**: a native extension (`.so`/`.bundle`) inside the repository; Fiddle (`Fiddle.dlopen`, also of
   `nil`, and any `Fiddle::Function`); FFI: a **call** of an attached function or variable, an `FFI::Function` or
   `VariadicInvoker` invoked directly (`native:FFI`; opening a library is recorded, not refused, and a failed `ffi_lib`
@@ -2002,6 +2010,52 @@ Rails specifics (collector taints and checks; see [Quick start (Rails)](#quick-s
   [Quick start (RSpec)](#quick-start-rspec)); reads outside the repository other than the bundle's gems, Ruby's own files,
   vci's temp dirs, `/dev/null`/`/dev/urandom` and the time zone data (the toolchain records which).
 
+### Waiving taints: `policy.ignore_taints`
+
+Since vci 1.7.0 a project can attest units the collectors would refuse. `ignore_taints` (top level in `[policy]` or
+in a project's `policy`, default `[]`) lists glob patterns over a taint's **reason key**, the same `category:kind`
+key the "why not attested" lines print (`process:system`, `native:FFI`, `go:syscall`, `cargo:process`,
+`network:postgresql`; node:test and Vitest report the API they saw, `child_process.execSync`, `fetch`,
+`process.env.enumerate`, `fs.readdir.recursive`; pytest its audit event, `subprocess.Popen`, `socket.connect`;
+`external-without-version` for a module read outside the repository that no package version identifies):
+
+```toml
+[policy]
+ignore_taints = ["process:*", "child_process.*", "fetch", "go:syscall", "external-without-version"]
+# ignore_taints = ["*"]   # every taint
+```
+
+- `*` matches any run of characters, `:` included, so `"*"` matches every key; a pattern without `:` also matches
+  every key of that category (`"process"` is `"process:*"`, `"go"` every `go:` key). Patterns are matched against
+  the key, not the full text (`process:system`, not `process:system at app/x.rb:3`).
+- A unit whose every taint matches is attested: `vci run` prints `vci: attested <unit> (waived: process:system, +2)
+  (...)` (the most frequent waived key and the number of other keys), the taints are recorded, as the collector
+  reported them, in the attestation's `waived` list, `--summary` lists them under the unit's `waived`, and the "why
+  not attested" lines no longer count them. A unit with one taint no pattern matches is refused as before, and its
+  refusal line names only the taints that refused it.
+- `vci plan` accepts such an attestation only while the **base commit's** policy still waives every recorded taint
+  (its `ignore_taints`, or `go_allow_net` for `go:net`, or for Cargo's `cargo:undeclared-reads` the unit's declared
+  `[[inputs]]`); otherwise the candidate fails the `waived` check and `vci explain` names each taint that is no longer
+  waived (`waived taint child_process.execSync`, `not waived by the base policy: no policy.ignore_taints pattern
+  matches child_process.execSync`). Removing a pattern from the default branch's `vci.toml` therefore re-runs every
+  unit attested under it.
+- `vci:` taints (vci's own record of the unit is incomplete: a missing result, a collector hook that failed, an
+  unparsable line) are never waived, `"*"` included. Refusals that are not taints (a failed or skipped test, a write
+  inside the repository, an input outside it or changed during the run, a toolchain mismatch) are not affected.
+- `go_allow_net = true` is the same waiver as `ignore_taints = ["go:net"]`.
+
+**The trade-off, plainly.** A taint means the collector saw the unit do something whose effect it cannot record: a
+child process's reads, a network response, the whole environment, a directory listed recursively, a native call. A
+waived unit's attestation therefore vouches only for what was observed; the inputs the taint stands for are not in
+it, so a change to them (the program a child process runs, a server's answer, an undeclared environment variable)
+does not re-run the unit, and a skip can hide a failure CI would have seen. That is the intended exchange: "it's fine
+if it's not 100% deterministic, the important thing is optimising for CI cost". The attestation says what was
+observed and what could not be recorded (`waived`), and the decision is the base branch's (the policy is read from the
+base commit, like every other key), so a pull request cannot widen it for itself. Keep `refs/heads/main` in
+`no_skip_refs` so the default branch still runs everything, and list units whose waived behaviour does matter in
+`never_skip`. Agents must not add `ignore_taints` to a repository's policy on their own: it is the maintainers'
+decision.
+
 ## Verification (`vci plan`)
 
 For each listed test file, each stored candidate for its test id is checked in this order; the first candidate that
@@ -2029,7 +2083,8 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
 8. **env-config**: digest of the effective env configuration (the base `vci.toml`'s `set` values and `hash`/`ignore`
    lists, and this vci's built-in lists) matches; attestations made before vci 1.6.0 fail it once;
 9. **result**: passed and untainted; **inputs-config**: the `[[inputs]]` globs recorded equal the base config's for
-   the test id; every waived refusal still waived by the base policy (one recorded under the removed
+   the test id; **waived**: every taint recorded in `waived` still waived by the base policy (`ignore_taints`,
+   `go_allow_net`, or for `cargo:undeclared-reads` declared `[[inputs]]`; one recorded under the removed
    `rails_allow_db` never is); **dirty** only if `allow_dirty = false`;
 10. **global-inputs**: every attested global entry re-hashed from the checkout, and the current global input set
     has the same root;
@@ -2397,7 +2452,7 @@ skipped; a new `.go` file in b's directory, a change to the repository package b
 hashed and marks the attestation platform-specific; a module bump in `go.mod`/`go.sum` runs everything; tampered
 payloads, unknown signers and PR-only `allowed_signers` are rejected; a `hash` env var with another value in CI
 runs b; each refusal (a child process, `net`, `os.Environ`, `syscall`, a read outside the repository, a failing
-test, `t.Skip`, a change to the repository during the run); `go_allow_net` only with the base policy's consent;
+test, `t.Skip`, a change to the repository during the run); `go_allow_net` and `ignore_taints` (`go:net` and `go:syscall`) only with the base policy's consent;
 push/fetch into a fresh clone, `vci ci` exit codes, a module in a subdirectory, `vci init --adapter go`, and that
 another Go version (another go binary, or a `GOTOOLCHAIN` switch to a toolchain already in the module cache) runs
 everything. Regression tests for adversarial findings prove: link targets read through `io/fs.ReadLink` (over

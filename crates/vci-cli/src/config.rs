@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::util::{glob_match, parse_duration};
+use crate::util::{glob_match, name_match, parse_duration};
 
 pub const CONFIG_FILE: &str = "vci.toml";
 pub const ALLOWED_SIGNERS_FILE: &str = ".vci/allowed_signers";
@@ -131,6 +131,7 @@ pub struct PolicyOverride {
     pub no_skip_refs_except: Option<Vec<String>>,
     pub never_skip: Option<Vec<String>>,
     pub go_allow_net: Option<bool>,
+    pub ignore_taints: Option<Vec<String>>,
     /// Removed in vci 1.4.0: parsed (so a `vci.toml` that still has it stays
     /// valid) and otherwise ignored; see [`Policy::removed_rails_allow_db`].
     #[serde(default, rename = "rails_allow_db", skip_serializing)]
@@ -383,6 +384,17 @@ pub struct Policy {
     /// accepted while it is set there.
     #[serde(default)]
     pub go_allow_net: bool,
+    /// Taints that do not refuse a unit: globs over a taint's reason key
+    /// (`category:kind`, the key of `vci run`'s "why not attested" lines,
+    /// [`crate::run::taint_key`]); `*` matches any run of characters, and a
+    /// pattern without `:` also matches every key of that category
+    /// (`"process"` = `"process:*"`). A waived taint is recorded in the
+    /// attestation (`waived`), which `vci plan` accepts only while the base
+    /// commit's policy still waives it. The collectors could not record what
+    /// such a unit did, so this trades determinism for CI time; `vci:` taints
+    /// (vci's own record is incomplete) are never waived.
+    #[serde(default)]
+    pub ignore_taints: Vec<String>,
     /// `rails_allow_db`, removed in vci 1.4.0 (the Rails test database is
     /// the test engine's business: vci neither prepares nor refuses it, and
     /// its contents are not an input). Still parsed, so that a base
@@ -427,6 +439,7 @@ impl Default for Policy {
             no_skip_refs_except: vec![],
             never_skip: vec![],
             go_allow_net: false,
+            ignore_taints: vec![],
             removed_rails_allow_db: None,
             node_exact: false,
             allow_superuser_mismatch: false,
@@ -456,7 +469,30 @@ impl Policy {
                 );
             }
         }
+        for p in &self.ignore_taints {
+            if p.trim().is_empty() {
+                bail!("policy.ignore_taints: an empty pattern matches no taint");
+            }
+        }
         Ok(())
+    }
+
+    /// The policy that waives `taint` of an `adapter` unit, if any:
+    /// `policy.go_allow_net` (Go's `go:net:`) or the first matching
+    /// `policy.ignore_taints` pattern. `vci:` taints are never waived (they
+    /// mean vci's own record of the unit is incomplete or broken).
+    pub fn taint_waiver(&self, adapter: &str, taint: &str) -> Option<String> {
+        let key = crate::run::taint_key(taint);
+        if key == "vci" || key.starts_with("vci:") {
+            return None;
+        }
+        if adapter == "go" && self.go_allow_net && taint.starts_with(vci_adapter::GO_NET_TAINT) {
+            return Some("policy.go_allow_net".to_owned());
+        }
+        self.ignore_taints
+            .iter()
+            .find(|p| ignore_pattern_matches(p, &key))
+            .map(|p| format!("policy.ignore_taints {p:?}"))
     }
 
     /// On a ref matching `no_skip_refs`, may an attestation by `principal`
@@ -942,6 +978,9 @@ impl Config {
                     if let Some(v) = o.go_allow_net {
                         policy.go_allow_net = v;
                     }
+                    if let Some(v) = &o.ignore_taints {
+                        policy.ignore_taints = v.clone();
+                    }
                     if let Some(v) = o.node_exact {
                         policy.node_exact = v;
                     }
@@ -986,6 +1025,22 @@ impl Config {
     }
 }
 
+/// Does a `policy.ignore_taints` pattern match a taint's reason key
+/// (`process:system`, `child_process.execSync`, `go:net`,
+/// `external-without-version`)? `*` matches any run of characters (`:`
+/// included, so `"*"` matches every key); a pattern without `:` also
+/// matches every key of that category (`"go"` matches `go:syscall`).
+pub fn ignore_pattern_matches(pattern: &str, key: &str) -> bool {
+    let pattern = pattern.trim();
+    if name_match(pattern, key) {
+        return true;
+    }
+    !pattern.contains(':')
+        && key
+            .split_once(':')
+            .is_some_and(|(category, _)| name_match(pattern, category))
+}
+
 /// Template written by `vci init`.
 pub const TEMPLATE: &str = r#"# vci configuration. Policy is read from the BASE commit in CI.
 
@@ -1011,6 +1066,11 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 # no_skip_refs_except = ["github-actions"]
 # Test files (globs) that are never skipped.
 never_skip = []
+# Taints that do not refuse a file (globs over the reason key that `vci run`'s
+# "why not attested" lines print; "*" for all). The file is attested with them
+# recorded as waived; vci could not record what it did there, so a skip may
+# miss a change: this trades determinism for CI time. Read from the base commit.
+# ignore_taints = ["child_process.*", "fetch"]
 
 # [[policy.platform_overrides]]
 # match = ["src/native/**"]
@@ -1059,6 +1119,11 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 # Test files (project-relative globs) that are never skipped, e.g. files whose
 # inputs no collector can see (see "pytest limitations" in docs/REFERENCE.md).
 never_skip = []
+# Taints that do not refuse a file (globs over the reason key that `vci run`'s
+# "why not attested" lines print; "*" for all). The file is attested with them
+# recorded as waived; vci could not record what it did there, so a skip may
+# miss a change: this trades determinism for CI time. Read from the base commit.
+# ignore_taints = ["subprocess.Popen", "socket.*"]
 
 [env]
 # Only the variables named here and in vci's short built-in lists reach the
@@ -1106,6 +1171,11 @@ never_skip = []
 # Attest packages whose tests link package net (testify's assert imports
 # net/http). vci cannot see network I/O: set this only if the tests use none.
 go_allow_net = false
+# Taints that do not refuse a file (globs over the reason key that `vci run`'s
+# "why not attested" lines print; "*" for all). The file is attested with them
+# recorded as waived; vci could not record what it did there, so a skip may
+# miss a change: this trades determinism for CI time. Read from the base commit.
+# ignore_taints = ["go:syscall", "exec"]   # "go:net" = go_allow_net
 
 [env]
 # Only the variables named here and in vci's short built-in lists reach the
@@ -1152,6 +1222,11 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 # no_skip_refs_except = ["github-actions"]
 # Units (project-relative ids such as "crates/a#test:it", globs) that are never skipped.
 never_skip = []
+# Taints that do not refuse a file (globs over the reason key that `vci run`'s
+# "why not attested" lines print; "*" for all). The file is attested with them
+# recorded as waived; vci could not record what it did there, so a skip may
+# miss a change: this trades determinism for CI time. Read from the base commit.
+# ignore_taints = ["cargo:process", "cargo:net"]
 
 # Files a unit reads outside its package directory must be declared (vci
 # hashes every file in the package directories of the crates the unit
@@ -1216,6 +1291,11 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 # no_skip_refs_except = ["github-actions"]
 # Test files (project-relative globs) that are never skipped.
 never_skip = []
+# Taints that do not refuse a file (globs over the reason key that `vci run`'s
+# "why not attested" lines print; "*" for all). The file is attested with them
+# recorded as waived; vci could not record what it did there, so a skip may
+# miss a change: this trades determinism for CI time. Read from the base commit.
+# ignore_taints = ["process:*", "native:FFI"]
 
 [env]
 # Only the variables named here and in vci's short built-in lists reach the
@@ -1271,6 +1351,11 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 # Test files (project-relative globs) that are never skipped.
 never_skip = []
 node_exact = false
+# Taints that do not refuse a file (globs over the reason key that `vci run`'s
+# "why not attested" lines print; "*" for all). The file is attested with them
+# recorded as waived; vci could not record what it did there, so a skip may
+# miss a change: this trades determinism for CI time. Read from the base commit.
+# ignore_taints = ["child_process.*", "fetch"]
 
 [env]
 # Only the variables named here and in vci's short built-in lists reach the
@@ -1389,6 +1474,92 @@ mod tests {
         assert_eq!(s[0].adapter, "pytest");
         assert_eq!(s[0].rel, ".");
         assert_eq!(s[0].name, "");
+    }
+
+    #[test]
+    fn ignore_taints_patterns_match_reason_keys() {
+        let m = ignore_pattern_matches;
+        // Exact keys and globs over the whole key.
+        assert!(m("process:system", "process:system"));
+        assert!(!m("process:system", "process:spawn"));
+        assert!(m("process:*", "process:spawn"));
+        assert!(m("process:*", "process:Kernel"));
+        assert!(!m("process:*", "network:pg"));
+        assert!(m("child_process.*", "child_process.execSync"));
+        assert!(!m("child_process.*", "fs.readdir.recursive"));
+        assert!(m("*.enumerate", "process.env.enumerate"));
+        assert!(m("external-without-version", "external-without-version"));
+        assert!(m(" go:net ", "go:net"));
+        // "*" matches every key, ':' included.
+        for k in [
+            "go:syscall",
+            "env:enumerated",
+            "fetch",
+            "native:FFI",
+            "exec",
+        ] {
+            assert!(m("*", k), "{k}");
+        }
+        // A pattern without ':' also matches the category of a key.
+        assert!(m("process", "process:backtick"));
+        assert!(m("go", "go:source"));
+        assert!(m("nat*", "native:libxml2"));
+        assert!(!m("process", "child_process.execSync"));
+        assert!(!m("go", "golang"));
+        // A pattern with ':' is matched against the whole key only.
+        assert!(!m("go:sys", "go:syscall"));
+    }
+
+    #[test]
+    fn ignore_taints_waivers_and_go_allow_net_equivalence() {
+        let c = Config::parse(
+            "[policy]\nignore_taints = [\"process:*\", \"external-without-version\", \"go:syscall\"]\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"go\"\n[projects.policy]\nignore_taints = [\"go:net\"]\n\n[[projects]]\nname = \"c\"\npath = \"c\"\nadapter = \"go\"\n[projects.policy]\ngo_allow_net = true\nignore_taints = []\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        let a = &s[0].policy;
+        assert_eq!(
+            a.taint_waiver("rails", "process:system").as_deref(),
+            Some("policy.ignore_taints \"process:*\"")
+        );
+        assert!(
+            a.taint_waiver("vitest", "external-without-version:/abs/x.js")
+                .is_some()
+        );
+        assert!(a.taint_waiver("rails", "native:FFI call x").is_none());
+        // The per-project key replaces the top-level list.
+        let b = &s[1].policy;
+        assert_eq!(b.ignore_taints, ["go:net"]);
+        assert!(
+            b.taint_waiver("go", "go:syscall: x imports syscall")
+                .is_none()
+        );
+        // go_allow_net is ignore_taints = ["go:net"].
+        let net = "go:net: the test links package net (...)";
+        assert_eq!(
+            b.taint_waiver("go", net).as_deref(),
+            Some("policy.ignore_taints \"go:net\"")
+        );
+        let c3 = &s[2].policy;
+        assert_eq!(
+            c3.taint_waiver("go", net).as_deref(),
+            Some("policy.go_allow_net")
+        );
+        assert!(
+            c3.taint_waiver("go", "go:source: a.go uses Environ")
+                .is_none()
+        );
+        // vci's own taints are never waived, even by "*".
+        let all = Config::parse("adapter = \"go\"\n[policy]\nignore_taints = [\"*\"]\n").unwrap();
+        let all = &all.project_specs()[0].policy;
+        assert!(all.taint_waiver("go", net).is_some());
+        assert!(all.taint_waiver("node-test", "fetch").is_some());
+        for t in ["vci:missing-result", "vci:not-hooked:ffi (x)", "vci"] {
+            assert!(all.taint_waiver("rails", t).is_none(), "{t}");
+        }
+        // An empty pattern is an error.
+        assert!(Config::parse("[policy]\nignore_taints = [\"\"]\n").is_err());
+        assert!(Config::parse("[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\n[projects.policy]\nignore_taints = [\" \"]\n").is_err());
     }
 
     #[test]

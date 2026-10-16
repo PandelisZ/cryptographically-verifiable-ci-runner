@@ -249,7 +249,7 @@ pub const PYTEST_HASH: &[&str];     // PYTHONHASHSEED, PYTHONOPTIMIZE, ..., PYTE
 pub const GO_IGNORE: &[&str];      // GOPATH, GOROOT, GOCACHE, GOMODCACHE, GOENV, GOPROXY, ..., XDG_*, SSL_CERT_*, *_PROXY
 pub const GO_HASH: &[&str];        // ZONEINFO, GOFLAGS, GOEXPERIMENT, GODEBUG, GOTOOLCHAIN, GOOS, GOARCH, GOAMD64, ..., CGO_*, CC, CFLAGS, ..., PKG_CONFIG*
 pub const GO_ALWAYS_READ_ENV: &[&str];   // TZ, ZONEINFO
-pub const GO_NET_TAINT: &str;            // "go:net:" (the only taint policy.go_allow_net waives)
+pub const GO_NET_TAINT: &str;            // "go:net:" (the only taint policy.go_allow_net waives; = policy.ignore_taints ["go:net"])
 pub const CARGO_IGNORE: &[&str];   // CARGO_HOME, RUSTUP_*, CARGO_TARGET_DIR, CARGO_NET_*, CARGO_HTTP_*, RUSTC_WRAPPER, SCCACHE_*, ... (not RUST_BACKTRACE/RUST_LIB_BACKTRACE/RUST_LOG: removed)
 pub const CARGO_HASH: &[&str];     // RUSTFLAGS, RUSTDOCFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_PROFILE_*, RUSTC, RUST_TEST_THREADS, CC, CFLAGS, ..., PKG_CONFIG*
 pub const CARGO_UNDECLARED_TAINT: &str;  // "cargo:undeclared-reads" (waived by declaring [[inputs]] for the unit)
@@ -470,7 +470,8 @@ exit code is not 0 (or it died from a signal). The CLI allows `write` records on
 project's `RAILS_SCRATCH_DIRS`. Database taints: `rails:sqlite-file:<path>` (a SQLite file other than the test
 environment's configured ones or one in vci's temp dir), `rails:sqlite-attach`, `rails:sqlite-load-extension`,
 `network:<mysql2|postgresql|trilogy> client` (a client the test opened itself; Active Record's connections are
-accepted). No Rails taint is waivable (`policy.rails_allow_db`, removed in 1.4.0, still parses and has no effect).
+accepted). A Rails taint is waived only by `policy.ignore_taints` (`policy.rails_allow_db`, removed in 1.4.0, still
+parses and has no effect).
 
 ## vci-cli predicate and storage
 
@@ -479,10 +480,14 @@ relative), `runnerProject` (Vitest project name), `projectName` (the `[[projects
 single-project form), and for Go `platformSpecific` (repository files built only for some GOOS/GOARCH, or whose
 code refers to `GOOS`/`GOARCH`: the attestation then needs the same OS and architecture), `archSpecific` (why the
 results may differ on another architecture, i.e. floating-point code in a non-standard package of the closure: the
-attestation then needs the same architecture) and `waived` (refusals waived by `policy.go_allow_net`, or for Cargo by
-declared `[[inputs]]`, which the base policy must still waive; Rails writes none since 1.4.0, and an old envelope's
-`rails:network-db:` entry, written under the removed `policy.rails_allow_db`, is still deserialised and never
-accepted), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
+attestation then needs the same architecture) and `waived` (every adapter, since vci 1.7.0: the taints, as the
+collector reported them, that a policy waived: `policy.ignore_taints`, whose glob patterns match a taint's reason key
+`category:kind` (`vci_cli::run::taint_key`; `*` matches any run of characters, a pattern without `:` also matches
+its category, `vci:` taints are never waived), `policy.go_allow_net` for `go:net:`, or for Cargo's
+`cargo:undeclared-reads` declared `[[inputs]]`. `vci plan`'s `waived` check accepts the attestation only while the
+base commit's policy still waives every entry; an older vci, which knows only the last two, refuses an entry
+`ignore_taints` waived. An old envelope's `rails:network-db:` entry, written under the removed
+`policy.rails_allow_db`, is still deserialised and never accepted), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
 host's cfg set), and for every adapter `declaredInputs` (the `[[inputs]] extra` globs of the test id, which must equal
 the base config's) and `envSet` (since vci 1.6.0: the names of the variables vci set from `[env] set`, whose manifest
 env entries hash the declared value; informational, older vci ignores it); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.

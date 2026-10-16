@@ -44,6 +44,9 @@ struct UnitOutcome {
     detail: Option<String>,
     /// Every refusing taint, as the collector reported it.
     taints: Vec<String>,
+    /// Attested units: the taints a policy waived (the attestation's
+    /// `waived`).
+    waived: Vec<String>,
 }
 
 impl UnitOutcome {
@@ -56,6 +59,7 @@ impl UnitOutcome {
             reasons,
             detail: Some(detail),
             taints: vec![],
+            waived: vec![],
         }
     }
 }
@@ -94,6 +98,7 @@ fn summary_json(outcomes: &[UnitOutcome]) -> serde_json::Value {
                 "reasons": o.reasons,
                 "detail": o.detail,
                 "taints": o.taints,
+                "waived": o.waived,
             }))
             .collect::<Vec<_>>(),
     })
@@ -472,20 +477,42 @@ fn summarize_taints(taints: &[&String]) -> String {
         .join(", ")
 }
 
-/// The taints of `o` that refuse it, and those a base policy waives (Go's
-/// `policy.go_allow_net`, Cargo's declared inputs).
+/// The taints of `o` a policy waives, and those that refuse it: `(waived,
+/// refusing)`. Waived are those `policy.ignore_taints` matches (by
+/// [`taint_key`]), Go's `go:net:` under `policy.go_allow_net`, and Cargo's
+/// `cargo:undeclared-reads` when the unit declares `[[inputs]]`.
 fn split_waived<'a>(
     project: &Project,
     declared: &[String],
     o: &'a Observed,
 ) -> (Vec<&'a String>, Vec<&'a String>) {
-    let name = project.adapter.name();
-    o.taints.iter().partition(|t| {
-        (name == "go" && project.policy.go_allow_net && t.starts_with(vci_adapter::GO_NET_TAINT))
-            || (name == "cargo"
-                && !declared.is_empty()
-                && t.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT))
+    split_waived_taints(&project.policy, project.adapter.name(), declared, &o.taints)
+}
+
+fn split_waived_taints<'a>(
+    policy: &crate::config::Policy,
+    adapter: &str,
+    declared: &[String],
+    taints: &'a [String],
+) -> (Vec<&'a String>, Vec<&'a String>) {
+    taints.iter().partition(|t| {
+        (adapter == "cargo"
+            && !declared.is_empty()
+            && t.starts_with(vci_adapter::CARGO_UNDECLARED_TAINT))
+            || policy.taint_waiver(adapter, t).is_some()
     })
+}
+
+/// `process:system, +2` for the `attested` line: the most frequent waived
+/// reason key and the number of other keys.
+fn waived_note(waived: &[String]) -> String {
+    let refs: Vec<&String> = waived.iter().collect();
+    let groups = group_taints(&refs);
+    match groups.split_first() {
+        None => String::new(),
+        Some((first, [])) => first.0.clone(),
+        Some((first, rest)) => format!("{}, +{}", first.0, rest.len()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -521,7 +548,8 @@ fn check_one(
     {
         return Err(format!("collector root {} is not the project dir", o.root));
     }
-    // Go: `policy.go_allow_net` waives the `net` refusal (recorded in the
+    // `policy.ignore_taints` (and Go's `policy.go_allow_net`, which is
+    // `ignore_taints = ["go:net"]`) waives matching taints (recorded in the
     // attestation, which is then only accepted while the base policy agrees).
     // Cargo: declaring inputs for the unit (`[[inputs]]`) waives the
     // "may read outside its package" refusal (the declaration is recorded
@@ -1551,9 +1579,15 @@ pub fn run_units(
                         reasons: vec![],
                         detail: None,
                         taints: vec![],
+                        waived: p.waived.clone(),
                     });
+                    let waived = if p.waived.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (waived: {})", waived_note(&p.waived))
+                    };
                     eprintln!(
-                        "vci: attested {label} ({} inputs, root {}) as git-meta {} {}",
+                        "vci: attested {label}{waived} ({} inputs, root {}) as git-meta {} {}",
                         p.core.manifest.entries.len(),
                         &p.core.input_root[..16],
                         stored.target,
@@ -1807,6 +1841,11 @@ mod tests {
             reasons: reasons.iter().map(|r| (*r).to_owned()).collect(),
             detail: (!attested).then(|| "tainted: ...".to_owned()),
             taints: vec![],
+            waived: if attested {
+                vec!["process:system".to_owned()]
+            } else {
+                vec![]
+            },
         };
         let outcomes = [
             unit("a", true, &[]),
@@ -1829,6 +1868,132 @@ mod tests {
         assert_eq!(v["units"][1]["reasons"][1], "process:system");
         assert_eq!(v["reasons"][0]["reason"], "native:FFI");
         assert_eq!(v["reasons"][0]["files"], 2);
+        assert_eq!(v["units"][0]["waived"][0], "process:system");
+        assert_eq!(v["units"][1]["waived"].as_array().unwrap().len(), 0);
+    }
+
+    fn policy(toml: &str) -> crate::config::Policy {
+        crate::config::Config::parse(toml).unwrap().project_specs()[0]
+            .policy
+            .clone()
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn split_waived_by_ignore_taints() {
+        let taints = strings(&[
+            "process:system",
+            "process:backtick",
+            "native:FFI attach_function(x)",
+            "network:pg client (a database connection the test opened itself)",
+            "vci:not-hooked:ffi (x)",
+            "external-without-version:/abs/x.js",
+        ]);
+        let split = |toml: &str, adapter: &str| {
+            let p = policy(toml);
+            let (w, r) = split_waived_taints(&p, adapter, &[], &taints);
+            (
+                w.into_iter().cloned().collect::<Vec<_>>(),
+                r.into_iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        // Default: nothing waived.
+        let (w, r) = split("[policy]\n", "rails");
+        assert!(w.is_empty());
+        assert_eq!(r, taints);
+        // A glob over the kind, and an exact key.
+        let (w, r) = split(
+            "[policy]\nignore_taints = [\"process:*\", \"external-without-version\"]\n",
+            "rails",
+        );
+        assert_eq!(
+            w,
+            strings(&[
+                "process:system",
+                "process:backtick",
+                "external-without-version:/abs/x.js"
+            ])
+        );
+        assert_eq!(r.len(), 3);
+        // A category-only pattern.
+        let (w, _) = split(
+            "[policy]\nignore_taints = [\"native\", \"network\"]\n",
+            "rails",
+        );
+        assert_eq!(w.len(), 2);
+        assert!(w[0].starts_with("native:FFI") && w[1].starts_with("network:pg"));
+        // A pattern with a kind matches that kind only.
+        let (w, _) = split("[policy]\nignore_taints = [\"process:system\"]\n", "rails");
+        assert_eq!(w, ["process:system"]);
+        // "*" waives everything but vci's own taints.
+        let (w, r) = split("[policy]\nignore_taints = [\"*\"]\n", "rails");
+        assert_eq!(w.len(), 5);
+        assert_eq!(r, ["vci:not-hooked:ffi (x)"]);
+    }
+
+    #[test]
+    fn go_allow_net_is_ignore_taints_go_net() {
+        let taints = strings(&[
+            "go:net: the test links package net (...)",
+            "go:syscall: x imports syscall",
+            "exec: /bin/sh",
+        ]);
+        let waived = |toml: &str| {
+            let p = policy(toml);
+            split_waived_taints(&p, "go", &[], &taints)
+                .0
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let by_flag = waived("adapter = \"go\"\n[policy]\ngo_allow_net = true\n");
+        let by_key = waived("adapter = \"go\"\n[policy]\nignore_taints = [\"go:net\"]\n");
+        assert_eq!(by_flag, ["go:net: the test links package net (...)"]);
+        assert_eq!(by_flag, by_key);
+        assert_eq!(
+            waived("adapter = \"go\"\n[policy]\nignore_taints = [\"go\", \"exec\"]\n").len(),
+            3
+        );
+        assert!(waived("adapter = \"go\"\n").is_empty());
+        // go_allow_net only concerns Go units.
+        let p = policy("[policy]\ngo_allow_net = true\n");
+        assert!(split_waived_taints(&p, "vitest", &[], &taints).0.is_empty());
+    }
+
+    #[test]
+    fn cargo_declared_inputs_still_waive_undeclared_reads() {
+        let taints = strings(&["cargo:undeclared-reads (x)", "cargo:process: Command::new"]);
+        let p = policy("adapter = \"cargo\"\n");
+        let declared = strings(&["testdata/**"]);
+        let (w, r) = split_waived_taints(&p, "cargo", &declared, &taints);
+        assert_eq!((w.len(), r.len()), (1, 1));
+        let (w, _) = split_waived_taints(&p, "cargo", &[], &taints);
+        assert!(w.is_empty());
+        let p = policy("adapter = \"cargo\"\n[policy]\nignore_taints = [\"cargo:*\"]\n");
+        let (w, r) = split_waived_taints(&p, "cargo", &[], &taints);
+        assert_eq!((w.len(), r.len()), (2, 0));
+    }
+
+    #[test]
+    fn waived_note_names_the_first_key_and_counts_the_others() {
+        assert_eq!(waived_note(&[]), "");
+        assert_eq!(
+            waived_note(&strings(&["child_process.execSync"])),
+            "child_process.execSync"
+        );
+        assert_eq!(
+            waived_note(&strings(&[
+                "process:spawn",
+                "process:system",
+                "process:system",
+                "native:FFI a",
+                "fetch"
+            ])),
+            "process:system, +3"
+        );
     }
 
     #[test]

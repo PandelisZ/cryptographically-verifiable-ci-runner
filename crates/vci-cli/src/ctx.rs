@@ -40,10 +40,12 @@ pub struct VciPredicate {
     /// architecture, whatever `policy.platform` says (the OS may differ).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch_specific: Vec<String>,
-    /// Refusal reasons a policy waived when this attestation was made
-    /// (`go:net:` with `policy.go_allow_net`, `cargo:undeclared-reads` with
-    /// declared `[[inputs]]`). `vci plan` accepts the attestation only while
-    /// the base commit's policy still waives them. Rails never writes one
+    /// Taints a policy waived when this attestation was made, as the
+    /// collector reported them (any taint whose reason key
+    /// `policy.ignore_taints` matches, `go:net:` with `policy.go_allow_net`,
+    /// `cargo:undeclared-reads` with declared `[[inputs]]`). `vci plan`
+    /// accepts the attestation only while the base commit's policy still
+    /// waives every one (the `waived` check). Rails never writes one
     /// since vci 1.4.0; a `rails:network-db:` entry (written under the
     /// removed `policy.rails_allow_db`) is still read, and refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

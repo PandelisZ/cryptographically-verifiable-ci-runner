@@ -164,7 +164,7 @@ vci push</code></pre>
 <li>a skipped test;</li>
 <li>using the local time zone with <code>TZ</code> unset.</li>
 </ul>
-<div class="note"><p><strong>Network waiver.</strong> Many test helpers import <code>net/http</code> without using it (testify's <code>assert</code> does). Set <code>go_allow_net = true</code> under <code>[policy]</code> to state that these tests do no network I/O. The waiver is recorded in the attestation and only accepted while the base commit's policy still sets it.</p></div>
+<div class="note"><p><strong>Network waiver.</strong> Many test helpers import <code>net/http</code> without using it (testify's <code>assert</code> does). Set <code>go_allow_net = true</code> under <code>[policy]</code> to state that these tests do no network I/O. The waiver is recorded in the attestation and only accepted while the base commit's policy still sets it. It is the same as <code>ignore_taints = ["go:net"]</code>; <code>ignore_taints</code> waives the other refusals too (see <a href="configuration.html#policy">configuration</a>).</p></div>
 <h3>Laptop to Linux runner</h3>
 <ul>
 <li>Pin the exact Go version in <code>actions/setup-go</code>.</li>

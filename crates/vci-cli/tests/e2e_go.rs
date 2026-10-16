@@ -719,6 +719,7 @@ fn go_run_refuses_unattestable_packages() {
 
 /// `policy.go_allow_net` waives the `net` refusal; the attestation records
 /// the waiver and is only accepted while the base commit's policy has it.
+/// `policy.ignore_taints = ["go:net"]` is the same waiver.
 #[test]
 fn go_allow_net_is_the_base_policys_decision() {
     let Some(w) = World::new() else { return };
@@ -736,7 +737,16 @@ fn go_allow_net_is_the_base_policys_decision() {
     );
     w.git(&work, &["add", "-A"]);
     w.git(&work, &["commit", "-q", "-m", "allow net"]);
-    w.run(&work, "netpkg", &w.trusted);
+    let out = w.vci(
+        &work,
+        &["run", "netpkg", "--key", w.trusted.to_str().unwrap()],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("vci: attested netpkg (waived: go:net) ("),
+        "{stderr}"
+    );
     let pred = &w.predicates("netpkg")[0];
     assert!(
         pred["waived"][0].as_str().unwrap().starts_with("go:net:"),
@@ -744,11 +754,89 @@ fn go_allow_net_is_the_base_policys_decision() {
     );
     // main's policy does not allow it.
     let ex = w.explain(&work, "netpkg", "main");
-    assert!(ex.contains("waived refusal"), "{ex}");
+    assert!(ex.contains("failed check: waived"), "{ex}");
+    assert!(ex.contains("waived taint go:net"), "{ex}");
+    assert!(ex.contains("policy.go_allow_net = false"), "{ex}");
     assert!(w.plan(&work, "main").run.contains("netpkg"));
     // A base that allows it (the commit that set it) accepts it.
     let allow = w.git(&work, &["rev-parse", "HEAD"]);
     assert!(w.plan(&work, &allow).skip.contains("netpkg"));
+    // The same waiver as ignore_taints = ["go:net"] (vci.toml is a global
+    // input of a Go package, so attest again under the new file): accepted
+    // by a base that says it either way.
+    w.put(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"go:net\"]",
+        ),
+    );
+    w.git(&work, &["commit", "-q", "-am", "ignore go:net"]);
+    let ignore = w.git(&work, &["rev-parse", "HEAD"]);
+    let out = w.vci(
+        &work,
+        &["run", "netpkg", "--key", w.trusted.to_str().unwrap()],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vci: attested netpkg (waived: go:net) ("),
+        "{stderr}"
+    );
+    assert!(w.plan(&work, &ignore).skip.contains("netpkg"));
+    assert!(w.plan(&work, &allow).skip.contains("netpkg"));
+    assert!(w.plan(&work, "main").run.contains("netpkg"));
+}
+
+/// `policy.ignore_taints` waives other Go refusals the same way: a package
+/// that imports `syscall` is attested under `["go:syscall"]` and skipped
+/// only while the base policy still waives it.
+#[test]
+fn go_ignore_taints_waives_syscall() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.put(
+        "sys/sys.go",
+        "package sys\n\nimport \"syscall\"\n\nfunc Pid() int { return syscall.Getpid() }\n",
+    );
+    w.put(
+        "sys/sys_test.go",
+        "package sys\n\nimport \"testing\"\n\nfunc TestPid(t *testing.T) {\n\tif Pid() <= 0 {\n\t\tt.Fatal()\n\t}\n}\n",
+    );
+    let out = w.vci(&work, &["run", "sys", "--key", w.trusted.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vci: not attesting sys: tainted: go:syscall"),
+        "{stderr}"
+    );
+    w.put(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"go:syscall\"]",
+        ),
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "ignore syscall"]);
+    let out = w.vci(&work, &["run", "sys", "--key", w.trusted.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("vci: attested sys (waived: go:syscall) ("),
+        "{stderr}"
+    );
+    let pred = &w.predicates("sys")[0];
+    assert!(
+        pred["waived"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("go:syscall: "),
+        "{pred}"
+    );
+    let here = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(w.plan(&work, &here).skip.contains("sys"));
+    assert!(w.plan(&work, "main").run.contains("sys"));
+    let ex = w.explain(&work, "sys", "main");
+    assert!(ex.contains("waived taint go:syscall"), "{ex}");
 }
 
 #[test]

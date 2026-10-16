@@ -39,6 +39,15 @@ Both fail open: the worst outcome is that CI runs the unit. Never "fix" either b
 | `listed under more than one runner project (or by more than one vci project)` | The file belongs to two projects | Fix the project configuration (user decision) |
 | `not in the runner's test file list` / `the collector produced no output for it` | The runner did not run it as a unit, or crashed | Check the path and the runner output |
 
+**`policy.ignore_taints` (vci 1.7.0+).** A repository's `vci.toml` can waive taints: `ignore_taints = ["process:*",
+"child_process.*", "go:syscall"]` (globs over the reason key the "why not attested" lines print; `"*"` for all,
+`vci:` taints never). A waived unit is attested (`vci: attested <unit> (waived: process:system, +2)`), the taints are
+recorded in the attestation's `waived`, and `vci plan` accepts it only while the base branch's policy still waives
+each one (otherwise the `waived` check fails). It knowingly trades determinism for CI cost: what the taint stands for
+(a child process's reads, a network answer) is not recorded. Adding it, widening it, or setting it to `"*"` is the
+maintainers' decision: never add `ignore_taints` (or `go_allow_net`) to a repository's policy on your own to get a
+unit attested; report the taint, and mention the knob only as an option for the user to decide on.
+
 Errors that stop `vci run` before anything runs:
 
 - `<arg> is not a test file of any project (not listed by the test runner)`: wrong path, a non-test file, a Go file
@@ -75,7 +84,7 @@ attestation recorded) and `actual` (what this checkout and the base policy give)
 | `repo`, `test-id`, `adapter`, `argv` | Attested in another repository, for another unit id, adapter, project dir or runner command | Attest in this repository and project |
 | `toolchain` | Node/Vitest/Vite, Python/pytest/distributions, Go version and settings, rustc/cargo, Ruby/Rails/bundle, root vs non-root, or OS/arch per `policy.platform` differ; `ruby libraries` / `python libraries` (SQLite, libyaml, tz data, OpenSSL versions) differ under `policy.libraries = "exact"`, or one side lacks the library (`... loaded or not`, also under `"any"`) | Pin toolchains (runners.md). Locally, compare with what CI uses. For library versions between macOS and Linux, the user may set `libraries = "any"` on the default branch |
 | `env-config` | The effective `[env]` configuration (`set` values, `hash`/`ignore` lists, vci's built-in lists) differs from the base `vci.toml`'s; every attestation made before vci 1.6.0 fails this once | The PR changed `[env]`, the base did, or vci was upgraded; re-attest once the base has the same config (`vci env --base-ref <ref>` shows the difference) |
-| `result` / `inputs-config` / waived refusals / `dirty` | Not passed; `[[inputs]]` globs differ from the base config; a waiver (`go_allow_net`) no longer set on base, or an attestation made under the removed `rails_allow_db`; dirty tree with `allow_dirty = false` | Merge config changes to the default branch first; commit before attesting when `allow_dirty = false` |
+| `result` / `inputs-config` / `waived` / `dirty` | Not passed; `[[inputs]]` globs differ from the base config; a taint the attestation recorded as waived is no longer waived by the base policy (`waived taint <key>`: its `ignore_taints` or `go_allow_net` no longer covers it), or an attestation made under the removed `rails_allow_db`; dirty tree with `allow_dirty = false` | Merge config changes to the default branch first (a waiver is the user's decision); commit before attesting when `allow_dirty = false` |
 | `global-inputs` | A global input (lockfile, runner config, `vci.toml`, ...) differs | Re-attest after the change |
 | `inputs` | A recorded input differs: `entry:<path>` with both hashes (file edited after attesting, new file where an absent probe was, listing changed) | Re-run `vci run` on the unit after your last edit |
 | `externals` | An external package/module/crate/gem version differs; or a native library opened through FFI (`external:native:libvips.42.dylib`) is another file or build where CI checks, or `native library libvips: not loaded here` | Re-attest with the lockfile CI uses. For native libraries: install the library in CI; across macOS and Linux the user may set `policy.libraries = "any"` (matches by library name) on the default branch |

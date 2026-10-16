@@ -687,6 +687,125 @@ fn run_refuses_unattestable_test_files() {
     );
 }
 
+/// The predicates stored for `test_id`.
+fn predicates(dir: &Path, test_id: &str) -> Vec<Value> {
+    let repo = store_for(dir);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    AttestStore::new(&repo)
+        .list(Some(test_id))
+        .unwrap()
+        .iter()
+        .map(|s| {
+            let env: Value = serde_json::from_slice(&s.bytes).unwrap();
+            let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
+            let st: Value = serde_json::from_slice(&payload).unwrap();
+            st["predicate"].clone()
+        })
+        .collect()
+}
+
+/// `policy.ignore_taints`: a file that spawns a child process is attested,
+/// the taint recorded as waived, and it is skipped only while the base
+/// commit's policy still waives it.
+#[test]
+fn ignore_taints_attests_while_the_base_policy_waives() {
+    let w = World::new();
+    let work = w.work.clone();
+    let spawn = "src/spawn.test.mjs";
+    w.write(
+        spawn,
+        "import { test } from 'node:test';\nimport { execFileSync } from 'node:child_process';\ntest('a', () => { execFileSync(process.execPath, ['-e', '1']); });\n",
+    );
+    // Without the key the file is refused (execFileSync copies process.env
+    // for the child: it enumerates the environment).
+    let stderr = w.run(&work, &[spawn], &w.trusted);
+    assert!(
+        refused_line(&stderr, spawn).contains("child_process.execFileSync"),
+        "{stderr}"
+    );
+    w.write(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"child_process.*\", \"process.env.enumerate\"]",
+        ),
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "ignore child processes"]);
+    let summary = w.base.join("summary.json");
+    let out = w.vci(
+        &work,
+        &[
+            "run",
+            spawn,
+            "--key",
+            w.trusted.to_str().unwrap(),
+            "--summary",
+            summary.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "vci: attested {spawn} (waived: child_process.execFileSync, +1) ("
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("vci: 1 attested, 0 not attested"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("why not attested"), "{stderr}");
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+    assert_eq!(
+        v["units"][0]["waived"][0], "child_process.execFileSync",
+        "{v}"
+    );
+    assert!(v["reasons"].as_array().unwrap().is_empty(), "{v}");
+    let preds = predicates(&work, spawn);
+    assert_eq!(preds.len(), 1);
+    assert_eq!(
+        preds[0]["waived"],
+        serde_json::json!(["child_process.execFileSync", "process.env.enumerate"])
+    );
+    // A base that waives it (the commit that set the key) skips the file.
+    let here = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(w.plan(&work, &here).skip.contains(spawn));
+    // main's policy does not: it runs, and explain names the taint.
+    assert!(w.plan(&work, "main").run.contains(spawn));
+    let ex = w.explain(&work, spawn, "main");
+    assert!(ex.contains("failed check: waived"), "{ex}");
+    assert!(
+        ex.contains("waived taint child_process.execFileSync"),
+        "{ex}"
+    );
+    assert!(
+        ex.contains("no policy.ignore_taints pattern matches child_process.execFileSync"),
+        "{ex}"
+    );
+    // A base that keeps the key but drops the pattern runs it too.
+    w.write(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"process.env.enumerate\"]",
+        ),
+    );
+    w.git(
+        &work,
+        &["commit", "-q", "-am", "child processes refuse again"],
+    );
+    let dropped = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(w.plan(&work, &dropped).run.contains(spawn));
+    let ex = w.explain(&work, spawn, &dropped);
+    assert!(
+        ex.contains("waived taint child_process.execFileSync"),
+        "{ex}"
+    );
+    assert!(!ex.contains("waived taint process.env.enumerate"), "{ex}");
+}
+
 /// Test commands vci cannot vouch for: nothing is attested, `vci plan` runs
 /// everything, and `vci ci` runs the package.json script itself.
 #[test]
