@@ -160,17 +160,24 @@ If a test is not skipped and you expected it to be, `vci explain <unit> --base-r
 
 [`skills/vci`](skills/vci/SKILL.md) is an agent skill that teaches Claude Code, Codex, Cursor and other agents the vci workflow: after a change, find the units that cover it, `vci run` them with the agent's own key, read what was attested or refused, check `vci plan`, and `vci push`. It also covers setup and `vci explain`, and forbids touching `allowed_signers`, weakening policy or attesting failing tests.
 
-Install it one of three ways:
+Two skills ship in this repository: `vci` (the workflow) and `vci-setup` (gets one engineer ready: CLI, trusted key, environment, first plan). Install both into every agent you use with the [skills CLI](https://github.com/vercel-labs/skills), which writes them where Claude Code, Codex, Cursor and the others look:
 
-- **Claude Code** (plugin): `/plugin marketplace add PandelisZ/cryptographically-verifiable-ci-runner`, then `/plugin install vci@pandelisz`.
-- **Codex**: in a session, `$skill-installer install https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/skills/vci`, or copy `skills/vci` to `~/.agents/skills/vci` (yours) or a repository's `.agents/skills/vci`. A clone of this repository already offers it (`.agents/skills/vci`).
-- **Any agent**, via the [skills CLI](https://github.com/vercel-labs/skills):
+```sh
+npx skills add PandelisZ/cryptographically-verifiable-ci-runner
+```
+
+Or per tool:
+
+- **Claude Code** (plugin, adds `/vci-setup` too):
 
   ```sh
-  npx skills add PandelisZ/cryptographically-verifiable-ci-runner
+  claude plugin marketplace add PandelisZ/cryptographically-verifiable-ci-runner
+  claude plugin install vci@pandelisz
   ```
 
-**Distribute to your org**: commit the skill into your monorepo once, at `.agents/skills/vci` (Codex) with a `.claude/skills/vci` symlink to it (Claude Code), and add your repository's facts and a setup script, as the vex monorepo does; every engineer's agent then has it. Every route, the org setup, and what was tested: [docs/SKILL.md](docs/SKILL.md).
+- **Codex**: in a session, `$skill-installer install https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/skills/vci`, or copy `skills/vci` and `skills/vci-setup` to `~/.agents/skills/` (yours) or a repository's `.agents/skills/`. A clone of this repository already offers them (`.agents/skills/`).
+
+**Distribute to your org**: commit the skill into your monorepo once, at `.agents/skills/vci` (Codex) with a `.claude/skills/vci` symlink to it (Claude Code), and add your repository's facts and a setup script, as the vex monorepo does; every engineer's agent then has it. Every route, the org setup, and what was tested: [docs/AGENT-SKILL.md](docs/AGENT-SKILL.md).
 
 ## Learn more
 
