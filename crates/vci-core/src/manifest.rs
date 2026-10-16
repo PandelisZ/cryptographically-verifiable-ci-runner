@@ -51,6 +51,32 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
+    /// One-letter code of the compact manifest encoding
+    /// ([`InputManifest::to_compact`]).
+    pub fn code(self) -> &'static str {
+        match self {
+            EntryKind::File => "f",
+            EntryKind::Symlink => "l",
+            EntryKind::Absent => "a",
+            EntryKind::DirListing => "d",
+            EntryKind::Dir => "t",
+            EntryKind::Excluded => "x",
+        }
+    }
+
+    /// The kind a [`EntryKind::code`] names.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "f" => EntryKind::File,
+            "l" => EntryKind::Symlink,
+            "a" => EntryKind::Absent,
+            "d" => EntryKind::DirListing,
+            "t" => EntryKind::Dir,
+            "x" => EntryKind::Excluded,
+            _ => return None,
+        })
+    }
+
     /// Tag used in the input root encoding (same spelling as the JSON form).
     pub fn tag(self) -> &'static str {
         match self {
@@ -229,6 +255,8 @@ pub enum ManifestError {
     CaseCollision { a: String, b: String },
     #[error("invalid environment variable name {0:?}")]
     InvalidEnvKey(String),
+    #[error("not a compact input manifest: {0}")]
+    Compact(String),
 }
 
 fn io_err(path: &Utf8Path, source: io::Error) -> ManifestError {
@@ -614,6 +642,140 @@ impl InputManifest {
             e.str(&x.key).str(&x.hash);
         }
         e.finish()
+    }
+
+    /// The compact encoding a manifest is stored in on its own (since vci
+    /// 1.9.0 an attestation references its manifest by input root instead of
+    /// embedding it). One JSON document, version 2:
+    ///
+    /// ```text
+    /// {"v":2,"entries":[[path,kind,size,hash,exec?],...],
+    ///  "externals":[[name,version],...],"env":[[key,hash|null],...]}
+    /// ```
+    ///
+    /// `kind` is [`EntryKind::code`] (`f` file, `l` symlink, `a` absent,
+    /// `d` dirListing, `t` dir, `x` excluded), `hash` lowercase hex as
+    /// recorded, `exec` present (as `1`) only when true, and an env hash
+    /// `null` when the variable was unset ([`ABSENT_HASH`]). The vectors keep
+    /// their order. The bytes carry no trust: [`Self::root`] of the decoded
+    /// manifest must equal the signed input root, and it hashes the entries,
+    /// not this encoding.
+    pub fn to_compact(&self) -> String {
+        fn s(out: &mut String, v: &str) {
+            // Serializing a str cannot fail.
+            out.push_str(&serde_json::to_string(v).unwrap_or_default());
+        }
+        let mut out = String::with_capacity(64 + self.entries.len() * 120);
+        out.push_str("{\"v\":2,\"entries\":[");
+        for (i, e) in self.entries.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            s(&mut out, e.path.as_str());
+            out.push_str(",\"");
+            out.push_str(e.kind.code());
+            out.push_str("\",");
+            out.push_str(&e.size.to_string());
+            out.push(',');
+            s(&mut out, &e.hash);
+            if e.exec {
+                out.push_str(",1");
+            }
+            out.push(']');
+        }
+        out.push_str("],\"externals\":[");
+        for (i, x) in self.externals.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            s(&mut out, &x.name);
+            out.push(',');
+            s(&mut out, &x.version);
+            out.push(']');
+        }
+        out.push_str("],\"env\":[");
+        for (i, x) in self.env.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            s(&mut out, &x.key);
+            out.push(',');
+            if x.hash == ABSENT_HASH {
+                out.push_str("null");
+            } else {
+                s(&mut out, &x.hash);
+            }
+            out.push(']');
+        }
+        out.push_str("]}");
+        out
+    }
+
+    /// Decode [`Self::to_compact`]'s encoding. Anything else (another
+    /// version, an unknown kind or field, a path that is not a canonical
+    /// [`RepoPath`]) is an error.
+    pub fn from_compact(bytes: &[u8]) -> Result<Self, ManifestError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Compact {
+            v: u32,
+            entries: Vec<Vec<serde_json::Value>>,
+            externals: Vec<(String, String)>,
+            env: Vec<(String, Option<String>)>,
+        }
+        let bad = |m: String| ManifestError::Compact(m);
+        let c: Compact = serde_json::from_slice(bytes).map_err(|e| bad(e.to_string()))?;
+        if c.v != 2 {
+            return Err(bad(format!("version {} (expected 2)", c.v)));
+        }
+        let mut entries = Vec::with_capacity(c.entries.len());
+        for (i, e) in c.entries.into_iter().enumerate() {
+            let at = |what: &str| bad(format!("entry {i}: {what}"));
+            let (path, kind, size, hash, exec) = match e.as_slice() {
+                [p, k, n, h] => (p, k, n, h, false),
+                [p, k, n, h, x] if x.as_u64() == Some(1) => (p, k, n, h, true),
+                _ => return Err(at("expected [path, kind, size, hash] or [..., 1]")),
+            };
+            let path = path
+                .as_str()
+                .ok_or_else(|| at("path is not a string"))
+                .and_then(|p| RepoPath::try_from(p.to_owned()).map_err(|e| at(&e.to_string())))?;
+            let kind = kind
+                .as_str()
+                .and_then(EntryKind::from_code)
+                .ok_or_else(|| at("unknown kind"))?;
+            let size = size.as_u64().ok_or_else(|| at("size is not a u64"))?;
+            let hash = hash
+                .as_str()
+                .ok_or_else(|| at("hash is not a string"))?
+                .to_owned();
+            entries.push(InputEntry {
+                path,
+                kind,
+                exec,
+                size,
+                hash,
+            });
+        }
+        Ok(InputManifest {
+            entries,
+            externals: c
+                .externals
+                .into_iter()
+                .map(|(name, version)| External { name, version })
+                .collect(),
+            env: c
+                .env
+                .into_iter()
+                .map(|(key, hash)| EnvEntry {
+                    key,
+                    hash: hash.unwrap_or_else(|| ABSENT_HASH.to_owned()),
+                })
+                .collect(),
+        })
     }
 
     /// Re-observe every entry path under `repo_root` (without re-following

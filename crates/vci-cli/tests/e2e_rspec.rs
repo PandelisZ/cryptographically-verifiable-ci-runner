@@ -22,6 +22,7 @@ use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
 mod env_common;
+mod store_common;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -581,6 +582,7 @@ fn rspec_end_to_end_verification_steps() {
         .decode(env["payload"].as_str().unwrap())
         .unwrap();
     let st: Value = serde_json::from_slice(&payload).unwrap();
+    let st = store_common::inline_statement_manifest(&store_for(&work), st);
     let argv: Vec<&str> = st["predicate"]["argv"]
         .as_array()
         .unwrap()
@@ -1941,6 +1943,7 @@ fn rspec_bundle_installed_in_the_repository() {
             .decode(env["payload"].as_str().unwrap())
             .unwrap();
         let st: Value = serde_json::from_slice(&payload).unwrap();
+        let st = store_common::inline_statement_manifest(&store_for(&work), st);
         let m = &st["predicate"]["manifest"];
         let inside: Vec<&Value> = m["entries"]
             .as_array()

@@ -1,6 +1,6 @@
 {
   "name": "@vci/vitest",
-  "version": "1.8.2",
+  "version": "1.9.0",
   "description": "Records per-test-file runtime dependencies for Vitest and node:test (vci collectors)",
   "type": "module",
   "license": "MIT",

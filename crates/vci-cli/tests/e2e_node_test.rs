@@ -18,6 +18,7 @@ use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
 mod env_common;
+mod store_common;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -693,7 +694,7 @@ fn predicates(dir: &Path, test_id: &str) -> Vec<Value> {
             let env: Value = serde_json::from_slice(&s.bytes).unwrap();
             let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
             let st: Value = serde_json::from_slice(&payload).unwrap();
-            st["predicate"].clone()
+            store_common::inline_manifest(&repo, st["predicate"].clone())
         })
         .collect()
 }

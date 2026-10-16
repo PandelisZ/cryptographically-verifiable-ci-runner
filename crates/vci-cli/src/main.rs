@@ -124,6 +124,9 @@ enum Cmd {
         allowed_signers: Option<Utf8PathBuf>,
         #[arg(long)]
         base_ref: Option<String>,
+        /// The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the local git-meta store when run inside the repository.
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<Utf8PathBuf>,
     },
     /// Publish local attestations: git-meta push (refs/meta/main) with merge and retry.
     Push {
@@ -288,7 +291,13 @@ fn main() {
             envelope,
             allowed_signers,
             base_ref,
-        } => cmds::verify(&envelope, allowed_signers.as_deref(), base_ref.as_deref()),
+            manifest,
+        } => cmds::verify(
+            &envelope,
+            allowed_signers.as_deref(),
+            base_ref.as_deref(),
+            manifest.as_deref(),
+        ),
         Cmd::Push {
             remote,
             rewrite_history,

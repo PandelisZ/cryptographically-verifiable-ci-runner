@@ -290,7 +290,18 @@ pub struct Predicate {
     pub toolchain: Toolchain,
     pub global_input_root: String,
     pub input_root: String,
-    pub manifest: InputManifest,
+    /// The input manifest, embedded (attestations made before vci 1.9.0).
+    /// Exactly one of `manifest` and [`Predicate::manifest_ref`] is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<InputManifest>,
+    /// The input manifest by reference (since vci 1.9.0): its input root,
+    /// which is `inputRoot`. The manifest is stored once, in its compact
+    /// encoding ([`InputManifest::to_compact`]), under git-meta's `project`
+    /// target, key `vci:manifest:<root>`, shared by every attestation with
+    /// that root; it is trusted only when its recomputed root is the signed
+    /// `inputRoot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_ref: Option<String>,
     pub global_manifest: InputManifest,
     pub result: TestResult,
     pub tainted: Vec<String>,
@@ -347,7 +358,8 @@ mod tests {
             global_input_root: "g".into(),
             input_root: manifest.root(),
             global_manifest: InputManifest::default(),
-            manifest,
+            manifest: Some(manifest),
+            manifest_ref: None,
             result: TestResult {
                 state: "passed".into(),
                 tests: 1,
@@ -383,6 +395,24 @@ mod tests {
         assert_eq!(v["manifest"]["entries"][0]["path"], "src/b.ts");
         let back: Predicate = serde_json::from_value(v).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn a_manifest_by_reference_omits_the_inline_manifest() {
+        let mut p = sample();
+        let root = p.input_root.clone();
+        p.manifest = None;
+        p.manifest_ref = Some(root.clone());
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("manifest").is_none(), "{v}");
+        assert_eq!(v["manifestRef"], root.as_str());
+        let back: Predicate = serde_json::from_value(v).unwrap();
+        assert_eq!(back, p);
+        // A pre-1.9 predicate (inline manifest, no manifestRef) still reads.
+        let old = serde_json::to_value(sample()).unwrap();
+        assert!(old.get("manifestRef").is_none());
+        let back: Predicate = serde_json::from_value(old).unwrap();
+        assert!(back.manifest.is_some() && back.manifest_ref.is_none());
     }
 
     #[test]

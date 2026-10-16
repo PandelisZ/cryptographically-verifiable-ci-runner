@@ -20,6 +20,12 @@
 //!   root, toolchain, argv, ...). The same signer re-attesting the same unit
 //!   and inputs therefore rewrites the same key.
 //! * Value: the signed DSSE envelope, byte for byte.
+//! * Input manifests (since vci 1.9.0 an attestation references its manifest
+//!   by input root instead of embedding it): target `project`, key
+//!   `vci:manifest:<input root>`, value the manifest's compact encoding.
+//!   Content-addressed: written once, shared by every attestation, unit and
+//!   signer with that root, and trusted only when its recomputed root is
+//!   the root an attestation signed.
 //!
 //! Nothing here is trusted: keys and values are hints. `vci plan` verifies
 //! every envelope's signature against the base commit's `allowed_signers` and
@@ -62,6 +68,9 @@ use crate::validate;
 
 /// Key namespace of every vci attestation.
 pub const KEY_PREFIX: &str = "vci:attestation";
+/// Key namespace of the stored input manifests (`vci:manifest:<root>`, on
+/// the `project` target).
+pub const MANIFEST_PREFIX: &str = "vci:manifest";
 /// The project-local file naming the recommended metadata remote
 /// (`url: <url>`), as read by `git meta setup`.
 pub const SETUP_FILE: &str = ".git-meta";
@@ -94,6 +103,20 @@ pub struct StoredEnvelope {
     /// Why the value could not be read (a blob missing from the object
     /// database, a value not fetched yet). Such an entry is never valid; it
     /// is listed so that only its own unit loses it.
+    pub error: Option<String>,
+}
+
+/// An input manifest read back from storage (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredManifest {
+    /// The input root it is stored under (a hint until the manifest's own
+    /// root is recomputed).
+    pub root: String,
+    /// Full git-meta key (`vci:manifest:<root>`, target `project`).
+    pub key: String,
+    /// The stored bytes (empty when `error` is set).
+    pub bytes: Vec<u8>,
+    /// Why the value could not be read.
     pub error: Option<String>,
 }
 
@@ -166,6 +189,44 @@ pub fn target_label(t: &Target) -> String {
 /// The key an attestation is stored under.
 pub fn attestation_key(test_key: &str, signer: &str, storage_key: &str) -> String {
     format!("{KEY_PREFIX}:{test_key}:{signer}:{storage_key}")
+}
+
+/// The key the input manifest with this root is stored under (target
+/// `project`).
+pub fn manifest_key(root: &str) -> String {
+    format!("{MANIFEST_PREFIX}:{root}")
+}
+
+/// The input root a manifest key names, if it has vci's shape.
+pub fn parse_manifest_key(key: &str) -> Option<&str> {
+    let root = key.strip_prefix(MANIFEST_PREFIX)?.strip_prefix(':')?;
+    validate::is_hex_id(root).then_some(root)
+}
+
+/// The `manifestRef` of a stored DSSE envelope's vci predicate (unverified:
+/// only which stored manifest it names), if it has one.
+fn envelope_manifest_ref(bytes: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    let env: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(env["payload"].as_str()?)
+        .ok()?;
+    let st: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let r = st["predicate"]["manifestRef"].as_str()?;
+    validate::is_hex_id(r).then(|| r.to_owned())
+}
+
+/// The id of the blob git-meta writes for deletion record `t`, in the hash
+/// of `like` (an object id of the same repository); `None` when it cannot be
+/// computed here.
+fn tombstone_blob_id(t: &Tombstone, like: &str) -> Option<String> {
+    if like.len() != 40 {
+        return None;
+    }
+    let bytes = serde_json::to_vec(t).ok()?;
+    gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &bytes)
+        .ok()
+        .map(|id| id.to_string())
 }
 
 /// Split a key into (test key, signer, storage key) if it has vci's shape.
@@ -442,6 +503,16 @@ impl Reader {
             bytes: Vec::new(),
             error: None,
         };
+        match self.value_bytes(row) {
+            Ok(b) => env.bytes = b,
+            Err(e) => env.error = Some(e),
+        }
+        Some(env)
+    }
+
+    /// A string row's value, read the way git-meta's `get_value` does (a
+    /// blob reference through `git cat-file`, a promised entry an error).
+    fn value_bytes(&self, row: Row) -> Result<Vec<u8>, String> {
         let raw = if row.is_promised {
             Err(
                 "the value has not been fetched (git-meta promised entry); run `vci fetch`"
@@ -452,10 +523,7 @@ impl Reader {
             if blobs.is_none() {
                 match CatFile::start(&self.root) {
                     Ok(c) => *blobs = Some(c),
-                    Err(e) => {
-                        env.error = Some(format!("reading blob {}: {e}", row.value));
-                        return Some(env);
-                    }
+                    Err(e) => return Err(format!("reading blob {}: {e}", row.value)),
                 }
             }
             let r = blobs.as_mut().expect("started").blob(row.value.trim());
@@ -467,14 +535,63 @@ impl Reader {
         } else {
             Ok(row.value)
         };
-        match raw {
-            Ok(s) => {
-                let s: String = serde_json::from_str(&s).unwrap_or(s);
-                env.bytes = s.into_bytes();
-            }
-            Err(e) => env.error = Some(e),
+        raw.map(|s| {
+            let s: String = serde_json::from_str(&s).unwrap_or(s);
+            s.into_bytes()
+        })
+    }
+
+    /// The stored input manifest with this root (see the module docs), or
+    /// `None` when the store has none. A value that cannot be read is
+    /// returned with [`StoredManifest::error`] set.
+    pub fn manifest(&self, root: &str) -> Result<Option<StoredManifest>, GitError> {
+        if !validate::is_hex_id(root) {
+            return Ok(None);
         }
-        Some(env)
+        let key = manifest_key(root);
+        let ty = TargetType::Project.as_str().to_owned();
+        let rows = self.rows(
+            "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised
+             FROM metadata WHERE target_type = ?1 AND key = ?2",
+            &[&ty, &key],
+        )?;
+        let Some(row) = rows.into_iter().find(|r| r.key == key) else {
+            return Ok(None);
+        };
+        let mut m = StoredManifest {
+            root: root.to_owned(),
+            key,
+            bytes: Vec::new(),
+            error: None,
+        };
+        if row.value_type != "string" {
+            m.error = Some(format!("a {} value, not a string", row.value_type));
+            return Ok(Some(m));
+        }
+        match self.value_bytes(row) {
+            Ok(b) => m.bytes = b,
+            Err(e) => m.error = Some(e),
+        }
+        Ok(Some(m))
+    }
+
+    /// The roots of every stored input manifest, sorted (values not read).
+    pub fn manifest_roots(&self) -> Result<Vec<String>, GitError> {
+        let prefix = format!("{MANIFEST_PREFIX}:");
+        let len = prefix.len() as i64;
+        let ty = TargetType::Project.as_str().to_owned();
+        let rows = self.rows(
+            "SELECT target_type, target_value, key, '', value_type, is_git_ref, is_promised
+             FROM metadata WHERE target_type = ?1 AND substr(key, 1, ?2) = ?3",
+            &[&ty, &len, &prefix],
+        )?;
+        let mut out: Vec<String> = rows
+            .iter()
+            .filter_map(|r| parse_manifest_key(&r.key).map(str::to_owned))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// Every stored attestation for `test_id`. Entries whose key does not
@@ -538,6 +655,10 @@ struct KeySnapshot {
     tree: String,
     values: BTreeSet<Key>,
     tombstones: BTreeSet<Key>,
+    /// The blob of each whole-key tombstone (its deletion record).
+    tombstone_blobs: BTreeMap<Key, String>,
+    /// The blob of each stored input manifest, by input root.
+    manifest_blobs: BTreeMap<String, String>,
     bad: Vec<String>,
     clean_tree: Option<String>,
 }
@@ -750,6 +871,77 @@ impl<'a> AttestStore<'a> {
         self.session()?
             .target(&target)
             .remove(&e.key)
+            .map_err(meta_err)
+    }
+
+    /// Delete the envelopes of `test_id` signed by `signer` that `keep`
+    /// rejects (one session; git-meta tombstones, published by `push`).
+    /// Returns the deleted envelopes.
+    pub fn remove_for_signer(
+        &self,
+        test_id: &str,
+        signer: &str,
+        keep: impl Fn(&StoredEnvelope) -> bool,
+    ) -> Result<Vec<StoredEnvelope>, GitError> {
+        let doomed: Vec<StoredEnvelope> = self
+            .list(Some(test_id))?
+            .into_iter()
+            .filter(|e| e.signer == signer && !keep(e))
+            .collect();
+        if doomed.is_empty() {
+            return Ok(doomed);
+        }
+        let session = self.session()?;
+        let mut removed = Vec::new();
+        for e in doomed {
+            let target = Target::parse(&e.target).map_err(meta_err)?;
+            if session.target(&target).remove(&e.key).map_err(meta_err)? {
+                removed.push(e);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Store an input manifest's encoded `bytes` under its `root` (target
+    /// `project`, key `vci:manifest:<root>`) unless the store already holds
+    /// exactly those bytes. Returns whether a value was written. The caller
+    /// guarantees `bytes` decode to a manifest whose root is `root` (a
+    /// reader recomputes it anyway).
+    pub fn put_manifest(&self, root: &str, bytes: &[u8]) -> Result<bool, GitError> {
+        validate::hex_id("input root", root)?;
+        let text = std::str::from_utf8(bytes).map_err(|_| GitError::Invalid {
+            what: "manifest",
+            value: String::new(),
+            reason: "must be UTF-8",
+        })?;
+        let key = manifest_key(root);
+        let session = self.session()?;
+        let handle = session.target(&Target::project());
+        let current = handle.get_value(&key).ok().flatten();
+        if current == Some(MetaValue::String(text.to_owned())) {
+            return Ok(false);
+        }
+        handle.set(&key, text).map_err(meta_err)?;
+        Ok(true)
+    }
+
+    /// The stored input manifest with this root (see [`Reader::manifest`]).
+    pub fn manifest(&self, root: &str) -> Result<Option<StoredManifest>, GitError> {
+        self.reader()?.manifest(root)
+    }
+
+    /// The roots of every stored input manifest.
+    pub fn manifests(&self) -> Result<Vec<String>, GitError> {
+        self.reader()?.manifest_roots()
+    }
+
+    /// Delete the stored input manifest with this root (a tombstone, which
+    /// `push` publishes). Returns whether it existed.
+    pub fn remove_manifest(&self, root: &str) -> Result<bool, GitError> {
+        validate::hex_id("input root", root)?;
+        self.session()?
+            .target(&Target::project())
+            .remove(&manifest_key(root))
             .map_err(meta_err)
     }
 
@@ -1022,7 +1214,10 @@ impl<'a> AttestStore<'a> {
         let mut keep: Vec<u8> = Vec::new();
         let mut values = BTreeSet::new();
         let mut tombstones = BTreeSet::new();
+        let mut tombstone_blobs = BTreeMap::new();
+        let mut manifest_blobs = BTreeMap::new();
         for (mode, kind, oid, path) in &records {
+            let oid_str = || String::from_utf8_lossy(oid).into_owned();
             let reason = match std::str::from_utf8(path) {
                 Err(_) => Some("name is not UTF-8"),
                 Ok(p) => {
@@ -1041,12 +1236,18 @@ impl<'a> AttestStore<'a> {
                                 PathKey::Value(k) => {
                                     let k = key(k);
                                     if valid_key(&k) {
+                                        if k.target_type == TargetType::Project
+                                            && let Some(root) = parse_manifest_key(&k.key)
+                                        {
+                                            manifest_blobs.insert(root.to_owned(), oid_str());
+                                        }
                                         values.insert(k);
                                     }
                                 }
                                 PathKey::Tombstone(k) => {
                                     let k = key(k);
                                     if valid_key(&k) {
+                                        tombstone_blobs.insert(k.clone(), oid_str());
                                         tombstones.insert(k);
                                     }
                                 }
@@ -1094,6 +1295,8 @@ impl<'a> AttestStore<'a> {
             tree,
             values,
             tombstones,
+            tombstone_blobs,
+            manifest_blobs,
             bad,
             clean_tree,
         })
@@ -1222,10 +1425,16 @@ impl<'a> AttestStore<'a> {
             })
             .collect();
         // The usual case, decided from the tree's paths alone: the store
-        // holds (or deleted) every value of the ref and the ref records no
-        // deletion, so nothing is restored and no value needs reading.
+        // holds (or deleted) every value of the ref, and every deletion the
+        // ref records is one the store made itself (no row, a deletion
+        // record), so nothing is restored and no value needs reading. A
+        // deletion record for a key the store still holds needs its
+        // timestamp, read below.
         let keys = self.snapshot_keys(&local)?;
-        if keys.tombstones.is_empty()
+        if keys
+            .tombstones
+            .iter()
+            .all(|k| !rows.contains_key(k) && deleted.contains(k))
             && keys
                 .values
                 .iter()
@@ -1320,10 +1529,21 @@ impl<'a> AttestStore<'a> {
     /// everyone.
     fn serialize_checked(&self, session: &Session, local_ref: &str) -> Result<(), GitError> {
         let prev = self.read_ref(local_ref)?;
+        // With filter rules (meta:filter, local:meta:filter), git-meta's
+        // incremental serialization keeps the untouched targets' subtrees as
+        // they are, so a rule that excludes vci's keys would leave the
+        // published values in place but silently leave new ones out: the
+        // full serialization applies the rules to everything, and the check
+        // below then refuses the commit that drops values.
+        let rules = guarded("reading git-meta filter rules", || {
+            git_meta_lib::tree::filter::parse_filter_rules(session.store())
+        })?;
+        let full = !rules.is_empty();
         // Nothing changed in the store since it was last serialized or
         // materialized: the ref already holds it. (git-meta's serialization
         // with no modified rows rebuilds, and hashes, the whole tree.)
-        if prev.is_some()
+        if !full
+            && prev.is_some()
             && let Some(since) = guarded("reading the store", || {
                 session.store().get_last_materialized()
             })?
@@ -1340,7 +1560,13 @@ impl<'a> AttestStore<'a> {
         // object id); a full serialization hashes every value of the store
         // again, most of the cost of a fetch or push on a large store. The
         // check below still refuses a commit that drops a value.
-        let _ = guarded("serializing the git-meta store", || session.serialize())?;
+        let _ = guarded("serializing the git-meta store", || {
+            if full {
+                session.serialize_full()
+            } else {
+                session.serialize()
+            }
+        })?;
         let new = self.read_ref(local_ref)?;
         let (Some(prev), Some(new)) = (prev, new) else {
             return Ok(());
@@ -1472,6 +1698,9 @@ impl<'a> AttestStore<'a> {
         // A fresh session sees the objects the fetch just wrote.
         let session = self.session()?;
         let mut remote_deleted = BTreeSet::new();
+        let mut remote_values = BTreeSet::new();
+        let mut remote_tombstone_blobs = BTreeMap::new();
+        let mut remote_manifest_blobs = BTreeMap::new();
         if found && let Some(tip) = self.read_ref(&tracking)? {
             let snap = self.snapshot_keys(&tip)?;
             if let Some(clean) = &snap.clean_tree {
@@ -1514,6 +1743,9 @@ impl<'a> AttestStore<'a> {
                 ));
             }
             remote_deleted = snap.tombstones;
+            remote_values = snap.values;
+            remote_tombstone_blobs = snap.tombstone_blobs;
+            remote_manifest_blobs = snap.manifest_blobs;
         }
         let restored = self.cover_local_ref(&session, &local_ref)?;
         if restored > 0 {
@@ -1534,28 +1766,102 @@ impl<'a> AttestStore<'a> {
             None
         };
         let marker = self.materialized_marker(&tracking)?;
-        let materialized = tip_now.as_deref().is_some_and(|tip| {
-            restored == 0
-                && std::fs::read_to_string(&marker)
-                    .map(|s| s.trim() == tip)
-                    .unwrap_or(false)
-        });
+        let previous = std::fs::read_to_string(&marker)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| is_oid(s));
+        let materialized = tip_now
+            .as_deref()
+            .is_some_and(|tip| restored == 0 && previous.as_deref() == Some(tip));
+        // git-meta imports a side remote's values as rows of their own
+        // (never serialized, the local ref left alone), not as a merge.
+        let side = self
+            .remotes()?
+            .iter()
+            .any(|r| r.3 && tracking == format!("refs/{ns}/remotes/{}/main", r.0));
         if found && !materialized {
             let before = self.attestation_keys(&session)?;
-            let suffix = tracking
-                .strip_prefix(&format!("refs/{ns}/"))
-                .unwrap_or(&tracking)
-                .to_owned();
-            let _ = guarded("materializing fetched metadata", || {
-                session.materialize(Some(&suffix))
-            })?;
+            let manifests_before: BTreeSet<String> = if side {
+                BTreeSet::new()
+            } else {
+                self.reader()?.manifest_roots()?.into_iter().collect()
+            };
+            let local_before = self.read_ref(&local_ref)?;
+            let started = std::time::Instant::now();
+            // A store materialized from this remote before (and holding
+            // everything of the local ref) takes only what the new tip
+            // changed; git-meta's materialize does the first fetch, merges
+            // local commits and side remotes, and is the fallback for
+            // anything else.
+            let incremental = match (&tip_now, &previous) {
+                (Some(tip), Some(_)) if restored == 0 && !side => match self
+                    .materialize_incremental(
+                        &session,
+                        &local_ref,
+                        &tracking,
+                        tip,
+                        &remote_values,
+                        &remote_tombstone_blobs,
+                        report,
+                    ) {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        report.note(format!(
+                            "merging only what changed in {name}'s {remote_ref} failed ({e}); merged it in full"
+                        ));
+                        None
+                    }
+                },
+                _ => None,
+            };
+            if incremental.is_none() {
+                let suffix = tracking
+                    .strip_prefix(&format!("refs/{ns}/"))
+                    .unwrap_or(&tracking)
+                    .to_owned();
+                let _ = guarded("materializing fetched metadata", || {
+                    session.materialize(Some(&suffix))
+                })?;
+            }
+            if std::env::var_os("VCI_TIMING").is_some() {
+                let how = match incremental {
+                    Some(n) => format!(
+                        "incremental, {n} changed entr{}",
+                        if n == 1 { "y" } else { "ies" }
+                    ),
+                    None => "full".to_owned(),
+                };
+                eprintln!(
+                    "vci: timing: materialize ({how}): {:.2}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
             if self.purge_unserializable_rows()? > 0 {
                 report.warn(
                     "removed entries the merge wrote that git-meta cannot serialize".to_owned(),
                 );
             }
+            if !side {
+                let back = self.restore_referenced_manifests(
+                    &session,
+                    &manifests_before,
+                    local_before.as_deref(),
+                    &remote_manifest_blobs,
+                )?;
+                if back > 0 {
+                    report.note(format!(
+                        "put back {back} input manifest(s) that attestations here reference, which a `vci prune` or supersession elsewhere deleted; the next `vci push` publishes them"
+                    ));
+                }
+            }
             // Materialize may have applied tombstones or legacy deletes.
             self.serialize_checked(&session, &local_ref)?;
+            if incremental.is_none()
+                && !side
+                && let Some(tip) = &tip_now
+            {
+                self.adopt_equal_tip(&local_ref, tip)?;
+            }
             let after = self.attestation_keys(&session)?;
             let implicit = before
                 .difference(&after)
@@ -1575,6 +1881,438 @@ impl<'a> AttestStore<'a> {
             found,
             deleted_here,
         })
+    }
+
+    /// Merge the fetched tip `tip` into the store by reading only the
+    /// entries that differ between its tree and the local metadata commit's
+    /// (`git diff-tree`), instead of git-meta's materialize, which parses
+    /// both trees in full, every value included. Done only where
+    /// materialize would fast-forward (`refs/<ns>/local/main` is an ancestor
+    /// of `tip`, so the store, just serialized onto it, holds exactly its
+    /// tree), and with the same effect: the tip's new and changed values and
+    /// deletion records are applied, every other deletion record of the tip
+    /// the store holds differently is set back to the tip's (`tip_tombstones`:
+    /// key -> blob), a value the tip no longer has is deleted (git-meta's
+    /// legacy delete), the local ref moves to `tip` and the store is marked
+    /// materialized. Returns how many entries changed. The caller never asks
+    /// for a side remote's tip, which git-meta imports instead of merging.
+    ///
+    /// `Ok(None)` applies nothing and leaves the merge to git-meta: local
+    /// metadata commits (a real merge), another ref git-meta would
+    /// materialize with this one, or a changed entry this does not read the
+    /// way git-meta's parse does (a set or list value, a path that is not
+    /// where git-meta writes its key, a mode change; noted in `report`).
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_incremental(
+        &self,
+        session: &Session,
+        local_ref: &str,
+        tracking: &str,
+        tip: &str,
+        tip_values: &BTreeSet<Key>,
+        tip_tombstones: &BTreeMap<Key, String>,
+        report: &mut Report,
+    ) -> Result<Option<usize>, GitError> {
+        // Taken before anything is read: a row another writer stores from
+        // here on is newer than the merge and stays to be serialized.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let store = session.store();
+        let Some(since) = guarded("reading the store", || store.get_last_materialized())? else {
+            return Ok(None);
+        };
+        let Some(local) = self.read_ref(local_ref)? else {
+            return Ok(None);
+        };
+        // git-meta materializes every ref whose name starts with the
+        // tracking ref's; any other such ref takes the full path.
+        let dir = tracking.rsplit_once('/').map_or(tracking, |(d, _)| d);
+        let refs = self
+            .repo
+            .git()
+            .args(["for-each-ref", "--format=%(refname)", dir])
+            .run_str()?;
+        if refs
+            .lines()
+            .any(|r| r != tracking && r.starts_with(tracking))
+        {
+            return Ok(None);
+        }
+        if !self.is_ancestor(&local, tip)? {
+            return Ok(None);
+        }
+        let mut fallback = |why: String| -> Result<Option<usize>, GitError> {
+            report.note(format!(
+                "merged the fetched metadata in full: {why} is not read incrementally"
+            ));
+            Ok(None)
+        };
+        let raw = self
+            .repo
+            .git()
+            .args(["diff-tree", "-r", "-z", "--no-renames", "--no-commit-id"])
+            .arg(format!("{local}^{{tree}}"))
+            .arg(format!("{tip}^{{tree}}"))
+            .run()?;
+        let Some(changes) = Self::tree_changes(&raw) else {
+            return fallback("git diff-tree output".to_owned());
+        };
+        let mut values: BTreeMap<Key, TreeValue> = BTreeMap::new();
+        let mut tombstones: BTreeMap<Key, Tombstone> = BTreeMap::new();
+        let mut removed: Vec<Key> = Vec::new();
+        let mut blobs: Option<CatFile> = None;
+        for ([status, old_mode, new_mode, oid], path) in changes {
+            let (key, tombstone) = match Self::classify_change(status, old_mode, new_mode, path) {
+                Err(why) => return fallback(why),
+                Ok(None) => continue,
+                Ok(Some(c)) => c,
+            };
+            if status == "D" {
+                // The tip no longer has the value. Still holding it (under
+                // another spelling of its path) is not something to guess.
+                if tip_values.contains(&key) {
+                    return fallback(String::from_utf8_lossy(path).into_owned());
+                }
+                removed.push(key);
+                continue;
+            }
+            if blobs.is_none() {
+                blobs = Some(CatFile::start(self.repo.root())?);
+            }
+            let bytes = match blobs.as_mut().expect("started").blob(oid) {
+                Ok(b) => b,
+                Err(e) => return fallback(format!("{} ({e})", String::from_utf8_lossy(path))),
+            };
+            if tombstone {
+                let Ok(t) = serde_json::from_slice::<Tombstone>(&bytes) else {
+                    return fallback(format!(
+                        "{} (unreadable deletion record)",
+                        String::from_utf8_lossy(path)
+                    ));
+                };
+                tombstones.insert(key, t);
+            } else {
+                if !tip_values.contains(&key) {
+                    return fallback(String::from_utf8_lossy(path).into_owned());
+                }
+                // git-meta's parse reads a value blob the same way.
+                values.insert(
+                    key,
+                    TreeValue::String(String::from_utf8_lossy(&bytes).into_owned()),
+                );
+            }
+        }
+        // In one tree a value wins over a deletion record of its key.
+        tombstones.retain(|k, _| !tip_values.contains(k) && !values.contains_key(k));
+        let changed = values.len() + tombstones.len() + removed.len();
+        let email = session.email().to_owned();
+        guarded("applying fetched metadata", || {
+            store.apply_tree(
+                &values,
+                &tombstones,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &email,
+                now,
+            )
+        })?;
+        // git-meta's fast-forward applies every deletion record of the tip,
+        // not only the changed ones: a record this store holds with another
+        // time or email than the tip's is set back to the tip's. (A value
+        // deleted by an earlier merge was stamped with that merge's own time
+        // and email, git-meta's legacy delete below, until the next merge.)
+        // Compared by blob id first, the blob git-meta writes for the stored
+        // record, so only a record that differs is read. The values deleted
+        // now are stamped below, after the tip's records, as git-meta does.
+        let mut restamped: Vec<(Key, Tombstone)> = Vec::new();
+        {
+            let skip: BTreeSet<&Key> = removed.iter().chain(tombstones.keys()).collect();
+            let held: BTreeMap<Key, Tombstone> =
+                guarded("reading the store", || store.get_all_tombstones())?
+                    .into_iter()
+                    .map(|t| {
+                        (
+                            Key {
+                                target_type: t.target_type,
+                                target_value: t.target_value,
+                                key: t.key,
+                            },
+                            Tombstone {
+                                timestamp: t.timestamp,
+                                email: t.email,
+                            },
+                        )
+                    })
+                    .collect();
+            for (k, oid) in tip_tombstones {
+                if tip_values.contains(k) || skip.contains(k) {
+                    continue;
+                }
+                let current = held.get(k);
+                if current.is_some_and(|t| tombstone_blob_id(t, oid).as_deref() == Some(oid)) {
+                    continue;
+                }
+                if blobs.is_none() {
+                    blobs = Some(CatFile::start(self.repo.root())?);
+                }
+                // git-meta's parse skips a record it cannot read.
+                let Some(t) = blobs
+                    .as_mut()
+                    .expect("started")
+                    .blob(oid)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Tombstone>(&b).ok())
+                else {
+                    continue;
+                };
+                if current != Some(&t) {
+                    restamped.push((k.clone(), t));
+                }
+            }
+        }
+        drop(blobs);
+        for (k, t) in &restamped {
+            guarded("applying a deletion record", || {
+                store.apply_tombstone(&k.to_target(), &k.key, &t.email, t.timestamp)
+            })?;
+        }
+        for k in &removed {
+            guarded("applying a deletion", || {
+                store.apply_tombstone(&k.to_target(), &k.key, &email, now)
+            })?;
+        }
+        if local != tip {
+            self.cas_ref(
+                local_ref,
+                Some(tip),
+                &local,
+                "vci: fast-forward materialize",
+            )?;
+        }
+        // Marked materialized (git-meta's next serialization then skips
+        // what this merge wrote, which the tip already holds) only when every
+        // row modified since the last serialization is one this merge wrote:
+        // a row another writer (a `vci run` beside this fetch, a git-meta
+        // client) stored meanwhile must stay modified, or it would never be
+        // published. Otherwise the serialization that follows rewrites what
+        // this merge wrote, unchanged, with it.
+        let ours: BTreeSet<&Key> = values
+            .keys()
+            .chain(tombstones.keys())
+            .chain(removed.iter())
+            .chain(restamped.iter().map(|(k, _)| k))
+            .collect();
+        let others = guarded("reading the store", || store.get_modified_since(since))?
+            .into_iter()
+            .any(|m| {
+                !ours.contains(&Key {
+                    target_type: m.target_type,
+                    target_value: m.target_value,
+                    key: m.key,
+                })
+            });
+        if !others {
+            guarded("recording the materialization", || {
+                store.set_last_materialized(now)
+            })?;
+        }
+        Ok(Some(changed))
+    }
+
+    /// Put back the stored input manifests this merge left deleted although
+    /// an attestation in the store references them, from the tree that
+    /// still has them (the fetched tip, whose manifest blobs are
+    /// `tip_blobs`, or `local_before`, the local metadata commit before the
+    /// merge). Two clones cross that way: one
+    /// deletes a manifest no attestation it knows of references (`vci
+    /// prune`, supersession), while the other publishes, or holds, an
+    /// attestation referencing it; git-meta's merge then keeps the deletion
+    /// (one side deleted, the other left the value alone), and the
+    /// attestation would run its unit until re-attested. Only manifests
+    /// deleted in the store that the store held before the merge or the tip
+    /// holds are candidates, so a merge that deletes no manifest reads no
+    /// attestation; the bytes put back must decode to a manifest with the
+    /// root they are stored under. Returns how many were put back.
+    fn restore_referenced_manifests(
+        &self,
+        session: &Session,
+        before: &BTreeSet<String>,
+        local_before: Option<&str>,
+        tip_blobs: &BTreeMap<String, String>,
+    ) -> Result<usize, GitError> {
+        let store = session.store();
+        let deleted: BTreeSet<String> =
+            guarded("reading the store", || store.get_all_tombstones())?
+                .into_iter()
+                .filter(|t| t.target_type == TargetType::Project)
+                .filter_map(|t| parse_manifest_key(&t.key).map(str::to_owned))
+                .filter(|r| before.contains(r) || tip_blobs.contains_key(r))
+                .collect();
+        if deleted.is_empty() {
+            return Ok(0);
+        }
+        let handle = session.target(&Target::project());
+        let mut candidates = BTreeSet::new();
+        for r in deleted {
+            if handle.get_value(&manifest_key(&r)).ok().flatten().is_none() {
+                candidates.insert(r);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let referenced: BTreeSet<String> = self
+            .list(None)?
+            .iter()
+            .filter(|e| e.error.is_none())
+            .filter_map(|e| envelope_manifest_ref(&e.bytes))
+            .collect();
+        let mut back = 0;
+        for root in candidates.intersection(&referenced) {
+            let key = manifest_key(root);
+            let mut sources: Vec<String> = Vec::new();
+            if let Some(oid) = tip_blobs.get(root) {
+                sources.push(oid.clone());
+            }
+            if let Some(local) = local_before {
+                let path = guarded("building a git-meta tree path", || {
+                    git_meta_lib::tree_paths::tree_path(&Target::project(), &key)
+                })?;
+                sources.push(format!("{local}:{path}"));
+            }
+            for src in sources {
+                let Ok(bytes) = self.repo.git().args(["cat-file", "blob", &src]).run() else {
+                    continue;
+                };
+                let ok =
+                    vci_core::InputManifest::from_compact(&bytes).is_ok_and(|m| m.root() == *root);
+                let Ok(text) = String::from_utf8(bytes) else {
+                    continue;
+                };
+                if !ok {
+                    continue;
+                }
+                guarded("putting back an input manifest", || {
+                    handle.set(&key, text.as_str())
+                })?;
+                back += 1;
+                break;
+            }
+        }
+        Ok(back)
+    }
+
+    /// After git-meta merged `tip` into the local metadata commit: when the
+    /// merge commit holds exactly the tip's tree (nothing local that the tip
+    /// lacks, such as after the remote's history was rewritten), point the
+    /// local ref at the tip itself. The next fetch is then a fast-forward
+    /// (merged incrementally) instead of another merge, and a push has
+    /// nothing to send rather than the old history merged back in.
+    fn adopt_equal_tip(&self, local_ref: &str, tip: &str) -> Result<(), GitError> {
+        let Some(local) = self.read_ref(local_ref)? else {
+            return Ok(());
+        };
+        if local == tip {
+            return Ok(());
+        }
+        let tree = |c: &str| {
+            self.repo
+                .git()
+                .args(["rev-parse", "--verify"])
+                .arg(format!("{c}^{{tree}}"))
+                .run()
+                .and_then(|o| parse_oid(&o))
+        };
+        if tree(&local)? != tree(tip)? {
+            return Ok(());
+        }
+        self.cas_ref(
+            local_ref,
+            Some(tip),
+            &local,
+            "vci: the merge holds exactly the fetched tip",
+        )
+    }
+
+    /// The records of `git diff-tree -r -z` raw output: `[status, old mode,
+    /// new mode, new object id]` and the path. `None` when the output does
+    /// not have that shape.
+    fn tree_changes(raw: &[u8]) -> Option<Vec<([&str; 4], &[u8])>> {
+        let mut out = Vec::new();
+        let mut fields = raw.split(|b| *b == 0);
+        while let Some(head) = fields.next() {
+            if head.is_empty() {
+                // The output ends with a NUL.
+                continue;
+            }
+            let head = std::str::from_utf8(head.strip_prefix(b":")?).ok()?;
+            let path = fields.next().filter(|p| !p.is_empty())?;
+            let f: Vec<&str> = head.split(' ').collect();
+            let [old_mode, new_mode, _old_oid, new_oid, status] = f.as_slice() else {
+                return None;
+            };
+            out.push(([*status, *old_mode, *new_mode, *new_oid], path));
+        }
+        Some(out)
+    }
+
+    /// How the store takes one changed tree entry, read the way git-meta's
+    /// tree parse reads it: `Ok(Some((key, is a deletion record)))` for a
+    /// string value or a whole-key deletion record added or modified (a
+    /// value also deleted: status `D`), `Ok(None)` for what the merge
+    /// ignores (a path naming no target, which git-meta's parse skips too,
+    /// or a deletion record removed: the store keeps its own), and `Err`
+    /// naming the entry for anything else.
+    fn classify_change(
+        status: &str,
+        old_mode: &str,
+        new_mode: &str,
+        path: &[u8],
+    ) -> Result<Option<(Key, bool)>, String> {
+        let Ok(p) = std::str::from_utf8(path) else {
+            return Err(format!(
+                "{} (name is not UTF-8)",
+                String::from_utf8_lossy(path)
+            ));
+        };
+        let parts: Vec<&str> = p.split('/').collect();
+        let Ok((ty, value, key_parts)) = parse_path_parts(&parts) else {
+            return Ok(None);
+        };
+        if !valid_target(&ty, &value) {
+            return Err(format!("{p} (target git-meta cannot serialize)"));
+        }
+        let (key, tombstone) = match classify_key_parts(key_parts) {
+            PathKey::Value(k) => (k, false),
+            PathKey::Tombstone(k) => (k, true),
+            PathKey::Other => {
+                return Err(format!("{p} (not a string value or a deletion record)"));
+            }
+        };
+        let key = Key {
+            target_type: ty,
+            target_value: value,
+            key,
+        };
+        let target = key.to_target();
+        let canonical = guarded("building a git-meta tree path", || {
+            if tombstone {
+                git_meta_lib::tree_paths::tombstone_path(&target, &key.key)
+            } else {
+                git_meta_lib::tree_paths::tree_path(&target, &key.key)
+            }
+        });
+        if canonical.ok().as_deref() != Some(p) {
+            return Err(format!("{p} (not the path git-meta writes for its key)"));
+        }
+        match (status, old_mode, new_mode) {
+            ("A", "000000", "100644") | ("M", "100644", "100644") => Ok(Some((key, tombstone))),
+            ("D", "100644", "000000") if tombstone => Ok(None),
+            ("D", "100644", "000000") => Ok(Some((key, false))),
+            _ => Err(format!("{p} ({status} {old_mode} -> {new_mode})")),
+        }
     }
 
     /// Fetch and merge, then push the local metadata commit as one
@@ -1892,6 +2630,141 @@ mod tests {
             "k/__tombstones/x/__value",
         ] {
             assert_eq!(c(other), PathKey::Other, "{other}");
+        }
+    }
+
+    #[test]
+    fn diff_tree_records() {
+        let (a, b) = ("1".repeat(40), "2".repeat(40));
+        let raw = format!(
+            ":100644 100644 {a} {b} M\0path/src/a.ts/__target__/k/__value\0:000000 100644 {z} {b} A\0project/k/__value\0",
+            z = "0".repeat(40)
+        );
+        let got = AttestStore::tree_changes(raw.as_bytes()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    ["M", "100644", "100644", b.as_str()],
+                    &b"path/src/a.ts/__target__/k/__value"[..]
+                ),
+                (
+                    ["A", "000000", "100644", b.as_str()],
+                    &b"project/k/__value"[..]
+                ),
+            ]
+        );
+        assert_eq!(AttestStore::tree_changes(b"").unwrap(), vec![]);
+        for bad in [
+            &b"100644 100644 a b M\0p\0"[..],
+            b":100644 100644 a b\0p\0",
+            b":100644 100644 a b M\0",
+        ] {
+            assert_eq!(AttestStore::tree_changes(bad), None);
+        }
+    }
+
+    #[test]
+    fn changed_entries_read_like_git_meta() {
+        let key = attestation_key(&"ab".repeat(32), "0123456789abcdef", &"cd".repeat(32));
+        let target = Target::path("src/a.test.ts");
+        let value = git_meta_lib::tree_paths::tree_path(&target, &key).unwrap();
+        let deleted = git_meta_lib::tree_paths::tombstone_path(&target, &key).unwrap();
+        let k = Key {
+            target_type: TargetType::Path,
+            target_value: "src/a.test.ts".into(),
+            key: key.clone(),
+        };
+        let c = |st, old, new, p: &str| AttestStore::classify_change(st, old, new, p.as_bytes());
+        assert_eq!(
+            c("A", "000000", "100644", &value),
+            Ok(Some((k.clone(), false)))
+        );
+        assert_eq!(
+            c("M", "100644", "100644", &value),
+            Ok(Some((k.clone(), false)))
+        );
+        assert_eq!(
+            c("D", "100644", "000000", &value),
+            Ok(Some((k.clone(), false)))
+        );
+        assert_eq!(
+            c("A", "000000", "100644", &deleted),
+            Ok(Some((k.clone(), true)))
+        );
+        assert_eq!(c("D", "100644", "000000", &deleted), Ok(None));
+        let project = git_meta_lib::tree_paths::tree_path(&Target::project(), "owner").unwrap();
+        assert_eq!(
+            c("A", "000000", "100644", &project),
+            Ok(Some((
+                Key {
+                    target_type: TargetType::Project,
+                    target_value: String::new(),
+                    key: "owner".into(),
+                },
+                false
+            )))
+        );
+        // git-meta's parse skips a path that names no target.
+        assert_eq!(c("A", "000000", "100644", "README"), Ok(None));
+        // Everything else is merged by git-meta.
+        for (st, old, new, p) in [
+            ("A", "000000", "100755", value.as_str()),
+            ("A", "000000", "120000", value.as_str()),
+            ("T", "100644", "120000", value.as_str()),
+            ("M", "100755", "100644", value.as_str()),
+            ("A", "000000", "100644", "project/meta/filter/__set/0123"),
+            ("A", "000000", "100644", "project/notes/__list/0001-ab"),
+            ("A", "000000", "100644", "project/__x/__value"),
+            ("A", "000000", "100644", "project/k"),
+            ("A", "000000", "100644", "path/ab/__target__/k/__value"),
+            (
+                "A",
+                "000000",
+                "100644",
+                "path/~src/a.test.ts/__target__/k/__value",
+            ),
+        ] {
+            assert!(c(st, old, new, p).is_err(), "{st} {old} {new} {p}");
+        }
+        assert!(
+            AttestStore::classify_change("A", "000000", "100644", b"project/k\xff/__value")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tombstone_blob_ids_are_git_metas() {
+        let t = Tombstone {
+            timestamp: 1792185565887,
+            email: "test@example.com".into(),
+        };
+        // `printf '{"timestamp":1792185565887,"email":"test@example.com"}' | git hash-object --stdin`
+        let id = "d23a30604540207f251a99661cfbc79cd5a5fb72";
+        assert_eq!(tombstone_blob_id(&t, id).as_deref(), Some(id));
+        assert_eq!(tombstone_blob_id(&t, &"ab".repeat(32)), None);
+    }
+
+    #[test]
+    fn manifest_refs_of_envelopes() {
+        use base64::Engine as _;
+        let b64 = |v: serde_json::Value| {
+            serde_json::json!({
+                "payloadType": "application/vnd.in-toto+json",
+                "payload": base64::engine::general_purpose::STANDARD.encode(v.to_string()),
+                "signatures": [],
+            })
+            .to_string()
+        };
+        let root = "ab".repeat(32);
+        let env = b64(serde_json::json!({"predicate": {"manifestRef": root}}));
+        assert_eq!(envelope_manifest_ref(env.as_bytes()), Some(root));
+        for bad in [
+            b64(serde_json::json!({"predicate": {"manifest": {}}})),
+            b64(serde_json::json!({"predicate": {"manifestRef": "../x"}})),
+            "not json".to_owned(),
+        ] {
+            assert_eq!(envelope_manifest_ref(bad.as_bytes()), None, "{bad}");
         }
     }
 

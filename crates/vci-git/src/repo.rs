@@ -188,6 +188,59 @@ impl Repo {
         Err(command_error(&describe, &out))
     }
 
+    /// Whether history moved on from commit `old` to commit `new` and
+    /// nothing else still needs `old`: `old` is a strict ancestor of `new`,
+    /// and every branch, remote-tracking branch and tag containing `old` also
+    /// contains `new`, except the current branch's namesakes on the remotes
+    /// (`origin/<branch>` behind a local `<branch>` is the same line of work,
+    /// not yet pushed). Any other ref containing `old` (`main` under a
+    /// feature branch, a sibling branch, a release tag) may be checked out
+    /// with `old`'s files. `false` when either commit is unknown here (a
+    /// shallow clone): nothing is concluded from a history that is not
+    /// there.
+    pub fn moved_on(&self, old: &str, new: &str) -> Result<bool, GitError> {
+        if !is_oid(old) || !is_oid(new) || old == new {
+            return Ok(false);
+        }
+        let (_, out) = self
+            .git()
+            .args(["merge-base", "--is-ancestor", old, new])
+            .output_described()?;
+        if out.status.code() != Some(0) {
+            return Ok(false);
+        }
+        let branch = {
+            let (_, out) = self
+                .git()
+                .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .output_described()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                .filter(|b| !b.is_empty())
+        };
+        let remotes = match &branch {
+            Some(_) => self.git().args(["remote"]).run_str()?,
+            None => String::new(),
+        };
+        let namesakes: Vec<String> = match &branch {
+            Some(b) => remotes
+                .lines()
+                .map(|r| format!("refs/remotes/{}/{b}", r.trim()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let others = self
+            .git()
+            .args(["for-each-ref", "--format=%(refname)", "--contains", old])
+            .args(["--no-contains", new])
+            .args(["refs/heads", "refs/remotes", "refs/tags"])
+            .run_str()?;
+        Ok(others
+            .lines()
+            .all(|r| namesakes.iter().any(|n| n == r) || r.ends_with("/HEAD")))
+    }
+
     /// Contents of `path` at `rev` (like `git show <rev>:<path>`).
     ///
     /// `Ok(None)` if the path does not exist at that revision. A symlink

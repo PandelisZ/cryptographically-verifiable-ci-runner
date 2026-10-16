@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.23.1"
 camino = "1.2.6"
 # Attestations are git-meta metadata (https://git-meta.com/). Pinned exactly:
 # `internal` exposes the store's key listing, which is not a stable API.
@@ -18,4 +19,4 @@ rusqlite = { version = "=0.39.0", default-features = false }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-vci-core = { version = "1.8.2", path = "../vci-core" }
+vci-core = { version = "1.9.0", path = "../vci-core" }

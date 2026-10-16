@@ -19,8 +19,8 @@ mod repo;
 mod validate;
 
 pub use meta::{
-    AttestStore, FetchOutcome, KEY_PREFIX, PushOutcome, PushStatus, Reader, SETUP_FILE,
-    StoredEnvelope,
+    AttestStore, FetchOutcome, KEY_PREFIX, MANIFEST_PREFIX, PushOutcome, PushStatus, Reader,
+    SETUP_FILE, StoredEnvelope, StoredManifest, manifest_key, parse_manifest_key,
 };
 pub use repo::Repo;
 

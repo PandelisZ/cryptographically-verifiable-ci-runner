@@ -1148,3 +1148,136 @@ fn excluded_paths_are_left_out_of_their_parents_listing() {
     );
     assert!(both.is_err());
 }
+
+// ------------------------------------------------------------- compact ----
+
+#[test]
+fn compact_round_trips_and_keeps_the_root() {
+    let m = golden_manifest();
+    let c = m.to_compact();
+    let back = InputManifest::from_compact(c.as_bytes()).unwrap();
+    assert_eq!(back, m);
+    assert_eq!(
+        back.root(),
+        GOLDEN_ROOT,
+        "the root hashes entries, not bytes"
+    );
+    // A captured manifest (sorted, every field) too.
+    let r = sample_repo();
+    let m = capture(&r.root, &sample_obs());
+    let back = InputManifest::from_compact(m.to_compact().as_bytes()).unwrap();
+    assert_eq!(back, m);
+    assert_eq!(back.root(), m.root());
+    assert!(diff(&back, &r.root).is_empty());
+}
+
+/// The stored bytes of the golden manifest: changing the encoding makes every
+/// stored manifest unreadable to the other version (the root is unaffected).
+#[test]
+fn compact_encoding_is_pinned() {
+    let m = golden_manifest();
+    let h = |b: &[u8]| b3(b);
+    let expected = format!(
+        concat!(
+            r#"{{"v":2,"entries":["#,
+            r#"["src","d",2,"{}"],"#,
+            r#"["a.txt","f",5,"{}"],"#,
+            r#"["bin/run.sh","f",10,"{}",1],"#,
+            r#"["missing.json","a",0,"{}"],"#,
+            r#"["link","l",5,"{}"]],"#,
+            r#""externals":[["vitest","5.0.2"],["ms","2.1.3"]],"#,
+            r#""env":[["TZ","{}"],["HOME",null]]}}"#
+        ),
+        m.entries[0].hash,
+        h(b"hello"),
+        h(b"#!/bin/sh\n"),
+        ABSENT_HASH,
+        h(b"a.txt"),
+        h(b"UTC"),
+    );
+    assert_eq!(m.to_compact(), expected);
+    // Valid JSON, much smaller than the predicate's JSON form.
+    let _: serde_json::Value = serde_json::from_str(&expected).unwrap();
+    assert!(expected.len() < serde_json::to_string(&m).unwrap().len());
+}
+
+#[test]
+fn compact_covers_every_kind_and_special_strings() {
+    let kinds = [
+        EntryKind::File,
+        EntryKind::Symlink,
+        EntryKind::Absent,
+        EntryKind::DirListing,
+        EntryKind::Dir,
+        EntryKind::Excluded,
+    ];
+    let mut codes = std::collections::BTreeSet::new();
+    for k in kinds {
+        assert_eq!(EntryKind::from_code(k.code()), Some(k));
+        assert!(codes.insert(k.code()), "code {} reused", k.code());
+    }
+    let m = InputManifest {
+        entries: kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| InputEntry {
+                path: rp(&format!("d\"ir/é\t\u{1}{i}")),
+                kind: *k,
+                exec: i == 0,
+                size: u64::MAX - i as u64,
+                hash: b3(&[i as u8]),
+            })
+            .collect(),
+        externals: vec![External {
+            name: "a\"b".into(),
+            version: "\n".into(),
+        }],
+        env: vec![EnvEntry {
+            key: "K\u{1}".into(),
+            hash: ABSENT_HASH.into(),
+        }],
+    };
+    let back = InputManifest::from_compact(m.to_compact().as_bytes()).unwrap();
+    assert_eq!(back, m);
+    assert_eq!(back.root(), m.root());
+    let empty = InputManifest::default();
+    assert_eq!(
+        empty.to_compact(),
+        r#"{"v":2,"entries":[],"externals":[],"env":[]}"#
+    );
+    assert_eq!(
+        InputManifest::from_compact(empty.to_compact().as_bytes()).unwrap(),
+        empty
+    );
+}
+
+#[test]
+fn compact_rejects_anything_else() {
+    let h = "ab".repeat(32);
+    for bad in [
+        String::new(),
+        "[]".to_owned(),
+        r#"{"v":1,"entries":[],"externals":[],"env":[]}"#.to_owned(),
+        r#"{"v":2,"entries":[],"externals":[]}"#.to_owned(),
+        r#"{"v":2,"entries":[],"externals":[],"env":[],"x":1}"#.to_owned(),
+        format!(r#"{{"v":2,"entries":[["a","z",1,"{h}"]],"externals":[],"env":[]}}"#),
+        format!(r#"{{"v":2,"entries":[["a","f",1,"{h}",0]],"externals":[],"env":[]}}"#),
+        format!(r#"{{"v":2,"entries":[["a","f",1,"{h}",true]],"externals":[],"env":[]}}"#),
+        format!(r#"{{"v":2,"entries":[["a","f",-1,"{h}"]],"externals":[],"env":[]}}"#),
+        format!(r#"{{"v":2,"entries":[["a","f","1","{h}"]],"externals":[],"env":[]}}"#),
+        r#"{"v":2,"entries":[["a","f",1]],"externals":[],"env":[]}"#.to_owned(),
+        format!(r#"{{"v":2,"entries":[["../a","f",1,"{h}"]],"externals":[],"env":[]}}"#),
+        format!(r#"{{"v":2,"entries":[["a//b","f",1,"{h}"]],"externals":[],"env":[]}}"#),
+        format!(r#"{{"v":2,"entries":[["a/","f",1,"{h}"]],"externals":[],"env":[]}}"#),
+        r#"{"v":2,"entries":[],"externals":[["a"]],"env":[]}"#.to_owned(),
+        r#"{"v":2,"entries":[],"externals":[],"env":[["K",1]]}"#.to_owned(),
+    ] {
+        assert!(
+            matches!(
+                InputManifest::from_compact(bad.as_bytes()),
+                Err(ManifestError::Compact(_))
+            ),
+            "accepted {bad:?}"
+        );
+    }
+}

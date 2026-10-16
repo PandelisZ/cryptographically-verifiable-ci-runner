@@ -1247,12 +1247,12 @@ checkout, clock, policy and environment.
 | Command | Purpose |
 |---|---|
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet |
-| `vci run [FILES…] [--key PATH] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON |
+| `vci run [FILES…] [--key PATH] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON. Since 1.9.0 each distinct input manifest is stored once, as its own value (`vci:manifest:<input root>`), and the attestation references it; storing an attestation deletes the same signer's attestations of that unit it supersedes (an earlier commit of this line of history, other files: see "Where attestations live (git-meta)"), printing `vci: removed N superseded attestation(s) ...` and how many manifests nothing references any more |
 | `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]] [--project NAME]...` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally. `--project NAME` (repeatable) plans only those `[[projects]]` entries (by `name`, as the base commit's vci.toml names them): the other projects are not listed, probed or verified (their toolchains need not be installed) and are absent from the output. An unknown name is an error (exit 2) naming the configured projects; the single-project form has no names, so `--project` is an error there |
 | `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--key PATH [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). `--project` as for `vci plan`: only those projects are planned, run (and with `--key` attested), and only they appear in the printed plan and in the audit log's `projects`, `skipped` and `ran`; one CI job per suite (`vci ci --fetch origin --base-ref "$BASE" --project web`). Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose) |
-| `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R]` | Verify one DSSE envelope and print its claims |
-| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history. See "What `vci fetch` and `vci push` guard against" |
-| `vci prune [--dry-run] [--superseded]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them). `--superseded` (since 1.8.2) also deletes, per unit and signer, every attestation but the one issued last (an older one vouches for inputs the tree no longer has, or soon will not) |
+| `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R] [--manifest FILE]` | Verify one DSSE envelope and print its claims, including the input manifest: inline (before 1.9.0) or the one it references, read from `--manifest FILE` (its compact encoding, as `git meta get project vci:manifest:<root>` prints it) or else from the git-meta store of the repository it runs in; its root must be the signed input root (exit 1 otherwise, or when it is not available) |
+| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history. Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed (`VCI_TIMING=1` prints `materialize (incremental, N changed entries)` or `materialize (full)`), and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against" |
+| `vci prune [--dry-run] [--superseded]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them). `--superseded` (since 1.8.2) also deletes, per unit and signer, every attestation but the one issued last (an older one vouches for inputs the tree no longer has, or soon will not). Since 1.9.0 it then deletes the stored input manifests (`vci:manifest:<root>`) no remaining attestation references (none while an attestation, or the manifest reference of one it leaves alone, cannot be read), and prints how many |
 | `vci explain <test-file> [--base-ref R]` | Every candidate attestation and the first check it failed, with expected vs actual (an env failure names the variable and its class under the base policy, `env:DATABASE_URL (hash)`, never its value) |
 | `vci env [--base-ref R] [--project NAME] [--format text\|json]` | Print the effective environment policy of each project: every variable `[env]` and the runner's built-in lists name, its class (`set`, `hash`, `ignore`, `built-in hash`, `built-in ignore`, `stripped`), where the rule comes from (`vci.toml set`, `vci.toml hash`, an old key name, `built-in <adapter>`, `test script`) and what it is here (the value vci sets; `present (<hash prefix>)` or `absent`); variables present here that the tests will not see are listed as removed. With `--base-ref`, a `BASE` column says where the base commit's policy differs (CI judges with it). Runs nothing (docs/ENV.md, "vci env") |
 
@@ -1362,22 +1362,55 @@ vci keeps no storage format of its own. Every attestation is one [git-meta](http
   toolchain, argv, env configuration, project). Re-attesting the same unit with the same inputs rewrites the same key;
 - **value**: the signed DSSE envelope, byte for byte (git-meta keeps values over 1 KiB as blobs; nothing truncates).
 
+Since vci 1.9.0 the envelope does not embed the unit's input manifest (every path, hash, external and env hash it
+recorded): its predicate carries `manifestRef`, the input root, and the manifest is a value of its own on the
+`project` target, key `vci:manifest:<input root>`, in a compact JSON encoding (`{"v":2,"entries":[[path,kind,size,
+hash,exec?],...],"externals":[...],"env":[...]}`). It is written once per distinct manifest and shared by every
+attestation, unit and signer with that root (the cargo targets of one package often share one). The signed root
+makes it tamper-evident: `vci plan` recomputes the stored manifest's root and uses it only when it is the root the
+attestation signed; a manifest missing from the store (``manifest <root> not in the store: run `vci fetch` `` in `vci
+explain`), unreadable or forged makes the unit run. Attestations made before 1.9.0, with the manifest inline, verify
+as before; vci before 1.9.0 cannot read a new attestation (the unit runs there).
+
+`vci run` (and `vci ci --key`) deletes the signer's earlier attestations of a unit it re-attests (same OS and
+architecture) when their files differ from the new one's and they were made on an earlier commit of the same line of
+history that nothing else still contains: the new commit descends from it, and every branch, remote-tracking branch
+and tag containing it contains the new commit too (`origin/<branch>` of the branch being worked on counts as the same
+line). Kept: one made on a sibling branch or pull request, on a commit `main` (or a tag, or another branch) still
+contains, such as an attestation of `main`'s tip when a feature branch re-attests the unit, one made on the same
+commit (work in progress), one of the same files under another environment or toolchain, and one on a commit a shallow
+clone does not have. The published tree so keeps one attestation per unit and signer as a line of work moves on,
+without deleting what other branches still use (`vci prune --superseded` keeps only the newest, whatever the branch).
+The manifests only the deleted attestations referenced are deleted with them, and `vci prune` deletes the stored
+manifests no remaining attestation references. A clone that still references a deleted manifest (it attested, or
+fetched an attestation, before it saw the deletion) puts it back when it merges the deletion in, and its next push
+publishes it again: a deletion never takes the manifest of an attestation another clone holds.
+
 ```sh
 git meta get path:src/b.test.ts             # keys and (abbreviated) envelopes
 git meta get path:src/b.test.ts vci:attestation:<test key>:<signer>:<storage key> --json
+git meta get project vci:manifest:<input root>  # a stored input manifest (vci 1.9.0+), compact JSON
 ```
 
 No other fields (signer, expiry, result) are stored next to the envelope: the envelope already carries them, `vci
-explain` shows them, and every extra key would count against git-meta's auto-prune limit (`meta:prune:max-keys`,
-10000 when a remote was initialized by `git meta setup`). The standard commit-target `attestation` list is not used
-either: vci attestations are content-addressed by unit and inputs, not tied to a commit, so they survive rebases and
-apply on every branch.
+explain` shows them, and every extra key would count against git-meta's auto-prune limit (`meta:prune:max-keys`, 10000
+when a remote was initialized by `git meta setup`; the stored input manifests count too, one key per distinct
+manifest, and one it prunes makes every unit whose attestation references it run). The standard commit-target
+`attestation` list is not used either: vci attestations are content-addressed by unit and inputs, not tied to a
+commit, so they survive rebases and apply on every branch.
 
 **Exchange.** Metadata lives locally in git-meta's SQLite store (`.git/git-meta.sqlite`, written by `vci run`; your
 index, `HEAD` and work tree are never touched) and is exchanged on the remote's `refs/meta/main`:
 
 - `vci fetch` fetches `refs/meta/main` into `refs/meta/remotes/main` (whole trees: `--no-filter`), serializes local
-  values and materializes the remote's (git-meta's merge) into the store, like `git meta pull`;
+  values and materializes the remote's (git-meta's merge) into the store, like `git meta pull`. Since 1.9.0, when the
+  store was merged from the primary remote before and the local metadata commit (`refs/meta/local/main`) is an
+  ancestor of the fetched tip, vci applies only what `git diff-tree` reports between the two trees, with the result
+  git-meta's fast-forward gives (new and changed values and deletion records, git-meta's delete for values the tip no
+  longer has, the local ref moved to the tip); the first fetch of a clone, a side remote, local metadata commits not
+  yet pushed, and any entry it does not read the way git-meta does (a set or list value, an unexpected path or mode:
+  a `vci: note:` says so) go through git-meta's full merge. When that merge's tree is exactly the tip's (after the
+  remote's history was rewritten), the local ref is pointed at the tip, so the next fetch is incremental again;
 - `vci push` does the same, then rewrites the local metadata commit (`refs/meta/local/main`) as one commit on top of
   the remote tip and pushes it as a fast-forward, retrying from the fetch when the remote moved, like `git meta push`.
   It refuses to push a tree that does not contain the remote tip (that would drop other people's values), and pushes
@@ -2171,7 +2204,8 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
 2. **signature**: SSHSIG over the DSSE PAE of the exact stored payload bytes, namespace `vci-attest`, SHA-2 only;
 3. **signer**: the key is in the base commit's `allowed_signers` (`namespaces=`, `valid-after`, `valid-before`
    honoured; `cert-authority` rejected);
-4. **statement**: predicate type and subject match;
+4. **statement**: predicate type and subject match, and the predicate has exactly one of `manifest` (the input
+   manifest inline: attestations made before 1.9.0) and `manifestRef`, which must be the input root;
 5. **expiry**: not expired, not issued in the future (5 min skew), lifetime within `max_ttl`;
 6. **repo** (root commit), **test-id**, **adapter**, **argv** (including project dir) match;
 7. **toolchain**: Node major, Vitest, Vite (pytest: exact Python version, implementation, pytest; Go: exact Go
@@ -2195,8 +2229,10 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
    `rails_allow_db` never is); **dirty** only if `allow_dirty = false`;
 10. **global-inputs**: every attested global entry re-hashed from the checkout, and the current global input set
     has the same root;
-11. **inputs**: every attested per-file entry re-hashed (files, symlinks, directory listings, directory types,
-    absences); pytest: no native extension module for another platform (`b.cpython-314-x86_64-linux-gnu.so`,
+11. **inputs**: the input manifest is the inline one or the stored one `manifestRef` names, whose recomputed root
+    must be the signed input root (otherwise ``manifest <root> not in the store: run `vci fetch` ``, `... unreadable`,
+    `... corrupt`, or `inputRoot` against the root recomputed from it); every attested per-file entry re-hashed (files,
+    symlinks, directory listings, directory types, absences); pytest: no native extension module for another platform (`b.cpython-314-x86_64-linux-gnu.so`,
     `b.cp314-win_amd64.pyd`) next to a probed extension candidate;
 12. **externals**: every `name@version` is what is installed now (pytest: in the `uv run --locked` environment, and
     pinned by `uv.lock`; Go: the module is in the build list in exactly that version and replacement; Cargo: the
@@ -2217,7 +2253,9 @@ Each candidate is checked inside an error boundary (panics included): an error i
 
 Protected against:
 
-- **Forged or tampered attestations**: the signature covers the exact payload bytes; one flipped byte fails.
+- **Forged or tampered attestations**: the signature covers the exact payload bytes; one flipped byte fails. A stored
+  input manifest (since 1.9.0 a value of its own, outside the signed payload) is used only when its recomputed root is
+  the input root the payload signed: a forged or swapped manifest makes the unit run.
 - **Untrusted signers**, including a pull request that adds its own key to `.vci/allowed_signers`: trust and policy
   come only from the base commit, never from the working tree.
 - **Replay** across repositories (root commit), test files, argv/project, toolchains, env configuration, or after
@@ -2635,15 +2673,32 @@ repository does not need the other projects' toolchains (`e2e_pytest.rs`).
   `node-options`, and yarn Plug'n'Play layouts are not supported. Each file runs in its own `node --test` process, as node:test's default process isolation does; the
   `@vci/vitest` version is not part of the attestation (like the other collectors).
 - Attestation metadata grows; `vci prune` deletes expired attestations (`--superseded`: and those a newer one of the
-  same unit by the same signer replaced), `vci push --rewrite-history` drops what was deleted from the published
-  history, and git-meta's own auto-prune (`meta:prune:max-keys`) may drop the least recently written keys (those units
+  same unit by the same signer replaced) and, since 1.9.0, the input manifests nothing references any more; `vci run`
+  deletes the attestations a re-attestation supersedes on the same line of history (see "Where attestations live
+  (git-meta)"); `vci push --rewrite-history` drops what was deleted from the published history, and git-meta's own auto-prune (`meta:prune:max-keys`) may drop the least recently written keys (those units
   then run). No spot-check re-runs or transparency log.
 - What `vci fetch` and `vci push` read: since 1.8.2 the keys of a metadata tree come from its paths, and the fetched
   tree is materialized into the store only when its tip changed since the last time (recorded in the git directory),
   and the store is serialized only when it holds modified rows, so with nothing new neither reads a single
   attestation. Measured on a 1.8 GB store (3980 attestations) against a local copy of the remote: a fetch with
-  nothing new took 51 s with 1.8.1 and takes 3 s; a push with nothing new, 206 s and 1.4 s. A fetch whose tip did
-  change still parses the whole tree (git-meta's materialize), about 35 s on that store.
+  nothing new took 51 s with 1.8.1 and takes 3 s; a push with nothing new, 206 s and 1.4 s. Since 1.9.0 a fetch whose
+  tip did change applies only the tree entries that changed (when the local metadata commit is an ancestor of the
+  tip): on a copy of that store (3805 attestations) with one attestation added, one deleted and one deletion record
+  published, such a fetch took 31 s with 1.8.2 and takes 3.4 s (the merge itself 0.04 s), leaving a store identical
+  to git-meta's full merge. The first fetch of a clone still parses the whole tree once (52 s on that store). Not
+  fixed yet: once the local metadata tree holds a deletion record (a published `vci prune` or supersession), the
+  check that the store covers `refs/meta/local/main` parses the whole tree in every fetch and push, tip changed or
+  not: 11.8 s on that store, with 1.8.2 and 1.9.0 alike.
+- Attestation size: since 1.9.0 an attestation references its input manifest instead of embedding it, and each
+  distinct manifest is stored once. Measured on 10 cargo units of the same workspace attested into a scratch
+  metadata remote: the attestation values went from 667,512 to 92,104 bytes (6 to 20 KB each instead of 14 to 241
+  KB), the whole tree with the 7 distinct manifests they reference (303,655 bytes; the three test targets of one
+  package share one) from 667,512 to 395,759 bytes (-41%), and a fresh clone's `vci fetch` downloaded 127,055 bytes
+  instead of 184,800 (-31%). On a store that small, fetch and plan take 0.2 to 0.3 s with either version. What is
+  left in an attestation is mostly `toolchain` (about 1.6 KB), `globalManifest` (1.3 KB), `waived` (up to 10 KB) and
+  the signature; a manifest repeats each external crate's full source string. Attestations already published keep
+  their inline manifest until the unit is re-attested (or `vci prune --superseded` and `vci push --rewrite-history`
+  shed them).
 - git-meta keeps its store per git directory: in a linked worktree (`git worktree add`), `vci run` writes the
   worktree's own `.git/worktrees/<name>/git-meta.sqlite`, while the `refs/meta/*` refs are shared by all worktrees.
   `vci fetch`/`vci push` copy what the shared ref holds into the worktree's store first (see "What `vci fetch` and

@@ -18,6 +18,7 @@ use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
 mod env_common;
+mod store_common;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -411,7 +412,7 @@ impl World {
                 let env: Value = serde_json::from_slice(&s.bytes).unwrap();
                 let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
                 let st: Value = serde_json::from_slice(&payload).unwrap();
-                st["predicate"].clone()
+                store_common::inline_manifest(&repo, st["predicate"].clone())
             })
             .collect()
     }
@@ -2428,4 +2429,843 @@ fn cargo_prune_superseded_and_rewrite_history() {
     w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
     let p = w.plan(&fresh, "main");
     assert!(p.skip.contains(B) && p.skip.contains(C), "{p:?}");
+}
+
+// ---- manifests by reference (vci 1.9.0) -----------------------------------
+
+/// The stored statements of `test_id`, as signed (no manifest inlined).
+fn raw_statements(work: &Path, test_id: &str) -> Vec<(vci_git::StoredEnvelope, Value)> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    AttestStore::new(&store_for(work))
+        .list(Some(test_id))
+        .unwrap()
+        .into_iter()
+        .map(|s| {
+            let env: Value = serde_json::from_slice(&s.bytes).unwrap();
+            let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
+            let st: Value = serde_json::from_slice(&payload).unwrap();
+            (s, st)
+        })
+        .collect()
+}
+
+/// The git-meta tree of a ref, as `(path, size)` per blob.
+fn meta_blobs(w: &World, dir: &Path, refname: &str) -> Vec<(String, u64)> {
+    w.git(dir, &["ls-tree", "-r", "-l", "--full-tree", refname])
+        .lines()
+        .filter_map(|l| {
+            let (meta, path) = l.split_once('\t')?;
+            let size = meta.split_whitespace().nth(3)?.parse().ok()?;
+            Some((path.to_owned(), size))
+        })
+        .collect()
+}
+
+/// An attestation carries `manifestRef` (its input root) instead of the
+/// manifest; the manifest is stored once under `project`
+/// `vci:manifest:<root>` in its compact encoding, however many units and
+/// attestations share it, and published with the attestations.
+#[test]
+fn cargo_manifests_are_stored_once_by_reference() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let units = [A_LIB, A_DOC, B, C, D];
+    w.run(&work, &units, &w.trusted);
+    let p = w.plan(&work, "main");
+    for u in units {
+        assert!(p.skip.contains(u), "{u}: {p:?}");
+    }
+    let mut roots = BTreeSet::new();
+    for u in units {
+        let stmts = raw_statements(&work, u);
+        assert_eq!(stmts.len(), 1, "{u}");
+        let pred = &stmts[0].1["predicate"];
+        assert!(pred.get("manifest").is_none(), "{u}: {pred}");
+        assert_eq!(pred["manifestRef"], pred["inputRoot"], "{u}");
+        assert!(pred["globalManifest"]["entries"].is_array(), "{u}");
+        roots.insert(pred["inputRoot"].as_str().unwrap().to_owned());
+    }
+    let store_repo = store_for(&work);
+    let store = AttestStore::new(&store_repo);
+    let stored: BTreeSet<String> = store.manifests().unwrap().into_iter().collect();
+    assert_eq!(stored, roots, "one manifest per distinct input root");
+    // Two units of the same package share their manifest: it is stored once.
+    assert!(roots.len() < units.len(), "{roots:?}");
+    for r in &roots {
+        let m = store.manifest(r).unwrap().unwrap();
+        let text = String::from_utf8(m.bytes).unwrap();
+        assert!(text.starts_with(r#"{"v":2,"entries":[["#), "{text}");
+        assert_eq!(
+            vci_core::InputManifest::from_compact(text.as_bytes())
+                .unwrap()
+                .root(),
+            *r
+        );
+    }
+    // Attesting again stores nothing new: the same keys, the same values.
+    w.run(&work, &[A_LIB, A_DOC], &w.trusted);
+    assert_eq!(store.manifests().unwrap().len(), roots.len());
+    // Published once each, next to the attestations.
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let tree = meta_blobs(&w, &w.remote, "refs/meta/main");
+    let manifests: Vec<&(String, u64)> = tree
+        .iter()
+        .filter(|(p, _)| p.starts_with("project/vci/manifest/") && p.ends_with("/__value"))
+        .collect();
+    assert_eq!(manifests.len(), roots.len(), "{tree:?}");
+    let attestations = tree
+        .iter()
+        .filter(|(p, _)| p.contains("/vci/attestation/") && p.ends_with("/__value"))
+        .count();
+    assert_eq!(attestations, units.len(), "{tree:?}");
+    // A fresh clone fetches both and skips every unit.
+    let fresh = w.base.join("fresh-clone");
+    w.git(
+        &w.base,
+        &["clone", "-q", w.remote.to_str().unwrap(), "fresh-clone"],
+    );
+    w.git(&fresh, &["checkout", "-q", "feature"]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&fresh, "main");
+    for u in units {
+        assert!(p.skip.contains(u), "{u}: {p:?}");
+    }
+}
+
+/// An attestation made before vci 1.9.0 (the manifest inline, no
+/// `manifestRef`) still verifies and skips, with no stored manifest.
+#[test]
+fn cargo_inline_manifest_attestation_still_verifies() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, &[B], &w.trusted);
+    let store_repo = store_for(&work);
+    let store = AttestStore::new(&store_repo);
+    let (stored, mut st) = raw_statements(&work, B).remove(0);
+    let root = st["predicate"]["inputRoot"].as_str().unwrap().to_owned();
+    let m = store.manifest(&root).unwrap().unwrap();
+    let m = vci_core::InputManifest::from_compact(&m.bytes).unwrap();
+    // The pre-1.9 predicate: `manifest` inline, in its JSON form, and no
+    // `manifestRef`; signed with the same key, as vci 1.8 signed it.
+    let pred = st["predicate"].as_object_mut().unwrap();
+    pred.remove("manifestRef");
+    pred.insert("manifest".into(), serde_json::to_value(&m).unwrap());
+    pred.insert("toolVersion".into(), "1.8.2".into());
+    let stmt: vci_attest::Statement = serde_json::from_value(st).unwrap();
+    let key = Utf8Path::from_path(&w.trusted).unwrap();
+    let env = vci_attest::sign_statement(&stmt, key).unwrap();
+    store
+        .put(B, &stored.signer, &stored.storage_key, &env.to_json())
+        .unwrap();
+    assert!(store.remove_manifest(&root).unwrap());
+    assert!(store.manifest(&root).unwrap().is_none());
+    let (_, st) = raw_statements(&work, B).remove(0);
+    assert!(st["predicate"]["manifest"]["entries"].is_array());
+    assert!(st["predicate"].get("manifestRef").is_none());
+    assert!(w.plan(&work, "main").skip.contains(B), "inline manifest");
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains("all checks passed"), "{ex}");
+    let file = w.base.join("old.dsse.json");
+    std::fs::write(&file, env.to_json()).unwrap();
+    let out = w.vci_ok(
+        &work,
+        &["verify", file.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert!(
+        out.contains("VALID signature by trusted@example.com"),
+        "{out}"
+    );
+    assert!(out.contains("(root verified; inline)"), "{out}");
+    // It still fails like any attestation when an input changes.
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains("entry:b/tests/data/b.json"), "{ex}");
+}
+
+/// A referenced manifest that is missing, unreadable or forged fails its
+/// candidate (the unit runs), with the reason named by `vci explain`;
+/// `vci verify` reads it from the store or from `--manifest FILE`.
+#[test]
+fn cargo_missing_or_forged_manifest_makes_the_unit_run() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, &[B, C], &w.trusted);
+    assert!(w.plan(&work, "main").skip.contains(B));
+    let store_repo = store_for(&work);
+    let store = AttestStore::new(&store_repo);
+    let (stored, st) = raw_statements(&work, B).remove(0);
+    let root = st["predicate"]["inputRoot"].as_str().unwrap().to_owned();
+    let good = store.manifest(&root).unwrap().unwrap().bytes;
+    let file = w.base.join("b.dsse.json");
+    std::fs::write(&file, &stored.bytes).unwrap();
+    let out = w.vci_ok(
+        &work,
+        &["verify", file.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert!(
+        out.contains("(root verified; git-meta project vci:manifest:"),
+        "{out}"
+    );
+
+    // Missing (deleted, or never fetched).
+    assert!(store.remove_manifest(&root).unwrap());
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(B), "{p:?}");
+    assert!(p.skip.contains(C), "only B's manifest is gone: {p:?}");
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains("failed check: inputs"), "{ex}");
+    assert!(
+        ex.contains(&format!(
+            "manifest {root} not in the store: run `vci fetch`"
+        )),
+        "{ex}"
+    );
+    let out = w.vci(
+        &work,
+        &["verify", file.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("VALID signature"), "{text}");
+    assert!(text.contains("manifest: INVALID"), "{text}");
+    assert!(text.contains("not in the store"), "{text}");
+    // `--manifest FILE` instead of the store.
+    let mfile = w.base.join("b.manifest.json");
+    std::fs::write(&mfile, &good).unwrap();
+    let out = w.vci_ok(
+        &work,
+        &[
+            "verify",
+            file.to_str().unwrap(),
+            "--base-ref",
+            "main",
+            "--manifest",
+            mfile.to_str().unwrap(),
+        ],
+    );
+    assert!(out.contains("root verified"), "{out}");
+
+    // Corrupt: not a compact manifest.
+    store.put_manifest(&root, b"{\"v\":3}").unwrap();
+    assert!(w.plan(&work, "main").run.contains(B));
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains(&format!("manifest {root} corrupt")), "{ex}");
+
+    // Forged: a valid manifest (C's) under B's root. The signed root does
+    // not match it.
+    let c_root = raw_statements(&work, C).remove(0).1["predicate"]["inputRoot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(c_root, root);
+    let c_manifest = store.manifest(&c_root).unwrap().unwrap().bytes;
+    store.put_manifest(&root, &c_manifest).unwrap();
+    assert!(w.plan(&work, "main").run.contains(B));
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains("inputRoot"), "{ex}");
+    assert!(ex.contains("recomputed from the attested manifest"), "{ex}");
+    let out = w.vci(
+        &work,
+        &["verify", file.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("is not the signed input root"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Restored: B skips again.
+    store.put_manifest(&root, &good).unwrap();
+    assert!(w.plan(&work, "main").skip.contains(B));
+}
+
+/// Supersession on store: re-attesting a unit on a later commit of the same
+/// line of work deletes the signer's earlier attestation of it (same
+/// platform) and the manifest only it referenced, so the store keeps one
+/// attestation per unit and signer; another signer's are kept, and so is
+/// one made on a commit another branch still contains (`main`'s).
+#[test]
+fn cargo_supersession_keeps_one_attestation_per_unit_and_signer() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    // On the base commit, which `main` contains: never superseded from a
+    // feature branch.
+    w.run(&work, &[B], &w.trusted);
+    w.run(&work, &[B], &w.untrusted);
+    assert_eq!(w.predicates(B).len(), 2, "one per signer");
+    let on_main = raw_statements(&work, B);
+    let keys = |v: &[(vci_git::StoredEnvelope, Value)]| -> BTreeSet<String> {
+        v.iter().map(|(s, _)| s.key.clone()).collect()
+    };
+    let root_of = |v: &(vci_git::StoredEnvelope, Value)| {
+        v.1["predicate"]["inputRoot"].as_str().unwrap().to_owned()
+    };
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(!err.contains("superseded"), "main still needs it: {err}");
+    assert_eq!(raw_statements(&work, B).len(), 3);
+    // Pushed: `origin/feature` is this branch's own line, not another.
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    let f1: Vec<_> = raw_statements(&work, B)
+        .into_iter()
+        .filter(|(s, _)| !keys(&on_main).contains(&s.key))
+        .collect();
+    assert_eq!(f1.len(), 1);
+    let f1_root = root_of(&f1[0]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 3}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes again"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(
+        err.contains("vci: removed 1 superseded attestation(s)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("vci: removed 1 input manifest(s) no attestation references any more"),
+        "{err}"
+    );
+    let now = raw_statements(&work, B);
+    assert_eq!(now.len(), 3, "main's two and the new one: {now:?}");
+    assert!(keys(&on_main).is_subset(&keys(&now)));
+    assert!(!keys(&now).contains(&f1[0].0.key));
+    let store_repo = store_for(&work);
+    let store = AttestStore::new(&store_repo);
+    let stored = store.manifests().unwrap();
+    assert!(!stored.contains(&f1_root), "{stored:?}");
+    for st in &now {
+        assert!(stored.contains(&root_of(st)), "{stored:?}");
+    }
+    assert!(w.plan(&work, "main").skip.contains(B));
+    // The other signer on this line: its `main` one is kept too.
+    let err = w.run(&work, &[B], &w.untrusted);
+    assert!(!err.contains("superseded"), "{err}");
+    assert_eq!(raw_statements(&work, B).len(), 4);
+    // Work in progress on the same commit supersedes nothing: reverting the
+    // edit skips again with the commit's attestation.
+    let committed = w.read("b/tests/data/b.json");
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 4}\n",
+    );
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(!err.contains("superseded"), "{err}");
+    assert_eq!(raw_statements(&work, B).len(), 5);
+    w.put("b/tests/data/b.json", &committed);
+    assert!(w.plan(&work, "main").skip.contains(B));
+}
+
+/// Supersession never deletes an attestation another branch still needs: a
+/// run on a sibling branch (another pull request) keeps the one made on this
+/// branch, which still skips when this branch is checked out again.
+#[test]
+fn cargo_supersession_keeps_other_branches_attestations() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.put("README.md", "feature work\n");
+    w.git(&work, &["add", "README.md"]);
+    w.git(&work, &["commit", "-qm", "feature work"]);
+    w.run(&work, &[B], &w.trusted);
+    assert!(w.plan(&work, "main").skip.contains(B));
+    w.git(&work, &["checkout", "-q", "-b", "other", "main"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b changes on other"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(!err.contains("superseded"), "{err}");
+    assert_eq!(raw_statements(&work, B).len(), 2);
+    w.git(&work, &["checkout", "-q", "feature"]);
+    let p = w.plan(&work, "main");
+    assert!(p.skip.contains(B), "{p:?}");
+    w.git(&work, &["checkout", "-q", "other"]);
+    assert!(w.plan(&work, "main").skip.contains(B));
+}
+
+/// `vci prune` deletes the stored manifests no remaining attestation
+/// references (a dry run lists them), and publishes the deletion.
+#[test]
+fn cargo_prune_deletes_unreferenced_manifests() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, &[B, C], &w.trusted);
+    let store_repo = store_for(&work);
+    let store = AttestStore::new(&store_repo);
+    let old_root = raw_statements(&work, B).remove(0).1["predicate"]["inputRoot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    w.run(&work, &[B], &w.trusted);
+    // The first attestation (made on `main`'s commit, which supersession
+    // keeps) goes away, as an expired one would.
+    let (old, new): (Vec<_>, Vec<_>) = raw_statements(&work, B)
+        .into_iter()
+        .partition(|(_, st)| st["predicate"]["inputRoot"] == old_root.as_str());
+    assert_eq!((old.len(), new.len()), (1, 1));
+    assert!(store.remove(&old[0].0).unwrap());
+    let new_root = new[0].1["predicate"]["inputRoot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(old_root, new_root);
+    let before = store.manifests().unwrap();
+    assert!(before.contains(&old_root) && before.contains(&new_root));
+    let out = w.vci(&work, &["prune", "--dry-run"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains(&format!(
+            "would remove project vci:manifest:{old_root} (unreferenced manifest)"
+        )),
+        "{stdout}"
+    );
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stderr.contains("vci prune: 1 unreferenced input manifest(s) (dry run)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        store.manifests().unwrap(),
+        before,
+        "a dry run deletes nothing"
+    );
+    let out = w.vci(&work, &["prune"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("vci prune: 1 unreferenced input manifest(s) removed"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = store.manifests().unwrap();
+    assert_eq!(after.len(), before.len() - 1);
+    assert!(!after.contains(&old_root) && after.contains(&new_root));
+    let p = w.plan(&work, "main");
+    assert!(p.skip.contains(B) && p.skip.contains(C), "{p:?}");
+    // Nothing more to prune.
+    let out = w.vci(&work, &["prune"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("0 unreferenced input manifest(s)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The deletion is published.
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let tree: Vec<String> = meta_blobs(&w, &w.remote, "refs/meta/main")
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect();
+    assert!(
+        !tree
+            .iter()
+            .any(|p| p == &format!("project/vci/manifest/{old_root}/__value")),
+        "{tree:?}"
+    );
+    assert!(
+        tree.iter()
+            .any(|p| p.starts_with("project/__tombstones/vci/manifest/") && p.contains(&old_root)),
+        "{tree:?}"
+    );
+}
+
+// ---- exchanging manifests and merging fetched tips (vci 1.9.0) -------------
+
+/// A clone of the world's remote on `branch`.
+fn clone_on(w: &World, name: &str, branch: &str) -> PathBuf {
+    let dir = w.base.join(name);
+    w.git(
+        &w.base,
+        &[
+            "clone",
+            "-q",
+            w.remote.to_str().unwrap(),
+            dir.to_str().unwrap(),
+        ],
+    );
+    w.git(&dir, &["checkout", "-q", branch]);
+    dir
+}
+
+/// One commit on `feature` that `main` does not contain.
+fn feature_commit(w: &World) {
+    w.put("README.md", "feature work\n");
+    w.git(&w.work, &["add", "README.md"]);
+    w.git(&w.work, &["commit", "-qm", "feature work"]);
+}
+
+/// What a clone's git-meta store holds, for comparing two merges: values
+/// (without their write time), deletion records (a time at or after `since`
+/// is the merge's own, shown as `now`), and the local metadata commit.
+type Rows = (Vec<String>, Vec<String>, String);
+
+fn store_rows(w: &World, dir: &Path, since: i64) -> Rows {
+    let s = git_meta_lib::Session::open(dir).unwrap();
+    let values = s
+        .store()
+        .get_all_metadata()
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            format!(
+                "{:?} {} {} {:?} {} {}",
+                e.target_type, e.target_value, e.key, e.value_type, e.is_git_ref, e.value
+            )
+        })
+        .collect();
+    let tombs = s
+        .store()
+        .get_all_tombstones()
+        .unwrap()
+        .into_iter()
+        .map(|t| {
+            let ts = if t.timestamp >= since {
+                "now".to_owned()
+            } else {
+                t.timestamp.to_string()
+            };
+            format!(
+                "{:?} {} {} {ts} {}",
+                t.target_type, t.target_value, t.key, t.email
+            )
+        })
+        .collect();
+    drop(s);
+    let local = w.git(dir, &["rev-parse", "refs/meta/local/main"]);
+    (values, tombs, local)
+}
+
+const MAIN_MARKER: &str = ".git/vci-materialized-refs_meta_remotes_main";
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// Fetch `dir` from `remote` (incremental when it has fetched before) and,
+/// first, a copy of it without the `marker` (git-meta's full merge). Returns
+/// the fetch's stderr and both stores.
+fn fetch_both(
+    w: &World,
+    dir: &Path,
+    tag: &str,
+    remote: &str,
+    marker: &str,
+) -> (String, Rows, Rows, PathBuf) {
+    let full = w.base.join(format!("full-{tag}"));
+    cp(dir, &full);
+    std::fs::remove_file(full.join(marker)).unwrap();
+    let since = now_ms();
+    let a = w.vci_env(dir, &["fetch", "--remote", remote], &[("VCI_TIMING", "1")]);
+    assert!(a.status.success());
+    let b = w.vci_env(
+        &full,
+        &["fetch", "--remote", remote],
+        &[("VCI_TIMING", "1")],
+    );
+    assert!(b.status.success());
+    let eb = String::from_utf8_lossy(&b.stderr);
+    assert!(eb.contains("materialize (full)"), "{eb}");
+    (
+        String::from_utf8_lossy(&a.stderr).into_owned(),
+        store_rows(w, dir, since),
+        store_rows(w, &full, since),
+        full,
+    )
+}
+
+/// A clone that fetched before merges each later tip by what changed, with
+/// the store git-meta's full merge gives (values, deletion records with the
+/// tree's time and email, local ref), also on the fetch after one that
+/// deleted values; after the remote's history is rewritten it merges in
+/// full once and incrementally again from the next tip on.
+#[test]
+fn cargo_incremental_fetch_matches_a_full_merge() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    feature_commit(&w);
+    w.run(&work, &[B, C], &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let b = clone_on(&w, "b", "feature");
+    w.vci_ok(&b, &["fetch", "--remote", "origin"]);
+    let step = |tag: &str, incremental: bool| {
+        let (e, inc, full, _) = fetch_both(&w, &b, tag, "origin", MAIN_MARKER);
+        assert_eq!(
+            e.contains("materialize (incremental"),
+            incremental,
+            "{tag}: {e}"
+        );
+        assert_eq!(inc, full, "{tag}");
+    };
+
+    // B superseded (an attestation and its manifest deleted, a new one).
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b changes"]);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(err.contains("removed 1 superseded"), "{err}");
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    step("1", true);
+    // An unrelated attestation: the deletion records the previous merge
+    // stamped are the tree's again, as after git-meta's merge.
+    w.run(&work, &[D], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    step("2", true);
+    w.run(&work, &[A_LIB], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    step("3", true);
+    // The remote's history rewritten: merged in full, and the local ref is
+    // the new tip (nothing local is missing from it).
+    w.vci_ok(&work, &["push", "--remote", "origin", "--rewrite-history"]);
+    step("4", false);
+    assert_eq!(
+        w.git(&b, &["rev-parse", "refs/meta/local/main"]),
+        w.git(&b, &["rev-parse", "refs/meta/remotes/main"])
+    );
+    let out = w.vci(&b, &["push", "--remote", "origin"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("vci: nothing to push"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    w.run(&work, &[A_DOC], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    step("5", true);
+    w.git(&b, &["fetch", "-q", "origin"]);
+    w.git(&b, &["merge", "-q", "--ff-only", "origin/feature"]);
+    let p = w.plan(&b, "main");
+    for u in [A_LIB, A_DOC, B, C, D] {
+        assert!(p.skip.contains(u), "{u}: {p:?}");
+    }
+}
+
+/// A side metadata remote (`remote.<name>.metaside`) is merged the way
+/// git-meta merges it, never incrementally: its values are imported (not
+/// published by a push to the primary) and the local ref stays.
+#[test]
+fn cargo_side_remote_fetch_is_not_merged_into_the_local_ref() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, &[B], &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let side = w.base.join("side.git");
+    w.git(
+        &w.base,
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            w.remote.to_str().unwrap(),
+            side.to_str().unwrap(),
+        ],
+    );
+    let side_url = side.to_str().unwrap().to_owned();
+    let b = clone_on(&w, "b", "feature");
+    w.vci_ok(&b, &["fetch", "--remote", "origin"]);
+    w.vci_ok(&b, &["fetch", "--remote", &side_url]);
+    let markers: Vec<String> = std::fs::read_dir(b.join(".git"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| {
+            n.starts_with("vci-materialized-") && n != "vci-materialized-refs_meta_remotes_main"
+        })
+        .collect();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    let marker = format!(".git/{}", markers[0]);
+    let local = w.git(&b, &["rev-parse", "refs/meta/local/main"]);
+    // Another clone publishes C's attestation to the side remote only.
+    let s = clone_on(&w, "s", "feature");
+    w.vci_ok(&s, &["fetch", "--remote", &side_url]);
+    w.run(&s, &[C], &w.trusted);
+    w.vci_ok(&s, &["push", "--remote", &side_url]);
+    let (e, inc, full, full_dir) = fetch_both(&w, &b, "side", &side_url, &marker);
+    assert!(!e.contains("materialize (incremental"), "{e}");
+    assert_eq!(inc, full);
+    assert_eq!(inc.2, local, "the local ref stays");
+    assert!(w.plan(&b, "main").skip.contains(C));
+    // A push to the primary does not publish the side remote's values.
+    let attestations = || {
+        w.git(
+            &w.remote,
+            &["ls-tree", "-r", "--full-tree", "refs/meta/main"],
+        )
+        .lines()
+        .filter(|l| l.contains("/vci/attestation/") && l.ends_with("/__value"))
+        .count()
+    };
+    for dir in [&b, &full_dir] {
+        let tip = w.git(&w.remote, &["rev-parse", "refs/meta/main"]);
+        w.vci_ok(dir, &["push", "--remote", "origin"]);
+        assert_eq!(attestations(), 1);
+        assert_eq!(w.git(&w.remote, &["rev-parse", "refs/meta/main"]), tip);
+    }
+}
+
+/// An input manifest deleted by one clone (supersession, `vci prune`)
+/// while another clone references it is put back by the merge that brings
+/// the two together, so it is never lost: when the deleting clone pushes
+/// after the other published its attestation, and when the other clone
+/// pushes an attestation it made before it saw the deletion.
+#[test]
+fn cargo_a_manifest_another_clone_references_is_never_lost() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    feature_commit(&w);
+    w.run(&work, &[A_LIB, C], &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let root_of = |dir: &Path, id: &str| {
+        raw_statements(dir, id).remove(0).1["predicate"]["inputRoot"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let r = root_of(&work, A_LIB);
+    let rc = root_of(&work, C);
+    let x = clone_on(&w, "x", "feature");
+    w.vci_ok(&x, &["fetch", "--remote", "origin"]);
+    w.run(&x, &[A_DOC], &w.trusted);
+    assert_eq!(root_of(&x, A_DOC), r, "a#lib and a#doc share a manifest");
+    w.vci_ok(&x, &["push", "--remote", "origin"]);
+    // x also attests C with another key, and does not publish it yet.
+    w.run(&x, &[C], &w.untrusted);
+
+    // work, without fetching, supersedes a#lib and C: their manifests are
+    // referenced by nothing work knows of, and are deleted.
+    let lib = w.read("a/src/lib.rs");
+    w.put("a/src/lib.rs", &format!("{lib}\n// change\n"));
+    let c = w.read("c/src/lib.rs");
+    w.put("c/src/lib.rs", &format!("{c}\n// change\n"));
+    w.git(&work, &["commit", "-qam", "a and c change"]);
+    let err = w.run(&work, &[A_LIB, C], &w.trusted);
+    assert!(err.contains("removed 2 superseded"), "{err}");
+    assert!(err.contains("removed 2 input manifest(s)"), "{err}");
+    let manifest_value = |root: &str| {
+        w.git(
+            &w.remote,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "--full-tree",
+                "refs/meta/main",
+            ],
+        )
+        .lines()
+        .any(|p| p == format!("project/vci/manifest/{root}/__value"))
+    };
+    // work's push merges x's a#doc in, and puts its manifest back.
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("put back 1 input manifest(s)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(manifest_value(&r), "a#doc's manifest is published");
+    assert!(
+        !manifest_value(&rc),
+        "C's is deleted: nothing published uses it"
+    );
+    // x merges the deletion of C's manifest, which its own C attestation
+    // references: the merge puts it back, and x's push publishes it.
+    let out = w.vci(&x, &["fetch", "--remote", "origin"]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("put back 1 input manifest(s)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let p = w.plan(&x, "main");
+    assert!(p.skip.contains(A_DOC), "{p:?}");
+    w.vci_ok(&x, &["push", "--remote", "origin"]);
+    assert!(manifest_value(&rc));
+    let fresh = clone_on(&w, "fresh", "feature");
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    let store_repo = store_for(&fresh);
+    let stored = AttestStore::new(&store_repo).manifests().unwrap();
+    assert!(stored.contains(&r) && stored.contains(&rc), "{stored:?}");
+}
+
+/// `vci prune` keeps the manifest an attestation it leaves alone (one whose
+/// payload it cannot parse, as a later vci might write) references.
+#[test]
+fn cargo_prune_keeps_the_manifest_of_an_unparsable_attestation() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, &[B], &w.trusted);
+    let repo = store_for(&work);
+    let store = AttestStore::new(&repo);
+    let (stored, mut st) = raw_statements(&work, B).remove(0);
+    let root = st["predicate"]["inputRoot"].as_str().unwrap().to_owned();
+    st["predicate"]["issuedAt"] = "2026-10-16T21:20:19.5+00:00 (a later format)".into();
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut env: Value = serde_json::from_slice(&stored.bytes).unwrap();
+    env["payload"] = b64.encode(serde_json::to_vec(&st).unwrap()).into();
+    store
+        .put(
+            B,
+            &stored.signer,
+            &"ee".repeat(32),
+            serde_json::to_string(&env).unwrap().as_bytes(),
+        )
+        .unwrap();
+    assert!(store.remove(&stored).unwrap());
+    let out = w.vci(&work, &["prune", "--dry-run"]);
+    assert!(out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!text.contains(&format!("vci:manifest:{root}")), "{text}");
+    assert!(text.contains("1 unreadable (left alone)"), "{text}");
+    assert!(text.contains("0 unreferenced input manifest(s)"), "{text}");
+    // An unparsable payload that names no manifest: none is removed.
+    st["predicate"]
+        .as_object_mut()
+        .unwrap()
+        .remove("manifestRef");
+    env["payload"] = b64.encode(serde_json::to_vec(&st).unwrap()).into();
+    store
+        .put(
+            B,
+            &stored.signer,
+            &"ee".repeat(32),
+            serde_json::to_string(&env).unwrap().as_bytes(),
+        )
+        .unwrap();
+    store
+        .put_manifest(
+            &"ab".repeat(32),
+            b"{\"v\":2,\"entries\":[],\"externals\":[],\"env\":[]}",
+        )
+        .unwrap();
+    let out = w.vci(&work, &["prune", "--dry-run"]);
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("no input manifest is removed"), "{text}");
 }

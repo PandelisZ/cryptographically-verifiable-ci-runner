@@ -192,3 +192,47 @@ fn show_file_symlink_yields_target() {
     let repo = Repo::discover(&root).unwrap();
     assert_eq!(repo.show_file("HEAD", "link").unwrap().unwrap(), b"a.txt");
 }
+
+#[test]
+fn moved_on_only_along_one_line_of_history() {
+    let w = world(1);
+    let dir = &w.clones[0];
+    let repo = Repo::discover(dir).unwrap();
+    let commit = |msg: &str| {
+        write(dir, "a.txt", msg);
+        git(dir, &["commit", "-q", "-am", msg]);
+        git(dir, &["rev-parse", "HEAD"])
+    };
+    let main = git(dir, &["rev-parse", "HEAD"]);
+    git(dir, &["checkout", "-q", "-b", "feature"]);
+    let f1 = commit("f1");
+    let f2 = commit("f2");
+    // main (and origin/main) still contain main's commit; feature's own
+    // earlier commit is contained by nothing else.
+    assert!(!repo.moved_on(&main, &f2).unwrap());
+    assert!(repo.moved_on(&f1, &f2).unwrap());
+    assert!(!repo.moved_on(&f2, &f2).unwrap(), "the same commit");
+    assert!(!repo.moved_on(&f2, &f1).unwrap(), "backwards");
+    // The branch's own remote-tracking branch, behind it: the same line.
+    git(dir, &["push", "-q", "origin", "feature"]);
+    let f3 = commit("f3");
+    assert!(repo.moved_on(&f2, &f3).unwrap());
+    assert!(repo.moved_on(&f1, &f3).unwrap());
+    // Another branch or a tag containing it: still needed.
+    git(dir, &["branch", "other", &f1]);
+    assert!(!repo.moved_on(&f1, &f3).unwrap());
+    assert!(repo.moved_on(&f2, &f3).unwrap());
+    git(dir, &["tag", "v1", &f2]);
+    assert!(!repo.moved_on(&f2, &f3).unwrap());
+    // A sibling branch's commit: not an ancestor.
+    git(dir, &["checkout", "-q", "-b", "sibling", &main]);
+    let s1 = commit("s1");
+    assert!(!repo.moved_on(&f3, &s1).unwrap());
+    // Detached: every ref counts, a namesake included.
+    git(dir, &["checkout", "-q", "--detach", "feature"]);
+    let d = commit("detached");
+    assert!(!repo.moved_on(&f3, &d).unwrap(), "feature contains f3");
+    // Unknown commits conclude nothing.
+    assert!(!repo.moved_on(&"0".repeat(40), &d).unwrap());
+    assert!(!repo.moved_on("HEAD", &d).unwrap());
+}

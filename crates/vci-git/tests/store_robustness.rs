@@ -631,3 +631,207 @@ fn push_says_whether_anything_was_sent() {
     assert_eq!(st.push(None).unwrap().status, PushStatus::UpToDate);
     assert_eq!(git(&w.remote, &["rev-parse", "refs/meta/main"]), tip);
 }
+
+// ---- incremental merges of a fetched tip --------------------------------------
+
+/// Everything a store holds for vci: (target, key, bytes, read error).
+fn contents(st: &AttestStore) -> Vec<(String, String, Vec<u8>, Option<String>)> {
+    st.list(None)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.target, e.key, e.bytes, e.error))
+        .collect()
+}
+
+/// What a fresh clone of the world's remote holds after one fetch.
+fn fresh_contents(w: &World) -> Vec<(String, String, Vec<u8>, Option<String>)> {
+    let dir = fresh_reader(w, &format!("reader-{}", rand_suffix()));
+    let r = repo(&dir);
+    let st = AttestStore::new(&r);
+    st.fetch(Some("origin")).unwrap();
+    contents(&st)
+}
+
+fn merged_in_full(out: &vci_git::FetchOutcome) -> bool {
+    out.notes.iter().any(|n| n.contains("in full"))
+}
+
+/// Remove `path` from the remote's refs/meta/main without a deletion record
+/// (what git-meta's auto-prune publishes).
+fn drop_entry(remote: &Utf8Path, path: &str) {
+    let ls = Command::new("git")
+        .args(["-C", remote.as_str(), "ls-tree", "-r", "-z", "--full-tree"])
+        .arg("refs/meta/main")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let mut index_info = Vec::new();
+    let mut found = false;
+    for rec in ls.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        if rec.ends_with(format!("\t{path}").as_bytes()) {
+            found = true;
+            continue;
+        }
+        index_info.extend_from_slice(rec);
+        index_info.push(0);
+    }
+    assert!(found, "{path} is in the tree");
+    let idx = remote.join("drop-index");
+    let _ = std::fs::remove_file(&idx);
+    let mut u = Command::new("git")
+        .args(["-C", remote.as_str(), "update-index", "-z", "--index-info"])
+        .env("GIT_INDEX_FILE", idx.as_str())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    u.stdin.take().unwrap().write_all(&index_info).unwrap();
+    assert!(u.wait().unwrap().success());
+    let tree = Command::new("git")
+        .args(["-C", remote.as_str(), "write-tree"])
+        .env("GIT_INDEX_FILE", idx.as_str())
+        .output()
+        .unwrap();
+    assert!(tree.status.success());
+    let tree = String::from_utf8(tree.stdout).unwrap().trim().to_owned();
+    std::fs::remove_file(&idx).unwrap();
+    let commit = git(
+        remote,
+        &["commit-tree", &tree, "-p", "refs/meta/main", "-m", "drop"],
+    );
+    git(remote, &["update-ref", "refs/meta/main", &commit]);
+}
+
+#[test]
+fn a_fetch_onto_an_earlier_fetch_merges_what_changed_like_a_fresh_clone() {
+    let w = world(2);
+    let ra = repo(&w.clones[0]);
+    let sa = AttestStore::new(&ra);
+    sa.put(A, S1, &hex64(1), &big("a")).unwrap();
+    sa.put(B, S1, &hex64(2), &big("b")).unwrap();
+    sa.put(C, S1, &hex64(3), b"c").unwrap();
+    sa.put(".", S1, &hex64(4), b"root unit").unwrap();
+    sa.push(Some("origin")).unwrap();
+
+    let b = &w.clones[1];
+    let rb = repo(b);
+    let sb = AttestStore::new(&rb);
+    let first = sb.fetch(Some("origin")).unwrap();
+    assert_eq!(contents(&sb), fresh_contents(&w), "{first:?}");
+    let marker = b.join(".git/vci-materialized-refs_meta_remotes_main");
+    assert!(marker.exists());
+
+    // New values, a value rewritten under its key, deletions (a large and
+    // a small value, a project-target one), all published by A.
+    sa.fetch(None).unwrap();
+    sa.put(D, S1, &hex64(5), &big("d")).unwrap();
+    sa.put(B, S1, &hex64(2), &big("b, rewritten")).unwrap();
+    sa.put(B, S2, &hex64(6), b"b by another signer").unwrap();
+    for e in sa.list(None).unwrap() {
+        if [A, C, "."]
+            .iter()
+            .any(|id| e.test_key == vci_core::test_key(id))
+        {
+            assert!(sa.remove(&e).unwrap());
+        }
+    }
+    sa.push(None).unwrap();
+    let out = sb.fetch(None).unwrap();
+    assert!(!merged_in_full(&out), "{out:?}");
+    assert!(out.warnings.is_empty(), "{out:?}");
+    assert_eq!(contents(&sb), fresh_contents(&w));
+    assert_eq!(ids(&sb), tk(&[B, D]));
+    assert_eq!(
+        git(b, &["rev-parse", "refs/meta/local/main"]),
+        git(b, &["rev-parse", "refs/meta/remotes/main"]),
+        "the local ref fast-forwards to the tip, as git-meta's would"
+    );
+    // Nothing is left to serialize: a push has nothing to send.
+    assert_eq!(sb.push(None).unwrap().status, vci_git::PushStatus::UpToDate);
+
+    // B publishes; its next fetch merges A's later values onto its own push.
+    sb.put(C, S2, &hex64(7), &big("c again")).unwrap();
+    sb.push(None).unwrap();
+    sa.fetch(None).unwrap();
+    sa.put(A, S1, &hex64(8), &big("a again")).unwrap();
+    sa.push(None).unwrap();
+    let out = sb.fetch(None).unwrap();
+    assert!(!merged_in_full(&out), "{out:?}");
+    assert_eq!(contents(&sb), fresh_contents(&w));
+    assert_eq!(ids(&sb), tk(&[A, B, C, D]));
+
+    // A value dropped from the tip without a deletion record is dropped
+    // here too, with the same warning as git-meta's merge.
+    let e = sa.list(Some(D)).unwrap().into_iter().next().unwrap();
+    let path =
+        git_meta_lib::tree_paths::tree_path(&Target::parse(&e.target).unwrap(), &e.key).unwrap();
+    drop_entry(&w.remote, &path);
+    let out = sb.fetch(None).unwrap();
+    assert!(!merged_in_full(&out), "{out:?}");
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("without a deletion record")),
+        "{out:?}"
+    );
+    assert_eq!(contents(&sb), fresh_contents(&w));
+    assert_eq!(ids(&sb), tk(&[A, B, C]));
+
+    // Local values not published yet: git-meta merges, as before.
+    sb.put(D, S2, &hex64(9), b"local only").unwrap();
+    sa.fetch(None).unwrap();
+    sa.put(".", S1, &hex64(10), b"root again").unwrap();
+    sa.push(None).unwrap();
+    let out = sb.fetch(None).unwrap();
+    assert!(!merged_in_full(&out), "a merge is not a fallback: {out:?}");
+    assert_eq!(ids(&sb), tk(&[A, B, C, D, "."]));
+    sb.push(None).unwrap();
+    assert_eq!(contents(&sb), fresh_contents(&w));
+}
+
+#[test]
+fn a_changed_entry_the_incremental_merge_does_not_read_is_merged_in_full() {
+    let w = world(2);
+    let ra = repo(&w.clones[0]);
+    let sa = AttestStore::new(&ra);
+    sa.put(A, S1, &hex64(1), &big("a")).unwrap();
+    sa.push(Some("origin")).unwrap();
+    let b = &w.clones[1];
+    let rb = repo(b);
+    let sb = AttestStore::new(&rb);
+    sb.fetch(Some("origin")).unwrap();
+
+    // A git-meta set value (and a new attestation) lands on the remote.
+    sa.fetch(None).unwrap();
+    sa.put(B, S1, &hex64(2), &big("b")).unwrap();
+    sa.push(None).unwrap();
+    graft(
+        &w.remote,
+        &[(b"project/reviewers/__set/0123456789".to_vec(), b"someone")],
+    );
+    let out = sb.fetch(None).unwrap();
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("project/reviewers/__set/0123456789")),
+        "{out:?}"
+    );
+    assert_eq!(contents(&sb), fresh_contents(&w));
+    assert_eq!(ids(&sb), tk(&[A, B]));
+    let s = Session::open(b.as_std_path()).unwrap();
+    assert!(
+        s.target(&Target::project())
+            .get_value("reviewers")
+            .unwrap()
+            .is_some(),
+        "git-meta's merge read the set"
+    );
+    drop(s);
+
+    // The next change is incremental again.
+    sa.fetch(None).unwrap();
+    sa.put(C, S1, &hex64(3), b"c").unwrap();
+    sa.push(None).unwrap();
+    let out = sb.fetch(None).unwrap();
+    assert!(!merged_in_full(&out), "{out:?}");
+    assert_eq!(contents(&sb), fresh_contents(&w));
+}

@@ -195,7 +195,7 @@ Options:
   -h, --help             Print help
 ```
 
-- git-meta pull: fetches `refs/meta/main` and materializes it into `.git/git-meta.sqlite` so `vci plan`/`explain` see other signers' attestations.
+- git-meta pull: fetches `refs/meta/main` and materializes it into `.git/git-meta.sqlite` so `vci plan`/`explain` see other signers' attestations (and, since 1.9.0, the input manifests they reference). Since 1.9.0 a fetch after an earlier one applies only the entries that changed.
 - In CI always pass `--remote origin` (the action does): the checkout must not choose where attestations come from.
 
 ## vci prune
@@ -211,6 +211,7 @@ Options:
 ```
 
 - Deletes expired attestations from the local store as deletion records; publish them with `vci push`. Never needed for correctness: expired attestations are simply not accepted.
+- Since 1.9.0 it then deletes the stored input manifests (`project` key `vci:manifest:<root>`) that no remaining attestation references and prints `vci prune: N unreferenced input manifest(s) removed` (`(dry run)` with `--dry-run`); none while an attestation cannot be read.
 
 ## vci verify
 
@@ -232,6 +233,7 @@ Options:
 ```
 
 - Verifies one DSSE envelope (a file, or `-` for stdin) and prints signer, test id, repo id, commit, input root. Mostly for debugging; `vci explain` is the usual tool.
+- Since 1.9.0 an attestation references its input manifest instead of embedding it: `vci verify` reads it from `--manifest FILE` (as `git meta get project vci:manifest:<root>` prints it) or else from the repository's git-meta store, checks that its root is the signed input root, and exits 1 when it is missing, corrupt or another manifest.
 
 ## Environment variables
 

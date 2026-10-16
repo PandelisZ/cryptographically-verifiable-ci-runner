@@ -1,6 +1,6 @@
 //! `ci`, `verify`, `init`, `push`, `fetch`, `prune`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -380,10 +380,16 @@ fn run_plain(
     Ok(code.unwrap_or(1))
 }
 
+/// `vci verify`: the envelope's signature against the trust root, its
+/// predicate, expiry, and the input manifest it records: inline (before vci
+/// 1.9.0) or the one it references, read from `--manifest FILE` or else
+/// from the local git-meta store, whose recomputed root must be the signed
+/// input root.
 pub fn verify(
     envelope_path: &Utf8Path,
     allowed_signers: Option<&Utf8Path>,
     base_ref: Option<&str>,
+    manifest_file: Option<&Utf8Path>,
 ) -> Result<i32> {
     let bytes = if envelope_path == "-" {
         let mut v = Vec::new();
@@ -433,6 +439,16 @@ pub fn verify(
                         p.core.result.state, p.core.result.tests
                     );
                     println!("  input root: {}", p.core.input_root);
+                    let manifest_ok = match verify_manifest(&p, manifest_file) {
+                        Ok(line) => {
+                            println!("  manifest: {line}");
+                            true
+                        }
+                        Err(line) => {
+                            println!("  manifest: INVALID: {line}");
+                            false
+                        }
+                    };
                     let expired = parse_rfc3339(&p.core.expires_at)
                         .map(|e| e <= now)
                         .unwrap_or(true);
@@ -442,7 +458,7 @@ pub fn verify(
                         p.core.expires_at,
                         if expired { " (EXPIRED)" } else { "" }
                     );
-                    Ok(if expired { 1 } else { 0 })
+                    Ok(if expired || !manifest_ok { 1 } else { 0 })
                 }
                 Err(e) => {
                     println!("  predicate is not a vci test predicate: {e}");
@@ -451,6 +467,53 @@ pub fn verify(
             }
         }
     }
+}
+
+/// The input manifest of a verified predicate, as one line for `vci
+/// verify`: what it holds and where it came from, or why it is not usable.
+fn verify_manifest(p: &VciPredicate, file: Option<&Utf8Path>) -> Result<String, String> {
+    let (m, source) = match (&p.core.manifest, &p.core.manifest_ref) {
+        (Some(m), None) => (m.clone(), "inline".to_owned()),
+        (None, Some(r)) if *r != p.core.input_root => {
+            return Err(format!(
+                "manifestRef {r} is not the input root {}",
+                p.core.input_root
+            ));
+        }
+        (None, Some(r)) => match file {
+            Some(f) => {
+                let bytes = std::fs::read(f).map_err(|e| format!("reading {f}: {e}"))?;
+                let m = vci_core::InputManifest::from_compact(&bytes)
+                    .or_else(|e| serde_json::from_slice(&bytes).map_err(|_| e))
+                    .map_err(|e| format!("{f}: {e}"))?;
+                (m, f.to_string())
+            }
+            None => {
+                let (repo, _) = open_repo().map_err(|e| {
+                    format!("manifest {r} is stored in the repository's git-meta store, and {e:#} (pass --manifest FILE)")
+                })?;
+                let stored = AttestStore::new(&repo).manifest(r);
+                let m = crate::plan::load_manifest(r, stored)
+                    .map_err(|(what, actual)| format!("{what} ({actual})"))?;
+                (m, format!("git-meta project {}", vci_git::manifest_key(r)))
+            }
+        },
+        (Some(_), Some(_)) => return Err("both manifest and manifestRef are set".to_owned()),
+        (None, None) => return Err("neither manifest nor manifestRef is set".to_owned()),
+    };
+    let root = m.root();
+    if root != p.core.input_root {
+        return Err(format!(
+            "{source}: its root {root} is not the signed input root {}",
+            p.core.input_root
+        ));
+    }
+    Ok(format!(
+        "{} entries, {} externals, {} env (root verified; {source})",
+        m.entries.len(),
+        m.externals.len(),
+        m.env.len()
+    ))
 }
 
 pub fn init(
@@ -854,7 +917,11 @@ pub fn fetch_messages(repo: &vci_git::Repo, remote: Option<&str>) -> Result<Vec<
 
 /// `vci prune`: delete attestations that have expired (git-meta tombstones,
 /// published by the next `vci push`). Only the claimed expiry is read; an
-/// envelope that cannot be parsed is left alone.
+/// envelope that cannot be parsed is left alone. Then delete the stored input
+/// manifests no remaining attestation references (`manifestRef`; one with
+/// its manifest inline references none), unless an attestation's value, or
+/// the `manifestRef` of one left alone, cannot be read (what it references
+/// is then unknown).
 pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let store = AttestStore::new(&repo);
@@ -864,7 +931,13 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
     // one vouches for inputs that tree no longer has (or soon will not).
     let mut newest: BTreeMap<(String, String), (i64, String)> = BTreeMap::new();
     let mut current = Vec::new();
+    // Manifests the remaining attestations reference; `None` once one of
+    // them cannot be read.
+    let mut referenced: Option<BTreeSet<String>> = Some(BTreeSet::new());
     for e in store.list(None)? {
+        if e.error.is_some() {
+            referenced = None;
+        }
         match envelope_meta(&e.bytes) {
             Some(m) if m.expires_at <= now => {
                 expired += 1;
@@ -877,6 +950,10 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
             }
             Some(m) => {
                 kept += 1;
+                if !superseded && let (Some(r), Some(set)) = (&m.manifest_ref, referenced.as_mut())
+                {
+                    set.insert(r.clone());
+                }
                 if superseded {
                     let slot = newest
                         .entry((m.test_id.clone(), e.signer.clone()))
@@ -887,11 +964,38 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
                     current.push((m, e));
                 }
             }
-            None => unreadable += 1,
+            None => {
+                unreadable += 1;
+                // Left alone, so whatever it references stays: the
+                // manifest it names when that much can be read, else none
+                // is removed.
+                let r = envelope_statement(&e.bytes).and_then(|v| {
+                    v["predicate"]["manifestRef"]
+                        .as_str()
+                        .filter(|r| {
+                            vci_git::parse_manifest_key(&vci_git::manifest_key(r)).is_some()
+                        })
+                        .map(str::to_owned)
+                });
+                match (r, referenced.as_mut()) {
+                    (Some(r), Some(set)) => {
+                        set.insert(r);
+                    }
+                    (Some(_), None) => {}
+                    (None, _) => referenced = None,
+                }
+            }
         }
     }
     for (m, e) in current {
-        if newest.get(&(m.test_id, e.signer.clone())).map(|n| &n.1) == Some(&e.key) {
+        if newest
+            .get(&(m.test_id.clone(), e.signer.clone()))
+            .map(|n| &n.1)
+            == Some(&e.key)
+        {
+            if let (Some(r), Some(set)) = (&m.manifest_ref, referenced.as_mut()) {
+                set.insert(r.clone());
+            }
             continue;
         }
         older += 1;
@@ -903,6 +1007,27 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
             println!("removed {} {} (superseded)", e.target, e.key);
         }
     }
+    let mut manifests = 0usize;
+    match &referenced {
+        Some(set) => {
+            for root in store.manifests()? {
+                if set.contains(&root) {
+                    continue;
+                }
+                manifests += 1;
+                let key = vci_git::manifest_key(&root);
+                if dry_run {
+                    println!("would remove project {key} (unreferenced manifest)");
+                } else {
+                    store.remove_manifest(&root)?;
+                    println!("removed project {key} (unreferenced manifest)");
+                }
+            }
+        }
+        None => eprintln!(
+            "vci prune: an attestation could not be read (run `vci fetch`), so no input manifest is removed"
+        ),
+    }
     eprintln!(
         "vci prune: {expired} expired{}{}, {kept} current, {unreadable} unreadable (left alone)",
         if superseded {
@@ -912,7 +1037,11 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
         },
         if dry_run { " (dry run)" } else { "" }
     );
-    if expired + older > 0 && !dry_run {
+    eprintln!(
+        "vci prune: {manifests} unreferenced input manifest(s){}",
+        if dry_run { " (dry run)" } else { " removed" }
+    );
+    if expired + older + manifests > 0 && !dry_run {
         eprintln!(
             "vci prune: run `vci push` to publish the deletions (`vci push --rewrite-history` also drops the deleted values from what a fetch downloads)"
         );
@@ -920,25 +1049,51 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// What `prune` reads from an envelope's payload (unverified).
-struct EnvelopeMeta {
-    test_id: String,
-    issued_at: i64,
-    expires_at: i64,
+/// What `prune` (and supersession on store) reads from an envelope's
+/// payload (unverified).
+pub(crate) struct EnvelopeMeta {
+    pub test_id: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    /// `commit` (empty when absent).
+    pub commit: String,
+    /// `toolchain.os` / `toolchain.arch` (empty when absent).
+    pub os: String,
+    pub arch: String,
+    /// The input manifest it references (`manifestRef`; `None` for an
+    /// attestation with its manifest inline, made before vci 1.9.0).
+    pub manifest_ref: Option<String>,
 }
 
-fn envelope_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
+/// An envelope's statement (unverified).
+fn envelope_statement(bytes: &[u8]) -> Option<serde_json::Value> {
     use base64::Engine as _;
     let env = Envelope::from_json(bytes).ok()?;
     let payload = base64::engine::general_purpose::STANDARD
         .decode(&env.payload)
         .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+/// The inline input manifest of an envelope made before vci 1.9.0
+/// (unverified).
+pub(crate) fn envelope_inline_manifest(bytes: &[u8]) -> Option<vci_core::InputManifest> {
+    let mut v = envelope_statement(bytes)?;
+    serde_json::from_value(v["predicate"]["manifest"].take()).ok()
+}
+
+pub(crate) fn envelope_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
+    let v = envelope_statement(bytes)?;
     let p = &v["predicate"];
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_owned();
     Some(EnvelopeMeta {
         test_id: p["testId"].as_str()?.to_owned(),
         issued_at: parse_rfc3339(p["issuedAt"].as_str()?).ok()?,
         expires_at: parse_rfc3339(p["expiresAt"].as_str()?).ok()?,
+        commit: s(&p["commit"]),
+        os: s(&p["toolchain"]["os"]),
+        arch: s(&p["toolchain"]["arch"]),
+        manifest_ref: p["manifestRef"].as_str().map(str::to_owned),
     })
 }
 

@@ -64,9 +64,23 @@ pub struct Predicate {
     pub tool_version: String, pub adapter: String, pub test_id: String, pub argv: Vec<String>,
     pub repo_id: String, pub commit: String, pub tree_dirty: bool,
     pub toolchain: Toolchain, pub global_input_root: String, pub input_root: String,
-    pub manifest: InputManifest, pub global_manifest: InputManifest,
+    pub manifest: Option<InputManifest>,   // inline: attestations made before vci 1.9.0 (omitted when None)
+    pub manifest_ref: Option<String>,      // `manifestRef`, since vci 1.9.0: = input_root; exactly one of the two is set
+    pub global_manifest: InputManifest,    // always inline
     pub result: TestResult, pub tainted: Vec<String>,
     pub issued_at: String, pub expires_at: String,   // RFC 3339 UTC
+}
+impl InputManifest {
+    // Compact encoding a manifest is stored in on its own (version 2; the root hashes entries, not these bytes):
+    // {"v":2,"entries":[[path,kind,size,hash,exec?],...],"externals":[[name,version],...],"env":[[key,hash|null],...]}
+    // to_compact writes no whitespace and the fields in this order, strings as serde_json escapes them, size an integer.
+    // kind: f file, l symlink, a absent, d dirListing, t dir (type only), x excluded; hash as recorded (lowercase
+    // hex); exec present (as 1) only when true; env hash null = unset (ABSENT_HASH); vectors in their order. E.g.
+    // {"v":2,"entries":[["a.txt","f",5,"<hex>"],["bin/run.sh","f",10,"<hex>",1],["missing.json","a",0,"<hex>"]],
+    //  "externals":[["vitest","5.0.2"]],"env":[["TZ","<hex>"],["HOME",null]]}
+    // from_compact rejects any other shape, version, kind or field, and paths that are not canonical RepoPaths.
+    pub fn to_compact(&self) -> String;
+    pub fn from_compact(bytes: &[u8]) -> Result<Self, ManifestError>;
 }
 pub const PREDICATE_TYPE: &str = "https://vci.dev/test-attestation/v1";
 pub fn test_key(test_id: &str) -> String;   // blake3 hex of test id, used as storage key
@@ -109,6 +123,9 @@ impl Repo {
     pub fn is_dirty(&self) -> Result<bool, GitError>;
     pub fn resolve(&self, rev: &str) -> Result<String, GitError>;
     pub fn merge_base(&self, a: &str, b: &str) -> Result<String, GitError>;
+    /// `old` is a strict ancestor of `new` and every branch, remote-tracking branch and tag containing `old` contains
+    /// `new` (the current branch's namesakes on the remotes excepted); false when either commit is unknown (shallow).
+    pub fn moved_on(&self, old: &str, new: &str) -> Result<bool, GitError>;
     /// `git show <rev>:<path>`; Ok(None) if the path doesn't exist at that rev.
     pub fn show_file(&self, rev: &str, path: &str) -> Result<Option<Vec<u8>>, GitError>;
 }
@@ -120,6 +137,7 @@ pub struct StoredEnvelope {
     pub bytes: Vec<u8>,       // the DSSE envelope, exactly as stored (empty when `error` is set)
     pub error: Option<String>,// the value could not be read (missing blob, unfetched value): fails only this candidate
 }
+pub struct StoredManifest { pub root: String, pub key: String, pub bytes: Vec<u8>, pub error: Option<String> }
 pub struct FetchOutcome { pub remote: String, pub found: bool, pub warnings: Vec<String>, pub notes: Vec<String> }
 pub enum PushStatus { Pushed, UpToDate, NothingStored }
 pub struct PushOutcome { pub remote: String, pub status: PushStatus, pub warnings: Vec<String>, pub notes: Vec<String> }
@@ -132,6 +150,14 @@ impl<'a> AttestStore<'a> {
     pub fn list(&self, test_id: Option<&str>) -> Result<Vec<StoredEnvelope>, GitError>;
     pub fn reader(&self) -> Result<Reader, GitError>;      // many per-unit lookups; read-only SQLite, no lock, creates nothing
     pub fn remove(&self, e: &StoredEnvelope) -> Result<bool, GitError>;   // git-meta tombstone
+    /// Deletes (one session) the envelopes of test_id by signer that `keep` rejects; returns them.
+    pub fn remove_for_signer(&self, test_id: &str, signer: &str, keep: impl Fn(&StoredEnvelope) -> bool)
+        -> Result<Vec<StoredEnvelope>, GitError>;
+    /// Input manifests: target `project`, key `vci:manifest:<root>`, value the compact encoding.
+    pub fn put_manifest(&self, root: &str, bytes: &[u8]) -> Result<bool, GitError>;  // false: identical bytes stored
+    pub fn manifest(&self, root: &str) -> Result<Option<StoredManifest>, GitError>; // Reader::manifest too
+    pub fn manifests(&self) -> Result<Vec<String>, GitError>;                       // stored roots, sorted
+    pub fn remove_manifest(&self, root: &str) -> Result<bool, GitError>;            // git-meta tombstone
     pub fn ensure_remote(&self, spec: Option<&str>) -> Result<String, GitError>;
     pub fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, GitError>; // git-meta pull
     pub fn push(&self, remote: Option<&str>) -> Result<PushOutcome, GitError>;   // git-meta push, retried
@@ -159,7 +185,10 @@ another git process wins a ref lock):
 Storage is [git-meta](https://git-meta.com/) (`git-meta-lib` 0.1.13, embedded): target `path:<unit path>` (the test id
 up to `#`; `project` when git-meta cannot hold it as a path target: `.` or shorter than 3 bytes), key
 `vci:attestation:<blake3(test_id)>:<signer>:<storage_key>`, value the envelope. `signer` is 16 lowercase hex chars and
-`storage_key` lowercase hex, both validated. Exchange is on `refs/<meta.namespace or meta>/main` with git-meta's merge;
+`storage_key` lowercase hex, both validated. Since vci 1.9.0 input manifests are stored on their own: target `project`,
+key `vci:manifest:<input root>`, value `InputManifest::to_compact` (not base64, not inside DSSE); written once per
+distinct root and shared by every attestation, unit and signer with that root. A stored manifest is trusted only when
+its recomputed root is the root an attestation signed. Exchange is on `refs/<meta.namespace or meta>/main` with git-meta's merge;
 transport is the git CLI with a scrubbed environment; the metadata commit vci rewrites for push uses a fixed
 committer identity, so it works where no git user is configured.
 
@@ -507,6 +536,8 @@ base commit's policy still waives every entry; an older vci, which knows only th
 host's cfg set), and for every adapter `declaredInputs` (the `[[inputs]] extra` globs of the test id, which must equal
 the base config's) and `envSet` (since vci 1.6.0: the names of the variables vci set from `[env] set`, whose manifest
 env entries hash the declared value; informational, older vci ignores it); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
+Since vci 1.9.0 `vci run` writes `manifestRef` (= `inputRoot`) and omits `manifest` (see "Manifests by reference"
+below); `globalManifest` is always inline.
 `input_root` is the per-file manifest root; `global_input_root` is the per-file global manifest root (lockfiles,
 package.json, `.npmrc`, config candidates and their relative references, tsconfig chain, `vci.toml`, the test's
 snapshot file, and the `NODE_OPTIONS` env hash; for pytest: `vci.toml`, `pyproject.toml`/`uv.lock`/`.python-version`/
@@ -520,6 +551,48 @@ test id, input root, global input root, env config digest, toolchain and argv (p
 project name, the Go, Rust and Rails toolchain fields, `platformSpecific`, `archSpecific`, `waived`, `cfgPredicates`, `declaredInputs` and a
 non-Vitest adapter name when set), so re-running with identical inputs replaces (renews) the
 stored envelope.
+
+Manifests by reference (since vci 1.9.0): the predicate carries `manifestRef` (= `inputRoot`) instead of `manifest`;
+`globalManifest` stays inline. `vci run` stores the manifest (`put_manifest`, a no-op when the store holds it) and then
+the attestation. Verification (`vci plan`, `explain`, `ci`) loads the manifest by `manifestRef` from the local store
+and requires its recomputed root to be `inputRoot`; a predicate with both or neither of `manifest`/`manifestRef`, or a
+`manifestRef` other than `inputRoot`, fails the `statement` check; a manifest that is missing (``manifest <root> not in
+the store: run `vci fetch` ``), unreadable or corrupt fails the `inputs` check: the unit runs. A pre-1.9 predicate (inline
+`manifest`) verifies as before; an older vci cannot deserialize a new predicate (no `manifest`), so the unit runs there.
+`vci verify` reads the referenced manifest from `--manifest FILE`, else from the store of the repository it runs in.
+
+Supersession on store (since vci 1.9.0): after storing an attestation, `vci run` deletes (git-meta tombstones,
+published by the next push) the same signer's other attestations of the same test id on the same `toolchain.os` and
+`toolchain.arch`, issued no later than the new one, whose manifest entries (files) differ from the new one's, made on
+a commit the new `commit` strictly descends from that no branch, remote-tracking branch or tag still contains without
+also containing the new commit (`Repo::moved_on`; the current branch's namesakes on the remotes, such as
+`origin/<branch>` not yet pushed to, are the same line of work): this line of history no longer has their files.
+Kept: other signers', other platforms' (a CI matrix sharing a key), later ones, ones made on the same commit (work in
+progress, which an edit may revert), on a commit the new one does not descend from (another branch or pull request),
+on one another ref still contains (`main` under a feature branch: every branch made from it needs it) or one this
+clone does not have (a shallow clone), ones with the same entries (another environment or toolchain on this tree),
+and ones whose payload or manifest cannot be read. It then deletes the stored manifests the deleted attestations
+referenced that no attestation left in the store references (none when one cannot be read). `vci prune` (also with
+`--superseded`) deletes the stored manifests no remaining attestation's `manifestRef` names (none when an
+attestation's value, or the `manifestRef` of one it leaves alone because its payload cannot be parsed, cannot be
+read).
+
+A clone deletes a manifest knowing only its own attestations, so another clone may hold or have published one that
+references it. Every merge of a fetched tip (`vci fetch`, `vci push`, `--fetch`) puts back the manifests it leaves
+deleted although an attestation in the store references them, from the fetched tip or the local metadata commit
+before the merge (bytes whose recomputed root is the key's), so the next push publishes them again ("put back N input
+manifest(s)" note). Only manifests the merge deleted, or that the store deleted while the tip still has them, are
+candidates: a merge that deletes no manifest reads no attestation.
+
+Incremental merge (since vci 1.9.0): when the store was materialized from the primary metadata remote before and
+`refs/<ns>/local/main` is an ancestor of the fetched tip, vci applies only what `git diff-tree` reports between the two
+trees (git-meta's materialize parses both trees in full), with git-meta's fast-forward result: new and changed values
+and deletion records, git-meta's legacy delete for values the tip no longer has, every deletion record of the tip that
+the store holds with another time or email set back to the tip's, the local ref moved to the tip. The first fetch, a
+side remote (`remote.<name>.metaside`, imported by git-meta as rows of their own), local metadata commits and any
+entry it does not read the way git-meta does go through git-meta's materialize. After git-meta's merge, a local ref
+whose tree is exactly the tip's (such as after the remote's history was rewritten) is pointed at the tip, so the next
+fetch is incremental again and a push has nothing to send.
 
 ## Environment variables
 

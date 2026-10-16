@@ -294,7 +294,10 @@ pub fn toolchain_for(adapter: &str, v: &vci_adapter::ToolVersions) -> Toolchain 
 }
 
 struct Attestable {
+    /// The predicate to sign: the manifest by reference (`manifestRef`).
     predicate: VciPredicate,
+    /// The input manifest it references, stored on its own.
+    manifest: InputManifest,
 }
 
 /// Collector versions vs the project's, per adapter.
@@ -866,7 +869,8 @@ fn check_one(
         toolchain: toolchain_for(adapter.name(), versions),
         global_input_root: gm.root(),
         input_root: manifest.root(),
-        manifest,
+        manifest: None,
+        manifest_ref: Some(manifest.root()),
         global_manifest: gm,
         result,
         tainted: vec![],
@@ -887,6 +891,7 @@ fn check_one(
             declared_inputs: declared,
             env_set: fenv.set.keys().cloned().collect(),
         },
+        manifest,
     })
 }
 
@@ -1480,6 +1485,11 @@ pub fn run_units(
     let store = AttestStore::new(&ctx.repo);
     let mut attested = 0;
     let mut refused = 0;
+    let mut superseded = 0usize;
+    // Supersession's answers per earlier commit, and the input roots of the
+    // attestations it deleted.
+    let moved_on = std::cell::RefCell::new(BTreeMap::new());
+    let mut dropped_roots = BTreeSet::new();
     let mut outcomes: Vec<UnitOutcome> = Vec::new();
     let mut exit: Option<i32> = Some(0);
     for &pi in &involved {
@@ -1619,12 +1629,12 @@ pub fn run_units(
                 }
                 Ok(a) => {
                     let p = &a.predicate;
-                    for w in junk_in_listings(&ctx.root, &p.core.manifest) {
+                    for w in junk_in_listings(&ctx.root, &a.manifest) {
                         eprintln!("vci: warning: {label}: {w}");
                     }
                     // Stripped (absent on both sides) or set by vci, CI is
                     // the same everywhere; taken from the machine, it is not.
-                    if p.core.manifest.env.iter().any(|e| e.key == "CI")
+                    if a.manifest.env.iter().any(|e| e.key == "CI")
                         && project.project_env().classify("CI") == crate::envpolicy::EnvClass::Hash
                     {
                         eprintln!(
@@ -1637,7 +1647,7 @@ pub fn run_units(
                         );
                     }
                     if matches!(project.adapter.name(), "cargo" | "rails" | "node-test") {
-                        let ignored = ignored_inputs(&ctx.root, &p.core.manifest);
+                        let ignored = ignored_inputs(&ctx.root, &a.manifest);
                         if !ignored.is_empty() {
                             let why = if project.adapter.name() == "cargo" {
                                 "every file in a package directory is an input"
@@ -1678,7 +1688,23 @@ pub fn run_units(
                         );
                         let env = sign_statement(&stmt, &key.path)
                             .with_context(|| format!("signing with {}", key.path))?;
-                        Ok(store.put(&p.core.test_id, &signer, &skey, &env.to_json())?)
+                        // The manifest first: an attestation is never stored
+                        // without the manifest it references.
+                        store
+                            .put_manifest(&p.core.input_root, a.manifest.to_compact().as_bytes())
+                            .context("storing the input manifest")?;
+                        let stored = store.put(&p.core.test_id, &signer, &skey, &env.to_json())?;
+                        superseded += supersede(
+                            &store,
+                            &ctx.repo,
+                            p,
+                            &a.manifest,
+                            &signer,
+                            &stored.key,
+                            &moved_on,
+                            &mut dropped_roots,
+                        );
+                        Ok(stored)
                     })();
                     let stored = match signed {
                         Ok(s) => s,
@@ -1715,7 +1741,7 @@ pub fn run_units(
                     };
                     eprintln!(
                         "vci: attested {label}{waived} ({} inputs, root {}) as git-meta {} {}",
-                        p.core.manifest.entries.len(),
+                        a.manifest.entries.len(),
                         &p.core.input_root[..16],
                         stored.target,
                         stored.key
@@ -1738,6 +1764,17 @@ pub fn run_units(
         }
     }
     eprintln!("vci: {attested} attested, {refused} not attested");
+    if superseded > 0 {
+        eprintln!(
+            "vci: removed {superseded} superseded attestation(s) (earlier ones of the same units by the same signer and platform, made on a commit this one descends from that no other branch or tag contains, of files the tree no longer has)"
+        );
+        let orphans = drop_orphan_manifests(&store, &dropped_roots);
+        if orphans > 0 {
+            eprintln!(
+                "vci: removed {orphans} input manifest(s) no attestation references any more"
+            );
+        }
+    }
     let counts = reason_counts(&outcomes);
     if !counts.is_empty() {
         eprintln!("vci: why not attested (files per reason; a file can have several):");
@@ -1764,6 +1801,141 @@ pub fn run_units(
             })
             .collect(),
     })
+}
+
+/// Supersession on store: delete this signer's earlier attestations of the
+/// same unit from the local store when they vouch for files this line of
+/// history no longer has: made on a commit that `new commit` descends from
+/// and that no other branch or tag still contains ([`vci_git::Repo::moved_on`]),
+/// and their manifest's entries differ from the new one's. The signer
+/// re-attesting is the newest truth for that line, so the published tree
+/// keeps one attestation per unit and signer as commits go by, without a
+/// separate `vci prune --superseded`. Kept: one made on the same commit (work
+/// in progress: an edit may be reverted), on a commit this one does not
+/// descend from (another branch or pull request) or one another ref still
+/// contains (`main` under a feature branch: every branch made from it needs
+/// it), one issued later than this one (another machine with the same key),
+/// one for another OS or architecture (a CI matrix sharing a key:
+/// platform-specific files differ), one with the same entries (another
+/// environment or toolchain on this tree), and one whose payload or manifest
+/// cannot be read. Failing to delete is only a warning: a kept attestation is
+/// verified like any other. Returns how many were deleted, and adds the
+/// input roots they referenced to `dropped_roots`.
+#[allow(clippy::too_many_arguments)]
+fn supersede(
+    store: &AttestStore,
+    repo: &vci_git::Repo,
+    p: &VciPredicate,
+    manifest: &InputManifest,
+    signer: &str,
+    keep_key: &str,
+    moved_on: &std::cell::RefCell<BTreeMap<String, bool>>,
+    dropped_roots: &mut BTreeSet<String>,
+) -> usize {
+    let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
+    let tc = &p.core.toolchain;
+    let mut entries: Vec<&vci_core::InputEntry> = manifest.entries.iter().collect();
+    entries.sort();
+    let keep = |e: &vci_git::StoredEnvelope| {
+        if e.key == keep_key || e.error.is_some() {
+            return true;
+        }
+        let Some(m) = crate::cmds::envelope_meta(&e.bytes) else {
+            return true;
+        };
+        if m.test_id != p.core.test_id
+            || m.commit == p.core.commit
+            || m.os != tc.os
+            || m.arch != tc.arch
+            || issued.is_none_or(|i| m.issued_at > i)
+        {
+            return true;
+        }
+        let old = match &m.manifest_ref {
+            Some(r) => store
+                .manifest(r)
+                .ok()
+                .flatten()
+                .filter(|s| s.error.is_none())
+                .and_then(|s| InputManifest::from_compact(&s.bytes).ok())
+                .filter(|o| o.root() == *r),
+            None => crate::cmds::envelope_inline_manifest(&e.bytes),
+        };
+        let Some(old) = old else {
+            return true;
+        };
+        let mut old_entries: Vec<&vci_core::InputEntry> = old.entries.iter().collect();
+        old_entries.sort();
+        if old_entries == entries {
+            return true;
+        }
+        // Last, as the only check that runs git: one answer per commit.
+        let cached = moved_on.borrow().get(&m.commit).copied();
+        let moved = cached.unwrap_or_else(|| {
+            let moved = repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false);
+            moved_on.borrow_mut().insert(m.commit.clone(), moved);
+            moved
+        });
+        !moved
+    };
+    match store.remove_for_signer(&p.core.test_id, signer, keep) {
+        Ok(removed) => {
+            for e in &removed {
+                if let Some(r) = crate::cmds::envelope_meta(&e.bytes).and_then(|m| m.manifest_ref) {
+                    dropped_roots.insert(r);
+                }
+            }
+            removed.len()
+        }
+        Err(e) => {
+            eprintln!(
+                "vci: warning: {}: cannot remove superseded attestations: {e}",
+                p.core.test_id
+            );
+            0
+        }
+    }
+}
+
+/// After supersession: delete the stored input manifests in `roots` that no
+/// attestation left in the store references (a tombstone each, published by
+/// the next `vci push`), so the published tree does not keep one orphan
+/// manifest per changed unit and commit. None is deleted when an
+/// attestation's value or payload cannot be read (what it references is
+/// then unknown). A clone that still holds an attestation referencing one of
+/// them (made, or fetched, before it sees the deletion) puts the manifest
+/// back when it merges the deletion in (see `vci fetch`). Returns how many
+/// were deleted.
+fn drop_orphan_manifests(store: &AttestStore, roots: &BTreeSet<String>) -> usize {
+    if roots.is_empty() {
+        return 0;
+    }
+    let all = match store.list(None) {
+        Ok(all) => all,
+        Err(e) => {
+            eprintln!("vci: warning: cannot read the store to remove unreferenced manifests: {e}");
+            return 0;
+        }
+    };
+    let mut referenced = BTreeSet::new();
+    for e in &all {
+        if e.error.is_some() {
+            return 0;
+        }
+        match crate::cmds::envelope_meta(&e.bytes) {
+            Some(m) => referenced.extend(m.manifest_ref),
+            None => return 0,
+        }
+    }
+    let mut n = 0;
+    for r in roots.difference(&referenced) {
+        match store.remove_manifest(r) {
+            Ok(true) => n += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("vci: warning: cannot remove the input manifest {r}: {e}"),
+        }
+    }
+    n
 }
 
 /// The units [`Selection::Units`] names, as indexes into `files`. A test id

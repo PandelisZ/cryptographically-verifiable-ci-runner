@@ -1852,6 +1852,19 @@ fn an_unreadable_value_runs_only_its_unit_and_plan_reads_a_read_only_git_dir() {
         w.git(&fresh, &["update-ref", "-d", r]);
     }
     w.git(&fresh, &["update-ref", "refs/keep/c", &c_blob]);
+    // Since vci 1.9.0 the input manifests are values of their own: keep
+    // them (C's is needed to skip C).
+    for (i, l) in tree
+        .lines()
+        .filter(|l| l.contains("\tproject/vci/manifest/"))
+        .enumerate()
+    {
+        let blob = l.split_whitespace().nth(2).unwrap();
+        w.git(
+            &fresh,
+            &["update-ref", &format!("refs/keep/manifest-{i}"), blob],
+        );
+    }
     w.git(&fresh, &["reflog", "expire", "--expire=now", "--all"]);
     w.git(&fresh, &["gc", "-q", "--prune=now"]);
     let out = w.vci(&fresh, &["plan", "--base-ref", "main"]);
@@ -2086,4 +2099,112 @@ test("env", () => {
         "src/env.test.ts",
         &["src/env.test.ts"],
     );
+}
+
+/// A clone that fetched before merges only what later pushes changed: after
+/// new attestations and a deletion (`vci prune --superseded`, `vci push`),
+/// its plan, `vci explain` and stored attestations match a fresh clone's;
+/// a changed entry the incremental merge does not read (a git-meta set
+/// value) is merged in full by git-meta, with the same result.
+#[test]
+fn a_clone_that_fetched_before_merges_what_changed_like_a_fresh_clone() {
+    let w = World::new();
+    let work = w.work.clone();
+    let key = w.trusted.to_str().unwrap();
+    w.run(&work, B, &w.trusted);
+    w.run(&work, C, &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+
+    let clone = |name: &str| -> PathBuf {
+        let dir = w.base.join(name);
+        w.git(
+            &w.base,
+            &[
+                "clone",
+                "-q",
+                w.remote.to_str().unwrap(),
+                dir.to_str().unwrap(),
+            ],
+        );
+        w.install_node_modules(&dir);
+        w.git(&dir, &["checkout", "-q", "feature"]);
+        dir
+    };
+    let fetch = |dir: &Path| -> String {
+        let out = w.vci_with(
+            dir,
+            &["fetch", "--remote", "origin"],
+            &[("VCI_TIMING", Path::new("1"))],
+        );
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let stored = |dir: &Path| -> Vec<(String, String, Vec<u8>)> {
+        let repo = store_for(dir);
+        AttestStore::new(&repo)
+            .list(None)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.target, e.key, e.bytes))
+            .collect()
+    };
+    let b = clone("b");
+    let first = fetch(&b);
+    assert!(first.contains("materialize (full)"), "{first}");
+    assert_eq!(w.plan(&b, "main").skip, set(&[B, C]));
+
+    // A changes C's input and attests C again and A; the superseded C
+    // attestation is deleted and the deletion published.
+    let c_src = w.read("src/c.ts");
+    w.write("src/c.ts", &format!("{c_src}// changed\n"));
+    w.git(&work, &["commit", "-q", "-am", "change c"]);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["run", C, "--key", key]);
+    w.vci_ok(&work, &["run", A, "--key", key]);
+    w.vci_ok(&work, &["prune", "--superseded"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let tree = w.git(
+        &w.remote,
+        &["ls-tree", "-r", "--name-only", "refs/meta/main"],
+    );
+    assert!(
+        tree.contains("path/src/c.test.ts/__target__/__tombstones/vci"),
+        "{tree}"
+    );
+    assert_eq!(stored(&work).len(), 3, "A, B and the new C");
+
+    w.git(&b, &["fetch", "-q", "origin"]);
+    w.git(&b, &["merge", "-q", "--ff-only", "origin/feature"]);
+    let second = fetch(&b);
+    assert!(second.contains("materialize (incremental"), "{second}");
+    let fresh = clone("fresh");
+    assert!(fetch(&fresh).contains("materialize (full)"));
+    let plan = w.plan(&b, "main");
+    assert_eq!(plan.skip, set(&[A, B, C]), "{plan:?}");
+    assert_eq!(plan, w.plan(&fresh, "main"));
+    assert_eq!(w.explain(&b, C, "main"), w.explain(&fresh, C, "main"));
+    assert_eq!(stored(&b), stored(&fresh));
+    assert_eq!(stored(&b), stored(&work));
+
+    // A git-meta set value is not read incrementally: git-meta merges it.
+    let s = git_meta_lib::Session::open(&work).unwrap();
+    s.target(&git_meta_lib::Target::project())
+        .set_add("reviewers", "someone@example.com")
+        .unwrap();
+    drop(s);
+    w.vci_ok(&work, &["run", D, "--key", key]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let third = fetch(&b);
+    assert!(
+        third.contains("materialize (full)")
+            && third.contains("merged the fetched metadata in full"),
+        "{third}"
+    );
+    let fresh2 = clone("fresh2");
+    fetch(&fresh2);
+    let plan = w.plan(&b, "main");
+    assert_eq!(plan.skip, set(&[A, B, C, D]), "{plan:?}");
+    assert_eq!(plan, w.plan(&fresh2, "main"));
+    assert_eq!(stored(&b), stored(&fresh2));
 }

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
 use vci_core::{InputManifest, PREDICATE_TYPE};
-use vci_git::{AttestStore, Repo, StoredEnvelope};
+use vci_git::{AttestStore, Reader, Repo, StoredEnvelope, StoredManifest};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
 use crate::ctx::{Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo};
@@ -322,6 +322,70 @@ struct Verifier<'a> {
     /// boot of the application: once per project, and none when no candidate
     /// records a native library).
     natives: std::sync::OnceLock<Result<vci_adapter::InstalledExternals, String>>,
+    /// The input manifests candidates reference, read from the local store.
+    manifests: ManifestLoader,
+}
+
+/// Why a referenced input manifest cannot be used, as the `what` and
+/// `actual` of a failed check's detail.
+pub(crate) type ManifestUnavailable = (String, String);
+
+/// Decode the input manifest an attestation references (`manifestRef`)
+/// from what the store returned for it. Its root is not checked here: the
+/// caller compares it with the signed `inputRoot`.
+pub(crate) fn load_manifest(
+    root: &str,
+    stored: Result<Option<StoredManifest>, vci_git::GitError>,
+) -> Result<InputManifest, ManifestUnavailable> {
+    match stored {
+        Err(e) => Err((
+            format!("manifest {root} cannot be read from the store"),
+            e.to_string(),
+        )),
+        Ok(None) => Err((
+            format!("manifest {root} not in the store: run `vci fetch`"),
+            "missing from the local git-meta store".to_owned(),
+        )),
+        Ok(Some(m)) => match m.error {
+            Some(e) => Err((format!("manifest {root} unreadable"), e)),
+            None => InputManifest::from_compact(&m.bytes)
+                .map_err(|e| (format!("manifest {root} corrupt"), e.to_string())),
+        },
+    }
+}
+
+/// Reads (once each) the input manifests a project's candidates reference,
+/// through one store reader opened on first use.
+#[derive(Default)]
+struct ManifestLoader {
+    #[allow(clippy::type_complexity)]
+    inner: std::sync::Mutex<(
+        Option<Result<Reader, String>>,
+        BTreeMap<String, Result<std::sync::Arc<InputManifest>, ManifestUnavailable>>,
+    )>,
+}
+
+impl ManifestLoader {
+    fn load(
+        &self,
+        repo: &Repo,
+        root: &str,
+    ) -> Result<std::sync::Arc<InputManifest>, ManifestUnavailable> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let (reader, cache) = &mut *guard;
+        if let Some(r) = cache.get(root) {
+            return r.clone();
+        }
+        let reader = reader
+            .get_or_insert_with(|| AttestStore::new(repo).reader().map_err(|e| e.to_string()));
+        let stored = match reader {
+            Ok(r) => r.manifest(root),
+            Err(e) => Err(vci_git::GitError::Store(e.clone())),
+        };
+        let r = load_manifest(root, stored).map(std::sync::Arc::new);
+        cache.insert(root.to_owned(), r.clone());
+        r
+    }
 }
 
 impl Verifier<'_> {
@@ -802,6 +866,7 @@ fn plan_with(
                     cargo_lock: r.cargo_lock,
                     rails_gems: r.rails_gems,
                     natives: std::sync::OnceLock::new(),
+                    manifests: ManifestLoader::default(),
                 }),
             },
         )
@@ -1073,6 +1138,42 @@ impl Verifier<'_> {
         })?;
         info.issued_at = Some(p.core.issued_at.clone());
         info.expires_at = Some(p.core.expires_at.clone());
+        // The input manifest: inline (before vci 1.9.0) or by reference to
+        // the signed input root, exactly one of them.
+        match (&p.core.manifest, &p.core.manifest_ref) {
+            (Some(_), None) => {}
+            (None, Some(r)) if *r == p.core.input_root => {}
+            (None, Some(r)) => {
+                return Err(Failure::one(
+                    "statement",
+                    4,
+                    "manifestRef",
+                    r.clone(),
+                    format!("{} (inputRoot)", p.core.input_root),
+                ));
+            }
+            (m, r) => {
+                return Err(Failure::one(
+                    "statement",
+                    4,
+                    "manifest / manifestRef",
+                    format!(
+                        "{} and {}",
+                        if m.is_some() {
+                            "manifest"
+                        } else {
+                            "no manifest"
+                        },
+                        if r.is_some() {
+                            "manifestRef"
+                        } else {
+                            "no manifestRef"
+                        }
+                    ),
+                    "exactly one of manifest and manifestRef",
+                ));
+            }
+        }
         let subject_ok = st.subject.len() == 1
             && st.subject[0].name == p.core.test_id
             && st.subject[0].digest.get("blake3") == Some(&p.core.input_root);
@@ -1371,8 +1472,39 @@ impl Verifier<'_> {
             }
         }
 
-        // Per-file inputs.
-        let m = &p.core.manifest;
+        // Per-file inputs: the manifest inline, or the stored one the
+        // attestation references (trusted only through the signed root).
+        let loaded;
+        let m: &InputManifest = match (&p.core.manifest, &p.core.manifest_ref) {
+            (Some(m), _) => m,
+            (None, Some(r)) => {
+                loaded = self
+                    .manifests
+                    .load(&self.ctx.repo, r)
+                    .map_err(|(what, actual)| {
+                        Failure::one(
+                            "inputs",
+                            15,
+                            what,
+                            format!(
+                                "the input manifest, git-meta project {}",
+                                vci_git::manifest_key(r)
+                            ),
+                            actual,
+                        )
+                    })?;
+                &loaded
+            }
+            (None, None) => {
+                return Err(Failure::one(
+                    "statement",
+                    4,
+                    "manifest / manifestRef",
+                    "neither",
+                    "exactly one of manifest and manifestRef",
+                ));
+            }
+        };
         if m.root() != p.core.input_root {
             return Err(Failure::one(
                 "inputs",
