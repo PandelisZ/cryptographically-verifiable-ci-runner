@@ -1,6 +1,6 @@
 ---
 name: vci-setup
-description: Set up vci for the current engineer in the current repository: install or upgrade the vci CLI (brew install pandelisz/tap/vci), get their GitHub SSH key trusted in .vci/allowed_signers (open the pull request if asked), check the environment, verify with vci plan, and explain the per-change loop (vci run, vci plan, vci push). Use when someone says "set up vci", "onboard me to vci", "get my key trusted", "install vci", or after installing the vci plugin.
+description: "Set up vci for the current engineer in the current repository: install or upgrade the vci CLI (brew install pandelisz/tap/vci), get their GitHub SSH key trusted in .vci/allowed_signers (open the pull request if asked), check the environment, verify with vci plan, and explain the per-change loop (vci run, vci plan, vci push). Use when someone says 'set up vci', 'onboard me to vci', 'get my key trusted', 'install vci', or after installing the vci plugin."
 compatibility: Needs the vci CLI (brew install pandelisz/tap/vci), git, gh and ssh-keygen.
 metadata:
   homepage: https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
