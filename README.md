@@ -168,7 +168,7 @@ npx skills add PandelisZ/cryptographically-verifiable-ci-runner
 
 Or per tool:
 
-- **Claude Code** (plugin, adds `/vci-setup` too):
+- **Claude Code** (plugin; the skills are also slash commands, `/vci-setup`):
 
   ```sh
   claude plugin marketplace add PandelisZ/cryptographically-verifiable-ci-runner
