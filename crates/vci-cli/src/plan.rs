@@ -1256,17 +1256,25 @@ impl Verifier<'_> {
             ));
         }
 
-        // Result.
-        if !p.core.result.is_pass() || !p.core.tainted.is_empty() {
+        // Result. A pass with skipped tests counts only when the attestation
+        // recorded the skips as waived (`result:skipped`), which the base
+        // policy must still waive (below).
+        let r = &p.core.result;
+        let skips_waived = r.state == "passed"
+            && r.failed == 0
+            && p.waived
+                .iter()
+                .any(|w| w.starts_with(crate::run::RESULT_SKIPPED_TAINT));
+        if !(r.is_pass() || skips_waived) || !p.core.tainted.is_empty() {
             return Err(Failure::one(
                 "result",
                 12,
                 "result",
                 format!(
-                    "{} failed={} tainted={:?}",
-                    p.core.result.state, p.core.result.failed, p.core.tainted
+                    "{} failed={} skipped={} tainted={:?}",
+                    r.state, r.failed, r.skipped, p.core.tainted
                 ),
-                "passed, untainted (required)",
+                "passed, untainted (required; skipped tests only with policy.ignore_taints waiving result:skipped)",
             ));
         }
         // Declared inputs (`[[inputs]]`) must be exactly the base config's:
@@ -2118,6 +2126,36 @@ mod tests {
             .len(),
             3
         );
+    }
+
+    /// vci's own refusals recorded as waived: each by its key.
+    #[test]
+    fn outside_writes_and_skips_need_the_base_policy() {
+        let waived: Vec<String> = [
+            "outside-repository:/proc/sys/net/core/somaxconn",
+            "wrote-inside-repository: web/node_modules/other.txt",
+            "result:skipped:1 of 4",
+        ]
+        .map(String::from)
+        .to_vec();
+        let p = policy(
+            "adapter = \"pytest\"\n[policy]\nignore_taints = [\"outside-repository\", \"wrote-inside-repository\", \"result:skipped\"]\n",
+        );
+        assert!(not_waived(&p, "pytest", &[], &waived).is_empty());
+        let p = policy("adapter = \"pytest\"\n[policy]\nignore_taints = [\"*\"]\n");
+        assert!(not_waived(&p, "pytest", &[], &waived).is_empty());
+        let p =
+            policy("adapter = \"pytest\"\n[policy]\nignore_taints = [\"outside-repository\"]\n");
+        let d = not_waived(&p, "pytest", &[], &waived);
+        let what: Vec<&str> = d.iter().map(|d| d.what.as_str()).collect();
+        assert_eq!(
+            what,
+            [
+                "waived taint wrote-inside-repository",
+                "waived taint result:skipped"
+            ]
+        );
+        assert_eq!(d[1].expected, "result:skipped:1 of 4");
     }
 
     #[test]

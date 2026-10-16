@@ -58,7 +58,8 @@ pub struct Toolchain {                  // adapter-specific; unused fields are e
 }
 impl Toolchain { pub fn diff(&self, now: &Toolchain) -> Vec<(&'static str, String, String)>; } // node by major, go_arch_level on the same arch, rust_host/rust_cfg on the same platform, rest exact (Rails fields all exact)
 pub struct TestResult { pub state: String /* "passed" | "failed" */, pub tests: u32, pub failed: u32, pub skipped: u32, pub duration_ms: u64 }
-// is_pass(): state == "passed" && failed == 0 && skipped == 0 (a skipped or xfailed test did not run)
+// is_pass(): state == "passed" && failed == 0 && skipped == 0 (a skipped or xfailed test did not run; since 1.7.1 a
+// "passed" result with skips is accepted when the predicate's `waived` holds `result:skipped:<n> of <m>`)
 pub struct Predicate {
     pub tool_version: String, pub adapter: String, pub test_id: String, pub argv: Vec<String>,
     pub repo_id: String, pub commit: String, pub tree_dirty: bool,
@@ -484,7 +485,12 @@ attestation then needs the same architecture) and `waived` (every adapter, since
 collector reported them, that a policy waived: `policy.ignore_taints`, whose glob patterns match a taint's reason key
 `category:kind` (`vci_cli::run::taint_key`; `*` matches any run of characters, a pattern without `:` also matches
 its category, `vci:` taints are never waived), `policy.go_allow_net` for `go:net:`, or for Cargo's
-`cargo:undeclared-reads` declared `[[inputs]]`. `vci plan`'s `waived` check accepts the attestation only while the
+`cargo:undeclared-reads` declared `[[inputs]]`. Since vci 1.7.1 `vci run` adds entries of its own for three refusals
+`policy.ignore_taints` waives by key: `outside-repository:<absolute path>` (a read outside the repository, one entry
+per path; the path is not in the manifest), `wrote-inside-repository: <path>, <path>` (repository-relative paths the
+unit wrote; not inputs) and `result:skipped:<skipped> of <tests>` (a `passed` result with `failed` 0 and `skipped`
+above 0, which `vci plan`'s result check accepts only with this entry present; a pre-1.7.1 `vci plan` refuses such a
+result). `vci plan`'s `waived` check accepts the attestation only while the
 base commit's policy still waives every entry; an older vci, which knows only the last two, refuses an entry
 `ignore_taints` waived. An old envelope's `rails:network-db:` entry, written under the removed
 `policy.rails_allow_db`, is still deserialised and never accepted), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying

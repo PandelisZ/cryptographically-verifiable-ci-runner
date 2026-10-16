@@ -643,10 +643,7 @@ fn run_refuses_unattestable_test_files() {
         stderr.contains("vci: why not attested (files per reason; a file can have several):"),
         "{stderr}"
     );
-    assert!(
-        stderr.contains(" input outside the repository\n"),
-        "{stderr}"
-    );
+    assert!(stderr.contains(" outside-repository\n"), "{stderr}");
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
     assert_eq!(v["attested"], 0);
     assert_eq!(v["notAttested"], 10);
@@ -662,21 +659,18 @@ fn run_refuses_unattestable_test_files() {
             .map(|r| r.as_str().unwrap().to_owned())
             .collect()
     };
-    assert_eq!(
-        reasons_of("src/outside.test.mjs"),
-        ["input outside the repository"]
-    );
+    assert_eq!(reasons_of("src/outside.test.mjs"), ["outside-repository"]);
     assert_eq!(reasons_of("src/fail.test.mjs"), ["result failed"]);
     assert_eq!(
         reasons_of("src/write.test.mjs"),
-        ["wrote inside the repository"]
+        ["wrote-inside-repository"]
     );
     assert!(
         v["reasons"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r["reason"] == "input outside the repository" && r["files"] == 1),
+            .any(|r| r["reason"] == "outside-repository" && r["files"] == 1),
         "{v}"
     );
     assert!(
@@ -804,6 +798,137 @@ fn ignore_taints_attests_while_the_base_policy_waives() {
         "{ex}"
     );
     assert!(!ex.contains("waived taint process.env.enumerate"), "{ex}");
+}
+
+/// vci's own refusals that `policy.ignore_taints` waives: a read outside the
+/// repository (`outside-repository`: not hashed, recorded as waived) and a
+/// write inside it (`wrote-inside-repository`). Writes to tool caches under
+/// node_modules (`.vite`, `.vite-temp`, `.cache`) need no policy.
+#[test]
+fn ignore_taints_waives_outside_reads_and_writes() {
+    let w = World::new();
+    let work = w.work.clone();
+    let outside_t = "src/outside.test.mjs";
+    let write_t = "src/write.test.mjs";
+    let vite_t = "src/vite.test.mjs";
+    w.write(
+        outside_t,
+        "import { test } from 'node:test';\nimport fs from 'node:fs';\ntest('a', () => { fs.readFileSync(process.env.VCI_E2E_OUTSIDE); });\n",
+    );
+    w.write(
+        write_t,
+        "import { test } from 'node:test';\nimport fs from 'node:fs';\ntest('a', () => { fs.writeFileSync(new URL('../node_modules/other.txt', import.meta.url), 'x'); });\n",
+    );
+    w.write(
+        vite_t,
+        "import { test } from 'node:test';\nimport fs from 'node:fs';\ntest('a', () => {\n  for (const d of ['.vite/deps_temp_1', '.vite-temp', '.cache/x']) {\n    const u = new URL(`../node_modules/${d}/`, import.meta.url);\n    fs.mkdirSync(u, { recursive: true });\n    fs.writeFileSync(new URL('f.js', u), 'x');\n  }\n});\n",
+    );
+    let outside = w.base.join("outside.txt");
+    std::fs::write(&outside, "outside the repository").unwrap();
+    let outside_s = outside.to_str().unwrap();
+    // The test reads the variable: it is hashed, so plan sees it too.
+    let env = [("VCI_E2E_OUTSIDE", Some(outside_s))];
+    let plan = |base: &str| w.plan_env(&work, base, &env);
+    let explain = |base: &str| {
+        let out = w.vci_env(&work, &["explain", outside_t, "--base-ref", base], &env);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let run = |files: &[&str]| {
+        let mut args = vec!["run"];
+        args.extend(files);
+        args.extend(["--key", w.trusted.to_str().unwrap()]);
+        let out = w.vci_env(&work, &args, &env);
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // No policy: the tool caches are not writes; the others are refused,
+    // keyed by the pattern that would waive them.
+    let stderr = run(&[outside_t, write_t, vite_t]);
+    assert!(
+        stderr.contains(&format!("vci: attested {vite_t} (")),
+        "{stderr}"
+    );
+    assert!(
+        refused_line(&stderr, outside_t)
+            .ends_with(&format!(": input outside the repository: {outside_s}")),
+        "{stderr}"
+    );
+    assert!(
+        refused_line(&stderr, write_t)
+            .ends_with(": wrote inside the repository: node_modules/other.txt"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(" outside-repository\n"), "{stderr}");
+    assert!(stderr.contains(" wrote-inside-repository\n"), "{stderr}");
+    assert!(plan("main").skip.contains(vite_t));
+
+    // outside-repository waived: attested, the path not hashed.
+    w.write(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"outside-repository\"]",
+        ),
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "accept reads outside"]);
+    let stderr = run(&[outside_t, write_t]);
+    assert!(
+        stderr.contains(&format!(
+            "vci: attested {outside_t} (waived: outside-repository) ("
+        )),
+        "{stderr}"
+    );
+    refused_line(&stderr, write_t);
+    let preds = predicates(&work, outside_t);
+    assert_eq!(preds.len(), 1);
+    assert_eq!(
+        preds[0]["waived"],
+        serde_json::json!([format!("outside-repository:{outside_s}")])
+    );
+    let entries = preds[0]["manifest"]["entries"].as_array().unwrap();
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e["path"].as_str().unwrap().contains("outside")
+                && e["path"].as_str().unwrap() != outside_t),
+        "{entries:?}"
+    );
+    let with_key = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(plan(&with_key).skip.contains(outside_t));
+    // A base without the key runs it, and explain names the taint.
+    assert!(plan("main").run.contains(outside_t));
+    let ex = explain("main");
+    assert!(ex.contains("failed check: waived"), "{ex}");
+    assert!(ex.contains("waived taint outside-repository"), "{ex}");
+
+    // wrote-inside-repository waived: attested; the outside read is not
+    // waived by this base.
+    w.write(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"wrote-inside-repository\"]",
+        ),
+    );
+    w.git(&work, &["commit", "-q", "-am", "accept writes instead"]);
+    let stderr = run(&[write_t]);
+    assert!(
+        stderr.contains(&format!(
+            "vci: attested {write_t} (waived: wrote-inside-repository) ("
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        predicates(&work, write_t)[0]["waived"],
+        serde_json::json!(["wrote-inside-repository: node_modules/other.txt"])
+    );
+    let writes = w.git(&work, &["rev-parse", "HEAD"]);
+    let p = plan(&writes);
+    assert!(p.skip.contains(write_t), "{p:?}");
+    assert!(p.run.contains(outside_t), "{p:?}");
+    assert!(explain(&writes).contains("waived taint outside-repository"));
+    assert!(plan(&with_key).run.contains(write_t));
 }
 
 /// Test commands vci cannot vouch for: nothing is attested, `vci plan` runs

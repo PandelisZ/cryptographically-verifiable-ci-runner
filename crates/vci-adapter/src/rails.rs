@@ -834,7 +834,12 @@ fn exit_code_must_agree(files: &mut [Observed], code: Option<i32>) {
         |c| format!("exited {c}"),
     );
     for o in files.iter_mut() {
-        if o.result.as_ref().is_some_and(|r| r.is_pass()) {
+        // A pass with skipped tests too: those are attested when the policy
+        // waives `result:skipped`.
+        if o.result
+            .as_ref()
+            .is_some_and(|r| r.state == "passed" && r.failed == 0)
+        {
             o.taints.push(format!(
                 "{RAILS_EXIT_TAINT}{} (the process {how} after the test framework reported a pass: an at_exit handler such as SimpleCov's minimum_coverage failed the run)",
                 code.map_or_else(|| "signal".to_owned(), |c| c.to_string())

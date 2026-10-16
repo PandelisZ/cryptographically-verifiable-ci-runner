@@ -14,7 +14,8 @@ Both fail open: the worst outcome is that CI runs the unit. Never "fix" either b
 
 | Reason (prefix) | Meaning | What to do |
 |---|---|---|
-| `result failed (F failed, S skipped or xfailed of N; ...)` | A test failed or was skipped/xfailed/pending | Fix the code (or the test, if the user agrees) and run again. Never attest around a failure. A skip is refused because the skipped test did not run |
+| `result failed (F failed, S skipped or xfailed of N; ...)` | A test failed (Rails/RSpec: or was skipped/pending) | Fix the code (or the test, if the user agrees) and run again. Never attest around a failure; no policy waives one |
+| `result passed (0 failed, S skipped or xfailed of N; ...)` (key `result:skipped`) | It passed, but a test was skipped/xfailed/todo, so that test did not run | Leave it unattested, or (the user's decision) `ignore_taints = ["result:skipped"]`: attested with `result:skipped:S of N` recorded as waived |
 | `result no-tests (...)` / `result filtered (...)` | No test ran, or only some (focus, `-k`, tag filters, `--only-failures`, `TestMain` filtering) | Remove the filter; every test in the unit must run |
 | `result no-assertions (...)` | Minitest test without an assertion | Add assertions or leave it unattested |
 | `tainted: <process event>`: `subprocess.Popen`, `os.system`, `os.fork` (pytest), `child_process...` (Vitest), `exec: <program>` (Go), `process:backtick`, `process:fork`, `process:system` (Rails), `cargo:process...` | The test (or its setup/config) started a child process, whose reads vci cannot see | Not attestable; CI runs it. (Rails: the `bin/rails db:test:prepare` Active Record's `maintain_test_schema!` starts is the engine's and is not refused) |
@@ -29,8 +30,8 @@ Both fail open: the worst outcome is that CI runs the unit. Never "fix" either b
 | `tainted: vci:process-exit:N` | The process exited non-zero after the framework reported success (SimpleCov `minimum_coverage`, an `at_exit`) | Fix the exit status or leave it unattested |
 | `tainted: cargo:undeclared-reads` / `its source refers to <path> (...), which is not an input; declare it in vci.toml ([[inputs]] ...)` | A Rust test reads a file outside its package directories | Ask the user to declare it under `[[inputs]]` in `vci.toml` and merge that to the default branch |
 | `cargo:path-case` | A path literal differs in letter case from the file | Fix the path's case |
-| `wrote inside the repository: <paths>` | The test created, changed or deleted files in the repo | Write to a temp dir (`tmp_path`, `t.TempDir()`, `TMPDIR`) instead |
-| `input outside the repository: <path>` | A read outside the repo (`/etc/hosts`, `~/...`, an unowned temp file) | Not attestable unless the test stops reading it |
+| `wrote inside the repository: <paths>` (key `wrote-inside-repository`) | The test created, changed or deleted files in the repo. Since 1.7.1 writes under `node_modules/.vite`, `node_modules/.vite-temp` and `node_modules/.cache` (tool caches) never count | Write to a temp dir (`tmp_path`, `t.TempDir()`, `TMPDIR`) instead; or (the user's decision) `ignore_taints = ["wrote-inside-repository"]`: the written paths are then not inputs |
+| `input outside the repository: <path>` (key `outside-repository`) | A read outside the repo (`/etc/hosts`, `/proc/sys/...`, `/etc/lsb-release`, `~/...`, an unowned temp file) | Stop reading it; or (the user's decision) `ignore_taints = ["outside-repository"]`: attested with `outside-repository:<path>` recorded as waived and the path not hashed |
 | `input changed during the run: ...` / `global inputs changed during the run` / `the repository changed during the run: ...` (Go) | Something modified the working tree while tests ran (an editor, a formatter, a watcher, another process, the test itself) | Stop other writers and run again |
 | `env mode "loose": the cargo adapter only attests in strict mode ...` | `[env] mode = "loose"` (deprecated since 1.6.0) with cargo | The user must remove `mode = "loose"` (the default policy is the only one going forward) |
 | `read PYTHONPATH, which vci sets to its collector` | The test reads `PYTHONPATH` | Not attestable |
@@ -43,8 +44,11 @@ Both fail open: the worst outcome is that CI runs the unit. Never "fix" either b
 "child_process.*", "go:syscall"]` (globs over the reason key the "why not attested" lines print; `"*"` for all,
 `vci:` taints never). A waived unit is attested (`vci: attested <unit> (waived: process:system, +2)`), the taints are
 recorded in the attestation's `waived`, and `vci plan` accepts it only while the base branch's policy still waives
-each one (otherwise the `waived` check fails). It knowingly trades determinism for CI cost: what the taint stands for
-(a child process's reads, a network answer) is not recorded. Adding it, widening it, or setting it to `"*"` is the
+each one (otherwise the `waived` check fails). Since 1.7.1 it also waives three of vci's own refusals by key:
+`outside-repository` (reads outside the repository), `wrote-inside-repository` (writes inside it) and
+`result:skipped` (a pass with skipped tests); `"*"` includes them. A failed result is never waived. It knowingly
+trades determinism for CI cost: what the taint stands for (a child process's reads, a network answer, a kernel
+parameter or OS release file, a test that did not run) is not recorded. Adding it, widening it, or setting it to `"*"` is the
 maintainers' decision: never add `ignore_taints` (or `go_allow_net`) to a repository's policy on your own to get a
 unit attested; report the taint, and mention the knob only as an option for the user to decide on.
 

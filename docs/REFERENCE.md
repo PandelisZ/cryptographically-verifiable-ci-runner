@@ -319,7 +319,8 @@ toolchain check compares is identical there:
 
 Everything else (a different OS, `sys.platform`-dependent code paths in your tests or dependencies) is what
 `platform = "any"` accepts; use `platform_overrides` with `"exact"` for files that behave differently per platform.
-Files with skipped tests (`skipif(sys.platform == ...)`) are never attested.
+Files with skipped tests (`skipif(sys.platform == ...)`) are not attested unless the base policy waives
+`result:skipped` (see [Waiving taints](#waiving-taints-policyignore_taints)).
 
 ## Quick start (Go)
 
@@ -1229,9 +1230,10 @@ vci:   1 result failed
 
 A reason is a stable key: for a taint, its category (the text up to the first `:`, space or `(`, plus the name after
 a single `:`: `native:FFI attach_function(...)` -> `native:FFI`, `cargo:process: Command::new in ...` ->
-`cargo:process`, `go:source: ...` -> `go:source`, `vci:not-hooked:ffi (...)` -> `vci:not-hooked`); for any other
-refusal, its text up to the first `:` or `(` (`input outside the repository`, `result failed`, `wrote inside the
-repository`). On a unit's line, taints that share a key are shown once, as the first of them with the number of the
+`cargo:process`, `go:source: ...` -> `go:source`, `vci:not-hooked:ffi (...)` -> `vci:not-hooked`); for the three
+refusals `policy.ignore_taints` can waive that are not collector taints, the key that waives them
+(`outside-repository`, `wrote-inside-repository`, `result:skipped`); for any other refusal, its text up to the first
+`:` or `(` (`result failed`, `no result`). On a unit's line, taints that share a key are shown once, as the first of them with the number of the
 others (`native:FFI call Vips.vips_init (...) (+129 more native:FFI)`), most frequent first. `--summary FILE` writes:
 
 ```json
@@ -1806,8 +1808,10 @@ else under [Quick start (RSpec)](#quick-start-rspec).
 
 A test file gets no attestation (and will run in CI) if any of these hold. The collector taints below (every reason
 `vci run` prints as `tainted: ...`) can be waived with `policy.ignore_taints` (see [Waiving taints](#waiving-taints-policyignore_taints)
-at the end of this section); the other refusals (a failed or skipped test, a write inside the repository, an input
-outside it or changed during the run, a toolchain mismatch, ...) cannot.
+at the end of this section), and since vci 1.7.1 so can three of vci's own refusals, by their key: a passing file
+with skipped tests (`result:skipped`), a read outside the repository (`outside-repository`) and a write inside it
+(`wrote-inside-repository`). The other refusals (a failed test, an input changed during the run, a toolchain
+mismatch, ...) cannot.
 
 - a collector tainted it: child processes, network (including `new net.Socket().connect()` and `dgram` sockets),
   `worker_threads`, `fetch`, enumerating `process.env`, recursive readdir/glob, snapshot writes, `isolate: false`,
@@ -1815,8 +1819,20 @@ outside it or changed during the run, a toolchain mismatch, ...) cannot.
   globalSetup file in the main process (that taints every file of the run);
 - it did not pass (failed, missing result), or **any of its tests was skipped or xfailed**: a skip is usually
   conditional (platform, `CI`, an optional import), and the skipped test did not run, so the attestation cannot
-  vouch for it where the condition differs;
-- any input lies outside the repository (e.g. a read of `/etc/hosts` or an unowned temp file);
+  vouch for it where the condition differs (`vci: not attesting <unit>: result passed (0 failed, 1 skipped or
+  xfailed of 4; a skipped test did not run, so it cannot be vouched for elsewhere)`, key `result:skipped`; waivable,
+  recorded as `result:skipped:1 of 4`; a failed result never is. Minitest and RSpec report a skipped or pending
+  test as a failed result, which stays a refusal);
+- any input lies outside the repository (e.g. a read of `/etc/hosts`, `/proc/sys/net/core/somaxconn`,
+  `/etc/lsb-release` or an unowned temp file): `vci: not attesting <unit>: input outside the repository: <path>`,
+  key `outside-repository`; waivable, and then the path is not hashed, only recorded as
+  `outside-repository:<path>`;
+- the test wrote inside the repository (below; every runner whose collector records writes: node:test, pytest,
+  Rails): `vci: not attesting <unit>: wrote inside the repository: <paths>`, key `wrote-inside-repository`;
+  waivable, and then the written paths are neither inputs nor a refusal, recorded as
+  `wrote-inside-repository: <paths>`. Writes to tool caches under any `node_modules` directory (`node_modules/.vite`,
+  `node_modules/.vite-temp`, `node_modules/.cache`: Vite's dependency optimizer and bundled config, babel-loader and
+  the like) are never writes, with or without a policy, as Rails' `log/` and `tmp/` are not;
 - any input changed during the run: the working tree's metadata (size, mtime, ctime, inode, mode) is snapshotted
   before the run and every attested entry must be untouched afterwards, and the global inputs (including snapshot
   files) are hashed before and after. Hard-linking a repository file (`fs.link`) changes its ctime and link count, so
@@ -1898,7 +1914,7 @@ package, decided from the import closure of the test and the source of every non
   `go_asm.h` are searched) or that resolves outside the repository;
 - **the repository changed during the run** (a file written, removed, renamed; a directory created): package os
   logs writes as opens but not removals, so every package of that `vci run` is refused;
-- a skipped test or subtest (`t.Skip`), a failed or unbuilt package (including `go vet` failures, which fail
+- a skipped test or subtest (`t.Skip`; waivable as `result:skipped`), a failed or unbuilt package (including `go vet` failures, which fail
   `go test`), no log (`vci:no-testlog`: the overlay did not apply), the standard library hooks not installable
   for this Go version, a module cache that does not match `go.sum`, a `go.work` outside the repository;
 - `GOFLAGS` naming programs or files vci does not hash (`vci run` stops with an error; only the flag text is
@@ -2040,15 +2056,34 @@ ignore_taints = ["process:*", "child_process.*", "fetch", "go:syscall", "externa
   matches child_process.execSync`). Removing a pattern from the default branch's `vci.toml` therefore re-runs every
   unit attested under it.
 - `vci:` taints (vci's own record of the unit is incomplete: a missing result, a collector hook that failed, an
-  unparsable line) are never waived, `"*"` included. Refusals that are not taints (a failed or skipped test, a write
-  inside the repository, an input outside it or changed during the run, a toolchain mismatch) are not affected.
+  unparsable line) are never waived, `"*"` included. Neither is a failed result. Other refusals that are not taints
+  (an input changed during the run, a toolchain mismatch, Go's "the repository changed during the run") are not
+  affected.
+- Since vci 1.7.1 three of vci's own refusals are taints too, waived the same way and recorded the same way:
+
+  | Key | Refusal without the waiver | Recorded in `waived` | Waived, the unit is attested and |
+  | --- | --- | --- | --- |
+  | `outside-repository` | `input outside the repository: /proc/sys/net/core/somaxconn` | `outside-repository:/proc/sys/net/core/somaxconn`, one per path | the path is not hashed |
+  | `wrote-inside-repository` | `wrote inside the repository: web/node_modules/other.txt` | `wrote-inside-repository: web/node_modules/other.txt` (every path, comma-separated) | the written paths are not inputs |
+  | `result:skipped` | `result passed (0 failed, 1 skipped or xfailed of 4; ...)` | `result:skipped:1 of 4` | `vci plan` accepts the passed-with-skips result |
+
+  The key is the category: `ignore_taints = ["outside-repository"]` waives every read outside the repository, and
+  a path pattern such as `"outside-repository:/proc/*"` matches nothing (patterns match the key, never the path).
+  `"result"` is `"result:*"`, which is only `result:skipped`. `"*"` waives all three. Writes to `node_modules/.vite`,
+  `node_modules/.vite-temp` and `node_modules/.cache` need no waiver (tool caches, never writes).
 - `go_allow_net = true` is the same waiver as `ignore_taints = ["go:net"]`.
 
 **The trade-off, plainly.** A taint means the collector saw the unit do something whose effect it cannot record: a
 child process's reads, a network response, the whole environment, a directory listed recursively, a native call. A
 waived unit's attestation therefore vouches only for what was observed; the inputs the taint stands for are not in
 it, so a change to them (the program a child process runs, a server's answer, an undeclared environment variable)
-does not re-run the unit, and a skip can hide a failure CI would have seen. That is the intended exchange: "it's fine
+does not re-run the unit, and a skip can hide a failure CI would have seen. The same holds for vci's own refusals:
+with `["*"]`, a unit that read a kernel parameter (`/proc/sys/net/core/somaxconn`), the OS release file
+(`/etc/lsb-release`, `/etc/alpine-release`) or `/proc/self/exe` is attested although that file is not hashed, and a
+different value on a runner does not re-run it; a skipped test (`skipif(sys.platform == "darwin")`, `t.Skip` without
+a database) is vouched for where it never ran, and on a platform where it runs it may fail; a written file is no
+input, so a test that depends on what it wrote earlier is not re-run when that changes. The attestation records each
+of them as waived, and `vci plan` re-checks them against the base policy. That is the intended exchange: "it's fine
 if it's not 100% deterministic, the important thing is optimising for CI cost". The attestation says what was
 observed and what could not be recorded (`waived`), and the decision is the base branch's (the policy is read from the
 base commit, like every other key), so a pull request cannot widen it for itself. Keep `refs/heads/main` in
@@ -2082,7 +2117,8 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
    zone data versions of Rails and the SQLite/OpenSSL versions of pytest are not compared, whether each is loaded is);
 8. **env-config**: digest of the effective env configuration (the base `vci.toml`'s `set` values and `hash`/`ignore`
    lists, and this vci's built-in lists) matches; attestations made before vci 1.6.0 fail it once;
-9. **result**: passed and untainted; **inputs-config**: the `[[inputs]]` globs recorded equal the base config's for
+9. **result**: passed and untainted (passed with skipped tests only when the attestation recorded `result:skipped`
+   as waived, which the waived check then requires the base policy to waive); **inputs-config**: the `[[inputs]]` globs recorded equal the base config's for
    the test id; **waived**: every taint recorded in `waived` still waived by the base policy (`ignore_taints`,
    `go_allow_net`, or for `cargo:undeclared-reads` declared `[[inputs]]`; one recorded under the removed
    `rails_allow_db` never is); **dirty** only if `allow_dirty = false`;

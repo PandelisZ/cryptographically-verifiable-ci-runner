@@ -706,6 +706,102 @@ fn pytest_ignore_taints_star() {
     assert!(ex.contains("waived taint subprocess.Popen"), "{ex}");
 }
 
+/// `policy.ignore_taints = ["result:skipped"]`: a file that passes with a
+/// skipped test is refused without the key, attested with the skip recorded
+/// as waived, and skipped only while the base policy waives
+/// `result:skipped`. A failing file stays refused even with `["*"]`.
+#[test]
+fn pytest_ignore_taints_result_skipped() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let skip = "tests/test_skipping.py";
+    let fail = "tests/test_failing.py";
+    w.put(
+        skip,
+        "import pytest\n\ndef test_ok():\n    assert 1 + 1 == 2\n\n@pytest.mark.skip(reason='not here')\ndef test_skipped():\n    assert False\n",
+    );
+    w.put(
+        fail,
+        "import pytest\n\ndef test_fails():\n    assert 1 == 2\n\n@pytest.mark.skip(reason='not here')\ndef test_skipped():\n    pass\n",
+    );
+    let key = w.trusted.to_str().unwrap();
+    let out = w.vci(&work, &["run", skip, "--key", key]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stderr.contains(&format!(
+            "vci: not attesting {skip}: result passed (0 failed, 1 skipped or xfailed of 2;"
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains(" result:skipped\n"), "{stderr}");
+    w.put(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"result:skipped\"]",
+        ),
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "accept skipped tests"]);
+    let out = w.vci(&work, &["run", skip, "--key", key]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("vci: attested {skip} (waived: result:skipped) (")),
+        "{stderr}"
+    );
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let stored = AttestStore::new(&store_for(&work))
+        .list(Some(skip))
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    let env: Value = serde_json::from_slice(&stored[0].bytes).unwrap();
+    let st: Value =
+        serde_json::from_slice(&b64.decode(env["payload"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(
+        st["predicate"]["waived"],
+        serde_json::json!(["result:skipped:1 of 2"])
+    );
+    assert_eq!(st["predicate"]["result"]["skipped"], 1);
+    let here = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(w.plan(&work, &here).skip.contains(skip));
+    assert!(w.plan(&work, "main").run.contains(skip));
+    let ex = w.explain(&work, skip, "main");
+    assert!(ex.contains("failed check: waived"), "{ex}");
+    assert!(ex.contains("waived taint result:skipped"), "{ex}");
+    // "*" waives the skips, never a failure.
+    w.put(
+        "vci.toml",
+        &VCI_TOML.replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nignore_taints = [\"*\"]",
+        ),
+    );
+    w.git(&work, &["commit", "-q", "-am", "ignore every taint"]);
+    let out = w.vci(&work, &["run", skip, fail, "--key", key]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "vci: not attesting {fail}: result failed (1 failed, 1 skipped or xfailed of 2;"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("vci: attested {skip} (waived: result:skipped) (")),
+        "{stderr}"
+    );
+    assert!(
+        AttestStore::new(&store_for(&work))
+            .list(Some(fail))
+            .unwrap()
+            .is_empty()
+    );
+    let star = w.git(&work, &["rev-parse", "HEAD"]);
+    assert!(w.plan(&work, &star).skip.contains(skip));
+    assert!(w.plan(&work, &star).run.contains(fail));
+}
+
 #[test]
 fn pytest_push_fetch_fresh_clone_and_ci() {
     let Some(w) = World::new() else { return };

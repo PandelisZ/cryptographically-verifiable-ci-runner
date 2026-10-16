@@ -137,7 +137,9 @@ pub(crate) struct TestRun {
     /// The output `go test -v` would print (every `Output` field, and lines
     /// that are not events).
     pub output: String,
-    /// Top-level tests (`TestX`, `FuzzX`, `ExampleX`) that passed.
+    /// Top-level tests (`TestX`, `FuzzX`, `ExampleX`) that passed or were
+    /// skipped (they ran: a skip is the result's business, not a test that
+    /// a TestMain kept from running).
     pub passed: BTreeSet<String>,
 }
 
@@ -187,7 +189,7 @@ pub(crate) fn parse_test2json(stdout: &str, import_path: &str, exit_ok: bool) ->
     let skipped = tests.values().filter(|a| *a == "skip").count() as u32;
     let passed: BTreeSet<String> = tests
         .iter()
-        .filter(|(t, a)| *a == "pass" && !t.contains('/'))
+        .filter(|(t, a)| matches!(a.as_str(), "pass" | "skip") && !t.contains('/'))
         .map(|(t, _)| t.clone())
         .collect();
     let ok = package_action == "pass" && !build_failed && !foreign && exit_ok;
@@ -293,6 +295,12 @@ mod tests {
         let r = parse_test2json(&skip, PKG, true);
         assert_eq!(r.result.skipped, 1);
         assert!(!r.result.is_pass());
+        // A skipped top-level test ran (a TestMain did not keep it from
+        // running): the skip is the result's (`result:skipped`).
+        let top = [ev("skip", "TestS"), ev("pass", "TestOK"), ev("pass", "")].join("\n");
+        let r = parse_test2json(&top, PKG, true);
+        assert_eq!((r.result.state.as_str(), r.result.skipped), ("passed", 1));
+        assert_eq!(r.passed.iter().collect::<Vec<_>>(), ["TestOK", "TestS"]);
         let fail = [ev("fail", "TestF"), ev("fail", "")].join("\n");
         let r = parse_test2json(&fail, PKG, false);
         assert_eq!((r.result.state.as_str(), r.result.failed), ("failed", 1));

@@ -496,7 +496,9 @@ impl GoAdapter {
         go: &GoEnv,
     ) -> Observed {
         let testlog::TestRun { result, passed, .. } = run;
-        let passed_all = result.is_pass();
+        // Skipped tests ran (they are in `passed`) and are the result's
+        // business (`result:skipped`).
+        let passed_all = result.state == "passed" && result.failed == 0;
         let mut o = Observed {
             test_id: rel.to_owned(),
             root: self.project_dir.to_string(),

@@ -184,6 +184,41 @@ pub fn observations_for(
     Ok(out)
 }
 
+/// The paths of `o`'s observations (reads, modules, probes, listings, stats)
+/// outside the repository `root`, sorted and once each.
+fn outside_repository<'a>(root: &Utf8Path, o: &'a Observed) -> BTreeSet<&'a Utf8PathBuf> {
+    [
+        &o.modules,
+        &o.reads,
+        &o.probes,
+        &o.readdirs,
+        &o.stats,
+        &o.excluded,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|p| RepoPath::from_abs(root, p).is_err())
+    .collect()
+}
+
+/// `o` without the observations of `paths` and of everything under them
+/// (waived reads outside the repository, waived writes).
+fn without_paths(o: &Observed, paths: &[Utf8PathBuf]) -> Observed {
+    let mut o = o.clone();
+    let keep = |p: &Utf8PathBuf| !paths.iter().any(|d| p.starts_with(d));
+    for set in [
+        &mut o.modules,
+        &mut o.reads,
+        &mut o.probes,
+        &mut o.readdirs,
+        &mut o.stats,
+        &mut o.excluded,
+    ] {
+        set.retain(keep);
+    }
+    o
+}
+
 /// Whether this process (and so the tests it starts) runs as the superuser:
 /// the owner of a file it creates is uid 0 (the effective, or on Linux the
 /// filesystem, uid). Permission checks do not apply to root, so a test's
@@ -406,6 +441,38 @@ pub fn taint_key(t: &str) -> String {
     }
 }
 
+/// A read outside the repository (not an external, not a path the
+/// collectors exempt): `outside-repository:<absolute path>`, key
+/// `outside-repository`. It refuses the unit (the file cannot be an input)
+/// unless `policy.ignore_taints` waives it; then the path is not hashed, only
+/// recorded in the attestation's `waived`.
+pub const OUTSIDE_REPOSITORY_TAINT: &str = "outside-repository:";
+/// Paths the unit created, changed or deleted inside the repository:
+/// `wrote-inside-repository: <path>, <path>` (repository-relative), key
+/// `wrote-inside-repository`. Waived, the written paths are neither inputs
+/// nor a refusal.
+pub const WROTE_INSIDE_REPOSITORY_TAINT: &str = "wrote-inside-repository: ";
+/// A passing result with skipped (or xfailed, or todo) tests:
+/// `result:skipped:<skipped> of <tests>`, key `result:skipped`. A failed
+/// result is never a taint.
+pub const RESULT_SKIPPED_TAINT: &str = "result:skipped:";
+
+/// Directories inside `node_modules` that tools write caches to while tests
+/// run (Vite's dependency optimizer, `.vite-temp` for bundled configs, the
+/// `.cache` convention of babel-loader, eslint and others): writes there are
+/// not outputs of the test, like Rails' log/ and tmp/.
+const NODE_MODULES_CACHE_DIRS: &[&str] = &[".vite", ".vite-temp", ".cache"];
+
+/// Is the repository-relative path `rel` (a write) in one of
+/// [`NODE_MODULES_CACHE_DIRS`] of any `node_modules` directory (the
+/// directory itself included)?
+fn is_tool_cache_write(rel: &str) -> bool {
+    let comps: Vec<&str> = rel.split('/').collect();
+    comps
+        .windows(2)
+        .any(|w| w[0] == "node_modules" && NODE_MODULES_CACHE_DIRS.contains(&w[1]))
+}
+
 /// The stable reason key of a refusal message that is not a list of taints
 /// (those are keyed by [`taint_key`]): the text before the first `:` or
 /// `(`, or a fixed key for messages that start with a varying part.
@@ -432,8 +499,16 @@ pub fn refusal_key(msg: &str) -> String {
             return (*key).to_owned();
         }
     }
-    if msg.starts_with("result ") && msg.contains(" skipped or xfailed of ") {
-        return "result has skipped tests".into();
+    // The refusals `policy.ignore_taints` can waive are keyed by their taint
+    // key, the pattern that waives them.
+    if msg.starts_with("input outside the repository: ") {
+        return taint_key(OUTSIDE_REPOSITORY_TAINT);
+    }
+    if msg.starts_with("wrote inside the repository: ") {
+        return taint_key(WROTE_INSIDE_REPOSITORY_TAINT);
+    }
+    if msg.starts_with("result passed (0 failed, ") && msg.contains(" skipped or xfailed of ") {
+        return taint_key(RESULT_SKIPPED_TAINT);
     }
     if msg.contains(" is built from a local directory") {
         return "external built from a local directory".into();
@@ -559,7 +634,11 @@ fn check_one(
     if !taints.is_empty() {
         return Err(format!("tainted: {}", summarize_taints(&taints)));
     }
-    let waived: Vec<String> = waived.into_iter().cloned().collect();
+    let mut waived: Vec<String> = waived.into_iter().cloned().collect();
+    // vci's own refusals that are taints too (`outside-repository`,
+    // `wrote-inside-repository`, `result:skipped`): waived by the same
+    // policy, otherwise the refusal they always were.
+    let waives = |taint: &str| project.policy.taint_waiver(adapter.name(), taint).is_some();
     if adapter.name() == "cargo" && project.env.mode == crate::config::EnvMode::Loose {
         // What a Rust test reads from the environment cannot be observed;
         // only strict mode (undeclared variables removed, so unset on both
@@ -614,11 +693,21 @@ fn check_one(
         let ignored: BTreeSet<String> = git_ignored(&ctx.root, &candidates).into_iter().collect();
         written.retain(|w| !ignored.contains(w));
     }
+    // Tool caches under node_modules (Vite's dependency optimizer) are not
+    // outputs of the test.
+    written.retain(|w| !is_tool_cache_write(w));
+    // Waived writes: neither inputs nor a refusal.
+    let mut not_inputs: Vec<Utf8PathBuf> = Vec::new();
     if !written.is_empty() {
-        return Err(format!(
-            "wrote inside the repository: {}",
-            written.join(", ")
-        ));
+        let taint = format!("{WROTE_INSIDE_REPOSITORY_TAINT}{}", written.join(", "));
+        if !waives(&taint) {
+            return Err(format!(
+                "wrote inside the repository: {}",
+                written.join(", ")
+            ));
+        }
+        waived.push(taint);
+        not_inputs.extend(written.iter().map(|w| ctx.root.join(w)));
     }
     let result = o.result.clone().ok_or("no result")?;
     if !result.is_pass() && matches!(result.state.as_str(), "no-tests" | "filtered") {
@@ -633,7 +722,20 @@ fn check_one(
             result.tests
         ));
     }
-    if !result.is_pass() {
+    // Passed, with skipped tests: refused unless `result:skipped` is waived
+    // (a failed result never is).
+    let mut skips_waived = false;
+    if !result.is_pass() && result.state == "passed" && result.failed == 0 && result.skipped > 0 {
+        let taint = format!(
+            "{RESULT_SKIPPED_TAINT}{} of {}",
+            result.skipped, result.tests
+        );
+        if waives(&taint) {
+            waived.push(taint);
+            skips_waived = true;
+        }
+    }
+    if !result.is_pass() && !skips_waived {
         return Err(if result.skipped > 0 {
             format!(
                 "result {} ({} failed, {} skipped or xfailed of {}; a skipped test did not run, so it cannot be vouched for elsewhere)",
@@ -670,6 +772,23 @@ fn check_one(
     if let Some(m) = collector_toolchain_mismatch(adapter.name(), o, versions) {
         return Err(m);
     }
+    // Reads outside the repository: refused, unless `outside-repository` is
+    // waived (then they are not hashed, only recorded in `waived`).
+    for p in outside_repository(&ctx.root, o) {
+        let taint = format!("{OUTSIDE_REPOSITORY_TAINT}{p}");
+        if !waives(&taint) {
+            return Err(format!("input outside the repository: {p}"));
+        }
+        not_inputs.push(p.to_owned());
+        waived.push(taint);
+    }
+    let pruned;
+    let o = if not_inputs.is_empty() {
+        o
+    } else {
+        pruned = without_paths(o, &not_inputs);
+        &pruned
+    };
     let mut obs = observations_for(&ctx.root, o, adapter.name(), adapter.tsconfig_is_input())?;
     obs.extend(expand_extra_inputs(
         &ctx.root,
@@ -680,7 +799,7 @@ fn check_one(
     let mut platform_specific: Vec<String> = Vec::new();
     for p in &o.platform_files {
         let rp = RepoPath::from_abs(&ctx.root, p)
-            .map_err(|_| format!("input outside the repository: {p}"))?;
+            .map_err(|_| format!("platform-specific file outside the repository: {p}"))?;
         platform_specific.push(rp.as_str().to_owned());
     }
     platform_specific.sort();
@@ -1793,22 +1912,43 @@ mod tests {
             ("fs.readdir.recursive", "fs.readdir.recursive"),
             ("cargo: cannot list /x", "cargo"),
             ("exec: /bin/sh", "exec"),
+            // vci's own refusals that ignore_taints can waive.
+            (
+                "outside-repository:/proc/sys/net/core/somaxconn",
+                "outside-repository",
+            ),
+            ("outside-repository:/etc/lsb-release", "outside-repository"),
+            (
+                "wrote-inside-repository: web/node_modules/other.txt, out-dir",
+                "wrote-inside-repository",
+            ),
+            ("result:skipped:1 of 4", "result:skipped"),
         ] {
             assert_eq!(taint_key(t), k, "{t}");
         }
         for (m, k) in [
+            // The refusals ignore_taints waives: keyed by the pattern.
             (
                 "input outside the repository: /etc/hosts",
-                "input outside the repository",
+                "outside-repository",
             ),
             ("result failed (1 failed of 3)", "result failed"),
             (
                 "result passed (0 failed, 1 skipped or xfailed of 2; a skipped test did not run)",
-                "result has skipped tests",
+                "result:skipped",
+            ),
+            // A failed result with skips is a failure, never waivable.
+            (
+                "result failed (1 failed, 1 skipped or xfailed of 3; a skipped test did not run)",
+                "result failed",
             ),
             (
                 "wrote inside the repository: out.txt",
-                "wrote inside the repository",
+                "wrote-inside-repository",
+            ),
+            (
+                "platform-specific file outside the repository: /x/y_linux.go",
+                "platform-specific file outside the repository",
             ),
             (
                 "collector root /x is not the project dir",
@@ -1932,6 +2072,102 @@ mod tests {
         let (w, r) = split("[policy]\nignore_taints = [\"*\"]\n", "rails");
         assert_eq!(w.len(), 5);
         assert_eq!(r, ["vci:not-hooked:ffi (x)"]);
+    }
+
+    /// vci's own refusals that are taints: waived by their key (or a
+    /// category pattern, or "*"), never by another key.
+    #[test]
+    fn split_waived_outside_writes_and_skips() {
+        let taints = strings(&[
+            "outside-repository:/proc/self/exe",
+            "outside-repository:/etc/alpine-release",
+            "wrote-inside-repository: web/node_modules/other.txt",
+            "result:skipped:1 of 4",
+        ]);
+        let waived = |toml: &str| {
+            let p = policy(toml);
+            split_waived_taints(&p, "node-test", &[], &taints)
+                .0
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(waived("[policy]\n").is_empty());
+        assert_eq!(
+            waived("[policy]\nignore_taints = [\"outside-repository\"]\n"),
+            &taints[..2]
+        );
+        assert_eq!(
+            waived("[policy]\nignore_taints = [\"wrote-inside-repository\"]\n"),
+            &taints[2..3]
+        );
+        assert_eq!(
+            waived("[policy]\nignore_taints = [\"result:skipped\"]\n"),
+            &taints[3..]
+        );
+        // The category pattern "result" is result:* (only skips are taints).
+        assert_eq!(
+            waived("[policy]\nignore_taints = [\"result\"]\n"),
+            &taints[3..]
+        );
+        assert_eq!(waived("[policy]\nignore_taints = [\"*\"]\n"), taints);
+        // The key is the category: patterns are not matched against paths.
+        assert!(waived("[policy]\nignore_taints = [\"outside-repository:/proc/*\"]\n").is_empty());
+        assert!(waived("[policy]\nignore_taints = [\"wrote-inside\"]\n").is_empty());
+    }
+
+    #[test]
+    fn tool_caches_under_node_modules_are_not_writes() {
+        for w in [
+            "node_modules/.vite",
+            "node_modules/.vite/deps_temp_1a2b/react.js",
+            "vex-web/node_modules/.vite-temp",
+            "vex-web/node_modules/.vite-temp/vite.config.ts.timestamp-1.mjs",
+            "a/b/node_modules/.cache/babel-loader/x.json",
+        ] {
+            assert!(is_tool_cache_write(w), "{w}");
+        }
+        for w in [
+            "node_modules/other.txt",
+            "node_modules/.vitest/x",
+            "node_modules/pkg/.cache/x",
+            ".vite/x",
+            "src/node_modules.vite",
+            "out.txt",
+        ] {
+            assert!(!is_tool_cache_write(w), "{w}");
+        }
+    }
+
+    #[test]
+    fn outside_paths_are_found_once_and_pruned() {
+        let root = Utf8Path::new("/r");
+        let mut o = Observed::default();
+        o.reads.insert("/etc/hosts".into());
+        o.reads.insert("/r/a.txt".into());
+        o.stats.insert("/etc/hosts".into());
+        o.probes.insert("/proc/self/exe".into());
+        o.readdirs.insert("/r/out".into());
+        o.reads.insert("/r/out/x".into());
+        let out: Vec<&str> = outside_repository(root, &o)
+            .into_iter()
+            .map(|p| p.as_str())
+            .collect();
+        assert_eq!(out, ["/etc/hosts", "/proc/self/exe"]);
+        let pruned = without_paths(
+            &o,
+            &[
+                "/etc/hosts".into(),
+                "/proc/self/exe".into(),
+                "/r/out".into(),
+            ],
+        );
+        assert!(outside_repository(root, &pruned).is_empty());
+        assert_eq!(
+            pruned.reads.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            ["/r/a.txt"]
+        );
+        assert!(pruned.readdirs.is_empty() && pruned.stats.is_empty());
     }
 
     #[test]

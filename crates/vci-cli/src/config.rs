@@ -392,7 +392,11 @@ pub struct Policy {
     /// attestation (`waived`), which `vci plan` accepts only while the base
     /// commit's policy still waives it. The collectors could not record what
     /// such a unit did, so this trades determinism for CI time; `vci:` taints
-    /// (vci's own record is incomplete) are never waived.
+    /// (vci's own record is incomplete) are never waived. Three of `vci run`'s
+    /// own refusals are taints too: `outside-repository` (a read outside the
+    /// repository, then not hashed), `wrote-inside-repository` (then the
+    /// written paths are not inputs) and `result:skipped` (a pass with skipped
+    /// tests); a failed result never is one.
     #[serde(default)]
     pub ignore_taints: Vec<String>,
     /// `rails_allow_db`, removed in vci 1.4.0 (the Rails test database is

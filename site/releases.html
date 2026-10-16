@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-7-1">1.7.1</a></td><td>16 Oct 2026</td><td><code>ignore_taints</code> waives reads outside the repository, writes inside it and skipped tests; Vite's caches are not writes</td></tr>
 <tr><td><a href="#v1-7-0">1.7.0</a></td><td>16 Oct 2026</td><td><code>policy.ignore_taints</code>: attest through refusals, by pattern</td></tr>
 <tr><td><a href="#v1-6-2">1.6.2</a></td><td>16 Oct 2026</td><td><code>--project</code> on <code>vci ci</code> and <code>vci plan</code>; node:test leftovers run in one process</td></tr>
 <tr><td><a href="#v1-6-1">1.6.1</a></td><td>16 Oct 2026</td><td><code>vci run</code> with explicit files fails open on an unrelated project's listing error</td></tr>
@@ -32,6 +33,11 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-7-1">1.7.1</h2>
+<p><em>16 October 2026.</em> On a real monorepo with <code>ignore_taints = ["*"]</code>, one unit in ten was still refused, by three of vci's own refusals that were not taints. They are now, waived by key and recorded in the attestation's <code>waived</code> like any other: <code>outside-repository</code> (<code>input outside the repository: /proc/sys/net/core/somaxconn</code>, <code>/proc/self/exe</code>, <code>/etc/lsb-release</code>; waived, the path is recorded as <code>outside-repository:&lt;path&gt;</code> and not hashed), <code>wrote-inside-repository</code> (waived, the written paths are neither inputs nor a refusal) and <code>result:skipped</code> (<code>result passed (0 failed, 1 skipped or xfailed of 4; ...)</code>, recorded as <code>result:skipped:1 of 4</code>; <code>vci plan</code> accepts the skips only while the base policy waives <code>result:skipped</code>). A failed result is never waived, nor are <code>vci:</code> taints. The "why not attested" lines print these keys instead of <code>input outside the repository</code>, <code>wrote inside the repository</code> and <code>result has skipped tests</code>.</p>
+<p>Writes under <code>node_modules/.vite</code>, <code>node_modules/.vite-temp</code> and <code>node_modules/.cache</code> (Vite's dependency optimizer writing during tests, babel-loader and similar caches) are no longer writes, with no policy needed.</p>
+<p>The trade-off is 1.7.0's: a kernel parameter, the OS release file or a skipped test could change a result elsewhere, and the attestation records that it was waived. <strong>Upgrade notes.</strong> A pre-1.7.1 <code>vci plan</code> refuses attestations with a waived skip.</p>
 
 <h2 id="v1-7-0">1.7.0</h2>
 <p><em>16 October 2026.</em> A unit whose collector saw something it cannot record, a child process, a socket, the whole environment, a raw syscall, a dependency without a version, used to be refused. <code>policy.ignore_taints</code> waives those refusals by pattern over the taint key the "why not attested" summary prints: <code>["*"]</code> for everything, or a narrower list such as <code>["child_process.*", "process.env.enumerate", "go:syscall"]</code>. The unit is attested, the waived taints are recorded in the attestation and shown in the <code>vci run</code> output, and <code>vci plan</code> accepts the attestation only while the base commit's policy still waives every recorded taint; otherwise the new <code>waived</code> check fails and <code>vci explain</code> names the taint. <code>vci:</code> taints, which mean vci's own record is broken, are never waived. <code>go_allow_net = true</code> is now the same as <code>ignore_taints = ["go:net"]</code>.</p>
