@@ -668,11 +668,16 @@ fn parse_summary(line: &str) -> Option<Summary> {
     }
     (seen >= 5).then_some(s)
 }
-
-/// The unit's result from its output and exit code. Only an explicit pass
-/// with at least one test run, nothing failed and nothing filtered out is
-/// `passed`; `#[ignore]`d tests are counted but do not prevent it (they are
-/// fixed at compile time; see the README).
+/// The result of one unit from its harness output. libtest's summaries
+/// decide it: a failure anywhere fails; a summary with nothing passed and
+/// nothing failed or filtered (`0 passed; 0 failed; ... 0 filtered out`:
+/// a target with no tests, or no doctests) is a pass with 0 tests, since
+/// cargo filters nothing here and a target without tests passes wherever
+/// the same sources build; no summary at all (a custom harness) is
+/// `no-tests`, which refuses the unit, as is a target whose every test is
+/// `#[ignore]`d (counted, but none ran). `#[ignore]`d tests next to tests
+/// that ran do not prevent a pass (they are fixed at compile time; see the
+/// README).
 fn unit_result(stdout_text: &str, exit_ok: bool, duration_ms: u64) -> vci_core::TestResult {
     let sums: Vec<Summary> = stdout_text.lines().filter_map(parse_summary).collect();
     let passed: u32 = sums.iter().map(|s| s.passed).sum();
@@ -681,8 +686,9 @@ fn unit_result(stdout_text: &str, exit_ok: bool, duration_ms: u64) -> vci_core::
     let filtered: u32 = sums.iter().map(|s| s.filtered).sum();
     let state = if !exit_ok || failed > 0 || sums.iter().any(|s| !s.ok) {
         "failed"
-    } else if sums.is_empty() || passed == 0 {
-        // No libtest summary (a custom harness), or nothing ran.
+    } else if sums.is_empty() || (passed == 0 && ignored > 0) {
+        // No libtest summary (a custom harness), or only ignored tests:
+        // nothing is known. (No tests at all is a pass with 0 tests.)
         "no-tests"
     } else if filtered > 0 {
         "filtered"
@@ -2490,7 +2496,12 @@ mod tests {
         assert_eq!(unit_result(failed, false, 0).state, "failed");
         assert_eq!(unit_result(ok, false, 0).state, "failed", "exit code wins");
         let zero = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
-        assert_eq!(unit_result(zero, true, 0).state, "no-tests");
+        let z = unit_result(zero, true, 0);
+        assert!(
+            z.is_pass() && z.tests == 0,
+            "a target without tests passes: {z:?}"
+        );
+        assert_eq!(unit_result(zero, false, 0).state, "failed");
         let all_ignored = "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
         assert!(!unit_result(all_ignored, true, 0).is_pass());
         assert_eq!(

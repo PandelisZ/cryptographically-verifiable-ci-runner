@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-9-1">1.9.1</a></td><td>16 Oct 2026</td><td>A cargo target without tests is attested (0 tests) instead of rebuilt on every push</td></tr>
 <tr><td><a href="#v1-9-0">1.9.0</a></td><td>16 Oct 2026</td><td>Attestations reference their input manifest, stored once; a fetch applies only what changed; <code>vci run</code> deletes what it supersedes</td></tr>
 <tr><td><a href="#v1-8-2">1.8.2</a></td><td>16 Oct 2026</td><td>Fetch and push no longer read every attestation; <code>vci prune --superseded</code>; <code>vci push --rewrite-history</code></td></tr>
 <tr><td><a href="#v1-8-1">1.8.1</a></td><td>16 Oct 2026</td><td>A <code>CARGO_HOME</code> inside the checkout is not part of the repository</td></tr>
@@ -37,6 +38,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-9-1">1.9.1</h2>
+<p><em>16 October 2026.</em> A cargo target whose harness reports no tests (<code>0 passed; 0 failed; 0 filtered out</code>: a library without unit tests, a binary, a crate with no doctests) was refused as <code>result no-tests</code>, so every master push built and ran it again: on vex, 17 of 59 units, about 4 of the attest job's 6.7 minutes. It is now attested as a pass with 0 tests: cargo filters nothing, so the target stays empty wherever the same sources build, and the attestation saves its build. A custom harness that prints no summary, and a target whose every test is <code>#[ignore]</code>d, still refuse.</p>
 
 <h2 id="v1-9-0">1.9.0</h2>
 <p><em>16 October 2026.</em> An attestation embedded its unit's whole input manifest (every path and hash the tests read, every external crate, every hashed variable). On the 242-unit workspace of 1.8.2's entry, a median large attestation was 211 KB stored, its manifest 147 KB of a 158 KB payload, and the 84 units of one package stored the same two manifests 84 times. An attestation now carries <code>manifestRef</code>, its input root, and each distinct manifest is stored once as a git-meta value of its own (target <code>project</code>, key <code>vci:manifest:&lt;input root&gt;</code>, compact JSON rather than base64), shared by every unit and signer with that root. The manifest is not signed on its own: <code>vci plan</code> uses a stored manifest only when its recomputed root is the input root the attestation signed, so a forged manifest, like a missing one (<code>manifest &lt;root&gt; not in the store: run `vci fetch`</code> in <code>vci explain</code>), makes the unit run. <strong>Measured</strong> on 10 units of that workspace attested into a scratch remote: the attestations went from 667,512 bytes to 92,104 (6 to 20 KB each instead of 14 to 241 KB), the whole tree, with the 7 manifests they reference, from 667,512 to 395,759 bytes (-41%), and the pack a fresh clone downloads from 184,800 to 127,055 bytes (-31%). On a store that small, fetch and plan take 0.2 to 0.3 s with either version. What is left in an attestation is mostly the toolchain, the global manifest, waived taints and the signature.</p>

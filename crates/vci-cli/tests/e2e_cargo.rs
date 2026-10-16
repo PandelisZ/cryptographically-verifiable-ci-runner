@@ -838,7 +838,6 @@ fn cargo_run_refuses_unattestable_units() {
         ("fail#lib", "result failed"),
         ("envall#lib", "cargo:env-enumeration"),
         ("netio#lib", "cargo:net"),
-        ("notests#lib", "result no-tests"),
         ("outside#lib", "shared/other.txt"),
         ("outside#lib", "declare it in vci.toml"),
         ("ffi#lib", "cargo:native"),
@@ -846,15 +845,26 @@ fn cargo_run_refuses_unattestable_units() {
         let line = refusal(&stderr, id);
         assert!(line.contains(why), "{id}: expected {why:?} in {line:?}");
     }
+    // A target without tests passes with 0 tests (since 1.9.1): cargo
+    // filters nothing, and it stays empty wherever the same sources build.
+    assert!(stderr.contains("vci: attested notests#lib ("), "{stderr}");
     assert!(
-        stderr.contains("vci: 0 attested, 7 not attested"),
+        stderr.contains("vci: 1 attested, 6 not attested"),
         "{stderr}"
     );
     let stored = AttestStore::new(&store_for(&work)).list(None).unwrap();
-    assert!(stored.is_empty(), "nothing may be stored: {stored:?}");
+    assert_eq!(
+        stored.len(),
+        1,
+        "only the target without tests may be stored: {stored:?}"
+    );
     let p = w.plan(&work, "main");
     for id in &ids {
-        assert!(p.run.contains(id), "{id} must run: {p:?}");
+        if id.as_str() == "notests#lib" {
+            assert!(p.skip.contains(id), "{id} skips: {p:?}");
+        } else {
+            assert!(p.run.contains(id), "{id} must run: {p:?}");
+        }
     }
 
     // Declaring the file the unit reads makes it attestable; the declared

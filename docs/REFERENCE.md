@@ -1875,8 +1875,9 @@ architecture; on another platform the attested `cfgPredicates` must evaluate the
 `policy.platform`, and exactly when the attestation lists `platformSpecific` files.
 
 **Test results**: a unit passes when `cargo test` exits 0, libtest's summary reports no failures and nothing filtered
-out, and **at least one test ran** (a target without tests, or a custom harness that prints no libtest summary, is never
-attested and always runs). **`#[ignore]`d tests do not prevent an attestation**, unlike skipped pytest or Go tests:
+out. A target without tests (`0 passed; 0 failed`, no doctests) passes with 0 tests since 1.9.1: cargo filters nothing,
+so it stays empty wherever the same sources build, and skipping it saves its build. A custom harness that prints no
+libtest summary, or a target whose every test is `#[ignore]`d, is never attested and always runs. **`#[ignore]`d tests do not prevent an attestation**, unlike skipped pytest or Go tests:
 pytest's `skipif` and Go's `t.Skip` decide at run time (on the platform, `CI`, an optional import), so the skipped test
 may run elsewhere. `#[ignore]` is decided at compile time from hashed inputs, so CI's `cargo test` ignores the same tests;
 the one exception, `#[cfg_attr(target_os = "linux", ignore)]`, is a target cfg and is checked like any other (the unit
