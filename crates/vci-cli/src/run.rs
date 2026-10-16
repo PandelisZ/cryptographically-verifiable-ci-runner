@@ -820,17 +820,23 @@ fn check_one(
         .check_case_collisions()
         .map_err(|e| format!("inputs: {e}"))?;
     // Paths the unit's source names outside its package directories must be
-    // recorded inputs (declared with `[[inputs]]`).
+    // recorded inputs (declared with `[[inputs]]`), unless the policy waives
+    // `cargo:undeclared-reads` (the path is then recorded as waived).
     for (p, seen) in &o.path_refs {
-        let rp = RepoPath::from_abs(&ctx.root, p)
-            .map_err(|_| format!("its source refers to {p}, outside the repository ({seen})"))?;
-        if !covered(&ctx.root, &manifest, &rp) {
-            return Err(format!(
+        let why = match RepoPath::from_abs(&ctx.root, p) {
+            Err(_) => format!("its source refers to {p}, outside the repository ({seen})"),
+            Ok(rp) if !covered(&ctx.root, &manifest, &rp) => format!(
                 "its source refers to {} ({seen}), which is not an input; declare it in vci.toml ([[inputs]] match = [{:?}], extra = [...])",
                 rp.as_str(),
                 file.project_rel
-            ));
+            ),
+            Ok(_) => continue,
+        };
+        let taint = format!("{}: {why}", vci_adapter::CARGO_UNDECLARED_TAINT);
+        if !waives(&taint) {
+            return Err(why);
         }
+        waived.push(taint);
     }
     let gm = global_manifest(ctx, project, child, &file.abs)
         .map_err(|e| format!("global inputs: {e:#}"))?;
@@ -844,12 +850,10 @@ fn check_one(
     for e in &manifest.entries {
         pre_stat
             .unchanged_excluding(e, excluded.get(&e.path))
-            .map_err(|r| format!("input changed during the run: {r}"))?;
+            .map_err(|r| r.to_string())?;
     }
     for e in &gm.entries {
-        pre_stat
-            .unchanged(e)
-            .map_err(|r| format!("input changed during the run: {r}"))?;
+        pre_stat.unchanged(e).map_err(|r| r.to_string())?;
     }
     let core = Predicate {
         tool_version: TOOL_VERSION.to_owned(),

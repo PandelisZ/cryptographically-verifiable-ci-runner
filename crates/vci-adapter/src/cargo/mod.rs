@@ -13,8 +13,9 @@
 //! `required-features` are enabled by default).
 //!
 //! Rust has no hook for what a test does at run time, so the inputs of a
-//! unit are decided conservatively, from `cargo test --message-format=json`
-//! of that unit alone (which reports every crate the unit builds):
+//! unit are decided conservatively, from `cargo test --no-run
+//! --message-format=json` of that unit alone (which reports every crate the
+//! unit builds):
 //!
 //! * every file and directory listing in the package directory of every
 //!   crate of the repository the unit builds (the package under test and its
@@ -31,19 +32,32 @@
 //! and static checks of the repository sources refuse what cannot be
 //! observed (processes, sockets, native code, environment enumeration,
 //! reads outside the recorded inputs; see [`scan`]).
+//!
+//! How a run goes (see [`lane`]): a warm-up build of each requested package
+//! (alone, so its features are its units') with cargo's full parallelism,
+//! then the cargo lane builds each unit alone (`cargo test <unit> --no-run`,
+//! so its features and the artifacts it reports are the unit's own) and
+//! hands its test executable to the execution pool, which runs several units
+//! at once the way `cargo test` runs them ([`exec`]; `VCI_CARGO_JOBS` at a
+//! time). Once every test has run, the units are analysed (in parallel, with
+//! run-wide caches). Doctests cannot be built without running them: `#doc`
+//! units run `cargo test --doc` in the lane.
 
 pub(crate) mod cfgexpr;
 pub(crate) mod config;
 pub(crate) mod depinfo;
+pub(crate) mod exec;
+mod lane;
 pub(crate) mod scan;
 pub(crate) mod sources;
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
+use std::hash::Hash;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -443,6 +457,42 @@ struct Package {
     targets: Vec<Target>,
     #[serde(default)]
     features: BTreeMap<String, Vec<String>>,
+    /// The fields `cargo test` exports to test processes (`CARGO_PKG_*`).
+    #[serde(default)]
+    authors: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    license_file: Option<String>,
+    #[serde(default)]
+    rust_version: Option<String>,
+    #[serde(default)]
+    readme: Option<String>,
+}
+
+impl Package {
+    /// What a test process of this package is told about it.
+    fn fields(&self) -> exec::PkgFields {
+        exec::PkgFields {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            authors: self.authors.clone(),
+            description: self.description.clone(),
+            homepage: self.homepage.clone(),
+            repository: self.repository.clone(),
+            license: self.license.clone(),
+            license_file: self.license_file.clone(),
+            rust_version: self.rust_version.clone(),
+            readme: self.readme.clone(),
+            manifest_path: Utf8PathBuf::from(&self.manifest_path),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -531,6 +581,9 @@ fn default_features(p: &Package) -> BTreeSet<String> {
     on
 }
 
+/// Target kinds of a library (its `#lib` and `#doc` units).
+const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+
 /// Units of the workspace members (what `cargo test --workspace` runs), as
 /// (package dir, unit kind).
 fn units(meta: &Metadata) -> Vec<(Utf8PathBuf, UnitKind)> {
@@ -551,9 +604,7 @@ fn units(meta: &Metadata) -> Vec<(Utf8PathBuf, UnitKind)> {
                 continue;
             }
             let is = |k: &str| t.kind.iter().any(|x| x == k);
-            let lib_like = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"]
-                .iter()
-                .any(|k| is(k));
+            let lib_like = LIB_KINDS.iter().any(|k| is(k));
             if lib_like {
                 if t.test {
                     out.push((dir.to_owned(), UnitKind::Lib));
@@ -700,6 +751,12 @@ struct Artifact {
     /// Cargo reused it from an earlier build (its mtime-based fingerprint
     /// said so). Absent in the message: treated as reused.
     fresh: bool,
+    /// `target.name`.
+    target_name: String,
+    /// `profile.test`: built as a test harness (`--test`).
+    test_profile: bool,
+    /// The executable (test harnesses and bins), if any.
+    executable: Option<Utf8PathBuf>,
 }
 
 /// A `build-script-executed` message.
@@ -709,6 +766,8 @@ struct BuildRun {
     linked_libs: Vec<String>,
     linked_paths: Vec<String>,
     out_dir: Utf8PathBuf,
+    /// `cargo::rustc-env` variables (also set for the package's tests).
+    env: Vec<(String, String)>,
 }
 
 /// Split cargo's stdout into JSON messages and everything else (the test
@@ -766,6 +825,19 @@ fn split_messages(stdout: &str) -> (Vec<Artifact>, Vec<BuildRun>, String) {
                     .collect(),
                 features: strs("features"),
                 fresh: v.get("fresh").and_then(Value::as_bool).unwrap_or(true),
+                target_name: v
+                    .pointer("/target/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                test_profile: v
+                    .pointer("/profile/test")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                executable: v
+                    .get("executable")
+                    .and_then(Value::as_str)
+                    .map(Utf8PathBuf::from),
             }),
             Some("build-script-executed") => runs.push(BuildRun {
                 package_id: pid,
@@ -774,6 +846,21 @@ fn split_messages(stdout: &str) -> (Vec<Artifact>, Vec<BuildRun>, String) {
                 out_dir: Utf8PathBuf::from(
                     v.get("out_dir").and_then(Value::as_str).unwrap_or_default(),
                 ),
+                env: v
+                    .get("env")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|kv| {
+                                let kv = kv.as_array()?;
+                                Some((
+                                    kv.first()?.as_str()?.to_owned(),
+                                    kv.get(1)?.as_str()?.to_owned(),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             _ => {}
         }
@@ -811,8 +898,60 @@ fn rustc_used(target_dir: &Utf8Path) -> Option<String> {
         .and_then(rustc_id)
 }
 
+/// The sysroot of the rustc cargo used for builds in `target_dir`, from the
+/// `--print=sysroot` output it caches in `.rustc_info.json`: the one
+/// absolute line naming a directory with a `lib/rustlib`. `None` when the
+/// cache is absent or unreadable, or names several.
+fn rustc_sysroot(target_dir: &Utf8Path) -> Option<Utf8PathBuf> {
+    let text = std::fs::read_to_string(target_dir.join(".rustc_info.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let found: BTreeSet<Utf8PathBuf> = v
+        .get("outputs")?
+        .as_object()?
+        .values()
+        .filter_map(|o| o.get("stdout")?.as_str())
+        .flat_map(str::lines)
+        .map(Utf8Path::new)
+        .filter(|p| p.is_absolute() && p.join("lib/rustlib").is_dir())
+        .map(canonical)
+        .collect();
+    let mut it = found.into_iter();
+    match (it.next(), it.next()) {
+        (Some(s), None) => Some(s),
+        _ => None,
+    }
+}
+
 fn canonical(p: &Utf8Path) -> Utf8PathBuf {
     p.canonicalize_utf8().unwrap_or_else(|_| normalise(p))
+}
+
+/// `path` (inside `repo_root`) with every symlinked directory on the way
+/// resolved: the symlinks met, in order, and the path through their targets.
+/// Unchanged when a link leads outside the repository (the caller's checks
+/// then apply to the path as spelled).
+fn through_links(path: &Utf8Path, repo_root: &Utf8Path) -> (Vec<Utf8PathBuf>, Utf8PathBuf) {
+    let mut links = Vec::new();
+    let Ok(rel) = path.strip_prefix(repo_root) else {
+        return (links, path.to_owned());
+    };
+    let comps: Vec<&str> = rel.components().map(|c| c.as_str()).collect();
+    let mut cur = repo_root.to_owned();
+    for (i, c) in comps.iter().enumerate() {
+        cur.push(c);
+        if i + 1 == comps.len() {
+            break;
+        }
+        if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+            let target = canonical(&cur);
+            if !target.starts_with(repo_root) {
+                return (links, path.to_owned());
+            }
+            links.push(cur.clone());
+            cur = target;
+        }
+    }
+    (links, cur)
 }
 
 /// The directory holding `.git` above (or at) `dir`; `dir` itself if none.
@@ -1336,23 +1475,136 @@ impl CargoAdapter {
             cmd.arg("-p").arg(n);
         }
         let out = self.output(&mut cmd, "cargo")?;
-        ctx.cleaned.borrow_mut().extend(pkgs.iter().cloned());
+        lock(&ctx.cleaned).extend(pkgs.iter().cloned());
         let mut block = format!("vci: {}\n", describe(&cmd)).into_bytes();
         block.extend_from_slice(&out.stderr);
         Ok(block)
+    }
+
+    /// What every unit of a run shares: the toolchain probe, the workspace,
+    /// Cargo.lock, the repository's cargo config, the caches.
+    fn run_ctx(&self, env: &ChildEnv) -> Result<RunCtx, AdapterError> {
+        let probe = self.probe(env)?;
+        let ws = self.workspace(env)?;
+        let lock = self.lock().map_err(|e| AdapterError::Parse {
+            what: "Cargo.lock".into(),
+            detail: e,
+        })?;
+        let repo_root = canonical(&repo_root_of(&self.project_dir));
+        let cfg_files = self.config_files(env);
+        let mut config = config::repo_facts(&cfg_files);
+        let var = |k: &str| Self::child_var(env, k);
+        config
+            .taints
+            .extend(config::wrapper_problems(&var, &cfg_files));
+        // `-C linker=<program>` in the flags: a program vci does not hash.
+        if let Some(f) = probe.rustflags.iter().find(|f| f.contains("linker=")) {
+            config.taints.insert(format!(
+                "cargo:config: the rustflags set {f:?}, a linker that is not an input vci hashes (custom linkers are not supported)"
+            ));
+        }
+        for (k, _) in child_vars(env) {
+            if k.starts_with("CARGO_TARGET_") && (k.ends_with("_RUNNER") || k.ends_with("_LINKER"))
+            {
+                config.taints.insert(format!(
+                    "cargo:config: ${k} names a program that is not an input vci hashes (custom test runners and linkers are not supported)"
+                ));
+            }
+        }
+        let member_ids: BTreeSet<&str> = ws
+            .meta
+            .workspace_members
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let members: BTreeMap<Utf8PathBuf, usize> = ws
+            .meta
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| member_ids.contains(p.id.as_str()))
+            .filter_map(|(i, p)| Some((canonical(Utf8Path::new(&p.manifest_path).parent()?), i)))
+            .collect();
+        let raw = |k: &str| Self::child_var_raw(env, k);
+        let cargo_exe = exec::cargo_exe(&self.cargo, &probe.sysroot, &raw);
+        let proxy_env = if cargo_exe.1 {
+            exec::proxy_env(self.cargo_cmd(env), raw("PATH"))
+        } else {
+            vec![]
+        };
+        Ok(RunCtx {
+            target_dir: ws.target_dir.join(VCI_TARGET_SUBDIR),
+            excluded: vec![
+                ws.target_dir.clone(),
+                repo_root.join(".git"),
+                repo_root.join(".vci/out"),
+            ],
+            repo_root,
+            config,
+            config_env: exec::config_env(&cfg_files),
+            cargo_exe,
+            proxy_env,
+            members,
+            cleaned: Mutex::new(BTreeSet::new()),
+            caches: Caches::default(),
+            probe,
+            lock,
+            ws,
+        })
+    }
+
+    /// `cargo test --locked --manifest-path <pkg>/Cargo.toml <target>` for
+    /// each unit, one at a time; without units, `cargo test --locked
+    /// --workspace`. Output goes to stderr.
+    fn run_plain_serial(
+        &self,
+        files: &[String],
+        env: &ChildEnv,
+    ) -> Result<Option<i32>, AdapterError> {
+        let target = self.vci_target_dir(env)?;
+        let mut invocations: Vec<Vec<String>> = Vec::new();
+        if files.is_empty() {
+            invocations.push(vec!["test".into(), "--locked".into(), "--workspace".into()]);
+        } else {
+            for f in files {
+                let argv = self.canonical_argv("", f);
+                if parse_unit(f).is_none() {
+                    return Err(AdapterError::NotFound(format!("{f:?} is not a cargo unit")));
+                }
+                invocations.push(argv[1..].to_vec());
+            }
+        }
+        let mut codes = Vec::new();
+        for args in invocations {
+            let tmp = tempfile::Builder::new().prefix("vci-cargotmp-").tempdir()?;
+            let mut cmd = self.cargo_cmd(env);
+            cmd.args(&args)
+                .arg("--target-dir")
+                .arg(target.as_str())
+                .env("TMPDIR", tmp.path())
+                .stdout(std::io::stderr())
+                .stderr(std::io::stderr());
+            let _ = writeln!(std::io::stderr(), "vci: {}", describe(&cmd));
+            codes.push(
+                cmd.status()
+                    .map_err(|e| self.not_installed("cargo", e))?
+                    .code(),
+            );
+        }
+        Ok(fold_exit(codes))
     }
 
     /// Artifacts of crates inside the repository that cargo reused (fresh)
     /// although vci has not built them since it cleaned them in this run:
     /// (name, version) of each.
     fn reused_repo_packages(&self, arts: &[Artifact], ctx: &RunCtx) -> BTreeSet<(String, String)> {
-        let cleaned = ctx.cleaned.borrow();
+        let cleaned = lock(&ctx.cleaned).clone();
         arts.iter()
             .filter(|a| a.fresh)
             .filter(|a| {
                 a.manifest_path
                     .parent()
-                    .is_some_and(|d| canonical(d).starts_with(&ctx.repo_root))
+                    .is_some_and(|d| ctx.canon(d).starts_with(&ctx.repo_root))
             })
             .filter_map(|a| parse_pkgid(&a.package_id))
             .map(|p| (p.name, p.version))
@@ -1360,92 +1612,10 @@ impl CargoAdapter {
             .collect()
     }
 
-    /// Run one unit and build its observations.
-    fn run_unit(
-        &self,
-        unit: &str,
-        env: &ChildEnv,
-        ctx: &RunCtx,
-    ) -> Result<(Option<i32>, Observed, Vec<u8>), AdapterError> {
-        let mut o = Observed {
-            test_id: unit.to_owned(),
-            root: self.project_dir.to_string(),
-            adapter: "cargo".into(),
-            collector: "cargo".into(),
-            runner_version: ctx.probe.versions.runner.clone(),
-            ..Default::default()
-        };
-        let Some((pkg_rel, kind)) = parse_unit(unit) else {
-            o.taints.push(format!("cargo: {unit:?} is not a unit id"));
-            o.result = Some(unit_result("", false, 0));
-            return Ok((
-                Some(1),
-                o,
-                format!("vci: {unit:?} is not a cargo unit\n").into_bytes(),
-            ));
-        };
-        let mut block: Vec<u8> = Vec::new();
-        let mut retried = false;
-        loop {
-            let tmp = tempfile::Builder::new().prefix("vci-cargotmp-").tempdir()?;
-            let mut cmd = self.cargo_cmd(env);
-            cmd.args(["test", "--locked", "--manifest-path"])
-                .arg(manifest_arg(&pkg_rel))
-                .args(kind.selector())
-                .arg("--message-format=json")
-                .arg("--target-dir")
-                .arg(ctx.target_dir.as_str())
-                .env("TMPDIR", tmp.path());
-            let started = std::time::Instant::now();
-            let out = cmd.output().map_err(|e| self.not_installed("cargo", e))?;
-            let elapsed = started.elapsed().as_millis() as u64;
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let (arts, runs, text) = split_messages(&stdout);
-            block.extend_from_slice(
-                format!(
-                    "vci: {} (exit {})\n",
-                    describe(&cmd),
-                    out.status
-                        .code()
-                        .map_or_else(|| "signal".to_owned(), |c| c.to_string())
-                )
-                .as_bytes(),
-            );
-            block.extend_from_slice(&out.stderr);
-            block.extend_from_slice(text.as_bytes());
-            // A crate of the repository vci did not clean at the start of
-            // the run (a path dependency outside the workspace, a crate
-            // vendored in the repository) and that cargo reused: clean it
-            // and run the unit again, once.
-            let reused = self.reused_repo_packages(&arts, ctx);
-            if !reused.is_empty() && !retried {
-                retried = true;
-                block.extend_from_slice(
-                    format!(
-                        "vci: cargo reused {} from an earlier build; rebuilding it and running {unit} again\n",
-                        reused
-                            .iter()
-                            .map(|(n, v)| format!("{n}@{v}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                    .as_bytes(),
-                );
-                block.extend(self.clean(&reused, env, ctx)?);
-                continue;
-            }
-            o.result = Some(unit_result(&text, out.status.success(), elapsed));
-            // The rustc cargo actually built with; `vci run` refuses the unit
-            // if it is not the one probed (and recorded in the toolchain).
-            if let Some(used) = rustc_used(&ctx.target_dir) {
-                o.runner_version = used;
-            }
-            self.analyse(&mut o, &arts, &runs, ctx);
-            return Ok((out.status.code(), o, block));
-        }
-    }
-
     /// Everything the unit's build reports -> inputs, externals, taints.
+    /// Runs in the execution pool's threads: what does not depend on the
+    /// unit (package directory walks, dep-info, source and manifest scans,
+    /// external source checks) comes from the run-wide caches in `ctx`.
     fn analyse(&self, o: &mut Observed, arts: &[Artifact], runs: &[BuildRun], ctx: &RunCtx) {
         let mut problems: BTreeSet<String> = BTreeSet::new();
         if arts.is_empty() {
@@ -1475,7 +1645,7 @@ impl CargoAdapter {
                 problems.insert(format!("cargo: no manifest path for package {id}"));
                 continue;
             };
-            let dir = canonical(manifest.parent().unwrap_or(Utf8Path::new("/")));
+            let dir = ctx.canon(manifest.parent().unwrap_or(Utf8Path::new("/")));
             match &p.source {
                 None => {
                     if dir.starts_with(&ctx.repo_root) {
@@ -1545,24 +1715,18 @@ impl CargoAdapter {
                         // In $CARGO_HOME: what cargo compiles must be what
                         // Cargo.lock pins (an extracted crate or a checkout
                         // edited in place is not noticed by cargo).
-                        let verdict = ctx
-                            .verified
-                            .borrow_mut()
-                            .entry(dir.clone())
-                            .or_insert_with(|| {
-                                if src.starts_with("git+") {
-                                    sources::verify_git(&dir, &p.name, &l.source)
-                                } else if src.starts_with("registry+") || src.starts_with("sparse+")
-                                {
-                                    sources::verify_registry(&dir, &p.name, &p.version, &l.checksum)
-                                } else {
-                                    Err(format!(
-                                        "{} {}: source {src} cannot be verified against Cargo.lock",
-                                        p.name, p.version
-                                    ))
-                                }
-                            })
-                            .clone();
+                        let verdict = ctx.verified(&dir, || {
+                            if src.starts_with("git+") {
+                                sources::verify_git(&dir, &p.name, &l.source)
+                            } else if src.starts_with("registry+") || src.starts_with("sparse+") {
+                                sources::verify_registry(&dir, &p.name, &p.version, &l.checksum)
+                            } else {
+                                Err(format!(
+                                    "{} {}: source {src} cannot be verified against Cargo.lock",
+                                    p.name, p.version
+                                ))
+                            }
+                        });
                         if let Err(e) = verdict {
                             problems.insert(format!("cargo:source: {e}"));
                         }
@@ -1574,18 +1738,17 @@ impl CargoAdapter {
         // Package directories of the repository's crates: every file and
         // listing. A nested package inside another's directory is included
         // in both (harmless).
-        let mut walker = Walker::new(&ctx.repo_root, &ctx.excluded);
         let mut findings = scan::Findings::default();
         for dir in &vendored {
-            walker.walk(dir, o, &mut problems);
+            ctx.walk(dir).merge_into(o, &mut problems);
         }
         for dir in in_repo.values() {
-            walker.walk(dir, o, &mut problems);
+            ctx.walk(dir).merge_into(o, &mut problems);
             let manifest = dir.join("Cargo.toml");
-            match std::fs::read_to_string(&manifest) {
-                Ok(t) => findings.scan_manifest(&manifest, &t),
+            match &*ctx.manifest_scan(&manifest) {
+                Ok(f) => merge_findings(&mut findings, f),
                 Err(e) => {
-                    problems.insert(format!("cargo: reading {manifest}: {e}"));
+                    problems.insert(e.clone());
                 }
             }
         }
@@ -1607,28 +1770,28 @@ impl CargoAdapter {
                 ));
                 continue;
             };
-            let text = match std::fs::read_to_string(&d) {
-                Ok(t) => t,
+            let info = ctx.dep_info(&d);
+            let info = match &*info {
+                Ok(i) => i,
                 Err(e) => {
-                    problems.insert(format!("cargo: reading {d}: {e}"));
+                    problems.insert(e.clone());
                     continue;
                 }
             };
-            let info = depinfo::parse(&text, &ctx.ws.root);
-            for k in info.env {
-                if !scan::is_cargo_set_env(&k) {
-                    o.env_keys.insert(k);
+            for k in &info.env {
+                if !scan::is_cargo_set_env(k) {
+                    o.env_keys.insert(k.clone());
                 }
             }
             let is = |k: &str| a.kind.iter().any(|x| x == k);
-            for f in info.files {
-                let f = normalise(&f);
+            for f in &info.files {
+                let f = normalise(f);
                 if f.starts_with(&ctx.probe.sysroot) {
                     continue;
                 }
-                let generated = f.starts_with(target_dir) || canonical(&f).starts_with(target_dir);
+                let generated = f.starts_with(target_dir) || ctx.canon(&f).starts_with(target_dir);
                 if !generated && !f.starts_with(&ctx.repo_root) {
-                    let real = canonical(&f);
+                    let real = ctx.canon(&f);
                     if real.starts_with(&ctx.probe.sysroot)
                         || external_dirs.iter().any(|e| real.starts_with(e))
                     {
@@ -1640,7 +1803,13 @@ impl CargoAdapter {
                     continue;
                 }
                 if !generated {
-                    o.modules.insert(f.clone());
+                    // Reached through a symlinked directory (`jj/cli/docs ->
+                    // ../docs`): the links and the file at its real path are
+                    // the inputs, not the spelling through the link (which
+                    // the pre-run snapshot does not hold).
+                    let (links, real) = through_links(&f, &ctx.repo_root);
+                    o.modules.extend(links);
+                    o.modules.insert(real);
                 }
                 let e = roles
                     .entry(f)
@@ -1656,25 +1825,18 @@ impl CargoAdapter {
         }
         let mut scanned_from: BTreeMap<Utf8PathBuf, Utf8PathBuf> = BTreeMap::new();
         for (f, (r, pkg)) in &roles {
-            let bytes = match std::fs::read(f) {
-                Ok(b) => b,
+            // Generated code (OUT_DIR) can be rewritten when a package is
+            // rebuilt during the run: scanned every time.
+            let cacheable = !f.starts_with(target_dir);
+            match &*ctx.source_scan(f, *r, pkg, cacheable) {
                 Err(e) => {
-                    problems.insert(format!("cargo: reading {f}: {e}"));
+                    problems.insert(e.clone());
                     continue;
                 }
-            };
-            // Not UTF-8: only `include_bytes!` can have read it (data).
-            let Ok(t) = String::from_utf8(bytes) else {
-                continue;
-            };
-            let t = if matches!(f.extension(), Some("md" | "markdown")) {
-                // Documentation included as doc comments (its doctests run):
-                // scanned line by line like `///` comments.
-                t.lines().map(|l| format!("///{l}\n")).collect::<String>()
-            } else {
-                t
-            };
-            findings.scan_source(f, &t, *r, pkg);
+                // Not UTF-8: only `include_bytes!` can have read it (data).
+                Ok(None) => continue,
+                Ok(Some(found)) => merge_findings(&mut findings, found),
+            }
             scanned_from.insert(f.clone(), pkg.clone());
         }
         // Build scripts: declared inputs, and native libraries.
@@ -1710,7 +1872,7 @@ impl CargoAdapter {
                         continue;
                     }
                     match std::fs::symlink_metadata(&abs) {
-                        Ok(m) if m.is_dir() => walker.walk(&abs, o, &mut problems),
+                        Ok(m) if m.is_dir() => ctx.walk(&abs).merge_into(o, &mut problems),
                         Ok(_) => {
                             o.modules.insert(abs);
                         }
@@ -1725,7 +1887,7 @@ impl CargoAdapter {
                     .linked_paths
                     .iter()
                     .map(|p| p.split_once('=').map_or(p.as_str(), |(_, v)| v))
-                    .filter(|p| !canonical(Utf8Path::new(p)).starts_with(target_dir))
+                    .filter(|p| !ctx.canon(Utf8Path::new(p)).starts_with(target_dir))
                     .collect();
                 if r.linked_paths.is_empty() || !outside.is_empty() {
                     problems.insert(format!(
@@ -1792,6 +1954,44 @@ impl CargoAdapter {
     }
 }
 
+/// Add one file's (or manifest's) findings to a unit's, as scanning it into
+/// the unit's findings would have: sets are joined, and a path already
+/// recorded keeps where it was seen first (files are merged in path order).
+fn merge_findings(into: &mut scan::Findings, from: &scan::Findings) {
+    into.taints.extend(from.taints.iter().cloned());
+    into.env_names.extend(from.env_names.iter().cloned());
+    into.cfg_predicates
+        .extend(from.cfg_predicates.iter().cloned());
+    into.platform_files
+        .extend(from.platform_files.iter().cloned());
+    for (k, v) in &from.path_refs {
+        into.path_refs.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    for (k, v) in &from.local_refs {
+        into.local_refs
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+}
+
+/// The run's exit code from the units': `None` when one was killed by a
+/// signal, else the first non-zero one.
+fn fold_exit(codes: impl IntoIterator<Item = Option<i32>>) -> Option<i32> {
+    let mut exit = Some(0);
+    for code in codes {
+        match code {
+            Some(0) => {}
+            None => exit = None,
+            Some(c) => {
+                if exit == Some(0) {
+                    exit = Some(c);
+                }
+            }
+        }
+    }
+    exit
+}
+
 /// When `path` (inside `repo_root`) does not exist with exactly these
 /// letters but a case-insensitive filesystem finds it anyway, the path as it
 /// is on disk.
@@ -1819,7 +2019,85 @@ fn case_mismatch(repo_root: &Utf8Path, path: &Utf8Path) -> Option<Utf8PathBuf> {
     wrong.then_some(dir)
 }
 
-/// Per-run context shared by the units.
+/// Lock a mutex, also after a thread panicked holding it (the data is
+/// caches and sets that stay consistent).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What walking one directory recorded ([`Walker`] from that directory
+/// alone).
+#[derive(Debug, Default)]
+struct Walked {
+    o: Observed,
+    problems: BTreeSet<String>,
+}
+
+impl Walked {
+    /// Add the walk to a unit's observations. A unit that walks several
+    /// directories records the union of their walks: the paths a walk
+    /// records are canonical below its start, so a directory reached by two
+    /// walks is recorded the same way by both.
+    fn merge_into(&self, o: &mut Observed, problems: &mut BTreeSet<String>) {
+        o.readdirs.extend(self.o.readdirs.iter().cloned());
+        o.excluded.extend(self.o.excluded.iter().cloned());
+        o.modules.extend(self.o.modules.iter().cloned());
+        problems.extend(self.problems.iter().cloned());
+    }
+}
+
+/// A scan of one source file: its findings, `None` when it is not UTF-8
+/// (data), or why it could not be read.
+type SourceScan = Result<Option<scan::Findings>, String>;
+
+/// A run-wide memo: each key's value is computed once, by the first thread
+/// that asks for it (others asking meanwhile wait for that value).
+struct Memo<K, V>(Mutex<HashMap<K, Arc<OnceLock<V>>>>);
+
+impl<K, V> Default for Memo<K, V> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+impl<K: Eq + Hash, V: Clone> Memo<K, V> {
+    /// The value of `key`, computed with `f` if nobody has yet.
+    fn get<Q>(&self, key: &Q, f: impl FnOnce() -> V) -> V
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Eq + Hash + ToOwned<Owned = K>,
+    {
+        let cell = {
+            let mut m = lock(&self.0);
+            match m.get(key) {
+                Some(c) => c.clone(),
+                None => {
+                    let c = Arc::new(OnceLock::new());
+                    m.insert(key.to_owned(), c.clone());
+                    c
+                }
+            }
+        };
+        cell.get_or_init(f).clone()
+    }
+}
+
+/// Run-wide caches of what does not depend on the unit. Repository files do
+/// not change during a run (`vci run` refuses the run when they do), so
+/// each is read, walked and scanned once.
+#[derive(Default)]
+struct Caches {
+    canonical: Memo<Utf8PathBuf, Utf8PathBuf>,
+    walks: Memo<Utf8PathBuf, Arc<Walked>>,
+    dep_info: Memo<Utf8PathBuf, Arc<Result<depinfo::DepInfo, String>>>,
+    sources: Memo<(Utf8PathBuf, scan::Roles, Utf8PathBuf), Arc<SourceScan>>,
+    manifests: Memo<Utf8PathBuf, Arc<Result<scan::Findings, String>>>,
+    /// External source directories checked against Cargo.lock.
+    verified: Memo<Utf8PathBuf, Result<(), String>>,
+}
+
+/// Per-run context shared by the units (and the threads of the execution
+/// pool).
 struct RunCtx {
     probe: Probe,
     ws: Workspace,
@@ -1831,11 +2109,117 @@ struct RunCtx {
     excluded: Vec<Utf8PathBuf>,
     /// The repository's cargo config and rustc wrappers, for every unit.
     config: config::ConfigFacts,
+    /// The `[env]` table of the cargo configuration (test processes get it).
+    config_env: Vec<exec::ConfigEnv>,
+    /// `CARGO` for test processes, and whether cargo is rustup's proxy.
+    cargo_exe: (String, bool),
+    /// What rustup's proxy sets for cargo (see [`exec::proxy_env`]), for
+    /// test processes; empty when cargo is not the proxy.
+    proxy_env: Vec<(String, String)>,
+    /// Workspace members by canonical package directory (index into
+    /// `ws.meta.packages`).
+    members: BTreeMap<Utf8PathBuf, usize>,
     /// Packages of the repository cleaned from `target_dir` in this run, as
     /// (name, version): every artifact of theirs was built in this run.
-    cleaned: RefCell<BTreeSet<(String, String)>>,
-    /// External source directories checked against Cargo.lock.
-    verified: RefCell<BTreeMap<Utf8PathBuf, Result<(), String>>>,
+    cleaned: Mutex<BTreeSet<(String, String)>>,
+    caches: Caches,
+}
+
+impl RunCtx {
+    /// [`canonical`], once per path.
+    fn canon(&self, p: &Utf8Path) -> Utf8PathBuf {
+        self.caches.canonical.get(p, || canonical(p))
+    }
+
+    /// The walk of `dir` (see [`Walker`]), once per directory.
+    fn walk(&self, dir: &Utf8Path) -> Arc<Walked> {
+        self.caches.walks.get(dir, || {
+            let mut w = Walked::default();
+            Walker::new(&self.repo_root, &self.excluded).walk(dir, &mut w.o, &mut w.problems);
+            Arc::new(w)
+        })
+    }
+
+    /// The dep-info file `d`, parsed once.
+    fn dep_info(&self, d: &Utf8Path) -> Arc<Result<depinfo::DepInfo, String>> {
+        self.caches.dep_info.get(d, || {
+            Arc::new(
+                std::fs::read_to_string(d)
+                    .map(|t| depinfo::parse(&t, &self.ws.root))
+                    .map_err(|e| format!("cargo: reading {d}: {e}")),
+            )
+        })
+    }
+
+    /// The scan of a package manifest, once per file.
+    fn manifest_scan(&self, manifest: &Utf8Path) -> Arc<Result<scan::Findings, String>> {
+        self.caches.manifests.get(manifest, || {
+            Arc::new(match std::fs::read_to_string(manifest) {
+                Ok(t) => {
+                    let mut f = scan::Findings::default();
+                    f.scan_manifest(manifest, &t);
+                    Ok(f)
+                }
+                Err(e) => Err(format!("cargo: reading {manifest}: {e}")),
+            })
+        })
+    }
+
+    /// The scan of source file `f` with `roles` for the crate in `pkg`;
+    /// remembered when `cacheable`.
+    fn source_scan(
+        &self,
+        f: &Utf8Path,
+        roles: scan::Roles,
+        pkg: &Utf8Path,
+        cacheable: bool,
+    ) -> Arc<SourceScan> {
+        let scan = || {
+            Arc::new(match std::fs::read(f) {
+                Err(e) => Err(format!("cargo: reading {f}: {e}")),
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Err(_) => Ok(None),
+                    Ok(t) => {
+                        let t = if matches!(f.extension(), Some("md" | "markdown")) {
+                            // Documentation included as doc comments (its
+                            // doctests run): scanned line by line like `///`
+                            // comments.
+                            t.lines().map(|l| format!("///{l}\n")).collect::<String>()
+                        } else {
+                            t
+                        };
+                        let mut found = scan::Findings::default();
+                        found.scan_source(f, &t, roles, pkg);
+                        Ok(Some(found))
+                    }
+                },
+            })
+        };
+        if cacheable {
+            self.caches
+                .sources
+                .get(&(f.to_owned(), roles, pkg.to_owned()), scan)
+        } else {
+            scan()
+        }
+    }
+
+    /// Whether the external source directory `dir` is what Cargo.lock pins,
+    /// checked once.
+    fn verified(
+        &self,
+        dir: &Utf8Path,
+        check: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.caches.verified.get(dir, check)
+    }
+
+    /// The workspace member whose package directory is `pkg_rel` (relative
+    /// to the project dir).
+    fn member(&self, project_dir: &Utf8Path, pkg_rel: &str) -> Option<&Package> {
+        let dir = self.canon(&project_dir.join(pkg_rel));
+        self.members.get(&dir).map(|&i| &self.ws.meta.packages[i])
+    }
 }
 
 impl Adapter for CargoAdapter {
@@ -1946,51 +2330,13 @@ impl Adapter for CargoAdapter {
         vec![]
     }
 
-    /// One `cargo test --message-format=json <unit>` per unit, one at a time
-    /// (cargo locks the build directory), each with a fresh TMPDIR.
+    /// Every unit built alone by the cargo lane (`cargo test <unit> --no-run
+    /// --message-format=json`, after one warm-up build), its test executable
+    /// run by the execution pool with the environment `cargo test` gives it
+    /// and a fresh TMPDIR, several units at once (see [`lane`]). Doctests:
+    /// `cargo test --doc` in the lane.
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {
-        let probe = self.probe(env)?;
-        let ws = self.workspace(env)?;
-        let lock = self.lock().map_err(|e| AdapterError::Parse {
-            what: "Cargo.lock".into(),
-            detail: e,
-        })?;
-        let repo_root = canonical(&repo_root_of(&self.project_dir));
-        let cfg_files = self.config_files(env);
-        let mut config = config::repo_facts(&cfg_files);
-        let var = |k: &str| Self::child_var(env, k);
-        config
-            .taints
-            .extend(config::wrapper_problems(&var, &cfg_files));
-        // `-C linker=<program>` in the flags: a program vci does not hash.
-        if let Some(f) = probe.rustflags.iter().find(|f| f.contains("linker=")) {
-            config.taints.insert(format!(
-                "cargo:config: the rustflags set {f:?}, a linker that is not an input vci hashes (custom linkers are not supported)"
-            ));
-        }
-        for (k, _) in child_vars(env) {
-            if k.starts_with("CARGO_TARGET_") && (k.ends_with("_RUNNER") || k.ends_with("_LINKER"))
-            {
-                config.taints.insert(format!(
-                    "cargo:config: ${k} names a program that is not an input vci hashes (custom test runners and linkers are not supported)"
-                ));
-            }
-        }
-        let ctx = RunCtx {
-            target_dir: ws.target_dir.join(VCI_TARGET_SUBDIR),
-            excluded: vec![
-                ws.target_dir.clone(),
-                repo_root.join(".git"),
-                repo_root.join(".vci/out"),
-            ],
-            repo_root,
-            config,
-            cleaned: RefCell::new(BTreeSet::new()),
-            verified: RefCell::new(BTreeMap::new()),
-            probe,
-            lock,
-            ws,
-        };
+        let ctx = self.run_ctx(env)?;
         // Every package of the workspace is built from its sources in this
         // run (see `clean`); others found in the repository later are
         // cleaned when first met.
@@ -2011,72 +2357,37 @@ impl Adapter for CargoAdapter {
             .collect();
         let block = self.clean(&pkgs, env, &ctx)?;
         let _ = std::io::stderr().write_all(&block);
-        let mut exit = Some(0);
-        let mut observed = Vec::new();
-        for f in files {
-            let (code, o, block) = self.run_unit(f, env, &ctx)?;
-            let _ = std::io::stderr().write_all(&block);
-            match code {
-                Some(0) => {}
-                None => exit = None,
-                Some(c) => {
-                    if exit == Some(0) {
-                        exit = Some(c);
-                    }
-                }
-            }
-            observed.push(o);
-        }
+        let results = self.run_units(files, env, &ctx, true)?;
+        let exit = fold_exit(results.iter().map(|(c, _)| *c));
         Ok(RunOutput {
             exit_code: exit,
-            files: observed,
+            files: results.into_iter().map(|(_, o)| o).collect(),
         })
     }
 
-    /// With units: `cargo test --locked --manifest-path <pkg>/Cargo.toml
-    /// <target>` for each, one at a time (the selection and features the
-    /// attestations were made with). Without: `cargo test --locked
-    /// --workspace`. Output goes to stderr.
+    /// With units: each built by the cargo lane and run by the execution
+    /// pool like [`Adapter::run_collect`] (the selection and features the
+    /// attestations were made with), without analysis. Without: `cargo test
+    /// --locked --workspace`. Output goes to stderr, one block per unit.
     fn run_plain(&self, files: &[String], env: &ChildEnv) -> Result<Option<i32>, AdapterError> {
-        let target = self.vci_target_dir(env)?;
-        let mut invocations: Vec<Vec<String>> = Vec::new();
         if files.is_empty() {
-            invocations.push(vec!["test".into(), "--locked".into(), "--workspace".into()]);
-        } else {
-            for f in files {
-                let argv = self.canonical_argv("", f);
-                if parse_unit(f).is_none() {
-                    return Err(AdapterError::NotFound(format!("{f:?} is not a cargo unit")));
-                }
-                invocations.push(argv[1..].to_vec());
-            }
+            return self.run_plain_serial(files, env);
         }
-        let mut exit = Some(0);
-        for args in invocations {
-            let tmp = tempfile::Builder::new().prefix("vci-cargotmp-").tempdir()?;
-            let mut cmd = self.cargo_cmd(env);
-            cmd.args(&args)
-                .arg("--target-dir")
-                .arg(target.as_str())
-                .env("TMPDIR", tmp.path())
-                .stdout(std::io::stderr())
-                .stderr(std::io::stderr());
-            let _ = writeln!(std::io::stderr(), "vci: {}", describe(&cmd));
-            let code = cmd
-                .status()
-                .map_err(|e| self.not_installed("cargo", e))?
-                .code();
-            match code {
-                Some(0) => {}
-                None => exit = None,
-                Some(c) => {
-                    if exit == Some(0) {
-                        exit = Some(c);
-                    }
-                }
-            }
+        if let Some(f) = files.iter().find(|f| parse_unit(f).is_none()) {
+            return Err(AdapterError::NotFound(format!("{f:?} is not a cargo unit")));
         }
-        Ok(exit)
+        let ctx = match self.run_ctx(env) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "vci: {e}; running each unit with its own `cargo test`"
+                );
+                return self.run_plain_serial(files, env);
+            }
+        };
+        let results = self.run_units(files, env, &ctx, false)?;
+        Ok(fold_exit(results.iter().map(|(c, _)| *c)))
     }
 
     fn scratch_dirs(&self) -> Vec<Utf8PathBuf> {
@@ -2231,6 +2542,61 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         assert_eq!(rustc_used(&d).as_deref(), Some("1.96.0 ac68 LLVM 22.1.6"));
     }
 
+    /// The sysroot of the rustc cargo used (rustup's proxied cargo can find
+    /// Homebrew's rustc first on PATH): from the `--print=sysroot` line of
+    /// its cache, for the library search path of the tests.
+    #[test]
+    fn the_sysroot_cargo_used_is_read_from_its_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let d = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        assert_eq!(rustc_sysroot(&d), None);
+        let sysroot = d.join("brew/rust/1.96.0");
+        std::fs::create_dir_all(sysroot.join("lib/rustlib")).unwrap();
+        let info = |sysroots: &[&Utf8Path]| {
+            let outputs: serde_json::Map<String, Value> = sysroots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let out = format!("___\nlib___.rlib\n{s}\noff\n___\ndebug_assertions\n");
+                    (
+                        i.to_string(),
+                        serde_json::json!({"success": true, "stdout": out}),
+                    )
+                })
+                .collect();
+            serde_json::json!({"rustc_fingerprint": 1, "outputs": outputs}).to_string()
+        };
+        std::fs::write(d.join(".rustc_info.json"), info(&[&sysroot])).unwrap();
+        assert_eq!(rustc_sysroot(&d), Some(sysroot.clone()));
+        let other = d.join("rustup/toolchains/stable");
+        std::fs::create_dir_all(other.join("lib/rustlib")).unwrap();
+        std::fs::write(d.join(".rustc_info.json"), info(&[&sysroot, &other])).unwrap();
+        assert_eq!(rustc_sysroot(&d), None, "two rustcs: not known which");
+    }
+
+    /// The run-wide caches compute each key once, also when the execution
+    /// pool's threads ask at the same time.
+    #[test]
+    fn memo_computes_each_key_once() {
+        let memo: Memo<Utf8PathBuf, usize> = Memo::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for k in ["a", "b"] {
+                        let v = memo.get(Utf8Path::new(k), || {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            k.len()
+                        });
+                        assert_eq!(v, 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn package_ids_parse() {
         assert_eq!(
@@ -2286,6 +2652,24 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
     /// No built-in ignore name is matched by a built-in hash pattern (built-in
     /// hash would win, and cargo's locations would re-run every unit).
+    #[test]
+    fn dep_info_paths_through_symlinked_directories_resolve_to_the_target() {
+        let t = tempfile::tempdir().unwrap();
+        let root = canonical(Utf8Path::from_path(t.path()).unwrap());
+        std::fs::create_dir_all(root.join("jj/docs")).unwrap();
+        std::fs::create_dir_all(root.join("jj/cli")).unwrap();
+        std::fs::write(root.join("jj/docs/b.md"), "x").unwrap();
+        std::os::unix::fs::symlink("../docs", root.join("jj/cli/docs")).unwrap();
+        let (links, real) = through_links(&root.join("jj/cli/docs/b.md"), &root);
+        assert_eq!(links, [root.join("jj/cli/docs")]);
+        assert_eq!(real, root.join("jj/docs/b.md"));
+        let plain = root.join("jj/docs/b.md");
+        assert_eq!(through_links(&plain, &root), (vec![], plain));
+        std::os::unix::fs::symlink("/", root.join("jj/cli/out")).unwrap();
+        let outside = root.join("jj/cli/out/etc/hosts");
+        assert_eq!(through_links(&outside, &root), (vec![], outside));
+    }
+
     #[test]
     fn ignore_and_hash_lists_are_disjoint() {
         let m = |pat: &str, name: &str| match pat.split_once('*') {

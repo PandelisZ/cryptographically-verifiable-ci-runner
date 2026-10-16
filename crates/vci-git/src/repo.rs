@@ -218,6 +218,40 @@ impl Repo {
         }
         Ok(None)
     }
+
+    /// The submodules checked out in the work tree, recursively: paths the
+    /// index records as gitlinks (mode 160000) whose directory holds a `.git`
+    /// entry, as absolute paths, sorted. A submodule's own submodules come
+    /// from its index; one whose index cannot be read is left out.
+    pub fn submodules(&self) -> Result<Vec<Utf8PathBuf>, GitError> {
+        let mut out = Vec::new();
+        let mut todo = vec![self.root.clone()];
+        while let Some(root) = todo.pop() {
+            let listing = match Git::at(&root).args(["ls-files", "--stage", "-z"]).run() {
+                Ok(l) => l,
+                Err(e) if root == self.root => return Err(e),
+                Err(_) => continue,
+            };
+            for record in listing.split(|b| *b == 0) {
+                let Some(rest) = record.strip_prefix(b"160000 ") else {
+                    continue;
+                };
+                let Some(tab) = rest.iter().position(|b| *b == b'\t') else {
+                    continue;
+                };
+                let Ok(path) = std::str::from_utf8(&rest[tab + 1..]) else {
+                    continue;
+                };
+                let dir = root.join(path);
+                if dir.join(".git").exists() {
+                    todo.push(dir.clone());
+                    out.push(dir);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
 }
 
 /// One record of `git ls-tree -z` output.

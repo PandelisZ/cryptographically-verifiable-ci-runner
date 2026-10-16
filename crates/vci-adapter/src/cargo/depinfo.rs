@@ -96,6 +96,16 @@ pub fn dep_info_for(filenames: &[Utf8PathBuf]) -> Option<Utf8PathBuf> {
             return Some(c);
         }
     }
+    // Binaries uplifted to `<target>/debug/<name>` (built for an
+    // integration test's `CARGO_BIN_EXE_<name>`): a copy of
+    // `deps/<name>-<hash>`, whose dep-info sits next to the copy's source.
+    // Matched by size, then by content when several builds of the name are
+    // there.
+    for f in filenames {
+        if let Some(d) = uplifted_dep_info(f) {
+            return Some(d);
+        }
+    }
     // Build scripts: `build/<pkg>-<hash>/build-script-build` next to
     // `build_script_build-<hash>.d`.
     for f in filenames {
@@ -116,6 +126,45 @@ pub fn dep_info_for(filenames: &[Utf8PathBuf]) -> Option<Utf8PathBuf> {
         }
     }
     None
+}
+
+/// The dep-info of the `deps/<name>-<hash>` build that `uplifted`
+/// (`<dir>/<name>` or `<dir>/<name>.exe`) is a copy of.
+fn uplifted_dep_info(uplifted: &Utf8Path) -> Option<Utf8PathBuf> {
+    let (dir, stem) = match uplifted.extension() {
+        None => (uplifted.parent()?, uplifted.file_name()?),
+        Some("exe") => (uplifted.parent()?, uplifted.file_stem()?),
+        Some(_) => return None,
+    };
+    let len = std::fs::metadata(uplifted).ok()?.len();
+    let is_hash = |h: &str| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit());
+    let mut same: Vec<Utf8PathBuf> = dir
+        .join("deps")
+        .read_dir_utf8()
+        .ok()?
+        .flatten()
+        .map(|e| e.path().to_owned())
+        .filter(|p| {
+            let name = match p.extension() {
+                None => p.file_name(),
+                Some("exe") => p.file_stem(),
+                Some(_) => None,
+            };
+            name.and_then(|n| n.strip_prefix(stem))
+                .and_then(|r| r.strip_prefix('-'))
+                .is_some_and(is_hash)
+        })
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() == len))
+        .collect();
+    if same.len() > 1 {
+        let bytes = std::fs::read(uplifted).ok()?;
+        same.retain(|p| std::fs::read(p).ok().as_deref() == Some(bytes.as_slice()));
+    }
+    let [one] = same.as_slice() else {
+        return None;
+    };
+    let d = one.with_extension("d");
+    d.is_file().then_some(d)
 }
 
 /// What a build script declared in its output (`<out_dir>/../output`).
@@ -193,5 +242,24 @@ mod tests {
             Some(b.join("build_script_build-99.d"))
         );
         assert_eq!(dep_info_for(&[d.join("nothing-1")]), None);
+        // An uplifted binary: a copy of one of the `deps/<name>-<hash>`
+        // builds, told apart by size, then content.
+        let deps = d.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        for (h, body) in [
+            ("0123456789abcdef", "one"),
+            ("fedcba9876543210", "two"),
+            ("00000000deadbeef", "longer"),
+        ] {
+            std::fs::write(deps.join(format!("tool-{h}")), body).unwrap();
+            std::fs::write(deps.join(format!("tool-{h}.d")), "").unwrap();
+        }
+        std::fs::write(d.join("tool"), "two").unwrap();
+        assert_eq!(
+            dep_info_for(&[d.join("tool")]),
+            Some(deps.join("tool-fedcba9876543210.d"))
+        );
+        std::fs::write(d.join("tool"), "unknown").unwrap();
+        assert_eq!(dep_info_for(&[d.join("tool")]), None);
     }
 }

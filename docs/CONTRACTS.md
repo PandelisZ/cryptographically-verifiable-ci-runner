@@ -345,9 +345,17 @@ metadata` `workspace_root`) and hold `Cargo.lock`. All commands run with cwd = p
 - `installed_externals`: Cargo.lock, name -> `version source checksum` (every locked version).
 - `run_collect`: first `cargo clean --locked --target-dir <target dir>/vci -p <every workspace member>` (the
   repository's crates are always rebuilt; a repository crate reported `fresh` that was not cleaned in this run is
-  cleaned and its unit run again, once, else the unit is tainted), then per unit, one at a time, `TMPDIR=<fresh> cargo test --locked --manifest-path <pkg>/Cargo.toml
-  <--lib|--doc|--bin n|--test n|--example n|--bench n> --message-format=json --target-dir <target dir>/vci`. The JSON
-  messages (`compiler-artifact` with `manifest_path`, `filenames`, `features`; `build-script-executed` with `out_dir`,
+  cleaned and its unit run again, once, else the unit is tainted). Then, in one cargo lane (one cargo at a time, each
+  with a fresh TMPDIR): a warm-up `cargo test --locked --no-run --manifest-path <pkg>/Cargo.toml --message-format=json
+  --target-dir <target dir>/vci` per package with a requested unit (its failure is not fatal; reused repository crates
+  are cleaned and the package's warm-up repeated, once), then per unit `cargo test --locked --manifest-path
+  <pkg>/Cargo.toml <--lib|--bin n|--test n|--example n|--bench n> --no-run --message-format=json --target-dir <target
+  dir>/vci` (`#doc`: `--doc` instead of `--no-run`, which runs the doctests in the lane). The test executable that
+  build reports for the unit (same package, `profile.test`, matching kind and name; none: tainted) is run by the
+  execution pool (`VCI_CARGO_JOBS` threads, default the CPU count) in the package dir with a fresh TMPDIR and the
+  variables `cargo test` sets (`cargo/exec.rs`); its exit status maps to 0 or 101. Each unit's output goes to stderr
+  as one block when it finishes. Once every test has run, the units are analysed in parallel with run-wide caches. The
+  JSON messages (`compiler-artifact` with `manifest_path`, `filenames`, `features`; `build-script-executed` with `out_dir`,
   `linked_libs`, `linked_paths`) become one `Observed`: `modules` = every file of every repository crate's package dir
   plus dep-info files, `readdirs` = every directory there (symlinked directories walked at their target),
   `excluded` = the target dir / repo `.git` / repo `.vci/out` where a walked directory holds them, `probes` = missing
@@ -359,8 +367,10 @@ metadata` `workspace_root`) and hold `Cargo.lock`. All commands run with cwd = p
   problems. The result:
   `passed` needs exit 0, no failure, nothing filtered out and at least one test (`no-tests`, `filtered`, `failed`
   otherwise); ignored tests count in `tests`, `skipped` is 0.
-- `run_plain`: with units, `cargo test --locked --manifest-path ... <target> --target-dir <target dir>/vci` per unit,
-  one at a time, fresh TMPDIR, output to stderr; without, `cargo test --locked --workspace`.
+- `run_plain`: with units, the same warm-up, lane and pool as `run_collect`, without the clean, the reused-crate retry
+  and analysis (if the run cannot be set up: `cargo test --locked --manifest-path ... <target> --target-dir <target
+  dir>/vci` per unit, one at a time, fresh TMPDIR); output to stderr; without units, `cargo test --locked
+  --workspace`.
 - `canonical_argv`: `["cargo", "test", "--locked", "--manifest-path", "<pkg>/Cargo.toml", <selector>...]`;
   `config_candidates`: `Cargo.toml`, `Cargo.lock`; built-in ignore `CARGO_IGNORE`; built-in hash
   `CARGO_HASH`; `scratch_dirs`: the target dir.

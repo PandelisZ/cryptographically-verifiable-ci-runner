@@ -1761,6 +1761,37 @@ fn cargo_paths_in_consts_and_letter_case() {
     } else {
         assert!(line.contains("result failed"), "{line}");
     }
+    // The policy can waive the undeclared path (`cargo:undeclared-reads`):
+    // the unit is attested with it recorded as waived, and the base policy
+    // must still waive it for the plan to skip the unit.
+    let toml = w.read("vci.toml");
+    w.put(
+        "vci.toml",
+        &toml.replace(
+            "[policy]\n",
+            "[policy]\nignore_taints = [\"cargo:undeclared-reads\"]\n",
+        ),
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "waive undeclared reads"]);
+    let waiving_base = w.git(&work, &["rev-parse", "HEAD"]);
+    let (_, stderr) = w.run_env(&["rds#lib"], &[]);
+    assert!(stderr.contains("vci: attested rds#lib"), "{stderr}");
+    let waived = w.predicates("rds#lib")[0]["waived"].clone();
+    assert!(
+        waived.to_string().contains("cargo:undeclared-reads"),
+        "{waived}"
+    );
+    let p = w.plan(&work, &waiving_base);
+    assert!(
+        p.skip.contains("rds#lib"),
+        "{p:?}\n{}",
+        w.explain(&work, "rds#lib", &waiving_base)
+    );
+    // `main` (the base without the waiver) does not accept it.
+    let ex = w.explain(&work, "rds#lib", "main");
+    assert!(ex.contains("waived taint cargo:undeclared-reads"), "{ex}");
+    assert!(w.plan(&work, "main").run.contains("rds#lib"));
 }
 
 /// The sources of the crates `$CARGO_HOME` holds for this cargo.
@@ -2010,4 +2041,272 @@ mod tests {
         "envp#lib",
         &["envp#lib"],
     );
+}
+
+/// The execution pool runs several units' test executables at once: two
+/// units that each sleep 1.5 s run at the same time in one `vci run` (each
+/// writes when it ran next to its own TMPDIR, which is where `vci` makes
+/// every unit's TMPDIR), every unit of the run is attested, doctests
+/// included, and each unit's output is printed as one block. The tests also
+/// check some of what `cargo test` gives a test process: the package
+/// directory as working directory and the `CARGO_PKG_*` variables.
+#[test]
+fn cargo_runs_units_in_parallel() {
+    let Some(w) = World::new() else { return };
+    let slow = |name: &str| {
+        format!(
+            r#"#[cfg(test)]
+mod tests {{
+    use std::time::{{Duration, SystemTime, UNIX_EPOCH}};
+
+    #[test]
+    fn takes_a_while() {{
+        let now = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        assert_eq!(std::env::var("CARGO_PKG_NAME").unwrap(), env!("CARGO_PKG_NAME"));
+        assert_eq!(std::env::var("CARGO_PKG_VERSION").unwrap(), "0.1.0");
+        assert!(std::path::Path::new("src/lib.rs").is_file(), "runs in its package directory");
+        let start = now();
+        std::thread::sleep(Duration::from_millis(1500));
+        let end = now();
+        let tag = std::env::var("APP_MODE").unwrap();
+        let dir = std::env::temp_dir();
+        let out = dir.parent().unwrap().join(format!("{{tag}}-{name}"));
+        std::fs::write(out, format!("{{start}} {{end}}")).unwrap();
+    }}
+}}
+"#
+        )
+    };
+    w.add_crate("slowa", &slow("slowa"));
+    w.add_crate("slowb", &slow("slowb"));
+    let tag = format!(
+        "vci-e2e-parallel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let units = ["slowa#lib", "slowb#lib", A_LIB, A_DOC, B, C, D];
+    let (code, stderr) = w.run_env(
+        &units,
+        &[("APP_MODE", tag.as_str()), ("VCI_CARGO_JOBS", "4")],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    for u in units {
+        assert!(
+            stderr.contains(&format!("vci: attested {u} ")),
+            "{u}: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("vci: warm-up build: "),
+        "one warm-up build: {stderr}"
+    );
+    let span = |name: &str| -> (u128, u128) {
+        let p = std::env::temp_dir().join(format!("{tag}-{name}"));
+        let t = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        let _ = std::fs::remove_file(&p);
+        let (a, b) = t.split_once(' ').unwrap();
+        (a.parse().unwrap(), b.parse().unwrap())
+    };
+    let (a0, a1) = span("slowa");
+    let (b0, b1) = span("slowb");
+    assert!(
+        a0 < b1 && b0 < a1,
+        "the two units ran one after the other: slowa {a0}..{a1}, slowb {b0}..{b1}"
+    );
+    // Each unit's output is one block: its test lines follow its own header.
+    for name in ["slowa", "slowb"] {
+        let at = stderr
+            .find(&format!("/{name}) "))
+            .unwrap_or_else(|| panic!("no block for {name}: {stderr}"));
+        let block = &stderr[at..];
+        let block = &block[..block[1..].find("\nvci: ").map_or(block.len(), |i| i + 1)];
+        assert!(
+            block.contains("test tests::takes_a_while ... ok"),
+            "{name}: {block}"
+        );
+    }
+    for u in ["slowa#lib", "slowb#lib"] {
+        let ms = w.predicates(u)[0]["result"]["durationMs"].as_u64().unwrap();
+        assert!(ms >= 1500, "{u}: {ms} ms");
+    }
+}
+
+/// Regression: a test that deletes an untracked nested git repository in
+/// its package directory (the repository root) changed the tree it ran in.
+/// The nested repository was left out of the tree snapshot, so the unit was
+/// attested (for a tree without it, where its test fails); and run with
+/// another unit of the same package, whose analysis walked the package
+/// directory before the test ran, it was refused for another reason. Every
+/// unit is analysed once every test has run, and the removal is a change.
+#[test]
+fn cargo_test_deleting_a_nested_repository_is_refused() {
+    let Some(w) = World::build(
+        VCI_TOML,
+        |d| {
+            std::fs::create_dir_all(d.join("src")).unwrap();
+            std::fs::write(
+                d.join("Cargo.toml"),
+                "[package]\nname = \"rootp\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n",
+            )
+            .unwrap();
+            std::fs::write(
+                d.join("src/lib.rs"),
+                "/// ```\n/// assert_eq!(rootp::two(), 2);\n/// ```\npub fn two() -> i32 {\n    2\n}\n\n#[test]\nfn removes_inner() {\n    assert!(std::path::Path::new(\"inner/.git\").exists());\n    std::fs::remove_dir_all(\"inner\").unwrap();\n}\n",
+            )
+            .unwrap();
+            let st = Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(d)
+                .env_remove("CARGO_TARGET_DIR")
+                .status()
+                .unwrap();
+            assert!(st.success());
+        },
+        &[],
+    ) else {
+        return;
+    };
+    let work = w.work.clone();
+    let inner = work.join("inner");
+    let make_inner = || {
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("README"), "r\n").unwrap();
+        w.git(&inner, &["init", "-q"]);
+        w.git(&inner, &["add", "-A"]);
+        w.git(&inner, &["commit", "-q", "-m", "inner"]);
+    };
+    for units in [&[".#lib"][..], &[".#doc", ".#lib"]] {
+        make_inner();
+        let (_, stderr) = w.run_env(units, &[]);
+        assert!(!inner.exists(), "the test ran: {stderr}");
+        let line = refusal(&stderr, ".#lib");
+        assert!(
+            line.contains("input changed during the run: .: modified during the run"),
+            "{units:?}: {line}"
+        );
+    }
+}
+
+/// The warm-up builds each package alone, as its units' own builds do: a
+/// package whose dependency's features another package unifies (`fb`
+/// enables `fa/x`) is not compiled again by its units' builds.
+#[test]
+fn cargo_warm_up_unifies_features_like_the_units() {
+    let Some(w) = World::new() else { return };
+    w.add_pkg(
+        "fa",
+        "\n[lib]\ndoctest = false\n\n[features]\nx = []\n",
+        &[(
+            "src/lib.rs",
+            "pub fn x() -> bool {\n    cfg!(feature = \"x\")\n}\n\n#[test]\nfn plain() {\n    assert!(!x());\n}\n",
+        )],
+    );
+    w.add_pkg(
+        "fb",
+        "\n[lib]\ndoctest = false\n\n[dependencies]\nfa = { path = \"../fa\", features = [\"x\"] }\n",
+        &[(
+            "src/lib.rs",
+            "#[test]\nfn unified() {\n    assert!(fa::x());\n}\n",
+        )],
+    );
+    let (code, stderr) = w.run_env(&["fa#lib", "fb#lib"], &[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    for u in ["fa#lib", "fb#lib"] {
+        assert!(stderr.contains(&format!("vci: attested {u} ")), "{stderr}");
+    }
+    for pkg in ["fa", "fb"] {
+        assert!(
+            stderr.contains(&format!(
+                "vci: warm-up build: cargo test --locked --no-run --manifest-path {pkg}/Cargo.toml"
+            )),
+            "{stderr}"
+        );
+        let head = format!("--manifest-path {pkg}/Cargo.toml --lib --no-run");
+        let at = stderr
+            .find(&head)
+            .unwrap_or_else(|| panic!("no build of {pkg}#lib: {stderr}"));
+        let block = &stderr[at..];
+        let block = &block[..block.find("\nvci: ").unwrap_or(block.len())];
+        assert!(
+            !block.contains("Compiling"),
+            "{pkg}#lib compiled after the warm-up: {block}"
+        );
+    }
+}
+
+/// A package with a binary: `cargo test --test <t>` also builds the binary
+/// (for `CARGO_BIN_EXE_<name>`), uplifted to `<target>/debug/<name>` where
+/// no dep-info sits next to it. Its dep-info is found through the
+/// `deps/<name>-<hash>` build it copies, so the integration tests are
+/// attested (1.7.1 refused every one of them with "no dep-info file").
+#[test]
+fn cargo_integration_tests_of_a_package_with_a_binary_are_attested() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.add_pkg(
+        "withbin",
+        "",
+        &[
+            ("src/lib.rs", "pub fn two() -> u32 {\n    2\n}\n"),
+            (
+                "src/main.rs",
+                "fn main() {\n    println!(\"{}\", withbin::two());\n}\n",
+            ),
+            (
+                "tests/pure.rs",
+                "#[test]\nfn lib_works() {\n    assert_eq!(withbin::two(), 2);\n}\n",
+            ),
+        ],
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "a package with a binary"]);
+    let stderr = w.run(&work, &["withbin#test:pure"], &w.trusted);
+    assert!(
+        stderr.contains("vci: attested withbin#test:pure"),
+        "{stderr}"
+    );
+    let entries = w.entries("withbin#test:pure");
+    assert!(
+        entries.iter().any(|e| e == "withbin/src/main.rs"),
+        "the binary's sources are inputs: {entries:?}"
+    );
+    let p = w.plan(&work, "main");
+    assert!(p.skip.contains("withbin#test:pure"), "{p:?}");
+}
+
+/// A file rustc reads through a symlinked directory (`sl/docs -> ../shared`,
+/// `include_str!("../docs/x.md")`): the link and the file at its real path
+/// are the inputs, and the unit is attested (the pre-run snapshot holds no
+/// entry for the spelling through the link).
+#[test]
+fn cargo_dep_info_through_a_symlinked_directory_is_attested() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.put("shared/docs/x.md", "# x\n");
+    w.add_crate(
+        "sl",
+        "pub const DOC: &str = include_str!(\"../docs/x.md\");\n\n#[test]\nfn has_doc() {\n    assert!(DOC.starts_with(\"# x\"));\n}\n",
+    );
+    std::os::unix::fs::symlink("../shared/docs", work.join("sl/docs")).unwrap();
+    w.git(&work, &["add", "-A"]);
+    w.git(
+        &work,
+        &["commit", "-q", "-m", "a crate reading through a symlink"],
+    );
+    let stderr = w.run(&work, &["sl#lib"], &w.trusted);
+    assert!(stderr.contains("vci: attested sl#lib"), "{stderr}");
+    let entries = w.entries("sl#lib");
+    for want in ["sl/docs", "shared/docs/x.md"] {
+        assert!(entries.iter().any(|e| e == want), "{want}: {entries:?}");
+    }
+    assert!(
+        !entries.iter().any(|e| e == "sl/docs/x.md"),
+        "not the spelling through the link: {entries:?}"
+    );
+    w.put("shared/docs/x.md", "# changed\n");
+    w.git(&work, &["commit", "-qam", "edit through the target"]);
+    assert!(w.plan(&work, "main").run.contains("sl#lib"));
 }

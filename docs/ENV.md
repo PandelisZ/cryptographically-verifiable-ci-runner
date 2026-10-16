@@ -29,8 +29,9 @@ input (`hash = ["HOME"]`), and `set` overrides everything.
 **Where `set` applies:** wherever vci starts a test process: `vci run`, `vci ci` (the tests it runs plainly and the
 ones it attests with `--key`) and the probes `vci plan` runs. The only values that win over `set` are the ones vci
 itself sets for a runner: `RAILS_ENV`/`RACK_ENV=test` and `RUBYOPT` with the collector (Rails), a node:test
-script's `NAME=value` assignments, vci's own `NODE_OPTIONS` additions, and the fresh `TMPDIR` of every Go, Cargo and
-Rails process.
+script's `NAME=value` assignments, vci's own `NODE_OPTIONS` additions, the fresh `TMPDIR` of every Go, Cargo and
+Rails process, and the variables `cargo test` gives a test process (`CARGO_PKG_*`, `OUT_DIR`, ...; see
+[Runner notes](#runner-notes)).
 
 **`vci env`** prints the effective policy of each project: every variable in a list, its class, where the rule comes
 from, and what it is on this machine. `vci env --base-ref origin/main` also shows where the base commit's policy
@@ -401,7 +402,14 @@ effective build settings (`go env`, including `go env -w` values) are part of th
 Cargo: nothing observes what a Rust test reads at run time, so the adapter only attests under the default policy
 (not `mode = "loose"`), where every unlisted variable is unset both where the unit was attested and in CI. Built-in
 ignore variables are hashed when the source names them literally (`std::env::var("HOME")`); a computed name is not
-seen. `TMPDIR` is a fresh directory for every `cargo test` vci starts.
+seen. `TMPDIR` is a fresh directory for every cargo build and every test executable vci starts. vci runs the test
+executables itself (`VCI_CARGO_JOBS` at a time) and adds what `cargo test` would: `CARGO`, `CARGO_MANIFEST_DIR`,
+`CARGO_MANIFEST_PATH`, `CARGO_PKG_*`, `OUT_DIR` and the build script's `cargo::rustc-env` variables,
+`CARGO_BIN_EXE_<name>`, the library search path, the cargo configuration's `[env]` table, and under rustup's proxy
+`CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `RUSTUP_TOOLCHAIN_SOURCE` and `RUST_RECURSION_COUNT` (see
+[Quick start (Cargo)](REFERENCE.md#quick-start-cargo)). As under `cargo test`, these win over the policy (`set`
+included), except `[env]` entries without `force`; they come from hashed inputs (the manifests, the build, the
+repository's cargo config) or name locations.
 
 Rails: reads RubyGems and Bundler make of their own variables while setting up the bundle are not observations (the
 bundle they produce is checked). Rails' generated `config/environments/test.rb` reads `CI`

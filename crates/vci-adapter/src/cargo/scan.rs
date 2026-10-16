@@ -14,7 +14,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use super::cfgexpr;
 
 /// What kind of code a source file is compiled into.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Roles {
     /// Linked into a test binary or a doctest (runs when the tests run).
     pub runtime: bool,
@@ -676,6 +676,11 @@ impl Findings {
     /// tests' working directory), or absolute (only with a file API: tests
     /// use absolute strings as data).
     fn path_literal(&mut self, lit: &str, io: bool, package_dir: &Utf8Path, seen: &str) {
+        // A glob pattern or data with control characters (`"/*/\n"` fed to
+        // an ignore-file parser), not a path anything opens.
+        if lit.contains(['*', '?']) || lit.chars().any(char::is_control) {
+            return;
+        }
         let resolved = if lit.starts_with('/') {
             if !io {
                 return;
@@ -915,6 +920,7 @@ fn t() {
     let p = Path::new("../joined/dir");
     let q = Utf8Path::new("/abs/data/only"); let r = RepoPath::new("../not/a/path/api");
     let s = Path::new("/abs/without/io");
+    let g = std::fs::read("/pat/*.json"); let h = ignore.chain(root, b"/*/\n");
 }
 "#,
             RT,
@@ -945,6 +951,11 @@ fn t() {
             f.path_refs
         );
         assert!(f.taints.is_empty());
+        assert!(
+            !f.path_refs.keys().any(|p| p.as_str().contains('*')),
+            "glob patterns are not paths: {:?}",
+            f.path_refs
+        );
         let f = scan(
             "let root = Path::new(env!(\"CARGO_MANIFEST_DIR\")).parent().unwrap();",
             RT,

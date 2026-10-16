@@ -424,26 +424,90 @@ vci explain crates/b#test:b --base-ref origin/main
 vci push
 ```
 
-`vci run` runs one `cargo test` per unit, one at a time (cargo locks the build directory), each with a fresh empty
-`TMPDIR`:
+`vci run` builds and runs the units in three parts (`crates/vci-adapter/src/cargo/lane.rs`):
 
-```
-cargo test --locked --manifest-path crates/b/Cargo.toml --test b --message-format=json --target-dir <target>/vci
-```
+1. **A warm-up build**: `cargo test --locked --no-run --manifest-path <pkg>/Cargo.toml --message-format=json
+   --target-dir <target>/vci` for each package with a requested unit, one package after another, each with cargo's
+   full job parallelism. Each package is built alone so that its dependencies' features are unified as they are for
+   its units (a build of several packages can turn on more features, and each unit's own build would then compile
+   again). A failed warm-up does not stop the run: each unit's own build then compiles what it needs.
+2. **The cargo lane**: one thread makes every cargo call of the run, in order (cargo locks the build directory). For
+   each unit it runs the unit's own build, the unit alone:
 
-`--manifest-path` selects the package the way `-p <name>` would (package names can be ambiguous; the path cannot).
-vci builds into `<target dir>/vci`, which only ever sees builds made with vci's environment policy, and **rebuilds the
+   ```
+   cargo test --locked --manifest-path crates/b/Cargo.toml --test b --no-run --message-format=json --target-dir <target>/vci
+   ```
+
+   After the warm-up this mostly finds everything fresh. The unit's inputs are derived from this build's messages,
+   and the test executable it reports (the unit's package, `profile.test`, the unit's target kind and name) is the
+   one that runs, so the artifacts analysed and the binary executed come from the same cargo invocation. `#doc` units
+   run `cargo test --locked --manifest-path <pkg>/Cargo.toml --doc --message-format=json --target-dir <target>/vci`
+   in the lane instead: doctests cannot be built without running them.
+3. **The execution pool**: `VCI_CARGO_JOBS` threads (default: the number of CPUs) run the test executables as the
+   lane hands them over, several at a time, each in its package directory, with a fresh empty `TMPDIR` and with what
+   `cargo test` adds to a test's environment (below). A unit's output (its cargo calls, then `vci: (in <package dir>)
+   <executable> (exit N)` and the test output) is printed as one block when the unit is done: blocks come in the
+   order units finish, and nothing is shown while a test runs. A failing test executable counts as exit 101, the
+   code `cargo test` exits with.
+
+Once every test of the run has run, the units are analysed, in parallel, with run-wide caches (directory walks,
+dep-info, source scans, manifest scans, registry and git source checks); a package directory shared by several units
+is walked after all of their tests ran. A unit whose build fails, whose build reports no test executable for it, or
+whose executable cannot be started is not attested (the reason says which); the other units go on.
+
+What a test executable gets on top of the run's environment is what cargo adds (`fill_env` in cargo's
+`core/compiler/compilation.rs`), compared with the environment a test sees under cargo 1.96's own `cargo test`
+(Homebrew's and rustup's, on macOS; Linux and Windows are covered by unit tests only):
+
+- `CARGO` (the cargo binary, as cargo reports it: `$CARGO`, or the toolchain's own cargo under rustup's proxy),
+  `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, and the package's `CARGO_PKG_NAME`, `CARGO_PKG_VERSION` (and its
+  `_MAJOR`, `_MINOR`, `_PATCH`, `_PRE` parts), `CARGO_PKG_AUTHORS`, `CARGO_PKG_DESCRIPTION`, `CARGO_PKG_HOMEPAGE`,
+  `CARGO_PKG_REPOSITORY`, `CARGO_PKG_LICENSE`, `CARGO_PKG_LICENSE_FILE`, `CARGO_PKG_RUST_VERSION`, `CARGO_PKG_README`;
+- `CARGO_BIN_EXE_<name>` for each binary of the package (integration tests and benches only);
+- `OUT_DIR` and the `cargo::rustc-env` variables of the package's build script;
+- the library search path (`DYLD_FALLBACK_LIBRARY_PATH` on macOS, `LD_LIBRARY_PATH` on Linux, `PATH` on Windows):
+  the build scripts' link directories inside `<target>/vci/debug`, then `<target>/vci/debug`, its `deps`, and the
+  sysroot's `lib/rustlib/<host>/lib`, then the variable's existing value (macOS's defaults when it had none);
+- the `[env]` table of the cargo configuration (`force` and `relative` as cargo reads them);
+- under rustup's proxy, what the proxy sets for cargo: `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`,
+  `RUSTUP_TOOLCHAIN_SOURCE`, `RUST_RECURSION_COUNT`, and `<sysroot>/lib` in front of the library search path.
+
+`CARGO_CRATE_NAME` and `CARGO_TARGET_TMPDIR` are set at compile time only; `cargo test` does not give them to the test
+process, so vci does not either.
+
+**Measured** on vex (a workspace of 26 members, 242 units, 955 packages) on a 14-CPU Mac, 2026-10-16, with the
+compiler cache (sccache) warm. All 242 units in one `vci run`: 1304 s with nothing built yet (the 26 warm-up builds
+took 684 s of that; the units' own builds, the tests, the analysis and the signing the remaining 10 minutes), and
+653 s with the dependencies already in `target/vci`. The units' own builds after the warm-up were 247 cargo steps
+totalling 218 s (median 0.5 s), 36 of which compiled something again (a build script that hashes a directory it
+rewrites). `cargo nextest run --workspace --exclude vex-jj` on the same machine, with the same compiler cache: 440 s
+(83 s of compilation, 254 s of tests). Six units alone: 39.6 s against 109.4 s for vci 1.7.1 with the dependencies
+built (182.0 s cold), both attesting the same three with byte-identical attestations. What the 242-unit run attested
+with `ignore_taints = ["*"]`: 172 units (91 of them through a waived `cargo:undeclared-reads`; the 72 units of
+the package whose build script embeds a prebuilt UI bundle needed that bundle's path ignored in `[env]`, else the
+script rebuilt the bundle during the run and changed its own inputs), with 64 refused for having no tests (23 doctest
+units, 23 binaries, 12 integration tests, 6 libraries) and 6 failing on that machine. Before 1.8.0 the same workspace
+attested 13 of 242: integration tests of packages with a binary (107 units) were refused for a missing dep-info
+file, every unit building jj-lib for a glob pattern taken as a path, and every vex-cli unit for a file reached
+through a symlinked directory (`jj/cli/docs -> ../docs`), which 1.8.0 records at its real path.
+
+`--manifest-path` selects the package the way `-p <name>` would (package names can be ambiguous; the path cannot). vci
+builds into `<target dir>/vci`, which only ever sees builds made with vci's environment policy, and **rebuilds the
 repository's crates in every `vci run`** (`cargo clean -p <every workspace member>` there first; a crate of the
 repository found reused later, such as a path dependency outside the workspace, is cleaned and its unit run again):
-cargo decides freshness by modification times and by what build scripts declare, vci by content, so a file restored
-with an older mtime (`cp -p`, `tar`, `rsync -t`), a build script reading a file or a variable it does not declare, or
-a proc macro reading a variable, would otherwise be attested against a stale build. External crates stay cached. `vci ci` runs every
-remaining unit with the same command (without `--message-format`), one unit per `cargo test`, so each unit is built
-with the features the attestation was made with (Cargo resolves features per selected package); it exits non-zero if
-any fails. **An attestation vouches for the unit run on its own**: a plain `cargo test --workspace` can unify features
-differently. `cargo test` also compiles examples that are not test targets; `vci ci` does not (the example workflow
-keeps a `cargo build --examples` step). CI example: [`examples/github-actions-cargo.yml`](../examples/github-actions-cargo.yml).
-Findings behind this design: [`docs/spike-cargo.md`](spike-cargo.md).
+cargo decides freshness by modification times and by what build scripts declare, vci by content, so a file restored with
+an older mtime (`cp -p`, `tar`, `rsync -t`), a build script reading a file or a variable it does not declare, or a proc
+macro reading a variable, would otherwise be attested against a stale build. External crates stay cached. `vci ci` runs
+every remaining unit the same way (warm-up, lane and pool, without the clean and without analysis), so each unit is
+still built alone, with the features the attestation was made with (Cargo resolves features per selected package); it
+exits non-zero if any fails. If it cannot set that up (the toolchain probe, `cargo metadata` or `Cargo.lock` fails), it
+runs each unit with its own `cargo test --locked --manifest-path <pkg>/Cargo.toml <selector> --target-dir <target>/vci`,
+one at a time, as before. **An attestation vouches for the unit run on its own**: a plain `cargo test --workspace` can
+unify features differently. `cargo test` also compiles examples that are not test targets; the warm-up compiles those of
+the packages it builds, but not of a package with no unit left to run, and a failed warm-up does not fail `vci ci` (the
+example workflow keeps a `cargo build --examples` step). CI example:
+[`examples/github-actions-cargo.yml`](../examples/github-actions-cargo.yml). Findings behind this design:
+[`docs/spike-cargo.md`](spike-cargo.md).
 
 ### What the cargo adapter can and cannot see (read this)
 
@@ -1203,9 +1267,10 @@ project; for node:test, then `js/vitest-plugin` or `share/vci/vitest-plugin` abo
 `py/pytest-plugin` or `share/vci/pytest-plugin` above the `vci` executable, then the source checkout `vci` was built
 from, then `py/pytest-plugin` above the project; a clear error names the variable when none is found), `VCI_UV` (uv
 binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`; Rails files run one at a time), `VCI_GO`
-(go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_RUBY` (ruby
-binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory holding `vci_collector.rb`;
-looked up like `VCI_PY_PLUGIN`).
+(go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_CARGO_JOBS` (Cargo test
+executables run at once in `vci run` and `vci ci`; default: the number of CPUs; cargo itself runs one build at a
+time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory
+holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`).
 
 Every collector directory is resolved to its real path before use, and what a test process reads of vci's own
 collector files is never an input, whichever path reached them: Homebrew installs them in
@@ -1717,8 +1782,9 @@ read through package os and recorded like any other testdata.
 
 ### Cargo
 
-Per unit, from `cargo test --locked --message-format=json <unit>` (every crate the unit builds, including build scripts,
-proc macros and dev-dependencies, with the features actually enabled):
+Per unit, from the unit's own `cargo test --locked --no-run --message-format=json <unit>` (`--doc` instead of `--no-run`
+for doctests; see [Quick start (Cargo)](#quick-start-cargo)), which reports every crate the unit builds, including
+build scripts, proc macros and dev-dependencies, with the features actually enabled:
 
 - **every crate of the repository the unit builds** (the package under test and its path dependencies, workspace
   members or not): every file in its package directory and every directory listing there (a new file anywhere in it
@@ -2051,7 +2117,8 @@ ignore_taints = ["process:*", "child_process.*", "fetch", "go:syscall", "externa
   refusal line names only the taints that refused it.
 - `vci plan` accepts such an attestation only while the **base commit's** policy still waives every recorded taint
   (its `ignore_taints`, or `go_allow_net` for `go:net`, or for Cargo's `cargo:undeclared-reads` the unit's declared
-  `[[inputs]]`); otherwise the candidate fails the `waived` check and `vci explain` names each taint that is no longer
+  `[[inputs]]` or, since 1.8.0, an `ignore_taints` pattern matching that key: the undeclared path is then recorded as
+  waived instead of refusing the unit); otherwise the candidate fails the `waived` check and `vci explain` names each taint that is no longer
   waived (`waived taint child_process.execSync`, `not waived by the base policy: no policy.ignore_taints pattern
   matches child_process.execSync`). Removing a pattern from the default branch's `vci.toml` therefore re-runs every
   unit attested under it.
