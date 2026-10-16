@@ -13,11 +13,14 @@ no_skip_refs_except = ["github-actions"]
 never_skip = []
 
 [env]
-# "strict": only declared and pass-through variables reach tests.
-mode = "strict"
-# Hashed into every test unit's inputs. Set to the same values locally and in CI.
-global = ["TZ", "CGO_ENABLED"]
-pass_through = []
+# Only the variables named here and in vci's short built-in lists reach the
+# tests; every other one is removed (docs/ENV.md; `vci env` shows the lists).
+# Set by vci in every test process, here and in CI (nothing to export).
+set = { TZ = "UTC", CGO_ENABLED = "0" }
+# Taken from the machine and hashed: another value re-runs the test.
+hash = []
+# Taken from the machine, never hashed, never a reason to re-run.
+ignore = []
 
 [[projects]]
 name = "py"

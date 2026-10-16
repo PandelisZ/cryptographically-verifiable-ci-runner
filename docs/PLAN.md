@@ -161,4 +161,4 @@ Automated as an `assert_cmd` integration test using throwaway SSH keys generated
 
 ## Environment variables
 
-See `docs/ENV.md`. It is part of the design: `vci.toml` `[env]` config with strict/loose mode, declared and pass-through patterns, hashed into each test file input root and checked in `vci plan`.
+See `docs/ENV.md`. It is part of the design: `vci.toml` `[env]` lists `set` (vci sets the value), `hash` and `ignore`, plus a short built-in list per runner; every other variable is removed from the test process; hashed into each test file input root and checked in `vci plan`.

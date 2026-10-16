@@ -20,7 +20,7 @@
 <p>Two terms first. A <strong>unit</strong> is what vci can skip; here, one spec file. An <strong>attestation</strong> is a signed record that a unit passed against exactly the inputs it read.</p>
 
 <h3>1. Run and sign locally</h3>
-<pre><code>TZ=UTC vci run spec/models/b_spec.rb spec/lib/a_spec.rb \
+<pre><code>vci run spec/models/b_spec.rb spec/lib/a_spec.rb \
   --key ~/.ssh/id_ed25519</code></pre>
 <pre data-nocopy><code>3 examples, 0 failures
 
@@ -32,7 +32,7 @@ vci: 2 attested, 0 not attested</code></pre>
 <p>Why the input counts differ: <code>a_spec.rb</code> loads only <code>spec_helper.rb</code> and one library file. <code>b_spec.rb</code> boots Rails, so its inputs include every file Rails loaded or looked for.</p>
 
 <h3>2. See what CI will do</h3>
-<pre><code>TZ=UTC vci plan --base-ref origin/main</code></pre>
+<pre><code>vci plan --base-ref origin/main</code></pre>
 <pre data-nocopy><code><span class="g">SKIP</span> demo/rspec-app/spec/lib/a_spec.rb [rspec]      (attested by vci-demo-agent (SHA256:RASHZ3Nm…))
 <span class="g">SKIP</span> demo/rspec-app/spec/models/b_spec.rb [rspec]   (attested by vci-demo-agent (SHA256:RASHZ3Nm…))
 <span class="a">RUN </span> demo/rspec-app/spec/requests/d_spec.rb [rspec] (no attestation)
@@ -75,7 +75,9 @@ candidate 1: git-meta path:demo/rspec-app/spec/models/b_spec.rb vci:attestation:
 <p>Each candidate attestation is listed with the first check it failed. <code>expected</code> is what the attestation recorded; <code>actual</code> is this checkout now. The common failed checks:</p>
 <table>
 <tr><th>Failed check</th><th>Meaning</th><th>What to do</th></tr>
-<tr><td><code>inputs</code></td><td>A file, directory listing or env var the test used has changed</td><td>Run the test again with <code>vci run</code></td></tr>
+<tr><td><code>inputs</code></td><td>A file or directory listing the test used has changed</td><td>Run the test again with <code>vci run</code></td></tr>
+<tr><td><code>env</code></td><td class="wrap">A hashed environment variable has another value here, or is unset; explain names it and its class, e.g. <code>env:DATABASE_URL (hash)</code></td><td class="wrap">Give it the same value on both sides, or move it to <code>[env] set</code>; <code>vci env</code> shows the lists</td></tr>
+<tr><td><code>env-config</code></td><td class="wrap">The base branch's <code>[env]</code> lists (or vci's built-in lists) differ from the attestation's; every attestation made before vci 1.6.0 fails this once</td><td class="wrap">Run the test again; <code>vci env --base-ref origin/main</code> shows the difference</td></tr>
 <tr><td><code>toolchain</code></td><td>Language, runner or library versions differ between the two machines</td><td>Pin the same versions on both sides; see <a href="adapters.html">Test runners</a></td></tr>
 <tr><td><code>signer</code></td><td>The key is not in <code>.vci/allowed_signers</code> on the base branch, or has expired</td><td>Add the key on the default branch</td></tr>
 <tr><td><code>expiry</code></td><td>The attestation is older than its lifetime or <code>max_ttl</code></td><td>Run the test again</td></tr>
@@ -86,7 +88,7 @@ candidate 1: git-meta path:demo/rspec-app/spec/models/b_spec.rb vci:attestation:
 <p>Two settings recur in every <code>vci.toml</code> below:</p>
 <ul>
 <li><code>platform = "any"</code>: an attestation made on one OS and architecture (a Mac laptop) may count on another (a Linux runner), as long as the toolchain matches.</li>
-<li><code>mode = "strict"</code>: <strong>strict mode</strong>. Environment variables you have not declared are removed from the test's environment (apart from a few built-in ones such as <code>PATH</code> and <code>HOME</code>), so they cannot change its result. <code>global</code> lists the ones you declare; their values are hashed.</li>
+<li><code>[env] set = { TZ = "UTC" }</code>: vci sets these variables in every test process, on the laptop and in CI, so nobody exports anything. Every variable no <code>[env]</code> list names (<code>set</code>, <code>hash</code>, <code>ignore</code>) is removed from the test's environment, apart from a short built-in list per runner (<code>PATH</code>, <code>HOME</code>, ...), so it cannot change the result. See <a href="configuration.html#env">[env]</a>.</li>
 </ul>
 
 <div class="tabs" data-sync="adapter">
@@ -101,8 +103,7 @@ platform = "any"
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 
 [env]
-mode = "strict"
-global = ["NODE_ENV"]</code></pre>
+set = { TZ = "UTC", LANG = "C.UTF-8" }</code></pre>
 <p>Locally</p>
 <pre><code>vci run src/cart.test.ts src/price.test.ts --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
@@ -129,8 +130,7 @@ platform = "any"
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 
 [env]
-mode = "strict"
-global = ["TZ"]</code></pre>
+set = { TZ = "UTC" }</code></pre>
 <p>Locally</p>
 <pre><code>export UV_PYTHON_PREFERENCE=only-managed
 vci run tests/test_orders.py --key ~/.ssh/id_ed25519
@@ -161,18 +161,13 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 go_allow_net = false          <span class="c"># true if tests only link package net, e.g. through testify</span>
 
 [env]
-mode = "strict"
-global = ["TZ", "CGO_ENABLED"]</code></pre>
+set = { TZ = "UTC", CGO_ENABLED = "0" }  <span class="c"># vci sets them everywhere</span></code></pre>
 <p>Locally. The unit is a package, so pass package directories:</p>
-<pre><code>export CGO_ENABLED=0 TZ=UTC
-vci run ./orders ./pricing --key ~/.ssh/id_ed25519
+<pre><code>vci run ./orders ./pricing --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
 vci push</code></pre>
 <p>CI steps</p>
-<pre><code>env:
-  CGO_ENABLED: "0"
-  TZ: UTC
-steps:
+<pre><code>steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
@@ -193,8 +188,7 @@ platform = "any"
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 
 [env]
-mode = "strict"               <span class="c"># the cargo adapter only attests in strict mode</span>
-global = ["TZ"]
+set = { TZ = "UTC" }          <span class="c"># every unlisted variable is removed from the tests</span>
 
 <span class="c"># Files a test reads outside its own package must be declared.</span>
 [[inputs]]
@@ -227,17 +221,13 @@ platform = "any"
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 
 [env]
-mode = "strict"
-global = ["TZ"]</code></pre>
+set = { TZ = "UTC" }</code></pre>
 <p>Locally</p>
-<pre><code>export TZ=UTC LANG=en_US.UTF-8
-vci run test/models/order_test.rb --key ~/.ssh/id_ed25519
+<pre><code>vci run test/models/order_test.rb --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
 vci push</code></pre>
 <p>CI steps</p>
-<pre><code>env:
-  TZ: UTC
-steps:
+<pre><code>steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
@@ -259,17 +249,14 @@ platform = "any"
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 
 [env]
-mode = "strict"
-global = ["TZ"]               <span class="c"># add "SPEC_OPTS" here if you set it</span></code></pre>
+set = { TZ = "UTC" }
+hash = []                     <span class="c"># add "SPEC_OPTS" here if you set it</span></code></pre>
 <p>Locally</p>
-<pre><code>export TZ=UTC LANG=en_US.UTF-8
-vci run spec/models/order_spec.rb --key ~/.ssh/id_ed25519
+<pre><code>vci run spec/models/order_spec.rb --key ~/.ssh/id_ed25519
 vci plan --base-ref origin/main
 vci push</code></pre>
 <p>CI steps</p>
-<pre><code>env:
-  TZ: UTC
-steps:
+<pre><code>steps:
   - uses: actions/checkout@v4
     with:
       fetch-depth: 0
@@ -327,8 +314,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 
 [env]
-mode = "strict"
-global = ["TZ", "CGO_ENABLED"]
+set = { TZ = "UTC", CGO_ENABLED = "0" }
 
 [[projects]]
 name = "py"
@@ -361,9 +347,7 @@ runner = "rspec"</code></pre>
   --key ~/.ssh/id_ed25519</code></pre>
 <p>In CI, set up every toolchain and call the action once. Adapted from this repository's <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/.github/workflows/ci.yml">workflow</a>:</p>
 <pre><code>env:
-  UV_PYTHON_PREFERENCE: only-managed
-  CGO_ENABLED: "0"
-  TZ: UTC
+  UV_PYTHON_PREFERENCE: only-managed   <span class="c"># TZ and CGO_ENABLED come from vci.toml</span>
 steps:
   - uses: actions/checkout@v4
     with:

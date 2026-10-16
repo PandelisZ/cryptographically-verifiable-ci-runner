@@ -15,6 +15,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
+mod env_common;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -41,8 +43,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-mode = "strict"
-global = ["NODE_ENV"]
+hash = ["NODE_ENV"]
 "#;
 
 fn keygen(path: &Path, comment: &str) {
@@ -1317,7 +1318,7 @@ const SNAPR: &str = "// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.ht
 
 #[test]
 fn main_process_inputs_and_loose_env_run_again() {
-    let toml = VCI_TOML.replace("mode = \"strict\"", "mode = \"loose\"");
+    let toml = VCI_TOML.replace("[env]\n", "[env]\nmode = \"loose\"\n");
     let w = World::new_with(
         &[
             ("vitest.config.ts", MAIN_PROCESS_CONFIG),
@@ -2046,4 +2047,43 @@ fn init_in_a_linked_worktree_notes_the_shared_config() {
     let err = init(&other);
     assert!(err.contains("git-meta remote \"meta\" configured"), "{err}");
     assert!(!err.contains("linked git worktree"), "{err}");
+}
+
+/// The `[env]` lists end to end (tests/env_common): a `set` variable reaches
+/// the test and is the same on every machine, a `hash` variable's change
+/// re-runs, an `ignore` variable's does not, an undeclared variable never
+/// reaches the test, `vci env` shows it all, and the old key names still work.
+#[test]
+fn vitest_env_set_hash_ignore_and_strip() {
+    let w = World::new_with(&[], &env_common::with_env(VCI_TOML, env_common::ENV_NEW));
+    w.put(
+        "src/env.test.ts",
+        r#"import { expect, test } from "vitest";
+
+test("env", () => {
+  expect(process.env.APP_SET).toBe("declared");
+  expect(process.env.TZ).toBe("UTC");
+  expect(process.env.APP_HASH).toBeTruthy();
+  expect(process.env.APP_IGNORE).toBeTruthy();
+  expect(process.env.APP_UNDECLARED).toBeUndefined();
+});
+"#,
+    );
+    let vci = |args: &[&str], env: &[(&'static str, String)]| {
+        let env: Vec<(&str, Option<&str>)> =
+            env.iter().map(|(k, v)| (*k, Some(v.as_str()))).collect();
+        w.vci_env(&w.work, args, &env)
+    };
+    let git = |dir: &Path, args: &[&str]| w.git(dir, args);
+    env_common::check_env_lists(
+        &env_common::Ops {
+            work: &w.work,
+            scratch: &w.base,
+            vci: &vci,
+            git: &git,
+            key: w.trusted.to_str().unwrap(),
+        },
+        "src/env.test.ts",
+        &["src/env.test.ts"],
+    );
 }

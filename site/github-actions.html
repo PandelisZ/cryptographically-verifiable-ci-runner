@@ -65,6 +65,7 @@ jobs:
 
 <h2 id="setup-steps-for-each-runner">Setup steps for each runner</h2>
 <p>Each tab replaces the toolchain steps of the workflow above. Pin the same versions you use locally: an attestation only counts where the toolchain matches.</p>
+<p><strong>Environment variables.</strong> The job exports nothing for vci. A variable that must have the same value on the laptop and the runner (<code>TZ</code>, <code>LANG</code>, <code>CGO_ENABLED</code>) goes in <code>vci.toml</code>'s <code>[env] set</code>, and vci sets it in every test process, here and where attestations are made. Every other variable of the runner (<code>GITHUB_*</code>, <code>RUNNER_*</code>, <code>CI</code>, ...) is removed from the tests unless <code>[env]</code> lists it. <code>vci env --base-ref origin/main</code> prints the policy the runner applies (see <a href="configuration.html#env">[env]</a>).</p>
 <div class="tabs" data-sync="adapter">
 <div class="tab-panel" data-tab="Vitest">
 <pre><code>      - uses: actions/setup-node@v4
@@ -84,10 +85,7 @@ jobs:
       - run: uv sync --locked</code></pre>
 </div>
 <div class="tab-panel" data-tab="Go">
-<p>Add to the job, with the same values as locally. Both variables are declared in <code>vci.toml</code> <code>[env] global</code>.</p>
-<pre><code>    env:
-      CGO_ENABLED: "0"
-      TZ: UTC</code></pre>
+<p><code>TZ</code> and <code>CGO_ENABLED</code> belong in <code>vci.toml</code> (<code>[env] set = { TZ = "UTC", CGO_ENABLED = "0" }</code>): vci sets them on the runner and locally, so the job exports nothing.</p>
 <p>Steps:</p>
 <pre><code>      - uses: actions/setup-go@v5
         with:
@@ -101,9 +99,7 @@ jobs:
       - run: cargo fetch --locked</code></pre>
 </div>
 <div class="tab-panel" data-tab="Rails">
-<p>Add to the job. <code>TZ</code> is declared in <code>vci.toml</code> <code>[env] global</code> and set the same way locally.</p>
-<pre><code>    env:
-      TZ: UTC</code></pre>
+<p><code>TZ</code> comes from <code>vci.toml</code> (<code>[env] set = { TZ = "UTC" }</code>, as <code>vci init</code> writes it): vci sets it on the runner and locally.</p>
 <p>Steps:</p>
 <pre><code>      - uses: ruby/setup-ruby@v1
         with:
@@ -112,9 +108,7 @@ jobs:
 <p><code>Gemfile.lock</code> must list the runner's platform (<code>bundle lock --add-platform x86_64-linux</code>). More in <a href="adapters.html#getting-skips-on-a-linux-runner">Rails: laptop to Linux runner</a>.</p>
 </div>
 <div class="tab-panel" data-tab="RSpec">
-<p>The same as Rails. Add to the job:</p>
-<pre><code>    env:
-      TZ: UTC</code></pre>
+<p>The same as Rails (<code>TZ</code> comes from <code>vci.toml</code>'s <code>[env] set</code>).</p>
 <p>Steps:</p>
 <pre><code>      - uses: ruby/setup-ruby@v1
         with:
@@ -346,12 +340,14 @@ refs/tags/v1). To compile vci in this job anyway, set build-from-source: true.</
 <tr><td class="wrap">Everything runs on a pull request</td><td class="wrap"><code>vci.toml</code> or <code>.vci/allowed_signers</code> is not on the base branch yet, or attestations were not pushed (<code>git ls-remote origin refs/meta/main</code> is empty)</td></tr>
 <tr><td class="wrap"><code>failed check: toolchain</code></td><td class="wrap">Python, Node, uv, Ruby, Bundler or package versions differ between the laptop and the runner</td></tr>
 <tr><td class="wrap"><code>failed check: inputs</code></td><td class="wrap">A file the test depends on changed after it was attested; <code>vci explain</code> names it</td></tr>
+<tr><td class="wrap"><code>failed check: env</code></td><td class="wrap">A hashed variable has another value (or is unset) on the runner; <code>vci explain</code> names it and its class (<code>env:DATABASE_URL (hash)</code>). Give it the same value on both sides, or move it to <code>[env] set</code></td></tr>
+<tr><td class="wrap"><code>failed check: env-config</code></td><td class="wrap">The base commit's <code>[env]</code> lists (or vci's built-in lists) differ from the attestation's; every attestation made before vci 1.6.0 fails this once. <code>vci env --base-ref origin/main</code> shows the difference</td></tr>
 <tr><td class="wrap"><code>failed check: signer</code></td><td class="wrap">The signing key is not in the base commit's <code>allowed_signers</code>, or it has expired</td></tr>
 <tr><td class="wrap"><code>failed check: signer</code> on main: <code>... is not in no_skip_refs_except</code></td><td class="wrap">Expected: on a ref in <code>no_skip_refs</code> only the principals in <code>no_skip_refs_except</code> (CI's key) can skip</td></tr>
 <tr><td class="wrap">Every push to main still runs everything</td><td class="wrap"><code>no_skip_refs_except</code> is empty or not on main yet, CI's key is not in main's <code>allowed_signers</code>, or the previous push's attestations were not published (<code>pushed</code> in the audit log; the job needs <code>contents: write</code>)</td></tr>
 <tr><td class="wrap"><code>not attesting: the key signs as github-actions ...</code></td><td class="wrap">CI's key reached a run on a ref outside <code>no_skip_refs</code>, such as a pull request: pass it only from the main-branch job with the environment</td></tr>
 <tr><td class="wrap">A Go package or cargo target never skips on the runner</td><td class="wrap">Its code depends on the platform (build tags, <code>_linux.go</code> files, <code>cfg(target_os)</code>, <code>runtime.GOOS</code>, floating-point maths); such units are only accepted on the same OS and architecture</td></tr>
-<tr><td class="wrap">A test reads <code>CI</code>, <code>HOME</code> or <code>USER</code></td><td class="wrap">Those values differ on a runner, so that file always runs there</td></tr>
+<tr><td class="wrap">A test reads <code>HOME</code> or <code>USER</code>, or a variable in <code>[env] hash</code> such as <code>CI</code></td><td class="wrap">Those values differ on a runner, so that file always runs there. <code>CI</code> is removed from the tests unless listed; <code>set = { CI = "true" }</code> gives both sides the same value</td></tr>
 <tr><td class="wrap">No Rails test file ever skips on the runner</td><td class="wrap">See <a href="adapters.html#getting-skips-on-a-linux-runner">Rails: laptop to Linux runner</a></td></tr>
 <tr><td class="wrap">An RSpec file is never attested</td><td class="wrap">An example was pending, skipped, filtered out or retried, or the process exited non-zero after the report; <code>vci run</code> prints the reason (<code>rspec:filtered:...</code>, <code>rspec:retry</code>, ...)</td></tr>
 <tr><td class="wrap">Minitest files never run with <code>runner = "rspec"</code></td><td class="wrap">An explicit runner leaves the other runner's files to you; <code>vci plan</code> and <code>vci ci</code> warn, and the audit log lists it under <code>warnings</code></td></tr>

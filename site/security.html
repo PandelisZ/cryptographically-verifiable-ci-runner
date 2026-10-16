@@ -59,7 +59,7 @@
 
 <h2 id="verification">How CI decides</h2>
 <p><code>vci plan</code> asks the same questions of every unit, and skips it only when every answer is yes:</p>
-<img src="assets/diagrams/decision.svg" alt="Five checks for every test unit: signed by a key in main's allowed_signers; not expired and within max_ttl; same project, runner and toolchain versions; every recorded input re-hashed to the same root; declared environment variables with the same hashes. All yes means SKIP, recorded in the audit log with who vouched. Any no means RUN, which is also the verdict on any error, a missing store, a refused unit, or a ref in no_skip_refs." width="776" height="486" loading="lazy" style="width:100%;height:auto">
+<img src="assets/diagrams/decision.svg" alt="Five checks for every test unit: signed by a key in main's allowed_signers; not expired and within max_ttl; same project, runner and toolchain versions; every recorded input re-hashed to the same root; hashed environment variables (set, hash, built-in) with the same hashes. All yes means SKIP, recorded in the audit log with who vouched. Any no means RUN, which is also the verdict on any error, a missing store, a refused unit, or a ref in no_skip_refs." width="776" height="486" loading="lazy" style="width:100%;height:auto">
 
 <h3 id="fail-open">The core rule: fail open</h3>
 <p>The default verdict for every unit is <span class="badge run">RUN</span>. A unit gets <span class="badge skip">SKIP</span> only when one attestation passes every check. Any error, doubt or unrecognised behaviour means it runs. Each candidate is checked inside an error boundary, so even a crash while checking is a failed check, never a skip.</p>
@@ -116,7 +116,7 @@
 <li><strong>Test code that deliberately evades the collectors.</strong></li>
 <li><strong>Malicious dependencies that match the lockfile</strong>: packages are identified by version, not by file hashes.</li>
 <li><strong>Third-party Vite plugins reading files</strong> in the main process: only their package version is an input.</li>
-<li><strong>Time zone and locale in strict mode</strong>: <code>TZ</code> counts only if declared; the system zone and <code>LANG</code>/<code>LC_*</code> are not hashed.</li>
+<li><strong>Time zone and locale</strong>: <code>TZ</code> is hashed whenever present (<code>vci init</code> puts it in <code>[env] set</code>); with <code>TZ</code> unset the system zone is not hashed (Go and node:test refuse such tests). <code>LANG</code>/<code>LC_*</code> are hashed for Vitest and node:test (ICU); for Rails the default encoding they decide is compared, not the variables; for pytest, Go and Cargo they are removed unless listed.</li>
 <li><strong>A CI job whose base ref the pull request controls</strong>: pass the base branch's commit, as the action does by default.</li>
 </ul>
 <div class="note">

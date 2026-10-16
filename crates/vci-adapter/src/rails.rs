@@ -125,13 +125,17 @@ pub const RSPEC_GLOBAL_FILES: &[&str] = &[".rspec"];
 /// checkout, so that file runs in CI).
 pub const RAILS_SCRATCH_DIRS: &[&str] = &["log", "tmp", "storage", "coverage"];
 
-/// Variables the child always sees, on top of the global built-in list: where
-/// Ruby, RubyGems, Bundler and version managers find things. The gems and
-/// Ruby they lead to are checked directly (exact Ruby version, the resolved
-/// bundle, every loaded gem's version), so their values are not inputs; like
-/// every built-in pass-through variable they are hashed when a test (not
-/// RubyGems or Bundler) reads one.
-pub const RAILS_PASS_THROUGH: &[&str] = &[
+/// Built-in ignore for Rails (docs/ENV.md): where Ruby, RubyGems, Bundler and
+/// version managers find things, and the locale. The gems and Ruby they lead
+/// to are checked directly (exact Ruby version, the resolved bundle, every
+/// loaded gem's version), and so is the default encoding the locale decides
+/// (the toolchain's `encoding=`). Reads of them by RubyGems' and Bundler's own code are not
+/// observations; a test that reads one gets it hashed.
+pub const RAILS_IGNORE: &[&str] = &[
+    // The default encoding they decide is recorded in the toolchain.
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
     "GEM_HOME",
     "GEM_PATH",
     "GEM_SPEC_CACHE",
@@ -169,13 +173,11 @@ pub const RAILS_PASS_THROUGH: &[&str] = &[
     "no_proxy",
 ];
 
-/// Variables hashed whenever they are present (loose mode, or declared in
-/// strict mode, which otherwise removes them): Ruby reads `RUBY*` in C at
-/// startup, Bundler takes its settings from every `BUNDLE_*`, and Rails,
-/// Rack and Minitest read theirs before or outside anything a test does.
-/// `RUBYOPT`, `RAILS_ENV`, `RACK_ENV`, `BUNDLE_GEMFILE`, `PARALLEL_WORKERS`,
-/// `DISABLE_SPRING` and `DISABLE_BOOTSNAP` are set by vci.
-pub const RAILS_HASHED_ENV: &[&str] = &[
+/// Hashed whenever present in loose mode (deprecated), where every variable
+/// reaches the tests: vci 1.5's list of what the runtime reads where nothing
+/// observes it, kept so that loose mode hashes what it did. Strict mode removes
+/// these unless they are built-in or vci.toml lists them.
+pub const RAILS_LOOSE_HASH: &[&str] = &[
     "RUBY*",
     "!RUBYOPT",
     "RAILS_*",
@@ -227,6 +229,31 @@ pub const RAILS_HASHED_ENV: &[&str] = &[
     // SSL_CERT_FILE and SSL_CERT_DIR are not here: the collector refuses a
     // file that verifies with a store holding OpenSSL's default paths.
     "OPENSSL_*",
+];
+
+/// Built-in hash for Rails (docs/ENV.md): what Ruby reads in C at startup
+/// (`RUBYLIB`, the VM and GC settings)
+/// and the database and secret settings Rails takes from the environment
+/// when it boots. Every other variable (`SEED`, `TESTOPTS`, `SPEC_OPTS`,
+/// `BUNDLE_WITHOUT`, `RAILS_MASTER_KEY`, ...) is removed unless vci.toml lists
+/// it; `RAILS_ENV`, `RACK_ENV` and `RUBYOPT` are vci's ([`RAILS_RUN_VARS`]).
+pub const RAILS_HASH: &[&str] = &[
+    "RUBYLIB",
+    "RUBYGEMS_GEMDEPS",
+    "RUBY_YJIT_ENABLE",
+    "RUBY_GC_*",
+    "RUBY_THREAD_VM_STACK_SIZE",
+    "RUBY_THREAD_MACHINE_STACK_SIZE",
+    "RUBY_FIBER_VM_STACK_SIZE",
+    "RUBY_FIBER_MACHINE_STACK_SIZE",
+    "RUBY_FREE_AT_EXIT",
+    "RUBY_CRASH_REPORT",
+    "RUBY_BOX",
+    "RUBY_MN_THREADS",
+    "RUBY_MAX_CPU",
+    "DATABASE_URL",
+    "*_DATABASE_URL",
+    "SECRET_KEY_BASE",
 ];
 
 /// Variables vci sets for every Rails test process (never inputs).
@@ -1220,12 +1247,16 @@ impl Adapter for RailsAdapter {
         Ok(self.light_probe(env)?.versions)
     }
 
-    fn builtin_pass_through(&self) -> &'static [&'static str] {
-        RAILS_PASS_THROUGH
+    fn builtin_ignore(&self) -> &'static [&'static str] {
+        RAILS_IGNORE
     }
 
-    fn hashed_env_patterns(&self) -> &'static [&'static str] {
-        RAILS_HASHED_ENV
+    fn builtin_hash(&self) -> &'static [&'static str] {
+        RAILS_HASH
+    }
+
+    fn loose_hash(&self) -> &'static [&'static str] {
+        RAILS_LOOSE_HASH
     }
 
     /// The gems of the bundle Bundler resolves (without booting).
@@ -1343,10 +1374,6 @@ impl Adapter for RailsAdapter {
             .collect()
     }
 
-    fn inferred_env_patterns(&self) -> &'static [&'static str] {
-        &[]
-    }
-
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {
         let collector = self.collector_file()?;
         per_file_jobs(files, self.jobs(), |f| self.run_one(&collector, f, env))
@@ -1415,11 +1442,12 @@ mod tests {
                 "test/models/b_test.rb"
             ]
         );
-        assert!(a.builtin_pass_through().contains(&"GEM_HOME"));
-        assert!(a.hashed_env_patterns().contains(&"RUBY*"));
-        assert!(a.hashed_env_patterns().contains(&"!RUBYOPT"));
-        // Read by OpenSSL in C when Ruby's openssl loads.
-        assert!(a.hashed_env_patterns().contains(&"OPENSSL_*"));
+        assert!(a.builtin_ignore().contains(&"GEM_HOME"));
+        assert!(a.builtin_hash().contains(&"RUBYLIB"));
+        // vci sets RUBYOPT, RAILS_ENV and RACK_ENV itself.
+        for k in RAILS_RUN_VARS {
+            assert!(!a.builtin_hash().contains(k), "{k}");
+        }
         assert!(
             a.config_candidates()
                 .iter()

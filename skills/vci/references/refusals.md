@@ -32,7 +32,7 @@ Both fail open: the worst outcome is that CI runs the unit. Never "fix" either b
 | `wrote inside the repository: <paths>` | The test created, changed or deleted files in the repo | Write to a temp dir (`tmp_path`, `t.TempDir()`, `TMPDIR`) instead |
 | `input outside the repository: <path>` | A read outside the repo (`/etc/hosts`, `~/...`, an unowned temp file) | Not attestable unless the test stops reading it |
 | `input changed during the run: ...` / `global inputs changed during the run` / `the repository changed during the run: ...` (Go) | Something modified the working tree while tests ran (an editor, a formatter, a watcher, another process, the test itself) | Stop other writers and run again |
-| `env mode "loose": the cargo adapter only attests in strict mode ...` | `[env] mode = "loose"` with cargo | The user must switch to strict |
+| `env mode "loose": the cargo adapter only attests in strict mode ...` | `[env] mode = "loose"` (deprecated since 1.6.0) with cargo | The user must remove `mode = "loose"` (the default policy is the only one going forward) |
 | `read PYTHONPATH, which vci sets to its collector` | The test reads `PYTHONPATH` | Not attestable |
 | `<python/node/ruby> collector ... differs` / toolchain mismatch messages | The collector's interpreter differs from the project's | Fix the environment (uv-managed Python, same Node, same Ruby) |
 | `go.work <path> is outside the repository (...)` | A `go.work` from outside the repo | `GOWORK=off` or move it in |
@@ -56,7 +56,7 @@ Warnings worth acting on:
 - `vci: warning: policy.rails_allow_db in vci.toml is ignored: rails_allow_db was removed in vci 1.4.0 ...` (`vci
   plan`: `in vci.toml at the base commit`): a no-op key left in `vci.toml`; the test database needs no policy now. Tell
   the user and suggest removing it (a `vci.toml` change on the default branch, theirs to make).
-- `declared env var X looks like a secret; its hash is published in attestations`: move it to `pass_through`
+- `hashed env var X looks like a secret; its hash is published in attestations`: move it to `[env] ignore`
   (user decision).
 - `--ttl ... exceeds policy.max_ttl ...`: use a shorter `--ttl`.
 
@@ -74,12 +74,12 @@ attestation recorded) and `actual` (what this checkout and the base policy give)
 | `expiry` | Expired, issued in the future (clock skew > 5 min), or lifetime above `max_ttl` | Re-attest (`--ttl` within `max_ttl`) |
 | `repo`, `test-id`, `adapter`, `argv` | Attested in another repository, for another unit id, adapter, project dir or runner command | Attest in this repository and project |
 | `toolchain` | Node/Vitest/Vite, Python/pytest/distributions, Go version and settings, rustc/cargo, Ruby/Rails/bundle, root vs non-root, or OS/arch per `policy.platform` differ; `ruby libraries` / `python libraries` (SQLite, libyaml, tz data, OpenSSL versions) differ under `policy.libraries = "exact"`, or one side lacks the library (`... loaded or not`, also under `"any"`) | Pin toolchains (runners.md). Locally, compare with what CI uses. For library versions between macOS and Linux, the user may set `libraries = "any"` on the default branch |
-| `env-config` | The effective `[env]` configuration differs from the base `vci.toml` | The PR changed `[env]` or the base did; re-attest after the base has the same config |
+| `env-config` | The effective `[env]` configuration (`set` values, `hash`/`ignore` lists, vci's built-in lists) differs from the base `vci.toml`'s; every attestation made before vci 1.6.0 fails this once | The PR changed `[env]`, the base did, or vci was upgraded; re-attest once the base has the same config (`vci env --base-ref <ref>` shows the difference) |
 | `result` / `inputs-config` / waived refusals / `dirty` | Not passed; `[[inputs]]` globs differ from the base config; a waiver (`go_allow_net`) no longer set on base, or an attestation made under the removed `rails_allow_db`; dirty tree with `allow_dirty = false` | Merge config changes to the default branch first; commit before attesting when `allow_dirty = false` |
 | `global-inputs` | A global input (lockfile, runner config, `vci.toml`, ...) differs | Re-attest after the change |
 | `inputs` | A recorded input differs: `entry:<path>` with both hashes (file edited after attesting, new file where an absent probe was, listing changed) | Re-run `vci run` on the unit after your last edit |
 | `externals` | An external package/module/crate/gem version differs; or a native library opened through FFI (`external:native:libvips.42.dylib`) is another file or build where CI checks, or `native library libvips: not loaded here` | Re-attest with the lockfile CI uses. For native libraries: install the library in CI; across macOS and Linux the user may set `policy.libraries = "any"` (matches by library name) on the default branch |
-| `env` | A hashed variable's value differs (`TZ`, a declared variable, or `CI`/`HOME` the test read) | Set declared values the same on both sides; units reading `CI`/`HOME` never skip on runners |
+| `env` | A hashed variable's value differs; the detail is `env:<NAME> (<class>)`: `hash`/`built-in hash` (taken from the machine) or `built-in ignore` (`HOME`, `USER` the test read) | Give `hash` variables the same value on both sides or propose moving them to `[env] set` (the user's decision); units reading `HOME`/`USER` never skip on runners |
 | `internal` | A check panicked | Report it as a vci bug |
 
 Plan-wide reasons (`running everything: ...`, or `running everything in <project>: ...` for one project of a

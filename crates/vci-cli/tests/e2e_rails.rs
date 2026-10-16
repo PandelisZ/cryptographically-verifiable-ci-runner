@@ -20,6 +20,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
+mod env_common;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -120,8 +122,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-mode = "strict"
-global = ["APP_MODE", "TZ"]
+hash = ["APP_MODE", "TZ"]
 "#;
 
 struct World {
@@ -677,7 +678,7 @@ fn rails_end_to_end_verification_steps() {
         "step 12 control: with the PR commit as the (wrong) trust root"
     );
 
-    // Step 13: a variable declared in [env] global with another value in CI
+    // Step 13: a variable listed in [env] hash with another value in CI
     // forces a run.
     let p = w.plan_env(&work, "main", &[("APP_MODE", "ci")]);
     assert!(p.run.contains(B), "step 13: {p:?}");
@@ -2693,5 +2694,50 @@ fn rails_native_libraries_boot_the_application_only_when_attested() {
     assert!(
         stderr.contains("simulated: bigdecimal.bundle is not a valid extension"),
         "{stderr}"
+    );
+}
+
+/// The `[env]` lists end to end (tests/env_common): a `set` variable reaches
+/// the test and is the same on every machine, a `hash` variable's change
+/// re-runs, an `ignore` variable's does not, an undeclared variable never
+/// reaches the test, `vci env` shows it all, and the old key names still work.
+#[test]
+fn rails_env_set_hash_ignore_and_strip() {
+    let Some(w) = World::build(
+        &env_common::with_env(VCI_TOML, env_common::ENV_NEW),
+        copy_rails_fixture,
+    ) else {
+        return;
+    };
+    w.put(
+        "test/lib/env_test.rb",
+        r#"require "test_helper"
+
+class EnvTest < ActiveSupport::TestCase
+  test "env" do
+    assert_equal "declared", ENV["APP_SET"]
+    assert_equal "UTC", ENV["TZ"]
+    assert ENV["APP_HASH"]
+    assert ENV["APP_IGNORE"]
+    assert_nil ENV["APP_UNDECLARED"]
+  end
+end
+"#,
+    );
+    let vci = |args: &[&str], env: &[(&'static str, String)]| {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        w.vci_env(&w.work, args, &env)
+    };
+    let git = |dir: &Path, args: &[&str]| w.git(dir, args);
+    env_common::check_env_lists(
+        &env_common::Ops {
+            work: &w.work,
+            scratch: &w.base,
+            vci: &vci,
+            git: &git,
+            key: w.trusted.to_str().unwrap(),
+        },
+        "test/lib/env_test.rb",
+        &["test/lib/env_test.rb"],
     );
 }

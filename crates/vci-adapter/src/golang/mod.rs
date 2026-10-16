@@ -65,11 +65,10 @@ const TESTLOG_ENV: &str = "VCI_GO_TESTLOG";
 /// The logger overlaid into internal/testlog.
 const TESTLOG_SRC: &str = include_str!("vci_testlog.go");
 
-/// Variables the child always sees (on top of the global built-in list) so
-/// that the go command works in strict mode: where modules, the build cache
-/// and the toolchain live and how modules are fetched. Like every built-in
-/// pass-through variable, they are hashed only when a test reads one.
-pub const GO_PASS_THROUGH: &[&str] = &[
+/// Built-in ignore for Go (docs/ENV.md): where modules, the build cache and
+/// the toolchain live and how modules are fetched, so that the go command
+/// works. The modules and toolchain they lead to are checked directly.
+pub const GO_IGNORE: &[&str] = &[
     "GOPATH",
     "GOROOT",
     "GOCACHE",
@@ -104,13 +103,11 @@ pub const GO_PASS_THROUGH: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-/// Variables hashed whenever present (loose mode, or declared in strict
-/// mode, which otherwise removes them): they change the build (`GOFLAGS`,
-/// `CGO_ENABLED`, `GOEXPERIMENT`, `GOAMD64`, `CGO_CFLAGS`, `GOTOOLCHAIN`, ...)
-/// or the runtime (`GODEBUG`, `GOMAXPROCS`, `GOGC`, `GOTRACEBACK`, read by
-/// the runtime where no log sees it). The go command's own locations are
-/// pass-through instead.
-pub const GO_HASHED_ENV: &[&str] = &[
+/// Hashed whenever present in loose mode (deprecated), where every variable
+/// reaches the tests: vci 1.5's list of what the runtime reads where nothing
+/// observes it, kept so that loose mode hashes what it did. Strict mode removes
+/// these unless they are built-in or vci.toml lists them.
+pub const GO_LOOSE_HASH: &[&str] = &[
     "GO*",
     "CGO_*",
     "!GOPATH",
@@ -130,6 +127,38 @@ pub const GO_HASHED_ENV: &[&str] = &[
     "!GOAUTH",
     "!GOTELEMETRY",
     "!GOTELEMETRYDIR",
+];
+
+/// Built-in hash for Go (docs/ENV.md): what the go command, the compiler,
+/// cgo's C toolchain and the runtime read where no test log sees it, and that
+/// changes what is built or how it runs. Every other `GO*` variable
+/// (`GOMAXPROCS`, `GOGC`, `GOWORK`, ...) is removed unless vci.toml lists it.
+pub const GO_HASH: &[&str] = &[
+    "ZONEINFO",
+    "GOFLAGS",
+    "GOEXPERIMENT",
+    "GODEBUG",
+    "GOTOOLCHAIN",
+    "GOOS",
+    "GOARCH",
+    "GOAMD64",
+    "GOARM",
+    "GOARM64",
+    "GO386",
+    "GOPPC64",
+    "GORISCV64",
+    "GOMIPS",
+    "GOMIPS64",
+    "GOWASM",
+    "CGO_*",
+    "CC",
+    "CXX",
+    "AR",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "PKG_CONFIG*",
 ];
 
 /// Read by package time through syscall.Getenv, which package os does not
@@ -768,12 +797,16 @@ impl Adapter for GoAdapter {
         Ok(self.probe(env)?.versions)
     }
 
-    fn builtin_pass_through(&self) -> &'static [&'static str] {
-        GO_PASS_THROUGH
+    fn builtin_ignore(&self) -> &'static [&'static str] {
+        GO_IGNORE
     }
 
-    fn hashed_env_patterns(&self) -> &'static [&'static str] {
-        GO_HASHED_ENV
+    fn builtin_hash(&self) -> &'static [&'static str] {
+        GO_HASH
+    }
+
+    fn loose_hash(&self) -> &'static [&'static str] {
+        GO_LOOSE_HASH
     }
 
     /// Modules of the build list (`go list -m -json all`), as the module
@@ -814,10 +847,6 @@ impl Adapter for GoAdapter {
 
     fn snapshot_candidates(&self, _test_abs: &Utf8Path) -> Vec<Utf8PathBuf> {
         vec![]
-    }
-
-    fn inferred_env_patterns(&self) -> &'static [&'static str] {
-        &[]
     }
 
     /// One `go test` process per package, at most `$VCI_JOBS` at a time,
@@ -937,9 +966,9 @@ mod tests {
         );
         assert_eq!(a.canonical_argv(".", ".").last().unwrap(), ".");
         assert_eq!(pkg_arg("b/c"), "./b/c");
-        assert!(a.builtin_pass_through().contains(&"GOMODCACHE"));
-        assert!(a.hashed_env_patterns().contains(&"GO*"));
-        assert!(a.hashed_env_patterns().contains(&"!GOPATH"));
+        assert!(a.builtin_ignore().contains(&"GOMODCACHE"));
+        assert!(a.builtin_hash().contains(&"GOFLAGS"));
+        assert!(a.builtin_hash().contains(&"CGO_*"));
         assert_eq!(
             relative_to(Utf8Path::new("/r/p"), Utf8Path::new("/r/p/go.work")),
             "go.work"
@@ -952,15 +981,12 @@ mod tests {
         assert_eq!(arch_level_var("arm64"), Some("GOARM64"));
     }
 
-    /// Every pass-through name is excluded from the hashed patterns, so
-    /// strict mode keeps them and they are hashed only when read.
+    /// No built-in ignore name is also built-in hash (built-in hash would
+    /// win, and the go command's locations would re-run every package).
     #[test]
-    fn pass_through_and_hashed_patterns_are_disjoint() {
-        for p in GO_PASS_THROUGH.iter().filter(|p| p.starts_with("GO")) {
-            assert!(
-                GO_HASHED_ENV.contains(&format!("!{p}").as_str()),
-                "{p} must be excluded from GO_HASHED_ENV"
-            );
+    fn ignore_and_hash_lists_are_disjoint() {
+        for p in GO_IGNORE {
+            assert!(!GO_HASH.contains(p), "{p}");
         }
     }
 

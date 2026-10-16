@@ -30,10 +30,10 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 <span class="c"># ...except what CI's own key attested (see GitHub Actions).</span>
 <span class="c"># no_skip_refs_except = ["github-actions"]</span>
 
-[env]
-mode = "strict"                <span class="c"># undeclared variables are removed</span>
-global = ["NODE_ENV", "TZ"]    <span class="c"># hashed into every unit's inputs</span>
-pass_through = []              <span class="c"># visible, never hashed: secrets go here</span></code></pre>
+[env]                          <span class="c"># every variable in no list is removed</span>
+set = { TZ = "UTC" }           <span class="c"># vci sets these everywhere</span>
+hash = []                      <span class="c"># from the machine; a change re-runs</span>
+ignore = []                    <span class="c"># visible, never hashed: secrets go here</span></code></pre>
 <p>Every key you leave out takes its default, listed below. Unknown keys are errors.</p>
 <table>
 <tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
@@ -75,43 +75,85 @@ libraries = "any"</code></pre>
 <p>Install libvips on the runner as well; under <code>"any"</code> it is matched by name, but it must still be loaded there. Everything else is still compared exactly: the Ruby or Python version, every gem or distribution in the lockfile, the inputs and the declared environment. By setting it you state that these libraries behave the same on both platforms for your tests. <code>vci explain</code> lists every difference the policy accepted.</p>
 
 <h2 id="env">[env]: environment variables</h2>
-<p>Environment variables can change a test's result, so vci controls which ones a test sees and hashes the ones that matter. In <strong>strict mode</strong>, the default, a test sees only the variables you list in <code>[env]</code>, plus a few built-ins such as <code>PATH</code>. This holds both in <code>vci run</code> and in CI:</p>
-<img src="assets/diagrams/env.svg" alt="Strict mode in three columns. The machine's environment holds TZ, DATABASE_URL, AWS_SECRET, PATH, RANDOM_THING and NO_COLOR. The test sees TZ, DATABASE_URL, AWS_SECRET and PATH; undeclared variables such as RANDOM_THING and NO_COLOR are removed. Only TZ and DATABASE_URL, declared in global, are hashed; AWS_SECRET, listed in pass_through, is visible but never hashed; built-ins such as PATH and HOME are hashed only if the test reads them." width="756" height="361" loading="lazy" style="width:100%;height:auto">
-<p>The design follows Turborepo's <code>env</code>, <code>globalEnv</code> and <code>passThroughEnv</code>, with one addition: vci also observes which variables each test actually reads.</p>
+<p>Environment variables can change a test's result, so vci decides which ones a test sees and hashes the ones that matter. The policy is three short lists, plus a short built-in list per runner; every other variable is removed from the test processes, in <code>vci run</code> and in CI alike:</p>
+<img src="assets/diagrams/env.svg" alt="Three columns. The machine's environment holds TZ=Europe/Paris, DATABASE_URL, AWS_SECRET, PATH, RANDOM_THING and NO_COLOR. The test sees TZ (set to UTC by vci), DATABASE_URL, AWS_SECRET and PATH; RANDOM_THING and NO_COLOR, in no list, are removed. TZ and DATABASE_URL are hashed; AWS_SECRET, in ignore, is visible but never hashed; built-ins such as PATH and HOME are hashed only if the test reads them." width="756" height="361" loading="lazy" style="width:100%;height:auto">
 <pre><code>[env]
-mode = "strict"          <span class="c"># "strict" (default) | "loose"</span>
-<span class="c"># hashed into every test's inputs</span>
-global = ["NODE_ENV", "TZ", "CI_*", "!CI_JOB_*"]
-<span class="c"># visible to tests, never hashed</span>
-pass_through = ["GITHUB_TOKEN", "AWS_*"]
+<span class="c"># vci sets these in every test process, on every machine</span>
+set = { TZ = "UTC", LANG = "C.UTF-8" }
+<span class="c"># taken from the machine and hashed: another value re-runs the test</span>
+hash = ["DATABASE_URL", "FEATURE_*", "!FEATURE_DEBUG"]
+<span class="c"># taken from the machine, never hashed, never a reason to re-run</span>
+ignore = ["GITHUB_TOKEN", "AWS_*"]
 
 [[env.files]]            <span class="c"># additions for matching test files</span>
 match = ["src/db/**/*.test.ts"]
-env = ["DATABASE_URL"]
-pass_through = ["PG*"]</code></pre>
-<p>Patterns are exact names, <code>*</code> wildcards, and a leading <code>!</code> to exclude. Exclusions win. Matching is case-sensitive.</p>
+hash = ["PGDATABASE"]
+ignore = ["PGPASSWORD"]</code></pre>
+<p>Patterns are exact names, <code>*</code> wildcards, and a leading <code>!</code> to exclude. Exclusions win. Matching is case-sensitive. <code>set</code> takes exact names and string values (write <code>"1"</code>, not <code>1</code>). The variables an <code>[[env.files]]</code> entry names reach every test of the project; only the matching files hash them up front.</p>
 
-<h3 id="strict-mode">Strict and loose mode</h3>
-<p>Each variable falls in one of these groups:</p>
+<h3 id="strict-mode">Which variables reach the test</h3>
 <table>
 <tr><th>Variable</th><th>Reaches the test</th><th>Hashed</th></tr>
-<tr><td class="wrap">Declared (<code>global</code>, per-file <code>env</code>)</td><td>yes</td><td>yes</td></tr>
-<tr><td class="wrap">Pass-through (<code>pass_through</code>)</td><td>yes</td><td>no</td></tr>
-<tr><td class="wrap">Built-in pass-through (<code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>TMPDIR</code>, <code>LANG</code>, <code>CI</code>, ...)</td><td>yes</td><td class="wrap">only if the test was observed reading it</td></tr>
-<tr><td>Undeclared, strict mode</td><td><strong>no</strong> (removed)</td><td class="wrap">recorded as absent if read</td></tr>
-<tr><td>Undeclared, loose mode</td><td>yes</td><td class="wrap">yes, if the test was observed reading it</td></tr>
+<tr><td class="wrap"><code>set</code></td><td class="wrap">yes, with the value from <code>vci.toml</code>, on every machine</td><td class="wrap">yes (the same value everywhere)</td></tr>
+<tr><td class="wrap"><code>hash</code></td><td>yes</td><td>yes</td></tr>
+<tr><td class="wrap"><code>ignore</code></td><td>yes</td><td>never</td></tr>
+<tr><td class="wrap">Built-in hash (<code>TZ</code>; per runner what the runtime reads natively: <code>RUSTFLAGS</code>, <code>GOFLAGS</code>, <code>PYTHONHASHSEED</code>, Node's <code>LANG</code>, ...)</td><td>yes</td><td>when present</td></tr>
+<tr><td class="wrap">Built-in ignore (<code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>TMPDIR</code>, caches)</td><td>yes</td><td class="wrap">only if the test was observed reading it</td></tr>
+<tr><td>Every other variable</td><td><strong>no</strong> (removed)</td><td class="wrap">recorded as absent if read</td></tr>
 </table>
-<p>Strict mode removes undeclared variables in both <code>vci run</code> and <code>vci ci</code>, so local and CI runs see the same environment shape. To give your tests a variable, declare it in <code>global</code> and set the same value on both sides.</p>
+<p>Precedence when lists overlap: <code>set</code>, then <code>hash</code>, then <code>ignore</code>, then the built-in lists. <code>vci env</code> prints the effective lists of each project and what each variable is on this machine; <code>vci env --base-ref origin/main</code> shows where the base policy (the one CI uses) differs.</p>
 <div class="note warn">
-<p><strong>A test that reads <code>CI</code>, <code>HOME</code> or <code>USER</code> is never skipped on a runner</strong> when it was attested on a laptop. Those values differ by definition, and a variable a test reads is hashed.</p>
+<p><strong>Use <code>set</code> for what must be identical locally and in CI</strong> (time zone, locale, <code>CI</code>, feature switches): nobody exports anything, and a laptop and a runner see the same value. A test that reads <code>HOME</code> or <code>USER</code> is never skipped on a runner when it was attested on a laptop: those values differ by definition.</p>
 </div>
-<p><code>NO_COLOR</code> and <code>FORCE_COLOR</code> are removed in strict mode too. Add them to <code>pass_through</code> if you need them.</p>
+<p><code>CI</code>, <code>NO_COLOR</code> and <code>FORCE_COLOR</code> are removed unless listed. Only the values vci itself sets for a runner win over <code>set</code>: <code>RAILS_ENV=test</code> and the collector's <code>RUBYOPT</code>, a node:test script's <code>NAME=value</code> assignments, and the fresh <code>TMPDIR</code> of Go, Cargo and Rails processes.</p>
+
+<h3 id="vci-env">Seeing the policy: <code>vci env</code></h3>
+<p><code>vci env [--base-ref REF] [--project NAME] [--format text|json]</code> prints, per project, every variable the lists name, its class, where the rule comes from and what it is on this machine. It runs nothing.</p>
+<pre><code>$ vci env --project web
+project web (node-test): env config ff29623f04f0
+  VARIABLE        CLASS            SOURCE                   HERE
+  LANG            set              vci.toml set             "C.UTF-8"
+  TZ              set              vci.toml set             "UTC"
+  FEATURE_*       hash             vci.toml hash            pattern: 1 here
+  FEATURE_SEARCH  hash             vci.toml hash            present (5d2a6bf0fba6)
+  NODE_ENV        hash             test script              present (4878ca0425c7)
+  SCCACHE_*       ignore           vci.toml ignore          pattern: 1 here
+  SCCACHE_DIR     ignore           vci.toml ignore          present
+  HOME            built-in ignore  built-in (every runner)  present
+  PATH            built-in ignore  built-in (every runner)  present
+  built-in, not set here:
+    LC_ALL LC_MESSAGES NODE_OPTIONS UV_THREADPOOL_SIZE ...
+  present here, removed from the tests (recorded as absent if a test reads one):
+    CI GITHUB_TOKEN</code></pre>
+<p>With <code>--base-ref origin/main</code> a <code>BASE</code> column shows where the base commit's policy, the one CI judges with, differs (<code>=</code> where it does not), and the header says <code>base policy differs</code> or <code>same as base</code>. When a test runs in CI because of the environment, <code>vci explain</code> names the variable and its class, never its value: <code>env:FEATURE_SEARCH (hash)</code>.</p>
+
+<h3 id="old-names">Old names (vci 1.5 and earlier)</h3>
+<table>
+<tr><th>vci 1.5</th><th>vci 1.6</th></tr>
+<tr><td><code>global = [...]</code></td><td><code>hash = [...]</code></td></tr>
+<tr><td><code>pass_through = [...]</code></td><td><code>ignore = [...]</code></td></tr>
+<tr><td class="wrap"><code>env = [...]</code> in <code>[[env.files]]</code></td><td><code>hash = [...]</code></td></tr>
+<tr><td><code>mode = "strict"</code></td><td class="wrap">the only mode; accepted silently</td></tr>
+<tr><td><code>mode = "loose"</code></td><td class="wrap">deprecated: still behaves as before, with a warning</td></tr>
+<tr><td class="wrap">a variable in <code>global</code> exported with the same value everywhere</td><td><code>set = { TZ = "UTC", ... }</code>, and drop the exports</td></tr>
+</table>
+<p>The old names still work, at the top level, per project and in <code>[[env.files]]</code>, with one warning that names each key to rename. Giving both an old and a new name in one table is an error. Renaming alone re-runs nothing, but every attestation made before vci 1.6.0 fails the <code>env-config</code> check once and its test re-runs, because what is hashed changed.</p>
 
 <h3 id="secrets">Secrets</h3>
-<p>vci never stores values, only their BLAKE3 hashes. But anyone who can read the attestations can brute-force the hash of a low-entropy value. <strong>Put secrets in <code>pass_through</code>, not in <code>global</code>.</strong> <code>vci run</code> warns when a declared name matches <code>*TOKEN*</code>, <code>*SECRET*</code>, <code>*PASSWORD*</code> or <code>*KEY*</code>.</p>
+<p>vci never stores values, only their BLAKE3 hashes. But anyone who can read the attestations can brute-force the hash of a low-entropy value. <strong>Put secrets in <code>ignore</code>, not in <code>hash</code>, and never in <code>set</code></strong> (its values are in <code>vci.toml</code>). <code>vci run</code> warns when a <code>hash</code> name matches <code>*TOKEN*</code>, <code>*SECRET*</code>, <code>*PASSWORD*</code> or <code>*KEY*</code>.</p>
 
-<h3 id="runner-specific-variables">Runner-specific variables</h3>
-<p>Each adapter adds the pass-through variables its toolchain needs (uv's <code>UV_*</code>, Go's <code>GOPATH</code> and <code>GOCACHE</code>, Cargo's <code>CARGO_HOME</code>, Bundler's <code>BUNDLE_PATH</code>, ...). It also hashes, whenever they are present, the ones that change behaviour (<code>PYTHON*</code>, <code>GOFLAGS</code>, <code>RUSTFLAGS</code>, <code>RAILS_*</code>, ...). The full table is in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/ENV.md">docs/ENV.md</a>.</p>
+<h3 id="runner-specific-variables">Built-in lists</h3>
+<p>Each runner's built-in lists are short: the few variables its runtime reads natively that change results (<strong>built-in hash</strong>: they reach the test and are hashed when present) and the ones its toolchain needs to work (<strong>built-in ignore</strong>: they reach the test and are hashed only if a test reads one). Every runner adds <code>TZ</code> to the first and <code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>SHELL</code>, <code>TMPDIR</code>, <code>TEMP</code>, <code>TMP</code>, <code>TERM</code>, <code>VCI_*</code> (and Windows' startup variables) to the second.</p>
+<table>
+<tr><th>Runner</th><th>Built-in hash</th><th>Built-in ignore</th></tr>
+<tr><td>Vitest</td><td class="wrap"><code>LANG</code>, <code>LC_ALL</code>, <code>LC_MESSAGES</code> (ICU's locale), <code>NODE_OPTIONS</code>, <code>UV_THREADPOOL_SIZE</code>, <code>VITE_*</code></td><td class="wrap"><code>VITEST*</code></td></tr>
+<tr><td>node:test</td><td class="wrap"><code>LANG</code>, <code>LC_ALL</code>, <code>LC_MESSAGES</code>, <code>NODE_OPTIONS</code>, <code>UV_THREADPOOL_SIZE</code></td><td>none</td></tr>
+<tr><td>pytest</td><td class="wrap"><code>PYTHONHASHSEED</code>, <code>PYTHONOPTIMIZE</code>, <code>PYTHONDEVMODE</code>, <code>PYTHONUTF8</code>, <code>PYTHONSAFEPATH</code>, <code>PYTHONNOUSERSITE</code>, <code>PYTHONUSERBASE</code>, <code>PYTHONHOME</code>, <code>PYTHONIOENCODING</code>, <code>PYTHONWARNINGS</code>, <code>PYTHONINTMAXSTRDIGITS</code>, <code>PYTEST_ADDOPTS</code>, <code>PYTEST_PLUGINS</code>, <code>PYTEST_DISABLE_PLUGIN_AUTOLOAD</code></td><td class="wrap"><code>UV</code>, <code>UV_*</code>, <code>VIRTUAL_ENV</code>, <code>PYTHONPATH</code> (vci's own), <code>XDG_*_HOME</code>, <code>SSL_CERT_*</code>, proxies</td></tr>
+<tr><td>Go</td><td class="wrap"><code>ZONEINFO</code>, <code>GOFLAGS</code>, <code>GOEXPERIMENT</code>, <code>GODEBUG</code>, <code>GOTOOLCHAIN</code>, <code>GOOS</code>, <code>GOARCH</code> and the arch-level variables (<code>GOAMD64</code>, <code>GOARM64</code>, ...), <code>CGO_*</code>, <code>CC</code>, <code>CXX</code>, <code>AR</code>, <code>CFLAGS</code>, <code>CXXFLAGS</code>, <code>CPPFLAGS</code>, <code>LDFLAGS</code>, <code>PKG_CONFIG*</code></td><td class="wrap"><code>GOPATH</code>, <code>GOROOT</code>, <code>GOCACHE</code>, <code>GOMODCACHE</code>, <code>GOPROXY</code> and the other module/cache locations, <code>XDG_CACHE_HOME</code>, <code>XDG_CONFIG_HOME</code>, <code>SSL_CERT_*</code>, proxies, <code>GIT_SSH*</code>, <code>SSH_AUTH_SOCK</code></td></tr>
+<tr><td>Cargo</td><td class="wrap"><code>RUSTFLAGS</code>, <code>RUSTDOCFLAGS</code> (and their <code>CARGO_ENCODED_</code>/<code>CARGO_BUILD_</code> forms), <code>CARGO_TARGET_*_RUSTFLAGS</code>, <code>CARGO_PROFILE_*</code>, <code>CARGO_BUILD_TARGET</code>, <code>RUSTC</code>, <code>RUSTDOC</code>, <code>RUSTC_BOOTSTRAP</code>, <code>RUST_TEST_THREADS</code>, <code>RUST_MIN_STACK</code>, the C toolchain (<code>CC</code>, <code>CFLAGS</code>, <code>CC_*</code>, <code>TARGET_CC</code>, <code>PKG_CONFIG*</code>, ...), <code>MACOSX_DEPLOYMENT_TARGET</code>, <code>SDKROOT</code></td><td class="wrap"><code>CARGO_HOME</code>, <code>RUSTUP_*</code> locations, <code>CARGO_TARGET_DIR</code>, <code>CARGO_NET_*</code>, <code>CARGO_HTTP_*</code>, <code>CARGO_REGISTRIES_*</code>, <code>CARGO_TERM_*</code>, <code>RUSTC_WRAPPER</code>, <code>SCCACHE_*</code>, <code>XDG_CACHE_HOME</code>, <code>SSL_CERT_*</code>, proxies, <code>GIT_SSH*</code>, <code>SSH_AUTH_SOCK</code></td></tr>
+<tr><td class="wrap">Rails, RSpec</td><td class="wrap"><code>RUBYLIB</code>, <code>RUBYGEMS_GEMDEPS</code>, <code>RUBY_YJIT_ENABLE</code>, <code>RUBY_GC_*</code>, the <code>RUBY_*_STACK_SIZE</code> variables, <code>RUBY_FREE_AT_EXIT</code>, <code>RUBY_CRASH_REPORT</code>, <code>RUBY_BOX</code>, <code>RUBY_MN_THREADS</code>, <code>RUBY_MAX_CPU</code>, <code>DATABASE_URL</code>, <code>*_DATABASE_URL</code>, <code>SECRET_KEY_BASE</code></td><td class="wrap"><code>LANG</code>, <code>LC_ALL</code>, <code>LC_CTYPE</code> (the encoding is part of the toolchain), <code>GEM_HOME</code>, <code>GEM_PATH</code>, Bundler's location and install settings (<code>BUNDLE_PATH</code>, <code>BUNDLE_APP_CONFIG</code>, ...), <code>MISE_*</code>, <code>RBENV_*</code>, <code>ASDF_*</code>, <code>XDG_*_HOME</code>, <code>SSL_CERT_*</code>, proxies</td></tr>
+</table>
+<p>Everything else of a runner's families is removed unless listed: <code>GOMAXPROCS</code>, <code>NODE_PATH</code>, <code>RUST_BACKTRACE</code> and <code>RUST_LOG</code> (<code>set = { RUST_BACKTRACE = "1" }</code> for backtraces), Minitest's <code>SEED</code> and <code>TESTOPTS</code>, RSpec's <code>SPEC_OPTS</code>, <code>RAILS_MASTER_KEY</code>, ... A removed variable is unset where the test was attested and in CI, so it cannot make the two runs differ. Rails processes always get <code>RAILS_ENV=test</code> from vci. The full tables, with a reason per line, are in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/ENV.md">docs/ENV.md</a>.</p>
 
 <h2 id="inputs">[[inputs]]: extra inputs</h2>
 <p>Declare files a unit depends on that vci cannot find on its own. Any adapter accepts this; the cargo adapter needs it for tests that read outside their package directory.</p>
@@ -126,12 +168,12 @@ extra = ["testdata/**", "shared/config.json"]</code></pre>
 </ul>
 
 <h2 id="projects">Several projects in one repository</h2>
-<p>Replace <code>project</code> and <code>adapter</code> with a list of <code>[[projects]]</code>. The top-level <code>[policy]</code> and <code>[env]</code> become shared defaults. A key in a project's own table replaces the top-level key for that project only:</p>
+<p>Replace <code>project</code> and <code>adapter</code> with a list of <code>[[projects]]</code>. The top-level <code>[policy]</code> and <code>[env]</code> become shared defaults. A key in a project's own table replaces the top-level key for that project only (a project's <code>set</code> replaces the whole top-level <code>set</code>; it does not merge):</p>
 <pre><code>[policy]
 max_ttl = "30d"
 
 [env]
-global = ["NODE_ENV"]
+set = { TZ = "UTC" }
 
 [[projects]]
 name = "web"           <span class="c"># unique: letters, digits, '.', '_', '-'</span>
@@ -145,7 +187,7 @@ adapter = "pytest"
 [projects.policy]
 platform = "same-os"
 [projects.env]
-global = ["TZ", "APP_*"]</code></pre>
+hash = ["APP_*"]</code></pre>
 <ul>
 <li>Test ids stay repo-relative paths, so they are unambiguous across projects.</li>
 <li><code>vci run</code>, <code>plan</code>, <code>ci</code> and <code>explain</code> work across all projects.</li>

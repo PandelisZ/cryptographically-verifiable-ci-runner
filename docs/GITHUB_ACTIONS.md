@@ -71,6 +71,13 @@ risky for tests that depend on file permissions: see the [reference](REFERENCE.m
 
 Pin the same versions you use locally: an attestation only counts where the toolchain matches.
 
+**Environment variables.** The job exports nothing for vci. A variable that must have the same value on the laptop
+and the runner (`TZ`, `LANG`, `CGO_ENABLED`) goes in `vci.toml`'s `[env] set`, and vci sets it in every test
+process it starts, here and where attestations are made. A variable that legitimately differs and matters goes in
+`[env] hash` (the runner's value is compared with the attested one), and a secret or cache in `[env] ignore`. Every
+other variable of the runner (`GITHUB_*`, `RUNNER_*`, `CI`, ...) is removed from the test processes. `vci env
+--base-ref origin/main` prints the policy the runner will apply ([docs/ENV.md](ENV.md)).
+
 **pytest (uv).** Add `UV_PYTHON_PREFERENCE: only-managed` to the workflow's top-level `env:`, then:
 
 ```yaml
@@ -80,8 +87,8 @@ Pin the same versions you use locally: an attestation only counts where the tool
       - run: uv sync --locked
 ```
 
-**Go.** Add `CGO_ENABLED: "0"` and `TZ: UTC` to the job's `env:` (same values as locally; both are declared in
-`vci.toml` `[env] global`), then:
+**Go.** `TZ` and `CGO_ENABLED` belong in `vci.toml` (`[env] set = { TZ = "UTC", CGO_ENABLED = "0" }`): vci sets
+them in every test process, on the runner and locally, so the job exports nothing. Then:
 
 ```yaml
       - uses: actions/setup-go@v5
@@ -99,8 +106,8 @@ Pin the same versions you use locally: an attestation only counts where the tool
       - run: cargo fetch --locked
 ```
 
-**Rails (Minitest or RSpec).** Add `TZ: UTC` to the job's `env:` (declared in `[env] global`, set the same way
-locally), then:
+**Rails (Minitest or RSpec).** `TZ` comes from `vci.toml` (`[env] set = { TZ = "UTC" }`, as `vci init` writes it):
+vci sets it on the runner and locally. Then:
 
 ```yaml
       - uses: ruby/setup-ruby@v1
@@ -119,8 +126,8 @@ locally), then:
   engine sets it up: `maintain_test_schema!` creates `db/test.sqlite3` on a fresh checkout). Its contents are never an
   input.
 - RSpec reads only the repository's `.rspec`. `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` and `.rspec-local` are
-  never read, on the runner or the laptop. `SPEC_OPTS` reaches RSpec only if declared in `[env] global` (then set it
-  to the same value on both sides).
+  never read, on the runner or the laptop. `SPEC_OPTS` reaches RSpec only if listed in `[env] hash` (then give it the
+  same value on both sides) or `[env] set`.
 - The job needs the same database service it always needed, and nothing vci-specific. SQLite needs no step. A
   database server (MySQL, PostgreSQL) needs no policy: run the same adapter as a service container, with the host, port
   and database `config/database.yml` names for the test environment (the same as where you attest), and create the
@@ -468,13 +475,15 @@ Run `vci explain <file> --base-ref origin/main` locally for the full reason a un
 | Everything runs on a pull request | `vci.toml` or `.vci/allowed_signers` is not on the base branch yet; or attestations were not pushed (`git ls-remote origin refs/meta/main` is empty) |
 | `failed check: toolchain` | Python, Node, uv, Ruby, Bundler or package versions differ between the laptop and the runner |
 | `failed check: inputs` | A file the test depends on changed after it was attested; `vci explain` names it |
+| `failed check: env` | A hashed variable has another value (or is unset) on the runner; `vci explain` names it and its class (`env:DATABASE_URL (hash)`). Give it the same value on both sides, move it to `[env] set`, or to `ignore` if it does not change results |
+| `failed check: env-config` | The base commit's `[env]` lists (or vci's built-in lists) differ from the attestation's: every attestation made before vci 1.6.0 fails this once. `vci env --base-ref origin/main` shows the difference |
 | `failed check: signer` | The signing key is not in the base commit's `allowed_signers`, or it has expired |
 | `failed check: signer` on main, `... is not in no_skip_refs_except` | Expected: on a ref in `policy.no_skip_refs` only the principals in `policy.no_skip_refs_except` (CI's key) can skip |
 | Every push to main still runs everything | `no_skip_refs_except` is empty or not on main yet, the CI key's line is not in main's `allowed_signers`, the previous push's attestations were not published (see `pushed` in the audit log and the `could not push attestations` warning: the job needs `contents: write`), or the key changed |
 | `::warning title=vci::not attesting: the key signs as github-actions ...` | The CI key reached a run on a ref outside `no_skip_refs` (a pull request): pass it only from the main-branch job with the environment |
 | A Go package or cargo target never skips on the runner | Its code depends on the platform (build tags, `_linux.go` files, `cfg(target_os)`, `runtime.GOOS`, floating-point maths): such units are only accepted on the same OS and architecture |
-| A test reads `CI`, `HOME` or `USER` | Those values differ on a runner, so that file always runs there |
-| No Rails test file ever skips on the runner | `config/environments/test.rb` reads `ENV["CI"]` (the generator's `config.eager_load = ENV["CI"].present?`); the Ruby patchlevel, Bundler, SQLite library or time zone data differ (`failed check: toolchain`; use `gem "tzinfo-data"`); or `Gemfile.lock` lacks the runner's platform |
+| A test reads `HOME` or `USER`, or a variable in `[env] hash` such as `CI` | Those values differ on a runner, so that file always runs there. `CI` is removed from the tests unless listed; `[env] set = { CI = "true" }` gives both sides the same value |
+| No Rails test file ever skips on the runner | `config/environments/test.rb` reads `ENV["CI"]` (the generator's `config.eager_load = ENV["CI"].present?`) and `vci.toml` lists `CI` in `[env] hash` (leave it out: removed, it is unset on both sides); the Ruby patchlevel, Bundler, SQLite library or time zone data differ (`failed check: toolchain`; use `gem "tzinfo-data"`); or `Gemfile.lock` lacks the runner's platform |
 | An RSpec file is never attested | An example is pending, skipped or filtered out (`fit` with `filter_run_when_matching :focus`, an excluded tag), rspec-retry / parallel_tests is loaded, a failure was retried away (`rspec:failure-cleared`), or the process exited non-zero after RSpec's report (SimpleCov's `minimum_coverage`: `vci:process-exit:2`). `vci run` prints the reason (`rspec:filtered:...`, `rspec:retry`, ...) |
 | Every Rails test is refused on a Mac with `/etc/resolv.conf`, `native:FFI ffi_lib(["vips.42"])` or `config/master.key` | An older collector (`resolv.conf`, read when Capybara loads `net/http`; `ffi_lib`, which collector 0.4.0 records instead of refusing, so `image_processing`/`ruby-vips` with Homebrew libvips is attested), or the generator's credentials: see "What the Rails adapter records" in [the reference](REFERENCE.md#what-the-rails-adapter-records) |
 | Every Rails test is refused on the runner with `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0` | Collector 0.4.1, which took the bundle `bundler-cache` installs inside the repository for gems outside the bundle. Collector 0.4.2 attests these files; its new version makes existing Rails attestations run once more |

@@ -3,6 +3,7 @@
 mod cmds;
 mod config;
 mod ctx;
+mod envcmd;
 mod envpolicy;
 mod externals;
 mod global;
@@ -32,6 +33,12 @@ enum Format {
     Text,
     Json,
     Github,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum EnvFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -129,6 +136,17 @@ enum Cmd {
         /// Only list what would be deleted.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Print the effective environment policy of each project: what vci sets, hashes, ignores and removes (docs/ENV.md).
+    Env {
+        /// Also compare with the policy in vci.toml at this ref.
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// Only this project (`[[projects]]` name).
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: EnvFormat,
     },
     /// Show each candidate attestation for a test file (Go: package directory; Cargo: `<package dir>#<target>`) and the first check it failed.
     Explain {
@@ -258,6 +276,15 @@ fn main() {
         Cmd::Push { remote } => cmds::push(remote.as_deref()),
         Cmd::Fetch { remote } => cmds::fetch(remote.as_deref()),
         Cmd::Prune { dry_run } => cmds::prune(dry_run),
+        Cmd::Env {
+            base_ref,
+            project,
+            format,
+        } => envcmd::env(envcmd::EnvArgs {
+            base_ref,
+            project,
+            json: matches!(format, EnvFormat::Json),
+        }),
         Cmd::Explain {
             test_file,
             base_ref,

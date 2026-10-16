@@ -26,6 +26,7 @@
 <tr><td><a href="#push-fetch"><code>vci fetch</code></a></td><td class="wrap">Download attestations from the remote</td></tr>
 <tr><td><a href="#ci"><code>vci ci</code></a></td><td class="wrap">In CI: plan, run the rest, write an audit log; with a key, attest what ran</td></tr>
 <tr><td><a href="#explain"><code>vci explain</code></a></td><td class="wrap">Show why one unit was not skipped</td></tr>
+<tr><td><a href="#env"><code>vci env</code></a></td><td class="wrap">Show which environment variables vci sets, hashes, ignores and removes</td></tr>
 <tr><td><a href="#prune"><code>vci prune</code></a></td><td class="wrap">Delete expired attestations</td></tr>
 <tr><td><a href="#verify"><code>vci verify</code></a></td><td class="wrap">Verify one attestation envelope and print its claims</td></tr>
 </table>
@@ -52,7 +53,7 @@
 <li><code>--key</code>: the SSH signing key (see <a href="#signing-key">signing key</a>).</li>
 <li><code>--ttl</code>: how long the attestation is valid. Default <code>14d</code>.</li>
 </ul>
-<pre><code>TZ=UTC vci run spec/models/b_spec.rb spec/lib/a_spec.rb --key ~/.ssh/id_ed25519</code></pre>
+<pre><code>vci run spec/models/b_spec.rb spec/lib/a_spec.rb --key ~/.ssh/id_ed25519</code></pre>
 <pre data-nocopy><code>3 examples, 0 failures
 
 vci: attested demo/rspec-app/spec/lib/a_spec.rb (65 inputs, root 2cbdcb32a9721b03)
@@ -103,7 +104,22 @@ vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --push --remote ori
 <pre data-nocopy><code>vci explain &lt;unit&gt; [--base-ref R]</code></pre>
 <p>Lists every candidate attestation for one unit and the first check each failed, with expected and actual values.</p>
 <pre><code>vci explain spec/models/b_spec.rb --base-ref origin/main</code></pre>
-<p>Full output and what each failed check means: <a href="examples.html#explain">Examples</a>.</p>
+<p>Full output and what each failed check means: <a href="examples.html#explain">Examples</a>. An environment failure names the variable and its class under the base policy, never its value:</p>
+<pre data-nocopy><code>  failed check: env
+    env:FEATURE_SEARCH (hash)
+      expected: blake3=5d2a6bf0...
+      actual:   unset</code></pre>
+
+<h3 id="env">vci env</h3>
+<pre data-nocopy><code>vci env [--base-ref R] [--project NAME] [--format text|json]</code></pre>
+<p>Prints the effective <a href="configuration.html#env">environment policy</a> of each project, as vci applies it on this machine. It runs nothing.</p>
+<ul>
+<li>One row per variable the lists name: its class (<code>set</code>, <code>hash</code>, <code>ignore</code>, <code>built-in hash</code>, <code>built-in ignore</code>, or <code>stripped</code>), where the rule comes from (<code>vci.toml set</code>, <code>vci.toml hash</code>, <code>vci.toml global (old name of hash)</code>, <code>built-in go</code>, <code>test script</code>, ...) and what it is here (the value vci sets, <code>present (&lt;hash prefix&gt;)</code>, <code>present</code> or <code>absent</code>).</li>
+<li>Built-in variables not set here, and variables present here that the tests will not see, are listed below the table.</li>
+<li><code>--base-ref R</code>: adds a <code>BASE</code> column with what the base commit's policy (the one CI judges with) does differently, <code>=</code> where it agrees.</li>
+<li><code>--project NAME</code>: one project only. <code>--format json</code>: every row, for scripts.</li>
+</ul>
+<pre><code>vci env --base-ref origin/main</code></pre>
 
 <h3 id="prune">vci prune</h3>
 <pre data-nocopy><code>vci prune [--dry-run]</code></pre>

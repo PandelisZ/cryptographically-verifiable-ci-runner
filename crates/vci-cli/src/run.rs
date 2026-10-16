@@ -734,6 +734,7 @@ fn check_one(
             waived,
             cfg_predicates: o.cfg_predicates.iter().cloned().collect(),
             declared_inputs: declared,
+            env_set: fenv.set.keys().cloned().collect(),
         },
     })
 }
@@ -1040,7 +1041,7 @@ pub struct RunOutcome {
 pub fn run(args: RunArgs) -> Result<i32> {
     let (repo, root) = open_repo()?;
     let config = working_tree_config(&root)?;
-    if let Some(w) = config.removed_keys_warning(crate::config::CONFIG_FILE) {
+    for w in config.warnings(crate::config::CONFIG_FILE) {
         eprintln!("vci: warning: {w}");
     }
     let out = run_units(
@@ -1215,7 +1216,7 @@ pub fn run_units(
             .secret_like()
         {
             eprintln!(
-                "vci: warning: declared env var {s} looks like a secret; its hash is published in attestations. Put it in pass_through instead."
+                "vci: warning: hashed env var {s} looks like a secret; its hash is published in attestations. Put it in [env] ignore instead."
             );
         }
     }
@@ -1418,9 +1419,13 @@ pub fn run_units(
                     for w in junk_in_listings(&ctx.root, &p.core.manifest) {
                         eprintln!("vci: warning: {label}: {w}");
                     }
-                    if p.core.manifest.env.iter().any(|e| e.key == "CI") {
+                    // Stripped (absent on both sides) or set by vci, CI is
+                    // the same everywhere; taken from the machine, it is not.
+                    if p.core.manifest.env.iter().any(|e| e.key == "CI")
+                        && project.project_env().classify("CI") == crate::envpolicy::EnvClass::Hash
+                    {
                         eprintln!(
-                            "vci: warning: {label}: it reads CI, which CI runners set (to \"true\"): unless it had that value here, this attestation will not match on a runner{}",
+                            "vci: warning: {label}: it reads CI, which vci.toml hashes and CI runners set (to \"true\"): unless it had that value here, this attestation will not match on a runner (set it instead: [env] set = {{ CI = \"true\" }}){}",
                             if project.adapter.name() == "rails" {
                                 "; Rails' generated config/environments/test.rb reads it (config.eager_load = ENV[\"CI\"].present?)"
                             } else {

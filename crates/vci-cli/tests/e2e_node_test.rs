@@ -17,6 +17,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
+mod env_common;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -34,8 +36,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-mode = "strict"
-global = ["APP_MODE", "TZ"]
+hash = ["APP_MODE", "TZ"]
 "#;
 
 const A: &str = "src/a.test.ts";
@@ -861,7 +862,7 @@ path = "apps/web"
 adapter = "node-test"
 
 [env]
-global = ["TZ"]
+hash = ["TZ"]
 "#;
     let w = World::new_with(Fixture::Pnpm, &[], toml);
     let work = w.work.clone();
@@ -917,7 +918,7 @@ node_args = ["--import", "./test/register-hooks.mjs"]
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-global = ["TZ"]
+hash = ["TZ"]
 "#;
     let w = World::new_with(Fixture::Abcd, &[], toml);
     let work = w.work.clone();
@@ -1187,5 +1188,49 @@ fn collector_behind_a_symlinked_install_prefix() {
     assert!(
         stderr.contains("vci: 1 attested, 0 not attested"),
         "{stderr}"
+    );
+}
+
+/// The `[env]` lists end to end (tests/env_common): a `set` variable reaches
+/// the test and is the same on every machine, a `hash` variable's change
+/// re-runs, an `ignore` variable's does not, an undeclared variable never
+/// reaches the test, `vci env` shows it all, and the old key names still work.
+#[test]
+fn node_test_env_set_hash_ignore_and_strip() {
+    let w = World::new_with(
+        Fixture::Abcd,
+        &[],
+        &env_common::with_env(VCI_TOML, env_common::ENV_NEW),
+    );
+    w.write(
+        "src/env.test.mjs",
+        r#"import { test } from "node:test";
+import assert from "node:assert/strict";
+
+test("env", () => {
+  assert.equal(process.env.APP_SET, "declared");
+  assert.equal(process.env.TZ, "UTC");
+  assert.ok(process.env.APP_HASH);
+  assert.ok(process.env.APP_IGNORE);
+  assert.equal(process.env.APP_UNDECLARED, undefined);
+});
+"#,
+    );
+    let vci = |args: &[&str], env: &[(&'static str, String)]| {
+        let env: Vec<(&str, Option<&str>)> =
+            env.iter().map(|(k, v)| (*k, Some(v.as_str()))).collect();
+        w.vci_env(&w.work, args, &env)
+    };
+    let git = |dir: &Path, args: &[&str]| w.git(dir, args);
+    env_common::check_env_lists(
+        &env_common::Ops {
+            work: &w.work,
+            scratch: &w.base,
+            vci: &vci,
+            git: &git,
+            key: w.trusted.to_str().unwrap(),
+        },
+        "src/env.test.mjs",
+        &["src/env.test.mjs"],
     );
 }

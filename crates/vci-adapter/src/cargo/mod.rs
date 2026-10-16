@@ -64,11 +64,14 @@ pub const CARGO_BIN_ENV: &str = "VCI_CARGO";
 /// vci.toml (`[[inputs]]`) waives it.
 pub const CARGO_UNDECLARED_TAINT: &str = "cargo:undeclared-reads";
 
-/// Variables the child always sees so that cargo, rustup and the linker work
-/// in strict mode: where toolchains, the registry and the build cache live,
-/// how crates are fetched, and wrappers that cache compilation. Like every
-/// built-in pass-through variable they are hashed only when a test reads one.
-pub const CARGO_PASS_THROUGH: &[&str] = &[
+/// Built-in ignore for Cargo (docs/ENV.md): where toolchains, the registry
+/// and the build cache live, how crates are fetched, and wrappers that cache
+/// compilation (any wrapper other than sccache refuses the unit).
+/// `RUST_BACKTRACE`, `RUST_LIB_BACKTRACE` and `RUST_LOG` are not here: std
+/// (`Backtrace::capture`) and dependency crates (`env_logger`, `tracing`'s
+/// `EnvFilter`) read them where the source scan cannot see the read, and a
+/// test can depend on them, so they are removed unless vci.toml lists them.
+pub const CARGO_IGNORE: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
@@ -108,13 +111,11 @@ pub const CARGO_PASS_THROUGH: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-/// Variables hashed whenever present (loose mode, or declared in strict
-/// mode, which otherwise removes them): they change what is built
-/// (`RUSTFLAGS`, `CARGO_PROFILE_TEST_*`, `CARGO_BUILD_*`, `CC`, `CFLAGS`, ...)
-/// or how tests run (`RUST_TEST_THREADS`, `RUST_BACKTRACE`, `RUST_LOG`,
-/// `RUST_MIN_STACK`, read where nothing observes it). Cargo's own locations
-/// and network settings are pass-through instead.
-pub const CARGO_HASHED_ENV: &[&str] = &[
+/// Hashed whenever present in loose mode (deprecated), where every variable
+/// reaches the tests: vci 1.5's list of what the runtime reads where nothing
+/// observes it, kept so that loose mode hashes what it did. Strict mode removes
+/// these unless they are built-in or vci.toml lists them.
+pub const CARGO_LOOSE_HASH: &[&str] = &[
     "RUST*",
     "CARGO*",
     "CC",
@@ -158,6 +159,51 @@ pub const CARGO_HASHED_ENV: &[&str] = &[
     "!RUSTC_WORKSPACE_WRAPPER",
     "!CARGO_BUILD_RUSTC_WRAPPER",
     "!CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+];
+
+/// Built-in hash for Cargo (docs/ENV.md): what changes what is built (the
+/// compiler and its flags, profiles, the target, the C toolchain build
+/// scripts use) or how the test harness runs, read by cargo, rustc, build
+/// scripts or the harness where nothing observes it. Every other `RUST*` and
+/// `CARGO*` variable is removed unless vci.toml lists it.
+pub const CARGO_HASH: &[&str] = &[
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_ENCODED_RUSTDOCFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_RUSTDOCFLAGS",
+    "CARGO_BUILD_TARGET",
+    "CARGO_TARGET_*_RUSTFLAGS",
+    "CARGO_PROFILE_*",
+    "RUSTC",
+    "RUSTDOC",
+    "RUSTC_BOOTSTRAP",
+    "RUST_TEST_THREADS",
+    "RUST_MIN_STACK",
+    "CC",
+    "CXX",
+    "AR",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "CC_*",
+    "CXX_*",
+    "AR_*",
+    "CFLAGS_*",
+    "CXXFLAGS_*",
+    "TARGET_CC",
+    "TARGET_CXX",
+    "TARGET_AR",
+    "TARGET_CFLAGS",
+    "TARGET_CXXFLAGS",
+    "HOST_CC",
+    "HOST_CXX",
+    "HOST_CFLAGS",
+    "PKG_CONFIG*",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "SDKROOT",
 ];
 
 /// External crates whose purpose is network I/O or child processes (the
@@ -1836,12 +1882,16 @@ impl Adapter for CargoAdapter {
         Ok(self.probe(env)?.versions)
     }
 
-    fn builtin_pass_through(&self) -> &'static [&'static str] {
-        CARGO_PASS_THROUGH
+    fn builtin_ignore(&self) -> &'static [&'static str] {
+        CARGO_IGNORE
     }
 
-    fn hashed_env_patterns(&self) -> &'static [&'static str] {
-        CARGO_HASHED_ENV
+    fn builtin_hash(&self) -> &'static [&'static str] {
+        CARGO_HASH
+    }
+
+    fn loose_hash(&self) -> &'static [&'static str] {
+        CARGO_LOOSE_HASH
     }
 
     /// Every package Cargo.lock pins: name -> `version source checksum`.
@@ -1894,10 +1944,6 @@ impl Adapter for CargoAdapter {
 
     fn snapshot_candidates(&self, _test_abs: &Utf8Path) -> Vec<Utf8PathBuf> {
         vec![]
-    }
-
-    fn inferred_env_patterns(&self) -> &'static [&'static str] {
-        &[]
     }
 
     /// One `cargo test --message-format=json <unit>` per unit, one at a time
@@ -2238,28 +2284,19 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         assert!(parse_lock("[[package]]\nname = \"x\"\n").is_err());
     }
 
-    /// Every pass-through name that the hashed patterns would match is
-    /// excluded from them, so strict mode keeps it and it is hashed only
-    /// when read.
+    /// No built-in ignore name is matched by a built-in hash pattern (built-in
+    /// hash would win, and cargo's locations would re-run every unit).
     #[test]
-    fn pass_through_and_hashed_patterns_are_disjoint() {
-        let m = |pat: &str, name: &str| match pat.strip_suffix('*') {
-            Some(p) => name.starts_with(p),
+    fn ignore_and_hash_lists_are_disjoint() {
+        let m = |pat: &str, name: &str| match pat.split_once('*') {
+            Some((a, b)) => {
+                name.starts_with(a) && name.ends_with(b) && name.len() >= a.len() + b.len()
+            }
             None => pat == name,
         };
-        for p in CARGO_PASS_THROUGH {
+        for p in CARGO_IGNORE {
             let name = p.trim_end_matches('*');
-            let included = CARGO_HASHED_ENV
-                .iter()
-                .any(|h| !h.starts_with('!') && m(h, name));
-            let excluded = CARGO_HASHED_ENV
-                .iter()
-                .filter_map(|h| h.strip_prefix('!'))
-                .any(|h| m(h, name));
-            assert!(
-                !included || excluded,
-                "{p} must be excluded from CARGO_HASHED_ENV"
-            );
+            assert!(!CARGO_HASH.iter().any(|h| m(h, name)), "{p}");
         }
     }
 

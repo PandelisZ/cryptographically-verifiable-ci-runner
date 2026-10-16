@@ -218,18 +218,18 @@ pub trait Adapter: Send + Sync {
     fn list_test_files(&self, env: &ChildEnv) -> Result<Vec<ListedFile>, AdapterError>;   // vitest list --filesOnly --json=<tmp>
     fn tool_versions(&self) -> Result<ToolVersions, AdapterError>;
     fn tool_versions_with_env(&self, env: &ChildEnv) -> Result<ToolVersions, AdapterError>;  // default: tool_versions()
-    fn builtin_pass_through(&self) -> &'static [&'static str];                                // default: []
-    fn hashed_env_patterns(&self) -> &'static [&'static str];     // default: []; pytest: PYTHON*, PYTEST_*, !PYTHONPATH (hashed if present, not kept in strict mode)
+    fn builtin_ignore(&self) -> &'static [&'static str];  // default: []; on top of COMMON_IGNORE (PATH, HOME, ...): visible, hashed only when read
+    fn builtin_hash(&self) -> &'static [&'static str];    // default: []; on top of COMMON_HASH (TZ): visible, hashed whenever present (docs/ENV.md tables)
+    fn loose_hash(&self) -> &'static [&'static str];      // default: []; loose mode only: vci 1.5's families (GO_LOOSE_HASH = GO*, CGO_* minus locations; PYTHON*, PYTEST_*; RUBY*, BUNDLE_*, RAILS_*, MT_*, ...; NODE_*; RUST*, CARGO*), hashed whenever present unless ignore
     fn warnings(&self, env: &ChildEnv) -> Vec<String>;           // default: []; pytest: interpreter not uv-managed
     fn installed_externals(&self, env: &ChildEnv) -> Result<Option<InstalledExternals>, AdapterError>; // default: None
     fn canonical_argv(&self, project_dir_rel_to_repo: &str, project_rel: &str) -> Vec<String>; // ["vitest","run","--root",dir,file]
     fn config_candidates(&self) -> Vec<Utf8PathBuf>;
     fn snapshot_candidates(&self, test_abs: &Utf8Path) -> Vec<Utf8PathBuf>;
-    fn inferred_env_patterns(&self) -> &'static [&'static str];   // ["VITE_*"]
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError>;
     fn run_plain(&self, files: &[String], env: &ChildEnv) -> Result<Option<i32>, AdapterError>;
     fn scratch_dirs(&self) -> Vec<Utf8PathBuf>;   // default: []; Cargo: the target dir (not snapshotted by `vci run`)
-    fn declared_env(&self) -> Vec<String>;        // default: []; node-test: NODE_ENV + the test script's assignments (added to [env] global)
+    fn declared_env(&self) -> Vec<String>;        // default: []; node-test: NODE_ENV + the test script's assignments (added to [env] hash)
     fn forced_env(&self) -> Vec<(String, String)>; // default: []; node-test: the script's assignments, set in every test process and in the hashed child env
     fn tsconfig_is_input(&self) -> bool;          // default: true; node-test: only with a TypeScript loader preloaded
 }
@@ -244,16 +244,17 @@ pub fn adapter_for_with(name: &str, project_dir: &Utf8Path, opts: &AdapterOption
 pub struct RailsAdapter;   // RailsAdapter::new(project_dir).with_collector(dir).with_runner(Option<RailsRunner>); `ruby` from $VCI_RUBY
 pub fn find_ruby_collector(project_dir: &Utf8Path) -> Result<Utf8PathBuf, AdapterError>; // $VCI_RUBY_COLLECTOR, else ruby/vci-collector near the exe / build checkout / project
 pub const PYTEST_CONFIG_NAMES: &[&str];   // pytest.toml, .pytest.toml, pytest.ini, .pytest.ini, pyproject.toml, tox.ini, setup.cfg
-pub const PYTEST_PASS_THROUGH: &[&str];   // UV, UV_*, VIRTUAL_ENV, PYTHONPATH, XDG_*_HOME, SSL_CERT_*, *_PROXY
-pub const GO_PASS_THROUGH: &[&str];      // GOPATH, GOROOT, GOCACHE, GOMODCACHE, GOENV, GOPROXY, ..., XDG_*, SSL_CERT_*, *_PROXY
-pub const GO_HASHED_ENV: &[&str];        // GO*, CGO_*, minus the pass-through GO* names
+pub const PYTEST_IGNORE: &[&str];   // UV, UV_*, VIRTUAL_ENV, PYTHONPATH, XDG_*_HOME, SSL_CERT_*, *_PROXY
+pub const PYTEST_HASH: &[&str];     // PYTHONHASHSEED, PYTHONOPTIMIZE, ..., PYTEST_ADDOPTS, PYTEST_PLUGINS, PYTEST_DISABLE_PLUGIN_AUTOLOAD
+pub const GO_IGNORE: &[&str];      // GOPATH, GOROOT, GOCACHE, GOMODCACHE, GOENV, GOPROXY, ..., XDG_*, SSL_CERT_*, *_PROXY
+pub const GO_HASH: &[&str];        // ZONEINFO, GOFLAGS, GOEXPERIMENT, GODEBUG, GOTOOLCHAIN, GOOS, GOARCH, GOAMD64, ..., CGO_*, CC, CFLAGS, ..., PKG_CONFIG*
 pub const GO_ALWAYS_READ_ENV: &[&str];   // TZ, ZONEINFO
 pub const GO_NET_TAINT: &str;            // "go:net:" (the only taint policy.go_allow_net waives)
-pub const CARGO_PASS_THROUGH: &[&str];   // CARGO_HOME, RUSTUP_*, CARGO_TARGET_DIR, CARGO_NET_*, CARGO_HTTP_*, RUSTC_WRAPPER, SCCACHE_*, ...
-pub const CARGO_HASHED_ENV: &[&str];     // RUST*, CARGO*, CC, CFLAGS, ..., minus the pass-through names
+pub const CARGO_IGNORE: &[&str];   // CARGO_HOME, RUSTUP_*, CARGO_TARGET_DIR, CARGO_NET_*, CARGO_HTTP_*, RUSTC_WRAPPER, SCCACHE_*, ... (not RUST_BACKTRACE/RUST_LIB_BACKTRACE/RUST_LOG: removed)
+pub const CARGO_HASH: &[&str];     // RUSTFLAGS, RUSTDOCFLAGS, CARGO_ENCODED_RUSTFLAGS, CARGO_PROFILE_*, RUSTC, RUST_TEST_THREADS, CC, CFLAGS, ..., PKG_CONFIG*
 pub const CARGO_UNDECLARED_TAINT: &str;  // "cargo:undeclared-reads" (waived by declaring [[inputs]] for the unit)
-pub const RAILS_PASS_THROUGH: &[&str];   // GEM_HOME, GEM_PATH, BUNDLE_PATH and Bundler's location/install settings, MISE_*, RBENV_*, ...
-pub const RAILS_HASHED_ENV: &[&str];     // RUBY*, RAILS_*, RACK_*, BUNDLE_*, BUNDLER_*, GEM_*, DATABASE_URL, MT_*, ... minus pass-through and vci-set
+pub const RAILS_IGNORE: &[&str];   // LANG, LC_ALL, LC_CTYPE, GEM_HOME, GEM_PATH, BUNDLE_PATH and Bundler's location/install settings, MISE_*, RBENV_*, ...
+pub const RAILS_HASH: &[&str];     // RUBYLIB, RUBYGEMS_GEMDEPS, RUBY_YJIT_ENABLE, RUBY_GC_*, ..., DATABASE_URL, *_DATABASE_URL, SECRET_KEY_BASE
 pub const RAILS_RUN_VARS: &[&str];       // RUBYOPT, RAILS_ENV, RACK_ENV, BUNDLE_GEMFILE, PARALLEL_WORKERS, DISABLE_SPRING, DISABLE_BOOTSNAP
 pub const RAILS_SCRATCH_DIRS: &[&str];   // log, tmp, storage, coverage (git-ignored writes there are allowed)
 pub const RAILS_GLOBAL_FILES: &[&str];   // Gemfile, Gemfile.lock, gems.rb, gems.locked, .ruby-version, ..., config/application.rb, bin/rails, test/test_helper.rb
@@ -324,8 +325,8 @@ with cwd = project dir (the module root; `go env GOMOD` must be its `go.mod`) an
 - `run_plain`: `go test -count=1 -json <./pkg... | ./...>` with a fresh TMPDIR; the events' `Output` is written to
   stderr as text.
 - `canonical_argv`: `["go", "test", "-C", <project dir>, "-count=1", "-json", "./<pkg>"]`; `config_candidates`:
-  `go.mod`, `go.sum`, `go.work`, `go.work.sum`; no snapshot candidates or inferred patterns; built-in pass-through
-  `GO_PASS_THROUGH`; hashed patterns `GO_HASHED_ENV`.
+  `go.mod`, `go.sum`, `go.work`, `go.work.sum`; no snapshot candidates; built-in ignore
+  `GO_IGNORE`; built-in hash `GO_HASH`.
 
 ### Cargo adapter
 
@@ -360,8 +361,8 @@ metadata` `workspace_root`) and hold `Cargo.lock`. All commands run with cwd = p
 - `run_plain`: with units, `cargo test --locked --manifest-path ... <target> --target-dir <target dir>/vci` per unit,
   one at a time, fresh TMPDIR, output to stderr; without, `cargo test --locked --workspace`.
 - `canonical_argv`: `["cargo", "test", "--locked", "--manifest-path", "<pkg>/Cargo.toml", <selector>...]`;
-  `config_candidates`: `Cargo.toml`, `Cargo.lock`; built-in pass-through `CARGO_PASS_THROUGH`; hashed patterns
-  `CARGO_HASHED_ENV`; `scratch_dirs`: the target dir.
+  `config_candidates`: `Cargo.toml`, `Cargo.lock`; built-in ignore `CARGO_IGNORE`; built-in hash
+  `CARGO_HASH`; `scratch_dirs`: the target dir.
 
 ### node:test adapter
 
@@ -388,7 +389,8 @@ dir, the child env applied and the script's assignments set:
   `run <script>` (`packageManager`, else the nearest lockfile; npm by default), or `node <node_args> --test <globs>`.
 - `canonical_argv`: `["node", <kept options, normalised as --name=value>..., "--test", <file>]` (an unusable command:
   `["node", "--vci-unsupported-command", <file>]`); `config_candidates`: the preloaded files and `--env-file`s;
-  `snapshot_candidates`: `<file>.snapshot`; hashed patterns `NODE_*`, `!NODE_OPTIONS`, `UV_THREADPOOL_SIZE`.
+  `snapshot_candidates`: `<file>.snapshot`; built-in hash `NODE_TEST_HASH` (`LANG`, `LC_ALL`,
+  `LC_MESSAGES`, `NODE_OPTIONS`, `UV_THREADPOOL_SIZE`).
 
 Collector records (`js/vitest-plugin/src/node-test/`): `meta` has `adapter: "node-test"` and `node`; records as for
 Vitest (`module` via `node-hooks`, `external`, `read`, `probe`, `readdir`, `env`, `taint`) plus `write` (paths the
@@ -441,8 +443,8 @@ db:test:prepare`) is started with `VCI_RAILS_MODE=engine`, in which the collecto
   "rspec", "--root", <project dir>, "--options", ".rspec", "--default-seed", "0", <file>]` (a file whose runner cannot
   be decided gets `["rails", "undecided-runner", ...]`, which no attestation has); `config_candidates`:
   `RAILS_GLOBAL_FILES` in the project dir, and `config_candidates_for(<RSpec file>)` the same without
-  `test/test_helper.rb` plus `RSPEC_GLOBAL_FILES`; built-in pass-through `RAILS_PASS_THROUGH`; hashed patterns
-  `RAILS_HASHED_ENV` (includes `SPEC_OPTS`); `scratch_dirs`: `<project>/vendor/bundle`.
+  `test/test_helper.rb` plus `RSPEC_GLOBAL_FILES`; built-in ignore `RAILS_IGNORE`; built-in hash
+  `RAILS_HASH` (`SPEC_OPTS` is in neither: removed unless listed); `scratch_dirs`: `<project>/vendor/bundle`.
 
 Collector records (`docs/spike-rails.md`): `meta` has `adapter: "rails"`, `ruby`, `engine`, `rails`, `bundler`,
 `runner`, `platform`, `db`, `tz`, `collector`; `module` (every Ruby file compiled from disk, loaded native extensions),
@@ -482,7 +484,8 @@ declared `[[inputs]]`, which the base policy must still waive; Rails writes none
 `rails:network-db:` entry, written under the removed `policy.rails_allow_db`, is still deserialised and never
 accepted), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
 host's cfg set), and for every adapter `declaredInputs` (the `[[inputs]] extra` globs of the test id, which must equal
-the base config's); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
+the base config's) and `envSet` (since vci 1.6.0: the names of the variables vci set from `[env] set`, whose manifest
+env entries hash the declared value; informational, older vci ignores it); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
 `input_root` is the per-file manifest root; `global_input_root` is the per-file global manifest root (lockfiles,
 package.json, `.npmrc`, config candidates and their relative references, tsconfig chain, `vci.toml`, the test's
 snapshot file, and the `NODE_OPTIONS` env hash; for pytest: `vci.toml`, `pyproject.toml`/`uv.lock`/`.python-version`/
@@ -499,4 +502,26 @@ stored envelope.
 
 ## Environment variables
 
-See `docs/ENV.md`. It is part of the design: `vci.toml` `[env]` config with strict/loose mode, declared and pass-through patterns, hashed into each test file input root and checked in `vci plan`.
+See `docs/ENV.md`. It is part of the design: `vci.toml` `[env]` lists `set` (vci sets the value in every test
+process), `hash` and `ignore`, plus a short built-in list per runner (`Adapter::builtin_hash`, `builtin_ignore` on top
+of `COMMON_HASH`/`COMMON_IGNORE`); every other variable is removed from the test process. Precedence: `set` > `hash` >
+`ignore` > built-in hash > built-in ignore > removed (`envpolicy::EnvClass`: `Set`, `Hash`, `Ignore`, `BuiltinHash`,
+`BuiltinIgnore`, `Stripped`). The old names `global` and `pass_through` (and `env` in `[[env.files]]`) are parsed as
+`hash` and `ignore` (`Config::warnings` names them); `mode = "loose"` keeps the 1.5 behaviour with
+`Adapter::loose_hash`.
+
+Attestation env section (format unchanged since 1.5 apart from `envSet`):
+
+- `InputManifest.env`: one `EnvEntry { key, hash }` per hashed variable, sorted by key; `hash` is BLAKE3 of the value
+  or `ABSENT_HASH` if unset. Hashed: every `set` name (with the declared value), every `hash` or built-in hash variable
+  present in the child environment, every exact `hash` name (absent included), and every observed read except
+  `ignore` ones and the adapter's own plumbing (`envpolicy::never_hashed`; a removed variable is recorded absent). An
+  `ignore` variable a test read is never hashed. The entries are part of the input root.
+- `envConfigDigest`: BLAKE3 over `vci/env-config/v2`, the mode, the `set` names and values, and the sorted `hash`,
+  `ignore`, built-in hash and built-in ignore lists that apply to the file (`[[env.files]]` included; in loose mode
+  also `loose_hash`). The domain was `v1` before 1.6.0, so older attestations fail `env-config` once and re-run.
+- `envSet`: the `set` names (informational).
+
+`vci plan` reads the policy from the base `vci.toml`, requires `envConfigDigest` to equal the base policy's digest,
+re-hashes every recorded key in the child environment it would give the tests (`set` applied), and requires every key
+`FileEnv::required_keys` lists to be recorded. `vci explain` prints env failures as `env:<NAME> (<class>)`.

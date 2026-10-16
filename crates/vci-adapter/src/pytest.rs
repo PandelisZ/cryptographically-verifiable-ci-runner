@@ -64,17 +64,12 @@ pub const PYTEST_CONFIG_NAMES: &[&str] = &[
     "setup.cfg",
 ];
 
-/// Variables the child always sees, on top of the global built-in list:
-/// what `uv` needs to find its cache, config, interpreters and index in
-/// strict mode, and `PYTHONPATH`, which vci sets itself (the user's value
-/// never reaches the tests). Like every built-in pass-through variable they
-/// are hashed only when a test reads one.
-///
-/// `PYTEST_*` and `PYTHON*` (other than `PYTHONPATH`) are deliberately not
-/// here: they are [`PYTEST_HASHED_ENV`]. In strict mode they are removed
-/// unless declared, so they hash as unset on both sides; declare them in
-/// `[env] global` to set them.
-pub const PYTEST_PASS_THROUGH: &[&str] = &[
+/// Built-in ignore for pytest (docs/ENV.md): what `uv` needs to find its
+/// cache, config, interpreters and index, and `PYTHONPATH`, which vci sets
+/// itself (the user's value never reaches the tests; `vci run` refuses a test
+/// that reads it). The interpreter and packages they lead to are checked
+/// directly (exact Python version, the installed distributions, `uv.lock`).
+pub const PYTEST_IGNORE: &[&str] = &[
     "UV",
     "UV_*",
     "VIRTUAL_ENV",
@@ -95,12 +90,31 @@ pub const PYTEST_PASS_THROUGH: &[&str] = &[
     "no_proxy",
 ];
 
-/// Variables hashed whenever they are present in the child environment
-/// (loose mode, or declared in strict mode): the interpreter and pytest read
-/// many of them in C before any hook runs (`PYTHON_CPU_COUNT`,
-/// `PYTHONBREAKPOINT`, `PYTHON_GIL`, `PYTEST_ADDOPTS`, ...), so a read cannot
-/// be observed. `PYTHONPATH` is vci's own.
-pub const PYTEST_HASHED_ENV: &[&str] = &["PYTHON*", "PYTEST_*", "!PYTHONPATH"];
+/// Hashed whenever present in loose mode (deprecated), where every variable
+/// reaches the tests: vci 1.5's list of what the runtime reads where nothing
+/// observes it, kept so that loose mode hashes what it did. Strict mode removes
+/// these unless they are built-in or vci.toml lists them.
+pub const PYTEST_LOOSE_HASH: &[&str] = &["PYTHON*", "PYTEST_*", "!PYTHONPATH"];
+
+/// Built-in hash for pytest (docs/ENV.md): what the interpreter and pytest
+/// read in C or before any hook runs, and that changes results. Every other
+/// `PYTHON*`/`PYTEST_*` variable is removed unless vci.toml lists it.
+pub const PYTEST_HASH: &[&str] = &[
+    "PYTHONHASHSEED",
+    "PYTHONOPTIMIZE",
+    "PYTHONDEVMODE",
+    "PYTHONUTF8",
+    "PYTHONSAFEPATH",
+    "PYTHONNOUSERSITE",
+    "PYTHONUSERBASE",
+    "PYTHONHOME",
+    "PYTHONIOENCODING",
+    "PYTHONWARNINGS",
+    "PYTHONINTMAXSTRDIGITS",
+    "PYTEST_ADDOPTS",
+    "PYTEST_PLUGINS",
+    "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+];
 
 /// Arguments of every `uv run`: `--locked` (uv.lock is the truth), `--exact`
 /// (packages not in uv.lock are removed, so the attesting machine and CI see
@@ -648,12 +662,16 @@ impl Adapter for PytestAdapter {
         Ok(self.probe(env)?.versions)
     }
 
-    fn builtin_pass_through(&self) -> &'static [&'static str] {
-        PYTEST_PASS_THROUGH
+    fn builtin_ignore(&self) -> &'static [&'static str] {
+        PYTEST_IGNORE
     }
 
-    fn hashed_env_patterns(&self) -> &'static [&'static str] {
-        PYTEST_HASHED_ENV
+    fn builtin_hash(&self) -> &'static [&'static str] {
+        PYTEST_HASH
+    }
+
+    fn loose_hash(&self) -> &'static [&'static str] {
+        PYTEST_LOOSE_HASH
     }
 
     fn warnings(&self, env: &ChildEnv) -> Vec<String> {
@@ -689,10 +707,6 @@ impl Adapter for PytestAdapter {
 
     fn collector_dirs(&self) -> Vec<Utf8PathBuf> {
         self.plugin_dir().ok().into_iter().collect()
-    }
-
-    fn inferred_env_patterns(&self) -> &'static [&'static str] {
-        &[]
     }
 
     /// One `pytest` process per file, at most [`pytest_jobs`] at a time,
@@ -740,14 +754,11 @@ mod tests {
         );
         assert_eq!(a.config_candidates().len(), PYTEST_CONFIG_NAMES.len());
         assert!(a.snapshot_candidates(Utf8Path::new("/p/t.py")).is_empty());
-        assert!(a.builtin_pass_through().contains(&"UV_*"));
-        assert!(
-            !a.builtin_pass_through()
-                .iter()
-                .any(|p| p.starts_with("PYTEST"))
-        );
+        assert!(a.builtin_ignore().contains(&"UV_*"));
+        assert!(!a.builtin_ignore().iter().any(|p| p.starts_with("PYTEST")));
         assert_eq!(file_arg("-x.py"), "./-x.py");
-        assert!(a.hashed_env_patterns().contains(&"PYTHON*"));
+        assert!(a.builtin_hash().contains(&"PYTHONHASHSEED"));
+        assert!(!a.builtin_hash().iter().any(|p| p.contains('*')));
     }
 
     /// Regressions: `uv run` loaded a `.env` file (`UV_ENV_FILE`) behind vci's

@@ -17,6 +17,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
+mod env_common;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -46,8 +48,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-mode = "strict"
-global = ["APP_MODE"]
+hash = ["APP_MODE"]
 "#;
 
 /// Variables removed from every `vci` and `cargo` invocation so the host
@@ -745,7 +746,7 @@ fn cargo_end_to_end_verification_steps() {
     // Control: with the PR commit as the (wrong) trust root, d would be skipped.
     assert!(w.plan(&work, "HEAD").skip.contains(D), "step 10 control");
 
-    // Step 11: a variable declared in [env] global with a different value in
+    // Step 11: a variable listed in [env] hash with a different value in
     // CI forces a run (it was unset when b was attested).
     let p = w.plan_env(&work, "main", &[("APP_MODE", "ci")]);
     assert!(p.run.contains(B), "step 11: {p:?}");
@@ -776,13 +777,13 @@ fn cargo_end_to_end_verification_steps() {
             .contains(B)
     );
 
-    // Step 12: a rustc flag in the environment (hashed whenever present,
-    // removed in strict mode unless declared) is compared too.
+    // Step 12: a rustc flag in the environment (built-in hash: it reaches the
+    // build and is hashed whenever present) runs the unit; an undeclared
+    // variable outside the built-in lists is removed, so it changes nothing.
     let p = w.plan_env(&work, "main", &[("RUSTFLAGS", "-Copt-level=1")]);
-    assert!(
-        p.skip.contains(B),
-        "strict mode removes an undeclared RUSTFLAGS: {p:?}"
-    );
+    assert!(p.run.contains(B), "RUSTFLAGS is built-in hash: {p:?}");
+    let p = w.plan_env(&work, "main", &[("CARGO_SOMETHING_ELSE", "1")]);
+    assert!(p.skip.contains(B), "removed: {p:?}");
 }
 
 #[test]
@@ -885,7 +886,7 @@ fn cargo_run_refuses_unattestable_units() {
     // environment reads are not observed).
     w.put(
         "vci.toml",
-        &toml.replace("mode = \"strict\"", "mode = \"loose\""),
+        &toml.replace("[env]\n", "[env]\nmode = \"loose\"\n"),
     );
     let out = w.vci(&work, &["run", A_LIB, "--key", w.trusted.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1120,7 +1121,7 @@ fn cargo_init_writes_config_and_prints_the_cargo_workflow() {
     let toml = std::fs::read_to_string(dir.join("vci.toml")).unwrap();
     assert!(toml.contains("adapter = \"cargo\""), "{toml}");
     assert!(toml.contains("project = \"rs\""), "{toml}");
-    assert!(toml.contains("mode = \"strict\""), "{toml}");
+    assert!(toml.contains("set = { TZ = \"UTC\" }"), "{toml}");
     let signers = std::fs::read_to_string(dir.join(".vci/allowed_signers")).unwrap();
     assert!(signers.contains("me@example.com namespaces=\"vci-attest\" ssh-ed25519 "));
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1136,7 +1137,7 @@ fn cargo_attests_vci_itself() {
     let root = workspace_root();
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("vci-self-target");
     let Some(w) = World::build(
-        &VCI_TOML.replace("global = [\"APP_MODE\"]", "global = []"),
+        &VCI_TOML.replace("hash = [\"APP_MODE\"]", "hash = []"),
         |d| {
             for name in ["Cargo.toml", "Cargo.lock", "crates", "examples"] {
                 cp(&root.join(name), &d.join(name));
@@ -1919,5 +1920,94 @@ fn cargo_git_checkouts_must_match_the_locked_commit() {
     assert!(
         line.contains("cargo:source") && line.contains("differs from commit"),
         "{line}"
+    );
+}
+
+/// Regression: `RUST_BACKTRACE`, `RUST_LIB_BACKTRACE` and `RUST_LOG` were
+/// built-in ignore (visible, never hashed), but std and dependency crates read
+/// them where the source scan does not see it, so a test that depends on one
+/// was attested where it is unset and skipped where it is set (and fails
+/// there). They are removed unless vci.toml lists them, as in vci 1.5: the
+/// test sees them unset under vci whatever the machine has.
+#[test]
+fn cargo_backtrace_and_log_variables_do_not_reach_the_tests() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.add_crate(
+        "bt",
+        r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn backtraces_are_off() {
+        use std::backtrace::{Backtrace, BacktraceStatus};
+        assert_eq!(Backtrace::capture().status(), BacktraceStatus::Disabled);
+        assert!(std::env::var_os("RUST_LOG").is_none());
+    }
+}
+"#,
+    );
+    let set = [
+        ("RUST_BACKTRACE", "1"),
+        ("RUST_LIB_BACKTRACE", "1"),
+        ("RUST_LOG", "debug"),
+    ];
+    let (code, stderr) = w.run_env(&["bt#lib"], &set);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("vci: attested bt#lib "), "{stderr}");
+    let p = w.plan_env(&work, "main", &set);
+    assert!(p.skip.contains("bt#lib"), "{p:?}");
+    let out = w.vci_env(&work, &["env"], &set);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("RUST_BACKTRACE") && l.contains("ignore")),
+        "{text}"
+    );
+}
+
+/// The `[env]` lists end to end (tests/env_common): a `set` variable reaches
+/// the test and is the same on every machine, a `hash` variable's change
+/// re-runs, an `ignore` variable's does not, an undeclared variable never
+/// reaches the test, `vci env` shows it all, and the old key names still work.
+#[test]
+fn cargo_env_set_hash_ignore_and_strip() {
+    let Some(w) = World::build(
+        &env_common::with_env(VCI_TOML, env_common::ENV_NEW),
+        copy_cargo_fixture,
+        &[],
+    ) else {
+        return;
+    };
+    w.add_crate(
+        "envp",
+        r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn env() {
+        assert_eq!(std::env::var("APP_SET").as_deref(), Ok("declared"));
+        assert_eq!(std::env::var("TZ").as_deref(), Ok("UTC"));
+        assert!(std::env::var("APP_HASH").is_ok());
+        assert!(std::env::var("APP_IGNORE").is_ok());
+        assert!(std::env::var_os("APP_UNDECLARED").is_none());
+    }
+}
+"#,
+    );
+    let vci = |args: &[&str], env: &[(&'static str, String)]| {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        w.vci_env(&w.work, args, &env)
+    };
+    let git = |dir: &Path, args: &[&str]| w.git(dir, args);
+    env_common::check_env_lists(
+        &env_common::Ops {
+            work: &w.work,
+            scratch: &w.base,
+            vci: &vci,
+            git: &git,
+            key: w.trusted.to_str().unwrap(),
+        },
+        "envp#lib",
+        &["envp#lib"],
     );
 }

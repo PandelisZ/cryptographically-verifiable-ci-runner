@@ -24,29 +24,58 @@ use std::ffi::OsString;
 use camino::Utf8PathBuf;
 
 pub use cargo::{
-    CARGO_BIN_ENV, CARGO_HASHED_ENV, CARGO_PASS_THROUGH, CARGO_UNDECLARED_TAINT, CargoAdapter,
-    cfg_predicate_differs, unit_package_dir,
+    CARGO_BIN_ENV, CARGO_HASH, CARGO_IGNORE, CARGO_LOOSE_HASH, CARGO_UNDECLARED_TAINT,
+    CargoAdapter, cfg_predicate_differs, unit_package_dir,
 };
 pub use golang::{
-    GO_ALWAYS_READ_ENV, GO_BIN_ENV, GO_HASHED_ENV, GO_NET_TAINT, GO_PASS_THROUGH, GoAdapter,
+    GO_ALWAYS_READ_ENV, GO_BIN_ENV, GO_HASH, GO_IGNORE, GO_LOOSE_HASH, GO_NET_TAINT, GoAdapter,
 };
 pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file};
 pub use nodetest::{
-    Invocation as NodeTestInvocation, NODE_TEST_HASHED_ENV, NODE_TEST_RUN_VARS,
+    Invocation as NodeTestInvocation, NODE_TEST_HASH, NODE_TEST_LOOSE_HASH, NODE_TEST_RUN_VARS,
     NODE_TEST_TS_LOADERS, NodeTestAdapter, NodeTestOptions, Preload as NodeTestPreload,
     find_node_test_collector, glob_escape as node_test_glob_escape,
     package_manager as node_package_manager, parse_script as parse_node_test_script,
 };
 pub use pytest::{
-    JOBS_ENV, PY_PLUGIN_ENV, PYTEST_CONFIG_NAMES, PYTEST_HASHED_ENV, PYTEST_PASS_THROUGH,
+    JOBS_ENV, PY_PLUGIN_ENV, PYTEST_CONFIG_NAMES, PYTEST_HASH, PYTEST_IGNORE, PYTEST_LOOSE_HASH,
     PytestAdapter, UV_ENV, UV_RUN_ARGS, find_py_plugin, pytest_jobs,
 };
 pub use rails::{
-    RAILS_GLOBAL_FILES, RAILS_HASHED_ENV, RAILS_PASS_THROUGH, RAILS_RUN_VARS, RAILS_SCRATCH_DIRS,
-    RAILS_SEED, RSPEC_GLOBAL_FILES, RUBY_BIN_ENV, RUBY_COLLECTOR_ENV, RailsAdapter, RailsRunner,
-    find_ruby_collector,
+    RAILS_GLOBAL_FILES, RAILS_HASH, RAILS_IGNORE, RAILS_LOOSE_HASH, RAILS_RUN_VARS,
+    RAILS_SCRATCH_DIRS, RAILS_SEED, RSPEC_GLOBAL_FILES, RUBY_BIN_ENV, RUBY_COLLECTOR_ENV,
+    RailsAdapter, RailsRunner, find_ruby_collector,
 };
-pub use vitest::{JS_PLUGIN_ENV, VitestAdapter, find_js_plugin};
+pub use vitest::{JS_PLUGIN_ENV, VITEST_HASH, VITEST_IGNORE, VitestAdapter, find_js_plugin};
+
+/// Built-in ignore for every runner (docs/ENV.md): what any process needs to
+/// start and find its tools. They reach the test process and are not a reason
+/// to re-run; a test observed reading one gets it hashed (they differ between
+/// a laptop and a CI runner by definition).
+pub const COMMON_IGNORE: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "VCI_*",
+    // Needed for processes to start at all on Windows.
+    "SYSTEMROOT",
+    "SystemRoot",
+    "COMSPEC",
+    "PATHEXT",
+    "WINDIR",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
+/// Built-in hash for every runner (docs/ENV.md): the local time zone, which
+/// every runtime reads natively (ICU, Ruby, Go's package time, libc).
+pub const COMMON_HASH: &[&str] = &["TZ"];
 
 /// Adapter names accepted in `vci.toml`.
 pub const ADAPTERS: &[&str] = &["vitest", "pytest", "go", "cargo", "rails", "node-test"];
@@ -208,17 +237,27 @@ pub trait Adapter: Send + Sync {
         let _ = env;
         self.tool_versions()
     }
-    /// Env var patterns that always reach the child process and are never
-    /// hashed, in addition to the global built-in list (e.g. what the
-    /// runner's launcher needs to work at all in strict mode).
-    fn builtin_pass_through(&self) -> &'static [&'static str] {
+    /// Built-in ignore (docs/ENV.md): env var patterns (`!pat` excludes) the
+    /// runner needs to work at all (where the toolchain, caches and packages
+    /// live), on top of [`COMMON_IGNORE`]. They reach the test process and are
+    /// not a reason to re-run; a test observed reading one gets it hashed.
+    fn builtin_ignore(&self) -> &'static [&'static str] {
         &[]
     }
-    /// Env var patterns (`!pat` excludes) hashed whenever they are present in
-    /// the child environment, without being kept in strict mode (unlike
-    /// [`Adapter::inferred_env_patterns`]): variables the runtime reads where
-    /// no collector can see it.
-    fn hashed_env_patterns(&self) -> &'static [&'static str] {
+    /// Built-in hash (docs/ENV.md): env var patterns (`!pat` excludes) the
+    /// runtime reads natively, where no collector sees the read, and that
+    /// change test results, on top of [`COMMON_HASH`]. They reach the test
+    /// process and are hashed whenever present.
+    fn builtin_hash(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Env var patterns (`!pat` excludes) hashed whenever present in loose
+    /// mode (deprecated) only, on top of the built-in hash: vci 1.5's
+    /// per-runner families (`GO*`, `PYTHON*`, `RUBY*`, `NODE_*`, ...), which
+    /// the runtime reads where nothing observes it. Loose mode lets every
+    /// variable reach the tests, so these must stay inputs there; strict mode
+    /// removes the ones that are not built-in or listed.
+    fn loose_hash(&self) -> &'static [&'static str] {
         &[]
     }
     /// Env var names declared (hashed, and kept in the child in strict mode)
@@ -287,8 +326,6 @@ pub trait Adapter: Send + Sync {
     }
     /// Snapshot files belonging to a test file (absolute; may not exist).
     fn snapshot_candidates(&self, test_abs: &camino::Utf8Path) -> Vec<Utf8PathBuf>;
-    /// Env var patterns the runner exposes implicitly (hashed if present).
-    fn inferred_env_patterns(&self) -> &'static [&'static str];
     /// Run `files` (project-relative) with dependency collection on.
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError>;
     /// Run `files` (project-relative; empty = everything) without collection.

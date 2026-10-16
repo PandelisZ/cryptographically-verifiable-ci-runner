@@ -17,6 +17,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
+mod env_common;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -46,8 +48,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-mode = "strict"
-global = ["APP_MODE"]
+hash = ["APP_MODE"]
 "#;
 
 /// Variables removed from every `vci` and `go` invocation so the host
@@ -73,6 +74,7 @@ const SCRUB: &[&str] = &[
     "GOTOOLCHAIN",
     "NODE_OPTIONS",
     "CI",
+    "GOMAXPROCS",
 ];
 
 struct World {
@@ -576,7 +578,7 @@ fn go_end_to_end_verification_steps() {
     // Control: with the PR commit as the (wrong) trust root, d would be skipped.
     assert!(w.plan(&work, "HEAD").skip.contains(D), "step 12 control");
 
-    // Step 13: a variable declared in [env] global with a different value in
+    // Step 13: a variable listed in [env] hash with a different value in
     // CI forces a run (it was unset when b was attested).
     let p = w.plan_env(&work, "main", &[("APP_MODE", "ci")]);
     assert!(p.run.contains(B), "step 13: {p:?}");
@@ -949,8 +951,8 @@ fn go_init_writes_config_and_prints_the_go_workflow() {
 #[test]
 fn go_other_go_version_runs() {
     let toml = VCI_TOML.replace(
-        "global = [\"APP_MODE\"]",
-        "global = [\"APP_MODE\", \"GOTOOLCHAIN\"]",
+        "hash = [\"APP_MODE\"]",
+        "hash = [\"APP_MODE\", \"GOTOOLCHAIN\"]",
     );
     let Some(w) = World::build(&toml, copy_go_fixture, &["."]) else {
         return;
@@ -1542,8 +1544,8 @@ fn go_package_where_not_every_test_ran_is_refused() {
 #[test]
 fn go_goflags_toolexec_is_refused() {
     let toml = VCI_TOML.replace(
-        "global = [\"APP_MODE\"]",
-        "global = [\"APP_MODE\", \"GOFLAGS\"]",
+        "hash = [\"APP_MODE\"]",
+        "hash = [\"APP_MODE\", \"GOFLAGS\"]",
     );
     let Some(w) = World::build(&toml, copy_go_fixture, &["."]) else {
         return;
@@ -1630,7 +1632,7 @@ fn go_local_time_zone_needs_a_declared_tz() {
     // b does not use the local zone.
     attested(&stderr, B);
 
-    let toml = VCI_TOML.replace("global = [\"APP_MODE\"]", "global = [\"APP_MODE\", \"TZ\"]");
+    let toml = VCI_TOML.replace("hash = [\"APP_MODE\"]", "hash = [\"APP_MODE\", \"TZ\"]");
     let Some(w) = World::build(&toml, copy_go_fixture, &["."]) else {
         return;
     };
@@ -1652,9 +1654,10 @@ fn go_local_time_zone_needs_a_declared_tz() {
     );
 }
 
-/// Regression: `NODE_OPTIONS` and the user's `VCI_*` variables are built-in
-/// pass-through (they reach the test), but reads of them were never hashed,
-/// so a Go test that fails when one is set was skipped where it is set.
+/// Regression: the user's `VCI_*` variables are built-in ignore (they reach
+/// the test), but reads of them were never hashed, so a Go test that fails
+/// when one is set was skipped where it is set. `NODE_OPTIONS` is not built
+/// in for Go (since vci 1.6.0): removed, it is unset on both sides.
 #[test]
 fn go_reads_of_node_options_and_vci_variables_are_hashed() {
     let Some(w) = World::new() else { return };
@@ -1667,11 +1670,104 @@ fn go_reads_of_node_options_and_vci_variables_are_hashed() {
     assert!(ok, "{stderr}");
     attested(&stderr, "ve");
     assert!(w.plan(&work, "main").skip.contains("ve"));
-    for env in [
-        ("NODE_OPTIONS", "--max-old-space-size=4096"),
-        ("VCI_BASE_REF", "main"),
-    ] {
-        let p = w.plan_env(&work, "main", &[env]);
-        assert!(p.run.contains("ve"), "{env:?}: {p:?}");
-    }
+    let p = w.plan_env(&work, "main", &[("VCI_BASE_REF", "main")]);
+    assert!(p.run.contains("ve"), "{p:?}");
+    let p = w.plan_env(
+        &work,
+        "main",
+        &[("NODE_OPTIONS", "--max-old-space-size=4096")],
+    );
+    assert!(
+        p.skip.contains("ve"),
+        "NODE_OPTIONS is removed for Go: {p:?}"
+    );
+}
+
+/// Regression: in loose mode (deprecated) every variable reaches the tests,
+/// but vci 1.6 hashed only the short built-in hash list there, so a test
+/// attested with `GOMAXPROCS=1` (which the runtime reads where the test log
+/// does not see it) was skipped where `GOMAXPROCS` is unset, and fails there.
+/// Loose mode hashes `GO*` whenever present, as vci 1.5 did.
+#[test]
+fn go_loose_mode_hashes_runtime_variables() {
+    let Some(w) = World::build(
+        &VCI_TOML.replace("[env]\n", "[env]\nmode = \"loose\"\n"),
+        copy_go_fixture,
+        &["."],
+    ) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.put(
+        "mp/mp_test.go",
+        "package mp\n\nimport (\n\t\"runtime\"\n\t\"testing\"\n)\n\nfunc TestOneProc(t *testing.T) {\n\tif runtime.GOMAXPROCS(0) != 1 {\n\t\tt.Fatal(\"GOMAXPROCS\")\n\t}\n}\n",
+    );
+    let (ok, stderr) = w.run_pkgs(&["mp"], &[("GOMAXPROCS", "1")]);
+    assert!(ok, "{stderr}");
+    attested(&stderr, "mp");
+    let p = w.plan_env(&work, "main", &[("GOMAXPROCS", "1")]);
+    assert!(p.skip.contains("mp"), "{p:?}");
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains("mp"), "GOMAXPROCS unset must re-run: {p:?}");
+    let p = w.plan_env(&work, "main", &[("GOMAXPROCS", "2")]);
+    assert!(
+        p.run.contains("mp"),
+        "another GOMAXPROCS must re-run: {p:?}"
+    );
+}
+
+/// The `[env]` lists end to end (tests/env_common): a `set` variable reaches
+/// the test and is the same on every machine, a `hash` variable's change
+/// re-runs, an `ignore` variable's does not, an undeclared variable never
+/// reaches the test, `vci env` shows it all, and the old key names still work.
+#[test]
+fn go_env_set_hash_ignore_and_strip() {
+    let Some(w) = World::build(
+        &env_common::with_env(VCI_TOML, env_common::ENV_NEW),
+        copy_go_fixture,
+        &["."],
+    ) else {
+        return;
+    };
+    w.put(
+        "envp/envp_test.go",
+        r#"package envp
+
+import (
+	"os"
+	"testing"
+)
+
+func TestEnv(t *testing.T) {
+	if v := os.Getenv("APP_SET"); v != "declared" {
+		t.Fatal("APP_SET", v)
+	}
+	if v := os.Getenv("TZ"); v != "UTC" {
+		t.Fatal("TZ", v)
+	}
+	if os.Getenv("APP_HASH") == "" || os.Getenv("APP_IGNORE") == "" {
+		t.Fatal("APP_HASH or APP_IGNORE missing")
+	}
+	if _, ok := os.LookupEnv("APP_UNDECLARED"); ok {
+		t.Fatal("APP_UNDECLARED reached the test")
+	}
+}
+"#,
+    );
+    let vci = |args: &[&str], env: &[(&'static str, String)]| {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        w.vci_env(&w.work, args, &env)
+    };
+    let git = |dir: &Path, args: &[&str]| w.git(dir, args);
+    env_common::check_env_lists(
+        &env_common::Ops {
+            work: &w.work,
+            scratch: &w.base,
+            vci: &vci,
+            git: &git,
+            key: w.trusted.to_str().unwrap(),
+        },
+        "envp",
+        &["envp"],
+    );
 }

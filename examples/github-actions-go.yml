@@ -13,15 +13,10 @@ permissions:
 jobs:
   go-test:
     runs-on: ubuntu-latest
-    # Attestations made on a Mac are accepted here (platform = "any") only if
-    # these match the attesting side: declare them in vci.toml
-    # ([env] global = ["CGO_ENABLED", "TZ"]) and set the same values when you
-    # run `vci run` locally. CGO_ENABLED=0 makes `go env` agree whether or not
-    # a C compiler is installed; a TZ makes tests that use the local time zone
-    # attestable (with TZ unset they are refused).
-    env:
-      CGO_ENABLED: "0"
-      TZ: UTC
+    # TZ (and, to build without cgo everywhere, CGO_ENABLED = "0") belong in
+    # vci.toml's [env] set: vci sets them in every test process, here and
+    # where `vci run` attests, so nothing is exported. Tests that use the local
+    # time zone with TZ unset are refused.
     steps:
       - uses: actions/checkout@v4
         with:

@@ -12,6 +12,8 @@
 //! Unknown keys are errors: in `vci plan` a config that cannot be parsed
 //! means every test runs.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +55,13 @@ pub struct Config {
     /// Extra inputs declared for test ids (`[[inputs]]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputsConfig>,
+    /// Deprecated env keys this file used (`env.global`, ...), with their
+    /// new names, for the warning ([`Config::warnings`]).
+    #[serde(skip)]
+    pub env_renamed: Vec<(String, &'static str)>,
+    /// Where this file sets `mode = "loose"` (deprecated), for the warning.
+    #[serde(skip)]
+    pub env_loose: Vec<String>,
 }
 
 /// `[[inputs]]`: files a test reads that its adapter cannot see (Cargo: reads
@@ -135,9 +144,16 @@ pub struct PolicyOverride {
 #[serde(deny_unknown_fields)]
 pub struct EnvOverride {
     pub mode: Option<EnvMode>,
-    pub global: Option<Vec<String>>,
-    pub pass_through: Option<Vec<String>>,
+    pub set: Option<BTreeMap<String, String>>,
+    pub hash: Option<Vec<String>>,
+    pub ignore: Option<Vec<String>>,
     pub files: Option<Vec<EnvFiles>>,
+    /// Old name of `hash` (before vci 1.6.0).
+    #[serde(rename = "global", skip_serializing)]
+    pub old_global: Option<Vec<String>>,
+    /// Old name of `ignore` (before vci 1.6.0).
+    #[serde(rename = "pass_through", skip_serializing)]
+    pub old_pass_through: Option<Vec<String>>,
 }
 
 /// The effective configuration of one project.
@@ -494,35 +510,231 @@ pub enum EnvMode {
     Loose,
 }
 
+/// `[env]` (docs/ENV.md): three lists. Every variable none of them (nor a
+/// runner's built-in lists) names is removed from the test processes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct EnvConfig {
+    /// `"strict"` (the default, and the only mode from vci 1.6.0 on) or
+    /// `"loose"` (deprecated: every variable reaches the tests).
     #[serde(default)]
     pub mode: EnvMode,
+    /// Set by vci in every test process it starts, on every machine,
+    /// whatever the machine's value: inputs by construction.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
+    /// Taken from the machine, visible to the tests, hashed: another value
+    /// (or its absence) re-runs the test. Patterns (`*`, `!` excludes).
     #[serde(default)]
-    pub global: Vec<String>,
+    pub hash: Vec<String>,
+    /// Taken from the machine, visible to the tests, never hashed and never a
+    /// reason to re-run. Patterns (`*`, `!` excludes).
     #[serde(default)]
-    pub pass_through: Vec<String>,
+    pub ignore: Vec<String>,
     #[serde(default)]
     pub files: Vec<EnvFiles>,
+    /// Old name of `hash` (before vci 1.6.0).
+    #[serde(default, rename = "global", skip_serializing)]
+    pub old_global: Option<Vec<String>>,
+    /// Old name of `ignore` (before vci 1.6.0).
+    #[serde(default, rename = "pass_through", skip_serializing)]
+    pub old_pass_through: Option<Vec<String>>,
 }
 
+/// `[[env.files]]`: `hash` and `ignore` patterns for the test files matching
+/// `match` only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvFiles {
     #[serde(rename = "match")]
     pub match_: Vec<String>,
     #[serde(default)]
-    pub env: Vec<String>,
+    pub hash: Vec<String>,
     #[serde(default)]
-    pub pass_through: Vec<String>,
+    pub ignore: Vec<String>,
+    /// Old name of `hash` (before vci 1.6.0).
+    #[serde(default, rename = "env", skip_serializing)]
+    pub old_env: Option<Vec<String>>,
+    /// Old name of `ignore` (before vci 1.6.0).
+    #[serde(default, rename = "pass_through", skip_serializing)]
+    pub old_pass_through: Option<Vec<String>>,
+}
+
+/// Move an old key's value to its new key (`at` names the table for errors
+/// and the deprecation warning).
+fn rename_key(
+    old: &mut Option<Vec<String>>,
+    new: &mut Vec<String>,
+    at: &str,
+    old_name: &str,
+    new_name: &'static str,
+    renamed: &mut Vec<(String, &'static str)>,
+) -> Result<()> {
+    if let Some(v) = old.take() {
+        if !new.is_empty() {
+            bail!("{at}: `{old_name}` is the old name of `{new_name}`; give only `{new_name}`");
+        }
+        *new = v;
+        renamed.push((format!("{at}.{old_name}"), new_name));
+    }
+    Ok(())
+}
+
+impl EnvFiles {
+    fn normalize(&mut self, at: &str, renamed: &mut Vec<(String, &'static str)>) -> Result<()> {
+        rename_key(
+            &mut self.old_env,
+            &mut self.hash,
+            at,
+            "env",
+            "hash",
+            renamed,
+        )?;
+        rename_key(
+            &mut self.old_pass_through,
+            &mut self.ignore,
+            at,
+            "pass_through",
+            "ignore",
+            renamed,
+        )
+    }
+}
+
+/// `set` names: plain variable names (no patterns), values without NUL.
+fn check_set(at: &str, set: &BTreeMap<String, String>) -> Result<()> {
+    for (k, v) in set {
+        if k.is_empty() || k.contains(['=', '\0', '*', '!']) || k.chars().any(char::is_whitespace) {
+            bail!("{at}.set: {k:?} is not a variable name (patterns are not allowed in `set`)");
+        }
+        if v.contains('\0') {
+            bail!("{at}.set: the value of {k} contains a NUL byte");
+        }
+    }
+    Ok(())
+}
+
+impl EnvConfig {
+    /// Move the old key names to the new ones and check `set`.
+    fn normalize(
+        &mut self,
+        at: &str,
+        renamed: &mut Vec<(String, &'static str)>,
+        loose: &mut Vec<String>,
+    ) -> Result<()> {
+        rename_key(
+            &mut self.old_global,
+            &mut self.hash,
+            at,
+            "global",
+            "hash",
+            renamed,
+        )?;
+        rename_key(
+            &mut self.old_pass_through,
+            &mut self.ignore,
+            at,
+            "pass_through",
+            "ignore",
+            renamed,
+        )?;
+        for (i, f) in self.files.iter_mut().enumerate() {
+            f.normalize(&format!("{at}.files[{i}]"), renamed)?;
+        }
+        if self.mode == EnvMode::Loose {
+            loose.push(format!("{at}.mode"));
+        }
+        check_set(at, &self.set)
+    }
+}
+
+impl EnvOverride {
+    fn normalize(
+        &mut self,
+        at: &str,
+        renamed: &mut Vec<(String, &'static str)>,
+        loose: &mut Vec<String>,
+    ) -> Result<()> {
+        for (old, new, old_name, new_name) in [
+            (&mut self.old_global, &mut self.hash, "global", "hash"),
+            (
+                &mut self.old_pass_through,
+                &mut self.ignore,
+                "pass_through",
+                "ignore",
+            ),
+        ] {
+            if let Some(v) = old.take() {
+                if new.is_some() {
+                    bail!(
+                        "{at}: `{old_name}` is the old name of `{new_name}`; give only `{new_name}`"
+                    );
+                }
+                *new = Some(v);
+                renamed.push((format!("{at}.{old_name}"), new_name));
+            }
+        }
+        for (i, f) in self.files.iter_mut().flatten().enumerate() {
+            f.normalize(&format!("{at}.files[{i}]"), renamed)?;
+        }
+        if self.mode == Some(EnvMode::Loose) {
+            loose.push(format!("{at}.mode"));
+        }
+        if let Some(set) = &self.set {
+            check_set(at, set)?;
+        }
+        Ok(())
+    }
 }
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
-        let c: Config = toml::from_str(text).context("parsing vci.toml")?;
+        let mut c: Config = toml::from_str(text).context("parsing vci.toml")?;
+        c.normalize_env()?;
         c.validate()?;
         Ok(c)
+    }
+
+    /// Old env key names to new ones (recorded for [`Self::warnings`]).
+    fn normalize_env(&mut self) -> Result<()> {
+        let (mut renamed, mut loose) = (Vec::new(), Vec::new());
+        self.env.normalize("env", &mut renamed, &mut loose)?;
+        for p in &mut self.projects {
+            if let Some(o) = &mut p.env {
+                o.normalize(
+                    &format!("projects.{}.env", p.name),
+                    &mut renamed,
+                    &mut loose,
+                )?;
+            }
+        }
+        self.env_renamed = renamed;
+        self.env_loose = loose;
+        Ok(())
+    }
+
+    /// Every warning about this file's keys (removed and deprecated ones),
+    /// for the `vci.toml` described by `which`.
+    pub fn warnings(&self, which: &str) -> Vec<String> {
+        let mut out: Vec<String> = self.removed_keys_warning(which).into_iter().collect();
+        if !self.env_renamed.is_empty() {
+            let list: Vec<String> = self
+                .env_renamed
+                .iter()
+                .map(|(old, new)| format!("{old} -> {new}"))
+                .collect();
+            out.push(format!(
+                "{which} uses the old env key names, which still work: rename {} (vci 1.6.0 renamed `global`, and `env` in [[env.files]], to `hash`, and `pass_through` to `ignore`; see docs/ENV.md)",
+                list.join(", ")
+            ));
+        }
+        if !self.env_loose.is_empty() {
+            out.push(format!(
+                "{} = \"loose\" in {which} is deprecated: it behaves as before (every variable reaches the tests; ones a test is seen reading are hashed) and will be removed; remove it to get the default, where only the variables vci.toml and the built-in lists name reach the tests (docs/ENV.md)",
+                self.env_loose.join(", ")
+            ));
+        }
+        out
     }
 
     fn validate(&self) -> Result<()> {
@@ -716,11 +928,14 @@ impl Config {
                     if let Some(v) = o.mode {
                         env.mode = v;
                     }
-                    if let Some(v) = &o.global {
-                        env.global = v.clone();
+                    if let Some(v) = &o.set {
+                        env.set = v.clone();
                     }
-                    if let Some(v) = &o.pass_through {
-                        env.pass_through = v.clone();
+                    if let Some(v) = &o.hash {
+                        env.hash = v.clone();
+                    }
+                    if let Some(v) = &o.ignore {
+                        env.ignore = v.clone();
                     }
                     if let Some(v) = &o.files {
                         env.files = v.clone();
@@ -776,12 +991,18 @@ never_skip = []
 # platform = "exact"     # and/or libraries = "exact"
 
 [env]
-# "strict": only declared and pass-through variables reach tests.
-mode = "strict"
-# Hashed into every test file's inputs.
-global = ["NODE_ENV", "TZ"]
-# Visible to tests, never hashed. Put secrets here.
-pass_through = []
+# Only the variables named here and in vci's short built-in lists reach the
+# tests; every other one is removed from the test processes (docs/ENV.md;
+# `vci env` prints the effective lists).
+# Set by vci in every test process, here and in CI (nothing to export): the
+# time zone and the locale ICU formats dates and numbers with.
+set = { TZ = "UTC", LANG = "C.UTF-8" }
+# Taken from the machine and hashed: another value (or its absence) re-runs
+# the test. Patterns allowed ("FEATURE_*").
+hash = []
+# Taken from the machine, never hashed, never a reason to re-run. Put secrets
+# and per-machine settings here.
+ignore = []
 "#;
 
 /// Template written by `vci init --adapter pytest`.
@@ -814,12 +1035,17 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 never_skip = []
 
 [env]
-# "strict": only declared and pass-through variables reach tests.
-mode = "strict"
-# Hashed into every test file's inputs.
-global = ["TZ"]
-# Visible to tests, never hashed. Put secrets here.
-pass_through = []
+# Only the variables named here and in vci's short built-in lists reach the
+# tests; every other one is removed from the test processes (docs/ENV.md;
+# `vci env` prints the effective lists).
+# Set by vci in every test process, here and in CI (nothing to export).
+set = { TZ = "UTC" }
+# Taken from the machine and hashed: another value (or its absence) re-runs
+# the test. Patterns allowed ("FEATURE_*").
+hash = []
+# Taken from the machine, never hashed, never a reason to re-run. Put secrets
+# and per-machine settings here.
+ignore = []
 "#;
 
 /// Template written by `vci init --adapter go`.
@@ -856,12 +1082,19 @@ never_skip = []
 go_allow_net = false
 
 [env]
-# "strict": only declared and pass-through variables reach tests.
-mode = "strict"
-# Hashed into every package's inputs.
-global = ["TZ"]
-# Visible to tests, never hashed. Put secrets here.
-pass_through = []
+# Only the variables named here and in vci's short built-in lists reach the
+# tests; every other one is removed from the test processes (docs/ENV.md;
+# `vci env` prints the effective lists).
+# Set by vci in every test process, here and in CI (nothing to export). A
+# package that uses the local time zone needs TZ. Add CGO_ENABLED = "0" to
+# build without cgo everywhere.
+set = { TZ = "UTC" }
+# Taken from the machine and hashed: another value (or its absence) re-runs
+# the test. Patterns allowed ("FEATURE_*").
+hash = []
+# Taken from the machine, never hashed, never a reason to re-run. Put secrets
+# and per-machine settings here.
+ignore = []
 "#;
 
 /// Template written by `vci init --adapter cargo`.
@@ -902,13 +1135,17 @@ never_skip = []
 # extra = ["testdata/**"]
 
 [env]
-# "strict" (required by the cargo adapter): only declared and pass-through
-# variables reach tests.
-mode = "strict"
-# Hashed into every unit's inputs.
-global = ["TZ"]
-# Visible to tests, never hashed. Put secrets here.
-pass_through = []
+# Only the variables named here and in vci's short built-in lists reach the
+# tests; every other one is removed from the test processes (docs/ENV.md;
+# `vci env` prints the effective lists).
+# Set by vci in every test process, here and in CI (nothing to export).
+set = { TZ = "UTC" }
+# Taken from the machine and hashed: another value (or its absence) re-runs
+# the test. Patterns allowed ("FEATURE_*").
+hash = []
+# Taken from the machine, never hashed, never a reason to re-run. Put secrets
+# and per-machine settings here.
+ignore = []
 "#;
 
 /// Template written by `vci init --adapter rails`.
@@ -955,15 +1192,20 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 never_skip = []
 
 [env]
-# "strict": only declared and pass-through variables reach tests.
-mode = "strict"
-# Hashed into every test file's inputs. Declare TZ and set it (TZ=UTC) on
-# both sides: Ruby's local time zone otherwise comes from the machine.
-# RSpec reads SPEC_OPTS: strict mode removes it unless you add "SPEC_OPTS"
-# here (it is then hashed).
-global = ["TZ"]
-# Visible to tests, never hashed. Put secrets here.
-pass_through = []
+# Only the variables named here and in vci's short built-in lists reach the
+# tests; every other one is removed from the test processes (docs/ENV.md;
+# `vci env` prints the effective lists).
+# Set by vci in every test process, here and in CI (nothing to export): Ruby's
+# local time zone otherwise comes from the machine. vci sets RAILS_ENV and
+# RACK_ENV to "test" itself. RSpec's SPEC_OPTS and Minitest's SEED/TESTOPTS are
+# removed unless listed (hash = ["SPEC_OPTS"] passes it on, hashed).
+set = { TZ = "UTC" }
+# Taken from the machine and hashed: another value (or its absence) re-runs
+# the test. Patterns allowed ("FEATURE_*").
+hash = []
+# Taken from the machine, never hashed, never a reason to re-run. Put secrets
+# and per-machine settings here.
+ignore = []
 "#;
 
 /// Template written by `vci init --adapter node-test`.
@@ -1005,15 +1247,21 @@ never_skip = []
 node_exact = false
 
 [env]
-# "strict": only declared and pass-through variables reach tests.
-mode = "strict"
-# Hashed into every test file's inputs. NODE_ENV and every variable the test
-# script assigns (NODE_ENV=test node --test ...) are declared automatically.
-# Set TZ (TZ=UTC) where vci runs and in CI: with TZ unset every file is
-# refused (the machine's zone is not an input). LANG/LC_ALL are inputs too.
-global = ["TZ"]
-# Visible to tests, never hashed. Put secrets here.
-pass_through = []
+# Only the variables named here and in vci's short built-in lists reach the
+# tests; every other one is removed from the test processes (docs/ENV.md;
+# `vci env` prints the effective lists).
+# Set by vci in every test process, here and in CI (nothing to export): the
+# time zone (with TZ unset every file is refused: the machine's zone is not an
+# input) and the locale ICU formats dates and numbers with. NODE_ENV and every
+# variable the test script assigns (NODE_ENV=test node --test ...) are hashed
+# automatically.
+set = { TZ = "UTC", LANG = "C.UTF-8" }
+# Taken from the machine and hashed: another value (or its absence) re-runs
+# the test. Patterns allowed ("FEATURE_*").
+hash = []
+# Taken from the machine, never hashed, never a reason to re-run. Put secrets
+# and per-machine settings here.
+ignore = []
 "#;
 
 /// The `vci init` template for `adapter`.
@@ -1046,6 +1294,10 @@ mod tests {
             NODE_TEST_TEMPLATE,
         ] {
             let c = Config::parse(t).unwrap();
+            // The new env key names, TZ set by vci (nothing to export).
+            assert!(c.warnings("vci.toml").is_empty(), "{t}");
+            assert_eq!(c.project_specs()[0].env.set["TZ"], "UTC");
+            assert!(!t.contains("global =") && !t.contains("pass_through ="));
             let refs = &c.project_specs()[0].policy.no_skip_refs;
             assert!(
                 refs.iter().any(|r| glob_match(r, "refs/heads/main")),
@@ -1139,7 +1391,8 @@ mod tests {
         assert!(c.removed_keys_warning("vci.toml").is_none());
         let s = c.project_specs();
         assert_eq!(s[0].adapter, "rails");
-        assert_eq!(s[0].env.global, ["TZ"]);
+        assert_eq!(s[0].env.set["TZ"], "UTC");
+        assert!(s[0].env.hash.is_empty());
         let plain = Config::parse("[policy]\nmax_ttl = \"30d\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n").unwrap();
         let c = Config::parse(
             "[policy]\nrails_allow_db = true\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n[projects.policy]\nrails_allow_db = false\n",
@@ -1296,7 +1549,7 @@ mod tests {
 max_ttl = "20d"
 no_skip_refs = ["refs/heads/main"]
 [env]
-global = ["NODE_ENV"]
+hash = ["NODE_ENV"]
 
 [[projects]]
 name = "web"
@@ -1310,7 +1563,7 @@ adapter = "pytest"
 [projects.policy]
 platform = "exact"
 [projects.env]
-global = ["TZ", "APP_*"]
+hash = ["TZ", "APP_*"]
 "#,
         )
         .unwrap();
@@ -1318,14 +1571,14 @@ global = ["TZ", "APP_*"]
         let s = c.project_specs();
         assert_eq!(s.len(), 2);
         assert_eq!((s[0].name.as_str(), s[0].rel.as_str()), ("web", "web"));
-        assert_eq!(s[0].env.global, ["NODE_ENV"]);
+        assert_eq!(s[0].env.hash, ["NODE_ENV"]);
         assert_eq!(s[0].policy.platform, Platform::Any);
         assert_eq!(s[1].adapter, "pytest");
         assert_eq!(s[1].policy.platform, Platform::Exact);
         // Inherited keys stay.
         assert_eq!(s[1].policy.max_ttl, "20d");
         assert_eq!(s[1].policy.no_skip_refs, ["refs/heads/main"]);
-        assert_eq!(s[1].env.global, ["TZ", "APP_*"]);
+        assert_eq!(s[1].env.hash, ["TZ", "APP_*"]);
     }
 
     #[test]

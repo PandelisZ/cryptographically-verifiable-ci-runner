@@ -17,6 +17,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
+mod env_common;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -46,8 +48,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-mode = "strict"
-global = ["APP_MODE"]
+hash = ["APP_MODE"]
 "#;
 
 /// Variables removed from every `vci` invocation so the host environment
@@ -545,7 +546,7 @@ fn pytest_end_to_end_verification_steps() {
     // Control: with the PR commit as the (wrong) trust root, D would be skipped.
     assert!(w.plan(&work, "HEAD").skip.contains(D), "step 9 control");
 
-    // Step 10: a variable declared in [env] global with a different value in
+    // Step 10: a variable listed in [env] hash with a different value in
     // CI forces a run (it was unset when B was attested).
     let p = w.plan_env(&work, "main", &[("APP_MODE", "ci")]);
     assert!(
@@ -884,8 +885,7 @@ platform = "any"
 max_ttl = "30d"
 
 [env]
-mode = "strict"
-global = ["NODE_ENV"]
+hash = ["NODE_ENV"]
 
 [[projects]]
 name = "web"
@@ -897,7 +897,7 @@ name = "py"
 path = "py"
 adapter = "pytest"
 [projects.env]
-global = ["APP_MODE"]
+hash = ["APP_MODE"]
 "#;
 
 /// One repository with a Vitest project and a pytest project.
@@ -1067,7 +1067,8 @@ fn pytest_other_python_version_runs() {
 }
 
 /// Regressions from adversarial verification, each a false skip before:
-/// a test reading a built-in pass-through variable (CI), a file with a
+/// a test reading a variable no list names (CI: removed, so unset on both
+/// sides), a file with a
 /// conditionally skipped test, a Linux-only native extension next to an
 /// attested module, and a package installed outside uv.lock.
 #[test]
@@ -1112,20 +1113,14 @@ fn pytest_environment_skips_and_foreign_extensions_fail_open() {
     assert!(p.skip.contains("tests/test_optdep.py"), "{p:?}");
     assert!(p.skip.contains(B), "{p:?}");
 
-    // CI=true in CI: the test that read CI runs (it would fail there).
+    // CI=true in CI: CI is in no [env] list, so vci removes it from every
+    // test process; the test that read it saw it unset here and sees it unset
+    // there (it passes in `vci ci` too), and is skipped.
     let p = w.plan_env(&work, "main", &[("CI", "true")]);
-    assert!(p.run.contains("tests/test_ci_value.py"), "{p:?}");
+    assert!(p.skip.contains("tests/test_ci_value.py"), "{p:?}");
     assert!(p.skip.contains(B), "B never read CI: {p:?}");
-    let out = w.vci_env(
-        &work,
-        &["explain", "tests/test_ci_value.py", "--base-ref", "main"],
-        &[("CI", "true")],
-    );
-    let ex = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        ex.contains("failed check: env") && ex.contains("env:CI"),
-        "{ex}"
-    );
+    let out = w.vci_env(&work, &["ci", "--base-ref", "main"], &[("CI", "true")]);
+    assert_eq!(out.status.code(), Some(0));
 
     // A native extension only a Linux (or Windows) interpreter would import
     // instead of src/b.py.
@@ -1569,4 +1564,48 @@ fn pytest_listing_is_what_pytest_collects() {
         eprintln!("{file}: {content:?}: {rel:?}");
         assert_eq!(vci_listed(&w), want, "{file}: {content}");
     }
+}
+
+/// The `[env]` lists end to end (tests/env_common): a `set` variable reaches
+/// the test and is the same on every machine, a `hash` variable's change
+/// re-runs, an `ignore` variable's does not, an undeclared variable never
+/// reaches the test, `vci env` shows it all, and the old key names still work.
+#[test]
+fn pytest_env_set_hash_ignore_and_strip() {
+    let Some(w) = World::build(
+        &env_common::with_env(VCI_TOML, env_common::ENV_NEW),
+        copy_pytest_fixture,
+        &["."],
+    ) else {
+        return;
+    };
+    w.put(
+        "tests/test_env.py",
+        r#"import os
+
+
+def test_env():
+    assert os.environ.get("APP_SET") == "declared"
+    assert os.environ.get("TZ") == "UTC"
+    assert os.environ.get("APP_HASH")
+    assert os.environ.get("APP_IGNORE")
+    assert os.environ.get("APP_UNDECLARED") is None
+"#,
+    );
+    let vci = |args: &[&str], env: &[(&'static str, String)]| {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        w.vci_env(&w.work, args, &env)
+    };
+    let git = |dir: &Path, args: &[&str]| w.git(dir, args);
+    env_common::check_env_lists(
+        &env_common::Ops {
+            work: &w.work,
+            scratch: &w.base,
+            vci: &vci,
+            git: &git,
+            key: w.trusted.to_str().unwrap(),
+        },
+        "tests/test_env.py",
+        &["tests/test_env.py"],
+    );
 }

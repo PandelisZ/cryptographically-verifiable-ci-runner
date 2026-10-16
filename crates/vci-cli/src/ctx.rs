@@ -11,7 +11,7 @@ use vci_core::{Predicate, RepoPath};
 use vci_git::Repo;
 
 use crate::config::{CONFIG_FILE, Config, EnvConfig, InputsConfig, Policy};
-use crate::envpolicy::{ChildEnvMap, FileEnv, build_child_env_with};
+use crate::envpolicy::{ChildEnvMap, FileEnv, build_child_env};
 
 /// The signed predicate: the `vci-core` [`Predicate`] plus vci-cli fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +57,12 @@ pub struct VciPredicate {
     /// attested (they must still be exactly what the base config declares).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_inputs: Vec<String>,
+    /// The env variables vci set itself (vci.toml `[env] set`, since vci
+    /// 1.6.0): their manifest entries hash the declared value, not the
+    /// attesting machine's. Informational (`envConfigDigest` covers the
+    /// declared values); empty and omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_set: Vec<String>,
 }
 
 /// Storage key for an attestation: everything that must match for two
@@ -245,29 +251,34 @@ impl Project {
     }
 
     /// The `[env]` configuration plus the variables the adapter declares
-    /// itself (node-test: `NODE_ENV` and the test script's assignments).
+    /// itself (node-test: `NODE_ENV` and the test script's assignments), as
+    /// `hash` patterns.
     pub fn effective_env(&self) -> EnvConfig {
         let mut env = self.env.clone();
         for k in self.adapter.declared_env() {
-            if !env.global.contains(&k) {
-                env.global.push(k);
+            if !env.hash.contains(&k) {
+                env.hash.push(k);
             }
         }
         env
     }
 
+    /// Add this project's built-in lists and adapter to a policy.
+    fn with_builtins(&self, f: FileEnv) -> FileEnv {
+        f.with_builtins(self.adapter.builtin_hash(), self.adapter.builtin_ignore())
+            .with_loose_hash(self.adapter.loose_hash())
+            .with_adapter(self.adapter.name())
+    }
+
     /// Effective env configuration for a test file of this project.
     pub fn file_env(&self, project_rel: &str) -> FileEnv {
-        let inferred: Vec<&str> = self
-            .adapter
-            .inferred_env_patterns()
-            .iter()
-            .chain(self.adapter.hashed_env_patterns())
-            .copied()
-            .collect();
-        FileEnv::for_file(&self.effective_env(), &inferred, project_rel)
-            .with_builtin(self.adapter.builtin_pass_through())
-            .with_adapter(self.adapter.name())
+        self.with_builtins(FileEnv::for_file(&self.effective_env(), project_rel))
+    }
+
+    /// Effective env configuration for any file of this project (every
+    /// `[[env.files]]` entry applies): what decides the child environment.
+    pub fn project_env(&self) -> FileEnv {
+        self.with_builtins(FileEnv::for_project(&self.effective_env()))
     }
 
     /// `[[inputs]] extra` globs declared for a project-relative test id.
@@ -277,14 +288,10 @@ impl Project {
 
     /// The environment this project's test processes get.
     pub fn child_env(&self) -> ChildEnvMap {
-        let mut child = build_child_env_with(
-            &self.effective_env(),
-            self.adapter.inferred_env_patterns(),
-            self.adapter.builtin_pass_through(),
-            std::env::vars_os(),
-        );
+        let mut child = build_child_env(&self.project_env(), std::env::vars_os());
         // What the adapter sets for every test process is what the tests
-        // see, so it is what is hashed.
+        // see, so it is what is hashed (it wins over `set`: the test script's
+        // own `NAME=value` assignments are what a plain run sees).
         for (k, v) in self.adapter.forced_env() {
             child.set(&k, v.into());
         }

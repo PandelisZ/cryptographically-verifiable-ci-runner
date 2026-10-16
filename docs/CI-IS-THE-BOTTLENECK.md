@@ -104,8 +104,9 @@ not found: all recorded, all hashed. Each unit runs in its own process. Anything
 process, a socket, an `ENV` enumeration, a read through a C extension) makes the test ineligible rather than guessed
 at; it simply runs in CI as before.
 
-Environment variables are handled Turborepo-style: strict mode removes undeclared variables from the test process,
-declared ones are hashed into the inputs, pass-through ones are visible but never hashed.
+Environment variables are three short lists in `vci.toml`: `set` (vci sets them, the same everywhere), `hash`
+(taken from the machine and hashed) and `ignore` (visible, never hashed); every other variable is removed from the
+test process.
 
 ## Why a signature, and why trust comes from the base branch
 

@@ -18,6 +18,7 @@ Commands:
   push     Publish local attestations: git-meta push (refs/meta/main) with merge and retry
   fetch    Fetch attestations: git-meta pull (fetch refs/meta/main and materialize it locally)
   prune    Delete expired attestations from the local git-meta store (publish with `vci push`)
+  env      Print the effective environment policy of each project: what vci sets, hashes, ignores and removes (docs/ENV.md)
   explain  Show each candidate attestation for a test file (Go: package directory; Cargo: `<package dir>#<target>`) and the first check it failed
   help     Print this message or the help of the given subcommand(s)
 
@@ -122,6 +123,24 @@ Options:
 - Audit log keys added by `--key`: `attested` (`[{testId, project}]`), `attestErrors`, `notAttested`, `pushed` (`true`/`false`/`null`).
 - `vci ci --key` is for CI's own key; agents attest with `vci run`. Never `--push` from a scratch clone (its git-meta remote is the upstream repository).
 
+## vci env
+
+```text
+Print the effective environment policy of each project: what vci sets, hashes, ignores and removes (docs/ENV.md)
+
+Usage: vci env [OPTIONS]
+
+Options:
+      --base-ref <BASE_REF>  Also compare with the policy in vci.toml at this ref
+      --project <PROJECT>    Only this project (`[[projects]]` name)
+      --format <FORMAT>      [default: text] [possible values: text, json]
+  -h, --help                 Print help
+```
+
+- One table per project: each variable vci.toml or the runner's built-in lists name, its class (`set`, `hash`, `ignore`, `built-in hash`, `built-in ignore`, `stripped`), where the rule comes from (`vci.toml hash`, `vci.toml global (old name of hash)`, `built-in go`, `test script`, ...) and what it is here (the value vci sets; `present (<hash prefix>)` or `absent` for hashed ones). Built-in variables not set here and variables present here but removed from the tests are listed in one line each.
+- `--base-ref REF`: a `BASE` column says where the policy in vci.toml at REF classifies a variable differently (CI verifies with the base policy).
+- Reads vci.toml from the working tree; prints the deprecation warning for old key names (`global`, `pass_through`).
+
 ## vci explain
 
 ```text
@@ -139,6 +158,7 @@ Options:
 
 - The argument is a unit id as `vci run` takes it (file, Go package directory, cargo `<package dir>#<target>`).
 - Prints each candidate attestation (git-meta key, signer, issue and expiry times) and the first check it failed, with `expected` (what the attestation recorded) and `actual` (what this checkout computes). See `refusals.md` for every check name.
+- An env failure names the variable and its class under the base policy, never its value: `env:DATABASE_URL (hash)` with `expected: blake3=...` / `actual: unset`, or `expected: not hashed` / `actual: must be hashed (env config)` when the base policy requires a variable the attestation lacks. Run `vci env --base-ref <ref>` to see the lists.
 - `<unit>: not a listed test file` means the runner does not list it (wrong path, not a unit of any project).
 
 ## vci push
@@ -217,5 +237,5 @@ Options:
 | `VCI_PY_PLUGIN`, `VCI_JS_PLUGIN`, `VCI_RUBY_COLLECTOR` | Collector locations (not needed with Homebrew) |
 | `VCI_UV`, `VCI_NODE`, `VCI_GO`, `VCI_CARGO`, `VCI_RUBY` | Toolchain binaries to use |
 
-Strict env mode (the default) removes every variable that is not declared in `[env] global`/`[[env.files]]`, not in `pass_through` and not built in, from the test process, in `vci run` and `vci ci` alike. Declared variables are hashed; pass-through ones are visible but never hashed (put secrets there). Built-in pass-through variables (`PATH`, `HOME`, `USER`, `TMPDIR`, `LANG`, `LC_*`, `CI`, ...) are hashed only when a test is observed reading them, which makes that unit unskippable on a CI runner where their values differ.
+The `[env]` policy (docs/ENV.md) is three lists: `set` (vci sets the variable in every test process, on every machine), `hash` (taken from the machine and hashed: another value re-runs) and `ignore` (taken from the machine, never hashed: put secrets there). Each runner adds a short built-in list: built-in hash (`TZ`, and per runner what the runtime reads natively, e.g. `RUSTFLAGS`, `GOFLAGS`, `PYTHONHASHSEED`, Node's `LANG`) and built-in ignore (`PATH`, `HOME`, `TMPDIR`, caches; hashed only when a test reads one). Every other variable, `CI` included, is removed from the test process in `vci run`, `vci ci` and the plan's probes. `vci env` prints the effective lists. The old names `global` and `pass_through` still work, with a warning.
 

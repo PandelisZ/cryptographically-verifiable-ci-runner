@@ -97,10 +97,10 @@ For projects whose tests run with Node's built-in test runner, `node --test`, us
 Prerequisites: `git`, `node` 22.15 or later (`module.registerHooks`), `ssh-keygen` (OpenSSH 8.1+), a Rust toolchain,
 and an `origin` remote (without one pass `vci init --meta-url URL`, or `.git-meta` is not written). The project dir is
 the package whose `package.json` holds the script (in a pnpm/npm workspace, one `[[projects]]` entry per package).
-`TZ` must be set where vci runs and in CI (the template declares it; `TZ=UTC` on both sides): with `TZ` unset every
-file is refused, since the machine's own zone is not an input. `LANG`/`LC_ALL`/`LC_MESSAGES` (ICU's default locale)
-are inputs of every file: use the same value on both sides (`LANG=C.UTF-8`, a runner's default) for files to skip in
-CI.
+`TZ` must reach the tests: the template sets it (`[env] set = { TZ = "UTC", LANG = "C.UTF-8" }`, applied by vci
+where it runs and in CI); with `TZ` unset every file is refused, since the machine's own zone is not an input.
+`LANG`/`LC_ALL`/`LC_MESSAGES` (ICU's default locale) are inputs of every file: `set` gives them the same value on both
+sides.
 
 ```sh
 cargo install --path crates/vci-cli            # the collector (js/vitest-plugin/src/node-test) is found in this
@@ -112,7 +112,6 @@ git add vci.toml .vci/allowed_signers .git-meta && git commit -m "Enable vci"
 git push origin main                           # the trust root is read from the base branch
 
 git checkout -b my-change                      # main itself never skips (no_skip_refs in vci.toml)
-export TZ=UTC LANG=C.UTF-8                     # the same zone and locale as CI
 vci run src/b.test.ts --key ~/.ssh/id_ed25519  # one `node --test` process per file, collect, sign, store
 vci plan --base-ref origin/main                # SKIP src/b.test.ts, RUN the rest
 vci push
@@ -232,8 +231,8 @@ UTC, runners are) or naming a zoneinfo file (`node-test:TZ-file`); a package cop
 
 A test that uses `only` (`test.only`, `{ only: true }`) taints its file (`node-test:only`): without `--test-only`
 (refused) Node 22 to 26 still run every test, but the file asks for a filtered run, which a later Node or a
-`--test-only` run would honour. Set the time zone where vci runs and in CI (`TZ=UTC`, declared in `[env] global` as the
-`vci init` template does), or in the script (`TZ=UTC node --test ...`: an assignment there is declared and hashed).
+`--test-only` run would honour. Set the time zone in vci.toml (`[env] set = { TZ = "UTC" }`, as the `vci init` template does: vci sets it here and
+in CI), or in the script (`TZ=UTC node --test ...`: an assignment there is hashed).
 
 ## Quick start (pytest)
 
@@ -308,8 +307,9 @@ toolchain check compares is identical there:
 - **directory listings**: a test that lists a directory records every entry, including `.DS_Store` and
   `__pycache__`, which a fresh checkout does not have. `vci run` warns about such listings; delete the junk and attest
   again;
-- **environment**: in strict mode only declared variables reach tests. A test that reads `CI`, `HOME`, `USER`,
-  `TMPDIR`, `LANG`, ... records their values, so it is skipped only where they are equal (on a runner: never).
+- **environment**: only the variables `[env]` and the built-in lists name reach tests (docs/ENV.md). A test that
+  reads `HOME`, `USER`, `TMPDIR`, ... records their values, so it is skipped only where they are equal (on a runner:
+  never); `set` gives a variable the same value everywhere.
 
 Everything else (a different OS, `sys.platform`-dependent code paths in your tests or dependencies) is what
 `platform = "any"` accepts; use `platform_overrides` with `"exact"` for files that behave differently per platform.
@@ -355,8 +355,8 @@ Under `platform = "any"` a package attested on macOS arm64 is skipped on an ubun
 - **the Go version is identical** (`go env GOVERSION`; pin it in `actions/setup-go`), and so are the effective
   `CGO_ENABLED`, `GOFLAGS`, `GOEXPERIMENT`, `GOFIPS140`, `GODEBUG` and `GOWORK`. `CGO_ENABLED` defaults to 1 only
   where a C compiler is found (Xcode's command line tools, the runner's gcc; a container without one defaults to 0),
-  so the robust setting is to declare it (`[env] global = ["CGO_ENABLED", ...]`) and set `CGO_ENABLED=0` on both
-  sides (cgo is refused anyway). The architecture level (`GOARM64`, `GOAMD64`) is compared only between machines of
+  so the robust setting is `[env] set = { CGO_ENABLED = "0" }` (vci sets it on both sides; cgo is refused
+  anyway). The architecture level (`GOARM64`, `GOAMD64`) is compared only between machines of
   the same architecture, and another architecture is accepted only between 64-bit little-endian ones (amd64,
   arm64, riscv64, loong64);
 - **no file of the test's own code is platform-specific**: if the package, or any package of the repository it
@@ -376,8 +376,8 @@ Under `platform = "any"` a package attested on macOS arm64 is skipped on an ubun
   every architecture;
 - **the local time zone is not used**, or `TZ` is set: a test that uses `time.Local` (`time.Now().Zone()`,
   formatting a local time, `time.Unix`, the `log` package's timestamps) with `TZ` unset reads `/etc/localtime`,
-  which is not an input (macOS laptops are rarely on UTC; runners are), and is refused. Declare `TZ` in `[env]
-  global` and set the same value on both sides (`TZ=UTC`): it is then hashed;
+  which is not an input (macOS laptops are rarely on UTC; runners are), and is refused. Set it in vci.toml
+  (`[env] set = { TZ = "UTC" }`, as `vci init` writes): vci sets it on both sides;
 - the directory listings match (`.DS_Store` in a package directory breaks that; `vci run` warns), and the test
   read no variable whose value differs (`HOME`, `CI`, `USER`, ...).
 
@@ -425,7 +425,7 @@ cargo test --locked --manifest-path crates/b/Cargo.toml --test b --message-forma
 ```
 
 `--manifest-path` selects the package the way `-p <name>` would (package names can be ambiguous; the path cannot).
-vci builds into `<target dir>/vci`, which only ever sees builds made with vci's strict environment, and **rebuilds the
+vci builds into `<target dir>/vci`, which only ever sees builds made with vci's environment policy, and **rebuilds the
 repository's crates in every `vci run`** (`cargo clean -p <every workspace member>` there first; a crate of the
 repository found reused later, such as a path dependency outside the workspace, is cleaned and its unit run again):
 cargo decides freshness by modification times and by what build scripts declare, vci by content, so a file restored
@@ -505,8 +505,8 @@ Under `platform = "any"` a unit attested on macOS arm64 is skipped on an ubuntu-
 - **the same privileges**: the tests run as root on one side only (a GitHub `container:` job) is a toolchain
   difference (`superuser`), for every adapter, unless the base branch sets `policy.allow_superuser_mismatch = true`
   (see [`vci.toml`](#vcitoml));
-- the environment matches (strict mode removes `RUSTFLAGS`, `CARGO_*`, `RUST*` unless declared; declared values must
-  be equal) and no input is missing in the checkout (`.DS_Store` in a package directory breaks that).
+- the environment matches (`RUSTFLAGS`, `CARGO_PROFILE_*`, the C toolchain variables and the other built-in hash
+  variables are hashed when present, other `RUST*`/`CARGO*` variables are removed unless listed; see docs/ENV.md) and no input is missing in the checkout (`.DS_Store` in a package directory breaks that).
 
 Accepted under `any` without a check: platform-dependent code **outside the repository** (a crate from crates.io with
 `cfg(target_os)` code or target-specific dependencies, its `consts::OS` checks and float math), the C compiler and
@@ -533,8 +533,8 @@ git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock && git commit -m "E
 # .git-meta is written only when the repository has an origin remote (or with --meta-url <url>); without one,
 # leave it out of `git add`. The trust root is read from the base branch: push or merge this commit to main first.
 
-TZ=UTC vci run test/models/b_test.rb --key ~/.ssh/id_ed25519   # one Ruby process per file, collect, sign, store
-TZ=UTC vci plan --base-ref origin/main                          # SKIP test/models/b_test.rb, RUN the rest
+vci run test/models/b_test.rb --key ~/.ssh/id_ed25519   # one Ruby process per file, collect, sign, store
+vci plan --base-ref origin/main                          # SKIP test/models/b_test.rb, RUN the rest
 vci push
 ```
 
@@ -668,8 +668,8 @@ first is recorded, and the overwrite then refuses the file as an input changed d
 
 **Credentials.** `config/credentials*.yml.enc` and the key files are recorded when the test reads them (Rails reads
 them lazily). `config/master.key` is git-ignored and secret: only its BLAKE3 hash is stored, and a fresh checkout does
-not have it, so a test that read it runs in CI. A key given as `RAILS_MASTER_KEY` follows the env policy (strict mode
-removes it unless declared; declared, its hash is stored, as for any declared variable).
+not have it, so a test that read it runs in CI. A key given as `RAILS_MASTER_KEY` follows the env policy (removed unless listed;
+listed in `hash`, its hash is stored, as for any hashed variable).
 
 **In an app generated with credentials (`rails new` writes `config/master.key` and `config/credentials.yml.enc`),
 Active Record reads `config/master.key` while Rails boots** (its encryption settings come from the credentials), so
@@ -681,7 +681,7 @@ config/master.key, Rails' credentials key`). Nothing is wrong (it fails open), b
   `.gitignore` lists it) and `config/credentials/test.yml.enc`. Rails then reads those in the test environment
   instead of `config/master.key`;
 - remove `config/master.key` and `config/credentials.yml.enc` if nothing needs them;
-- or declare `RAILS_MASTER_KEY` (`[env] global = ["RAILS_MASTER_KEY"]`) and set it to the same value where you attest
+- or list `RAILS_MASTER_KEY` (`[env] hash = ["RAILS_MASTER_KEY"]`) and set it to the same value where you attest
   and in CI (a secret there): Rails then reads the key from the environment, not the file.
 
 **Native libraries (FFI) and Active Storage's libvips.** Opening a library through FFI (`ffi_lib`,
@@ -725,8 +725,8 @@ identified by its file.) What the library's C code may read is reached by **call
   and `"VipsForeignLoadPngFile"` are `pngload` and `"SYSTEM"` is `system` (the collector asks libvips the same way);
   a name libvips does not resolve is refused.
 
-  `VIPS_*` and `G_*` variables (read by libvips and GLib in C) are hashed whenever present (strict mode removes
-  them unless declared).
+  `VIPS_*` and `G_*` variables (read by libvips and GLib in C) are removed from the test processes unless
+  listed in `[env]` (then hashed, or ignored).
 
 **Active Storage** loads ruby-vips at boot whenever it is in the bundle (`image_processing`, which `rails new` adds,
 depends on it). With these rules, on a machine with libvips installed:
@@ -839,8 +839,8 @@ The rules:
 where you attest and in CI (a service container; see [`docs/GITHUB_ACTIONS.md`](GITHUB_ACTIONS.md)), and create the
 test database before the tests as any Rails CI job does (`bin/rails db:test:prepare`; SQLite needs no step, the engine
 creates the file). The server's version and configuration are not compared. `config/database.yml` is an input, and so
-is `DATABASE_URL` (hashed whenever present, removed in strict mode unless declared): name the same host, port and
-database on both sides, and put a password `database.yml` reads from the environment in `pass_through`.
+is `DATABASE_URL` (built-in hash: it reaches the tests and is hashed whenever present): name the same host, port and
+database on both sides, and put a password `database.yml` reads from the environment in `[env] ignore`.
 
 **Collector 0.5.0.** The collector's version is part of the toolchain, and vci 1.4.0 changes it (0.4.2 to 0.5.0): every
 Rails and RSpec attestation made with an earlier vci runs once more in CI, and is skipped again once attested anew.
@@ -869,12 +869,15 @@ Under `platform = "any"` a file attested on macOS arm64 is skipped on an ubuntu-
 - **time zone data comes from the `tzinfo-data` gem** (`gem "tzinfo-data"` for every platform, not the generator's
   `platforms: %i[ windows jruby ]`): without it Rails reads the system's zoneinfo, whose version is compared (macOS
   and Ubuntu rarely ship the same one), and nothing is skipped across them (under `policy.libraries = "any"` the
-  version is not compared, but the zone rules then are those of each machine). `TZ` is declared and set to the same
-  value on both sides (`TZ=UTC`): Ruby's local time zone otherwise comes from the machine (`/etc/localtime`, which
+  version is not compared, but the zone rules then are those of each machine). `TZ` is set in vci.toml
+  (`[env] set = { TZ = "UTC" }`, vci applies it on both sides): Ruby's local time zone otherwise comes from the machine (`/etc/localtime`, which
   is not an input);
-- **`config/environments/test.rb` does not read `CI`**: the generator writes `config.eager_load = ENV["CI"].present?`,
-  which makes every test depend on `CI` (unset on a laptop, `true` on a runner), so nothing is ever skipped there.
-  Write `config.eager_load = false` (or declare and set `CI` the same way on both sides);
+- **`CI` is the same on both sides**: the generator writes `config.eager_load = ENV["CI"].present?` in
+  `config/environments/test.rb`, which makes every test depend on `CI`. Since vci 1.6.0 `CI` is removed from the test
+  processes unless vci.toml lists it, so it is unset on both sides and this is fine; listing it in `[env] hash` would
+  make nothing skip on a runner (unset on a laptop, `true` there). `[env] set = { CI = "true" }` gives both sides
+  eager loading, which loads every application file in every test process (each becomes an input of every test), so
+  leave `CI` out;
 - **`vendor/` exists in the repository** (`vendor/.keep`, which `rails new` creates): `ruby/setup-ruby`'s
   `bundler-cache` installs gems into `vendor/bundle`, and Rails checks whether `vendor` exists; with it committed only
   its type is recorded. A bundle installed inside the repository this way (`BUNDLE_PATH=vendor/bundle`) is handled
@@ -930,7 +933,7 @@ run` records, so attestations already made are accepted once the key is on the b
 **Still compared, exactly:** the Ruby release and patchlevel (pin it in `.ruby-version`, used by mise locally and by
 `ruby/setup-ruby` in CI), Rails, Bundler, the test frameworks and every gem of the bundle (through `Gemfile.lock`, with
 both platforms listed), the default encodings, the collector version, the database adapters, root or not; every input
-file; the declared environment variables (`TZ`) and the `[env]` configuration. For pytest: the Python version and
+file; the hashed environment variables (`TZ`, which vci sets) and the `[env]` configuration. For pytest: the Python version and
 implementation, pytest and the installed distributions. Whether each library is loaded at all is compared too: a
 Python without `_sqlite3`, or a Ruby process that loaded no SQLite where the attestation did, runs the file.
 
@@ -964,8 +967,8 @@ git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock && git commit -m "E
 # .git-meta is written only with an origin remote (or --meta-url <url>); without one, leave it out of `git add`.
 # The trust root is read from the base branch: push or merge this commit to main first.
 
-TZ=UTC vci run spec/models/b_spec.rb --key ~/.ssh/id_ed25519   # one RSpec process per spec file
-TZ=UTC vci plan --base-ref origin/main                          # SKIP spec/models/b_spec.rb, RUN the rest
+vci run spec/models/b_spec.rb --key ~/.ssh/id_ed25519   # one RSpec process per spec file
+vci plan --base-ref origin/main                          # SKIP spec/models/b_spec.rb, RUN the rest
 vci push
 ```
 
@@ -974,11 +977,11 @@ apply to Minitest too; each is explained under [Quick start (Rails)](#quick-star
 
 - replace the generator's `pending "add some examples to (or delete) ..."` specs with real examples (or delete them):
   a pending example refuses its file;
-- `config.eager_load = false` in `config/environments/test.rb` (the generator's `ENV["CI"].present?` makes every file
-  depend on `CI`);
+- `CI` left out of `[env]` (removed, it is unset on both sides, so the generator's `config.eager_load =
+  ENV["CI"].present?` is false everywhere), or `config.eager_load = false` in `config/environments/test.rb`;
 - credentials: commit test-environment credentials and their key, drop `config/master.key` and
   `config/credentials.yml.enc`, or declare `RAILS_MASTER_KEY` (otherwise every file reads `config/master.key`);
-- `gem "tzinfo-data"` for every platform (not `platforms: %i[ windows jruby ]`), and `TZ` declared and set (`TZ=UTC`);
+- `gem "tzinfo-data"` for every platform (not `platforms: %i[ windows jruby ]`), and `TZ` set (`[env] set = { TZ = "UTC" }`);
 - `image_processing` on a machine with libvips installed: attested, with libvips recorded by its file hash (see
   "Native libraries (FFI) and Active Storage's libvips" under the Rails section), so CI skips only where the same
   libvips file is installed, or any libvips under `policy.libraries = "any"` (see "Attest on macOS, skip on Linux");
@@ -1032,7 +1035,7 @@ sides:
 | `.rspec` in the project | read (vci passes `--options .rspec`), and a **global input** of every spec file: any edit runs everything |
 | `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` (`~/.config/rspec/options`) | **never read**: `--options` replaces every options file, so the laptop's and the runner's are both ignored (nothing to configure in CI) |
 | `.rspec-local` | **never read**, for the same reason: it is usually git-ignored, so CI could not have the same one. Put options vci should use in `.rspec` |
-| `SPEC_OPTS` | the env policy: hashed whenever present; strict mode removes it unless declared (`[env] global = ["SPEC_OPTS"]`, then its value must match) |
+| `SPEC_OPTS` | the env policy: removed unless listed (`[env] hash = ["SPEC_OPTS"]`, then its value must match; or `set`) |
 | the command line | vci's: `--options .rspec <file>` and nothing else |
 
 A plain `bundle exec rspec` still reads all of them; only vci's runs do not.
@@ -1175,7 +1178,8 @@ checkout, clock, policy and environment.
 | `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R]` | Verify one DSSE envelope and print its claims |
 | `vci push` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. See "What `vci fetch` and `vci push` guard against" |
 | `vci prune [--dry-run]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them) |
-| `vci explain <test-file> [--base-ref R]` | Every candidate attestation and the first check it failed, with expected vs actual |
+| `vci explain <test-file> [--base-ref R]` | Every candidate attestation and the first check it failed, with expected vs actual (an env failure names the variable and its class under the base policy, `env:DATABASE_URL (hash)`, never its value) |
+| `vci env [--base-ref R] [--project NAME] [--format text\|json]` | Print the effective environment policy of each project: every variable `[env]` and the runner's built-in lists name, its class (`set`, `hash`, `ignore`, `built-in hash`, `built-in ignore`, `stripped`), where the rule comes from (`vci.toml set`, `vci.toml hash`, an old key name, `built-in <adapter>`, `test script`) and what it is here (the value vci sets; `present (<hash prefix>)` or `absent`); variables present here that the tests will not see are listed as removed. With `--base-ref`, a `BASE` column says where the base commit's policy differs (CI judges with it). Runs nothing (docs/ENV.md, "vci env") |
 
 Signing key: `--key`, else `$VCI_SIGNING_KEY`, else `git config user.signingkey` when `gpg.format = ssh` (a GPG
 signing key is never used). Errors name the source the key came from. A `.pub` path works when the private
@@ -1240,63 +1244,30 @@ others (`native:FFI call Vips.vips_init (...) (+129 more native:FFI)`), most fre
 (`project` is the `[[projects]]` name, `null` in the single-project form; `taints` lists every refusing taint as the
 collector reported it.)
 
-Strict env mode removes every variable that is not declared or pass-through from the test process, including
-`NO_COLOR` and `FORCE_COLOR`, so `NO_COLOR=1 vci ci` still prints Vitest's colours. Add them to `pass_through` (seen
-by tests, not hashed) or `global` (hashed) if you need them; they are not built in because a test's result can
-depend on them.
+The environment policy is three lists in `[env]` (docs/ENV.md has the details and the built-in table per runner):
+`set` (vci sets the variable in every test process, on every machine, so it is the same everywhere), `hash` (taken
+from the machine, hashed: another value re-runs the test) and `ignore` (taken from the machine, never hashed). A short
+built-in list per runner adds the variables the runtime reads natively that change results (built-in hash: `TZ`
+everywhere; `NODE_OPTIONS` and ICU's `LANG`/`LC_ALL`/`LC_MESSAGES` for Node; `RUSTFLAGS`, `CARGO_PROFILE_*`, the C
+toolchain for Cargo; `GOFLAGS`, `GODEBUG`, `CGO_*` for Go; `PYTHONHASHSEED`, `PYTEST_ADDOPTS`, ... for pytest;
+`RUBYLIB`, `RUBY_YJIT_ENABLE`, `DATABASE_URL` for Rails) and what the runner needs to work (built-in ignore: `PATH`,
+`HOME`, caches, version managers; hashed only when a test reads one). Every other variable is removed from the test
+processes, including `CI`, `NO_COLOR` and `FORCE_COLOR` (so `NO_COLOR=1 vci ci` still prints Vitest's colours): list
+one to keep it. `vci env` prints the effective lists per project and what each variable is on this machine.
 
-Built-in pass-through variables (`PATH`, `HOME`, `USER`, `TMPDIR`, `LANG`, `LC_*`, `TERM`, `CI`, `NODE_OPTIONS`,
-`VCI_*`, ...) are always visible, and **hashed when a test file is observed reading one**: their values differ between a
-laptop and a CI runner, so a test that reads `CI` is not skipped on a runner. The exceptions are values vci sets for
-the run itself (`VCI_OUT`, `VCI_WORKER`, `VCI_LIST_OUT`, `VCI_GO_TESTLOG`), and for Vitest its `VITEST*` worker
-variables and `NODE_OPTIONS` (hashed as a global input instead); a Go, Rust or pytest test that reads `NODE_OPTIONS`
-or `VCI_BASE_REF` gets it hashed. Configured
-`pass_through` variables stay unhashed (your decision).
+Reads are observed (Vitest, node:test, pytest, Go, Rails; Cargo by the names written literally in the source): a
+read of a variable is hashed unless it is in `ignore` or is vci's own plumbing (`VCI_OUT`, `VCI_WORKER`,
+`VCI_LIST_OUT`, `VCI_GO_TESTLOG`; Vitest's `VITEST*`; pytest's `PYTHONPATH`, which vci sets to its collector and a
+test that reads it is not attested; what vci sets for every Rails process: `RUBYOPT`, `RAILS_ENV`/`RACK_ENV`,
+`BUNDLE_GEMFILE`, `PARALLEL_WORKERS=1`, `DISABLE_SPRING=1`, `DISABLE_BOOTSNAP=1`, a fresh `TMPDIR`); a read of a
+removed variable is recorded as absent. Reading the whole environment (`dict(os.environ)`, `os.Environ`,
+`env::vars()`, `ENV.to_h`, ...) refuses the test, except Bundler's own copy for child processes and its selection of
+`BUNDLE_*` settings while it sets up the bundle. The cargo adapter does not attest under the deprecated
+`mode = "loose"`.
 
-pytest adds its own built-in pass-through so that `uv` works in strict mode: `UV`, `UV_*`, `VIRTUAL_ENV`,
-`XDG_{CACHE,CONFIG,DATA,BIN}_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, the `*_PROXY` variables, and `PYTHONPATH` (vci
-sets it to the collector directory; your value never reaches the tests, and a test that reads it is not attested).
-Go adds `GOPATH`, `GOROOT`, `GOCACHE`, `GOMODCACHE`, `GOENV`, `GOPROXY`, `GONOPROXY`, `GOPRIVATE`, `GONOSUMDB`,
-`GOSUMDB`, `GOINSECURE`, `GOVCS`, `GOAUTH`, `GOTELEMETRY*`, `GOCACHEPROG`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`,
-`SSL_CERT_*`, the `*_PROXY` variables, `GIT_SSH`, `GIT_SSH_COMMAND` and `SSH_AUTH_SOCK` (where the go command finds
-its caches and fetches modules). Every other `GO*` and `CGO_*` variable (`GOFLAGS`, `CGO_ENABLED`, `GOEXPERIMENT`,
-`GODEBUG`, `GOMAXPROCS`, `GOAMD64`, `GOTOOLCHAIN`, ...) is **hashed whenever present** and removed in strict mode
-unless declared (declare it in `[env] global` to set it). `TZ` and `ZONEINFO` are hashed for every package (package
-time reads them without the log seeing it). `PWD` (set by `go test` to the package directory) and `TMPDIR` (vci's
-fresh directory) are not inputs.
-
-Cargo adds `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS`, `CARGO_NET_*`,
-`CARGO_HTTP_*`, `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*`, `CARGO_TERM_*`, `CARGO_INCREMENTAL`, `RUSTC_WRAPPER`,
-`RUSTC_WORKSPACE_WRAPPER`, `SCCACHE_*`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `SSL_CERT_*`, the `*_PROXY` variables,
-`GIT_SSH`, `GIT_SSH_COMMAND` and `SSH_AUTH_SOCK`. Every other `RUST*` and `CARGO*` variable (`RUSTFLAGS`,
-`RUSTDOCFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `RUST_TEST_THREADS`, `RUST_BACKTRACE`, `RUST_LOG`, `RUSTC_BOOTSTRAP`,
-...) and the C toolchain variables build scripts read (`CC`, `CFLAGS`, `CC_*`, `PKG_CONFIG*`, `MACOSX_DEPLOYMENT_TARGET`,
-...) are **hashed whenever present** and removed in strict mode unless declared. Also hashed: the variables rustc lists
-as `env!`/`option_env!` dependencies, the `rerun-if-env-changed` variables of every build script the unit builds, and
-every variable named literally in `env::var("X")`/`env::var_os("X")` in the unit's repository code (a read of `CI` or
-`HOME` is compared like an observed read). The cargo adapter only attests in strict mode.
-
-Rails adds what Ruby, RubyGems, Bundler and version managers need to find things: `GEM_HOME`, `GEM_PATH`,
-`GEM_SPEC_CACHE`, Bundler's location and install settings (`BUNDLE_PATH`, `BUNDLE_APP_CONFIG`, `BUNDLE_USER_*`,
-`BUNDLE_CACHE_PATH`, `BUNDLE_BIN`, `BUNDLE_JOBS`, `BUNDLE_RETRY`, `BUNDLE_DEPLOYMENT`, `BUNDLE_FROZEN`, ...), `MISE_*`,
-`RBENV_*`, `ASDF_*`, `XDG_*_HOME`, `SSL_CERT_*` and the `*_PROXY` variables. The Ruby, gems and bundle they lead to
-are checked directly. Every other `RUBY*`, `BUNDLE_*` (`BUNDLE_WITHOUT`, `BUNDLE_FORCE_RUBY_PLATFORM`, ...),
-`BUNDLER_*`, `GEM_*`, `RAILS_*` (`RAILS_MASTER_KEY`, ...), `RACK_*`, `MT_*`, `MINITEST_*`, `BOOTSNAP_*`, `SPRING_*`,
-`VIPS_*` and `G_*` (libvips and GLib, read in C when ruby-vips loads)
-variable, `DATABASE_URL`, `*_DATABASE_URL`, `SECRET_KEY_BASE`, `SEED`, `TESTOPTS`, `TEST`, `TESTS`, `N`,
-`DEFAULT_TEST`, `DEFAULT_TEST_EXCLUDE`, `SCHEMA` and `SPEC_OPTS` (RSpec's options) is **hashed whenever present** and
-removed in strict mode unless declared. vci sets `RUBYOPT` (the collector; your value never reaches the tests), `RAILS_ENV`/`RACK_ENV` (`test`),
-`BUNDLE_GEMFILE` (the project's), `PARALLEL_WORKERS=1`, `DISABLE_SPRING=1`, `DISABLE_BOOTSNAP=1` and a fresh
-`TMPDIR`: none of them is an input. Reads through `ENV` are observed; reading the whole environment (`ENV.to_h`,
-`ENV.each`, `ENV.inspect`, ...) refuses the file, except Bundler's own copy it keeps for child processes and its
-selection of `BUNDLE_*` settings (both while it sets up the bundle).
-
-`PYTEST_*` and `PYTHON*` are **hashed**: the collector reports `PYTEST_ADDOPTS`, `PYTEST_PLUGINS`,
-`PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTHONHASHSEED`, `PYTHONWARNINGS`, `PYTHONOPTIMIZE`, ... and `TZ` as read by every
-file (the interpreter and pytest read them before any hook runs), and every `PYTHON*`/`PYTEST_*` variable present
-in the test environment is hashed (the interpreter reads `PYTHON_CPU_COUNT`, `PYTHONBREAKPOINT`, `PYTHON_GIL`, ...
-in C). Strict mode removes them unless declared, so they hash as unset on both sides; to set one, declare it in
-`[env] global` and its value is hashed.
+The old key names `global` (now `hash`), `pass_through` (now `ignore`) and `env` in `[[env.files]]` (now `hash`) still
+work, with one warning naming each key to rename; `mode = "strict"` is accepted silently and `mode = "loose"` with a
+deprecation warning. Attestations made before vci 1.6.0 re-run once: the env config digest changed (docs/ENV.md).
 
 ## Where attestations live (git-meta)
 
@@ -1499,14 +1470,16 @@ match = ["src/native/**"]   # project-relative globs
 platform = "exact"          # an entry sets platform, libraries, or both
 # libraries = "exact"
 
-[env]                  # see docs/ENV.md
-mode = "strict"        # strict: undeclared variables are removed from the test environment
-global = ["NODE_ENV", "TZ"]
-pass_through = ["GITHUB_TOKEN"]
+[env]                  # see docs/ENV.md; every variable not named here or built in is removed
+set = { TZ = "UTC" }   # vci sets these in every test process, on every machine (exact names, string values)
+hash = ["NODE_ENV"]    # taken from the machine and hashed: another value re-runs (patterns: *, !exclude)
+ignore = ["GITHUB_TOKEN"]  # taken from the machine, never hashed (patterns)
+# Precedence: set > hash > ignore > built-in hash > built-in ignore. Old names: global = hash, pass_through = ignore.
 
-[[env.files]]
+[[env.files]]          # extra lists for the matching test files (project-relative globs)
 match = ["src/db/**/*.test.ts"]
-env = ["DATABASE_URL"]
+hash = ["DATABASE_URL"]
+ignore = ["PGPASSWORD"]
 
 [[inputs]]             # extra inputs of matching test ids (any adapter; needed by Cargo, see above)
 match = ["crates/b#test:*"]
@@ -1579,14 +1552,15 @@ manage the database" under Quick start (Rails)). In `vci plan` an unreadable or 
 ### Several projects in one repository
 
 Instead of `project`/`adapter`, list projects; `[policy]` and `[env]` are shared defaults, and each key given in a
-project's `policy`/`env` table replaces the top-level key for that project (keys not given are inherited):
+project's `policy`/`env` table replaces the top-level key for that project (keys not given are inherited; a project's
+`set` replaces the whole top-level `set` table, it does not merge with it):
 
 ```toml
 [policy]
 max_ttl = "30d"
 
 [env]
-global = ["NODE_ENV"]
+hash = ["NODE_ENV"]
 
 [[projects]]
 name = "web"           # unique: letters, digits, '.', '_', '-'
@@ -1600,7 +1574,7 @@ adapter = "pytest"
 [projects.policy]
 platform = "same-os"
 [projects.env]
-global = ["TZ", "APP_*"]
+hash = ["APP_*"]
 ```
 
 Test ids stay repo-relative paths (`services/api/tests/test_b.py`), so they are unambiguous across projects; a file
@@ -1617,7 +1591,7 @@ Per test file (from the `@vci/vitest` collectors, see `js/vitest-plugin/README.m
 and every module the worker's module runner evaluated (this catches computed `import()`), every file or directory read
 or stat'ed, every failed lookup (so creating a file that was probed as absent invalidates), directory listings
 (including the static prefix of `import.meta.glob` and template `import()`, aliased prefixes included), external
-packages as `name@version`, and env vars (declared patterns, `VITE_*`, and anything read that is not pass-through).
+packages as `name@version`, and env vars (`set` and `hash` variables, built-in hash ones such as `VITE_*`, and anything read that is not `ignore`).
 Also:
 
 - the resolution candidates of every relative or absolute import: candidates that do not exist are probes (so an
@@ -1656,7 +1630,9 @@ import system inside the repository (including `conftest.py` files and modules r
 with a computed name), every candidate path each import lookup could have used (so a module created later that would
 shadow or satisfy an import is noticed: a new `tests/pkg/__init__.py` in front of `src/pkg`), every file opened or
 stat'ed, failed lookups, directory listings, installed distributions as `name@version` (PEP 503 names, as in
-`uv.lock`), env vars read through `os.environ`/`os.getenv`, and always `PYTEST_*`/`PYTHON*`/`TZ` (see above). Also:
+`uv.lock`), env vars read through `os.environ`/`os.getenv`, and always `TZ` and the variables pytest and the interpreter read before the plugin loads (`PYTEST_ADDOPTS`,
+`PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTHONHASHSEED`, `PYTHONWARNINGS`, ...: pytest's built-in hash
+list, docs/ENV.md). Also:
 
 - activity on any thread other than the main one (thread pools, `asyncio.to_thread`, `run_in_executor`) is the
   test's, whatever the stack looks like;
@@ -1722,8 +1698,8 @@ found exactly once, as a future Go version may move it, every package is refused
 `os.Symlink`, `os.Link` and their `os.Root` forms record the new link's target (see the refusals);
 `os.Environ` refuses; `File.Chdir` marks the working directory as changed; and package time's first use of the
 local time zone is checked against `TZ`. Paths under vci's fresh `TMPDIR` (`t.TempDir()`) and `/dev/null` are not
-inputs; any other path outside the repository refuses the package (with `GOTMPDIR` set, which strict mode removes
-unless declared, `t.TempDir()` uses it instead and the package is refused). Fuzz seed corpora (`testdata/fuzz/FuzzX`) are
+inputs; any other path outside the repository refuses the package (with `GOTMPDIR` set, which is removed
+unless `[env]` lists it, `t.TempDir()` uses it instead and the package is refused). Fuzz seed corpora (`testdata/fuzz/FuzzX`) are
 read through package os and recorded like any other testdata.
 
 ### Cargo
@@ -1946,8 +1922,9 @@ builds the call evades it):
 - **a crate of the repository cargo reused from a build vci did not make in this run** (should not happen: vci
   cleans them first and retries once);
 - a failed unit, a unit where no test ran, a path dependency or dep-info path outside the repository, a git dependency
-  without a locked commit, a crate not in `Cargo.lock`, and env mode `"loose"` (Rust environment reads are not
-  observed; in strict mode an undeclared variable is unset both where the unit was attested and in CI).
+  without a locked commit, a crate not in `Cargo.lock`, and the deprecated env mode `"loose"` (Rust environment reads
+  are not observed; under the default policy a variable no list names is unset both where the unit was attested and
+  in CI).
 
 Rails specifics (collector taints and checks; see [Quick start (Rails)](#quick-start-rails)):
 
@@ -2041,7 +2018,8 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
    -mocks, -rails, -support), SQLite library, libyaml, time zone data, encodings, collector version, database adapters
    and the whole bundle, exactly; under the base policy's `libraries = "any"` for the file, the SQLite/libyaml/time
    zone data versions of Rails and the SQLite/OpenSSL versions of pytest are not compared, whether each is loaded is);
-8. **env-config**: digest of the effective env configuration (from the base `vci.toml`) matches;
+8. **env-config**: digest of the effective env configuration (the base `vci.toml`'s `set` values and `hash`/`ignore`
+   lists, and this vci's built-in lists) matches; attestations made before vci 1.6.0 fail it once;
 9. **result**: passed and untainted; **inputs-config**: the `[[inputs]]` globs recorded equal the base config's for
    the test id; every waived refusal still waived by the base policy (one recorded under the removed
    `rails_allow_db` never is); **dirty** only if `allow_dirty = false`;
@@ -2056,8 +2034,10 @@ passes every check means SKIP, otherwise RUN (with the furthest-reaching failure
    this checkout in exactly that version, a git source's revision included; a native library opened through FFI,
    `native:<file name>`, must be loaded by the probe's process with the same file name and sha256, or under
    `policy.libraries = "any"` one of the same library name);
-13. **env**: every hashed variable has the same value, and every variable that matches a declared pattern in CI is
-    covered by the attestation.
+13. **env**: every hashed variable has the same value in the environment the tests get here (with `set` applied, so a
+    `set` variable always matches), and every variable the base policy requires (every `set` name, every `hash` or
+    built-in hash variable present here, every exact `hash` name) is covered by the attestation; `vci explain` names
+    the variable and its class (`env:FEATURE_X (hash)`, expected `blake3=...`, actual `unset`).
 
 Before any candidate is checked, a file matching `policy.never_skip` (base commit) runs.
 
@@ -2098,8 +2078,9 @@ Not protected against:
   the base commit is HEAD or contains it.
 - Third-party Vite plugins (code under `node_modules`) reading files in the main process: only their package version
   is an input. Reads by the config file itself, inline plugins and globalSetup files are recorded.
-- Timezone and locale in strict mode: `TZ` reaches tests only if declared (then hashed); the system timezone and
-  `LANG`/`LC_*` (built-in pass-through) are not hashed. In loose mode `TZ` is always hashed. (Go refuses a package
+- Timezone and locale: `TZ`, `LANG`, `LC_ALL` and `LC_MESSAGES` are built-in hash for Vitest (hashed when
+  present; the `vci init` template sets `TZ` and `LANG` with `[env] set`, so both sides get the same values); with
+  `TZ` unset the system timezone is not hashed. In the deprecated loose mode `TZ` is always hashed. (Go refuses a package
   that uses the system timezone, see "Go specifics"; node:test refuses every file when `TZ` is unset and records
   `LANG`, `LC_ALL` and `LC_MESSAGES` as read by every file.)
 
@@ -2120,7 +2101,8 @@ pytest limitations (details and the measured audit-hook coverage in `docs/spike-
   repository and `ATTACH` taint; a test that replaces vci's authorizer with its own (`set_authorizer`) hides later
   `ATTACH`es. List such files in `policy.never_skip`.
 - **C-level `getenv`** is not seen: `TZ` (hashed always) and the interpreter/pytest variables are handled, but
-  `LANG`/`LC_*` read by `locale`, `os.environ._data` and `posix.environ` bypass the collector.
+  `LANG`/`LC_*` read by `locale`, `os.environ._data` and `posix.environ` bypass the collector (`LANG`/`LC_*` are
+  removed from pytest's tests unless `[env]` lists them; `set` gives them the same value on both sides).
 - `posix.stat` called directly, or `os.stat` bound before the plugin loaded; `DirEntry.stat()` after `scandir` (the
   listing is recorded, not sizes); custom meta-path finders and zipimport misses; threads outliving the session;
   `realpath()` of paths outside the repository.
@@ -2174,12 +2156,12 @@ Cargo limitations (on top of the rule that reads outside the package directories
 - **Run-time behaviour is not observed at all.** Reads, environment lookups, processes and sockets are inferred from
   the source text; a path, variable name or program built at run time, a call through an alias or a macro, and anything
   an **external crate** does (`dotenvy` reading `.env`, `tempfile` honouring `TMPDIR`, `jiff`/`chrono` reading the time
-  zone database, a crate spawning a helper) is not seen. Non-literal `env::var(name)` is accepted: strict mode makes
-  undeclared variables unset on both sides, but a computed read of a built-in pass-through variable (`HOME`, `CI`,
+  zone database, a crate spawning a helper) is not seen. Non-literal `env::var(name)` is accepted: variables no list
+  names are removed on both sides, but a computed read of a built-in ignore variable (`HOME`,
   `PATH`) is not hashed.
 - **Build scripts and proc macros** may read files or variables they do not declare (`rerun-if-*`). vci rebuilds the
-  repository's crates in every `vci run` (in its own target subdirectory, with the strict environment), so what they
-  read is read again; but a build script reading a pass-through variable (`HOME`) or a file outside the repository is
+  repository's crates in every `vci run` (in its own target subdirectory, with vci's environment policy), so what they
+  read is read again; but a build script reading a built-in ignore variable (`HOME`) or a file outside the repository is
   not seen, and neither is a proc macro in an external crate reading files. External crates are reused from earlier
   builds of vci's target subdirectory (cargo identifies them by version): an artifact built from an extracted crate
   that was edited and later restored is not noticed (`cargo clean` if you ever edited `$CARGO_HOME`).
@@ -2209,7 +2191,7 @@ Rails limitations (details and the verified mechanisms in [`docs/spike-rails.md`
   files (external entities, XInclude, schema includes, XSLT) and Fiddle and FFI are refused (above). SQLite, the
   common case, is handled (above). Neither are reads by the C library of the user database (`Etc.getpwuid`), the
   host name (`Socket.gethostname`), the number of CPUs (`Etc.nprocessors`, which concurrent-ruby and other gems
-  read for their own sizing), `/etc/localtime` (declare `TZ`), or reads made through a method captured before the
+  read for their own sizing), `/etc/localtime` (set `TZ`), or reads made through a method captured before the
   collector loaded (nothing of the application loads before it, as it comes first through `RUBYOPT`). A test whose
   result depends on these is not reproduced in CI; they are not refused.
 - **What RubyGems and Bundler look up while setting up the bundle** (`HOME`, `PATH`, `GEM_*`, `BUNDLE_*`, `~/.gem`,
@@ -2302,6 +2284,15 @@ uv run --project fixtures/pytest-abcd pytest py/pytest-plugin/tests   # pytest c
 ruby ruby/vci-collector/test/collector_test.rb   # Ruby collector tests (also run by cargo test)
 ```
 
+Every runner's end-to-end suite (`e2e.rs` for Vitest, `e2e_node_test.rs`, `e2e_pytest.rs`, `e2e_go.rs`,
+`e2e_cargo.rs`, `e2e_rails.rs`, `e2e_rspec.rs`) has one environment policy test built on
+`crates/vci-cli/tests/env_common/mod.rs`. It proves: a `set` variable reaches the test, and an attestation made where
+the machine has another value still skips for a verifier with a third value; a `hash` variable's change re-runs and
+`vci explain` names it with its class (`env:APP_HASH (hash)`); an `ignore` variable's change and an undeclared
+variable's change both skip, and the undeclared variable is absent in the test; `vci ci`, plain and with `--key`,
+applies `set`; the `vci env` rows for the `vci.toml` variables are exactly as expected; and a base commit that still
+uses `global`/`pass_through` verifies the same attestation, with one deprecation warning and the same digest.
+
 The Rails end-to-end tests (`crates/vci-cli/tests/e2e_rails.rs`) copy `fixtures/rails-abcd` into a temporary repository
 and print `SKIPPED:` (and pass) when the Ruby of its `.ruby-version` is not found (`$VCI_TEST_RUBY_BIN`, `mise where
 ruby@<version>`, or `ruby` on PATH) or `bundle check` fails for it; `crates/vci-adapter/tests/rails_collector.rs` runs
@@ -2311,7 +2302,7 @@ it; a model only b uses runs b alone; the view template runs c alone, and of the
 read matters; `config/routes.rb` runs d; a new file in
 `app/models` that takes over a constant (`Calc`) runs a; `db/schema.rb`, a gem version in `Gemfile.lock` and
 `.ruby-version` (another version, and the same one spelled differently) run everything; tampered payloads, unknown
-signers and PR-only `allowed_signers` are rejected; a declared env var with another value runs b; each refusal
+signers and PR-only `allowed_signers` are rejected; a `hash` env var with another value runs b; each refusal
 (backticks, `system`, a failure, a skip, no assertions, `ENV.to_h`, a write into `app/`, a read outside the repository,
 a socket) while writing to `tmp/` is attested; rows written into `db/test.sqlite3` directly, its journal files, a
 database in `storage/` and a fresh checkout without any database change no verdict, no manifest names them (a listing of
@@ -2337,7 +2328,7 @@ skips only b; editing `fixtures/b.json` runs b and `explain` names it with both 
 `fixtures/b.local.json` b probed runs b; editing the computed import's target runs c alone, and so does creating the
 `src/c.ts` the hook would resolve first; `src/a.ts` (reached through the hook's `@/` alias) runs a alone; the `--import`
 hooks file, an option added to the script and the lockfile run everything; another installed `ms` version runs d; a
-declared variable with another value and `NODE_OPTIONS` run everything, while the environment's `NODE_ENV` (the script
+`hash` variable with another value and `NODE_OPTIONS` run everything, while the environment's `NODE_ENV` (the script
 sets it) and `TEST_CONCURRENCY` (it only sets a dropped option) skip as before, and a `TEST_CONCURRENCY` that smuggles
 in `--test-only` runs everything; tampered payloads, unknown signers and PR-only `allowed_signers` are rejected; each
 refusal (a skipped or todo test, `describe.skip`, `test.only`, a failure, a child process, `process.exit`, no tests, a
@@ -2385,7 +2376,7 @@ code, content, `Gem.read_binary` and a spec's check of `vendor/bundle` are refus
 The pytest end-to-end tests (`crates/vci-cli/tests/e2e_pytest.rs`, `crates/vci-adapter/tests/pytest_fixture.rs`)
 copy `fixtures/pytest-abcd` the same way and print `SKIPPED:` (and pass) when `uv` is not installed or cannot set up
 the fixture's environment. They prove the same steps for pytest (fixture edit, computed import target, shadowing
-package, `conftest.py`, `uv.lock` and dependency changes, tampering, untrusted and PR-added signers, a declared env
+package, `conftest.py`, `uv.lock` and dependency changes, tampering, untrusted and PR-added signers, a `hash` env
 var), each refusal (`subprocess`, failure, writes in the repo, env enumeration, outside reads), push/fetch into a fresh
 clone, `vci ci` exit codes, and a repository with a Vitest and a pytest project.
 
@@ -2396,7 +2387,7 @@ a file read during package initialisation) runs it and `explain` names the file;
 skipped; a new `.go` file in b's directory, a change to the repository package b imports, a new file matching c's
 `go:embed` pattern and the file c picks by name at run time each run the right package; a `//go:build linux` file is
 hashed and marks the attestation platform-specific; a module bump in `go.mod`/`go.sum` runs everything; tampered
-payloads, unknown signers and PR-only `allowed_signers` are rejected; a declared env var with another value in CI
+payloads, unknown signers and PR-only `allowed_signers` are rejected; a `hash` env var with another value in CI
 runs b; each refusal (a child process, `net`, `os.Environ`, `syscall`, a read outside the repository, a failing
 test, `t.Skip`, a change to the repository during the run); `go_allow_net` only with the base policy's consent;
 push/fetch into a fresh clone, `vci ci` exit codes, a module in a subdirectory, `vci init --adapter go`, and that
@@ -2422,14 +2413,14 @@ crate). They prove: attesting b's integration test skips only it; editing the fi
 skipped; a's unit tests (with an `#[ignore]`d test) and doctests are separate units; c runs when its `include_str!`
 target or its build script's `rerun-if-changed` file (both outside its package) changes, not for a neighbouring file;
 a `Cargo.lock` version bump and a new `rust-toolchain.toml` run everything; tampered payloads, unknown signers and
-PR-only `allowed_signers` are rejected; a declared env var with another value runs b; each refusal (a child process, a
+PR-only `allowed_signers` are rejected; a `hash` env var with another value runs b; each refusal (a child process, a
 failing test, `env::vars()`, a socket, no tests, an undeclared read outside the package that `[[inputs]]` then
 allows, FFI, loose env mode); push/fetch into a fresh clone, `vci ci` exit codes, a missing `Cargo.lock`, cargo
 missing; cfg predicates and runtime platform checks recorded (and evaluated against the real
 `x86_64-unknown-linux-gnu` cfg set that rustc prints); `vci init --adapter cargo`; and on a copy of **vci's own
 workspace**: `crates/vci-core#lib` is attested and then skipped, `crates/vci-git#test:repo` (runs `git`) is refused,
 and editing `vci-core` runs it while editing `vci-git` does not. Regression tests for adversarial findings prove: a
-build script's undeclared file, a declared variable read by a build script without `rerun-if-env-changed` or by a
+build script's undeclared file, a listed variable read by a build script without `rerun-if-env-changed` or by a
 proc macro, and an edit restored with an old mtime are rebuilt (the unit fails and is not attested); a README
 doctest, an `include!`d `.inc` file and `OUT_DIR` code are scanned; a runner or rustc wrapper in cargo config and
 `RUSTC_WRAPPER` are refused; `[target.'cfg(..)']` tables are recorded (and their flags probed) and `[target.<triple>]`

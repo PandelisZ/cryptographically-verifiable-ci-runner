@@ -19,10 +19,10 @@ on:
 permissions:
   contents: read
 
+# TZ and CGO_ENABLED come from vci.toml ([env] set): vci sets them in every
+# test process, here and on laptops alike.
 env:
   UV_PYTHON_PREFERENCE: only-managed
-  CGO_ENABLED: "0"
-  TZ: UTC
 
 jobs:
   # Pull requests (and pushes to other branches) consume attestations only:

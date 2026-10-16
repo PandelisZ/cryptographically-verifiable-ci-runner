@@ -30,11 +30,25 @@ use crate::{
     Adapter, AdapterError, ChildEnv, ListedFile, RunOutput, ToolVersions, parse_jsonl_dir,
 };
 
-/// Env var patterns hashed whenever present in the child environment: what
-/// Node reads natively (`NODE_PATH`, `NODE_PRESERVE_SYMLINKS`,
-/// `NODE_EXTRA_CA_CERTS`, `NODE_ICU_DATA`, ...). `NODE_OPTIONS` is hashed as
-/// a global input instead.
-pub const NODE_TEST_HASHED_ENV: &[&str] = &["NODE_*", "!NODE_OPTIONS", "UV_THREADPOOL_SIZE"];
+/// Hashed whenever present in loose mode (deprecated), where every variable
+/// reaches the tests: vci 1.5's list of what the runtime reads where nothing
+/// observes it, kept so that loose mode hashes what it did. Strict mode removes
+/// these unless they are built-in or vci.toml lists them.
+pub const NODE_TEST_LOOSE_HASH: &[&str] = &["NODE_*", "!NODE_OPTIONS", "UV_THREADPOOL_SIZE"];
+
+/// Built-in hash for node:test (docs/ENV.md): what Node reads natively. ICU
+/// reads `LANG`/`LC_ALL`/`LC_MESSAGES` for the default locale (`de_DE` formats
+/// `1234.5` as `1.234,5`); `NODE_OPTIONS` reaches every process before the
+/// collector (it is also a global input); `UV_THREADPOOL_SIZE` sizes libuv's
+/// pool. Every other `NODE_*` variable (`NODE_PATH`, `NODE_EXTRA_CA_CERTS`,
+/// ...) is removed unless vci.toml lists it.
+pub const NODE_TEST_HASH: &[&str] = &[
+    "LANG",
+    "LC_ALL",
+    "LC_MESSAGES",
+    "NODE_OPTIONS",
+    "UV_THREADPOOL_SIZE",
+];
 
 /// Variables vci sets for every node:test process (never inputs).
 pub const NODE_TEST_RUN_VARS: &[&str] = &["VCI_OUT", "VCI_TEST_FILE", "VCI_ROOT"];
@@ -1286,8 +1300,12 @@ impl Adapter for NodeTestAdapter {
         })
     }
 
-    fn hashed_env_patterns(&self) -> &'static [&'static str] {
-        NODE_TEST_HASHED_ENV
+    fn builtin_hash(&self) -> &'static [&'static str] {
+        NODE_TEST_HASH
+    }
+
+    fn loose_hash(&self) -> &'static [&'static str] {
+        NODE_TEST_LOOSE_HASH
     }
 
     fn declared_env(&self) -> Vec<String> {
@@ -1362,10 +1380,6 @@ impl Adapter for NodeTestAdapter {
             .and_then(|p| p.canonicalize_utf8().ok())
             .into_iter()
             .collect()
-    }
-
-    fn inferred_env_patterns(&self) -> &'static [&'static str] {
-        &[]
     }
 
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {

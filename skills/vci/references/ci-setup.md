@@ -46,8 +46,11 @@ Requirements: `git`, `ssh-keygen` (OpenSSH 8.1+), an Ed25519 SSH key, and the ru
    default branch**. CI reads both files from the base commit only, so nothing skips until they are on `main`.
 
 4. Pin toolchains so local and CI runs match (see runners.md): `.python-version` + `uv.lock` + uv version +
-   `UV_PYTHON_PREFERENCE=only-managed`; Node major + `package-lock.json`; exact Go version + `CGO_ENABLED=0` + `TZ=UTC`;
-   `rust-toolchain.toml` (rustup build); exact Ruby + `Gemfile.lock` with `x86_64-linux` + `tzinfo-data` + `TZ=UTC`.
+   `UV_PYTHON_PREFERENCE=only-managed`; Node major + `package-lock.json`; exact Go version; `rust-toolchain.toml`
+   (rustup build); exact Ruby + `Gemfile.lock` with `x86_64-linux` + `tzinfo-data`. Variables that must be equal on
+   both sides go in `vci.toml`'s `[env] set` (`vci init` writes `TZ = "UTC"`; Go: add `CGO_ENABLED = "0"`; Vitest and
+   node:test: `LANG = "C.UTF-8"`): vci sets them in every test process, so neither the laptop nor the workflow exports
+   them. `vci env --base-ref origin/main` shows the policy CI will apply.
 
 5. Give whoever attests push access to `refs/meta/main` on the metadata remote (usually the repository itself).
 
@@ -92,7 +95,7 @@ Toolchain steps per runner:
         with:
           version: "0.11.7"       # same uv version as locally
       - run: uv sync --locked
-# Go: also add CGO_ENABLED: "0" and TZ: UTC to the job's env:
+# Go: nothing to export (TZ and CGO_ENABLED come from vci.toml's [env] set)
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.2"    # exact version used locally
@@ -102,7 +105,7 @@ Toolchain steps per runner:
         with:
           toolchain: "1.95.0"     # same release as rust-toolchain.toml
       - run: cargo fetch --locked
-# Rails (Minitest or RSpec): also add TZ: UTC to the job's env:
+# Rails (Minitest or RSpec): nothing to export (TZ comes from vci.toml's [env] set)
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4.9"   # exact Ruby used locally; omit to use .ruby-version
@@ -198,9 +201,11 @@ Never print, copy or use the CI key yourself, and never add an agent's or person
 | Everything runs on a pull request | `vci.toml` or `.vci/allowed_signers` not on the base branch; or attestations not pushed (`git ls-remote origin refs/meta/main` is empty) |
 | `failed check: toolchain` | Python, Node, uv, Go, Rust, Ruby, Bundler or package versions differ between laptop and runner |
 | `failed check: inputs` | A file changed after it was attested; `vci explain` names it |
+| `failed check: env` | A hashed variable differs on the runner; `vci explain` names it and its class (`env:X (hash)`): same value on both sides, or move it to `[env] set` |
+| `failed check: env-config` | The base `[env]` lists (or vci's built-in lists) differ from the attestation's; attestations made before vci 1.6.0 fail this once; `vci env --base-ref origin/main` |
 | `failed check: signer` | Key not in the base commit's `allowed_signers`, or expired; on main, a signer not in `no_skip_refs_except` |
 | Every push to main still runs everything | `no_skip_refs_except` empty or not merged; CI key not in main's `allowed_signers`; last push's attestations not published (`pushed` in the audit log; job lacks `contents: write`) |
 | `::warning title=vci::not attesting: the key signs as ...` | CI's key reached a non-main run (a pull request): pass it only from the main-only job with the environment |
 | A Go package or cargo target never skips on the runner | Platform-specific code (`_linux.go`, `cfg(target_os)`, `runtime.GOOS`, float maths): accepted only on the same OS/arch |
-| A test reads `CI`, `HOME` or `TMPDIR` | Values differ on a runner; that unit always runs there |
-| No Rails file ever skips | `config/environments/test.rb` reads `ENV["CI"]`; Ruby patchlevel, Bundler, SQLite or tz data differ; `Gemfile.lock` lacks `x86_64-linux`; the app loads libvips (Active Storage), whose Homebrew file never matches the runner's (`policy.libraries = "any"` matches it by name, with libvips installed on the runner; also stops comparing the SQLite, libyaml and tz data versions) |
+| A test reads `HOME` or `TMPDIR`, or a variable in `[env] hash` such as `CI` | Values differ on a runner; that unit always runs there (`CI` is removed unless listed) |
+| No Rails file ever skips | `config/environments/test.rb` reads `ENV["CI"]` and `CI` is in `[env] hash` (leave it out of `[env]`); Ruby patchlevel, Bundler, SQLite or tz data differ; `Gemfile.lock` lacks `x86_64-linux`; the app loads libvips (Active Storage), whose Homebrew file never matches the runner's (`policy.libraries = "any"` matches it by name, with libvips installed on the runner; also stops comparing the SQLite, libyaml and tz data versions) |

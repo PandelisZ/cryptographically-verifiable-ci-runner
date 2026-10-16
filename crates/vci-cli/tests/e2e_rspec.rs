@@ -21,6 +21,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
+mod env_common;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -127,8 +129,7 @@ max_ttl = "30d"
 no_skip_refs = ["refs/heads/release/*"]
 
 [env]
-mode = "strict"
-global = ["APP_MODE", "TZ", "SPEC_OPTS"]
+hash = ["APP_MODE", "TZ", "SPEC_OPTS"]
 "#;
 
 struct World {
@@ -778,7 +779,7 @@ fn rspec_end_to_end_verification_steps() {
     w.put("Gemfile.lock", &lock);
     assert_eq!(w.plan(&work, "main").skip, set(ALL), "step 11: restored");
 
-    // Step 12: SPEC_OPTS (declared in [env] global) set differently in CI
+    // Step 12: SPEC_OPTS (listed in [env] hash) set differently in CI
     // -> everything runs.
     let p = w.plan_env(&work, "main", &[("SPEC_OPTS", "--format documentation")]);
     assert!(p.skip.is_empty(), "step 12: {p:?}");
@@ -1086,7 +1087,7 @@ fn rspec_run_refuses_unattestable_spec_files() {
     }
 
     // RSpec options that do not run the file's examples as such, from
-    // SPEC_OPTS (declared in [env] global, so it reaches RSpec).
+    // SPEC_OPTS (listed in [env] hash, so it reaches RSpec).
     for (opts, why) in [
         ("--dry-run", "rspec:dry-run"),
         (
@@ -1562,8 +1563,7 @@ const TWO_PROJECTS: &str = r#"[policy]
 platform = "any"
 
 [env]
-mode = "strict"
-global = ["TZ"]
+hash = ["TZ"]
 
 [[projects]]
 name = "mt"
@@ -1992,5 +1992,51 @@ fn rspec_bundle_installed_in_the_repository() {
     assert!(
         stderr.contains("vci: 0 attested, 4 not attested"),
         "{stderr}"
+    );
+}
+
+/// The `[env]` lists end to end (tests/env_common): a `set` variable reaches
+/// the test and is the same on every machine, a `hash` variable's change
+/// re-runs, an `ignore` variable's does not, an undeclared variable never
+/// reaches the test, `vci env` shows it all, and the old key names still work.
+#[test]
+fn rspec_env_set_hash_ignore_and_strip() {
+    let Some(w) = World::build(
+        &env_common::with_env(VCI_TOML, env_common::ENV_NEW),
+        copy_rspec_fixture,
+        &["."],
+    ) else {
+        return;
+    };
+    w.put(
+        "spec/lib/env_spec.rb",
+        r#"require "spec_helper"
+
+RSpec.describe "the environment" do
+  it "has what vci.toml lists" do
+    expect(ENV["APP_SET"]).to eq("declared")
+    expect(ENV["TZ"]).to eq("UTC")
+    expect(ENV["APP_HASH"]).to be_truthy
+    expect(ENV["APP_IGNORE"]).to be_truthy
+    expect(ENV["APP_UNDECLARED"]).to be_nil
+  end
+end
+"#,
+    );
+    let vci = |args: &[&str], env: &[(&'static str, String)]| {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        w.vci_env(&w.work, args, &env)
+    };
+    let git = |dir: &Path, args: &[&str]| w.git(dir, args);
+    env_common::check_env_lists(
+        &env_common::Ops {
+            work: &w.work,
+            scratch: &w.base,
+            vci: &vci,
+            git: &git,
+            key: w.trusted.to_str().unwrap(),
+        },
+        "spec/lib/env_spec.rb",
+        &["spec/lib/env_spec.rb"],
     );
 }

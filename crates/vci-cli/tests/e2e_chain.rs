@@ -46,8 +46,7 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 no_skip_refs_except = [{}]
 
 [env]
-mode = "strict"
-global = ["NODE_ENV"]
+hash = ["NODE_ENV"]
 "#,
         except
             .iter()
@@ -66,8 +65,7 @@ no_skip_refs = ["refs/heads/main", "refs/tags/**"]
 no_skip_refs_except = ["github-actions"]
 
 [env]
-mode = "strict"
-global = ["NODE_ENV"]
+hash = ["NODE_ENV"]
 
 [[projects]]
 name = "p1"

@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-6-0">1.6.0</a></td><td>16 Oct 2026</td><td>Environment policy: set, hash, ignore; nothing to export; <code>vci env</code></td></tr>
 <tr><td><a href="#v1-5-0">1.5.0</a></td><td>16 Oct 2026</td><td>vci's fixed cost per CI job drops from 12 s to about a second</td></tr>
 <tr><td><a href="#v1-4-1">1.4.1</a></td><td>15 Oct 2026</td><td>The action never compiles vci in your CI; version tags carry their own binaries</td></tr>
 <tr><td><a href="#v1-4-0">1.4.0</a></td><td>15 Oct 2026</td><td>The Rails test database is the test engine's: its contents are never an input, and database servers need no policy</td></tr>
@@ -28,6 +29,21 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-6-0">1.6.0</h2>
+<p><em>16 October 2026.</em> The environment policy becomes three short lists, and nobody exports anything.</p>
+<pre><code>[env]
+set = { TZ = "UTC", LANG = "C.UTF-8", CI = "true" }   # vci sets these in every test process, locally and in CI
+hash = ["FEATURE_*"]                                  # taken from the machine; a different value re-runs the test
+ignore = ["HOME", "SCCACHE_*"]                        # visible to the tests, never a reason to re-run
+</code></pre>
+<ul>
+<li>Everything else is removed from the test process. <code>set</code> wins over <code>hash</code>, <code>hash</code> over <code>ignore</code>, the user's lists over the built-ins, which shrink to one short table per runner in the environment docs: the variables a runtime reads natively where the collector cannot see the read, and the tooling variables each runner needs. The implicit "every <code>RUST*</code>, <code>GO*</code>, <code>PYTHON*</code>, <code>RAILS_*</code> is hashed whenever present" families are gone.</li>
+<li>With <code>set</code> the values live in <code>vci.toml</code>, already an input of every attestation, and apply on every machine: a monorepo with node:test and Rails projects needs no shell profile block.</li>
+<li><code>vci env</code> prints the effective policy per project, with each variable's class and source, and where a base policy differs. <code>vci explain</code> names the variable and its class in env failures.</li>
+<li><code>global</code>, <code>pass_through</code> and <code>env</code> in <code>[[env.files]]</code> still work with one deprecation warning; <code>mode = "loose"</code> still behaves as before, deprecated.</li>
+</ul>
+<p><strong>Upgrade notes.</strong> The env-config digest changed, so every attestation made before 1.6.0 re-runs once. The <code>@v1</code> action before this version cannot parse <code>set</code>; an older vci reading such a base policy runs everything until <code>@v1</code> resolves to 1.6.0.</p>
 
 <h2 id="v1-5-0">1.5.0</h2>
 <p><em>16 October 2026.</em> On the demo benchmark a job where nothing changed used to spend 12 seconds in vci before deciding there was nothing to run: a download with the gh CLI, a fetch, a plan, then <code>vci ci</code> planning again from scratch, every project probed one after another and each Rails project booted. Measured now on the same benchmark: <code>vci ci --fetch</code> with nothing changed takes 0.96 s, plus the binary download.</p>

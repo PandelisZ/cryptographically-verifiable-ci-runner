@@ -15,6 +15,24 @@ use crate::{
 /// project's `node_modules/@vci/vitest`).
 pub const JS_PLUGIN_ENV: &str = "VCI_JS_PLUGIN";
 
+/// Built-in hash for Vitest (docs/ENV.md): what Node and Vite read where no
+/// collector sees it. ICU reads `LANG`/`LC_ALL`/`LC_MESSAGES` for the default
+/// locale; `NODE_OPTIONS` reaches every process before the collector (vci adds
+/// its own options; the user's value is also a global input);
+/// `UV_THREADPOOL_SIZE` sizes libuv's pool; Vite exposes `VITE_*` through
+/// `import.meta.env`.
+pub const VITEST_HASH: &[&str] = &[
+    "LANG",
+    "LC_ALL",
+    "LC_MESSAGES",
+    "NODE_OPTIONS",
+    "UV_THREADPOOL_SIZE",
+    "VITE_*",
+];
+
+/// Built-in ignore for Vitest: its per-worker variables.
+pub const VITEST_IGNORE: &[&str] = &["VITEST*"];
+
 /// Env var naming the `node` binary to use (default: `node` on PATH).
 pub const NODE_ENV: &str = "VCI_NODE";
 
@@ -391,8 +409,12 @@ impl Adapter for VitestAdapter {
         }
     }
 
-    fn inferred_env_patterns(&self) -> &'static [&'static str] {
-        &["VITE_*"]
+    fn builtin_hash(&self) -> &'static [&'static str] {
+        VITEST_HASH
+    }
+
+    fn builtin_ignore(&self) -> &'static [&'static str] {
+        VITEST_IGNORE
     }
 
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {

@@ -218,7 +218,10 @@ pub struct PlanOptions {
 /// Resolve the base ref: explicit, `$VCI_BASE_REF`, `$GITHUB_BASE_REF`
 /// (as `origin/<ref>` or `<ref>`), else `origin/HEAD`, `origin/main`,
 /// `origin/master`, `main`, `master`.
-fn resolve_base(repo: &Repo, explicit: Option<&str>) -> Result<(String, String), String> {
+pub(crate) fn resolve_base(
+    repo: &Repo,
+    explicit: Option<&str>,
+) -> Result<(String, String), String> {
     let mut tries: Vec<String> = Vec::new();
     if let Some(r) = explicit {
         tries.push(r.to_owned());
@@ -602,7 +605,7 @@ fn plan_with(
             return Ok(());
         }
     };
-    if let Some(w) = config.removed_keys_warning(&format!("{CONFIG_FILE} at the base commit")) {
+    for w in config.warnings(&format!("{CONFIG_FILE} at the base commit")) {
         eprintln!("vci: warning: {w}");
         res.warnings.push(w);
     }
@@ -1234,7 +1237,7 @@ impl Verifier<'_> {
             return Err(Failure::one(
                 "env-config",
                 11,
-                "envConfigDigest",
+                "envConfigDigest (the [env] lists of the base vci.toml, or vci's built-in lists, differ from the attestation's; attestations made before vci 1.6.0 all differ once)",
                 p.env_config_digest.clone(),
                 fenv.digest(),
             ));
@@ -1455,6 +1458,11 @@ impl Verifier<'_> {
         }
 
         // Env: values, and declared variables present now but not attested.
+        // Name the variable and its class under the base policy.
+        let classed = |what: &str| match what.strip_prefix("env:") {
+            Some(k) => format!("{what} ({})", fenv.classify(k).label()),
+            None => what.to_owned(),
+        };
         if !env_diff.is_empty() {
             return Err(Failure {
                 check: "env",
@@ -1462,7 +1470,7 @@ impl Verifier<'_> {
                 details: env_diff
                     .into_iter()
                     .map(|m| Detail {
-                        what: m.what,
+                        what: classed(&m.what),
                         expected: m.expected,
                         actual: m.actual,
                     })
@@ -1482,7 +1490,7 @@ impl Verifier<'_> {
                 details: missing
                     .into_iter()
                     .map(|k| Detail {
-                        what: format!("env:{k}"),
+                        what: classed(&format!("env:{k}")),
                         expected: "not hashed".into(),
                         actual: "must be hashed (env config)".into(),
                     })

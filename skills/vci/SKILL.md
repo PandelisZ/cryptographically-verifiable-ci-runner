@@ -5,7 +5,7 @@ license: MIT
 compatibility: Needs the vci CLI (brew install pandelisz/tap/vci), git, ssh-keygen (OpenSSH 8.1+) and the project's test toolchain, on macOS or Linux.
 metadata:
   homepage: https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
-  vci-version: "1.5.0"
+  vci-version: "1.6.0"
 ---
 
 # vci: run tests once, prove it, let CI skip them
@@ -41,7 +41,7 @@ Run these once per session and stop to tell the user if something is missing:
 ```sh
 vci --version                                   # installed? (brew install pandelisz/tap/vci)
 git rev-parse --show-toplevel                   # run vci from the repository root
-test -f vci.toml && sed -n '1,40p' vci.toml     # set up? which adapter(s) and project dirs, [env] global
+test -f vci.toml && sed -n '1,40p' vci.toml     # set up? which adapter(s) and project dirs, [env] set/hash/ignore
 git branch --show-current                       # must not be the default branch (see below)
 git fetch origin                                # so origin/main is the real base
 echo "${VCI_SIGNING_KEY:-unset}"                # signing key, or pass --key
@@ -56,8 +56,9 @@ echo "${VCI_SIGNING_KEY:-unset}"                # signing key, or pass --key
 - **Default branch**: `vci init` puts `refs/heads/main` in `policy.no_skip_refs`, so on `main` `vci plan` prints
   `running everything: policy.no_skip_refs matches refs/heads/main` (or, when `policy.no_skip_refs_except` names
   CI's own key, skips only what that key attested). Work on a feature branch.
-- **Declared environment**: strict env mode removes undeclared variables from tests. Every variable in `[env] global`
-  (commonly `TZ`, `CGO_ENABLED`) must have the same value locally as in CI, e.g. `TZ=UTC vci run ...`.
+- **Environment**: only the variables `[env]` and the runner's short built-in lists name reach tests (`vci env` lists
+  them). `[env] set` values (commonly `TZ`, `CGO_ENABLED`) are set by vci on both sides; nothing to export. Every
+  variable in `[env] hash` must have the same value locally as in CI.
 
 ## Workflow after a code change
 
@@ -195,7 +196,8 @@ vci explain <unit> --base-ref origin/main
 | `signer` | Key not in the base branch's `allowed_signers`, or expired; on main, a signer not in `no_skip_refs_except` | The user adds the key on the default branch; on main this is expected |
 | `expiry` | Attestation expired (default TTL 14 days, policy max 30) | Re-attest |
 | `global-inputs`, `externals` | Lockfile, runner config or dependency versions changed | Re-attest after the change |
-| `env` | A hashed variable differs (`TZ`, a declared variable, or `CI`/`HOME` the test read) | Match declared values; units that read `CI` never skip on runners |
+| `env` | A hashed variable differs; explain names it and its class (`env:DATABASE_URL (hash)`, `env:HOME (built-in ignore)` for one the test read) | Report to the user: same value on both sides, or a move to `[env] set` (a vci.toml change); units that read `HOME`/`USER` never skip on runners |
+| `env-config` | The base `[env]` lists or vci's built-in lists differ from the attestation's (every attestation from before vci 1.6.0, once) | Re-attest; `vci env --base-ref origin/main` shows the difference |
 
 Plan-wide: `running everything: policy.no_skip_refs matches ...` (you are on main or a tag), `vci.toml is missing at
 the base commit` (setup not merged yet), and the warning `no git-meta store ... run vci fetch first`. Full list:
@@ -218,8 +220,8 @@ Short version (details in [references/runners.md](references/runners.md)):
 - **pytest**: uv project with `uv.lock`; uv-managed Python pinned to the full version in `.python-version`, the same
   uv version in CI, `UV_PYTHON_PREFERENCE=only-managed` on both sides. Any skipped test refuses its file. The
   interpreter's SQLite and OpenSSL versions are compared unless the user sets `policy.libraries = "any"`.
-- **Go**: units are package directories; exact Go version on both sides; `CGO_ENABLED=0` and `TZ=UTC` declared in
-  `[env] global` and set on both sides. Package `net` in the closure (including testify) is refused unless the user
+- **Go**: units are package directories; exact Go version on both sides; `[env] set = { TZ = "UTC", CGO_ENABLED = "0" }`
+  (vci sets them on both sides). Package `net` in the closure (including testify) is refused unless the user
   sets `go_allow_net`. Platform-specific or floating-point code pins the unit to the attesting OS/arch.
 - **Cargo**: ids `<package dir>#<target>`; every file of the package and its in-repo dependencies is an input; reads
   elsewhere must be declared under `[[inputs]]` (a vci.toml change for the user). Exact rustc/cargo via rustup and
@@ -228,12 +230,13 @@ Short version (details in [references/runners.md](references/runners.md)):
 - **Rails (Minitest/RSpec)**: files only, run one at a time (`vci ci` runs the rest in one process); vci does not
   manage the test database: Rails sets it up, its contents are not an input, and SQLite or a server needs no policy
   (`rails_allow_db` was removed in 1.4.0; a leftover key only warns). Exact Ruby patchlevel; `Gemfile.lock` with
-  `x86_64-linux`; `gem "tzinfo-data"`; `TZ=UTC` declared and set (`TZ=UTC vci run ...`); UTF-8 locale on both sides;
-  `config.eager_load = false` (not `ENV["CI"].present?`). Changing `Gemfile.lock`, `config/**` or `spec/support`
+  `x86_64-linux`; `gem "tzinfo-data"`; `[env] set = { TZ = "UTC" }` (vci sets it; no export); UTF-8 locale on both
+  sides; `CI` left out of `[env]` (removed, so `config.eager_load = ENV["CI"].present?` is false on both sides).
+  Changing `Gemfile.lock`, `config/**` or `spec/support`
   affects everything. libvips (Active Storage) is matched by file hash, so macOS attestations never skip on Linux
   unless the user sets `policy.libraries = "any"` (by library name, with libvips installed in CI; it also ignores
   the SQLite, libyaml and tz data versions).
-- **All**: `TZ=UTC` and `LANG` with UTF-8 the same locally and in CI; delete `.DS_Store`/`__pycache__` junk from
+- **All**: `TZ` (and for Node `LANG`) in `[env] set`, never exported by hand; delete `.DS_Store`/`__pycache__` junk from
   directories tests list; run CI jobs on the hosted runner, not as root.
 
 ## Safety rules (must follow)
@@ -246,7 +249,7 @@ Short version (details in [references/runners.md](references/runners.md)):
    unless the user explicitly asks; changes there only take effect on the default branch, which the user merges.
 4. **Never weaken policy** without the user: do not change `platform`, `libraries`, `platform_overrides`,
    `never_skip`, `no_skip_refs`, `no_skip_refs_except` (never add your own principal), `max_ttl`, `allow_dirty`,
-   `go_allow_net`, `[env]` mode or declarations, or `[[inputs]]`. Propose the change and let the
+   `go_allow_net`, `[env]` (`set`, `hash`, `ignore`, `mode`), or `[[inputs]]`. Propose the change and let the
    user decide.
 5. **Never change the CI wiring to skip more**: do not alter `base-ref`, switch to `pull_request_target`, unpin the
    action, or build vci from the PR checkout.

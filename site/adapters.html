@@ -75,7 +75,7 @@ vci push</code></pre>
 <li>every module in the Vite graph and every module the worker evaluated, including computed <code>import()</code>;</li>
 <li>every file or directory read or stat'ed, and every failed lookup, so creating a file that was probed as absent invalidates the attestation;</li>
 <li>external packages as <code>name@version</code>;</li>
-<li>env vars: declared patterns, <code>VITE_*</code>, and anything the test read.</li>
+<li>env vars: the <code>set</code> and <code>hash</code> lists, the built-in hash ones (<code>TZ</code>, <code>LANG</code>, <code>NODE_OPTIONS</code>, <code>VITE_*</code>, ...), and anything the test read that is not in <code>ignore</code>.</li>
 </ul>
 <details class="more">
 <summary>Inputs of every test file</summary>
@@ -118,7 +118,7 @@ vci push</code></pre>
 <li>every module imported from the repository, including <code>conftest.py</code> files, and every path an import could have resolved to (so a new module that would shadow one is noticed);</li>
 <li>every file opened or stat'ed, failed lookups and directory listings;</li>
 <li>installed distributions as <code>name@version</code>, checked against <code>uv.lock</code>;</li>
-<li>env vars read through <code>os.environ</code>, and always <code>PYTEST_*</code>, <code>PYTHON*</code> and <code>TZ</code>.</li>
+<li>env vars read through <code>os.environ</code>, and always <code>TZ</code> and the variables the interpreter and pytest read at startup (<code>PYTHONHASHSEED</code>, <code>PYTEST_ADDOPTS</code>, ...: the built-in hash list); other <code>PYTHON*</code> and <code>PYTEST_*</code> variables are removed unless listed.</li>
 </ul>
 <p>Any change to <code>uv.lock</code> runs everything.</p>
 <h3>What is refused</h3>
@@ -168,7 +168,7 @@ vci push</code></pre>
 <h3>Laptop to Linux runner</h3>
 <ul>
 <li>Pin the exact Go version in <code>actions/setup-go</code>.</li>
-<li>Declare <code>CGO_ENABLED</code> and <code>TZ</code> in <code>[env] global</code>, and set <code>CGO_ENABLED=0</code> and <code>TZ=UTC</code> on both sides.</li>
+<li>Put <code>set = { TZ = "UTC", CGO_ENABLED = "0" }</code> in <code>[env]</code>: vci sets them on both sides.</li>
 <li>A package with platform-specific files (<code>b_linux.go</code>, <code>//go:build darwin</code>) or code that refers to <code>runtime.GOOS</code> is only accepted on the same OS and architecture.</li>
 <li>A package with floating-point code is only accepted on the same architecture.</li>
 </ul>
@@ -212,7 +212,7 @@ extra = ["testdata/**", "shared/config.json"]</code></pre>
 <li>FFI and <code>libc</code>;</li>
 <li><code>env::vars()</code>;</li>
 <li>a unit where no test ran;</li>
-<li>env mode <code>"loose"</code>. The cargo adapter only attests in <strong>strict mode</strong> (<code>[env] mode = "strict"</code>: variables you have not declared are removed from the test's environment).</li>
+<li>the deprecated env mode <code>"loose"</code>. The cargo adapter relies on the default policy, where every variable no <code>[env]</code> list names is removed from the test's environment on both sides. That includes <code>RUST_BACKTRACE</code> and <code>RUST_LOG</code>: use <code>set = { RUST_BACKTRACE = "1" }</code> for backtraces.</li>
 </ul>
 <h3>Laptop to Linux runner</h3>
 <ul>
@@ -237,8 +237,8 @@ vci init --adapter rails --key ~/.ssh/id_ed25519.pub
 git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock \
   &amp;&amp; git commit -m "Enable vci"
 
-TZ=UTC vci run test/models/b_test.rb --key ~/.ssh/id_ed25519
-TZ=UTC vci plan --base-ref origin/main
+vci run test/models/b_test.rb --key ~/.ssh/id_ed25519   <span class="c"># TZ comes from vci.toml's [env] set</span>
+vci plan --base-ref origin/main
 vci push</code></pre>
 <p>The collector is plain Ruby loaded through <code>RUBYOPT</code>; nothing is installed into your project. It sets these run conditions:</p>
 <ul>
@@ -270,12 +270,12 @@ vci push</code></pre>
 <h3 id="getting-skips-on-a-linux-runner">Laptop to Linux runner</h3>
 <p>A generated Rails app needs a few changes before anything is skipped across machines:</p>
 <ul>
-<li><strong>Credentials.</strong> Active Record reads <code>config/master.key</code> at boot. That file is git-ignored, so CI never matches. Give the test environment its own committed credentials (<code>bin/rails credentials:edit --environment test</code>), remove the credentials, or declare <code>RAILS_MASTER_KEY</code>.</li>
-<li><strong><code>CI</code>.</strong> Change the generator's <code>config.eager_load = ENV["CI"].present?</code> to <code>config.eager_load = false</code> in <code>config/environments/test.rb</code>.</li>
-<li><strong>Time zone data.</strong> Use <code>gem "tzinfo-data"</code> for every platform, and declare and set <code>TZ=UTC</code>.</li>
+<li><strong>Credentials.</strong> Active Record reads <code>config/master.key</code> at boot. That file is git-ignored, so CI never matches. Give the test environment its own committed credentials (<code>bin/rails credentials:edit --environment test</code>), remove the credentials, or list <code>RAILS_MASTER_KEY</code> in <code>[env] hash</code> and give it the same value on both sides.</li>
+<li><strong><code>CI</code>.</strong> The generator's <code>config.eager_load = ENV["CI"].present?</code> makes every test depend on <code>CI</code>. Leave <code>CI</code> out of <code>[env]</code>: it is removed from the tests, so it is unset on both sides and nothing is eager-loaded. (In <code>hash</code>, a laptop never matches a runner; in <code>set</code>, every test loads every application file.)</li>
+<li><strong>Time zone data.</strong> Use <code>gem "tzinfo-data"</code> for every platform, and keep <code>set = { TZ = "UTC" }</code> in <code>[env]</code> (<code>vci init</code> writes it): vci sets it on both sides.</li>
 <li><strong>Lockfile platforms.</strong> <code>Gemfile.lock</code> must list both <code>arm64-darwin</code> and <code>x86_64-linux</code>.</li>
 <li><strong>Ruby and <code>vendor/</code>.</strong> Pin the exact Ruby in <code>.ruby-version</code>, and keep <code>vendor/.keep</code> committed.</li>
-<li><strong>Locale.</strong> Attest with a UTF-8 locale (<code>LANG=en_US.UTF-8</code>). Ruby's default encoding is compared, and runners use UTF-8.</li>
+<li><strong>Locale.</strong> Attest with a UTF-8 locale (<code>LANG=en_US.UTF-8</code>). For Rails, <code>LANG</code> and <code>LC_*</code> are built-in ignore: they reach the tests unhashed, and the default encoding they decide is compared as part of the toolchain. Runners use UTF-8.</li>
 <li><strong>libvips and library versions.</strong> Homebrew's libvips is a different file from the runner's, so every file that loaded it runs, and so does every file when the SQLite, libyaml or time zone data versions differ. Set <code>libraries = "any"</code> under <code>[policy]</code> to match libvips by name and ignore those versions, and install libvips on the runner. See <a href="configuration.html#mac-to-linux">macOS to Linux</a>.</li>
 </ul>
 
@@ -288,9 +288,9 @@ vci init --adapter rails --key ~/.ssh/id_ed25519.pub
 git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock \
   .rspec &amp;&amp; git commit -m "Enable vci"
 
-TZ=UTC vci run spec/models/order_spec.rb \
+vci run spec/models/order_spec.rb \
   --key ~/.ssh/id_ed25519
-TZ=UTC vci plan --base-ref origin/main
+vci plan --base-ref origin/main
 vci push</code></pre>
 <pre><code><span class="c"># vci.toml</span>
 project = "."
@@ -303,7 +303,7 @@ runner = "rspec"</code></pre>
 <tr><td><code>.rspec</code></td><td>read, and an input of every spec file: editing it runs everything</td></tr>
 <tr><td><code>~/.rspec</code>, <code>$XDG_CONFIG_HOME/rspec/options</code></td><td>never read</td></tr>
 <tr><td><code>.rspec-local</code></td><td>never read (it is usually git-ignored, so CI could not match it)</td></tr>
-<tr><td><code>SPEC_OPTS</code></td><td>hashed when set; strict mode removes it unless declared in <code>[env]</code></td></tr>
+<tr><td><code>SPEC_OPTS</code></td><td class="wrap">removed unless listed in <code>[env]</code>; in <code>hash</code> its value is compared, in <code>set</code> vci gives it the same value everywhere</td></tr>
 </table>
 <h3>What is recorded</h3>
 <p>On top of the Rails list:</p>

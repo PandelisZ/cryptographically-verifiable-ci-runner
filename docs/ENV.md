@@ -1,184 +1,412 @@
-# Environment variables in hashing
+# Environment variables
 
-Modeled on Turborepo's `env` / `globalEnv` / `passThroughEnv` and strict mode, with one addition: vci also observes which variables a test file actually reads at runtime.
+An environment variable can change a test's result, so vci decides, for every variable, whether it reaches the test
+processes and whether its value is an input. Since vci 1.6.0 that policy is three short lists in `vci.toml`, plus a
+short built-in list per runner. Every other variable is removed from the test processes.
 
 ## In one minute
 
-Environment variables can change a test's result, so vci treats the ones a test depends on as inputs. It stores a hash of each value (never the value) in the attestation, and CI skips the test only if its own values hash the same.
-
-**Strict mode**, the default, removes every undeclared variable from the test process, in `vci run` and in `vci ci` alike. Local and CI runs therefore see the same environment shape: only the variables you allowed. (Loose mode leaves them in place; the cargo adapter only attests in strict mode.)
-
-Every variable is one of three kinds:
-
-| Kind | Where you list it | Reaches the test | Hashed |
-|---|---|---|---|
-| Declared | `global`, or `env` under `[[env.files]]` | yes | yes |
-| Pass-through | `pass_through` (put secrets here) | yes | no |
-| Undeclared | nowhere | strict: no (removed); loose: yes | if the test reads it: strict records it as absent, loose hashes its value |
-
-A few built-in pass-through variables (`PATH`, `HOME`, `CI`, `TMPDIR`, ...) always reach the test so that tooling works; they are hashed only if the test reads them.
-
 ```toml
 [env]
-mode = "strict"
-global = ["NODE_ENV", "TZ"]      # set the same values locally and in CI
-pass_through = ["GITHUB_TOKEN"]  # visible to tests, never hashed
+set = { TZ = "UTC", LANG = "C.UTF-8", CI = "true" }  # vci sets these, on every machine
+hash = ["VEX_TEST_DATABASE_URL", "FEATURE_*"]        # taken from the machine; a change re-runs the test
+ignore = ["SCCACHE_*", "MISE_*", "GITHUB_TOKEN"]     # taken from the machine; never a reason to re-run
 ```
 
-Each runner adds its own built-in pass-through and hashed-if-present variables (`PYTHON*`, `GO*`, `RUSTFLAGS`, `RAILS_*`, ...). The [Categories](#categories) table below gives the exact rules per runner.
+| Class | Reaches the test | Hashed | Use it for |
+|---|---|---|---|
+| `set` | yes, with the value written here, on every machine (the machine's own value is replaced) | yes, the declared value (so it is the same everywhere) | what must be identical locally and in CI: the time zone, the locale, `CI`, feature switches. Nobody exports anything. |
+| `hash` | yes, the machine's value | yes: another value, or its absence, re-runs the test | what legitimately differs between machines and matters: a database URL, a service endpoint |
+| `ignore` | yes, the machine's value | never, not even when a test reads it | secrets, caches, tooling locations, anything you decide does not change results |
+| built-in hash | yes, the machine's value | when present | the few variables a runtime reads natively (where no collector sees the read) that change results; [tables below](#built-in-lists) |
+| built-in ignore | yes, the machine's value | only if a test is seen reading it | what a runner needs to work at all (`PATH`, `HOME`, caches); [tables below](#built-in-lists) |
+| everything else (`stripped`) | **no**: removed from every test process vci starts | a test seen reading one gets it recorded as absent | |
+
+**Precedence**, when lists overlap: `set` > `hash` > `ignore` > built-in hash > built-in ignore. So your `ignore`
+silences a built-in hash variable (`ignore = ["RUSTFLAGS"]`), your `hash` turns a built-in ignore variable into an
+input (`hash = ["HOME"]`), and `set` overrides everything.
+
+**Where `set` applies:** wherever vci starts a test process: `vci run`, `vci ci` (the tests it runs plainly and the
+ones it attests with `--key`) and the probes `vci plan` runs. The only values that win over `set` are the ones vci
+itself sets for a runner: `RAILS_ENV`/`RACK_ENV=test` and `RUBYOPT` with the collector (Rails), a node:test
+script's `NAME=value` assignments, vci's own `NODE_OPTIONS` additions, and the fresh `TMPDIR` of every Go, Cargo and
+Rails process.
+
+**`vci env`** prints the effective policy of each project: every variable in a list, its class, where the rule comes
+from, and what it is on this machine. `vci env --base-ref origin/main` also shows where the base commit's policy
+differs (CI judges with the base policy). See [`vci env`](#vci-env).
 
 ## Config (`vci.toml`)
 
 ```toml
 [env]
-mode = "strict"                         # "strict" (default) | "loose"
-global = ["NODE_ENV", "TZ", "CI_*", "!CI_JOB_*"]   # hashed into every test file's input root
-pass_through = ["GITHUB_TOKEN", "AWS_*"]          # visible to tests, never hashed
+set = { TZ = "UTC" }                      # exact names; string values
+hash = ["NODE_ENV", "CI_*", "!CI_JOB_*"]  # patterns
+ignore = ["GITHUB_TOKEN", "AWS_*"]        # patterns
 
-[[env.files]]                           # per-glob additions, like Turborepo task-level env
+[[env.files]]                             # extra lists for the test files matching `match` only
 match = ["src/db/**/*.test.ts"]
-env = ["DATABASE_URL"]
-pass_through = ["PG*"]
+hash = ["DATABASE_URL"]
+ignore = ["PG*"]
 ```
 
-Patterns: exact names, `*` wildcards, and a leading `!` to exclude. Exclusions win over inclusions. Matching is case-sensitive.
+- **`set`** takes exact variable names (no `*`, `!`, `=` or whitespace) and string values (`set = { N = 1 }` is an
+  error; write `"1"`). An empty string is a value: the variable is set, empty. Values are in `vci.toml` in plain text,
+  so never put a secret in `set`.
+- **`hash` and `ignore`** take patterns: exact names, `*` wildcards (anywhere in the name), and a leading `!` to
+  exclude. Within one list an exclusion wins over an inclusion, and an excluded variable falls through to the next
+  class. Matching is case-sensitive.
+- **`[[env.files]]`** adds `hash` and `ignore` patterns for the test files that match `match` (project-relative
+  globs). The variables they name reach every test process of the project (a run shares one environment); only the
+  matching files hash them up front, and another file that reads one has the read hashed like any observed read.
+- **`[[projects]]`**: each project's `[projects.env]` table replaces the top-level keys it gives (`set`, `hash`,
+  `ignore`, `files`) for that project, as a whole: a project's `set` does not merge with the top-level `set`, so repeat
+  the variables you want to keep. Keys it does not give are inherited.
 
-## Categories
+node:test adds `NODE_ENV` and every variable its test script assigns (`NODE_ENV=test node --test ...`) to `hash`
+itself, with the script's value (`vci env` shows them with the source `test script`).
 
-| Category | Visible to test process | Hashed |
+## Built-in lists
+
+The built-in lists are short on purpose. A built-in hash variable is one the runtime reads natively, before or
+outside the collectors, and that changes results; it reaches the tests and is hashed whenever present. A built-in
+ignore variable is one the runner needs to work at all; it reaches the tests and is hashed only if a test is seen
+reading it (a test that reads `HOME` depends on it). Everything else is removed: unset where the test was attested and
+unset in CI, so it cannot make two runs differ.
+
+**Every runner.** Built-in hash: `TZ` (every runtime reads the local time zone natively). Built-in ignore: `PATH`,
+`HOME`, `USER`, `SHELL`, `TMPDIR`, `TEMP`, `TMP`, `TERM`, `VCI_*` (your `VCI_BASE_REF`, ...; vci's own per-run
+`VCI_OUT`, ... are never hashed), and on Windows `SYSTEMROOT`, `COMSPEC`, `PATHEXT`, `WINDIR`, `USERPROFILE`,
+`APPDATA`, `LOCALAPPDATA`.
+
+### Vitest
+
+| Variable | Class | Why |
 |---|---|---|
-| Declared (`global`, per-file `env`) | yes | yes |
-| Pass-through (`pass_through`) | yes | no (name is recorded if read) |
-| Built-in pass-through: `PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_*`, `TERM`, `CI`, `NODE_OPTIONS`, `VCI_*`, `VITEST*` | yes | **only if the test file was observed reading it** (never vci's per-run `VCI_OUT`, `VCI_WORKER`, `VCI_LIST_OUT`, `VCI_GO_TESTLOG`; for Vitest also never `VITEST*` and `NODE_OPTIONS`, which is hashed globally; the user's `VCI_BASE_REF`, ... and, outside Vitest, `NODE_OPTIONS` are hashed when read) |
-| Adapter built-in pass-through, pytest: `UV`, `UV_*`, `VIRTUAL_ENV`, `PYTHONPATH` (set by vci), `XDG_{CACHE,CONFIG,DATA,BIN}_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase) | yes | **only if the test file was observed reading it** (never `PYTHONPATH`: a test that reads it is not attested) |
-| Adapter-inferred: `VITE_*` for Vitest (exposed through `import.meta.env`) | yes | yes |
-| Adapter built-in pass-through, Go: `GOPATH`, `GOROOT`, `GOCACHE`, `GOCACHEPROG`, `GOMODCACHE`, `GOENV`, `GOPROXY`, `GONOPROXY`, `GOPRIVATE`, `GONOSUMDB`, `GONOSUMCHECK`, `GOSUMDB`, `GOINSECURE`, `GOVCS`, `GOAUTH`, `GOTELEMETRY`, `GOTELEMETRYDIR`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, the `*_PROXY` variables, `GIT_SSH`, `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK` | yes | **only if the test was observed reading it** |
-| Go hashed-if-present: every other `GO*` and `CGO_*` (`GOFLAGS`, `CGO_ENABLED`, `GOEXPERIMENT`, `GODEBUG`, `GOMAXPROCS`, `GOGC`, `GOAMD64`, `GOTOOLCHAIN`, ...) | only if declared (strict) | **yes, whenever present** |
-| Go always-read: `TZ`, `ZONEINFO` (package time reads them through `syscall.Getenv`, which is not logged). A package that uses the local time zone with `TZ` unset is refused (it would come from `/etc/localtime`): declare `TZ` and set it (`TZ=UTC`) on both sides | only if declared (strict) | **yes** (reported as read by every package) |
-| Adapter built-in pass-through, Cargo: `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `RUSTUP_DIST_SERVER`, `RUSTUP_UPDATE_ROOT`, `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR`, `CARGO_BUILD_JOBS`, `CARGO_NET_*`, `CARGO_HTTP_*`, `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*`, `CARGO_TERM_*`, `CARGO_LOG`, `CARGO_CACHE_RUSTC_INFO`, `CARGO_INCREMENTAL`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`, `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER`, `SCCACHE_*`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, the `*_PROXY` variables, `GIT_SSH`, `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK` | yes | **only if the unit's source names it literally** (`env::var("X")`) |
-| Cargo hashed-if-present: every other `RUST*` and `CARGO*` (`RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `RUST_TEST_THREADS`, `RUST_BACKTRACE`, `RUST_LOG`, `RUST_MIN_STACK`, `RUSTC`, `RUSTC_BOOTSTRAP`, ...) and the C toolchain variables build scripts read (`CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, `CC_*`, `CXX_*`, `AR_*`, `CFLAGS_*`, `CXXFLAGS_*`, `TARGET_CC`, `HOST_CC`, ..., `PKG_CONFIG*`, `MACOSX_DEPLOYMENT_TARGET`, `SDKROOT`) | only if declared (strict) | **yes, whenever present** |
-| Cargo compile-time and declared reads: the `env!`/`option_env!` variables rustc lists in its dep-info, every build script's `rerun-if-env-changed` variables, and variables named literally in `env::var("X")`/`env::var_os("X")` in the unit's repository sources (cargo's own `CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `TARGET`, ... and `TMPDIR`/`PWD` excepted) | only if declared or pass-through (strict) | **yes** |
-| Go run-specific: `PWD` (go test sets it to the package directory), `TMPDIR` (vci's fresh directory) | yes (set per run) | never (like the checkout location) |
-| Adapter built-in pass-through, Rails: `GEM_HOME`, `GEM_PATH`, `GEM_SPEC_CACHE`, Bundler's location and install settings (`BUNDLE_PATH`, `BUNDLE_APP_CONFIG`, `BUNDLE_USER_*`, `BUNDLE_CACHE_PATH`, `BUNDLE_GLOBAL_GEM_CACHE`, `BUNDLE_BIN`, `BUNDLE_JOBS`, `BUNDLE_RETRY`, `BUNDLE_DEPLOYMENT`, `BUNDLE_FROZEN`, `BUNDLE_SILENCE_ROOT_WARNING`), `MISE_*`, `__MISE_*`, `RBENV_*`, `ASDF_*`, `XDG_{CACHE,CONFIG,DATA,STATE}_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, the `*_PROXY` variables | yes | **only if the test was observed reading it** (reads by RubyGems' and Bundler's own code of their variables, `HOME` and `PATH`, while setting up the bundle, are not observations: the bundle they produce is checked instead) |
-| Rails hashed-if-present: every other `RUBY*` (not `RUBYOPT`), `BUNDLE_*` (`BUNDLE_WITHOUT`, `BUNDLE_WITH`, `BUNDLE_FORCE_RUBY_PLATFORM`, ...), `BUNDLER_*`, `GEM_*`, `RAILS_*` (not `RAILS_ENV`), `RACK_*` (not `RACK_ENV`), `MT_*`, `MINITEST_*`, `BOOTSNAP_*`, `SPRING_*`, `DATABASE_URL`, `*_DATABASE_URL`, `SECRET_KEY_BASE`, `SECRET_KEY_BASE_DUMMY`, `SEED`, `TESTOPTS`, `TEST`, `TESTS`, `N`, `DEFAULT_TEST`, `DEFAULT_TEST_EXCLUDE`, `SCHEMA`, `SPEC_OPTS` (RSpec's options) | only if declared (strict) | **yes, whenever present** |
-| Rails always-read: `TZ`, `RUBYLIB`, `RUBY_YJIT_ENABLE`, `RUBY_GC_HEAP_INIT_SLOTS`, `RUBY_THREAD_VM_STACK_SIZE`, `RUBY_FREE_AT_EXIT`, `RUBY_CRASH_REPORT`, `RUBYGEMS_GEMDEPS`, `RUBY_BOX`, `RUBY_PAGER` (Ruby reads them in C, at startup or for every local time) | only if declared (strict) | **yes** (reported as read by every file) |
-| Rails run-specific, set by vci: `RUBYOPT` (the collector), `RAILS_ENV`/`RACK_ENV` (`test`), `BUNDLE_GEMFILE` (the project's), `PARALLEL_WORKERS` (`1`), `DISABLE_SPRING`, `DISABLE_BOOTSNAP`, `TMPDIR` (a fresh directory), `VCI_*` (`VCI_RAILS_MODE`, `VCI_RAILS_RUNNER`, ...) | yes (set per run) | never |
-| pytest always-read: `PYTEST_ADDOPTS`, `PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTHONHASHSEED`, `PYTHONWARNINGS`, `PYTHONOPTIMIZE`, `PYTHONDEVMODE`, `PYTHONUTF8`, `PYTHONSAFEPATH`, `PYTHONNOUSERSITE`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONINTMAXSTRDIGITS`, `PYTHONIOENCODING`, `TZ` | only if declared (strict) | **yes** (reported as read by every file) |
-| pytest hashed-if-present: every `PYTHON*` and `PYTEST_*` except `PYTHONPATH` (the interpreter reads many in C: `PYTHON_CPU_COUNT`, `PYTHONBREAKPOINT`, `PYTHON_GIL`, ...) | only if declared (strict) | **yes, whenever present** (loose mode, or declared) |
-| node:test, declared automatically: `NODE_ENV` and every variable the test script assigns (`NODE_ENV=test node --test ...`; the script's value is set for the test processes) | yes | yes |
-| node:test hashed-if-present: every other `NODE_*` (Node reads `NODE_PATH`, `NODE_PRESERVE_SYMLINKS`, `NODE_EXTRA_CA_CERTS`, `NODE_ICU_DATA`, ... natively) except `NODE_OPTIONS` (hashed as a global input), and `UV_THREADPOOL_SIZE` | only if declared (strict) | **yes, whenever present** |
-| node:test always-read: `TZ`, `LANG`, `LC_ALL`, `LC_MESSAGES` (ICU reads them natively for the local time zone and the default locale; `de_DE` formats `1234.5` as `1.234,5`). An unset `TZ` refuses every file (the machine's zone is not an input), so set `TZ` the same on both sides (`TZ=UTC`, declared in `global` as the template does); `LANG` is built-in pass-through, so a laptop's `en_US.UTF-8` and a runner's `C.UTF-8` differ: set the same value on both sides (`LANG=C.UTF-8`) for files to skip there | only if declared or pass-through (strict) | **yes** (reported as read by every file) |
-| node:test run-specific, set by vci: `VCI_OUT`, `VCI_TEST_FILE`, `VCI_ROOT` (`NODE_TEST_CONTEXT` and `NODE_TEST_WORKER_ID` are node:test's own and are removed from vci's environment) | yes (set per run) | never |
-| Undeclared, strict mode | **no** (removed from the child environment) | recorded as absent if read |
-| Undeclared, loose mode | yes | yes, **if the test file was observed reading it** |
-| `TZ`, loose mode | yes | **always** (set or not): ICU reads it natively, never through the `process.env` proxy |
+| `LANG`, `LC_ALL`, `LC_MESSAGES` | hash | ICU's default locale (`Intl`, `toLocaleString`) |
+| `NODE_OPTIONS` | hash | reaches every process before the collector (also a global input) |
+| `UV_THREADPOOL_SIZE` | hash | libuv's thread pool |
+| `VITE_*` | hash | Vite exposes them through `import.meta.env` |
+| `VITEST*` | ignore | Vitest's own per-worker variables (never hashed) |
 
-Reads are observed in the Vitest workers and in the main process: a variable read by the Vitest config file (for
-example in `define`), an inline plugin or a globalSetup file counts as read by every test file of the run.
+### node:test
 
-`NO_COLOR` and `FORCE_COLOR` are not built-in pass-through (a test's result can depend on colour output), so strict
-mode removes them: add them to `pass_through` or `global` to keep them.
+| Variable | Class | Why |
+|---|---|---|
+| `LANG`, `LC_ALL`, `LC_MESSAGES` | hash | ICU's default locale (`de_DE` formats `1234.5` as `1.234,5`) |
+| `NODE_OPTIONS` | hash | reaches every process before the collector (also a global input; options other than memory, warning and stack-trace ones refuse every file) |
+| `UV_THREADPOOL_SIZE` | hash | libuv's thread pool |
 
-`NODE_OPTIONS` is pass-through because vci sets it, but if the user's value is non-empty it is hashed as part of the toolchain digest.
-For node:test it is hashed as a global input too, and a value with anything but memory, warning and stack-trace
-options refuses every file (it reaches every process before vci's collector); the collector checks the value each
-process actually has as well, so `NODE_OPTIONS` from an `--env-file`, or set by a `--require` preload of the `node
---test` process for the file's process, is held to the same rule. `.npmrc` `node-options` (which `npm run` hands the
-script as `NODE_OPTIONS`) with anything else refuses the whole project. Variables a node:test script only
-expands in its options (`${TEST_CONCURRENCY:+--test-concurrency=$TEST_CONCURRENCY}`) are not hashed: their effect is
-the option list recorded in the attestation's argv (and `--test-concurrency` is dropped, as each file runs alone).
+Every other `NODE_*` (`NODE_PATH`, `NODE_EXTRA_CA_CERTS`, ...) is removed unless listed, and so are node:test's own
+`NODE_TEST_CONTEXT` and `NODE_TEST_WORKER_ID`. With `TZ` unset every file is refused (the machine's zone is not an
+input): the `vci init` template sets it.
 
-Built-in pass-through variables are visible so that tooling works, not because their values cannot matter: `CI`,
-`HOME`, `USER`, `TMPDIR`, `LANG` differ between a laptop and a CI runner by definition. A test file observed reading
-one (`os.environ.get("CI")`, `os.path.expanduser`, `tempfile.gettempdir()`) gets its value hashed, so it is only
-skipped where the value is the same (in practice: not on a CI runner when it was attested on a laptop). Reads in C
-(`getenv` in a C extension, the `locale` module) are not observed. Configured `pass_through` stays unhashed: that is
-the user's decision.
+### pytest
 
-pytest: the interpreter and pytest read `PYTHON*` and `PYTEST_*` before any hook can observe them, so the collector
-reports the list above as read by every test file and they are **hashed** (never built-in pass-through). In strict
-mode they are removed from the child unless declared, so they hash as unset locally and in CI; declare one in
-`global` to set it (its value is then hashed). In loose mode every `PYTHON*`/`PYTEST_*` variable present is hashed
-(the pattern list `PYTHON*`, `PYTEST_*`, `!PYTHONPATH` is part of the env config digest), and one present in CI but
-not when the file was attested fails the env check. `PYTHONPATH` is the exception: vci always sets it to the collector
-directory (and removes it for listing and `vci ci`), so the user's value never reaches the tests and it is built-in
-pass-through; `vci run` refuses to attest a file that read it. uv's own variables are built-in pass-through so that
-`uv run` works in strict mode; they choose the interpreter and index, which the toolchain (exact Python version,
-bundled library versions, the full installed distribution set) and externals (installed version pinned by `uv.lock`)
-checks cover. `UV_ENV_FILE` has no effect: every `uv run` gets `--no-env-file` (a `.env` file would add variables
-after vci computed the environment it hashes). Reading the whole environment (`dict(os.environ)`, iteration, `len`, `repr`) is recorded as
-key `*` and makes the file non-attestable.
+| Variable | Class | Why |
+|---|---|---|
+| `PYTHONHASHSEED`, `PYTHONOPTIMIZE`, `PYTHONDEVMODE`, `PYTHONUTF8`, `PYTHONSAFEPATH`, `PYTHONNOUSERSITE`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONIOENCODING`, `PYTHONWARNINGS`, `PYTHONINTMAXSTRDIGITS` | hash | read by the interpreter in C at startup; change hashing order, asserts, imports, encodings, warnings |
+| `PYTEST_ADDOPTS`, `PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD` | hash | read by pytest before any hook runs; change options and plugins |
+| `UV`, `UV_*`, `VIRTUAL_ENV` | ignore | where uv and the environment are; the interpreter and packages are checked directly |
+| `PYTHONPATH` | ignore | vci sets it to its collector; `vci run` refuses a test that reads it |
+| `XDG_{CACHE,CONFIG,DATA,BIN}_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `*_PROXY` (and lowercase) | ignore | uv's cache, config and index access |
 
-Go: the test log records every `os.Getenv`/`os.LookupEnv` (including those made while packages are initialised,
-before the test starts). The go command and the runtime read `GO*` variables where no log sees them, so every
-`GO*`/`CGO_*` variable that is not one of the go command's locations is treated like pytest's `PYTHON*`: removed in
-strict mode unless declared, hashed whenever present. The effective build settings (including values written with
-`go env -w`) are also part of the toolchain. `os.Environ` cannot be observed: a test whose code (or a non-standard
-package it imports) calls it is not attested.
+Every other `PYTHON*`/`PYTEST_*` (`PYTHON_CPU_COUNT`, `PYTHONBREAKPOINT`, ...) and the locale are removed unless
+listed.
 
-Cargo: nothing observes what a Rust test reads from the environment at run time. The cargo adapter therefore only
-attests in strict mode, where an undeclared variable is removed from the test process and so unset both where the unit
-was attested and in CI; built-in pass-through variables (`HOME`, `CI`, `PATH`, ...) stay visible and are hashed only
-when the source names them literally (`std::env::var("CI")`), so a computed name (`env::var(name)`) that happens to be
-one of them is not seen. `env::vars()`/`env::vars_os()` (enumeration) refuse the unit, like `os.Environ` for Go and
-`dict(os.environ)` for pytest. `TMPDIR` is a fresh empty directory for every `cargo test` vci starts, and not an input. The wrapper variables
-(`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` and their `CARGO_BUILD_` forms) stay pass-through so that `sccache`
-works, but any other wrapper refuses every unit of `vci run` (the program is not hashed); a declared
-`CARGO_TARGET_<TRIPLE>_RUNNER` or `_LINKER` refuses them too.
-Environment reads by external crates are not seen (as with C `getenv` for pytest).
+### Go
 
-Rails: the collector wraps `ENV` (`[]`, `fetch`, `key?`, `values_at`, `slice`, `assoc`, ...) and records each key
-read, with the reading code's file. Reading the whole environment (`to_h`, `each`, `keys`, `inspect`, `select`, any
-`Enumerable` method, `replace`, ...) is recorded as key `*` and refuses the file, except two call sites in Bundler
-that run while it sets up the bundle: `environment_preserver.rb` (a copy of the environment kept to restore it for
-child processes, and `ENV.replace` adding its `BUNDLER_ORIG_*` copies) and `settings.rb` (selecting its `BUNDLE_*`
-settings, which are hashed whenever present). Reads RubyGems and Bundler make of their own variables (`HOME`, `PATH`,
-`USER`, `TMPDIR`, `GEM_*`, `BUNDLE_*`, `BUNDLER_*`, `RUBYOPT`, `RUBYLIB`, `XDG_*`, ...) are not recorded either: what
-they decide (which Ruby, which gems, from where) is part of the toolchain and externals. Reads in C (`getenv` in a C
-extension, `TZ` for local time, the locale for Ruby's default encoding, which the toolchain records) are not observed;
-`TZ` and the variables Ruby reads at startup are reported as read by every file. `RAILS_MASTER_KEY` is hashed when
-present (strict mode removes it unless declared): a 128-bit random key's hash does not reveal it.
+| Variable | Class | Why |
+|---|---|---|
+| `ZONEINFO` | hash | package time reads it through `syscall.Getenv`, which the test log does not see |
+| `GOFLAGS`, `GOEXPERIMENT`, `GODEBUG`, `GOTOOLCHAIN` | hash | change the build or the runtime |
+| `GOOS`, `GOARCH`, `GOAMD64`, `GOARM`, `GOARM64`, `GO386`, `GOPPC64`, `GORISCV64`, `GOMIPS`, `GOMIPS64`, `GOWASM` | hash | the target and its instruction set level |
+| `CGO_*`, `CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, `PKG_CONFIG*` | hash | cgo and its C toolchain |
+| `GOPATH`, `GOROOT`, `GOCACHE`, `GOCACHEPROG`, `GOMODCACHE`, `GOENV`, `GOPROXY`, `GONOPROXY`, `GOPRIVATE`, `GONOSUMDB`, `GONOSUMCHECK`, `GOSUMDB`, `GOINSECURE`, `GOVCS`, `GOAUTH`, `GOTELEMETRY`, `GOTELEMETRYDIR` | ignore | where modules, caches and the toolchain are; the modules and toolchain are checked directly |
+| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `*_PROXY`, `GIT_SSH`, `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK` | ignore | module downloads |
 
-RSpec (Rails adapter): `SPEC_OPTS` is RSpec's option source in the environment. It follows the policy above: hashed
-whenever present, removed in strict mode unless declared (`[env] global = ["SPEC_OPTS"]` to use it; its value is then
-compared in `vci plan`). The option files RSpec would read from `HOME` and `XDG_CONFIG_HOME` (`~/.rspec`,
-`$XDG_CONFIG_HOME/rspec/options`) are never read under vci (every RSpec process gets `--options .rspec`), so those
-variables do not matter to RSpec; a test that reads them itself gets them hashed like any built-in pass-through read.
+Every other `GO*` (`GOMAXPROCS`, `GOGC`, `GOWORK`, `GOTMPDIR`, ...) is removed unless listed. `PWD` and `TMPDIR` are
+set per run by go test and vci (never inputs).
 
-With `[[projects]]` in vci.toml, each project's `env` table replaces the given top-level `[env]` keys for that
-project; the digest is computed from the project's effective configuration.
+### Cargo
+
+| Variable | Class | Why |
+|---|---|---|
+| `RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_ENCODED_RUSTDOCFLAGS`, `CARGO_BUILD_RUSTFLAGS`, `CARGO_BUILD_RUSTDOCFLAGS`, `CARGO_TARGET_*_RUSTFLAGS` | hash | compiler flags |
+| `CARGO_PROFILE_*`, `CARGO_BUILD_TARGET` | hash | profile settings and the target |
+| `RUSTC`, `RUSTDOC`, `RUSTC_BOOTSTRAP` | hash | which compiler, and unstable features |
+| `RUST_TEST_THREADS`, `RUST_MIN_STACK` | hash | read by the test harness and std |
+| `CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, `CC_*`, `CXX_*`, `AR_*`, `CFLAGS_*`, `CXXFLAGS_*`, `TARGET_{CC,CXX,AR,CFLAGS,CXXFLAGS}`, `HOST_{CC,CXX,CFLAGS}`, `PKG_CONFIG*`, `MACOSX_DEPLOYMENT_TARGET`, `SDKROOT` | hash | the C toolchain build scripts use |
+| `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `RUSTUP_DIST_SERVER`, `RUSTUP_UPDATE_ROOT`, `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, `CARGO_BUILD_BUILD_DIR`, `CARGO_BUILD_JOBS`, `CARGO_NET_*`, `CARGO_HTTP_*`, `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*`, `CARGO_TERM_*`, `CARGO_LOG`, `CARGO_CACHE_RUSTC_INFO`, `CARGO_INCREMENTAL` | ignore | where toolchains, the registry and the build cache are; rustc and cargo are checked exactly |
+| `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` (and their `CARGO_BUILD_` forms), `SCCACHE_*` | ignore | compilation caches (a wrapper other than sccache refuses every unit) |
+| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `*_PROXY`, `GIT_SSH`, `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK` | ignore | crate downloads |
+
+Every other `RUST*`/`CARGO*` is removed unless listed, including `RUST_BACKTRACE`, `RUST_LIB_BACKTRACE` and
+`RUST_LOG`: std (`Backtrace::capture`) and dependency crates (`env_logger`, `tracing`'s `EnvFilter`) read them where
+the source scan cannot see it, and a test can depend on them, so they are unset on every machine. To get backtraces
+under vci, `set = { RUST_BACKTRACE = "1" }` (the same everywhere); `ignore` lets the machine's value through
+unhashed, which is only safe if no test depends on it. A `CARGO_TARGET_<TRIPLE>_RUNNER` or `_LINKER` that reaches
+the tests (listed in `hash` or `ignore`) refuses every unit (the program is not hashed).
+
+### Rails (Minitest and RSpec)
+
+| Variable | Class | Why |
+|---|---|---|
+| `RUBYLIB`, `RUBYGEMS_GEMDEPS` | hash | read at startup, before the collector: change what is loaded |
+| `RUBY_YJIT_ENABLE`, `RUBY_GC_*`, `RUBY_THREAD_VM_STACK_SIZE`, `RUBY_THREAD_MACHINE_STACK_SIZE`, `RUBY_FIBER_VM_STACK_SIZE`, `RUBY_FIBER_MACHINE_STACK_SIZE`, `RUBY_FREE_AT_EXIT`, `RUBY_CRASH_REPORT`, `RUBY_BOX`, `RUBY_MN_THREADS`, `RUBY_MAX_CPU` | hash | the VM's settings, read in C at startup |
+| `DATABASE_URL`, `*_DATABASE_URL` | hash | which database Active Record connects to (CI usually needs its own) |
+| `SECRET_KEY_BASE` | hash | read by Rails when it boots |
+| `LANG`, `LC_ALL`, `LC_CTYPE` | ignore | Ruby's default encoding, which the toolchain records (and Rails sets to UTF-8) |
+| `GEM_HOME`, `GEM_PATH`, `GEM_SPEC_CACHE`, `BUNDLE_PATH`, `BUNDLE_APP_CONFIG`, `BUNDLE_USER_*`, `BUNDLE_CACHE_PATH`, `BUNDLE_GLOBAL_GEM_CACHE`, `BUNDLE_BIN`, `BUNDLE_JOBS`, `BUNDLE_RETRY`, `BUNDLE_DEPLOYMENT`, `BUNDLE_FROZEN`, `BUNDLE_SILENCE_ROOT_WARNING` | ignore | where gems are; Ruby, the bundle and every loaded gem's version are checked directly |
+| `MISE_*`, `__MISE_*`, `RBENV_*`, `ASDF_*`, `XDG_{CACHE,CONFIG,DATA,STATE}_HOME`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `*_PROXY` | ignore | version managers and downloads |
+
+Set by vci for every test process (never inputs, and not changeable with `set`): `RUBYOPT` (the collector),
+`RAILS_ENV`/`RACK_ENV` (`test`), `BUNDLE_GEMFILE`, `PARALLEL_WORKERS` (`1`), `DISABLE_SPRING`, `DISABLE_BOOTSNAP`,
+`TMPDIR`. Every other variable is removed unless listed, including Minitest's `SEED`, `TESTOPTS`, `N`, `MT_*`,
+RSpec's `SPEC_OPTS`, `BUNDLE_WITHOUT`, `RAILS_MASTER_KEY`, `BOOTSNAP_*`, `SPRING_*`, `OPENSSL_*`, `VIPS_*`: removed,
+they are unset on every machine, so they cannot make two runs differ. List one in `hash` (or `set`) to use it.
+
+## `vci env`
+
+```
+vci env [--base-ref REF] [--project NAME] [--format text|json]
+```
+
+Prints, per project, the effective policy as vci applies it on this machine: the `vci.toml` of the working tree, the
+runner's built-in lists, and what each variable is here. It runs nothing. Warnings about old key names go to stderr.
+
+| Column | What it says |
+|---|---|
+| `VARIABLE` | a name, or a pattern from a list (`FEATURE_*`), followed by the variables it matches here |
+| `CLASS` | `set`, `hash`, `ignore`, `built-in hash`, `built-in ignore` or `stripped` (present here, removed from the tests; a test that reads one gets it recorded as absent) |
+| `SOURCE` | `vci.toml set`, `vci.toml hash`, `vci.toml ignore`, `vci.toml [[env.files]] hash`/`ignore`, `vci.toml global (old name of hash)`, `vci.toml pass_through (old name of ignore)`, `test script` (node:test assignments), `built-in (every runner)`, `built-in <adapter>` |
+| `HERE` | for `set`, the value vci sets; for hashed classes, `present (<first 12 hex of the hash>)` or `absent`; for ignored ones, `present` or `absent`; for a pattern, how many variables it matches here |
+| `BASE` | with `--base-ref` only: `=` when the base commit's policy classifies the variable the same way, else the base's class (`hash`), its `set` value (`set "UTC"`), `not listed` for a pattern the base does not have, or `no such project` |
+
+Built-in variables that are not set here are listed in one line under the table (`built-in, not set here`), and so
+are the variables present here that the tests will not see. The header line gives the project's env config digest
+(the first 12 hex) and, with `--base-ref`, `base policy differs` or `same as base`: when it differs, every attestation
+made under the other policy fails the `env-config` check in CI (see [Verification in CI](#verification-in-ci)).
+
+`--project NAME` keeps one project (its `[[projects]]` name). `--format json` prints an array of
+`{ project, adapter, digest, baseDiffers?, rows: [{ variable, class, source, here, base? }] }`, with every row (the
+built-in ones not set here included); `class` is `set`, `hash`, `ignore`, `builtin-hash`, `builtin-ignore` or
+`stripped`.
+
+## Worked example: a monorepo with node:test and Rails
+
+A repository with a node:test package in `web/` and a Rails app in `api/` (SQLite in tests). The goal: tests
+attested on a laptop skip in CI, and nobody exports anything, locally or in the workflow.
+
+```toml
+[env]
+set = { TZ = "UTC" }      # the same zone everywhere
+ignore = ["SCCACHE_*"]    # a cache: visible, never a reason to re-run
+
+[[projects]]
+name = "web"
+path = "web"
+adapter = "node-test"
+
+[projects.env]
+set = { TZ = "UTC", LANG = "C.UTF-8" }  # replaces the top-level set: repeat TZ
+hash = ["FEATURE_*"]                    # feature switches the tests read
+
+[[projects]]
+name = "api"
+path = "api"
+adapter = "rails"
+```
+
+On a laptop with `TZ=Europe/London`, `LANG=en_US.UTF-8`, `CI=true`, `FEATURE_SEARCH=on`, `SCCACHE_DIR` and a
+`GITHUB_TOKEN` in the shell, `vci env` prints (the built-in lines shortened):
+
+```
+project web (node-test): env config ff29623f04f0
+  VARIABLE        CLASS            SOURCE                   HERE
+  LANG            set              vci.toml set             "C.UTF-8"
+  TZ              set              vci.toml set             "UTC"
+  FEATURE_*       hash             vci.toml hash            pattern: 1 here
+  FEATURE_SEARCH  hash             vci.toml hash            present (5d2a6bf0fba6)
+  NODE_ENV        hash             test script              present (4878ca0425c7)
+  SCCACHE_*       ignore           vci.toml ignore          pattern: 1 here
+  SCCACHE_DIR     ignore           vci.toml ignore          present
+  HOME            built-in ignore  built-in (every runner)  present
+  PATH            built-in ignore  built-in (every runner)  present
+  built-in, not set here:
+    LC_ALL LC_MESSAGES NODE_OPTIONS UV_THREADPOOL_SIZE APPDATA COMSPEC ... VCI_* WINDIR
+  present here, removed from the tests (recorded as absent if a test reads one):
+    CI GITHUB_TOKEN
+
+project api (rails): env config 3c5a161b8da1
+  VARIABLE     CLASS            SOURCE                   HERE
+  TZ           set              vci.toml set             "UTC"
+  SCCACHE_*    ignore           vci.toml ignore          pattern: 1 here
+  SCCACHE_DIR  ignore           vci.toml ignore          present
+  HOME         built-in ignore  built-in (every runner)  present
+  LANG         built-in ignore  built-in rails           present
+  PATH         built-in ignore  built-in (every runner)  present
+  built-in, not set here:
+    *_DATABASE_URL DATABASE_URL RUBYGEMS_GEMDEPS RUBYLIB RUBY_BOX ... all_proxy http_proxy https_proxy no_proxy
+  present here, removed from the tests (recorded as absent if a test reads one):
+    CI FEATURE_SEARCH GITHUB_TOKEN
+```
+
+What happens:
+
+- **`TZ` and `LANG`**: vci sets them in every test process, on the laptop (whose own `Europe/London` and
+  `en_US.UTF-8` never reach a test) and on the runner. They are hashed with the declared value, so they always match.
+  The workflow sets neither.
+- **`CI`**: removed from both projects' tests, so it is unset on the laptop and on the runner alike. The Rails
+  generator's `config.eager_load = ENV["CI"].present?` is therefore false on both sides, and each Rails test keeps
+  depending only on the application files it loads.
+- **`FEATURE_SEARCH`**: `web` hashes it. A runner without it re-runs the `web` files attested with it set (`vci
+  explain` says `env:FEATURE_SEARCH (hash)`, expected `blake3=...`, actual `unset`). Either give it the same value in
+  the workflow, or move it to `set` if it should be the same everywhere. `api` does not list it, so its tests never
+  see it.
+- **`NODE_ENV`**: the `web` test script assigns it (`NODE_ENV=test node --test ...`), so it is hashed with the
+  script's value, the same everywhere.
+- **`SCCACHE_DIR`**: visible, never hashed: its value on the runner does not matter.
+- **`GITHUB_TOKEN`**: removed. A test that reads it sees it unset, here and in CI, and the read is recorded as absent.
+- **Rails' `LANG`**: built-in ignore: the default encoding it decides is part of the Ruby toolchain, which is compared.
+  If CI's database were a service named by `DATABASE_URL` (built-in hash for Rails), the laptop and the runner would
+  need the same URL, for example by putting it in `api`'s `set`.
+
+## Observed reads
+
+The collectors record which variables a test reads (Vitest and node:test through `process.env`, pytest through
+`os.environ`, Go through the test log, Rails through a wrapper of `ENV`; Cargo only by the names written literally in
+`env::var("X")`, `env!` and `option_env!` and build scripts' `rerun-if-env-changed`). A read is hashed unless the
+variable is in `ignore` or is vci's own plumbing; for `ignore` only the fact that the test read it is kept, never the
+value. A read of a removed variable is recorded as absent: an input, so a CI whose policy lets the variable through
+re-runs the test. Reading the whole environment (`dict(os.environ)`, `os.Environ`, `env::vars()`, `ENV.to_h`)
+refuses the test.
+
+Variables the runtime reads before or outside the collectors (the tables' "hash" rows) are reported as read by every
+test file by the pytest, Go, node:test and Rails collectors, so they are hashed as set or unset even when absent.
 
 ## What goes into the attestation
 
-Values are never stored. For each hashed variable the manifest holds `{ key, hash }` where `hash` is BLAKE3 of the value, or `ABSENT_HASH` if unset.
+Values are never stored. The manifest's env section holds `{ key, hash }` per hashed variable, `hash` being BLAKE3 of
+the value or `ABSENT_HASH` if unset:
 
-Per test file the hashed set is:
+1. every `set` variable, with the declared value (the same on every machine);
+2. every `hash` and built-in hash variable present, plus every exact `hash` name even if unset (loose mode also `TZ`,
+   and every variable present of the runner's 1.5 families that is not `ignore`);
+3. every variable a test was seen reading, except `ignore` ones and vci's plumbing (removed ones as absent).
 
-1. every variable in the environment matching the declared patterns that apply to that file, plus every exact (non-wildcard) declared name even if unset;
-2. adapter-inferred variables present in the environment;
-3. variables observed being read at runtime, except configured `pass_through`, vci's per-run variables (`VCI_OUT`,
-   `VCI_WORKER`, `VCI_LIST_OUT`, `VCI_GO_TESTLOG`) and the adapter's own plumbing (Vitest: `VITEST*`, `NODE_OPTIONS`;
-   pytest: `PYTHONPATH`); built-in pass-through variables that are read are hashed (a Go test reading `NODE_OPTIONS`
-   or `VCI_BASE_REF`);
-4. in loose mode, `TZ` (unless excluded with `!TZ`).
+The predicate also records:
 
-The predicate also records `envConfigDigest`: BLAKE3 over the mode and the sorted effective pattern lists for that file.
+- `envConfigDigest`: BLAKE3 over `vci/env-config/v2`, the mode, the `set` names and values, and the sorted `hash`,
+  `ignore`, built-in hash and built-in ignore lists that apply to the file (in loose mode also the runner's 1.5
+  families). Another `set` value, a list entry added or removed, or a vci whose built-in lists differ, changes it.
+- `envSet`: the names vci set (so `vci explain` and readers of the attestation can tell a declared value from a
+  machine's). Informational, since `envConfigDigest` already covers the values; omitted when empty.
+
+**Format decision (1.6.0).** The attestation format stays compatible: each env entry is still a key and a hash, and
+the only new field, `envSet`, is optional and ignored by older vci. The digest's domain moved from `v1` to `v2`,
+because the classes and built-in lists changed what is hashed. So every attestation made before 1.6.0 fails the
+`env-config` check once (`vci explain` says so) and its test re-runs; the new attestation then skips as usual. No
+storage or envelope version changed.
 
 ## Verification in CI
 
-1. Env config is read from `vci.toml` at the **base commit**, like the rest of policy.
-2. `envConfigDigest` must equal the digest computed from the base config for that test file. A different mode or pattern list means RUN.
-3. Expand the patterns against CI's own environment. The resulting key set, unioned with the attested observed keys, must equal the attested key set. A variable that matches a pattern in CI but is missing from the attestation means RUN.
-4. Every hash must match CI's value. Any mismatch means RUN, and `explain` names the variable (never its value).
+1. The env policy is read from `vci.toml` at the **base commit**, like the rest of the policy.
+2. `envConfigDigest` must equal the digest of the base policy for that file, else RUN (`env-config`).
+3. Every recorded hash must match the value in the environment the tests would get here, with `set` applied (so a
+   `set` variable always matches), else RUN. `vci explain` names the variable and its class under the base policy,
+   never its value:
 
-`vci ci` runs the remaining tests under the same strict-mode filtering, so local and CI runs see the same environment shape.
+   ```
+     failed check: env
+       env:DATABASE_URL (hash)
+         expected: blake3=3d1aba79...
+         actual:   unset
+   ```
+
+4. Every variable the base policy requires (every `set` name, every `hash`/built-in hash variable present here, every
+   exact `hash` name) must be in the attestation, else RUN (`env:NAME (class)`, expected `not hashed`, actual
+   `must be hashed (env config)`).
+
+## Old names, and upgrading from 1.5
+
+| vci 1.5 | vci 1.6 |
+|---|---|
+| `global = [...]` (top level, per project) | `hash = [...]` |
+| `pass_through = [...]` (top level, per project, `[[env.files]]`) | `ignore = [...]` |
+| `env = [...]` in `[[env.files]]` | `hash = [...]` |
+| `mode = "strict"` | (the only mode; accepted silently) |
+| `mode = "loose"` | deprecated; still works as before, with a warning |
+| a variable in `global` exported with the same value on every machine (`TZ`, `LANG`, `CGO_ENABLED`) | `set = { TZ = "UTC", ... }`, and drop the exports |
+
+The old names still work, top level, per project and in `[[env.files]]`, with one warning that names each old key and
+its new name, for example:
+
+```
+vci: warning: vci.toml uses the old env key names, which still work: rename env.global -> hash, env.pass_through -> ignore (vci 1.6.0 renamed `global`, and `env` in [[env.files]], to `hash`, and `pass_through` to `ignore`; see docs/ENV.md)
+```
+
+`vci run` and `vci env` print it for the working tree's `vci.toml`; `vci plan` prints it for the base commit's
+(`vci.toml at the base commit uses the old env key names ...`), and `vci env --base-ref` for the ref it compares with
+(`vci.toml at <ref> ...`). Giving both an old and a new name in one table is an error (`` `global` is the old name of
+`hash`; give only `hash` ``). A base commit that uses the old names computes the same digest as one with the new
+names, so renaming alone re-runs nothing.
+
+`mode = "loose"` keeps vci 1.5's behaviour: every variable reaches the tests, ones a test is seen reading are hashed,
+`TZ` always is, and so is every present variable of vci 1.5's per-runner families (`GO*`, `CGO_*`, `PYTHON*`,
+`PYTEST_*`, `RUBY*`, `BUNDLE_*`, `RAILS_*`, `MT_*`, `NODE_*`, `RUST*`, `CARGO*`, ..., minus the location variables),
+which the runtime reads where nothing observes it; `ignore` opts a variable out. It prints a deprecation warning and
+will be removed. The Cargo adapter never attests in loose mode.
+
+What changed in 1.6.0, besides the names:
+
+- The long "hashed whenever present" families (`RUST*`, `CARGO*`, `GO*`, `CGO_*`, `PYTHON*`, `PYTEST_*`, `RUBY*`,
+  `BUNDLE_*`, `RAILS_*`, `NODE_*`, ...) are gone. The variables in them that matter are in the short built-in hash
+  lists above and reach the tests; the rest are removed.
+- `LANG`, `LC_*`, `CI`, `NO_COLOR`, `FORCE_COLOR` and `NODE_OPTIONS` are no longer built in for every runner. `CI` is
+  removed unless you list it (`set = { CI = "true" }` gives every test the value CI runners have). The locale variables
+  are built-in hash only where a runtime reads them and nothing records the effect (Node's ICU); Rails keeps them as
+  built-in ignore, the encoding they decide being part of the toolchain.
+- Every attestation made before 1.6.0 re-runs once (the digest's domain changed; see above).
+
+To upgrade: rename the keys, move every variable you exported with the same value everywhere into `set`, delete those
+exports from the workflow and from your shell setup, and run `vci env --base-ref origin/main` to see the difference.
 
 ## Secrets
 
-A hash of a low-entropy value can be brute-forced by anyone who can read the attestations (git-meta metadata on `refs/meta/main`). Put secrets in `pass_through`, not in `env`. `vci run` warns when a declared variable's name matches `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*KEY*`.
+A hash of a low-entropy value can be brute-forced by anyone who can read the attestations (git-meta metadata on
+`refs/meta/main`). Put secrets in `ignore`, never in `hash`: `vci run` warns when a `hash` name matches `*TOKEN*`,
+`*SECRET*`, `*PASSWORD*`, `*KEY*`. `set` values are in `vci.toml` in plain text: never put a secret there.
 
-## Implementation notes
+## Runner notes
 
-- Pattern expansion, category resolution and `envConfigDigest` live in `vci-cli` (or a small module in `vci-core`); `InputManifest::capture` already takes the final list of keys to hash and `diff_against_checkout` re-hashes them from the current process environment.
-- The Vitest adapter builds the child environment explicitly (`Command::env_clear()` then add) in strict mode.
-- The JS collector already emits `{"kind":"env","key":...}` for each read; reads of `import.meta.env.*` must be covered too, or `VITE_*` must always be hashed (the default above).
+Vitest: reads are observed in the workers and in the main process (a variable read by the config file, an inline
+plugin or a globalSetup file counts as read by every test file). `NO_COLOR` and `FORCE_COLOR` are removed unless
+listed (output colour can change a test's result).
+
+node:test: a `NODE_OPTIONS` value (from the environment, an `--env-file` or a `--require` preload) with anything but
+memory, warning and stack-trace options refuses every file; `.npmrc` `node-options` with anything else refuses the
+project. Variables a script only expands in its options (`${TEST_CONCURRENCY:+...}`) are not hashed: their effect is
+the recorded argv.
+
+pytest: uv's variables are built-in ignore so that `uv run` works; every `uv run` gets `--no-env-file` (a `.env`
+file would add variables after vci computed the environment). `PYTHONPATH` is vci's own: the user's value never
+reaches the tests.
+
+Go: the test log records every `os.Getenv`/`os.LookupEnv`, including during package initialisation. A package that
+uses the local time zone with `TZ` unset is refused (it would come from `/etc/localtime`): `set = { TZ = "UTC" }`. The
+effective build settings (`go env`, including `go env -w` values) are part of the toolchain. `set = { CGO_ENABLED =
+"0" }` makes `go env` agree whether or not a C compiler is installed.
+
+Cargo: nothing observes what a Rust test reads at run time, so the adapter only attests under the default policy
+(not `mode = "loose"`), where every unlisted variable is unset both where the unit was attested and in CI. Built-in
+ignore variables are hashed when the source names them literally (`std::env::var("HOME")`); a computed name is not
+seen. `TMPDIR` is a fresh directory for every `cargo test` vci starts.
+
+Rails: reads RubyGems and Bundler make of their own variables while setting up the bundle are not observations (the
+bundle they produce is checked). Rails' generated `config/environments/test.rb` reads `CI`
+(`config.eager_load = ENV["CI"].present?`): removed by default, it is unset everywhere and nothing is eager-loaded;
+`set = { CI = "true" }` makes it the same everywhere but eager-loads every application file in every test process, so
+each of them becomes an input of every test; in `hash`, a laptop's attestation will not match a runner's (vci
+warns). The option files RSpec would read from `HOME` and `XDG_CONFIG_HOME` are never read
+(every RSpec process gets `--options .rspec`).

@@ -139,6 +139,8 @@ CI can attest its own runs too. Give the action a signing key of its own, kept a
 
 Each adapter runs every unit in its own process, prepares fresh state (vci does not manage a Rails test database: Rails sets it up as in a plain `bin/rails test`, and what it holds is not an input), and refuses to attest a unit whose test was skipped, failed, or did something the collector cannot follow. Toolchain versions must match between the machine that attested and CI; the docs say what to pin for each runner.
 
+Environment variables follow three short lists in `vci.toml`: `set` (vci sets them in every test process, on the laptop and in CI alike, so nobody exports `TZ=UTC`), `hash` (taken from the machine; another value re-runs the test) and `ignore` (visible, never hashed). Every other variable is removed from the test processes, apart from a short built-in list per runner. `vci env` prints the effective policy; details in [docs/ENV.md](docs/ENV.md).
+
 ## How a skip is decided
 
 ```

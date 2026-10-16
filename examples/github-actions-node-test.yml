@@ -13,11 +13,9 @@ permissions:
 jobs:
   node-test:
     runs-on: ubuntu-latest
-    env:
-      # The zone and locale are inputs of every node:test file: use the values
-      # the attestations were made with (an unset TZ refuses every file).
-      TZ: UTC
-      LANG: C.UTF-8
+    # The zone and locale (inputs of every node:test file) come from vci.toml:
+    # [env] set = { TZ = "UTC", LANG = "C.UTF-8" } (vci init writes it), so
+    # vci sets the same values here and where attestations are made.
     steps:
       - uses: actions/checkout@v4
         with:

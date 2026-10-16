@@ -127,10 +127,10 @@ Run these in the repository you want to speed up.
   |---|---|
   | Vitest | Node major version, `package-lock.json` |
   | pytest | full Python version in `.python-version` (a uv-managed build such as `3.14.4`), `uv.lock`, the uv version, `UV_PYTHON_PREFERENCE=only-managed` |
-  | Go | exact Go version (`go version` must print the same on both sides), `go.sum`, `CGO_ENABLED=0` and `TZ=UTC` declared in `[env] global` and set on both sides |
-  | Rust | exact release in `rust-toolchain.toml` (a `rustup` build, not Homebrew's), `Cargo.lock`, `[env] mode = "strict"` |
-  | Rails | exact Ruby in `.ruby-version` (and `ruby-version:` in `ruby/setup-ruby`), `Gemfile.lock` with the `x86_64-linux` platform (`bundle lock --add-platform x86_64-linux`), `gem "tzinfo-data"` for time zone data, `config.eager_load = false` (not `ENV["CI"].present?`) in `config/environments/test.rb`, `TZ=UTC` declared in `[env] global` and set on both sides |
-  | RSpec | everything in the Rails row, plus options in `.rspec` (vci never reads `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` or `.rspec-local`), and `SPEC_OPTS` declared in `[env] global` if you set it |
+  | Go | exact Go version (`go version` must print the same on both sides), `go.sum`, `[env] set = { TZ = "UTC", CGO_ENABLED = "0" }` in vci.toml (vci sets them on both sides) |
+  | Rust | exact release in `rust-toolchain.toml` (a `rustup` build, not Homebrew's), `Cargo.lock`, no `mode = "loose"` in `[env]` (the default policy) |
+  | Rails | exact Ruby in `.ruby-version` (and `ruby-version:` in `ruby/setup-ruby`), `Gemfile.lock` with the `x86_64-linux` platform (`bundle lock --add-platform x86_64-linux`), `gem "tzinfo-data"` for time zone data, `[env] set = { TZ = "UTC" }` in vci.toml, and `CI` left out of `[env]` (removed, so the generator's `config.eager_load = ENV["CI"].present?` is false on both sides) |
+  | RSpec | everything in the Rails row, plus options in `.rspec` (vci never reads `~/.rspec`, `$XDG_CONFIG_HOME/rspec/options` or `.rspec-local`), and `SPEC_OPTS` listed in `[env] hash` (or `set`) if you use it |
 
 - [ ] **Add the GitHub Action** after your toolchain setup: [GitHub Actions setup](GITHUB_ACTIONS.md).
 
