@@ -1001,6 +1001,42 @@ fn resolve_files(args: &[String], files: &[TestFile]) -> Result<BTreeSet<usize>>
     Ok(out)
 }
 
+/// `vci run <units>` when some projects that could hold a requested unit
+/// (`unlisted`: label, listing error) could not be listed: when every
+/// requested unit resolved (`resolved`) to a unit of a project that was
+/// listed, the run goes on without the others (one warning each); when one
+/// did not, the error also names the listing failures, which are likely
+/// why.
+fn settle_unlisted(
+    resolved: Result<BTreeSet<usize>>,
+    unlisted: &[(String, anyhow::Error)],
+) -> Result<(BTreeSet<usize>, Vec<String>)> {
+    match resolved {
+        Ok(selected) => {
+            let warnings = unlisted
+                .iter()
+                .map(|(label, e)| {
+                    format!(
+                        "listing the test files of {label} failed: {e:#}; none of the requested units is in it"
+                    )
+                })
+                .collect();
+            Ok((selected, warnings))
+        }
+        Err(e) if unlisted.is_empty() => Err(e),
+        Err(e) => {
+            let why: Vec<String> = unlisted
+                .iter()
+                .map(|(label, e)| format!("listing the test files of {label} failed: {e:#}"))
+                .collect();
+            bail!(
+                "{e:#} (it may be in a project that could not be listed: {})",
+                why.join("; ")
+            )
+        }
+    }
+}
+
 /// Which units [`run_units`] runs.
 pub enum Selection {
     /// `vci run`'s arguments (paths relative to the current directory,
@@ -1147,7 +1183,6 @@ pub fn run_units(
                             .list_test_files(&children[i].to_child_env())
                             .map_err(anyhow::Error::from)
                             .and_then(|l| p.test_files(i, l))
-                            .with_context(|| format!("listing the test files of {}", p.label()))
                     })
                 })
             })
@@ -1157,25 +1192,38 @@ pub fn run_units(
             .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
             .collect()
     });
+    // `vci run <units>`: projects that could not be listed, settled once the
+    // units are resolved (see [`settle_unlisted`]).
+    let mut unlisted: Vec<(String, anyhow::Error)> = Vec::new();
     for (i, listed) in listings.into_iter().enumerate() {
         let Some(listed) = listed else { continue };
+        let label = ctx.projects[i].label();
         match listed {
             Ok(f) => files.extend(f),
             // `vci ci`: one project that cannot be listed does not stop the
             // others from being attested (it runs without attesting).
             Err(e) if matches!(selection, Selection::Units(_)) => {
-                let msg = format!("{e:#}");
+                let msg = format!("listing the test files of {label}: {e:#}");
                 eprintln!("vci: error: {msg}");
                 errors.push(msg);
                 unrun.insert(i);
             }
-            Err(e) => return Err(e),
+            Err(e) if matches!(&selection, Selection::Args(a) if !a.is_empty()) => {
+                unlisted.push((label, e));
+            }
+            Err(e) => return Err(e.context(format!("listing the test files of {label}"))),
         }
     }
     mark_cross_project_ambiguity(&mut files);
     let selected: BTreeSet<usize> = match &selection {
         Selection::Args(a) if a.is_empty() => (0..files.len()).collect(),
-        Selection::Args(a) => resolve_files(a, &files)?,
+        Selection::Args(a) => {
+            let (selected, warnings) = settle_unlisted(resolve_files(a, &files), &unlisted)?;
+            for w in warnings {
+                eprintln!("vci: warning: {w}");
+            }
+            selected
+        }
         Selection::Units(u) => {
             let listed: BTreeMap<usize, Option<BTreeSet<String>>> = u
                 .iter()
@@ -1601,6 +1649,44 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, body).unwrap();
+    }
+
+    /// `vci run <units>` with a project that could not be listed: fail open
+    /// when every unit resolved elsewhere, else the error names the listing
+    /// failure too.
+    #[test]
+    fn unlisted_projects_fail_open_only_when_every_unit_resolved() {
+        let unlisted = || {
+            vec![(
+                "rust".to_owned(),
+                anyhow::anyhow!("cargo metadata failed").context("could not parse cargo workspace"),
+            )]
+        };
+        let (selected, warnings) =
+            settle_unlisted(Ok(BTreeSet::from([0, 2])), &unlisted()).unwrap();
+        assert_eq!(selected, BTreeSet::from([0, 2]));
+        assert_eq!(
+            warnings,
+            [
+                "listing the test files of rust failed: could not parse cargo workspace: cargo metadata failed; none of the requested units is in it"
+            ]
+        );
+        let e = settle_unlisted(
+            Err(anyhow::anyhow!(
+                "src/x.rs is not a test file of any project (not listed by the test runner)"
+            )),
+            &unlisted(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "src/x.rs is not a test file of any project (not listed by the test runner) (it may be in a project that could not be listed: listing the test files of rust failed: could not parse cargo workspace: cargo metadata failed)"
+        );
+        // Nothing failed to list: the result is unchanged.
+        let (selected, warnings) = settle_unlisted(Ok(BTreeSet::from([1])), &[]).unwrap();
+        assert_eq!((selected, warnings.len()), (BTreeSet::from([1]), 0));
+        let e = settle_unlisted(Err(anyhow::anyhow!("x is not a test file")), &[]).unwrap_err();
+        assert_eq!(format!("{e:#}"), "x is not a test file");
     }
 
     #[test]

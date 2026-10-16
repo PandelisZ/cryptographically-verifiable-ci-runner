@@ -18,4 +18,4 @@ rusqlite = { version = "=0.39.0", default-features = false }
 serde_json = "1.0.151"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-vci-core = { version = "1.6.0", path = "../vci-core" }
+vci-core = { version = "1.6.1", path = "../vci-core" }

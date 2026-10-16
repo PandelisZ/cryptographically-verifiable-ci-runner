@@ -1028,6 +1028,77 @@ fn multi_project_vitest_and_pytest() {
     assert!(p.skip.contains(pa), "{p:?}");
 }
 
+const BROKEN_ROOT_TOML: &str = r#"[policy]
+platform = "any"
+max_ttl = "30d"
+
+[[projects]]
+name = "rust"
+path = "."
+adapter = "cargo"
+
+[[projects]]
+name = "py"
+path = "py"
+adapter = "pytest"
+"#;
+
+/// `vci run <units>` lists every project whose directory can hold a
+/// requested unit, so a root project is always listed. When it cannot be
+/// listed (here an invalid Cargo.toml) and no requested unit is in it, the
+/// run goes on with a warning (it died: "listing the test files of rust:
+/// could not parse cargo workspace"); when a requested unit did not
+/// resolve, the error names the listing failure.
+#[test]
+fn pytest_run_fails_open_when_an_unrelated_project_cannot_be_listed() {
+    let layout = |dir: &Path| {
+        copy_pytest_fixture(&dir.join("py"));
+        std::fs::write(dir.join("Cargo.toml"), "[package\nthis is not toml\n").unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/it.rs"), "#[test]\nfn t() {}\n").unwrap();
+    };
+    let Some(w) = World::build(BROKEN_ROOT_TOML, layout, &["py"]) else {
+        return;
+    };
+    let work = w.work.clone();
+    let key = w.trusted.to_str().unwrap();
+    let pa = "py/tests/test_a.py";
+
+    let out = w.vci(&work, &["run", "--key", key, pa]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // The listing error (cargo's own message) may span lines.
+    let (_, warning) = stderr
+        .split_once("vci: warning: listing the test files of rust failed: ")
+        .unwrap_or_else(|| panic!("no warning about the rust project:\n{stderr}"));
+    let (why, _) = warning
+        .split_once("; none of the requested units is in it")
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(why.contains("could not parse cargo workspace"), "{why}");
+    let stored = AttestStore::new(&store_for(&work)).list(Some(pa)).unwrap();
+    assert_eq!(stored.len(), 1, "{pa} must be attested: {stderr}");
+    assert!(w.plan(&work, "main").skip.contains(pa));
+
+    // A requested path under the broken project does not resolve: the run
+    // fails, and the error names the listing failure as well.
+    let out = w.vci(&work, &["run", "--key", key, pa, "tests/it.rs"]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    let (_, err) = stderr
+        .split_once("vci: error: ")
+        .unwrap_or_else(|| panic!("no error:\n{stderr}"));
+    assert!(
+        err.starts_with("tests/it.rs is not a test file of any project"),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "(it may be in a project that could not be listed: listing the test files of rust failed: could not parse cargo workspace"
+        ),
+        "{err}"
+    );
+}
+
 /// uv's variables are pass-through (not hashed), so a CI that selects another
 /// interpreter (`UV_PYTHON`) must be caught by the toolchain check: the
 /// Python version has to match exactly.

@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-6-1">1.6.1</a></td><td>16 Oct 2026</td><td><code>vci run</code> with explicit files fails open on an unrelated project's listing error</td></tr>
 <tr><td><a href="#v1-6-0">1.6.0</a></td><td>16 Oct 2026</td><td>Environment policy: set, hash, ignore; nothing to export; <code>vci env</code></td></tr>
 <tr><td><a href="#v1-5-0">1.5.0</a></td><td>16 Oct 2026</td><td>vci's fixed cost per CI job drops from 12 s to about a second</td></tr>
 <tr><td><a href="#v1-4-1">1.4.1</a></td><td>15 Oct 2026</td><td>The action never compiles vci in your CI; version tags carry their own binaries</td></tr>
@@ -29,6 +30,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-6-1">1.6.1</h2>
+<p><em>16 October 2026.</em> <code>vci run &lt;files...&gt;</code> no longer aborts when a project that holds none of the requested units fails to list. In a monorepo whose root project is a Cargo workspace every path is under its directory, so a cargo probe that could not run on a CI runner killed a run that only asked for node:test and Go units. Such a project now produces one warning and the run continues; a requested path that resolves to no unit still fails, with the listing errors appended as the likely cause.</p>
 
 <h2 id="v1-6-0">1.6.0</h2>
 <p><em>16 October 2026.</em> The environment policy becomes three short lists, and nobody exports anything.</p>
