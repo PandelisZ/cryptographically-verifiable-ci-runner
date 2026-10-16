@@ -33,6 +33,8 @@ class Vci < Formula
   desc "Skip tests a trusted signer already ran against identical inputs"
   homepage "https://pandelisz.github.io/cryptographically-verifiable-ci-runner/"
   license "$license"
+  # Homebrew cannot read the version from URLs inside on_macos/on_linux blocks.
+  version "${tag#v}"
 
   on_macos do
     on_arm do
