@@ -140,11 +140,11 @@ files_of() {
 # on an import-like line add their own stem; then every test file (matching
 # $3) mentioning any collected stem is a candidate. $4: file with stems.
 import_closure() {
-  local proj=$1 srcre=$2 testre=$3 stems=$4 i pat
+  local proj=$1 srcre=$2 testre=$3 stems=$4 pat
   files_of "$proj" | grep -E "$srcre" | grep -vE "$testre" >"$T/src" || true
   files_of "$proj" | grep -E "$testre" >"$T/tests" || true
   sort -u "$stems" | grep . >"$T/seen"; cp "$T/seen" "$T/frontier"
-  for i in 1 2 3 4; do
+  for _ in 1 2 3 4; do  # four rounds of imports
     [ -s "$T/frontier" ] || break
     pat=$(sed 's/[][\.*^$+?(){}|/]/\\&/g' "$T/frontier" | paste -sd'|' -)
     pat="(import|from|require|export|load|include).*(^|[^A-Za-z0-9_])($pat)([^A-Za-z0-9_]|\$)"
@@ -257,7 +257,6 @@ go_finish() { # reverse dependencies of changed packages, per module
   for proj in $go_units_done; do
     key=$(printf '%s' "$proj" | tr '/.' '__')
     sort -u "$T/go.changed.$key" -o "$T/go.changed.$key"
-    local abs; abs=$(cd "$proj" && pwd -P)
     if command -v go >/dev/null 2>&1 && (cd "$proj" && go list -e -test \
         -f '{{.ImportPath}}	{{.Dir}}	{{join .Deps " "}}' ./... >"$T/go.list" 2>/dev/null); then
       # import paths of the changed package directories
@@ -393,11 +392,11 @@ do_rails() {
     t=$(in_proj "$proj" "$t"); [ -f "$t" ] && unit "$t" "conventional test of $f"
   done
   # Ruby code refers to constants, not files: follow constant names.
-  local i pat
+  local pat
   files_of "$proj" | grep -E "$RB_SRC" | grep -vE "$RB_TEST" >"$T/src" || true
   files_of "$proj" | grep -E "$RB_TEST" >"$T/tests" || true
   sort -u "$T/stems" | grep . >"$T/seen"; cp "$T/seen" "$T/frontier"
-  for i in 1 2 3; do
+  for _ in 1 2 3; do  # three rounds of constant references
     [ -s "$T/frontier" ] || break
     pat=$(sed 's/[][\.*^$+?(){}|/]/\\&/g' "$T/frontier" | paste -sd'|' -)
     tr '\n' '\0' <"$T/src" | xargs -0 grep -lE "(^|[^A-Za-z0-9_])($pat)([^A-Za-z0-9_]|\$)" -- 2>/dev/null \

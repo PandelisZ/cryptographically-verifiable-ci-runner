@@ -12,7 +12,7 @@ The skill does not install vci itself. Install the CLI first (`brew install pand
 `.vci/allowed_signers` on your default branch.
 
 ```
-skills/vci/
+skills/vci/                      # the skill (.agents/skills/vci is a symlink to it, for Codex)
 ├── SKILL.md                     # the workflow, mental model, safety rules
 ├── references/
 │   ├── commands.md              # verbatim `vci <command> --help` plus notes
@@ -24,6 +24,17 @@ skills/vci/
 ```
 
 ## Install
+
+Three routes, by agent:
+
+| Agent | Route |
+|---|---|
+| Claude Code | the plugin from this repository's marketplace (`/plugin install vci@pandelisz`), or a personal or project skill |
+| Codex | `$skill-installer` with this repository's GitHub path, or copy `skills/vci` into `~/.agents/skills/vci` or a repository's `.agents/skills/vci` |
+| Any agent (Claude Code, Codex, Cursor, ...) | `npx skills add PandelisZ/cryptographically-verifiable-ci-runner` |
+
+To give a whole team the skill, commit it into your repository instead: see
+[Distribute to your org](#distribute-to-your-org).
 
 ### Any agent: the `skills` CLI
 
@@ -81,12 +92,71 @@ installed from; get newer commits with `claude plugin marketplace update pandeli
 `claude plugin update vci@pandelisz` (third-party marketplaces do not auto-update unless you turn it on in
 `/plugin`).
 
-### Codex, Cursor and other agents without the CLI
+### Codex
+
+Codex reads skills from `.agents/skills/<name>/SKILL.md` in every directory from the current one up to the repository
+root, and from `~/.agents/skills/` for the user; it follows symlinked skill folders. This repository has
+`.agents/skills/vci` (a symlink to `skills/vci`), so Codex offers the skill in a clone of it without any install.
+Elsewhere, pick one:
+
+- Ask the built-in installer for it by GitHub path, in a Codex session:
+
+  ```text
+  $skill-installer install https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/skills/vci
+  ```
+
+- Copy it for yourself (every repository):
+
+  ```sh
+  git clone https://github.com/PandelisZ/cryptographically-verifiable-ci-runner.git ~/.local/share/vci-skill
+  mkdir -p ~/.agents/skills
+  cp -R ~/.local/share/vci-skill/skills/vci ~/.agents/skills/vci     # or ln -s to follow `git pull`
+  ```
+
+- Copy it into one repository: `cp -R skills/vci <repo>/.agents/skills/vci` and commit it.
+
+Codex picks up a new skill on its own; restart it if the skill does not appear. Codex requires only `name` and
+`description` in the frontmatter, which the skill has. Codex's optional `agents/openai.yaml` (display name, default
+prompt, invocation policy) is not needed.
+
+### Cursor and other agents
 
 Copy or symlink `skills/vci` into the agent's skill directory. The `skills` CLI uses `.agents/skills/` (project) and
 `~/.agents/skills/` (user) for Codex, Cursor, Gemini CLI, GitHub Copilot and OpenCode; other agents have their own
 directories (`.windsurf/skills/`, `.roo/skills/`, `.kiro/skills/`, ...). The skill uses only the portable
 `SKILL.md` fields (`name`, `description`, `license`, `compatibility`, `metadata`).
+
+## Distribute to your org
+
+Engineers should not each have to find and install the skill. Commit it into the repository where vci runs, once,
+at the paths both agents read, with one real copy:
+
+```sh
+mkdir -p .agents/skills .claude/skills
+cp -R <vci checkout>/skills/vci .agents/skills/vci     # the copy Codex reads
+ln -s ../../.agents/skills/vci .claude/skills/vci      # Claude Code follows the symlink
+git add .agents/skills/vci .claude/skills/vci
+```
+
+(`npx skills add PandelisZ/cryptographically-verifiable-ci-runner --skill vci --agent claude-code codex -y` produces
+the same layout and records the source in `skills-lock.json`.) Every engineer who opens the repository in Codex or
+Claude Code then has the skill, and updates arrive with `git pull`.
+
+Then make it yours. The generic skill knows vci; it does not know your repository. Teams get the most from a skill
+that also states, in its body:
+
+- the default branch (`origin/master` or `origin/main`) and that it never skips;
+- each project in `vci.toml`, its unit ids and how slow its units are;
+- the environment values to export (or `vci env`, when vci has it), and services such as a test database;
+- how an engineer gets their key into `.vci/allowed_signers`: who reviews it, and the principal to use.
+
+The vex monorepo does this: its `vci` skill sits at `.agents/skills/vci` with `.claude/skills/vci` linking to it,
+adds its own projects and gotchas, and ships `scripts/setup.sh`, which sets up each engineer: it installs or upgrades
+vci, finds the SSH key GitHub knows for them, opens the pull request that adds it to `.vci/allowed_signers`, checks
+the environment and runs `vci plan` (`--check` reports only, `--dry-run` prints every action, `--no-pr` skips the
+pull request, and the shell profile is written only by a separate, profile-only `--write-profile` run). An engineer
+says "set up vci" to their agent and is done after one review. Keep a repository skill's name `vci` only if engineers
+do not also install the generic one, or rename it (`<repo>-vci`) so the two are not confused.
 
 ## Using it
 
@@ -122,5 +192,9 @@ Checked on macOS arm64 on 2026-10-13, before the skill was pushed:
 - The skill's workflow was run end to end in a scratch clone with a throwaway key: `units-for-change.sh` →
   `vci run demo/go-app/b` (attested) → `vci plan` → `vci explain` (`failed check: signer`, as expected for a key that
   is not in the base branch's `allowed_signers`), and the `--format json` one-liner.
-- Not verified: loading the skill in a live Codex, Cursor or Gemini CLI session, and the personal-skill symlink in
-  a live Claude Code session.
+- Checked on 2026-10-15: with the `.agents/skills/vci` symlink added, `npx skills add <this checkout> --list`
+  (skills CLI 1.7.2) still finds exactly one skill, `vci`. Codex's skills documentation says it scans `.agents/skills`
+  from the working directory to the repository root and follows symlinked skill folders; Claude Code's says a
+  project or personal skill entry can be a symlink to a directory.
+- Not verified: loading the skill in a live Codex, Cursor or Gemini CLI session, `$skill-installer` with the GitHub
+  path, and the personal-skill symlink in a live Claude Code session.
