@@ -10,10 +10,15 @@
 //! per-run plumbing (`--test-concurrency`, `--test-reporter`) is dropped,
 //! and anything else is refused, so nothing is attested and CI runs it.
 //!
-//! Each file runs in its own `node --test` process:
+//! A recording run (`vci run`, `vci ci --key`) runs each file in its own
+//! `node --test` process:
 //! `node --require <collector> <user flags> --import <late hooks>
 //! --test-reporter=<vci reporter> --test-reporter=spec --test <file>`. The
 //! collectors are the `@vci/vitest` package's `src/node-test/` modules.
+//! A plain run (`vci ci` without `--key`: nothing recorded) of some files
+//! is one process, the test command restricted to them:
+//! `<assignments> node <every option of the command> --test <files>`; of
+//! every file, the command itself (`<package manager> run <script>`).
 
 mod shell;
 
@@ -101,6 +106,11 @@ pub struct Invocation {
     pub assignments: Vec<(String, String)>,
     /// Kept node options, normalised (`--import=./x.mjs`), in order.
     pub flags: Vec<String>,
+    /// Every node option of the command, normalised, in order: the kept
+    /// ones and the per-run plumbing vci's recording runs drop
+    /// (`--test-concurrency`, `--test-reporter`, `--test-isolation=process`).
+    /// What a plain run (nothing recorded) passes to node.
+    pub plain_flags: Vec<String>,
     /// Test file patterns (node:test globs).
     pub patterns: Vec<String>,
     pub preloads: Vec<Preload>,
@@ -393,12 +403,14 @@ fn parse_node_args(
                 if name.contains("strip-types") || name.contains("transform-types") {
                     inv.strip_flags.push(name.clone());
                 }
+                inv.plain_flags.push(name.clone());
                 inv.flags.push(name);
             }
             Class::KeepEqValue => {
                 let Some(v) = inline else {
                     return Err(format!("{name} must be written as {name}=<value>"));
                 };
+                inv.plain_flags.push(format!("{name}={v}"));
                 inv.flags.push(format!("{name}={v}"));
             }
             Class::KeepValue => {
@@ -431,6 +443,7 @@ fn parse_node_args(
                     }
                     _ => {}
                 }
+                inv.plain_flags.push(format!("{name}={v}"));
                 inv.flags.push(format!("{name}={v}"));
             }
             Class::DropValue => {
@@ -439,11 +452,13 @@ fn parse_node_args(
                     let n: usize = v.parse().map_err(|_| format!("{name}={v}: not a number"))?;
                     inv.concurrency = (n > 0).then_some(n);
                 }
+                inv.plain_flags.push(format!("{name}={v}"));
             }
             Class::Refuse(why) => {
                 if name == "--test-isolation" {
                     let v = value(&name)?;
                     if v == "process" {
+                        inv.plain_flags.push(format!("{name}={v}"));
                         continue;
                     }
                     return Err(format!("--test-isolation={v}: {why}"));
@@ -1140,14 +1155,34 @@ impl NodeTestAdapter {
             .collect()
     }
 
-    /// The node arguments of one test file's process (without the leading
-    /// collector flags).
-    fn file_args(&self, inv: &Invocation, abs: &Utf8Path) -> Result<Vec<String>, AdapterError> {
-        let pattern = glob_escape(abs.as_str()).map_err(AdapterError::NotFound)?;
-        let mut a: Vec<String> = inv.flags.clone();
+    /// The node arguments of a plain run (nothing recorded) of `patterns`:
+    /// the command's own options (`--import` hooks, type stripping,
+    /// `--test-concurrency`, its reporters), node:test's `spec` reporter
+    /// when the command names none, `--test`, the patterns.
+    fn plain_args(inv: &Invocation, patterns: &[String]) -> Vec<String> {
+        let mut a = inv.plain_flags.clone();
+        if !a.iter().any(|f| f.starts_with("--test-reporter=")) {
+            a.push("--test-reporter=spec".into());
+        }
         a.push("--test".into());
-        a.push(pattern);
-        Ok(a)
+        a.extend(patterns.iter().cloned());
+        a
+    }
+
+    /// One `node --test` process running `args` (from [`Self::plain_args`])
+    /// as the test command would: from the project dir, with its `NAME=value`
+    /// assignments; node's output on stderr. Returns node's exit code.
+    fn run_plain_node(
+        &self,
+        inv: &Invocation,
+        args: &[String],
+        env: &ChildEnv,
+    ) -> Result<Option<i32>, AdapterError> {
+        let mut cmd = self.node_cmd();
+        cmd.args(args);
+        self.apply_test_env(&mut cmd, env, inv);
+        cmd.stdin(Stdio::null()).stdout(std::io::stderr());
+        Ok(cmd.status()?.code())
     }
 
     /// Run `files` (project-relative) one per process, at most `jobs` at a
@@ -1478,11 +1513,8 @@ impl Adapter for NodeTestAdapter {
             // Everything: the user's own command.
             match self.invocation() {
                 Ok(inv) if inv.script.is_none() => {
-                    let mut cmd = self.node_cmd();
-                    cmd.args(&inv.flags).arg("--test").args(&inv.patterns);
-                    self.apply_test_env(&mut cmd, env, inv);
-                    cmd.stdin(Stdio::null()).stdout(std::io::stderr());
-                    return Ok(cmd.status()?.code());
+                    let args = Self::plain_args(inv, &inv.patterns);
+                    return self.run_plain_node(inv, &args, env);
                 }
                 _ if self.options.test_globs.is_some() => {
                     return Err(self.invocation().err().unwrap_or_else(|| {
@@ -1510,37 +1542,64 @@ impl Adapter for NodeTestAdapter {
             }
         }
         let inv = self.invocation()?;
-        if let Some(f) = files
-            .iter()
-            .find(|f| glob_escape(self.project_dir.join(f).as_str()).is_err())
-        {
-            eprintln!(
-                "vci: {f} cannot run on its own (node:test's glob cannot name it): running every test file"
-            );
-            return self.run_plain(&[], env);
-        }
-        let make = |_i: usize, abs: &Utf8Path| -> Result<Command, AdapterError> {
-            let mut cmd = self.node_cmd();
-            let args = self.file_args(inv, abs)?;
-            let (pattern, flags) = args.split_last().expect("non-empty");
-            cmd.args(flags)
-                .arg("--test-reporter=spec")
-                .arg("--test-reporter-destination=stdout")
-                .arg(pattern);
-            self.apply_test_env(&mut cmd, env, inv);
-            Ok(cmd)
-        };
-        let statuses = self.run_each(files, &make)?;
-        let mut code = Some(0);
-        for (_, st) in statuses {
-            match (code, st.code()) {
-                (Some(0), c) => code = c,
-                (Some(_), None) => code = None,
-                _ => {}
+        // One `node --test` process for every file, as the test command
+        // runs them, restricted to these files (each a literal glob).
+        let mut patterns: Vec<String> = Vec::with_capacity(files.len());
+        for f in files {
+            // A path starting with `-` would read as an option: absolute.
+            let p = if f.starts_with('-') {
+                self.project_dir.join(f).into_string()
+            } else {
+                f.clone()
+            };
+            match glob_escape(&p) {
+                Ok(p) => patterns.push(p),
+                Err(_) => {
+                    eprintln!(
+                        "vci: {f} cannot run on its own (node:test's glob cannot name it): running every test file"
+                    );
+                    return self.run_plain(&[], env);
+                }
             }
         }
-        Ok(code)
+        let args = Self::plain_args(inv, &patterns);
+        eprintln!(
+            "vci: node-test: {}",
+            plain_command_line(&inv.assignments, &args, PRINTED_FILES)
+        );
+        self.run_plain_node(inv, &args, env)
     }
+}
+
+/// How many test files [`plain_command_line`] names before `(+N more)`.
+const PRINTED_FILES: usize = 20;
+
+/// A plain run's command as `sh` would read it (assignments, `node`, the
+/// arguments), naming at most `max_files` of the patterns after `--test`.
+fn plain_command_line(
+    assignments: &[(String, String)],
+    args: &[String],
+    max_files: usize,
+) -> String {
+    let mut words: Vec<String> = assignments
+        .iter()
+        .map(|(k, v)| format!("{k}={}", sh_quote(v)))
+        .collect();
+    words.push("node".into());
+    let test = args
+        .iter()
+        .position(|a| a == "--test")
+        .unwrap_or(args.len());
+    words.extend(args[..test.min(args.len())].iter().map(|a| sh_quote(a)));
+    if test < args.len() {
+        words.push("--test".into());
+        let files = &args[test + 1..];
+        words.extend(files.iter().take(max_files).map(|a| sh_quote(a)));
+        if files.len() > max_files {
+            words.push(format!("(+{} more)", files.len() - max_files));
+        }
+    }
+    words.join(" ")
 }
 
 #[cfg(test)]
@@ -1588,6 +1647,80 @@ mod tests {
         let only = |k: &str| (k == "TEST_CONCURRENCY").then(|| "1 --test-only".to_owned());
         let e = parse_script(s, &cwd(), &only).unwrap_err();
         assert!(e.contains("--test-only"), "{e}");
+    }
+
+    /// The plain run (nothing recorded) of some files is the script's own
+    /// command restricted to them: every option, the per-run plumbing a
+    /// recording run drops included, then the files.
+    #[test]
+    fn plain_run_keeps_every_option_of_the_script() {
+        let s = "NODE_ENV=test FOO='a b' node --experimental-strip-types --import ./test/register-hooks.mjs --test ${TEST_CONCURRENCY:+--test-concurrency=$TEST_CONCURRENCY} --test-isolation=process 'src/**/*.test.ts'";
+        let four = |k: &str| (k == "TEST_CONCURRENCY").then(|| "4".to_owned());
+        let inv = parse_script(s, &cwd(), &four).unwrap();
+        assert_eq!(
+            inv.flags,
+            [
+                "--experimental-strip-types",
+                "--import=./test/register-hooks.mjs"
+            ]
+        );
+        assert_eq!(
+            inv.plain_flags,
+            [
+                "--experimental-strip-types",
+                "--import=./test/register-hooks.mjs",
+                "--test-concurrency=4",
+                "--test-isolation=process"
+            ]
+        );
+        let files = ["src/a.test.ts".to_owned(), "src/[id].test.ts".to_owned()];
+        let args = NodeTestAdapter::plain_args(&inv, &files);
+        assert_eq!(
+            args,
+            [
+                "--experimental-strip-types",
+                "--import=./test/register-hooks.mjs",
+                "--test-concurrency=4",
+                "--test-isolation=process",
+                "--test-reporter=spec",
+                "--test",
+                "src/a.test.ts",
+                "src/[id].test.ts"
+            ]
+        );
+        assert_eq!(
+            plain_command_line(&inv.assignments, &args, 1),
+            "NODE_ENV=test FOO='a b' node --experimental-strip-types --import=./test/register-hooks.mjs --test-concurrency=4 --test-isolation=process --test-reporter=spec --test src/a.test.ts (+1 more)"
+        );
+        // The script's own reporters are kept (no spec added).
+        let inv = parse_script(
+            "node --test-reporter junit --test-reporter-destination=out.xml --test 'src/*.test.mjs'",
+            &cwd(),
+            &no_env,
+        )
+        .unwrap();
+        assert!(inv.flags.is_empty());
+        assert_eq!(
+            NodeTestAdapter::plain_args(&inv, &["src/b.test.mjs".to_owned()]),
+            [
+                "--test-reporter=junit",
+                "--test-reporter-destination=out.xml",
+                "--test",
+                "src/b.test.mjs"
+            ]
+        );
+        // test_globs + node_args: the same.
+        let inv = from_globs(
+            &["src/*.test.mjs".to_owned()],
+            &[
+                "--test-concurrency=1".to_owned(),
+                "--no-warnings".to_owned(),
+            ],
+            &cwd(),
+        )
+        .unwrap();
+        assert_eq!(inv.flags, ["--no-warnings"]);
+        assert_eq!(inv.plain_flags, ["--test-concurrency=1", "--no-warnings"]);
     }
 
     #[test]

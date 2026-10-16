@@ -26,6 +26,13 @@ inputs:
   audit-log:
     description: Where `vci ci` writes the JSON audit log of skipped and run tests.
     default: vci-audit.json
+  project:
+    description: >
+      Only these projects of a multi-project vci.toml (names from its
+      `[[projects]]` entries, space separated). Other projects are not listed,
+      probed or run: a job that owns one suite names its project here and
+      needs only that project's toolchain. Empty: every project.
+    default: ""
   working-directory:
     description: Directory inside the repository to run vci from.
     default: .
@@ -203,11 +210,14 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        PROJECT: ${{ inputs.project }}
         BASE: ${{ inputs.base-ref }}
         REMOTE: ${{ inputs.remote }}
       run: |
         set -o pipefail
-        vci plan --fetch "$REMOTE" --base-ref "$BASE" --format text | tee "$RUNNER_TEMP/vci-plan.txt"
+        projects=()
+        for p in $PROJECT; do projects+=(--project "$p"); done
+        vci plan --fetch "$REMOTE" --base-ref "$BASE" --format text "${projects[@]}" | tee "$RUNNER_TEMP/vci-plan.txt"
         echo "skipped=$(grep -c '^SKIP ' "$RUNNER_TEMP/vci-plan.txt" || true)" >> "$GITHUB_OUTPUT"
         echo "run=$(grep -c '^RUN ' "$RUNNER_TEMP/vci-plan.txt" || true)" >> "$GITHUB_OUTPUT"
         {
@@ -240,6 +250,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        PROJECT: ${{ inputs.project }}
         BASE: ${{ inputs.base-ref }}
         AUDIT: ${{ inputs.audit-log }}
         SIGN: ${{ inputs.signing-key != '' }}
@@ -248,6 +259,7 @@ runs:
         REMOTE: ${{ inputs.remote }}
       run: |
         args=(--fetch "$REMOTE" --base-ref "$BASE" --audit-log "$AUDIT")
+        for p in $PROJECT; do args+=(--project "$p"); done
         if [ "$SIGN" = "true" ]; then
           args+=(--key "$RUNNER_TEMP/vci-key" --ttl "$TTL")
           if [ "$PUSH" = "true" ]; then

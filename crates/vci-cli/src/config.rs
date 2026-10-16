@@ -864,6 +864,32 @@ impl Config {
         !self.projects.is_empty()
     }
 
+    /// `--project NAME`...: keep only the named `[[projects]]` entries (in
+    /// file order), so nothing else is listed, probed, verified or run. No
+    /// names keeps every project. An unknown name, and any name in the
+    /// single-project form (its project has no name), is an error; `which`
+    /// says which vci.toml this is (for the message).
+    pub fn select_projects(&mut self, names: &[String], which: &str) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        if !self.is_multi() {
+            bail!(
+                "--project {}: {which} has the single-project form, whose one project has no name; --project selects [[projects]] entries by name (drop --project)",
+                names[0]
+            );
+        }
+        let known: Vec<&str> = self.projects.iter().map(|p| p.name.as_str()).collect();
+        if let Some(n) = names.iter().find(|n| !known.contains(&n.as_str())) {
+            bail!(
+                "--project {n}: no such project in {which} (its projects: {})",
+                known.join(", ")
+            );
+        }
+        self.projects.retain(|p| names.contains(&p.name));
+        Ok(())
+    }
+
     /// Effective configuration of every project, in file order.
     pub fn project_specs(&self) -> Vec<ProjectSpec> {
         if self.projects.is_empty() {
@@ -1579,6 +1605,78 @@ hash = ["TZ", "APP_*"]
         assert_eq!(s[1].policy.max_ttl, "20d");
         assert_eq!(s[1].policy.no_skip_refs, ["refs/heads/main"]);
         assert_eq!(s[1].env.hash, ["TZ", "APP_*"]);
+    }
+
+    /// `--project`: only the named `[[projects]]` entries are kept, in file
+    /// order; an unknown name names the configured ones; the single-project
+    /// form has no names.
+    #[test]
+    fn select_projects_keeps_the_named_ones() {
+        let three = r#"[policy]
+max_ttl = "20d"
+
+[[projects]]
+name = "a"
+path = "a"
+adapter = "cargo"
+
+[[projects]]
+name = "b"
+path = "b"
+adapter = "pytest"
+[projects.policy]
+platform = "exact"
+
+[[projects]]
+name = "c"
+path = "c"
+adapter = "node-test"
+"#;
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = Config::parse(three).unwrap();
+        let mut all = c.clone();
+        all.select_projects(&[], "vci.toml").unwrap();
+        assert_eq!(all, c, "no --project keeps every project");
+
+        let mut b = c.clone();
+        b.select_projects(&names(&["b"]), "vci.toml").unwrap();
+        assert!(b.is_multi());
+        let s = b.project_specs();
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].name.as_str(), s[0].adapter.as_str()), ("b", "pytest"));
+        assert_eq!(s[0].policy.platform, Platform::Exact);
+        assert_eq!(s[0].policy.max_ttl, "20d");
+
+        // Repeated: file order, duplicates are harmless.
+        let mut ca = c.clone();
+        ca.select_projects(&names(&["c", "a", "c"]), "vci.toml")
+            .unwrap();
+        let got: Vec<String> = ca.project_specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(got, ["a", "c"]);
+
+        let e = c
+            .clone()
+            .select_projects(&names(&["b", "web"]), "vci.toml at the base commit")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "--project web: no such project in vci.toml at the base commit (its projects: a, b, c)"
+        );
+
+        let single = Config::parse("project = \".\"\nadapter = \"pytest\"\n").unwrap();
+        let e = single
+            .clone()
+            .select_projects(&names(&["b"]), "vci.toml")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("--project b: vci.toml has the single-project form"),
+            "{e}"
+        );
+        let mut kept = single.clone();
+        kept.select_projects(&[], "vci.toml").unwrap();
+        assert_eq!(kept, single);
     }
 
     #[test]

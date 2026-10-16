@@ -213,6 +213,9 @@ pub struct PlanOptions {
     /// Fetch attestations first, as `vci fetch` does (`Some(None)`: the
     /// default remote), while the projects are probed; fail-open.
     pub fetch: Option<Option<String>>,
+    /// `--project`: only these `[[projects]]` (empty: every project). The
+    /// others are not listed, probed or verified.
+    pub projects: Vec<String>,
 }
 
 /// Resolve the base ref: explicit, `$VCI_BASE_REF`, `$GITHUB_BASE_REF`
@@ -572,8 +575,7 @@ fn plan_with(
         Ok(x) => x,
         Err(e) => {
             res.run_all = Some(e);
-            fallback_listing(res, repo, root);
-            return Ok(());
+            return fallback_listing(opts, res, repo, root);
         }
     };
     if let Some(w) = self_referential_base(&repo, &base_ref, &base) {
@@ -590,25 +592,26 @@ fn plan_with(
             Ok(c) => c,
             Err(e) => {
                 res.run_all = Some(format!("{CONFIG_FILE} at base is invalid: {e:#}"));
-                fallback_listing(res, repo, root);
-                return Ok(());
+                return fallback_listing(opts, res, repo, root);
             }
         },
         Ok(None) => {
             res.run_all = Some(format!("{CONFIG_FILE} is missing at the base commit"));
-            fallback_listing(res, repo, root);
-            return Ok(());
+            return fallback_listing(opts, res, repo, root);
         }
         Err(e) => {
             res.run_all = Some(format!("reading {CONFIG_FILE} at base: {e}"));
-            fallback_listing(res, repo, root);
-            return Ok(());
+            return fallback_listing(opts, res, repo, root);
         }
     };
     for w in config.warnings(&format!("{CONFIG_FILE} at the base commit")) {
         eprintln!("vci: warning: {w}");
         res.warnings.push(w);
     }
+    // `--project`: the other projects are not listed, probed or verified
+    // (their toolchains may be missing in this job).
+    let mut config = config;
+    config.select_projects(&opts.projects, &format!("{CONFIG_FILE} at the base commit"))?;
     let allowed = match repo.show_file(&base, ALLOWED_SIGNERS_FILE) {
         Ok(Some(bytes)) => match std::str::from_utf8(&bytes)
             .map_err(|e| e.to_string())
@@ -872,9 +875,18 @@ fn finish(res: &mut PlanResult) {
 
 /// When policy can't be read, still try to list files so the output names
 /// them (everything runs).
-fn fallback_listing(res: &mut PlanResult, repo: Repo, root: camino::Utf8PathBuf) {
+fn fallback_listing(
+    opts: &PlanOptions,
+    res: &mut PlanResult,
+    repo: Repo,
+    root: camino::Utf8PathBuf,
+) -> Result<()> {
     let reason = res.run_all.clone().unwrap_or_default();
-    let config = crate::ctx::working_tree_config(&root).unwrap_or_default();
+    let mut config = crate::ctx::working_tree_config(&root).unwrap_or_default();
+    config.select_projects(
+        &opts.projects,
+        &format!("{CONFIG_FILE} in the working tree"),
+    )?;
     res.multi = config.is_multi();
     res.config = Some(config.clone());
     if let Ok(ctx) = Ctx::new(repo, root, config) {
@@ -905,6 +917,7 @@ fn fallback_listing(res: &mut PlanResult, repo: Repo, root: camino::Utf8PathBuf)
         res.files = files.iter().map(|f| verdict_run(f, &reason)).collect();
     }
     finish(res);
+    Ok(())
 }
 
 impl Verifier<'_> {
@@ -2374,6 +2387,151 @@ mod tests {
                 "entry:src/pkg/__init__.cp314-win_amd64.pyd"
             ]
         );
+    }
+
+    /// A git repository at a temp dir with `files` committed on `main`.
+    fn commit_repo(files: &[(&str, &str)]) -> (tempfile::TempDir, camino::Utf8PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        (t, root)
+    }
+
+    fn plan_in(root: &camino::Utf8Path, projects: &[&str]) -> Result<PlanResult> {
+        let opts = PlanOptions {
+            base_ref: Some("HEAD".into()),
+            only: None,
+            fetch: None,
+            projects: projects.iter().map(|p| p.to_string()).collect(),
+        };
+        let mut res = PlanResult {
+            base_ref: None,
+            base_commit: None,
+            run_all: None,
+            warnings: vec![],
+            projects: vec![],
+            files: vec![],
+            multi: false,
+            config: None,
+            allowed: None,
+            fetch_failed: None,
+        };
+        let repo = Repo::discover(root).unwrap();
+        plan_with(&opts, repo, root.to_owned(), &mut res, &mut None).map(|()| res)
+    }
+
+    /// `--project b` of three projects: only b is listed and planned (a, a
+    /// Cargo project whose Cargo.toml is invalid, is never touched); an
+    /// unknown name names the configured projects; the single-project form
+    /// has no names. (No allowed_signers: nothing is resolved, everything
+    /// runs, which is all this needs.)
+    #[test]
+    fn plan_with_project_lists_only_that_project() {
+        let toml = r#"[[projects]]
+name = "a"
+path = "a"
+adapter = "cargo"
+
+[[projects]]
+name = "b"
+path = "b"
+adapter = "pytest"
+
+[[projects]]
+name = "c"
+path = "c"
+adapter = "pytest"
+"#;
+        let (_t, root) = commit_repo(&[
+            ("vci.toml", toml),
+            ("a/Cargo.toml", "[package\nthis is not toml\n"),
+            ("a/tests/it.rs", "#[test]\nfn t() {}\n"),
+            ("b/pytest.ini", "[pytest]\n"),
+            ("b/tests/test_b1.py", "def test_b1():\n    pass\n"),
+            ("b/tests/test_b2.py", "def test_b2():\n    pass\n"),
+            ("c/pytest.ini", "[pytest]\n"),
+            ("c/tests/test_c.py", "def test_c():\n    pass\n"),
+        ]);
+        let res = plan_in(&root, &["b"]).unwrap();
+        assert!(res.multi);
+        let names: Vec<&str> = res.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["b"]);
+        let ids: Vec<&str> = res.files.iter().map(|f| f.test_id.as_str()).collect();
+        assert_eq!(ids, ["b/tests/test_b1.py", "b/tests/test_b2.py"]);
+        assert!(
+            res.files
+                .iter()
+                .all(|f| f.project == "b" && f.project_idx == 0)
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("a:") || w.contains("cargo")),
+            "{:?}",
+            res.warnings
+        );
+        // What `vci ci --key` runs and attests with is the same selection.
+        let cfg = res.config.as_ref().unwrap();
+        assert_eq!(cfg.projects.len(), 1);
+        assert_eq!(cfg.projects[0].name, "b");
+        let text = {
+            let mut lines: Vec<String> = res
+                .files
+                .iter()
+                .map(|f| format!("{} [{}]", f.test_id, f.project))
+                .collect();
+            lines.push(summary_line(&res));
+            lines.join("\n")
+        };
+        assert!(!text.contains("[a]") && !text.contains("[c]"), "{text}");
+
+        // Without --project every project is planned (a's listing fails).
+        let res = plan_in(&root, &[]).unwrap();
+        let names: Vec<&str> = res.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+
+        let e = plan_in(&root, &["b", "web"]).err().unwrap().to_string();
+        assert_eq!(
+            e,
+            "--project web: no such project in vci.toml at the base commit (its projects: a, b, c)"
+        );
+
+        let (_t, single) = commit_repo(&[
+            ("vci.toml", "project = \".\"\nadapter = \"pytest\"\n"),
+            ("tests/test_x.py", "def test_x():\n    pass\n"),
+        ]);
+        let e = plan_in(&single, &["b"]).err().unwrap().to_string();
+        assert!(
+            e.starts_with("--project b: vci.toml at the base commit has the single-project form"),
+            "{e}"
+        );
+        assert_eq!(plan_in(&single, &[]).unwrap().projects.len(), 1);
     }
 
     #[test]

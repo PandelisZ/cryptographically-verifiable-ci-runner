@@ -84,6 +84,8 @@ Usage: vci plan [OPTIONS]
 Options:
       --base-ref <BASE_REF>  
       --format <FORMAT>      [default: text] [possible values: text, json, github]
+      --fetch [<REMOTE>]     Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`
+      --project <NAME>       Only this `[[projects]]` entry (by name; repeatable): the other projects are not listed, probed or verified. Not for the single-project form
   -h, --help                 Print help
 ```
 
@@ -96,6 +98,7 @@ Options:
   `vci plan --base-ref origin/main --format json | python3 -c 'import json,sys; [print(f["testId"]) for f in json.load(sys.stdin)["files"] if not f["skip"]]'`
 - `--format github`: `::notice`/`::warning` lines and outputs for Actions.
 - Reads attestations from the local store only: run `vci fetch` first to see other people's.
+- `--project NAME` (repeatable; `[[projects]]` names of the base commit's vci.toml): only those projects are listed, probed and verified; the others are not touched (their toolchains need not be installed) and are absent from the output. An unknown name is an error naming the configured projects; the single-project form has no names (`--project` is an error there).
 
 ## vci ci
 
@@ -111,11 +114,14 @@ Options:
       --ttl <TTL>              Attestation lifetime (with --key) [default: 14d]
       --push                   Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code)
       --remote <REMOTE>        git-meta remote, or a git remote / URL, to push to (as `vci push --remote`)
+      --fetch [<REMOTE>]       Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`
+      --project <NAME>         Only this `[[projects]]` entry (by name; repeatable): the other projects are not listed, probed, verified or run. Not for the single-project form
   -h, --help                   Print help
 ```
 
-- `vci plan`, then runs every unit not skipped (each in its own process, the same way `vci run` ran it; Rails: a project's remaining files in one `bin/rails test <files>` or `rspec <files>` process, the engine's own way) and exits non-zero if any fails. Writes a JSON audit log of every skip (signer, unit, reason) with `--audit-log`.
+- `vci plan`, then runs every unit not skipped (each in its own process, the same way `vci run` ran it; Rails: a project's remaining files in one `bin/rails test <files>` or `rspec <files>` process, the engine's own way; node-test without `--key`: one `node --test` process, the package.json script's assignments and options followed by the files, printed as `vci: node-test: <command>`, or the script itself when nothing of the project is skipped) and exits non-zero if any fails. Writes a JSON audit log of every skip (signer, unit, reason) with `--audit-log`.
 - Normally only run in CI (the GitHub Action runs it). Locally it is a way to run exactly what CI would run.
+- `--project NAME` (repeatable) as for `vci plan`: one job per suite in a monorepo (`vci ci --fetch origin --base-ref "$BASE" --project web`); only those projects run (and are attested with `--key`) and appear in the audit log.
 - When every unit is skipped it prints `vci ci: every test file is covered by a valid attestation; nothing to run` and does not start the test runner.
 - `--key PATH` (CI's own key, the action's `signing-key`): the units left run as `vci run --key` runs them and every one that passed and is attestable is attested; when the plan runs everything (`running everything: ...`), every unit is. Refused or failing units still run; only test failures make the exit code non-zero. The next commit's CI skips each attested unit whose inputs did not change. `--ttl` (default `14d`) only with `--key`.
 - `--push` (only with `--key`) publishes afterwards as `vci push` does, whatever the tests did; `--remote R` (only with `--push`) as `vci push --remote`. A failed push prints `::warning title=vci::could not push attestations ...` and does not change the exit code.

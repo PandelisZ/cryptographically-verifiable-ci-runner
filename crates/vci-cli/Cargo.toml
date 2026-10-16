@@ -17,10 +17,10 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 toml = "1.1.6"
-vci-adapter = { version = "1.6.1", path = "../vci-adapter" }
-vci-attest = { version = "1.6.1", path = "../vci-attest" }
-vci-core = { version = "1.6.1", path = "../vci-core" }
-vci-git = { version = "1.6.1", path = "../vci-git" }
+vci-adapter = { version = "1.6.2", path = "../vci-adapter" }
+vci-attest = { version = "1.6.2", path = "../vci-attest" }
+vci-core = { version = "1.6.2", path = "../vci-core" }
+vci-git = { version = "1.6.2", path = "../vci-git" }
 
 [[bin]]
 name = "vci"

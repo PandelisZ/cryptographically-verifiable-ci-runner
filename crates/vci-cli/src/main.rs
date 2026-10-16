@@ -87,6 +87,9 @@ enum Cmd {
         /// Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`.
         #[arg(long, value_name = "REMOTE", num_args = 0..=1, default_missing_value = "")]
         fetch: Option<String>,
+        /// Only this `[[projects]]` entry (by name; repeatable): the other projects are not listed, probed or verified. Not for the single-project form.
+        #[arg(long = "project", value_name = "NAME")]
+        project: Vec<String>,
     },
     /// Plan, run the remaining tests, and write an audit log of the skips (with --key: attest what runs).
     Ci {
@@ -109,6 +112,9 @@ enum Cmd {
         /// Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`.
         #[arg(long, value_name = "REMOTE", num_args = 0..=1, default_missing_value = "")]
         fetch: Option<String>,
+        /// Only this `[[projects]]` entry (by name; repeatable): the other projects are not listed, probed, verified or run. Not for the single-project form.
+        #[arg(long = "project", value_name = "NAME")]
+        project: Vec<String>,
     },
     /// Verify one attestation envelope (file path or `-`).
     Verify {
@@ -231,10 +237,12 @@ fn main() {
             base_ref,
             format,
             fetch,
+            project,
         } => plan::plan(&plan::PlanOptions {
             base_ref,
             only: None,
             fetch: fetch_remote(fetch),
+            projects: project,
         })
         .and_then(|res| {
             let format = match format {
@@ -259,6 +267,7 @@ fn main() {
             push,
             remote,
             fetch,
+            project,
         } => cmds::ci(cmds::CiArgs {
             base_ref,
             audit_log,
@@ -267,6 +276,7 @@ fn main() {
             push,
             remote,
             fetch: fetch_remote(fetch),
+            projects: project,
         }),
         Cmd::Verify {
             envelope,
@@ -293,6 +303,7 @@ fn main() {
                 base_ref,
                 only: Some(id.clone()),
                 fetch: None,
+                projects: vec![],
             })?;
             plan::explain(&res, &id)
         }),
@@ -303,5 +314,62 @@ fn main() {
             eprintln!("vci: error: {e:#}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--project NAME` is repeatable on `vci ci` and `vci plan`; without it
+    /// every project is selected (an empty list).
+    #[test]
+    fn project_flag_is_repeatable_on_ci_and_plan() {
+        let cli = Cli::try_parse_from([
+            "vci",
+            "ci",
+            "--fetch",
+            "origin",
+            "--base-ref",
+            "abc",
+            "--project",
+            "vex-web",
+            "--project=rails",
+        ])
+        .unwrap();
+        let Cmd::Ci {
+            project,
+            fetch,
+            base_ref,
+            ..
+        } = cli.cmd
+        else {
+            panic!("not ci")
+        };
+        assert_eq!(project, ["vex-web", "rails"]);
+        assert_eq!(fetch.as_deref(), Some("origin"));
+        assert_eq!(base_ref.as_deref(), Some("abc"));
+
+        let cli = Cli::try_parse_from(["vci", "plan", "--project", "b"]).unwrap();
+        let Cmd::Plan { project, .. } = cli.cmd else {
+            panic!("not plan")
+        };
+        assert_eq!(project, ["b"]);
+
+        let cli = Cli::try_parse_from(["vci", "ci"]).unwrap();
+        let Cmd::Ci { project, .. } = cli.cmd else {
+            panic!("not ci")
+        };
+        assert!(project.is_empty());
+
+        // A name is required; `vci run` has no --project.
+        assert!(Cli::try_parse_from(["vci", "ci", "--project"]).is_err());
+        assert!(Cli::try_parse_from(["vci", "run", "--project", "b"]).is_err());
+        // `vci env --project` is unchanged (one name).
+        let cli = Cli::try_parse_from(["vci", "env", "--project", "b"]).unwrap();
+        let Cmd::Env { project, .. } = cli.cmd else {
+            panic!("not env")
+        };
+        assert_eq!(project.as_deref(), Some("b"));
     }
 }

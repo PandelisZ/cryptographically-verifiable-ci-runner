@@ -791,7 +791,7 @@ fn push_fetch_fresh_clone_and_ci() {
         "same plan after push + fetch"
     );
 
-    // `vci ci` runs only A and D, one `node --test` process each.
+    // `vci ci` runs only A and D, in one `node --test` process.
     let audit = w.base.join("audit.json");
     let out = w.vci(
         &fresh,
@@ -846,6 +846,129 @@ fn push_fetch_fresh_clone_and_ci() {
     w.git(&fresh, &["checkout", "-q", "-b", "release/1"]);
     let p = w.plan(&fresh, "main");
     assert!(p.run_all.is_some() && p.skip.is_empty(), "{p:?}");
+}
+
+/// A test file that appends the pid of its parent (the `node --test`
+/// process that started it) to `.vci/out/ppids` (ignored by git).
+const PPID_TEST: &str = r#"import fs from "node:fs";
+import { test } from "node:test";
+
+test("records its runner", () => {
+  const dir = new URL("../.vci/out/", import.meta.url);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(new URL("ppids", dir), `${process.ppid}\n`);
+});
+"#;
+
+/// `vci ci` without `--key` (nothing recorded) runs the leftover files of a
+/// node-test project in ONE `node --test` process: the package.json
+/// script's assignments and options (`--experimental-strip-types`, the
+/// `--import` hooks, `--test-concurrency`) followed by the files, from the
+/// project dir. Its exit code is node's: a failing leftover fails the job.
+/// When nothing is skipped the script itself runs; when everything is
+/// skipped nothing starts.
+#[test]
+fn ci_plain_run_is_one_node_process_with_the_script_flags() {
+    const E: &str = "src/e.test.mjs";
+    const F: &str = "src/f.test.mjs";
+    let w = World::new_with(Fixture::Abcd, &[(E, PPID_TEST), (F, PPID_TEST)], VCI_TOML);
+    let work = w.work.clone();
+    let audit = w.base.join("audit.json");
+    let ppids = work.join(".vci/out/ppids");
+    let ci = |env: &[(&str, Option<&str>)]| {
+        let _ = std::fs::remove_file(&ppids);
+        let out = w.vci_env(
+            &work,
+            &[
+                "ci",
+                "--base-ref",
+                "main",
+                "--audit-log",
+                audit.to_str().unwrap(),
+            ],
+            env,
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let runners: Vec<String> = std::fs::read_to_string(&ppids)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (out.status.code(), stderr, runners)
+    };
+
+    // Nothing attested: the leftover set is the whole project, so the
+    // script runs as is (`npm run test`), not a file list.
+    let (code, stderr, runners) = ci(&[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("vci ci: running all tests"), "{stderr}");
+    assert!(!stderr.contains("vci: node-test:"), "{stderr}");
+    assert_eq!(runners.len(), 2, "{stderr}");
+
+    // B and C attested: A, D, E and F are left, run by one node process.
+    let out = w.run(&work, &[B, C], &w.trusted);
+    assert!(out.contains("2 attested"), "{out}");
+    let (code, stderr, runners) = ci(&[("TEST_CONCURRENCY", Some("2"))]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("vci ci: running 4 test file(s)"),
+        "{stderr}"
+    );
+    let line = "vci: node-test: NODE_ENV=test node --experimental-strip-types --import=./test/register-hooks.mjs --test-concurrency=2 --test-reporter=spec --test src/a.test.ts src/d.test.mjs src/e.test.mjs src/f.test.mjs\n";
+    assert_eq!(stderr.matches("vci: node-test:").count(), 1, "{stderr}");
+    assert!(stderr.contains(line), "{stderr}");
+    // A (TypeScript through the --import hooks' `@/` alias) and D ran, B did not.
+    assert!(
+        stderr.contains("add") && stderr.contains("uses an external package"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("reads fixture"),
+        "B must not run: {stderr}"
+    );
+    // E and F were started by the same node --test process (a per-file run
+    // starts one runner each).
+    assert_eq!(runners.len(), 2, "{stderr}");
+    assert_eq!(runners[0], runners[1], "one runner for both: {stderr}");
+    let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+    assert_eq!(log["exitCode"], 0);
+    // Without TEST_CONCURRENCY the script has no --test-concurrency.
+    let (code, stderr, _) = ci(&[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&line.replace(" --test-concurrency=2", "")),
+        "{stderr}"
+    );
+
+    // A deliberate failure in a leftover file fails the job (node's exit
+    // code), the others still run in the same process.
+    w.write(
+        F,
+        "import assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\ntest(\"deliberately fails\", () => { assert.equal(1, 2); });\n",
+    );
+    let (code, stderr, runners) = ci(&[]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("deliberately fails"), "{stderr}");
+    assert_eq!(runners.len(), 1, "E still ran: {stderr}");
+    let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+    assert_eq!(log["exitCode"], 1);
+
+    // Everything attested: nothing starts.
+    w.remove(E);
+    w.remove(F);
+    let out = w.run(&work, &[A, D], &w.trusted);
+    assert!(out.contains("2 attested"), "{out}");
+    let (code, stderr, runners) = ci(&[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("every test file is covered by a valid attestation; nothing to run"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("vci: node-test:"), "{stderr}");
+    assert!(runners.is_empty());
+    assert!(!stderr.contains("add"), "{stderr}");
+    let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+    assert_eq!(log["ran"].as_array().unwrap().len(), 0, "{log}");
 }
 
 /// A pnpm workspace: the project is apps/web; a workspace package

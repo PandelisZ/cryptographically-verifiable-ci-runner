@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-6-2">1.6.2</a></td><td>16 Oct 2026</td><td><code>--project</code> on <code>vci ci</code> and <code>vci plan</code>; node:test leftovers run in one process</td></tr>
 <tr><td><a href="#v1-6-1">1.6.1</a></td><td>16 Oct 2026</td><td><code>vci run</code> with explicit files fails open on an unrelated project's listing error</td></tr>
 <tr><td><a href="#v1-6-0">1.6.0</a></td><td>16 Oct 2026</td><td>Environment policy: set, hash, ignore; nothing to export; <code>vci env</code></td></tr>
 <tr><td><a href="#v1-5-0">1.5.0</a></td><td>16 Oct 2026</td><td>vci's fixed cost per CI job drops from 12 s to about a second</td></tr>
@@ -30,6 +31,10 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-6-2">1.6.2</h2>
+<p><em>16 October 2026.</em> <code>vci ci</code> and <code>vci plan</code> take <code>--project NAME</code> (repeatable): only the named <code>[[projects]]</code> entries are listed, probed, verified and run; the others are not touched, so a job that owns one suite needs only that suite's toolchain. The GitHub Action gets a matching <code>project</code> input. This is what lets a monorepo gate each existing test job through vci: vex's <code>node --test (vex-web)</code> job runs <code>vci ci --project vex-web</code>, which skips what a trusted signer already ran and runs the rest.</p>
+<p>node:test leftovers now run in one <code>node --test</code> process per project, with the test script's own options, hooks, env assignments and reporter, instead of one process per file; when nothing was skipped the script runs as is, when everything was skipped nothing starts. The recording runs are unchanged.</p>
 
 <h2 id="v1-6-1">1.6.1</h2>
 <p><em>16 October 2026.</em> <code>vci run &lt;files...&gt;</code> no longer aborts when a project that holds none of the requested units fails to list. In a monorepo whose root project is a Cargo workspace every path is under its directory, so a cargo probe that could not run on a CI runner killed a run that only asked for node:test and Go units. Such a project now produces one warning and the run continues; a requested path that resolves to no unit still fails, with the listing errors appended as the likely cause.</p>

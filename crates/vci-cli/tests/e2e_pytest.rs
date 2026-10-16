@@ -1099,6 +1099,144 @@ fn pytest_run_fails_open_when_an_unrelated_project_cannot_be_listed() {
     );
 }
 
+/// Does vci's output mention the root cargo project of BROKEN_ROOT_TOML
+/// (named "rust"; "trusted@example.com" contains "rust" too)?
+fn untouched_root_mentioned(s: &str) -> bool {
+    [
+        "[rust]",
+        "rust (",
+        "of rust",
+        "rust:",
+        "cargo",
+        "Cargo.toml",
+    ]
+    .iter()
+    .any(|w| s.contains(w))
+}
+
+/// `vci ci --project py` / `vci plan --project py` in a monorepo whose other
+/// project cannot even be read here (an invalid Cargo.toml at the root, as
+/// in a job without that project's toolchain): only py is listed, probed,
+/// verified and run, and only py is in the audit log. Without `--project`
+/// the root project is planned (and fails); an unknown name is an error
+/// naming the projects.
+#[test]
+fn pytest_ci_project_runs_only_that_project() {
+    let layout = |dir: &Path| {
+        copy_pytest_fixture(&dir.join("py"));
+        std::fs::write(dir.join("Cargo.toml"), "[package\nthis is not toml\n").unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("tests/it.rs"), "#[test]\nfn t() {}\n").unwrap();
+    };
+    let Some(w) = World::build(BROKEN_ROOT_TOML, layout, &["py"]) else {
+        return;
+    };
+    let work = w.work.clone();
+    let key = w.trusted.to_str().unwrap();
+    let pa = "py/tests/test_a.py";
+    w.vci_ok(&work, &["run", "--key", key, pa]);
+
+    let out = w.vci(
+        &work,
+        &[
+            "plan",
+            "--base-ref",
+            "main",
+            "--project",
+            "py",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names: Vec<&str> = v["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["py"]);
+    assert!(v["runAll"].is_null(), "{v}");
+    let p = Plan::from_json(&v);
+    assert_eq!(p.skip, set(&[pa]));
+    assert!(
+        p.run.iter().all(|f| f.starts_with("py/")) && p.run.len() == 3,
+        "{p:?}"
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(!untouched_root_mentioned(&stderr), "{stderr}");
+
+    let audit = w.base.join("audit.json");
+    let ci = |extra: &[&str]| {
+        let mut args = vec![
+            "ci",
+            "--base-ref",
+            "main",
+            "--audit-log",
+            audit.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        let out = w.vci(&work, &args);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        (out.status.code(), stdout, stderr)
+    };
+    let (code, stdout, stderr) = ci(&["--project", "py"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("running 3 test file(s)"), "{stderr}");
+    assert!(
+        !untouched_root_mentioned(&stderr) && !untouched_root_mentioned(&stdout),
+        "the root project must not be touched: {stdout}{stderr}"
+    );
+    assert!(stdout.contains("1 to skip, 3 to run"), "{stdout}");
+    let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+    let names: Vec<&str> = log["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["py"]);
+    assert!(log["runAll"].is_null(), "{log}");
+    let of = |k: &str| -> Vec<(String, String)> {
+        log[k]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["testId"].as_str().unwrap().to_owned(),
+                    f["project"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(of("skipped"), [(pa.to_owned(), "py".to_owned())]);
+    let ran = of("ran");
+    assert_eq!(ran.len(), 3, "{ran:?}");
+    assert!(ran.iter().all(|(id, p)| id.starts_with("py/") && p == "py"));
+    assert_eq!(log["exitCode"], 0);
+
+    // Without --project the root project is planned: its listing fails, so
+    // all of it runs (and fails), which is what a py-only job must avoid.
+    let (code, _, stderr) = ci(&[]);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("of rust (cargo)"), "{stderr}");
+
+    // An unknown name names the configured projects; nothing runs.
+    std::fs::remove_file(&audit).unwrap();
+    let (code, _, stderr) = ci(&["--project", "web"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "vci: error: --project web: no such project in vci.toml at the base commit (its projects: rust, py)"
+        ),
+        "{stderr}"
+    );
+    assert!(!audit.exists());
+}
+
 /// uv's variables are pass-through (not hashed), so a CI that selects another
 /// interpreter (`UV_PYTHON`) must be caught by the toolchain check: the
 /// Python version has to match exactly.

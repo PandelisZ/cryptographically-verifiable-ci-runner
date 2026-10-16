@@ -33,6 +33,9 @@ pub struct CiArgs {
     /// Fetch attestations first (`--fetch [REMOTE]`; `Some(None)`: the
     /// default remote), while the projects are probed.
     pub fetch: Option<Option<String>>,
+    /// `--project`: only these `[[projects]]` are planned and run (empty:
+    /// every project).
+    pub projects: Vec<String>,
 }
 
 pub fn ci(args: CiArgs) -> Result<i32> {
@@ -40,6 +43,7 @@ pub fn ci(args: CiArgs) -> Result<i32> {
         base_ref: args.base_ref.clone(),
         only: None,
         fetch: args.fetch.clone(),
+        projects: args.projects.clone(),
     })?;
     if let Some(w) = &res.fetch_failed {
         github_warning(w);
@@ -323,12 +327,21 @@ fn run_plain(
         let files = if res.run_all.is_some() || p.run_all.is_some() {
             None
         } else {
-            Some(
-                res.to_run()
-                    .filter(|f| f.project_idx == i)
-                    .map(|f| f.file.clone())
-                    .collect(),
-            )
+            let run: Vec<String> = res
+                .to_run()
+                .filter(|f| f.project_idx == i)
+                .map(|f| f.file.clone())
+                .collect();
+            // node-test: when nothing of the project is skipped, its test
+            // script runs as is (its own file set, `npm run test`).
+            if p.adapter == "node-test"
+                && !run.is_empty()
+                && !res.skipped().any(|f| f.project_idx == i)
+            {
+                None
+            } else {
+                Some(run)
+            }
         };
         jobs.push((label, adapter, env, files));
     }
