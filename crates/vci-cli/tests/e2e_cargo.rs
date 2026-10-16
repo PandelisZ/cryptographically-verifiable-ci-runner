@@ -2348,3 +2348,84 @@ fn cargo_home_inside_the_repository_is_not_part_of_it() {
     );
     assert!(entries.iter().any(|e| e == "d/src/lib.rs"), "{entries:?}");
 }
+
+/// `vci prune --superseded` keeps, per unit and signer, the attestation
+/// issued last; `vci push --rewrite-history` publishes the metadata as one
+/// commit, so a fresh clone downloads only the current values, and a clone
+/// holding the old history merges onto the new one at its next fetch.
+#[test]
+fn cargo_prune_superseded_and_rewrite_history() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, &[B], &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    w.run(&work, &[B], &w.trusted);
+    assert_eq!(w.predicates(B).len(), 2, "two attestations of b");
+    let listed = w.vci_ok(&work, &["prune", "--superseded", "--dry-run"]);
+    assert_eq!(
+        listed.lines().filter(|l| l.contains("superseded")).count(),
+        1,
+        "{listed}"
+    );
+    assert_eq!(w.predicates(B).len(), 2, "a dry run deletes nothing");
+    w.vci_ok(&work, &["prune", "--superseded"]);
+    let left = w.predicates(B);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        w.plan(&work, "main").skip.contains(B),
+        "the newest one is kept"
+    );
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    // The second publication (the new attestation and the deletion), then
+    // an old clone holding the history before the rewrite.
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let old = w.base.join("old-clone");
+    w.git(
+        &w.base,
+        &["clone", "-q", w.remote.to_str().unwrap(), "old-clone"],
+    );
+    w.git(&old, &["checkout", "-q", "feature"]);
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
+    // A clone's fetched metadata is its tracking ref; the bare remote holds
+    // refs/meta/main itself.
+    let history = |dir: &Path, refname: &str| {
+        w.git(dir, &["rev-list", "--count", refname])
+            .trim()
+            .parse::<u32>()
+            .unwrap()
+    };
+    const TRACKING: &str = "refs/meta/remotes/main";
+    assert!(history(&old, TRACKING) > 1, "the clone fetched the history");
+    w.vci_ok(&work, &["push", "--remote", "origin", "--rewrite-history"]);
+    let bare = w.remote.clone();
+    assert_eq!(
+        history(&bare, "refs/meta/main"),
+        1,
+        "one commit on the remote"
+    );
+    // A fresh clone sees the pruned store and skips b.
+    let fresh = w.base.join("fresh-clone");
+    w.git(
+        &w.base,
+        &["clone", "-q", w.remote.to_str().unwrap(), "fresh-clone"],
+    );
+    w.git(&fresh, &["checkout", "-q", "feature"]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert!(w.plan(&fresh, "main").skip.contains(B));
+    assert_eq!(history(&fresh, TRACKING), 1);
+    // The old clone merges onto the new history and still skips b.
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
+    assert!(w.plan(&old, "main").skip.contains(B));
+    // And can publish on top of it: attest c there, push, fresh fetches it.
+    w.run(&old, &[C], &w.trusted);
+    w.vci_ok(&old, &["push", "--remote", "origin"]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&fresh, "main");
+    assert!(p.skip.contains(B) && p.skip.contains(C), "{p:?}");
+}

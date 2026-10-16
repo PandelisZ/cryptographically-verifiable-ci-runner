@@ -383,10 +383,8 @@ impl UnitKind {
                     Self::Test(n)
                 } else if let Some(n) = named("example:") {
                     Self::Example(n)
-                } else if let Some(n) = named("bench:") {
-                    Self::Bench(n)
                 } else {
-                    return None;
+                    Self::Bench(named("bench:")?)
                 }
             }
         })

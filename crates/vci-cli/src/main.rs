@@ -130,6 +130,9 @@ enum Cmd {
         /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin).
         #[arg(long)]
         remote: Option<String>,
+        /// Publish the metadata as one commit without history (after `vci prune`: what a fetch downloads is then the current attestations, not every version ever published). Other clones merge onto it at their next fetch.
+        #[arg(long)]
+        rewrite_history: bool,
     },
     /// Fetch attestations: git-meta pull (fetch refs/meta/main and materialize it locally).
     Fetch {
@@ -142,6 +145,9 @@ enum Cmd {
         /// Only list what would be deleted.
         #[arg(long)]
         dry_run: bool,
+        /// Also delete attestations superseded by a newer one of the same unit by the same signer (their inputs no longer match the current tree, or soon will not).
+        #[arg(long)]
+        superseded: bool,
     },
     /// Print the effective environment policy of each project: what vci sets, hashes, ignores and removes (docs/ENV.md).
     Env {
@@ -283,9 +289,15 @@ fn main() {
             allowed_signers,
             base_ref,
         } => cmds::verify(&envelope, allowed_signers.as_deref(), base_ref.as_deref()),
-        Cmd::Push { remote } => cmds::push(remote.as_deref()),
+        Cmd::Push {
+            remote,
+            rewrite_history,
+        } => cmds::push(remote.as_deref(), rewrite_history),
         Cmd::Fetch { remote } => cmds::fetch(remote.as_deref()),
-        Cmd::Prune { dry_run } => cmds::prune(dry_run),
+        Cmd::Prune {
+            dry_run,
+            superseded,
+        } => cmds::prune(dry_run, superseded),
         Cmd::Env {
             base_ref,
             project,

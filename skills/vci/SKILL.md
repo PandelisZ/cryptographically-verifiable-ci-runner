@@ -5,7 +5,7 @@ license: MIT
 compatibility: Needs the vci CLI (brew install pandelisz/tap/vci), git, ssh-keygen (OpenSSH 8.1+) and the project's test toolchain, on macOS or Linux.
 metadata:
   homepage: https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
-  vci-version: "1.8.1"
+  vci-version: "1.8.2"
 ---
 
 # vci: run tests once, prove it, let CI skip them

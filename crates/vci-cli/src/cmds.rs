@@ -1,5 +1,7 @@
 //! `ci`, `verify`, `init`, `push`, `fetch`, `prune`.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::json;
@@ -109,7 +111,7 @@ pub fn ci(args: CiArgs) -> Result<i32> {
     }
     let pushed = if push_wanted {
         // Best effort: CI's result is the tests', never the publication's.
-        match push(args.remote.as_deref()) {
+        match push(args.remote.as_deref(), false) {
             Ok(_) => Some(true),
             Err(e) => {
                 github_warning(&format!(
@@ -781,10 +783,14 @@ pub(crate) fn redact_userinfo(url: &str) -> String {
     }
 }
 
-pub fn push(remote: Option<&str>) -> Result<i32> {
+pub fn push(remote: Option<&str>, rewrite_history: bool) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let store = AttestStore::new(&repo);
-    let out = store.push(remote)?;
+    let out = if rewrite_history {
+        store.push_rewriting_history(remote)?
+    } else {
+        store.push(remote)?
+    };
     print_default_remote(&store, remote, &out.remote);
     print_exchange_messages(&out.warnings, &out.notes);
     match out.status {
@@ -849,14 +855,18 @@ pub fn fetch_messages(repo: &vci_git::Repo, remote: Option<&str>) -> Result<Vec<
 /// `vci prune`: delete attestations that have expired (git-meta tombstones,
 /// published by the next `vci push`). Only the claimed expiry is read; an
 /// envelope that cannot be parsed is left alone.
-pub fn prune(dry_run: bool) -> Result<i32> {
+pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let store = AttestStore::new(&repo);
     let now = now_unix();
-    let (mut expired, mut kept, mut unreadable) = (0usize, 0usize, 0usize);
+    let (mut expired, mut kept, mut unreadable, mut older) = (0usize, 0usize, 0usize, 0usize);
+    // Of a unit's attestations by one signer, the one issued last: an older
+    // one vouches for inputs that tree no longer has (or soon will not).
+    let mut newest: BTreeMap<(String, String), (i64, String)> = BTreeMap::new();
+    let mut current = Vec::new();
     for e in store.list(None)? {
-        match envelope_expiry(&e.bytes) {
-            Some(t) if t <= now => {
+        match envelope_meta(&e.bytes) {
+            Some(m) if m.expires_at <= now => {
                 expired += 1;
                 if dry_run {
                     println!("would remove {} {}", e.target, e.key);
@@ -865,29 +875,71 @@ pub fn prune(dry_run: bool) -> Result<i32> {
                     println!("removed {} {}", e.target, e.key);
                 }
             }
-            Some(_) => kept += 1,
+            Some(m) => {
+                kept += 1;
+                if superseded {
+                    let slot = newest
+                        .entry((m.test_id.clone(), e.signer.clone()))
+                        .or_insert((m.issued_at, e.key.clone()));
+                    if (m.issued_at, &e.key) > (slot.0, &slot.1) {
+                        *slot = (m.issued_at, e.key.clone());
+                    }
+                    current.push((m, e));
+                }
+            }
             None => unreadable += 1,
         }
     }
+    for (m, e) in current {
+        if newest.get(&(m.test_id, e.signer.clone())).map(|n| &n.1) == Some(&e.key) {
+            continue;
+        }
+        older += 1;
+        kept -= 1;
+        if dry_run {
+            println!("would remove {} {} (superseded)", e.target, e.key);
+        } else {
+            store.remove(&e)?;
+            println!("removed {} {} (superseded)", e.target, e.key);
+        }
+    }
     eprintln!(
-        "vci prune: {expired} expired{}, {kept} current, {unreadable} unreadable (left alone)",
+        "vci prune: {expired} expired{}{}, {kept} current, {unreadable} unreadable (left alone)",
+        if superseded {
+            format!(", {older} superseded")
+        } else {
+            String::new()
+        },
         if dry_run { " (dry run)" } else { "" }
     );
-    if expired > 0 && !dry_run {
-        eprintln!("vci prune: run `vci push` (or `git meta push`) to publish the deletions");
+    if expired + older > 0 && !dry_run {
+        eprintln!(
+            "vci prune: run `vci push` to publish the deletions (`vci push --rewrite-history` also drops the deleted values from what a fetch downloads)"
+        );
     }
     Ok(0)
 }
 
-/// The `expiresAt` an envelope claims (unverified), as Unix seconds.
-fn envelope_expiry(bytes: &[u8]) -> Option<i64> {
+/// What `prune` reads from an envelope's payload (unverified).
+struct EnvelopeMeta {
+    test_id: String,
+    issued_at: i64,
+    expires_at: i64,
+}
+
+fn envelope_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
     use base64::Engine as _;
     let env = Envelope::from_json(bytes).ok()?;
     let payload = base64::engine::general_purpose::STANDARD
         .decode(&env.payload)
         .ok()?;
     let v: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    parse_rfc3339(v["predicate"]["expiresAt"].as_str()?).ok()
+    let p = &v["predicate"];
+    Some(EnvelopeMeta {
+        test_id: p["testId"].as_str()?.to_owned(),
+        issued_at: parse_rfc3339(p["issuedAt"].as_str()?).ok()?,
+        expires_at: parse_rfc3339(p["expiresAt"].as_str()?).ok()?,
+    })
 }
 
 #[cfg(test)]

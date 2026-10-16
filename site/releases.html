@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-8-2">1.8.2</a></td><td>16 Oct 2026</td><td>Fetch and push no longer read every attestation; <code>vci prune --superseded</code>; <code>vci push --rewrite-history</code></td></tr>
 <tr><td><a href="#v1-8-1">1.8.1</a></td><td>16 Oct 2026</td><td>A <code>CARGO_HOME</code> inside the checkout is not part of the repository</td></tr>
 <tr><td><a href="#v1-8-0">1.8.0</a></td><td>16 Oct 2026</td><td>Cargo: one build, then the test binaries run in parallel; integration tests of packages with binaries attest; undeclared paths can be waived</td></tr>
 <tr><td><a href="#v1-7-1">1.7.1</a></td><td>16 Oct 2026</td><td><code>ignore_taints</code> waives reads outside the repository, writes inside it and skipped tests; Vite's caches are not writes</td></tr>
@@ -35,6 +36,10 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-8-2">1.8.2</h2>
+<p><em>16 October 2026.</em> On a store of 3800 attestations (1.8 GB of metadata, after 1.8.0's first CI run on a large workspace), <code>vci push</code> with nothing new took 206 s of CPU on a laptop and 14 minutes on a 4-core runner, and <code>vci fetch</code> 56 s: every pass over a metadata tree parsed it the way git-meta does, reading and verifying every attestation blob, and a push made several such passes. The keys of a tree now come from its paths alone, and a fetched tree is merged into the store only when its tip changed since the last time. Measured on that store against a local copy of the remote: a fetch with nothing new went from 51 s to 3 s, a push with nothing new from 206 s to 1.4 s. A fetch whose tip did change still parses the whole tree once (about 35 s there); making attestations small is the next release.</p>
+<p><code>vci prune --superseded</code> deletes, per unit and signer, every attestation but the one issued last (the older ones vouch for inputs the tree no longer has). <code>vci push --rewrite-history</code> publishes the metadata as one commit without parents, so a fetch downloads the attestations the tree holds rather than every version ever published; other clones merge onto the new history at their next fetch. Together they are how to shed a store's dead weight: <code>vci prune --superseded &amp;&amp; vci push --rewrite-history</code>.</p>
 
 <h2 id="v1-8-1">1.8.1</h2>
 <p><em>16 October 2026.</em> CI runners often keep <code>$CARGO_HOME</code> under the checkout (<code>.cargo-home/</code>, git-ignored, mounted as a cache). The cargo adapter took the registry's extracted crates and git checkouts there for crates of the repository: it cleaned and rebuilt them at every warm-up (each package's warm-up ran twice), hashed every file of theirs as an input (git-ignored paths an attestation then depended on), and refused units whose build touched one of them during the run (<code>input changed during the run: .cargo-home/registry/src/.../rustix-0.38.44</code>). A <code>$CARGO_HOME</code> inside the repository is now external everywhere: its crates are verified against Cargo.lock like any registry crate, never walked, never cleaned, and the pre-run snapshot leaves it out. First seen on a 242-unit workspace's first CI attest run: 11 units refused for it, and 14 of 26 warm-ups doubled.</p>

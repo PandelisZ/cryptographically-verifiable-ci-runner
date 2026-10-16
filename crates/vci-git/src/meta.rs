@@ -524,16 +524,54 @@ impl Reader {
 /// cannot read.
 struct Snapshot {
     parsed: ParsedTree,
-    /// Entries left out: names that are not UTF-8, or targets git-meta
-    /// cannot serialize.
+}
+
+/// What a metadata commit's tree holds, read from its paths alone: the keys
+/// of its string values and of its whole-key tombstones (git-meta's tree
+/// layout: `<target>/<key segments>/__value` and
+/// `<target>/__tombstones/<key segments>/__deleted`, a key's segments being
+/// its `:`-separated parts), plus what [`Snapshot`] records about entries
+/// git-meta cannot read. No blob is read: parsing values ([`Snapshot`]) reads
+/// every attestation of the tree, which on a large store is most of the
+/// cost of a fetch or push.
+struct KeySnapshot {
+    tree: String,
+    values: BTreeSet<Key>,
+    tombstones: BTreeSet<Key>,
     bad: Vec<String>,
-    /// The tree without `bad` entries, when there are any.
     clean_tree: Option<String>,
 }
 
-impl Snapshot {
-    fn value_keys(&self) -> BTreeSet<Key> {
-        self.parsed.values.keys().cloned().collect()
+/// git-meta's tree layout names (pinned with the crate version).
+const VALUE_BLOB: &str = "__value";
+const TOMBSTONE_DIR: &str = "__tombstones";
+const TOMBSTONE_BLOB: &str = "__deleted";
+const SET_DIR: &str = "__set";
+const LIST_DIR: &str = "__list";
+
+/// The key a git-meta tree path names, as [`KeySnapshot`] classifies it.
+#[derive(Debug, PartialEq, Eq)]
+enum PathKey {
+    Value(String),
+    Tombstone(String),
+    Other,
+}
+
+fn classify_key_parts(key_parts: &[&str]) -> PathKey {
+    let reserved = |segs: &[&str]| {
+        segs.iter()
+            .any(|s| [VALUE_BLOB, TOMBSTONE_DIR, TOMBSTONE_BLOB, SET_DIR, LIST_DIR].contains(s))
+    };
+    match key_parts.split_last() {
+        Some((&VALUE_BLOB, segs)) if !segs.is_empty() && !reserved(segs) => {
+            PathKey::Value(segs.join(":"))
+        }
+        Some((&TOMBSTONE_BLOB, rest))
+            if rest.first() == Some(&TOMBSTONE_DIR) && rest.len() >= 2 && !reserved(&rest[1..]) =>
+        {
+            PathKey::Tombstone(rest[1..].join(":"))
+        }
+        _ => PathKey::Other,
     }
 }
 
@@ -893,6 +931,19 @@ impl<'a> AttestStore<'a> {
     }
 
     /// The local tracking ref of a metadata remote.
+    /// The file recording the tip of `tracking` last materialized into this
+    /// repository's store (in the git directory, next to git-meta's store).
+    fn materialized_marker(&self, tracking: &str) -> Result<Utf8PathBuf, GitError> {
+        let name: String = tracking
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        Ok(self
+            .repo
+            .git_dir()?
+            .join(format!("vci-materialized-{name}")))
+    }
+
     fn tracking_ref(&self, name: &str, ns: &str) -> Result<String, GitError> {
         let side = self.remotes()?.iter().any(|r| r.0 == name && r.2 && r.3);
         Ok(if side {
@@ -952,7 +1003,8 @@ impl<'a> AttestStore<'a> {
     /// Parse `commit`'s tree as git-meta does, leaving out entries git-meta
     /// cannot read (a name that is not UTF-8 fails git-meta's whole parse; a
     /// target it cannot serialize fails every later serialization).
-    fn snapshot(&self, session: &Session, commit: &str) -> Result<Snapshot, GitError> {
+    /// The keys `commit`'s tree holds, from its paths (see [`KeySnapshot`]).
+    fn snapshot_keys(&self, commit: &str) -> Result<KeySnapshot, GitError> {
         let tree = self
             .repo
             .git()
@@ -968,6 +1020,8 @@ impl<'a> AttestStore<'a> {
         let records = split_ls_tree(&listing);
         let mut bad = Vec::new();
         let mut keep: Vec<u8> = Vec::new();
+        let mut values = BTreeSet::new();
+        let mut tombstones = BTreeSet::new();
         for (mode, kind, oid, path) in &records {
             let reason = match std::str::from_utf8(path) {
                 Err(_) => Some("name is not UTF-8"),
@@ -977,7 +1031,30 @@ impl<'a> AttestStore<'a> {
                         Ok((ty, value, _)) if !valid_target(&ty, &value) => {
                             Some("target git-meta cannot serialize")
                         }
-                        _ => None,
+                        Ok((ty, value, key_parts)) => {
+                            let key = |key: String| Key {
+                                target_type: ty.clone(),
+                                target_value: value.clone(),
+                                key,
+                            };
+                            match classify_key_parts(key_parts) {
+                                PathKey::Value(k) => {
+                                    let k = key(k);
+                                    if valid_key(&k) {
+                                        values.insert(k);
+                                    }
+                                }
+                                PathKey::Tombstone(k) => {
+                                    let k = key(k);
+                                    if valid_key(&k) {
+                                        tombstones.insert(k);
+                                    }
+                                }
+                                PathKey::Other => {}
+                            }
+                            None
+                        }
+                        Err(_) => None,
                     }
                 }
             };
@@ -1013,6 +1090,21 @@ impl<'a> AttestStore<'a> {
                 .run()?;
             Some(parse_oid(&t)?)
         };
+        Ok(KeySnapshot {
+            tree,
+            values,
+            tombstones,
+            bad,
+            clean_tree,
+        })
+    }
+
+    /// Parse `commit`'s tree as git-meta does (reading every value), leaving
+    /// out entries git-meta cannot read.
+    fn snapshot(&self, session: &Session, commit: &str) -> Result<Snapshot, GitError> {
+        let KeySnapshot {
+            tree, clean_tree, ..
+        } = self.snapshot_keys(commit)?;
         let id = clean_tree.as_deref().unwrap_or(&tree);
         let oid = gix::ObjectId::from_hex(id.as_bytes())
             .map_err(|e| GitError::Parse(format!("object id {id}: {e}")))?;
@@ -1023,11 +1115,7 @@ impl<'a> AttestStore<'a> {
         parsed.tombstones.retain(|k, _| valid_key(k));
         parsed.set_tombstones.retain(|(k, _), _| valid_key(k));
         parsed.list_tombstones.retain(|(k, _), _| valid_key(k));
-        Ok(Snapshot {
-            parsed,
-            bad,
-            clean_tree,
-        })
+        Ok(Snapshot { parsed })
     }
 
     /// Delete store rows (values, deletion records) whose target git-meta
@@ -1111,7 +1199,6 @@ impl<'a> AttestStore<'a> {
         let Some(local) = self.read_ref(local_ref)? else {
             return Ok(0);
         };
-        let snap = self.snapshot(session, &local)?;
         let store = session.store();
         let rows: BTreeMap<Key, i64> = guarded("reading the store", || store.get_all_metadata())?
             .into_iter()
@@ -1134,6 +1221,19 @@ impl<'a> AttestStore<'a> {
                 key: t.key,
             })
             .collect();
+        // The usual case, decided from the tree's paths alone: the store
+        // holds (or deleted) every value of the ref and the ref records no
+        // deletion, so nothing is restored and no value needs reading.
+        let keys = self.snapshot_keys(&local)?;
+        if keys.tombstones.is_empty()
+            && keys
+                .values
+                .iter()
+                .all(|k| rows.contains_key(k) || deleted.contains(k))
+        {
+            return Ok(0);
+        }
+        let snap = self.snapshot(session, &local)?;
         let missing: BTreeMap<Key, TreeValue> = snap
             .parsed
             .values
@@ -1219,11 +1319,28 @@ impl<'a> AttestStore<'a> {
     /// match the ref. Publishing such a commit would delete the value for
     /// everyone.
     fn serialize_checked(&self, session: &Session, local_ref: &str) -> Result<(), GitError> {
-        let deleted = self.deletion_records(session)?;
         let prev = self.read_ref(local_ref)?;
-        let _ = guarded("serializing the git-meta store", || {
-            session.serialize_full()
-        })?;
+        // Nothing changed in the store since it was last serialized or
+        // materialized: the ref already holds it. (git-meta's serialization
+        // with no modified rows rebuilds, and hashes, the whole tree.)
+        if prev.is_some()
+            && let Some(since) = guarded("reading the store", || {
+                session.store().get_last_materialized()
+            })?
+            && guarded("reading the store", || {
+                session.store().get_modified_since(since)
+            })?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let deleted = self.deletion_records(session)?;
+        // Incremental: only the targets with rows modified since the last
+        // materialization are rebuilt (the rest of the tree is reused by
+        // object id); a full serialization hashes every value of the store
+        // again, most of the cost of a fetch or push on a large store. The
+        // check below still refuses a commit that drops a value.
+        let _ = guarded("serializing the git-meta store", || session.serialize())?;
         let new = self.read_ref(local_ref)?;
         let (Some(prev), Some(new)) = (prev, new) else {
             return Ok(());
@@ -1231,8 +1348,8 @@ impl<'a> AttestStore<'a> {
         if prev == new {
             return Ok(());
         }
-        let before = self.snapshot(session, &prev)?.value_keys();
-        let after = self.snapshot(session, &new)?.value_keys();
+        let before = self.snapshot_keys(&prev)?.values;
+        let after = self.snapshot_keys(&new)?.values;
         let dropped: Vec<&Key> = before
             .difference(&after)
             .filter(|k| !deleted.contains(*k))
@@ -1356,7 +1473,7 @@ impl<'a> AttestStore<'a> {
         let session = self.session()?;
         let mut remote_deleted = BTreeSet::new();
         if found && let Some(tip) = self.read_ref(&tracking)? {
-            let snap = self.snapshot(&session, &tip)?;
+            let snap = self.snapshot_keys(&tip)?;
             if let Some(clean) = &snap.clean_tree {
                 // Merge a copy of the tip without what git-meta cannot read:
                 // a commit on top of it, so a push stays a fast-forward. It is
@@ -1396,7 +1513,7 @@ impl<'a> AttestStore<'a> {
                     snap.bad[0]
                 ));
             }
-            remote_deleted = snap.parsed.tombstones.keys().cloned().collect();
+            remote_deleted = snap.tombstones;
         }
         let restored = self.cover_local_ref(&session, &local_ref)?;
         if restored > 0 {
@@ -1407,7 +1524,23 @@ impl<'a> AttestStore<'a> {
         }
         let deleted_here = self.deletion_records(&session)?;
         self.serialize_checked(&session, &local_ref)?;
-        if found {
+        // Materializing parses the fetched tree and the local one, reading
+        // every value: skipped when the fetched tip is the one materialized
+        // into this store last time (and nothing had to be restored into
+        // the store, which would mean it is not that store any more).
+        let tip_now = if found {
+            self.read_ref(&tracking)?
+        } else {
+            None
+        };
+        let marker = self.materialized_marker(&tracking)?;
+        let materialized = tip_now.as_deref().is_some_and(|tip| {
+            restored == 0
+                && std::fs::read_to_string(&marker)
+                    .map(|s| s.trim() == tip)
+                    .unwrap_or(false)
+        });
+        if found && !materialized {
             let before = self.attestation_keys(&session)?;
             let suffix = tracking
                 .strip_prefix(&format!("refs/{ns}/"))
@@ -1433,6 +1566,9 @@ impl<'a> AttestStore<'a> {
                     "{implicit} attestation(s) were dropped from {name}'s {remote_ref} without a deletion record (git-meta's auto-prune does this) and are gone from this store too; their units run until attested again"
                 ));
             }
+            if let Some(tip) = &tip_now {
+                let _ = std::fs::write(&marker, format!("{tip}\n"));
+            }
         }
         self.settings_warnings(&session, report);
         Ok(Round {
@@ -1448,6 +1584,17 @@ impl<'a> AttestStore<'a> {
         self.push_with_hook(remote, |_| {})
     }
 
+    /// [`AttestStore::push`], publishing the local metadata as a single
+    /// commit without parents (with a lease on the tip fetched): the
+    /// remote's history then holds only the values the tree still has, so a
+    /// fetch downloads the current attestations rather than every version
+    /// ever published (`vci prune` only writes tombstones; the pruned values
+    /// stay in the history until this). Other clones' next fetch merges onto
+    /// the new history.
+    pub fn push_rewriting_history(&self, remote: Option<&str>) -> Result<PushOutcome, GitError> {
+        self.push_impl(remote, |_| {}, true)
+    }
+
     /// `push`, calling `before_push(attempt)` right before each `git push`.
     /// Exists so tests can simulate a concurrent writer landing in that
     /// window.
@@ -1455,7 +1602,16 @@ impl<'a> AttestStore<'a> {
     pub fn push_with_hook(
         &self,
         remote: Option<&str>,
+        before_push: impl FnMut(u32),
+    ) -> Result<PushOutcome, GitError> {
+        self.push_impl(remote, before_push, false)
+    }
+
+    fn push_impl(
+        &self,
+        remote: Option<&str>,
         mut before_push: impl FnMut(u32),
+        rewrite: bool,
     ) -> Result<PushOutcome, GitError> {
         let _lock = self.exchange_lock()?;
         let name = self.ensure_remote(remote)?;
@@ -1494,7 +1650,7 @@ impl<'a> AttestStore<'a> {
             };
             let tip = self.read_ref(&tracking)?;
             if let Some(tip) = &tip {
-                if *tip == local && round.found {
+                if *tip == local && round.found && !rewrite {
                     return Ok(done(PushStatus::UpToDate, report));
                 }
                 if !self.is_ancestor(tip, &local)? {
@@ -1507,9 +1663,8 @@ impl<'a> AttestStore<'a> {
                 }
                 // Every value of the remote tip must still be there, unless
                 // this store deleted it (vci prune, git meta rm).
-                let session = self.session()?;
-                let theirs = self.snapshot(&session, tip)?.value_keys();
-                let ours = self.snapshot(&session, &local)?.value_keys();
+                let theirs = self.snapshot_keys(tip)?.values;
+                let ours = self.snapshot_keys(&local)?.values;
                 let dropped: Vec<&Key> = theirs
                     .difference(&ours)
                     .filter(|k| !round.deleted_here.contains(*k))
@@ -1532,18 +1687,26 @@ impl<'a> AttestStore<'a> {
                     Err(e) => return Err(e),
                 }
             }
-            let pushed = self.read_ref(&local_ref)?.unwrap_or(local);
+            let mut pushed = self.read_ref(&local_ref)?.unwrap_or(local);
+            if rewrite {
+                pushed = self.orphan_of(&local_ref, &pushed)?;
+            }
             before_push(attempt);
-            let (describe, out) = self
-                .repo
-                .git()
-                .args([
-                    "push",
-                    "--porcelain",
-                    "--no-verify",
-                    "--recurse-submodules=no",
-                    &name,
-                ])
+            let mut git = self.repo.git().args([
+                "push",
+                "--porcelain",
+                "--no-verify",
+                "--recurse-submodules=no",
+            ]);
+            if rewrite {
+                // Only on top of the tip this round fetched.
+                git = git.arg(format!(
+                    "--force-with-lease={remote_ref}:{}",
+                    tip.as_deref().unwrap_or("")
+                ));
+            }
+            let (describe, out) = git
+                .arg(&name)
                 .arg(format!("{pushed}:{remote_ref}"))
                 .output_described()?;
             if out.status.success() {
@@ -1575,6 +1738,44 @@ impl<'a> AttestStore<'a> {
             attempts: PUSH_ATTEMPTS,
             detail: last,
         })
+    }
+
+    /// Rewrite `local_ref` as a commit without parents holding `local`'s
+    /// tree (a no-op when it has none), returning the commit.
+    fn orphan_of(&self, local_ref: &str, local: &str) -> Result<String, GitError> {
+        let parents = self
+            .repo
+            .git()
+            .args(["rev-list", "--parents", "-n", "1", local])
+            .run_str()?;
+        if parents.split_whitespace().count() == 1 {
+            return Ok(local.to_owned());
+        }
+        let tree = self
+            .repo
+            .git()
+            .args(["rev-parse", "--verify"])
+            .arg(format!("{local}^{{tree}}"))
+            .run()?;
+        let tree = parse_oid(&tree)?;
+        let mut git = self.repo.git().args([
+            "commit-tree",
+            "--no-gpg-sign",
+            &tree,
+            "-m",
+            "vci: metadata history rewritten (vci push --rewrite-history)",
+        ]);
+        for (k, v) in IDENTITY {
+            git = git.env(k, v);
+        }
+        let commit = parse_oid(&git.run()?)?;
+        self.cas_ref(
+            local_ref,
+            Some(&commit),
+            local,
+            "vci push --rewrite-history",
+        )?;
+        Ok(commit)
     }
 
     /// Rewrite `local_ref` as a single commit with `local`'s tree on top of
@@ -1670,6 +1871,29 @@ fn backoff(attempt: u32, base_ms: u64, cap_ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_paths_name_values_and_tombstones() {
+        let c = |p: &str| classify_key_parts(&p.split('/').collect::<Vec<_>>());
+        assert_eq!(
+            c("vci:attestation/ab12/cd34/ef56/__value"),
+            PathKey::Value("vci:attestation:ab12:cd34:ef56".into())
+        );
+        assert_eq!(
+            c("__tombstones/vci:attestation/ab12/cd34/ef56/__deleted"),
+            PathKey::Tombstone("vci:attestation:ab12:cd34:ef56".into())
+        );
+        for other in [
+            "__value",
+            "k/__set/member",
+            "k/__list/0",
+            "k/__tombstones/member",
+            "__tombstones/__deleted",
+            "k/__tombstones/x/__value",
+        ] {
+            assert_eq!(c(other), PathKey::Other, "{other}");
+        }
+    }
 
     #[test]
     fn key_round_trip() {
