@@ -35,7 +35,19 @@ pub fn sign_statement(statement: &Statement, key_path: &Utf8Path) -> Result<Enve
 pub fn sign_payload(payload: &[u8], key_path: &Utf8Path) -> Result<Envelope, SignError> {
     let message = pae(PAYLOAD_TYPE, payload);
 
-    let mut child = Command::new("ssh-keygen")
+    // A private key on disk is used as it is: ssh-keygen consults ssh-agent
+    // first whenever SSH_AUTH_SOCK is set, and an agent that asks a person
+    // to approve each signature (1Password's does) refuses an unattended
+    // run (`agent refused operation`, `communication with agent failed`),
+    // although the key file needs nobody. Only a `.pub` needs the agent.
+    let private_key_on_disk = std::fs::read(key_path.as_std_path())
+        .map(|b| b.starts_with(b"-----BEGIN"))
+        .unwrap_or(false);
+    let mut command = Command::new("ssh-keygen");
+    if private_key_on_disk {
+        command.env_remove("SSH_AUTH_SOCK");
+    }
+    let mut child = command
         .args(["-Y", "sign", "-n", NAMESPACE, "-f"])
         .arg(key_path.as_std_path())
         .stdin(Stdio::piped())

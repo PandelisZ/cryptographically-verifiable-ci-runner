@@ -1350,7 +1350,7 @@ built-in list per runner adds the variables the runtime reads natively that chan
 everywhere; `NODE_OPTIONS` and ICU's `LANG`/`LC_ALL`/`LC_MESSAGES` for Node; `RUSTFLAGS`, `CARGO_PROFILE_*`, the C
 toolchain for Cargo; `GOFLAGS`, `GODEBUG`, `CGO_*` for Go; `PYTHONHASHSEED`, `PYTEST_ADDOPTS`, ... for pytest;
 `RUBYLIB`, `RUBY_YJIT_ENABLE`, `DATABASE_URL` for Rails) and what the runner needs to work (built-in ignore: `PATH`,
-`HOME`, caches, version managers; hashed only when a test reads one). Every other variable is removed from the test
+`HOME`, caches, version managers; never hashed, since 2.0.2 not even when a test reads one: `hash` opts one in). Every other variable is removed from the test
 processes, including `CI`, `NO_COLOR` and `FORCE_COLOR` (so `NO_COLOR=1 vci ci` still prints Vitest's colours): list
 one to keep it. `vci env` prints the effective lists per project and what each variable is on this machine.
 

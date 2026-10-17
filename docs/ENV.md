@@ -19,7 +19,7 @@ ignore = ["SCCACHE_*", "MISE_*", "GITHUB_TOKEN"]     # taken from the machine; n
 | `hash` | yes, the machine's value | yes: another value, or its absence, re-runs the test | what legitimately differs between machines and matters: a database URL, a service endpoint |
 | `ignore` | yes, the machine's value | never, not even when a test reads it | secrets, caches, tooling locations, anything you decide does not change results |
 | built-in hash | yes, the machine's value | when present | the few variables a runtime reads natively (where no collector sees the read) that change results; [tables below](#built-in-lists) |
-| built-in ignore | yes, the machine's value | only if a test is seen reading it | what a runner needs to work at all (`PATH`, `HOME`, caches); [tables below](#built-in-lists) |
+| built-in ignore | yes, the machine's value | never, not even when a test reads it (since 2.0.2; `hash` opts one in) | what a runner needs to work at all (`PATH`, `HOME`, caches); [tables below](#built-in-lists) |
 | everything else (`stripped`) | **no**: removed from every test process vci starts | a test seen reading one gets it recorded as absent | |
 
 **Precedence**, when lists overlap: `set` > `hash` > `ignore` > built-in hash > built-in ignore. So your `ignore`
@@ -294,7 +294,7 @@ the value or `ABSENT_HASH` if unset:
 1. every `set` variable, with the declared value (the same on every machine);
 2. every `hash` and built-in hash variable present, plus every exact `hash` name even if unset (loose mode also `TZ`,
    and every variable present of the runner's 1.5 families that is not `ignore`);
-3. every variable a test was seen reading, except `ignore` ones and vci's plumbing (removed ones as absent).
+3. every variable a test was seen reading, except `ignore` and built-in ignore ones (since 2.0.2) and vci's plumbing (removed ones as absent).
 
 The predicate also records:
 

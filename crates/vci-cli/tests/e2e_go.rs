@@ -1743,24 +1743,28 @@ fn go_local_time_zone_needs_a_declared_tz() {
     );
 }
 
-/// Regression: the user's `VCI_*` variables are built-in ignore (they reach
-/// the test), but reads of them were never hashed, so a Go test that fails
-/// when one is set was skipped where it is set. `NODE_OPTIONS` is not built
-/// in for Go (since vci 1.6.0): removed, it is unset on both sides.
+/// The user's `VCI_*` variables are built-in ignore (they reach the test),
+/// and since 2.0.2 a read of one is not hashed: a Go test that fails when
+/// `VCI_BASE_REF` is set is skipped where it is set, as a read of `PATH` or
+/// `HOME` is (an attestation made on one machine is otherwise never reused
+/// on another). `hash = ["VCI_BASE_REF"]` makes the read an input again.
+/// `NODE_OPTIONS` is not built in for Go (since vci 1.6.0): removed, it is
+/// unset on both sides.
 #[test]
-fn go_reads_of_node_options_and_vci_variables_are_hashed() {
+fn go_reads_of_builtin_ignore_variables_are_not_hashed_unless_declared() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
-    w.put(
-        "ve/ve_test.go",
-        "package ve\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestUnset(t *testing.T) {\n\tif os.Getenv(\"NODE_OPTIONS\") != \"\" || os.Getenv(\"VCI_BASE_REF\") != \"\" {\n\t\tt.Fatal(\"set\")\n\t}\n}\n",
-    );
+    let test = "package ve\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestUnset(t *testing.T) {\n\tif os.Getenv(\"NODE_OPTIONS\") != \"\" || os.Getenv(\"VCI_BASE_REF\") != \"\" {\n\t\tt.Fatal(\"set\")\n\t}\n}\n";
+    w.put("ve/ve_test.go", test);
     let (ok, stderr) = w.run_pkgs(&["ve"], &[]);
     assert!(ok, "{stderr}");
     attested(&stderr, "ve");
     assert!(w.plan(&work, "main").skip.contains("ve"));
     let p = w.plan_env(&work, "main", &[("VCI_BASE_REF", "main")]);
-    assert!(p.run.contains("ve"), "{p:?}");
+    assert!(
+        p.skip.contains("ve"),
+        "a read of a built-in ignore variable is not an input: {p:?}"
+    );
     let p = w.plan_env(
         &work,
         "main",
@@ -1769,6 +1773,29 @@ fn go_reads_of_node_options_and_vci_variables_are_hashed() {
     assert!(
         p.skip.contains("ve"),
         "NODE_OPTIONS is removed for Go: {p:?}"
+    );
+
+    // Declared `hash`: the read is an input, and its value must match.
+    let Some(w) = World::build(
+        &VCI_TOML.replace(
+            "hash = [\"APP_MODE\"]",
+            "hash = [\"APP_MODE\", \"VCI_BASE_REF\"]",
+        ),
+        copy_go_fixture,
+        &["."],
+    ) else {
+        return;
+    };
+    let work = w.work.clone();
+    w.put("ve/ve_test.go", test);
+    let (ok, stderr) = w.run_pkgs(&["ve"], &[]);
+    assert!(ok, "{stderr}");
+    attested(&stderr, "ve");
+    assert!(w.plan(&work, "main").skip.contains("ve"));
+    let p = w.plan_env(&work, "main", &[("VCI_BASE_REF", "main")]);
+    assert!(
+        p.run.contains("ve"),
+        "a declared hash variable set now re-runs: {p:?}"
     );
 }
 

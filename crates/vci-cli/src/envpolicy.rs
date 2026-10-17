@@ -311,15 +311,21 @@ impl FileEnv {
     }
 
     /// An observed read of `key` is hashed unless it is `ignore` (the user's
-    /// decision) or in the adapter's [`never_hashed`] list. Built-in ignore
-    /// variables that are read are hashed: they are visible so that tooling
-    /// works, not because their values do not matter to a test that reads
-    /// them; stripped ones are recorded as absent.
+    /// decision), built-in ignore, or in the adapter's [`never_hashed`]
+    /// list. Built-in ignore variables (`PATH`, `HOME`, `TERM`, `VCI_*`,
+    /// ...) are visible so that tooling works; until 2.0.2 a read of one was
+    /// hashed, and since a test that hands its whole environment to a child
+    /// process reads every one of them, an attestation then matched only
+    /// the machine, job and runner directory it was made on (on vex, 93 of
+    /// 115 re-runs on pull requests). `hash = ["HOME"]` makes a read of one
+    /// an input again; stripped ones are recorded as absent.
     pub fn hashed_when_read(&self, key: &str) -> bool {
-        self.classify(key) != EnvClass::Ignore
-            && !never_hashed(&self.adapter)
-                .iter()
-                .any(|p| name_match(p, key))
+        !matches!(
+            self.classify(key),
+            EnvClass::Ignore | EnvClass::BuiltinIgnore
+        ) && !never_hashed(&self.adapter)
+            .iter()
+            .any(|p| name_match(p, key))
     }
 
     /// Keys hashed whatever the test reads: every `set` name, every `hash` or
@@ -612,8 +618,7 @@ mod tests {
                 "CI",
                 // hash, present
                 "CI_REF",
-                // built-in ignore, read
-                "HOME",
+                // (HOME: built-in ignore, read: not hashed since 2.0.2)
                 // built-in hash, present
                 "LANG",
                 "NODE_ENV",
@@ -807,8 +812,8 @@ mod tests {
     /// stripped (including ones the runtime reads natively that are not on
     /// the built-in hash list), set variables get their declared value,
     /// ignore, hash and built-in variables keep the machine's value; built-in
-    /// hash ones are hashed whenever present, built-in ignore ones only when
-    /// read.
+    /// hash ones are hashed whenever present, built-in ignore ones never
+    /// (since 2.0.2, not even when read; `hash` opts one in).
     #[test]
     fn every_adapters_child_environment() {
         type Lists = (&'static [&'static str], &'static [&'static str]);
@@ -968,11 +973,11 @@ mod tests {
                     "{adapter}: {k} must not be hashed: {req:?}"
                 );
             }
-            // Reads: ignore never hashed, built-in ignore and stripped hashed
-            // (unless vci's own plumbing).
+            // Reads: ignore and built-in ignore never hashed (since 2.0.2),
+            // stripped hashed as absent (unless vci's own plumbing).
             assert!(!f.hashed_when_read("APP_IGNORE"));
             assert!(f.hashed_when_read("APP_OTHER"));
-            assert!(f.hashed_when_read("HOME"));
+            assert!(!f.hashed_when_read("HOME"));
             // The user can opt a built-in hash variable out (ignore) and a
             // built-in ignore one in (hash).
             c.ignore.push(hashed[0].to_string());
@@ -1053,7 +1058,8 @@ mod tests {
 
     /// Rails: what vci sets for every test process (RUBYOPT with the
     /// collector, RAILS_ENV, a fresh TMPDIR, ...) is never an input, so a
-    /// read of it is not hashed; other built-in ignore reads are.
+    /// read of it is not hashed; nor is a read of another built-in ignore
+    /// variable (since 2.0.2), while a read of a declared `hash` one is.
     #[test]
     fn rails_run_variables_are_never_hashed() {
         let f = FileEnv::for_file(&EnvConfig::default(), "test/a_test.rb")
@@ -1062,6 +1068,12 @@ mod tests {
         for k in vci_adapter::RAILS_RUN_VARS.iter().chain(&["TMPDIR"]) {
             assert!(!f.hashed_when_read(k), "{k}");
         }
+        assert!(!f.hashed_when_read("HOME"));
+        let mut c = EnvConfig::default();
+        c.hash.push("HOME".into());
+        let f = FileEnv::for_file(&c, "test/a_test.rb")
+            .with_builtins(vci_adapter::RAILS_HASH, vci_adapter::RAILS_IGNORE)
+            .with_adapter("rails");
         assert!(f.hashed_when_read("HOME"));
     }
 

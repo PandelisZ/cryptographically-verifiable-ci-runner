@@ -1679,6 +1679,18 @@ impl Verifier<'_> {
             .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
         let (env_diff, file_diff): (Vec<_>, Vec<_>) =
             diff.into_iter().partition(|m| m.what.starts_with("env:"));
+        // An attestation made before 2.0.2 recorded reads of built-in ignore
+        // variables (PATH, HOME, VCI_*); those are not inputs under the base
+        // policy now, so a difference in one is no difference.
+        let required = fenv.required_keys(&self.child);
+        let env_diff: Vec<_> = env_diff
+            .into_iter()
+            .filter(|m| {
+                m.what
+                    .strip_prefix("env:")
+                    .is_none_or(|k| fenv.hashed_when_read(k) || required.contains(k))
+            })
+            .collect();
         if !file_diff.is_empty() {
             return Err(Failure {
                 check: "inputs",
