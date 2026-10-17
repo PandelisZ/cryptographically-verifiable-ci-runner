@@ -59,7 +59,7 @@ Requirements: `git`, `ssh-keygen` (OpenSSH 8.1+), an Ed25519 SSH key, and the ru
 After checkout and toolchain setup:
 
 ```yaml
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 ```
 
 Complete workflow (Vitest; swap the toolchain steps for other runners):
@@ -84,7 +84,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 ```
 
 Toolchain steps per runner:
@@ -127,12 +127,13 @@ it never compiles `vci`), runs `vci fetch --remote origin`, writes `vci plan` to
 
 Inputs (all optional): `base-ref` (default: the PR base commit, or the pushed commit), `command` (`ci` or `plan`),
 `remote` (`origin`), `audit-log` (`vci-audit.json`), `working-directory` (`.`), `build-from-source` (`false`), `token`,
-`signing-key` (`""`: contents of CI's own SSH private key; see below), `ttl` (`14d`), `push` (`true`; with
-`signing-key`, needs `permissions: contents: write`). Outputs: `skipped`, `run`, `attested`. `prebuilt` is a
+`signing-key` (`""`: contents of CI's own SSH private key; see below), `oidc` (`false`; `true`, `github` or
+`public-good`: attest keylessly with the job's OIDC token instead, since 2.0; see below), `ttl` (`14d`), `push`
+(`true`; with `signing-key` or `oidc`, needs `permissions: contents: write`). Outputs: `skipped`, `run`, `attested`. `prebuilt` is a
 deprecated alias (`false` compiles). Never set `build-from-source: true` in a user's workflow: it exists for vci's
 own development. If the action fails with `this commit of the action (...) has no published binary`, the workflow
-pins a branch or a commit that is not a release: change it to `@v1` (or the full SHA `v1` points to, from
-`git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v1`).
+pins a branch or a commit that is not a release: change it to `@v2` (or the full SHA `v2` points to, from
+`git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v2`).
 
 ## Let CI attest its own runs (optional)
 
@@ -164,7 +165,7 @@ docs/GITHUB_ACTIONS.md.
          contents: write             # --push writes refs/meta/main
        steps:
          # ...the same checkout (fetch-depth: 0) and toolchain steps...
-         - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+         - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
            with:
              signing-key: ${{ secrets.VCI_SIGNING_KEY }}
    ```
@@ -177,18 +178,57 @@ docs/GITHUB_ACTIONS.md.
 Never print, copy or use the CI key yourself, and never add an agent's or person's principal to
 `no_skip_refs_except`.
 
+### Keyless instead of a key (vci 2.0, GitHub Actions)
+
+The same, with no key and no secret: the main-branch job proves who it is with its OIDC token and signs through
+Sigstore (an ephemeral key, a ten-minute certificate from Fulcio, a timestamp per attestation). Full text: "Keyless
+attestation (OIDC)" in docs/GITHUB_ACTIONS.md. Propose it as above; the trust files are the user's to review and
+merge.
+
+1. `vci init --oidc` (or by hand) writes `.vci/identities.toml` and the trust root
+   (`gh attestation trusted-root > .vci/sigstore-trusted-root.json`):
+
+   ```toml
+   [[identity]]
+   principal = "github-actions"
+   issuer = "https://token.actions.githubusercontent.com"
+   repository = "owner/name"
+   workflow = ".github/workflows/test.yml"   # the file of the attesting job (glob)
+   ref = "refs/heads/main"                   # glob
+   event = "push"                            # optional, as are environment and runner_environment
+   ```
+
+   The identity must match only runs on main: any step of the attesting job can request its token.
+2. `no_skip_refs_except = ["github-actions"]`, as for a key. Merge the three files to the default branch.
+3. The main-branch job gets `permissions: id-token: write` (and `contents: write`) instead of the secret:
+
+   ```yaml
+         - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+           with:
+             oidc: true
+   ```
+
+   The action then runs `vci ci --oidc=github ... --push --remote origin`. `signing-key` and `oidc` together are an
+   error.
+
+Never run `vci run --oidc` or `vci ci --oidc` yourself, even inside a CI job: it signs as the workflow's identity.
+GitHub renews its Sigstore intermediates yearly; when `vci explain` says the certificate's issuer is no authority of
+the trust root, the user refreshes `.vci/sigstore-trusted-root.json` on the default branch.
+
 ## Security rules (do not relax them)
 
-- Pin the action (`@v1`, or the full commit SHA `v1` points to); never a branch, and not `@v1.0.0` to `@v1.4.0`
-  (those tags compile `vci` instead of downloading it). Never build `vci` from the pull request's own checkout.
+- Pin the action (`@v2`, or the full commit SHA `v2` points to; `@v1` stays on 1.9.2); never a branch, and not
+  `@v1.0.0` to `@v1.4.0` (those tags compile `vci` instead of downloading it). Never build `vci` from the pull request's own checkout.
 - Leave `base-ref` at its default. Use `pull_request`, not `pull_request_target`.
 - Keep `refs/heads/main` in `policy.no_skip_refs` (the `vci init` default): pushes to main run everything, the
   backstop against a trusted signer's false claim. `no_skip_refs_except` names only CI's own principal, if anything.
 - CI's signing key lives only in an Environment limited to the default branch and reaches only the main-branch job;
   one key per repository; rotate by replacing its `allowed_signers` line (then the secret). Whoever holds it can make
-  main skip anything.
+  main skip anything. Keyless: the `[[identity]]` main skips on pins `ref`, `event` and best an `environment` limited
+  to the default branch; `id-token: write` only in the jobs that attest.
 - Run on the hosted runner, not in a `container:` job (root on one side is a toolchain difference).
-- Revoke a signer by removing their line from `.vci/allowed_signers` on the default branch.
+- Revoke a signer by removing their line from `.vci/allowed_signers` (or its `[[identity]]` from
+  `.vci/identities.toml`) on the default branch.
 - Without the action, always pass `--remote` to `vci fetch`, and pass
   `--base-ref "${{ github.event.pull_request.base.sha || github.sha }}"` to `vci ci`.
 - Anyone with push access can write or delete `refs/meta/main`; that can only make units run. Limit writers with a
@@ -203,7 +243,9 @@ Never print, copy or use the CI key yourself, and never add an agent's or person
 | `failed check: inputs` | A file changed after it was attested; `vci explain` names it |
 | `failed check: env` | A hashed variable differs on the runner; `vci explain` names it and its class (`env:X (hash)`): same value on both sides, or move it to `[env] set` |
 | `failed check: env-config` | The base `[env]` lists (or vci's built-in lists) differ from the attestation's; attestations made before vci 1.6.0 fail this once; `vci env --base-ref origin/main` |
-| `failed check: signer` | Key not in the base commit's `allowed_signers`, or expired; on main, a signer not in `no_skip_refs_except` |
+| `failed check: signer` | Key not in the base commit's `allowed_signers`, or expired; a keyless attestation whose identity matches no `[[identity]]` (or no `identities.toml` on the base branch); on main, a signer not in `no_skip_refs_except` |
+| `failed check: signature` on CI's keyless attestations | The base `.vci/sigstore-trusted-root.json` is missing, invalid or stale (GitHub renewed its intermediate): refresh it with `gh attestation trusted-root` on the default branch |
+| ``unreadable: value not fetched: run `vci fetch` online`` | vci 2.0 fetches values when a plan reads them; that fetch failed (network, or the metadata remote refuses fetching by object id). The unit runs; re-run online |
 | Every push to main still runs everything | `no_skip_refs_except` empty or not merged; CI key not in main's `allowed_signers`; last push's attestations not published (`pushed` in the audit log; job lacks `contents: write`) |
 | `::warning title=vci::not attesting: the key signs as ...` | CI's key reached a non-main run (a pull request): pass it only from the main-only job with the environment |
 | A Go package or cargo target never skips on the runner | Platform-specific code (`_linux.go`, `cfg(target_os)`, `runtime.GOOS`, float maths): accepted only on the same OS/arch |

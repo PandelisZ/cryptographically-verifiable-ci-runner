@@ -33,6 +33,14 @@ inputs:
       probed or run: a job that owns one suite names its project here and
       needs only that project's toolchain. Empty: every project.
     default: ""
+  partition:
+    description: >
+      `I/N` (1-based): this job runs only partition I of the N shares of what
+      the plan runs (`vci ci --partition I/N`), so a matrix of N jobs covers
+      a suite once: every unit lands in exactly one partition, by a hash of
+      its test id. With signing-key or oidc each job attests its own share.
+      Empty: the whole suite in this job.
+    default: ""
   working-directory:
     description: Directory inside the repository to run vci from.
     default: .
@@ -70,12 +78,27 @@ inputs:
       With a principal in no_skip_refs_except, vci ci attests nothing on a
       ref that policy.no_skip_refs does not match.
     default: ""
+  oidc:
+    description: >
+      `true` (or `github`, or `public-good`): attest like signing-key, but
+      keylessly, with no secret: `vci ci --oidc` proves the job's identity
+      with its OIDC token and signs through Sigstore (an ephemeral key
+      certified by Fulcio, and a timestamp per attestation; `true` and
+      `github` use GitHub's instance, fulcio.githubapp.com and
+      timestamp.githubapp.com, `public-good` sigstore.dev's). The job needs
+      `permissions: id-token: write`. The identity (repository, workflow
+      file, ref, event) must match an [[identity]] of .vci/identities.toml on
+      the base branch, whose principal the policy lists use like an
+      allowed_signers principal, and the base branch must carry the trust
+      root (.vci/sigstore-trusted-root.json, from `gh attestation
+      trusted-root`). Do not combine with signing-key.
+    default: "false"
   ttl:
-    description: Lifetime of the attestations made with signing-key (at most policy.max_ttl).
+    description: Lifetime of the attestations made with signing-key or oidc (at most policy.max_ttl).
     default: 14d
   push:
     description: >
-      With signing-key: publish the attestations afterwards (`vci ci --push`,
+      With signing-key or oidc: publish the attestations afterwards (`vci ci --push`,
       git-meta pushes refs/meta/main to `remote` with the checkout's
       credentials, so the job needs `permissions: contents: write`). A failed
       push is a warning and never fails the job.
@@ -89,7 +112,7 @@ outputs:
     description: Number of test units that had to run.
     value: ${{ steps.ci.outputs.run || steps.plan.outputs.run }}
   attested:
-    description: Number of test units attested with signing-key (0 without it).
+    description: Number of test units attested with signing-key or oidc (0 without either).
     value: ${{ steps.ci.outputs.attested }}
 
 runs:
@@ -254,17 +277,32 @@ runs:
         BASE: ${{ inputs.base-ref }}
         AUDIT: ${{ inputs.audit-log }}
         SIGN: ${{ inputs.signing-key != '' }}
+        OIDC: ${{ inputs.oidc }}
         TTL: ${{ inputs.ttl }}
         PUSH: ${{ inputs.push }}
         REMOTE: ${{ inputs.remote }}
+        PARTITION: ${{ inputs.partition }}
       run: |
         args=(--fetch "$REMOTE" --base-ref "$BASE" --audit-log "$AUDIT")
         for p in $PROJECT; do args+=(--project "$p"); done
+        if [ -n "$PARTITION" ]; then args+=(--partition "$PARTITION"); fi
+        case "${OIDC:-false}" in
+          true | github) oidc=github ;;
+          public-good) oidc=public-good ;;
+          false | "") oidc= ;;
+          *) echo "::error title=vci::oidc must be true, false, github or public-good (got $OIDC)"; exit 2 ;;
+        esac
+        if [ "$SIGN" = "true" ] && [ -n "$oidc" ]; then
+          echo "::error title=vci::set either signing-key or oidc, not both"
+          exit 2
+        fi
         if [ "$SIGN" = "true" ]; then
           args+=(--key "$RUNNER_TEMP/vci-key" --ttl "$TTL")
-          if [ "$PUSH" = "true" ]; then
-            args+=(--push --remote "$REMOTE")
-          fi
+        elif [ -n "$oidc" ]; then
+          args+=(--oidc="$oidc" --ttl "$TTL")
+        fi
+        if { [ "$SIGN" = "true" ] || [ -n "$oidc" ]; } && [ "$PUSH" = "true" ]; then
+          args+=(--push --remote "$REMOTE")
         fi
         out="$RUNNER_TEMP/vci-ci.txt"
         set +e

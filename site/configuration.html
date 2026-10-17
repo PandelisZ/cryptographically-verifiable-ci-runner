@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Configuration · vci</title>
-<meta name="description" content="Reference for vci.toml: policy, environment variables, extra inputs, several projects, and allowed signers.">
+<meta name="description" content="Reference for vci.toml: policy, environment variables, extra inputs, several projects, allowed signers and CI identities.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/style.css">
 </head>
@@ -13,10 +13,10 @@
 <aside class="toc"><h2>On this page</h2></aside>
 <main>
 <h1>Configuration</h1>
-<p class="lede">Two committed files control vci: <code>vci.toml</code> sets policy, and <code>.vci/allowed_signers</code> says whose attestations count.</p>
+<p class="lede">Two committed files control vci: <code>vci.toml</code> sets policy, and <code>.vci/allowed_signers</code> says whose attestations count. A repository whose CI signs keylessly (vci 2.0) adds <code>.vci/identities.toml</code> and the Sigstore trust root.</p>
 
 <div class="note">
-<p><strong>CI reads both from the base commit</strong>, the tip of the branch a pull request merges into. A change to either file in a pull request has no effect on that pull request; it takes effect once merged. If either file is missing or unreadable at the base commit, everything runs. See <a href="security.html#trust">trust comes from the base branch</a>.</p>
+<p><strong>CI reads them from the base commit</strong>, the tip of the branch a pull request merges into. A change to any of them in a pull request has no effect on that pull request; it takes effect once merged. If <code>vci.toml</code> is missing or unreadable at the base commit, everything runs; so does a missing <code>allowed_signers</code>, unless the base commit has <code>.vci/identities.toml</code>. See <a href="security.html#trust">trust comes from the base branch</a>.</p>
 </div>
 
 <h2 id="vci-toml">vci.toml</h2>
@@ -52,8 +52,8 @@ ignore = []                    <span class="c"># visible, never hashed: secrets 
 <tr><td><code>max_ttl</code></td><td><code>"30d"</code></td><td class="wrap">Longest accepted attestation lifetime. <code>vci run --ttl</code> sets the lifetime of a new attestation (14 days unless you say otherwise).</td></tr>
 <tr><td><code>allow_dirty</code></td><td><code>true</code></td><td class="wrap">Accept attestations made from a working tree with uncommitted changes. Inputs are hashed by content, not by commit.</td></tr>
 <tr><td><code>no_skip_refs</code></td><td><code>[]</code></td><td class="wrap">Refs on which nothing is skipped, except what <code>no_skip_refs_except</code> allows. <code>vci init</code> writes <code>["refs/heads/main", "refs/tags/**"]</code>. Keep your default branch here: that full run is the backstop against a false claim.</td></tr>
-<tr><td><code>no_skip_refs_except</code></td><td><code>[]</code></td><td class="wrap"><code>allowed_signers</code> principals whose attestations may still skip on a <code>no_skip_refs</code> ref, such as <code>["github-actions"]</code> for CI's own key (see <a href="github-actions.html#attesting-in-ci">attesting in CI</a>). There, every other signer's attestation fails the <code>signer</code> check. Empty: those refs run everything. List no developer or agent here.</td></tr>
-<tr><td><code>attest_on_any_ref</code></td><td><code>[]</code></td><td class="wrap">Since 1.9.2. Principals of <code>no_skip_refs_except</code> that <code>vci ci --key</code> may attest as on refs outside <code>no_skip_refs</code>: a pull request's run then attests what it ran and publishes it, and the merge queue and main skip it. Only for a key the repository's own pull requests get and forks never do (a repository secret), where their authors are trusted with that; otherwise <code>vci ci</code> refuses to attest off <code>no_skip_refs</code> with such a key.</td></tr>
+<tr><td><code>no_skip_refs_except</code></td><td><code>[]</code></td><td class="wrap">Principals whose attestations may still skip on a <code>no_skip_refs</code> ref, such as <code>["github-actions"]</code> for CI's own key (see <a href="github-actions.html#attesting-in-ci">attesting in CI</a>) or its keyless identity: a principal of <code>allowed_signers</code> or of <a href="#identities"><code>.vci/identities.toml</code></a>, which count the same. There, every other signer's attestation fails the <code>signer</code> check. Empty: those refs run everything. List no developer or agent here.</td></tr>
+<tr><td><code>attest_on_any_ref</code></td><td><code>[]</code></td><td class="wrap">Since 1.9.2. Principals of <code>no_skip_refs_except</code> that <code>vci ci --key</code> (or <code>--oidc</code>) may attest as on refs outside <code>no_skip_refs</code>: a pull request's run then attests what it ran and publishes it, and the merge queue and main skip it. Only for a key the repository's own pull requests get and forks never do (a repository secret), where their authors are trusted with that; otherwise <code>vci ci</code> refuses to attest off <code>no_skip_refs</code> with such a key.</td></tr>
 <tr><td><code>never_skip</code></td><td><code>[]</code></td><td class="wrap">Project-relative globs of test files that always run. Use it for tests whose inputs no collector can see.</td></tr>
 <tr><td><code>go_allow_net</code></td><td><code>false</code></td><td class="wrap">Go: attest packages whose test links package <code>net</code>. The same as <code>ignore_taints = ["go:net"]</code>. See <a href="adapters.html#go">Go</a>.</td></tr>
 <tr><td><code>ignore_taints</code></td><td><code>[]</code></td><td class="wrap">Since 1.7.0: taints that do not refuse a unit. Glob patterns over the reason key that <code>vci run</code>'s "why not attested" lines print (<code>"process:*"</code>, <code>"child_process.*"</code>, <code>"fetch"</code>, <code>"go:syscall"</code>, <code>"external-without-version"</code>); <code>"*"</code> matches every taint, and a pattern without <code>:</code> matches a whole category. The unit is attested with the taints recorded as <code>waived</code> (<code>vci: attested a.test.ts (waived: child_process.execSync, +1)</code>), and <code>vci plan</code> accepts it only while the base commit's policy still waives each one (otherwise the <code>waived</code> check fails and <code>vci explain</code> names the taint). <code>vci:</code> taints are never waived. Since 1.7.1 three of <code>vci run</code>'s own refusals are waived the same way, by key: <code>outside-repository</code> (a read outside the repository, such as <code>/proc/sys/net/core/somaxconn</code> or <code>/etc/lsb-release</code>; the path is then not hashed), <code>wrote-inside-repository</code> (the written paths are then not inputs) and <code>result:skipped</code> (a pass with skipped tests); a failed result never is. Writes to <code>node_modules/.vite</code>, <code>.vite-temp</code> and <code>.cache</code> need no waiver. The trade-off: what a waived taint stands for (a child process's reads, a network response) is not recorded, so a change there does not re-run the unit. That is the point: CI cost over full determinism. See <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md#waiving-taints-policyignore_taints">the reference</a>.</td></tr>
@@ -207,6 +207,33 @@ build-agent namespaces="vci-attest",valid-before="20270101" ssh-ed25519 AAAAC3Nz
 <li><code>cert-authority</code> entries are rejected.</li>
 <li><strong>To revoke a signer, remove the line</strong> on the default branch. Attestations by that key stop being accepted at once.</li>
 </ul>
+
+<h2 id="identities">.vci/identities.toml</h2>
+<p>Since 2.0. Which CI jobs may sign keylessly (<code>vci ci --oidc</code>, the action's <code>oidc: true</code>), and as which principal. A GitHub Actions job proves its identity with its OIDC token, Sigstore's Fulcio certifies it, and vci matches what the certificate says against these entries. The principal then counts exactly like an <code>allowed_signers</code> one in <code>no_skip_refs_except</code> and <code>attest_on_any_ref</code>. <code>vci init --oidc</code> writes a first version.</p>
+<pre><code>[[identity]]
+principal = "github-actions"                           <span class="c"># the name policy lists use</span>
+issuer = "https://token.actions.githubusercontent.com" <span class="c"># exactly</span>
+repository = "owner/name"                              <span class="c"># exactly; no glob</span>
+workflow = ".github/workflows/test.yml"                <span class="c"># glob: the file the signing job is defined in</span>
+ref = "refs/heads/main"                                <span class="c"># glob</span>
+event = "push"                                         <span class="c"># optional, glob</span>
+environment = "vci-attest"                             <span class="c"># optional, glob: the job's GitHub Environment</span>
+runner_environment = "github-hosted"                   <span class="c"># optional, glob</span>
+
+[[identity]]                                           <span class="c"># pull requests: skip on each other's runs, not on main</span>
+principal = "github-actions-pr"
+issuer = "https://token.actions.githubusercontent.com"
+repository = "owner/name"
+workflow = ".github/workflows/test.yml"
+ref = "refs/pull/*/merge"
+event = "pull_request"</code></pre>
+<ul>
+<li>Every field present must match; <code>*</code> and <code>?</code> do not cross <code>/</code>, <code>**</code> does. <code>workflow</code> is the path in the repository, or <code>owner/name/&lt;path&gt;</code> for a reusable workflow of another repository. The first matching entry names the principal.</li>
+<li>Pin the identity main skips on to main (<code>ref</code>, <code>event</code>, best an <code>environment</code> limited to the default branch): any step of the attesting job can request its token and sign as it.</li>
+<li>Unknown keys are errors. An invalid file is a warning, and every keyless attestation then fails: those units run.</li>
+<li><strong>To revoke an identity, remove its entry</strong> on the default branch.</li>
+</ul>
+<p><code>.vci/sigstore-trusted-root.json</code> sits next to it: the certificate and timestamp authorities keyless signatures must chain to, as <code>gh attestation trusted-root</code> prints them. GitHub renews its intermediates yearly; refresh the file with the same command when <code>vci explain</code> says the certificate's issuer is no authority of the trust root. Without it, keyless attestations fail and their units run. Verification is offline. Details: <a href="github-actions.html#keyless-attestation-oidc">keyless attestation</a>.</p>
 
 <h2 id="git-meta">.git-meta</h2>
 <p>Names the remote that attestations are exchanged with. <code>vci init</code> writes <code>url:</code> with your origin's URL; pass <code>--meta-url URL</code> to keep metadata in a separate repository.</p>

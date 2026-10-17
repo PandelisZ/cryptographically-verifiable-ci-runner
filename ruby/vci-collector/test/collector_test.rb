@@ -1632,4 +1632,170 @@ class CollectorTest < Minitest::Test
     system(e, RbConfig.ruby, "script.rb", chdir: @repo, exception: true)
     assert_empty Dir[File.join(@out, "*")]
   end
+
+  # A stub that saves and restores a hooked method by alias (Minitest's
+  # `stub`, vex-api's `Object#stub`) used to leave a copy of the hook whose
+  # `super` called itself: every later `ENV[]` or `File.read` overflowed the
+  # stack. The stub works, the method is restored, and reads after it are
+  # still recorded.
+  def test_alias_stub_of_a_hooked_method_restores_it
+    put("data.txt", "data")
+    recs = collect(<<~RUBY)
+      def stub_by_alias(obj, name, val)
+        meta = obj.singleton_class
+        meta.alias_method :"__saved_\#{name}", name
+        meta.define_method(name) { |*| val }
+        yield
+      ensure
+        meta.alias_method name, :"__saved_\#{name}"
+        meta.undef_method :"__saved_\#{name}"
+      end
+      stub_by_alias(ENV, :[], "stubbed") { raise "not stubbed" unless ENV["VCI_STUBBED"] == "stubbed" }
+      stub_by_alias(File, :read, "stubbed") { raise "not stubbed" unless File.read("nope") == "stubbed" }
+      raise "not restored" unless ENV["VCI_STUBBED"].nil? && File.read("data.txt") == "data"
+    RUBY
+    assert_includes paths(recs, "read"), "data.txt"
+    assert_includes recs.select { |r| r["kind"] == "env" }.map { |r| r["key"] }, "VCI_STUBBED"
+    assert_equal 0, recs.last["exitStatus"]
+    assert_empty taints(recs)
+  end
+
+  # Batch mode (VCI_RAILS_BATCH): the loader (a stand-in for Rails'
+  # Runner.load_tests) asks for the first file, and the process boots once
+  # per helper the files require first, then forks one process per file.
+  # Each file's output is what its own run writes: its own reads, the boot's,
+  # never another file's; nothing one file's process defines or leaves in
+  # vci's temp dir reaches the next; each result and exit status is its own;
+  # the batch's own forks are not a test's ("process:fork").
+  def test_batch_mode_runs_each_file_in_a_process_of_its_own
+    put("test/test_helper.rb", "require \"minitest\"\nBOOT = File.read(File.expand_path(\"boot.txt\", __dir__))\n")
+    put("test/boot.txt", "boot")
+    put("test/data/a.txt", "a")
+    put("test/data/b.txt", "b")
+    put("test/a_test.rb", <<~RUBY)
+      require "test_helper"
+
+      QMARK = true
+      String.class_eval { def vci_patched = true }
+
+      class ATest < Minitest::Test
+        def test_a
+          assert_equal "a", File.read("test/data/a.txt")
+          File.write(File.join(Dir.tmpdir, "cache.txt"), "a")
+        end
+      end
+    RUBY
+    put("test/b_test.rb", <<~RUBY)
+      require_relative "test_helper"
+
+      raise "a is loaded" if defined?(QMARK)
+
+      class BTest < Minitest::Test
+        def test_b
+          assert_equal "b", File.read("test/data/b.txt")
+          refute "".respond_to?(:vci_patched)
+          refute File.exist?(File.join(Dir.tmpdir, "cache.txt"))
+          assert false, "b fails"
+        end
+      end
+    RUBY
+    put("test/c_test.rb", <<~RUBY)
+      # frozen_string_literal: true
+
+      require "test_helper"
+
+      class CTest < Minitest::Test
+        def test_c = assert(BOOT == "boot")
+      end
+    RUBY
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb]
+    out = batch(ids)
+    # A and C require "test_helper" first (one boot), B require_relative's
+    # it (a boot of its own).
+    assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/c_test.rb", "exit" => 0 },
+                  { "id" => "test/b_test.rb", "exit" => 1 }, { "done" => true }], out[:status], out[:said]
+    a, b, c = out.values_at(*ids)
+    assert_equal %w[test/boot.txt test/data/a.txt], paths(a, "read").sort
+    assert_equal %w[test/boot.txt test/data/b.txt], paths(b, "read").sort
+    assert_equal %w[test/boot.txt], paths(c, "read")
+    assert_includes paths(a, "module"), "test/a_test.rb"
+    refute_includes paths(b, "module"), "test/a_test.rb"
+    assert_includes paths(b, "module"), "test/test_helper.rb"
+    assert_equal({ "state" => "passed", "tests" => 1, "failed" => 0 }, a.last.slice("state", "tests", "failed"))
+    assert_equal({ "state" => "failed", "tests" => 1, "failed" => 1 }, b.last.slice("state", "tests", "failed"))
+    assert_equal "passed", c.last["state"]
+    [a, b, c].each { |r| assert_empty taints(r) }
+    assert_empty Dir.children(@tmpdir)
+
+    # A's output is what a run of A on its own writes.
+    alone = collect(<<~'RUBY', env: { "VCI_TEST_ID" => "script.rb" }, args: ["test/a_test.rb", "--seed", "0"])
+      require "minitest/autorun"
+      $LOAD_PATH << "test"
+      require_relative "loader/rails/test_unit/runner"
+      FakeRunner.load_tests(ARGV.grep(/_test\.rb\z/))
+    RUBY
+    norm = ->(recs) { recs.reject { |r| %w[meta result].include?(r["kind"]) }.sort_by(&:to_s) }
+    assert_equal norm.call(alone), norm.call(a)
+  end
+
+  # Batch mode whose files the loader never asks for (they are required
+  # some other way): every file goes back to run on its own. A boot that
+  # fails sends its group's files back.
+  def test_batch_mode_sends_back_what_it_cannot_run_per_file
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    put("test/a_test.rb", "require \"test_helper\"\nclass ATest < Minitest::Test\n  def test_a = assert(true)\nend\n")
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = assert(true)\nend\n")
+    ids = %w[test/a_test.rb test/b_test.rb]
+    out = batch(ids, script: "require \"minitest/autorun\"\n$LOAD_PATH << \"test\"\nrequire_relative \"test/a_test\"\nrequire_relative \"test/b_test\"\n")
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["why"]&.include?("own loader") }, out[:said]
+    assert_equal({ "done" => true }, out[:status].last)
+    ids.each { |id| assert_nil out[id] }
+
+    put("test/test_helper.rb", "require \"minitest\"\nraise \"no database\"\n")
+    out = batch(ids)
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["why"]&.include?("RuntimeError: no database") }, out[:said]
+    ids.each { |id| assert_nil out[id] }
+
+    # The boot's process dies: its files go back.
+    put("test/test_helper.rb", "require \"minitest\"\nProcess.kill(:KILL, Process.pid)\n")
+    out = batch(ids)
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["why"]&.include?("ended (signal 9)") }, out[:said]
+
+    # A's process changes a file the boot left in vci's temp dir, which B's
+    # process would see: B goes back (A's own run stands).
+    put("test/test_helper.rb", "require \"minitest\"\nrequire \"tmpdir\"\nFile.write(File.join(Dir.tmpdir, \"boot.txt\"), \"boot\")\n")
+    put("test/a_test.rb", "require \"test_helper\"\nclass ATest < Minitest::Test\n  def test_a = File.write(File.join(Dir.tmpdir, \"boot.txt\"), \"a was here\")\nend\n")
+    out = batch(ids)
+    assert_equal({ "id" => "test/a_test.rb", "exit" => 0 }, out[:status][0], out[:said])
+    assert_match(/process of test\/a_test.rb changed .*boot.txt in vci's temp directory/, out[:status][1]["why"])
+    assert_equal "test/b_test.rb", out[:status][1]["id"]
+    assert_equal "no-assertions", out["test/a_test.rb"].last["state"]
+  end
+
+  # Run the files `ids` with the collector in batch mode, the loader asking
+  # for each (or `script`): each id's records, the lines of files.jsonl
+  # (:status) and what the process said (:said).
+  def batch(ids, script: nil)
+    put("loader/rails/test_unit/runner.rb",
+        "module FakeRunner\n  def self.load_tests(files) = files.each { |f| require File.expand_path(f) }\nend\n")
+    script ||= "require \"minitest/autorun\"\n$LOAD_PATH << \"test\"\nrequire_relative \"loader/rails/test_unit/runner\"\n" \
+               "FakeRunner.load_tests(ARGV.grep(/_test\\.rb\\z/))\n"
+    put("script.rb", script)
+    list = File.join(@tmp, "batch-files.txt")
+    File.write(list, ids.join("\n"))
+    FileUtils.rm_rf(Dir[File.join(@out, "*")])
+    e = {
+      "RUBYOPT" => "-r#{COLLECTOR}", "VCI_RAILS_MODE" => "collect", "VCI_OUT" => @out, "VCI_RAILS_BATCH" => list,
+      "VCI_ROOT" => @repo, "VCI_REPO" => @repo, "TMPDIR" => @tmpdir, "RUBYLIB" => nil, "BUNDLE_GEMFILE" => nil
+    }
+    said = IO.popen(e, [RbConfig.ruby, "script.rb", *ids, "--seed", "0"], chdir: @repo, err: %i[child out], &:read)
+    status_file = File.join(@out, "batch", "files.jsonl")
+    assert File.file?(status_file), "no batch status; process said:\n#{said}"
+    out = { said: said, status: File.readlines(status_file).map { |l| JSON.parse(l) } }
+    ids.each do |id|
+      f = File.join(@out, "#{Digest::SHA256.hexdigest(id)}.jsonl")
+      out[id] = File.readlines(f).map { |l| JSON.parse(l) } if File.file?(f)
+    end
+    out
+  end
 end

@@ -1,8 +1,9 @@
 # frozen_string_literal: true
 
 # vci_collector: records what one Rails test file (one Ruby process) reads,
-# for `vci run` (crates/vci-adapter/src/rails.rs). Findings behind it:
-# docs/spike-rails.md.
+# for `vci run` (crates/vci-adapter/src/rails.rs); in batch mode
+# (VCI_RAILS_BATCH, see Batch) one process boots once for several files and
+# forks one such process per file. Findings behind it: docs/spike-rails.md.
 #
 # Loaded with RUBYOPT=-r<abs>/vci_collector.rb, so it runs before bin/rails,
 # Bundler, Rails and the test file. Pure Ruby; it requires no gem while the
@@ -11,6 +12,8 @@
 #
 # Modes (VCI_RAILS_MODE):
 #   collect  record everything, write $VCI_OUT/<sha256(VCI_TEST_ID)>.jsonl at exit
+#            (batch mode: each file's process writes its own, and
+#            $VCI_OUT/batch/files.jsonl says how each one ended)
 #   plain    no recording, only the run conditions `vci run` uses (a fresh
 #            local secret, RSpec's seed and status file); used by `vci ci`
 #   probe    print one "VCI-PROBE <json>" line with the toolchain at exit
@@ -48,6 +51,18 @@ module VciCollector
   RUNNER = ENV["VCI_RAILS_RUNNER"] == "rspec" ? "rspec" : "minitest"
   OUT = ENV["VCI_OUT"]
   TEST_ID = ENV["VCI_TEST_ID"]
+  # Batch mode (collect mode with VCI_RAILS_BATCH): one process for several
+  # test files (`bin/rails test <files>`, `rspec <files>`); the variable names
+  # a file listing their test ids, one per line. Read here, before any hook
+  # is installed. See Batch.
+  BATCH = ENV["VCI_RAILS_BATCH"]
+  BATCH_IDS = if BATCH && !BATCH.empty? && MODE == "collect"
+                begin
+                  File.read(BATCH).split("\n").reject(&:empty?).freeze
+                rescue StandardError
+                  [].freeze
+                end
+              end
   # The fresh temp dir vci gave this process (TMPDIR), read once here: a test
   # that later sets ENV["TMPDIR"] (to "/tmp", HOME, "/") changes where its
   # own temp files go, never which reads the collector treats as vci's
@@ -104,8 +119,10 @@ module VciCollector
   end
 
   # Only the process vci started writes output (a forked child inherits the
-  # collector, and its "process:fork" taint).
-  PID = Process.pid
+  # collector, and its "process:fork" taint), or in batch mode the process
+  # Batch forked for a file (it sets @pid and @test_id).
+  @pid = Process.pid
+  @test_id = TEST_ID
   @busy_key = :__vci_collector_busy
   @records = {}      # [kind, abs] => true, insertion ordered
   @env_keys = {}     # key => {where => true}
@@ -124,7 +141,7 @@ module VciCollector
   @hooks_done = {}
 
   class << self
-    attr_reader :records, :taints, :written, :produced, :env_keys, :enumerations, :reals
+    attr_reader :records, :taints, :written, :produced, :env_keys, :enumerations, :reals, :pid, :test_id
 
     def collect?
       MODE == "collect"
@@ -250,6 +267,7 @@ module VciCollector
           walked(kind, abs, walk, where)
           return
         end
+        Batch.loader_check(kind, abs, where) if Batch.on?
       end
       @records[[kind, abs]] = true
     end
@@ -723,11 +741,358 @@ module VciCollector
   end
 end
 
+# ---------------------------------------------------------------------------
+# Batch mode: several test files, one boot (BATCH_IDS).
+# ---------------------------------------------------------------------------
+module VciCollector
+  # `vci run` of several files of one runner starts one process
+  # (`bin/rails test <files>`, `rspec <files>`) with VCI_RAILS_BATCH naming
+  # their test ids. When the runner's loader asks for the first of them
+  # (Rails' Runner.load_tests requires each file, RSpec's load_spec_files
+  # loads each), that process (the driver) loads none of them: for each
+  # group of files whose first statement requires the same helper
+  # (test_helper, rails_helper: the boot), it forks a process that requires
+  # that helper, which then forks one process per file of the group, one at
+  # a time (they share the test database, as one-file runs do). From the
+  # fork on, a file's process is a one-file run of that file: the loader's
+  # requests for the other files of the batch are skipped, its own file
+  # loads (and whatever it requires, other test files included), its tests
+  # run, and at exit it writes its output as a one-file run does
+  # (VciCollector.test_id: its file), holding what the boot observed before
+  # the fork, which a one-file run observes too. Nothing one file's process
+  # does reaches another's: classes, monkey patches, constants, shared
+  # examples, memoized data, loaded code, threads, native libraries,
+  # results. What they share is what one process per file shares: the file
+  # system and the database, plus vci's temp dir, from which what a file's
+  # process left is removed before the next one starts (see tmp_cleanup).
+  #
+  # The boot is the file's own first statement, so a file's process has
+  # run exactly what its one-file run runs, in the same order. A file whose
+  # first statement is not a plain require of a helper (`require "x"`,
+  # `require_relative "x"`, `require File.expand_path("x", __dir__)`) has
+  # no boot in common with others: its process requires everything itself.
+  #
+  # $VCI_OUT/batch/files.jsonl gets a line per file: {id, exit} (its
+  # process's exit status; null: a signal killed it), or {id, why}: vci must
+  # run it again on its own. The driver ends with {done: true}.
+  module Batch
+    # The loaders of the test runners (the frame that asks for a test file).
+    LOADERS = %r{/(rails/test_unit/runner|rspec/core/configuration)\.rb\z}
+    # Frames between a loader and the collector's hook: require wrappers
+    # (Zeitwerk's Kernel#require, Ruby's bundled_gems replace_require,
+    # RSpec's __send__).
+    WRAPPERS = /require|load|\A(__send__|send|public_send)\z/
+    LEADING = [
+      [/\Arequire\s*\(?\s*(["'])([^"'\\#]+)\1\s*\)?\s*(?:#.*)?\z/, :require],
+      [/\Arequire_relative\s*\(?\s*(["'])([^"'\\#]+)\1\s*\)?\s*(?:#.*)?\z/, :relative],
+      [/\Arequire\s*\(?\s*File\.expand_path\(\s*(["'])([^"'\\#]+)\1\s*,\s*(__dir__|__FILE__|File\.dirname\(__FILE__\))\s*\)\s*\)?\s*(?:#.*)?\z/,
+       :expand]
+    ].freeze
+
+    @target = nil
+    @own_fork = false
+
+    class << self
+      # The test id this process runs (a file's process), or nil.
+      attr_reader :target
+
+      def on?
+        !BATCH_IDS.nil?
+      end
+
+      # Whether the running fork is the batch's own (not a test's).
+      def own_fork?
+        @own_fork
+      end
+
+      # Absolute path (as given and real) => test id.
+      def ids
+        @ids ||= VciCollector.quiet do
+          h = {}
+          BATCH_IDS.each do |id|
+            abs = Real.expand_path(id, VciCollector.root)
+            h[abs] ||= id
+            h[VciCollector.real_of(abs)] ||= id
+          end
+          h
+        end
+      end
+
+      # The base names (without .rb) of the batch's files: most requires are
+      # none of them.
+      def names
+        @names ||= VciCollector.quiet { BATCH_IDS.to_h { |id| [Real.basename(id, ".rb"), true] } }
+      end
+
+      # The test id of a file (absolute, or relative to the project), or nil.
+      def id_of(path)
+        p = VciCollector.pathify(path)
+        return nil unless p.is_a?(String) && !p.empty?
+        VciCollector.quiet do
+          abs = Real.expand_path(p, VciCollector.root)
+          ids[abs] || ids[abs.end_with?(".rb") ? abs : "#{abs}.rb"] || ids[VciCollector.real_of(abs)]
+        end
+      rescue StandardError
+        nil
+      end
+
+      # Whether the runner's loader makes the require or load being hooked.
+      def loader_call?
+        me = __FILE__
+        (caller_locations(2, 40) || []).each do |l|
+          p = (l.absolute_path || l.path).to_s
+          return true if LOADERS.match?(p)
+          next if p == me || WRAPPERS.match?(l.base_label.to_s)
+          return false
+        end
+        false
+      end
+
+      # A require or load of `path`: :skip when, in a file's process, the
+      # loader asks for another file of the batch; else :load. The first
+      # request of the loader for a file of the batch forks the run (drive!,
+      # which returns only in a file's process).
+      def gate(path)
+        p = VciCollector.pathify(path)
+        return :load unless p.is_a?(String) && names.key?(VciCollector.quiet { Real.basename(p, ".rb") })
+        id = id_of(p)
+        return :load unless id && loader_call?
+        drive! if @target.nil?
+        id == @target ? :load : :skip
+      end
+
+      # --- the driver ---------------------------------------------------------
+
+      def drive!
+        status_dir = File.join(OUT.to_s, "batch")
+        VciCollector.quiet { Dir.mkdir(status_dir) unless Real.directory?(status_dir) }
+        groups = BATCH_IDS.uniq.group_by { |f| boot_of(f) }
+        code = 0
+        groups.each do |boot, files|
+          pid = fork_own
+          return become(run_group(boot, files)) if pid.nil?
+          _, st = Process.wait2(pid)
+          c = st.exitstatus || 1
+          code = c if code.zero?
+          unsaid(files, st)
+        end
+        status(done: true)
+        flush
+        Process.exit!(code)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        raise if @target
+        $stderr.puts "vci_collector: batch driver: #{e.class}: #{e.message}"
+        Process.exit!(1)
+      end
+
+      # In a group's process: the boot, then one process per file (returns
+      # the file in that file's process; exits in the group's).
+      def run_group(boot, files)
+        why = nil
+        if boot
+          begin
+            preload(boot)
+          rescue ScriptError, StandardError, SystemExit => e
+            why = "its first statement failed in the batch's boot (#{e.class}: #{e.message.to_s.lines.first.to_s.strip}): " \
+                  "it runs on its own"
+          end
+        end
+        first = 0
+        files.each do |f|
+          if why
+            status(id: f, why: why)
+            next
+          end
+          before = tmp_entries
+          disconnect
+          pid = fork_own
+          return f if pid.nil?
+          _, st = Process.wait2(pid)
+          status(id: f, exit: st.exitstatus)
+          first = st.exitstatus || 1 if first.zero? && !st.success?
+          changed = tmp_cleanup(before)
+          unless changed.empty?
+            why = "the process of #{f} changed #{changed.first(3).join(", ")} in vci's temp directory, which the " \
+                  "files after it in the batch would see: they run on their own"
+          end
+        end
+        flush
+        Process.exit!(first)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        raise if @target
+        $stderr.puts "vci_collector: batch boot: #{e.class}: #{e.message}"
+        Process.exit!(1)
+      end
+
+      # The runner's handling of its arguments (Rails' extract_filters,
+      # RSpec's files_to_run) checks each file of the batch before the run
+      # forks; a one-file run checks its own file only (become).
+      def loader_check(kind, abs, where)
+        return unless @target.nil? && LOADERS.match?(where) && ids.key?(abs)
+        (@loader_checks ||= {})[[kind, abs]] = true
+      end
+
+      # After a group's process: a line for each of its files it said
+      # nothing of (it died: a signal, a crash in the boot).
+      def unsaid(files, st)
+        said = VciCollector.quiet do
+          File.readlines(File.join(OUT.to_s, "batch", "files.jsonl")).map { |l| l[/"id":"((?:[^"\\]|\\.)*)"/, 1] }
+        rescue StandardError
+          []
+        end
+        how = st.signaled? ? "signal #{st.termsig}" : "exit #{st.exitstatus}"
+        files.each do |f|
+          next if said.include?(Json.str(f)[1..-2])
+          status(id: f, why: "the process that booted its group ended (#{how}) before it ran it")
+        end
+      end
+
+      # A file's process: from now on a one-file run of `id`.
+      def become(id)
+        @target = id
+        (@loader_checks || {}).each_key { |k| VciCollector.records.delete(k) unless ids[k[1]] == id }
+        VciCollector.instance_variable_set(:@pid, Process.pid)
+        VciCollector.instance_variable_set(:@test_id, id)
+        # Minitest's at_exit (registered by the driver) sets the exit status
+        # only in the process that registered it, unless forks may.
+        ::Minitest.allow_fork = true if defined?(::Minitest) && ::Minitest.respond_to?(:allow_fork=)
+        id
+      end
+
+      # Close the boot's database connections before a file's process forks,
+      # as Rails' `parallelize` does before it forks its workers: a forked
+      # process that used them, and closed them at exit, would leave the
+      # next one a dead socket ("Lost connection to MySQL server during
+      # query" on vex-api). Each file's process connects anew, as its
+      # one-file run connected at boot.
+      def disconnect
+        return unless defined?(::ActiveRecord::Base) && ::ActiveRecord::Base.respond_to?(:connection_handler)
+        VciCollector.quiet { ::ActiveRecord::Base.connection_handler.clear_all_connections! }
+      rescue StandardError
+        nil
+      end
+
+      def flush
+        [$stdout, $stderr].each { |io| io.flush rescue nil }
+      end
+
+      def fork_own
+        flush
+        @own_fork = true
+        Process.fork
+      ensure
+        @own_fork = false
+      end
+
+      # A line of $VCI_OUT/batch/files.jsonl.
+      def status(line)
+        VciCollector.quiet do
+          File.open(File.join(OUT.to_s, "batch", "files.jsonl"), "a") { |f| f.write(Json.dump(line), "\n") }
+        end
+      end
+
+      # The driver's process ran the tests itself: the loader never asked
+      # for a file of the batch (a runner vci does not know). Every file
+      # runs again on its own.
+      def undriven!
+        return unless OUT
+        VciCollector.quiet { Dir.mkdir(File.join(OUT, "batch")) unless Real.directory?(File.join(OUT, "batch")) }
+        why = "the test runner did not load the batch's files through its own loader (Rails' Runner.load_tests, " \
+              "RSpec's load_spec_files)"
+        BATCH_IDS.uniq.each { |f| status(id: f, why: why) }
+        status(done: true)
+      end
+
+      # --- the boot -----------------------------------------------------------
+
+      # What the first statement of file `id` requires ([kind, name]), or
+      # nil (comments, blank lines and magic comments before it).
+      def boot_of(id)
+        abs = VciCollector.quiet { Real.expand_path(id, VciCollector.root) }
+        text = VciCollector.quiet { Real.binread(abs) }.dup.force_encoding(Encoding::UTF_8).scrub
+        in_doc = false
+        text.each_line do |raw|
+          line = raw.strip
+          if in_doc
+            in_doc = false if raw.start_with?("=end")
+            next
+          end
+          if raw.start_with?("=begin")
+            in_doc = true
+            next
+          end
+          next if line.empty? || line.start_with?("#")
+          LEADING.each do |re, kind|
+            m = re.match(line) or next
+            return [:require, m[2]] if kind == :require
+            dir = VciCollector.quiet { Real.dirname(VciCollector.real_of(abs)) }
+            return [:path, VciCollector.quiet { Real.expand_path(m[2], dir) }] if kind == :relative
+            base = m[3] == "__FILE__" ? abs : VciCollector.quiet { Real.dirname(abs) }
+            base = VciCollector.quiet { Real.dirname(VciCollector.real_of(abs)) } if m[3] == "__dir__"
+            return [:path, VciCollector.quiet { Real.expand_path(m[2], base) }]
+          end
+          return nil
+        end
+        nil
+      rescue StandardError
+        nil
+      end
+
+      # Run a boot as the file's first statement does (recorded as anything
+      # else the process loads).
+      def preload(boot)
+        require boot[1]
+      end
+
+      # --- vci's temp dir -----------------------------------------------------
+
+      # Everything under vci's temp dir: path => [type, size, mtime].
+      def tmp_entries
+        out = {}
+        return out if TMP.nil? || TMP.empty?
+        VciCollector.quiet do
+          walk = lambda do |d|
+            (Real.dir_children(d) rescue []).each do |c|
+              p = Real.join(d, c)
+              st = (Real.lstat(p) rescue nil) or next
+              out[p] = [st.ftype, st.size, st.mtime.to_r]
+              walk.call(p) if st.directory?
+            end
+          end
+          walk.call(TMP)
+        end
+        out
+      end
+
+      # Remove what a file's process added to vci's temp dir (a fresh temp
+      # dir per process, as one-file runs get). Returns the files it found
+      # there before and changed or removed (the next file's process would
+      # see that).
+      def tmp_cleanup(before)
+        after = tmp_entries
+        VciCollector.quiet do
+          (after.keys - before.keys).sort_by { |p| -p.length }.each do |p|
+            after[p][0] == "directory" ? (Dir.rmdir(p) rescue nil) : (File.unlink(p) rescue nil)
+          end
+        end
+        before.filter_map do |p, (type, size, mtime)|
+          next if type == "directory"
+          a = after[p]
+          p if a.nil? || a != [type, size, mtime]
+        end
+      end
+    end
+  end
+end
+
 module VciCollector
     # `require` of a feature: record the lookup (see VciCollector.lookup),
-    # then hook libraries that appeared. The block does the require.
+    # then hook libraries that appeared. The block does the require. In
+    # batch mode the test runner's request for a test file is where the run
+    # forks (Batch.gate).
     def self.around_require(path)
       return yield if busy?
+      return false if Batch.on? && Batch.gate(path) == :skip
       f = pathify(path)
       lp = f && relative_feature?(f) ? expanded_load_path : nil
       n = $LOADED_FEATURES.size
@@ -742,6 +1107,7 @@ module VciCollector
 
     # `load` of a relative path also searches the load path.
     def self.around_load(path)
+      return true if !busy? && Batch.on? && Batch.gate(path) == :skip
       unless busy?
         f = pathify(path)
         if f && relative_feature?(f)
@@ -1428,7 +1794,7 @@ if VciCollector.collect?
       # Every fork (Kernel#fork, Process.fork, IO.popen("-")) goes through
       # Process._fork (Ruby 3.1+), including Rails' parallel test workers.
       def _fork
-        VciCollector.taint("process:fork")
+        VciCollector.taint("process:fork") unless VciCollector::Batch.own_fork?
         super
       end
 
@@ -1550,24 +1916,61 @@ if VciCollector.collect?
     end
   end
 
-  File.singleton_class.prepend(VciCollector::FileStatHooks)
-  File.singleton_class.prepend(VciCollector::FileWriteHooks)
-  FileTest.singleton_class.prepend(VciCollector::FileStatHooks)
-  IO.singleton_class.prepend(VciCollector::IOHooks)
-  File.prepend(VciCollector::FileInitHook)
-  File.prepend(VciCollector::FileMetaHooks)
-  IO.prepend(VciCollector::IOInitHook)
-  IO.prepend(VciCollector::IOStatHook)
-  File::Stat.prepend(VciCollector::FileStatInit)
-  Dir.singleton_class.prepend(VciCollector::DirHooks)
-  Dir.prepend(VciCollector::DirInitHook)
-  Process.singleton_class.prepend(VciCollector::ProcessHooks)
-  Process::UID.singleton_class.prepend(VciCollector.identity_hook("Process::UID", %i[rid eid]))
-  Process::GID.singleton_class.prepend(VciCollector.identity_hook("Process::GID", %i[rid eid]))
-  Process::Sys.singleton_class.prepend(VciCollector.identity_hook("Process::Sys", %i[getuid geteuid getgid getegid]))
-  ENV.singleton_class.prepend(VciCollector::EnvHooks)
-  RubyVM::InstructionSequence.singleton_class.prepend(VciCollector::ISeqHooks)
-  ARGF.singleton_class.prepend(VciCollector::ArgfHooks)
+  module VciCollector
+    # The modules the collector prepends to Ruby's file, process and ENV
+    # entry points (AliasGuard).
+    HOOK_MODULES = {}.compare_by_identity
+
+    def self.hook(target, mod)
+      HOOK_MODULES[mod] = true
+      target.prepend(mod)
+    end
+
+    # A test's stub that saves a method by alias and restores it the same way
+    # (Minitest's `stub`, an `alias_method` + `define_method` helper such as
+    # `ENV.stub(:[], ...)`) would save the collector's hook, which is what
+    # the name resolves to, instead of the method; restoring it put a copy of
+    # the hook in the class, whose `super` called itself: every later call
+    # of the method recursed until the stack overflowed (vex-api's
+    # `Object#stub` of `ENV[]`: the process wrote no output). Aliasing a hooked method aliases the method the hook
+    # wraps, so the stub replaces and restores that one, and the hook keeps
+    # recording around it.
+    # Only for a hook prepended to this very class: an alias in a subclass
+    # (`File.read`, hooked on IO's singleton class) is a copy whose `super`
+    # goes on to the superclass, as it should.
+    module AliasGuard
+      def alias_method(new_name, old_name)
+        um = (instance_method(old_name) rescue nil)
+        return super unless um && VciCollector::HOOK_MODULES.key?(um.owner)
+        mine = ancestors.take_while { |a| !a.equal?(self) }
+        return super unless mine.any? { |a| a.equal?(um.owner) }
+        um = um.super_method while um && VciCollector::HOOK_MODULES.key?(um.owner)
+        return super unless um
+        define_method(new_name, um)
+        new_name.to_sym
+      end
+    end
+  end
+  Module.prepend(VciCollector::AliasGuard)
+
+  VciCollector.hook(File.singleton_class, VciCollector::FileStatHooks)
+  VciCollector.hook(File.singleton_class, VciCollector::FileWriteHooks)
+  VciCollector.hook(FileTest.singleton_class, VciCollector::FileStatHooks)
+  VciCollector.hook(IO.singleton_class, VciCollector::IOHooks)
+  VciCollector.hook(File, VciCollector::FileInitHook)
+  VciCollector.hook(File, VciCollector::FileMetaHooks)
+  VciCollector.hook(IO, VciCollector::IOInitHook)
+  VciCollector.hook(IO, VciCollector::IOStatHook)
+  VciCollector.hook(File::Stat, VciCollector::FileStatInit)
+  VciCollector.hook(Dir.singleton_class, VciCollector::DirHooks)
+  VciCollector.hook(Dir, VciCollector::DirInitHook)
+  VciCollector.hook(Process.singleton_class, VciCollector::ProcessHooks)
+  VciCollector.hook(Process::UID.singleton_class, VciCollector.identity_hook("Process::UID", %i[rid eid]))
+  VciCollector.hook(Process::GID.singleton_class, VciCollector.identity_hook("Process::GID", %i[rid eid]))
+  VciCollector.hook(Process::Sys.singleton_class, VciCollector.identity_hook("Process::Sys", %i[getuid geteuid getgid getegid]))
+  VciCollector.hook(ENV.singleton_class, VciCollector::EnvHooks)
+  VciCollector.hook(RubyVM::InstructionSequence.singleton_class, VciCollector::ISeqHooks)
+  VciCollector.hook(ARGF.singleton_class, VciCollector::ArgfHooks)
 
   # Every Ruby source compiled from a file (require, require_relative, load,
   # autoload, Zeitwerk) is a module input.
@@ -3475,9 +3878,13 @@ end
 at_exit do
   status = VciCollector.exit_status($!)
   begin
-    next unless Process.pid == VciCollector::PID
+    next unless Process.pid == VciCollector.pid
     case VciCollector::MODE
-    when "collect" then VciCollector::Output.write!(status)
+    when "collect"
+      # A batch whose runner never asked for one of its files through the
+      # runner's own loader (Batch.gate): nothing here is attributable.
+      next VciCollector::Batch.undriven! if VciCollector::Batch.on? && !VciCollector::Batch.target
+      VciCollector::Output.write!(status)
     when "probe" then VciCollector::Probe.print!
     end
   rescue Exception => e # rubocop:disable Lint/RescueException
@@ -3842,7 +4249,7 @@ module VciCollector
     end
 
     def write!(status)
-      unless OUT && TEST_ID
+      unless OUT && VciCollector.test_id
         $stderr.puts "vci_collector: VCI_OUT or VCI_TEST_ID not set; nothing written"
         return
       end
@@ -3987,14 +4394,14 @@ module VciCollector
       taints.uniq.each { |t| lines << { kind: "taint", reason: t } }
       lines << res
       require "digest/sha2"
-      File.open(File.join(OUT, "#{Digest::SHA256.hexdigest(TEST_ID)}.jsonl"), "w") do |f|
+      File.open(File.join(OUT, "#{Digest::SHA256.hexdigest(VciCollector.test_id)}.jsonl"), "w") do |f|
         lines.each { |l| f.write(Json.dump(l), "\n") }
       end
     end
 
     def meta
       {
-        v: 1, kind: "meta", testId: TEST_ID, adapter: "rails",
+        v: 1, kind: "meta", testId: VciCollector.test_id, adapter: "rails",
         ruby: Probe.ruby_version, engine: Probe.engine,
         rails: Probe.rails_version, bundler: Probe.bundler_version, runner: Probe.runner_version,
         root: VciCollector.root, platform: RUBY_PLATFORM, collector: "vci_collector@#{VERSION}",

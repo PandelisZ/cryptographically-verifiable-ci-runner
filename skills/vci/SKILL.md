@@ -1,11 +1,11 @@
 ---
 name: vci
-description: Run tests locally with vci (cryptographically verifiable CI), sign an attestation of exactly what they depended on, push it through git, and let CI skip those tests. Use when the user or an agent wants to run tests with proof, attest tests, skip already-run tests in CI, speed up CI for a pull request, or set up vci / verifiable CI (vci init, allowed_signers, the PandelisZ/cryptographically-verifiable-ci-runner GitHub Action), and when diagnosing why vci did not skip a test or refused to attest one. Covers Vitest, pytest (uv), Go, Cargo, Rails Minitest and RSpec. Triggers include "vci", "attest", "attestation", "verifiable CI", "skip tests in CI", "vci.toml", "allowed_signers", "refs/meta/main".
+description: Run tests locally with vci (cryptographically verifiable CI), sign an attestation of exactly what they depended on, push it through git, and let CI skip those tests. Use when the user or an agent wants to run tests with proof, attest tests, skip already-run tests in CI, speed up CI for a pull request, or set up vci / verifiable CI (vci init, allowed_signers, the PandelisZ/cryptographically-verifiable-ci-runner GitHub Action), and when diagnosing why vci did not skip a test or refused to attest one. Covers Vitest, pytest (uv), Go, Cargo, Rails Minitest and RSpec. Triggers include "vci", "attest", "attestation", "verifiable CI", "skip tests in CI", "vci.toml", "allowed_signers", "identities.toml", "vci --oidc", "refs/meta/main".
 license: MIT
 compatibility: Needs the vci CLI (brew install pandelisz/tap/vci), git, ssh-keygen (OpenSSH 8.1+) and the project's test toolchain, on macOS or Linux.
 metadata:
   homepage: https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
-  vci-version: "1.9.2"
+  vci-version: "2.0.0"
 ---
 
 # vci: run tests once, prove it, let CI skip them
@@ -30,8 +30,9 @@ unit only when everything matches. Everything else runs.
 2. **`vci run <units>`** runs each unit in its own process, records what it read, and signs an attestation; only
    units whose tests all ran and passed, with nothing unobservable going on, are attested.
 3. **`vci push`** publishes attestations on `refs/meta/main`; there is no server.
-4. **Trust and policy come from the base branch** (`.vci/allowed_signers`, `vci.toml` at the PR's base commit), never
-   from the pull request.
+4. **Trust and policy come from the base branch** (`.vci/allowed_signers`, `vci.toml` at the PR's base commit, and
+   for CI jobs that sign keylessly with their OIDC token `.vci/identities.toml` and `.vci/sigstore-trusted-root.json`),
+   never from the pull request.
 5. **Fail open**: any mismatch means the unit runs. A mistake can only cost a skip, never cause a wrong one.
 
 ## Before you start
@@ -164,7 +165,7 @@ git add vci.toml .vci/allowed_signers .git-meta && git commit -m "Enable vci"
 In the workflow, after checkout (`fetch-depth: 0`) and the toolchain setup steps:
 
 ```yaml
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 ```
 
 Remind the user to: add each signer (agents with their own key and a `valid-before` expiry) to
@@ -176,8 +177,11 @@ Optionally, CI can attest its own runs: with a key of its own (the action's `sig
 --remote origin`), each push to main attests what it ran and the next commit skips every unit whose inputs did not
 change. It needs a key the user creates, its line in `allowed_signers`, `no_skip_refs_except = ["<its principal>"]`
 in `vci.toml`, a GitHub Environment secret limited to the default branch, and a main-only job with
-`permissions: contents: write`. Steps: [references/ci-setup.md](references/ci-setup.md) ("Let CI attest its own
-runs"). Propose it; do not set it up unasked.
+`permissions: contents: write`. Since vci 2.0 it can do without a key: the action's `oidc: true` (`vci ci --oidc`)
+signs with the job's OIDC token through Sigstore (`permissions: id-token: write`, no secret), trusted through
+`.vci/identities.toml` and the trust root that `vci init --oidc` writes. Steps for both:
+[references/ci-setup.md](references/ci-setup.md) ("Let CI attest its own runs"). Propose it; do not set it up
+unasked.
 
 ## Diagnose "not skipped"
 
@@ -186,6 +190,10 @@ vci fetch                                      # get attestations others pushed 
 vci explain <unit> --base-ref origin/main
 ```
 
+Since vci 2.0 `vci fetch` downloads the keys of the metadata, not its values; `plan` and `explain` fetch the values
+they read from the metadata remote. Offline, those candidates fail `envelope` with ``unreadable: value not fetched:
+run `vci fetch` online``: run again with network access.
+
 `explain` prints every candidate attestation and the first check it failed, with `expected` (recorded) and `actual`
 (this checkout). Most common:
 
@@ -193,7 +201,8 @@ vci explain <unit> --base-ref origin/main
 |---|---|---|
 | `inputs` | A file changed after attesting (`entry:<path>` names it) | Re-run `vci run <unit>` |
 | `toolchain` | Different Python/Node/Go/rustc/Ruby/bundle/package versions, or OS/arch under the policy | Pin versions (runners.md); report to the user |
-| `signer` | Key not in the base branch's `allowed_signers`, or expired; on main, a signer not in `no_skip_refs_except` | The user adds the key on the default branch; on main this is expected |
+| `signer` | Key not in the base branch's `allowed_signers`, or expired; for CI's keyless attestations, an identity in no `[[identity]]` of the base `identities.toml`; on main, a signer not in `no_skip_refs_except` | The user adds the key or identity on the default branch; on main this is expected |
+| `signature` (CI's keyless attestations) | The base `.vci/sigstore-trusted-root.json` is missing or stale (GitHub renews its intermediate yearly) | Report to the user: refresh it with `gh attestation trusted-root` on the default branch |
 | `expiry` | Attestation expired (default TTL 14 days, policy max 30) | Re-attest |
 | `global-inputs`, `externals` | Lockfile, runner config or dependency versions changed | Re-attest after the change |
 | `env` | A hashed variable differs; explain names it and its class (`env:DATABASE_URL (hash)`, `env:HOME (built-in ignore)` for one the test read) | Report to the user: same value on both sides, or a move to `[env] set` (a vci.toml change); units that read `HOME`/`USER` never skip on runners |
@@ -245,8 +254,9 @@ Short version (details in [references/runners.md](references/runners.md)):
    edit or re-sign envelopes, and never write to `refs/meta/*` except through `vci push`.
 2. **Never attest failing, skipped or filtered tests**, and never add skips, filters, retries, or delete or weaken
    tests to get a unit attested or green.
-3. **Never touch trust**: do not add your key (or any key) to `.vci/allowed_signers`, on a PR branch or anywhere,
-   unless the user explicitly asks; changes there only take effect on the default branch, which the user merges.
+3. **Never touch trust**: do not add your key (or any key) to `.vci/allowed_signers`, an identity to
+   `.vci/identities.toml` or an authority to `.vci/sigstore-trusted-root.json`, on a PR branch or anywhere, unless the
+   user explicitly asks; changes there only take effect on the default branch, which the user merges.
 4. **Never weaken policy** without the user: do not change `platform`, `libraries`, `platform_overrides`,
    `never_skip`, `no_skip_refs`, `no_skip_refs_except` (never add your own principal), `max_ttl`, `allow_dirty`,
    `go_allow_net`, `ignore_taints`, `[env]` (`set`, `hash`, `ignore`, `mode`), or `[[inputs]]`. Propose the change and let the
@@ -254,7 +264,8 @@ Short version (details in [references/runners.md](references/runners.md)):
 5. **Never change the CI wiring to skip more**: do not alter `base-ref`, switch to `pull_request_target`, unpin the
    action, or build vci from the PR checkout.
 6. **Use the key you were given.** Do not create keys or read other people's keys; do not print private key
-   material. Never use CI's own key (the GitHub secret behind the action's `signing-key`): it skips on main.
+   material. Never use CI's own key (the GitHub secret behind the action's `signing-key`): it skips on main. Never
+   sign with `--oidc` (`vci run --oidc`, `vci ci --oidc`), even inside a CI job: it signs as the workflow's identity.
 7. **Re-attest after editing**: if you change any file the tests read after `vci run`, run it again before pushing.
 8. **Report honestly**: list refused units and failed checks; never claim CI will skip something `vci plan` shows as
    `RUN`.

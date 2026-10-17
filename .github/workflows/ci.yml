@@ -79,6 +79,136 @@ jobs:
         if: always()
         run: cat vci-audit.json
 
+  # Keyless attestation (OIDC / Sigstore), no secret at all: on pull requests
+  # this job attests the demo units with its own OIDC token (`vci run
+  # --oidc`: an ephemeral key certified by fulcio.githubapp.com, a timestamp
+  # from timestamp.githubapp.com per unit), then plans twice against base
+  # commits built locally (never pushed) on the pull request's base (the
+  # merge commit's first parent): one with this commit's .vci/identities.toml
+  # (identity: this workflow on refs/pull/*/merge, principal
+  # github-actions-oidc-pr) and trust root added, where every unit it
+  # attested must be skipped on that word, and one with both files removed,
+  # where none may be. The commit under test has the files in both plans, so
+  # this shows trust is read from the base commit, not from the pull request.
+  # It starts from an empty store (no fetch), so the SSH key's attestations
+  # from main play no part.
+  demo-oidc:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/demo-setup
+
+      - name: Build vci from this commit
+        run: |
+          cargo build --release --locked -p vci-cli
+          {
+            echo "$PWD/target/release"
+          } >> "$GITHUB_PATH"
+          {
+            echo "VCI_PY_PLUGIN=$PWD/py/pytest-plugin"
+            echo "VCI_JS_PLUGIN=$PWD/js/vitest-plugin"
+            echo "VCI_RUBY_COLLECTOR=$PWD/ruby/vci-collector"
+          } >> "$GITHUB_ENV"
+
+      - name: Attest keylessly with the job's OIDC token
+        run: vci run --oidc --ttl 1d --summary "$RUNNER_TEMP/run-summary.json"
+
+      # Two base commits on the pull request's base, local to this job:
+      # with-trust adds this commit's identities.toml and trust root,
+      # without-trust removes them (whatever the base branch has).
+      - name: Build the base commits to plan against
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse HEAD^1)
+          files=(.vci/identities.toml .vci/sigstore-trusted-root.json)
+          export GIT_INDEX_FILE="$RUNNER_TEMP/base.index"
+          export GIT_AUTHOR_NAME=vci GIT_AUTHOR_EMAIL=vci@localhost GIT_COMMITTER_NAME=vci GIT_COMMITTER_EMAIL=vci@localhost
+          git read-tree "$base"
+          git rm -q --cached --ignore-unmatch -- "${files[@]}"
+          without=$(git commit-tree "$(git write-tree)" -p "$base" -m 'base without keyless trust')
+          for f in "${files[@]}"; do
+            git update-index --add --cacheinfo "100644,$(git rev-parse "HEAD:$f"),$f"
+          done
+          with=$(git commit-tree "$(git write-tree)" -p "$base" -m 'base with keyless trust')
+          rm -f "$GIT_INDEX_FILE"
+          echo "pull request base $base; with trust $with; without trust $without"
+          {
+            echo "BASE_WITH_TRUST=$with"
+            echo "BASE_WITHOUT_TRUST=$without"
+          } >> "$GITHUB_ENV"
+
+      - name: Plan on the keyless attestations
+        run: |
+          set -o pipefail
+          attested=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["attested"])' "$RUNNER_TEMP/run-summary.json")
+          skip_re='^SKIP .*(attested by github-actions-oidc-pr (oidc repo:PandelisZ/cryptographically-verifiable-ci-runner workflow:.github/workflows/ci.yml ref:refs/pull/'
+          vci plan --base-ref "$BASE_WITH_TRUST" | tee "$RUNNER_TEMP/plan.txt"
+          by_oidc=$(grep -c "$skip_re" "$RUNNER_TEMP/plan.txt" || true)
+          vci plan --base-ref "$BASE_WITHOUT_TRUST" 2>&1 | tee "$RUNNER_TEMP/plan-untrusted.txt"
+          untrusted=$(grep -c "$skip_re" "$RUNNER_TEMP/plan-untrusted.txt" || true)
+          echo "attested keylessly: $attested; skipped on a keyless attestation: $by_oidc with the base's trust, $untrusted without it"
+          if [ "$attested" -eq 0 ] || [ "$by_oidc" -ne "$attested" ]; then
+            echo "::error title=vci::expected every keylessly attested unit ($attested) to be skipped on its attestation ($by_oidc)"
+            exit 1
+          fi
+          if [ "$untrusted" -ne 0 ]; then
+            echo "::error title=vci::$untrusted unit(s) skipped on a keyless attestation although the base commit has no identities.toml or trust root"
+            exit 1
+          fi
+          if ! grep -q 'identities.toml' "$RUNNER_TEMP/plan-untrusted.txt"; then
+            echo "::error title=vci::the plan without the base's trust does not say why keyless attestations are not trusted"
+            exit 1
+          fi
+          first=$(grep -m1 '^SKIP ' "$RUNNER_TEMP/plan.txt" | awk '{print $2}')
+          vci explain "$first" --base-ref "$BASE_WITH_TRUST"
+          vci explain "$first" --base-ref "$BASE_WITHOUT_TRUST" || true
+          {
+            echo '### vci keyless (OIDC) proof'
+            echo "$by_oidc of $attested keylessly attested units skipped on their attestation with the base commit's identities.toml and trust root; $untrusted without them"
+            echo '```'
+            cat "$RUNNER_TEMP/plan.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # One stored envelope (DSSE + Sigstore bundle material), verified with
+      # `vci verify` and kept as an artifact (a test fixture for vci).
+      - name: Export and verify one keyless envelope
+        run: |
+          python3 - "$RUNNER_TEMP/keyless-envelope.json" <<'PY'
+          import json, sqlite3, subprocess, sys
+          db = sqlite3.connect(".git/git-meta.sqlite")
+          rows = db.execute("SELECT key, value, is_git_ref FROM metadata WHERE key LIKE 'vci:attestation:%'").fetchall()
+          for key, value, is_ref in rows:
+              raw = subprocess.run(["git", "cat-file", "blob", value], capture_output=True, check=True).stdout.decode() if is_ref else value
+              try:
+                  env = json.loads(raw)
+                  if isinstance(env, str):
+                      env = json.loads(env)
+              except ValueError:
+                  continue
+              if isinstance(env, dict) and "sigstore" in env:
+                  json.dump(env, open(sys.argv[1], "w"), indent=1)
+                  print(key)
+                  break
+          else:
+              sys.exit("no keyless envelope in the store")
+          PY
+          vci verify "$RUNNER_TEMP/keyless-envelope.json" --base-ref "$BASE_WITH_TRUST"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keyless-envelope
+          path: ${{ runner.temp }}/keyless-envelope.json
+          if-no-files-found: ignore
+
   # Proves on a real runner that a commit of the action with no published
   # binary fails at once (scripts/action-binary.sh) instead of compiling vci.
   # On a commit whose sources match release/manifest.txt the gate passes and

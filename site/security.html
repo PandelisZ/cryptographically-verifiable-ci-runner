@@ -50,7 +50,7 @@
 <pre><code>git meta get path:src/b.test.ts</code></pre>
 <ul>
 <li>Locally, values sit in git-meta's SQLite store at <code>.git/git-meta.sqlite</code>. Your index, <code>HEAD</code> and work tree are never touched.</li>
-<li>They are exchanged on the remote's <code>refs/meta/main</code> by ordinary git push and fetch: <code>vci push</code> and <code>vci fetch</code>, or <code>git meta push</code> and <code>git meta pull</code>.</li>
+<li>They are exchanged on the remote's <code>refs/meta/main</code> by ordinary git push and fetch: <code>vci push</code> and <code>vci fetch</code>, or <code>git meta push</code> and <code>git meta pull</code>. Since 2.0 <code>vci fetch</code> downloads the keys, and a plan fetches only the values it reads.</li>
 <li>Two signers never write the same key, and merges keep keys added on either side.</li>
 </ul>
 <div class="note">
@@ -126,6 +126,7 @@
 <p><strong>The backstop.</strong> Keep your default branch in <code>policy.no_skip_refs</code> (the <code>vci init</code> default). Every merge then gets a full run, which catches a false claim after the fact.</p>
 </div>
 <p id="ci-key"><strong>CI as a trusted signer.</strong> CI can attest its own runs (<code>vci ci --key</code>, the action's <code>signing-key</code>), and <code>policy.no_skip_refs_except</code> lets that key's attestations skip on main too. Main then skips only what CI itself already ran on the same inputs, but whoever holds that key can make main skip anything until its line is removed. Keep it in a GitHub Environment limited to the default branch, use one key per repository, keep its <code>ttl</code> short, and rotate it by replacing its line in <code>.vci/allowed_signers</code>. See <a href="github-actions.html#attesting-in-ci">attesting in CI</a>.</p>
+<p id="ci-oidc"><strong>CI without a key.</strong> Since 2.0 a GitHub Actions job can attest keylessly (<code>vci ci --oidc</code>, the action's <code>oidc: true</code>): its OIDC token gets a ten-minute Sigstore certificate for a key that never leaves the job's memory, so there is no secret to leak or rotate. Trust moves to <a href="configuration.html#identities"><code>.vci/identities.toml</code></a> on the base branch, which names the repository, workflow file, ref and event whose runs count, and to the committed Sigstore trust root; verification is offline and checks no transparency log. Any step of the attesting job can still request its token, so the identity main skips on must match only main's runs. See <a href="github-actions.html#keyless-attestation-oidc">keyless attestation</a>.</p>
 
 <h2 id="go-deeper">Go deeper</h2>
 <p>The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md">reference</a> has every recorded input, every refusal, and the known limitations per adapter. Design notes are in <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/docs">docs/</a>.</p>

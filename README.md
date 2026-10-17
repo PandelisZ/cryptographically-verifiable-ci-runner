@@ -119,12 +119,12 @@ vci push && git push                                    # share the attestation 
 In GitHub Actions, after your toolchain setup steps:
 
 ```yaml
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 ```
 
-The action downloads the published `vci` release binary (about a second, checksum pinned in the action), fetches the attestations, prints the plan in the job summary, runs what is left, and fails the job if any of it fails. It never compiles `vci` in your CI: pinned to a commit that has no published binary, it fails at once and says to use `@v1`. Setup and security notes: [docs/GITHUB_ACTIONS.md](docs/GITHUB_ACTIONS.md).
+The action downloads the published `vci` release binary (about a second, checksum pinned in the action), fetches the attestations (since 2.0 only their keys: the plan then fetches the attestations it reads, so a store of thousands costs about 2 MB rather than everything ever attested), prints the plan in the job summary, runs what is left, and fails the job if any of it fails. It never compiles `vci` in your CI: pinned to a commit that has no published binary, it fails at once and says to use `@v2` (`@v1` stays on 1.9.2). Setup and security notes: [docs/GITHUB_ACTIONS.md](docs/GITHUB_ACTIONS.md).
 
-CI can attest its own runs too. Give the action a signing key of its own, kept as a secret that only pushes to your default branch can read, and each push to main records what it ran and passed. The next commit then skips every test whose inputs did not change, on main as well as on pull requests, so a commit that only touches the docs runs nothing CI already ran. Setup, and what trusting that key means: [Attesting in CI](docs/GITHUB_ACTIONS.md#attesting-in-ci).
+CI can attest its own runs too. Give the action a signing key of its own, kept as a secret that only pushes to your default branch can read, and each push to main records what it ran and passed. The next commit then skips every test whose inputs did not change, on main as well as on pull requests, so a commit that only touches the docs runs nothing CI already ran. Setup, and what trusting that key means: [Attesting in CI](docs/GITHUB_ACTIONS.md#attesting-in-ci). Since 2.0 it needs no key at all: with `oidc: true` and `permissions: id-token: write`, the job signs with its own OIDC token through Sigstore, as `npm publish --provenance` does, and `.vci/identities.toml` on the base branch says which workflow, ref and event may skip what: [Keyless attestation (OIDC)](docs/GITHUB_ACTIONS.md#keyless-attestation-oidc).
 
 ## Test runners
 

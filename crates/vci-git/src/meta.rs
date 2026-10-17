@@ -49,6 +49,40 @@
 //! row or deletion record for, refuses any serialization or push that would
 //! drop a key without a deletion record, ignores tree entries git-meta cannot
 //! read, and removes store rows git-meta cannot serialize.
+//!
+//! # Lazy values (vci 2.0)
+//!
+//! A fetch downloads the metadata commits and the trees it reads, not the
+//! values: `git fetch --filter=blob:none`, and for the first fetch of a
+//! tracking ref `--filter=tree:0` (every commit, no tree) followed by the
+//! tip's tree alone (fetched by object id), so a fresh clone's download does
+//! not grow with the length of the metadata history while the history stays
+//! complete (never shallow: `.git/shallow` and `git fetch --unshallow` only
+//! ever concern the code). The tree's paths are its keys, so the store gets a row per key without reading
+//! a value: a value whose blob is already here is stored as a reference to it
+//! (as git-meta stores values over its size limit), any other one as a
+//! git-meta *promised* row (`is_promised`: known to exist, not fetched). The
+//! value of a promised row is the blob at its key's path in
+//! `refs/<ns>/local/main`; [`AttestStore::hydrate_units`] and its siblings
+//! fetch the blobs a caller is about to read in one `git fetch --stdin` of
+//! object ids and turn those rows into blob references. Deletion records
+//! (tiny) are fetched and read as before. A serialization never needs the
+//! values it does not change: git-meta reuses unchanged targets' subtrees by
+//! object id, and the promised entries of a target it rebuilds are put back
+//! at the object ids the previous commit held. A value that cannot be fetched
+//! (offline) only reads as not fetched, which makes its unit run.
+//!
+//! git keeps such a repository working (`gc`, `fsck`, connectivity checks)
+//! only with a *promisor* remote configured, and asks a promisor remote for
+//! any object it misses, code included, with its whole history (`git fetch`
+//! without negotiation). So the metadata remote is never recorded as one:
+//! vci's own fetches name it a promisor for that command only (`-c
+//! remote.<name>.promisor=true`), and the repository's promisor is
+//! [`NO_LAZY_FETCH_REMOTE`], a remote without a URL: a missing object is
+//! reported missing at once, as in a repository vci never fetched into,
+//! instead of being downloaded. A value vci reads is fetched by vci, in
+//! batches; a merge never keeps a value this clone never had that the
+//! fetched tip no longer has (it could not publish it).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,6 +117,48 @@ const PUSH_ATTEMPTS: u32 = 10;
 const FETCH_ATTEMPTS: u32 = 5;
 /// Project-target settings that make every `git meta serialize` prune.
 const PRUNE_KEYS: &[&str] = &["meta:prune:max-keys", "meta:prune:max-size"];
+/// Blobs asked for in one `git fetch --stdin` (git-meta's batch size: GitHub
+/// rejects very large want lists).
+const FETCH_BLOB_BATCH: usize = 4000;
+/// The repository's promisor remote (see the module docs): no URL, so git
+/// never downloads an object it misses (the metadata values vci fetches
+/// itself). `skipFetchAll`/`skipDefaultUpdate` keep `git fetch --all` and
+/// `git remote update` away from it.
+pub const NO_LAZY_FETCH_REMOTE: &str = "vci-no-lazy-fetch";
+/// How a value not fetched yet reads (a promised row).
+const NOT_FETCHED: &str = "value not fetched: run `vci fetch` online (a git-meta promised entry; its blob is not in this clone yet)";
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// What [`AttestStore::hydrate_units`] and its siblings did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hydration {
+    /// Values that had not been fetched and now are readable.
+    pub resolved: usize,
+    /// Values asked for that are still not fetched (the fetch failed, or the
+    /// local metadata commit does not hold them).
+    pub unresolved: usize,
+    /// Blobs downloaded.
+    pub fetched: usize,
+    /// Why some values could not be fetched.
+    pub error: Option<String>,
+}
+
+impl Hydration {
+    fn add(&mut self, o: Hydration) {
+        self.resolved += o.resolved;
+        self.unresolved += o.unresolved;
+        self.fetched += o.fetched;
+        if self.error.is_none() {
+            self.error = o.error;
+        }
+    }
+}
 
 /// An envelope read back from storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +180,14 @@ pub struct StoredEnvelope {
     /// database, a value not fetched yet). Such an entry is never valid; it
     /// is listed so that only its own unit loses it.
     pub error: Option<String>,
+}
+
+impl StoredEnvelope {
+    /// Whether the value is unread only because it has not been fetched
+    /// yet (a git-meta promised entry, see the module docs).
+    pub fn not_fetched(&self) -> bool {
+        self.error.as_deref() == Some(NOT_FETCHED)
+    }
 }
 
 /// An input manifest read back from storage (see the module docs).
@@ -309,8 +393,11 @@ struct CatFile {
 
 impl CatFile {
     fn start(root: &Utf8Path) -> Result<Self, GitError> {
+        // A blob missing here reads as missing: values are fetched in
+        // batches, never one by one behind a read (`GIT_NO_LAZY_FETCH`).
         let mut child = crate::cmd::Git::at(root)
             .args(["cat-file", "--batch"])
+            .env("GIT_NO_LAZY_FETCH", "1")
             .spawn_piped()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout piped"));
@@ -514,10 +601,7 @@ impl Reader {
     /// blob reference through `git cat-file`, a promised entry an error).
     fn value_bytes(&self, row: Row) -> Result<Vec<u8>, String> {
         let raw = if row.is_promised {
-            Err(
-                "the value has not been fetched (git-meta promised entry); run `vci fetch`"
-                    .to_owned(),
-            )
+            Err(NOT_FETCHED.to_owned())
         } else if row.is_git_ref {
             let mut blobs = self.blobs.borrow_mut();
             if blobs.is_none() {
@@ -619,6 +703,35 @@ impl Reader {
         Ok(out)
     }
 
+    /// How many attestations are stored (values not read).
+    pub fn count(&self) -> Result<usize, GitError> {
+        let prefix = format!("{KEY_PREFIX}:");
+        let len = prefix.len() as i64;
+        let rows = self.rows(
+            "SELECT target_type, target_value, key, '', value_type, is_git_ref, is_promised
+             FROM metadata WHERE substr(key, 1, ?1) = ?2",
+            &[&len, &prefix],
+        )?;
+        Ok(rows
+            .iter()
+            .filter(|r| r.value_type == "string" && parse_key(&r.key).is_some())
+            .count())
+    }
+
+    /// How many values of the store have not been fetched (promised rows).
+    pub fn promised(&self) -> Result<usize, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(0);
+        };
+        db.query_row(
+            "SELECT count(*) FROM metadata WHERE is_promised = 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as usize)
+        .map_err(|e| sql_err(path, e))
+    }
+
     /// Every stored attestation on any target.
     pub fn all(&self) -> Result<Vec<StoredEnvelope>, GitError> {
         let prefix = format!("{KEY_PREFIX}:");
@@ -654,11 +767,17 @@ struct Snapshot {
 struct KeySnapshot {
     tree: String,
     values: BTreeSet<Key>,
+    /// The blob of each string value.
+    value_blobs: BTreeMap<Key, String>,
     tombstones: BTreeSet<Key>,
     /// The blob of each whole-key tombstone (its deletion record).
     tombstone_blobs: BTreeMap<Key, String>,
     /// The blob of each stored input manifest, by input root.
     manifest_blobs: BTreeMap<String, String>,
+    /// Entries of a target git-meta reads that are neither a string value
+    /// nor a whole-key deletion record (a set or list value, or a member
+    /// deletion record), by path: only git-meta's own merge reads those.
+    others: Vec<String>,
     bad: Vec<String>,
     clean_tree: Option<String>,
 }
@@ -721,6 +840,18 @@ struct Round {
     deleted_here: BTreeSet<Key>,
 }
 
+/// What a merge from the trees' paths ([`AttestStore::materialize_lazy`])
+/// did.
+struct Materialized {
+    /// Entries changed (values taken, deletion records applied, values
+    /// deleted).
+    changed: usize,
+    /// Whether it merged two histories (else a fast-forward).
+    merged: bool,
+    /// Values taken whose blobs are not here (promised rows).
+    promised: usize,
+}
+
 /// Messages collected along an exchange.
 #[derive(Default)]
 struct Report {
@@ -746,6 +877,23 @@ impl Report {
 fn is_missing_remote_ref(e: &GitError) -> bool {
     let text = e.to_string().to_ascii_lowercase();
     text.contains("couldn't find remote ref") || text.contains("could not find remote ref")
+}
+
+/// What [`AttestStore::unsendable`] found.
+#[derive(Debug, Default)]
+struct Unsendable {
+    /// Values the remote does not have (any more).
+    gone: Vec<Key>,
+    /// Values that could not be fetched for another reason, with it.
+    stuck: Vec<(Key, Option<String>)>,
+}
+
+/// A fetch of object ids the server refused because it does not have them
+/// (any more): not reachable from its refs, or never there.
+fn is_unavailable_object(text: &str) -> bool {
+    text.contains("not our ref")
+        || text.contains("unadvertised object")
+        || text.contains("no such object")
 }
 
 fn is_ref_race(e: &GitError) -> bool {
@@ -945,6 +1093,640 @@ impl<'a> AttestStore<'a> {
             .map_err(meta_err)
     }
 
+    /// How many attestations are stored (values not read).
+    pub fn count(&self) -> Result<usize, GitError> {
+        self.reader()?.count()
+    }
+
+    // ---- lazy values -----------------------------------------------------
+
+    /// Fetch the values of the stored attestations of these units that were
+    /// not fetched yet (see the module docs), then those of the input
+    /// manifests the units' attestations reference: at most two `git fetch`
+    /// of object ids, whatever the number of units. Nothing is done (and
+    /// nothing locked or written) when no value is missing. A fetch that
+    /// fails leaves the values unread ([`Hydration::error`]): their units
+    /// run.
+    pub fn hydrate_units<'s>(
+        &self,
+        test_ids: impl IntoIterator<Item = &'s str>,
+    ) -> Result<Hydration, GitError> {
+        let ids: BTreeSet<&str> = test_ids.into_iter().collect();
+        if ids.is_empty() || self.reader()?.promised()? == 0 {
+            return Ok(Hydration::default());
+        }
+        let wanted: BTreeSet<(String, String, String)> = ids
+            .iter()
+            .map(|id| {
+                let t = target_for(id);
+                (
+                    t.target_type().as_str().to_owned(),
+                    t.value().unwrap_or("").to_owned(),
+                    vci_core::test_key(id),
+                )
+            })
+            .collect();
+        let _lock = self.exchange_lock()?;
+        let remote = self.value_remote()?;
+        let mut out = self.hydrate_locked(&remote, |k| {
+            parse_key(&k.key).is_some_and(|(tk, _, _)| {
+                wanted.contains(&(
+                    k.target_type.as_str().to_owned(),
+                    k.target_value.clone(),
+                    tk.to_owned(),
+                ))
+            })
+        })?;
+        let reader = self.reader()?;
+        let mut roots = BTreeSet::new();
+        for id in &ids {
+            for e in reader.candidates(id)? {
+                if e.error.is_none()
+                    && let Some(r) = envelope_manifest_ref(&e.bytes)
+                {
+                    roots.insert(r);
+                }
+            }
+        }
+        drop(reader);
+        if !roots.is_empty() {
+            out.add(self.hydrate_locked(&remote, |k| {
+                k.target_type == TargetType::Project
+                    && parse_manifest_key(&k.key).is_some_and(|r| roots.contains(r))
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch the stored input manifests with these roots that were not
+    /// fetched yet (see [`AttestStore::hydrate_units`]).
+    pub fn hydrate_manifests<'s>(
+        &self,
+        roots: impl IntoIterator<Item = &'s str>,
+    ) -> Result<Hydration, GitError> {
+        let roots: BTreeSet<&str> = roots.into_iter().collect();
+        if roots.is_empty() || self.reader()?.promised()? == 0 {
+            return Ok(Hydration::default());
+        }
+        let _lock = self.exchange_lock()?;
+        let remote = self.value_remote()?;
+        self.hydrate_locked(&remote, |k| {
+            k.target_type == TargetType::Project
+                && parse_manifest_key(&k.key).is_some_and(|r| roots.contains(r))
+        })
+    }
+
+    /// Fetch every stored attestation not fetched yet (input manifests
+    /// excluded): what reading the whole store (`vci prune`) needs. On a
+    /// large store that is most of what a full fetch used to download.
+    pub fn hydrate_attestations(&self) -> Result<Hydration, GitError> {
+        if self.reader()?.promised()? == 0 {
+            return Ok(Hydration::default());
+        }
+        let _lock = self.exchange_lock()?;
+        let remote = self.value_remote()?;
+        self.hydrate_locked(&remote, |k| parse_key(&k.key).is_some())
+    }
+
+    /// Before supersession deletes the stored input manifests among `roots`
+    /// that no stored attestation references: fetch, in one batch, the
+    /// attestations not fetched yet that could reference one of them, and
+    /// return the roots that cannot be decided (keep them): a manifest that
+    /// cannot be read, or one an attestation still not fetched could
+    /// reference. Any other root is referenced by the readable attestations
+    /// or by none (an attestation [`StoredEnvelope::not_fetched`] then
+    /// cannot reference it).
+    ///
+    /// Which attestations could: one referencing a manifest was made by a
+    /// unit that observed exactly the manifest's inputs, its own path among
+    /// them (its test file, or the files of its package directory), so it is
+    /// stored on the `project` target or on a path target at or above a
+    /// path the manifest lists. (Were a unit's path ever missing from its
+    /// own inputs, a manifest still referenced could go: its unit runs,
+    /// and is attested again.)
+    pub fn hydrate_manifest_referrers(
+        &self,
+        roots: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, GitError> {
+        let is_attestation = |k: &Key| parse_key(&k.key).is_some();
+        if roots.is_empty() || !self.promised_keys()?.iter().any(is_attestation) {
+            return Ok(BTreeSet::new());
+        }
+        let _ = self.hydrate_manifests(roots.iter().map(String::as_str))?;
+        let mut undecided = BTreeSet::new();
+        let mut scopes: Vec<(&String, BTreeSet<String>)> = Vec::new();
+        let reader = self.reader()?;
+        for r in roots {
+            let decoded = reader
+                .manifest(r)?
+                .filter(|m| m.error.is_none())
+                .and_then(|m| vci_core::InputManifest::from_compact(&m.bytes).ok());
+            let Some(m) = decoded else {
+                undecided.insert(r.clone());
+                continue;
+            };
+            let mut paths = BTreeSet::new();
+            for e in &m.entries {
+                let p = e.path.as_str();
+                paths.extend(p.match_indices('/').map(|(i, _)| p[..i].to_owned()));
+                paths.insert(p.to_owned());
+            }
+            scopes.push((r, paths));
+        }
+        drop(reader);
+        let may_reference = |k: &Key, paths: &BTreeSet<String>| {
+            is_attestation(k)
+                && (k.target_type == TargetType::Project
+                    || k.target_type == TargetType::Path && paths.contains(&k.target_value))
+        };
+        let could = |k: &Key| scopes.iter().any(|(_, p)| may_reference(k, p));
+        if self.promised_keys()?.iter().any(could) {
+            let _lock = self.exchange_lock()?;
+            if let Ok(remote) = self.value_remote() {
+                self.hydrate_locked(&remote, could)?;
+            }
+        }
+        let still = self.promised_keys()?;
+        for (r, paths) in &scopes {
+            if still.iter().any(|k| may_reference(k, paths)) {
+                undecided.insert((*r).clone());
+            }
+        }
+        Ok(undecided)
+    }
+
+    /// The metadata remote values are fetched from: the primary git-meta
+    /// remote, the one `vci fetch` fetched them from.
+    fn value_remote(&self) -> Result<String, GitError> {
+        let remotes = self.remotes()?;
+        remotes
+            .iter()
+            .find(|r| r.2 && !r.3)
+            .map(|r| r.0.clone())
+            .ok_or_else(|| {
+                GitError::NoMetaRemote(
+                    "no git-meta remote is configured to fetch values from; run `vci fetch`"
+                        .to_owned(),
+                )
+            })
+    }
+
+    /// [`AttestStore::hydrate_units`]'s work for the promised rows `wanted`
+    /// selects, the exchange lock held: their blobs are the ones at their
+    /// keys' paths in `refs/<ns>/local/main` (a promised row stands for
+    /// exactly that value), fetched from `remote` when missing, and each row
+    /// whose blob is now here becomes a reference to it.
+    fn hydrate_locked(
+        &self,
+        remote: &str,
+        wanted: impl Fn(&Key) -> bool,
+    ) -> Result<Hydration, GitError> {
+        let started = std::time::Instant::now();
+        let promised: Vec<Key> = self
+            .promised_keys()?
+            .into_iter()
+            .filter(|k| wanted(k))
+            .collect();
+        if promised.is_empty() {
+            return Ok(Hydration::default());
+        }
+        let local_ref = format!("refs/{}/local/main", self.namespace()?);
+        let Some(local) = self.read_ref(&local_ref)? else {
+            return Ok(Hydration {
+                unresolved: promised.len(),
+                error: Some(format!("{local_ref} does not exist")),
+                ..Default::default()
+            });
+        };
+        let snap = self.snapshot_keys(&local)?;
+        let blobs: BTreeMap<&Key, &String> = promised
+            .iter()
+            .filter_map(|k| snap.value_blobs.get(k).map(|o| (k, o)))
+            .collect();
+        let oids: BTreeSet<String> = blobs.values().map(|o| (*o).clone()).collect();
+        let (have, fetched, error) = self.ensure_blobs(remote, &oids)?;
+        let mut out = Hydration {
+            fetched,
+            error,
+            ..Default::default()
+        };
+        let resolve: Vec<(&Key, &String)> = blobs
+            .iter()
+            .filter(|(_, o)| have.contains(**o))
+            .map(|(k, o)| (*k, *o))
+            .collect();
+        out.unresolved = promised.len() - resolve.len();
+        if let Some((path, db)) = self.db_rw()? {
+            let tx = db.unchecked_transaction().map_err(|e| sql_err(&path, e))?;
+            for (k, oid) in &resolve {
+                out.resolved += tx
+                    .execute(
+                        "UPDATE metadata SET value = ?4, value_type = 'string', is_git_ref = 1, is_promised = 0
+                         WHERE target_type = ?1 AND target_value = ?2 AND key = ?3 AND is_promised = 1",
+                        rusqlite::params![k.target_type.as_str(), k.target_value, k.key, oid],
+                    )
+                    .map_err(|e| sql_err(&path, e))?;
+            }
+            tx.commit().map_err(|e| sql_err(&path, e))?;
+        }
+        if std::env::var_os("VCI_TIMING").is_some() {
+            eprintln!(
+                "vci: timing: fetch {} value(s) ({} blob(s) downloaded): {:.2}s",
+                out.resolved,
+                out.fetched,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(out)
+    }
+
+    /// A read-write connection to the store, `None` when there is none yet.
+    fn db_rw(&self) -> Result<Option<(Utf8PathBuf, rusqlite::Connection)>, GitError> {
+        let path = self.db_path()?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let db = rusqlite::Connection::open(&path).map_err(|e| sql_err(&path, e))?;
+        db.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| sql_err(&path, e))?;
+        let tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql_err(&path, e))?;
+        Ok((tables > 0).then_some((path, db)))
+    }
+
+    /// The store's value rows (promised ones included, side-remote imports
+    /// excluded, as git-meta's serialization reads them): key -> (time of the
+    /// last write, promised).
+    fn store_rows(&self) -> Result<BTreeMap<Key, (i64, bool)>, GitError> {
+        let Some((path, db)) = self.db_rw()? else {
+            return Ok(BTreeMap::new());
+        };
+        let mut stmt = db
+            .prepare(
+                "SELECT target_type, target_value, key, last_timestamp, is_promised
+                 FROM metadata WHERE source_ref IS NULL",
+            )
+            .map_err(|e| sql_err(&path, e))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, bool>(4)?,
+                ))
+            })
+            .map_err(|e| sql_err(&path, e))?;
+        let mut out = BTreeMap::new();
+        for r in rows {
+            let (ty, value, key, ts, promised) = r.map_err(|e| sql_err(&path, e))?;
+            if let Ok(target_type) = TargetType::from_str(&ty) {
+                out.insert(
+                    Key {
+                        target_type,
+                        target_value: value,
+                        key,
+                    },
+                    (ts, promised),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// The keys of the store's promised rows.
+    fn promised_keys(&self) -> Result<BTreeSet<Key>, GitError> {
+        Ok(self
+            .store_rows()?
+            .into_iter()
+            .filter(|(_, (_, p))| *p)
+            .map(|(k, _)| k)
+            .collect())
+    }
+
+    /// Point the store's rows for `entries` (key -> blob id in `commit`'s
+    /// tree) at those values, reading none that is not here: a blob in the
+    /// object database is stored as git-meta's merge stores the value (up to
+    /// `inline_max` bytes in the row, a larger one as a reference to the
+    /// blob), a missing one as a promised row. Like git-meta's own write of a
+    /// value, it replaces the row and deletes a deletion record of the key;
+    /// unlike it, nothing is logged as a local change (the tree already
+    /// holds the value). Returns how many rows are promised.
+    fn mark_values(
+        &self,
+        entries: &BTreeMap<Key, String>,
+        commit: &str,
+        now: i64,
+        inline_max: usize,
+    ) -> Result<usize, GitError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let oids: BTreeSet<String> = entries.values().cloned().collect();
+        let sizes = self.present_sizes(&oids)?;
+        let small: BTreeSet<String> = sizes
+            .iter()
+            .filter(|(_, n)| usize::try_from(**n).is_ok_and(|n| n <= inline_max))
+            .map(|(o, _)| o.clone())
+            .collect();
+        let read = self.read_blobs(&small)?;
+        let Some((path, db)) = self.db_rw()? else {
+            return Err(GitError::Store(
+                "the git-meta store does not exist".to_owned(),
+            ));
+        };
+        let tx = db.unchecked_transaction().map_err(|e| sql_err(&path, e))?;
+        let mut promised = 0;
+        for (k, oid) in entries {
+            let here = sizes.contains_key(oid);
+            promised += usize::from(!here);
+            // git-meta's parse reads a value blob as (lossy) UTF-8, and its
+            // merge keeps a value of up to its size limit in the row, as JSON.
+            let inline = read
+                .get(oid)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .filter(|s| s.len() <= inline_max)
+                .map(|s| serde_json::to_string(&s))
+                .transpose()
+                .map_err(|e| GitError::Store(format!("encoding a value: {e}")))?;
+            let (value, git_ref) = match (&inline, here) {
+                (Some(json), _) => (json.as_str(), false),
+                (None, true) => (oid.as_str(), true),
+                (None, false) => ("", false),
+            };
+            let (ty, tv, key) = (k.target_type.as_str(), &k.target_value, &k.key);
+            tx.execute(
+                "INSERT INTO metadata (target_type, target_value, key, value, value_type, last_timestamp, is_git_ref, is_promised, promised_commit, source_ref)
+                 VALUES (?1, ?2, ?3, ?4, 'string', ?5, ?6, ?7, ?8, NULL)
+                 ON CONFLICT(target_type, target_value, key) DO UPDATE
+                 SET value = excluded.value, value_type = 'string', last_timestamp = excluded.last_timestamp,
+                     is_git_ref = excluded.is_git_ref, is_promised = excluded.is_promised,
+                     promised_commit = excluded.promised_commit, source_ref = NULL",
+                rusqlite::params![
+                    ty,
+                    tv,
+                    key,
+                    value,
+                    now,
+                    git_ref,
+                    !here,
+                    if here { None } else { Some(commit) },
+                ],
+            )
+            .map_err(|e| sql_err(&path, e))?;
+            for sql in [
+                "DELETE FROM list_values WHERE metadata_id IN
+                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
+                "DELETE FROM set_values WHERE metadata_id IN
+                 (SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3)",
+                "DELETE FROM tombstones WHERE tombstone_type = 'metadata'
+                 AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+            ] {
+                tx.execute(sql, rusqlite::params![ty, tv, key])
+                    .map_err(|e| sql_err(&path, e))?;
+            }
+        }
+        tx.commit().map_err(|e| sql_err(&path, e))?;
+        Ok(promised)
+    }
+
+    /// Which of `oids` the local object database holds (nothing is fetched:
+    /// `GIT_NO_LAZY_FETCH`).
+    fn present(&self, oids: &BTreeSet<String>) -> Result<BTreeSet<String>, GitError> {
+        Ok(self.present_sizes(oids)?.into_keys().collect())
+    }
+
+    /// The size of each blob of `oids` the local object database holds
+    /// (nothing is fetched).
+    fn present_sizes(&self, oids: &BTreeSet<String>) -> Result<BTreeMap<String, u64>, GitError> {
+        if oids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut input = Vec::new();
+        for o in oids {
+            if !is_oid(o) {
+                return Err(GitError::Parse(format!("not an object id: {o:?}")));
+            }
+            input.extend_from_slice(o.as_bytes());
+            input.push(b'\n');
+        }
+        let out = self
+            .repo
+            .git()
+            .args([
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_with_stdin(&input)?;
+        Ok(String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split(' ');
+                match (f.next(), f.next(), f.next().map(str::parse::<u64>)) {
+                    (Some(o), Some("blob"), Some(Ok(n))) if oids.contains(o) => {
+                        Some((o.to_owned(), n))
+                    }
+                    _ => None,
+                }
+            })
+            .collect())
+    }
+
+    /// Download the blobs `oids` from `remote` as a blobless clone fetches a
+    /// value it reads (`git fetch --filter=blob:none --stdin`, in batches).
+    fn fetch_blobs(&self, remote: &str, oids: &[&String]) -> Result<(), GitError> {
+        for batch in oids.chunks(FETCH_BLOB_BATCH) {
+            self.fetch_objects(remote, batch)?;
+        }
+        Ok(())
+    }
+
+    /// `git fetch --stdin` of the objects `oids` (blobs, or a tree with its
+    /// subtrees) from `remote`, values left out, without negotiation: what
+    /// git's own lazy fetch runs, except that `remote` is a promisor for
+    /// this command only (see the module docs).
+    fn fetch_objects(&self, remote: &str, oids: &[&String]) -> Result<(), GitError> {
+        let mut input = Vec::new();
+        for o in oids {
+            input.extend_from_slice(o.as_bytes());
+            input.push(b'\n');
+        }
+        self.filtered_fetch(remote, "blob:none")?
+            .args(["-c", "fetch.negotiationAlgorithm=noop"])
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--recurse-submodules=no",
+                "--filter=blob:none",
+                "--stdin",
+                remote,
+            ])
+            .run_with_stdin(&input)?;
+        Ok(())
+    }
+
+    /// The start of a `git fetch` from `remote` with `--filter` (the caller
+    /// adds `fetch`, its options and `--filter=<filter>`): `remote` named a
+    /// promisor on the command line, so git neither records it as one in
+    /// the repository's configuration (which would make it the remote of
+    /// every lazy fetch) nor refuses the objects it leaves out; the
+    /// repository's own promisor is [`NO_LAZY_FETCH_REMOTE`], configured
+    /// first so `git gc` and `git fsck` accept the objects left out.
+    fn filtered_fetch(&self, remote: &str, filter: &str) -> Result<crate::cmd::Git, GitError> {
+        self.ensure_no_lazy_fetch_remote()?;
+        Ok(self.repo.git().args([
+            "-c".to_owned(),
+            format!("remote.{remote}.promisor=true"),
+            "-c".to_owned(),
+            format!("remote.{remote}.partialclonefilter={filter}"),
+        ]))
+    }
+
+    /// Configure [`NO_LAZY_FETCH_REMOTE`] as the repository's promisor
+    /// remote unless it is (see the module docs).
+    fn ensure_no_lazy_fetch_remote(&self) -> Result<(), GitError> {
+        let section = format!("remote.{NO_LAZY_FETCH_REMOTE}");
+        if self.config_get(&format!("{section}.promisor"))?.as_deref() == Some("true") {
+            return Ok(());
+        }
+        self.config_set(&format!("{section}.skipFetchAll"), "true")?;
+        self.config_set(&format!("{section}.skipDefaultUpdate"), "true")?;
+        self.config_set(&format!("{section}.promisor"), "true")
+    }
+
+    /// Make `commit`'s whole tree present (not its values): a commit fetched
+    /// without trees (`--filter=tree:0`), or one whose trees a fetch left
+    /// out because the server counted them as reachable from a commit whose
+    /// trees this clone never fetched, gets its tree and subtrees in one
+    /// fetch of the tree's id. Nothing is fetched when they are here.
+    fn complete_tree(&self, remote: &str, commit: &str) -> Result<(), GitError> {
+        let complete = || -> Result<bool, GitError> {
+            let (_, out) = self
+                .repo
+                .git()
+                .args(["ls-tree", "-r", "-d", "-z", "--full-tree", commit])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .output_described()?;
+            Ok(out.status.success())
+        };
+        if complete()? {
+            return Ok(());
+        }
+        // The commit's own record (`<commit>^{tree}` wants the tree there).
+        let raw = self
+            .repo
+            .git()
+            .args(["cat-file", "commit", commit])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()?;
+        let tree = raw
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("tree "))
+            .filter(|t| is_oid(t))
+            .ok_or_else(|| GitError::Parse(format!("no tree in commit {commit}")))?
+            .to_owned();
+        self.fetch_objects(remote, &[&tree])?;
+        if complete()? {
+            Ok(())
+        } else {
+            Err(GitError::Meta(format!(
+                "the tree of metadata commit {commit} is incomplete after fetching it from {remote}"
+            )))
+        }
+    }
+
+    /// Make the blobs `oids` present, fetching the missing ones from
+    /// `remote`: (the ones present now, how many were downloaded, why the
+    /// fetch failed).
+    fn ensure_blobs(
+        &self,
+        remote: &str,
+        oids: &BTreeSet<String>,
+    ) -> Result<(BTreeSet<String>, usize, Option<String>), GitError> {
+        let mut have = self.present(oids)?;
+        let missing: BTreeSet<String> = oids.difference(&have).cloned().collect();
+        if missing.is_empty() {
+            return Ok((have, 0, None));
+        }
+        let error = self
+            .fetch_blobs(remote, &missing.iter().collect::<Vec<_>>())
+            .err()
+            .map(|e| e.to_string());
+        let now = self.present(&missing)?;
+        let fetched = now.len();
+        have.extend(now);
+        Ok((have, fetched, error))
+    }
+
+    /// The contents of the blobs `oids` that can be read.
+    fn read_blobs(&self, oids: &BTreeSet<String>) -> Result<BTreeMap<String, Vec<u8>>, GitError> {
+        let mut out = BTreeMap::new();
+        if oids.is_empty() {
+            return Ok(out);
+        }
+        let mut cat = CatFile::start(self.repo.root())?;
+        for o in oids {
+            match cat.blob(o) {
+                Ok(b) => {
+                    out.insert(o.clone(), b);
+                }
+                Err(_) => cat = CatFile::start(self.repo.root())?,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every blob of `commit`'s tree.
+    fn tree_blobs(&self, commit: &str) -> Result<BTreeSet<String>, GitError> {
+        let listing = self
+            .repo
+            .git()
+            .args(["ls-tree", "-r", "-z", "--full-tree"])
+            .arg(format!("{commit}^{{tree}}"))
+            .run()?;
+        Ok(split_ls_tree(&listing)
+            .into_iter()
+            .filter(|(_, kind, _, _)| *kind == b"blob")
+            .map(|(_, _, oid, _)| String::from_utf8_lossy(oid).into_owned())
+            .collect())
+    }
+
+    /// Fetch every blob git-meta's own merge of these commits reads (it
+    /// reads every value of the trees it merges, through gix, which never
+    /// fetches a missing object).
+    fn hydrate_trees(&self, remote: &str, commits: &[&str]) -> Result<usize, GitError> {
+        let mut oids = BTreeSet::new();
+        for c in commits {
+            self.complete_tree(remote, c)?;
+            oids.extend(self.tree_blobs(c)?);
+        }
+        let (have, fetched, error) = self.ensure_blobs(remote, &oids)?;
+        if let Some(e) = error
+            && have.len() < oids.len()
+        {
+            return Err(GitError::Meta(format!(
+                "fetching the {} value(s) git-meta's merge reads: {e}",
+                oids.len() - have.len()
+            )));
+        }
+        Ok(fetched)
+    }
+
+    /// The empty tree's id (written if needed).
+    fn empty_tree(&self) -> Result<String, GitError> {
+        parse_oid(&self.repo.git().args(["mktree", "-z"]).run_with_stdin(b"")?)
+    }
+
     // ---- remotes ---------------------------------------------------------
 
     /// The metadata namespace (`meta.namespace`, default `meta`).
@@ -1090,8 +1872,8 @@ impl<'a> AttestStore<'a> {
     }
 
     /// Configure a metadata remote for `url` the way `git meta remote add`
-    /// does (minus its starter commit and blobless fetch settings: vci
-    /// fetches whole trees).
+    /// does (minus its starter commit; never as a promisor remote, see the
+    /// module docs).
     fn add_remote(
         &self,
         url: &str,
@@ -1213,9 +1995,11 @@ impl<'a> AttestStore<'a> {
         let mut bad = Vec::new();
         let mut keep: Vec<u8> = Vec::new();
         let mut values = BTreeSet::new();
+        let mut value_blobs = BTreeMap::new();
         let mut tombstones = BTreeSet::new();
         let mut tombstone_blobs = BTreeMap::new();
         let mut manifest_blobs = BTreeMap::new();
+        let mut others = Vec::new();
         for (mode, kind, oid, path) in &records {
             let oid_str = || String::from_utf8_lossy(oid).into_owned();
             let reason = match std::str::from_utf8(path) {
@@ -1241,6 +2025,7 @@ impl<'a> AttestStore<'a> {
                                         {
                                             manifest_blobs.insert(root.to_owned(), oid_str());
                                         }
+                                        value_blobs.insert(k.clone(), oid_str());
                                         values.insert(k);
                                     }
                                 }
@@ -1251,7 +2036,7 @@ impl<'a> AttestStore<'a> {
                                         tombstones.insert(k);
                                     }
                                 }
-                                PathKey::Other => {}
+                                PathKey::Other => others.push(p.to_owned()),
                             }
                             None
                         }
@@ -1294,9 +2079,11 @@ impl<'a> AttestStore<'a> {
         Ok(KeySnapshot {
             tree,
             values,
+            value_blobs,
             tombstones,
             tombstone_blobs,
             manifest_blobs,
+            others,
             bad,
             clean_tree,
         })
@@ -1398,23 +2185,21 @@ impl<'a> AttestStore<'a> {
     /// git-meta's serialization (a commit on top of that ref, built from the
     /// store alone) would delete those values for everyone on the next push.
     /// Returns how many entries were applied.
-    fn cover_local_ref(&self, session: &Session, local_ref: &str) -> Result<usize, GitError> {
+    fn cover_local_ref(
+        &self,
+        session: &Session,
+        remote: &str,
+        local_ref: &str,
+    ) -> Result<usize, GitError> {
         let Some(local) = self.read_ref(local_ref)? else {
             return Ok(0);
         };
         let store = session.store();
-        let rows: BTreeMap<Key, i64> = guarded("reading the store", || store.get_all_metadata())?
+        // Promised rows are rows: the store holds those values, unread.
+        let rows: BTreeMap<Key, i64> = self
+            .store_rows()?
             .into_iter()
-            .map(|e| {
-                (
-                    Key {
-                        target_type: e.target_type,
-                        target_value: e.target_value,
-                        key: e.key,
-                    },
-                    e.last_timestamp,
-                )
-            })
+            .map(|(k, (ts, _))| (k, ts))
             .collect();
         let deleted: BTreeSet<Key> = guarded("reading the store", || store.get_all_tombstones())?
             .into_iter()
@@ -1442,7 +2227,77 @@ impl<'a> AttestStore<'a> {
         {
             return Ok(0);
         }
-        let snap = self.snapshot(session, &local)?;
+        if !keys.others.is_empty() {
+            // A set or list value: git-meta parses the tree, every value
+            // read, so every blob of it must be here first.
+            self.hydrate_trees(remote, &[&local])?;
+            let fresh = self.session()?;
+            return self.cover_local_ref_parsed(&fresh, &local, &rows, &deleted);
+        }
+        // From the paths: a value the store lacks becomes a row pointing at
+        // the ref's blob (promised when the blob is not here); only the
+        // deletion records that may apply are read (tiny blobs, fetched in
+        // one batch when missing).
+        let missing: BTreeMap<Key, String> = keys
+            .value_blobs
+            .iter()
+            .filter(|(k, _)| !rows.contains_key(*k) && !deleted.contains(*k))
+            .map(|(k, o)| (k.clone(), o.clone()))
+            .collect();
+        let candidates: BTreeMap<&Key, &String> = keys
+            .tombstone_blobs
+            .iter()
+            .filter(|(k, _)| rows.contains_key(*k) || !deleted.contains(*k))
+            .collect();
+        let oids: BTreeSet<String> = candidates.values().map(|o| (*o).clone()).collect();
+        let (_, _, error) = self.ensure_blobs(remote, &oids)?;
+        let read = self.read_blobs(&oids)?;
+        let mut deletions: Vec<(&Key, Tombstone)> = Vec::new();
+        for (k, oid) in candidates {
+            // git-meta's parse skips a record it cannot read.
+            let Some(t) = read
+                .get(oid)
+                .and_then(|b| serde_json::from_slice::<Tombstone>(b).ok())
+            else {
+                if let Some(e) = &error {
+                    return Err(GitError::Meta(format!(
+                        "fetching the deletion records of {local_ref}: {e}"
+                    )));
+                }
+                continue;
+            };
+            let applies = match rows.get(k) {
+                Some(ts) => *ts < t.timestamp,
+                None => !deleted.contains(k),
+            };
+            if applies {
+                deletions.push((k, t));
+            }
+        }
+        if missing.is_empty() && deletions.is_empty() {
+            return Ok(0);
+        }
+        let inline_max = guarded("reading the store", || store.object_max_size())?;
+        self.mark_values(&missing, &local, now_ms(), inline_max)?;
+        for (k, t) in &deletions {
+            guarded("applying a deletion record", || {
+                store.apply_tombstone(&k.to_target(), &k.key, &t.email, t.timestamp)
+            })?;
+        }
+        Ok(missing.len() + deletions.len())
+    }
+
+    /// [`AttestStore::cover_local_ref`] for a ref holding entries only
+    /// git-meta's parse reads (every blob of it present).
+    fn cover_local_ref_parsed(
+        &self,
+        session: &Session,
+        local: &str,
+        rows: &BTreeMap<Key, i64>,
+        deleted: &BTreeSet<Key>,
+    ) -> Result<usize, GitError> {
+        let store = session.store();
+        let snap = self.snapshot(session, local)?;
         let missing: BTreeMap<Key, TreeValue> = snap
             .parsed
             .values
@@ -1476,10 +2331,7 @@ impl<'a> AttestStore<'a> {
         if missing.is_empty() && deletions.is_empty() {
             return Ok(0);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let now = now_ms();
         let email = session.email().to_owned();
         guarded("restoring values into the store", || {
             store.apply_tree(&missing, &BTreeMap::new(), &set_t, &list_t, &email, now)
@@ -1506,19 +2358,13 @@ impl<'a> AttestStore<'a> {
         )
     }
 
-    /// vci attestation keys the store holds a value for.
-    fn attestation_keys(&self, session: &Session) -> Result<BTreeSet<Key>, GitError> {
-        Ok(
-            guarded("reading the store", || session.store().get_all_metadata())?
-                .into_iter()
-                .filter(|e| parse_key(&e.key).is_some())
-                .map(|e| Key {
-                    target_type: e.target_type,
-                    target_value: e.target_value,
-                    key: e.key,
-                })
-                .collect(),
-        )
+    /// vci attestation keys the store holds a value for (fetched or not).
+    fn attestation_keys(&self) -> Result<BTreeSet<Key>, GitError> {
+        Ok(self
+            .store_rows()?
+            .into_keys()
+            .filter(|k| parse_key(&k.key).is_some())
+            .collect())
     }
 
     /// git-meta's full serialization of the store onto `local_ref`, refused
@@ -1555,6 +2401,7 @@ impl<'a> AttestStore<'a> {
             return Ok(());
         }
         let deleted = self.deletion_records(session)?;
+        let promised = self.promised_keys()?;
         // Incremental: only the targets with rows modified since the last
         // materialization are rebuilt (the rest of the tree is reused by
         // object id); a full serialization hashes every value of the store
@@ -1568,18 +2415,30 @@ impl<'a> AttestStore<'a> {
             }
         })?;
         let new = self.read_ref(local_ref)?;
-        let (Some(prev), Some(new)) = (prev, new) else {
+        let (Some(prev), Some(mut new)) = (prev, new) else {
             return Ok(());
         };
         if prev == new {
             return Ok(());
         }
-        let before = self.snapshot_keys(&prev)?.values;
+        let before = self.snapshot_keys(&prev)?;
         let after = self.snapshot_keys(&new)?.values;
-        let dropped: Vec<&Key> = before
+        let (graft, dropped): (Vec<&Key>, Vec<&Key>) = before
+            .values
             .difference(&after)
             .filter(|k| !deleted.contains(*k))
-            .collect();
+            .partition(|k| promised.contains(*k));
+        if !graft.is_empty() {
+            // git-meta rebuilds a changed target's subtree from the rows it
+            // holds values for, so the target's values not fetched yet fell
+            // out: put them back at the blobs the previous commit held (the
+            // values those rows stand for), without reading them.
+            let entries: Vec<(&Key, &String)> = graft
+                .iter()
+                .filter_map(|k| before.value_blobs.get(*k).map(|o| (*k, o)))
+                .collect();
+            new = self.graft_values(local_ref, &new, &entries)?;
+        }
         if dropped.is_empty() {
             return Ok(());
         }
@@ -1596,6 +2455,85 @@ impl<'a> AttestStore<'a> {
             target_label(&dropped[0].to_target()),
             dropped[0].key
         )))
+    }
+
+    /// Rewrite `commit` (the tip of `local_ref`) with `entries` (key -> blob
+    /// id) put back into its tree, none of the blobs read; the same commit
+    /// otherwise (parents, message, author). Returns the new commit.
+    fn graft_values(
+        &self,
+        local_ref: &str,
+        commit: &str,
+        entries: &[(&Key, &String)],
+    ) -> Result<String, GitError> {
+        let mut paths = Vec::new();
+        for (k, oid) in entries {
+            let p = guarded("building a git-meta tree path", || {
+                git_meta_lib::tree_paths::tree_path(&k.to_target(), &k.key)
+            })?;
+            paths.push((p, oid.as_str()));
+        }
+        let tree = self.tree_with(Some(&format!("{commit}^{{tree}}")), &paths)?;
+        let raw = self.repo.git().args(["cat-file", "commit", commit]).run()?;
+        let mut lines = raw.splitn(2, |b| *b == b'\n');
+        let (Some(first), Some(rest)) = (lines.next(), lines.next()) else {
+            return Err(GitError::Parse(format!("commit {commit} has no header")));
+        };
+        if !first.starts_with(b"tree ") {
+            return Err(GitError::Parse(format!(
+                "commit {commit} does not start with its tree"
+            )));
+        }
+        let mut obj = format!("tree {tree}\n").into_bytes();
+        obj.extend_from_slice(rest);
+        let c = self
+            .repo
+            .git()
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .run_with_stdin(&obj)?;
+        let c = parse_oid(&c)?;
+        self.cas_ref(
+            local_ref,
+            Some(&c),
+            commit,
+            "vci: keep the values not fetched yet",
+        )?;
+        Ok(c)
+    }
+
+    /// Write the tree `base` (a tree-ish; `None`: empty) with `entries`
+    /// (path -> blob id) added or replaced, none of the blobs read.
+    fn tree_with(
+        &self,
+        base: Option<&str>,
+        entries: &[(String, &str)],
+    ) -> Result<String, GitError> {
+        let dir = tempfile::tempdir()?;
+        let index = dir.path().join("index");
+        if let Some(b) = base {
+            self.repo
+                .git()
+                .args(["read-tree", b])
+                .env("GIT_INDEX_FILE", &index)
+                .run()?;
+        }
+        let mut info = Vec::new();
+        for (path, oid) in entries {
+            info.extend_from_slice(format!("100644 blob {oid}\t{path}").as_bytes());
+            info.push(0);
+        }
+        self.repo
+            .git()
+            .args(["update-index", "-z", "--index-info"])
+            .env("GIT_INDEX_FILE", &index)
+            .run_with_stdin(&info)?;
+        let t = self
+            .repo
+            .git()
+            .args(["write-tree", "--missing-ok"])
+            .env("GIT_INDEX_FILE", &index)
+            .run()?;
+        parse_oid(&t)
     }
 
     /// Warnings about project-target settings that affect attestations for
@@ -1633,10 +2571,11 @@ impl<'a> AttestStore<'a> {
         }
     }
 
-    /// Fetch the remote's `refs/<ns>/main` into its tracking ref (whole
-    /// trees, no blob filter), serialize local values, and materialize the
-    /// remote's into the local store (git-meta's merge). Same refs and result
-    /// as `git meta pull`.
+    /// Fetch the remote's `refs/<ns>/main` into its tracking ref (its
+    /// commits and trees, no values: see the module docs), serialize local
+    /// values, and materialize the remote's into the local store (git-meta's
+    /// merge, done from the trees' paths). Same refs and result as `git meta
+    /// pull`.
     pub fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, GitError> {
         let _lock = self.exchange_lock()?;
         let name = self.ensure_remote(remote)?;
@@ -1666,28 +2605,47 @@ impl<'a> AttestStore<'a> {
         let remote_ref = format!("refs/{ns}/main");
         let local_ref = format!("refs/{ns}/local/main");
         let tracking = self.tracking_ref(name, &ns)?;
+        // Commits and trees only (a tree's paths are its keys): values are
+        // fetched when read (see the module docs). The first fetch of the
+        // tracking ref takes the commits alone (`tree:0`) and then the tip's
+        // tree: the history is complete (never shallow) without
+        // downloading the trees of every commit in it. Later ones take the
+        // commits since the tip they have, with their trees, so the local
+        // metadata commit and the remote's keep the history (and the merge
+        // bases' trees) they share.
+        let first = self.read_ref(&tracking)?.is_none();
+        let refspec = format!("+{remote_ref}:{tracking}");
         // One round trip: fetch the ref, and read "not there yet" from git's
         // own error (an `ls-remote` first would be a second round trip, about
         // half a second against GitHub).
-        let fetched = self
-            .repo
-            .git()
-            .args([
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--recurse-submodules=no",
-                "--no-filter",
-                name,
-            ])
-            .arg(format!("+{remote_ref}:{tracking}"))
-            .run();
+        let fetch = |filter: &str| -> Result<Vec<u8>, GitError> {
+            self.filtered_fetch(name, filter)?
+                .args([
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--recurse-submodules=no",
+                ])
+                .arg(format!("--filter={filter}"))
+                .arg(name)
+                .arg(&refspec)
+                .run()
+        };
+        let mut fetched = fetch(if first { "tree:0" } else { "blob:none" });
+        if first && matches!(&fetched, Err(e) if e.to_string().contains("filter")) {
+            // A server that refuses tree filters (`uploadpackfilter.tree.allow
+            // = false`) still serves blobless fetches.
+            fetched = fetch("blob:none");
+        }
         let found = match fetched {
             Ok(_) => true,
             Err(e) if is_missing_remote_ref(&e) => false,
             Err(e) => return Err(e),
         };
+        if found && let Some(tip) = self.read_ref(&tracking)? {
+            self.complete_tree(name, &tip)?;
+        }
         let purged = self.purge_unserializable_rows()?;
         if purged > 0 {
             report.warn(format!(
@@ -1696,11 +2654,9 @@ impl<'a> AttestStore<'a> {
             ));
         }
         // A fresh session sees the objects the fetch just wrote.
-        let session = self.session()?;
+        let mut session = self.session()?;
         let mut remote_deleted = BTreeSet::new();
-        let mut remote_values = BTreeSet::new();
-        let mut remote_tombstone_blobs = BTreeMap::new();
-        let mut remote_manifest_blobs = BTreeMap::new();
+        let mut tip_snap: Option<KeySnapshot> = None;
         if found && let Some(tip) = self.read_ref(&tracking)? {
             let snap = self.snapshot_keys(&tip)?;
             if let Some(clean) = &snap.clean_tree {
@@ -1742,12 +2698,14 @@ impl<'a> AttestStore<'a> {
                     snap.bad[0]
                 ));
             }
-            remote_deleted = snap.tombstones;
-            remote_values = snap.values;
-            remote_tombstone_blobs = snap.tombstone_blobs;
-            remote_manifest_blobs = snap.manifest_blobs;
+            remote_deleted = snap.tombstones.clone();
+            tip_snap = Some(snap);
         }
-        let restored = self.cover_local_ref(&session, &local_ref)?;
+        let remote_manifest_blobs = tip_snap
+            .as_ref()
+            .map(|s| s.manifest_blobs.clone())
+            .unwrap_or_default();
+        let restored = self.cover_local_ref(&session, name, &local_ref)?;
         if restored > 0 {
             report.note(format!(
                 "restored {restored} entr{} of {local_ref} into this repository's git-meta store, which did not hold them (a new or replaced .git/git-meta.sqlite, or a linked worktree)",
@@ -1756,10 +2714,10 @@ impl<'a> AttestStore<'a> {
         }
         let deleted_here = self.deletion_records(&session)?;
         self.serialize_checked(&session, &local_ref)?;
-        // Materializing parses the fetched tree and the local one, reading
-        // every value: skipped when the fetched tip is the one materialized
-        // into this store last time (and nothing had to be restored into
-        // the store, which would mean it is not that store any more).
+        // Materializing is skipped when the fetched tip is the one
+        // materialized into this store last time (and nothing had to be
+        // restored into the store, which would mean it is not that store any
+        // more).
         let tip_now = if found {
             self.read_ref(&tracking)?
         } else {
@@ -1780,7 +2738,7 @@ impl<'a> AttestStore<'a> {
             .iter()
             .any(|r| r.3 && tracking == format!("refs/{ns}/remotes/{}/main", r.0));
         if found && !materialized {
-            let before = self.attestation_keys(&session)?;
+            let before = self.attestation_keys()?;
             let manifests_before: BTreeSet<String> = if side {
                 BTreeSet::new()
             } else {
@@ -1788,33 +2746,40 @@ impl<'a> AttestStore<'a> {
             };
             let local_before = self.read_ref(&local_ref)?;
             let started = std::time::Instant::now();
-            // A store materialized from this remote before (and holding
-            // everything of the local ref) takes only what the new tip
-            // changed; git-meta's materialize does the first fetch, merges
-            // local commits and side remotes, and is the fallback for
-            // anything else.
-            let incremental = match (&tip_now, &previous) {
-                (Some(tip), Some(_)) if restored == 0 && !side => match self
-                    .materialize_incremental(
-                        &session,
-                        &local_ref,
-                        &tracking,
-                        tip,
-                        &remote_values,
-                        &remote_tombstone_blobs,
-                        report,
-                    ) {
-                    Ok(applied) => applied,
+            // From the trees' paths (see `materialize_lazy`); git-meta's
+            // materialize, which reads every value of the trees it merges,
+            // imports side remotes and is the fallback for anything else.
+            // `VCI_MATERIALIZE=full` (tests): git-meta's merge, every value
+            // fetched and read, to compare with.
+            let full = std::env::var_os("VCI_MATERIALIZE").is_some_and(|v| v == "full");
+            let lazy = match (&tip_now, &tip_snap) {
+                (Some(tip), Some(snap)) if !side && !full => match self
+                    .materialize_lazy(&session, name, &local_ref, &tracking, tip, snap, report)
+                {
+                    Ok(m) => m,
                     Err(e) => {
                         report.note(format!(
-                            "merging only what changed in {name}'s {remote_ref} failed ({e}); merged it in full"
+                            "merging {name}'s {remote_ref} from its paths failed ({e}); merged it in full, every value read"
                         ));
                         None
                     }
                 },
                 _ => None,
             };
-            if incremental.is_none() {
+            if lazy.is_none() {
+                if let Some(tip) = &tip_now {
+                    let mut commits = vec![tip.clone()];
+                    if !side && let Some(l) = self.read_ref(&local_ref)? {
+                        if let Some(b) = self.merge_base(&l, tip)? {
+                            commits.push(b);
+                        }
+                        commits.push(l);
+                    }
+                    let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
+                    self.hydrate_trees(name, &commits)?;
+                    // A fresh session reads the blobs just fetched.
+                    session = self.session()?;
+                }
                 let suffix = tracking
                     .strip_prefix(&format!("refs/{ns}/"))
                     .unwrap_or(&tracking)
@@ -1824,10 +2789,13 @@ impl<'a> AttestStore<'a> {
                 })?;
             }
             if std::env::var_os("VCI_TIMING").is_some() {
-                let how = match incremental {
-                    Some(n) => format!(
-                        "incremental, {n} changed entr{}",
-                        if n == 1 { "y" } else { "ies" }
+                let how = match &lazy {
+                    Some(m) => format!(
+                        "from paths{}, {} changed entr{}, {} not fetched",
+                        if m.merged { ", a merge" } else { "" },
+                        m.changed,
+                        if m.changed == 1 { "y" } else { "ies" },
+                        m.promised
                     ),
                     None => "full".to_owned(),
                 };
@@ -1844,6 +2812,7 @@ impl<'a> AttestStore<'a> {
             if !side {
                 let back = self.restore_referenced_manifests(
                     &session,
+                    name,
                     &manifests_before,
                     local_before.as_deref(),
                     &remote_manifest_blobs,
@@ -1856,13 +2825,13 @@ impl<'a> AttestStore<'a> {
             }
             // Materialize may have applied tombstones or legacy deletes.
             self.serialize_checked(&session, &local_ref)?;
-            if incremental.is_none()
+            if lazy.as_ref().is_none_or(|m| m.merged)
                 && !side
                 && let Some(tip) = &tip_now
             {
                 self.adopt_equal_tip(&local_ref, tip)?;
             }
-            let after = self.attestation_keys(&session)?;
+            let after = self.attestation_keys()?;
             let implicit = before
                 .difference(&after)
                 .filter(|k| !remote_deleted.contains(*k))
@@ -1883,49 +2852,66 @@ impl<'a> AttestStore<'a> {
         })
     }
 
-    /// Merge the fetched tip `tip` into the store by reading only the
-    /// entries that differ between its tree and the local metadata commit's
-    /// (`git diff-tree`), instead of git-meta's materialize, which parses
-    /// both trees in full, every value included. Done only where
-    /// materialize would fast-forward (`refs/<ns>/local/main` is an ancestor
-    /// of `tip`, so the store, just serialized onto it, holds exactly its
-    /// tree), and with the same effect: the tip's new and changed values and
-    /// deletion records are applied, every other deletion record of the tip
-    /// the store holds differently is set back to the tip's (`tip_tombstones`:
-    /// key -> blob), a value the tip no longer has is deleted (git-meta's
-    /// legacy delete), the local ref moves to `tip` and the store is marked
-    /// materialized. Returns how many entries changed. The caller never asks
-    /// for a side remote's tip, which git-meta imports instead of merging.
+    /// The merge base of two commits, `None` when they share no history.
+    fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>, GitError> {
+        let (describe, out) = self
+            .repo
+            .git()
+            .args(["merge-base", a, b])
+            .output_described()?;
+        match out.status.code() {
+            Some(0) => parse_oid(&out.stdout).map(Some),
+            Some(1) => Ok(None),
+            _ => Err(command_error(&describe, &out)),
+        }
+    }
+
+    /// Merge the fetched tip `tip` (whose tree `tip_snap` lists) into the
+    /// store from the trees' paths, with the result of git-meta's
+    /// materialize and without reading a value: git-meta's merge rules
+    /// decide between values by equality only (a string conflict goes to
+    /// the local side), so blob ids stand in for the values.
     ///
-    /// `Ok(None)` applies nothing and leaves the merge to git-meta: local
-    /// metadata commits (a real merge), another ref git-meta would
-    /// materialize with this one, or a changed entry this does not read the
-    /// way git-meta's parse does (a set or list value, a path that is not
-    /// where git-meta writes its key, a mode change; noted in `report`).
+    /// * No local metadata commit (a clone's first fetch): every entry of the
+    ///   tip is taken, as git-meta's fast-forward from nothing does.
+    /// * `refs/<ns>/local/main` an ancestor of `tip` (the store, just
+    ///   serialized onto it, holds exactly its tree): what `git diff-tree`
+    ///   says changed is taken, as git-meta's fast-forward does.
+    /// * Otherwise git-meta's three-way merge (two-way when the commits share
+    ///   no history) of the trees' entries makes a merge commit, and what
+    ///   differs between the local commit and it is taken.
+    ///
+    /// A value taken becomes a row pointing at its blob (promised when the
+    /// blob is not here, see [`AttestStore::mark_values`]); deletion records
+    /// are read (fetched in one batch when missing): the changed ones, and
+    /// every other one the store holds differently is set back to the
+    /// tree's, as git-meta's fast-forward does; a value the tree no longer
+    /// has is deleted (git-meta's legacy delete, unless a merge keeps a
+    /// deletion record for it); the local ref moves to the tip or the merge,
+    /// and the store is marked materialized. The caller never asks for a
+    /// side remote's tip, which git-meta imports instead of merging.
+    ///
+    /// `Ok(None)` applies nothing and leaves the merge to git-meta: another
+    /// ref git-meta would materialize with this one, or an entry this does
+    /// not read the way git-meta's parse does (a set or list value, a path
+    /// that is not where git-meta writes its key, a mode change; noted in
+    /// `report`).
     #[allow(clippy::too_many_arguments)]
-    fn materialize_incremental(
+    fn materialize_lazy(
         &self,
         session: &Session,
+        remote: &str,
         local_ref: &str,
         tracking: &str,
         tip: &str,
-        tip_values: &BTreeSet<Key>,
-        tip_tombstones: &BTreeMap<Key, String>,
+        tip_snap: &KeySnapshot,
         report: &mut Report,
-    ) -> Result<Option<usize>, GitError> {
+    ) -> Result<Option<Materialized>, GitError> {
         // Taken before anything is read: a row another writer stores from
         // here on is newer than the merge and stays to be serialized.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let now = now_ms();
         let store = session.store();
-        let Some(since) = guarded("reading the store", || store.get_last_materialized())? else {
-            return Ok(None);
-        };
-        let Some(local) = self.read_ref(local_ref)? else {
-            return Ok(None);
-        };
+        let since = guarded("reading the store", || store.get_last_materialized())?;
         // git-meta materializes every ref whose name starts with the
         // tracking ref's; any other such ref takes the full path.
         let dir = tracking.rsplit_once('/').map_or(tracking, |(d, _)| d);
@@ -1940,29 +2926,50 @@ impl<'a> AttestStore<'a> {
         {
             return Ok(None);
         }
-        if !self.is_ancestor(&local, tip)? {
-            return Ok(None);
-        }
-        let mut fallback = |why: String| -> Result<Option<usize>, GitError> {
+        let mut fallback = |why: String| -> Result<Option<Materialized>, GitError> {
             report.note(format!(
-                "merged the fetched metadata in full: {why} is not read incrementally"
+                "merged the fetched metadata in full, every value read: {why} is not merged from paths"
             ));
             Ok(None)
+        };
+        let local = self.read_ref(local_ref)?;
+        // A fast-forward takes only what changed (a changed set or list entry
+        // falls back below); taking a whole tree or merging two reads them
+        // all.
+        let set_or_list = |first: &String| format!("{first} (a git-meta set or list entry)");
+        let (from_tree, to_commit, merged) = match &local {
+            None if !tip_snap.others.is_empty() => {
+                return fallback(set_or_list(&tip_snap.others[0]));
+            }
+            None => (self.empty_tree()?, tip.to_owned(), false),
+            Some(l) if self.is_ancestor(l, tip)? => {
+                (format!("{l}^{{tree}}"), tip.to_owned(), false)
+            }
+            Some(l) => match self.merge_from_paths(remote, l, tip, tip_snap)? {
+                Err(why) => return fallback(why),
+                Ok(m) => (format!("{l}^{{tree}}"), m, true),
+            },
+        };
+        let merged_snap;
+        let to_snap = if merged {
+            merged_snap = self.snapshot_keys(&to_commit)?;
+            &merged_snap
+        } else {
+            tip_snap
         };
         let raw = self
             .repo
             .git()
             .args(["diff-tree", "-r", "-z", "--no-renames", "--no-commit-id"])
-            .arg(format!("{local}^{{tree}}"))
-            .arg(format!("{tip}^{{tree}}"))
+            .arg(&from_tree)
+            .arg(format!("{to_commit}^{{tree}}"))
             .run()?;
         let Some(changes) = Self::tree_changes(&raw) else {
             return fallback("git diff-tree output".to_owned());
         };
-        let mut values: BTreeMap<Key, TreeValue> = BTreeMap::new();
-        let mut tombstones: BTreeMap<Key, Tombstone> = BTreeMap::new();
+        let mut values: BTreeMap<Key, String> = BTreeMap::new();
+        let mut changed_tombstones: BTreeMap<Key, String> = BTreeMap::new();
         let mut removed: Vec<Key> = Vec::new();
-        let mut blobs: Option<CatFile> = None;
         for ([status, old_mode, new_mode, oid], path) in changes {
             let (key, tombstone) = match Self::classify_change(status, old_mode, new_mode, path) {
                 Err(why) => return fallback(why),
@@ -1970,155 +2977,315 @@ impl<'a> AttestStore<'a> {
                 Ok(Some(c)) => c,
             };
             if status == "D" {
-                // The tip no longer has the value. Still holding it (under
+                // The tree no longer has the value. Still holding it (under
                 // another spelling of its path) is not something to guess.
-                if tip_values.contains(&key) {
+                if to_snap.values.contains(&key) {
                     return fallback(String::from_utf8_lossy(path).into_owned());
                 }
                 removed.push(key);
-                continue;
-            }
-            if blobs.is_none() {
-                blobs = Some(CatFile::start(self.repo.root())?);
-            }
-            let bytes = match blobs.as_mut().expect("started").blob(oid) {
-                Ok(b) => b,
-                Err(e) => return fallback(format!("{} ({e})", String::from_utf8_lossy(path))),
-            };
-            if tombstone {
-                let Ok(t) = serde_json::from_slice::<Tombstone>(&bytes) else {
-                    return fallback(format!(
-                        "{} (unreadable deletion record)",
-                        String::from_utf8_lossy(path)
-                    ));
-                };
-                tombstones.insert(key, t);
+            } else if tombstone {
+                changed_tombstones.insert(key, oid.to_owned());
             } else {
-                if !tip_values.contains(&key) {
+                if !to_snap.values.contains(&key) {
                     return fallback(String::from_utf8_lossy(path).into_owned());
                 }
-                // git-meta's parse reads a value blob the same way.
-                values.insert(
-                    key,
-                    TreeValue::String(String::from_utf8_lossy(&bytes).into_owned()),
-                );
+                values.insert(key, oid.to_owned());
             }
         }
         // In one tree a value wins over a deletion record of its key.
-        tombstones.retain(|k, _| !tip_values.contains(k) && !values.contains_key(k));
-        let changed = values.len() + tombstones.len() + removed.len();
-        let email = session.email().to_owned();
-        guarded("applying fetched metadata", || {
-            store.apply_tree(
-                &values,
-                &tombstones,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &email,
-                now,
-            )
-        })?;
-        // git-meta's fast-forward applies every deletion record of the tip,
+        changed_tombstones.retain(|k, _| !to_snap.values.contains(k) && !values.contains_key(k));
+        // git-meta's fast-forward applies every deletion record of the tree,
         // not only the changed ones: a record this store holds with another
-        // time or email than the tip's is set back to the tip's. (A value
+        // time or email than the tree's is set back to the tree's. (A value
         // deleted by an earlier merge was stamped with that merge's own time
         // and email, git-meta's legacy delete below, until the next merge.)
         // Compared by blob id first, the blob git-meta writes for the stored
-        // record, so only a record that differs is read. The values deleted
-        // now are stamped below, after the tip's records, as git-meta does.
-        let mut restamped: Vec<(Key, Tombstone)> = Vec::new();
+        // record, so only a record that differs is read.
+        let held: BTreeMap<Key, Tombstone> =
+            guarded("reading the store", || store.get_all_tombstones())?
+                .into_iter()
+                .map(|t| {
+                    (
+                        Key {
+                            target_type: t.target_type,
+                            target_value: t.target_value,
+                            key: t.key,
+                        },
+                        Tombstone {
+                            timestamp: t.timestamp,
+                            email: t.email,
+                        },
+                    )
+                })
+                .collect();
+        let restamp: BTreeMap<Key, String> = {
+            let skip: BTreeSet<&Key> = removed.iter().chain(changed_tombstones.keys()).collect();
+            to_snap
+                .tombstone_blobs
+                .iter()
+                .filter(|(k, oid)| {
+                    !to_snap.values.contains(*k)
+                        && !skip.contains(*k)
+                        && !held
+                            .get(*k)
+                            .is_some_and(|t| tombstone_blob_id(t, oid).as_deref() == Some(oid))
+                })
+                .map(|(k, o)| (k.clone(), o.clone()))
+                .collect()
+        };
+        let oids: BTreeSet<String> = changed_tombstones
+            .values()
+            .chain(restamp.values())
+            .cloned()
+            .collect();
+        let (have, _, error) = self.ensure_blobs(remote, &oids)?;
+        if let Some(e) = error
+            && changed_tombstones.values().any(|o| !have.contains(o))
         {
-            let skip: BTreeSet<&Key> = removed.iter().chain(tombstones.keys()).collect();
-            let held: BTreeMap<Key, Tombstone> =
-                guarded("reading the store", || store.get_all_tombstones())?
-                    .into_iter()
-                    .map(|t| {
-                        (
-                            Key {
-                                target_type: t.target_type,
-                                target_value: t.target_value,
-                                key: t.key,
-                            },
-                            Tombstone {
-                                timestamp: t.timestamp,
-                                email: t.email,
-                            },
-                        )
-                    })
-                    .collect();
-            for (k, oid) in tip_tombstones {
-                if tip_values.contains(k) || skip.contains(k) {
-                    continue;
-                }
-                let current = held.get(k);
-                if current.is_some_and(|t| tombstone_blob_id(t, oid).as_deref() == Some(oid)) {
-                    continue;
-                }
-                if blobs.is_none() {
-                    blobs = Some(CatFile::start(self.repo.root())?);
-                }
-                // git-meta's parse skips a record it cannot read.
-                let Some(t) = blobs
-                    .as_mut()
-                    .expect("started")
-                    .blob(oid)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<Tombstone>(&b).ok())
-                else {
-                    continue;
-                };
-                if current != Some(&t) {
-                    restamped.push((k.clone(), t));
-                }
-            }
+            return Err(GitError::Meta(format!(
+                "fetching the deletion records of {tracking}: {e}"
+            )));
         }
-        drop(blobs);
+        let read = self.read_blobs(&oids)?;
+        let tombstone = |oid: &String| {
+            read.get(oid)
+                .and_then(|b| serde_json::from_slice::<Tombstone>(b).ok())
+        };
+        let mut tombstones: BTreeMap<Key, Tombstone> = BTreeMap::new();
+        for (k, oid) in &changed_tombstones {
+            let Some(t) = tombstone(oid) else {
+                return fallback(format!(
+                    "the deletion record of {} {} (unreadable)",
+                    target_label(&k.to_target()),
+                    k.key
+                ));
+            };
+            tombstones.insert(k.clone(), t);
+        }
+        // git-meta's parse skips a record it cannot read.
+        let restamped: Vec<(Key, Tombstone)> = restamp
+            .iter()
+            .filter_map(|(k, oid)| tombstone(oid).map(|t| (k.clone(), t)))
+            .filter(|(k, t)| held.get(k) != Some(t))
+            .collect();
+        let changed = values.len() + tombstones.len() + removed.len();
+        let inline_max = guarded("reading the store", || store.object_max_size())?;
+        let promised = self.mark_values(&values, &to_commit, now, inline_max)?;
+        let email = session.email().to_owned();
+        if !tombstones.is_empty() {
+            guarded("applying fetched metadata", || {
+                store.apply_tree(
+                    &BTreeMap::new(),
+                    &tombstones,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &email,
+                    now,
+                )
+            })?;
+        }
         for (k, t) in &restamped {
             guarded("applying a deletion record", || {
                 store.apply_tombstone(&k.to_target(), &k.key, &t.email, t.timestamp)
             })?;
         }
-        for k in &removed {
+        // The values deleted now are stamped after the tree's records, as
+        // git-meta does; a merge keeps the deletion record its tree holds.
+        let legacy: Vec<&Key> = removed
+            .iter()
+            .filter(|k| !(merged && to_snap.tombstones.contains(*k)))
+            .collect();
+        for k in &legacy {
             guarded("applying a deletion", || {
                 store.apply_tombstone(&k.to_target(), &k.key, &email, now)
             })?;
         }
-        if local != tip {
-            self.cas_ref(
-                local_ref,
-                Some(tip),
-                &local,
-                "vci: fast-forward materialize",
-            )?;
+        match &local {
+            Some(l) if *l == to_commit => {}
+            Some(l) => self.cas_ref(local_ref, Some(&to_commit), l, "vci: materialize")?,
+            None => self.cas_ref(local_ref, Some(&to_commit), "", "vci: materialize")?,
         }
         // Marked materialized (git-meta's next serialization then skips
-        // what this merge wrote, which the tip already holds) only when every
+        // what this merge wrote, which the tree already holds) only when every
         // row modified since the last serialization is one this merge wrote:
         // a row another writer (a `vci run` beside this fetch, a git-meta
         // client) stored meanwhile must stay modified, or it would never be
         // published. Otherwise the serialization that follows rewrites what
-        // this merge wrote, unchanged, with it.
-        let ours: BTreeSet<&Key> = values
+        // this merge wrote, unchanged, with it. (The values taken are not
+        // logged as changes at all.)
+        let ours: BTreeSet<&Key> = tombstones
             .keys()
-            .chain(tombstones.keys())
             .chain(removed.iter())
             .chain(restamped.iter().map(|(k, _)| k))
             .collect();
-        let others = guarded("reading the store", || store.get_modified_since(since))?
-            .into_iter()
-            .any(|m| {
-                !ours.contains(&Key {
-                    target_type: m.target_type,
-                    target_value: m.target_value,
-                    key: m.key,
-                })
-            });
+        let others = guarded("reading the store", || {
+            store.get_modified_since(since.unwrap_or(0))
+        })?
+        .into_iter()
+        .any(|m| {
+            !ours.contains(&Key {
+                target_type: m.target_type,
+                target_value: m.target_value,
+                key: m.key,
+            })
+        });
         if !others {
             guarded("recording the materialization", || {
                 store.set_last_materialized(now)
             })?;
         }
-        Ok(Some(changed))
+        Ok(Some(Materialized {
+            changed,
+            merged,
+            promised,
+        }))
+    }
+
+    /// git-meta's merge of the local metadata commit `local` and the fetched
+    /// tip `tip` (three-way on their merge base, two-way without one), on
+    /// the trees' entries with blob ids standing in for the values, written
+    /// as a merge commit (parents `local` and `tip`) without reading a
+    /// value. `Ok(Err(why))` when a tree holds what only git-meta's own
+    /// merge reads.
+    fn merge_from_paths(
+        &self,
+        remote: &str,
+        local: &str,
+        tip: &str,
+        tip_snap: &KeySnapshot,
+    ) -> Result<Result<String, String>, GitError> {
+        use git_meta_lib::tree::merge::{
+            merge_tombstones, three_way_merge, two_way_merge_no_common_ancestor,
+        };
+        let base = self.merge_base(local, tip)?;
+        let ours = self.snapshot_keys(local)?;
+        let base_snap = match &base {
+            Some(b) => {
+                // The first fetch of a tracking ref takes commits without
+                // their trees (only the tip's).
+                self.complete_tree(remote, b)?;
+                Some(self.snapshot_keys(b)?)
+            }
+            None => None,
+        };
+        if let Some(first) = ours
+            .others
+            .first()
+            .or_else(|| tip_snap.others.first())
+            .or_else(|| base_snap.as_ref().and_then(|b| b.others.first()))
+        {
+            return Ok(Err(format!("{first} (a git-meta set or list entry)")));
+        }
+        let values = |s: &KeySnapshot| -> BTreeMap<Key, TreeValue> {
+            s.value_blobs
+                .iter()
+                .map(|(k, o)| (k.clone(), TreeValue::String(o.clone())))
+                .collect()
+        };
+        let tombstones = |s: &KeySnapshot| -> BTreeMap<Key, Tombstone> {
+            s.tombstone_blobs
+                .iter()
+                .map(|(k, o)| {
+                    (
+                        k.clone(),
+                        Tombstone {
+                            timestamp: 0,
+                            email: o.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
+        let (mut merged_values, mut merged_tombstones) = match &base_snap {
+            Some(b) => {
+                let (mv, _) = guarded("merging metadata", || {
+                    three_way_merge(&values(b), &values(&ours), &values(tip_snap), 0, 0)
+                })?;
+                let mt = merge_tombstones(
+                    &tombstones(b),
+                    &tombstones(&ours),
+                    &tombstones(tip_snap),
+                    &mv,
+                );
+                (mv, mt)
+            }
+            None => {
+                let (mv, mt, _) = two_way_merge_no_common_ancestor(
+                    &values(&ours),
+                    &tombstones(&ours),
+                    &values(tip_snap),
+                    &tombstones(tip_snap),
+                );
+                (mv, mt)
+            }
+        };
+        // A value whose blob this clone never had (a promised row: the
+        // remote's value, never written here) that the merge keeps although
+        // the tip no longer holds it takes the tip's state instead. git-meta
+        // keeps the local side of a conflict, and a two-way merge (the
+        // remote's history rewritten) keeps every local value; but this one
+        // was never local, the remote dropped it, and a push could not
+        // publish a blob it does not have (once the remote's gc removed
+        // it, nobody can).
+        let unsure: BTreeSet<String> = merged_values
+            .iter()
+            .filter_map(|(k, v)| match v {
+                TreeValue::String(o) if tip_snap.value_blobs.get(k) != Some(o) => Some(o.clone()),
+                _ => None,
+            })
+            .collect();
+        let here = self.present(&unsure)?;
+        let never_had: Vec<Key> = merged_values
+            .iter()
+            .filter(|(_, v)| matches!(v, TreeValue::String(o) if unsure.contains(o) && !here.contains(o)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in never_had {
+            merged_values.remove(&k);
+            if let Some(o) = tip_snap.value_blobs.get(&k) {
+                merged_values.insert(k, TreeValue::String(o.clone()));
+            } else if let Some(o) = tip_snap.tombstone_blobs.get(&k) {
+                merged_tombstones.insert(
+                    k,
+                    Tombstone {
+                        timestamp: 0,
+                        email: o.clone(),
+                    },
+                );
+            }
+        }
+        let mut entries: Vec<(String, &str)> = Vec::new();
+        for (k, v) in &merged_values {
+            let TreeValue::String(oid) = v else {
+                return Ok(Err("a git-meta set or list value".to_owned()));
+            };
+            let Ok(p) = git_meta_lib::tree_paths::tree_path(&k.to_target(), &k.key) else {
+                return Ok(Err(format!("{} {}", target_label(&k.to_target()), k.key)));
+            };
+            entries.push((p, oid));
+        }
+        for (k, t) in &merged_tombstones {
+            let Ok(p) = git_meta_lib::tree_paths::tombstone_path(&k.to_target(), &k.key) else {
+                return Ok(Err(format!("{} {}", target_label(&k.to_target()), k.key)));
+            };
+            entries.push((p, &t.email));
+        }
+        let tree = self.tree_with(None, &entries)?;
+        let mut git = self.repo.git().args([
+            "commit-tree",
+            "--no-gpg-sign",
+            &tree,
+            "-p",
+            local,
+            "-p",
+            tip,
+            "-m",
+            "materialize",
+        ]);
+        for (k, v) in IDENTITY {
+            git = git.env(k, v);
+        }
+        Ok(Ok(parse_oid(&git.run()?)?))
     }
 
     /// Put back the stored input manifests this merge left deleted although
@@ -2138,6 +3305,7 @@ impl<'a> AttestStore<'a> {
     fn restore_referenced_manifests(
         &self,
         session: &Session,
+        remote: &str,
         before: &BTreeSet<String>,
         local_before: Option<&str>,
         tip_blobs: &BTreeMap<String, String>,
@@ -2163,12 +3331,21 @@ impl<'a> AttestStore<'a> {
         if candidates.is_empty() {
             return Ok(0);
         }
-        let referenced: BTreeSet<String> = self
-            .list(None)?
-            .iter()
-            .filter(|e| e.error.is_none())
-            .filter_map(|e| envelope_manifest_ref(&e.bytes))
-            .collect();
+        // Which attestations reference them needs every attestation read:
+        // fetch the ones not fetched yet (rare: a merge just deleted a
+        // manifest). One that still cannot be read might reference any of
+        // them, so then every candidate is put back (an unreferenced
+        // manifest only takes space until `vci prune`).
+        let fetched = self.hydrate_locked(remote, |k| parse_key(&k.key).is_some());
+        let all = self.list(None)?;
+        let referenced: BTreeSet<String> =
+            if fetched.is_err() || all.iter().any(|e| e.error.is_some()) {
+                candidates.clone()
+            } else {
+                all.iter()
+                    .filter_map(|e| envelope_manifest_ref(&e.bytes))
+                    .collect()
+            };
         let mut back = 0;
         for root in candidates.intersection(&referenced) {
             let key = manifest_key(root);
@@ -2366,6 +3543,8 @@ impl<'a> AttestStore<'a> {
         let remote_ref = format!("refs/{ns}/main");
         let tracking = self.tracking_ref(&name, &ns)?;
         let mut last = String::new();
+        // Notes of a round that started over (see below).
+        let mut carried: Vec<String> = Vec::new();
         let done = |status, report: Report| PushOutcome {
             remote: name.clone(),
             status,
@@ -2373,7 +3552,10 @@ impl<'a> AttestStore<'a> {
             notes: report.notes,
         };
         for attempt in 1..=PUSH_ATTEMPTS {
-            let mut report = Report::default();
+            let mut report = Report {
+                notes: std::mem::take(&mut carried),
+                ..Report::default()
+            };
             let round = match self.fetch_named(&name, &mut report) {
                 Ok(r) => r,
                 Err(e) if is_ref_race(&e) && attempt < PUSH_ATTEMPTS => {
@@ -2387,6 +3569,7 @@ impl<'a> AttestStore<'a> {
                 return Ok(done(PushStatus::NothingStored, report));
             };
             let tip = self.read_ref(&tracking)?;
+            let mut theirs_snap = None;
             if let Some(tip) = &tip {
                 if *tip == local && round.found && !rewrite {
                     return Ok(done(PushStatus::UpToDate, report));
@@ -2401,7 +3584,8 @@ impl<'a> AttestStore<'a> {
                 }
                 // Every value of the remote tip must still be there, unless
                 // this store deleted it (vci prune, git meta rm).
-                let theirs = self.snapshot_keys(tip)?.values;
+                let theirs_keys = self.snapshot_keys(tip)?;
+                let theirs = &theirs_keys.values;
                 let ours = self.snapshot_keys(&local)?.values;
                 let dropped: Vec<&Key> = theirs
                     .difference(&ours)
@@ -2415,6 +3599,52 @@ impl<'a> AttestStore<'a> {
                         first.key
                     )));
                 }
+                theirs_snap = Some(theirs_keys);
+            }
+            // Every value the push sends must be here: one this clone never
+            // fetched (a promised row) is fetched now, and one the remote no
+            // longer has (deleted and garbage-collected there) cannot be
+            // published by anyone, so it is deleted here (a deletion record,
+            // as the remote's own history says) and the round starts over.
+            let ours_snap = self.snapshot_keys(&local)?;
+            // A commit without parents (`--rewrite-history`) sends its
+            // whole tree: every value must be here.
+            let unsendable = self.unsendable(&name, &ours_snap, theirs_snap.as_ref(), !rewrite)?;
+            if let Some((first, why)) = unsendable.stuck.first() {
+                return Err(GitError::Meta(format!(
+                    "the local metadata holds {} value(s) this clone never fetched that {name} did not serve (first: {} {}){}; not pushing (`vci fetch` and push again)",
+                    unsendable.stuck.len(),
+                    target_label(&first.to_target()),
+                    first.key,
+                    why.as_ref().map(|w| format!(": {w}")).unwrap_or_default()
+                )));
+            }
+            if let Some(first) = unsendable.gone.first() {
+                if attempt == PUSH_ATTEMPTS {
+                    return Err(GitError::Meta(format!(
+                        "the local metadata still holds {} value(s) {name} no longer has (first: {} {}); not pushing",
+                        unsendable.gone.len(),
+                        target_label(&first.to_target()),
+                        first.key
+                    )));
+                }
+                let session = self.session()?;
+                for k in &unsendable.gone {
+                    session
+                        .target(&k.to_target())
+                        .remove(&k.key)
+                        .map_err(meta_err)?;
+                }
+                report.note(format!(
+                    "deleted {} value(s) this clone never fetched that {name} no longer has (deleted there and garbage-collected; first: {} {}): no push can publish them",
+                    unsendable.gone.len(),
+                    target_label(&first.to_target()),
+                    first.key
+                ));
+                carried = std::mem::take(&mut report.notes);
+                continue;
+            }
+            if let Some(tip) = &tip {
                 match self.rebase_onto(&local_ref, &local, tip) {
                     Ok(()) => {}
                     Err(e) if is_ref_race(&e) && attempt < PUSH_ATTEMPTS => {
@@ -2430,9 +3660,13 @@ impl<'a> AttestStore<'a> {
                 pushed = self.orphan_of(&local_ref, &pushed)?;
             }
             before_push(attempt);
+            // `--no-thin`: a thin pack deltifies against the remote's
+            // versions of the values, which a blobless clone does not have
+            // (git would try to download each).
             let mut git = self.repo.git().args([
                 "push",
                 "--porcelain",
+                "--no-thin",
                 "--no-verify",
                 "--recurse-submodules=no",
             ]);
@@ -2462,7 +3696,9 @@ impl<'a> AttestStore<'a> {
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
             let rejected: Vec<&str> = stdout.lines().filter(|l| l.starts_with("!\t")).collect();
-            if rejected.is_empty() {
+            // A pack that could not be built or unpacked (an object missing
+            // here) fails the same way on every attempt.
+            if rejected.is_empty() || rejected.iter().any(|l| l.contains("unpacker error")) {
                 // Not a ref rejection (unreachable remote, auth...): no retry.
                 return Err(command_error(&describe, &out));
             }
@@ -2476,6 +3712,85 @@ impl<'a> AttestStore<'a> {
             attempts: PUSH_ATTEMPTS,
             detail: last,
         })
+    }
+
+    /// The values of `ours` (the local metadata commit's tree) a push would
+    /// send whose blobs are not here even after fetching them (in one batch)
+    /// from the metadata remote they came from (`remote` when there is
+    /// none): every value whose blob this clone never fetched, or with
+    /// `on_theirs` only those `theirs` (the remote's tip, when it has one)
+    /// does not hold (a commit on top of it sends nothing it holds). Split
+    /// into the ones the remote said it does not have (deleted there, and
+    /// not a value of `theirs`) and the others, with why their fetch failed.
+    fn unsendable(
+        &self,
+        remote: &str,
+        ours: &KeySnapshot,
+        theirs: Option<&KeySnapshot>,
+        on_theirs: bool,
+    ) -> Result<Unsendable, GitError> {
+        let sent_already: BTreeSet<&String> = theirs
+            .filter(|_| on_theirs)
+            .map(|t| {
+                t.value_blobs
+                    .values()
+                    .chain(t.tombstone_blobs.values())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let need: BTreeSet<String> = ours
+            .value_blobs
+            .values()
+            .chain(ours.tombstone_blobs.values())
+            .filter(|o| !sent_already.contains(o))
+            .cloned()
+            .collect();
+        let here = self.present(&need)?;
+        let missing: BTreeSet<String> = need.difference(&here).cloned().collect();
+        let mut out = Unsendable::default();
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let from = self.value_remote().unwrap_or_else(|_| remote.to_owned());
+        let list: Vec<&String> = missing.iter().collect();
+        let mut why: BTreeMap<&String, String> = BTreeMap::new();
+        if let Err(e) = self.fetch_blobs(&from, &list) {
+            let e = e.to_string();
+            if is_unavailable_object(&e) && list.len() > 1 && list.len() <= 100 {
+                // One object the server does not have fails the whole
+                // batch: ask for each alone to tell which.
+                for o in &list {
+                    if let Err(e) = self.fetch_objects(&from, &[o]) {
+                        why.insert(o, e.to_string());
+                    }
+                }
+            } else {
+                why.extend(list.iter().map(|o| (*o, e.clone())));
+            }
+        }
+        let now = self.present(&missing)?;
+        for (k, o) in &ours.value_blobs {
+            if !missing.contains(o) || now.contains(o) {
+                continue;
+            }
+            let reason = why.get(o).cloned();
+            let held_there = theirs.is_some_and(|t| t.values.contains(k));
+            if !held_there && reason.as_deref().is_some_and(is_unavailable_object) {
+                out.gone.push(k.clone());
+            } else {
+                out.stuck.push((k.clone(), reason));
+            }
+        }
+        if out.gone.is_empty() && out.stuck.is_empty() {
+            // A deletion record's blob is what is missing.
+            if let Some(o) = missing.iter().find(|o| !now.contains(*o)) {
+                return Err(GitError::Meta(format!(
+                    "a deletion record of the local metadata ({o}) is not here and {from} did not serve it{}",
+                    why.get(o).map(|w| format!(": {w}")).unwrap_or_default()
+                )));
+            }
+        }
+        Ok(out)
     }
 
     /// Rewrite `local_ref` as a commit without parents holding `local`'s

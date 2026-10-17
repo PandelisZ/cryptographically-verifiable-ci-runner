@@ -8,7 +8,8 @@ in OrbStack with a static `x86_64-unknown-linux-musl` `vci`.
 
 ## How it collects
 
-The Rust adapter runs one process per test file:
+The Rust adapter runs one process per test file (several files: since vci 2.0 one process that boots once and forks
+one process per file, see "Batch mode" below):
 
 ```
 RUBYOPT=-r<abs>/ruby/vci-collector/vci_collector.rb VCI_RAILS_MODE=collect VCI_OUT=<dir> VCI_TEST_ID=<file> \
@@ -475,8 +476,210 @@ pending example's goes to `pending_exception` instead) and refuses a file in whi
 is reported as passed (`rspec:failure-cleared`), and compares the reporter's counts with the examples'
 `execution_result.status` (`rspec:status-mismatch`).
 
+## Batch mode: one boot, one process per file (vci 2.1)
+
+Date: 2026-10-16. Same machine, Ruby 3.4.9, Rails 8.1.3.1, Minitest 6.0.6, rspec-core 3.13.6; vex-api
+(`/Users/pz/w/vex-git`, master `2b59eb17cc`, MySQL 8 in Docker on 127.0.0.1:3306).
+
+One process per file boots the application once per file. On vex-api that averaged 41 s a file (the boot with the
+collector, Oaken reseeding the database in each process's first test, then the file's tests), so `vci run` of the
+`application` group (925 files) would take about ten and a half hours, and CI never attested Rails. `vci run` (and `vci
+ci --key`) of several files now starts one process per runner, `bin/rails test <files> --seed 0` or `rspec --options
+.rspec <files>`, with the collector in **batch mode** (`VCI_RAILS_BATCH` names a file listing the test ids). One file,
+or `VCI_RAILS_PER_FILE=1` in vci's environment, still runs one process per file from the start.
+
+**B1. One boot, then a fork per file.** The collector lets the process run until the test runner's loader asks for the
+first file of the batch (Rails' `Runner.load_tests` requires each file; RSpec's `load_spec_files` loads each; the
+collector recognises the request by the loader's frame, past `require` wrappers such as Zeitwerk's and Ruby's
+`bundled_gems`). That process, the *driver*, loads no test file. It groups the files by what their first statement
+requires (`require "test_helper"`, `require_relative "../test_helper"`, `require File.expand_path("x", __dir__)`;
+comments, blank lines and magic comments may come first) and, per group, forks a process that requires it: the
+**boot**, exactly what a run of any file of the group does first, from the same place in the runner. The boot's
+process then forks one process per file of the group, one at a time (they share the test database, as one-file runs
+do), and waits for it. From the fork on, a file's process is a one-file run of that file: the loader's requests for the
+other files of the batch are skipped (only the loader's: a test file may still require another one, which then loads
+as in its own run), its own file loads, its tests run, and at exit the collector writes its output as a one-file run
+does (the collector's test id becomes its file, and its process the one allowed to write). Everything the boot
+observed before the fork is in its tables, as it is in a one-file run's. A file whose first statement is not such a
+require has a group of its own with nothing preloaded: its process boots by itself (correct, only slower).
+
+Nothing one file's process does reaches another's: classes and the tests they inherit, monkey patches and constants
+defined at a file's top level, RSpec shared examples, memoized helpers, lazily loaded code and what loading it read,
+threads (Minitest's `parallelize_me!`), native libraries opened through FFI, results and exit statuses. So each
+file's inputs, verdict and exit status are those of its own run; there is nothing to attribute. The first design of
+batch mode (one process for every file, observations attributed to files by segments, with Rails' fixture and
+template caches replayed) was reviewed against that standard and failed it in eight ways, each reproduced with the
+e2e fixture: a failing inherited test counted for the parent's file, a file requiring another test file without it as
+an input, top-level patches and shared examples making a file pass that fails on its own, Minitest's thread pool
+mixing two files' reads and results, a read outside the repository refusing only the first file that lazily loaded
+it, a memoized helper and a cache in vci's temp dir serving later files without an input, an absent-path probe
+dropped because another file wrote that path, and a non-zero exit after every file passed on its own. All eight are
+gone by construction; `rails_batch_mode_gives_what_one_process_per_file_gives` (below) runs each of them.
+
+What the processes of a batch share is what processes of one-file runs share, plus two things vci handles:
+
+- **The database connections of the boot.** A forked process that used them and closed them at exit left the next
+  file's process a dead socket (on vex-api: `Mysql2::Error::ConnectionError: Lost connection to MySQL server during
+  query` in the second file's first test). Before each fork the boot's process closes its Active Record connections
+  (`connection_handler.clear_all_connections!`), as Rails' `parallelize` does before forking its workers; each file's
+  process connects anew. (A connection-level setting the boot made by hand would be lost; Rails re-applies
+  `database.yml`'s.)
+- **vci's temp dir** (`TMPDIR`), which a one-file run gets fresh. After each file's process the boot's process removes
+  what it added there, so a cache one file left there (`Dir.tmpdir/x`) is not there for the next. A file the boot had
+  put there and a file's process changed or removed cannot be put back: the rest of the group goes back to one
+  process per file (B3).
+
+The repository's own scratch directories (`tmp/`, `log/`, `storage/`) and the database are shared as between
+one-file runs: a file reading what an earlier file's process wrote there records it as an input, as it would after an
+earlier one-file run, and what the database holds is not an input either way.
+
+The runner's handling of its arguments checks every file it is given before the fork (Rails' `extract_filters`,
+RSpec's `files_to_run`); a one-file run checks only its own. Those checks, made from the loader's frames before the
+fork, are dropped from every other file's process (`Batch.loader_check`): otherwise renaming any test file would run
+every file batched with it.
+
+macOS: the Objective-C runtime kills a forked process that touches a class another thread was initialising at the fork
+(`+[__NSCFConstantString initialize] may have been in progress in another thread when fork() was called`: vex-api's
+boot, every file). vci sets `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` for batch processes on macOS (read by the
+runtime only).
+
+**B2. Output.** Each file's `<sha256(id)>.jsonl` is written by its own process, in the format of a one-file run.
+`batch/files.jsonl` has a line per file: `{"id", "exit"}` (its process's exit status, `null` for a signal) or
+`{"id", "why"}`, and the driver ends it with `{"done": true}`. The adapter reads each file's output with its own exit
+status as it reads a one-file run's (a pass whose process exited non-zero is refused, `vci:process-exit:`), and the
+exit code of `vci run` is the first non-zero one of the files' own processes (a failed result whose process exited 0
+counts as 1: a Minitest without `allow_fork` sets the status only in the process that registered its `at_exit`). The driver's own exit status is only logged (`vci: ruby bin/rails test <50 files> --seed 0, booted
+once, one process per file (exit 1)`).
+
+**B3. What goes back to one process per file.** vci runs these files again on their own and says so (`vci: 2 of 2
+file(s) of the batch run again one process per file:` and why each):
+
+- the group's first statement failed in the boot's process (a database that does not exist yet, a helper that
+  raises): its files; the boot's process died (a signal): its files;
+- a file's process wrote no output (killed, or the collector failed): that file;
+- a file's process changed a file the boot left in vci's temp dir: the files after it in its group;
+- the loader never asked for a file of the batch (a runner vci does not recognise): every file, after the driver
+  ran them all itself (nothing of that run is used);
+- no `batch/files.jsonl`, or a line vci cannot read: every file.
+
+**B4. Run conditions.** As before: `PARALLEL_WORKERS=1` (Rails' `parallelize` takes the variable over its argument and
+does not fork), the fixed seed, no Spring, no Bootsnap. A fork that a test makes is still refused (`process:fork`);
+the batch's own forks are not a test's and are not. Minitest's `allow_fork` is set in each file's process (Minitest
+6's `at_exit` would otherwise keep a forked process's status at 0).
+
+**B5. Parallel workers: `PARALLEL_WORKERS=1`.** What that costs, measured with plain `bin/rails test <files> --seed 0`
+(vci's run conditions, no collector), vex-api's own `parallelize(workers: :number_of_processors)` (14 here) against
+`PARALLEL_WORKERS=1`:
+
+| files | `PARALLEL_WORKERS=1` | 14 workers |
+|---|---|---|
+| 50 of the `application` group | 66.1 s | 99.3 s (every worker loads the schema and Oaken's seeds into its own database) |
+| the `application` group, 925 | 1364.4 s | 336.3 s |
+
+So one file at a time costs a factor of four on a whole group, and nothing on a partition's share of a few dozen
+files. `vci ci --partition I/N` gets the parallelism back across jobs, each attesting its share. Running a group's
+file processes in parallel would need a database per process, as `parallelize` makes.
+
+**B6. A stub saved by alias broke every later call of the method (collector, all modes).** The first batch run of 50
+vex-api files overflowed the stack:
+
+```
+vci_collector.rb:2076:in 'block (2 levels) in <module:EnvHooks>'
+vci_collector.rb:2077:in 'block (2 levels) in <module:EnvHooks>'
+ ... 9351 levels...
+```
+
+vex-api's `test_helper.rb` defines `Object#stub` (Minitest 6 no longer ships `minitest/mock`) the way Minitest's own
+`stub` works: `alias_method "__vex_stub__#{name}", name`, `define_method(name)`, and in `ensure` `alias_method name,
+"__vex_stub__#{name}"`. On `ENV`, `alias_method` resolves `[]` to the collector's hook (`EnvHooks`, prepended to `ENV`'s
+singleton class), so the stub saved the hook and the restore put a copy of the hook in the singleton class, whose
+`super` (looked up after `EnvHooks`) is that copy again: every later `ENV[...]` recursed, the collector's own reads at
+exit too, so the file's output was lost and it was never attested. `HEAD`'s collector does the same (reproduced with a
+ten-line script). The collector now prepends `Module` with an `alias_method` that, for a method a collector hook
+prepended to that very class wraps, aliases the wrapped method instead (`AliasGuard`): the stub replaces and restores
+the real method and the hook keeps recording around it. An alias in a subclass (`File.read`, hooked on `IO`'s
+singleton class) is left alone: its copy's `super` goes on to the superclass, as it should. `collector_test.rb`:
+`test_alias_stub_of_a_hooked_method_restores_it`.
+
+**B7. Soundness notes.**
+
+- **Eager loading.** With `config.eager_load = true` (vex-api sets it from `CI`, and its vci.toml declares `CI=true`)
+  every application file is loaded at boot: an input of every test file, in per-file and batch mode alike, so any
+  application change runs every Rails file. Without eager loading a constant is autoloaded by the file's process that
+  uses it, and is an input of that file only, as in its own run.
+- **The boot is the first statement of each file of its group**, run once, from the same place in the runner as in a
+  one-file run (inside its request for a test file). A helper that inspects how it was required (the caller's file)
+  sees the collector instead of the test file; none of the fixtures' or vex-api's helpers do.
+- **What a file's process inherits but its own run would not have**: nothing recorded (the loader's checks of the other
+  files are dropped, B1); in memory, `ARGV` still lists every file of the batch.
+
+**Tests.** `crates/vci-cli/tests/e2e_rails.rs`, `rails_batch_mode_gives_what_one_process_per_file_gives`: twenty files,
+one or two per finding above (an inherited failing test, a file requiring another, a top-level monkey patch, Minitest
+threads, lazily loaded code reading `/etc/hosts`, a memoized helper, a cache in `Dir.tmpdir`, a probe of a path
+another file writes, a file that does not load, a top-level constant that breaks another file's load, a skip), run by
+`vci run --key` in batch mode and, in another copy of the repository, one process per file: the same files are
+attested and refused for the same reasons, the attested files' manifests are equal entry for entry, the exit code is
+the same, and changes to what a file read (the base test file, the memoized data, the cache's source, the probed path)
+run that file. Before the change the test failed on every finding (the reproductions above). `e2e_rspec.rs`,
+`rspec_batch_mode_gives_what_one_process_per_file_gives`: the RSpec fixture's specs, a failing and a pending spec, a
+spec defining shared examples at its top level and one using them without requiring it; two boots (`rails_helper`,
+`spec_helper`). Both e2e harnesses now run every test in batch mode, as `vci run` does by default
+(`VCI_E2E_RAILS_PER_FILE=1` runs them one process per file); all pass both ways, including
+`rails_active_storage_with_libvips`, which the first design failed (a native library one file opened at load time was
+in every file's inputs). `collector_test.rb`: `test_batch_mode_runs_each_file_in_a_process_of_its_own` (a file's output
+equals its own run's, a top-level constant and a patch do not reach the next file, the temp dir is cleaned),
+`test_batch_mode_sends_back_what_it_cannot_run_per_file` (no loader, a boot that raises, a boot killed, a changed temp
+file). The adapter: `batch_output_is_read_per_file`.
+
+**Measurements (vex-api).** 50 files of the `application` group (every 18th of its sorted list, as
+`scripts/ci/rails-tests.sh` makes the group), from a clone of vex-git master `2b59eb17cc` (no remote, never pushed),
+its own test database, a release `vci` built from this tree, a throwaway key, `/usr/bin/time -l mise exec -- vci run
+<50 files> --key <key>`:
+
+| | wall | user + sys | attested / refused |
+|---|---|---|---|
+| one process per file (`VCI_RAILS_PER_FILE=1`; measured for the first design) | 2034.7 s | 448.6 s + 175.7 s | 47 / 3 |
+| batch: one boot, one process per file | 1110.0 s | 215.0 s + 69.7 s | 47 / 3, the same three (one without tests, two that skip one) |
+| the first design's single process (unsound, see B1) | 117.7 s | 62.0 s + 51.0 s | 47 / 3 |
+
+The files' processes reported 855.8 s of test time in all (10.6 to 34.2 s each, 218 tests): most of it is vex-api's
+Oaken `replant_seed` (truncate every table, load `db/seeds/test/**`) in each process's first test. Oaken runs it "once"
+by removing its `before_setup` after the first call, in memory, so every file's process does it again, as every one-file
+run does; the shared process of the first design did it once for all 50 files, which is most of what it saved. On
+vex-api batch mode therefore saves the boot (about 20 of the 41 s a one-file run took) and keeps the reseed: the
+`application` group (925 files) would take about 5.7 h in one job at 22 s a file, which `vci ci --partition I/N`
+divides by N.
+
+What a project can do about that is its own business, and vex-api can: an experiment in a scratch clone (never
+committed to vex) replaced Oaken's first-test reseed by a reseed in `test_helper.rb` itself (`Oaken.loader.replant_seed`
+after `include Oaken.loader.test_setup`, and Oaken's `before_setup` removed), so the boot seeds once and every file's
+process inherits the seeded database (its tests run in transactions, as before). The same 50 files: **265.0 s** (201.6 s
+user, 57.8 s sys), 47 attested and the same 3 refused, 37.6 s of test time in all. What is left is about 5 s a file:
+the collector writing the file's output at exit (about 3.3 s, measured in three file processes: 2.3 s classifying
+~13,800 observations, 0.6 to 1.1 s checking the used gems' files against their archives), vci checking and signing
+(about 1.1 s), and the fork. A one-file run pays the same per file. The trade-off is the project's: with the seed in the
+helper, a file's process starts from the database the previous file's non-transactional tests left, where a one-file
+run with Oaken's own setup starts from a fresh reseed; vci does not record the database either way.
+
+Manifests: four of the 50 files run one process per file with the same build and database (`VCI_RAILS_PER_FILE=1`,
+151.8 s) have the same input root as in the batch for three (`slack_run_preview_job_test.rb`,
+`email_verification_test.rb`, `openapi_from_routes_test.rb`; 13806, 13811 and 13914 inputs), and for
+`inbox_page_test.rb` the same 13902 entries but for six `absent` probes of `public/api/v1/organizations/org-<random
+id>/pages/inbox{,.br,.gz,.html,...}` (`ActionDispatch::Static` looking up a request path whose id is random per run).
+`app_access_controller_test.rb` run on its own, then in a batch of two: the same root (`ef8fed40bdd1022a`, 13880
+inputs). Against the first design's one-process-per-file run (an older build): every batch manifest has about 90 more
+`absent` probes, of `lib/` and `vendor/` for `active_record/fixture_set/*` and `action_view/template/handlers/*` (the
+load-path lookups of features; this build records them one process per file too, as the equal roots above show), and
+misses only random request paths (245 entries over 47 files).
+
+macOS needed `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` (B1: without it every file's process died and all 50 went back
+to one process per file), and the boot's database connections had to be closed before each fork (B1: the second
+file's first test lost its MySQL connection).
+
 ## Not done
 
+- **Batch files in parallel**: a batch runs its files' processes one at a time (B5); in parallel each would need a
+  database of its own, as Rails' `parallelize` makes.
 - **RSpec expectation counts**: RSpec does not count expectations, and vci does not either; an example without one
   passes (Minitest's no-assertion rule has no RSpec counterpart).
 - **RSpec on a GitHub runner**: checked in the Linux container only (R14).

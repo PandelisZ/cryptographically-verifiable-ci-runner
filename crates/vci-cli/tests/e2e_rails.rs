@@ -10,7 +10,7 @@
 //! no such Ruby is found or `bundle check` fails for the fixture (the gems are
 //! not installed for it: `bundle install` in `fixtures/rails-abcd`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -97,6 +97,7 @@ const SCRUB: &[&str] = &[
     "VCI_SIGNING_KEY",
     "VCI_OUT",
     "VCI_RUBY",
+    "VCI_RAILS_PER_FILE",
     "VCI_JOBS",
     "APP_MODE",
     "RUBYOPT",
@@ -362,6 +363,12 @@ end"##;
             .env("NO_COLOR", "1");
         for k in SCRUB {
             cmd.env_remove(k);
+        }
+        // `vci run` of several files runs them in batch mode, as it does
+        // by default; VCI_E2E_RAILS_PER_FILE=1 runs every test one process
+        // per file instead (to compare).
+        if std::env::var_os("VCI_E2E_RAILS_PER_FILE").is_some_and(|v| v == "1") {
+            cmd.env("VCI_RAILS_PER_FILE", "1");
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -2740,5 +2747,332 @@ end
         },
         "test/lib/env_test.rb",
         &["test/lib/env_test.rb"],
+    );
+}
+
+/// The test files of the batch-mode tests (`test/batch/`), each with
+/// `require "test_helper"` first: what one test file can do to another when
+/// they share a process. Their outcome must be what one process per file
+/// gives.
+const BATCH_FILES: &[(&str, &str)] = &[
+    // A test inherited from another test file's class; a file that requires
+    // another test file.
+    (
+        "test/batch/base_test.rb",
+        "class InheritBaseTest < ActiveSupport::TestCase\n  def expected = \"ok\"\n\n  test \"inherited\" do\n    assert_equal \"ok\", expected\n  end\nend\n",
+    ),
+    (
+        "test/batch/sub_test.rb",
+        "require_relative \"base_test\"\n\nclass InheritSubTest < InheritBaseTest\n  def expected = \"bad\"\n\n  test \"own\" do\n    assert true\n  end\nend\n",
+    ),
+    (
+        "test/batch/req_test.rb",
+        "require_relative \"base_test\"\n\nclass ReqTest < ActiveSupport::TestCase\n  test \"uses the base\" do\n    assert_equal \"ok\", InheritBaseTest.new(\"x\").expected\n  end\nend\n",
+    ),
+    // A monkey patch at the top level of one file, which another relies on.
+    (
+        "test/batch/patch_test.rb",
+        "Widget.class_eval { def label = \"patched\" }\n\nclass PatchTest < ActiveSupport::TestCase\n  test \"patches\" do\n    assert_equal \"patched\", Widget.new(name: \"x\", size: 1).label\n  end\nend\n",
+    ),
+    (
+        "test/batch/user_test.rb",
+        "class UserTest < ActiveSupport::TestCase\n  test \"sees the patch\" do\n    assert_equal \"patched\", Widget.new(name: \"x\", size: 1).label\n  end\nend\n",
+    ),
+    // Minitest's own thread pool (parallelize_me!).
+    (
+        "test/batch/par1_test.rb",
+        "class Par1Test < Minitest::Test\n  parallelize_me!\n\n  def test_reads\n    sleep 0.05\n    assert_equal \"par1\\n\", File.read(Rails.root.join(\"test/fixtures/files/par1.txt\"))\n  end\n\n  def test_fails\n    sleep 0.05\n    assert false\n  end\nend\n",
+    ),
+    (
+        "test/batch/par2_test.rb",
+        "class Par2Test < Minitest::Test\n  parallelize_me!\n\n  3.times do |i|\n    define_method(:\"test_reads_#{i}\") do\n      sleep 0.05\n      assert_equal \"par2\\n\", File.read(Rails.root.join(\"test/fixtures/files/par2.txt\"))\n    end\n  end\nend\n",
+    ),
+    // Lazily loaded code that reads outside the repository.
+    (
+        "test/batch/o1_test.rb",
+        "class O1Test < ActiveSupport::TestCase\n  test \"hosts\" do\n    assert HostsReader::DATA.size >= 0\n  end\nend\n",
+    ),
+    (
+        "test/batch/o2_test.rb",
+        "class O2Test < ActiveSupport::TestCase\n  test \"hosts\" do\n    assert HostsReader::DATA.size >= 0\n  end\nend\n",
+    ),
+    // A memoized helper and a cache in the temp directory.
+    (
+        "test/batch/m1_test.rb",
+        "require_relative \"memo_helper\"\n\nclass M1Test < ActiveSupport::TestCase\n  test \"memo\" do\n    assert_equal \"memo\\n\", MemoHelper.data\n  end\nend\n",
+    ),
+    (
+        "test/batch/m2_test.rb",
+        "require_relative \"memo_helper\"\n\nclass M2Test < ActiveSupport::TestCase\n  test \"memo\" do\n    assert_equal \"memo\\n\", MemoHelper.data\n  end\nend\n",
+    ),
+    (
+        "test/batch/tc1_test.rb",
+        "class Tc1Test < ActiveSupport::TestCase\n  test \"cache\" do\n    cache = File.join(Dir.tmpdir, \"vci-prove-cache.txt\")\n    File.write(cache, File.read(Rails.root.join(\"test/fixtures/files/tc.txt\"))) unless File.exist?(cache)\n    assert_equal \"tc\\n\", File.read(cache)\n  end\nend\n",
+    ),
+    (
+        "test/batch/tc2_test.rb",
+        "class Tc2Test < ActiveSupport::TestCase\n  test \"cache\" do\n    cache = File.join(Dir.tmpdir, \"vci-prove-cache.txt\")\n    File.write(cache, File.read(Rails.root.join(\"test/fixtures/files/tc.txt\"))) unless File.exist?(cache)\n    assert_equal \"tc\\n\", File.read(cache)\n  end\nend\n",
+    ),
+    // An absent path one file checks and another writes.
+    (
+        "test/batch/pr1_test.rb",
+        "class Pr1Test < ActiveSupport::TestCase\n  test \"no flag\" do\n    assert_not File.exist?(Rails.root.join(\"config/flag.yml\"))\n  end\nend\n",
+    ),
+    (
+        "test/batch/pr2_test.rb",
+        "class Pr2Test < ActiveSupport::TestCase\n  test \"writes the flag\" do\n    p = Rails.root.join(\"config/flag.yml\")\n    File.write(p, \"x\")\n    File.delete(p)\n    assert true\n  end\nend\n",
+    ),
+    // A file that does not load, a file that reads a file only it reads, a
+    // file with a skipped test.
+    (
+        "test/batch/broken_test.rb",
+        "class BrokenTest < ActiveSupport::TestCase\n  test \"x\" do\nend\n",
+    ),
+    (
+        "test/batch/e_test.rb",
+        "class BatchETest < ActiveSupport::TestCase\n  test \"reads its own file\" do\n    assert_equal \"only e\\n\", file_fixture(\"only_e.txt\").read\n  end\nend\n",
+    ),
+    (
+        "test/batch/g_test.rb",
+        "class BatchGTest < ActiveSupport::TestCase\n  test \"skips\" do\n    skip \"elsewhere\"\n  end\n\n  test \"passes\" do\n    assert true\n  end\nend\n",
+    ),
+    // Top-level code of one file that breaks another one's load.
+    (
+        "test/batch/q1_test.rb",
+        "QMARKER = true\n\nclass Q1Test < ActiveSupport::TestCase\n  test \"q1\" do\n    assert true\n  end\nend\n",
+    ),
+    (
+        "test/batch/q2_test.rb",
+        "raise \"q1 is loaded\" if defined?(QMARKER)\n\nclass Q2Test < ActiveSupport::TestCase\n  test \"q2\" do\n    assert true\n  end\nend\n",
+    ),
+];
+
+const ONLY_E: &str = "test/fixtures/files/only_e.txt";
+
+/// Batch mode, whatever the harness's default (`VCI_E2E_RAILS_PER_FILE`).
+const BATCH: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0")];
+
+fn add_batch_files(w: &World) {
+    for (f, body) in BATCH_FILES {
+        w.put(f, &format!("require \"test_helper\"\n{body}"));
+    }
+    w.put(
+        "test/batch/memo_helper.rb",
+        "module MemoHelper\n  def self.data = (@data ||= File.read(File.expand_path(\"../fixtures/files/memo.txt\", __dir__)))\nend\n",
+    );
+    w.put(
+        "app/models/hosts_reader.rb",
+        "module HostsReader\n  DATA = File.read(\"/etc/hosts\")\nend\n",
+    );
+    for (f, text) in [
+        (ONLY_E, "only e\n"),
+        ("test/fixtures/files/par1.txt", "par1\n"),
+        ("test/fixtures/files/par2.txt", "par2\n"),
+        ("test/fixtures/files/memo.txt", "memo\n"),
+        ("test/fixtures/files/tc.txt", "tc\n"),
+    ] {
+        w.put(f, text);
+    }
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "batch files"]);
+}
+
+/// The (path, kind) manifest entries (test and global) of `id`'s stored
+/// attestation.
+fn entries_of(work: &Path, id: &str) -> BTreeSet<(String, String)> {
+    manifest_entries(&stored_predicate(work, id))
+        .into_iter()
+        .collect()
+}
+
+/// What `vci run` said of each file: `None` attested, else why not.
+fn outcomes(stderr: &str) -> BTreeMap<String, Option<String>> {
+    let mut out = BTreeMap::new();
+    for l in stderr.lines() {
+        if let Some(f) = l.strip_prefix("vci: attested ") {
+            out.insert(f.split_whitespace().next().unwrap().to_owned(), None);
+        } else if let Some(rest) = l.strip_prefix("vci: not attesting ")
+            && let Some((f, why)) = rest.split_once(": ")
+        {
+            out.insert(f.to_owned(), Some(why.to_owned()));
+        }
+    }
+    out
+}
+
+/// Batch mode: `vci run` of several files boots the application once and
+/// runs each file in a process of its own forked from it, so whatever one
+/// test file does (a class another file's test inherits, a monkey patch at
+/// its top level, a constant, Minitest threads, lazily loaded code that
+/// reads outside the repository, a memoized helper, a cache in the temp
+/// directory, a path it writes and removes, a file that does not load)
+/// cannot change another file's result or inputs. Compared with one process
+/// per file (`VCI_RAILS_PER_FILE=1`, in another copy of the repository):
+/// the same files are attested and refused for the same reasons, and the
+/// attested files' manifests are the same. `vci plan` afterwards skips the
+/// attested ones, and a change to what a file read runs that file.
+#[test]
+fn rails_batch_mode_gives_what_one_process_per_file_gives() {
+    let Some(alone) = World::new() else { return };
+    let Some(w) = World::new() else { return };
+    add_batch_files(&alone);
+    add_batch_files(&w);
+    let files: Vec<&str> = BATCH_FILES.iter().map(|(f, _)| *f).collect();
+
+    // Two files, one of which breaks the other's load when they share a
+    // process: both pass, and vci exits 0.
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let q = ["test/batch/q1_test.rb", "test/batch/q2_test.rb"];
+    let out = w.vci_env(&w.work, &["run", q[0], q[1], "--key", key.as_str()], BATCH);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "vci: ruby bin/rails test <2 files> --seed 0, booted once, one process per file"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("run again one process per file"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("vci: 2 attested, 0 not attested"),
+        "{stderr}"
+    );
+
+    let run = |x: &World, env: &[(&str, &str)]| {
+        let key = x.trusted.to_str().unwrap().to_owned();
+        let mut args = vec!["run"];
+        args.extend(files.iter().copied());
+        args.extend(["--key", key.as_str()]);
+        let out = x.vci_env(&x.work, &args, env);
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        (out.status.code(), stderr)
+    };
+    let (code_alone, err_alone) = run(&alone, &[("VCI_RAILS_PER_FILE", "1")]);
+    assert!(!err_alone.contains("booted once"), "{err_alone}");
+    let (code, err) = run(&w, BATCH);
+    assert!(
+        err.contains(&format!(
+            "vci: ruby bin/rails test <{} files> --seed 0, booted once, one process per file",
+            files.len()
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("run again one process per file"), "{err}");
+    assert_eq!(code, code_alone);
+    let (want, got) = (outcomes(&err_alone), outcomes(&err));
+    assert_eq!(want.len(), files.len(), "{err_alone}");
+    assert_eq!(
+        got, want,
+        "batch:\n{err}\none process per file:\n{err_alone}"
+    );
+    // What one process per file gives, as the review found it.
+    let refused = |f: &str, why: &str| {
+        let w = want[f]
+            .as_deref()
+            .unwrap_or_else(|| panic!("{f} was attested"));
+        assert!(w.contains(why), "{f}: {w}");
+    };
+    refused("test/batch/sub_test.rb", "result failed (1 failed of 3)");
+    refused("test/batch/user_test.rb", "result failed");
+    refused("test/batch/par1_test.rb", "result failed (1 failed of 2)");
+    refused("test/batch/o1_test.rb", "/etc/hosts");
+    refused("test/batch/o2_test.rb", "/etc/hosts");
+    refused("test/batch/pr2_test.rb", "config/flag.yml");
+    refused("test/batch/g_test.rb", "1 skipped");
+    assert!(want["test/batch/broken_test.rb"].is_some());
+
+    let attested: Vec<&str> = files
+        .iter()
+        .copied()
+        .filter(|f| want[*f].is_none())
+        .collect();
+    for id in &attested {
+        let own = entries_of(&alone.work, id);
+        let batch = entries_of(&w.work, id);
+        assert_eq!(
+            batch.difference(&own).collect::<Vec<_>>(),
+            Vec::<&(String, String)>::new(),
+            "{id}: entries only the batch run has"
+        );
+        assert_eq!(
+            own.difference(&batch).collect::<Vec<_>>(),
+            Vec::<&(String, String)>::new(),
+            "{id}: entries only its own run has"
+        );
+    }
+    let has = |id: &str, path: &str| entries_of(&w.work, id).iter().any(|(p, _)| p == path);
+    assert!(has("test/batch/req_test.rb", "test/batch/base_test.rb"));
+    assert!(has("test/batch/m2_test.rb", "test/fixtures/files/memo.txt"));
+    assert!(has("test/batch/tc2_test.rb", "test/fixtures/files/tc.txt"));
+    assert!(has("test/batch/pr1_test.rb", "config/flag.yml"));
+    assert!(has(
+        "test/batch/par2_test.rb",
+        "test/fixtures/files/par2.txt"
+    ));
+    assert!(!has(
+        "test/batch/par2_test.rb",
+        "test/fixtures/files/par1.txt"
+    ));
+    assert!(has("test/batch/e_test.rb", ONLY_E));
+    for id in &attested {
+        assert_eq!(has(id, ONLY_E), *id == "test/batch/e_test.rb", "{id}");
+    }
+
+    let p = w.plan(&w.work, "main");
+    let refused: BTreeSet<String> = want
+        .iter()
+        .filter(|(_, v)| v.is_some())
+        .map(|(k, _)| k.clone())
+        .collect();
+    let batch_files: BTreeSet<String> = files.iter().map(|f| f.to_string()).collect();
+    assert_eq!(
+        p.skip
+            .intersection(&batch_files)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        attested.iter().map(|f| f.to_string()).collect(),
+        "{p:?}"
+    );
+    assert!(refused.is_subset(&p.run), "{p:?}");
+    // A change to what one file read runs that file (and the files that
+    // read it too).
+    for (path, text, runs) in [
+        (
+            "test/batch/base_test.rb",
+            "require \"test_helper\"\nclass InheritBaseTest < ActiveSupport::TestCase\n  def expected = \"ok\"\n\n  test \"inherited\" do\n    assert_equal \"ok\", expected\n  end\n\n  test \"more\" do\n    assert true\n  end\nend\n",
+            &["test/batch/base_test.rb", "test/batch/req_test.rb"][..],
+        ),
+        (
+            "test/fixtures/files/memo.txt",
+            "changed\n",
+            &["test/batch/m1_test.rb", "test/batch/m2_test.rb"][..],
+        ),
+        (
+            "test/fixtures/files/tc.txt",
+            "changed\n",
+            &["test/batch/tc1_test.rb", "test/batch/tc2_test.rb"][..],
+        ),
+        ("config/flag.yml", "x\n", &["test/batch/pr1_test.rb"][..]),
+    ] {
+        let before = std::fs::read_to_string(w.work.join(path)).ok();
+        w.put(path, text);
+        let p = w.plan(&w.work, "main");
+        for f in runs {
+            assert!(p.run.contains(*f), "{path} changed: {f} must run: {p:?}");
+        }
+        match before {
+            Some(t) => w.put(path, &t),
+            None => std::fs::remove_file(w.work.join(path)).unwrap(),
+        }
+    }
+    assert_eq!(
+        w.plan(&w.work, "main")
+            .skip
+            .intersection(&batch_files)
+            .count(),
+        attested.len()
     );
 }

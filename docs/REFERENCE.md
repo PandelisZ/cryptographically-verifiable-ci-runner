@@ -14,13 +14,14 @@ to run it again. `vci` makes that safe:
    path:src/b.test.ts`), exchanged on `refs/meta/main` by ordinary git push and fetch (`vci push`, `vci fetch`, or
    `git meta push` / `git meta pull`). vci adds no database or files of its own; git is the transport and the
    authority. See [Where attestations live (git-meta)](#where-attestations-live-git-meta).
-3. In CI, `vci plan` checks each attestation against the **base commit's** `.vci/allowed_signers` and `vci.toml`,
-   re-hashes every recorded input from CI's own checkout, and skips a test file only when everything matches.
+3. In CI, `vci plan` checks each attestation against the **base commit's** `.vci/allowed_signers` (SSH keys) or
+   `.vci/identities.toml` (CI jobs that sign keylessly with their OIDC token, since 2.0) and `vci.toml`, re-hashes
+   every recorded input from CI's own checkout, and skips a test file only when everything matches.
    `vci ci` then runs the rest.
 
 The core rule is **fail open**: the default verdict is RUN. Any error, doubt or unrecognised behaviour means the test runs.
 
-Status: v1, Vitest `>=3.2 <6` (tested on 5.0.2 and 4.1.11), Node 22.15+; Node's built-in test runner
+Status: 2.0, Vitest `>=3.2 <6` (tested on 5.0.2 and 4.1.11), Node 22.15+; Node's built-in test runner
 (`node --test`, tested on Node 22.23, 24.13 and 26.9); pytest 9 (tested on 9.1.1) on CPython
 3.11-3.14 through `uv`; Go modules with Go 1.26 (tested on 1.26.2); Cargo workspaces (tested with Rust and cargo
 1.96.0); Rails 8 with Minitest or RSpec on Ruby 3.4 (tested with Rails 8.1.3.1, Minitest 6.0.6, rspec-core 3.13.6 with
@@ -45,14 +46,15 @@ Full guide: [INSTALL.md](INSTALL.md).
 After your toolchain setup steps, add:
 
 ```yaml
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 ```
 
-It builds `vci`, fetches attestations, and runs only what is not already attested. Setup, inputs and security rules:
-[docs/GITHUB_ACTIONS.md](GITHUB_ACTIONS.md).
+(`@v2` follows the latest 2.x release; `@v1` stays on 1.9.2.) It builds `vci`, fetches attestations, and runs only
+what is not already attested. Setup, inputs and security rules: [docs/GITHUB_ACTIONS.md](GITHUB_ACTIONS.md).
 
-With a `signing-key`, CI attests what it runs too, so the next commit skips every unit whose inputs did not change:
-see [CI attests its own runs](#ci-attests-its-own-runs).
+With a `signing-key`, or with `oidc: true` and no secret at all (the job's OIDC token, since 2.0), CI attests what it
+runs too, so the next commit skips every unit whose inputs did not change: see [CI attests its own
+runs](#ci-attests-its-own-runs) and [Keyless signing (OIDC)](#keyless-signing-oidc).
 
 ## Quick start (Vitest)
 
@@ -608,19 +610,34 @@ git add vci.toml .vci/allowed_signers .git-meta Gemfile.lock && git commit -m "E
 # .git-meta is written only when the repository has an origin remote (or with --meta-url <url>); without one,
 # leave it out of `git add`. The trust root is read from the base branch: push or merge this commit to main first.
 
-vci run test/models/b_test.rb --key ~/.ssh/id_ed25519   # one Ruby process per file, collect, sign, store
+vci run test/models/b_test.rb --key ~/.ssh/id_ed25519   # collect, sign, store (several files: one boot)
 vci plan --base-ref origin/main                          # SKIP test/models/b_test.rb, RUN the rest
 vci push
 ```
 
-`vci run` runs every file in its own process, one at a time (the files of a project share the test database, as in
-`bin/rails test`):
+`vci run` (and `vci ci --key`) of several files starts **one process per runner**, as `bin/rails test` does, with
+the collector in batch mode (vci 2.0): it boots the application once, then forks one process per file, one at a time
+(the files of a project share the test database), each of which runs that file alone. One file, or
+`VCI_RAILS_PER_FILE=1` in vci's environment, runs one process per file from the start:
 
 ```
 RUBYOPT=-r<abs>/ruby/vci-collector/vci_collector.rb VCI_RAILS_MODE=collect VCI_OUT=<fresh dir> \
   TMPDIR=<fresh dir> RAILS_ENV=test PARALLEL_WORKERS=1 DISABLE_SPRING=1 \
   DISABLE_BOOTSNAP=1 BUNDLE_GEMFILE=<project>/Gemfile ruby bin/rails test test/models/b_test.rb --seed 0
+# several files: VCI_RAILS_BATCH=<list of their test ids> ... ruby bin/rails test <files> --seed 0
 ```
+
+In batch mode the process waits until the test runner asks for the first test file (Rails' `Runner.load_tests`,
+RSpec's `load_spec_files`), loads none of them, and forks: once per group of files whose first statement requires the
+same helper (`require "test_helper"`, `require "rails_helper"`), a process that requires it (the boot), and from it
+one process per file, which skips the runner's requests for the other files, loads its own, runs its tests and writes
+its output as a one-file run does. Each file's inputs, result and exit status are therefore those of a run of that
+file on its own, with the boot observed once: nothing one file's code defines, patches, caches or loads reaches
+another file's process, and what a file's process leaves in vci's temp dir is removed before the next one starts. A
+file whose first statement is not such a require boots in its own process. What the batch cannot run this way (a helper
+that fails in the boot, a process that writes no output, a runner whose loader vci does not know) runs again one
+process per file, and `vci run` says so. Details and measurements: [`docs/spike-rails.md`](spike-rails.md) ("Batch
+mode").
 
 The collector (`ruby/vci-collector/vci_collector.rb`, plain Ruby, nothing is installed into your project) is loaded
 through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run conditions:
@@ -642,8 +659,9 @@ through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run condi
 
 `vci ci` runs the remaining files of a project the engine's own way, in **one process per runner**
 (`bin/rails test <files> --seed 0`, `rspec --options .rspec <files>`; `VCI_RAILS_MODE=plain`: the same run conditions,
-nothing recorded), and exits non-zero if any fails. **An attestation vouches for the file run on its own**, like the
-pytest adapter: a test that passes only after another file ran in the same process is not reproduced. CI example:
+nothing recorded), and exits non-zero if any fails. **An attestation vouches for the file's result with the inputs
+recorded for it**, as a run of that file on its own gives them (in batch mode too); what the database holds is not an
+input (one file's leftovers there can reach the next file, as with one process per file). CI example:
 [`examples/github-actions-rails.yml`](../examples/github-actions-rails.yml). Findings behind this design:
 [`docs/spike-rails.md`](spike-rails.md).
 
@@ -1246,20 +1264,22 @@ checkout, clock, policy and environment.
 
 | Command | Purpose |
 |---|---|
-| `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet |
-| `vci run [FILES…] [--key PATH] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON. Since 1.9.0 each distinct input manifest is stored once, as its own value (`vci:manifest:<input root>`), and the attestation references it; storing an attestation deletes the same signer's attestations of that unit it supersedes (an earlier commit of this line of history, other files: see "Where attestations live (git-meta)"), printing `vci: removed N superseded attestation(s) ...` and how many manifests nothing references any more |
+| `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL] [--oidc]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet. `--oidc` (since 2.0) also writes `.vci/identities.toml`, trusting pushes to origin's default branch by the repository's workflow (its only file under `.github/workflows`, else `*`, to narrow) as principal `github-actions` (an existing file is left alone), and `.vci/sigstore-trusted-root.json` from `gh attestation trusted-root` (refreshed each time; without `gh`, a note says to write it): see [Keyless signing (OIDC)](#keyless-signing-oidc) |
+| `vci run [FILES…] [--key PATH \| --oidc[=github\|public-good]] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON. Since 1.9.0 each distinct input manifest is stored once, as its own value (`vci:manifest:<input root>`), and the attestation references it; storing an attestation deletes the same signer's attestations of that unit it supersedes (an earlier commit of this line of history, other files: see "Where attestations live (git-meta)"), printing `vci: removed N superseded attestation(s) ...` and how many manifests nothing references any more (since 2.0 it first fetches, in one batch, the stored attestations of those units that were not fetched yet; one that cannot be fetched is kept). `--oidc` (since 2.0; GitHub Actions with `permissions: id-token: write`) signs keylessly with the job's OIDC token instead of a key, through GitHub's Sigstore instance or, with `--oidc=public-good`, sigstore.dev's; the instance needs the `=` (`vci run --oidc a_test.go` runs `a_test.go`). See [Keyless signing (OIDC)](#keyless-signing-oidc) |
 | `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]] [--project NAME]...` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally. `--project NAME` (repeatable) plans only those `[[projects]]` entries (by `name`, as the base commit's vci.toml names them): the other projects are not listed, probed or verified (their toolchains need not be installed) and are absent from the output. An unknown name is an error (exit 2) naming the configured projects; the single-project form has no names, so `--project` is an error there |
-| `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--key PATH [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). `--project` as for `vci plan`: only those projects are planned, run (and with `--key` attested), and only they appear in the printed plan and in the audit log's `projects`, `skipped` and `ran`; one CI job per suite (`vci ci --fetch origin --base-ref "$BASE" --project web`). Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list, or name the principal in `policy.attest_on_any_ref` (since 1.9.2) to let pull requests attest with it on purpose. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose) |
-| `vci verify <envelope\|-> [--allowed-signers F] [--base-ref R] [--manifest FILE]` | Verify one DSSE envelope and print its claims, including the input manifest: inline (before 1.9.0) or the one it references, read from `--manifest FILE` (its compact encoding, as `git meta get project vci:manifest:<root>` prints it) or else from the git-meta store of the repository it runs in; its root must be the signed input root (exit 1 otherwise, or when it is not available) |
-| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history. Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed (`VCI_TIMING=1` prints `materialize (incremental, N changed entries)` or `materialize (full)`), and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against" |
-| `vci prune [--dry-run] [--superseded]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them). `--superseded` (since 1.8.2) also deletes, per unit and signer, every attestation but the one issued last (an older one vouches for inputs the tree no longer has, or soon will not). Since 1.9.0 it then deletes the stored input manifests (`vci:manifest:<root>`) no remaining attestation references (none while an attestation, or the manifest reference of one it leaves alone, cannot be read), and prints how many |
-| `vci explain <test-file> [--base-ref R]` | Every candidate attestation and the first check it failed, with expected vs actual (an env failure names the variable and its class under the base policy, `env:DATABASE_URL (hash)`, never its value) |
+| `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--partition I/N] [--key PATH \| --oidc[=INSTANCE] [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). `--project` as for `vci plan`: only those projects are planned, run (and with `--key` attested), and only they appear in the printed plan and in the audit log's `projects`, `skipped` and `ran`; one CI job per suite (`vci ci --fetch origin --base-ref "$BASE" --project web`). `--partition I/N` (since 2.0; `1 <= I <= N`, anything else is a usage error, exit 2) splits a suite over N jobs: of the units the plan runs (for a project that runs everything, every unit it lists), this job runs only those whose test id falls in partition I (the first 8 bytes of the unit's storage key, BLAKE3 of the test id, big-endian, modulo N, plus one): the same in every job and on every machine, whatever the order or the other jobs, so every unit runs in exactly one partition. What the plan skips is skipped in every partition. A project that runs everything and whose units cannot be listed runs whole in every partition that cannot list it, with a `::warning` (each job lists on its own and cannot know whether another listed it, so such a project may run in more than one job, never in none); without any readable project every partition runs the default project. After the plan it prints `partition 2/3: 41 of 120 units to run`; the exit code is this partition's tests'; the audit log's `ran` holds this partition's units and `partition` is `{index, count, units, total, unlisted}` (`units`: this partition's, `total`: all partitions', `unlisted`: projects this partition runs whole because it could not list them), `null` without the flag. With `--key --push` each job attests and publishes its own share (concurrent pushes merge and retry), so the next plan skips every partition's units: `vci ci --fetch origin --base-ref "$BASE" --project rust --partition ${{ matrix.part }}/3 --key ci-key --push --remote origin`. `--partition 1/1` runs what `vci ci` without it runs. Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list, or name the principal in `policy.attest_on_any_ref` (since 1.9.2) to let pull requests attest with it on purpose. `--oidc[=INSTANCE]` (since 2.0) attests as `--key` does, keylessly as `vci run --oidc` signs, and refuses on the same terms with the principals of the base `.vci/identities.toml` entries the job's identity matches (or when that file cannot be read there); a job without a token (no `permissions: id-token: write`) fails before anything runs, and an identity that matches no entry attests with a `::warning` that nothing will trust it. `--key` and `--oidc` exclude each other; `--ttl` and `--push` need one of them. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose) |
+| `vci verify <envelope\|-> [--allowed-signers F] [--identities F --trusted-root F] [--base-ref R] [--manifest FILE]` | Verify one DSSE envelope against `.vci/allowed_signers` (SSH-signed) or `.vci/identities.toml` and `.vci/sigstore-trusted-root.json` (keyless) at `--base-ref` or HEAD, or against the files given: once any trust file is given, an envelope whose kind needs one that was not is INVALID (the repository's files are then not used). It prints its claims, including the input manifest: inline (before 1.9.0) or the one it references, read from `--manifest FILE` (its compact encoding, as `git meta get project vci:manifest:<root>` prints it) or else from the git-meta store of the repository it runs in (since 2.0 fetched from the metadata remote when it was not fetched yet); its root must be the signed input root (exit 1 otherwise, or when it is not available). A keyless envelope prints the identity, the principal it matched, the timestamp authority and the run URL |
+| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history. Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed; since 2.0 a fetch downloads keys, not values (blobless; values are fetched when a plan, verify, run or prune reads them), and every merge is done from the trees' paths (`VCI_TIMING=1` prints `materialize (from paths, N changed entries, M not fetched)` or `materialize (full)`); and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against" |
+| `vci prune [--dry-run] [--superseded]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them). `--superseded` (since 1.8.2) also deletes, per unit and signer, every attestation but the one issued last (an older one vouches for inputs the tree no longer has, or soon will not). Since 1.9.0 it then deletes the stored input manifests (`vci:manifest:<root>`) no remaining attestation references (none while an attestation, or the manifest reference of one it leaves alone, cannot be read), and prints how many. Since 2.0 it reads every attestation, so it first fetches the ones a blobless fetch left out (one batch; on a large store most of what a fetch downloaded before 2.0); one that cannot be fetched is left alone, with a warning |
+| `vci explain <test-file> [--base-ref R]` | Every candidate attestation and the first check it failed, with expected vs actual (an env failure names the variable and its class under the base policy, `env:DATABASE_URL (hash)`, never its value). It plans as `vci plan` does, fetching the values it reads; one that could not be fetched fails its candidate's `envelope` check with ``unreadable: value not fetched: run `vci fetch` online`` |
 | `vci env [--base-ref R] [--project NAME] [--format text\|json]` | Print the effective environment policy of each project: every variable `[env]` and the runner's built-in lists name, its class (`set`, `hash`, `ignore`, `built-in hash`, `built-in ignore`, `stripped`), where the rule comes from (`vci.toml set`, `vci.toml hash`, an old key name, `built-in <adapter>`, `test script`) and what it is here (the value vci sets; `present (<hash prefix>)` or `absent`); variables present here that the tests will not see are listed as removed. With `--base-ref`, a `BASE` column says where the base commit's policy differs (CI judges with it). Runs nothing (docs/ENV.md, "vci env") |
 
 Signing key: `--key`, else `$VCI_SIGNING_KEY`, else `git config user.signingkey` when `gpg.format = ssh` (a GPG
 signing key is never used). Errors name the source the key came from. A `.pub` path works when the private
 half is in `ssh-agent` (hardware keys included). The signer id (a segment of the git-meta key) is the first 16 hex chars of SHA-256 over the
-public key blob.
+public key blob. Keyless (since 2.0): `--oidc` instead of a key, in a GitHub Actions job with `permissions: id-token:
+write`; the signer id is then the first 16 hex chars of SHA-256 over the job's identity claims (see [Keyless signing
+(OIDC)](#keyless-signing-oidc)).
 
 Base ref: `--base-ref`, else `$VCI_BASE_REF`, else `origin/$GITHUB_BASE_REF`, else the first of `origin/HEAD`,
 `origin/main`, `origin/master`, `main`, `master` that exists. If none resolves, everything runs. The base ref is the
@@ -1270,7 +1290,7 @@ Environment: `VCI_JS_PLUGIN` (path of the `@vci/vitest` package; default `node_m
 project; for node:test, then `js/vitest-plugin` or `share/vci/vitest-plugin` above the `vci` executable), `VCI_NODE` (node binary), `VCI_PY_PLUGIN` (the `py/pytest-plugin` directory holding `vci_pytest`; default:
 `py/pytest-plugin` or `share/vci/pytest-plugin` above the `vci` executable, then the source checkout `vci` was built
 from, then `py/pytest-plugin` above the project; a clear error names the variable when none is found), `VCI_UV` (uv
-binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`; Rails files run one at a time), `VCI_GO`
+binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`; Rails files run one at a time), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_GO`
 (go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_CARGO_JOBS` (Cargo test
 executables run at once in `vci run` and `vci ci`; default: the number of CPUs; cargo itself runs one build at a
 time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory
@@ -1284,7 +1304,7 @@ outside the repository whose real path lies in its collector directory; inside t
 file. The Go adapter's standard library hooks are compiled into `vci` and written to a fresh temp dir for each run.)
 The collectors are vci's tooling: the Ruby collector's `VERSION` is part of the Rails toolchain; the versions of the
 JavaScript and Python collectors are not compared by `vci plan`, so pin the vci you attest with in CI (the action's
-`@v1`, the same Homebrew version).
+`@v2`, the same Homebrew version).
 
 **Refusal summary.** After the per-unit lines (`vci: not attesting <unit>: <why>`, unchanged), `vci run` prints how
 many files each reason refused, most first, every reason listed:
@@ -1402,15 +1422,42 @@ commit, so they survive rebases and apply on every branch.
 **Exchange.** Metadata lives locally in git-meta's SQLite store (`.git/git-meta.sqlite`, written by `vci run`; your
 index, `HEAD` and work tree are never touched) and is exchanged on the remote's `refs/meta/main`:
 
-- `vci fetch` fetches `refs/meta/main` into `refs/meta/remotes/main` (whole trees: `--no-filter`), serializes local
-  values and materializes the remote's (git-meta's merge) into the store, like `git meta pull`. Since 1.9.0, when the
-  store was merged from the primary remote before and the local metadata commit (`refs/meta/local/main`) is an
-  ancestor of the fetched tip, vci applies only what `git diff-tree` reports between the two trees, with the result
-  git-meta's fast-forward gives (new and changed values and deletion records, git-meta's delete for values the tip no
-  longer has, the local ref moved to the tip); the first fetch of a clone, a side remote, local metadata commits not
-  yet pushed, and any entry it does not read the way git-meta does (a set or list value, an unexpected path or mode:
-  a `vci: note:` says so) go through git-meta's full merge. When that merge's tree is exactly the tip's (after the
-  remote's history was rewritten), the local ref is pointed at the tip, so the next fetch is incremental again;
+- `vci fetch` fetches `refs/meta/main` into `refs/meta/remotes/main`, serializes local values and materializes the
+  remote's (git-meta's merge) into the store, like `git meta pull`. Since 2.0 it downloads keys, not values: `git
+  fetch --filter=blob:none` (commits and trees), and for the first fetch of `refs/meta/remotes/main` `--filter=tree:0`
+  (every commit of the metadata history, no tree) followed by the tip's tree alone, fetched by object id, so a fresh
+  clone's download does not grow with the length of the history; later fetches take the commits since, with their
+  trees, so merges keep their base (a merge base whose tree was never fetched gets it first). The repository is never
+  made shallow. A tree's paths are its
+  keys, so the store gets a row per key without reading a value: a value whose blob is already here is stored as a
+  reference to it, any other one as a git-meta *promised* row (not fetched). Only deletion records (tiny) are
+  downloaded and read. `vci plan` (and `vci ci`, `vci explain`) then fetches the values it reads in one `git fetch
+  --stdin` of blob ids each: the attestations of the units it verifies, then the input manifests they reference;
+  `vci verify` fetches the one manifest it reads, `vci run` the attestations of the units it attests (supersession
+  reads them), and `vci prune` every attestation (on a large store, what a fetch downloaded before 2.0). A value that
+  cannot be fetched (offline) reads as ``value not fetched: run `vci fetch` online`` and makes its unit run (a
+  warning, never an error); a vci before 2.0 reading such a row reports it unreadable and runs the unit too. On vex
+  (4,540 entries, 1,257 values, 38.6 MiB packed, 24 commits; a local copy of the remote) a fresh clone's fetch went
+  from 40.6 MB in 5.5 s to 1.8 MB in 1.0 s, and a plan of one project then fetched 1.4 MB (621 values) in 0.5 s; on a
+  later copy (6,006 entries, 85 commits) the fetch is 2.1 MB, of which the 84 earlier commits are 36 KB (their trees
+  would be 2 MB more). The merge is done from the trees' paths too, with
+  the result git-meta's gives: a fetched tip the local metadata commit is an ancestor of is merged by applying what
+  `git diff-tree` reports between the two trees (new and changed values and deletion records, git-meta's delete for
+  values the tip no longer has, the local ref moved to the tip); local metadata commits not yet pushed are merged by
+  git-meta's three-way merge (two-way without a common history) of the trees' entries, blob ids standing in for the
+  values (its rules only compare them), as a merge commit; a clone's first fetch takes the tip's entries. A side
+  remote, and any entry it does not read the way git-meta does (a set or list value, an unexpected path or mode: a
+  `vci: note:` says so), go through git-meta's full merge after fetching every value of the trees it reads
+  (`VCI_TIMING=1` prints `materialize (from paths, ...)` or `materialize (full)`). A serialization rebuilds a changed
+  target's subtree from the values it holds and puts the values not fetched back at the blob ids the previous commit
+  held, so a push from such a clone sends only what it wrote (a pack that is not thin, `git push --no-thin`: a thin
+  one would be deltified against the remote's values, which the clone does not have); a value whose blob the clone
+  never fetched that a merge would keep although the tip no longer holds it (the remote's history rewritten or
+  forced back without it) takes the tip's state instead, since no push could publish it, and a push that finds such
+  a value in the local metadata commit (made by a 2.0 pre-release) fetches it, or deletes it when the remote says it
+  does not have it any more. `--rewrite-history` sends the whole tree, so from such a clone it fetches every value
+  first. When a merge's tree is exactly the tip's (after the
+  remote's history was rewritten), the local ref is pointed at the tip, so the next fetch is a fast-forward again;
 - `vci push` does the same, then rewrites the local metadata commit (`refs/meta/local/main`) as one commit on top of
   the remote tip and pushes it as a fast-forward, retrying from the fetch when the remote moved, like `git meta push`.
   It refuses to push a tree that does not contain the remote tip (that would drop other people's values), and pushes
@@ -1463,9 +1510,9 @@ inputs, write different keys, and git-meta's merge keeps keys added on either si
 the same unit and inputs on two machines: both envelopes vouch for the same thing, and git-meta keeps one of them. A
 deletion (tombstone, `git meta rm`, `vci prune`) loses to a concurrent re-attestation of the same key. A value deleted,
 overwritten, pruned by git-meta's auto-prune, or never fetched only means the unit runs. Nothing in the store is
-trusted: only an envelope signed by a key in the base commit's `allowed_signers`, for exactly this unit, repository,
-toolchain and inputs, skips anything. Anyone with push access to the metadata remote can write or delete metadata,
-exactly as with any other ref.
+trusted: only an envelope signed by a key in the base commit's `allowed_signers` (or keylessly, by an identity of its
+`identities.toml`), for exactly this unit, repository, toolchain and inputs, skips anything. Anyone with push access
+to the metadata remote can write or delete metadata, exactly as with any other ref.
 
 Interoperability, checked by the tests against `git-meta` 0.1.13 when it is installed: values vci pushes are
 readable with `git meta pull` + `git meta get`; values set (`git meta set`) or deleted (`git meta rm`) with the CLI and
@@ -1502,13 +1549,14 @@ failures make the exit code non-zero. The run uses the configuration the plan wa
 expire after `--ttl` (default `14d`, at most `policy.max_ttl`): a unit skipped for that long fails `expiry`, runs
 again and is attested again, so every unit still gets a real run at least once per `ttl`.
 
-**Flags** (`vci ci`; without `--key` nothing changes):
+**Flags** (`vci ci`; without `--key` or `--oidc` nothing changes):
 
 | Flag | Meaning |
 |---|---|
 | `--key PATH` | Run the remainder as `vci run --key` does and attest it with this SSH key (a private key, or a `.pub` with the private half in `ssh-agent`) |
-| `--ttl DURATION` | Lifetime of those attestations, default `14d`; only with `--key` |
-| `--push` | After the run, whatever the tests did, publish as `vci push` does (only passing units have attestations, so pushing after a failure is right). A failed push prints `::warning title=vci::could not push attestations ...` and does not change the exit code; only with `--key` |
+| `--oidc[=INSTANCE]` | Since 2.0: attest as `--key` does, keylessly, with the GitHub Actions job's OIDC token (`permissions: id-token: write`) and no secret; `github` (the default) or `public-good`. See [Keyless signing (OIDC)](#keyless-signing-oidc) |
+| `--ttl DURATION` | Lifetime of those attestations, default `14d`; only with `--key` or `--oidc` |
+| `--push` | After the run, whatever the tests did, publish as `vci push` does (only passing units have attestations, so pushing after a failure is right). A failed push prints `::warning title=vci::could not push attestations ...` and does not change the exit code; only with `--key` or `--oidc` |
 | `--remote R` | Where `--push` pushes, as `vci push --remote R`; only with `--push`. CI should pass it (the action passes `origin`) |
 
 The audit log adds `attested` (`[{testId, project}]`), `attestErrors`, `notAttested` and `pushed` (`true`, `false`,
@@ -1518,8 +1566,9 @@ and pushes nothing; the Commands table above has the remaining cases.
 
 **On main: `policy.no_skip_refs_except`.** `no_skip_refs` makes main run everything, CI's attestations included, so
 on its own it would keep every push to main at full cost. `no_skip_refs_except = ["github-actions"]` (per project,
-default `[]`) names the `allowed_signers` principals whose attestations may still skip on a ref matching
-`no_skip_refs`; the principal is the one on the `allowed_signers` line that verified the signature. On such a ref
+default `[]`) names the principals whose attestations may still skip on a ref matching `no_skip_refs`: the one on
+the `allowed_signers` line that verified the signature, or, for a keyless attestation (since 2.0), the one of the first
+`[[identity]]` in `.vci/identities.toml` its certificate matches. On such a ref
 `vci plan` prints `vci: note: policy.no_skip_refs matches refs/heads/main: only attestations by github-actions
 (policy.no_skip_refs_except) can skip`, and every other signer's candidate fails the `signer` check; `vci explain`
 shows `policy.no_skip_refs matches refs/heads/main and signer dev@example.com is not in no_skip_refs_except`. With the
@@ -1555,6 +1604,109 @@ trusted signer's false claim, so treat the key as the most powerful signer in `a
 - **Inputs no collector sees** (see [Threat model (v1)](#threat-model-v1)) now go untested on main for as long as the
   recorded inputs do not change, up to `ttl`. List such tests in `policy.never_skip`.
 
+`vci ci --oidc` replaces the key with the job's identity: there is no secret to keep out of other runs, and the
+`[[identity]]` whose principal main skips on takes its place. It must match only main's runs: see [Keyless signing
+(OIDC)](#keyless-signing-oidc).
+
+## Keyless signing (OIDC)
+
+Since 2.0 a CI job can attest without a key: `vci ci --oidc` (the action's `oidc: true`) and `vci run --oidc` prove
+the job's identity with the OIDC token GitHub Actions gives a job that has `permissions: id-token: write`, and sign
+through [Sigstore](https://www.sigstore.dev/) the way `npm publish --provenance` and `actions/attest` do. Trust is a
+policy on the job's identity (repository, workflow file, ref, event, environment), committed on the base branch next
+to `allowed_signers`. Laptops keep SSH keys; both kinds of attestation live in the same store under the same key
+layout and go through the same policy. Research, endpoints and the CI run that proved it:
+[docs/spike-oidc.md](spike-oidc.md); the workflow recipe:
+[docs/GITHUB_ACTIONS.md](GITHUB_ACTIONS.md#keyless-attestation-oidc).
+
+**Signing.** Once per job: an ephemeral ECDSA P-256 key, held in memory only; the job's token (`GET
+$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sigstore`, or a ready token in `$SIGSTORE_ID_TOKEN`); a certificate for the key
+from Fulcio, valid ten minutes, requested again when less than a minute is left. Per attestation: an ECDSA-SHA256
+signature over the DSSE PAE and an RFC 3161 timestamp of that signature from the instance's timestamp authority (about
+0.1 s each on a GitHub-hosted runner). The instance is GitHub's (`--oidc`, `--oidc=github`: `fulcio.githubapp.com`,
+`timestamp.githubapp.com`), for public repositories too, so no public transparency log entry names the repository and
+workflow of every unit; `--oidc=public-good` uses `fulcio.sigstore.dev` and `timestamp.sigstore.dev`, also without a
+Rekor entry. Neither needs `attestations: write` or a GitHub API call. HTTP goes through `curl` (every GitHub-hosted
+runner has it), with the tokens on its standard input, never on a command line. Without a token `--oidc` fails before
+any test runs (`no OIDC token: the job needs permissions: id-token: write ...`). `vci run` prints whom it signs as:
+`vci: signing keylessly as repo:owner/name workflow:.github/workflows/ci.yml ref:refs/heads/main event:push (Sigstore:
+...)`.
+
+**Stored form.** The DSSE envelope JSON as for an SSH signature (one signature, `keyid` empty, `sig` the DER ECDSA
+signature), plus a top-level `sigstore` member: the verification material of a Sigstore v0.3 bundle (the leaf
+certificate and the timestamp); with `dsseEnvelope` added from the envelope's fields it is a standard bundle
+(docs/CONTRACTS.md). An SSH envelope is stored byte for byte as before. The git-meta key layout is unchanged: the
+signer id is the first 16 hex chars of SHA-256 over the identity claims an `[[identity]]` can match (issuer,
+repository, workflow file, ref, event, environment, runner environment), with a pull request's number
+(`refs/pull/12/merge` is `refs/pull/*/merge`) and a merge queue entry folded, so all pull requests are one signer, as
+one pull request key would be. Main's runs and pull requests' runs of the same workflow file are different signers:
+supersession never lets one replace the other's attestation.
+
+**Trust: `.vci/identities.toml`**, read from the base commit like `allowed_signers`:
+
+```toml
+[[identity]]
+principal = "github-actions"                           # the name policy lists use
+issuer = "https://token.actions.githubusercontent.com" # exactly
+repository = "owner/name"                              # exactly (ASCII case-insensitive); no glob
+workflow = ".github/workflows/ci.yml"                  # glob: the file the signing job is defined in
+ref = "refs/heads/main"                                # glob
+event = "push"                                         # optional, glob
+environment = "vci-attest"                             # optional, glob: the job's GitHub Environment
+runner_environment = "github-hosted"                   # optional, glob: or "self-hosted"
+```
+
+Every field present must match what Fulcio wrote into the certificate from the token (`*` and `?` do not cross `/`,
+`**` does, as in `no_skip_refs`). `workflow` is the path in the repository, or `owner/name/<path>` for a reusable
+workflow of another repository (the job's `job_workflow_ref` without `@ref`). The first matching entry names the
+principal. Unknown keys, a principal that is empty or has whitespace, an issuer that is not an https URL and a
+repository that is not `owner/name` make the file invalid. A principal from identities.toml behaves exactly like one
+from `allowed_signers` in `policy.no_skip_refs_except` and `policy.attest_on_any_ref`: name it in
+`no_skip_refs_except` for main to skip on CI's attestations. With identities.toml at the base commit,
+`.vci/allowed_signers` may be absent (no SSH key is then trusted); with neither, everything runs.
+
+**The trust root: `.vci/sigstore-trusted-root.json`**, read from the base commit too: what `gh attestation
+trusted-root` prints (JSON Lines: the certificate and timestamp authorities of GitHub's instance and of the public-good
+one). It is the trust anchor, as `allowed_signers` is: vci runs no TUF update and checks no transparency log or SCT.
+GitHub renews its Fulcio and timestamp intermediates yearly (the current one is valid until 12 June 2027 and is
+published in GitHub's TUF repository weeks before use). A committed copy then goes stale: attestations certified under
+the new intermediate fail the `signature` check (their units run; `vci explain` names the issuer) until the file is
+refreshed on the default branch with the same command. `vci init --oidc` writes both files.
+
+**Verification** (`vci plan`, `vci explain`, `vci verify`), offline: exactly one signature; the leaf certificate's key
+verifies it over the PAE; an RFC 3161 timestamp of the signature verifies with a timestamp authority of the trust
+root (its certificate and `validFor` at that time); that time is within the leaf's ten minutes and at most five minutes
+in the future; the leaf is issued by a certificate authority of the trust root, at that time within the authority's
+`validFor` and every chain certificate's validity, for code signing; its repository and workflow URIs are https URLs
+on the issuer's host (`github.com` for `https://token.actions.githubusercontent.com`, `<name>.ghe.com` for GHE.com's
+`https://token.actions.<name>.ghe.com`, else the issuer's own host); and its identity matches an `[[identity]]`. The
+attestation's own expiry, subject and every later check are as for an SSH signature. A failure is the `signature`
+check (chain, timestamp, signature: ``the certificate's issuer (...) is no certificate authority of the trust root
+(refresh .vci/sigstore-trusted-root.json with `gh attestation trusted-root`)``, `signed at ..., outside the
+certificate's validity ...`) or the `signer` check (`identity repo:owner/name workflow:.github/workflows/ci.yml
+ref:refs/pull/12/merge event:pull_request (issuer ...) matches no [[identity]] in .vci/identities.toml`, or a principal
+not in `no_skip_refs_except` on such a ref). Without identities.toml at the base commit every keyless candidate fails
+(`a keyless signature, and .vci/identities.toml is missing at the base commit`); an invalid one, or a missing or
+invalid trust root, does too, with a warning (`... attestations signed keylessly (vci --oidc) are not trusted`): those
+units run. `vci plan` names the signer as `github-actions (oidc repo:... workflow:... ref:... event:...)`. vci before
+2.0 cannot verify a keyless attestation, and runs its unit.
+
+**The action.** `oidc: true` (or `github`, `public-good`) runs `vci ci --oidc=<instance>` where `signing-key` would
+run `vci ci --key`, with `ttl` and `push` as for a key; setting both is an error. The job needs `permissions: id-token:
+write` (and `contents: write` to push). [docs/GITHUB_ACTIONS.md](GITHUB_ACTIONS.md#keyless-attestation-oidc) has the
+workflow.
+
+**What it trusts.** The certificate binds a signature to the job's identity at the time a timestamp authority vouches
+for, not to possession of a file: there is nothing secret to store, rotate or leak, and a certificate is useless ten
+minutes after it was issued. What does not change: any step of the attesting job (the tests, their dependencies) can
+request a token while the job runs and sign as its identity. So the rules for CI's key hold for the identity main
+skips on: it must match only runs on main (pin `ref` and `event`, and best an `environment` restricted to the default
+branch), and its principal alone goes in `no_skip_refs_except`. A second identity for pull requests (`ref =
+"refs/pull/*/merge"`, `event = "pull_request"`) under a principal outside that list lets pull requests skip on each
+other's runs; listing that principal in `policy.attest_on_any_ref` too (with `no_skip_refs_except`) lets main skip what
+they ran, with 1.9.2's trade-off. `vci ci --oidc` refuses to attest when the job's identity signs as a principal of
+`no_skip_refs_except` on a ref `no_skip_refs` does not match, exactly as for `--key`.
+
 ## `vci.toml`
 
 ```toml
@@ -1571,10 +1723,12 @@ libraries = "exact"    # "exact" | "any": native libraries (FFI) by file and has
 max_ttl = "30d"        # longest accepted attestation lifetime
 allow_dirty = true     # accept attestations made from an uncommitted working tree
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]   # never skip on these refs (the `vci init` default)
-no_skip_refs_except = ["github-actions"]             # ...except attestations by these allowed_signers principals (default [])
-attest_on_any_ref = []                                # of those, principals `vci ci --key` may attest as off no_skip_refs: a pull
-                                                      # request's run then attests, and main skips what it ran (since 1.9.2; only
-                                                      # for a key the repository's own pull requests get and forks never do)
+no_skip_refs_except = ["github-actions"]             # ...except attestations by these principals (allowed_signers or
+                                                      # .vci/identities.toml; default [])
+attest_on_any_ref = []                                # of those, principals `vci ci --key` (or `--oidc`) may attest as off
+                                                      # no_skip_refs: a pull request's run then attests, and main skips what
+                                                      # it ran (since 1.9.2; only for a key the repository's own pull
+                                                      # requests get and forks never do)
 never_skip = ["tests/test_attach_db.py"]             # never skip these files (project-relative globs)
 go_allow_net = false   # Go: attest packages whose test links package net (see "When vci run refuses"); = ignore_taints = ["go:net"]
 ignore_taints = []     # taints that do not refuse a unit (globs over reason keys, "*" = all; see "Waiving taints: policy.ignore_taints")
@@ -1663,7 +1817,9 @@ Unknown keys are errors, with one exception: `rails_allow_db` (top level or in a
 1.4.0, is a deprecated no-op kept for compatibility. It still parses, so a base `vci.toml` that sets it stays valid
 (an invalid one would run every file); it has no effect, and `vci run` and `vci plan` warn once (see "vci does not
 manage the database" under Quick start (Rails)). In `vci plan` an unreadable or missing `vci.toml` or
-`.vci/allowed_signers` at the base commit means everything runs.
+`.vci/allowed_signers` at the base commit means everything runs (a missing `allowed_signers` does not when the base
+commit has `.vci/identities.toml`: then only CI identities are trusted, see [Keyless signing
+(OIDC)](#keyless-signing-oidc)).
 
 ### Several projects in one repository
 
@@ -2205,9 +2361,13 @@ For each listed test file, each stored candidate for its test id is checked in t
 passes every check means SKIP, otherwise RUN (with the furthest-reaching failure as the reason):
 
 1. **envelope** parses as DSSE with the in-toto payload type;
-2. **signature**: SSHSIG over the DSSE PAE of the exact stored payload bytes, namespace `vci-attest`, SHA-2 only;
+2. **signature**: SSHSIG over the DSSE PAE of the exact stored payload bytes, namespace `vci-attest`, SHA-2 only; for a
+   keyless attestation (since 2.0), the certificate's ECDSA signature over the PAE, an RFC 3161 timestamp of it by an
+   authority of the base `.vci/sigstore-trusted-root.json` within the certificate's validity, and the certificate
+   issued by a certificate authority of that trust root (see [Keyless signing (OIDC)](#keyless-signing-oidc));
 3. **signer**: the key is in the base commit's `allowed_signers` (`namespaces=`, `valid-after`, `valid-before`
-   honoured; `cert-authority` rejected);
+   honoured; `cert-authority` rejected), or the keyless certificate's identity matches an `[[identity]]` of the base
+   `.vci/identities.toml`; on a ref matching `policy.no_skip_refs`, its principal is in `no_skip_refs_except`;
 4. **statement**: predicate type and subject match, and the predicate has exactly one of `manifest` (the input
    manifest inline: attestations made before 1.9.0) and `manifestRef`, which must be the input root;
 5. **expiry**: not expired, not issued in the future (5 min skew), lifetime within `max_ttl`;
@@ -2253,6 +2413,14 @@ Before any candidate is checked, a file matching `policy.never_skip` (base commi
 
 Each candidate is checked inside an error boundary (panics included): an error is a failed check, never a skip.
 
+Since 2.0 `vci fetch` downloads the store's keys, not its values (see [Where attestations live
+(git-meta)](#where-attestations-live-git-meta)). Before the checks, the plan fetches the values it reads that are not
+here yet: the candidates of every unit of the projects it verifies (not of projects that run everything), in one `git
+fetch` of blob ids, then the input manifests they reference, in a second. A fetch that fails is a warning (`could not
+fetch N stored attestation value(s): ...; their units run`); a value that still cannot be read fails only its own
+candidate, at the `envelope` check (``unreadable: value not fetched: run `vci fetch` online``), or, for a manifest,
+the `inputs` check.
+
 ## Threat model (v1)
 
 Protected against:
@@ -2260,8 +2428,11 @@ Protected against:
 - **Forged or tampered attestations**: the signature covers the exact payload bytes; one flipped byte fails. A stored
   input manifest (since 1.9.0 a value of its own, outside the signed payload) is used only when its recomputed root is
   the input root the payload signed: a forged or swapped manifest makes the unit run.
-- **Untrusted signers**, including a pull request that adds its own key to `.vci/allowed_signers`: trust and policy
-  come only from the base commit, never from the working tree.
+- **Untrusted signers**, including a pull request that adds its own key to `.vci/allowed_signers`, or its own
+  identity to `.vci/identities.toml` or authority to `.vci/sigstore-trusted-root.json`: trust and policy come only
+  from the base commit, never from the working tree.
+- **A stolen CI signing credential, with keyless signing**: there is no key file; the ephemeral key never leaves the
+  job's memory and its certificate is valid for ten minutes.
 - **Replay** across repositories (root commit), test files, argv/project, toolchains, env configuration, or after
   expiry.
 - **Stale inputs**: every recorded input is re-hashed from CI's checkout, including files that must still be absent
@@ -2270,6 +2441,9 @@ Protected against:
 Not protected against:
 
 - A trusted signer lying, or a stolen signing key. An attestation proves who made a claim, not that the test ran.
+  With keyless signing, any process of a job whose identity is trusted can request the job's token while it runs
+  and sign as that identity; and a certificate or timestamp authority of the committed trust root issuing a false
+  certificate or time is not detected (vci checks no transparency log).
   In particular `vci plan` re-hashes only the inputs the signed manifest lists and cannot check that the list is
   complete, so a signer can under-declare inputs and get a changed dependency skipped. Keep `allowed_signers` short,
   use hardware-backed keys, and set `valid-before` on entries. Spot-check re-runs or a second-signer requirement on
@@ -2297,9 +2471,10 @@ Not protected against:
   `LANG`, `LC_ALL` and `LC_MESSAGES` as read by every file.)
 
 Use `no_skip_refs` to run everything on the default branch and release refs. To keep that backstop and still
-skip on main what CI itself already ran, give CI its own key (`vci ci --key`, the action's `signing-key`) and name
-its principal in `no_skip_refs_except`: on a ref matching `no_skip_refs`, only attestations whose signature
-verifies against an `allowed_signers` line of one of those principals can skip; every other signer's candidate
+skip on main what CI itself already ran, give CI its own key (`vci ci --key`, the action's `signing-key`) or identity
+(`vci ci --oidc`, the action's `oidc`) and name its principal in `no_skip_refs_except`: on a ref matching
+`no_skip_refs`, only attestations whose signature verifies against an `allowed_signers` line, or whose certificate
+matches an `[[identity]]`, of one of those principals can skip; every other signer's candidate
 fails the `signer` check (`vci explain`: `policy.no_skip_refs matches refs/heads/main and signer dev@example.com is
 not in no_skip_refs_except`). With the list empty (the default), those refs run everything, as before. Like every
 policy key it is read from the base commit, per project in `[[projects]]`. See [CI attests its own
@@ -2449,8 +2624,11 @@ Rails limitations (details and the verified mechanisms in [`docs/spike-rails.md`
 
 ```
 crates/vci-core       repo paths, input manifests, input roots, predicate types
-crates/vci-attest     in-toto Statement, DSSE + PAE, SSHSIG verification, allowed_signers, ssh-keygen signing
-crates/vci-git        attestation storage on git-meta (git-meta-lib), base-commit file reads, repo identity
+crates/vci-attest     in-toto Statement, DSSE + PAE, SSHSIG verification, allowed_signers, ssh-keygen signing;
+                      src/keyless/: keyless (Sigstore) signing through curl, offline verification of the certificate,
+                      RFC 3161 timestamp and identity, identities.toml, the trust root
+crates/vci-git        attestation storage on git-meta (git-meta-lib): blobless fetch, values fetched on demand,
+                      merges from paths; base-commit file reads, repo identity
 crates/vci-adapter    Adapter trait + Vitest, node:test, pytest, Go, Cargo and Rails adapters (list, run, JSONL / go test log
                       parsing; src/golang/vci_testlog.go is the logger overlaid into Go's internal/testlog; src/cargo/
                       reads cargo's JSON messages, rustc dep-info and build script output, and scans sources;
@@ -2478,7 +2656,7 @@ fixtures/rails-vips   Rails 8.1 with Active Storage, image_processing and ruby-v
                       storage, one that attaches and analyses test/fixtures/files/pixel.png, one that calls C through FFI)
 docs/                 PLAN.md (design), CONTRACTS.md (interfaces), ENV.md (env vars), spike.md (Vitest findings),
                       spike-pytest.md (pytest findings), spike-go.md (Go findings), spike-cargo.md (Cargo findings),
-                      spike-rails.md (Rails findings)
+                      spike-rails.md (Rails findings), spike-oidc.md (keyless signing findings)
 ```
 
 ## Development
@@ -2656,6 +2834,28 @@ succeed; shared auto-prune and the attestations it dropped are reported; `vci pu
 `.git-meta` URLs naming remote helpers (`fd::3`, `ext::`) are refused; and `vci run <file>` in a multi-project
 repository does not need the other projects' toolchains (`e2e_pytest.rs`).
 
+The blobless exchange (since 2.0) has its own suite, `crates/vci-git/tests/store_lazy.rs`, which counts the objects in
+each clone. It proves: a fresh clone fetches keys only and reads exactly the values it fetches; a push from a blobless
+clone downloads nothing and drops nothing; a second fetch takes only what changed; diverged clones merge from paths
+and push the union; `--rewrite-history` from a blobless clone keeps every value; offline, values read as not fetched;
+a full clone and a server without filter support keep working, as does one refusing tree filters; set and list values
+fall back to git-meta's full merge; the code repository is never made a partial or shallow clone; a merge base fetched
+without its tree is completed; a stale blobless clone pushes after a prune, a history rewrite and a gc elsewhere; and
+supersession fetches the attestations that could still reference a manifest before deleting it.
+`e2e_cargo.rs` repeats the fetch and the plan in a blobless clone through the CLI, and the orphan manifest removal.
+
+Keyless signing is tested offline (`crates/vci-attest/tests/keyless.rs`, the unit tests in
+`crates/vci-attest/src/keyless/`, `crates/vci-cli/tests/e2e_keyless.rs`) against an envelope a GitHub Actions job of
+this repository signed with `fulcio.githubapp.com` and `timestamp.githubapp.com`
+(`crates/vci-attest/tests/fixtures/keyless/`), real responses of both timestamp authorities and the trust root `gh
+attestation trusted-root` printed on 2026-10-16. They prove: the real envelope verifies and names the principal; a
+tampered payload, signature or timestamp, an expired certificate, a timestamp in the future or of other data, a trust
+root without the authority (or an intermediate with the same name and another key) and repository URIs on another host
+all fail; an identity outside identities.toml is named; SSH verification rejects a keyless envelope; `vci verify` with
+trust pinned on the command line does not use the repository's; and `vci run --oidc` without a token fails before
+anything runs. The end-to-end proof (a job that attests with only `id-token: write`, then a plan that skips on its
+word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
+
 ## Known gaps
 
 - Vitest config imports are found by scanning for relative string literals (per-module `tsconfig.json` files and
@@ -2717,9 +2917,35 @@ repository does not need the other projects' toolchains (`e2e_pytest.rs`).
 - `vci plan` reads `.git/git-meta.sqlite` read-only (a read-only `.git` works; when SQLite cannot open it in WAL mode
   without writing, the file is read as it is, so changes still only in its `-wal` file are not seen: those units
   run). A value that cannot be read (its blob missing from the object database) fails only its own candidate.
-- `vci fetch` into a repository whose metadata history was earlier fetched blobless by `git meta pull` (a promisor
-  remote) needs the blobs git-meta's merge reads; if one is missing the fetch fails (an error, so everything runs)
-  rather than skipping anything.
+- `vci fetch` and `vci push` need the remote to serve partial clones (`uploadpack.allowFilter`, as GitHub does); a
+  server that ignores the filter sends every value, which then reads as before 2.0 (one that refuses tree filters
+  gets `--filter=blob:none` for the first fetch too). Values, and a tip's tree, are fetched by object id from the
+  primary git-meta remote, which must allow that (protocol v2 servers do for reachable objects). Promised rows `git
+  meta pull` writes for keys of earlier commits (its history index) stay not fetched: vci fetches the values of the
+  local metadata commit's tree only.
+- What a blobless metadata fetch changes in the repository (since 2.0): git accepts objects left out of a fetch
+  (`git gc`, `git fsck`, connectivity checks) only with a *promisor* remote configured, and asks a promisor remote
+  for any object it misses, code included, with that object's whole history. vci therefore never records the
+  metadata remote as one (its own fetches say so on their command line, `-c remote.<name>.promisor=true`); it
+  configures `remote.vci-no-lazy-fetch.promisor = true`, a remote without a URL (`skipFetchAll`,
+  `skipDefaultUpdate`: `git fetch --all` and `git remote update` leave it alone; `git remote` lists it). A git
+  command that looks up an object this clone lacks (a commit outside a shallow checkout, a metadata value) then fails
+  at once, as before 2.0, after git tries that remote (`fatal: 'vci-no-lazy-fetch' does not appear to be a git
+  repository`), instead of downloading it; vci's own commit lookups (the base ref, supersession's ancestry checks)
+  also set `GIT_NO_LAZY_FETCH=1` (git 2.45 and later, and the 2024 security releases 2.39.4 to 2.44.1, honour it; with an
+  older git they rely on that remote failing). Reading the metadata history's values with plain git (`git log --all -p`,
+  `git show refs/meta/...:<path>`) fails for values never fetched. The repository is never made shallow by vci:
+  `.git/shallow`, `git rev-parse --is-shallow-repository` and `git fetch --unshallow` only ever concern the code.
+  `core.repositoryformatversion` is left alone.
+- Moving a clone to 2.0 is one way: a vci before 2.0 run in a clone 2.0 fetched into fails its fetch and push
+  (`git-meta: An object with id ... could not be found`: git-meta reads every value of the trees it merges) and
+  runs every unit in a plan. To go back, push what is stored with 2.0, then download every value as a 1.9 fetch
+  would and rebuild the store from the local metadata commit:
+  `git fetch --refetch <metadata remote> '+refs/meta/main:refs/meta/remotes/main'` (git 2.36 or later; the whole
+  metadata history, values included) and `rm -f .git/git-meta.sqlite* .git/vci-materialized-*`; `git config
+  --remove-section remote.vci-no-lazy-fetch` is then optional. Checked on the vex copy above: 1.9.2's fetch restores
+  every entry and its plan matches 2.0's, and `git gc` and `git fsck` pass with and without that remote. Fresh CI
+  clones are not affected.
 - pytest: the adapter requires uv (`uv run --locked --exact`, which removes packages not in `uv.lock` from the
   project environment and syncs only the default dependency groups, so pytest must be in them); plain virtualenvs or
   Poetry are not supported yet. The `vci_pytest` version is not part of the attestation (as with `@vci/vitest`), so a

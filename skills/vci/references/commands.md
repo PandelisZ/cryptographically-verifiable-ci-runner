@@ -1,6 +1,6 @@
 # vci command reference
 
-The help text below is the verbatim output of `vci <command> --help` for vci 1.0.0 (generated with `cargo run -p vci-cli -- <command> --help`). Notes after each block come from docs/REFERENCE.md.
+The help text below is the verbatim output of `vci <command> --help` for vci 2.0.0 (generated with `cargo run -p vci-cli -- <command> --help`). Notes after each block come from docs/REFERENCE.md.
 
 ## vci --help
 
@@ -10,10 +10,10 @@ Skip CI tests that a trusted signer already ran against identical inputs
 Usage: vci <COMMAND>
 
 Commands:
-  init     Write vci.toml, .vci/allowed_signers and .git-meta, configure the git-meta remote, install @vci/vitest (Vitest), print a CI snippet
+  init     Write vci.toml, .vci/allowed_signers and .git-meta, configure the git-meta remote, install @vci/vitest (Vitest), print a CI snippet (node-test: no install)
   run      Run tests, collect their inputs, sign and store attestations
   plan     Decide which test files can be skipped
-  ci       Plan, run the remaining tests, and write an audit log of the skips (with --key: attest what runs)
+  ci       Plan, run the remaining tests, and write an audit log of the skips (with --key or --oidc: attest what runs)
   verify   Verify one attestation envelope (file path or `-`)
   push     Publish local attestations: git-meta push (refs/meta/main) with merge and retry
   fetch    Fetch attestations: git-meta pull (fetch refs/meta/main and materialize it locally)
@@ -30,7 +30,7 @@ Options:
 ## vci init
 
 ```text
-Write vci.toml, .vci/allowed_signers and .git-meta, configure the git-meta remote, install @vci/vitest (Vitest), print a CI snippet
+Write vci.toml, .vci/allowed_signers and .git-meta, configure the git-meta remote, install @vci/vitest (Vitest), print a CI snippet (node-test: no install)
 
 Usage: vci init [OPTIONS]
 
@@ -38,9 +38,10 @@ Options:
       --key <KEY>              Add this public key (or private key with a .pub next to it) to allowed_signers
       --principal <PRINCIPAL>  Principal for the key (default: git user.email)
       --project <PROJECT>      Project directory relative to the repo root
-      --adapter <ADAPTER>      Test runner adapter: vitest (default), pytest, go, cargo or rails
+      --adapter <ADAPTER>      Test runner adapter: vitest (default), pytest, go, cargo, rails or node-test
       --no-install             Do not run npm install
       --meta-url <META_URL>    git-meta metadata remote URL for .git-meta (default: origin's URL)
+      --oidc                   Also trust this repository's GitHub Actions workflows signing keylessly (`vci ci --oidc`): write .vci/identities.toml for origin's repository and the Sigstore trust root (.vci/sigstore-trusted-root.json, from `gh attestation trusted-root`)
   -h, --help                   Print help
 ```
 
@@ -48,6 +49,7 @@ Options:
 - Vitest: runs `npm install --save-dev` of the `@vci/vitest` collector unless `--no-install` (then set `VCI_JS_PLUGIN`).
 - Prints a GitHub Actions example for the adapter. Commit `vci.toml`, `.vci/allowed_signers` and `.git-meta`, then merge to the default branch: CI reads trust and policy from the base commit only.
 - Defaults written: `platform = "any"`, `no_skip_refs = ["refs/heads/main", "refs/tags/**"]`, env mode `strict`.
+- `--oidc` (since 2.0): also writes `.vci/identities.toml`, trusting pushes to origin's default branch by the repository's GitHub Actions workflow (its only file under `.github/workflows`, else `*` with a comment to narrow it) as principal `github-actions` (an existing file is left alone), and `.vci/sigstore-trusted-root.json` from `gh attestation trusted-root` (needs `gh`; otherwise a note says to write it). CI then attests keylessly with `vci ci --oidc` (the action's `oidc: true`). Review both files with the user; merge them to the default branch.
 
 ## vci run
 
@@ -60,14 +62,17 @@ Arguments:
   [FILES]...  Test files, package directories for Go, `<package dir>#<target>` units or package directories for Cargo (default: all)
 
 Options:
-      --key <KEY>  SSH key for `ssh-keygen -Y sign` (private key, or .pub with the key in ssh-agent)
-      --ttl <TTL>  Attestation lifetime [default: 14d]
-  -h, --help       Print help
+      --key <KEY>          SSH key for `ssh-keygen -Y sign` (private key, or .pub with the key in ssh-agent)
+      --oidc[=<INSTANCE>]  Sign keylessly with the CI job's OIDC token (GitHub Actions with `permissions: id-token: write`) through Sigstore: `--oidc` or `--oidc=github` (fulcio.githubapp.com, timestamp.githubapp.com), `--oidc=public-good` (fulcio.sigstore.dev, timestamp.sigstore.dev). The instance needs the `=`, so `vci run --oidc a_test.go` runs a_test.go
+      --ttl <TTL>          Attestation lifetime [default: 14d]
+      --summary <SUMMARY>  Write a JSON summary of every unit (attested or not, with its reason keys) to this file
+  -h, --help               Print help
 ```
 
 - Arguments are paths **relative to the current directory**: test files (Vitest, pytest, Minitest, RSpec), package directories (Go: `./b`), cargo units `<package dir>#<target>` (`crates/b#lib`, `crates/b#test:name`, `crates/b#doc`, `#bin:<name>`) or a cargo package directory (every unit of it). No arguments: every unit of every project.
 - One argument that is not a listed unit stops the whole run: `<arg> is not a test file of any project (not listed by the test runner)`.
 - Signing key: `--key`, else `$VCI_SIGNING_KEY`, else `git config user.signingkey` when `gpg.format = ssh` (a GPG key is never used). A `.pub` path works when the private half is in `ssh-agent`.
+- `--oidc` (since 2.0) signs keylessly with a GitHub Actions job's OIDC token (`permissions: id-token: write`) through Sigstore instead of a key; outside such a job it fails before running anything (`no OIDC token: ...`). It signs as the CI job's identity: agents never use it on their own (see the safety rules). `--oidc=public-good` picks sigstore.dev's instance; without `=` the next word is a file to run.
 - Output on stderr, one line per unit: `vci: attested <unit> (<n> inputs, root <hash>) as git-meta <target> <key>` or `vci: not attesting <unit>: <reason>`, then `vci: <a> attested, <r> not attested`. Warnings start with `vci: warning:`.
 - Exit code is the test runner's: non-zero if any test process failed. A refused unit with passing tests still exits 0, so read the lines.
 - Attestations go into the local git-meta store (`.git/git-meta.sqlite`); nothing is shared until `vci push`.
@@ -97,13 +102,13 @@ Options:
 - `--format json`: `{baseRef, baseCommit, runAll, warnings, projects:[{name,path,adapter,runAll}], files:[{testId,file,project,skip,reason,by}]}`. Units CI will run:
   `vci plan --base-ref origin/main --format json | python3 -c 'import json,sys; [print(f["testId"]) for f in json.load(sys.stdin)["files"] if not f["skip"]]'`
 - `--format github`: `::notice`/`::warning` lines and outputs for Actions.
-- Reads attestations from the local store only: run `vci fetch` first to see other people's.
+- Reads the attestations the local store lists: run `vci fetch` first to see other people's. Since 2.0 `vci fetch` downloads the keys only, and the plan fetches the values it reads (the candidates of the units it verifies, then their input manifests) from the metadata remote; a value that cannot be fetched (offline) makes its unit run, with a warning.
 - `--project NAME` (repeatable; `[[projects]]` names of the base commit's vci.toml): only those projects are listed, probed and verified; the others are not touched (their toolchains need not be installed) and are absent from the output. An unknown name is an error naming the configured projects; the single-project form has no names (`--project` is an error there).
 
 ## vci ci
 
 ```text
-Plan, run the remaining tests, and write an audit log of the skips (with --key: attest what runs)
+Plan, run the remaining tests, and write an audit log of the skips (with --key or --oidc: attest what runs)
 
 Usage: vci ci [OPTIONS]
 
@@ -111,11 +116,13 @@ Options:
       --base-ref <BASE_REF>    
       --audit-log <AUDIT_LOG>  
       --key <KEY>              Run the remaining tests as `vci run --key` does and attest them with this SSH key (private key, or .pub with the key in ssh-agent); with run-all (e.g. policy.no_skip_refs), every unit is attested
-      --ttl <TTL>              Attestation lifetime (with --key) [default: 14d]
+      --oidc[=<INSTANCE>]      Run the remaining tests as `vci run --oidc` does and attest them keylessly with the job's OIDC token (GitHub Actions, `permissions: id-token: write`); `--oidc=INSTANCE` as in `vci run --oidc`
+      --ttl <TTL>              Attestation lifetime (with --key or --oidc) [default: 14d]
       --push                   Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code)
       --remote <REMOTE>        git-meta remote, or a git remote / URL, to push to (as `vci push --remote`)
       --fetch [<REMOTE>]       Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`
       --project <NAME>         Only this `[[projects]]` entry (by name; repeatable): the other projects are not listed, probed, verified or run. Not for the single-project form
+      --partition <I/N>        Run only partition I of N (1-based) of the units the plan runs: a unit belongs to the partition its test id hashes to, the same in every job. Skips are the same in every partition; a project that cannot be listed runs whole in every partition that cannot list it (a warning), so its units run in some job. N jobs with `--key --push` each attest their own share
   -h, --help                   Print help
 ```
 
@@ -124,10 +131,11 @@ Options:
 - `--project NAME` (repeatable) as for `vci plan`: one job per suite in a monorepo (`vci ci --fetch origin --base-ref "$BASE" --project web`); only those projects run (and are attested with `--key`) and appear in the audit log.
 - When every unit is skipped it prints `vci ci: every test file is covered by a valid attestation; nothing to run` and does not start the test runner.
 - `--key PATH` (CI's own key, the action's `signing-key`): the units left run as `vci run --key` runs them and every one that passed and is attestable is attested; when the plan runs everything (`running everything: ...`), every unit is. Refused or failing units still run; only test failures make the exit code non-zero. The next commit's CI skips each attested unit whose inputs did not change. `--ttl` (default `14d`) only with `--key`.
-- `--push` (only with `--key`) publishes afterwards as `vci push` does, whatever the tests did; `--remote R` (only with `--push`) as `vci push --remote`. A failed push prints `::warning title=vci::could not push attestations ...` and does not change the exit code.
-- A key whose principal is in `policy.no_skip_refs_except` attests nothing on a ref outside `policy.no_skip_refs` (`::warning title=vci::not attesting: the key signs as <principal>, ...`; tests still run, nothing is pushed). If attesting cannot start (unreadable key, missing collector) everything runs without attesting, with a `::warning`.
-- Audit log keys added by `--key`: `attested` (`[{testId, project}]`), `attestErrors`, `notAttested`, `pushed` (`true`/`false`/`null`).
-- `vci ci --key` is for CI's own key; agents attest with `vci run`. Never `--push` from a scratch clone (its git-meta remote is the upstream repository).
+- `--oidc[=INSTANCE]` (since 2.0; the action's `oidc: true`): as `--key`, keylessly with the job's OIDC token (`permissions: id-token: write`, no secret); the job's identity must match an `[[identity]]` of the base `.vci/identities.toml`, whose principal the policy lists use like an `allowed_signers` principal. `--key` and `--oidc` exclude each other; `--ttl` and `--push` need one of them.
+- `--push` (only with `--key` or `--oidc`) publishes afterwards as `vci push` does, whatever the tests did; `--remote R` (only with `--push`) as `vci push --remote`. A failed push prints `::warning title=vci::could not push attestations ...` and does not change the exit code.
+- A key (or, with `--oidc`, an identity) whose principal is in `policy.no_skip_refs_except` attests nothing on a ref outside `policy.no_skip_refs` (`::warning title=vci::not attesting: the key signs as <principal>, ...`; tests still run, nothing is pushed). If attesting cannot start (unreadable key, missing collector) everything runs without attesting, with a `::warning`.
+- Audit log keys added by `--key` or `--oidc`: `attested` (`[{testId, project}]`), `attestErrors`, `notAttested`, `pushed` (`true`/`false`/`null`).
+- `vci ci --key` and `vci ci --oidc` are for CI's own key or identity; agents attest with `vci run --key`. Never `--push` from a scratch clone (its git-meta remote is the upstream repository).
 
 ## vci env
 
@@ -166,6 +174,8 @@ Options:
 - Prints each candidate attestation (git-meta key, signer, issue and expiry times) and the first check it failed, with `expected` (what the attestation recorded) and `actual` (what this checkout computes). See `refusals.md` for every check name.
 - An env failure names the variable and its class under the base policy, never its value: `env:DATABASE_URL (hash)` with `expected: blake3=...` / `actual: unset`, or `expected: not hashed` / `actual: must be hashed (env config)` when the base policy requires a variable the attestation lacks. Run `vci env --base-ref <ref>` to see the lists.
 - `<unit>: not a listed test file` means the runner does not list it (wrong path, not a unit of any project).
+- Since 2.0 it fetches the values it reads, as `vci plan` does; a candidate whose value could not be fetched fails `envelope` with ``unreadable: value not fetched: run `vci fetch` online``: run it again online.
+- A keyless (CI, `--oidc`) candidate that fails `signature` or `signer` names the reason: an issuer the base `.vci/sigstore-trusted-root.json` does not list (refresh it with `gh attestation trusted-root` on the default branch), or `identity repo:... workflow:... ref:... event:... matches no [[identity]] in .vci/identities.toml`.
 
 ## vci push
 
@@ -176,6 +186,7 @@ Usage: vci push [OPTIONS]
 
 Options:
       --remote <REMOTE>  git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin)
+      --rewrite-history  Publish the metadata as one commit without history (after `vci prune`: what a fetch downloads is then the current attestations, not every version ever published). Other clones merge onto it at their next fetch
   -h, --help             Print help
 ```
 
@@ -196,6 +207,7 @@ Options:
 ```
 
 - git-meta pull: fetches `refs/meta/main` and materializes it into `.git/git-meta.sqlite` so `vci plan`/`explain` see other signers' attestations (and, since 1.9.0, the input manifests they reference). Since 1.9.0 a fetch after an earlier one applies only the entries that changed.
+- Since 2.0 it is blobless: it downloads the metadata's commits and trees (the keys), not the values; `vci plan`, `explain`, `verify`, `run` and `prune` fetch the values they read. On a store of 4,500 entries it is about 2 MB instead of 40. `N attestations stored locally` counts keys. A clone fetched by 2.0 cannot be used by vci 1.x without a refetch (docs/REFERENCE.md, "Known gaps"); a `vci-no-lazy-fetch` remote without a URL appears in `git remote` (it is how git accepts the values left out).
 - In CI always pass `--remote origin` (the action does): the checkout must not choose where attestations come from.
 
 ## vci prune
@@ -206,11 +218,13 @@ Delete expired attestations from the local git-meta store (publish with `vci pus
 Usage: vci prune [OPTIONS]
 
 Options:
-      --dry-run  Only list what would be deleted
-  -h, --help     Print help
+      --dry-run     Only list what would be deleted
+      --superseded  Also delete attestations superseded by a newer one of the same unit by the same signer (their inputs no longer match the current tree, or soon will not)
+  -h, --help        Print help
 ```
 
 - Deletes expired attestations from the local store as deletion records; publish them with `vci push`. Never needed for correctness: expired attestations are simply not accepted.
+- Since 2.0 it first fetches every attestation a blobless fetch left out (one batch; on a large store most of what a fetch downloaded before 2.0).
 - Since 1.9.0 it then deletes the stored input manifests (`project` key `vci:manifest:<root>`) that no remaining attestation references and prints `vci prune: N unreferenced input manifest(s) removed` (`(dry run)` with `--dry-run`); none while an attestation cannot be read.
 
 ## vci verify
@@ -226,13 +240,20 @@ Arguments:
 Options:
       --allowed-signers <ALLOWED_SIGNERS>
           Trust root (default: .vci/allowed_signers at --base-ref, or HEAD)
+      --identities <IDENTITIES>
+          For a keyless envelope: the identities (default: .vci/identities.toml at --base-ref, or HEAD)
+      --trusted-root <TRUSTED_ROOT>
+          For a keyless envelope: the Sigstore trust root (default: .vci/sigstore-trusted-root.json at --base-ref, or HEAD)
       --base-ref <BASE_REF>
           
+      --manifest <FILE>
+          The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the local git-meta store when run inside the repository
   -h, --help
           Print help
 ```
 
 - Verifies one DSSE envelope (a file, or `-` for stdin) and prints signer, test id, repo id, commit, input root. Mostly for debugging; `vci explain` is the usual tool.
+- An SSH-signed envelope is checked against `.vci/allowed_signers`, a keyless one (since 2.0, a `sigstore` member) against `.vci/identities.toml` and `.vci/sigstore-trusted-root.json`, at `--base-ref` or HEAD. Once any of `--allowed-signers`, `--identities`, `--trusted-root` is given, only the given files are used: an envelope whose kind needs one that was not given is INVALID.
 - Since 1.9.0 an attestation references its input manifest instead of embedding it: `vci verify` reads it from `--manifest FILE` (as `git meta get project vci:manifest:<root>` prints it) or else from the repository's git-meta store, checks that its root is the signed input root, and exits 1 when it is missing, corrupt or another manifest.
 
 ## Environment variables
@@ -240,6 +261,7 @@ Options:
 | Variable | Meaning |
 |---|---|
 | `VCI_SIGNING_KEY` | Default signing key for `vci run` |
+| `SIGSTORE_ID_TOKEN` | A ready OIDC token for `--oidc` (otherwise taken from the GitHub Actions job) |
 | `VCI_BASE_REF` | Default base ref for `plan`, `ci`, `explain` |
 | `VCI_JOBS` | Parallel test processes in `vci run` (pytest, Go; Rails files run one at a time) |
 | `VCI_PY_PLUGIN`, `VCI_JS_PLUGIN`, `VCI_RUBY_COLLECTOR` | Collector locations (not needed with Homebrew) |

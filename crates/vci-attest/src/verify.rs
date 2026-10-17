@@ -38,6 +38,13 @@ pub enum VerifyError {
     /// The key only appears on `cert-authority` lines, which v1 rejects.
     #[error("signer {0} is only listed as a cert-authority, which is not supported")]
     CertAuthorityRejected(String),
+    /// Keyless: the certificate does not chain to the trust root, or no
+    /// trusted timestamp places the signature inside its validity.
+    #[error("untrusted Sigstore signature: {0}")]
+    Untrusted(String),
+    /// Keyless: the certificate's identity matches no `[[identity]]`.
+    #[error("{0}")]
+    UnknownIdentity(String),
 }
 
 /// Verify `envelope` against `allowed` at unix time `now`.

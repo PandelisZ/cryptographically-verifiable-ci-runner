@@ -24,7 +24,7 @@
 <tr><td><a href="#plan"><code>vci plan</code></a></td><td class="wrap">Show which units can be skipped and why the others run</td></tr>
 <tr><td><a href="#push-fetch"><code>vci push</code></a></td><td class="wrap">Publish your attestations to the remote</td></tr>
 <tr><td><a href="#push-fetch"><code>vci fetch</code></a></td><td class="wrap">Download attestations from the remote</td></tr>
-<tr><td><a href="#ci"><code>vci ci</code></a></td><td class="wrap">In CI: plan, run the rest, write an audit log; with a key, attest what ran</td></tr>
+<tr><td><a href="#ci"><code>vci ci</code></a></td><td class="wrap">In CI: plan, run the rest, write an audit log; with a key or the job's OIDC token, attest what ran</td></tr>
 <tr><td><a href="#explain"><code>vci explain</code></a></td><td class="wrap">Show why one unit was not skipped</td></tr>
 <tr><td><a href="#env"><code>vci env</code></a></td><td class="wrap">Show which environment variables vci sets, hashes, ignores and removes</td></tr>
 <tr><td><a href="#prune"><code>vci prune</code></a></td><td class="wrap">Delete expired attestations</td></tr>
@@ -34,7 +34,7 @@
 <h3 id="init">vci init</h3>
 <pre data-nocopy><code>vci init [--adapter vitest|pytest|go|cargo|rails]
          [--key K] [--principal P] [--project DIR]
-         [--no-install] [--meta-url URL]</code></pre>
+         [--no-install] [--meta-url URL] [--oidc]</code></pre>
 <p>Writes <code>vci.toml</code>, <code>.vci/allowed_signers</code> (adding key <code>K</code>) and <code>.git-meta</code>, configures the git-meta remote, and prints a CI snippet.</p>
 <ul>
 <li><code>--adapter</code>: the test runner. Default <code>vitest</code>.</li>
@@ -42,15 +42,17 @@
 <li><code>--project DIR</code>: the project directory, relative to the repository root.</li>
 <li><code>--no-install</code>: for Vitest, skip the <code>npm install</code> of <code>@vci/vitest</code>.</li>
 <li><code>--meta-url</code>: where attestations are exchanged (default: origin's URL). Without an origin remote or this flag, no <code>.git-meta</code> is written.</li>
+<li><code>--oidc</code> (since 2.0): also trust this repository's GitHub Actions workflow signing keylessly. Writes <a href="configuration.html#identities"><code>.vci/identities.toml</code></a> (pushes to origin's default branch, principal <code>github-actions</code>; an existing file is left alone) and the Sigstore trust root from <code>gh attestation trusted-root</code>.</li>
 </ul>
 <pre><code>vci init --adapter pytest --key ~/.ssh/id_ed25519.pub</code></pre>
 
 <h3 id="run">vci run</h3>
-<pre data-nocopy><code>vci run [UNITS…] [--key PATH] [--ttl 14d]</code></pre>
+<pre data-nocopy><code>vci run [UNITS…] [--key PATH | --oidc[=github|public-good]] [--ttl 14d]</code></pre>
 <p>Runs tests with input collection on, then signs and stores an attestation for every unit that can be attested. With no arguments it runs every unit. The exit code is the test runner's.</p>
 <ul>
 <li>Units are test files, Go package directories (<code>./b</code>), or Cargo targets (<code>crates/b#test:name</code>; a package directory means all its targets).</li>
 <li><code>--key</code>: the SSH signing key (see <a href="#signing-key">signing key</a>).</li>
+<li><code>--oidc</code> (since 2.0): in a GitHub Actions job with <code>permissions: id-token: write</code>, sign keylessly with the job's OIDC token instead (see <a href="github-actions.html#keyless-attestation-oidc">keyless attestation</a>). The instance needs the <code>=</code>: <code>vci run --oidc a_test.go</code> runs <code>a_test.go</code>.</li>
 <li><code>--ttl</code>: how long the attestation is valid. Default <code>14d</code>.</li>
 </ul>
 <pre><code>vci run spec/models/b_spec.rb spec/lib/a_spec.rb --key ~/.ssh/id_ed25519</code></pre>
@@ -77,7 +79,7 @@ vci: 2 attested, 0 not attested</code></pre>
 <h3 id="push-fetch">vci push, vci fetch</h3>
 <pre data-nocopy><code>vci push [--remote R]
 vci fetch [--remote R]</code></pre>
-<p>Exchange attestations on <code>refs/meta/main</code>, like <code>git meta push</code> and <code>git meta pull</code>. Push your branch with <code>git push</code> as usual.</p>
+<p>Exchange attestations on <code>refs/meta/main</code>, like <code>git meta push</code> and <code>git meta pull</code>. Push your branch with <code>git push</code> as usual. Since 2.0 a fetch downloads the keys, not the values; <code>plan</code>, <code>explain</code>, <code>verify</code>, <code>run</code> and <code>prune</code> fetch the values they read, and a value that cannot be fetched (offline) makes its unit run.</p>
 <ul>
 <li><code>--remote R</code>: a git-meta remote, or a git remote or URL to use as one. Default: the configured git-meta remote, else the <code>url:</code> in <code>.git-meta</code>, else origin.</li>
 <li>In CI, always pass <code>--remote</code>, so the checkout never chooses where attestations come from.</li>
@@ -86,17 +88,19 @@ vci fetch [--remote R]</code></pre>
 vci fetch --remote origin         <span class="c"># in CI (the action does this)</span></code></pre>
 
 <h3 id="ci">vci ci</h3>
-<pre data-nocopy><code>vci ci [--base-ref R] [--audit-log PATH]
-       [--key PATH [--ttl 14d] [--push [--remote R]]]</code></pre>
+<pre data-nocopy><code>vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--partition I/N]
+       [--key PATH | --oidc[=INSTANCE]] [--ttl 14d] [--push [--remote R]]</code></pre>
 <p>Plans, runs every unit that was not skipped, and exits non-zero if any test fails. The <a href="github-actions.html">GitHub Action</a> runs it for you. When every unit is skipped, it prints <code>nothing to run</code> and never starts the test runner.</p>
 <ul>
 <li><code>--audit-log PATH</code>: write a JSON record of every skip, by whom, and what ran.</li>
 <li><code>--key PATH</code>: run what is left the way <code>vci run --key</code> does, and attest every unit that passed. When the plan runs everything (for example on a <code>no_skip_refs</code> ref with an empty <code>no_skip_refs_except</code>), every unit is attested. The next commit's CI then skips each unit whose inputs did not change. See <a href="github-actions.html#attesting-in-ci">attesting in CI</a>.</li>
+<li><code>--oidc</code> (since 2.0): the same, keylessly, with the GitHub Actions job's OIDC token (<code>permissions: id-token: write</code>, no secret). The job's identity must match an entry of <a href="configuration.html#identities"><code>.vci/identities.toml</code></a> on the base branch.</li>
+<li><code>--partition I/N</code> (since 2.0): run only partition <code>I</code> of <code>N</code> shares of what the plan runs, for a matrix of <code>N</code> jobs. A unit belongs to the partition its test id hashes to, the same in every job and on every machine, so every unit runs in exactly one job; what the plan skips is skipped in all of them. A project a job cannot list runs whole in that job, with a warning. With <code>--key --push</code> each job attests and publishes its share. See <a href="github-actions.html#splitting-a-suite-over-jobs">splitting a suite over jobs</a>.</li>
 <li><code>--ttl</code>: lifetime of those attestations. Default <code>14d</code>.</li>
 <li><code>--push</code>: afterwards, publish them as <code>vci push</code> does, whether or not the tests passed. A failed push prints a warning and does not change the exit code.</li>
 <li><code>--remote R</code>: where <code>--push</code> pushes, as for <code>vci push</code>.</li>
 </ul>
-<p>With <code>--key</code>, the audit log also lists the <code>attested</code> units and whether they were <code>pushed</code>. A key whose principal is in <code>policy.no_skip_refs_except</code> attests nothing on other refs, such as a pull request's.</p>
+<p>With <code>--key</code> or <code>--oidc</code>, the audit log also lists the <code>attested</code> units and whether they were <code>pushed</code>. A key or identity whose principal is in <code>policy.no_skip_refs_except</code> attests nothing on other refs, such as a pull request's.</p>
 <pre><code>vci ci --base-ref origin/main --audit-log vci-audit.json
 vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --push --remote origin   <span class="c"># on main</span></code></pre>
 
@@ -123,15 +127,17 @@ vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --push --remote ori
 
 <h3 id="prune">vci prune</h3>
 <pre data-nocopy><code>vci prune [--dry-run]</code></pre>
-<p>Deletes expired attestations from the local store. <code>vci push</code> publishes the deletions. <code>--dry-run</code> only lists them.</p>
+<p>Deletes expired attestations from the local store. <code>vci push</code> publishes the deletions. <code>--dry-run</code> only lists them. It reads every attestation, so since 2.0 it first fetches the ones a fetch left out.</p>
 <pre><code>vci prune --dry-run
 vci prune &amp;&amp; vci push</code></pre>
 
 <h3 id="verify">vci verify</h3>
-<pre data-nocopy><code>vci verify &lt;envelope|-&gt; [--allowed-signers F] [--base-ref R]</code></pre>
+<pre data-nocopy><code>vci verify &lt;envelope|-&gt; [--allowed-signers F] [--identities F --trusted-root F] [--base-ref R]</code></pre>
 <p>Verifies one DSSE envelope (a file, or <code>-</code> for stdin) and prints its claims.</p>
 <ul>
-<li><code>--allowed-signers F</code>: the trust file to check against. Default: <code>.vci/allowed_signers</code> at <code>--base-ref</code>, or at HEAD.</li>
+<li><code>--allowed-signers F</code>: the trust file for an SSH-signed envelope. Default: <code>.vci/allowed_signers</code> at <code>--base-ref</code>, or at HEAD.</li>
+<li><code>--identities F</code>, <code>--trusted-root F</code>: the trust for a keyless (<code>--oidc</code>) envelope. Default: <code>.vci/identities.toml</code> and <code>.vci/sigstore-trusted-root.json</code> at <code>--base-ref</code>, or at HEAD.</li>
+<li>Trust given on the command line is the only trust: once any of these is given, an envelope whose kind needs a file that was not given is INVALID.</li>
 </ul>
 
 <h2>Signing key</h2>
@@ -142,6 +148,7 @@ vci prune &amp;&amp; vci push</code></pre>
 <li><code>git config user.signingkey</code>, when <code>gpg.format = ssh</code></li>
 </ol>
 <p>A GPG key is never used. A <code>.pub</code> path works when the private half is in <code>ssh-agent</code>, hardware keys included.</p>
+<p>In GitHub Actions, CI can sign without a key (since 2.0): <code>--oidc</code> uses the job's OIDC token, an ephemeral key and a ten-minute Sigstore certificate, and <code>.vci/identities.toml</code> says which workflow runs are trusted. See <a href="github-actions.html#keyless-attestation-oidc">keyless attestation</a>.</p>
 
 <h2>Base ref</h2>
 <p>The base ref is the commit vci trusts: it reads the policy and the allowed signers from there, never from the code under test. vci uses the first of:</p>
@@ -157,6 +164,7 @@ vci prune &amp;&amp; vci push</code></pre>
 <table>
 <tr><th>Variable</th><th>Meaning</th></tr>
 <tr><td><code>VCI_SIGNING_KEY</code></td><td class="wrap">Signing key path, when <code>--key</code> is not given</td></tr>
+<tr><td><code>SIGSTORE_ID_TOKEN</code></td><td class="wrap">A ready OIDC token for <code>--oidc</code>, instead of the GitHub Actions job's</td></tr>
 <tr><td><code>VCI_BASE_REF</code></td><td class="wrap">Base ref, when <code>--base-ref</code> is not given</td></tr>
 <tr><td><code>VCI_JOBS</code></td><td class="wrap">Parallel pytest or <code>go test</code> processes in <code>vci run</code> (default: CPUs, up to 8). Rails files run one at a time: they share the test database.</td></tr>
 <tr><td><code>VCI_JS_PLUGIN</code></td><td class="wrap">Path of the <code>@vci/vitest</code> package (default: <code>node_modules/@vci/vitest</code> above the project)</td></tr>

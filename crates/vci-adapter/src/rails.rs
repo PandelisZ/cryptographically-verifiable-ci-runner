@@ -1,12 +1,17 @@
-//! Rails adapter (Minitest and RSpec): one process per test file, with the
-//! `vci_collector` Ruby collector (`ruby/vci-collector`) loaded through
-//! `RUBYOPT` before Bundler and Rails boot.
+//! Rails adapter (Minitest and RSpec), with the `vci_collector` Ruby
+//! collector (`ruby/vci-collector`) loaded through `RUBYOPT` before Bundler
+//! and Rails boot. `vci run` of several files starts one process per runner
+//! with the collector in batch mode (`VCI_RAILS_BATCH` names the list of
+//! their test ids; see [`RailsAdapter::run_batch`]): it boots once and forks
+//! one process per file, each a one-file run of its file; one file, or
+//! `VCI_RAILS_PER_FILE=1`, runs one process per file from the start:
 //!
 //! ```text
 //! RUBYOPT=-r<abs>/vci_collector.rb VCI_RAILS_MODE=collect VCI_OUT=<fresh dir> \
 //!   TMPDIR=<fresh dir> RAILS_ENV=test PARALLEL_WORKERS=1 \
 //!   DISABLE_SPRING=1 DISABLE_BOOTSNAP=1 BUNDLE_GEMFILE=<project>/Gemfile \
 //!   ruby bin/rails test test/models/b_test.rb --seed 0
+//! # several files: VCI_RAILS_BATCH=<list> ... bin/rails test <files> --seed 0
 //! # an RSpec file (VCI_RAILS_RUNNER=rspec):
 //!   ruby -e '<RSPEC_RUN_SCRIPT>' -- --options .rspec spec/models/b_spec.rb
 //! ```
@@ -53,6 +58,14 @@ pub const RUBY_BIN_ENV: &str = "VCI_RUBY";
 pub const RUBY_COLLECTOR_ENV: &str = "VCI_RUBY_COLLECTOR";
 
 const COLLECTOR_FILE: &str = "vci_collector.rb";
+
+/// Set to `1` (in vci's environment): `vci run` runs one process per Rails
+/// test file, as before batch mode (for debugging, or to compare).
+pub const RAILS_PER_FILE_ENV: &str = "VCI_RAILS_PER_FILE";
+
+/// Env var (of the Ruby process) naming the file that lists the test ids of
+/// a batch run, one per line: the collector's batch mode.
+const RAILS_BATCH_ENV: &str = "VCI_RAILS_BATCH";
 
 /// The fixed Minitest seed of every run (`--seed`): the order of the tests in
 /// a file and `Kernel#rand` (Minitest seeds it) are the same where the file
@@ -394,6 +407,8 @@ fn utf8_tmp(t: &tempfile::TempDir) -> Result<Utf8PathBuf, AdapterError> {
 /// Fresh temp dirs of one Ruby process.
 struct RunDirs {
     _tmp: tempfile::TempDir,
+    /// Holds `tmp` and `out` (and a batch run's file list).
+    base: Utf8PathBuf,
     tmpdir: Utf8PathBuf,
     out: Utf8PathBuf,
 }
@@ -408,6 +423,7 @@ impl RunDirs {
         }
         Ok(Self {
             _tmp: t,
+            base,
             tmpdir,
             out,
         })
@@ -784,6 +800,66 @@ impl RailsAdapter {
         Ok((out.status.code(), vec![], log))
     }
 
+    /// Several files of `runner` with the collector in batch mode: `bin/rails
+    /// test <files> --seed 0` or `rspec --options .rspec <files>`,
+    /// `VCI_RAILS_BATCH` naming the list of their test ids. The process boots
+    /// once (per helper the files' first statements require) and forks one
+    /// process per file, one at a time, each a one-file run of its file from
+    /// then on (see `VciCollector::Batch` in `vci_collector.rb`): each file's
+    /// output is the one its one-file run writes, and its exit status is its
+    /// own process's ([`read_batch`]). The files the batch could not run
+    /// that way are returned to be run again one process per file.
+    fn run_batch(
+        &self,
+        collector: &Utf8Path,
+        runner: RailsRunner,
+        files: &[&str],
+        env: &ChildEnv,
+    ) -> Result<BatchRun, AdapterError> {
+        let dirs = RunDirs::new()?;
+        let list = dirs.base.join("batch-files.txt");
+        let mut text = files.join("\n");
+        text.push('\n');
+        std::fs::write(&list, text)?;
+        let mut cmd = self.test_cmd(env, "collect", &dirs, collector, runner, files);
+        cmd.env("VCI_OUT", dirs.out.as_str())
+            .env(RAILS_BATCH_ENV, list.as_str());
+        // macOS's Objective-C runtime kills a forked process that touches a
+        // class another thread was initializing at the fork (vex-api's
+        // boot: `+[__NSCFConstantString initialize] may have been in
+        // progress in another thread when fork() was called`), unless this
+        // is set when the process starts (the runtime's own switch for that
+        // check). Only the runtime reads it; a lookup from Ruby would be
+        // recorded like any other.
+        if cfg!(target_os = "macos") {
+            cmd.env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
+        }
+        let out = cmd.output().map_err(|e| self.not_installed(e))?;
+        let shown = match runner {
+            RailsRunner::Minitest => format!(
+                "ruby bin/rails test <{} files> --seed {RAILS_SEED}",
+                files.len()
+            ),
+            RailsRunner::Rspec => format!("rspec --options .rspec <{} files>", files.len()),
+        };
+        let mut log = format!(
+            "vci: {shown}, booted once, one process per file (exit {})\n",
+            out.status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string())
+        )
+        .into_bytes();
+        log.extend_from_slice(&out.stdout);
+        log.extend_from_slice(&out.stderr);
+        let (observed, fallback, code) = read_batch(&dirs.out, files)?;
+        Ok(BatchRun {
+            code,
+            files: observed,
+            fallback,
+            log,
+        })
+    }
+
     /// Processes at a time for `vci run`: one. The files of a project share
     /// the test environment's database (as in `bin/rails test`, which runs
     /// them in one process), and Rails' `maintain_test_schema!` may rebuild
@@ -814,6 +890,133 @@ impl RailsAdapter {
         }
         Ok(code)
     }
+}
+
+/// Files of a batch run to run again one process per file, with why.
+type Fallback = Vec<(String, String)>;
+
+/// What a batch run gave: the exit code of the files it ran (see
+/// [`read_batch`]), their observations, the files to run again one process
+/// per file, and its log.
+struct BatchRun {
+    code: Option<i32>,
+    files: Vec<Observed>,
+    fallback: Fallback,
+    log: Vec<u8>,
+}
+
+/// A batch run's output in `out`: every file's `<sha256(id)>.jsonl`, written
+/// by its own process as a one-file run writes it, and `batch/files.jsonl`
+/// with a line per file: `{"id", "exit"}` (its process's exit status, null
+/// when a signal killed it) or `{"id", "why"}` (it must run on its own).
+/// Each file's [`Observed`] is checked against its own exit status as
+/// [`RailsAdapter::run_one`] checks a one-file run's. A file without a line
+/// or without output, or every file when there is no `files.jsonl`, falls
+/// back. The exit code is the first non-zero one of the files' processes
+/// (`None`: one died from a signal), a failed result counting as 1 when its
+/// process exited 0 (Minitest without `allow_fork` keeps a forked process's
+/// status at 0).
+fn read_batch(
+    out: &Utf8Path,
+    files: &[&str],
+) -> Result<(Vec<Observed>, Fallback, Option<i32>), AdapterError> {
+    let everyone = |why: String| {
+        (
+            Vec::new(),
+            files
+                .iter()
+                .map(|f| (f.to_string(), why.clone()))
+                .collect::<Vec<_>>(),
+            Some(0),
+        )
+    };
+    let text = match std::fs::read_to_string(out.join("batch/files.jsonl")) {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok(everyone(format!(
+                "the batch run said nothing of its files ({e})"
+            )));
+        }
+    };
+    // id => Ok(exit status) or Err(why it must run on its own).
+    let mut said: BTreeMap<String, Result<Option<i32>, String>> = BTreeMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return Ok(everyone(format!(
+                "the batch run's files.jsonl has a bad line {line:?}"
+            )));
+        };
+        let Some(id) = v.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let st = match v.get("why").and_then(Value::as_str) {
+            Some(why) => Err(why.to_owned()),
+            None => Ok(v
+                .get("exit")
+                .and_then(Value::as_i64)
+                .and_then(|c| i32::try_from(c).ok())),
+        };
+        said.entry(id.to_owned()).or_insert(st);
+    }
+    let mut own: BTreeMap<String, Observed> = parse_jsonl_dir(out)?
+        .into_iter()
+        .map(|o| (o.test_id.clone(), o))
+        .collect();
+    let mut observed = Vec::new();
+    let mut fallback = Vec::new();
+    let mut code = Some(0);
+    for f in files {
+        let c = match said.remove(*f) {
+            None => {
+                fallback.push((
+                    f.to_string(),
+                    "the batch run said nothing of it (its boot or the run ended early)".into(),
+                ));
+                continue;
+            }
+            Some(Err(why)) => {
+                fallback.push((f.to_string(), why));
+                continue;
+            }
+            Some(Ok(c)) => c,
+        };
+        let Some(mut o) = own.remove(*f) else {
+            fallback.push((
+                f.to_string(),
+                format!(
+                    "its process wrote no output (exit {})",
+                    c.map_or_else(|| "signal".to_owned(), |c| c.to_string())
+                ),
+            ));
+            continue;
+        };
+        exit_code_must_agree(std::slice::from_mut(&mut o), c);
+        let c = if c == Some(0) && failed(&o) {
+            Some(1)
+        } else {
+            c
+        };
+        match (code, c) {
+            (Some(0), c) => code = c,
+            (Some(_), None) => code = None,
+            _ => {}
+        }
+        observed.push(o);
+    }
+    Ok((observed, fallback, code))
+}
+
+/// A result that failed (a test failed or errored).
+fn failed(o: &Observed) -> bool {
+    o.result
+        .as_ref()
+        .is_some_and(|r| r.state == "failed" && r.failed > 0)
+}
+
+/// Run each file one process per file, never in batch mode (set in vci's
+/// environment).
+fn per_file_forced() -> bool {
+    std::env::var(RAILS_PER_FILE_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Taint (prefix of) a passing result whose process did not exit 0.
@@ -1379,9 +1582,69 @@ impl Adapter for RailsAdapter {
             .collect()
     }
 
+    /// One file (or `VCI_RAILS_PER_FILE=1`): one process per file. Several:
+    /// one batch per runner for all its files, booted once
+    /// ([`RailsAdapter::run_batch`]); the files it could not run that way
+    /// run again one process per file afterwards (and say so). The exit
+    /// code: the first non-zero one of the files' own processes (`None`: one
+    /// died from a signal), never that of a batch's own process.
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {
         let collector = self.collector_file()?;
-        per_file_jobs(files, self.jobs(), |f| self.run_one(&collector, f, env))
+        if files.len() < 2 || per_file_forced() {
+            return per_file_jobs(files, self.jobs(), |f| self.run_one(&collector, f, env));
+        }
+        let mut groups: Vec<(RailsRunner, Vec<&str>)> = Vec::new();
+        for f in files {
+            let runner = self.runner_for_run(f)?;
+            match groups.iter_mut().find(|(r, _)| *r == runner) {
+                Some((_, v)) => v.push(f.as_str()),
+                None => groups.push((runner, vec![f.as_str()])),
+            }
+        }
+        let mut exit = Some(0);
+        let mut observed = Vec::new();
+        let mut again: Vec<String> = Vec::new();
+        let join = |exit: &mut Option<i32>, c: Option<i32>| match (*exit, c) {
+            (Some(0), c) => *exit = c,
+            (Some(_), None) => *exit = None,
+            _ => {}
+        };
+        for (runner, group) in &groups {
+            if group.len() < 2 {
+                again.extend(group.iter().map(|f| f.to_string()));
+                continue;
+            }
+            let b = self.run_batch(&collector, *runner, group, env)?;
+            {
+                use std::io::Write as _;
+                let _ = std::io::stderr().write_all(&b.log);
+            }
+            join(&mut exit, b.code);
+            observed.extend(b.files);
+            if !b.fallback.is_empty() {
+                eprintln!(
+                    "vci: {} of {} file(s) of the batch run again one process per file:",
+                    b.fallback.len(),
+                    group.len()
+                );
+                for (f, why) in b.fallback.iter().take(10) {
+                    eprintln!("vci:   {f}: {why}");
+                }
+                if b.fallback.len() > 10 {
+                    eprintln!("vci:   ... and {} more", b.fallback.len() - 10);
+                }
+                again.extend(b.fallback.into_iter().map(|(f, _)| f));
+            }
+        }
+        if !again.is_empty() {
+            let out = per_file_jobs(&again, self.jobs(), |f| self.run_one(&collector, f, env))?;
+            join(&mut exit, out.exit_code);
+            observed.extend(out.files);
+        }
+        Ok(RunOutput {
+            exit_code: exit,
+            files: observed,
+        })
     }
 
     /// With files: one process per runner for all of them (`bin/rails test
@@ -1651,6 +1914,128 @@ mod tests {
         let mut files = vec![pass("passed")];
         exit_code_must_agree(&mut files, None);
         assert!(files[0].taints[0].starts_with("vci:process-exit:signal"));
+    }
+
+    /// A batch run's output: each file's own output (written by its own
+    /// process) with its own exit status: a pass whose process exited
+    /// non-zero is tainted, a failure with exit 0 counts as exit 1, and the
+    /// batch's exit code is the files'. A file the collector sends back,
+    /// without a line, or without output falls back; no files.jsonl: every
+    /// file falls back.
+    #[test]
+    fn batch_output_is_read_per_file() {
+        use sha2::{Digest, Sha256};
+        let t = tempfile::tempdir().unwrap();
+        let out = Utf8PathBuf::from_path_buf(t.path().to_owned()).unwrap();
+        std::fs::create_dir(out.join("batch")).unwrap();
+        let name = |id: &str| format!("{}.jsonl", hex::encode(Sha256::digest(id.as_bytes())));
+        let write = |path: Utf8PathBuf, lines: &[String]| {
+            std::fs::write(path, lines.join("\n") + "\n").unwrap();
+        };
+        let meta =
+            |id: &str| format!(r#"{{"v":1,"kind":"meta","testId":"{id}","adapter":"rails"}}"#);
+        let read = |p: &str| format!(r#"{{"kind":"read","path":"/repo/{p}"}}"#);
+        let result = |state: &str, failed: u32| {
+            format!(
+                r#"{{"kind":"result","state":"{state}","tests":1,"failed":{failed},"skipped":0}}"#
+            )
+        };
+        let files = [
+            "test/a_test.rb",
+            "test/b_test.rb",
+            "test/c_test.rb",
+            "test/d_test.rb",
+            "test/e_test.rb",
+        ];
+        write(
+            out.join(name(files[0])),
+            &[
+                meta(files[0]),
+                read("config/boot.rb"),
+                read("test/fixtures/a.yml"),
+                result("passed", 0),
+            ],
+        );
+        write(
+            out.join(name(files[1])),
+            &[meta(files[1]), read("config/boot.rb"), result("passed", 0)],
+        );
+        write(
+            out.join(name(files[2])),
+            &[meta(files[2]), result("passed", 0)],
+        );
+        // files[3]: no output (its process died before writing it);
+        // files[4]: no line (the boot died).
+        let lines = [
+            r#"{"id":"test/a_test.rb","exit":0}"#,
+            r#"{"id":"test/b_test.rb","exit":1}"#,
+            r#"{"id":"test/c_test.rb","why":"its first statement failed in the batch's boot"}"#,
+            r#"{"id":"test/d_test.rb","exit":null}"#,
+        ];
+        write(
+            out.join("batch/files.jsonl"),
+            &lines.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+        );
+        let reads =
+            |o: &Observed| -> Vec<String> { o.reads.iter().map(|p| p.to_string()).collect() };
+        let (obs, fallback, code) = read_batch(&out, &files).unwrap();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].test_id, files[0]);
+        assert_eq!(
+            reads(&obs[0]),
+            ["/repo/config/boot.rb", "/repo/test/fixtures/a.yml"]
+        );
+        assert!(obs[0].taints.is_empty(), "{obs:?}");
+        assert_eq!(obs[1].test_id, files[1]);
+        assert_eq!(reads(&obs[1]), ["/repo/config/boot.rb"]);
+        assert!(
+            obs[1]
+                .taints
+                .iter()
+                .any(|t| t.starts_with(RAILS_EXIT_TAINT)),
+            "{obs:?}"
+        );
+        assert_eq!(code, Some(1));
+        assert_eq!(
+            fallback.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+            [files[2], files[3], files[4]]
+        );
+        assert!(fallback[0].1.contains("first statement"));
+        assert!(fallback[1].1.contains("no output (exit signal)"));
+        assert!(fallback[2].1.contains("said nothing"));
+
+        // A failure explains its own non-zero exit; one reported with exit 0
+        // still fails the run.
+        write(
+            out.join(name(files[1])),
+            &[meta(files[1]), result("failed", 1)],
+        );
+        let (obs, _, code) = read_batch(&out, &files).unwrap();
+        assert!(obs.iter().all(|o| o.taints.is_empty()), "{obs:?}");
+        assert_eq!(code, Some(1));
+        let mut zero = lines;
+        zero[1] = r#"{"id":"test/b_test.rb","exit":0}"#;
+        write(
+            out.join("batch/files.jsonl"),
+            &zero.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+        );
+        let (_, _, code) = read_batch(&out, &files).unwrap();
+        assert_eq!(code, Some(1));
+        write(
+            out.join(name(files[1])),
+            &[meta(files[1]), result("passed", 0)],
+        );
+        let (_, _, code) = read_batch(&out, &files).unwrap();
+        assert_eq!(code, Some(0));
+
+        std::fs::remove_file(out.join("batch/files.jsonl")).unwrap();
+        let (obs, fallback, _) = read_batch(&out, &files).unwrap();
+        assert!(obs.is_empty());
+        assert_eq!(fallback.len(), 5);
+        assert!(
+            fallback[0].1.contains("said nothing of its files"),
+            "{fallback:?}"
+        );
     }
 
     #[test]

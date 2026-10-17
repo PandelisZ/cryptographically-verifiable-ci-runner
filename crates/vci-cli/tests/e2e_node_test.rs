@@ -1611,3 +1611,206 @@ test("env", () => {
         &["src/env.test.mjs"],
     );
 }
+
+/// The partition (1-based) of `count` that `vci ci --partition` gives a
+/// test id: the first 8 bytes of its storage key (BLAKE3 of the id),
+/// big-endian, modulo `count`, plus one.
+fn partition_of(test_id: &str, count: u64) -> u32 {
+    let key = vci_core::test_key(test_id);
+    (u64::from_str_radix(&key[..16], 16).unwrap() % count) as u32 + 1
+}
+
+/// A string set from an audit log array of `{testId}` objects.
+fn ids_of(v: &Value) -> BTreeSet<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["testId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// `vci ci --partition I/3 --key --push` from three clones at once: every
+/// unit the plan runs is run and attested by exactly one partition (the one
+/// its test id hashes to), the skipped one is skipped by all, a partition
+/// with nothing to run exits 0, and afterwards a plan skips everything.
+/// Without `--key` a partition runs its share in one node process.
+#[test]
+fn ci_partitions_cover_every_unit_once() {
+    let w = World::new();
+    let work = w.work.clone();
+    // B is attested and published first: every partition skips it.
+    let out = w.run(&work, &[B], &w.trusted);
+    assert!(out.contains("1 attested"), "{out}");
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let to_run = set(&[A, C, D]);
+
+    let clone = |name: &str| {
+        let dir = w.base.join(name);
+        w.git(
+            &w.base,
+            &[
+                "clone",
+                "-q",
+                w.remote.to_str().unwrap(),
+                dir.to_str().unwrap(),
+            ],
+        );
+        w.install_node_modules(&dir);
+        w.git(&dir, &["checkout", "-q", "feature"]);
+        dir
+    };
+    let clones: Vec<PathBuf> = (1..=3).map(|i| clone(&format!("job{i}"))).collect();
+    let trusted = w.trusted.to_str().unwrap().to_owned();
+    let outs: Vec<(Output, Value)> = std::thread::scope(|s| {
+        let handles: Vec<_> = clones
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| {
+                let (w, trusted) = (&w, &trusted);
+                s.spawn(move || {
+                    let part = format!("{}/3", i + 1);
+                    let audit = w.base.join(format!("audit-{}.json", i + 1));
+                    let out = w.vci(
+                        dir,
+                        &[
+                            "ci",
+                            "--fetch",
+                            "origin",
+                            "--base-ref",
+                            "main",
+                            "--partition",
+                            &part,
+                            "--key",
+                            trusted,
+                            "--push",
+                            "--remote",
+                            "origin",
+                            "--audit-log",
+                            audit.to_str().unwrap(),
+                        ],
+                    );
+                    let log: Value =
+                        serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+                    (out, log)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut union = BTreeSet::new();
+    for (i, (out, log)) in outs.iter().enumerate() {
+        let index = i as u32 + 1;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{index}/3: {stderr}");
+        let mine: BTreeSet<String> = to_run
+            .iter()
+            .filter(|id| partition_of(id, 3) == index)
+            .cloned()
+            .collect();
+        assert!(
+            stdout.contains(&format!(
+                "partition {index}/3: {} of 3 units to run",
+                mine.len()
+            )),
+            "{stdout}"
+        );
+        assert_eq!(ids_of(&log["attested"]), mine, "{index}/3 attested");
+        assert_eq!(ids_of(&log["ran"]), mine, "{index}/3 ran");
+        assert_eq!(ids_of(&log["skipped"]), set(&[B]), "{index}/3 skipped");
+        assert_eq!(log["partition"]["index"], index);
+        assert_eq!(log["partition"]["count"], 3);
+        assert_eq!(log["partition"]["units"], mine.len());
+        assert_eq!(log["partition"]["total"], 3);
+        assert_eq!(log["pushed"], true, "{index}/3: {stderr}");
+        assert_eq!(log["exitCode"], 0);
+        if mine.is_empty() {
+            assert!(
+                stderr.contains(&format!(
+                    "none of the 3 test file(s) to run is in partition {index}/3; nothing to run here"
+                )),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("vci: node-test:"), "{stderr}");
+        } else {
+            assert!(
+                stderr.contains(&format!(
+                    "running {} of 3 test file(s) (partition {index}/3, attesting)",
+                    mine.len()
+                )),
+                "{stderr}"
+            );
+        }
+        assert!(
+            union.is_disjoint(&mine),
+            "{index}/3 overlaps: {union:?} {mine:?}"
+        );
+        union.extend(mine);
+    }
+    assert_eq!(union, to_run, "every unit in exactly one partition");
+    // This fixture leaves partition 2 of 3 empty (A and C hash to 3, D to 1).
+    assert_eq!(partition_of(D, 3), 1);
+    assert!(to_run.iter().all(|id| partition_of(id, 3) != 2));
+
+    // A fresh clone sees every partition's attestations: nothing to run.
+    let fresh = clone("fresh");
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&fresh, "main");
+    assert_eq!(p.skip, set(&[A, B, C, D]), "{p:?}");
+    assert!(p.run.is_empty(), "{p:?}");
+
+    // Without --key: an edit of A's module leaves A to run, in its partition
+    // only (one node process), and the other partitions exit 0.
+    std::fs::write(
+        fresh.join("src/a.ts"),
+        "export const add = (x: number, y: number): number => y + x;\n",
+    )
+    .unwrap();
+    assert_eq!(w.plan(&fresh, "main").run, set(&[A]));
+    for index in 1..=3u32 {
+        let audit = w.base.join("audit-plain.json");
+        let part = format!("{index}/3");
+        let out = w.vci(
+            &fresh,
+            &[
+                "ci",
+                "--base-ref",
+                "main",
+                "--partition",
+                &part,
+                "--audit-log",
+                audit.to_str().unwrap(),
+            ],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{part}: {stderr}");
+        let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+        if partition_of(A, 3) == index {
+            assert!(stdout.contains(&format!("partition {part}: 1 of 1 units to run")));
+            assert!(
+                stderr.contains(&format!("running 1 of 1 test file(s) (partition {part})")),
+                "{stderr}"
+            );
+            assert_eq!(stderr.matches("vci: node-test:").count(), 1, "{stderr}");
+            assert!(stderr.contains("--test src/a.test.ts\n"), "{stderr}");
+            assert_eq!(ids_of(&log["ran"]), set(&[A]));
+        } else {
+            assert!(stdout.contains(&format!("partition {part}: 0 of 1 units to run")));
+            assert!(!stderr.contains("vci: node-test:"), "{stderr}");
+            assert!(ids_of(&log["ran"]).is_empty());
+        }
+        assert_eq!(ids_of(&log["skipped"]), set(&[B, C, D]));
+    }
+
+    // Invalid partitions are usage errors (exit 2), before anything runs.
+    for bad in ["0/3", "4/3", "3/0"] {
+        let out = w.vci(&fresh, &["ci", "--base-ref", "main", "--partition", bad]);
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--partition"), "{bad}: {stderr}");
+        assert!(!stderr.contains("vci ci:"), "{bad}: {stderr}");
+    }
+}

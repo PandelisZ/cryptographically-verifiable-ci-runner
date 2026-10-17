@@ -1866,6 +1866,15 @@ fn an_unreadable_value_runs_only_its_unit_and_plan_reads_a_read_only_git_dir() {
         );
     }
     w.git(&fresh, &["reflog", "expire", "--expire=now", "--all"]);
+    // Since vci 2.0 a fetch is a partial-clone fetch: git keeps every object
+    // of a pack fetched from the promisor remote. Unmark those packs so the
+    // gc below loses B's blob.
+    for e in std::fs::read_dir(fresh.join(".git/objects/pack")).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "promisor") {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
     w.git(&fresh, &["gc", "-q", "--prune=now"]);
     let out = w.vci(&fresh, &["plan", "--base-ref", "main"]);
     let err = String::from_utf8_lossy(&out.stderr);
@@ -2104,7 +2113,7 @@ test("env", () => {
 /// A clone that fetched before merges only what later pushes changed: after
 /// new attestations and a deletion (`vci prune --superseded`, `vci push`),
 /// its plan, `vci explain` and stored attestations match a fresh clone's;
-/// a changed entry the incremental merge does not read (a git-meta set
+/// a changed entry the merge from paths does not read (a git-meta set
 /// value) is merged in full by git-meta, with the same result.
 #[test]
 fn a_clone_that_fetched_before_merges_what_changed_like_a_fresh_clone() {
@@ -2151,7 +2160,7 @@ fn a_clone_that_fetched_before_merges_what_changed_like_a_fresh_clone() {
     };
     let b = clone("b");
     let first = fetch(&b);
-    assert!(first.contains("materialize (full)"), "{first}");
+    assert!(first.contains("materialize (from paths"), "{first}");
     assert_eq!(w.plan(&b, "main").skip, set(&[B, C]));
 
     // A changes C's input and attests C again and A; the superseded C
@@ -2177,9 +2186,9 @@ fn a_clone_that_fetched_before_merges_what_changed_like_a_fresh_clone() {
     w.git(&b, &["fetch", "-q", "origin"]);
     w.git(&b, &["merge", "-q", "--ff-only", "origin/feature"]);
     let second = fetch(&b);
-    assert!(second.contains("materialize (incremental"), "{second}");
+    assert!(second.contains("materialize (from paths"), "{second}");
     let fresh = clone("fresh");
-    assert!(fetch(&fresh).contains("materialize (full)"));
+    assert!(fetch(&fresh).contains("materialize (from paths"));
     let plan = w.plan(&b, "main");
     assert_eq!(plan.skip, set(&[A, B, C]), "{plan:?}");
     assert_eq!(plan, w.plan(&fresh, "main"));
@@ -2187,7 +2196,7 @@ fn a_clone_that_fetched_before_merges_what_changed_like_a_fresh_clone() {
     assert_eq!(stored(&b), stored(&fresh));
     assert_eq!(stored(&b), stored(&work));
 
-    // A git-meta set value is not read incrementally: git-meta merges it.
+    // A git-meta set value is not merged from paths: git-meta merges it.
     let s = git_meta_lib::Session::open(&work).unwrap();
     s.target(&git_meta_lib::Target::project())
         .set_add("reviewers", "someone@example.com")

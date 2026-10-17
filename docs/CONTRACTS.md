@@ -109,7 +109,49 @@ pub struct Verified { pub principal: String, pub fingerprint: String /* "SHA256:
 pub fn verify_envelope(envelope: &Envelope, allowed: &AllowedSigners, now: i64) -> Result<Verified, VerifyError>;
 ```
 
-`VerifyError` variants must be distinguishable: `Malformed`, `WrongPayloadType`, `BadSignature`, `WrongNamespace`, `UnknownSigner`, `SignerNotValidNow`, `NoSignatures`.
+`VerifyError` variants must be distinguishable: `Malformed`, `WrongPayloadType`, `BadSignature`, `WrongNamespace`, `UnknownSigner`, `SignerNotValidNow`, `NoSignatures`, and for keyless envelopes `Untrusted` (certificate chain, timestamp, validity) and `UnknownIdentity`.
+
+Keyless signing (`vci_attest::keyless`, since vci 2.0; findings in docs/spike-oidc.md):
+
+```rust
+pub const IDENTITIES_FILE: &str = ".vci/identities.toml";          // [[identity]] principal, issuer, repository, workflow, ref, event?, environment?, runner_environment?
+pub const TRUSTED_ROOT_FILE: &str = ".vci/sigstore-trusted-root.json"; // `gh attestation trusted-root` output (JSON Lines or one object)
+pub struct Identities { pub rules: Vec<IdentityRule> }
+impl Identities { pub fn parse(text: &str) -> Result<Self, String>; pub fn matching(&self, id: &CertIdentity) -> Option<&IdentityRule>; pub fn principals(&self, id: &CertIdentity) -> Vec<String>; }
+pub struct CertIdentity { issuer, repository /* owner/name */, workflow /* owner/name/<path>, no @ref */, workflow_ref, ref_, event, environment, runner_environment, sha, run }
+impl CertIdentity { pub fn from_claims(claims: &serde_json::Value) -> Result<Self, String>; pub fn describe(&self) -> String; pub fn signer_id(&self) -> String /* 16 hex of SHA-256(issuer \n repository \n workflow \n ref \n event \n environment \n runner_environment), lowercased repo/workflow, absent claims empty, refs/pull/<n>/ and a merge queue entry's last segment folded to * */ }
+pub struct TrustedRoot { /* certificate and timestamp authorities */ } impl TrustedRoot { pub fn parse(text: &str) -> Result<Self, String>; }
+pub struct SigstoreMaterial { pub media_type: String, pub verification_material: VerificationMaterial }  // a Sigstore bundle without dsseEnvelope
+pub struct KeylessSigner;  // new(Instance) fetches the job's token (fails early without id-token: write); sign_statement -> (Envelope, SigstoreMaterial)
+pub fn to_stored_json(envelope: &Envelope, material: &SigstoreMaterial) -> Vec<u8>;
+pub fn material_from_json(stored: &[u8]) -> Result<Option<SigstoreMaterial>, VerifyError>;   // None: an SSH envelope
+pub fn to_bundle_json(envelope: &Envelope, material: &SigstoreMaterial) -> serde_json::Value;  // standard v0.3 bundle
+pub fn verify_keyless(envelope: &Envelope, material: &SigstoreMaterial, ids: &Identities, root: &TrustedRoot, now: i64) -> Result<KeylessVerified, VerifyError>;
+```
+
+Stored form of a keyless attestation: the DSSE envelope JSON (`payloadType`, `payload`, `signatures: [{keyid: "",
+sig: <base64 DER ECDSA-P256-SHA256 signature over the PAE>}]`) plus a top-level member `sigstore`:
+`{mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json", verificationMaterial: {certificate: {rawBytes}, tlogEntries: [],
+timestampVerificationData: {rfc3161Timestamps: [{signedTimestamp}]}}}` (vci's container; adding `dsseEnvelope` from
+the envelope's fields gives a standard bundle). `Envelope` itself is unchanged and ignores the member; an SSH envelope
+has none and is serialised byte for byte as before. Verification: exactly one signature; the leaf certificate's key
+verifies it over the PAE; an RFC 3161 timestamp over the signature bytes verifies with a timestamp authority of the
+trust root (messageImprint, signed attributes' messageDigest and contentType, signature, genTime within the TSA
+certificate and its `validFor`); genTime is within the leaf's validity, not more than 300 s after `now`; the leaf is
+issued (name and signature) by the first certificate of a certificate authority of the trust root, at genTime within
+its `validFor` and every chain certificate's validity, and has the code-signing EKU; its Fulcio extensions (`.8`
+issuer, `.9` build signer URI, `.12` source repository URI, `.14` ref, `.20` trigger, `.23` environment, `.11` runner
+environment) match an `[[identity]]`, whose `principal` is the signer. No transparency log or SCT is checked.
+
+`.vci/identities.toml` (read from the base commit, like `allowed_signers`): an array of `[[identity]]` tables, unknown
+keys rejected. `principal` (non-empty, no whitespace; what policy lists name), `issuer` (an https URL, compared
+exactly), `repository` (`owner/name`, no glob, ASCII case-insensitive), `workflow` (glob over the workflow file's path
+in the repository, or over `owner/name/<path>`) and `ref` (glob) are required; `event`, `environment` and
+`runner_environment` are optional globs (an absent key matches anything; a present one needs the claim). Globs: `*`
+and `?` do not cross `/`, `**` does. The first entry that matches gives the principal; `vci ci --oidc`'s refusal
+uses every matching entry's principal. `.vci/sigstore-trusted-root.json`: `gh attestation trusted-root` output, one
+`application/vnd.dev.sigstore.trustedroot+json;version=0.1` object per line (or one object); its
+`certificateAuthorities` and `timestampAuthorities` are used, `tlogs` and `ctlogs` ignored.
 
 ## vci-git (no dependency on other workspace crates; shells out to `git`)
 
@@ -137,6 +179,8 @@ pub struct StoredEnvelope {
     pub bytes: Vec<u8>,       // the DSSE envelope, exactly as stored (empty when `error` is set)
     pub error: Option<String>,// the value could not be read (missing blob, unfetched value): fails only this candidate
 }
+impl StoredEnvelope { pub fn not_fetched(&self) -> bool; }   // since 2.0: a promised row, not a broken one
+pub struct Hydration { pub resolved: usize, pub unresolved: usize, pub fetched: usize, pub error: Option<String> }
 pub struct StoredManifest { pub root: String, pub key: String, pub bytes: Vec<u8>, pub error: Option<String> }
 pub struct FetchOutcome { pub remote: String, pub found: bool, pub warnings: Vec<String>, pub notes: Vec<String> }
 pub enum PushStatus { Pushed, UpToDate, NothingStored }
@@ -158,10 +202,26 @@ impl<'a> AttestStore<'a> {
     pub fn manifest(&self, root: &str) -> Result<Option<StoredManifest>, GitError>; // Reader::manifest too
     pub fn manifests(&self) -> Result<Vec<String>, GitError>;                       // stored roots, sorted
     pub fn remove_manifest(&self, root: &str) -> Result<bool, GitError>;            // git-meta tombstone
+    pub fn count(&self) -> Result<usize, GitError>;   // attestations stored (rows; no value read). Reader::count too,
+                                                      // and Reader::promised: rows whose value is not fetched
+    /// Since 2.0 (values fetched on demand): fetch, in one `git fetch --filter=blob:none --stdin` of blob ids per
+    /// batch, the values not fetched yet that a caller is about to read, and turn their promised rows into blob
+    /// references. Nothing is fetched, locked or written when nothing is missing; a failed fetch is reported in
+    /// `Hydration::error` and leaves those rows promised (their units run).
+    pub fn hydrate_units<'s>(&self, test_ids: impl IntoIterator<Item = &'s str>) -> Result<Hydration, GitError>;
+                                                      // the units' attestations, then the manifests they reference
+    pub fn hydrate_manifests<'s>(&self, roots: impl IntoIterator<Item = &'s str>) -> Result<Hydration, GitError>;
+    pub fn hydrate_attestations(&self) -> Result<Hydration, GitError>;              // every attestation (vci prune)
+    /// Before supersession deletes manifests among `roots` nothing references: fetch the attestations not fetched
+    /// yet that could reference one (on the `project` target, or on a path target at or above a path the manifest
+    /// lists); returns the roots that cannot be decided (keep them).
+    pub fn hydrate_manifest_referrers(&self, roots: &BTreeSet<String>) -> Result<BTreeSet<String>, GitError>;
     pub fn ensure_remote(&self, spec: Option<&str>) -> Result<String, GitError>;
     pub fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, GitError>; // git-meta pull
     pub fn push(&self, remote: Option<&str>) -> Result<PushOutcome, GitError>;   // git-meta push, retried
+    pub fn push_rewriting_history(&self, remote: Option<&str>) -> Result<PushOutcome, GitError>; // one parentless commit
 }
+pub const NO_LAZY_FETCH_REMOTE: &str = "vci-no-lazy-fetch";   // the repository's promisor remote: no URL
 ```
 
 Exchange invariants (`fetch`, `push`; both hold one lock per repository, shared by its worktrees, and retry when
@@ -181,16 +241,39 @@ another git process wins a ref lock):
   remote dropped without a deletion record.
 - A `.git-meta` URL (from the checkout) must be an https/http/ssh/git/file URL, an scp-like address or a path; remote
   helpers (`fd::`, `ext::`, `<x>::`) are refused.
+- Since 2.0 the metadata is fetched blobless: `git fetch --filter=blob:none` (commits and trees); the first fetch of
+  the tracking ref `--filter=tree:0` and then the tip's tree by object id (a server refusing tree filters gets
+  `blob:none`); the repository is never made shallow. The store is built from the trees' paths: a value whose blob is
+  here is a blob reference (`is_git_ref`), any other a git-meta promised row (`is_promised = 1`, its value the blob
+  at its key's path in `refs/<ns>/local/main`). Deletion records are fetched and read. Readers never trigger a
+  download (`GIT_NO_LAZY_FETCH=1`): a promised row reads as ``value not fetched: run `vci fetch` online (a git-meta
+  promised entry; ...)`` in `StoredEnvelope::error` / `StoredManifest::error`.
+- Merges are done from paths, with git-meta's results: a fast-forward applies what `git diff-tree` reports; diverged
+  local and remote commits use git-meta's three-way (or two-way) rules on blob ids, as a merge commit; a clone's first
+  fetch takes the tip's entries. Set and list values, side remotes and unexpected paths fetch every value of the trees
+  involved and use git-meta's full merge (`VCI_MATERIALIZE=full` forces it, for tests). A merged value this clone
+  never fetched that the tip no longer holds takes the tip's state (no push could publish it).
+- Serialization puts promised values of a target it rebuilds back at the blob ids the previous commit held; the
+  dropped-value check is path-only. Push sends a pack that is not thin (`--no-thin`); values it would send that are
+  not here are fetched first, and deleted (with a deletion record, then the round restarts) when the remote answers
+  that it no longer has them. `--rewrite-history` fetches every value first.
+- The metadata remote is never recorded as a promisor (vci's filtered fetches pass `-c remote.<name>.promisor=true -c
+  remote.<name>.partialclonefilter=<f>`); `remote.vci-no-lazy-fetch.promisor = true` (no URL, `skipFetchAll`,
+  `skipDefaultUpdate`) is what lets `git gc` and `git fsck` accept the values left out, and makes a missing object
+  fail at once instead of being downloaded. `Repo::resolve`, `merge_base` and `moved_on` set `GIT_NO_LAZY_FETCH=1`.
 
 Storage is [git-meta](https://git-meta.com/) (`git-meta-lib` 0.1.13, embedded): target `path:<unit path>` (the test id
 up to `#`; `project` when git-meta cannot hold it as a path target: `.` or shorter than 3 bytes), key
 `vci:attestation:<blake3(test_id)>:<signer>:<storage_key>`, value the envelope. `signer` is 16 lowercase hex chars and
-`storage_key` lowercase hex, both validated. Since vci 1.9.0 input manifests are stored on their own: target `project`,
-key `vci:manifest:<input root>`, value `InputManifest::to_compact` (not base64, not inside DSSE); written once per
-distinct root and shared by every attestation, unit and signer with that root. A stored manifest is trusted only when
-its recomputed root is the root an attestation signed. Exchange is on `refs/<meta.namespace or meta>/main` with git-meta's merge;
-transport is the git CLI with a scrubbed environment; the metadata commit vci rewrites for push uses a fixed
-committer identity, so it works where no git user is configured.
+`storage_key` lowercase hex, both validated. Since vci 1.9.0 input manifests are stored on their own: target
+`project`, key `vci:manifest:<input root>`, value `InputManifest::to_compact` (not base64, not inside DSSE); written
+once per distinct root and shared by every attestation, unit and signer with that root. A stored manifest is trusted
+only when its recomputed root is the root an attestation signed. Since 2.0 a row may be promised (its value not
+fetched yet, see the exchange invariants above); vci before 2.0 reads such a row as unreadable and runs the unit, and
+its fetch and push fail in a clone 2.0 fetched into (docs/REFERENCE.md, "Known gaps", has the way back). Exchange is
+on `refs/<meta.namespace or meta>/main` with git-meta's merge; transport is the git CLI with a scrubbed environment;
+the metadata commit vci rewrites for push uses a fixed committer identity, so it works where no git user is
+configured.
 
 ## js/vitest-plugin (`@vci/vitest`)
 
@@ -514,6 +597,21 @@ accepted). A Rails taint is waived only by `policy.ignore_taints` (`policy.rails
 parses and has no effect).
 
 ## vci-cli predicate and storage
+
+Signer id in store keys: SSH, 16 hex of SHA-256 over the public key blob; keyless (since vci 2.0), 16 hex of SHA-256
+over `issuer \n repository \n workflow \n ref \n event \n environment \n runner_environment` of the job's token
+(`CertIdentity::signer_id`; repository and workflow lowercased, an absent claim empty, `refs/pull/<n>/...` read as
+`refs/pull/*/...` and `refs/heads/gh-readonly-queue/<base>/pr-...` as `refs/heads/gh-readonly-queue/<base>/*`). It
+covers every claim an `[[identity]]` can match, so runs identities.toml can trust differently (main and pull requests
+of one workflow file) are separate signers and never replace each other's attestations, while the runs of one ref,
+and all pull requests together, supersede each other. A keyless certificate's Source Repository URI and Build Signer
+URI must be https URLs on the issuer's host (`github.com` for `https://token.actions.githubusercontent.com[/...]`,
+`<name>.ghe.com` for `https://token.actions.<name>.ghe.com`, else the issuer's host); otherwise verification fails.
+`vci verify` with any of `--allowed-signers`, `--identities`, `--trusted-root` uses only the files given: an envelope
+whose kind needs one that was not given is INVALID. `vci plan` reads `.vci/identities.toml` and
+`.vci/sigstore-trusted-root.json` from the base commit; without `.vci/allowed_signers` there, an identities.toml is
+enough trust to plan (no SSH key is then trusted). An invalid or missing identities.toml or trust root is a warning
+and fails every keyless candidate (its unit runs).
 
 The signed predicate is `vci_core::Predicate` flattened, plus `envConfigDigest` (docs/ENV.md), `projectDir` (repo
 relative), `runnerProject` (Vitest project name), `projectName` (the `[[projects]]` name; omitted in the

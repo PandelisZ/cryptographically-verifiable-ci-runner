@@ -9,7 +9,7 @@ and runs the rest. The docs site has the same guide with tabs:
 Put this after your checkout and toolchain setup steps:
 
 ```yaml
-- uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 ```
 
 Terms used below:
@@ -20,14 +20,17 @@ Terms used below:
 - **Base branch**: the branch a pull request merges into, usually `main`. CI reads the trusted keys and the policy
   from its commit, never from the pull request.
 
-`@v1` follows the latest tested 1.x release. See [Pinning](#pinning) for stricter options.
+`@v2` follows the latest tested 2.x release. `@v1` stays on 1.9.2, without keyless signing and with the full metadata
+fetch; see the [release notes](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/releases.html#v2-0-0)
+before moving. See [Pinning](#pinning) for stricter options.
 
 ## Before you start
 
 1. `vci.toml` and `.vci/allowed_signers` are merged to your default branch ([install guide](INSTALL.md)).
 2. `.git-meta` (written by `vci init`) is committed.
 3. Attestations are pushed with `vci push` (or `git meta push`) before, or together with, the branch. With a
-   `signing-key`, CI also attests and pushes what it runs (see [Attesting in CI](#attesting-in-ci)).
+   `signing-key`, or keylessly with `oidc: true`, CI also attests and pushes what it runs (see [Attesting in
+   CI](#attesting-in-ci) and [Keyless attestation (OIDC)](#keyless-attestation-oidc)).
 
 ## A complete workflow
 
@@ -60,7 +63,7 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 ```
 
 Run the job on the hosted runner directly, not in a `container:` job: attestations made as a normal user are not
@@ -150,12 +153,22 @@ vci sets it on the runner and locally. Then:
    the projects (their toolchains and test files), plans, writes the plan to the job summary, runs every unit that was
    not skipped and writes an audit log. The job fails if any test fails. Attestations are
    [git-meta](https://git-meta.com/) metadata on `refs/meta/main`. The fetch configures a git-meta remote named `meta`
-   with origin's URL, so the checkout's credentials apply and a read-only `contents: read` token is enough. It fetches
-   every blob (no partial clone) and builds a new `.git/git-meta.sqlite`. If the fetch fails, vci warns and every test
-   runs. (`command: plan` runs `vci plan --fetch origin` instead, and runs nothing.)
+   with origin's URL, so the checkout's credentials apply and a read-only `contents: read` token is enough. Since vci
+   2.0 it fetches the metadata's keys, not its values (the commits of `refs/meta/main` and the tip's trees, no blob,
+   about 2 MB on a store of 6,000 entries whatever its history), builds a new `.git/git-meta.sqlite` from them, and
+   the plan then fetches, in one batch, the attestations of the units it verifies and the input manifests they
+   reference. If the fetch fails, vci warns and every test runs; a value that cannot be fetched makes its unit run.
+   (`command: plan` runs `vci plan --fetch origin` instead, and runs nothing.) The checkout's code is untouched: the
+   metadata remote is not made a promisor remote, so a later step's git command that looks up a commit the shallow
+   checkout lacks fails at once instead of downloading its history; the repository is never made shallow by the
+   fetch (`git fetch --unshallow` concerns the code only); vci configures `remote.vci-no-lazy-fetch` (no URL) as the
+   repository's promisor remote so `git gc` accepts the values left out. The [reference](REFERENCE.md)'s
+   limitations ("What a blobless metadata fetch changes in the repository") have the details, and how to go back to a
+   vci before 2.0 in a clone 2.0 fetched into.
 3. With `signing-key`: `vci ci --key` runs those units the way `vci run` does and attests every one that passed (on
    a push to main, which runs everything, every unit), then `--push` publishes them on `refs/meta/main`. The next
-   commit's CI skips each unit whose inputs did not change. See [Attesting in CI](#attesting-in-ci).
+   commit's CI skips each unit whose inputs did not change. See [Attesting in CI](#attesting-in-ci). With `oidc`
+   instead, `vci ci --oidc` does the same keylessly (see [Keyless attestation (OIDC)](#keyless-attestation-oidc)).
 
 `fetch-depth: 0` is needed for the base commit, not for the metadata: `refs/meta/main` is not a branch, so
 `actions/checkout` never fetches it.
@@ -171,22 +184,25 @@ Every input is optional.
 | `remote` | `origin` | Git remote name or URL whose `refs/meta/main` holds the attestations |
 | `audit-log` | `vci-audit.json` | JSON record of what was skipped, by whom, and what ran |
 | `working-directory` | `.` | Directory to run `vci` from |
+| `partition` | `""` | `I/N`: this job runs only partition `I` of `N` shares of what the plan runs (`vci ci --partition I/N`), so a matrix of `N` jobs covers a suite once (each unit in exactly one job, by a hash of its test id); with `signing-key` or `oidc` each job attests its share. See [Splitting a suite over jobs](#splitting-a-suite-over-jobs) |
 | `build-from-source` | `false` | `true` lets the action compile `vci` (about two minutes cold, needs a Rust toolchain) when no published binary fits; with `false` it never compiles and fails instead. For working on vci itself; see [Prebuilt binaries](#prebuilt-binaries) |
 | `prebuilt` | `true` | Deprecated alias: `false` means `build-from-source: true`, except that it compiles without trying the release binary first |
 | `token` | `github.token` | Token `gh` uses to download the release binary; without `gh`, the public release URL is used |
 | `signing-key` | `""` | Contents of an SSH private key, from an environment secret limited to the default branch. `vci ci` then attests what it runs. Its public half must be in `.vci/allowed_signers` on the base branch, under a principal listed in `policy.no_skip_refs_except` for main to skip on it. See [Attesting in CI](#attesting-in-ci) |
+| `oidc` | `false` | `true` (or `github`, `public-good`): attest like `signing-key`, keylessly, with the job's OIDC token and no secret (needs `permissions: id-token: write`). See [Keyless attestation (OIDC)](#keyless-attestation-oidc) |
 | `ttl` | `14d` | Lifetime of those attestations (at most `policy.max_ttl`) |
-| `push` | `true` | With `signing-key`: push the attestations to `remote` (needs `permissions: contents: write`); a failed push is a warning. Nothing is pushed when `vci ci` attested nothing on purpose (see [Attesting in CI](#attesting-in-ci)) |
+| `push` | `true` | With `signing-key` or `oidc`: push the attestations to `remote` (needs `permissions: contents: write`); a failed push is a warning. Nothing is pushed when `vci ci` attested nothing on purpose (see [Attesting in CI](#attesting-in-ci)) |
 
 | Output | Meaning |
 |---|---|
 | `skipped` | Number of test units skipped |
 | `run` | Number of test units that ran |
-| `attested` | Number of test units attested with `signing-key` |
+| `attested` | Number of test units attested with `signing-key` or `oidc` |
 
 ## Attesting in CI
 
-Without a key, CI only consumes attestations. With one, it leaves its own behind: a push to main runs what is not
+Without a key, CI only consumes attestations. With one (or, since vci 2.0, keylessly with the job's OIDC token: see
+[Keyless attestation (OIDC)](#keyless-attestation-oidc)), it leaves its own behind: a push to main runs what is not
 attested (the first time, everything) and attests every unit that passed and can be attested, so the next commit (on
 main or on a pull request) skips each unit whose inputs did not change. When every unit was attested, a commit that
 only changes a README runs no tests at all: the job prints `nothing to run` after fetching and verifying.
@@ -257,7 +273,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
 
   # Pushes to main: run what is not attested, attest it, publish it.
   test-main:
@@ -275,7 +291,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
         with:
           signing-key: ${{ secrets.VCI_SIGNING_KEY }}
           # ttl: 14d          # lifetime of CI's attestations (at most policy.max_ttl)
@@ -316,31 +332,137 @@ removed from `.vci/allowed_signers`. So treat it as a credential your locked dep
   stop counting the moment the line is gone, and the next push to main runs and attests everything again;
 - list no developer or agent principal in `no_skip_refs_except`.
 
+## Keyless attestation (OIDC)
+
+A job can attest without any key: with `oidc: true` (`vci ci --oidc`) it proves who it is with the OIDC token GitHub
+gives a job that has `permissions: id-token: write`, and signs through Sigstore the way `npm publish --provenance`
+and `actions/attest` do: an ephemeral key, certified for ten minutes by Fulcio from the token, and an RFC 3161
+timestamp per attestation. Nothing secret exists to leak. Trust is a policy on the job's identity (repository,
+workflow file, ref, event, environment), committed in `.vci/identities.toml` on the base branch next to
+`.vci/allowed_signers`; laptops keep SSH keys, and both kinds of attestation share the store and the policy.
+
+1. Write `.vci/identities.toml` and the Sigstore trust root (`vci init --oidc` writes both for origin's repository,
+   or by hand):
+
+   ```toml
+   [[identity]]
+   principal = "github-actions"          # the name policy lists use, like an allowed_signers principal
+   issuer = "https://token.actions.githubusercontent.com"
+   repository = "owner/name"
+   workflow = ".github/workflows/test.yml"   # the workflow file of the signing job (glob)
+   ref = "refs/heads/main"                   # glob
+   event = "push"                            # optional (glob), as are environment and runner_environment
+   environment = "vci-attest"
+   ```
+
+   ```sh
+   gh attestation trusted-root > .vci/sigstore-trusted-root.json
+   ```
+
+   Every field present must match the certificate Fulcio issued (`*` does not cross `/`, `**` does). A reusable
+   workflow of another repository is named `owner/repo/.github/workflows/x.yml`. The trust root lists the
+   certificate and timestamp authorities of GitHub's Sigstore instance and of the public-good one; GitHub renews its
+   intermediates yearly, so refresh the file (the same command) when `vci explain` names an unknown issuer.
+
+2. Name the principal in `no_skip_refs_except` as for a key, and merge both files (and `vci.toml`) to the default
+   branch.
+
+3. Attest from the main-branch job, with `id-token: write` instead of a secret:
+
+   ```yaml
+     test-main:
+       runs-on: ubuntu-latest
+       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+       environment: vci-attest      # optional: lets the identity require it
+       permissions:
+         contents: write            # vci ci --push
+         id-token: write            # the OIDC token Fulcio certifies
+       steps:
+         - uses: actions/checkout@v4
+           with:
+             fetch-depth: 0
+         - run: npm ci
+         - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+           with:
+             oidc: true
+   ```
+
+What changes against a key: no secret to store, rotate or leak (a stolen certificate is worthless ten minutes later,
+and its key never leaves the job's memory); the identity, not possession of a file, is what `no_skip_refs_except`
+trusts. What does not change: any step of the attesting job can still ask for a token and sign as that identity while
+the job runs, so the same rule holds as for a key: the identity that main skips on must only match runs on main (pin
+`ref`, `event` and, best, an `environment` restricted to the default branch). An identity for pull requests under
+another principal (not in `no_skip_refs_except`) lets pull request runs attest for each other, with no secret
+involved: `ref = "refs/pull/*/merge"`, `event = "pull_request"`. One workflow file can serve both: its pull request
+runs and its main runs are separate signers in the store (the signer id covers every claim an `[[identity]]` can
+match), so a pull request attesting a unit main already attested never replaces main's attestation. `vci ci --oidc`
+refuses to attest, like `--key`, when the job's identity signs as a principal of `no_skip_refs_except` on a ref
+`no_skip_refs` does not match.
+
+Signing uses GitHub's Sigstore instance (`fulcio.githubapp.com`, `timestamp.githubapp.com`) by default, also for
+public repositories (no public transparency log entry per test); `oidc: public-good` uses `fulcio.sigstore.dev` and
+`timestamp.sigstore.dev`. It needs `curl` (every GitHub-hosted runner has it). Verification is offline: the
+certificate must chain to the committed trust root, a trusted timestamp must place the signature inside the
+certificate's ten minutes, its repository and workflow URIs must be on the issuer's host (`github.com` for GitHub's
+issuer), and the certificate's identity must match an `[[identity]]`. Anything else (no trust root, an expired or
+unknown intermediate, a tampered envelope) makes the unit run, and `vci explain` names the check. A vci before 2.0
+cannot verify a keyless attestation, and runs its unit.
+
+## Splitting a suite over jobs
+
+A suite too slow for one runner runs as a matrix of `N` jobs with `partition: I/N` (`vci ci --partition I/N`, since
+2.0). Each job plans the same way (the plan is the same for every job), then runs only its share of what the plan
+runs: a unit belongs to the partition its test id hashes to, so the split is the same in every job and on every
+machine, and every unit runs in exactly one job. What the plan skips is skipped in every job. With `signing-key` or
+`oidc`, each job attests and pushes its own share, and the next commit's plan skips all of it:
+
+```yaml
+jobs:
+  rust:
+    strategy:
+      matrix:
+        part: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+        with:
+          project: rust
+          partition: ${{ matrix.part }}/3
+          signing-key: ${{ secrets.VCI_SIGNING_KEY }}
+```
+
+A job that cannot list a project (its toolchain is missing, a transient `cargo metadata` failure) runs that project
+whole, with a `::warning`: a job cannot know whether another job listed it and ran only its share, so running it
+whole is what keeps every unit running in some job (it may then run in more than one). Partitions balance the number
+of units, not their durations; a cargo unit is a whole test target, which cannot be split further. The audit log's
+`partition` names the job's share.
+
 ## Pinning
 
 The action is the verifier, so choose how far it may move:
 
 | Reference | Moves? | Use when |
 |---|---|---|
-| `@v1` | only to tested 1.x releases | the default |
-| `@v1.x.y` (after 1.4.0) | never | you want a specific release |
-| `@<full commit SHA>` | never | strictest pinning; it must be the commit of a release (the one `v1` points to, see below) |
+| `@v2` | only to tested 2.x releases | the default |
+| `@vX.Y.Z` (1.4.1 and later) | never | you want a specific release |
+| `@<full commit SHA>` | never | strictest pinning; it must be the commit of a release (the one `v2` points to, see below) |
+| `@v1` | only to tested 1.x releases (1.9.2, the last) | you stay on 1.x |
 
-A SHA pin must be the commit that records its release in `release/manifest.txt` (its message is "Record release
-vX.Y.Z for the action"). That is the commit `v1` points to after each release, and from the first release after 1.4.0
-on, the one its version tag and release page name. Any other commit of the repository has no published binary, so the
-action refuses it with an error instead of compiling. To find the SHA `v1` points to:
+A SHA pin must be the commit that records its release in `release/manifest.txt` (its message is "Record release vX.Y.Z
+for the action"). That is the commit `v2` points to after each 2.x release, and from the first release after 1.4.0 on,
+the one its version tag and release page name. Any other commit of the repository has no published binary, so the
+action refuses it with an error instead of compiling. To find the SHA `v2` points to:
 
 ```sh
-git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v1
+git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner refs/tags/v2
 # or
-gh api repos/PandelisZ/cryptographically-verifiable-ci-runner/git/ref/tags/v1 --jq .object.sha
+gh api repos/PandelisZ/cryptographically-verifiable-ci-runner/git/ref/tags/v2 --jq .object.sha
 ```
 
 Never reference a branch: the newest commits of `main` are usually not released, and the action fails on them. The
 version tags `v1.0.0` to `v1.4.0` (and their release-page SHAs) point at the commit before their release was recorded
 in `release/manifest.txt`, so they run the action as it was then, which compiles `vci` (about two minutes) instead of
-downloading it. Use `@v1`, or the SHA it points to, instead.
+downloading it. Use `@v2`, or the SHA it points to, instead.
 
 ## Prebuilt binaries
 
@@ -359,12 +481,12 @@ a commit that is not a release, it shows:
 
 ```text
 vci: this commit of the action (<ref>, sources <fingerprint>) has no published binary (release/manifest.txt records
-v1.4.0 built from <fingerprint>). Use a release: uses: PandelisZ/cryptographically-verifiable-ci-runner@v1, or the
-full commit SHA v1 points to (git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
-refs/tags/v1). To compile vci in this job anyway, set build-from-source: true.
+v2.0.0 built from <fingerprint>). Use a release: uses: PandelisZ/cryptographically-verifiable-ci-runner@v2, or the
+full commit SHA v2 points to (git ls-remote https://github.com/PandelisZ/cryptographically-verifiable-ci-runner
+refs/tags/v2). To compile vci in this job anyway, set build-from-source: true.
 ```
 
-Change the `uses:` line to `@v1` or that SHA (see [Pinning](#pinning)). The other errors are in
+Change the `uses:` line to `@v2` or that SHA (see [Pinning](#pinning)). The other errors are in
 [Troubleshooting](#troubleshooting).
 
 It downloads the public release URL with `curl` (one request, no API call), or `wget` without `curl`, and only when
@@ -393,8 +515,10 @@ request. The diagram is on the [docs site](https://pandelisz.github.io/cryptogra
   own key skip there (see [Attesting in CI](#attesting-in-ci)); list no developer or agent principal in it.
 - **Use `pull_request`, not `pull_request_target`.** Fork pull requests cannot push attestations to your repository,
   so every test runs for them.
-- **Revoke a signer** by removing their line from `.vci/allowed_signers` on the default branch. Their attestations
-  stop being accepted at once.
+- **Revoke a signer** by removing their line from `.vci/allowed_signers` (or a CI identity's `[[identity]]` from
+  `.vci/identities.toml`) on the default branch. Their attestations stop being accepted at once.
+- **Grant `id-token: write` only to the jobs that attest with `oidc`**, and pin the identity main skips on to main
+  (`ref`, `event`, best an `environment`): any step of a job with that permission can sign as its identity.
 - **Without the action, always pass `--remote`** to `vci fetch`. Without it, a clone with no git-meta remote takes the
   URL from `.git-meta` in the checked-out commit, which a pull request controls. vci refuses remote-helper URLs such as
   `fd::3`, and a foreign remote can only make tests run, but the checkout should not choose where attestations come
@@ -422,16 +546,16 @@ URL as `remote` and make sure the job can read it (and, to push CI's attestation
 ## Without the action
 
 ```yaml
-      # The release binary that v1 records in release/manifest.txt, checked
+      # The release binary that v2 records in release/manifest.txt, checked
       # against that checksum: about a second, nothing is compiled. For a
-      # strict pin, check out the commit SHA v1 points to instead of v1.
+      # strict pin, check out the commit SHA v2 points to instead of v2.
       - name: Install vci
         run: |
           git clone --quiet \
             https://github.com/PandelisZ/cryptographically-verifiable-ci-runner \
             "$RUNNER_TEMP/vci"
           cd "$RUNNER_TEMP/vci"
-          git checkout --quiet --detach v1
+          git checkout --quiet --detach v2
           asset=vci-x86_64-unknown-linux-musl.tar.gz  # Linux x86_64; release/manifest.txt lists the others
           tag=$(sed -n 's/^tag=//p' release/manifest.txt)
           curl -fsSL --retry 3 -o "$asset" \
@@ -488,8 +612,8 @@ Run `vci explain <file> --base-ref origin/main` locally for the full reason a un
 | Every Rails test is refused on a Mac with `/etc/resolv.conf`, `native:FFI ffi_lib(["vips.42"])` or `config/master.key` | An older collector (`resolv.conf`, read when Capybara loads `net/http`; `ffi_lib`, which collector 0.4.0 records instead of refusing, so `image_processing`/`ruby-vips` with Homebrew libvips is attested), or the generator's credentials: see "What the Rails adapter records" in [the reference](REFERENCE.md#what-the-rails-adapter-records) |
 | Every Rails test is refused on the runner with `ruby:read-outside-bundle:stat .../vendor/bundle/ruby/3.4.0` | Collector 0.4.1, which took the bundle `bundler-cache` installs inside the repository for gems outside the bundle. Collector 0.4.2 attests these files; its new version makes existing Rails attestations run once more |
 | Minitest files never run with `runner = "rspec"` | An explicit runner leaves the other runner's files to you: `vci plan`/`ci` warn and the audit log lists it under `warnings` |
-| `vci: this commit of the action (...) has no published binary` | The action is pinned to a branch or to a commit that is not a release. Use `@v1` or the SHA `v1` points to (see [Pinning](#pinning)); only vci's own development needs `build-from-source: true` |
-| The action takes about two minutes and its log shows `Build vci from source` | It is pinned to `v1.0.0` to `v1.4.0` or their SHAs, which predate releases recorded on their own commit (see [Pinning](#pinning)): use `@v1` |
+| `vci: this commit of the action (...) has no published binary` | The action is pinned to a branch or to a commit that is not a release. Use `@v2` or the SHA `v2` points to (see [Pinning](#pinning)); only vci's own development needs `build-from-source: true` |
+| The action takes about two minutes and its log shows `Build vci from source` | It is pinned to `v1.0.0` to `v1.4.0` or their SHAs, which predate releases recorded on their own commit (see [Pinning](#pinning)): use `@v2` |
 | `vci: release ... has no binary for Windows-X64` (or another platform) | Releases are built for Linux and macOS, x86_64 and arm64 only: run the job on one of those |
 | `vci: could not download vci-....tar.gz of release ...` | A network failure (re-run the job), or the runner cannot reach github.com (a self-hosted runner behind a proxy). The message lists what was tried: `gh` with the `token` input, then `curl` or `wget` on the public release URL |
 | `vci: cannot download ...: this job has none of gh, curl or wget` | A container image without them: install `curl` in the image |
@@ -505,7 +629,8 @@ scripts/publish-release.sh v1.5.0             # after it finishes, from an up-to
 
 Do not push the version tag yourself. `publish-release.sh` records the draft's tag, source fingerprint and checksums
 in `release/manifest.txt`, commits that, checks the commit the way the action will, pushes it to main, and only then
-publishes the draft, which creates `v1.5.0` on that commit; it moves `v1` there too. Every version tag, its
-release-page SHA and `@v1` therefore point at a commit whose `release/manifest.txt` matches its own binaries. A tag
-pushed before the build (as up to 1.4.0) carries the previous release's manifest, and the action refuses it. Any
-later change under `crates/`, `Cargo.toml` or `Cargo.lock` has no published binary until the next release.
+publishes the draft, which creates `v1.5.0` on that commit; it moves the major tag (`v1`, `v2`) there too. Every
+version tag, its release-page SHA and the major tag therefore point at a commit whose `release/manifest.txt` matches
+its own binaries. A tag pushed before the build (as up to 1.4.0) carries the previous release's manifest, and the
+action refuses it. Any later change under `crates/`, `Cargo.toml` or `Cargo.lock` has no published binary until the
+next release.

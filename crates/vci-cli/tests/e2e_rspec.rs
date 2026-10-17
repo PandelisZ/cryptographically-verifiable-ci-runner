@@ -11,7 +11,7 @@
 //! no such Ruby is found or `bundle check` fails for the fixture (the gems are
 //! not installed for it: `bundle install` in `fixtures/rails-rspec-abcd`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -102,6 +102,7 @@ const SCRUB: &[&str] = &[
     "VCI_SIGNING_KEY",
     "VCI_OUT",
     "VCI_RUBY",
+    "VCI_RAILS_PER_FILE",
     "VCI_JOBS",
     "APP_MODE",
     "RUBYOPT",
@@ -385,6 +386,12 @@ end"##;
             .env("NO_COLOR", "1");
         for k in SCRUB {
             cmd.env_remove(k);
+        }
+        // `vci run` of several files runs them in batch mode, as it does
+        // by default; VCI_E2E_RAILS_PER_FILE=1 runs every test one process
+        // per file instead (to compare).
+        if std::env::var_os("VCI_E2E_RAILS_PER_FILE").is_some_and(|v| v == "1") {
+            cmd.env("VCI_RAILS_PER_FILE", "1");
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -1601,12 +1608,16 @@ fn rails_minitest_and_rspec_projects_in_one_repository() {
     const RC: &str = "rs/spec/views/c_spec.rb";
     let out = w.run(&work, &[MB, MC, RB, RC], &w.trusted);
     assert!(out.contains("4 attested, 0 not attested"), "{out}");
+    // Two files of each project: one batch each (one process per file
+    // with VCI_E2E_RAILS_PER_FILE=1).
     assert!(
-        out.contains("bin/rails test test/models/b_test.rb"),
+        out.contains("bin/rails test <2 files> --seed 0, booted once")
+            || out.contains("bin/rails test test/models/b_test.rb"),
         "{out}"
     );
     assert!(
-        out.contains("--options .rspec spec/models/b_spec.rb"),
+        out.contains("rspec --options .rspec <2 files>, booted once")
+            || out.contains("--options .rspec spec/models/b_spec.rb"),
         "{out}"
     );
     let p = w.plan(&work, "main");
@@ -2042,4 +2053,146 @@ end
         "spec/lib/env_spec.rb",
         &["spec/lib/env_spec.rb"],
     );
+}
+
+/// The (path, kind) manifest entries (test and global) of `id`'s stored
+/// attestation.
+fn entries_of(work: &Path, id: &str) -> BTreeSet<(String, String)> {
+    let stored = AttestStore::new(&store_for(work)).list(Some(id)).unwrap();
+    let env: Value = serde_json::from_slice(&stored.last().unwrap().bytes).unwrap();
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(env["payload"].as_str().unwrap())
+        .unwrap();
+    let st: Value = serde_json::from_slice(&payload).unwrap();
+    let st = store_common::inline_statement_manifest(&store_for(work), st);
+    let mut out = BTreeSet::new();
+    for m in ["manifest", "globalManifest"] {
+        for e in st["predicate"][m]["entries"].as_array().unwrap() {
+            out.insert((
+                e["path"].as_str().unwrap().to_owned(),
+                e["kind"].as_str().unwrap().to_owned(),
+            ));
+        }
+    }
+    out
+}
+
+/// What `vci run` said of each file: `None` attested, else why not.
+fn outcomes(stderr: &str) -> BTreeMap<String, Option<String>> {
+    let mut out = BTreeMap::new();
+    for l in stderr.lines() {
+        if let Some(f) = l.strip_prefix("vci: attested ") {
+            out.insert(f.split_whitespace().next().unwrap().to_owned(), None);
+        } else if let Some(rest) = l.strip_prefix("vci: not attesting ")
+            && let Some((f, why)) = rest.split_once(": ")
+        {
+            out.insert(f.to_owned(), Some(why.to_owned()));
+        }
+    }
+    out
+}
+
+/// Batch mode for RSpec: `vci run` of several spec files starts one `rspec`
+/// process, which boots once per helper the files require first
+/// (`rails_helper`, `spec_helper`) and runs each file in a process of its
+/// own forked from that boot. Shared examples one file defines at its top
+/// level are not there for another file, whose examples cannot find them,
+/// as when it runs on its own. Compared with one process per file (in
+/// another copy of the repository): the same files are attested and
+/// refused for the same reasons, with the same manifests; `vci plan` skips
+/// the attested ones afterwards.
+#[test]
+fn rspec_batch_mode_gives_what_one_process_per_file_gives() {
+    let Some(alone) = World::new() else { return };
+    let Some(w) = World::new() else { return };
+    const F: &str = "spec/batch/f_spec.rb";
+    const G: &str = "spec/batch/g_spec.rb";
+    const PROVIDER: &str = "spec/batch/a_provider_spec.rb";
+    const CONSUMER: &str = "spec/batch/b_consumer_spec.rb";
+    for x in [&alone, &w] {
+        x.put(
+            F,
+            "require \"rails_helper\"\n\nRSpec.describe \"fails\" do\n  it \"fails\" do\n    expect(1).to eq(2)\n  end\nend\n",
+        );
+        x.put(
+            G,
+            "require \"spec_helper\"\n\nRSpec.describe \"pending\" do\n  it \"is pending\" do\n    pending \"not yet\"\n    expect(1).to eq(2)\n  end\n\n  it \"passes\" do\n    expect(1).to eq(1)\n  end\nend\n",
+        );
+        x.put(
+            PROVIDER,
+            "require \"rails_helper\"\n\nRSpec.shared_examples \"a positive number\" do\n  it { expect(subject).to be > 0 }\nend\n\nRSpec.describe \"provider\" do\n  subject { 1 }\n\n  it_behaves_like \"a positive number\"\nend\n",
+        );
+        x.put(
+            CONSUMER,
+            "require \"rails_helper\"\n\nRSpec.describe \"consumer\" do\n  subject { 2 }\n\n  it_behaves_like \"a positive number\"\nend\n",
+        );
+        x.git(&x.work, &["add", "-A"]);
+        x.git(&x.work, &["commit", "-q", "-m", "batch specs"]);
+    }
+    let mut files: Vec<&str> = ALL.to_vec();
+    files.extend([F, G, PROVIDER, CONSUMER]);
+    let run = |x: &World, env: &[(&str, &str)]| {
+        let key = x.trusted.to_str().unwrap().to_owned();
+        let mut args = vec!["run"];
+        args.extend(files.iter().copied());
+        args.extend(["--key", key.as_str()]);
+        let out = x.vci_env(&x.work, &args, env);
+        (
+            out.status.code(),
+            strip_ansi(&String::from_utf8_lossy(&out.stderr)),
+        )
+    };
+    let (code_alone, err_alone) = run(&alone, &[("VCI_RAILS_PER_FILE", "1")]);
+    assert!(!err_alone.contains("booted once"), "{err_alone}");
+    // Batch mode, whatever the harness's default (`VCI_E2E_RAILS_PER_FILE`).
+    let (code, err) = run(&w, &[("VCI_RAILS_PER_FILE", "0")]);
+    assert!(
+        err.contains(
+            "vci: rspec --options .rspec <8 files>, booted once, one process per file (exit 1)"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("run again one process per file"), "{err}");
+    assert_ne!(code, Some(0), "F fails the run");
+    assert_eq!(code, code_alone);
+    let (want, got) = (outcomes(&err_alone), outcomes(&err));
+    assert_eq!(want.len(), files.len(), "{err_alone}");
+    assert_eq!(
+        got, want,
+        "batch:\n{err}\none process per file:\n{err_alone}"
+    );
+    assert!(want[F].as_deref().unwrap().contains("result failed"));
+    assert!(want[G].as_deref().unwrap().contains("1 skipped"));
+    assert!(
+        want[CONSUMER]
+            .as_deref()
+            .unwrap()
+            .contains("rspec:error-outside-examples"),
+        "{want:?}"
+    );
+    let attested: Vec<&str> = files
+        .iter()
+        .copied()
+        .filter(|f| want[*f].is_none())
+        .collect();
+    assert_eq!(attested.len(), ALL.len() + 1, "{want:?}");
+    for id in &attested {
+        let own = entries_of(&alone.work, id);
+        let batch = entries_of(&w.work, id);
+        assert_eq!(
+            batch.difference(&own).collect::<Vec<_>>(),
+            Vec::<&(String, String)>::new(),
+            "{id}: entries only the batch run has"
+        );
+        assert_eq!(
+            own.difference(&batch).collect::<Vec<_>>(),
+            Vec::<&(String, String)>::new(),
+            "{id}: entries only its own run has"
+        );
+    }
+    let p = w.plan(&w.work, "main");
+    let mut skip = set(ALL);
+    skip.insert(PROVIDER.to_owned());
+    assert_eq!(p.skip, skip, "{p:?}");
+    assert_eq!(p.run, set(&[F, G, CONSUMER]), "{p:?}");
 }

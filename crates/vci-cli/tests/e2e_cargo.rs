@@ -2371,6 +2371,15 @@ fn cargo_prune_superseded_and_rewrite_history() {
     w.run(&work, &[B], &w.trusted);
     w.git(&work, &["push", "-q", "origin", "feature"]);
     w.vci_ok(&work, &["push", "--remote", "origin"]);
+    // An old clone that fetches the first publication (since vci 2.0 a
+    // clone's first fetch takes the tip commit only) and the second one.
+    let old = w.base.join("old-clone");
+    w.git(
+        &w.base,
+        &["clone", "-q", w.remote.to_str().unwrap(), "old-clone"],
+    );
+    w.git(&old, &["checkout", "-q", "feature"]);
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
     w.put(
         "b/tests/data/b.json",
         "{\"greeting\": \"hello\", \"v\": 2}\n",
@@ -2394,14 +2403,10 @@ fn cargo_prune_superseded_and_rewrite_history() {
     );
     w.git(&work, &["push", "-q", "origin", "feature"]);
     // The second publication (the new attestation and the deletion), then
-    // an old clone holding the history before the rewrite.
+    // the old clone holds the history before the rewrite.
     w.vci_ok(&work, &["push", "--remote", "origin"]);
-    let old = w.base.join("old-clone");
-    w.git(
-        &w.base,
-        &["clone", "-q", w.remote.to_str().unwrap(), "old-clone"],
-    );
-    w.git(&old, &["checkout", "-q", "feature"]);
+    w.git(&old, &["fetch", "-q", "origin"]);
+    w.git(&old, &["merge", "-q", "--ff-only", "origin/feature"]);
     w.vci_ok(&old, &["fetch", "--remote", "origin"]);
     // A clone's fetched metadata is its tracking ref; the bare remote holds
     // refs/meta/main itself.
@@ -2439,6 +2444,217 @@ fn cargo_prune_superseded_and_rewrite_history() {
     w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
     let p = w.plan(&fresh, "main");
     assert!(p.skip.contains(B) && p.skip.contains(C), "{p:?}");
+}
+
+// ---- lazy metadata (vci 2.0) ------------------------------------------------
+
+/// The blob ids of `test_id`'s stored attestations and of the manifests
+/// they reference, as the remote's refs/meta/main holds them.
+fn value_blobs(w: &World, work: &Path, test_id: &str) -> BTreeSet<String> {
+    let repo = store_for(work);
+    let st = AttestStore::new(&repo);
+    let at = |path: String| w.git(&w.remote, &["rev-parse", &format!("refs/meta/main:{path}")]);
+    let mut out = BTreeSet::new();
+    for (e, statement) in raw_statements(work, test_id) {
+        let target = git_meta_lib::Target::parse(&e.target).unwrap();
+        out.insert(at(
+            git_meta_lib::tree_paths::tree_path(&target, &e.key).unwrap()
+        ));
+        if let Some(root) = statement["predicate"]["manifestRef"].as_str() {
+            out.insert(at(git_meta_lib::tree_paths::tree_path(
+                &git_meta_lib::Target::project(),
+                &vci_git::manifest_key(root),
+            )
+            .unwrap()));
+        }
+    }
+    assert!(!st.list(Some(test_id)).unwrap().is_empty());
+    out
+}
+
+/// Whether `dir`'s object database holds `oid` (never fetching it).
+fn has_object(dir: &Path, oid: &str) -> bool {
+    Command::new("git")
+        .current_dir(dir)
+        .args(["cat-file", "-e", oid])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// A CI clone of a remote that serves partial clones (as GitHub does):
+/// `vci fetch` downloads the metadata's keys, a plan fetches the values it
+/// reads (and only those), the plan is the same as with every value, a push
+/// publishes without fetching the others, and values that cannot be fetched
+/// (offline) make their units run.
+#[test]
+fn cargo_blobless_clone_fetches_only_what_the_plan_reads() {
+    let Some(w) = World::new() else { return };
+    w.git(&w.remote, &["config", "uploadpack.allowFilter", "true"]);
+    let work = w.work.clone();
+    w.run(&work, &[B, C], &w.trusted);
+    let before = w.plan(&work, "main");
+    assert_eq!(before.skip, set(&[B, C]));
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let (b_blobs, c_blobs) = (value_blobs(&w, &work, B), value_blobs(&w, &work, C));
+
+    // `--no-local`: a clone of a local path would hard-link every object of
+    // the remote, metadata included.
+    let clone = |name: &str| {
+        let dir = w.base.join(name);
+        w.git(
+            &w.base,
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                w.remote.to_str().unwrap(),
+                dir.to_str().unwrap(),
+            ],
+        );
+        w.git(&dir, &["checkout", "-q", "feature"]);
+        dir
+    };
+    let fresh = clone("fresh");
+    let out = w.vci(&fresh, &["fetch", "--remote", "origin"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("(2 attestations stored locally)"),
+        "rows are counted without reading values: {stderr}"
+    );
+    assert_eq!(
+        w.git(&fresh, &["rev-parse", "--is-shallow-repository"]),
+        "false",
+        "a metadata fetch never makes the repository shallow"
+    );
+    for oid in b_blobs.iter().chain(&c_blobs) {
+        assert!(!has_object(&fresh, oid), "{oid} downloaded by the fetch");
+    }
+
+    // Explaining b reads b's values only.
+    let text = w.explain(&fresh, B, "main");
+    assert!(text.contains("SKIP"), "{text}");
+    for oid in &b_blobs {
+        assert!(has_object(&fresh, oid), "b's {oid} not fetched");
+    }
+    for oid in c_blobs.difference(&b_blobs) {
+        assert!(!has_object(&fresh, oid), "c's {oid} fetched for b");
+    }
+    // The whole plan reads (and fetches) the rest: the same plan as with
+    // every value.
+    assert_eq!(w.plan(&fresh, "main"), before);
+    for oid in &c_blobs {
+        assert!(has_object(&fresh, oid), "c's {oid} not fetched");
+    }
+
+    // Attest and publish from the blobless clone; the first clone reads it.
+    w.run(&fresh, &[D], &w.trusted);
+    w.vci_ok(&fresh, &["push", "--remote", "origin"]);
+    w.vci_ok(&work, &["fetch", "--remote", "origin"]);
+    assert_eq!(w.plan(&work, "main").skip, set(&[B, C, D]));
+
+    // Offline: values that cannot be fetched make their units run (never an
+    // error), and explain says why.
+    let offline = clone("offline");
+    w.vci_ok(&offline, &["fetch", "--remote", "origin"]);
+    w.git(
+        &offline,
+        &["config", "remote.meta.url", "/nonexistent/remote.git"],
+    );
+    let out = w.vci(
+        &offline,
+        &["plan", "--base-ref", "main", "--format", "json"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("could not fetch"), "{stderr}");
+    let p = Plan::from_json(&serde_json::from_slice(&out.stdout).unwrap());
+    assert!(p.skip.is_empty(), "{p:?}");
+    let text = w.explain(&offline, B, "main");
+    assert!(
+        text.contains("value not fetched: run `vci fetch` online"),
+        "{text}"
+    );
+}
+
+/// Supersession in a blobless clone: the earlier attestation (fetched for
+/// the run) is deleted and so is the manifest only it referenced, although
+/// other units' attestations were never fetched.
+#[test]
+fn cargo_supersession_in_a_blobless_clone_removes_the_orphan_manifest() {
+    let Some(w) = World::new() else { return };
+    w.git(&w.remote, &["config", "uploadpack.allowFilter", "true"]);
+    let work = w.work.clone();
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    w.run(&work, &[B, C], &w.trusted);
+    // An attestation of a unit no project lists any more: no plan or run
+    // reads (or fetches) it.
+    AttestStore::new(&store_for(&work))
+        .put(
+            "gone#lib",
+            "0123456789abcdef",
+            &"ab".repeat(32),
+            br#"{"payloadType":"application/vnd.in-toto+json","payload":"e30=","signatures":[]}"#,
+        )
+        .unwrap();
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let old_root = raw_statements(&work, B)[0].1["predicate"]["inputRoot"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let fresh = w.base.join("fresh");
+    w.git(
+        &w.base,
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            w.remote.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    w.git(&fresh, &["checkout", "-q", "feature"]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    std::fs::write(
+        fresh.join("b/tests/data/b.json"),
+        "{\"greeting\": \"hello\", \"v\": 3}\n",
+    )
+    .unwrap();
+    w.git(&fresh, &["commit", "-qam", "b's data changes again"]);
+    let err = w.run(&fresh, &[B], &w.trusted);
+    assert!(
+        err.contains("vci: removed 1 superseded attestation(s)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("vci: removed 1 input manifest(s) no attestation references any more"),
+        "{err}"
+    );
+    let store_repo = store_for(&fresh);
+    let store = AttestStore::new(&store_repo);
+    let stored = store.manifests().unwrap();
+    assert!(!stored.contains(&old_root), "{stored:?}");
+    assert!(
+        store.list(Some("gone#lib")).unwrap()[0].not_fetched(),
+        "an attestation that could not reference it is not fetched"
+    );
+    w.vci_ok(&fresh, &["push", "--remote", "origin"]);
+    w.vci_ok(&work, &["fetch", "--remote", "origin"]);
+    assert!(
+        !AttestStore::new(&store_for(&work))
+            .manifests()
+            .unwrap()
+            .contains(&old_root)
+    );
 }
 
 // ---- manifests by reference (vci 1.9.0) -----------------------------------
@@ -2971,9 +3187,9 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Fetch `dir` from `remote` (incremental when it has fetched before) and,
-/// first, a copy of it without the `marker` (git-meta's full merge). Returns
-/// the fetch's stderr and both stores.
+/// Fetch `dir` from `remote` (from the trees' paths) and, first, a copy of it
+/// without the `marker` with git-meta's full merge (`VCI_MATERIALIZE=full`).
+/// Returns the fetch's stderr and both stores.
 fn fetch_both(
     w: &World,
     dir: &Path,
@@ -2990,7 +3206,7 @@ fn fetch_both(
     let b = w.vci_env(
         &full,
         &["fetch", "--remote", remote],
-        &[("VCI_TIMING", "1")],
+        &[("VCI_TIMING", "1"), ("VCI_MATERIALIZE", "full")],
     );
     assert!(b.status.success());
     let eb = String::from_utf8_lossy(&b.stderr);
@@ -3006,8 +3222,9 @@ fn fetch_both(
 /// A clone that fetched before merges each later tip by what changed, with
 /// the store git-meta's full merge gives (values, deletion records with the
 /// tree's time and email, local ref), also on the fetch after one that
-/// deleted values; after the remote's history is rewritten it merges in
-/// full once and incrementally again from the next tip on.
+/// deleted values; after the remote's history is rewritten it merges the
+/// two histories from the trees' paths (git-meta's merge without a common
+/// ancestor), and fast-forwards again from the next tip on.
 #[test]
 fn cargo_incremental_fetch_matches_a_full_merge() {
     let Some(w) = World::new() else { return };
@@ -3018,13 +3235,10 @@ fn cargo_incremental_fetch_matches_a_full_merge() {
     w.vci_ok(&work, &["push", "--remote", "origin"]);
     let b = clone_on(&w, "b", "feature");
     w.vci_ok(&b, &["fetch", "--remote", "origin"]);
-    let step = |tag: &str, incremental: bool| {
+    let step = |tag: &str, merged: bool| {
         let (e, inc, full, _) = fetch_both(&w, &b, tag, "origin", MAIN_MARKER);
-        assert_eq!(
-            e.contains("materialize (incremental"),
-            incremental,
-            "{tag}: {e}"
-        );
+        assert!(e.contains("materialize (from paths"), "{tag}: {e}");
+        assert_eq!(e.contains("from paths, a merge"), merged, "{tag}: {e}");
         assert_eq!(inc, full, "{tag}");
     };
 
@@ -3038,19 +3252,19 @@ fn cargo_incremental_fetch_matches_a_full_merge() {
     let err = w.run(&work, &[B], &w.trusted);
     assert!(err.contains("removed 1 superseded"), "{err}");
     w.vci_ok(&work, &["push", "--remote", "origin"]);
-    step("1", true);
+    step("1", false);
     // An unrelated attestation: the deletion records the previous merge
     // stamped are the tree's again, as after git-meta's merge.
     w.run(&work, &[D], &w.trusted);
     w.vci_ok(&work, &["push", "--remote", "origin"]);
-    step("2", true);
+    step("2", false);
     w.run(&work, &[A_LIB], &w.trusted);
     w.vci_ok(&work, &["push", "--remote", "origin"]);
-    step("3", true);
-    // The remote's history rewritten: merged in full, and the local ref is
-    // the new tip (nothing local is missing from it).
+    step("3", false);
+    // The remote's history rewritten: a merge, and the local ref is the new
+    // tip (nothing local is missing from it).
     w.vci_ok(&work, &["push", "--remote", "origin", "--rewrite-history"]);
-    step("4", false);
+    step("4", true);
     assert_eq!(
         w.git(&b, &["rev-parse", "refs/meta/local/main"]),
         w.git(&b, &["rev-parse", "refs/meta/remotes/main"])
@@ -3063,7 +3277,7 @@ fn cargo_incremental_fetch_matches_a_full_merge() {
     );
     w.run(&work, &[A_DOC], &w.trusted);
     w.vci_ok(&work, &["push", "--remote", "origin"]);
-    step("5", true);
+    step("5", false);
     w.git(&b, &["fetch", "-q", "origin"]);
     w.git(&b, &["merge", "-q", "--ff-only", "origin/feature"]);
     let p = w.plan(&b, "main");
@@ -3113,7 +3327,7 @@ fn cargo_side_remote_fetch_is_not_merged_into_the_local_ref() {
     w.run(&s, &[C], &w.trusted);
     w.vci_ok(&s, &["push", "--remote", &side_url]);
     let (e, inc, full, full_dir) = fetch_both(&w, &b, "side", &side_url, &marker);
-    assert!(!e.contains("materialize (incremental"), "{e}");
+    assert!(!e.contains("materialize (from paths"), "{e}");
     assert_eq!(inc, full);
     assert_eq!(inc.2, local, "the local ref stays");
     assert!(w.plan(&b, "main").skip.contains(C));
@@ -3278,4 +3492,269 @@ fn cargo_prune_keeps_the_manifest_of_an_unparsable_attestation() {
     let out = w.vci(&work, &["prune", "--dry-run"]);
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("no input manifest is removed"), "{text}");
+}
+
+/// The partition (1-based) of `count` that `vci ci --partition` gives a
+/// unit: the first 8 bytes of its storage key (BLAKE3 of the test id),
+/// big-endian, modulo `count`, plus one.
+fn partition_of(test_id: &str, count: u64) -> u32 {
+    let key = vci_core::test_key(test_id);
+    (u64::from_str_radix(&key[..16], 16).unwrap() % count) as u32 + 1
+}
+
+/// The test ids of an audit log array of `{testId}` objects.
+fn ids_of(v: &Value) -> BTreeSet<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["testId"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Three CI jobs, `vci ci --partition I/3 --key --push` from three clones at
+/// once: each builds and runs (and attests) the units its partition owns,
+/// together exactly the plan's units; afterwards a plan skips them all. A
+/// project whose units cannot be listed runs whole in every partition that
+/// cannot list it, also when another partition listed it.
+#[test]
+fn cargo_ci_partitions_cover_every_unit_once() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    let all = set(&[A_LIB, A_DOC, B, C, D]);
+    assert_eq!(w.plan(&work, "main").run, all);
+    let clone = |name: &str| {
+        let dir = w.base.join(name);
+        w.git(
+            &w.base,
+            &[
+                "clone",
+                "-q",
+                w.remote.to_str().unwrap(),
+                dir.to_str().unwrap(),
+            ],
+        );
+        w.git(&dir, &["checkout", "-q", "feature"]);
+        dir
+    };
+    let clones: Vec<PathBuf> = (1..=3).map(|i| clone(&format!("job{i}"))).collect();
+    let trusted = w.trusted.to_str().unwrap().to_owned();
+    let outs: Vec<(Output, Value)> = std::thread::scope(|s| {
+        let handles: Vec<_> = clones
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| {
+                let (w, trusted) = (&w, &trusted);
+                s.spawn(move || {
+                    let part = format!("{}/3", i + 1);
+                    let audit = w.base.join(format!("audit-{}.json", i + 1));
+                    let out = w.vci(
+                        dir,
+                        &[
+                            "ci",
+                            "--fetch",
+                            "origin",
+                            "--base-ref",
+                            "main",
+                            "--partition",
+                            &part,
+                            "--key",
+                            trusted,
+                            "--push",
+                            "--remote",
+                            "origin",
+                            "--audit-log",
+                            audit.to_str().unwrap(),
+                        ],
+                    );
+                    let log: Value =
+                        serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+                    (out, log)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut union = BTreeSet::new();
+    for (i, (out, log)) in outs.iter().enumerate() {
+        let index = i as u32 + 1;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{index}/3: {stderr}");
+        let mine: BTreeSet<String> = all
+            .iter()
+            .filter(|id| partition_of(id, 3) == index)
+            .cloned()
+            .collect();
+        // With this fixture every partition has a unit.
+        assert!(!mine.is_empty(), "{index}/3");
+        assert!(
+            stdout.contains(&format!(
+                "partition {index}/3: {} of 5 units to run",
+                mine.len()
+            )),
+            "{stdout}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "running {} of 5 test file(s) (partition {index}/3, attesting)",
+                mine.len()
+            )),
+            "{stderr}"
+        );
+        // Only this partition's units are tested (one `cargo test` each).
+        for id in &all {
+            let (dir, target) = id.split_once('#').unwrap();
+            let flag = match target {
+                "lib" => "--lib".to_owned(),
+                "doc" => "--doc".to_owned(),
+                t => format!("--test {}", t.trim_start_matches("test:")),
+            };
+            let line = format!("--manifest-path {dir}/Cargo.toml {flag}");
+            assert_eq!(
+                stderr.contains(&line),
+                mine.contains(id),
+                "{index}/3, {id} ({line}): {stderr}"
+            );
+        }
+        assert_eq!(ids_of(&log["attested"]), mine, "{index}/3 attested");
+        assert_eq!(ids_of(&log["ran"]), mine, "{index}/3 ran");
+        assert_eq!(log["partition"]["units"], mine.len());
+        assert_eq!(log["partition"]["total"], 5);
+        assert_eq!(log["pushed"], true, "{index}/3: {stderr}");
+        assert!(union.is_disjoint(&mine), "{index}/3 overlaps");
+        union.extend(mine);
+    }
+    assert_eq!(union, all, "every unit in exactly one partition");
+
+    let fresh = clone("fresh");
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&fresh, "main");
+    assert_eq!(p.skip, all, "{p:?}");
+    assert!(p.run.is_empty(), "{p:?}");
+
+    // cargo cannot list the units in any job: every partition runs
+    // everything (here it fails: cargo is missing) and says so in a
+    // `::warning`; none can know whether another listed them.
+    for index in 1..=3u32 {
+        let part = format!("{index}/3");
+        let audit = w.base.join("audit-unlisted.json");
+        let out = w.vci_env(
+            &fresh,
+            &[
+                "ci",
+                "--base-ref",
+                "main",
+                "--partition",
+                &part,
+                "--audit-log",
+                audit.to_str().unwrap(),
+            ],
+            &[("VCI_CARGO", "/nonexistent/cargo")],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains(&format!("partition {part}: 0 of 0 units to run")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "::warning title=vci::partition {part}: the project runs everything and its test files could not be listed: it runs whole in this partition"
+            )),
+            "{stdout}"
+        );
+        assert!(stderr.contains("vci ci: running all tests"), "{stderr}");
+        assert!(!stderr.contains("not running"), "{stderr}");
+        // (cargo missing is an error before any audit log is written, as
+        // without `--partition`.)
+        assert_ne!(out.status.code(), Some(0), "{stderr}");
+    }
+
+    // Listing fails in some jobs only (a transient `cargo metadata`
+    // failure): partition 1 lists and runs its share; partitions 2 and 3
+    // cannot list and run the whole project, so the units hashed to them
+    // still run (and pass).
+    let Some(real_cargo) = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join("cargo"))
+            .find(|p| p.is_file())
+    }) else {
+        eprintln!("SKIPPED (part): cargo is not a file on PATH");
+        return;
+    };
+    let unfetched = clone("unfetched");
+    assert_eq!(w.plan(&unfetched, "main").run, all);
+    let flaky = |index: u32| {
+        // Fails the first `cargo metadata` (the plan's listing) only.
+        let script = w.base.join(format!("flaky-cargo-{index}"));
+        let mark = w.base.join(format!("flaky-cargo-{index}.failed"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = metadata ] && [ ! -e '{}' ]; then : > '{}'; echo 'flaky: cargo metadata failed' >&2; exit 101; fi\nexec '{}' \"$@\"\n",
+                mark.display(),
+                mark.display(),
+                real_cargo.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    };
+    let scripts: Vec<Option<PathBuf>> = (1..=3u32).map(|i| (i > 1).then(|| flaky(i))).collect();
+    let mut covered = BTreeSet::new();
+    for index in 1..=3u32 {
+        let part = format!("{index}/3");
+        let audit = w.base.join(format!("audit-flaky-{index}.json"));
+        let env: Vec<(&str, &str)> = scripts[index as usize - 1]
+            .iter()
+            .map(|s| ("VCI_CARGO", s.to_str().unwrap()))
+            .collect();
+        let out = w.vci_env(
+            &unfetched,
+            &[
+                "ci",
+                "--base-ref",
+                "main",
+                "--partition",
+                &part,
+                "--audit-log",
+                audit.to_str().unwrap(),
+            ],
+            &env,
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{part}: {stderr}");
+        let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+        if index == 1 {
+            let mine: BTreeSet<String> = all
+                .iter()
+                .filter(|id| partition_of(id, 3) == 1)
+                .cloned()
+                .collect();
+            assert!(!stdout.contains("::warning"), "{stdout}");
+            assert_eq!(ids_of(&log["ran"]), mine, "{part} ran");
+            assert_eq!(log["partition"]["unlisted"], serde_json::json!([]));
+            covered.extend(mine);
+        } else {
+            assert!(stdout.contains("flaky: cargo metadata failed"), "{stdout}");
+            assert!(
+                stdout.contains(&format!(
+                    "::warning title=vci::partition {part}: the project runs everything and its test files could not be listed: it runs whole in this partition"
+                )),
+                "{stdout}"
+            );
+            assert!(stderr.contains("vci ci: running all tests"), "{stderr}");
+            assert!(
+                stderr.contains("test --locked --workspace"),
+                "{part}: {stderr}"
+            );
+            assert_eq!(log["partition"]["unlisted"], serde_json::json!(["."]));
+            covered.extend(all.iter().cloned());
+        }
+    }
+    assert_eq!(covered, all, "every unit runs in some job");
 }

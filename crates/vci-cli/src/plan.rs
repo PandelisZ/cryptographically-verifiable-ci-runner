@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use vci_attest::keyless::{IDENTITIES_FILE, Identities, TRUSTED_ROOT_FILE, TrustedRoot};
 use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
 use vci_core::{InputManifest, PREDICATE_TYPE};
 use vci_git::{AttestStore, Reader, Repo, StoredEnvelope, StoredManifest};
@@ -280,6 +281,52 @@ fn self_referential_base(repo: &Repo, base_ref: &str, base: &str) -> Option<Stri
     })
 }
 
+/// Keyless trust from the base commit: `.vci/identities.toml` and the
+/// Sigstore trust root (`.vci/sigstore-trusted-root.json`).
+pub(crate) struct KeylessTrust {
+    pub identities: Result<Identities, String>,
+    pub root: Result<TrustedRoot, String>,
+}
+
+/// Read keyless trust from `base`: `None` without an identities.toml there.
+/// A file that is invalid or unreadable is a warning, and every keyless
+/// candidate then fails (its unit runs) naming it.
+fn load_keyless(repo: &Repo, base: &str, warnings: &mut Vec<String>) -> Option<KeylessTrust> {
+    let read = |file: &str| -> Result<Option<String>, String> {
+        match repo.show_file(base, file) {
+            Ok(Some(b)) => String::from_utf8(b)
+                .map(Some)
+                .map_err(|_| format!("{file} at base is not UTF-8")),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("reading {file} at base: {e}")),
+        }
+    };
+    let identities = match read(IDENTITIES_FILE) {
+        Ok(None) => return None,
+        Ok(Some(t)) => {
+            Identities::parse(&t).map_err(|e| format!("{IDENTITIES_FILE} at base is invalid: {e}"))
+        }
+        Err(e) => Err(e),
+    };
+    let root = match read(TRUSTED_ROOT_FILE) {
+        Ok(None) => Err(format!(
+            "{TRUSTED_ROOT_FILE} is missing at the base commit (write it with `gh attestation trusted-root > {TRUSTED_ROOT_FILE}`, or `vci init --oidc`)"
+        )),
+        Ok(Some(t)) => TrustedRoot::parse(&t)
+            .map_err(|e| format!("{TRUSTED_ROOT_FILE} at base is invalid: {e}")),
+        Err(e) => Err(e),
+    };
+    for e in [identities.as_ref().err(), root.as_ref().err()]
+        .into_iter()
+        .flatten()
+    {
+        let w = format!("{e}: attestations signed keylessly (vci --oidc) are not trusted");
+        eprintln!("vci: warning: {w}");
+        warnings.push(w);
+    }
+    Some(KeylessTrust { identities, root })
+}
+
 fn current_refs(repo: &Repo) -> Vec<String> {
     let mut refs = Vec::new();
     if let Ok(r) = std::env::var("GITHUB_REF")
@@ -305,6 +352,8 @@ struct Verifier<'a> {
     ctx: &'a Ctx,
     project: &'a Project,
     allowed: &'a AllowedSigners,
+    /// Keyless trust from the base commit (`None`: no identities.toml).
+    keyless: Option<&'a KeylessTrust>,
     now: i64,
     max_ttl: i64,
     repo_id: String,
@@ -680,6 +729,9 @@ fn plan_with(
     // (their toolchains may be missing in this job).
     let mut config = config;
     config.select_projects(&opts.projects, &format!("{CONFIG_FILE} at the base commit"))?;
+    // Keyless trust (identities and the Sigstore trust root) from the base
+    // commit too; without identities.toml there is none.
+    let keyless = load_keyless(&repo, &base, &mut res.warnings);
     let allowed = match repo.show_file(&base, ALLOWED_SIGNERS_FILE) {
         Ok(Some(bytes)) => match std::str::from_utf8(&bytes)
             .map_err(|e| e.to_string())
@@ -691,6 +743,8 @@ fn plan_with(
                 None
             }
         },
+        // Keyless signers only: no SSH key is trusted.
+        Ok(None) if keyless.as_ref().is_some_and(|k| k.identities.is_ok()) => None,
         Ok(None) => {
             res.run_all = Some(format!(
                 "{ALLOWED_SIGNERS_FILE} is missing at the base commit"
@@ -705,6 +759,9 @@ fn plan_with(
     let refs = current_refs(&repo);
     res.multi = config.is_multi();
     res.allowed = allowed.clone();
+    // Someone is trusted: an SSH key or a CI identity.
+    let trusted = allowed.is_some() || keyless.as_ref().is_some_and(|k| k.identities.is_ok());
+    let no_ssh_signers = AllowedSigners::default();
 
     // 2. Projects (base config), their test files and, for the projects
     // whose files are verified, the toolchain and externals CI resolves now.
@@ -764,7 +821,7 @@ fn plan_with(
             .zip(&starts)
             .enumerate()
             .map(|(i, (p, start))| {
-                let resolve = start.run_all.is_none() && allowed.is_some();
+                let resolve = start.run_all.is_none() && trusted;
                 let (ctx, repo_id) = (&ctx, &repo_id);
                 s.spawn(move || probe_project(ctx, i, p, &start.child, resolve, repo_id))
             })
@@ -820,6 +877,10 @@ fn plan_with(
     join_fetch(fetch, res);
     let mut by_id: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
     if !res.projects.iter().all(|p| p.run_all.is_some()) {
+        // A fetch downloads keys, not values: fetch the values this plan
+        // reads (the candidates of the units it verifies, then the input
+        // manifests they reference) in one batch each.
+        hydrate_for_plan(&ctx.repo, &files, res);
         let looked_up = AttestStore::new(&ctx.repo).reader().and_then(|r| {
         if !r.has_store() {
             let w = "no git-meta store in this repository: no attestations are available (run `vci fetch` first)".to_owned();
@@ -852,14 +913,15 @@ fn plan_with(
         .zip(resolved)
         .enumerate()
         .map(
-            |(pi, (project, resolved))| match (&res.projects[pi].run_all, &allowed, resolved) {
+            |(pi, (project, resolved))| match (&res.projects[pi].run_all, trusted, resolved) {
                 (Some(r), _, _) => Err(r.clone()),
-                (None, None, _) => Err("no trusted signers".to_owned()),
-                (None, Some(_), None) => Err("internal: the project was not resolved".to_owned()),
-                (None, Some(allowed), Some(r)) => r.map(|r| Verifier {
+                (None, false, _) => Err("no trusted signers".to_owned()),
+                (None, true, None) => Err("internal: the project was not resolved".to_owned()),
+                (None, true, Some(r)) => r.map(|r| Verifier {
                     ctx: &ctx,
                     project,
-                    allowed,
+                    allowed: allowed.as_ref().unwrap_or(&no_ssh_signers),
+                    keyless: keyless.as_ref(),
                     now,
                     max_ttl: r.max_ttl,
                     repo_id: r.repo_id,
@@ -920,6 +982,39 @@ fn plan_with(
     }
     finish(res);
     Ok(())
+}
+
+/// Fetch the stored values a plan of `files` reads that were not fetched yet
+/// (lazy metadata: `vci fetch` downloads the keys only): the candidates of
+/// the units of every project that is verified, and the manifests they
+/// reference. A failure is a warning: the values not fetched read as such,
+/// and their units run.
+fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
+    let t = std::time::Instant::now();
+    let ids = files
+        .iter()
+        .filter(|f| {
+            res.projects
+                .get(f.project)
+                .is_some_and(|p| p.run_all.is_none())
+        })
+        .map(|f| f.test_id.as_str());
+    let warning = match AttestStore::new(repo).hydrate_units(ids) {
+        Ok(h) => h.error.map(|e| {
+            format!(
+                "could not fetch {} stored attestation value(s): {e}; their units run",
+                h.unresolved
+            )
+        }),
+        Err(e) => Some(format!(
+            "could not fetch the stored attestation values this plan reads: {e:#}; units whose values were not fetched run"
+        )),
+    };
+    if let Some(w) = warning {
+        eprintln!("vci: warning: {w}");
+        res.warnings.push(w);
+    }
+    timing("fetch the stored values the plan reads", t);
 }
 
 /// Fill in project names on verdicts; set the top-level `run_all` when every
@@ -1059,6 +1154,46 @@ impl Verifier<'_> {
         out
     }
 
+    /// A keyless envelope: certificate chain and timestamp against the base
+    /// trust root, signature, and identity against the base identities.toml.
+    fn verify_keyless(
+        &self,
+        env: &Envelope,
+        m: &vci_attest::keyless::SigstoreMaterial,
+    ) -> Result<vci_attest::Verified, Failure> {
+        const EXPECTED: &str = "a Sigstore signature, certified and timestamped by an authority of base .vci/sigstore-trusted-root.json, by an identity in base .vci/identities.toml";
+        let trust = self.keyless.ok_or_else(|| {
+            Failure::one(
+                "signer",
+                3,
+                format!("a keyless signature, and {IDENTITIES_FILE} is missing at the base commit"),
+                EXPECTED,
+                "no CI identity is trusted",
+            )
+        })?;
+        let ids = trust
+            .identities
+            .as_ref()
+            .map_err(|e| Failure::one("signer", 3, e.clone(), EXPECTED, e.clone()))?;
+        let root = trust
+            .root
+            .as_ref()
+            .map_err(|e| Failure::one("signer", 3, e.clone(), EXPECTED, e.clone()))?;
+        vci_attest::keyless::verify_keyless(env, m, ids, root, self.now)
+            .map(|v| v.verified)
+            .map_err(|e| {
+                let (check, rank, what) = match &e {
+                    VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => {
+                        ("envelope", 1, "envelope".to_owned())
+                    }
+                    VerifyError::UnknownIdentity(m) => ("signer", 3, m.clone()),
+                    VerifyError::Untrusted(m) => ("signature", 2, m.clone()),
+                    _ => ("signature", 2, "signature verification".to_owned()),
+                };
+                Failure::one(check, rank, what, EXPECTED, e.to_string())
+            })
+    }
+
     fn check(
         &self,
         f: &TestFile,
@@ -1088,25 +1223,42 @@ impl Verifier<'_> {
             )
         })?;
 
-        // Signature, namespace, signer trust (base allowed_signers).
-        let verified = verify_envelope(&env, self.allowed, self.now).map_err(|e| {
-            let (check, rank) = match &e {
-                VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => ("envelope", 1),
-                VerifyError::BadSignature(_) | VerifyError::NoSignatures => ("signature", 2),
-                VerifyError::WrongNamespace(_) => ("signature", 2),
-                VerifyError::UnknownSigner(_) | VerifyError::CertAuthorityRejected(_) => {
-                    ("signer", 3)
-                }
-                VerifyError::SignerNotValidNow(_) => ("signer", 3),
-            };
+        // A keyless envelope (a `sigstore` member): certificate, timestamp,
+        // signature and identity against the base identities.toml and
+        // trust root.
+        let material = vci_attest::keyless::material_from_json(&s.bytes).map_err(|e| {
             Failure::one(
-                check,
-                rank,
-                "signature verification",
-                "a valid signature by a key in base allowed_signers",
-                e.to_string(),
+                "envelope",
+                1,
+                "envelope JSON",
+                format!("unparseable: {e}"),
+                "a DSSE envelope",
             )
         })?;
+        let verified = match material {
+            Some(m) => self.verify_keyless(&env, &m)?,
+            // Signature, namespace, signer trust (base allowed_signers).
+            None => verify_envelope(&env, self.allowed, self.now).map_err(|e| {
+                let (check, rank) = match &e {
+                    VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => ("envelope", 1),
+                    VerifyError::BadSignature(_) | VerifyError::NoSignatures => ("signature", 2),
+                    VerifyError::WrongNamespace(_) => ("signature", 2),
+                    VerifyError::UnknownSigner(_) | VerifyError::CertAuthorityRejected(_) => {
+                        ("signer", 3)
+                    }
+                    VerifyError::SignerNotValidNow(_) => ("signer", 3),
+                    VerifyError::Untrusted(_) => ("signature", 2),
+                    VerifyError::UnknownIdentity(_) => ("signer", 3),
+                };
+                Failure::one(
+                    check,
+                    rank,
+                    "signature verification",
+                    "a valid signature by a key in base allowed_signers",
+                    e.to_string(),
+                )
+            })?,
+        };
         info.principal = Some(verified.principal.clone());
         info.fingerprint = Some(verified.fingerprint.clone());
         if let Some(r) = &self.no_skip_ref

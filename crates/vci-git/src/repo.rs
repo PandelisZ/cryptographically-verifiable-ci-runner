@@ -6,6 +6,15 @@ use crate::GitError;
 use crate::cmd::{Git, command_error};
 use crate::validate;
 
+/// Set on the git commands that look up commits (a base ref, an earlier
+/// attestation's commit): a commit missing here is unknown, as in a shallow
+/// clone, rather than downloaded with its whole history from a promisor
+/// remote (a partial clone of the code; the promisor remote vci's metadata
+/// fetches configure fails such a fetch at once anyway, see [`crate::meta`]).
+/// Versions of git older than this variable (2024) ignore it. Reading file
+/// contents is left alone: a partial clone of the code needs those fetched.
+const NO_LAZY_FETCH: &str = "GIT_NO_LAZY_FETCH";
+
 /// A git repository, identified by its root directory (the work tree root, or
 /// the git directory for a bare repository).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,13 +163,16 @@ impl Repo {
         Ok(!out.is_empty())
     }
 
-    /// Resolve a revision to a full commit id (tags are peeled).
+    /// Resolve a revision to a full commit id (tags are peeled). A commit
+    /// this clone does not have is unknown, never fetched (see
+    /// [`NO_LAZY_FETCH`]).
     pub fn resolve(&self, rev: &str) -> Result<String, GitError> {
         validate::rev(rev)?;
         let (describe, out) = self
             .git()
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("{rev}^{{commit}}"))
+            .env(NO_LAZY_FETCH, "1")
             .output_described()?;
         if out.status.success() {
             return parse_oid(&out.stdout);
@@ -178,6 +190,7 @@ impl Repo {
         let (describe, out) = self
             .git()
             .args(["merge-base", &ca, &cb])
+            .env(NO_LAZY_FETCH, "1")
             .output_described()?;
         if out.status.success() {
             return parse_oid(&out.stdout);
@@ -205,6 +218,7 @@ impl Repo {
         let (_, out) = self
             .git()
             .args(["merge-base", "--is-ancestor", old, new])
+            .env(NO_LAZY_FETCH, "1")
             .output_described()?;
         if out.status.code() != Some(0) {
             return Ok(false);
@@ -235,6 +249,7 @@ impl Repo {
             .args(["for-each-ref", "--format=%(refname)", "--contains", old])
             .args(["--no-contains", new])
             .args(["refs/heads", "refs/remotes", "refs/tags"])
+            .env(NO_LAZY_FETCH, "1")
             .run_str()?;
         Ok(others
             .lines()
