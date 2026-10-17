@@ -63,14 +63,20 @@ enum Cmd {
         /// git-meta metadata remote URL for .git-meta (default: origin's URL).
         #[arg(long)]
         meta_url: Option<String>,
+        /// Also trust this repository's GitHub Actions workflows signing keylessly (`vci ci --oidc`): write .vci/identities.toml for origin's repository and the Sigstore trust root (.vci/sigstore-trusted-root.json, from `gh attestation trusted-root`).
+        #[arg(long)]
+        oidc: bool,
     },
     /// Run tests, collect their inputs, sign and store attestations.
     Run {
         /// Test files, package directories for Go, `<package dir>#<target>` units or package directories for Cargo (default: all).
         files: Vec<String>,
         /// SSH key for `ssh-keygen -Y sign` (private key, or .pub with the key in ssh-agent).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "oidc")]
         key: Option<Utf8PathBuf>,
+        /// Sign keylessly with the CI job's OIDC token (GitHub Actions with `permissions: id-token: write`) through Sigstore: `github` (default: fulcio.githubapp.com, timestamp.githubapp.com) or `public-good` (fulcio.sigstore.dev, timestamp.sigstore.dev).
+        #[arg(long, value_name = "INSTANCE", num_args = 0..=1, default_missing_value = "github")]
+        oidc: Option<String>,
         /// Attestation lifetime.
         #[arg(long, default_value = "14d")]
         ttl: String,
@@ -91,7 +97,8 @@ enum Cmd {
         #[arg(long = "project", value_name = "NAME")]
         project: Vec<String>,
     },
-    /// Plan, run the remaining tests, and write an audit log of the skips (with --key: attest what runs).
+    /// Plan, run the remaining tests, and write an audit log of the skips (with --key or --oidc: attest what runs).
+    #[command(group(clap::ArgGroup::new("signing").args(["key", "oidc"])))]
     Ci {
         #[arg(long)]
         base_ref: Option<String>,
@@ -100,11 +107,14 @@ enum Cmd {
         /// Run the remaining tests as `vci run --key` does and attest them with this SSH key (private key, or .pub with the key in ssh-agent); with run-all (e.g. policy.no_skip_refs), every unit is attested.
         #[arg(long)]
         key: Option<Utf8PathBuf>,
-        /// Attestation lifetime (with --key).
-        #[arg(long, default_value = "14d", requires = "key")]
+        /// Run the remaining tests as `vci run --oidc` does and attest them keylessly with the job's OIDC token (GitHub Actions, `permissions: id-token: write`); INSTANCE as in `vci run --oidc`.
+        #[arg(long, value_name = "INSTANCE", num_args = 0..=1, default_missing_value = "github")]
+        oidc: Option<String>,
+        /// Attestation lifetime (with --key or --oidc).
+        #[arg(long, default_value = "14d", requires = "signing")]
         ttl: String,
         /// Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code).
-        #[arg(long, requires = "key")]
+        #[arg(long, requires = "signing")]
         push: bool,
         /// git-meta remote, or a git remote / URL, to push to (as `vci push --remote`).
         #[arg(long, requires = "push")]
@@ -122,6 +132,12 @@ enum Cmd {
         /// Trust root (default: .vci/allowed_signers at --base-ref, or HEAD).
         #[arg(long)]
         allowed_signers: Option<Utf8PathBuf>,
+        /// For a keyless envelope: the identities (default: .vci/identities.toml at --base-ref, or HEAD).
+        #[arg(long)]
+        identities: Option<Utf8PathBuf>,
+        /// For a keyless envelope: the Sigstore trust root (default: .vci/sigstore-trusted-root.json at --base-ref, or HEAD).
+        #[arg(long)]
+        trusted_root: Option<Utf8PathBuf>,
         #[arg(long)]
         base_ref: Option<String>,
         /// The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the local git-meta store when run inside the repository.
@@ -223,6 +239,7 @@ fn main() {
             adapter,
             no_install,
             meta_url,
+            oidc,
         } => cmds::init(
             key.as_deref(),
             principal,
@@ -230,15 +247,18 @@ fn main() {
             adapter,
             !no_install,
             meta_url,
+            oidc,
         ),
         Cmd::Run {
             files,
             key,
+            oidc,
             ttl,
             summary,
         } => run::run(run::RunArgs {
             files,
             key,
+            oidc,
             ttl,
             summary,
         }),
@@ -272,6 +292,7 @@ fn main() {
             base_ref,
             audit_log,
             key,
+            oidc,
             ttl,
             push,
             remote,
@@ -281,6 +302,7 @@ fn main() {
             base_ref,
             audit_log,
             key,
+            oidc,
             ttl,
             push,
             remote,
@@ -290,11 +312,17 @@ fn main() {
         Cmd::Verify {
             envelope,
             allowed_signers,
+            identities,
+            trusted_root,
             base_ref,
             manifest,
         } => cmds::verify(
             &envelope,
-            allowed_signers.as_deref(),
+            cmds::VerifyTrust {
+                allowed_signers: allowed_signers.as_deref(),
+                identities: identities.as_deref(),
+                trusted_root: trusted_root.as_deref(),
+            },
             base_ref.as_deref(),
             manifest.as_deref(),
         ),

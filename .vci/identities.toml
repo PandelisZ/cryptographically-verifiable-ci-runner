@@ -1,0 +1,30 @@
+# CI identities whose keyless attestations (`vci ci --oidc`, `vci run --oidc`)
+# are trusted, read from the base commit like allowed_signers. Every field
+# must match the certificate Fulcio issued for the job's OIDC token; workflow,
+# ref, event, environment and runner_environment are globs. The principal is
+# the name the policy lists use (no_skip_refs_except, attest_on_any_ref).
+# The trust root is .vci/sigstore-trusted-root.json (`gh attestation
+# trusted-root`).
+
+# The demo-oidc job of ci.yml on pull requests: proves keyless signing with no
+# secret. Not in policy.no_skip_refs_except, so main never skips on its word.
+[[identity]]
+principal = "github-actions-oidc-pr"
+issuer = "https://token.actions.githubusercontent.com"
+repository = "PandelisZ/cryptographically-verifiable-ci-runner"
+workflow = ".github/workflows/ci.yml"
+ref = "refs/pull/*/merge"
+event = "pull_request"
+
+# What a keyless main-branch attester would look like: pushes to main in the
+# vci-attest environment sign as github-actions (the principal
+# no_skip_refs_except names, like the SSH key's). Not enabled: demo-main
+# attests with the SSH key.
+# [[identity]]
+# principal = "github-actions"
+# issuer = "https://token.actions.githubusercontent.com"
+# repository = "PandelisZ/cryptographically-verifiable-ci-runner"
+# workflow = ".github/workflows/ci.yml"
+# ref = "refs/heads/main"
+# event = "push"
+# environment = "vci-attest"

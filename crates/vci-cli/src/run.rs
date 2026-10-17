@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use vci_adapter::Observed;
+use vci_attest::keyless::KeylessSigner;
 use vci_attest::{Statement, Subject, sign_statement};
 use vci_core::{
     External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain,
@@ -24,6 +25,9 @@ use crate::{global, keys};
 pub struct RunArgs {
     pub files: Vec<String>,
     pub key: Option<Utf8PathBuf>,
+    /// Sign keylessly with the job's OIDC token (`--oidc`), with this
+    /// Sigstore instance (`--sigstore`).
+    pub oidc: Option<String>,
     pub ttl: String,
     /// Write a JSON summary of every unit (attested or not, with its
     /// reasons) to this file.
@@ -1193,6 +1197,58 @@ fn settle_unlisted(
     }
 }
 
+/// How [`run_units`] signs.
+pub enum Signing<'a> {
+    /// An SSH key: `--key`, else discovered ([`keys::discover`]).
+    Key(Option<&'a Utf8Path>),
+    /// Keyless, with the job's OIDC token (`--oidc`).
+    Oidc(&'a KeylessSigner),
+}
+
+/// A resolved signer.
+enum Signer<'a> {
+    Ssh(keys::SigningKey),
+    Keyless(&'a KeylessSigner),
+}
+
+impl Signer<'_> {
+    /// The signer id in store keys.
+    fn signer_id(&self) -> String {
+        match self {
+            Signer::Ssh(k) => k.signer_id(),
+            Signer::Keyless(k) => k.signer_id(),
+        }
+    }
+
+    /// Sign `stmt`; the bytes to store (the envelope JSON, plus the
+    /// Sigstore bundle's material for a keyless signature).
+    fn sign(&self, stmt: &Statement) -> Result<Vec<u8>> {
+        match self {
+            Signer::Ssh(key) => sign_statement(stmt, &key.path)
+                .map(|env| env.to_json())
+                .with_context(|| format!("signing with {}", key.path)),
+            Signer::Keyless(k) => k
+                .sign_statement(stmt)
+                .map(|(env, m)| vci_attest::keyless::to_stored_json(&env, &m))
+                .context("signing keylessly (OIDC)"),
+        }
+    }
+}
+
+/// `--oidc [INSTANCE]`: a keyless signer for the job's identity (fails
+/// before anything runs when the job has no OIDC token).
+pub fn keyless_signer(instance: &str) -> Result<KeylessSigner> {
+    let i = vci_attest::keyless::Instance::named(instance).map_err(anyhow::Error::msg)?;
+    let k = KeylessSigner::new(i).context("--oidc")?;
+    eprintln!(
+        "vci: signing keylessly as {} (Sigstore: {}, {})",
+        k.identity().describe(),
+        k.instance().fulcio,
+        k.instance().tsa
+    );
+    Ok(k)
+}
+
 /// Which units [`run_units`] runs.
 pub enum Selection {
     /// `vci run`'s arguments (paths relative to the current directory,
@@ -1236,12 +1292,17 @@ pub fn run(args: RunArgs) -> Result<i32> {
     for w in config.warnings(crate::config::CONFIG_FILE) {
         eprintln!("vci: warning: {w}");
     }
+    let keyless = args.oidc.as_deref().map(keyless_signer).transpose()?;
+    let signing = match &keyless {
+        Some(k) => Signing::Oidc(k),
+        None => Signing::Key(args.key.as_deref()),
+    };
     let out = run_units(
         repo,
         root,
         config,
         Selection::Args(args.files),
-        args.key.as_deref(),
+        signing,
         &args.ttl,
         args.summary.as_deref(),
     )?;
@@ -1265,13 +1326,16 @@ pub fn run_units(
     root: Utf8PathBuf,
     config: crate::config::Config,
     selection: Selection,
-    key: Option<&Utf8Path>,
+    signing: Signing<'_>,
     ttl_arg: &str,
     summary: Option<&Utf8Path>,
 ) -> Result<RunOutcome> {
     let ttl = parse_duration(ttl_arg).context("--ttl")?;
     let ctx = Ctx::new(repo, root.clone(), config)?;
-    let key = keys::discover(key, &root)?;
+    let key = match signing {
+        Signing::Key(k) => Signer::Ssh(keys::discover(k, &root)?),
+        Signing::Oidc(k) => Signer::Keyless(k),
+    };
     let signer = key.signer_id();
 
     let base = PredicateBase {
@@ -1686,14 +1750,13 @@ pub fn run_units(
                             PREDICATE_TYPE,
                             value,
                         );
-                        let env = sign_statement(&stmt, &key.path)
-                            .with_context(|| format!("signing with {}", key.path))?;
+                        let env = key.sign(&stmt)?;
                         // The manifest first: an attestation is never stored
                         // without the manifest it references.
                         store
                             .put_manifest(&p.core.input_root, a.manifest.to_compact().as_bytes())
                             .context("storing the input manifest")?;
-                        let stored = store.put(&p.core.test_id, &signer, &skey, &env.to_json())?;
+                        let stored = store.put(&p.core.test_id, &signer, &skey, &env)?;
                         superseded += supersede(
                             &store,
                             &ctx.repo,

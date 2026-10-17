@@ -6,10 +6,16 @@
 //!   PAE of the *exact stored payload bytes* (never re-serialised), and
 //!   authorises the signer against an OpenSSH `allowed_signers` file.
 //!
+//! Keyless signing (Sigstore: Fulcio certificate from a CI job's OIDC token,
+//! RFC 3161 timestamp) lives in [`keyless`]; its envelopes carry the bundle
+//! in a `sigstore` member and verify against `.vci/identities.toml` and a
+//! committed trust root instead of `allowed_signers`.
+//!
 //! Everything here is fail-closed with respect to trust: any doubt produces an
 //! error, which callers turn into "run the test".
 
 mod allowed_signers;
+pub mod keyless;
 mod sign;
 mod verify;
 
