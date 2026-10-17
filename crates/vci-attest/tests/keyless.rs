@@ -272,3 +272,82 @@ fn ssh_verification_rejects_a_keyless_envelope() {
     let e = vci_attest::verify_envelope(&env, &allowed, LATER).unwrap_err();
     assert!(matches!(e, VerifyError::Malformed(_)), "{e}");
 }
+
+/// A real envelope from this repository's CI (ci.yml `demo-oidc`, pull
+/// request 10 of PandelisZ/cryptographically-verifiable-ci-runner, run
+/// 38991254498): a certificate from fulcio.githubapp.com and a timestamp
+/// from timestamp.githubapp.com, against the real trust root.
+#[test]
+fn a_real_github_actions_envelope_verifies_against_the_real_trust_root() {
+    let bytes = read("github-pr10-envelope.json");
+    let env = Envelope::from_json(&bytes).unwrap();
+    let m = material_from_json(&bytes).unwrap().unwrap();
+    let gh =
+        TrustedRoot::parse(std::str::from_utf8(&read("gh-trusted-root-2026-10-16.jsonl")).unwrap())
+            .unwrap();
+    let pr = Identities::parse(
+        r#"
+[[identity]]
+principal = "github-actions-oidc-pr"
+issuer = "https://token.actions.githubusercontent.com"
+repository = "PandelisZ/cryptographically-verifiable-ci-runner"
+workflow = ".github/workflows/ci.yml"
+ref = "refs/pull/*/merge"
+event = "pull_request"
+runner_environment = "github-hosted"
+"#,
+    )
+    .unwrap();
+    let v = verify_keyless(&env, &m, &pr, &gh, LATER).unwrap();
+    assert_eq!(v.verified.principal, "github-actions-oidc-pr");
+    assert_eq!(v.timestamp.authority, "timestamp.githubapp.com");
+    assert_eq!(v.identity.ref_, "refs/pull/10/merge");
+    assert_eq!(
+        v.identity.workflow,
+        "PandelisZ/cryptographically-verifiable-ci-runner/.github/workflows/ci.yml"
+    );
+    assert_eq!(
+        v.identity.run.as_deref(),
+        Some(
+            "https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/actions/runs/38991254498/attempts/1"
+        )
+    );
+    assert_eq!(
+        v.identity.signer_id(),
+        keyless::CertIdentity {
+            issuer: "https://token.actions.githubusercontent.com".into(),
+            repository: "PandelisZ/cryptographically-verifiable-ci-runner".into(),
+            workflow: "PandelisZ/cryptographically-verifiable-ci-runner/.github/workflows/ci.yml"
+                .into(),
+            ..Default::default()
+        }
+        .signer_id()
+    );
+
+    // The same run is not main's identity.
+    let main = Identities::parse(
+        r#"
+[[identity]]
+principal = "github-actions"
+issuer = "https://token.actions.githubusercontent.com"
+repository = "PandelisZ/cryptographically-verifiable-ci-runner"
+workflow = ".github/workflows/ci.yml"
+ref = "refs/heads/main"
+event = "push"
+"#,
+    )
+    .unwrap();
+    let e = verify_keyless(&env, &m, &main, &gh, LATER).unwrap_err();
+    assert!(matches!(e, VerifyError::UnknownIdentity(_)), "{e}");
+
+    // The public-good instance's authorities alone do not certify it.
+    let public: String = std::str::from_utf8(&read("gh-trusted-root-2026-10-16.jsonl"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let e =
+        verify_keyless(&env, &m, &pr, &TrustedRoot::parse(&public).unwrap(), LATER).unwrap_err();
+    assert!(matches!(e, VerifyError::Untrusted(_)), "{e}");
+}

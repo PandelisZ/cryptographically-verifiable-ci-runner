@@ -137,3 +137,21 @@ the repository and workflow for every test unit, one Fulcio request per job (the
 more than a minute left) and one timestamp per unit. `--sigstore public-good` uses `fulcio.sigstore.dev` and
 `timestamp.sigstore.dev` (no Rekor entry either). Verification accepts either, from whatever authorities the
 committed trust root lists.
+
+## Confirmed in CI (2026-10-17)
+
+The `demo-oidc` job of `.github/workflows/ci.yml` (pull request 10 of PandelisZ/cryptographically-verifiable-ci-runner,
+run 38991254498, a public repository, `ubuntu-latest`) ran `vci run --oidc` with only `permissions: id-token: write`:
+
+- `fulcio.githubapp.com` issued certificates for a public repository's token (audience `sigstore`), valid exactly 10
+  minutes, issuer `O=GitHub, Inc., CN=Fulcio Intermediate l2`, empty subject, SAN the Build Signer URI
+  (`https://github.com/<repo>/.github/workflows/ci.yml@refs/pull/10/merge`), code-signing EKU, and extensions `.8`,
+  `.9`, `.11`, `.12`, `.14`, `.20`, `.21` with the values listed above. `timestamp.githubapp.com` timestamped every
+  signature. No `attestations: write`, no GitHub API call.
+- 21 units (pytest, Go, Cargo, Rails, RSpec) were signed in about 0.1 s each (one Fulcio request for the job, one
+  timestamp per unit), and `vci plan --base-ref HEAD` skipped all 21 on those attestations (`attested by
+  github-actions-oidc-pr (oidc repo:... workflow:.github/workflows/ci.yml ref:refs/pull/10/merge
+  event:pull_request)`); `vci verify` of one exported envelope printed `VALID` with the timestamp authority and the
+  run URL. That envelope is the fixture `crates/vci-attest/tests/fixtures/keyless/github-pr10-envelope.json`,
+  verified in the tests against the trust root of 2026-10-16.
+
