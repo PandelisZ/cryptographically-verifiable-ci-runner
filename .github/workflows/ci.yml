@@ -213,6 +213,29 @@ jobs:
   # binary fails at once (scripts/action-binary.sh) instead of compiling vci.
   # On a commit whose sources match release/manifest.txt the gate passes and
   # action-v1 already proves the download, so the check is skipped there.
+  # The git-meta store against the git a stock Ubuntu 24.04 ships (2.43):
+  # GitHub's runner images carry a newer git, and 2.0.0's presence check of
+  # values not yet downloaded died only on the older one (fixed in 2.0.1).
+  # Self-hosted runners (vex's) run the stock one.
+  store-stock-git:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Stock git and a Rust toolchain
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates curl build-essential pkg-config libssl-dev
+          git --version
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Store tests
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.email ci@vci.invalid
+          git config --global user.name vci
+          cargo test --locked -p vci-git
+
   action-gate:
     runs-on: ubuntu-latest
     steps:
