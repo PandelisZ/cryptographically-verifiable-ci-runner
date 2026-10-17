@@ -157,6 +157,10 @@ pub struct ProjectPlan {
     /// could not be read).
     #[serde(skip)]
     pub no_skip_refs_except: Vec<String>,
+    /// The base policy's `attest_on_any_ref` (empty when the base policy
+    /// could not be read).
+    #[serde(skip)]
+    pub attest_on_any_ref: Vec<String>,
     #[serde(skip)]
     pub dir: camino::Utf8PathBuf,
     #[serde(skip)]
@@ -799,6 +803,7 @@ fn plan_with(
             no_skip_ref: start.no_skip_ref,
             on_no_skip_ref: start.on_no_skip_ref,
             no_skip_refs_except: p.policy.no_skip_refs_except.clone(),
+            attest_on_any_ref: p.policy.attest_on_any_ref.clone(),
             dir: p.dir.clone(),
             child_env: Some(start.child),
             adapter_options: p.adapter_options.clone(),
@@ -974,6 +979,7 @@ fn fallback_listing(
                 no_skip_ref: None,
                 on_no_skip_ref: false,
                 no_skip_refs_except: vec![],
+                attest_on_any_ref: vec![],
                 dir: p.dir.clone(),
                 child_env: Some(child),
                 adapter_options: p.adapter_options.clone(),
@@ -2620,6 +2626,7 @@ mod tests {
             no_skip_ref: None,
             on_no_skip_ref: false,
             no_skip_refs_except: vec![],
+            attest_on_any_ref: vec![],
             dir: camino::Utf8PathBuf::from("/r"),
             child_env: None,
             adapter_options: Default::default(),

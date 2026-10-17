@@ -258,6 +258,11 @@ fn run_attested(res: &crate::plan::PlanResult, key: &Utf8Path, ttl: &str) -> Res
 /// refused off those refs when the base commit's allowed_signers cannot be
 /// read (whom the key signs as is unknown).
 ///
+/// `policy.attest_on_any_ref` names the principals this does not apply to:
+/// a pull request's run then attests with them, and the protected refs
+/// skip what it ran (the repository's own pull requests, a repository
+/// secret forks never get, authors trusted with that).
+///
 /// This is a guard against a misconfigured workflow, not a security
 /// boundary: a branch that can read the key can sign anything with it. The
 /// boundary is not handing the key to such runs (a secret of a GitHub
@@ -280,10 +285,10 @@ fn attest_refusal(res: &crate::plan::PlanResult, key_blob: &[u8]) -> Option<Stri
         .map(|e| e.principals.as_str())
         .collect();
     for p in off {
-        if let Some(principal) = principals
-            .iter()
-            .find(|pr| p.no_skip_refs_except.iter().any(|x| x == *pr))
-        {
+        if let Some(principal) = principals.iter().find(|pr| {
+            p.no_skip_refs_except.iter().any(|x| x == *pr)
+                && !p.attest_on_any_ref.iter().any(|x| x == *pr)
+        }) {
             return Some(format!(
                 "the key signs as {principal}, which policy.no_skip_refs_except{} lets skip on policy.no_skip_refs (e.g. main), but the current ref does not match policy.no_skip_refs: attestations made here would let main skip tests that never ran on main. Pass this key only to runs on main (a GitHub Environment secret restricted to the default branch), or give other refs a key whose principal is not in no_skip_refs_except",
                 if res.multi {

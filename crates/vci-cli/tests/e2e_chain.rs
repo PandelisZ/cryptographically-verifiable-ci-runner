@@ -954,3 +954,64 @@ fn fetch_while_planning_and_fail_open() {
     );
     assert_eq!(ids(&r.log["ran"]), all);
 }
+
+/// `policy.attest_on_any_ref` names a principal of no_skip_refs_except that
+/// may attest off main: a pull request's run with that key attests what it
+/// ran and publishes it, and after the merge main skips it (the repository's
+/// own pull requests, a repository secret forks never get).
+#[test]
+fn a_pull_request_run_with_a_key_in_attest_on_any_ref_attests_and_main_skips() {
+    let w = World::new();
+    let all = set(&[A, B, C, D]);
+    w.commit_on_main(
+        "vci.toml",
+        &vci_toml(&["github-actions"]).replace(
+            "no_skip_refs_except = [\"github-actions\"]\n",
+            "no_skip_refs_except = [\"github-actions\"]\nattest_on_any_ref = [\"github-actions\"]\n",
+        ),
+        "pull requests attest with the CI key",
+    );
+    let main_a = w.git(&w.dev, &["rev-parse", "HEAD"]);
+    let ci_a = w.ci_clone("ci-a");
+    let r = w.ci(&ci_a, "a", &["--push", "--remote", "origin"]);
+    assert_eq!(r.code, Some(0), "{}", r.stderr);
+    assert_eq!(r.attested(), all, "{}", r.stderr);
+
+    w.git(&w.dev, &["checkout", "-q", "-b", "pr1"]);
+    std::fs::write(
+        w.dev.join("src/b.ts"),
+        "import { readFileSync } from \"node:fs\";\n\n// pr1\nexport const loadGreeting = (path: string): string =>\n  JSON.parse(readFileSync(path, \"utf8\")).greeting;\n",
+    )
+    .unwrap();
+    w.git(&w.dev, &["commit", "-q", "-am", "pr1"]);
+    w.git(&w.dev, &["push", "-q", "origin", "pr1"]);
+    let pr = w.ci_clone("ci-pr");
+    w.git(&pr, &["checkout", "-q", "pr1"]);
+    w.vci_ok(&pr, "refs/pull/1/merge", &["fetch", "--remote", "origin"]);
+    // The pull request's run with the CI key attests B and publishes it.
+    let r = w.ci_at(
+        &pr,
+        "pr-ci-key",
+        "refs/pull/1/merge",
+        &main_a,
+        &w.ci_key,
+        &["--push", "--remote", "origin"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.stderr);
+    assert_eq!(r.attested(), set(&[B]), "{}", r.stderr);
+    assert_eq!(r.log["pushed"], true, "{}", r.log);
+    assert!(
+        !r.stdout.contains("::warning title=vci::not attesting"),
+        "{}",
+        r.stdout
+    );
+    // Merged: main skips everything, B on the pull request's word.
+    w.git(&w.dev, &["checkout", "-q", "main"]);
+    w.git(&w.dev, &["merge", "-q", "--ff-only", "pr1"]);
+    w.git(&w.dev, &["push", "-q", "origin", "main"]);
+    let ci_m = w.ci_clone("ci-merged");
+    w.vci_ok(&ci_m, MAIN, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&ci_m, MAIN);
+    assert_eq!(p.skip, all, "{p:?}");
+    assert!(p.reason(B).contains("attested by github-actions"), "{p:?}");
+}

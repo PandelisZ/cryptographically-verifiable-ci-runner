@@ -129,6 +129,7 @@ pub struct PolicyOverride {
     pub allow_dirty: Option<bool>,
     pub no_skip_refs: Option<Vec<String>>,
     pub no_skip_refs_except: Option<Vec<String>>,
+    pub attest_on_any_ref: Option<Vec<String>>,
     pub never_skip: Option<Vec<String>>,
     pub go_allow_net: Option<bool>,
     pub ignore_taints: Option<Vec<String>>,
@@ -372,6 +373,14 @@ pub struct Policy {
     /// skipped on those refs.
     #[serde(default)]
     pub no_skip_refs_except: Vec<String>,
+    /// Principals of `no_skip_refs_except` that `vci ci --key` may attest
+    /// as on refs that do not match `no_skip_refs` (a pull request's run):
+    /// what such a run ran is then skipped on the protected refs too. Only
+    /// for a key that pull requests of the repository itself can use and
+    /// forks cannot (a repository secret), where their authors are trusted
+    /// with that.
+    #[serde(default)]
+    pub attest_on_any_ref: Vec<String>,
     /// Test files (project-relative globs) that are never skipped, e.g. files
     /// with dependencies no collector can see (SQLite `ATTACH` behind a
     /// custom authorizer, a C library reading files).
@@ -441,6 +450,7 @@ impl Default for Policy {
             allow_dirty: true,
             no_skip_refs: vec![],
             no_skip_refs_except: vec![],
+            attest_on_any_ref: vec![],
             never_skip: vec![],
             go_allow_net: false,
             ignore_taints: vec![],
@@ -470,6 +480,18 @@ impl Policy {
             if p.is_empty() || p.chars().any(char::is_whitespace) {
                 bail!(
                     "policy.no_skip_refs_except: {p:?} is not an allowed_signers principal (non-empty, no whitespace)"
+                );
+            }
+        }
+        for p in &self.attest_on_any_ref {
+            if p.is_empty() || p.chars().any(char::is_whitespace) {
+                bail!(
+                    "policy.attest_on_any_ref: {p:?} is not an allowed_signers principal (non-empty, no whitespace)"
+                );
+            }
+            if !self.no_skip_refs_except.contains(p) {
+                bail!(
+                    "policy.attest_on_any_ref: {p:?} is not in policy.no_skip_refs_except (a key outside that list may attest anywhere already)"
                 );
             }
         }
@@ -975,6 +997,9 @@ impl Config {
                     }
                     if let Some(v) = &o.no_skip_refs_except {
                         policy.no_skip_refs_except = v.clone();
+                    }
+                    if let Some(v) = &o.attest_on_any_ref {
+                        policy.attest_on_any_ref = v.clone();
                     }
                     if let Some(v) = &o.never_skip {
                         policy.never_skip = v.clone();

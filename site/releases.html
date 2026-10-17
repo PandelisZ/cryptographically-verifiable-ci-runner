@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v1-9-2">1.9.2</a></td><td>17 Oct 2026</td><td><code>policy.attest_on_any_ref</code>: pull requests attest with a CI key, so the merge queue and main skip what they ran</td></tr>
 <tr><td><a href="#v1-9-1">1.9.1</a></td><td>16 Oct 2026</td><td>A cargo target without tests is attested (0 tests) instead of rebuilt on every push</td></tr>
 <tr><td><a href="#v1-9-0">1.9.0</a></td><td>16 Oct 2026</td><td>Attestations reference their input manifest, stored once; a fetch applies only what changed; <code>vci run</code> deletes what it supersedes</td></tr>
 <tr><td><a href="#v1-8-2">1.8.2</a></td><td>16 Oct 2026</td><td>Fetch and push no longer read every attestation; <code>vci prune --superseded</code>; <code>vci push --rewrite-history</code></td></tr>
@@ -38,6 +39,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v1-9-2">1.9.2</h2>
+<p><em>17 October 2026.</em> Until now a key whose principal is in <code>no_skip_refs_except</code> could attest only on <code>no_skip_refs</code> (main): a pull request's run with it attested nothing, so its tests ran again in the merge queue and a third time on main. <code>policy.attest_on_any_ref</code> lists the principals that may attest anywhere: give the repository's own pull requests a second CI key as a repository secret (forks never receive it), name its principal in both lists, and run the suites with <code>vci ci --key ... --push</code> on pull requests; what a pull request ran is then skipped in the merge queue and on main. The trade-off is explicit: a pull request from the repository lets main skip tests only it ran, so use it where those authors are trusted; the default stays refusing.</p>
 
 <h2 id="v1-9-1">1.9.1</h2>
 <p><em>16 October 2026.</em> A cargo target whose harness reports no tests (<code>0 passed; 0 failed; 0 filtered out</code>: a library without unit tests, a binary, a crate with no doctests) was refused as <code>result no-tests</code>, so every master push built and ran it again: on vex, 17 of 59 units, about 4 of the attest job's 6.7 minutes. It is now attested as a pass with 0 tests: cargo filters nothing, so the target stays empty wherever the same sources build, and the attestation saves its build. A custom harness that prints no summary, and a target whose every test is <code>#[ignore]</code>d, still refuse.</p>
