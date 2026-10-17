@@ -1504,6 +1504,16 @@ impl<'a> AttestStore<'a> {
 
     /// The size of each blob of `oids` the local object database holds
     /// (nothing is fetched).
+    ///
+    /// Two steps, because `git cat-file --batch-check` asked about an object
+    /// the repository does not hold tries the promisor remote first, and with
+    /// lazy fetching off (`GIT_NO_LAZY_FETCH`) git before 2.45 then dies
+    /// (`fatal: could not fetch <oid> from promisor remote`; Ubuntu 24.04's
+    /// 2.43 does) instead of answering `missing`. `git rev-list
+    /// --missing=allow-any` never fetches on any version, and with
+    /// `--ignore-missing` an absent object named on its input is left out
+    /// instead of being a `bad object`: it lists what is present, and only
+    /// that is then asked for.
     fn present_sizes(&self, oids: &BTreeSet<String>) -> Result<BTreeMap<String, u64>, GitError> {
         if oids.is_empty() {
             return Ok(BTreeMap::new());
@@ -1515,6 +1525,30 @@ impl<'a> AttestStore<'a> {
             }
             input.extend_from_slice(o.as_bytes());
             input.push(b'\n');
+        }
+        let listed = self
+            .repo
+            .git()
+            .args([
+                "rev-list",
+                "--objects",
+                "--no-walk",
+                "--missing=allow-any",
+                "--ignore-missing",
+                "--stdin",
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_with_stdin(&input)?;
+        let mut input = Vec::new();
+        for l in String::from_utf8_lossy(&listed).lines() {
+            let o = l.split(' ').next().unwrap_or("");
+            if oids.contains(o) {
+                input.extend_from_slice(o.as_bytes());
+                input.push(b'\n');
+            }
+        }
+        if input.is_empty() {
+            return Ok(BTreeMap::new());
         }
         let out = self
             .repo
