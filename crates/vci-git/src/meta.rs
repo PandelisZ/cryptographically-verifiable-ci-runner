@@ -991,6 +991,7 @@ impl<'a> AttestStore<'a> {
         let current = handle.get_value(&key).ok().flatten();
         if current != Some(MetaValue::String(text.to_owned())) {
             handle.set(&key, text).map_err(meta_err)?;
+            self.stamp_written([(&target, key.as_str())])?;
         }
         Ok(StoredEnvelope {
             target: target_label(&target),
@@ -1016,10 +1017,15 @@ impl<'a> AttestStore<'a> {
     /// publishes). Returns whether it existed.
     pub fn remove(&self, e: &StoredEnvelope) -> Result<bool, GitError> {
         let target = Target::parse(&e.target).map_err(meta_err)?;
-        self.session()?
+        let removed = self
+            .session()?
             .target(&target)
             .remove(&e.key)
-            .map_err(meta_err)
+            .map_err(meta_err)?;
+        if removed {
+            self.stamp_written([(&target, e.key.as_str())])?;
+        }
+        Ok(removed)
     }
 
     /// Delete the envelopes of `test_id` signed by `signer` that `keep`
@@ -1041,12 +1047,20 @@ impl<'a> AttestStore<'a> {
         }
         let session = self.session()?;
         let mut removed = Vec::new();
+        let mut targets = Vec::new();
         for e in doomed {
             let target = Target::parse(&e.target).map_err(meta_err)?;
             if session.target(&target).remove(&e.key).map_err(meta_err)? {
+                targets.push(target);
                 removed.push(e);
             }
         }
+        self.stamp_written(
+            targets
+                .iter()
+                .zip(&removed)
+                .map(|(t, e)| (t, e.key.as_str())),
+        )?;
         Ok(removed)
     }
 
@@ -1070,6 +1084,7 @@ impl<'a> AttestStore<'a> {
             return Ok(false);
         }
         handle.set(&key, text).map_err(meta_err)?;
+        self.stamp_written([(&Target::project(), key.as_str())])?;
         Ok(true)
     }
 
@@ -1087,10 +1102,16 @@ impl<'a> AttestStore<'a> {
     /// `push` publishes). Returns whether it existed.
     pub fn remove_manifest(&self, root: &str) -> Result<bool, GitError> {
         validate::hex_id("input root", root)?;
-        self.session()?
+        let key = manifest_key(root);
+        let removed = self
+            .session()?
             .target(&Target::project())
-            .remove(&manifest_key(root))
-            .map_err(meta_err)
+            .remove(&key)
+            .map_err(meta_err)?;
+        if removed {
+            self.stamp_written([(&Target::project(), key.as_str())])?;
+        }
+        Ok(removed)
     }
 
     /// How many attestations are stored (values not read).
@@ -1357,6 +1378,61 @@ impl<'a> AttestStore<'a> {
             )
             .map_err(|e| sql_err(&path, e))?;
         Ok((tables > 0).then_some((path, db)))
+    }
+
+    /// Stamps the store's log entry of each key just written (its latest)
+    /// with the time now, after the write was committed.
+    ///
+    /// git-meta stamps a write with the time it was asked for, before the
+    /// write waits for the store's lock, and its incremental serialization
+    /// takes the rows stamped after the last materialization marker. A
+    /// serialization running alongside (`vci push` or `git meta push` in
+    /// another thread or process) takes its own time first, reads the
+    /// modified rows (not this one, not committed yet), serializes them, and
+    /// sets the marker to its time, which is later than this row's stamp:
+    /// the row is never "modified since" a marker again, and never
+    /// published (`serialize_checked` even finds nothing to serialize). This
+    /// stamp is taken once the write is committed, so a serialization whose
+    /// read missed the row took its time before the commit, and the row
+    /// stays newer than its marker; one whose read had the row serialized
+    /// it. (A stamp that is already newer is left alone.)
+    fn stamp_written<'k>(
+        &self,
+        written: impl IntoIterator<Item = (&'k Target, &'k str)>,
+    ) -> Result<(), GitError> {
+        let mut written = written.into_iter().peekable();
+        if written.peek().is_none() {
+            return Ok(());
+        }
+        let Some((path, mut db)) = self.db_rw()? else {
+            return Err(GitError::Store(
+                "the git-meta store is gone right after a write".to_owned(),
+            ));
+        };
+        let now = now_ms();
+        let tx = db.transaction().map_err(|e| sql_err(&path, e))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE metadata_log SET timestamp = ?1
+                     WHERE rowid = (
+                         SELECT rowid FROM metadata_log
+                         WHERE target_type = ?2 AND target_value = ?3 AND key = ?4
+                         ORDER BY timestamp DESC, rowid DESC LIMIT 1
+                     ) AND timestamp < ?1",
+                )
+                .map_err(|e| sql_err(&path, e))?;
+            for (target, key) in written {
+                stmt.execute(rusqlite::params![
+                    now,
+                    target.target_type().as_str(),
+                    target.value().unwrap_or(""),
+                    key
+                ])
+                .map_err(|e| sql_err(&path, e))?;
+            }
+        }
+        tx.commit().map_err(|e| sql_err(&path, e))
     }
 
     /// The store's value rows (promised ones included, side-remote imports
@@ -2747,6 +2823,8 @@ impl<'a> AttestStore<'a> {
             ));
         }
         let deleted_here = self.deletion_records(&session)?;
+        // Taken before the serialization reads the store (see below).
+        let serialized_as_of = now_ms();
         self.serialize_checked(&session, &local_ref)?;
         // Materializing is skipped when the fetched tip is the one
         // materialized into this store last time (and nothing had to be
@@ -2811,16 +2889,31 @@ impl<'a> AttestStore<'a> {
                     }
                     let commits: Vec<&str> = commits.iter().map(String::as_str).collect();
                     self.hydrate_trees(name, &commits)?;
-                    // A fresh session reads the blobs just fetched.
-                    session = self.session()?;
                 }
                 let suffix = tracking
                     .strip_prefix(&format!("refs/{ns}/"))
                     .unwrap_or(&tracking)
                     .to_owned();
-                let _ = guarded("materializing fetched metadata", || {
-                    session.materialize(Some(&suffix))
+                // git-meta's materialize marks the store materialized as of
+                // its time without reading what was modified, which would
+                // leave out a row another writer stored since the
+                // serialization above read the store (`vci run` beside this
+                // fetch): it is pinned to the time that serialization is
+                // marked as of (or the time before it read, when it had
+                // nothing to do), so such a row stays newer than the marker
+                // and the serialization that follows takes it, while the
+                // rows the merge writes (the tree holds them) do not. A fresh
+                // session reads the blobs just fetched.
+                let marker = guarded("reading the store", || {
+                    session.store().get_last_materialized()
                 })?;
+                let as_of = marker.map_or(serialized_as_of, |m| m.max(serialized_as_of));
+                let pinned = self.session()?.with_timestamp(as_of);
+                let _ = guarded("materializing fetched metadata", || {
+                    pinned.materialize(Some(&suffix))
+                })?;
+                drop(pinned);
+                session = self.session()?;
             }
             if std::env::var_os("VCI_TIMING").is_some() {
                 let how = match &lazy {
@@ -3381,6 +3474,8 @@ impl<'a> AttestStore<'a> {
                     .collect()
             };
         let mut back = 0;
+        let project = Target::project();
+        let mut put_back: Vec<String> = Vec::new();
         for root in candidates.intersection(&referenced) {
             let key = manifest_key(root);
             let mut sources: Vec<String> = Vec::new();
@@ -3408,10 +3503,12 @@ impl<'a> AttestStore<'a> {
                 guarded("putting back an input manifest", || {
                     handle.set(&key, text.as_str())
                 })?;
+                put_back.push(key);
                 back += 1;
                 break;
             }
         }
+        self.stamp_written(put_back.iter().map(|k| (&project, k.as_str())))?;
         Ok(back)
     }
 
@@ -3663,12 +3760,17 @@ impl<'a> AttestStore<'a> {
                     )));
                 }
                 let session = self.session()?;
-                for k in &unsendable.gone {
-                    session
-                        .target(&k.to_target())
-                        .remove(&k.key)
-                        .map_err(meta_err)?;
+                let targets: Vec<Target> = unsendable.gone.iter().map(Key::to_target).collect();
+                for (k, t) in unsendable.gone.iter().zip(&targets) {
+                    session.target(t).remove(&k.key).map_err(meta_err)?;
                 }
+                self.stamp_written(
+                    unsendable
+                        .gone
+                        .iter()
+                        .zip(&targets)
+                        .map(|(k, t)| (t, k.key.as_str())),
+                )?;
                 report.note(format!(
                     "deleted {} value(s) this clone never fetched that {name} no longer has (deleted there and garbage-collected; first: {} {}): no push can publish them",
                     unsendable.gone.len(),
