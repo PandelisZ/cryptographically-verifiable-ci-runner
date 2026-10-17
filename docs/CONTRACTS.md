@@ -109,7 +109,39 @@ pub struct Verified { pub principal: String, pub fingerprint: String /* "SHA256:
 pub fn verify_envelope(envelope: &Envelope, allowed: &AllowedSigners, now: i64) -> Result<Verified, VerifyError>;
 ```
 
-`VerifyError` variants must be distinguishable: `Malformed`, `WrongPayloadType`, `BadSignature`, `WrongNamespace`, `UnknownSigner`, `SignerNotValidNow`, `NoSignatures`.
+`VerifyError` variants must be distinguishable: `Malformed`, `WrongPayloadType`, `BadSignature`, `WrongNamespace`, `UnknownSigner`, `SignerNotValidNow`, `NoSignatures`, and for keyless envelopes `Untrusted` (certificate chain, timestamp, validity) and `UnknownIdentity`.
+
+Keyless signing (`vci_attest::keyless`, since vci 2.0; findings in docs/spike-oidc.md):
+
+```rust
+pub const IDENTITIES_FILE: &str = ".vci/identities.toml";          // [[identity]] principal, issuer, repository, workflow, ref, event?, environment?, runner_environment?
+pub const TRUSTED_ROOT_FILE: &str = ".vci/sigstore-trusted-root.json"; // `gh attestation trusted-root` output (JSON Lines or one object)
+pub struct Identities { pub rules: Vec<IdentityRule> }
+impl Identities { pub fn parse(text: &str) -> Result<Self, String>; pub fn matching(&self, id: &CertIdentity) -> Option<&IdentityRule>; pub fn principals(&self, id: &CertIdentity) -> Vec<String>; }
+pub struct CertIdentity { issuer, repository /* owner/name */, workflow /* owner/name/<path>, no @ref */, workflow_ref, ref_, event, environment, runner_environment, sha, run }
+impl CertIdentity { pub fn from_claims(claims: &serde_json::Value) -> Result<Self, String>; pub fn describe(&self) -> String; pub fn signer_id(&self) -> String /* 16 hex of SHA-256(issuer \n repository \n workflow), lowercased repo/workflow */ }
+pub struct TrustedRoot { /* certificate and timestamp authorities */ } impl TrustedRoot { pub fn parse(text: &str) -> Result<Self, String>; }
+pub struct SigstoreMaterial { pub media_type: String, pub verification_material: VerificationMaterial }  // a Sigstore bundle without dsseEnvelope
+pub struct KeylessSigner;  // new(Instance) fetches the job's token (fails early without id-token: write); sign_statement -> (Envelope, SigstoreMaterial)
+pub fn to_stored_json(envelope: &Envelope, material: &SigstoreMaterial) -> Vec<u8>;
+pub fn material_from_json(stored: &[u8]) -> Result<Option<SigstoreMaterial>, VerifyError>;   // None: an SSH envelope
+pub fn to_bundle_json(envelope: &Envelope, material: &SigstoreMaterial) -> serde_json::Value;  // standard v0.3 bundle
+pub fn verify_keyless(envelope: &Envelope, material: &SigstoreMaterial, ids: &Identities, root: &TrustedRoot, now: i64) -> Result<KeylessVerified, VerifyError>;
+```
+
+Stored form of a keyless attestation: the DSSE envelope JSON (`payloadType`, `payload`, `signatures: [{keyid: "",
+sig: <base64 DER ECDSA-P256-SHA256 signature over the PAE>}]`) plus a top-level member `sigstore`:
+`{mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json", verificationMaterial: {certificate: {rawBytes}, tlogEntries: [],
+timestampVerificationData: {rfc3161Timestamps: [{signedTimestamp}]}}}` (vci's container; adding `dsseEnvelope` from
+the envelope's fields gives a standard bundle). `Envelope` itself is unchanged and ignores the member; an SSH envelope
+has none and is serialised byte for byte as before. Verification: exactly one signature; the leaf certificate's key
+verifies it over the PAE; an RFC 3161 timestamp over the signature bytes verifies with a timestamp authority of the
+trust root (messageImprint, signed attributes' messageDigest and contentType, signature, genTime within the TSA
+certificate and its `validFor`); genTime is within the leaf's validity, not more than 300 s after `now`; the leaf is
+issued (name and signature) by the first certificate of a certificate authority of the trust root, at genTime within
+its `validFor` and every chain certificate's validity, and has the code-signing EKU; its Fulcio extensions (`.8`
+issuer, `.9` build signer URI, `.12` source repository URI, `.14` ref, `.20` trigger, `.23` environment, `.11` runner
+environment) match an `[[identity]]`, whose `principal` is the signer. No transparency log or SCT is checked.
 
 ## vci-git (no dependency on other workspace crates; shells out to `git`)
 
@@ -514,6 +546,13 @@ accepted). A Rails taint is waived only by `policy.ignore_taints` (`policy.rails
 parses and has no effect).
 
 ## vci-cli predicate and storage
+
+Signer id in store keys: SSH, 16 hex of SHA-256 over the public key blob; keyless (since vci 2.0), 16 hex of SHA-256
+over `issuer \n repository \n workflow` of the job's token (`CertIdentity::signer_id`), so one workflow file's
+attestations supersede each other across runs and refs. `vci plan` reads `.vci/identities.toml` and
+`.vci/sigstore-trusted-root.json` from the base commit; without `.vci/allowed_signers` there, an identities.toml is
+enough trust to plan (no SSH key is then trusted). An invalid or missing identities.toml or trust root is a warning
+and fails every keyless candidate (its unit runs).
 
 The signed predicate is `vci_core::Predicate` flattened, plus `envConfigDigest` (docs/ENV.md), `projectDir` (repo
 relative), `runnerProject` (Vitest project name), `projectName` (the `[[projects]]` name; omitted in the

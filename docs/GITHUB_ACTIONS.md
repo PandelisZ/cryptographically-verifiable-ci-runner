@@ -175,14 +175,15 @@ Every input is optional.
 | `prebuilt` | `true` | Deprecated alias: `false` means `build-from-source: true`, except that it compiles without trying the release binary first |
 | `token` | `github.token` | Token `gh` uses to download the release binary; without `gh`, the public release URL is used |
 | `signing-key` | `""` | Contents of an SSH private key, from an environment secret limited to the default branch. `vci ci` then attests what it runs. Its public half must be in `.vci/allowed_signers` on the base branch, under a principal listed in `policy.no_skip_refs_except` for main to skip on it. See [Attesting in CI](#attesting-in-ci) |
+| `oidc` | `false` | `true` (or `github`, `public-good`): attest like `signing-key`, keylessly, with the job's OIDC token and no secret (needs `permissions: id-token: write`). See [Keyless attestation (OIDC)](#keyless-attestation-oidc) |
 | `ttl` | `14d` | Lifetime of those attestations (at most `policy.max_ttl`) |
-| `push` | `true` | With `signing-key`: push the attestations to `remote` (needs `permissions: contents: write`); a failed push is a warning. Nothing is pushed when `vci ci` attested nothing on purpose (see [Attesting in CI](#attesting-in-ci)) |
+| `push` | `true` | With `signing-key` or `oidc`: push the attestations to `remote` (needs `permissions: contents: write`); a failed push is a warning. Nothing is pushed when `vci ci` attested nothing on purpose (see [Attesting in CI](#attesting-in-ci)) |
 
 | Output | Meaning |
 |---|---|
 | `skipped` | Number of test units skipped |
 | `run` | Number of test units that ran |
-| `attested` | Number of test units attested with `signing-key` |
+| `attested` | Number of test units attested with `signing-key` or `oidc` |
 
 ## Attesting in CI
 
@@ -315,6 +316,78 @@ removed from `.vci/allowed_signers`. So treat it as a credential your locked dep
   then the secret, and do so whenever a dependency of the attested job is found compromised. Attestations it signed
   stop counting the moment the line is gone, and the next push to main runs and attests everything again;
 - list no developer or agent principal in `no_skip_refs_except`.
+
+## Keyless attestation (OIDC)
+
+A job can attest without any key: with `oidc: true` (`vci ci --oidc`) it proves who it is with the OIDC token GitHub
+gives a job that has `permissions: id-token: write`, and signs through Sigstore the way `npm publish --provenance`
+and `actions/attest` do: an ephemeral key, certified for ten minutes by Fulcio from the token, and an RFC 3161
+timestamp per attestation. Nothing secret exists to leak. Trust is a policy on the job's identity (repository,
+workflow file, ref, event, environment), committed in `.vci/identities.toml` on the base branch next to
+`.vci/allowed_signers`; laptops keep SSH keys, and both kinds of attestation share the store and the policy.
+
+1. Write `.vci/identities.toml` and the Sigstore trust root (`vci init --oidc` writes both for origin's repository,
+   or by hand):
+
+   ```toml
+   [[identity]]
+   principal = "github-actions"          # the name policy lists use, like an allowed_signers principal
+   issuer = "https://token.actions.githubusercontent.com"
+   repository = "owner/name"
+   workflow = ".github/workflows/test.yml"   # the workflow file of the signing job (glob)
+   ref = "refs/heads/main"                   # glob
+   event = "push"                            # optional (glob), as are environment and runner_environment
+   environment = "vci-attest"
+   ```
+
+   ```sh
+   gh attestation trusted-root > .vci/sigstore-trusted-root.json
+   ```
+
+   Every field present must match the certificate Fulcio issued (`*` does not cross `/`, `**` does). A reusable
+   workflow of another repository is named `owner/repo/.github/workflows/x.yml`. The trust root lists the
+   certificate and timestamp authorities of GitHub's Sigstore instance and of the public-good one; GitHub renews its
+   intermediates yearly, so refresh the file (the same command) when `vci explain` names an unknown issuer.
+
+2. Name the principal in `no_skip_refs_except` as for a key, and commit both files to the default branch.
+
+3. Attest from the main-branch job, with `id-token: write` instead of a secret:
+
+   ```yaml
+     test-main:
+       runs-on: ubuntu-latest
+       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+       environment: vci-attest      # optional: lets the identity require it
+       permissions:
+         contents: write            # vci ci --push
+         id-token: write            # the OIDC token Fulcio certifies
+       steps:
+         - uses: actions/checkout@v4
+           with:
+             fetch-depth: 0
+         - run: npm ci
+         - uses: PandelisZ/cryptographically-verifiable-ci-runner@v1
+           with:
+             oidc: true
+   ```
+
+What changes against a key: no secret to store, rotate or leak (a stolen certificate is worthless ten minutes later,
+and its key never leaves the job's memory); the identity, not possession of a file, is what `no_skip_refs_except`
+trusts. What does not change: any step of the attesting job can still ask for a token and sign as that identity
+while the job runs, so the same rule holds as for a key: the identity that main skips on must only match runs on
+main (pin `ref`, `event` and, best, an `environment` restricted to the default branch). An identity for pull
+requests under another principal (not in `no_skip_refs_except`) lets pull request runs attest for each other, with
+no secret involved: `ref = "refs/pull/*/merge"`, `event = "pull_request"`. `vci ci --oidc` refuses to attest, like
+`--key`, when the job's identity signs as a principal of `no_skip_refs_except` on a ref `no_skip_refs` does not
+match.
+
+Signing uses GitHub's Sigstore instance (`fulcio.githubapp.com`, `timestamp.githubapp.com`) by default, also for
+public repositories (no public transparency log entry per test); `oidc: public-good` uses `fulcio.sigstore.dev` and
+`timestamp.sigstore.dev`. It needs `curl` (every GitHub-hosted runner has it). Verification is offline: the
+certificate must chain to the committed trust root, a trusted timestamp must place the signature inside the
+certificate's ten minutes, and the certificate's identity must match an `[[identity]]`. Anything else (no trust
+root, an expired or unknown intermediate, a tampered envelope) makes the unit run, and `vci explain` names the
+check. Older vci versions see a keyless attestation as malformed and run the unit.
 
 ## Pinning
 
