@@ -1857,3 +1857,235 @@ fn listings_leave_out_what_git_ignores() {
     let p = w.plan(&work, "main");
     assert!(p.run.contains(B), "B probes its local override: {p:?}");
 }
+
+/// Lines, exit code, `--summary` and stored predicates of one run.
+type RunRecord = (Vec<String>, Option<i32>, Value, Vec<(String, Value)>);
+
+/// What one `vci run` of `files` reports and stores, for comparing runs:
+/// the per-unit lines of stderr in order (attested, not attesting, warnings,
+/// the counts), the exit code, `--summary`, and every stored predicate by
+/// store key (without the issue and expiry times and the tests' duration,
+/// the only fields that differ between two runs of the same tree).
+fn run_record(w: &World, files: &[&str], jobs: &str, tag: &str) -> RunRecord {
+    let dir = &w.work;
+    let _ = std::fs::remove_file(dir.join(".git/git-meta.sqlite"));
+    let summary = w.base.join(format!("summary-{tag}.json"));
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", w.trusted.to_str().unwrap()]);
+    args.extend(["--summary", summary.to_str().unwrap()]);
+    let out = w.vci_env(
+        dir,
+        &args,
+        &[("VCI_JOBS", Some(jobs)), ("VCI_TIMING", None)],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<String> = stderr
+        .lines()
+        .filter(|l| {
+            [
+                "vci: attested ",
+                "vci: not attesting ",
+                "vci: warning: src/",
+                "vci: error: ",
+            ]
+            .iter()
+            .any(|p| l.starts_with(p))
+                || l.ends_with(" not attested")
+        })
+        .map(str::to_owned)
+        .collect();
+    let summary: Value = serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+    let repo = store_for(dir);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut stored: Vec<(String, Value)> = AttestStore::new(&repo)
+        .list(None)
+        .unwrap()
+        .iter()
+        .map(|s| {
+            let env: Value = serde_json::from_slice(&s.bytes).unwrap();
+            let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
+            let st: Value = serde_json::from_slice(&payload).unwrap();
+            let mut p = store_common::inline_manifest(&repo, st["predicate"].clone());
+            let o = p.as_object_mut().unwrap();
+            assert!(o.remove("issuedAt").is_some(), "{st}");
+            assert!(o.remove("expiresAt").is_some(), "{st}");
+            let r = o["result"].as_object_mut().unwrap();
+            assert!(r.remove("durationMs").is_some(), "{st}");
+            (s.key.clone(), p)
+        })
+        .collect();
+    stored.sort_by(|a, b| a.0.cmp(&b.0));
+    (lines, out.status.code(), summary, stored)
+}
+
+/// Units are checked and signed several at a time (`VCI_JOBS`), and stored
+/// and reported in order: a run with four jobs prints the same lines in the
+/// same order, writes the same `--summary`, exits the same way and stores the
+/// same attestations under the same keys as a run with one job.
+#[test]
+fn units_checked_and_signed_at_once_match_one_at_a_time() {
+    let w = World::new();
+    let work = w.work.clone();
+    let mut files: Vec<String> = [A, B, C, D].iter().map(|s| (*s).to_owned()).collect();
+    let read = |name: &str, path: &str| {
+        format!(
+            "import assert from \"node:assert/strict\";\nimport {{ readFileSync }} from \"node:fs\";\nimport {{ test }} from \"node:test\";\n\ntest(\"{name}\", () => {{\n  assert.ok(readFileSync(new URL(\"../{path}\", import.meta.url), \"utf8\").length > 0);\n}});\n"
+        )
+    };
+    w.write(".gitignore", "node_modules/\n.vci/out/\nlocal/\n");
+    w.write("local/cache.txt", "only on this machine\n");
+    for i in 0..8 {
+        let rel = format!("src/e{i}.test.mjs");
+        // Every other one also reads a git-ignored file (a warning).
+        let path = if i % 2 == 0 {
+            "fixtures/b.json"
+        } else {
+            "local/cache.txt"
+        };
+        w.write(&rel, &read(&format!("e{i}"), path));
+        files.push(rel);
+    }
+    for (rel, body) in [
+        (
+            "src/skip.test.mjs",
+            "import { test } from 'node:test';\ntest('a', () => {});\ntest('b', { skip: true }, () => {});\n",
+        ),
+        (
+            "src/fail.test.mjs",
+            "import assert from 'node:assert';\nimport { test } from 'node:test';\ntest('a', () => { assert.equal(1, 2); });\n",
+        ),
+        (
+            "src/write.test.mjs",
+            "import { test } from 'node:test';\nimport fs from 'node:fs';\ntest('a', () => { fs.writeFileSync(new URL('../out.txt', import.meta.url), 'x'); });\n",
+        ),
+    ] {
+        w.write(rel, body);
+        files.push(rel.to_owned());
+    }
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "more test files"]);
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
+
+    let one = run_record(&w, &files, "1", "one");
+    let _ = std::fs::remove_file(work.join("out.txt"));
+    let four = run_record(&w, &files, "4", "four");
+    let _ = std::fs::remove_file(work.join("out.txt"));
+
+    let (lines, exit, summary, stored) = &one;
+    assert_eq!(*exit, Some(1), "the failing test fails the run");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "vci: 12 attested, 3 not attested"),
+        "{lines:#?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("vci: warning: src/e") && l.contains("inputs ignored by git"))
+            .count(),
+        4,
+        "{lines:#?}"
+    );
+    assert_eq!(summary["units"].as_array().unwrap().len(), 15, "{summary}");
+    assert_eq!(stored.len(), 12);
+    assert_eq!(one.0, four.0, "the same lines in the same order");
+    assert_eq!(one.1, four.1, "the same exit code");
+    assert_eq!(one.2, four.2, "the same --summary");
+    assert_eq!(one.3, four.3, "the same attestations under the same keys");
+}
+
+/// `git check-ignore` fails (exit 128) on a path inside a submodule, after
+/// printing only the ignored paths before it. A unit that lists a submodule
+/// and another directory then keeps that directory's ignored children in its
+/// listing, as before 2.1, however many other units were checked before it
+/// (`vci run` with one job checks `ign1` first and caches git's answer about
+/// `zdata/x.log`); and the plan verifies it the same way whatever file it
+/// verified first (one job: `ign1`, which lists `zdata` alone).
+#[test]
+fn a_failed_git_check_ignore_answers_as_before_whatever_came_first() {
+    let w = World::new();
+    let work = w.work.clone();
+    const I1: &str = "src/ign1.test.mjs";
+    const I2: &str = "src/ign2.test.mjs";
+    let lists = |name: &str, dirs: &[&str]| {
+        let reads: String = dirs
+            .iter()
+            .map(|d| format!("  readdirSync(new URL(\"../{d}\", import.meta.url));\n"))
+            .collect();
+        format!(
+            "import {{ readdirSync }} from \"node:fs\";\nimport {{ test }} from \"node:test\";\n\ntest(\"{name}\", () => {{\n{reads}}});\n"
+        )
+    };
+    w.write(".gitignore", "node_modules/\n.vci/out/\n*.log\n");
+    w.write("zdata/keep.txt", "tracked\n");
+    w.write("zdata/x.log", "ignored, present\n");
+    w.write("sub/a", "inside the submodule\n");
+    w.write(I1, &lists("ign1", &["zdata"]));
+    w.write(I2, &lists("ign2", &["sub", "zdata"]));
+    w.git(&work, &["add", ".gitignore", "zdata/keep.txt", I1, I2]);
+    w.git(
+        &work,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,sub",
+        ],
+    );
+    w.git(
+        &work,
+        &["commit", "-q", "-m", "a submodule and two listings"],
+    );
+    let one_job = [("VCI_JOBS", Some("1"))];
+    let root_of = |id: &str| -> String {
+        let p = predicates(&work, id);
+        assert_eq!(p.len(), 1, "{p:#?}");
+        p[0]["inputRoot"].as_str().unwrap().to_owned()
+    };
+
+    let out = w.vci_env(
+        &work,
+        &["run", I2, "--key", w.trusted.to_str().unwrap()],
+        &one_job,
+    );
+    assert!(out.status.success());
+    let alone = root_of(I2);
+    let excluded = |p: &Value| {
+        p["manifest"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "zdata/x.log")
+    };
+    let i2 = predicates(&work, I2);
+    assert!(
+        !excluded(&i2[0]),
+        "git failed for ign2's children: nothing left out, as before 2.1: {:#}",
+        i2[0]
+    );
+    let _ = std::fs::remove_file(work.join(".git/git-meta.sqlite"));
+    let out = w.vci_env(
+        &work,
+        &["run", I1, I2, "--key", w.trusted.to_str().unwrap()],
+        &one_job,
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        root_of(I2),
+        alone,
+        "ign2's listing as when it is checked alone"
+    );
+    let i1 = predicates(&work, I1);
+    assert!(
+        excluded(&i1[0]),
+        "ign1 leaves the ignored log out: {:#}",
+        i1[0]
+    );
+
+    for _ in 0..2 {
+        let p = w.plan_env(&work, "main", &one_job);
+        assert!(p.skip.contains(I1) && p.skip.contains(I2), "{p:?}");
+    }
+}

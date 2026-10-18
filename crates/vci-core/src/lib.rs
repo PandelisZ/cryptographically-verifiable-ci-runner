@@ -12,8 +12,8 @@ pub mod predicate;
 
 pub use hash::{ABSENT_HASH, blake3_hex};
 pub use manifest::{
-    EntryKind, EnvEntry, External, InputEntry, InputManifest, ManifestError, Mismatch, Observation,
-    env_value_hash,
+    CheckoutCache, EntryKind, EnvEntry, External, InputEntry, InputManifest, ManifestError,
+    Mismatch, Observation, env_value_hash,
 };
 pub use path::{PathError, RepoPath};
 pub use predicate::{

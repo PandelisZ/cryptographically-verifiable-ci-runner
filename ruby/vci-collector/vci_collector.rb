@@ -39,6 +39,19 @@
 # A child process of Active Record's schema maintenance (VCI_RAILS_MODE=engine,
 # set by the collector of its parent): not the test's, nothing to record.
 return if ENV["VCI_RAILS_MODE"] == "engine"
+# A process a test started (`ruby -e`, `bin/rails runner`) in batch mode: it
+# inherits RUBYOPT and VCI_OUT but no test id (the batch gives a file's
+# process its id, not its environment), and it is not the batch's own
+# process (VciCollector::BATCH). Its parent's hooks recorded it as a taint
+# ("process:spawn", "process:system", ...); here it is not the test's
+# process, so the collector does nothing at all: no hooks, no output, and
+# nothing on stderr (vex-api's batch_interaction_test.rb asserts that a
+# child `ruby -e` prints nothing). Without VCI_OUT (the collector loaded by
+# hand) it still says at exit that it wrote nothing.
+if ENV.fetch("VCI_RAILS_MODE", "collect") == "collect" && ENV["VCI_OUT"] && !ENV["VCI_TEST_ID"] &&
+   !(ENV["VCI_RAILS_BATCH"] && [nil, Process.pid.to_s].include?(ENV["VCI_RAILS_BATCH_PID"]))
+  return
+end
 
 module VciCollector
   # Part of the toolchain (Probe.libs): bumped whenever what the collector
@@ -1875,6 +1888,150 @@ module VciCollector
 end
 
 # ---------------------------------------------------------------------------
+# A hooked method a test redefines in the class the hook is prepended to
+# (every mode).
+# ---------------------------------------------------------------------------
+module VciCollector
+  # A test that captures a hooked method as an object and then redefines the
+  # method calls the object for what its redefinition does not fake:
+  #
+  #   original_env = ENV.method(:[])
+  #   ENV.stub(:[], ->(key) { key == "X" ? "x" : original_env.call(key) })
+  #
+  # (vex-api's manual_image_deploy_service_test.rb; also a lasting
+  # `define_singleton_method`; rspec-mocks puts its stubs in a module
+  # prepended in front of the hook, which does not loop). Without the
+  # collector the object is Ruby's own method. Under it, it is the collector's hook (a module prepended to
+  # the class that defines the method, so what `ENV.method(:[])` finds),
+  # whose `super` is whatever the class defines now: the redefinition, which
+  # called the object, which called the hook again, until SystemStackError.
+  #
+  # So a redefinition of a hooked name in the hooked class itself (seen by
+  # method_added / singleton_method_added) is wrapped: the wrapper runs the
+  # redefinition, and when the hook is re-entered from inside it on the same
+  # thread through a captured object (Method#call, Method#[], Method#===,
+  # UnboundMethod#bind_call: the frame that called the hook), it calls the
+  # method the class defined before the collector hooked it instead. The
+  # hook still records that call (the captured object is the hook). A direct
+  # call from inside the redefinition (`ENV[k]` in the stub, or in a block a
+  # stubbed `File.open` yields) runs the redefinition again, as it does
+  # without the collector. A captured object called some other way
+  # (`&original`, `original.to_proc`, `curry`) is not told apart from a
+  # direct call: after MAX_DEPTH nested runs of the redefinition on one
+  # thread the original is called (the recursion ends, where it would
+  # otherwise overflow the stack). Restoring the original (Minitest's
+  # `alias_method` back, AliasGuard) is not wrapped. Anything unexpected
+  # leaves the redefinition as the test made it.
+  module Redefined
+    # target => {name => the method the target itself defined before it was
+    # hooked (UnboundMethod), or nil (inherited, or none)}
+    WATCH = {}.compare_by_identity
+    ACTIVE = :__vci_collector_redefined
+    WRAPPING = :__vci_collector_wrapping
+    CAPTURED = /\A(Method#(call|\[\]|===)|UnboundMethod#bind_call)\z/
+    MAX_DEPTH = 16
+    HERE = __FILE__
+
+    # Prepended to the class whose method_added (instance methods of a
+    # hooked class) or singleton_method_added (a hooked singleton class: its
+    # object's) Ruby calls.
+    module Watch
+      private
+
+      def method_added(name)
+        VciCollector::Redefined.added(self, name)
+        super
+      end
+
+      def singleton_method_added(name)
+        VciCollector::Redefined.added(singleton_class, name)
+        super
+      end
+    end
+
+    class << self
+      # Watch the methods `mod` (a hook prepended to `target`) defines.
+      def watch(target, mod)
+        names = WATCH[target] ||= {}
+        (mod.instance_methods(false) + mod.private_instance_methods(false)).each do |m|
+          names[m] = own(target, m) unless names.key?(m)
+        end
+        (target.singleton_class? ? target : target.singleton_class).prepend(Watch)
+      rescue StandardError
+        nil
+      end
+
+      # The method `t` itself defines for `name` (behind what is prepended
+      # to it), or nil.
+      def own(t, name)
+        um = t.instance_method(name)
+        pre = t.ancestors.take_while { |a| !a.equal?(t) }
+        um = um.super_method while um && !um.owner.equal?(t) && pre.any? { |a| a.equal?(um.owner) }
+        um if um&.owner.equal?(t)
+      rescue NameError
+        nil
+      end
+
+      def added(t, name)
+        names = WATCH[t]
+        return unless names&.key?(name) && !Thread.current[WRAPPING]
+        user = own(t, name)
+        return if user.nil? || user == names[name]
+        wrap(t, name, user, names[name])
+      rescue StandardError
+        nil
+      end
+
+      def wrap(t, name, user, orig)
+        key = [t, name].freeze
+        vis = if t.private_instance_methods(false).include?(name) then :private
+              elsif t.protected_instance_methods(false).include?(name) then :protected
+              else :public
+              end
+        Thread.current[WRAPPING] = true
+        t.send(:define_method, name) do |*args, **kw, &blk|
+          VciCollector::Redefined.run(key, orig, user, self, args, kw, blk)
+        end
+        t.send(vis, name)
+      ensure
+        Thread.current[WRAPPING] = false
+      end
+
+      def run(key, orig, user, recv, args, kw, blk)
+        active = (Thread.current[ACTIVE] ||= {}.compare_by_identity)
+        depth = active[key] || 0
+        if depth.positive? && (depth >= MAX_DEPTH || captured?)
+          target = orig || inherited(*key)
+          return target.bind_call(recv, *args, **kw, &blk) if target
+        end
+        active[key] = depth + 1
+        begin
+          user.bind_call(recv, *args, **kw, &blk)
+        ensure
+          depth.zero? ? active.delete(key) : active[key] = depth
+        end
+      end
+
+      # Whether the hook that led here was called through a captured method
+      # object: the first frame outside the collector.
+      def captured?
+        caller_locations(2).each do |l|
+          next if l.path == HERE
+          return CAPTURED.match?(l.label)
+        end
+        false
+      end
+
+      def inherited(t, name)
+        t.superclass&.instance_method(name)
+      rescue NameError
+        nil
+      end
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
 # File system, process and ENV hooks (collect mode only).
 # ---------------------------------------------------------------------------
 if VciCollector.collect?
@@ -2530,6 +2687,7 @@ if VciCollector.collect?
 
     def self.hook(target, mod)
       HOOK_MODULES[mod] = true
+      Redefined.watch(target, mod)
       target.prepend(mod)
     end
 
@@ -5551,8 +5709,10 @@ end
 # hooks, which therefore record nothing for them).
 if VciCollector::RUNNER == "rspec"
   # Pathname#exist? asks FileTest, load_global_config.rb asks File.
-  File.singleton_class.prepend(VciCollector::RSpecSupport::SimpleCovConfigGuard)
-  FileTest.singleton_class.prepend(VciCollector::RSpecSupport::SimpleCovConfigGuard)
+  [File.singleton_class, FileTest.singleton_class].each do |t|
+    VciCollector::Redefined.watch(t, VciCollector::RSpecSupport::SimpleCovConfigGuard)
+    t.prepend(VciCollector::RSpecSupport::SimpleCovConfigGuard)
+  end
 end
 
 # Whenever a constant one of the hooked libraries defines is set (from Ruby

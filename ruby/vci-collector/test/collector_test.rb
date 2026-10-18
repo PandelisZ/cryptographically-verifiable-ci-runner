@@ -1660,6 +1660,57 @@ class CollectorTest < Minitest::Test
     assert_empty taints(recs)
   end
 
+  # A stub that captures the hooked method as a Method object first and
+  # calls it for what it does not fake (vex-api's
+  # manual_image_deploy_service_test.rb: `original_env = ENV.method(:[])`,
+  # then `ENV.stub(:[], ->(key) { ... original_env.call(key) })`). The
+  # captured method is the collector's hook, whose `super` is now the stub:
+  # the stub and the hook called each other until SystemStackError. The
+  # captured method reaches the method it was captured from, however it was
+  # captured (Method, UnboundMethod, a redefinition that stays), and what it
+  # reads is recorded.
+  def test_stub_calling_a_captured_hooked_method
+    put("data.txt", "data")
+    recs = collect(<<~'RUBY', env: { "VCI_SET" => "set" })
+      require "minitest/mock"
+      original_env = ENV.method(:[])
+      ENV.stub(:[], ->(key) { key == "VCI_FAKED" ? "faked" : original_env.call(key) }) do
+        raise "not stubbed" unless ENV["VCI_FAKED"] == "faked"
+        raise "not the original" unless ENV["VCI_SEEN"].nil? && ENV["VCI_SET"] == "set"
+      end
+      original_fetch = ENV.singleton_class.instance_method(:fetch)
+      ENV.stub(:fetch, ->(key, *d) { original_fetch.bind_call(ENV, key, *d) }) do
+        raise "not the original" unless ENV.fetch("VCI_FETCHED", "default") == "default"
+      end
+      original_exist = File.method(:exist?)
+      File.stub(:exist?, ->(p) { p == "fake.txt" || original_exist.call(p) }) do
+        raise "not stubbed" unless File.exist?("fake.txt") && File.exist?("data.txt") && !File.exist?("nope.txt")
+      end
+      original_key = ENV.method(:key?)
+      ENV.define_singleton_method(:key?) { |k| k == "VCI_ALWAYS" || original_key.call(k) }
+      raise "not redefined" unless ENV.key?("VCI_ALWAYS") && !ENV.key?("VCI_KEYED")
+      raise "not restored" unless ENV["VCI_FAKED"].nil? && File.exist?("data.txt")
+      t = Thread.new { ENV.stub(:[], ->(k) { original_env.call(k) }) { ENV["VCI_THREAD"] } }
+      raise "thread" unless t.value.nil?
+      # A direct call from inside the stub is the stub's, as without the collector.
+      calls = 0
+      File.stub(:open, ->(name, &b) { calls += 1; name == "outer" ? b.call(File.open("inner")) : :inner }) do
+        raise "direct call" unless File.open("outer") { |x| x } == :inner && calls == 2
+      end
+      # Called through a proc: ends at the original.
+      original_proc = ENV.method(:fetch).to_proc
+      ENV.stub(:fetch, ->(k, *d) { original_proc.call(k, *d) }) do
+        raise "proc" unless ENV.fetch("VCI_PROC", "p") == "p"
+      end
+    RUBY
+    assert_equal 0, recs.last["exitStatus"], recs.last.inspect
+    envs = recs.select { |r| r["kind"] == "env" }.map { |r| r["key"] }
+    %w[VCI_SEEN VCI_SET VCI_FETCHED VCI_KEYED VCI_THREAD VCI_PROC].each { |k| assert_includes envs, k }
+    assert_includes paths(recs, "stat"), "data.txt"
+    assert_includes paths(recs, "probe"), "nope.txt"
+    assert_empty taints(recs)
+  end
+
   # Batch mode (VCI_RAILS_BATCH): the loader (a stand-in for Rails'
   # Runner.load_tests) asks for the first file, and the process boots once
   # per helper the files require first, then forks one process per file.
@@ -2106,6 +2157,40 @@ class CollectorTest < Minitest::Test
       assert_equal [["test/a_test.rb", 0], ["test/b_test.rb", 0], [nil, nil]],
                    lines.map { |l| [l["id"], l["exit"]] }.sort_by(&:to_s), out[:said]
       assert_includes out["test/a_test.rb"].map { |r| r["reason"] }, "process:system"
+    end
+  end
+
+  # A Ruby process a batch file's test starts (vex-api's
+  # batch_interaction_test.rb: `Open3.capture3(RbConfig.ruby, "-e", ...)`,
+  # then `assert_empty stderr`) inherits RUBYOPT, so it loads the collector,
+  # but it has no test id of its own (the batch gives the file's process its
+  # id, not its environment). It printed "VCI_OUT or VCI_TEST_ID not set;
+  # nothing written" at exit, which failed that test. It says nothing and
+  # hooks nothing: the parent's hooks already recorded it ("process:...").
+  def test_batch_child_process_says_nothing
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    put("test/a_test.rb", <<~'RUBY')
+      require "test_helper"
+      require "open3"
+      require "rbconfig"
+      class ATest < Minitest::Test
+        def test_a
+          out, err, st = Open3.capture3(RbConfig.ruby, "-e", "print defined?(VciCollector).inspect; File.read(__FILE__) rescue nil")
+          assert st.success?
+          assert_equal "", err
+          assert_equal "nil", out
+        end
+      end
+    RUBY
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = assert(true)\nend\n")
+    ids = %w[test/a_test.rb test/b_test.rb]
+    [{}, { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }].each do |env|
+      out = batch(ids, env: env)
+      lines = out[:status].select { |l| l["id"] || l["done"] }
+      assert_equal [["test/a_test.rb", 0], ["test/b_test.rb", 0], [nil, nil]],
+                   lines.map { |l| [l["id"], l["exit"]] }.sort_by(&:to_s), out[:said]
+      assert_includes out["test/a_test.rb"].map { |r| r["reason"] }, "process:spawn"
+      refute_match(/vci_collector/, out[:said])
     end
   end
 

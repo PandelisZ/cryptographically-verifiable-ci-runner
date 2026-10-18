@@ -2217,3 +2217,97 @@ fn a_clone_that_fetched_before_merges_what_changed_like_a_fresh_clone() {
     assert_eq!(plan, w.plan(&fresh2, "main"));
     assert_eq!(stored(&b), stored(&fresh2));
 }
+
+/// The plan's checkout cache and parallel verification (one observation per
+/// path for every candidate of every file): files that share an input all
+/// run when it changes and the others still skip; a change to one file's
+/// own input runs only that file. Several candidates that pass: the newest
+/// (by issuedAt) is the one the plan names, whichever signer's key sorts
+/// first in the store.
+#[test]
+fn shared_inputs_run_only_their_dependents_and_the_newest_candidate_wins() {
+    const S1: &str = "src/s1.test.ts";
+    const S2: &str = "src/s2.test.ts";
+    const S3: &str = "src/s3.test.ts";
+    let w = World::new_with(
+        &[
+            ("src/shared.ts", "export const base = 1;\n"),
+            ("src/own2.ts", "export const two = 2;\n"),
+            ("src/own3.ts", "export const three = 3;\n"),
+            (
+                S1,
+                "import { expect, test } from \"vitest\";\nimport { base } from \"./shared\";\n\ntest(\"s1\", () => {\n  expect(base).toBe(1);\n});\n",
+            ),
+            (
+                S2,
+                "import { expect, test } from \"vitest\";\nimport { base } from \"./shared\";\nimport { two } from \"./own2\";\n\ntest(\"s2\", () => {\n  expect(base + two).toBe(3);\n});\n",
+            ),
+            (
+                S3,
+                "import { expect, test } from \"vitest\";\nimport { three } from \"./own3\";\n\ntest(\"s3\", () => {\n  expect(three).toBe(3);\n});\n",
+            ),
+        ],
+        VCI_TOML,
+    );
+    let work = w.work.clone();
+    // A second trusted signer at the base, for two passing candidates.
+    w.git(&work, &["checkout", "-q", "main"]);
+    let mut signers = w.read(".vci/allowed_signers");
+    signers.push_str(&format!(
+        "second@example.com namespaces=\"vci-attest\" {}\n",
+        pubkey(&w.untrusted)
+    ));
+    w.write(".vci/allowed_signers", &signers);
+    w.git(
+        &work,
+        &["commit", "-q", "-am", "base: trust a second signer"],
+    );
+    w.git(&work, &["checkout", "-q", "-B", "feature", "main"]);
+
+    let trusted = w.trusted.to_str().unwrap().to_owned();
+    w.vci_ok(&work, &["run", S1, S2, S3, "--key", &trusted]);
+    let all = w.plan(&work, "main");
+    assert_eq!(all.skip, set(&[S1, S2, S3]), "{all:?}");
+
+    // One file's own input: only that file runs.
+    let own2 = w.read("src/own2.ts");
+    w.write("src/own2.ts", "export const two = 2; // edited\n");
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[S1, S3]), "{p:?}");
+    assert!(p.run.contains(S2), "{p:?}");
+    w.write("src/own2.ts", &own2);
+
+    // The shared input: both its dependents run, the third still skips.
+    let shared = w.read("src/shared.ts");
+    w.write("src/shared.ts", "export const base = 1; // edited\n");
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[S3]), "{p:?}");
+    assert!(p.run.contains(S1) && p.run.contains(S2), "{p:?}");
+    let ex = w.explain(&work, S2, "main");
+    assert!(ex.contains("entry:src/shared.ts"), "{ex}");
+    w.write("src/shared.ts", &shared);
+    assert_eq!(w.plan(&work, "main").skip, set(&[S1, S2, S3]));
+
+    // Two passing candidates for S3: the newer one is used, whichever it is.
+    let by = |w: &World| -> String {
+        let out = w.vci_ok(&work, &["plan", "--base-ref", "main", "--format", "json"]);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let f = v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["testId"] == S3)
+            .unwrap()
+            .clone();
+        assert_eq!(f["skip"], true, "{f}");
+        f["by"]["principal"].as_str().unwrap().to_owned()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.run(&work, S3, &w.untrusted);
+    assert_eq!(by(&w), "second@example.com");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.run(&work, S3, &w.trusted);
+    assert_eq!(by(&w), "trusted@example.com");
+    let ex = w.explain(&work, S3, "main");
+    assert!(ex.contains("trusted@example.com"), "{ex}");
+}

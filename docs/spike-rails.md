@@ -613,6 +613,49 @@ singleton class) is left alone: its copy's `super` goes on to the superclass, as
 - **What a file's process inherits but its own run would not have**: nothing recorded (the loader's checks of the other
   files are dropped, B1); in memory, `ARGV` still lists every file of the batch.
 
+**B8. A stub that calls the method it captured looped (collector, collect mode).** vex-api's
+`manual_image_deploy_service_test.rb` (`services` group) does
+
+```ruby
+original_env = ENV.method(:[])
+ENV.stub(:[], ->(key) { key == "..." ? @service.public_id : original_env.call(key) }, &block)
+```
+
+Without the collector `original_env` is Ruby's own `ENV.[]`. Under it, it is the collector's hook (`EnvHooks`, prepended
+to `ENV`'s singleton class, is what `ENV.method(:[])` finds), and the hook's `super` is whatever the singleton class
+defines now: the stub, which calls `original_env`, which is the hook again. 5 of the file's 35 tests failed with
+`SystemStackError: 10279 -> 41`, one process per file and in a batch; plain `bin/rails test` passes 35 of 35. B6's
+`AliasGuard` does not help: nothing is aliased. The collector now watches every name its hooks wrap in the class they
+are prepended to (`method_added`, `singleton_method_added`; `VciCollector::Redefined`). A redefinition there (a stub,
+`define_singleton_method`) is wrapped: the wrapper runs it, and when the hook is re-entered from
+inside it on the same thread through a captured object (the frame that called the hook is `Method#call`, `Method#[]`,
+`Method#===` or `UnboundMethod#bind_call`), it calls the method the class defined before it was hooked instead. The hook
+still records that call (the captured object is the hook), so the stub's real reads are inputs. A direct call from
+inside the stub (`ENV[k]` in the stub, or in a block a stubbed `File.open` yields) runs the stub again, as without the
+collector. An object captured and called some other way (`&original`, `to_proc`, `curry`) is not told apart from a direct
+call: after 16 nested runs of the stub on one thread the original is called (the recursion ends where it overflowed the
+stack). Restoring the original (Minitest's alias back) is not wrapped; a hooked call costs nothing more when no stub is
+active. RSpec's `SimpleCovConfigGuard` (`File.exist?`, every mode) is watched the same way. `collector_test.rb`:
+`test_stub_calling_a_captured_hooked_method` (`ENV.method(:[])` + `ENV.stub`, an `UnboundMethod#bind_call` of `fetch`,
+`File.method(:exist?)` + `File.stub`, a lasting `define_singleton_method`, a stub in another thread, a direct call from
+inside a stub, a captured `to_proc`); it fails on the previous collector. vex-api, the two files below in one `vci run`
+(2 slots, `VCI_RUBY_COLLECTOR` pointing at each collector, a release `vci` of `HEAD`): before, 35 runs, 5 errors, not
+attested; after, 35 runs, 0 failures, attested (2,710 inputs), also alone (one process per file).
+
+**B9. A batch file's child Ruby printed to stderr (collector, batch mode).** vex-api's
+`merge_queue/reconciliation/batch_interaction_test.rb` runs `Open3.capture3(RbConfig.ruby, "-e", ...)` and asserts an
+empty stderr. The child inherits `RUBYOPT` (the collector) and `VCI_OUT`, but not a test id: a batch gives a file's
+process its id in memory (`VciCollector.test_id`), not in its environment, and the child is not the batch's own process
+(`VCI_RAILS_BATCH_PID`). It hooked everything, then said `vci_collector: VCI_OUT or VCI_TEST_ID not set; nothing written`
+at exit, and the test failed (one process per file it passes: the child inherits `VCI_TEST_ID` there). A process in
+collect mode with `VCI_OUT` set, no `VCI_TEST_ID` and not the batch's own now returns at the top of the collector, as
+an engine child does: no hooks, no output, nothing printed. What it does is already its parent's taint
+(`process:spawn`, `process:system`, ...). Loaded by hand without `VCI_OUT`, the collector still says it wrote nothing.
+`collector_test.rb`: `test_batch_child_process_says_nothing` (a child `ruby -e` in a batch, with and without slots,
+prints nothing and has no `VciCollector`); it fails on the previous collector. vex-api, the same run as B8: before,
+`Expected "vci_collector: VCI_OUT or VCI_TEST_ID not set; nothing written\n" to be empty`, not attested; after, 1 run,
+0 failures, attested (`waived: process:spawn`, 2,773 inputs).
+
 **Tests.** `crates/vci-cli/tests/e2e_rails.rs`, `rails_batch_mode_gives_what_one_process_per_file_gives`: twenty files,
 one or two per finding above (an inherited failing test, a file requiring another, a top-level monkey patch, Minitest
 threads, lazily loaded code reading `/etc/hosts`, a memoized helper, a cache in `Dir.tmpdir`, a probe of a path

@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-0">2.1.0</a></td><td>18 Oct 2026</td><td>Rails runs its files in parallel slots, one seeded database each; a plan reads the checkout once (minutes to seconds); units are checked and signed in parallel</td></tr>
 <tr><td><a href="#v2-0-4">2.0.4</a></td><td>18 Oct 2026</td><td>No more warning about <code>.DS_Store</code> in a listing git ignores it in</td></tr>
 <tr><td><a href="#v2-0-3">2.0.3</a></td><td>18 Oct 2026</td><td>Directory listings leave out what git ignores, so an attestation made on a laptop verifies in CI</td></tr>
 <tr><td><a href="#v2-0-2">2.0.2</a></td><td>18 Oct 2026</td><td>A read of <code>PATH</code>, <code>HOME</code> or another built-in-ignore variable no longer pins an attestation to one machine; a private key file signs without ssh-agent</td></tr>
@@ -44,6 +45,27 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-0">2.1.0</h2>
+<p><em>18 October 2026.</em> What it took for CI to attest a Rails application the size of vex-api (2,000 test files, a seeded MySQL database, 16-core runners that run the suite in 5 minutes with Rails' parallel workers), measured on it throughout. Three costs, each removed; the arithmetic is in <code>docs/notes-rails-rollout.md</code>.</p>
+
+<h3>Rails: slots</h3>
+<p>A batch of Rails files now runs <strong>W at a time</strong> when the project runs its tests in Rails' parallel worker processes (<code>parallelize</code> in <code>test_helper.rb</code>). Each slot is set up exactly as Rails sets up a worker: the before-fork hooks once, then in each slot <code>parallel_worker_id = i</code> and every after-fork hook (Active Record creates and loads <code>&lt;database&gt;_&lt;i&gt;</code>, <code>parallelize_setup</code> runs, Oaken loads its seeds), and <code>parallelize_teardown</code> at the end. Each file still runs in a process of its own, forked from its slot, so its inputs, result and exit status are its own; it does not seed again, because the slot answers Minitest's <code>should_parallelize?</code> as a worker does. By decision, this is not deterministic at the database level: a file starts from its slot's database as the slot's earlier files left it, as in a Rails worker; the database's contents were never an input. W is <code>VCI_RAILS_JOBS</code>, else <code>PARALLEL_WORKERS</code> above 1, else <code>VCI_JOBS</code> or the CPU count, capped by <code>parallelize(workers: n)</code>; <code>workers: 1</code> or <code>PARALLEL_WORKERS=1</code> keeps one file at a time, and so does a project without <code>parallelize</code>. Fail open throughout: a slot whose setup raises takes no file; a write to vci's temp directory outside a slot's own, even one undone before the batch ends, sends the group back to one process per file; a slot killed mid-batch hands its file back; each group starts from a clean temp directory. The boot's observations, identical for every file of a slot, are written once per slot instead of once per file: a file's output went from 3.5 s to 0.17 s, and the merged result is byte for byte what a one-file run writes (<code>VCI_RAILS_SHARED_OUTPUT=0</code> turns it off).</p>
+<p><strong>Measured</strong> on vex-api: 50 files 1,433 s one at a time, 168 s in 8 slots, the same 47 attested; the 939-file <code>application</code> group in 8 slots, 32 minutes, where one process per file was about ten hours. An adversarial review of the first version found five ways a slot could leak into another's file; all are fixed with tests, the serious one being a temporary file one slot's test wrote and removed that another slot's test saw.</p>
+
+<h3>The plan reads the checkout once</h3>
+<p><code>vci plan</code> rehashed every entry of every candidate's manifest and ran one <code>git check-ignore</code> per manifest per candidate: on vex-api's 1,992 files and 2,784 attestations, 513 to 613 seconds, growing with the store, paid twice per job. Now a path is observed once per plan and shared by every candidate of every file (<code>vci_core::CheckoutCache</code>), git is asked once per directory, the global manifest is captured once, files are verified in parallel (<code>VCI_JOBS</code>) in the listing's order, and each file's candidates are checked newest first. <strong>Measured:</strong> the verdicts phase 4.6 to 5.7 s warm, 10 s with the 8 GB store out of the page cache; the same verdict, reason and signer for all 1,992 files. The checkout must not change while a plan runs.</p>
+
+<h3>Units checked and signed in parallel</h3>
+<p>After the tests, <code>vci run</code> checked and signed units one after another, 1.23 s each on vex-api; sampling showed 95% of it in <code>git check-ignore</code> over every child of every listed directory, per unit, not hashing or <code>ssh-keygen</code>. Units are now checked and signed <code>VCI_JOBS</code> at a time, the checkout read once per run, git asked once per path; lines, summary, exit code and the store's keys are those of a one-at-a-time run. <strong>Measured:</strong> 939 units in 37.8 s (0.04 s a unit) instead of 1,154 s. Keyless signing is parallel too, its certificate renewal behind a lock.</p>
+
+<h3>Also</h3>
+<ul>
+<li>A test that captures <code>ENV.method(:[])</code> and then stubs <code>ENV[]</code> no longer recurses into the collector's hook (<code>SystemStackError</code>): a redefinition of a hooked method in the hooked class is watched, and a hook re-entered from the stub through <code>Method#call</code> runs the original.</li>
+<li>A child Ruby process a batch's test starts runs with no collector and prints nothing (it used to print <code>VCI_OUT or VCI_TEST_ID not set</code> to stderr, failing a test that expects it empty); the parent records the spawn as before. A child no longer ends the batch for every file at its exit, and a runner that execs Ruby again stays the batch.</li>
+<li>A test file whose first statement requires another test file of the batch no longer makes its group drive the batch again.</li>
+<li>The plan's "best failed" reason and a failed <code>git check-ignore</code> (a path in a submodule or beyond a symlink) give exactly the answers 2.0 gave, whatever the thread order.</li>
+</ul>
 
 <h2 id="v2-0-4">2.0.4</h2>
 <p><em>18 October 2026.</em> <code>vci run</code> still warned <code>the listing of vex-web includes .DS_Store (not in a fresh checkout, e.g. in CI): this attestation will not match there</code> after 2.0.3 had left what git ignores out of the listing, so the attestation did match (the pull request skipped the file on the laptop's signature: <code>attested by PandelisZ</code>). The warning now names only junk git does not ignore, which does stay in the listing.</p>

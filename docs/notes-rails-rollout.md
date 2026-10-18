@@ -1,25 +1,55 @@
 # vex Rails rollout on vci 2.1: design, measurements, cost
 
-Date: 2026-10-18. Status: designed and measured, **not merged**. The vex change is a patch outside this repository
-(the session's scratchpad, `vex-rails-rollout.patch`, against vex master `3738f8486d`); nothing was pushed to vex and
-nothing was published with `vci push`.
+Date: 2026-10-18. Status: designed and measured, **not merged**. The vex change is a patch outside this repository,
+in the session's scratchpad: `vex-rails-rollout-on-1668.patch`, on the head of vex PR #1668 (`vci-rust-partition`,
+`e5d0edf5d1`), is the final form; `vex-rails-rollout.patch`, against vex master `3738f8486d`, is the first version.
+The final form's `rails-tests.yml` timeout comment states the re-measured costs, and the timeout is now 30 minutes
+(it was 45).
+Nothing was pushed to vex and nothing was published with `vci push`.
 
-**Verdict, plainly:** with the vci in this tree (2.0.4 plus slots and shared output, not released), a pull request's
-Rails cost is **not** at or below today's 5 minutes per job. A job's share of a full run takes 13 to 16 minutes on
-this Mac, plus about a minute of job setup, before planning, and planning against a store of Rails attestations takes another 3 to 8 minutes and grows
-with the store. Only pull requests whose change re-runs a few dozen files would finish in under 5 minutes, and only
-once the plan is cheap. Two collector bugs also fail tests that pass in vex's plain run, so the jobs would be red.
-"What else is needed" lists the vci changes that would fix all of this.
+**Verdict, plainly** (re-measured with this tree: the per-plan checkout cache, units checked and signed in
+parallel, and the two collector fixes; "Cost model, re-measured" below). The plan and the checking and signing no
+longer decide the cost:
+
+- Both plans a job pays take 9 to 11 s together (4.2 to 6.1 s each, warm, against a store of 2,784 Rails
+  attestations). Before, they took 6 to 16 minutes.
+- Checking and signing takes 0.04 to 0.09 s a file in a full share. Before, it took 1.15 s.
+
+On this Mac, one job (partition 1 of 4) of a pull request on an attested base costs, with ~70 s of job setup:
+
+| change | per job | today's job |
+|---|---|---|
+| test-only | 2.9 min | 4.8 min |
+| median | 3.9 min | 4.8 min |
+| mean | 4.2 min | 4.8 min |
+| an input of every file (base attested) | 5.1 min | 4.8 min |
+| full share, nothing attested | 6.3 min (partition 1), 8.5 min (partition 2) | 4.8 min |
+
+- **At or below today's 4.8 minutes a job:** for changes up to about the mean, yes; for a change of an input of
+  every file, about the same; for a full run, no.
+- **The targets:** the plan under 20 s is met. A median change under 2 minutes is not (3.9 min). A full share
+  under 5 minutes with 4 jobs is not (6.3 and 8.5 min).
+- **What is left:** a fixed cost in every job (~70 s of job setup plus 40 to 100 s of boot and slot setup) and the
+  Ruby batch itself, whose slowest files set the end of a full share.
+- **Runner time:** four jobs cost more than today's two at every row: about 12 runner-minutes for a test-only
+  change and about 30 for a full run, against 9.7.
+- **Blocking:** one test still fails under vci and would turn partition 1 red on every pull request.
+  `test/config/solid_queue_shutdown_test.rb` fails in every slot batch since f165f67 (see "Found while measuring").
+  It is never attested, so it runs every time.
+
+The verdict before these changes: 13 to 16 minutes a share, plus 3 to 8 minutes of plan that grew with the store
+("Cost model before the plan cache").
 
 ## What the patch changes (vex)
 
 | file | change |
 |---|---|
 | `.github/workflows/rails-tests.yml` | The `application`/`services` matrix becomes `part: [1, 2, 3, 4]`, named `rails test (vci I/4)`. Each job runs on `composal-x64-16x` with the MySQL 8.0.46 service and `VCI_RAILS_JOBS=16`, and has `contents: write`. It installs the pull request key (`VCI_PR_SIGNING_KEY`; forks only plan), then runs the action `@v2` with `command: plan`, then `vci ci --base-ref <base> --project vex-api --partition I/4 --audit-log ... ${VCI_ATTEST_ARGS:-}`. This is the pattern of PR #1668's Rust jobs. Partition 1 also runs `CI=true bin/rails zeitwerk:check`. Manual and profiling runs (`workflow_dispatch`), and a job whose vci step failed, run their share of both groups with the plain `bin/rails test` (`RAILS_TEST_SHARD`/`RAILS_TEST_SHARDS` of `rails-test-group.rb`, 16 workers, eager loading). The timeout goes from 10 to 45 minutes. The gem cache is saved by partition 1 only, and the audit log is kept per job. |
-| `.github/workflows/vci.yml` | New job `attest-rails`: the master backstop. Hourly (`schedule: '17 * * * *'`) and on `workflow_dispatch`, never per push. It runs on `composal-x64-16x` with the same MySQL service and env, `environment: vci-attest`, `continue-on-error`. It runs `vci ci --base-ref $GITHUB_SHA --project vex-api --key <CI key>`, then `vci prune` and `vci push`. Two comments are updated. The other two jobs stay push-only (`if: github.event_name == 'push'`). |
+| `.github/workflows/vci.yml` | New job `attest-rails`: the master backstop. Hourly (`schedule: '17 * * * *'`) and on `workflow_dispatch`, never per push. It runs on `composal-x64-16x` with the same MySQL service and env, `environment: vci-attest`, `continue-on-error`. It runs `vci ci --base-ref $GITHUB_SHA --project vex-api --key <CI key>`, then `vci prune` and `vci push`. Three comments are updated: the header names both partitioned suites (Rust `I/3`, Rails `I/4`) and the master Rails backstop, and `attest` points at `attest-rails`. The other two jobs stay push-only (`if: github.event_name == 'push'`). |
 | `vci.toml` (vex-api) | `CI` is no longer declared, so files run without eager loading (see below); the comment says why. |
 | `vex-api/test/test_helper.rb` | The per-worker roots move from `tmp/storage/worker-<pid>` to `Dir.tmpdir/vex-test-worker-<pid>`: the Active Storage disk services (`test`, `tigris_agent_sessions`), and also `blob_artefacts`/`tigris_artefacts` and `VEX_TRANSCRIPT_ARCHIVE_TMPDIR`. Teardown removes that one directory. |
-| `docs/agents/vci.md` | The Rails bullets of "What CI does with vci" describe the above. |
+| `docs/agents/vci.md` | The Rails bullets of "What CI does with vci" describe the above, next to #1668's Rust bullet. The vci-skip bullet becomes the Rails jobs' fail-open rule (a `continue-on-error` action step, the plain runner when vci is missing) and says that no workflow calls `scripts/ci/vci-skip.py` any more. |
+| `docs/agents/vci-benchmarks.md` | "Known costs that remain": the "Rails files are attested only from laptops" bullet (#1668's) is replaced by what the Rails jobs and the backstop pay; their times are to be recorded once they run. |
 
 Why the test helper changes: vci hashes a file's inputs after the batch. Three things under the repository's `tmp/`
 refused files:
@@ -39,17 +69,36 @@ process of its own, so the second file runs the base's cases inside its own proc
 lands in (as in a one-file run), and the hash partition covers every file once. The groups stay only for the plain
 fallback.
 
-The patch applies cleanly to vex master `3738f8486d` (`git apply --check`). It conflicts with PR #1668
-(`vci-rust-partition`, not merged) in three places, all to be resolved after #1668 lands:
+The first version applied cleanly to vex master `3738f8486d` and conflicted with PR #1668 (`vci-rust-partition`, not
+merged; it moves every workflow to the action's `@v2` and runs the Rust jobs through `vci ci --partition I/3`). The
+final form is that patch rebased onto #1668's head `e5d0edf5d1` (`git apply -3` in a `--shared` clone of vex-git, then
+`git diff --cached e5d0edf5d1`):
 
-- the `@v1` → `@v2` line of `rails-tests.yml`, which this patch replaces anyway;
-- `vci.yml`'s header comment;
-- the vci-skip bullet of `docs/agents/vci.md`.
+- `rails-tests.yml`'s `@v1` → `@v2` line merged by itself: the patch replaces that step, already with `@v2`.
+- `vci.yml`'s header comment: each side had moved its own suite to `vci ci` and left the other on
+  `scripts/ci/vci-skip.py`; it now reads that rust-tests.yml (`vci ci --partition I/3`, root workspace and vex-roder)
+  and rails-tests.yml (`vci ci --partition I/4`, vex-api) both attest on pull requests. Its first line also names the
+  hourly Rails files.
+- `docs/agents/vci.md`: #1668's Rust bullet and this patch's Rails bullet are kept. Both sides' "<suite> asks
+  vci-skip.py" bullet is replaced by the Rails jobs' fail-open rule, since no workflow calls `vci-skip.py` now
+  (`rails-tests.sh` still would with `VCI_BASE` set; the fallback clears it). Of the "only skipped when an engineer
+  attested them locally" bullet, #1668 kept Rails and this patch kept Rust; both are now attested in CI, so only this
+  patch's sentence about `attest-rails` remains.
+- Not a conflict: #1668's `docs/agents/vci-benchmarks.md` says Rails is attested only from laptops; updated (table
+  above).
+
+`git apply --check` of the final patch passes on a fresh clone at `e5d0edf5d1` (and the applied tree equals the
+resolved one), and on #1668's head merged with today's vex master `1211d6a1a6` (`git merge-tree`, no conflict; no
+master commit since `3738f8486d` touches the patched files). The old patch still applies to `3738f8486d`.
 
 It needs vci 2.1 released and `v2` moved to it: slots, shared output, and the two batch fixes of Lane A.
-`actionlint` reports nothing new beyond the Composal `parallel:` step it already flags in the existing jobs. The vex
-scripts' tests pass in the patched clone: `rails-test-group-test.rb` (4 runs, 0 failures), `vci-skip-test.py` (OK),
-`test-selection-test.py` (OK) and `typescript-workflow-test.rb`.
+`actionlint` (on `rails-tests.yml` and `vci.yml`) reports nothing new against #1668's head beyond one more Composal
+`parallel:` step (`attest-rails`), which it already flags in the existing jobs. `ruby -c` of the test helper, YAML
+loads of both workflows and a TOML load of `vci.toml` pass. The vex scripts' tests pass in the patched clone of #1668
+(mise's Ruby 3.4.9, Python 3.15.0): `rails-test-group-test.rb` (4 runs, 25 assertions, 0 failures),
+`rails-test-shard-test.rb` (2 runs, 10 assertions, 0 failures), `typescript-workflow-test.rb` (passes),
+`docker-selection-test.py` (102 tests, OK), `test-selection-test.py` (22 tests, OK) and `vci-skip-test.py` (11 tests,
+OK).
 
 ## Eager loading: decided against (lazy loading under vci, one eager-load check per run)
 
@@ -154,7 +203,97 @@ the plan's numbers in all ten measured cases. It extends the table:
   | `app/jobs`, `app/resources`, `app/controllers`: the same as `app/services` | 58, 37, 18 |
   | `config/initializers` | 20 |
 
-## Cost model
+## Cost model, re-measured (plan cache, parallel check and sign, collector fixes)
+
+Setup:
+
+- vci was a release build (`cargo build --release -p vci-cli`) of a snapshot of this working tree: f165f67 plus
+  Lanes P, R and K, uncommitted. The collector came from the same snapshot.
+- The vex-api clone is the `lazy` branch of the clone above, at `442f6014`, with the throwaway key.
+- `VCI_RAILS_JOBS=14`, `VCI_TIMING=1`, with fresh scratch state each time (git-ignored `tmp/`, `log/` and
+  `storage/` removed, slot databases dropped).
+- The machine was this Mac, shared with other sessions' builds and test runs, at load averages of 5 to 25 (noted
+  per run).
+- The scripts and logs are in the session scratchpad's `lanec/`: `partition_run.sh` (now taking `VCI_BIN`,
+  `VCI_COLL` and `VCI_CLONE`), `row_run.sh`, `plan_both.sh`, `plan_count.sh`, and the `ci-lazy-p{1,2}of4-w14-cost`,
+  `row-*` and `planboth-*` logs.
+
+**Full shares, nothing attested** (`partition_run.sh <I>/4 14`: a fresh clone without a store, `vci ci --base-ref HEAD
+--project vex-api --partition I/4 --key <throwaway>`):
+
+| partition | files | `vci ci` wall | Ruby batch (boot and slot setup included) | slot setup | check, sign and store | attested / not | load |
+|---|---|---|---|---|---|---|---|
+| 1/4 | 499 | 298.0 s (before: 781.5 s) | ~256 s (before: 212 s) | 102.0 s | 42.4 s, 0.085 s a file (before: 574 s) | 494 / 5, exit 1 | 16 to 25 |
+| 2/4 | 534 | 430.7 s (before: 973.3 s) | ~412 s (before: 363 s) | 93.6 s | 22.4 s, 0.042 s a file (before: 613 s) | 531 / 3, exit 0 | 10 to 11 |
+
+The Ruby batch's length is read from a 5 s poll of the log. A file's process took 3.1 s (1/4) and 3.6 s (2/4) on
+average. The slowest took 95.3 s and 123.5 s.
+
+- `manual_image_deploy_service_test.rb` (partition 1) is now attested (2,734 inputs).
+- Partition 1's exit 1 is `solid_queue_shutdown_test.rb` (below). Its other four refusals are skipped tests and a
+  file with no tests, as before.
+
+**The two plans a job pays**, against the 2,784-attestation store (`plan_both.sh`, on `plan-cost`, an APFS copy of
+`plan-p`, load 5 to 8):
+
+- First, the action's plan step, `vci plan --base-ref HEAD --project vex-api`: plan total 4.27 to 6.07 s (wall 4.32
+  to 6.30 s), of which verdicts take 3.64 to 4.63 s.
+- Then `vci ci --partition 1/4`'s own plan, stopped at its partition line: plan total 4.24 to 4.25 s, 4.4 s to that
+  line. It skips 929 and runs 1,063, the same as `vci plan`.
+- Lane P measured 16.3 s for one plan with the store not in the page cache.
+- Before these changes, one plan took 486 to 495 s against this store.
+
+**The four rows, measured.** Each row ran on `ci-cost`, the clone of partition 1's full run, whose store holds
+partition 1's 494 attestations of the unchanged tree; the store was restored before each row (`row_run.sh`). Each
+row changed one path by appending a comment line, then ran what a job runs: the action's `vci plan`, then
+`vci ci --partition 1/4 --key`. Each path was picked with `vci plan` to re-run about as many of partition 1's files
+as the model's row:
+
+- test-only: `test/models/agent_connection_access_test.rb`;
+- median: `app/models/concerns/project_archivable.rb` (57 files; the model's row is ~63);
+- mean: `app/models/hosted_app.rb` (195 files; the model's row is ~215);
+- every file: `test/test_helper.rb`.
+
+F counts partition 1's 5 files that are never attested (4 refusals and `solid_queue_shutdown_test.rb`), which run in
+every row.
+
+| row | F | action's `vci plan` | `vci ci` wall (its plan; slot setup; check and sign) | per job: + ~70 s setup | before (model, plan excluded / with plans) |
+|---|---|---|---|---|---|
+| test-only change | 6 | 5.4 s | 98.0 s (3.9 s; 37.2 s, 6 slots; 0.8 s) | 173 s = **2.9 min** | 2.9 / 9–19 min |
+| median change | 57 | 4.9 s | 161.5 s (3.8 s; 91.8 s; 3.0 s) | 236 s = **3.9 min** | 4.4 / 11–21 min |
+| mean change | 195 | 7.8 s | 176.4 s (3.7 s; 72.5 s; 9.8 s) | 254 s = **4.2 min** | 8.2 / 15–25 min |
+| input of every file | 499 | 0.9 s | 236.4 s (0.6 s; 75.3 s; 17.3 s) | 307 s = **5.1 min** | 15.3 / 22–32 min |
+| full share, nothing attested | 499 / 534 | ~5 s | 298.0 s / 430.7 s (+ ~4 s of plan with a store) | ~377 s = **6.3 min** / ~510 s = **8.5 min** | 14.0–17.4 / 20–34 min |
+
+The arithmetic against today's job (median 284 s application, 298 s services, so ~4.8 minutes; 2 jobs, 9.7
+runner-minutes):
+
+- **Per job:** setup ~70 s + both plans 9 to 11 s + `vci ci`'s boot and slot setup 37 to 102 s + the Ruby of
+  F files + F × 0.04–0.09 s of check and sign. Partition 1 also runs `zeitwerk:check` (7.4 s).
+  - A test-only change: 70 + 5 + 98 ≈ 173 s, 1.9 minutes under today's job.
+  - A median change: 70 + 5 + 161 ≈ 236 s, 0.9 minutes under.
+  - A mean change: 70 + 8 + 176 ≈ 254 s, 0.6 minutes under.
+  - An input of every file: 70 + 1 + 236 ≈ 307 s, about today's job (0.3 minutes over).
+  - A full share: 6.3 and 8.5 minutes, 1.5 and 3.7 minutes over.
+- **Runner time** (4 jobs, partition 1's cost taken for every job): about 4 × 2.9 ≈ 12 runner-minutes for a
+  test-only change, ≈ 16 for a median change, ≈ 17 for a mean one, and 25 to 34 for a full run, against 9.7 today.
+- **Where a small change's minutes go:** the 70 s of job setup, then slot setup. That was 37 s for 6 files on 6
+  slots, and 72 to 92 s for 14 slots under load. Then the slowest files, up to 48 to 64 s each. Checking, signing
+  and the plans together are under 20 s.
+- **Where a full share's minutes go:** the Ruby batch. Partition 2's 534 files averaged 3.6 s a process, which is
+  ~137 s of work per slot on 14 slots plus 94 s of slot setup if spread evenly. The batch took ~412 s. The slowest
+  file (123.5 s) and the order the files were started in set its end.
+- **CI's runners** have 16 cores and 16 slots, and ran the plain suite at ~3.4 core-seconds a file against ~5.1
+  here. The Ruby part there may be about 0.6× of this Mac's. That would bring the full shares to about 4.5 to 6
+  minutes a job and the small rows down by up to a minute. This is not measured.
+- **The master backstop** (an estimate, not measured): partitions 1 and 2 spent ~0.46 s of batch a file beyond slot
+  setup ((256 − 102 + 412 − 94) s over 1,033 files).
+  - The whole project with nothing attested, in one job: 1,992 × 0.46 + ~100 s of setup + ~80 s of check and
+    sign ≈ 18 minutes.
+  - The mean vex-api commit (~860 files): about 9 minutes.
+  - Both fit in the hourly schedule. Before, the estimates were 51 and 23 minutes.
+
+## Cost model before the plan cache and parallel check and sign (2.0.4 plus slots)
 
 **Today**, from 20 successful pull-request runs of `rails-tests.yml` (2026-10-18, `gh api .../actions/runs/<id>/jobs`):
 
@@ -230,12 +369,27 @@ falls. Eager: every vex-api commit but a few is a full run.
 
 ## What else is needed
 
-1. **Plan cost (vci, blocking).** Verdicts must not scale with stored attestations × manifest size. Options: hash each
+Items 1, 2 and 4 are done in this tree (uncommitted): see "Cost model, re-measured". What is left, most important
+first:
+
+- **`solid_queue_shutdown_test.rb` in a slot batch (vci, blocking):** see "Found while measuring".
+- **The fixed cost of a small change.** Each job pays ~70 s of setup, then 40 to 100 s to boot and set up 14
+  slots, before its first file. Some options, none measured:
+  - start files as soon as the first slot is ready instead of after all of them;
+  - set up fewer slots for a few dozen files;
+  - fewer partitions, since each job pays this cost.
+- **The batch's tail.** Partition 2's batch took about twice what its files' average would give spread evenly.
+  Starting the longest files first (from the previous attestation's `durationMs`) would shorten it.
+- **Item 3 below** (shared inputs): this decides how often a pull request pays the full-share row.
+
+The original list:
+
+1. **Plan cost (vci, blocking).** Done (Lane P): 4.2 to 6.1 s a plan against 2,784 attestations. Verdicts must not scale with stored attestations × manifest size. Options: hash each
    checkout path once per plan and compare manifests against that cache; index candidates by unit and check the
    newest first, stopping at the first that matches; read the shared lines of a boot once (Lane B's file already
    identifies them); `vci prune --superseded` in the backstop. Target: under 20 s. This alone puts the
    small-change rows under 5 minutes.
-2. **Check and sign in parallel (vci).** `run_units` checks and signs one file after another (`check_one`, about
+2. **Check and sign in parallel (vci).** Done (Lane R): 0.04 to 0.09 s a file. `run_units` checks and signs one file after another (`check_one`, about
    1.0–1.2 s a file here). On 16 cores this becomes ~0.07 s a file, and a full share is ~70 + 20 + 100 + 499 × 0.42
    ≈ 400 s (~6.6 minutes) at N = 4, or ~5.5 minutes at N = 6. A full run of vci's per-file processes is then
    comparable in cost to the plain run: the partitions used 2.7 to 3.1 CPU-seconds a file (user + sys), while the
@@ -249,13 +403,33 @@ falls. Eager: every vex-api commit but a few is a full run.
    - Models that Oaken's seeds load are inputs of every slot's files; vex could seed less, or vci could attribute
      slot-setup reads more narrowly. That would be a soundness question.
 4. **The two collector bugs below must be fixed before rollout**, or vex's jobs fail on every run that includes
-   those files.
+   those files. Done (Lane K).
 5. With 1 and 2 done, N = 4 gives a full share of about 6.6 minutes and a typical pull request (median change)
-   about 3.6 minutes. N = 6 brings the full share near 5 minutes, at 6 jobs' fixed cost on every pull request.
+   about 3.6 minutes. Measured: 6.3 and 8.5 minutes for a full share, 3.9 minutes for a median change. N = 6 brings the full share near 5 minutes, at 6 jobs' fixed cost on every pull request.
 
 ## Found while measuring
 
-- **A collector bug fails a passing test (all modes, blocking).** `test/services/hosting/manual_image_deploy_service_test.rb`
+- **A slot batch fails `test/config/solid_queue_shutdown_test.rb` (vci 2.1 slots since f165f67, blocking).**
+  - **What fails:** its second test spawns `bin/rails runner`, which starts a SolidQueue supervisor in fork mode
+    against the slot's database (`vex_lanec_0`). In a slot batch, the forked worker's job fails in
+    `RepositoryEvent.create!` (`Vcs::RepositoryMutationLeaseOwner#record_acquisition!`) with
+    `ActiveRecord::ConnectionFailed (Mysql2::Error::ConnectionError: Lost connection to MySQL server during query)`.
+    The test then waits 45 s for `held` and fails with `Timeout::Error` (`solid_queue_shutdown_test.rb:132`).
+  - **Where it fails:**
+    - every slot batch measured here: full partition 1 and all four rows;
+    - a 2-slot batch of it and one other file, at load 4 to 6;
+    - with the HEAD collector and with Lane K's collector;
+    - Lane R's runs of f165f67, before and after its change.
+  - **Where it passes:**
+    - one file in a process of its own (`vci run` of that file alone: 2 runs, 0 failures, attested);
+    - in the same 2-slot batch with the pre-f165f67 build (`target-design-vex-rollout`) and its collector;
+    - in the runs before f165f67 (`lazy-app-w8`, the first partition 1/4).
+  - **Why it matters:** the file is never attested, so it runs, and fails, in partition 1 on every pull request.
+  - **Not found:** the cause. The failure is in a grandchild process of the file's process (runner → forked
+    worker), which suggests something a slot gives its files that the child processes inherit. It needs a fix in
+    vci, not in vex.
+- **A collector bug fails a passing test (all modes, blocking). Fixed (Lane K):** attested in partition 1 above;
+  `ruby/vci-collector` `VciCollector::Redefined`, spike B8. `test/services/hosting/manual_image_deploy_service_test.rb`
   (`services` group, never run under vci before) does this:
 
   ```ruby
@@ -271,7 +445,9 @@ falls. Eager: every vex-api commit but a few is a full run.
   - B6's `AliasGuard` covers `alias_method`, not a `Method` object captured before the stub.
   - A fix in `EnvHooks`: when it is re-entered from its own `super` on the same thread, call the original method
     saved at hook time instead of `super`.
-- **A batch file's child Ruby prints to stderr (batch mode, blocking).**
+- **A batch file's child Ruby prints to stderr (batch mode, blocking). Fixed (Lane K):** a batch file's child
+  process runs without the collector (spike B9). Lane K measured it attested in a 2-slot batch. Partition 3 was not
+  re-run here.
   `test/services/vcs/merge_queue/reconciliation/batch_interaction_test.rb` runs `Open3.capture3(RbConfig.ruby, "-e",
   ...)` and asserts that stderr is empty. In the batch (partition 3/4) the child inherits `RUBYOPT` (the collector)
   but no test id: the batch sets the file's test id in the process, and Lane A's fix removes `VCI_RAILS_BATCH`. At
@@ -298,3 +474,12 @@ falls. Eager: every vex-api commit but a few is a full run.
   crates removed 0 files.
 - The pull-request skip estimate for unattested bases (about half full runs) is a model, not a measurement.
 - The plan cost was measured with this tree's build only, on stores of up to 2,784 attestations.
+- The re-measured cost model:
+  - Only partitions 1 and 2 were re-run in full; partitions 3 and 4 were not.
+  - The four rows were measured on partition 1 only, against a store of partition 1's own attestations (the plans
+    against the large store were measured separately), with one changed path each, close to but not exactly the
+    model's F.
+  - Each number is one run on a shared machine (load 5 to 25).
+  - True cold page cache was not measured (`sudo purge` needs a password).
+  - The 70 s of job setup is today's CI figure, not measured with vci's binary install.
+  - The cause of the `solid_queue_shutdown_test.rb` failure was not found.

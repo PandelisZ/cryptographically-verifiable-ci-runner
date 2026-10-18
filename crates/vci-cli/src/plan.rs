@@ -4,19 +4,20 @@
 //! candidate passes every check below, in order. Every error is caught per
 //! candidate (or, for errors that affect everything, turns into "run all").
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use serde::Serialize;
 use vci_attest::keyless::{IDENTITIES_FILE, Identities, TRUSTED_ROOT_FILE, TrustedRoot};
 use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
-use vci_core::{InputManifest, PREDICATE_TYPE};
+use vci_core::{CheckoutCache, EntryKind, InputManifest, Observation, PREDICATE_TYPE, RepoPath};
 use vci_git::{AttestStore, Reader, Repo, StoredEnvelope, StoredManifest};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
 use crate::ctx::{Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo};
 use crate::envpolicy::{ChildEnvMap, lookup};
-use crate::run::global_manifest;
 use crate::util::{glob_match, now_unix, parse_rfc3339};
 
 /// Allowed clock skew for `issued_at` in the future.
@@ -377,6 +378,17 @@ struct Verifier<'a> {
     natives: std::sync::OnceLock<Result<vci_adapter::InstalledExternals, String>>,
     /// The input manifests candidates reference, read from the local store.
     manifests: ManifestLoader,
+    /// The checkout, each path observed once for the whole plan.
+    checkout: &'a CheckoutCache,
+    /// The git-ignored children of listed directories, found once per plan.
+    ignored: &'a IgnoredChildren,
+    /// The current global manifest per set of global observations (one set
+    /// for every file of most projects): captured once.
+    #[allow(clippy::type_complexity)]
+    globals: Mutex<HashMap<Vec<(RepoPath, Observation)>, Result<Arc<InputManifest>, String>>>,
+    /// Whether a manifest's paths collide under case folding, per input root
+    /// (a manifest is used only once its root is the signed one).
+    collisions: Mutex<HashMap<String, Result<(), String>>>,
 }
 
 /// Why a referenced input manifest cannot be used, as the `what` and
@@ -419,25 +431,186 @@ struct ManifestLoader {
 }
 
 impl ManifestLoader {
+    /// The store is read under the lock; the manifest is decoded outside it
+    /// (files are verified in parallel).
     fn load(
         &self,
         repo: &Repo,
         root: &str,
     ) -> Result<std::sync::Arc<InputManifest>, ManifestUnavailable> {
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let (reader, cache) = &mut *guard;
-        if let Some(r) = cache.get(root) {
-            return r.clone();
-        }
-        let reader = reader
-            .get_or_insert_with(|| AttestStore::new(repo).reader().map_err(|e| e.to_string()));
-        let stored = match reader {
-            Ok(r) => r.manifest(root),
-            Err(e) => Err(vci_git::GitError::Store(e.clone())),
+        let stored = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let (reader, cache) = &mut *guard;
+            if let Some(r) = cache.get(root) {
+                return r.clone();
+            }
+            let reader = reader
+                .get_or_insert_with(|| AttestStore::new(repo).reader().map_err(|e| e.to_string()));
+            match reader {
+                Ok(r) => r.manifest(root),
+                Err(e) => Err(vci_git::GitError::Store(e.clone())),
+            }
         };
         let r = load_manifest(root, stored).map(std::sync::Arc::new);
-        cache.insert(root.to_owned(), r.clone());
-        r
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.1.entry(root.to_owned()).or_insert(r).clone()
+    }
+}
+
+/// The children git ignores of the directories input manifests list, found
+/// once per directory for the whole plan: what
+/// [`crate::run::ignored_listing_children`] finds for one manifest (a
+/// child the manifest names is never left out), with one `git check-ignore`
+/// for the directories a manifest lists that no manifest listed before,
+/// instead of one per manifest. The checkout does not change during a plan.
+/// `None` for a directory git could not answer about (it exits 128 on a
+/// child inside a submodule): a manifest that lists one is asked about as
+/// before, alone.
+#[derive(Default)]
+struct IgnoredChildren(Mutex<HashMap<RepoPath, Option<Arc<Vec<String>>>>>);
+
+fn child_path(dir: &RepoPath, name: &str) -> String {
+    if dir.is_root() {
+        name.to_owned()
+    } else {
+        format!("{}/{name}", dir.as_str())
+    }
+}
+
+impl IgnoredChildren {
+    /// The children of `m`'s listed directories that git ignores and `m`
+    /// does not name: left out of the listings when `m` is rehashed.
+    fn of(&self, cache: &CheckoutCache, m: &InputManifest) -> Vec<RepoPath> {
+        let dirs: Vec<&RepoPath> = m
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::DirListing)
+            .map(|e| &e.path)
+            .collect();
+        if dirs.is_empty() {
+            return vec![];
+        }
+        let ignored: Option<Vec<Arc<Vec<String>>>> = {
+            let mut known = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            let mut missing: Vec<&RepoPath> = dirs
+                .iter()
+                .copied()
+                .filter(|d| !known.contains_key(*d))
+                .collect();
+            missing.sort();
+            missing.dedup();
+            if !missing.is_empty() {
+                match Self::ask(cache, &missing) {
+                    Some(found) => {
+                        for (d, names) in missing.into_iter().zip(found) {
+                            known.insert(d.clone(), Some(Arc::new(names)));
+                        }
+                    }
+                    // Git stopped at a child of one of them: each directory
+                    // on its own, so that only those git cannot answer about
+                    // are asked about per manifest.
+                    None => {
+                        for d in missing {
+                            let names = Self::ask(cache, &[d])
+                                .and_then(|f| f.into_iter().next())
+                                .map(Arc::new);
+                            known.insert(d.clone(), names);
+                        }
+                    }
+                }
+            }
+            dirs.iter()
+                .map(|d| known.get(*d).cloned().flatten())
+                .collect()
+        };
+        let Some(ignored) = ignored else {
+            // As before 2.1: one `git check-ignore` for this manifest's
+            // children, and what git printed before it stopped.
+            return crate::run::ignored_listing_children(
+                &crate::run::Checkout::direct(cache.root()),
+                m,
+            );
+        };
+        let seen: HashSet<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
+        let mut out: Vec<RepoPath> = dirs
+            .iter()
+            .zip(ignored)
+            .flat_map(|(d, names)| names.iter().map(|n| child_path(d, n)).collect::<Vec<_>>())
+            .filter(|c| !seen.contains(c.as_str()))
+            .filter_map(|c| RepoPath::new(&c).ok())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The names git ignores among the children of each of `dirs`, in one
+    /// `git check-ignore`; `None` when git did not answer (exit 0 or 1).
+    fn ask(cache: &CheckoutCache, dirs: &[&RepoPath]) -> Option<Vec<Vec<String>>> {
+        let mut owner: HashMap<String, (usize, String)> = HashMap::new();
+        for (i, d) in dirs.iter().enumerate() {
+            for name in cache.child_names(d) {
+                owner.insert(child_path(d, &name), (i, name));
+            }
+        }
+        let mut paths: Vec<String> = owner.keys().cloned().collect();
+        paths.sort();
+        let (ignored, answered) = crate::run::git_check_ignore(cache.root(), &paths);
+        if !answered {
+            return None;
+        }
+        let mut found = vec![Vec::new(); dirs.len()];
+        for p in ignored {
+            if let Some((i, name)) = owner.get(&p) {
+                found[*i].push(name.clone());
+            }
+        }
+        Some(found)
+    }
+}
+
+/// The failure a file's reason names when no candidate passes: the one that
+/// got furthest, and of several that got as far, the last in the store's
+/// order (`failed` is each failure with its candidate's place in it), as
+/// before 2.1, when candidates were checked in the store's order.
+fn best_failure<'a>(failed: impl IntoIterator<Item = (usize, &'a Failure)>) -> Option<&'a Failure> {
+    let mut failed: Vec<(usize, &Failure)> = failed.into_iter().collect();
+    failed.sort_by_key(|(i, _)| *i);
+    failed.into_iter().map(|(_, f)| f).max_by_key(|f| f.rank)
+}
+
+/// When a candidate says it was issued, read from its payload before any
+/// check, only to check the newest candidates first (each is still checked
+/// in full); `None` when it cannot be read.
+fn issued_hint(s: &StoredEnvelope) -> Option<i64> {
+    #[derive(serde::Deserialize)]
+    struct Statement {
+        predicate: Issued,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Issued {
+        issued_at: String,
+    }
+    if s.error.is_some() {
+        return None;
+    }
+    let payload = Envelope::from_json(&s.bytes).ok()?.payload_bytes().ok()?;
+    let st: Statement = serde_json::from_slice(&payload).ok()?;
+    parse_rfc3339(&st.predicate.issued_at).ok()
+}
+
+/// Run `f` (which verifies files in parallel) on `VCI_JOBS` threads, by
+/// default one per CPU; on the global pool if a pool cannot be made.
+fn in_plan_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    let jobs = std::env::var("VCI_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
+        Ok(pool) => pool.install(f),
+        Err(_) => f(),
     }
 }
 
@@ -451,6 +624,56 @@ impl Verifier<'_> {
                 .map_err(|e| e.to_string())
                 .and_then(|o| o.ok_or_else(|| "not enumerable".to_owned()))
         })
+    }
+
+    /// The current global manifest of `f` (`run::global_manifest`), captured
+    /// through the plan's checkout cache once per set of global observations.
+    fn global_now(&self, f: &TestFile) -> Result<Arc<InputManifest>, String> {
+        let obs =
+            crate::global::observations(&self.ctx.root, self.project.adapter.as_ref(), &f.abs)
+                .map_err(|e| format!("{e:#}"))?;
+        if let Some(g) = self
+            .globals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&obs)
+        {
+            return g.clone();
+        }
+        let g = InputManifest::capture_cached(
+            self.checkout,
+            &obs,
+            vec![],
+            &crate::run::global_env_keys(self.project.adapter.name()),
+            lookup(&self.child),
+        )
+        .and_then(|m| m.check_case_collisions().map(|()| Arc::new(m)))
+        .map_err(|e| format!("{:#}", anyhow::Error::from(e)));
+        self.globals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(obs)
+            .or_insert(g)
+            .clone()
+    }
+
+    /// [`InputManifest::check_case_collisions`] of a manifest whose root is
+    /// `root`, once per root.
+    fn case_collisions(&self, root: &str, m: &InputManifest) -> Result<(), String> {
+        if let Some(r) = self
+            .collisions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(root)
+        {
+            return r.clone();
+        }
+        let r = m.check_case_collisions().map_err(|e| e.to_string());
+        self.collisions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(root.to_owned(), r.clone());
+        r
     }
 }
 
@@ -907,6 +1130,10 @@ fn plan_with(
         }
     }
     let now = now_unix();
+    // The checkout does not change during a plan: each path is observed once
+    // for every candidate of every file (and every project).
+    let checkout = CheckoutCache::new(&ctx.root);
+    let ignored = IgnoredChildren::default();
     let verifiers: Vec<Result<Verifier<'_>, String>> = ctx
         .projects
         .iter()
@@ -934,43 +1161,42 @@ fn plan_with(
                     rails_gems: r.rails_gems,
                     natives: std::sync::OnceLock::new(),
                     manifests: ManifestLoader::default(),
+                    checkout: &checkout,
+                    ignored: &ignored,
+                    globals: Mutex::default(),
+                    collisions: Mutex::default(),
                 }),
             },
         )
         .collect();
-    // Every project's files at once (the checks rehash the checkout and may
-    // boot a Rails application, once per project, for the native libraries a
-    // candidate records), in project order.
+    // Every project's files at once, and each project's files in parallel
+    // (`VCI_JOBS` threads; the checks rehash the checkout through the cache
+    // and may boot a Rails application, once per project, for the native
+    // libraries a candidate records), collected in project and file order.
     let t_verdicts = std::time::Instant::now();
-    let verdicts: Vec<Vec<FileVerdict>> = std::thread::scope(|s| {
-        let handles: Vec<_> = verifiers
-            .iter()
+    let verdicts: Vec<Vec<FileVerdict>> = in_plan_pool(|| {
+        verifiers
+            .par_iter()
             .enumerate()
             .map(|(pi, verifier)| {
-                let (files, by_id) = (&files, &by_id);
-                s.spawn(move || {
-                    let mine = files.iter().filter(|f| f.project == pi);
-                    match verifier {
-                        Err(r) => mine.map(|f| verdict_run(f, r)).collect::<Vec<_>>(),
-                        Ok(v) => mine
-                            .map(|f| {
-                                // A test id listed by two projects: both see
-                                // the same candidates (they are ambiguous and
-                                // run anyway).
-                                let cands = by_id
-                                    .get(f.test_id.as_str())
-                                    .map(Vec::as_slice)
-                                    .unwrap_or_default();
-                                v.verdict(f, cands)
-                            })
-                            .collect(),
-                    }
-                })
+                let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
+                match verifier {
+                    Err(r) => mine.iter().map(|f| verdict_run(f, r)).collect::<Vec<_>>(),
+                    Ok(v) => mine
+                        .par_iter()
+                        .map(|f| {
+                            // A test id listed by two projects: both see the
+                            // same candidates (they are ambiguous and run
+                            // anyway).
+                            let cands = by_id
+                                .get(f.test_id.as_str())
+                                .map(Vec::as_slice)
+                                .unwrap_or_default();
+                            v.verdict(f, cands)
+                        })
+                        .collect(),
+                }
             })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
             .collect()
     });
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
@@ -1105,9 +1331,19 @@ impl Verifier<'_> {
             return out;
         }
         // Current global inputs are the same for every candidate.
-        let global_now = global_manifest(self.ctx, self.project, &self.child, &f.abs)
-            .map_err(|e| format!("{e:#}"));
-        for s in cands {
+        let global_now = self.global_now(f);
+        // Newest first (by the issuedAt each says, unread ones last; ties
+        // in store order): the first that passes is used, and a newer
+        // attestation is the likelier to match this checkout.
+        let mut cands: Vec<(Option<i64>, usize, &StoredEnvelope)> = cands
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (issued_hint(s), i, s))
+            .collect();
+        cands.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
+        // Each checked candidate's place in the store's order.
+        let mut stored_at = Vec::with_capacity(cands.len());
+        for (_, i, s) in cands {
             let mut info = CandidateInfo {
                 target: s.target.clone(),
                 meta_key: s.key.clone(),
@@ -1119,6 +1355,7 @@ impl Verifier<'_> {
             }))
             .unwrap_or_else(|_| Err(Failure::one("internal", 0, "panic while checking", "", "")));
             let passed = r.is_ok();
+            stored_at.push(i);
             out.candidates.push(Candidate {
                 info: info.clone(),
                 failure: r.err(),
@@ -1140,13 +1377,14 @@ impl Verifier<'_> {
                 return out;
             }
         }
-        let best = out
-            .candidates
-            .iter()
-            .filter_map(|c| c.failure.as_ref())
-            .max_by_key(|f| f.rank)
-            .map(Failure::summary)
-            .unwrap_or_default();
+        let best = best_failure(
+            stored_at
+                .iter()
+                .zip(&out.candidates)
+                .filter_map(|(i, c)| c.failure.as_ref().map(|f| (*i, f))),
+        )
+        .map(Failure::summary)
+        .unwrap_or_default();
         out.reason = format!(
             "no valid attestation ({} candidates; best failed {best})",
             out.candidates.len()
@@ -1198,7 +1436,7 @@ impl Verifier<'_> {
         &self,
         f: &TestFile,
         s: &StoredEnvelope,
-        global_now: &Result<InputManifest, String>,
+        global_now: &Result<Arc<InputManifest>, String>,
         info: &mut CandidateInfo,
     ) -> Result<(), Failure> {
         // A value the store could not read (e.g. a blob missing from the
@@ -1585,9 +1823,9 @@ impl Verifier<'_> {
                 format!("{} (recomputed from the attested manifest)", gm.root()),
             ));
         }
-        let gextra = crate::run::ignored_listing_children(&self.ctx.root, gm);
+        let gextra = self.ignored.of(self.checkout, gm);
         let gdiff = gm
-            .diff_against_checkout_excluding(&self.ctx.root, lookup(&self.child), &gextra)
+            .diff_against_cache(self.checkout, lookup(&self.child), &gextra)
             .map_err(|e| {
                 Failure::one("global-inputs", 14, "rehash", "re-hashable", e.to_string())
             })?;
@@ -1673,11 +1911,11 @@ impl Verifier<'_> {
                 format!("{} (recomputed from the attested manifest)", m.root()),
             ));
         }
-        m.check_case_collisions()
-            .map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e.to_string()))?;
-        let extra = crate::run::ignored_listing_children(&self.ctx.root, m);
+        self.case_collisions(&p.core.input_root, m)
+            .map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
+        let extra = self.ignored.of(self.checkout, m);
         let diff = m
-            .diff_against_checkout_excluding(&self.ctx.root, lookup(&self.child), &extra)
+            .diff_against_cache(self.checkout, lookup(&self.child), &extra)
             .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
         let (env_diff, file_diff): (Vec<_>, Vec<_>) =
             diff.into_iter().partition(|m| m.what.starts_with("env:"));
@@ -3014,5 +3252,21 @@ adapter = "pytest"
             "signer: policy.no_skip_refs matches refs/heads/main and signer dev is not in no_skip_refs_except"
         );
         assert!(f.details[0].actual.contains("github-actions"));
+    }
+
+    /// Candidates are checked newest first since 2.1, but the reason still
+    /// names what it named before: the furthest failure, and of several as
+    /// far, the last in the store's order.
+    #[test]
+    fn best_failure_ties_go_to_the_last_in_store_order() {
+        let f = |rank, what: &str| Failure::one("inputs", rank, what, "", "");
+        let (old, new, sig) = (f(13, "entry:old"), f(13, "entry:new"), f(2, "sig"));
+        // Checked newest first: `new` (stored second), `old` (stored first),
+        // `sig` (stored third).
+        let checked = [(1, &new), (0, &old), (2, &sig)];
+        assert_eq!(best_failure(checked).unwrap().details[0].what, "entry:new");
+        let checked = [(0, &new), (1, &old), (2, &sig)];
+        assert_eq!(best_failure(checked).unwrap().details[0].what, "entry:old");
+        assert!(best_failure([]).is_none());
     }
 }

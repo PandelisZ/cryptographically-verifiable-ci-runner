@@ -5,10 +5,11 @@
 //! (the test is then not attestable and simply runs); anything that differs
 //! during verification is a [`Mismatch`] or an error (the test runs).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::sync::{Arc, Mutex};
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use rayon::prelude::*;
@@ -98,7 +99,7 @@ pub fn excluded_hash() -> String {
 /// Child names left out of directory listings: parent path -> names, from
 /// the [`EntryKind::Excluded`] entries (or [`Observation::Exclude`]
 /// observations) of one manifest.
-type Exclusions = BTreeMap<RepoPath, std::collections::BTreeSet<String>>;
+type Exclusions = BTreeMap<RepoPath, BTreeSet<String>>;
 
 fn exclusions<'a>(paths: impl Iterator<Item = &'a RepoPath>) -> Exclusions {
     let mut out = Exclusions::new();
@@ -308,7 +309,7 @@ fn hash_file(abs: &Utf8Path) -> Result<(String, u64), ManifestError> {
 
 fn hash_dir(
     abs: &Utf8Path,
-    skip: Option<&std::collections::BTreeSet<String>>,
+    skip: Option<&BTreeSet<String>>,
 ) -> Result<(String, u64), ManifestError> {
     let mut children = Vec::new();
     for ent in fs::read_dir(abs).map_err(|e| io_err(abs, e))? {
@@ -334,7 +335,7 @@ fn observe_as(
     repo_root: &Utf8Path,
     path: &RepoPath,
     dir_type_only: bool,
-    excl: &Exclusions,
+    skip: Option<&BTreeSet<String>>,
 ) -> Result<InputEntry, ManifestError> {
     let abs = path.to_abs(repo_root);
     let md = match lstat(&abs, path.is_root()) {
@@ -358,7 +359,7 @@ fn observe_as(
     } else if ft.is_dir() && dir_type_only {
         (EntryKind::Dir, false, 0, dir_type_hash())
     } else if ft.is_dir() {
-        let (h, n) = hash_dir(&abs, excl.get(path))?;
+        let (h, n) = hash_dir(&abs, skip)?;
         (EntryKind::DirListing, false, n, h)
     } else {
         return Err(ManifestError::UnsupportedFileType(path.to_string()));
@@ -370,6 +371,296 @@ fn observe_as(
         size,
         hash,
     })
+}
+
+/// What `lstat` finds at a path, as [`resolve_chain`] follows it.
+enum Link {
+    Absent,
+    Target(Utf8PathBuf),
+    NotSymlink,
+}
+
+/// Where a capture or a diff observes paths: the checkout itself, or a
+/// [`CheckoutCache`] of it. Both observe a path the same way.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Fs(&'a Utf8Path),
+    Cache(&'a CheckoutCache),
+}
+
+impl Source<'_> {
+    fn root(&self) -> &Utf8Path {
+        match self {
+            Source::Fs(root) => root,
+            Source::Cache(c) => &c.root,
+        }
+    }
+
+    fn link(&self, path: &RepoPath) -> Result<Link, ManifestError> {
+        match self {
+            Source::Fs(root) => {
+                let abs = path.to_abs(root);
+                let md = match lstat(&abs, path.is_root()) {
+                    Ok(md) => md,
+                    Err(e) if is_absent_error(&e) => return Ok(Link::Absent),
+                    Err(e) => return Err(io_err(&abs, e)),
+                };
+                if md.file_type().is_symlink() {
+                    Ok(Link::Target(read_link_utf8(&abs)?))
+                } else {
+                    Ok(Link::NotSymlink)
+                }
+            }
+            Source::Cache(c) => Ok(match &*c.node(path)? {
+                Node::Absent => Link::Absent,
+                Node::Symlink { target, .. } => Link::Target(target.clone()),
+                _ => Link::NotSymlink,
+            }),
+        }
+    }
+
+    fn observe(
+        &self,
+        path: &RepoPath,
+        dir_type_only: bool,
+        skip: Option<&BTreeSet<String>>,
+    ) -> Result<InputEntry, ManifestError> {
+        match self {
+            Source::Fs(root) => observe_as(root, path, dir_type_only, skip),
+            Source::Cache(c) => c.observe(path, dir_type_only, skip),
+        }
+    }
+}
+
+/// One observation of each path of a checkout, shared by every capture and
+/// diff made through the cache ([`InputManifest::capture_cached`],
+/// [`InputManifest::diff_against_cache`]): a path's type, a file's contents
+/// hash, a symlink's target and a directory's children are read once, however
+/// many manifests name the path, and a directory's listing hash is computed
+/// once per set of children left out. Thread-safe (sharded locks; a path is
+/// observed by one thread while the others wait for it).
+///
+/// Nothing invalidates it: it is for a checkout that does not change while
+/// the cache is used (a plan verifying stored manifests, the inputs of a run
+/// that has finished). An observation that fails (an I/O error, a non-UTF-8
+/// name) is not kept, and is attempted again by the next caller, which then
+/// fails as the uncached observation would.
+pub struct CheckoutCache {
+    root: Utf8PathBuf,
+    hasher: std::hash::RandomState,
+    shards: Vec<Mutex<HashMap<RepoPath, Arc<Slot>>>>,
+}
+
+const CACHE_SHARDS: usize = 64;
+
+/// A path's observation, made once (`None` until then, or after a failure).
+#[derive(Default)]
+struct Slot(Mutex<Option<Arc<Node>>>);
+
+/// What `lstat` found at a path (the repository root itself is followed),
+/// with what [`observe_as`] reads of it.
+enum Node {
+    Absent,
+    Symlink {
+        target: Utf8PathBuf,
+        hash: String,
+    },
+    File {
+        exec: bool,
+        size: u64,
+        hash: String,
+    },
+    Dir(DirNode),
+    /// Not a regular file, directory or symlink.
+    Other,
+}
+
+#[derive(Default)]
+struct DirNode {
+    /// Every child (name, type), read on first use (a type-only observation
+    /// does not list the directory). A child whose type could not be read
+    /// keeps its error: it fails a listing that does not leave it out, as
+    /// [`hash_dir`] does.
+    #[allow(clippy::type_complexity)]
+    children: Mutex<Option<Arc<Vec<(String, Result<ChildType, (io::ErrorKind, String)>)>>>>,
+    /// Listing hash and size per set of children left out.
+    listings: Mutex<HashMap<BTreeSet<String>, (String, u64)>>,
+}
+
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+impl CheckoutCache {
+    /// An empty cache of the checkout at `repo_root`.
+    pub fn new(repo_root: &Utf8Path) -> Self {
+        CheckoutCache {
+            root: repo_root.to_owned(),
+            hasher: std::hash::RandomState::new(),
+            shards: (0..CACHE_SHARDS).map(|_| Mutex::default()).collect(),
+        }
+    }
+
+    /// The repository root the cache observes.
+    pub fn root(&self) -> &Utf8Path {
+        &self.root
+    }
+
+    /// The names of `dir`'s children now, unsorted; empty when `dir` is not
+    /// a directory (a symlink is not followed) or cannot be listed.
+    pub fn child_names(&self, dir: &RepoPath) -> Vec<String> {
+        let Ok(node) = self.node(dir) else {
+            return vec![];
+        };
+        let Node::Dir(d) = &*node else {
+            return vec![];
+        };
+        match self.children(dir, d) {
+            Ok(c) => c.iter().map(|(n, _)| n.clone()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    fn node(&self, path: &RepoPath) -> Result<Arc<Node>, ManifestError> {
+        use std::hash::BuildHasher as _;
+        let shard = &self.shards[self.hasher.hash_one(path) as usize % CACHE_SHARDS];
+        let slot = {
+            let mut m = locked(shard);
+            match m.get(path) {
+                Some(s) => s.clone(),
+                None => m.entry(path.clone()).or_default().clone(),
+            }
+        };
+        let mut g = locked(&slot.0);
+        if let Some(n) = &*g {
+            return Ok(n.clone());
+        }
+        let n = Arc::new(self.read_node(path)?);
+        *g = Some(n.clone());
+        Ok(n)
+    }
+
+    fn read_node(&self, path: &RepoPath) -> Result<Node, ManifestError> {
+        let abs = path.to_abs(&self.root);
+        let md = match lstat(&abs, path.is_root()) {
+            Ok(md) => md,
+            Err(e) if is_absent_error(&e) => return Ok(Node::Absent),
+            Err(e) => return Err(io_err(&abs, e)),
+        };
+        let ft = md.file_type();
+        Ok(if ft.is_symlink() {
+            let target = read_link_utf8(&abs)?;
+            let hash = blake3_hex(target.as_str().as_bytes());
+            Node::Symlink { target, hash }
+        } else if ft.is_file() {
+            let (hash, size) = hash_file(&abs)?;
+            Node::File {
+                exec: exec_bit(&md),
+                size,
+                hash,
+            }
+        } else if ft.is_dir() {
+            Node::Dir(DirNode::default())
+        } else {
+            Node::Other
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn children(
+        &self,
+        path: &RepoPath,
+        d: &DirNode,
+    ) -> Result<Arc<Vec<(String, Result<ChildType, (io::ErrorKind, String)>)>>, ManifestError> {
+        let mut g = locked(&d.children);
+        if let Some(c) = &*g {
+            return Ok(c.clone());
+        }
+        let abs = path.to_abs(&self.root);
+        let mut children = Vec::new();
+        for ent in fs::read_dir(&abs).map_err(|e| io_err(&abs, e))? {
+            let ent = ent.map_err(|e| io_err(&abs, e))?;
+            let name = ent
+                .file_name()
+                .into_string()
+                .map_err(|_| ManifestError::NonUtf8Name(abs.to_string()))?;
+            let ty = ent
+                .file_type()
+                .map(ChildType::from_file_type)
+                .map_err(|e| (e.kind(), e.to_string()));
+            children.push((name, ty));
+        }
+        let c = Arc::new(children);
+        *g = Some(c.clone());
+        Ok(c)
+    }
+
+    /// [`hash_dir`] of a directory, from its cached children.
+    fn listing(
+        &self,
+        path: &RepoPath,
+        d: &DirNode,
+        skip: Option<&BTreeSet<String>>,
+    ) -> Result<(String, u64), ManifestError> {
+        static NONE: BTreeSet<String> = BTreeSet::new();
+        let skip = skip.unwrap_or(&NONE);
+        if let Some(l) = locked(&d.listings).get(skip) {
+            return Ok(l.clone());
+        }
+        let children = self.children(path, d)?;
+        let mut kept = Vec::with_capacity(children.len());
+        for (name, ty) in children.iter() {
+            if skip.contains(name) {
+                continue;
+            }
+            match ty {
+                Ok(t) => kept.push((name.clone(), *t)),
+                Err((kind, msg)) => {
+                    return Err(io_err(
+                        &path.to_abs(&self.root),
+                        io::Error::new(*kind, msg.clone()),
+                    ));
+                }
+            }
+        }
+        let n = kept.len() as u64;
+        let l = (hash::dir_listing_hash(&mut kept), n);
+        locked(&d.listings).insert(skip.clone(), l.clone());
+        Ok(l)
+    }
+
+    /// [`observe_as`], from the cache.
+    fn observe(
+        &self,
+        path: &RepoPath,
+        dir_type_only: bool,
+        skip: Option<&BTreeSet<String>>,
+    ) -> Result<InputEntry, ManifestError> {
+        let node = self.node(path)?;
+        let (kind, exec, size, hash) = match &*node {
+            Node::Absent => return Ok(InputEntry::absent(path.clone())),
+            Node::Symlink { target, hash } => (
+                EntryKind::Symlink,
+                false,
+                target.as_str().len() as u64,
+                hash.clone(),
+            ),
+            Node::File { exec, size, hash } => (EntryKind::File, *exec, *size, hash.clone()),
+            Node::Dir(_) if dir_type_only => (EntryKind::Dir, false, 0, dir_type_hash()),
+            Node::Dir(d) => {
+                let (h, n) = self.listing(path, d, skip)?;
+                (EntryKind::DirListing, false, n, h)
+            }
+            Node::Other => return Err(ManifestError::UnsupportedFileType(path.to_string())),
+        };
+        Ok(InputEntry {
+            path: path.clone(),
+            kind,
+            exec,
+            size,
+            hash,
+        })
+    }
 }
 
 /// Resolve a symlink's target to the repo path the OS will follow next.
@@ -433,23 +724,17 @@ fn resolve_link_target(
 /// Follow symlinks starting at `start`, pushing a `Symlink` entry for every
 /// hop. Returns the first path that is not a symlink (possibly absent).
 fn resolve_chain(
-    repo_root: &Utf8Path,
+    src: Source<'_>,
     start: &RepoPath,
     out: &mut Vec<InputEntry>,
 ) -> Result<RepoPath, ManifestError> {
     let mut cur = start.clone();
     for _ in 0..MAX_SYMLINK_HOPS {
-        let abs = cur.to_abs(repo_root);
-        let md = match lstat(&abs, cur.is_root()) {
-            Ok(md) => md,
-            Err(e) if is_absent_error(&e) => return Ok(cur),
-            Err(e) => return Err(io_err(&abs, e)),
+        let target = match src.link(&cur)? {
+            Link::Absent | Link::NotSymlink => return Ok(cur),
+            Link::Target(t) => t,
         };
-        if !md.file_type().is_symlink() {
-            return Ok(cur);
-        }
-        let target = read_link_utf8(&abs)?;
-        let next = resolve_link_target(repo_root, &cur, &target)?;
+        let next = resolve_link_target(src.root(), &cur, &target)?;
         out.push(InputEntry {
             path: cur.clone(),
             kind: EntryKind::Symlink,
@@ -463,7 +748,7 @@ fn resolve_chain(
 }
 
 fn capture_one(
-    repo_root: &Utf8Path,
+    src: Source<'_>,
     path: &RepoPath,
     obs: Observation,
     excl: &Exclusions,
@@ -475,8 +760,8 @@ fn capture_one(
         return Ok(vec![InputEntry::excluded(path.clone())]);
     }
     let mut out = Vec::new();
-    let fin = resolve_chain(repo_root, path, &mut out)?;
-    let e = observe_as(repo_root, &fin, obs == Observation::Stat, excl)?;
+    let fin = resolve_chain(src, path, &mut out)?;
+    let e = src.observe(&fin, obs == Observation::Stat, excl.get(&fin))?;
     match (obs, e.kind) {
         (Observation::Exclude, _) | (_, EntryKind::Excluded) => {
             return Err(ManifestError::ConflictingEntries(fin.to_string()));
@@ -552,6 +837,35 @@ impl InputManifest {
     pub fn capture_with_env<F>(
         repo_root: &Utf8Path,
         observed: &[(RepoPath, Observation)],
+        externals: Vec<External>,
+        env_keys: &[String],
+        env: F,
+    ) -> Result<Self, ManifestError>
+    where
+        F: Fn(&str) -> Option<OsString> + Sync,
+    {
+        Self::capture_from(Source::Fs(repo_root), observed, externals, env_keys, env)
+    }
+
+    /// [`Self::capture_with_env`] observing the checkout through `cache`
+    /// (its root is the repository root): a path another capture or diff
+    /// through the same cache observed is not read again.
+    pub fn capture_cached<F>(
+        cache: &CheckoutCache,
+        observed: &[(RepoPath, Observation)],
+        externals: Vec<External>,
+        env_keys: &[String],
+        env: F,
+    ) -> Result<Self, ManifestError>
+    where
+        F: Fn(&str) -> Option<OsString> + Sync,
+    {
+        Self::capture_from(Source::Cache(cache), observed, externals, env_keys, env)
+    }
+
+    fn capture_from<F>(
+        src: Source<'_>,
+        observed: &[(RepoPath, Observation)],
         mut externals: Vec<External>,
         env_keys: &[String],
         env: F,
@@ -567,11 +881,11 @@ impl InputManifest {
         );
         let per_obs: Vec<Vec<InputEntry>> = observed
             .par_iter()
-            .map(|(p, o)| capture_one(repo_root, p, *o, &excl))
+            .map(|(p, o)| capture_one(src, p, *o, &excl))
             .collect::<Result<_, _>>()?;
         let mut entries: Vec<InputEntry> = per_obs.into_iter().flatten().collect();
         // A type-only `Dir` is implied by a listing of the same directory.
-        let listed: std::collections::BTreeSet<RepoPath> = entries
+        let listed: BTreeSet<RepoPath> = entries
             .iter()
             .filter(|e| e.kind == EntryKind::DirListing)
             .map(|e| e.path.clone())
@@ -814,6 +1128,35 @@ impl InputManifest {
     where
         F: Fn(&str) -> Option<OsString> + Sync,
     {
+        self.diff_from(Source::Fs(repo_root), env, extra_excluded)
+    }
+
+    /// [`Self::diff_against_checkout_excluding`] observing the checkout
+    /// through `cache` (its root is the repository root): every path is read
+    /// once for every manifest diffed through the same cache, which assumes
+    /// the checkout does not change while the cache is used. The mismatches
+    /// are the uncached diff's.
+    pub fn diff_against_cache<F>(
+        &self,
+        cache: &CheckoutCache,
+        env: F,
+        extra_excluded: &[RepoPath],
+    ) -> Result<Vec<Mismatch>, ManifestError>
+    where
+        F: Fn(&str) -> Option<OsString> + Sync,
+    {
+        self.diff_from(Source::Cache(cache), env, extra_excluded)
+    }
+
+    fn diff_from<F>(
+        &self,
+        src: Source<'_>,
+        env: F,
+        extra_excluded: &[RepoPath],
+    ) -> Result<Vec<Mismatch>, ManifestError>
+    where
+        F: Fn(&str) -> Option<OsString> + Sync,
+    {
         let mut excl = self.exclusions();
         for (parent, names) in exclusions(extra_excluded.iter()) {
             excl.entry(parent).or_default().extend(names);
@@ -826,7 +1169,8 @@ impl InputManifest {
                     // Not an input: only its parent's listing leaves it out.
                     return Ok(None);
                 }
-                let act = observe_as(repo_root, &exp.path, exp.kind == EntryKind::Dir, &excl)?;
+                let act =
+                    src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?;
                 Ok(if exp.same_state(&act) {
                     None
                 } else {
@@ -863,7 +1207,7 @@ impl InputManifest {
 
     /// Child names each directory listing of this manifest leaves out (its
     /// [`EntryKind::Excluded`] entries, by parent).
-    pub fn excluded_children(&self) -> BTreeMap<RepoPath, std::collections::BTreeSet<String>> {
+    pub fn excluded_children(&self) -> BTreeMap<RepoPath, BTreeSet<String>> {
         self.exclusions()
     }
 

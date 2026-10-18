@@ -2,6 +2,7 @@
 //! attestation for every test file that is provably attestable.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -111,7 +112,7 @@ fn summary_json(outcomes: &[UnitOutcome]) -> serde_json::Value {
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Env vars hashed into every test file's global manifest, per adapter.
-fn global_env_keys(adapter: &str) -> Vec<String> {
+pub(crate) fn global_env_keys(adapter: &str) -> Vec<String> {
     match adapter {
         // vci sets NODE_OPTIONS itself; a non-empty user value still matters.
         "vitest" | "node-test" => vec!["NODE_OPTIONS".to_owned()],
@@ -128,9 +129,18 @@ pub fn global_manifest(
     child: &ChildEnvMap,
     test_abs: &Utf8Path,
 ) -> Result<InputManifest> {
-    let obs = global::observations(&ctx.root, project.adapter.as_ref(), test_abs)?;
-    let m = InputManifest::capture_with_env(
-        &ctx.root,
+    global_manifest_in(&Checkout::direct(&ctx.root), project, child, test_abs)
+}
+
+/// [`global_manifest`], reading the checkout through `checkout`.
+fn global_manifest_in(
+    checkout: &Checkout<'_>,
+    project: &Project,
+    child: &ChildEnvMap,
+    test_abs: &Utf8Path,
+) -> Result<InputManifest> {
+    let obs = global::observations(checkout.root, project.adapter.as_ref(), test_abs)?;
+    let m = checkout.capture(
         &obs,
         vec![],
         &global_env_keys(project.adapter.name()),
@@ -157,6 +167,17 @@ pub fn observations_for(
     adapter: &str,
     tsconfig: bool,
 ) -> Result<Vec<(RepoPath, Observation)>, String> {
+    observations_in(&Checkout::direct(root), o, adapter, tsconfig)
+}
+
+/// [`observations_for`], reading the checkout through `checkout`.
+fn observations_in(
+    checkout: &Checkout<'_>,
+    o: &Observed,
+    adapter: &str,
+    tsconfig: bool,
+) -> Result<Vec<(RepoPath, Observation)>, String> {
+    let root = checkout.root;
     let mut out = Vec::new();
     let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 6] = [
         (&o.modules, Observation::Read),
@@ -174,7 +195,7 @@ pub fn observations_for(
             }
         }
     }
-    let ignored = ignored_children(root, &out);
+    let ignored = ignored_children(checkout, &out);
     out.extend(ignored);
     // package.json / tsconfig.json that decide how each module resolves its
     // imports and is transformed.
@@ -391,19 +412,19 @@ const CHECKOUT_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", "__pyc
 /// git does not ignore (what it ignores is left out of the listing since
 /// 2.0.3): the listing will differ in a fresh checkout, so the file will run
 /// there (never a false skip, but a lost skip worth knowing about).
-fn junk_in_listings(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
+fn junk_in_listings(checkout: &Checkout<'_>, m: &InputManifest) -> Vec<String> {
     let mut out = Vec::new();
     for e in &m.entries {
         if e.kind != vci_core::EntryKind::DirListing {
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(e.path.to_abs(root)) else {
+        let Some(names) = checkout.child_names(&e.path) else {
             continue;
         };
-        let junk: Vec<String> = rd
-            .flatten()
-            .filter_map(|d| d.file_name().into_string().ok())
+        let junk: Vec<String> = names
+            .iter()
             .filter(|n| CHECKOUT_JUNK.contains(&n.as_str()))
+            .cloned()
             .collect();
         let paths: Vec<String> = junk
             .iter()
@@ -415,7 +436,7 @@ fn junk_in_listings(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
                 }
             })
             .collect();
-        let ignored = git_ignored(root, &paths);
+        let ignored = checkout.git_ignored(&paths);
         let junk: Vec<String> = junk
             .into_iter()
             .zip(paths)
@@ -617,6 +638,157 @@ fn waived_note(waived: &[String]) -> String {
     }
 }
 
+/// What [`run_units`] decided for one unit, before storing it: made for
+/// several units at once, reported and stored in their order.
+enum Verdict {
+    /// Not attested: the refusal line's text, the reason keys, the
+    /// refusing taints.
+    Refused {
+        reason: String,
+        reasons: Vec<String>,
+        taints: Vec<String>,
+    },
+    /// Attestable: the warnings to print first (whole lines), and the signed
+    /// envelope to store, or why it could not be signed.
+    Attestable {
+        a: Box<Attestable>,
+        warnings: Vec<String>,
+        signed: Result<Vec<u8>>,
+    },
+}
+
+/// How many units [`run_units`] checks and signs at once after their tests
+/// ran: `$VCI_JOBS`, else the number of CPUs. Each mostly hashes inputs and
+/// waits for `ssh-keygen` or the Sigstore services; the store is written one
+/// unit at a time.
+fn check_jobs() -> usize {
+    std::env::var("VCI_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+}
+
+/// `work` on every item, `jobs` items at a time (on threads of their own),
+/// and `sink` (on the calling thread) on each result in the items' order, as
+/// soon as it and every result before it are ready. One job: one item after
+/// the other, each sunk before the next is worked on.
+fn in_order<T: Sync, R: Send>(
+    items: &[T],
+    jobs: usize,
+    work: impl Fn(&T) -> R + Sync,
+    mut sink: impl FnMut(usize, R),
+) {
+    if jobs <= 1 || items.len() <= 1 {
+        for (i, t) in items.iter().enumerate() {
+            sink(i, work(t));
+        }
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..jobs.min(items.len()) {
+            let (tx, next, work) = (tx.clone(), &next, &work);
+            s.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(t) = items.get(i) else { break };
+                    if tx.send((i, work(t))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut ready = BTreeMap::new();
+        let mut due = 0;
+        for (i, r) in rx {
+            ready.insert(i, r);
+            while let Some(r) = ready.remove(&due) {
+                sink(due, r);
+                due += 1;
+            }
+        }
+    });
+}
+
+/// The warnings about an attestable unit's inputs (whole lines): listings
+/// with checkout junk, `CI` taken from the machine, inputs git ignores.
+fn attested_warnings(
+    checkout: &Checkout<'_>,
+    project: &Project,
+    label: &str,
+    a: &Attestable,
+) -> Vec<String> {
+    let mut out: Vec<String> = junk_in_listings(checkout, &a.manifest)
+        .into_iter()
+        .map(|w| format!("vci: warning: {label}: {w}"))
+        .collect();
+    // Stripped (absent on both sides) or set by vci, CI is the same
+    // everywhere; taken from the machine, it is not.
+    if a.manifest.env.iter().any(|e| e.key == "CI")
+        && project.project_env().classify("CI") == crate::envpolicy::EnvClass::Hash
+    {
+        out.push(format!(
+            "vci: warning: {label}: it reads CI, which vci.toml hashes and CI runners set (to \"true\"): unless it had that value here, this attestation will not match on a runner (set it instead: [env] set = {{ CI = \"true\" }}){}",
+            if project.adapter.name() == "rails" {
+                "; Rails' generated config/environments/test.rb reads it (config.eager_load = ENV[\"CI\"].present?)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if matches!(project.adapter.name(), "cargo" | "rails" | "node-test") {
+        let ignored = ignored_inputs(checkout, &a.manifest);
+        if !ignored.is_empty() {
+            let why = if project.adapter.name() == "cargo" {
+                "every file in a package directory is an input"
+            } else {
+                "the test read them; delete them before attesting if they are leftovers"
+            };
+            out.push(format!(
+                "vci: warning: {label}: inputs ignored by git (a fresh checkout, e.g. in CI, will not have them, so this attestation will not match there; {why}): {}{}",
+                ignored
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if ignored.len() > 10 { ", ..." } else { "" }
+            ));
+            if project.adapter.name() == "rails"
+                && let Some(key) = ignored.iter().find(|p| is_rails_key_file(p))
+            {
+                out.push(format!(
+                    "vci: warning: {label}: it read {key}, Rails' credentials key (git-ignored, so never in CI): in an app generated with credentials, Active Record reads it at boot, so no test that boots Rails is skipped in CI. Give the test environment its own credentials with a committed key (`bin/rails credentials:edit --environment test`, then commit config/credentials/test.key and test.yml.enc), or remove config/master.key and the credentials file if the tests need none, or declare RAILS_MASTER_KEY in vci.toml and set it to the same value here and in CI"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Sign the statement of an attestable unit: the envelope bytes to store.
+fn sign_predicate(key: &Signer<'_>, p: &VciPredicate) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(p)?;
+    let mut digest = BTreeMap::new();
+    digest.insert("blake3".to_owned(), p.core.input_root.clone());
+    let stmt = Statement::new(
+        vec![Subject {
+            name: p.core.test_id.clone(),
+            digest,
+        }],
+        PREDICATE_TYPE,
+        value,
+    );
+    key.sign(&stmt)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_one(
     ctx: &Ctx,
@@ -630,6 +802,7 @@ fn check_one(
     base: &PredicateBase,
     locked: &Result<Option<crate::externals::LockedPackages>, String>,
     scratch: &[Utf8PathBuf],
+    checkout: &Checkout<'_>,
 ) -> Result<Attestable, String> {
     let file = file.ok_or_else(|| "not in the runner's test file list".to_owned())?;
     if file.ambiguous {
@@ -717,7 +890,7 @@ fn check_one(
             })
             .cloned()
             .collect();
-        let ignored: BTreeSet<String> = git_ignored(&ctx.root, &candidates).into_iter().collect();
+        let ignored: BTreeSet<String> = checkout.git_ignored(&candidates).into_iter().collect();
         written.retain(|w| !ignored.contains(w));
     }
     // Tool caches under node_modules (Vite's dependency optimizer) are not
@@ -816,7 +989,7 @@ fn check_one(
         pruned = without_paths(o, &not_inputs);
         &pruned
     };
-    let mut obs = observations_for(&ctx.root, o, adapter.name(), adapter.tsconfig_is_input())?;
+    let mut obs = observations_in(checkout, o, adapter.name(), adapter.tsconfig_is_input())?;
     obs.extend(expand_extra_inputs(
         &ctx.root,
         &project.dir,
@@ -840,9 +1013,9 @@ fn check_one(
             version: v.clone(),
         })
         .collect();
-    let manifest =
-        InputManifest::capture_with_env(&ctx.root, &obs, externals, &keys, lookup(child))
-            .map_err(|e| format!("capturing inputs: {e}"))?;
+    let manifest = checkout
+        .capture(&obs, externals, &keys, lookup(child))
+        .map_err(|e| format!("capturing inputs: {e}"))?;
     manifest
         .check_case_collisions()
         .map_err(|e| format!("inputs: {e}"))?;
@@ -865,7 +1038,7 @@ fn check_one(
         }
         waived.push(taint);
     }
-    let gm = global_manifest(ctx, project, child, &file.abs)
+    let gm = global_manifest_in(checkout, project, child, &file.abs)
         .map_err(|e| format!("global inputs: {e:#}"))?;
     match pre_global.get(file.test_id.as_str()) {
         Some(Ok(root)) if *root == gm.root() => {}
@@ -877,7 +1050,7 @@ fn check_one(
     // in them now: a cache a test wrote into a listed directory during the
     // run (`__pycache__`) is not a change to the listing (since 2.0.3).
     let mut excluded = manifest.excluded_children();
-    for p in ignored_listing_children(&ctx.root, &manifest) {
+    for p in ignored_listing_children(checkout, &manifest) {
         if let (Some(parent), Some(name)) = (p.parent(), p.components().last()) {
             excluded.entry(parent).or_default().insert(name.to_owned());
         }
@@ -1075,7 +1248,7 @@ fn is_rails_key_file(p: &str) -> bool {
 /// attestation made on one machine verifies on another (since 2.0.3). A
 /// child that is itself observed stays an input of its own.
 pub(crate) fn ignored_children(
-    root: &Utf8Path,
+    checkout: &Checkout<'_>,
     observed: &[(RepoPath, Observation)],
 ) -> Vec<(RepoPath, Observation)> {
     let seen: BTreeSet<&str> = observed.iter().map(|(p, _)| p.as_str()).collect();
@@ -1084,15 +1257,12 @@ pub(crate) fn ignored_children(
         if !matches!(o, Observation::ReadDir | Observation::Read) {
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(p.to_abs(root)) else {
+        let Some(names) = checkout.child_names(p) else {
             continue;
         };
-        for ent in rd.flatten() {
-            let Ok(name) = ent.file_name().into_string() else {
-                continue;
-            };
+        for name in names.iter() {
             let child = if p.is_root() {
-                name
+                name.clone()
             } else {
                 format!("{}/{name}", p.as_str())
             };
@@ -1103,7 +1273,8 @@ pub(crate) fn ignored_children(
     }
     candidates.sort();
     candidates.dedup();
-    git_ignored(root, &candidates)
+    checkout
+        .git_ignored(&candidates)
         .into_iter()
         .filter_map(|c| RepoPath::new(&c).ok())
         .map(|p| (p, Observation::Exclude))
@@ -1113,22 +1284,22 @@ pub(crate) fn ignored_children(
 /// The git-ignored children, present now, of every directory `m` records a
 /// listing of, minus `m`'s own entries: what a verification leaves out of
 /// the listings it rehashes (see [`ignored_children`]).
-pub(crate) fn ignored_listing_children(root: &Utf8Path, m: &InputManifest) -> Vec<RepoPath> {
+pub(crate) fn ignored_listing_children(
+    checkout: &Checkout<'_>,
+    m: &InputManifest,
+) -> Vec<RepoPath> {
     let seen: BTreeSet<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
     let mut candidates: Vec<String> = Vec::new();
     for e in &m.entries {
         if e.kind != vci_core::EntryKind::DirListing {
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(e.path.to_abs(root)) else {
+        let Some(names) = checkout.child_names(&e.path) else {
             continue;
         };
-        for ent in rd.flatten() {
-            let Ok(name) = ent.file_name().into_string() else {
-                continue;
-            };
+        for name in names.iter() {
             let child = if e.path.is_root() {
-                name
+                name.clone()
             } else {
                 format!("{}/{name}", e.path.as_str())
             };
@@ -1139,13 +1310,14 @@ pub(crate) fn ignored_listing_children(root: &Utf8Path, m: &InputManifest) -> Ve
     }
     candidates.sort();
     candidates.dedup();
-    git_ignored(root, &candidates)
+    checkout
+        .git_ignored(&candidates)
         .into_iter()
         .filter_map(|c| RepoPath::new(&c).ok())
         .collect()
 }
 
-fn ignored_inputs(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
+fn ignored_inputs(checkout: &Checkout<'_>, m: &InputManifest) -> Vec<String> {
     let paths: Vec<String> = m
         .entries
         .iter()
@@ -1157,15 +1329,21 @@ fn ignored_inputs(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
         })
         .map(|e| e.path.as_str().to_owned())
         .collect();
-    git_ignored(root, &paths)
+    checkout.git_ignored(&paths)
 }
 
 /// The repo-relative `paths` git ignores (`git check-ignore`); any error
 /// means none (so nothing is treated as ignored).
 pub(crate) fn git_ignored(root: &Utf8Path, paths: &[String]) -> Vec<String> {
+    git_check_ignore(root, paths).0
+}
+
+/// [`git_ignored`], and whether git answered (exited 0 or 1: some or none
+/// ignored); an answer git did not give is not one to keep.
+pub(crate) fn git_check_ignore(root: &Utf8Path, paths: &[String]) -> (Vec<String>, bool) {
     use std::io::Write as _;
     if paths.is_empty() {
-        return vec![];
+        return (vec![], true);
     }
     let child = std::process::Command::new("git")
         .args(["-C", root.as_str(), "check-ignore", "--stdin"])
@@ -1174,19 +1352,148 @@ pub(crate) fn git_ignored(root: &Utf8Path, paths: &[String]) -> Vec<String> {
         .stderr(std::process::Stdio::null())
         .spawn();
     let Ok(mut child) = child else {
-        return vec![];
+        return (vec![], false);
     };
     if let Some(mut i) = child.stdin.take() {
         let _ = i.write_all(paths.join("\n").as_bytes());
         let _ = i.write_all(b"\n");
     }
     let Ok(out) = child.wait_with_output() else {
-        return vec![];
+        return (vec![], false);
     };
-    String::from_utf8_lossy(&out.stdout)
+    let lines = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::to_owned)
-        .collect()
+        .collect();
+    (lines, matches!(out.status.code(), Some(0 | 1)))
+}
+
+/// How [`check_one`] reads the checkout: directly, or (once a project's
+/// tests have finished, when the tree no longer changes) through caches
+/// shared by every unit of the run, so that a path's contents, a
+/// directory's children and git's answer about a path are read once
+/// however many units name them. Nothing invalidates the caches: each unit
+/// still compares its entries with the snapshot taken before the run
+/// ([`TreeStat`]) after its manifest is captured, so a value read once is
+/// vouched for by every unit that uses it, as one read per unit was.
+pub(crate) struct Checkout<'a> {
+    root: &'a Utf8Path,
+    cache: Option<Caches>,
+}
+
+struct Caches {
+    files: vci_core::CheckoutCache,
+    /// `read_dir` of a directory (followed if a symlink, as [`ignored_children`]
+    /// lists it): the UTF-8 names, `None` when it cannot be listed.
+    children: std::sync::Mutex<std::collections::HashMap<Utf8PathBuf, Option<Arc<Vec<String>>>>>,
+    /// `git check-ignore` per repo-relative path.
+    ignored: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+}
+
+fn locked<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+impl<'a> Checkout<'a> {
+    /// Every read goes to the checkout (and to git).
+    pub(crate) fn direct(root: &'a Utf8Path) -> Self {
+        Checkout { root, cache: None }
+    }
+
+    /// Every path read once, for a checkout that does not change while this
+    /// is used.
+    pub(crate) fn cached(root: &'a Utf8Path) -> Self {
+        Checkout {
+            root,
+            cache: Some(Caches {
+                files: vci_core::CheckoutCache::new(root),
+                children: Default::default(),
+                ignored: Default::default(),
+            }),
+        }
+    }
+
+    /// [`git_ignored`]: the `paths` git ignores, in their order.
+    pub(crate) fn git_ignored(&self, paths: &[String]) -> Vec<String> {
+        let Some(c) = &self.cache else {
+            return git_ignored(self.root, paths);
+        };
+        let mut ask: Vec<String> = {
+            let known = locked(&c.ignored);
+            paths
+                .iter()
+                .filter(|p| !known.contains_key(p.as_str()))
+                .cloned()
+                .collect()
+        };
+        ask.sort();
+        ask.dedup();
+        let (found, answered) = git_check_ignore(self.root, &ask);
+        if !answered {
+            // git stopped before answering about every path (it exits 128 on
+            // a path inside a submodule or beyond a symbolic link, after
+            // printing what it found before it): nothing is kept, and the
+            // answer is the one git gives for `paths` alone, as before 2.1,
+            // whatever other units asked first.
+            return if ask == paths {
+                found
+            } else {
+                git_ignored(self.root, paths)
+            };
+        }
+        let found: BTreeSet<&str> = found.iter().map(String::as_str).collect();
+        let mut known = locked(&c.ignored);
+        for p in &ask {
+            known.insert(p.clone(), found.contains(p.as_str()));
+        }
+        paths
+            .iter()
+            .filter(|p| known.get(p.as_str()).copied().unwrap_or(false))
+            .cloned()
+            .collect()
+    }
+
+    /// The UTF-8 names in the directory `p` (`read_dir`, which follows a
+    /// symlink); `None` when it cannot be listed.
+    fn child_names(&self, p: &RepoPath) -> Option<Arc<Vec<String>>> {
+        let abs = p.to_abs(self.root);
+        let read = |abs: &Utf8Path| {
+            std::fs::read_dir(abs).ok().map(|rd| {
+                Arc::new(
+                    rd.flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
+        let Some(c) = &self.cache else {
+            return read(&abs);
+        };
+        if let Some(n) = locked(&c.children).get(&abs) {
+            return n.clone();
+        }
+        let n = read(&abs);
+        locked(&c.children).insert(abs, n.clone());
+        n
+    }
+
+    /// [`InputManifest::capture_with_env`] (through the cache when there is
+    /// one).
+    fn capture<F>(
+        &self,
+        observed: &[(RepoPath, Observation)],
+        externals: Vec<External>,
+        env_keys: &[String],
+        env: F,
+    ) -> Result<InputManifest, vci_core::ManifestError>
+    where
+        F: Fn(&str) -> Option<std::ffi::OsString> + Sync,
+    {
+        match &self.cache {
+            None => InputManifest::capture_with_env(self.root, observed, externals, env_keys, env),
+            Some(c) => InputManifest::capture_cached(&c.files, observed, externals, env_keys, env),
+        }
+    }
 }
 
 struct PredicateBase {
@@ -1666,6 +1973,7 @@ pub fn run_units(
     let mut dropped_roots = BTreeSet::new();
     let mut outcomes: Vec<UnitOutcome> = Vec::new();
     let mut exit: Option<i32> = Some(0);
+    let jobs = check_jobs();
     for &pi in &involved {
         let project = &ctx.projects[pi];
         let child = &children[pi];
@@ -1745,39 +2053,49 @@ pub fn run_units(
         // vci's own collector files are tooling, not inputs, however the
         // process reached them (a symlinked install prefix).
         let collector_dirs = project.adapter.collector_dirs();
-        for o in &out.files {
+        // Each output's unit and the name it is reported under, in order.
+        let units: Vec<(&Observed, Option<&TestFile>, String)> = out
+            .files
+            .iter()
+            .map(|o| {
+                let id = project
+                    .test_id(&o.test_id)
+                    .map(|p| p.as_str().to_owned())
+                    .ok();
+                let file = id.as_ref().and_then(|id| by_id.get(id.as_str()).copied());
+                let label = id.unwrap_or_else(|| o.test_id.clone());
+                seen.insert(label.clone());
+                (o, file, label)
+            })
+            .collect();
+        // The tests have finished, so the checkout no longer changes: every
+        // unit reads it through one cache (see [`Checkout`]).
+        let checkout = Checkout::cached(&ctx.root);
+        let t_check = std::time::Instant::now();
+        // Checked and signed `jobs` units at a time; reported and stored in
+        // order, one after the other.
+        let verdict = |(o, file, label): &(&Observed, Option<&TestFile>, String)| {
+            if let Some(why) = &tree_changed {
+                return Verdict::Refused {
+                    reason: why.clone(),
+                    reasons: vec![refusal_key(why)],
+                    taints: vec![],
+                };
+            }
             let filtered;
-            let o = if collector_dirs.is_empty() {
+            let o: &Observed = if collector_dirs.is_empty() {
                 o
             } else {
-                let mut c = o.clone();
+                let mut c = (*o).clone();
                 c.drop_collector_paths(&ctx.root, &collector_dirs);
                 filtered = c;
                 &filtered
             };
-            let id = project
-                .test_id(&o.test_id)
-                .map(|p| p.as_str().to_owned())
-                .ok();
-            let file = id.as_ref().and_then(|id| by_id.get(id.as_str()).copied());
-            let label = id.clone().unwrap_or_else(|| o.test_id.clone());
-            seen.insert(label.clone());
-            if let Some(why) = &tree_changed {
-                refused += 1;
-                eprintln!("vci: not attesting {label}: {why}");
-                outcomes.push(UnitOutcome::refused(
-                    &label,
-                    project,
-                    why.clone(),
-                    vec![refusal_key(why)],
-                ));
-                continue;
-            }
             match check_one(
                 &ctx,
                 project,
                 o,
-                file,
+                *file,
                 &versions[&pi],
                 child,
                 &pre_stat,
@@ -1785,143 +2103,129 @@ pub fn run_units(
                 &base,
                 &locks[pi],
                 &scratch,
+                &checkout,
             ) {
                 Err(reason) => {
-                    refused += 1;
-                    eprintln!("vci: not attesting {label}: {reason}");
-                    let mut out = UnitOutcome::refused(&label, project, reason.clone(), vec![]);
-                    match file {
+                    let (reasons, taints) = match file {
                         Some(f) if reason.starts_with("tainted: ") => {
                             let declared = project.extra_inputs(&f.project_rel);
                             let (_, taints) = split_waived(project, &declared, o);
-                            out.reasons = group_taints(&taints).into_iter().map(|g| g.0).collect();
-                            out.taints = taints.into_iter().cloned().collect();
+                            (
+                                group_taints(&taints).into_iter().map(|g| g.0).collect(),
+                                taints.into_iter().cloned().collect(),
+                            )
                         }
-                        _ => out.reasons = vec![refusal_key(&reason)],
-                    }
-                    outcomes.push(out);
-                }
-                Ok(a) => {
-                    let p = &a.predicate;
-                    for w in junk_in_listings(&ctx.root, &a.manifest) {
-                        eprintln!("vci: warning: {label}: {w}");
-                    }
-                    // Stripped (absent on both sides) or set by vci, CI is
-                    // the same everywhere; taken from the machine, it is not.
-                    if a.manifest.env.iter().any(|e| e.key == "CI")
-                        && project.project_env().classify("CI") == crate::envpolicy::EnvClass::Hash
-                    {
-                        eprintln!(
-                            "vci: warning: {label}: it reads CI, which vci.toml hashes and CI runners set (to \"true\"): unless it had that value here, this attestation will not match on a runner (set it instead: [env] set = {{ CI = \"true\" }}){}",
-                            if project.adapter.name() == "rails" {
-                                "; Rails' generated config/environments/test.rb reads it (config.eager_load = ENV[\"CI\"].present?)"
-                            } else {
-                                ""
-                            }
-                        );
-                    }
-                    if matches!(project.adapter.name(), "cargo" | "rails" | "node-test") {
-                        let ignored = ignored_inputs(&ctx.root, &a.manifest);
-                        if !ignored.is_empty() {
-                            let why = if project.adapter.name() == "cargo" {
-                                "every file in a package directory is an input"
-                            } else {
-                                "the test read them; delete them before attesting if they are leftovers"
-                            };
-                            eprintln!(
-                                "vci: warning: {label}: inputs ignored by git (a fresh checkout, e.g. in CI, will not have them, so this attestation will not match there; {why}): {}{}",
-                                ignored
-                                    .iter()
-                                    .take(10)
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                if ignored.len() > 10 { ", ..." } else { "" }
-                            );
-                            if project.adapter.name() == "rails"
-                                && let Some(key) = ignored.iter().find(|p| is_rails_key_file(p))
-                            {
-                                eprintln!(
-                                    "vci: warning: {label}: it read {key}, Rails' credentials key (git-ignored, so never in CI): in an app generated with credentials, Active Record reads it at boot, so no test that boots Rails is skipped in CI. Give the test environment its own credentials with a committed key (`bin/rails credentials:edit --environment test`, then commit config/credentials/test.key and test.yml.enc), or remove config/master.key and the credentials file if the tests need none, or declare RAILS_MASTER_KEY in vci.toml and set it to the same value here and in CI"
-                                );
-                            }
-                        }
-                    }
-                    let skey = storage_key(p);
-                    let signed = (|| -> Result<_> {
-                        let value = serde_json::to_value(p)?;
-                        let mut digest = std::collections::BTreeMap::new();
-                        digest.insert("blake3".to_owned(), p.core.input_root.clone());
-                        let stmt = Statement::new(
-                            vec![Subject {
-                                name: p.core.test_id.clone(),
-                                digest,
-                            }],
-                            PREDICATE_TYPE,
-                            value,
-                        );
-                        let env = key.sign(&stmt)?;
-                        // The manifest first: an attestation is never stored
-                        // without the manifest it references.
-                        store
-                            .put_manifest(&p.core.input_root, a.manifest.to_compact().as_bytes())
-                            .context("storing the input manifest")?;
-                        let stored = store.put(&p.core.test_id, &signer, &skey, &env)?;
-                        superseded += supersede(
-                            &store,
-                            &ctx.repo,
-                            p,
-                            &a.manifest,
-                            &signer,
-                            &stored.key,
-                            &moved_on,
-                            &mut dropped_roots,
-                        );
-                        Ok(stored)
-                    })();
-                    let stored = match signed {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let msg = format!("{label}: {e:#}");
-                            eprintln!("vci: error: not attesting {msg}");
-                            errors.push(msg);
-                            refused += 1;
-                            let why = format!("signing or storing failed: {e:#}");
-                            outcomes.push(UnitOutcome::refused(
-                                &label,
-                                project,
-                                why,
-                                vec!["signing or storing failed".to_owned()],
-                            ));
-                            continue;
-                        }
+                        _ => (vec![refusal_key(&reason)], vec![]),
                     };
-                    attested += 1;
-                    outcomes.push(UnitOutcome {
-                        test_id: label.clone(),
-                        project: (!project.name.is_empty()).then(|| project.name.clone()),
-                        adapter: project.adapter.name(),
-                        attested: true,
-                        reasons: vec![],
-                        detail: None,
-                        taints: vec![],
-                        waived: p.waived.clone(),
-                    });
-                    let waived = if p.waived.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (waived: {})", waived_note(&p.waived))
-                    };
-                    eprintln!(
-                        "vci: attested {label}{waived} ({} inputs, root {}) as git-meta {} {}",
-                        a.manifest.entries.len(),
-                        &p.core.input_root[..16],
-                        stored.target,
-                        stored.key
-                    );
+                    Verdict::Refused {
+                        reason,
+                        reasons,
+                        taints,
+                    }
                 }
+                Ok(a) => Verdict::Attestable {
+                    warnings: attested_warnings(&checkout, project, label, &a),
+                    signed: sign_predicate(&key, &a.predicate),
+                    a: Box::new(a),
+                },
             }
-        }
+        };
+        in_order(&units, jobs, verdict, |i, v| {
+            let label = &units[i].2;
+            let (a, signed) = match v {
+                Verdict::Refused {
+                    reason,
+                    reasons,
+                    taints,
+                } => {
+                    refused += 1;
+                    eprintln!("vci: not attesting {label}: {reason}");
+                    let mut out = UnitOutcome::refused(label, project, reason, reasons);
+                    out.taints = taints;
+                    outcomes.push(out);
+                    return;
+                }
+                Verdict::Attestable {
+                    a,
+                    warnings,
+                    signed,
+                } => {
+                    for w in &warnings {
+                        eprintln!("{w}");
+                    }
+                    (a, signed)
+                }
+            };
+            let p = &a.predicate;
+            let skey = storage_key(p);
+            let stored = signed.and_then(|env| {
+                // The manifest first: an attestation is never stored without
+                // the manifest it references.
+                store
+                    .put_manifest(&p.core.input_root, a.manifest.to_compact().as_bytes())
+                    .context("storing the input manifest")?;
+                let stored = store.put(&p.core.test_id, &signer, &skey, &env)?;
+                superseded += supersede(
+                    &store,
+                    &ctx.repo,
+                    p,
+                    &a.manifest,
+                    &signer,
+                    &stored.key,
+                    &moved_on,
+                    &mut dropped_roots,
+                );
+                Ok(stored)
+            });
+            let stored = match stored {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("{label}: {e:#}");
+                    eprintln!("vci: error: not attesting {msg}");
+                    errors.push(msg);
+                    refused += 1;
+                    let why = format!("signing or storing failed: {e:#}");
+                    outcomes.push(UnitOutcome::refused(
+                        label,
+                        project,
+                        why,
+                        vec!["signing or storing failed".to_owned()],
+                    ));
+                    return;
+                }
+            };
+            attested += 1;
+            outcomes.push(UnitOutcome {
+                test_id: label.clone(),
+                project: (!project.name.is_empty()).then(|| project.name.clone()),
+                adapter: project.adapter.name(),
+                attested: true,
+                reasons: vec![],
+                detail: None,
+                taints: vec![],
+                waived: p.waived.clone(),
+            });
+            let waived = if p.waived.is_empty() {
+                String::new()
+            } else {
+                format!(" (waived: {})", waived_note(&p.waived))
+            };
+            eprintln!(
+                "vci: attested {label}{waived} ({} inputs, root {}) as git-meta {} {}",
+                a.manifest.entries.len(),
+                &p.core.input_root[..16],
+                stored.target,
+                stored.key
+            );
+        });
+        crate::plan::timing(
+            &format!(
+                "check, sign and store {} unit(s) of {} ({jobs} at a time)",
+                units.len(),
+                project.label()
+            ),
+            t_check,
+        );
         for f in &mine {
             if !seen.contains(f.test_id.as_str()) {
                 refused += 1;
@@ -2583,6 +2887,116 @@ mod tests {
         let p = policy("adapter = \"cargo\"\n[policy]\nignore_taints = [\"cargo:*\"]\n");
         let (w, r) = split_waived_taints(&p, "cargo", &[], &taints);
         assert_eq!((w.len(), r.len()), (2, 0));
+    }
+
+    #[test]
+    fn in_order_sinks_every_result_in_the_items_order() {
+        // Later items finish first; each is sunk once, in order, on the
+        // calling thread, whatever the number of jobs.
+        let items: Vec<u64> = (0..40).collect();
+        let me = std::thread::current().id();
+        for jobs in [1, 3, 8, 64] {
+            let mut got = Vec::new();
+            in_order(
+                &items,
+                jobs,
+                |&i| {
+                    std::thread::sleep(std::time::Duration::from_millis((40 - i) % 7));
+                    i * 10
+                },
+                |i, r| {
+                    assert_eq!(std::thread::current().id(), me);
+                    got.push((i, r));
+                },
+            );
+            let want: Vec<(usize, u64)> = (0..40).map(|i| (i as usize, i * 10)).collect();
+            assert_eq!(got, want, "jobs {jobs}");
+        }
+        // One job: each result is sunk before the next item is worked on.
+        let worked = std::sync::atomic::AtomicUsize::new(0);
+        in_order(
+            &items,
+            1,
+            |_| worked.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            |i, n| {
+                assert_eq!(n, i);
+                assert_eq!(worked.load(std::sync::atomic::Ordering::SeqCst), i + 1);
+            },
+        );
+        in_order(&[] as &[u64], 4, |_| 0, |_, _: u64| panic!("no items"));
+    }
+
+    #[test]
+    fn cached_checkout_answers_as_the_direct_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap().to_owned();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root.as_str())
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        write(&root, ".gitignore", "*.log\nbuild/\n");
+        write(&root, "src/a.rb", "a");
+        write(&root, "src/b.log", "b");
+        write(&root, "build/out.txt", "o");
+        let direct = Checkout::direct(&root);
+        let cached = Checkout::cached(&root);
+        let paths: Vec<String> = [
+            "src/a.rb",
+            "src/b.log",
+            "build",
+            "build/out.txt",
+            "nope.log",
+        ]
+        .iter()
+        .map(|p| (*p).to_owned())
+        .collect();
+        let want = direct.git_ignored(&paths);
+        assert_eq!(want, ["src/b.log", "build", "build/out.txt", "nope.log"]);
+        // Asked twice (the second time from the cache), and in parts.
+        assert_eq!(cached.git_ignored(&paths), want);
+        assert_eq!(cached.git_ignored(&paths), want);
+        assert_eq!(cached.git_ignored(&paths[1..3]), want[..2]);
+        let observed = vec![
+            (RepoPath::new("src").unwrap(), Observation::ReadDir),
+            (RepoPath::new("src/a.rb").unwrap(), Observation::Read),
+        ];
+        assert_eq!(
+            ignored_children(&cached, &observed),
+            ignored_children(&direct, &observed)
+        );
+        assert_eq!(
+            ignored_children(&cached, &observed),
+            [(RepoPath::new("src/b.log").unwrap(), Observation::Exclude)]
+        );
+        let mut obs = observed.clone();
+        obs.extend(ignored_children(&direct, &observed));
+        let m = direct.capture(&obs, vec![], &[], |_: &str| None).unwrap();
+        assert_eq!(
+            cached.capture(&obs, vec![], &[], |_: &str| None).unwrap(),
+            m
+        );
+        assert_eq!(
+            cached.capture(&obs, vec![], &[], |_: &str| None).unwrap(),
+            m
+        );
+        assert_eq!(
+            ignored_listing_children(&cached, &m),
+            ignored_listing_children(&direct, &m)
+        );
+        assert!(junk_in_listings(&cached, &m).is_empty());
+        // Not a repository: git answers nothing, and nothing is kept.
+        let plain = tempfile::tempdir().unwrap();
+        let proot = Utf8Path::from_path(plain.path()).unwrap();
+        let c = Checkout::cached(proot);
+        assert!(c.git_ignored(&paths).is_empty());
+        assert!(locked(&c.cache.as_ref().unwrap().ignored).is_empty());
     }
 
     #[test]

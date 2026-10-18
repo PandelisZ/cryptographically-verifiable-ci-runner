@@ -1281,3 +1281,144 @@ fn compact_rejects_anything_else() {
         );
     }
 }
+
+// ------------------------------------------------------- checkout cache ----
+
+/// Diffs and captures through a [`CheckoutCache`] (fresh, or shared by
+/// several manifests and exclusion sets, as a plan shares one) give exactly
+/// the uncached results, after every kind of change.
+#[cfg(unix)]
+#[test]
+fn checkout_cache_gives_the_uncached_mismatches_and_captures() {
+    let r = Repo::new();
+    r.write("src/a.rs", "a");
+    r.write("src/b.rs", "b");
+    r.write("bin/run.sh", "#!/bin/sh\n");
+    r.chmod("bin/run.sh", 0o755);
+    r.symlink("link", "src/a.rs");
+    r.symlink("dirlink", "src");
+    r.mkdir("docs");
+    r.mkdir("target/debug");
+    let env = env_of(&[("A", "1")]);
+    let obs1 = vec![
+        read("src/a.rs"),
+        read("src/b.rs"),
+        read("bin/run.sh"),
+        read("link"),
+        read("dirlink/b.rs"),
+        readdir("."),
+        readdir("src"),
+        probe("missing.txt"),
+        (rp("target"), Observation::Exclude),
+        (rp("docs"), Observation::Stat),
+    ];
+    let obs2 = vec![
+        read("src/a.rs"),
+        readdir("src"),
+        readdir("."),
+        read("link"),
+        probe("gone.txt"),
+    ];
+    let m1 = capture_env(&r.root, &obs1, &["A"], &env);
+    let m2 = capture_env(&r.root, &obs2, &["A", "B"], &env);
+
+    let shared = CheckoutCache::new(&r.root);
+    let extras: [Vec<RepoPath>; 2] = [vec![], vec![rp("tmp"), rp("src/gen.rs")]];
+    let check = |stage: &str, shared: &CheckoutCache| {
+        let fresh = CheckoutCache::new(&r.root);
+        for (i, m) in [&m1, &m2].into_iter().enumerate() {
+            for extra in &extras {
+                let lookup = |k: &str| env.get(k).cloned();
+                let plain = m.diff_against_checkout_excluding(&r.root, lookup, extra);
+                for (which, cache) in [("fresh", &fresh), ("shared", shared)] {
+                    let cached = m.diff_against_cache(cache, lookup, extra);
+                    match (&plain, &cached) {
+                        (Ok(a), Ok(b)) => assert_eq!(
+                            a, b,
+                            "{stage}: manifest {i}, extra {extra:?}, {which} cache"
+                        ),
+                        // Both fail (with several failing entries, which
+                        // error is reported depends on the threads, cached
+                        // or not; one failing entry is compared below).
+                        (Err(_), Err(_)) => {}
+                        (a, b) => panic!("{stage}: manifest {i}, {which} cache: {a:?} vs {b:?}"),
+                    }
+                }
+            }
+        }
+        for obs in [&obs1, &obs2] {
+            let lookup = |k: &str| env.get(k).cloned();
+            let keys = vec!["A".to_owned()];
+            let plain = InputManifest::capture_with_env(&r.root, obs, vec![], &keys, lookup);
+            let cached = InputManifest::capture_cached(&fresh, obs, vec![], &keys, lookup);
+            match (plain, cached) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "{stage}: capture"),
+                (Err(_), Err(_)) => {}
+                (a, b) => panic!("{stage}: capture: {a:?} vs {b:?}"),
+            }
+        }
+    };
+
+    // Unchanged: nothing differs, through the shared cache too.
+    check("unchanged", &shared);
+    assert!(
+        m1.diff_against_cache(&shared, |k| env.get(k).cloned(), &[])
+            .unwrap()
+            .is_empty()
+    );
+
+    // Every kind of change (a new cache each time: the checkout changed).
+    r.write("src/b.rs", "b2");
+    r.chmod("bin/run.sh", 0o644);
+    r.write("missing.txt", "now here");
+    r.write("src/c.rs", "c");
+    r.rm("link");
+    r.symlink("link", "src/b.rs");
+    r.rm("docs");
+    r.write("docs", "a file now");
+    r.write("tmp/out.log", "ignored");
+    r.write("src/gen.rs", "generated");
+    r.write("target/debug/x", "build output");
+    let shared = CheckoutCache::new(&r.root);
+    check("changed", &shared);
+    let changed = m1
+        .diff_against_cache(&shared, |k| env.get(k).cloned(), &[])
+        .unwrap();
+    assert_eq!(
+        whats(&changed),
+        [
+            "entry:.",
+            "entry:bin/run.sh",
+            "entry:dirlink/b.rs",
+            "entry:docs",
+            "entry:link",
+            "entry:missing.txt",
+            "entry:src",
+            "entry:src/b.rs",
+        ]
+    );
+
+    // An unreadable file and a directory turned into a symlink: errors and
+    // mismatches as uncached.
+    r.chmod("src/a.rs", 0o000);
+    r.rm("dirlink");
+    r.symlink("dirlink", "bin");
+    let shared = CheckoutCache::new(&r.root);
+    check("unreadable", &shared);
+    // One failing entry: the same error, cached or not, and again from a
+    // cache that already failed to read it (a failure is not kept).
+    let one = InputManifest {
+        entries: vec![entry(&m1, "src/a.rs").clone()],
+        ..Default::default()
+    };
+    let plain = one.diff_against_checkout_excluding(&r.root, |_| None, &[]);
+    for _ in 0..2 {
+        let cached = one.diff_against_cache(&shared, |_| None, &[]);
+        match (&plain, &cached) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b), // readable: the tests run as root
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+            (a, b) => panic!("one entry: {a:?} vs {b:?}"),
+        }
+    }
+    r.chmod("src/a.rs", 0o644);
+}

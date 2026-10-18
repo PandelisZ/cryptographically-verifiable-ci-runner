@@ -87,3 +87,50 @@ per-file output (~3.3 s of each file's 5.5 s).
   share written 1 time(s), in 3.6 s at most)`; the timings are in `batch/output.jsonl`.
 - Next cost: vci checking and signing each result after the batch, one after another (~1 s a file), and parsing and
   hashing each file's ~14,500 inputs separately.
+
+## The plan: one observation per path, files in parallel
+
+- `vci plan` (and so `vci ci` and `vci explain`) reads the checkout once per plan instead of once per candidate: a
+  path's type, a file's hash, a symlink's target and a directory's children are read the first time a candidate names
+  them and shared by every other candidate of every file (`vci_core::CheckoutCache`); which children of a listed
+  directory git ignores is asked once per directory instead of one `git check-ignore` per manifest; the current global
+  manifest is captured once per set of global observations. The checkout must not change while the plan runs.
+- Files are verified in parallel (`VCI_JOBS` threads, default one per CPU); the output keeps the listing's order.
+- Each file's candidates are checked newest first (by the `issuedAt` their payload states); the first that passes is
+  used, as before, so when several pass the plan now names the newest. `vci explain` lists them in that order (and
+  so, when the newest passes, no longer shows the older ones that fail). When none passes, the reason names what it
+  named before: the furthest failure, of several as far the last in the store's order.
+- `git check-ignore` stops (exit 128) on a path inside a submodule or beyond a symbolic link, after printing what it
+  found before it. Both the plan and `vci run` give such a manifest or unit the answer it got before 2.1 (git's for
+  its own paths alone, partial answer included) and cache nothing from the failed call, so neither a verdict nor an
+  input root depends on which file or unit came first or on `VCI_JOBS` (an e2e with a submodule checks both).
+- Same verdicts: on vex-api (1,992 files, 2,784 attestations) every file's verdict, reason and `by` were identical
+  before and after, unchanged and with `app/models/user.rb` changed.
+- Measured (`VCI_TIMING=1 vci plan --base-ref HEAD --project vex-api`, this Mac, a shared machine): the verdicts phase
+  went from 513 to 613 s to 4.6 to 5.7 s warm (plan total 6.1 to 7.3 s), 10.1 s (total 16.3 s) with the 8 GB store
+  not in the page cache; with `user.rb` changed, 508.4 s to 3.2 s. The demo projects' plans are unchanged (0.8 to
+  0.9 s). Details: [`docs/spike-plan-cost.md`](spike-plan-cost.md).
+
+
+## `vci run`: units checked and signed in parallel, the checkout read once per run
+
+- Once a project's tests have finished, `vci run` (and `vci ci --key`) checks and signs its units in parallel
+  (`VCI_JOBS` at a time, default one per CPU), and reports and stores them in their order: the lines, `--summary`,
+  the exit code and the store's keys are those of a run one unit at a time (an e2e compares the two). The store is
+  written one unit at a time, as before. Keyless signing is parallel too: its one piece of shared state (the Fulcio
+  certificate, renewed a minute before it expires) is behind a lock; timestamps are requested concurrently.
+- Each path of the checkout is read once for the whole run instead of once per unit: a file's hash, a directory's
+  children (`vci_core::CheckoutCache`, the plan's cache), and git's answer to whether a path is ignored (one
+  `git check-ignore` per path instead of several per unit over every child of every listed directory). The tree no
+  longer changes after the tests; each unit still compares its inputs with the snapshot taken before the run.
+- Where the time went: sampling the old `vci run` during its post-run phase on vex-api, about 95% of the main thread
+  was `git check-ignore` (listing children for the manifest, for its listings, and the inputs-ignored warning), not
+  hashing or `ssh-keygen`.
+- Measured on vex-api's application group (939 files, `VCI_RAILS_JOBS=14`, lazy loading, a fresh clone state, this
+  Mac, shared with other work, load average 8 to 46): from the batch's end to `N attested`, **1154 s (1.23 s a file)
+  before, 37.8 s (0.040 s a file) after** (`vci: timing: check, sign and store 939 unit(s) of vex-api (14 at a time):
+  37.78s`). Whole run 1825 s before, 704 s after. Verdicts: 928/11 and 926/13 attested/not; the difference is two
+  request tests that failed under load in the second run (`result failed`), not a check.
+- The input roots of request and controller tests differ between two runs of the same tree with either binary (30
+  of 30 sampled files differed between two runs of the old binary); an old-binary `vci plan` skips all 926 files the
+  new binary attested, so the cached manifests are what the uncached checks see.
