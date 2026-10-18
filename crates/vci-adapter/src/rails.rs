@@ -1102,6 +1102,8 @@ fn read_batch(
     };
     // id => Ok(exit status) or Err(why it must run on its own).
     let mut said: BTreeMap<String, Result<Option<i32>, String>> = BTreeMap::new();
+    // id => the slot that ran it.
+    let mut slot_of: BTreeMap<String, u64> = BTreeMap::new();
     let mut slots: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut stats = SlotStats::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -1127,6 +1129,7 @@ fn read_batch(
             None => {
                 if let Some(s) = v.get("slot").and_then(Value::as_u64) {
                     slots.insert(s);
+                    slot_of.insert(id.to_owned(), s);
                 }
                 if let Some(ms) = v.get("ms").and_then(Value::as_u64) {
                     stats.file_ms.push(ms);
@@ -1196,6 +1199,23 @@ fn read_batch(
         } else {
             c
         };
+        // A file that failed in a slot runs again on its own, from a fresh
+        // boot and database: an earlier file of the slot may have left what
+        // its tests collide with (a Rails worker has the same exposure).
+        // The retry's result is the file's; this one counts for nothing.
+        if c != Some(0) && slots.len() > 1 {
+            let slot = slot_of
+                .get(*f)
+                .map_or_else(|| "a slot".to_owned(), |s| format!("slot {s}"));
+            fallback.push((
+                f.to_string(),
+                format!(
+                    "its process failed in {slot} (exit {}): it runs again on its own",
+                    c.map_or_else(|| "signal".to_owned(), |c| c.to_string())
+                ),
+            ));
+            continue;
+        }
         match (code, c) {
             (Some(0), c) => code = c,
             (Some(_), None) => code = None,
@@ -2408,6 +2428,7 @@ mod tests {
             r#"{"id":"test/a_test.rb","exit":0,"slot":0,"ms":2000,"at":3500}"#,
             r#"{"slot":2,"why":"slot 2's setup failed"}"#,
             r#"{"id":"test/b_test.rb","exit":0,"slot":1,"ms":3000,"at":3900}"#,
+            r#"{"id":"test/d_test.rb","exit":1,"slot":1,"ms":10,"at":4000}"#,
             r#"{"id":"test/c_test.rb","exit":0,"slot":0}"#,
             r#"{"id":"test/c_test.rb","why":"a process of the batch changed x in vci's temp directory"}"#,
             r#"{"done":true}"#,
@@ -2416,15 +2437,21 @@ mod tests {
             out.join("batch/files.jsonl"),
             &slotted.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
         );
+        write(
+            out.join(name(files[3])),
+            &[meta(files[3]), read("config/boot.rb"), result("failed", 1)],
+        );
         let (obs, fallback, code, slots) = read_batch(&out, &files).unwrap();
         assert_eq!(slots.count, 2);
         assert_eq!(slots.setup_ms, 1500);
-        assert_eq!(slots.file_ms, [2000, 3000]);
-        assert_eq!(slots.last_at, 3900);
+        assert_eq!(slots.file_ms, [2000, 3000, 10]);
+        assert_eq!(slots.last_at, 4000);
         assert_eq!(
             slots.slot_ms.values().copied().collect::<Vec<_>>(),
-            [2000, 3000]
+            [2000, 3010]
         );
+        // d failed in slot 1: it runs again on its own, and its failure
+        // does not count (the retry's result will).
         assert_eq!(code, Some(0));
         assert_eq!(
             obs.iter().map(|o| o.test_id.as_str()).collect::<Vec<_>>(),
@@ -2435,6 +2462,10 @@ mod tests {
             [files[2], files[3], files[4]]
         );
         assert!(fallback[0].1.contains("temp directory"), "{fallback:?}");
+        assert!(
+            fallback[1].1.contains("failed in slot 1 (exit 1)"),
+            "{fallback:?}"
+        );
 
         std::fs::remove_file(out.join("batch/files.jsonl")).unwrap();
         let (obs, fallback, _, _) = read_batch(&out, &files).unwrap();

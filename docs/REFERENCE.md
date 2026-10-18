@@ -638,8 +638,10 @@ file on its own, with the boot observed once: nothing one file's code defines, p
 another file's process, and what a file's process leaves in vci's temp dir is removed before the next one starts. A
 file whose first statement is not such a require boots in its own process. What the batch cannot run this way (a helper
 that fails in the boot, a process that writes no output, a runner whose loader vci does not know) runs again one
-process per file, and `vci run` says so. Details and measurements: [`docs/spike-rails.md`](spike-rails.md) ("Batch
-mode").
+process per file, and `vci run` says so. Since 2.1.5 so does a file whose process fails in a slot (below): an earlier
+file of the slot may have left rows its tests collide with, as in a Rails worker, so it runs again on its own from a
+fresh boot and database, and the retry's result is the file's (a failure on its own fails the run as before). Details
+and measurements: [`docs/spike-rails.md`](spike-rails.md) ("Batch mode").
 
 **Slots (vci 2.1).** When the project runs its tests in Rails' parallel worker processes (`parallelize` in
 `test_helper.rb`, with processes, as `rails new` writes it), a group's files run W at a time: W is `VCI_RAILS_JOBS`,

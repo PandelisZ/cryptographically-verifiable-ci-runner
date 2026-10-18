@@ -3041,7 +3041,16 @@ fn batch_gives_what_one_process_per_file_gives(batch: &[(&str, &str)]) {
         )),
         "{err}"
     );
-    assert!(!err.contains("run again one process per file"), "{err}");
+    // In slots, a file that fails in its slot runs again on its own (its
+    // result below is the retry's: the same, as it fails alone too).
+    if in_slots {
+        assert!(
+            err.contains("run again one process per file") && err.contains("failed in slot"),
+            "{err}"
+        );
+    } else {
+        assert!(!err.contains("run again one process per file"), "{err}");
+    }
     // What the files of a boot (or slot) share was written once for them,
     // and each file's process wrote the rest of its output: the inputs
     // compared below are those two read together.
@@ -3220,8 +3229,11 @@ fn rails_slots_give_what_one_process_per_file_gives() {
         ),
         "{stderr}"
     );
+    // The failing file ran again on its own (a slot's earlier files could
+    // have been the cause) and failed alone too: the result is the retry's.
     assert!(
-        !stderr.contains("run again one process per file"),
+        stderr.contains("1 of 3 file(s) of the batch run again one process per file")
+            && stderr.contains("fails_test.rb: its process failed in slot"),
         "{stderr}"
     );
     let got = outcomes(&stderr);
