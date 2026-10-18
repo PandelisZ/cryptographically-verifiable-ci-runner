@@ -387,9 +387,10 @@ fn collector_toolchain_mismatch(
 /// OS metadata and bytecode caches.
 const CHECKOUT_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", "__pycache__"];
 
-/// Warnings for attested directory listings that contain [`CHECKOUT_JUNK`]:
-/// the listing will differ in a fresh checkout, so the file will run there
-/// (never a false skip, but a lost skip worth knowing about).
+/// Warnings for attested directory listings that contain [`CHECKOUT_JUNK`]
+/// git does not ignore (what it ignores is left out of the listing since
+/// 2.0.3): the listing will differ in a fresh checkout, so the file will run
+/// there (never a false skip, but a lost skip worth knowing about).
 fn junk_in_listings(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
     let mut out = Vec::new();
     for e in &m.entries {
@@ -403,6 +404,23 @@ fn junk_in_listings(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
             .flatten()
             .filter_map(|d| d.file_name().into_string().ok())
             .filter(|n| CHECKOUT_JUNK.contains(&n.as_str()))
+            .collect();
+        let paths: Vec<String> = junk
+            .iter()
+            .map(|n| {
+                if e.path.is_root() {
+                    n.clone()
+                } else {
+                    format!("{}/{n}", e.path.as_str())
+                }
+            })
+            .collect();
+        let ignored = git_ignored(root, &paths);
+        let junk: Vec<String> = junk
+            .into_iter()
+            .zip(paths)
+            .filter(|(_, p)| !ignored.contains(p))
+            .map(|(n, _)| n)
             .collect();
         if !junk.is_empty() {
             let dir = if e.path.as_str().is_empty() {

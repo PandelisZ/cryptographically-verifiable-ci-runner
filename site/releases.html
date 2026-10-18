@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-0-4">2.0.4</a></td><td>18 Oct 2026</td><td>No more warning about <code>.DS_Store</code> in a listing git ignores it in</td></tr>
 <tr><td><a href="#v2-0-3">2.0.3</a></td><td>18 Oct 2026</td><td>Directory listings leave out what git ignores, so an attestation made on a laptop verifies in CI</td></tr>
 <tr><td><a href="#v2-0-2">2.0.2</a></td><td>18 Oct 2026</td><td>A read of <code>PATH</code>, <code>HOME</code> or another built-in-ignore variable no longer pins an attestation to one machine; a private key file signs without ssh-agent</td></tr>
 <tr><td><a href="#v2-0-1">2.0.1</a></td><td>17 Oct 2026</td><td>A blobless fetch works on git before 2.45 (Ubuntu 24.04's 2.43): the presence check no longer dies on a value not yet downloaded</td></tr>
@@ -43,6 +44,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-0-4">2.0.4</h2>
+<p><em>18 October 2026.</em> <code>vci run</code> still warned <code>the listing of vex-web includes .DS_Store (not in a fresh checkout, e.g. in CI): this attestation will not match there</code> after 2.0.3 had left what git ignores out of the listing, so the attestation did match (the pull request skipped the file on the laptop's signature: <code>attested by PandelisZ</code>). The warning now names only junk git does not ignore, which does stay in the listing.</p>
 
 <h2 id="v2-0-3">2.0.3</h2>
 <p><em>18 October 2026.</em> The last thing between a test run on a laptop and a skip in CI, found by trying exactly that on vex after 2.0.2: the pull request job ran the file with <code>best failed inputs: entry:vex-web</code>. The attestation records a listing of the directory the test lists (<code>vex-web</code>), and on the laptop that listing had <code>dist/</code>, <code>build/</code>, <code>.tanstack/</code> and <code>.DS_Store</code>, which CI's checkout does not have; CI's own listings had the same problem the other way round. A listing now records the directory's entries without the ones git ignores (build outputs, caches, editor files: what a fresh checkout does not have and every machine has differently), as <code>Excluded</code> entries of the manifest, and a verification leaves what git ignores in its checkout out of the listing too, so a listing says what the repository holds. A child a test reads or lists itself stays an input of its own; an ignored file a test reads directly is still an input, with the usual warning that a fresh checkout will not have it. Attestations made before 2.0.3 whose listings held ignored entries (CI's <code>node_modules</code>) are re-made once. This also ends the refusal of a unit whose test writes a cache into the source tree during the run (vex-roder's <code>__pycache__</code>): an ignored entry appearing is no change to the listing.</p>
