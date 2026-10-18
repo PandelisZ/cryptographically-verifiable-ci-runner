@@ -2072,6 +2072,18 @@ pub fn run_units(
         // unit reads it through one cache (see [`Checkout`]).
         let checkout = Checkout::cached(&ctx.root);
         let t_check = std::time::Instant::now();
+        // Thread-nanoseconds per part of this phase (`VCI_TIMING=1`).
+        let tm_check = std::sync::atomic::AtomicU64::new(0);
+        let tm_warn = std::sync::atomic::AtomicU64::new(0);
+        let tm_sign = std::sync::atomic::AtomicU64::new(0);
+        let tm_store = std::sync::atomic::AtomicU64::new(0);
+        let tm_supersede = std::sync::atomic::AtomicU64::new(0);
+        let add = |f: &std::sync::atomic::AtomicU64, since: std::time::Instant| {
+            f.fetch_add(
+                since.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        };
         // Checked and signed `jobs` units at a time; reported and stored in
         // order, one after the other.
         let verdict = |(o, file, label): &(&Observed, Option<&TestFile>, String)| {
@@ -2091,7 +2103,8 @@ pub fn run_units(
                 filtered = c;
                 &filtered
             };
-            match check_one(
+            let t = std::time::Instant::now();
+            let checked = check_one(
                 &ctx,
                 project,
                 o,
@@ -2104,7 +2117,9 @@ pub fn run_units(
                 &locks[pi],
                 &scratch,
                 &checkout,
-            ) {
+            );
+            add(&tm_check, t);
+            match checked {
                 Err(reason) => {
                     let (reasons, taints) = match file {
                         Some(f) if reason.starts_with("tainted: ") => {
@@ -2123,11 +2138,19 @@ pub fn run_units(
                         taints,
                     }
                 }
-                Ok(a) => Verdict::Attestable {
-                    warnings: attested_warnings(&checkout, project, label, &a),
-                    signed: sign_predicate(&key, &a.predicate),
-                    a: Box::new(a),
-                },
+                Ok(a) => {
+                    let t = std::time::Instant::now();
+                    let warnings = attested_warnings(&checkout, project, label, &a);
+                    add(&tm_warn, t);
+                    let t = std::time::Instant::now();
+                    let signed = sign_predicate(&key, &a.predicate);
+                    add(&tm_sign, t);
+                    Verdict::Attestable {
+                        warnings,
+                        signed,
+                        a: Box::new(a),
+                    }
+                }
             }
         };
         in_order(&units, jobs, verdict, |i, v| {
@@ -2161,10 +2184,13 @@ pub fn run_units(
             let stored = signed.and_then(|env| {
                 // The manifest first: an attestation is never stored without
                 // the manifest it references.
+                let t = std::time::Instant::now();
                 store
                     .put_manifest(&p.core.input_root, a.manifest.to_compact().as_bytes())
                     .context("storing the input manifest")?;
                 let stored = store.put(&p.core.test_id, &signer, &skey, &env)?;
+                add(&tm_store, t);
+                let t = std::time::Instant::now();
                 superseded += supersede(
                     &store,
                     &ctx.repo,
@@ -2175,6 +2201,7 @@ pub fn run_units(
                     &moved_on,
                     &mut dropped_roots,
                 );
+                add(&tm_supersede, t);
                 Ok(stored)
             });
             let stored = match stored {
@@ -2226,6 +2253,20 @@ pub fn run_units(
             ),
             t_check,
         );
+        if std::env::var_os("VCI_TIMING").is_some() {
+            let g = |f: &std::sync::atomic::AtomicU64| {
+                f.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+            };
+            eprintln!(
+                "vci: timing: {}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}; store (one at a time) {:.1}, supersede {:.1}",
+                project.label(),
+                g(&tm_check),
+                g(&tm_warn),
+                g(&tm_sign),
+                g(&tm_store),
+                g(&tm_supersede)
+            );
+        }
         for f in &mine {
             if !seen.contains(f.test_id.as_str()) {
                 refused += 1;
