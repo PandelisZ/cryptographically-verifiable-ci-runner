@@ -389,6 +389,62 @@ struct Verifier<'a> {
     /// Whether a manifest's paths collide under case folding, per input root
     /// (a manifest is used only once its root is the signed one).
     collisions: Mutex<HashMap<String, Result<(), String>>>,
+    /// Where the verdicts phase spends its time (`VCI_TIMING=1`).
+    timers: Timers,
+}
+
+/// Nanoseconds spent in each part of checking candidates, summed over
+/// threads (so the sum can exceed the wall time), and counts; printed with
+/// `VCI_TIMING=1` after the verdicts phase.
+#[derive(Default)]
+pub(crate) struct Timers {
+    candidates: std::sync::atomic::AtomicU64,
+    rehashed: std::sync::atomic::AtomicU64,
+    signature: std::sync::atomic::AtomicU64,
+    globals: std::sync::atomic::AtomicU64,
+    manifest_read: std::sync::atomic::AtomicU64,
+    manifest_decode: std::sync::atomic::AtomicU64,
+    collisions: std::sync::atomic::AtomicU64,
+    ignored: std::sync::atomic::AtomicU64,
+    rehash: std::sync::atomic::AtomicU64,
+    externals: std::sync::atomic::AtomicU64,
+    envs: std::sync::atomic::AtomicU64,
+}
+
+impl Timers {
+    fn add(field: &std::sync::atomic::AtomicU64, since: std::time::Instant) {
+        field.fetch_add(
+            since.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn count(field: &std::sync::atomic::AtomicU64) {
+        field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn report(&self, label: &str) {
+        if std::env::var_os("VCI_TIMING").is_none() {
+            return;
+        }
+        let g = |f: &std::sync::atomic::AtomicU64| {
+            f.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+        };
+        eprintln!(
+            "vci: timing: {label}: {} candidate(s) checked, {} rehashed; thread-seconds: signature {:.1}, globals {:.1}, manifest read {:.1}, manifest decode {:.1}, case collisions {:.1}, ignored children {:.1}, rehash {:.1}, externals {:.1}, env {:.1}",
+            self.candidates.load(std::sync::atomic::Ordering::Relaxed),
+            self.rehashed.load(std::sync::atomic::Ordering::Relaxed),
+            g(&self.signature),
+            g(&self.globals),
+            g(&self.manifest_read),
+            g(&self.manifest_decode),
+            g(&self.collisions),
+            g(&self.ignored),
+            g(&self.rehash),
+            g(&self.externals),
+            g(&self.envs),
+        );
+    }
 }
 
 /// Why a referenced input manifest cannot be used, as the `what` and
@@ -424,36 +480,70 @@ pub(crate) fn load_manifest(
 #[derive(Default)]
 struct ManifestLoader {
     #[allow(clippy::type_complexity)]
-    inner: std::sync::Mutex<(
-        Option<Result<Reader, String>>,
-        BTreeMap<String, Result<std::sync::Arc<InputManifest>, ManifestUnavailable>>,
-    )>,
+    cache: Mutex<BTreeMap<String, Result<Arc<InputManifest>, ManifestUnavailable>>>,
+    /// One store reader per verifying thread, opened on first use: a reader
+    /// holds a SQLite connection and a `git cat-file --batch` process, and a
+    /// manifest of a large application is megabytes, so reading them one at
+    /// a time behind one reader serialized the plan (2.1.0: on vex's runners,
+    /// 2,004 manifests of 1.9 MB took 1,124 s under one lock).
+    readers: Vec<Mutex<Option<Result<Reader, String>>>>,
 }
 
 impl ManifestLoader {
-    /// The store is read under the lock; the manifest is decoded outside it
-    /// (files are verified in parallel).
+    fn new(readers: usize) -> Self {
+        ManifestLoader {
+            cache: Mutex::default(),
+            readers: (0..readers.max(1)).map(|_| Mutex::new(None)).collect(),
+        }
+    }
+
+    /// The manifest is read with a reader no other thread is using and
+    /// decoded with the cache unlocked (files are verified in parallel);
+    /// two threads asking for the same root at once both read it, and the
+    /// first decoding wins.
     fn load(
         &self,
         repo: &Repo,
         root: &str,
-    ) -> Result<std::sync::Arc<InputManifest>, ManifestUnavailable> {
+        timers: &Timers,
+    ) -> Result<Arc<InputManifest>, ManifestUnavailable> {
+        if let Some(r) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(root)
+        {
+            return r.clone();
+        }
+        let t_read = std::time::Instant::now();
         let stored = {
-            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let (reader, cache) = &mut *guard;
-            if let Some(r) = cache.get(root) {
-                return r.clone();
-            }
-            let reader = reader
+            let slot = self.reader_slot();
+            let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+            let reader = guard
                 .get_or_insert_with(|| AttestStore::new(repo).reader().map_err(|e| e.to_string()));
             match reader {
                 Ok(r) => r.manifest(root),
                 Err(e) => Err(vci_git::GitError::Store(e.clone())),
             }
         };
-        let r = load_manifest(root, stored).map(std::sync::Arc::new);
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        guard.1.entry(root.to_owned()).or_insert(r).clone()
+        Timers::add(&timers.manifest_read, t_read);
+        let t_decode = std::time::Instant::now();
+        let r = load_manifest(root, stored).map(Arc::new);
+        Timers::add(&timers.manifest_decode, t_decode);
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.entry(root.to_owned()).or_insert(r).clone()
+    }
+
+    /// A reader slot: the first one not in use, else this thread's own.
+    fn reader_slot(&self) -> &Mutex<Option<Result<Reader, String>>> {
+        for slot in &self.readers {
+            if let Ok(guard) = slot.try_lock() {
+                drop(guard);
+                return slot;
+            }
+        }
+        let i = rayon::current_thread_index().unwrap_or(0) % self.readers.len();
+        &self.readers[i]
     }
 }
 
@@ -602,6 +692,15 @@ fn issued_hint(s: &StoredEnvelope) -> Option<i64> {
 
 /// Run `f` (which verifies files in parallel) on `VCI_JOBS` threads, by
 /// default one per CPU; on the global pool if a pool cannot be made.
+/// `VCI_JOBS`, else one per CPU: how many files are verified at once.
+fn plan_jobs() -> usize {
+    std::env::var("VCI_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 fn in_plan_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     let jobs = std::env::var("VCI_JOBS")
         .ok()
@@ -1160,11 +1259,12 @@ fn plan_with(
                     cargo_lock: r.cargo_lock,
                     rails_gems: r.rails_gems,
                     natives: std::sync::OnceLock::new(),
-                    manifests: ManifestLoader::default(),
+                    manifests: ManifestLoader::new(plan_jobs()),
                     checkout: &checkout,
                     ignored: &ignored,
                     globals: Mutex::default(),
                     collisions: Mutex::default(),
+                    timers: Timers::default(),
                 }),
             },
         )
@@ -1201,8 +1301,13 @@ fn plan_with(
     });
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
     for (pi, (verifier, verdicts)) in verifiers.iter().zip(verdicts).enumerate() {
-        if let Err(r) = verifier {
-            res.projects[pi].run_all.get_or_insert_with(|| r.clone());
+        match verifier {
+            Err(r) => {
+                res.projects[pi].run_all.get_or_insert_with(|| r.clone());
+            }
+            Ok(v) => v
+                .timers
+                .report(&format!("{}: verdicts", res.projects[pi].name)),
         }
         res.files.extend(verdicts);
     }
@@ -1331,7 +1436,9 @@ impl Verifier<'_> {
             return out;
         }
         // Current global inputs are the same for every candidate.
+        let t = std::time::Instant::now();
         let global_now = self.global_now(f);
+        Timers::add(&self.timers.globals, t);
         // Newest first (by the issuedAt each says, unread ones last; ties
         // in store order): the first that passes is used, and a newer
         // attestation is the likelier to match this checkout.
@@ -1473,6 +1580,8 @@ impl Verifier<'_> {
                 "a DSSE envelope",
             )
         })?;
+        Timers::count(&self.timers.candidates);
+        let t_sig = std::time::Instant::now();
         let verified = match material {
             Some(m) => self.verify_keyless(&env, &m)?,
             // Signature, namespace, signer trust (base allowed_signers).
@@ -1497,6 +1606,7 @@ impl Verifier<'_> {
                 )
             })?,
         };
+        Timers::add(&self.timers.signature, t_sig);
         info.principal = Some(verified.principal.clone());
         info.fingerprint = Some(verified.fingerprint.clone());
         if let Some(r) = &self.no_skip_ref
@@ -1877,7 +1987,7 @@ impl Verifier<'_> {
             (None, Some(r)) => {
                 loaded = self
                     .manifests
-                    .load(&self.ctx.repo, r)
+                    .load(&self.ctx.repo, r, &self.timers)
                     .map_err(|(what, actual)| {
                         Failure::one(
                             "inputs",
@@ -1911,12 +2021,19 @@ impl Verifier<'_> {
                 format!("{} (recomputed from the attested manifest)", m.root()),
             ));
         }
-        self.case_collisions(&p.core.input_root, m)
-            .map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
+        let t = std::time::Instant::now();
+        let collisions = self.case_collisions(&p.core.input_root, m);
+        Timers::add(&self.timers.collisions, t);
+        collisions.map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
+        let t = std::time::Instant::now();
         let extra = self.ignored.of(self.checkout, m);
+        Timers::add(&self.timers.ignored, t);
+        Timers::count(&self.timers.rehashed);
+        let t = std::time::Instant::now();
         let diff = m
             .diff_against_cache(self.checkout, lookup(&self.child), &extra)
             .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
+        Timers::add(&self.timers.rehash, t);
         let (env_diff, file_diff): (Vec<_>, Vec<_>) =
             diff.into_iter().partition(|m| m.what.starts_with("env:"));
         // An attestation made before 2.0.2 recorded reads of built-in ignore
@@ -1957,6 +2074,7 @@ impl Verifier<'_> {
         }
 
         // Externals: every attested package version must be what resolves now.
+        let t_ext = std::time::Instant::now();
         let mut ext_diff = vec![];
         for e in &m.externals {
             let found = match (
@@ -2009,6 +2127,8 @@ impl Verifier<'_> {
             });
         }
 
+        Timers::add(&self.timers.externals, t_ext);
+        let t_env = std::time::Instant::now();
         // Env: values, and declared variables present now but not attested.
         // Name the variable and its class under the base policy.
         let classed = |what: &str| match what.strip_prefix("env:") {
@@ -2049,6 +2169,7 @@ impl Verifier<'_> {
                     .collect(),
             });
         }
+        Timers::add(&self.timers.envs, t_env);
         Ok(())
     }
 }
