@@ -232,7 +232,48 @@ fn moved_on_only_along_one_line_of_history() {
     git(dir, &["checkout", "-q", "--detach", "feature"]);
     let d = commit("detached");
     assert!(!repo.moved_on(&f3, &d).unwrap(), "feature contains f3");
-    // Unknown commits conclude nothing.
-    assert!(!repo.moved_on(&"0".repeat(40), &d).unwrap());
+    // Rebased away: a commit still in the object database but on no ref
+    // (its remote namesake aside) can be checked out by no name.
+    git(dir, &["checkout", "-q", "feature"]);
+    git(dir, &["push", "-q", "origin", "feature"]);
+    let f4 = commit("f4");
+    git(dir, &["reset", "-q", "--hard", &f3]);
+    let f4b = commit("f4 again");
+    assert!(repo.moved_on(&f4, &f4b).unwrap(), "f4 is on no ref");
+    git(dir, &["push", "-q", "--force", "origin", "feature"]);
+    assert!(repo.moved_on(&f4, &f4b).unwrap());
+    git(dir, &["branch", "keeps-f4", &f4]);
+    assert!(
+        !repo.moved_on(&f4, &f4b).unwrap(),
+        "a branch holds f4 again"
+    );
+    // A commit this full clone does not have is on none of its refs; a
+    // shallow clone may just lack it, and concludes nothing. Not a commit
+    // id: nothing either.
+    assert!(repo.moved_on(&"0".repeat(40), &d).unwrap());
     assert!(!repo.moved_on("HEAD", &d).unwrap());
+    let base = w.remote.parent().unwrap();
+    let shallow_dir = base.join("shallow");
+    git(
+        base,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            "--branch",
+            "feature",
+            &format!("file://{}", w.remote),
+            shallow_dir.as_str(),
+        ],
+    );
+    let shallow = Repo::discover(&shallow_dir).unwrap();
+    assert!(shallow.is_shallow().unwrap());
+    assert!(!repo.is_shallow().unwrap());
+    let head = git(&shallow_dir, &["rev-parse", "HEAD"]);
+    assert!(
+        !shallow.moved_on(&f3, &head).unwrap(),
+        "f3 is beyond the cutoff"
+    );
+    assert!(!shallow.moved_on(&"0".repeat(40), &head).unwrap());
 }

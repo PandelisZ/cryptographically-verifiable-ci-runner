@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-3">2.1.3</a></td><td>19 Oct 2026</td><td>Files run longest first; a pull request's rebased-away attestations are superseded; the superseded ones are found in parallel; the push shows its parts</td></tr>
 <tr><td><a href="#v2-1-2">2.1.2</a></td><td>19 Oct 2026</td><td>The Linux binaries use mimalloc: on a 16-core runner a plan's verdicts phase was 20 times slower than on a laptop because musl's allocator serializes threads</td></tr>
 <tr><td><a href="#v2-1-1">2.1.1</a></td><td>19 Oct 2026</td><td>Rails on CI: the plan reads manifests in parallel, load-path probes fold into one listing, and timing shows every part</td></tr>
 <tr><td><a href="#v2-1-0">2.1.0</a></td><td>18 Oct 2026</td><td>Rails runs its files in parallel slots, one seeded database each; a plan reads the checkout once (minutes to seconds); units are checked and signed in parallel</td></tr>
@@ -47,6 +48,15 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-3">2.1.3</h2>
+<p><em>19 October 2026.</em> The first Rails run with 2.1.2 on vex's runners: the plan's verdicts phase 9.5 s (1,124 to 1,247 s before), the four jobs 5 to 9 minutes for all 2,005 files (28 to 30 before, cancelled). Where the rest went, and what this release does about it:</p>
+<ul>
+<li><strong>Files run longest first.</strong> The jobs' Ruby phases were 142, 202, 329 and 377 s for about 500 files each at 16 slots, where the files' process times add up to 94 to 117 s a slot: the slots waited on a last file of 78, 106, 141 and 212 s taken near the end of the listing. <code>vci run</code> now hands the runner the units longest first, by the duration their newest stored attestation records (<code>result.durationMs</code>, any signer; units without one first, in the listing's order), so a batch, Vitest, pytest or node:test run that takes several at once ends with its short files. The lines, the summary and the store keep the listing's order.</li>
+<li><strong>A rebased pull request's earlier attestations are superseded.</strong> Nothing was superseded on the runners: the earlier pushes' commits were rebased away, and an attestation whose commit this clone did not have was kept ("nothing is concluded from a history that is not there"). A commit on no branch, remote-tracking branch or tag at all, or one a full (not shallow) clone does not have, can be checked out by no name: an attestation of that commit by the same signer with other inputs is now superseded, as one on an earlier commit of the line was. A shallow clone still concludes nothing. Without this, every push of a pull request added its 2,000 attestations and their manifests to the store for good.</li>
+<li><strong>The superseded ones are found in parallel.</strong> Finding them (reading and decoding the unit's earlier manifests) ran one unit at a time with the store writes: 26 to 46 s of a 36 to 58 s check-and-sign phase. It now runs on the checking threads; only the removal stays with the store writes.</li>
+<li><strong><code>VCI_TIMING=1</code> shows the push's parts</strong> (fetch and materialize the remote's metadata, check what the push sends, put the local metadata on top, <code>git push</code>): 31 to 58 s a job on the runners, with no line saying why.</li>
+</ul>
 
 <h2 id="v2-1-2">2.1.2</h2>
 <p><em>19 October 2026.</em> The third Rails run on vex's 16-core runners, with 2.1.1's per-part timing, said where the plan's 10 to 16 minutes went: decoding a candidate's manifest took about 2 seconds of thread time and checking it for case collisions about 2.5, for each of 2,000 candidates, 250 times what the same binary's work costs on a laptop; the rehash itself was cheap. The Linux releases are static musl binaries, and musl's allocator takes one lock for every allocation, so sixteen verifying threads decoding 1.9 MB manifests spent their time waiting on each other. A benchmark that rehashes one real CI manifest 160 times on 8 threads, in an Ubuntu container on this Mac, reproduces it:</p>

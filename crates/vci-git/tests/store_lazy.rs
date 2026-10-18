@@ -635,7 +635,8 @@ fn a_metadata_fetch_leaves_the_code_repository_alone() {
     ));
 
     // A commit this clone lacks is unknown, at once and without a download,
-    // to git and to vci.
+    // to git and to vci: on none of a full clone's refs, so a line of
+    // history has moved on from it (an attestation of it is superseded).
     let missing = commit_missing_from(&w, &f);
     let kb = objects_kb(&f);
     let out = git_raw(&f, &["merge-base", "--is-ancestor", &missing, "HEAD"]);
@@ -643,7 +644,7 @@ fn a_metadata_fetch_leaves_the_code_repository_alone() {
     assert!(!has_object(&f, &missing));
     assert!(rf.resolve(&missing).is_err());
     assert!(
-        !rf.moved_on(&missing, &git(&f, &["rev-parse", "HEAD"]))
+        rf.moved_on(&missing, &git(&f, &["rev-parse", "HEAD"]))
             .unwrap()
     );
     assert_eq!(objects_kb(&f), kb, "nothing was downloaded");

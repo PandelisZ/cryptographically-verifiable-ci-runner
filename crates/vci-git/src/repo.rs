@@ -201,27 +201,31 @@ impl Repo {
         Err(command_error(&describe, &out))
     }
 
-    /// Whether history moved on from commit `old` to commit `new` and
-    /// nothing else still needs `old`: `old` is a strict ancestor of `new`,
-    /// and every branch, remote-tracking branch and tag containing `old` also
-    /// contains `new`, except the current branch's namesakes on the remotes
-    /// (`origin/<branch>` behind a local `<branch>` is the same line of work,
-    /// not yet pushed). Any other ref containing `old` (`main` under a
-    /// feature branch, a sibling branch, a release tag) may be checked out
-    /// with `old`'s files. `false` when either commit is unknown here (a
-    /// shallow clone): nothing is concluded from a history that is not
-    /// there.
+    /// Whether a line of history has moved on from `old` to `new`, so that
+    /// nothing else still needs `old`: no branch, remote-tracking branch or
+    /// tag contains `old` without containing `new`, except the current
+    /// branch's namesakes on the remotes (`origin/<branch>` behind a local
+    /// `<branch>` is the same line of work, not yet pushed), and either
+    /// `old` is an ancestor of `new` or no ref at all contains `old` (a
+    /// commit rebased or amended away: nothing can check its files out by
+    /// name). Any other ref containing `old` (`main` under a feature branch,
+    /// a sibling branch, a release tag) may be checked out with `old`'s
+    /// files, and so may `old` itself when `new` is behind it (a bisect).
+    /// An `old` this clone does not have at all is on none of its refs: moved
+    /// on in a full clone; `false` in a shallow one, which may just lack it
+    /// (nothing is concluded from a history that is not there).
     pub fn moved_on(&self, old: &str, new: &str) -> Result<bool, GitError> {
         if !is_oid(old) || !is_oid(new) || old == new {
             return Ok(false);
         }
         let (_, out) = self
             .git()
-            .args(["merge-base", "--is-ancestor", old, new])
+            .args(["cat-file", "-e"])
+            .arg(format!("{old}^{{commit}}"))
             .env(NO_LAZY_FETCH, "1")
             .output_described()?;
-        if out.status.code() != Some(0) {
-            return Ok(false);
+        if !out.status.success() {
+            return Ok(!self.is_shallow()?);
         }
         let branch = {
             let (_, out) = self
@@ -244,6 +248,25 @@ impl Repo {
                 .collect(),
             None => Vec::new(),
         };
+        let counts = |r: &str| namesakes.iter().any(|n| n == r) || r.ends_with("/HEAD");
+        let holders = self
+            .git()
+            .args(["for-each-ref", "--format=%(refname)", "--contains", old])
+            .args(["refs/heads", "refs/remotes", "refs/tags"])
+            .env(NO_LAZY_FETCH, "1")
+            .run_str()?;
+        if holders.lines().all(counts) {
+            // On no ref (namesakes aside): rebased or amended away.
+            return Ok(true);
+        }
+        let (_, out) = self
+            .git()
+            .args(["merge-base", "--is-ancestor", old, new])
+            .env(NO_LAZY_FETCH, "1")
+            .output_described()?;
+        if out.status.code() != Some(0) {
+            return Ok(false);
+        }
         let others = self
             .git()
             .args(["for-each-ref", "--format=%(refname)", "--contains", old])
@@ -251,9 +274,17 @@ impl Repo {
             .args(["refs/heads", "refs/remotes", "refs/tags"])
             .env(NO_LAZY_FETCH, "1")
             .run_str()?;
-        Ok(others
-            .lines()
-            .all(|r| namesakes.iter().any(|n| n == r) || r.ends_with("/HEAD")))
+        Ok(others.lines().all(counts))
+    }
+
+    /// `git rev-parse --is-shallow-repository`.
+    pub fn is_shallow(&self) -> Result<bool, GitError> {
+        Ok(self
+            .git()
+            .args(["rev-parse", "--is-shallow-repository"])
+            .run_str()?
+            .trim()
+            == "true")
     }
 
     /// Contents of `path` at `rev` (like `git show <rev>:<path>`).

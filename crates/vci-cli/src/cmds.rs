@@ -1549,6 +1549,8 @@ pub(crate) struct EnvelopeMeta {
     /// The input manifest it references (`manifestRef`; `None` for an
     /// attestation with its manifest inline, made before vci 1.9.0).
     pub manifest_ref: Option<String>,
+    /// How long the unit's tests took (`result.durationMs`), when recorded.
+    pub duration_ms: Option<u64>,
 }
 
 /// An envelope's statement (unverified).
@@ -1580,6 +1582,7 @@ pub(crate) fn envelope_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
         os: s(&p["toolchain"]["os"]),
         arch: s(&p["toolchain"]["arch"]),
         manifest_ref: p["manifestRef"].as_str().map(str::to_owned),
+        duration_ms: p["result"]["durationMs"].as_u64(),
     })
 }
 

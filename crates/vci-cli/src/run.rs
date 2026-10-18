@@ -654,6 +654,10 @@ enum Verdict {
         a: Box<Attestable>,
         warnings: Vec<String>,
         signed: Result<Vec<u8>>,
+        /// The same signer's stored attestations of the unit it supersedes
+        /// (found in parallel; removed, one unit at a time, once it is
+        /// stored).
+        doomed: Vec<vci_git::StoredEnvelope>,
     },
 }
 
@@ -1964,12 +1968,24 @@ pub fn run_units(
     // attestations: fetch the values not fetched yet, in one batch (best
     // effort: one not fetched is kept, never superseded).
     let _ = store.hydrate_units(selected.iter().map(|&i| files[i].test_id.as_str()));
+    // What the units took last time (any signer's newest attestation), to
+    // hand the runner the longest first.
+    let t = std::time::Instant::now();
+    let durations = last_durations(&store, selected.iter().map(|&i| files[i].test_id.as_str()));
+    crate::plan::timing(
+        &format!(
+            "read the last duration of {} unit(s) ({} recorded)",
+            selected.len(),
+            durations.len()
+        ),
+        t,
+    );
     let mut attested = 0;
     let mut refused = 0;
     let mut superseded = 0usize;
     // Supersession's answers per earlier commit, and the input roots of the
     // attestations it deleted.
-    let moved_on = std::cell::RefCell::new(BTreeMap::new());
+    let moved_on = std::sync::Mutex::new(BTreeMap::new());
     let mut dropped_roots = BTreeSet::new();
     let mut outcomes: Vec<UnitOutcome> = Vec::new();
     let mut exit: Option<i32> = Some(0);
@@ -1982,7 +1998,12 @@ pub fn run_units(
             .map(|&i| &files[i])
             .filter(|f| f.project == pi)
             .collect();
-        let rels: Vec<String> = mine.iter().map(|f| f.project_rel.clone()).collect();
+        // Longest first (the runner's parallelism ends sooner); lines,
+        // summary and the store keep the listing's order.
+        let rels: Vec<String> = longest_first(&mine, |f| f.test_id.as_str(), &durations)
+            .iter()
+            .map(|f| f.project_rel.clone())
+            .collect();
         if ctx.projects.len() > 1 {
             eprintln!(
                 "vci: running {} test file(s) of {} ({})",
@@ -2145,17 +2166,32 @@ pub fn run_units(
                     let t = std::time::Instant::now();
                     let signed = sign_predicate(&key, &a.predicate);
                     add(&tm_sign, t);
+                    let t = std::time::Instant::now();
+                    let doomed = if signed.is_ok() {
+                        superseded_by(
+                            &store,
+                            &ctx.repo,
+                            &a.predicate,
+                            &a.manifest,
+                            &signer,
+                            &moved_on,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    add(&tm_supersede, t);
                     Verdict::Attestable {
                         warnings,
                         signed,
                         a: Box::new(a),
+                        doomed,
                     }
                 }
             }
         };
         in_order(&units, jobs, verdict, |i, v| {
             let label = &units[i].2;
-            let (a, signed) = match v {
+            let (a, signed, doomed) = match v {
                 Verdict::Refused {
                     reason,
                     reasons,
@@ -2172,11 +2208,12 @@ pub fn run_units(
                     a,
                     warnings,
                     signed,
+                    doomed,
                 } => {
                     for w in &warnings {
                         eprintln!("{w}");
                     }
-                    (a, signed)
+                    (a, signed, doomed)
                 }
             };
             let p = &a.predicate;
@@ -2189,19 +2226,12 @@ pub fn run_units(
                     .put_manifest(&p.core.input_root, a.manifest.to_compact().as_bytes())
                     .context("storing the input manifest")?;
                 let stored = store.put(&p.core.test_id, &signer, &skey, &env)?;
+                // Never the one just stored (the same storage key: the same
+                // inputs, replaced).
+                let doomed: Vec<_> = doomed.into_iter().filter(|e| e.key != stored.key).collect();
+                superseded +=
+                    remove_superseded(&store, &p.core.test_id, doomed, &mut dropped_roots);
                 add(&tm_store, t);
-                let t = std::time::Instant::now();
-                superseded += supersede(
-                    &store,
-                    &ctx.repo,
-                    p,
-                    &a.manifest,
-                    &signer,
-                    &stored.key,
-                    &moved_on,
-                    &mut dropped_roots,
-                );
-                add(&tm_supersede, t);
                 Ok(stored)
             });
             let stored = match stored {
@@ -2258,13 +2288,13 @@ pub fn run_units(
                 f.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
             };
             eprintln!(
-                "vci: timing: {}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}; store (one at a time) {:.1}, supersede {:.1}",
+                "vci: timing: {}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}, find superseded {:.1}; store and remove superseded (one at a time) {:.1}",
                 project.label(),
                 g(&tm_check),
                 g(&tm_warn),
                 g(&tm_sign),
-                g(&tm_store),
-                g(&tm_supersede)
+                g(&tm_supersede),
+                g(&tm_store)
             );
         }
         for f in &mine {
@@ -2321,41 +2351,37 @@ pub fn run_units(
     })
 }
 
-/// Supersession on store: delete this signer's earlier attestations of the
-/// same unit from the local store when they vouch for files this line of
-/// history no longer has: made on a commit that `new commit` descends from
-/// and that no other branch or tag still contains ([`vci_git::Repo::moved_on`]),
-/// and their manifest's entries differ from the new one's. The signer
-/// re-attesting is the newest truth for that line, so the published tree
-/// keeps one attestation per unit and signer as commits go by, without a
-/// separate `vci prune --superseded`. Kept: one made on the same commit (work
-/// in progress: an edit may be reverted), on a commit this one does not
-/// descend from (another branch or pull request) or one another ref still
-/// contains (`main` under a feature branch: every branch made from it needs
-/// it), one issued later than this one (another machine with the same key),
-/// one for another OS or architecture (a CI matrix sharing a key:
-/// platform-specific files differ), one with the same entries (another
-/// environment or toolchain on this tree), and one whose payload or manifest
-/// cannot be read. Failing to delete is only a warning: a kept attestation is
-/// verified like any other. Returns how many were deleted, and adds the
-/// input roots they referenced to `dropped_roots`.
-#[allow(clippy::too_many_arguments)]
-fn supersede(
+/// The same signer's stored attestations of a unit that storing the new one
+/// (`p`, `manifest`) supersedes: made on a commit this line of history has
+/// moved on from ([`vci_git::Repo::moved_on`]: `new commit` descends from
+/// it and no other branch or tag still contains it, or it was rebased or
+/// amended away), with a manifest whose entries differ from the new one's.
+/// The signer re-attesting is the newest truth for that line, so the
+/// published tree keeps one attestation per unit and signer as commits go
+/// by, without a separate `vci prune --superseded`. Kept: one made on the
+/// same commit (work in progress: an edit may be reverted), on a commit
+/// another ref still contains (`main` under a feature branch: every branch
+/// made from it needs it; a sibling branch or pull request), one issued
+/// later than this one (another machine with the same key), one for another
+/// OS or architecture (a CI matrix sharing a key: platform-specific files
+/// differ), one with the same entries (another environment or toolchain on
+/// this tree), and one whose payload or manifest cannot be read. Read only
+/// (several units at once); [`remove_superseded`] deletes them once the new
+/// one is stored. `moved_on` caches git's answer per earlier commit.
+fn superseded_by(
     store: &AttestStore,
     repo: &vci_git::Repo,
     p: &VciPredicate,
     manifest: &InputManifest,
     signer: &str,
-    keep_key: &str,
-    moved_on: &std::cell::RefCell<BTreeMap<String, bool>>,
-    dropped_roots: &mut BTreeSet<String>,
-) -> usize {
+    moved_on: &std::sync::Mutex<BTreeMap<String, bool>>,
+) -> Vec<vci_git::StoredEnvelope> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
     let tc = &p.core.toolchain;
     let mut entries: Vec<&vci_core::InputEntry> = manifest.entries.iter().collect();
     entries.sort();
     let keep = |e: &vci_git::StoredEnvelope| {
-        if e.key == keep_key || e.error.is_some() {
+        if e.error.is_some() {
             return true;
         }
         let Some(m) = crate::cmds::envelope_meta(&e.bytes) else {
@@ -2387,16 +2413,50 @@ fn supersede(
         if old_entries == entries {
             return true;
         }
-        // Last, as the only check that runs git: one answer per commit.
-        let cached = moved_on.borrow().get(&m.commit).copied();
+        // Last, as the only check that runs git: one answer per commit
+        // (two threads may ask about the same commit at once; same answer).
+        let cached = moved_on
+            .lock()
+            .map(|c| c.get(&m.commit).copied())
+            .unwrap_or(None);
         let moved = cached.unwrap_or_else(|| {
             let moved = repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false);
-            moved_on.borrow_mut().insert(m.commit.clone(), moved);
+            if let Ok(mut c) = moved_on.lock() {
+                c.insert(m.commit.clone(), moved);
+            }
             moved
         });
         !moved
     };
-    match store.remove_for_signer(&p.core.test_id, signer, keep) {
+    match store.list(Some(&p.core.test_id)) {
+        Ok(all) => all
+            .into_iter()
+            .filter(|e| e.signer == signer && !keep(e))
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "vci: warning: {}: cannot read its stored attestations to supersede them: {e}",
+                p.core.test_id
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Delete what [`superseded_by`] found, once the new attestation is stored.
+/// Failing to delete is only a warning: a kept attestation is verified like
+/// any other. Returns how many were deleted, and adds the input roots they
+/// referenced to `dropped_roots`.
+fn remove_superseded(
+    store: &AttestStore,
+    test_id: &str,
+    doomed: Vec<vci_git::StoredEnvelope>,
+    dropped_roots: &mut BTreeSet<String>,
+) -> usize {
+    if doomed.is_empty() {
+        return 0;
+    }
+    match store.remove_envelopes(doomed) {
         Ok(removed) => {
             for e in &removed {
                 if let Some(r) = crate::cmds::envelope_meta(&e.bytes).and_then(|m| m.manifest_ref) {
@@ -2406,13 +2466,63 @@ fn supersede(
             removed.len()
         }
         Err(e) => {
-            eprintln!(
-                "vci: warning: {}: cannot remove superseded attestations: {e}",
-                p.core.test_id
-            );
+            eprintln!("vci: warning: {test_id}: cannot remove superseded attestations: {e}");
             0
         }
     }
+}
+
+/// The last recorded duration (`result.durationMs`) of each of these units:
+/// its newest stored attestation's, by any signer, when one records it.
+/// Best effort: a unit that cannot be read has none.
+fn last_durations<'s>(
+    store: &AttestStore,
+    test_ids: impl IntoIterator<Item = &'s str>,
+) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    let Ok(reader) = store.reader() else {
+        return out;
+    };
+    for id in test_ids {
+        let Ok(cands) = reader.candidates(id) else {
+            continue;
+        };
+        let newest = cands
+            .iter()
+            .filter(|e| e.error.is_none())
+            .filter_map(|e| crate::cmds::envelope_meta(&e.bytes))
+            .filter_map(|m| m.duration_ms.map(|d| (m.issued_at, d)))
+            .max_by_key(|(issued, _)| *issued);
+        if let Some((_, d)) = newest {
+            out.insert(id.to_owned(), d);
+        }
+    }
+    out
+}
+
+/// `items` for the runner: those without a recorded duration first, in
+/// the given order (a new file may be long), then the rest longest first
+/// (ties in the given order), so that a runner that takes several at once
+/// does not end on its longest file.
+fn longest_first<'a, T>(
+    items: &[&'a T],
+    key: impl Fn(&T) -> &str,
+    durations: &BTreeMap<String, u64>,
+) -> Vec<&'a T> {
+    let mut out: Vec<&'a T> = items
+        .iter()
+        .copied()
+        .filter(|t| !durations.contains_key(key(t)))
+        .collect();
+    let mut known: Vec<(usize, &'a T)> = items
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, t)| durations.contains_key(key(t)))
+        .collect();
+    known.sort_by(|(ia, a), (ib, b)| durations[key(b)].cmp(&durations[key(a)]).then(ia.cmp(ib)));
+    out.extend(known.into_iter().map(|(_, t)| t));
+    out
 }
 
 /// After supersession: delete the stored input manifests in `roots` that no
@@ -2514,6 +2624,27 @@ fn select_units(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longest_first_puts_unknown_then_longest() {
+        let items = ["a", "b", "c", "d", "e"];
+        let refs: Vec<&&str> = items.iter().collect();
+        let d: BTreeMap<String, u64> = [("a", 5), ("c", 90), ("d", 5), ("e", 20)]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        let got: Vec<&str> = longest_first(&refs, |t| t, &d)
+            .into_iter()
+            .copied()
+            .collect();
+        assert_eq!(got, ["b", "c", "e", "a", "d"]);
+        let none = BTreeMap::new();
+        let got: Vec<&str> = longest_first(&refs, |t| t, &none)
+            .into_iter()
+            .copied()
+            .collect();
+        assert_eq!(got, items);
+    }
 
     fn write(root: &Utf8Path, rel: &str, body: &str) {
         let p = root.join(rel);

@@ -1042,6 +1042,15 @@ impl<'a> AttestStore<'a> {
             .into_iter()
             .filter(|e| e.signer == signer && !keep(e))
             .collect();
+        self.remove_envelopes(doomed)
+    }
+
+    /// Delete these envelopes (one session; git-meta tombstones, published
+    /// by `push`). Returns the ones that existed.
+    pub fn remove_envelopes(
+        &self,
+        doomed: Vec<StoredEnvelope>,
+    ) -> Result<Vec<StoredEnvelope>, GitError> {
         if doomed.is_empty() {
             return Ok(doomed);
         }
@@ -3687,6 +3696,8 @@ impl<'a> AttestStore<'a> {
                 notes: std::mem::take(&mut carried),
                 ..Report::default()
             };
+            let timing = std::env::var_os("VCI_TIMING").is_some();
+            let t = std::time::Instant::now();
             let round = match self.fetch_named(&name, &mut report) {
                 Ok(r) => r,
                 Err(e) if is_ref_race(&e) && attempt < PUSH_ATTEMPTS => {
@@ -3696,6 +3707,13 @@ impl<'a> AttestStore<'a> {
                 }
                 Err(e) => return Err(e),
             };
+            if timing {
+                eprintln!(
+                    "vci: timing: push: fetch and materialize {name}'s metadata: {:.2}s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            let t = std::time::Instant::now();
             let Some(local) = self.read_ref(&local_ref)? else {
                 return Ok(done(PushStatus::NothingStored, report));
             };
@@ -3780,6 +3798,13 @@ impl<'a> AttestStore<'a> {
                 carried = std::mem::take(&mut report.notes);
                 continue;
             }
+            if timing {
+                eprintln!(
+                    "vci: timing: push: check what the push would delete and what it sends: {:.2}s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            let t = std::time::Instant::now();
             if let Some(tip) = &tip {
                 match self.rebase_onto(&local_ref, &local, tip) {
                     Ok(()) => {}
@@ -3795,6 +3820,13 @@ impl<'a> AttestStore<'a> {
             if rewrite {
                 pushed = self.orphan_of(&local_ref, &pushed)?;
             }
+            if timing {
+                eprintln!(
+                    "vci: timing: push: put the local metadata on top of {name}'s: {:.2}s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            let t = std::time::Instant::now();
             before_push(attempt);
             // `--no-thin`: a thin pack deltifies against the remote's
             // versions of the values, which a blobless clone does not have
@@ -3817,6 +3849,12 @@ impl<'a> AttestStore<'a> {
                 .arg(&name)
                 .arg(format!("{pushed}:{remote_ref}"))
                 .output_described()?;
+            if timing {
+                eprintln!(
+                    "vci: timing: push: git push (attempt {attempt}): {:.2}s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let status = if stdout.lines().any(|l| l.starts_with("=\t")) {
