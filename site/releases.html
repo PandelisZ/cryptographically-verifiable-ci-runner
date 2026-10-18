@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-4">2.1.4</a></td><td>19 Oct 2026</td><td>The manifests a run orphans are deleted in one session (a minute, before); the Rails batch says when its slots' last file ended and how busy the slots were</td></tr>
 <tr><td><a href="#v2-1-3">2.1.3</a></td><td>19 Oct 2026</td><td>Files run longest first; a pull request's rebased-away attestations are superseded; the superseded ones are found in parallel; the push shows its parts</td></tr>
 <tr><td><a href="#v2-1-2">2.1.2</a></td><td>19 Oct 2026</td><td>The Linux binaries use mimalloc: on a 16-core runner a plan's verdicts phase was 20 times slower than on a laptop because musl's allocator serializes threads</td></tr>
 <tr><td><a href="#v2-1-1">2.1.1</a></td><td>19 Oct 2026</td><td>Rails on CI: the plan reads manifests in parallel, load-path probes fold into one listing, and timing shows every part</td></tr>
@@ -48,6 +49,10 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-4">2.1.4</h2>
+<p><em>19 October 2026.</em> The first run with 2.1.3 on vex superseded 2,424 and 2,519 attestations a job (every earlier push of the pull request, rebased away) and then spent 65 and 60 seconds deleting their manifests one session each. The manifests nothing references are now deleted in one session. The Rails batch prints one more line, <code>vci: the slots' last file ended N s after the slots started; a slot's files add up to X s at most, Y s at least</code>: on that run a job's files added up to about 240 s a slot, and its slots were done 470 s after they started, which the next run will explain.</p>
+<p>Rails on vex after 2.1.3, for the record: a push whose files are attested runs two jobs of 1.6 to 1.8 minutes (<code>2006 to skip, 13 to run</code>; the plan 19 to 23 s, of which the values' fetch 6 to 7 s once the superseded manifests were gone), against the plain runner's two of 4.8. The remaining cost is the runner's own setup, a Rails boot for the files vci can never attest, and master moving under the pull request, which re-runs every file until master is attested again (vex now attests master's Rails files on every push).</p>
 
 <h2 id="v2-1-3">2.1.3</h2>
 <p><em>19 October 2026.</em> The first Rails run with 2.1.2 on vex's runners: the plan's verdicts phase 9.5 s (1,124 to 1,247 s before), the four jobs 5 to 9 minutes for all 2,005 files (28 to 30 before, cancelled). Where the rest went, and what this release does about it:</p>

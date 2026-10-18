@@ -1123,6 +1123,35 @@ impl<'a> AttestStore<'a> {
         Ok(removed)
     }
 
+    /// Delete the stored input manifests with these roots, in one session
+    /// (tombstones, which `push` publishes). Returns how many existed. A
+    /// root that is not one is an error before anything is deleted.
+    pub fn remove_manifests<'r>(
+        &self,
+        roots: impl IntoIterator<Item = &'r str>,
+    ) -> Result<usize, GitError> {
+        let mut keys = Vec::new();
+        for root in roots {
+            validate::hex_id("input root", root)?;
+            keys.push(manifest_key(root));
+        }
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let session = self.session()?;
+        let project = Target::project();
+        let mut removed = Vec::new();
+        for key in keys {
+            if session.target(&project).remove(&key).map_err(meta_err)? {
+                removed.push(key);
+            }
+        }
+        if !removed.is_empty() {
+            self.stamp_written(removed.iter().map(|k| (&project, k.as_str())))?;
+        }
+        Ok(removed.len())
+    }
+
     /// How many attestations are stored (values not read).
     pub fn count(&self) -> Result<usize, GitError> {
         self.reader()?.count()

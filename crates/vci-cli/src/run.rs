@@ -2571,18 +2571,20 @@ fn drop_orphan_manifests(store: &AttestStore, roots: &BTreeSet<String>) -> usize
             None => return 0,
         }
     }
-    let mut n = 0;
-    for r in roots
+    let orphans: Vec<&str> = roots
         .difference(&referenced)
         .filter(|r| !undecided.contains(*r))
-    {
-        match store.remove_manifest(r) {
-            Ok(true) => n += 1,
-            Ok(false) => {}
-            Err(e) => eprintln!("vci: warning: cannot remove the input manifest {r}: {e}"),
+        .map(String::as_str)
+        .collect();
+    // One session for all of them: a Rails run that superseded 2,400
+    // attestations took a minute deleting their manifests one by one.
+    match store.remove_manifests(orphans) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("vci: warning: cannot remove the unreferenced input manifests: {e}");
+            0
         }
     }
-    n
 }
 
 /// The units [`Selection::Units`] names, as indexes into `files`. A test id

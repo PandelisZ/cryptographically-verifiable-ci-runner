@@ -908,6 +908,22 @@ impl RailsAdapter {
                 )
                 .as_bytes(),
             );
+            // Where the batch's wall time went: a slot's files add up to
+            // its busy time; the rest it waited (the queue, a fork, the
+            // database, the CPU).
+            if slots.last_at > 0 && !slots.slot_ms.is_empty() {
+                let busiest = slots.slot_ms.values().max().copied().unwrap_or(0);
+                let idlest = slots.slot_ms.values().min().copied().unwrap_or(0);
+                log.extend_from_slice(
+                    format!(
+                        "vci: the slots' last file ended {:.1} s after the slots started; a slot's files add up to {:.1} s at most, {:.1} s at least\n",
+                        slots.last_at as f64 / 1000.0,
+                        busiest as f64 / 1000.0,
+                        idlest as f64 / 1000.0
+                    )
+                    .as_bytes(),
+                );
+            }
         }
         if !slots.output_ms.is_empty() {
             let n = slots.output_ms.len() as f64;
@@ -989,15 +1005,19 @@ struct BatchRun {
 }
 
 /// What `batch/files.jsonl` says of a batch's slots: how many ran files,
-/// the longest setup of one (ms), and how long each file's process took
-/// (ms); and what `batch/output.jsonl` says of the files' output: how long
-/// each file's process took to write it (ms), and each writing of the lines
-/// a boot's or slot's files share (ms).
+/// the longest setup of one (ms), how long each file's process took (ms),
+/// per slot the sum of its files' process times (ms), and when the last
+/// line was written, in ms since the slots were started (`at`); and what
+/// `batch/output.jsonl` says of the files' output: how long each file's
+/// process took to write it (ms), and each writing of the lines a boot's or
+/// slot's files share (ms).
 #[derive(Debug, Default)]
 struct SlotStats {
     count: usize,
     setup_ms: u64,
     file_ms: Vec<u64>,
+    slot_ms: BTreeMap<u64, u64>,
+    last_at: u64,
     output_ms: Vec<u64>,
     shared_ms: Vec<u64>,
 }
@@ -1090,6 +1110,9 @@ fn read_batch(
                 "the batch run's files.jsonl has a bad line {line:?}"
             )));
         };
+        if let Some(at) = v.get("at").and_then(Value::as_u64) {
+            stats.last_at = stats.last_at.max(at);
+        }
         let Some(id) = v.get("id").and_then(Value::as_str) else {
             if let Some(ms) = v.get("setup_ms").and_then(Value::as_u64) {
                 stats.setup_ms = stats.setup_ms.max(ms);
@@ -1107,6 +1130,9 @@ fn read_batch(
                 }
                 if let Some(ms) = v.get("ms").and_then(Value::as_u64) {
                     stats.file_ms.push(ms);
+                    if let Some(s) = v.get("slot").and_then(Value::as_u64) {
+                        *stats.slot_ms.entry(s).or_insert(0) += ms;
+                    }
                 }
                 let c = v
                     .get("exit")
@@ -2377,11 +2403,11 @@ mod tests {
         // line (no id) is not a file's; a later why overrides an earlier
         // exit (the group found afterwards that the file's run cannot stand).
         let slotted = [
-            r#"{"slot":0,"setup_ms":1500}"#,
-            r#"{"slot":1,"setup_ms":900}"#,
-            r#"{"id":"test/a_test.rb","exit":0,"slot":0,"ms":2000}"#,
+            r#"{"slot":0,"setup_ms":1500,"at":1500}"#,
+            r#"{"slot":1,"setup_ms":900,"at":900}"#,
+            r#"{"id":"test/a_test.rb","exit":0,"slot":0,"ms":2000,"at":3500}"#,
             r#"{"slot":2,"why":"slot 2's setup failed"}"#,
-            r#"{"id":"test/b_test.rb","exit":0,"slot":1,"ms":3000}"#,
+            r#"{"id":"test/b_test.rb","exit":0,"slot":1,"ms":3000,"at":3900}"#,
             r#"{"id":"test/c_test.rb","exit":0,"slot":0}"#,
             r#"{"id":"test/c_test.rb","why":"a process of the batch changed x in vci's temp directory"}"#,
             r#"{"done":true}"#,
@@ -2394,6 +2420,11 @@ mod tests {
         assert_eq!(slots.count, 2);
         assert_eq!(slots.setup_ms, 1500);
         assert_eq!(slots.file_ms, [2000, 3000]);
+        assert_eq!(slots.last_at, 3900);
+        assert_eq!(
+            slots.slot_ms.values().copied().collect::<Vec<_>>(),
+            [2000, 3000]
+        );
         assert_eq!(code, Some(0));
         assert_eq!(
             obs.iter().map(|o| o.test_id.as_str()).collect::<Vec<_>>(),

@@ -1147,6 +1147,8 @@ module VciCollector
         end if root
         queue = File.join(OUT.to_s, "batch", "queue-#{Process.pid}")
         VciCollector.quiet { File.write(queue, w.to_s) }
+        # Every slot's lines say when they were written, from here (ms).
+        @batch_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         if root
           @tmp_mark = File.join(OUT.to_s, "batch", "tmp-shared-#{Process.pid}")
           @shared_dirs = VciCollector.quiet { Output.both(TMP) }
@@ -1222,7 +1224,8 @@ module VciCollector
           @slot_setup = true
           rails_hooks(:after_fork_hooks).each { |cb| cb.call(i) }
           @slot_setup = false
-          status(slot: i, setup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round)
+          status(slot: i, setup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round,
+                 at: batch_at)
         rescue Exception => e # rubocop:disable Lint/RescueException
           status(slot: i, why: "slot #{i}'s setup (Rails' after-fork hooks: its database, parallelize_setup) " \
                                "failed: #{e.class}: #{e.message.to_s.lines.first.to_s.strip}")
@@ -1244,7 +1247,7 @@ module VciCollector
           return f if pid.nil?
           _, st = Process.wait2(pid)
           status(id: f, exit: st.exitstatus, slot: i,
-                 ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round)
+                 ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round, at: batch_at)
           first = st.exitstatus || 1 if first.zero? && !st.success?
           changed = @slot_tmp ? tmp_cleanup(before, @slot_tmp) : []
           unless changed.empty?
@@ -1269,6 +1272,11 @@ module VciCollector
         raise if @target
         $stderr.puts "vci_collector: batch slot #{i}: #{e.class}: #{e.message}"
         Process.exit!(1)
+      end
+
+      # Milliseconds since the slots were started (`run_slots`).
+      def batch_at
+        ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - (@batch_started || 0)) * 1000).round
       end
 
       # Rails' cleanup hooks (parallelize_teardown), as a worker runs them
