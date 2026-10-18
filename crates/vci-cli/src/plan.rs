@@ -1585,8 +1585,9 @@ impl Verifier<'_> {
                 format!("{} (recomputed from the attested manifest)", gm.root()),
             ));
         }
+        let gextra = crate::run::ignored_listing_children(&self.ctx.root, gm);
         let gdiff = gm
-            .diff_against_checkout_with_env(&self.ctx.root, lookup(&self.child))
+            .diff_against_checkout_excluding(&self.ctx.root, lookup(&self.child), &gextra)
             .map_err(|e| {
                 Failure::one("global-inputs", 14, "rehash", "re-hashable", e.to_string())
             })?;
@@ -1674,8 +1675,9 @@ impl Verifier<'_> {
         }
         m.check_case_collisions()
             .map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e.to_string()))?;
+        let extra = crate::run::ignored_listing_children(&self.ctx.root, m);
         let diff = m
-            .diff_against_checkout_with_env(&self.ctx.root, lookup(&self.child))
+            .diff_against_checkout_excluding(&self.ctx.root, lookup(&self.child), &extra)
             .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
         let (env_diff, file_diff): (Vec<_>, Vec<_>) =
             diff.into_iter().partition(|m| m.what.starts_with("env:"));

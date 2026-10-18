@@ -798,7 +798,26 @@ impl InputManifest {
     where
         F: Fn(&str) -> Option<OsString> + Sync,
     {
-        let excl = self.exclusions();
+        self.diff_against_checkout_excluding(repo_root, env, &[])
+    }
+
+    /// [`Self::diff_against_checkout_with_env`] leaving `extra_excluded`
+    /// (children of listed directories present in this checkout but not
+    /// inputs: what git ignores here, since 2.0.3) out of the listings it
+    /// rehashes, as the manifest's own [`EntryKind::Excluded`] entries are.
+    pub fn diff_against_checkout_excluding<F>(
+        &self,
+        repo_root: &Utf8Path,
+        env: F,
+        extra_excluded: &[RepoPath],
+    ) -> Result<Vec<Mismatch>, ManifestError>
+    where
+        F: Fn(&str) -> Option<OsString> + Sync,
+    {
+        let mut excl = self.exclusions();
+        for (parent, names) in exclusions(extra_excluded.iter()) {
+            excl.entry(parent).or_default().extend(names);
+        }
         let entry_results: Vec<Option<Mismatch>> = self
             .entries
             .par_iter()

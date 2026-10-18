@@ -1814,3 +1814,46 @@ fn ci_partitions_cover_every_unit_once() {
         assert!(!stderr.contains("vci ci:"), "{bad}: {stderr}");
     }
 }
+
+/// A directory listing records what the repository holds, not what git
+/// ignores (since 2.0.3): a build output or editor file that only one
+/// machine has, appearing in a listed directory, does not re-run the test
+/// that listed it, while a new tracked-able file does.
+#[test]
+fn listings_leave_out_what_git_ignores() {
+    let w = World::new();
+    let work = w.work.clone();
+    const L: &str = "src/list.test.mjs";
+    w.write(".gitignore", "*.local\n");
+    w.write(
+        L,
+        "import assert from \"node:assert/strict\";\nimport { readdirSync } from \"node:fs\";\nimport { test } from \"node:test\";\n\ntest(\"lists fixtures\", () => {\n  const names = readdirSync(new URL(\"../fixtures\", import.meta.url));\n  assert.ok(names.includes(\"b.json\"));\n});\n",
+    );
+    w.git(&work, &["add", ".gitignore", L]);
+    w.git(
+        &work,
+        &["commit", "-q", "-m", "a test that lists fixtures/"],
+    );
+    let out = w.run(&work, &[L], &w.trusted);
+    assert!(out.contains("vci: 1 attested, 0 not attested"), "{out}");
+    assert!(w.plan(&work, "main").skip.contains(L));
+
+    // An ignored file appears in the listed directory: still skipped.
+    w.write("fixtures/junk.local", "not an input\n");
+    let p = w.plan(&work, "main");
+    assert!(p.skip.contains(L), "an ignored entry is no change: {p:?}");
+
+    // A file git would track appears: the listing changed, the test runs.
+    w.write("fixtures/extra.json", "{}\n");
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(L), "a new entry re-runs the test: {p:?}");
+    let ex = w.explain(&work, L, "main");
+    assert!(ex.contains("entry:fixtures"), "{ex}");
+    w.remove("fixtures/extra.json");
+    assert!(w.plan(&work, "main").skip.contains(L));
+
+    // A test that reads an ignored file directly keeps it as an input.
+    w.write("fixtures/b.local.json", "{ \"greeting\": \"hello\" }\n");
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(B), "B probes its local override: {p:?}");
+}

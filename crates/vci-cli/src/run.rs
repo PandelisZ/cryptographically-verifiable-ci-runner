@@ -174,6 +174,8 @@ pub fn observations_for(
             }
         }
     }
+    let ignored = ignored_children(root, &out);
+    out.extend(ignored);
     // package.json / tsconfig.json that decide how each module resolves its
     // imports and is transformed.
     if adapter == "vitest" || adapter == "node-test" {
@@ -853,7 +855,15 @@ fn check_one(
         Some(Err(e)) => return Err(format!("global inputs before the run: {e}")),
         None => return Err("no pre-run global snapshot".into()),
     }
-    let excluded = manifest.excluded_children();
+    // What the manifest leaves out of its listings, plus what git ignores
+    // in them now: a cache a test wrote into a listed directory during the
+    // run (`__pycache__`) is not a change to the listing (since 2.0.3).
+    let mut excluded = manifest.excluded_children();
+    for p in ignored_listing_children(&ctx.root, &manifest) {
+        if let (Some(parent), Some(name)) = (p.parent(), p.components().last()) {
+            excluded.entry(parent).or_default().insert(name.to_owned());
+        }
+    }
     for e in &manifest.entries {
         pre_stat
             .unchanged_excluding(e, excluded.get(&e.path))
@@ -1039,6 +1049,84 @@ fn is_rails_key_file(p: &str) -> bool {
         })
 }
 
+/// The git-ignored children of every directory `observed` lists (a `ReadDir`,
+/// or a `Read` of a directory), as `Exclude` observations: build outputs,
+/// caches and editor files (`dist/`, `node_modules/`, `__pycache__/`,
+/// `.DS_Store`) that a fresh checkout does not have and every machine has
+/// differently, so that a listing records what the repository holds and an
+/// attestation made on one machine verifies on another (since 2.0.3). A
+/// child that is itself observed stays an input of its own.
+pub(crate) fn ignored_children(
+    root: &Utf8Path,
+    observed: &[(RepoPath, Observation)],
+) -> Vec<(RepoPath, Observation)> {
+    let seen: BTreeSet<&str> = observed.iter().map(|(p, _)| p.as_str()).collect();
+    let mut candidates: Vec<String> = Vec::new();
+    for (p, o) in observed {
+        if !matches!(o, Observation::ReadDir | Observation::Read) {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(p.to_abs(root)) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let Ok(name) = ent.file_name().into_string() else {
+                continue;
+            };
+            let child = if p.is_root() {
+                name
+            } else {
+                format!("{}/{name}", p.as_str())
+            };
+            if !seen.contains(child.as_str()) {
+                candidates.push(child);
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    git_ignored(root, &candidates)
+        .into_iter()
+        .filter_map(|c| RepoPath::new(&c).ok())
+        .map(|p| (p, Observation::Exclude))
+        .collect()
+}
+
+/// The git-ignored children, present now, of every directory `m` records a
+/// listing of, minus `m`'s own entries: what a verification leaves out of
+/// the listings it rehashes (see [`ignored_children`]).
+pub(crate) fn ignored_listing_children(root: &Utf8Path, m: &InputManifest) -> Vec<RepoPath> {
+    let seen: BTreeSet<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
+    let mut candidates: Vec<String> = Vec::new();
+    for e in &m.entries {
+        if e.kind != vci_core::EntryKind::DirListing {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(e.path.to_abs(root)) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let Ok(name) = ent.file_name().into_string() else {
+                continue;
+            };
+            let child = if e.path.is_root() {
+                name
+            } else {
+                format!("{}/{name}", e.path.as_str())
+            };
+            if !seen.contains(child.as_str()) {
+                candidates.push(child);
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    git_ignored(root, &candidates)
+        .into_iter()
+        .filter_map(|c| RepoPath::new(&c).ok())
+        .collect()
+}
+
 fn ignored_inputs(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
     let paths: Vec<String> = m
         .entries
@@ -1056,7 +1144,7 @@ fn ignored_inputs(root: &Utf8Path, m: &InputManifest) -> Vec<String> {
 
 /// The repo-relative `paths` git ignores (`git check-ignore`); any error
 /// means none (so nothing is treated as ignored).
-fn git_ignored(root: &Utf8Path, paths: &[String]) -> Vec<String> {
+pub(crate) fn git_ignored(root: &Utf8Path, paths: &[String]) -> Vec<String> {
     use std::io::Write as _;
     if paths.is_empty() {
         return vec![];

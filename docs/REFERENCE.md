@@ -312,9 +312,11 @@ toolchain check compares is identical there:
 - **uv**: pin the same uv version locally and in `astral-sh/setup-uv` (`version:`), so both resolve the same builds;
 - **the installed distributions**: the full `name==version` set must be equal (`python distributions`). A dependency
   with a platform marker (`sys_platform == 'linux'`) installs only on one side, so every file runs there;
-- **directory listings**: a test that lists a directory records every entry, including `.DS_Store` and
-  `__pycache__`, which a fresh checkout does not have. `vci run` warns about such listings; delete the junk and attest
-  again;
+- **directory listings**: a test that lists a directory records its entries without the ones git ignores
+  (`.DS_Store`, `__pycache__`, `dist/`, `node_modules/`: build outputs and junk a fresh checkout does not have and
+  every machine has differently; since 2.0.3, as `Excluded` entries of the manifest), and a verification leaves
+  what git ignores there out of the listing too. An ignored file a test reads directly is still an input, and
+  `vci run` warns that a fresh checkout will not have it;
 - **environment**: only the variables `[env]` and the built-in lists name reach tests (docs/ENV.md). A test that
   reads `HOME`, `USER`, `TMPDIR`, ... records their values, so it is skipped only where they are equal (on a runner:
   never); `set` gives a variable the same value everywhere.
@@ -387,7 +389,7 @@ Under `platform = "any"` a package attested on macOS arm64 is skipped on an ubun
   formatting a local time, `time.Unix`, the `log` package's timestamps) with `TZ` unset reads `/etc/localtime`,
   which is not an input (macOS laptops are rarely on UTC; runners are), and is refused. Set it in vci.toml
   (`[env] set = { TZ = "UTC" }`, as `vci init` writes): vci sets it on both sides;
-- the directory listings match (`.DS_Store` in a package directory breaks that; `vci run` warns), and the test
+- the directory listings match (what git ignores is left out of them since 2.0.3), and the test
   read no variable whose value differs (`HOME`, `CI`, `USER`, ...).
 
 What is accepted under `any` without a same-platform check: platform-dependent code in the standard library and in
