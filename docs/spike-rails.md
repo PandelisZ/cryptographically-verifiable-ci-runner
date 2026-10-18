@@ -676,10 +676,322 @@ macOS needed `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` (B1: without it every fil
 to one process per file), and the boot's database connections had to be closed before each fork (B1: the second
 file's first test lost its MySQL connection).
 
+## Slots: a batch's files in parallel, one database per slot (vci 2.1)
+
+Date: 2026-10-18. Same machine (14 cores, 36 GB), Ruby 3.4.9, Rails 8.1.3.1, Minitest 6.0.6, Oaken 1.0.0; vex-api from
+a clone of vex-git master `3738f8486d` (no remote, never pushed), MySQL 8 in Docker on 127.0.0.1:3306.
+
+Batch mode ran a group's files one at a time because they shared the test database (B5). On vex-api that cost about
+17 s of Oaken's `replant_seed` in every file's process (B "Measurements"), and a group of 925 files about 5.7 h. Rails'
+own parallel mode, which vex's CI uses, gives each worker a database of its own and seeds it once. Slots do the same
+for a batch. The decision behind it (the user's): an attestation need not be deterministic at the database level.
+Files may share seeded database state and run at the same time against separate databases, as Rails' workers do.
+What stays: each file's inputs, verdict and exit status are its own (the process per file), and everything fails
+open.
+
+**S1. What runs.** W slots (`VCI_RAILS_JOBS`, else `PARALLEL_WORKERS` above 1 in vci's environment, else `VCI_JOBS`,
+else the processor count; at most what the project's `parallelize(workers: n)` asks for unless vci's `PARALLEL_WORKERS`
+says, as in Rails, where the variable overrides `workers:`; at most one per file of the group). The collector learns
+`workers:` by wrapping `ActiveSupport::TestCase.parallelize` (`Batch::ParallelizeCall`): under vci's
+`PARALLEL_WORKERS=1` Rails' executor always has size 1. After the boot (one per helper group, as in B1), the
+group's process does what Rails' `Parallelization#start` does before it forks its workers: the before-fork hooks
+(Rails' own closes the Active Record connections), then forks one long-lived process per slot. A slot does what Rails'
+`Parallelization::Worker#after_fork` does: `ActiveSupport::TestCase.parallel_worker_id = i`, then every after-fork
+hook with `i`, in registration order. In Rails 8.1.3.1 (activesupport `testing/parallelization{,/worker}.rb`,
+activerecord `test_databases.rb`, `rails/test_help` includes `ActiveRecord::TestDatabases`) these are: Active Record's
+`create_and_load_schema(i, env_name:)` when `ActiveSupport.parallelize_test_databases` (it renames every test
+configuration to `<database>_<i>`, `reconstruct_from_schema`s it, which purges and loads `db/schema.rb` or, when the
+database is current, truncates its tables, then `establish_connection`), then the project's `parallelize_setup`
+blocks (vex-api: Active Storage roots under `tmp/storage/worker-<pid>`; Oaken's `TestSetup#included` registers `{
+@loader.load_seed }`). The slot then forks one process per file, one at a time: slot i's first file is the group's
+i-th, the rest come from a queue the slots share, in the group's order (a slot that finishes early takes the next).
+Each file's process is the one-file run of B1, against the slot's database: the loader's requests for other files
+skipped, its file loaded, its tests run, its output written at exit, its own exit status. At its end the slot runs
+the cleanup hooks (`parallelize_teardown`), as a worker does before it exits. Active Record connections are closed
+before every fork (group → slots, slot → files); a file's process reconnects through the renamed configuration, to
+its slot's database.
+
+**S2. No reseed in a file's process.** Oaken's `TestSetup#before_setup` runs `loader.replant_seed` (truncate every
+table, load `db/seeds/test/**`) in the first test of a process unless `Minitest.parallel_executor` answers
+`should_parallelize?` with true, which Rails' `ParallelizeExecutor` does only when it forks workers (never under
+vci's `PARALLEL_WORKERS=1`). A slot extends the executor object it inherited (`Batch::SlotExecutor`):
+`should_parallelize?` is true for everyone but the executor's own `start` (which still sees its own answer and forks
+nothing). The object stays Rails' (`ActiveSupport::Testing::Isolation` tests `is_a?(ParallelizeExecutor)` to decide
+whether to `parallelize_me!`; a wrapper would have made it send tests to an executor that drops them). Measured on
+vex-api, below: the 50 files' processes reported 1,126 s of test time one at a time and 63.6 s in slots
+(`cli_release_test.rb`, one test: 20.4 s one at a time, 3.9 s in a slot).
+
+**S3. When slots run.** When the boot called Rails' `parallelize` with processes (`Minitest.parallel_executor` is an
+`ActiveSupport::Testing::ParallelizeExecutor` with `parallelize_with == :processes`): the project's test setup is
+made for workers with a database each. Not when the project turned its workers off: `parallelize(workers: 1)` (its
+tests must not run at once), or `PARALLEL_WORKERS` set to 1 (or 0) in vci's environment, as Rails users turn
+parallelism off (vci then passes one slot). Never for a group without a boot (its files' first statement is not a
+plain require of a helper): nothing is loaded when its slots would fork, so the after-fork hooks the files' own
+`require "test_helper"` registers would come after the fork, and the files would run at once on one database; such a
+group runs one file at a time, `VCI_RAILS_JOBS` or not. Or when `VCI_RAILS_JOBS` is set (any project, `1`: one at a time, vci 2.0's
+batch). A project without `parallelize` and without `VCI_RAILS_JOBS` keeps one file at a time: its files share one
+database, which nothing in its setup prepares for parallel processes. With `VCI_RAILS_JOBS` such a Minitest project
+still gets Rails' after-fork hooks (`rails/test_help` registers Active Record's whatever `parallelize` says): a
+database per slot (`db/test.sqlite3_<i>` for SQLite). RSpec has no parallel mode (rspec-rails registers no hooks, and
+`TEST_ENV_NUMBER` of parallel_tests is read when `config/database.yml` is evaluated, at boot, before the slots fork):
+with `VCI_RAILS_JOBS` its slots share the test database (a project whose specs cannot share it should not set it);
+without it, one file at a time.
+
+**S4. What slots share, and what vci does about it.**
+
+- *The database server.* Each slot's database is its own; a file's process starts from what the slot's seed and the
+  earlier files of the slot left (their transactional tests rolled back, their non-transactional ones not), as a test
+  in a Rails worker starts from what that worker's earlier tests left. Not an input, as before.
+- *vci's temp dir.* Each slot gets its own (`$TMPDIR/vci-slots/<i>`, set as `TMPDIR` in the slot; RSpec's example
+  status file and SimpleCov's directory move there too), cleaned after each file's process as in B1; a slot whose
+  file changed what the slot's setup left there takes no more files (the others take them). Outside the slots' dirs,
+  the temp dir is snapshotted after the before-fork hooks; a change there (a path the boot computed before the slots
+  existed, written by a file's process) could have been read by any file of any slot: the slots stop taking files
+  and every file of the group runs again one process per file (`a process of the batch changed <path> in vci's temp
+  directory, outside its slot's`). A change undone before the slots end counts too: a slot that sees one after a
+  file notes it for the group's process (`batch/tmp-shared-<pid>`), and so does any process of a slot (its setup,
+  its files) when it writes there (`Batch.slot_wrote`, from the collector's write hooks), at the moment it writes:
+  a file that wrote `BOOT_TMP/flag` and removed it 3 s later while a file of another slot found it there used to be
+  attested for both (the reader fails on its own). A write vci cannot see (a C extension's) is caught only by the
+  snapshots. After a group, the driver removes what the group's processes left in vci's temp dir (the boot's files,
+  the slots' dirs and what their setup and cleanup hooks wrote there), so the next group's slots and files start
+  from what the one-file runs start from; if the group changed something that was there before it, the next groups'
+  files run on their own. (vci 2.0's batch left a boot's temp files to the next group.)
+- *The repository's scratch directories and files.* As between one-file runs, plus concurrency: a file reading a path
+  another slot's file is writing records what it read. Files that write inside the repository are refused anyway
+  (`wrote inside the repository`); a reader of such a path in another slot can see the write (in the fixture,
+  `pr2_test.rb` writes and removes `config/flag.yml` while `pr1_test.rb` checks it is absent: a window of microseconds,
+  not seen in the runs below).
+- *The database connections the slot's setup makes.* Active Record's tasks connect to the configured server without a
+  database (MySQL: `configuration_hash_without_database`; PostgreSQL: `postgres`) to create or purge the slot's
+  database. The collector accepts such a connection to a configured server only while a slot runs its after-fork
+  hooks (`Batch.slot_setup?`); a slot's `<database>_<i>` (and, for SQLite, `<file>_<i>` and its siblings) counts as
+  configured in the slot's processes (`DB.server_configs`, `DB.sqlite_files`). Before this, the slot's purge tainted
+  every file (`network:mysql2 (an Active Record connection to 127.0.0.1:<port>/, not one of the test environment's
+  databases)`, `rails_mysql_test_database` under `VCI_RAILS_JOBS=3`) and SQLite slot files were "not one of the test
+  environment's databases" (`rails:sqlite-file:.../db/test.sqlite3_0`).
+
+**S5. Inputs.** A file's manifest in a slot is its one-file run's plus what its slot's setup recorded before the
+file's process forked: the schema load requires `active_record/schema`, `active_record/tasks/*_database_tasks`,
+`active_record/migration/compatibility` and `active_support/benchmark`, whose load-path lookups in the project's `lib/`
+and `vendor/` are `absent` entries (in the fixture `active_record/schema`, `.../tasks/sqlite_database_tasks` and
+others, 30 entries; on vex-api, whose boot loads more, `active_record/migration/compatibility`,
+`.../tasks/abstract_tasks` and `.../tasks/mysql_database_tasks` as `.rb`, `.so` and `.bundle` in both directories, 18
+entries), and `create_and_load_schema` reads `VERBOSE` (absent). Oaken's seed files, read by the slot's `load_seed`, are inputs of every file of the slot, as
+they are of a one-file run (which reads them in `replant_seed`). A slot whose database is already current only
+truncates it and requires less; its files' manifests then lack some of those lookups. These extra entries make the
+attestation keys of slot runs differ from one-file runs; they never drop an input (`own ⊆ slot` for every file,
+checked below).
+
+**S6. Fallbacks (fail open).** Whatever a slot cannot run goes back to one process per file, with why: a slot whose
+after-fork hooks raise (`slot <i>'s setup (Rails' after-fork hooks: its database, parallelize_setup) failed: ...`)
+gives its first file back to the queue and takes none (the other slots run the group; if none can, every file runs on
+its own: `no slot of the batch ran it (...)`); before-fork hooks that raise send the group back; a slot that dies
+leaves its unsaid files to the group's process, which sends them back; B3's cases stand. `VCI_RAILS_PER_FILE=1` still
+runs one process per file from the start.
+
+**S7. Output.** `batch/files.jsonl` lines gain `"slot"` (and `"ms"`, the file's process's wall time); a slot says
+`{"slot", "setup_ms"}` when set up, `{"slot", "why"}` when it stops or cannot set up; a later `{"id", "why"}` overrides
+an earlier `{"id", "exit"}` (`read_batch`). Lines are appended with one `write` each (the slots append concurrently).
+The exit code is the first non-zero of the files' processes, in the order the files were given, as before. `vci run`
+logs `vci: ruby bin/rails test <50 files> --seed 0, booted once, one process per file (exit 0), 8 slots at once` and
+`vci: slots set up in 70.9 s at most; a file's process took 5.5 s on average, 12.1 s at most`.
+
+**Tests.** `e2e_rails.rs`: `rails_slots_give_what_one_process_per_file_gives` runs the twenty files of
+`rails_batch_mode_gives_what_one_process_per_file_gives` with `VCI_RAILS_JOBS=3` against one process per file in
+another copy: the same files attested and refused for the same reasons (the three failing files fail only
+themselves), the same exit code, every one-file entry in the slot run's manifest and nothing else but absent lookups in
+`lib/` and `vendor/` (`same_entries`), the plan afterwards and changes that re-run files; then two files that collide
+on one database (each, without transactions, inserts a row named `collide`, sleeps 2 s and expects to be the only one)
+and a failing file, three slots: both attested, the failure refused, exit 1, `db/test.sqlite3_{0,1,2}` made. With
+`ActiveSupport.parallelize_test_databases = false` (slots sharing `db/test.sqlite3`), the same two files fail
+(`Expected: [1] Actual: [1, 2]`), so the test tells shared from separate databases. The whole of `e2e_rails.rs` and
+`e2e_rspec.rs` passes with the default (no `parallelize` in the fixtures: one at a time), `VCI_RAILS_JOBS=1` and
+`VCI_RAILS_JOBS=3`; under slots three assertions that compare a slot run with a one-file run allow the slot's setup
+(`same_entries`, the slot databases in `db/`'s listing, and B's attestation count in
+`rails_database_contents_are_not_an_input`), and the batch log assertions match its new tail. `collector_test.rb`:
+`test_batch_slots_run_files_as_rails_workers` (a stand-in for Rails' Parallelization hooks and ParallelizeExecutor:
+before-fork hooks once in the group, after-fork hooks once per slot with its index, what they read in each file's
+inputs, `should_parallelize?` true in a file's process while the executor's own `start` sees false, each slot's
+temp dir and its cleanup between files, the cleanup hooks at the end, the deal of the first files, results and exit
+statuses per file), `test_batch_slots_send_back_what_they_cannot_run` (no `parallelize`: one at a time; asked: slots;
+one slot's setup failing: the other runs both files; every slot's failing: files sent back; a write where the boot's
+temp dir is: every file sent back), `test_batch_slots_send_back_a_transient_write_outside_their_temp_dirs` (a file
+writes `BOOT_TMP/flag` and removes it while a file of the other slot finds it: both sent back),
+`test_batch_groups_do_not_see_what_earlier_groups_left_in_the_temp_dir` (a boot's file and a slot's cleanup hook's
+file are gone for the next group, one at a time and in slots), `test_batch_slots_follow_the_projects_parallelize_workers`
+(`workers: 1`: one at a time; `workers: 2`: two slots; vci's `PARALLEL_WORKERS` or `VCI_RAILS_JOBS` overrides it),
+`test_batch_files_without_a_boot_run_one_at_a_time`; each fails with its fix taken out. The adapter:
+`batch_output_is_read_per_file` (slots, a slot's own lines, a later why overriding an exit, timings),
+`rails_slots_follow_the_environment` (`PARALLEL_WORKERS=1` or `0`: one slot).
+
+**Measurements (vex-api).** Release `vci` built from this tree, a throwaway key, a clone with its own test database
+(`vex_slots`; slots `vex_slots_0..7`), `/usr/bin/time -l env VCI_RAILS_JOBS=<W> mise exec -- vci run <files> --key
+<key>`:
+
+| | wall | user + sys | test time (files' own) | attested / refused |
+|---|---|---|---|---|
+| 50 files (B's list), W=1 (vci 2.0's batch; B measured 1,110.0 s on master `2b59eb17cc`) | 1432.9 s | 226.1 s + 83.2 s | 1126.0 s | 47 / 3 |
+| 50 files, W=8 | 167.6 s | 249.8 s + 79.5 s | 63.6 s | 47 / 3, the same three |
+| the `application` group, 939 files (`scripts/ci/rails-test-group.rb application` of every `test/**/*_test.rb`), W=8 | 1890.8 s | 4694.2 s + 1562.2 s | — | 894 / 45 |
+
+The W=8 run of 50 files: slots set up in 70.9 s at most (eight concurrent `load_seed`s into eight databases, six of them
+new), then 5.5 s per file's process on average (12.1 s at most): about 1.3 s of tests and the rest the collector's
+output at exit (B: ~3.3 s) and the fork; 47 files signed afterwards. Against W=1 the same 47 files are attested and the
+same 3 refused for the same reasons; their manifests (`dumpman` over the clone's store, the 47 pairs) differ by 660
+`absent` lookups under `lib/active_record` and `vendor/active_record` (S5: 18 for 36 files, 12 for one, none for the
+ten files of slots whose database was already current and only truncated), `VERBOSE` (absent) in `env`,
+and the random request paths B found (243 only in the slot run, 245 only in W=1, `public/api/v1/organizations/org-<id>/...`):
+nothing of a file's own run is missing otherwise.
+
+The `application` group at W=8: 939 files in 1890.8 s, 2.0 s a file. About 950 s of it is the Ruby batch (the slots
+set up in 57.0 s at most; a file's process took 5.5 s on average, 144.7 s at most) and about 940 s `vci` checking and
+signing the 939 results one after another afterwards (the `attested`/`not attesting` lines arrived at one a second:
+882 of them at 02:17:57, 939 at 02:18:54, the run having started at 01:47:23), so signing, not the tests, is now half
+of the wall time. No file went back to one process per file. Refused: 6 with a skipped test, 2 without tests, 2 for
+request paths that collide under case folding (`public/api/v1/organizations/ACME` and `.../acme` probed by one file:
+not slot-related), and two kinds slots cause:
+
+- 34 files `capturing inputs: vex-api/tmp/storage/worker-<pid>[/...] was read by the test but does not exist now`.
+  vex-api's `parallelize_setup` points Active Storage at `tmp/storage/worker-#{Process.pid}` (the slot's process) and
+  its `parallelize_teardown` removes that directory, as Rails' workers do when they exit; vci hashes a file's inputs
+  after the batch, when the slot's teardown has removed what the files read there. Refused, as it must be (fail
+  open). A per-worker root that survives the run (`worker-#{parallel_worker_id}` without the `rm_rf`, or cleaned in
+  `parallelize_setup` instead) would let them be attested; whether they could then be skipped in CI is Lane C's
+  question (tmp/ does not exist in a fresh checkout).
+- 1 file `input changed during the run: vex-api/tmp/bazel-blobs/.../action_result/ddd...: modified during the run`:
+  two slots' files wrote the same path in the repository's `tmp/` (S4); vci noticed and refused it.
+
+At 16 slots (vex's CI runners have 16 cores) the Ruby batch would take about 939 × 5.5 s / 16 + 57 s ≈ 380 s if a
+file's process kept its 5.5 s (this run used about 6.6 of the 14 cores on average: 6,256 CPU seconds over ~950 s),
+and checking and signing another ~940 s unless they run in parallel too: about 22 minutes for the group in one job,
+against 5 minutes for vex's plain `bin/rails test` with 16 workers. `vci ci --partition I/N` divides both.
+
+**S8. Two batch-mode bugs this measurement found (vci 2.0's batch had both).** Neither shows in the 50 files; both
+ran files of the `application` group again (two runs, stopped by hand, had run files 1,098 and 1,002 times for 939
+files, and sent every file back):
+
+- *A child Ruby process of a test took itself for the batch.* vex-api's `config/solid_queue_shutdown_test.rb` runs
+  `ruby bin/rails runner <script>`, which inherits `RUBYOPT` (the collector) and `VCI_RAILS_BATCH`; the runner never
+  asks for a test file, so at its exit the child said that every file of the batch must run on its own
+  (`Batch.undriven!`; ten `{"done": true}` lines in one run). The first process to load the collector now names
+  itself in `VCI_RAILS_BATCH_PID`, and only a process with that id is the batch: a child is a process without a test
+  id and writes nothing (`test_batch_child_processes_are_not_the_batch`, which also starts a child running the loader
+  on a file of the batch; it fails without the change), while a runner that execs Ruby again (a binstub or wrapper:
+  the same id) stays the batch (`test_batch_runner_that_execs_ruby_again`; removing `VCI_RAILS_BATCH` at load, the
+  first fix, lost the batch there and ran every file one process per file).
+- *A boot that is a test file of the batch drove the batch again.* `ci/batch_queue_result_reuse_test.rb` starts with
+  `require_relative "queue_result_reuse_test"`, another file of the batch, which is therefore its group's boot. The
+  group's process required it from inside the runner's request for the first file, so the gate took it for the
+  runner's request for a file of the batch and, `@target` being unset in a group's process, drove the whole batch again
+  from there. The boot now loads as a plain require (`Batch.preload`: as the file's first statement loads it in a
+  one-file run, its tests with it) (`test_batch_boot_that_is_a_test_file`; fails with 2.0.4's collector).
+
+## Shared output: what a boot's files share, written once (vci 2.1)
+
+Date: 2026-10-18. Same machine, Ruby 3.4.9, Rails 8.1.3.1; vex-api from a clone of vex-git master `3738f8486d` (no
+remote, never pushed), its own test database (`vex_laneb`; slots `vex_laneb_0..7`), MySQL 8 in Docker.
+
+At exit a file's process wrote its whole output, ~14,500 lines on vex-api, of which ~14,400 are what its boot had
+recorded before the fork (the same for every file of the group): 3.5 s a file (B measured ~3.3 s), profiled in four
+file processes as 1.8 to 2.0 s classifying ~21,500 records (`Output.classify`: real paths, gem lookups), 0.5 to 1.7 s
+comparing the used gems' files with their archives (`GemVerify`), 0.3 to 0.4 s writing the lines, the rest under 0.1 s.
+
+**O1. What is written once.** In the process files' processes fork from (the group's process, one file at a time; or
+each slot, after its setup), before the first fork, `Batch.share!` forks a child that makes the output this process
+would write if it ended now (`Output.lines_of(shared: true)`: no meta, no taints, no result, each line once; the
+runner's checks of the batch's files, `loader_check`, left out), writes it to `$VCI_OUT/batch/shared-<pid>.jsonl`,
+and sends back over a pipe (Marshal) how it classified each path, what it found in the gems' archives, the lines and
+their sha256. The parent keeps these; every file's process inherits them. The child does the work because making
+those lines loads and memoizes things (`DB.schema_files` requires Active Record's database tasks, `GemVerify`
+requires `rubygems/package` and zlib, `Tz.source` may set up TZInfo's data source): in the parent they would be
+loaded in every file's process, whose own run may load them (and record that) or not. Under slots the group's process
+does it once before the slots fork (classifications only, no file), so a slot's own `share!` classifies only what
+its setup recorded (0.8 to 1.4 s on vex-api against 3.0 to 3.6 s for a group's).
+
+**O2. What a file's process writes.** At exit it still makes all of its lines, as before (`Output.lines_of`), but a
+path the boot classified is not classified again and a gem file the boot compared with its archive is not compared
+again (the same functions, given the boot's answers; `GemVerify` keeps each file's result and its place in the archive
+so the taints come out in the same order). `Batch.split` then writes: its meta line; `{"kind":"shared", "base":
+"shared-<pid>.jsonl", "sha256": <of that file>, "drop": [<indexes of shared lines that are not this file's>]}`; and
+every line of its own that is not one of the shared lines (a line it has twice: once more), taints and result last as
+before. Lines are compared as values (`Hash#eql?`), so a line that differs in any way is the file's own and the
+shared line it replaces is dropped. On vex-api a file drops one or two lines (an `env` line whose `where` list grew:
+`PARALLEL_WORKERS`, `FORCE_DATABASE_SELECTOR` read again from another place) and writes 6 to 120 of its own (its
+test file, what it autoloaded, absent lookups, its result).
+
+**O3. Reading it.** `read_batch` (rails.rs) reads each file's output with the shared lines it names
+(`merge_shared`): the named file in `batch/` (a plain name, no path), checked against the sha256, then its lines but
+those dropped, then the file's own lines but the `shared` line, parsed as one output (`parse_jsonl_text`). The
+parser's sets do not depend on order, and taints are only in the file's own lines, so `Observed` is what the whole
+output gives, taints in the same order. A file whose shared lines cannot be read as named (missing, another sha256,
+an index they do not have, two `shared` lines, a bad name) runs again one process per file (`its output names lines
+it shares with the other files of its boot, which vci could not read (...)`). An output with a `shared` line read
+anywhere else is refused (`vci:unknown-record-kind:shared`).
+
+**O4. Why it is sound.** The shared lines hold only what the process the files fork from had recorded before the
+fork, which each file's process inherits. Nothing recorded after a fork is shared, and a file's process does not
+trust the shared lines to be its own: it makes all of its lines and writes the difference both ways (its lines that
+are not shared, the shared lines that are not its), so the two read together are its lines whatever happened after
+the fork (a path written that the boot probed, a record deleted, a classification depending on a file's state such
+as `DB.exempt`). What it reuses is the boot's classification of a path recorded before the fork and the boot's
+comparison of a gem file with its archive: both depend only on the path and on files that do not change during a run
+(the gems, the zone database, Ruby's directories), and a classification needing a gem the file's process does not
+have is made again. Anything that fails in `share!` (the child dies, the pipe is garbled) leaves `@shared` unset and
+every file's process writes all of its output; anything that fails in `split` writes all of that file's output.
+`VCI_RAILS_SHARED_OUTPUT=0` (in vci's environment, passed on) does the same for the whole run.
+
+**O5. Same output, checked.** Five vex-api files (the first five of B's 50), at W=1 and at W=3, with a scratch copy
+of the collector (`scratchpad/laneB/dual`) that also kept, in each file's process, its whole lines (as above) and its
+lines made again with the boot's classifications and gem checks forgotten (vci 2.0's output; only the result's
+`durationMs`, the time it is made, differs): for every file, the split output read with its shared lines is, sorted,
+byte for byte the whole output (14,407 to 14,519 lines at W=1; 14,422 to 14,521 at W=3); the whole output is line for
+line, in the same order, vci 2.0's; and Rust's `Observed` of the two (`parse_jsonl_text`; `scratchpad/laneB/obscmp`) is
+equal for all ten (10,046 to 10,140 probes, ~3,410 modules, 137 externals each). `cmp_shared.py`, output in
+`scratchpad/laneB/cmp-w{1,3}.txt`.
+
+**O6. Measurements (50 files, B's list).** Release `vci` built from this tree, a throwaway key, `/usr/bin/time -l env
+VCI_RAILS_JOBS=<W> [VCI_RAILS_SHARED_OUTPUT=0] VCI_TIMING=1 mise exec -- vci run <files> --key <key>`, one run after
+the other on this Mac (not otherwise idle). `a file's process wrote its output` is timed in each file's process from
+the start of `Output.write!` to its end (`batch/output.jsonl`, which `vci run` now logs):
+
+| | wall | user + sys | a file's output: average, longest | shared lines written | attested / refused |
+|---|---|---|---|---|---|
+| W=1, each file writes all (`VCI_RAILS_SHARED_OUTPUT=0`) | 1004.96 s | 214.70 s + 83.86 s | 3.50 s, 5.38 s | — | 47 / 3 |
+| W=1, shared | 851.58 s | 88.87 s + 61.46 s | **0.17 s**, 1.42 s | once, 3.6 s | 47 / 3, the same |
+| W=8, each file writes all | 136.79 s | 236.08 s + 78.68 s | 3.82 s, 6.34 s | — | 47 / 3, the same |
+| W=8, shared | 135.18 s | 87.76 s + 57.61 s | **0.13 s**, 0.24 s | 8 times (once per slot), 0.8 s at most | 47 / 3, the same |
+
+At W=1 the batch is 153 s shorter (3.3 s a file); the CPU time of the run drops from 299 s to 150 s. At W=8 a file's
+process took 1.2 s on average instead of 4.9 s, but the wall time is the same: the slots' setup varied from run to
+run (47.7 s and 62.2 s at most, eight concurrent seed loads) and vci checks and signs the 47 results one after another
+afterwards. W=1's 1,005 s against S's 1,432.9 s for the same files and build: the machine, not the code (the files'
+tests are most of it, B).
+
+**O7. What is left per file.** The collector's work at exit is now ~0.1 to 0.2 s (making the ~14,500 lines from the
+boot's answers, comparing them, writing ~100). Next: vci's own checking and signing of each result after the batch,
+one after another (~1 s a file, `ssh-keygen -Y sign` per attestation; S7: about half of the `application` group's
+wall time at W=8), and on the vci side parsing and hashing ~14,500 inputs per file, which the shared lines could let
+it do once per boot (not done: `Observed` and the store are unchanged).
+
+**Tests.** `collector_test.rb`: `test_batch_shared_output_is_each_files_own_output` (a file writing a path the boot
+found absent, a file reading an environment variable the boot read elsewhere, the runner's checks of each file; one
+at a time and in two slots: each file's output read with its shared lines is, sorted, the output written with
+`VCI_RAILS_SHARED_OUTPUT=0`; the probe is dropped for the file that wrote the path only; one shared file per boot or
+slot; it fails when the drops are not written); the batch helper reads every batch test's outputs as vci does, so the
+existing batch tests check the merged output. rails.rs: `batch_shared_output_is_merged` (a merged `Observed` equals the
+whole output's; another sha256, a missing index, a missing file, two references and a name outside `batch/` fall
+back; the timings). `e2e_rails.rs`/`e2e_rspec.rs`: the batch tests now also check that the shared lines were used; the
+manifests they compare, batch against one process per file, are the merged ones.
+
 ## Not done
 
-- **Batch files in parallel**: a batch runs its files' processes one at a time (B5); in parallel each would need a
-  database of its own, as Rails' `parallelize` makes.
+- **Slots for RSpec with a database each**: rspec-rails has no parallel workers; a project using parallel_tests
+  (`TEST_ENV_NUMBER` in `config/database.yml`) would need the configuration evaluated again in each slot. With
+  `VCI_RAILS_JOBS`, RSpec slots share the test database (S3).
+- **Signing in parallel**: after the slots, `vci` checks and signs each file one after another (about 1.1 s a file, B).
+- **Reading the shared lines once in vci**: `read_batch` puts each file's output back together and parses ~14,500
+  lines per file; the store and manifests are unchanged (Shared output, O7).
 - **RSpec expectation counts**: RSpec does not count expectations, and vci does not either; an example without one
   passes (Minitest's no-assertion rule has no RSpec counterpart).
 - **RSpec on a GitHub runner**: checked in the Linux container only (R14).

@@ -47,7 +47,7 @@ use crate::pytest::{OneRun, per_file_jobs};
 use crate::vitest::{apply_env, describe};
 use crate::{
     Adapter, AdapterError, ChildEnv, InstalledExternals, ListedFile, Observed, RunOutput,
-    ToolVersions, parse_jsonl_dir,
+    ToolVersions, parse_jsonl_dir, parse_jsonl_text,
 };
 
 /// Env var naming the `ruby` binary (default: `ruby` on PATH).
@@ -66,6 +66,29 @@ pub const RAILS_PER_FILE_ENV: &str = "VCI_RAILS_PER_FILE";
 /// Env var (of the Ruby process) naming the file that lists the test ids of
 /// a batch run, one per line: the collector's batch mode.
 const RAILS_BATCH_ENV: &str = "VCI_RAILS_BATCH";
+
+/// Set (in vci's environment) to a number: how many slots a batch runs at
+/// once, each a process set up as a Rails parallel worker is (a database of
+/// its own) that forks one process per file. Without it: `PARALLEL_WORKERS`
+/// above 1 (in vci's environment; the test processes always get 1), else
+/// `VCI_JOBS` or the processor count capped by the project's
+/// `parallelize(workers:)`, and only for a project whose test setup calls
+/// Rails' `parallelize` (with processes; `PARALLEL_WORKERS=1` in vci's
+/// environment or `workers: 1` turns them off); set, it applies to any
+/// project (`1`: one file at a time).
+pub const RAILS_JOBS_ENV: &str = "VCI_RAILS_JOBS";
+
+/// Env vars (of the Ruby process): the slots of a batch run (see
+/// [`RAILS_JOBS_ENV`]), and what asked for them ([`rails_slots`]).
+const RAILS_SLOTS_ENV: &str = "VCI_RAILS_SLOTS";
+const RAILS_SLOTS_ASKED_ENV: &str = "VCI_RAILS_SLOTS_ASKED";
+
+/// Set to `0` (in vci's environment; passed on to the Ruby process): in a
+/// batch, each file's process writes all of its output, as a one-file run
+/// does, instead of only what is not in the lines every file of its boot
+/// (or slot) shares, which the boot writes once ([`merge_shared`]). For
+/// debugging, or to compare.
+pub const RAILS_SHARED_OUTPUT_ENV: &str = "VCI_RAILS_SHARED_OUTPUT";
 
 /// The fixed Minitest seed of every run (`--seed`): the order of the tests in
 /// a file and `Kernel#rand` (Minitest seeds it) are the same where the file
@@ -567,7 +590,16 @@ impl RailsAdapter {
         let mut c = Command::new(&self.ruby);
         c.current_dir(&self.project_dir).stdin(Stdio::null());
         apply_env(&mut c, env);
-        for k in ["RUBYLIB", "VCI_OUT", "VCI_TEST_ID", "SPRING_SERVER_COMMAND"] {
+        // VCI_RAILS_BATCH_PID: the collector names the batch's own process
+        // there (a stale one would make it take itself for a test's child).
+        for k in [
+            "RUBYLIB",
+            "VCI_OUT",
+            "VCI_TEST_ID",
+            "VCI_RAILS_BATCH",
+            "VCI_RAILS_BATCH_PID",
+            "SPRING_SERVER_COMMAND",
+        ] {
             c.env_remove(k);
         }
         c.env("RUBYOPT", format!("-r{collector}"))
@@ -822,8 +854,16 @@ impl RailsAdapter {
         text.push('\n');
         std::fs::write(&list, text)?;
         let mut cmd = self.test_cmd(env, "collect", &dirs, collector, runner, files);
+        let (slots, asked) = rails_slots();
         cmd.env("VCI_OUT", dirs.out.as_str())
-            .env(RAILS_BATCH_ENV, list.as_str());
+            .env(RAILS_BATCH_ENV, list.as_str())
+            .env(RAILS_SLOTS_ENV, slots.to_string());
+        if let Some(asked) = asked {
+            cmd.env(RAILS_SLOTS_ASKED_ENV, asked);
+        }
+        if let Ok(v) = std::env::var(RAILS_SHARED_OUTPUT_ENV) {
+            cmd.env(RAILS_SHARED_OUTPUT_ENV, v);
+        }
         // macOS's Objective-C runtime kills a forked process that touches a
         // class another thread was initializing at the fork (vex-api's
         // boot: `+[__NSCFConstantString initialize] may have been in
@@ -842,16 +882,57 @@ impl RailsAdapter {
             ),
             RailsRunner::Rspec => format!("rspec --options .rspec <{} files>", files.len()),
         };
+        let (observed, fallback, code, slots) = read_batch(&dirs.out, files)?;
         let mut log = format!(
-            "vci: {shown}, booted once, one process per file (exit {})\n",
+            "vci: {shown}, booted once, one process per file (exit {}){}\n",
             out.status
                 .code()
-                .map_or_else(|| "signal".to_owned(), |c| c.to_string())
+                .map_or_else(|| "signal".to_owned(), |c| c.to_string()),
+            if slots.count > 1 {
+                format!(", {} slots at once", slots.count)
+            } else {
+                String::new()
+            },
         )
         .into_bytes();
+        if slots.count > 1 && !slots.file_ms.is_empty() {
+            let n = slots.file_ms.len() as f64;
+            let sum: u64 = slots.file_ms.iter().sum();
+            let max = slots.file_ms.iter().max().copied().unwrap_or(0);
+            log.extend_from_slice(
+                format!(
+                    "vci: slots set up in {:.1} s at most; a file's process took {:.1} s on average, {:.1} s at most\n",
+                    slots.setup_ms as f64 / 1000.0,
+                    sum as f64 / 1000.0 / n,
+                    max as f64 / 1000.0
+                )
+                .as_bytes(),
+            );
+        }
+        if !slots.output_ms.is_empty() {
+            let n = slots.output_ms.len() as f64;
+            let sum: u64 = slots.output_ms.iter().sum();
+            let max = slots.output_ms.iter().max().copied().unwrap_or(0);
+            let shared = if slots.shared_ms.is_empty() {
+                "none of it shared".to_owned()
+            } else {
+                format!(
+                    "what the files of a boot share written {} time(s), in {:.1} s at most",
+                    slots.shared_ms.len(),
+                    slots.shared_ms.iter().max().copied().unwrap_or(0) as f64 / 1000.0
+                )
+            };
+            log.extend_from_slice(
+                format!(
+                    "vci: a file's process wrote its output in {:.2} s on average, {:.2} s at most ({shared})\n",
+                    sum as f64 / 1000.0 / n,
+                    max as f64 / 1000.0
+                )
+                .as_bytes(),
+            );
+        }
         log.extend_from_slice(&out.stdout);
         log.extend_from_slice(&out.stderr);
-        let (observed, fallback, code) = read_batch(&dirs.out, files)?;
         Ok(BatchRun {
             code,
             files: observed,
@@ -860,10 +941,12 @@ impl RailsAdapter {
         })
     }
 
-    /// Processes at a time for `vci run`: one. The files of a project share
-    /// the test environment's database (as in `bin/rails test`, which runs
-    /// them in one process), and Rails' `maintain_test_schema!` may rebuild
-    /// it (`bin/rails db:test:prepare`) when it is not current.
+    /// Processes at a time for `vci run` one process per file: one. The
+    /// files of a project share the test environment's database (as in
+    /// `bin/rails test`, which runs them in one process), and Rails'
+    /// `maintain_test_schema!` may rebuild it (`bin/rails db:test:prepare`)
+    /// when it is not current. (A batch runs its files in slots, each with a
+    /// database of its own: [`rails_slots`].)
     fn jobs(&self) -> usize {
         1
     }
@@ -905,10 +988,68 @@ struct BatchRun {
     log: Vec<u8>,
 }
 
+/// What `batch/files.jsonl` says of a batch's slots: how many ran files,
+/// the longest setup of one (ms), and how long each file's process took
+/// (ms); and what `batch/output.jsonl` says of the files' output: how long
+/// each file's process took to write it (ms), and each writing of the lines
+/// a boot's or slot's files share (ms).
+#[derive(Debug, Default)]
+struct SlotStats {
+    count: usize,
+    setup_ms: u64,
+    file_ms: Vec<u64>,
+    output_ms: Vec<u64>,
+    shared_ms: Vec<u64>,
+}
+
+/// The slots of a batch run, and what decided their number (the value of
+/// `VCI_RAILS_SLOTS_ASKED`): `"1"` when [`RAILS_JOBS_ENV`] asked for them
+/// (any project), `"workers"` when `PARALLEL_WORKERS` above 1 in vci's
+/// environment did (it overrides the project's `parallelize(workers:)`, as
+/// in Rails), none otherwise (the project's `parallelize(workers:)` caps
+/// them). `PARALLEL_WORKERS` set to anything else (`1`, `0`) turns Rails'
+/// parallel workers off, and with them the slots.
+fn rails_slots() -> (usize, Option<&'static str>) {
+    rails_slots_from(
+        |k| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned()),
+        || std::thread::available_parallelism().map_or(1, |n| n.get()),
+    )
+}
+
+/// [`rails_slots`] with the environment read through `var` and the
+/// processor count from `cpus`.
+fn rails_slots_from(
+    var: impl Fn(&str) -> Option<String>,
+    cpus: impl Fn() -> usize,
+) -> (usize, Option<&'static str>) {
+    let n = |k: &str| {
+        var(k)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    };
+    if let Some(w) = n(RAILS_JOBS_ENV) {
+        return (w, Some("1"));
+    }
+    if let Some(v) = var("PARALLEL_WORKERS") {
+        return match v.trim().parse::<usize>() {
+            Ok(w) if w > 1 => (w, Some("workers")),
+            _ => (1, None),
+        };
+    }
+    (n(crate::JOBS_ENV).unwrap_or_else(cpus), None)
+}
+
 /// A batch run's output in `out`: every file's `<sha256(id)>.jsonl`, written
 /// by its own process as a one-file run writes it, and `batch/files.jsonl`
 /// with a line per file: `{"id", "exit"}` (its process's exit status, null
-/// when a signal killed it) or `{"id", "why"}` (it must run on its own).
+/// when a signal killed it; `"slot"`: the slot that ran it) or `{"id",
+/// "why"}` (it must run on its own; it overrides an earlier `{"id",
+/// "exit"}`: the batch found after the file ran that its run cannot stand).
+/// The last value returned says what the slots did (no slots: one file at
+/// a time).
+/// A file's output may name the lines it shares with the other files of its
+/// boot or slot, which are then read with it ([`merge_shared`]); when they
+/// cannot be, the file falls back.
 /// Each file's [`Observed`] is checked against its own exit status as
 /// [`RailsAdapter::run_one`] checks a one-file run's. A file without a line
 /// or without output, or every file when there is no `files.jsonl`, falls
@@ -919,7 +1060,7 @@ struct BatchRun {
 fn read_batch(
     out: &Utf8Path,
     files: &[&str],
-) -> Result<(Vec<Observed>, Fallback, Option<i32>), AdapterError> {
+) -> Result<(Vec<Observed>, Fallback, Option<i32>, SlotStats), AdapterError> {
     let everyone = |why: String| {
         (
             Vec::new(),
@@ -928,6 +1069,7 @@ fn read_batch(
                 .map(|f| (f.to_string(), why.clone()))
                 .collect::<Vec<_>>(),
             Some(0),
+            SlotStats::default(),
         )
     };
     let text = match std::fs::read_to_string(out.join("batch/files.jsonl")) {
@@ -940,6 +1082,8 @@ fn read_batch(
     };
     // id => Ok(exit status) or Err(why it must run on its own).
     let mut said: BTreeMap<String, Result<Option<i32>, String>> = BTreeMap::new();
+    let mut slots: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut stats = SlotStats::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             return Ok(everyone(format!(
@@ -947,21 +1091,47 @@ fn read_batch(
             )));
         };
         let Some(id) = v.get("id").and_then(Value::as_str) else {
+            if let Some(ms) = v.get("setup_ms").and_then(Value::as_u64) {
+                stats.setup_ms = stats.setup_ms.max(ms);
+            }
             continue;
         };
-        let st = match v.get("why").and_then(Value::as_str) {
-            Some(why) => Err(why.to_owned()),
-            None => Ok(v
-                .get("exit")
-                .and_then(Value::as_i64)
-                .and_then(|c| i32::try_from(c).ok())),
-        };
-        said.entry(id.to_owned()).or_insert(st);
+        match v.get("why").and_then(Value::as_str) {
+            // A why stands, whatever was said of the file before.
+            Some(why) => {
+                said.insert(id.to_owned(), Err(why.to_owned()));
+            }
+            None => {
+                if let Some(s) = v.get("slot").and_then(Value::as_u64) {
+                    slots.insert(s);
+                }
+                if let Some(ms) = v.get("ms").and_then(Value::as_u64) {
+                    stats.file_ms.push(ms);
+                }
+                let c = v
+                    .get("exit")
+                    .and_then(Value::as_i64)
+                    .and_then(|c| i32::try_from(c).ok());
+                said.entry(id.to_owned()).or_insert(Ok(c));
+            }
+        }
     }
-    let mut own: BTreeMap<String, Observed> = parse_jsonl_dir(out)?
-        .into_iter()
-        .map(|o| (o.test_id.clone(), o))
-        .collect();
+    if let Ok(t) = std::fs::read_to_string(out.join("batch/output.jsonl")) {
+        for v in t
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        {
+            let Some(ms) = v.get("ms").and_then(Value::as_u64) else {
+                continue;
+            };
+            if v.get("file").is_some() {
+                stats.output_ms.push(ms);
+            } else if v.get("shared").is_some() {
+                stats.shared_ms.push(ms);
+            }
+        }
+    }
+    let (mut own, broken) = read_batch_outputs(out)?;
     let mut observed = Vec::new();
     let mut fallback = Vec::new();
     let mut code = Some(0);
@@ -980,6 +1150,10 @@ fn read_batch(
             }
             Some(Ok(c)) => c,
         };
+        if let Some(why) = broken.get(*f) {
+            fallback.push((f.to_string(), why.clone()));
+            continue;
+        }
         let Some(mut o) = own.remove(*f) else {
             fallback.push((
                 f.to_string(),
@@ -1003,7 +1177,144 @@ fn read_batch(
         }
         observed.push(o);
     }
-    Ok((observed, fallback, code))
+    stats.count = slots.len();
+    Ok((observed, fallback, code, stats))
+}
+
+/// The files' outputs of a batch run (every top-level `*.jsonl` in `out`),
+/// by test id, each read with the lines it shares with the other files of
+/// its boot or slot when it names them ([`merge_shared`]); and the files
+/// whose shared lines could not be read, with why.
+fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
+    let mut names: Vec<Utf8PathBuf> = Vec::new();
+    for ent in out.read_dir_utf8()? {
+        let ent = ent?;
+        if ent.file_type()?.is_file() && ent.path().extension() == Some("jsonl") {
+            names.push(ent.path().to_owned());
+        }
+    }
+    names.sort();
+    let mut shared = BTreeMap::new();
+    let mut own = BTreeMap::new();
+    let mut broken = BTreeMap::new();
+    for p in names {
+        let text = std::fs::read_to_string(&p)?;
+        match merge_shared(&text, out, &mut shared) {
+            Ok(merged) => {
+                let o = parse_jsonl_text(merged.as_deref().unwrap_or(&text), &p);
+                own.insert(o.test_id.clone(), o);
+            }
+            Err(why) => {
+                let o = parse_jsonl_text(&text, &p);
+                broken.insert(
+                    o.test_id,
+                    format!(
+                        "its output names lines it shares with the other files of its boot, which vci could not read ({why})"
+                    ),
+                );
+            }
+        }
+    }
+    Ok((own, broken))
+}
+
+/// Each file's [`Observed`] by test id, and why some files' outputs cannot
+/// be read, by test id.
+type BatchOutputs = (BTreeMap<String, Observed>, BTreeMap<String, String>);
+
+/// The shared lines of a batch's boot or slot, by file name: their sha256
+/// (hex) and the lines, or why they cannot be read.
+type SharedLines = BTreeMap<String, Result<(String, Vec<String>), String>>;
+
+/// The output a file's process wrote in a batch (`own`) put together with
+/// the lines it shares with the other files of its boot or slot, when it
+/// names them: a line `{"kind":"shared","base":<name>,"sha256":<hex>,
+/// "drop":[<index>, ...]}` (the collector's `Batch.split`) names
+/// `<out>/batch/<name>`, which the boot's or slot's process wrote once
+/// before any of its files' processes forked (lines of what it had observed
+/// until then, which each of them inherited: `Batch.share!`), with the
+/// sha256 of its content, and the indexes (from 0) of its lines that are
+/// not this file's. Returns those lines but the dropped ones, then `own`
+/// but the `shared` line: the output the process writes when nothing is
+/// shared, line for line (in another order); `None` when `own` names no
+/// shared lines (it is whole). An error says why the two cannot be put
+/// together (a missing or changed file, a bad name or index, two `shared`
+/// lines).
+fn merge_shared(
+    own: &str,
+    out: &Utf8Path,
+    cache: &mut SharedLines,
+) -> Result<Option<String>, String> {
+    let mut refs = own.lines().filter(|l| l.contains(r#""kind":"shared""#));
+    let Some(line) = refs.next() else {
+        return Ok(None);
+    };
+    if refs.next().is_some() {
+        return Err("more than one line names them".into());
+    }
+    let v: Value = serde_json::from_str(line).map_err(|e| format!("a bad line {line:?}: {e}"))?;
+    if v.get("kind").and_then(Value::as_str) != Some("shared") {
+        return Err(format!("a bad line {line:?}"));
+    }
+    let name = v
+        .get("base")
+        .and_then(Value::as_str)
+        .filter(|n| {
+            !n.is_empty()
+                && !n.starts_with('.')
+                && n.ends_with(".jsonl")
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+        .ok_or_else(|| format!("a bad name in {line:?}"))?;
+    let want = v
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("no sha256 in {line:?}"))?;
+    let drop: Vec<u64> = v
+        .get("drop")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().map(Value::as_u64).collect())
+        .ok_or_else(|| format!("no list of dropped lines in {line:?}"))?;
+    let entry = cache.entry(name.to_owned()).or_insert_with(|| {
+        use sha2::{Digest, Sha256};
+        let path = out.join("batch").join(name);
+        std::fs::read_to_string(&path)
+            .map(|t| {
+                (
+                    hex::encode(Sha256::digest(t.as_bytes())),
+                    t.lines().map(str::to_owned).collect(),
+                )
+            })
+            .map_err(|e| format!("{path}: {e}"))
+    });
+    let (sha, lines) = entry.as_ref().map_err(Clone::clone)?;
+    if sha != want {
+        return Err(format!(
+            "batch/{name} does not have the sha256 the file's output names"
+        ));
+    }
+    let mut keep = vec![true; lines.len()];
+    for i in drop {
+        let slot = usize::try_from(i)
+            .ok()
+            .and_then(|i| keep.get_mut(i))
+            .ok_or_else(|| format!("batch/{name} has no line {i}"))?;
+        *slot = false;
+    }
+    let mut text =
+        String::with_capacity(own.len() + lines.iter().map(|l| l.len() + 1).sum::<usize>());
+    for (l, k) in lines.iter().zip(keep) {
+        if k {
+            text.push_str(l);
+            text.push('\n');
+        }
+    }
+    for l in own.lines().filter(|l| !std::ptr::eq(*l, line)) {
+        text.push_str(l);
+        text.push('\n');
+    }
+    Ok(Some(text))
 }
 
 /// A result that failed (a test failed or errored).
@@ -1916,6 +2227,39 @@ mod tests {
         assert!(files[0].taints[0].starts_with("vci:process-exit:signal"));
     }
 
+    /// How many slots a batch runs, and what asked for them:
+    /// VCI_RAILS_JOBS for any project; PARALLEL_WORKERS above 1 overrides
+    /// the project's `workers:`, and 1 (or 0, or anything else) turns the
+    /// slots off, as it turns Rails' workers off; else VCI_JOBS or the
+    /// processor count.
+    #[test]
+    fn rails_slots_follow_the_environment() {
+        let slots = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            rails_slots_from(
+                |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
+                || 14,
+            )
+        };
+        assert_eq!(slots(&[]), (14, None));
+        assert_eq!(slots(&[("VCI_JOBS", "6")]), (6, None));
+        assert_eq!(slots(&[("PARALLEL_WORKERS", "1")]), (1, None));
+        assert_eq!(slots(&[("PARALLEL_WORKERS", "0")]), (1, None));
+        assert_eq!(
+            slots(&[("PARALLEL_WORKERS", "x"), ("VCI_JOBS", "6")]),
+            (1, None)
+        );
+        assert_eq!(slots(&[("PARALLEL_WORKERS", "4")]), (4, Some("workers")));
+        assert_eq!(
+            slots(&[("PARALLEL_WORKERS", "1"), ("VCI_RAILS_JOBS", "3")]),
+            (3, Some("1"))
+        );
+        assert_eq!(slots(&[("VCI_RAILS_JOBS", "0")]), (14, None));
+    }
+
     /// A batch run's output: each file's own output (written by its own
     /// process) with its own exit status: a pass whose process exited
     /// non-zero is tainted, a failure with exit 0 counts as exit 1, and the
@@ -1978,7 +2322,8 @@ mod tests {
         );
         let reads =
             |o: &Observed| -> Vec<String> { o.reads.iter().map(|p| p.to_string()).collect() };
-        let (obs, fallback, code) = read_batch(&out, &files).unwrap();
+        let (obs, fallback, code, slots) = read_batch(&out, &files).unwrap();
+        assert_eq!(slots.count, 0);
         assert_eq!(obs.len(), 2);
         assert_eq!(obs[0].test_id, files[0]);
         assert_eq!(
@@ -2010,7 +2355,7 @@ mod tests {
             out.join(name(files[1])),
             &[meta(files[1]), result("failed", 1)],
         );
-        let (obs, _, code) = read_batch(&out, &files).unwrap();
+        let (obs, _, code, _) = read_batch(&out, &files).unwrap();
         assert!(obs.iter().all(|o| o.taints.is_empty()), "{obs:?}");
         assert_eq!(code, Some(1));
         let mut zero = lines;
@@ -2019,22 +2364,177 @@ mod tests {
             out.join("batch/files.jsonl"),
             &zero.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
         );
-        let (_, _, code) = read_batch(&out, &files).unwrap();
+        let (_, _, code, _) = read_batch(&out, &files).unwrap();
         assert_eq!(code, Some(1));
         write(
             out.join(name(files[1])),
             &[meta(files[1]), result("passed", 0)],
         );
-        let (_, _, code) = read_batch(&out, &files).unwrap();
+        let (_, _, code, _) = read_batch(&out, &files).unwrap();
         assert_eq!(code, Some(0));
 
+        // Slots: each line names the slot that ran the file; a slot's own
+        // line (no id) is not a file's; a later why overrides an earlier
+        // exit (the group found afterwards that the file's run cannot stand).
+        let slotted = [
+            r#"{"slot":0,"setup_ms":1500}"#,
+            r#"{"slot":1,"setup_ms":900}"#,
+            r#"{"id":"test/a_test.rb","exit":0,"slot":0,"ms":2000}"#,
+            r#"{"slot":2,"why":"slot 2's setup failed"}"#,
+            r#"{"id":"test/b_test.rb","exit":0,"slot":1,"ms":3000}"#,
+            r#"{"id":"test/c_test.rb","exit":0,"slot":0}"#,
+            r#"{"id":"test/c_test.rb","why":"a process of the batch changed x in vci's temp directory"}"#,
+            r#"{"done":true}"#,
+        ];
+        write(
+            out.join("batch/files.jsonl"),
+            &slotted.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+        );
+        let (obs, fallback, code, slots) = read_batch(&out, &files).unwrap();
+        assert_eq!(slots.count, 2);
+        assert_eq!(slots.setup_ms, 1500);
+        assert_eq!(slots.file_ms, [2000, 3000]);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            obs.iter().map(|o| o.test_id.as_str()).collect::<Vec<_>>(),
+            [files[0], files[1]]
+        );
+        assert_eq!(
+            fallback.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(),
+            [files[2], files[3], files[4]]
+        );
+        assert!(fallback[0].1.contains("temp directory"), "{fallback:?}");
+
         std::fs::remove_file(out.join("batch/files.jsonl")).unwrap();
-        let (obs, fallback, _) = read_batch(&out, &files).unwrap();
+        let (obs, fallback, _, _) = read_batch(&out, &files).unwrap();
         assert!(obs.is_empty());
         assert_eq!(fallback.len(), 5);
         assert!(
             fallback[0].1.contains("said nothing of its files"),
             "{fallback:?}"
+        );
+    }
+
+    /// A file's output that names the lines it shares with the other files
+    /// of its boot is read with them, but those it drops: what its process
+    /// writes when nothing is shared. A file whose shared lines cannot be
+    /// read as named (another sha256, an index they do not have, a missing
+    /// file, two names, a name outside `batch/`) falls back.
+    #[test]
+    fn batch_shared_output_is_merged() {
+        use sha2::{Digest, Sha256};
+        let t = tempfile::tempdir().unwrap();
+        let out = Utf8PathBuf::from_path_buf(t.path().to_owned()).unwrap();
+        std::fs::create_dir(out.join("batch")).unwrap();
+        let name = |id: &str| format!("{}.jsonl", hex::encode(Sha256::digest(id.as_bytes())));
+        let meta =
+            |id: &str| format!(r#"{{"v":1,"kind":"meta","testId":"{id}","adapter":"rails"}}"#);
+        let result = r#"{"kind":"result","state":"passed","tests":1,"failed":0,"skipped":0}"#;
+        let shared = [
+            r#"{"kind":"read","path":"/repo/config/boot.rb"}"#,
+            r#"{"kind":"probe","path":"/repo/tmp/made.txt"}"#,
+            r#"{"kind":"env","key":"HOST","where":"/repo/config/boot.rb"}"#,
+            r#"{"kind":"external","name":"rack","version":"3.2.7","platform":"ruby"}"#,
+        ];
+        let text = shared.join("\n") + "\n";
+        std::fs::write(out.join("batch/shared-7.jsonl"), &text).unwrap();
+        let sha = hex::encode(Sha256::digest(text.as_bytes()));
+        let reference = |base: &str, sha: &str, drop: &str| {
+            format!(r#"{{"kind":"shared","base":"{base}","sha256":"{sha}","drop":[{drop}]}}"#)
+        };
+        let files = [
+            "test/a_test.rb",
+            "test/b_test.rb",
+            "test/c_test.rb",
+            "test/d_test.rb",
+            "test/e_test.rb",
+            "test/f_test.rb",
+            "test/g_test.rb",
+        ];
+        let own = |id: &str, refs: &[String]| {
+            let mut l = vec![meta(id)];
+            l.extend(refs.iter().cloned());
+            l.push(format!(r#"{{"kind":"write","path":"/repo/tmp/{id}"}}"#));
+            l.push(r#"{"kind":"taint","reason":"its own"}"#.to_owned());
+            l.push(result.to_owned());
+            l.join("\n") + "\n"
+        };
+        let ok = reference("shared-7.jsonl", &sha, "1");
+        let cases = [
+            vec![ok.clone()],
+            vec![reference("shared-7.jsonl", &"0".repeat(64), "1")],
+            vec![reference("shared-7.jsonl", &sha, "1,4")],
+            vec![reference("shared-8.jsonl", &sha, "")],
+            vec![ok.clone(), ok.clone()],
+            vec![reference("../shared-7.jsonl", &sha, "")],
+            vec![],
+        ];
+        for (id, refs) in files.iter().zip(&cases) {
+            std::fs::write(out.join(name(id)), own(id, refs)).unwrap();
+        }
+        let status: Vec<String> = files
+            .iter()
+            .map(|f| format!(r#"{{"id":"{f}","exit":0}}"#))
+            .chain([r#"{"done":true}"#.to_owned()])
+            .collect();
+        std::fs::write(out.join("batch/files.jsonl"), status.join("\n") + "\n").unwrap();
+        std::fs::write(
+            out.join("batch/output.jsonl"),
+            [
+                r#"{"shared":"shared-7.jsonl","lines":4,"ms":2500}"#,
+                r#"{"file":"test/a_test.rb","ms":120,"lines":9,"own":4,"drop":1}"#,
+                r#"{"file":"test/g_test.rb","ms":300,"lines":5}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let (obs, fallback, code, stats) = read_batch(&out, &files).unwrap();
+        assert_eq!(code, Some(0));
+        assert_eq!(stats.output_ms, [120, 300]);
+        assert_eq!(stats.shared_ms, [2500]);
+        assert_eq!(
+            obs.iter().map(|o| o.test_id.as_str()).collect::<Vec<_>>(),
+            [files[0], files[6]]
+        );
+        // A: the shared lines but the probe, and its own.
+        let whole = [
+            meta(files[0]),
+            shared[0].to_owned(),
+            shared[2].to_owned(),
+            shared[3].to_owned(),
+            format!(r#"{{"kind":"write","path":"/repo/tmp/{}"}}"#, files[0]),
+            r#"{"kind":"taint","reason":"its own"}"#.to_owned(),
+            result.to_owned(),
+        ]
+        .join("\n");
+        assert_eq!(
+            obs[0],
+            parse_jsonl_text(&whole, &out.join(name(files[0]))),
+            "{obs:?}"
+        );
+        assert!(obs[0].probes.is_empty());
+        assert_eq!(obs[0].taints, ["its own"]);
+        assert_eq!(obs[0].env_keys.len(), 1);
+        assert_eq!(obs[0].externals.len(), 1);
+        // G names nothing shared: read as it is.
+        assert!(obs[1].reads.is_empty() && obs[1].env_keys.is_empty());
+        let whys: BTreeMap<&str, &str> = fallback
+            .iter()
+            .map(|(f, w)| (f.as_str(), w.as_str()))
+            .collect();
+        assert_eq!(whys.len(), 5, "{fallback:?}");
+        assert!(
+            whys[files[1]].contains("does not have the sha256"),
+            "{whys:?}"
+        );
+        assert!(whys[files[2]].contains("has no line 4"), "{whys:?}");
+        assert!(whys[files[3]].contains("shared-8.jsonl"), "{whys:?}");
+        assert!(whys[files[4]].contains("more than one line"), "{whys:?}");
+        assert!(whys[files[5]].contains("a bad name"), "{whys:?}");
+        assert!(
+            whys.values()
+                .all(|w| w.starts_with("its output names lines it shares")),
+            "{whys:?}"
         );
     }
 

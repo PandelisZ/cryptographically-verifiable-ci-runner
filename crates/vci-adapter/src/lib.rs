@@ -30,7 +30,7 @@ pub use cargo::{
 pub use golang::{
     GO_ALWAYS_READ_ENV, GO_BIN_ENV, GO_HASH, GO_IGNORE, GO_LOOSE_HASH, GO_NET_TAINT, GoAdapter,
 };
-pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file};
+pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file, parse_jsonl_text};
 pub use nodetest::{
     Invocation as NodeTestInvocation, NODE_TEST_HASH, NODE_TEST_LOOSE_HASH, NODE_TEST_RUN_VARS,
     NODE_TEST_TS_LOADERS, NodeTestAdapter, NodeTestOptions, Preload as NodeTestPreload,

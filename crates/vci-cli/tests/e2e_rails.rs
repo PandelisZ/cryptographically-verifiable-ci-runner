@@ -851,6 +851,21 @@ fn rails_run_refuses_unattestable_test_files() {
     );
 }
 
+/// Whether a `vci run` ran a batch in slots (its log says how many).
+fn slotted(stderr: &str) -> bool {
+    stderr.lines().any(|l| {
+        l.contains(", booted once, one process per file (exit ") && l.ends_with(" slots at once")
+    })
+}
+
+/// A slot's SQLite database or one of its siblings (`db/test.sqlite3_<i>`).
+fn is_slot_db(p: &str) -> bool {
+    p.strip_prefix("db/test.sqlite3_").is_some_and(|rest| {
+        let n = rest.split('-').next().unwrap_or("");
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 /// Every manifest entry (test and global) of a stored predicate, as
 /// (path, kind).
 fn manifest_entries(pred: &Value) -> Vec<(String, String)> {
@@ -911,6 +926,7 @@ fn rails_database_contents_are_not_an_input() {
         &["run", B, dblist, "--key", w.trusted.to_str().unwrap()],
     );
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    let in_slots = slotted(&stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(
         stderr.contains("vci: 2 attested, 0 not attested"),
@@ -965,12 +981,16 @@ fn rails_database_contents_are_not_an_input() {
                 manifest_entries(&pred).contains(&("db".to_owned(), "dirListing".to_owned())),
                 "{id}"
             );
+            // In slots (VCI_RAILS_JOBS), the slots' databases
+            // (db/test.sqlite3_<i>, Rails' parallel workers') are there too,
+            // left out of the listing the same way.
             let names: BTreeSet<String> = db
                 .iter()
                 .map(|(p, k)| {
                     assert_eq!(k, "excluded", "{id}: {p}");
                     p.clone()
                 })
+                .filter(|p| !(in_slots && is_slot_db(p)))
                 .collect();
             assert_eq!(
                 names,
@@ -985,6 +1005,20 @@ fn rails_database_contents_are_not_an_input() {
         }
     }
 
+    // In slots, B's manifest also has what its slot's setup recorded (see
+    // same_entries): its one-file run below is another attestation, made
+    // here first on the database as it is.
+    let attestations = || {
+        AttestStore::new(&store_for(&work))
+            .list(Some(B))
+            .unwrap()
+            .len()
+    };
+    if in_slots {
+        let alone = w.run(&work, &[B], &w.trusted);
+        assert!(alone.contains("1 attested"), "{alone}");
+    }
+    let before = attestations();
     // Rows written into the test database directly change nothing.
     bundle_ruby(
         &w,
@@ -997,11 +1031,8 @@ fn rails_database_contents_are_not_an_input() {
     let again = w.run(&work, &[B], &w.trusted);
     assert!(again.contains("1 attested"), "{again}");
     assert_eq!(
-        AttestStore::new(&store_for(&work))
-            .list(Some(B))
-            .unwrap()
-            .len(),
-        1,
+        attestations(),
+        before,
         "the database's contents are not part of the inputs"
     );
     // A row no fixture removes: still skipped (what the test database holds
@@ -2885,6 +2916,44 @@ fn entries_of(work: &Path, id: &str) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+/// A file's manifest in a batch (`batch`) has its own run's entries
+/// (`own`), entry for entry. In slots, it may also have what its slot's
+/// setup recorded before the file's process forked (collected in `setup`):
+/// Rails' TestDatabases loading the schema into a new slot database (or
+/// truncating one an earlier run left) requires Active Record's schema and
+/// database task files, whose load-path lookups in the project's lib/ and
+/// vendor/ are `absent` entries. A one-file run, whose database is already
+/// loaded, does not require them.
+fn same_entries(
+    own: &BTreeSet<(String, String)>,
+    batch: &BTreeSet<(String, String)>,
+    id: &str,
+    slotted: bool,
+    setup: &mut Option<BTreeSet<(String, String)>>,
+) {
+    assert_eq!(
+        own.difference(batch).collect::<Vec<_>>(),
+        Vec::<&(String, String)>::new(),
+        "{id}: entries only its own run has"
+    );
+    let extra: BTreeSet<(String, String)> = batch.difference(own).cloned().collect();
+    if !slotted {
+        assert_eq!(
+            extra,
+            BTreeSet::new(),
+            "{id}: entries only the batch run has"
+        );
+        return;
+    }
+    for (p, k) in &extra {
+        assert!(
+            k == "absent" && (p.starts_with("lib/") || p.starts_with("vendor/")),
+            "{id}: an entry only the batch run has that its slot's setup does not explain: {p} {k}"
+        );
+    }
+    setup.get_or_insert_with(BTreeSet::new).extend(extra);
+}
+
 /// What `vci run` said of each file: `None` attested, else why not.
 fn outcomes(stderr: &str) -> BTreeMap<String, Option<String>> {
     let mut out = BTreeMap::new();
@@ -2913,6 +2982,13 @@ fn outcomes(stderr: &str) -> BTreeMap<String, Option<String>> {
 /// attested ones, and a change to what a file read runs that file.
 #[test]
 fn rails_batch_mode_gives_what_one_process_per_file_gives() {
+    batch_gives_what_one_process_per_file_gives(BATCH);
+}
+
+/// [`rails_batch_mode_gives_what_one_process_per_file_gives`] with `batch`
+/// (vci's environment for the batch runs).
+fn batch_gives_what_one_process_per_file_gives(batch: &[(&str, &str)]) {
+    let in_slots = batch.iter().any(|(k, _)| *k == "VCI_RAILS_JOBS");
     let Some(alone) = World::new() else { return };
     let Some(w) = World::new() else { return };
     add_batch_files(&alone);
@@ -2923,7 +2999,7 @@ fn rails_batch_mode_gives_what_one_process_per_file_gives() {
     // process: both pass, and vci exits 0.
     let key = w.trusted.to_str().unwrap().to_owned();
     let q = ["test/batch/q1_test.rb", "test/batch/q2_test.rb"];
-    let out = w.vci_env(&w.work, &["run", q[0], q[1], "--key", key.as_str()], BATCH);
+    let out = w.vci_env(&w.work, &["run", q[0], q[1], "--key", key.as_str()], batch);
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "{stderr}");
     assert!(
@@ -2952,7 +3028,7 @@ fn rails_batch_mode_gives_what_one_process_per_file_gives() {
     };
     let (code_alone, err_alone) = run(&alone, &[("VCI_RAILS_PER_FILE", "1")]);
     assert!(!err_alone.contains("booted once"), "{err_alone}");
-    let (code, err) = run(&w, BATCH);
+    let (code, err) = run(&w, batch);
     assert!(
         err.contains(&format!(
             "vci: ruby bin/rails test <{} files> --seed 0, booted once, one process per file",
@@ -2961,6 +3037,25 @@ fn rails_batch_mode_gives_what_one_process_per_file_gives() {
         "{err}"
     );
     assert!(!err.contains("run again one process per file"), "{err}");
+    // What the files of a boot (or slot) share was written once for them,
+    // and each file's process wrote the rest of its output: the inputs
+    // compared below are those two read together.
+    assert!(
+        err.lines().any(
+            |l| l.starts_with("vci: a file's process wrote its output in ")
+                && l.contains("what the files of a boot share written ")
+        ),
+        "{err}"
+    );
+    if in_slots {
+        assert!(
+            err.contains(&format!(
+                "{} files> --seed 0, booted once, one process per file (exit 1), 3 slots at once",
+                files.len()
+            )),
+            "{err}"
+        );
+    }
     assert_eq!(code, code_alone);
     let (want, got) = (outcomes(&err_alone), outcomes(&err));
     assert_eq!(want.len(), files.len(), "{err_alone}");
@@ -2989,18 +3084,14 @@ fn rails_batch_mode_gives_what_one_process_per_file_gives() {
         .copied()
         .filter(|f| want[*f].is_none())
         .collect();
+    let mut setup = None;
     for id in &attested {
-        let own = entries_of(&alone.work, id);
-        let batch = entries_of(&w.work, id);
-        assert_eq!(
-            batch.difference(&own).collect::<Vec<_>>(),
-            Vec::<&(String, String)>::new(),
-            "{id}: entries only the batch run has"
-        );
-        assert_eq!(
-            own.difference(&batch).collect::<Vec<_>>(),
-            Vec::<&(String, String)>::new(),
-            "{id}: entries only its own run has"
+        same_entries(
+            &entries_of(&alone.work, id),
+            &entries_of(&w.work, id),
+            id,
+            slotted(&err),
+            &mut setup,
         );
     }
     let has = |id: &str, path: &str| entries_of(&w.work, id).iter().any(|(p, _)| p == path);
@@ -3075,4 +3166,74 @@ fn rails_batch_mode_gives_what_one_process_per_file_gives() {
             .count(),
         attested.len()
     );
+}
+
+/// Slots (`VCI_RAILS_JOBS=3`): the batch runs its files three at a time,
+/// each slot set up as a Rails parallel worker (a database of its own:
+/// `db/test.sqlite3_<i>`), each file still in a process of its own. What
+/// [`rails_batch_mode_gives_what_one_process_per_file_gives`] checks holds:
+/// the same files attested and refused for the same reasons as one process
+/// per file, a failing file failing only itself, the same exit code, the
+/// same inputs (but for the load-path lookups of the slot's database setup,
+/// see [`same_entries`]). And two files that would collide on one database
+/// (each, without a transaction, inserts a row and expects to be the only
+/// one with it while the other does the same) both pass, run at the same
+/// time in separate slots.
+#[test]
+fn rails_slots_give_what_one_process_per_file_gives() {
+    const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "3")];
+    batch_gives_what_one_process_per_file_gives(SLOTS);
+
+    let Some(w) = World::new() else { return };
+    let collide = |n: &str| {
+        format!(
+            "require \"test_helper\"\n\nclass Collide{n}Test < ActiveSupport::TestCase\n  self.use_transactional_tests = false\n\n  test \"owns its row\" do\n    Widget.create!(name: \"collide\", size: {n})\n    sleep 2\n    assert_equal [{n}], Widget.where(name: \"collide\").pluck(:size)\n  ensure\n    Widget.where(name: \"collide\").delete_all\n  end\nend\n"
+        )
+    };
+    let files = [
+        "test/slots/c1_test.rb",
+        "test/slots/c2_test.rb",
+        "test/slots/fails_test.rb",
+    ];
+    w.put(files[0], &collide("1"));
+    w.put(files[1], &collide("2"));
+    w.put(
+        files[2],
+        "require \"test_helper\"\n\nclass SlotFailsTest < ActiveSupport::TestCase\n  test \"fails\" do\n    sleep 1\n    assert_equal 1, Widget.count + 100\n  end\nend\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "slot files"]);
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", key.as_str()]);
+    let out = w.vci_env(&w.work, &args, SLOTS);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stderr.contains(
+            "vci: ruby bin/rails test <3 files> --seed 0, booted once, one process per file (exit 1), 3 slots at once"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("run again one process per file"),
+        "{stderr}"
+    );
+    let got = outcomes(&stderr);
+    assert_eq!(got[files[0]], None, "{stderr}");
+    assert_eq!(got[files[1]], None, "{stderr}");
+    assert!(
+        got[files[2]]
+            .as_deref()
+            .is_some_and(|w| w.contains("result failed (1 failed of 1)")),
+        "{stderr}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    // Each slot's database is Rails' parallel worker's.
+    for i in 0..3 {
+        assert!(
+            w.work.join(format!("db/test.sqlite3_{i}")).exists(),
+            "slot {i}"
+        );
+    }
 }

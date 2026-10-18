@@ -1772,10 +1772,446 @@ class CollectorTest < Minitest::Test
     assert_equal "no-assertions", out["test/a_test.rb"].last["state"]
   end
 
+  # A stand-in for Rails' parallel testing in a test_helper: the hooks
+  # (ActiveSupport::Testing::Parallelization) and `parallelize`'s executor
+  # (ParallelizeExecutor, which says whether its own `start` would fork
+  # workers: never under PARALLEL_WORKERS=1).
+  RAILS_PARALLEL = <<~RUBY
+    require "minitest"
+    module ActiveSupport
+      module Testing
+        class Parallelization
+          @before = []
+          @after = []
+          @cleanup = []
+          class << self
+            def before_fork_hooks = @before
+            def after_fork_hooks = @after
+            def run_cleanup_hooks = @cleanup
+          end
+        end
+
+        class ParallelizeExecutor
+          attr_reader :size, :parallelize_with, :started_with
+
+          def initialize(size:, with:)
+            @size = size
+            @parallelize_with = with
+          end
+
+          def start = (@started_with = should_parallelize?)
+          def <<(_work) = nil
+          def shutdown = nil
+
+          private
+
+          def should_parallelize? = false
+        end
+      end
+    end
+  RUBY
+
+  # Slots (VCI_RAILS_SLOTS): a project that runs its tests in Rails' worker
+  # processes gets its group's files run in that many slots at once. Each
+  # slot is set up as a Rails worker is (Rails' after-fork hooks with its
+  # index, once: what they read is in each of its files' inputs), then forks
+  # one process per file: the first files are dealt one per slot, the rest
+  # come from a shared queue. A file's process does not seed again (the
+  # executor says the run is parallel; its own `start` still gets its own
+  # answer), has its slot's temp dir, and its own output, result and exit
+  # status; the slot's cleanup hooks run at its end.
+  def test_batch_slots_run_files_as_rails_workers
+    put("test/seed.txt", "seed")
+    put("test/test_helper.rb", RAILS_PARALLEL + <<~RUBY)
+      require "tmpdir"
+      Minitest.parallel_executor = ActiveSupport::Testing::ParallelizeExecutor.new(size: 1, with: :processes)
+      $hooks = []
+      ActiveSupport::Testing::Parallelization.before_fork_hooks << -> { $hooks << :before_fork }
+      ActiveSupport::Testing::Parallelization.after_fork_hooks << lambda do |i|
+        $slot = i
+        $seeded_by = Process.pid
+        $seed = File.read(File.expand_path("seed.txt", __dir__))
+      end
+      ActiveSupport::Testing::Parallelization.run_cleanup_hooks << lambda do |i|
+        File.write(File.join(Dir.tmpdir, "cleanup-\#{i}"), $hooks.inspect)
+        File.write(File.expand_path("../cleanup-\#{i}", __dir__), [$hooks, Dir.children(Dir.tmpdir)].inspect)
+      end
+    RUBY
+    body = lambda do |name, ok|
+      <<~RUBY
+        require "test_helper"
+
+        class #{name}Test < Minitest::Test
+          def test_#{name.downcase}
+            assert_equal "seed", $seed
+            refute_equal Process.pid, $seeded_by
+            assert Minitest.parallel_executor.send(:should_parallelize?)
+            assert_equal false, Minitest.parallel_executor.started_with
+            assert_equal File.join(#{@tmpdir.inspect}, "vci-slots", $slot.to_s), Dir.tmpdir
+            refute File.exist?(File.join(Dir.tmpdir, "cache.txt"))
+            File.write(File.join(Dir.tmpdir, "cache.txt"), "x")
+            assert #{ok}, "#{name} fails"
+          end
+        end
+      RUBY
+    end
+    put("test/a_test.rb", body.call("A", true))
+    put("test/b_test.rb", body.call("B", false))
+    put("test/c_test.rb", body.call("C", true))
+    put("test/d_test.rb", body.call("D", true))
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb]
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2" })
+    lines = out[:status].select { |l| l["id"] }
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
+    # Each slot says when it is set up, each file how long its process took.
+    assert_equal [0, 1], out[:status].filter_map { |l| l["slot"] if l.key?("setup_ms") }.sort, out[:said]
+    assert(lines.all? { |l| l["ms"].is_a?(Integer) }, out[:said])
+    assert_equal ids, lines.map { |l| l["id"] }.sort, out[:said]
+    assert_equal [0, 1], lines.map { |l| l["slot"] }.uniq.sort, out[:said]
+    assert_equal({ "test/a_test.rb" => 0, "test/b_test.rb" => 1 },
+                 lines.to_h { |l| [l["id"], l["slot"]] }.slice("test/a_test.rb", "test/b_test.rb"))
+    assert_equal({ "test/a_test.rb" => 0, "test/b_test.rb" => 1, "test/c_test.rb" => 0, "test/d_test.rb" => 0 },
+                 lines.to_h { |l| [l["id"], l["exit"]] })
+    ids.each do |id|
+      recs = out[id]
+      refute_nil recs, "#{id}: no output\n#{out[:said]}"
+      assert_equal %w[test/seed.txt], paths(recs, "read"), id
+      assert_empty taints(recs), id
+      want = id == "test/b_test.rb" ? { "state" => "failed", "failed" => 1 } : { "state" => "passed", "failed" => 0 }
+      assert_equal want, recs.last.slice("state", "failed"), id
+    end
+    # At their cleanup, the slots' temp dirs held only what their cleanup
+    # hooks wrote (the before-fork hooks ran once, in the group's process,
+    # before the slots); after the group, the slots' dirs are gone (the next
+    # group's slots start with fresh ones).
+    %w[0 1].each do |i|
+      assert_equal "[[:before_fork], [\"cleanup-#{i}\"]]", File.read(File.join(@repo, "cleanup-#{i}"))
+    end
+    assert_empty Dir.children(@tmpdir)
+  end
+
+  # Slots fall back: without Rails' parallel workers and without
+  # VCI_RAILS_JOBS, one file at a time; asked for, slots run any project; a
+  # slot whose setup fails takes no file (the others take them, and when
+  # none can, the files run on their own); a change in vci's temp dir outside
+  # the slots' own (where the boot's own paths point) sends every file of the
+  # group back.
+  def test_batch_slots_send_back_what_they_cannot_run
+    put("test/test_helper.rb", "require \"minitest\"\nrequire \"tmpdir\"\nBOOT_TMP = Dir.tmpdir\n")
+    put("test/a_test.rb", "require \"test_helper\"\nclass ATest < Minitest::Test\n  def test_a = assert(true)\nend\n")
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = assert(true)\nend\n")
+    ids = %w[test/a_test.rb test/b_test.rb]
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2" })
+    assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/b_test.rb", "exit" => 0 },
+                  { "done" => true }], out[:status], out[:said]
+
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" })
+    assert_equal({ "test/a_test.rb" => 0, "test/b_test.rb" => 1 },
+                 out[:status].filter_map { |l| [l["id"], l["slot"]] if l["id"] }.to_h, out[:said])
+    ids.each { |id| assert_equal "passed", out[id].last["state"] }
+
+    # Slot 1's setup fails: slot 0 runs both files.
+    put("test/test_helper.rb", RAILS_PARALLEL + <<~RUBY)
+      Minitest.parallel_executor = ActiveSupport::Testing::ParallelizeExecutor.new(size: 1, with: :processes)
+      ActiveSupport::Testing::Parallelization.after_fork_hooks << ->(i) { raise "no database \#{i}" if i == 1 }
+    RUBY
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2" })
+    assert_equal({ "test/a_test.rb" => 0, "test/b_test.rb" => 0 },
+                 out[:status].filter_map { |l| [l["id"], l["slot"]] if l["id"] }.to_h, out[:said])
+    assert(out[:status].any? { |l| l["slot"] == 1 && l["why"]&.include?("RuntimeError: no database 1") }, out[:said])
+    # Every slot's setup fails: the files run on their own.
+    put("test/test_helper.rb", RAILS_PARALLEL + <<~RUBY)
+      Minitest.parallel_executor = ActiveSupport::Testing::ParallelizeExecutor.new(size: 1, with: :processes)
+      ActiveSupport::Testing::Parallelization.after_fork_hooks << ->(i) { raise "no database \#{i}" }
+    RUBY
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2" })
+    assert_equal ids, out[:status].filter_map { |l| l["id"] if l["why"]&.match?(/no slot .*no database/) }, out[:said]
+    ids.each { |id| assert_nil out[id] }
+
+    # A file's process writes where the boot's temp dir is (outside its
+    # slot's): every file goes back, whatever it said before.
+    put("test/test_helper.rb", "require \"minitest\"\nrequire \"tmpdir\"\nBOOT_TMP = Dir.tmpdir\n")
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = File.write(File.join(BOOT_TMP, \"leak.txt\"), \"b\")\nend\n")
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" })
+    whys = out[:status].filter_map { |l| l["id"] if l["why"]&.include?("leak.txt") }
+    assert_equal ids, whys.sort, out[:said]
+  end
+
+  # A file's process that writes where the boot's temp dir is (outside its
+  # slot's) and removes it again before any snapshot of the temp dir sees
+  # it: a file of another slot read it meanwhile (B passes only with A's
+  # flag there, and fails on its own), so every file of the group goes back.
+  def test_batch_slots_send_back_a_transient_write_outside_their_temp_dirs
+    put("test/test_helper.rb", "require \"minitest\"\nrequire \"tmpdir\"\nBOOT_TMP = Dir.tmpdir\n")
+    put("test/a_test.rb", <<~RUBY)
+      require "test_helper"
+      class ATest < Minitest::Test
+        def test_a
+          f = File.join(BOOT_TMP, "flag")
+          File.write(f, "a")
+          sleep 1.5
+          File.delete(f)
+        end
+      end
+    RUBY
+    put("test/b_test.rb", <<~RUBY)
+      require "test_helper"
+      class BTest < Minitest::Test
+        def test_b
+          sleep 0.5
+          assert File.exist?(File.join(BOOT_TMP, "flag")), "no flag"
+          sleep 2
+        end
+      end
+    RUBY
+    ids = %w[test/a_test.rb test/b_test.rb]
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" })
+    assert_equal({ "test/a_test.rb" => 0, "test/b_test.rb" => 1 },
+                 out[:status].filter_map { |l| [l["id"], l["slot"]] if l["id"] && l.key?("exit") }.to_h, out[:said])
+    assert_equal "passed", out["test/b_test.rb"].last["state"], out[:said]
+    whys = out[:status].filter_map { |l| l["id"] if l["why"]&.match?(%r{changed \S*/flag in vci's temp directory}) }
+    assert_equal ids, whys.sort, out[:said]
+  end
+
+  # What one helper group's processes leave in vci's temp dir (its boot's
+  # files, what its slots' cleanup hooks wrote in their dirs) is gone when
+  # the next group boots, one file at a time and in slots: as for a
+  # one-file run, which gets a fresh temp dir.
+  def test_batch_groups_do_not_see_what_earlier_groups_left_in_the_temp_dir
+    put("test/fake_rails.rb", RAILS_PARALLEL)
+    put("test/helper_one.rb", <<~RUBY)
+      require "fake_rails"
+      require "tmpdir"
+      File.write(File.join(Dir.tmpdir, "boot-left"), "x")
+      Minitest.parallel_executor = ActiveSupport::Testing::ParallelizeExecutor.new(size: 1, with: :processes)
+      ActiveSupport::Testing::Parallelization.run_cleanup_hooks << ->(_) { File.write(File.join(Dir.tmpdir, "cleanup-left"), "x") }
+    RUBY
+    put("test/helper_two.rb", <<~RUBY)
+      require "fake_rails"
+      require "tmpdir"
+      Minitest.parallel_executor = ActiveSupport::Testing::ParallelizeExecutor.new(size: 1, with: :processes)
+    RUBY
+    one = "class %sTest < Minitest::Test\n  def test_x = assert(true)\nend\n"
+    put("test/a_test.rb", "require \"helper_one\"\n#{format(one, "A")}")
+    put("test/b_test.rb", "require \"helper_one\"\n#{format(one, "B")}")
+    two = <<~RUBY
+      class %sTest < Minitest::Test
+        def test_x
+          refute File.exist?(File.join(Dir.tmpdir, "boot-left")), "boot-left"
+          refute File.exist?(File.join(Dir.tmpdir, "cleanup-left")), "cleanup-left"
+          refute File.exist?(File.join(Dir.tmpdir, "..", "boot-left")), "boot-left above"
+        end
+      end
+    RUBY
+    put("test/c_test.rb", "require \"helper_two\"\n#{format(two, "C")}")
+    put("test/d_test.rb", "require \"helper_two\"\n#{format(two, "D")}")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb test/d_test.rb]
+    [{ "VCI_RAILS_SLOTS" => "1" }, { "VCI_RAILS_SLOTS" => "2" }].each do |env|
+      out = batch(ids, env: env)
+      assert_equal ids.map { |id| [id, 0] }, out[:status].filter_map { |l| [l["id"], l["exit"]] if l["id"] }.sort,
+                   out[:said]
+      ids.each { |id| assert_equal "passed", out[id].last["state"], "#{env}: #{id}\n#{out[:said]}" }
+      assert_empty Dir.children(@tmpdir)
+    end
+  end
+
+  # A project that turned Rails' parallel workers off (`parallelize(workers:
+  # 1)`: its tests must not run at once) runs one file at a time; one that
+  # asks for fewer workers than vci's slots gets that many; vci's
+  # PARALLEL_WORKERS (VCI_RAILS_SLOTS_ASKED=workers) overrides `workers:`,
+  # as in Rails.
+  def test_batch_slots_follow_the_projects_parallelize_workers
+    put("test/fake_rails.rb", RAILS_PARALLEL + <<~RUBY)
+      module ActiveSupport
+        class TestCase < Minitest::Test
+          def self.parallelize(workers: :number_of_processors, with: :processes)
+            workers = ENV["PARALLEL_WORKERS"].to_i if ENV["PARALLEL_WORKERS"]
+            Minitest.parallel_executor = ActiveSupport::Testing::ParallelizeExecutor.new(size: workers, with: with)
+          end
+        end
+      end
+    RUBY
+    body = "require \"test_helper\"\nclass %sTest < ActiveSupport::TestCase\n  def test_x = assert(true)\nend\n"
+    ids = %w[a b c].map { |n| put("test/#{n}_test.rb", format(body, n.upcase)) && "test/#{n}_test.rb" }
+    slots = lambda do |workers, env = {}|
+      put("test/test_helper.rb", "require \"fake_rails\"\nActiveSupport::TestCase.parallelize(workers: #{workers})\n")
+      out = batch(ids, env: { "VCI_RAILS_SLOTS" => "4", "PARALLEL_WORKERS" => "1" }.merge(env))
+      lines = out[:status].select { |l| l["id"] }
+      assert_equal ids.map { |id| [id, 0] }, lines.map { |l| [l["id"], l["exit"]] }.sort, out[:said]
+      lines.map { |l| l["slot"] }.uniq.compact.sort
+    end
+    assert_equal [], slots.call(1)
+    assert_equal [], slots.call("1")
+    assert_equal [0, 1], slots.call(2)
+    assert_equal [0, 1, 2], slots.call(":number_of_processors")
+    assert_equal [0, 1, 2], slots.call(1, "VCI_RAILS_SLOTS_ASKED" => "workers")
+    assert_equal [0, 1, 2], slots.call(1, "VCI_RAILS_SLOTS_ASKED" => "1")
+  end
+
+  # Files whose first statement is not a require have no boot: nothing is
+  # loaded when slots would fork, so no after-fork hook would give a slot
+  # its database. They run one at a time, even when slots are asked for.
+  def test_batch_files_without_a_boot_run_one_at_a_time
+    put("test/fake_rails.rb", RAILS_PARALLEL)
+    put("test/test_helper.rb", <<~RUBY)
+      require "fake_rails"
+      ActiveSupport::Testing::Parallelization.after_fork_hooks << ->(i) { $db = i }
+    RUBY
+    body = "X%s = 1\nrequire \"test_helper\"\nclass %sTest < Minitest::Test\n  def test_x = assert_nil($db)\nend\n"
+    put("test/a_test.rb", format(body, "A", "A"))
+    put("test/b_test.rb", format(body, "B", "B"))
+    ids = %w[test/a_test.rb test/b_test.rb]
+    out = batch(ids, env: { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" })
+    assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/b_test.rb", "exit" => 0 },
+                  { "done" => true }], out[:status], out[:said]
+  end
+
+  # A runner that execs Ruby again (a binstub or wrapper: the same process)
+  # is still the batch: its files run in their own processes, as without
+  # the exec.
+  def test_batch_runner_that_execs_ruby_again
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    put("test/a_test.rb", "require \"test_helper\"\nclass ATest < Minitest::Test\n  def test_a = assert(true)\nend\n")
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = assert(true)\nend\n")
+    put("runner.rb", "require \"minitest/autorun\"\n$LOAD_PATH << \"test\"\nrequire_relative \"loader/rails/test_unit/runner\"\n" \
+                     "FakeRunner.load_tests(ARGV.grep(/_test\\.rb\\z/))\n")
+    ids = %w[test/a_test.rb test/b_test.rb]
+    out = batch(ids, script: "require \"rbconfig\"\nexec(RbConfig.ruby, \"runner.rb\", *ARGV)\n")
+    assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/b_test.rb", "exit" => 0 },
+                  { "done" => true }], out[:status], out[:said]
+    ids.each { |id| assert_equal "passed", out[id].last["state"], id }
+  end
+
+  # A child Ruby process a file's test starts (vex-api's `bin/rails runner`)
+  # loads the collector too (RUBYOPT) but is not the batch: it says nothing
+  # of the batch's files and drives nothing (it used to send every file back
+  # at its exit, and a child running the loader drove the batch again).
+  def test_batch_child_processes_are_not_the_batch
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    put("test/a_test.rb", <<~RUBY)
+      require "test_helper"
+      require "rbconfig"
+      class ATest < Minitest::Test
+        def test_a
+          assert system(RbConfig.ruby, "-e", "exit 0")
+          assert system(RbConfig.ruby, "script.rb", "test/b_test.rb", "--seed", "0", out: File::NULL, err: File::NULL)
+        end
+      end
+    RUBY
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = assert(true)\nend\n")
+    ids = %w[test/a_test.rb test/b_test.rb]
+    [{}, { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }].each do |env|
+      out = batch(ids, env: env)
+      lines = out[:status].select { |l| l["id"] || l["done"] }
+      assert_equal [["test/a_test.rb", 0], ["test/b_test.rb", 0], [nil, nil]],
+                   lines.map { |l| [l["id"], l["exit"]] }.sort_by(&:to_s), out[:said]
+      assert_includes out["test/a_test.rb"].map { |r| r["reason"] }, "process:system"
+    end
+  end
+
+  # A file whose first statement requires another test file of the batch
+  # (vex-api's ci/batch_queue_result_reuse_test.rb) has that file for its
+  # boot: loaded once in its group's process, as its own run loads it (its
+  # tests run too), and not taken for the runner's request for a file of the
+  # batch (which drove the whole batch again from the group's process).
+  def test_batch_boot_that_is_a_test_file
+    put("test/test_helper.rb", "require \"minitest\"\n")
+    put("test/a_test.rb", "require \"test_helper\"\nclass ATest < Minitest::Test\n  def test_a = assert(true)\nend\n")
+    put("test/b_test.rb", "require \"test_helper\"\nclass BTest < Minitest::Test\n  def test_b = assert(true)\nend\n")
+    put("test/c_test.rb", "require_relative \"a_test\"\nclass CTest < ATest\n  def test_c = assert(true)\nend\n")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb]
+    [{}, { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }].each do |env|
+      out = batch(ids, env: env)
+      lines = out[:status].select { |l| l["id"] || l["done"] }
+      assert_equal [["test/a_test.rb", 0], ["test/b_test.rb", 0], ["test/c_test.rb", 0], [nil, nil]],
+                   lines.map { |l| [l["id"], l["exit"]] }.sort_by(&:to_s), out[:said]
+      # C's run: A's test, C's own and the one it inherits.
+      assert_equal({ "state" => "passed", "tests" => 3 }, out["test/c_test.rb"].last.slice("state", "tests"))
+      assert_includes paths(out["test/c_test.rb"], "module"), "test/a_test.rb"
+      refute_includes paths(out["test/b_test.rb"], "module"), "test/a_test.rb"
+    end
+  end
+
+  # The lines every file of a boot (or slot) shares are written once
+  # (batch/shared-<pid>.jsonl), and each file's process writes only the rest
+  # of its lines, with the shared lines that are not its own: put together
+  # (as vci does), a file's output is, line for line, what its process
+  # writes when nothing is shared (VCI_RAILS_SHARED_OUTPUT=0), one file at a
+  # time and in slots. A's process writes a path the boot found absent (that
+  # probe is not A's input: dropped), B reads an environment variable the
+  # boot read from somewhere else (its line differs: B's own), each file
+  # keeps the runner's check of its own file only.
+  def test_batch_shared_output_is_each_files_own_output
+    put("test/test_helper.rb", <<~RUBY)
+      require "minitest"
+      BOOT = File.read(File.expand_path("boot.txt", __dir__))
+      MADE = File.exist?(File.expand_path("made_by_a.txt", __dir__))
+      ENV["VCI_BOOT_KEY"]
+    RUBY
+    put("test/boot.txt", "boot")
+    put("test/data/b.txt", "b")
+    put("test/a_test.rb", <<~RUBY)
+      require "test_helper"
+      class ATest < Minitest::Test
+        def test_a
+          path = File.expand_path("made_by_a.txt", __dir__)
+          File.write(path, "a")
+          File.delete(path)
+          assert true
+        end
+      end
+    RUBY
+    put("test/b_test.rb", <<~RUBY)
+      require "test_helper"
+      class BTest < Minitest::Test
+        def test_b
+          assert_equal "b", File.read("test/data/b.txt")
+          assert_nil ENV["VCI_BOOT_KEY"]
+        end
+      end
+    RUBY
+    put("test/c_test.rb", "require \"test_helper\"\nclass CTest < Minitest::Test\n  def test_c = assert(BOOT == \"boot\")\nend\n")
+    ids = %w[test/a_test.rb test/b_test.rb test/c_test.rb]
+    norm = lambda do |lines|
+      lines.map { |l| l.sub(/"durationMs":\d+/, "\"durationMs\":0") }.sort
+    end
+    slots = { "VCI_RAILS_SLOTS" => "2", "VCI_RAILS_SLOTS_ASKED" => "1" }
+    [{}, slots].each do |env|
+      full = batch(ids, env: env.merge("VCI_RAILS_SHARED_OUTPUT" => "0"))
+      out = batch(ids, env: env)
+      # (Which slot takes the third file is a race.)
+      assert_equal full[:status].filter_map { |l| l.slice("id", "exit") if l["id"] }.sort_by(&:to_s),
+                   out[:status].filter_map { |l| l.slice("id", "exit") if l["id"] }.sort_by(&:to_s), out[:said]
+      shared = out[:output].filter_map { |l| l["shared"] }
+      assert_equal(env.empty? ? 1 : 2, shared.size, out[:said])
+      ids.each do |id|
+        refute(full[:own][id].any? { |l| l.include?("\"kind\":\"shared\"") }, id)
+        refs = out[:own][id].select { |l| l.include?("\"kind\":\"shared\"") }
+        assert_equal 1, refs.size, "#{id}: #{out[:said]}"
+        assert_equal norm.call(full[:lines][id]), norm.call(out[:lines][id]), id
+        # Most of a file's output is its boot's.
+        assert_operator out[:own][id].size * 2, :<, out[:lines][id].size, id
+        assert_includes paths(out[id], "module"), id
+        (ids - [id]).each { |other| refute_includes paths(out[id], "module"), other, id }
+      end
+      a_ref = JSON.parse(out[:own]["test/a_test.rb"].find { |l| l.include?("\"kind\":\"shared\"") })
+      refute_empty a_ref["drop"]
+      refute_includes paths(out["test/a_test.rb"], "probe"), "test/made_by_a.txt"
+      assert_includes paths(out["test/c_test.rb"], "probe"), "test/made_by_a.txt"
+      assert_includes paths(out["test/a_test.rb"], "write"), "test/made_by_a.txt"
+      b_env = out["test/b_test.rb"].select { |r| r["kind"] == "env" && r["key"] == "VCI_BOOT_KEY" }
+      assert_equal 1, b_env.size
+      assert_includes b_env[0]["where"], "b_test.rb"
+      # Each file's process says how long writing its output took.
+      assert_equal ids.sort, out[:output].filter_map { |l| l["file"] }.sort
+      assert(out[:output].select { |l| l["file"] }.all? { |l| l["ms"].is_a?(Integer) && l["own"] < l["lines"] })
+    end
+  end
+
   # Run the files `ids` with the collector in batch mode, the loader asking
   # for each (or `script`): each id's records, the lines of files.jsonl
   # (:status) and what the process said (:said).
-  def batch(ids, script: nil)
+  def batch(ids, script: nil, env: {})
     put("loader/rails/test_unit/runner.rb",
         "module FakeRunner\n  def self.load_tests(files) = files.each { |f| require File.expand_path(f) }\nend\n")
     script ||= "require \"minitest/autorun\"\n$LOAD_PATH << \"test\"\nrequire_relative \"loader/rails/test_unit/runner\"\n" \
@@ -1787,15 +2223,36 @@ class CollectorTest < Minitest::Test
     e = {
       "RUBYOPT" => "-r#{COLLECTOR}", "VCI_RAILS_MODE" => "collect", "VCI_OUT" => @out, "VCI_RAILS_BATCH" => list,
       "VCI_ROOT" => @repo, "VCI_REPO" => @repo, "TMPDIR" => @tmpdir, "RUBYLIB" => nil, "BUNDLE_GEMFILE" => nil
-    }
+    }.merge(env)
+    FileUtils.rm_rf(Dir[File.join(@tmpdir, "*")])
     said = IO.popen(e, [RbConfig.ruby, "script.rb", *ids, "--seed", "0"], chdir: @repo, err: %i[child out], &:read)
     status_file = File.join(@out, "batch", "files.jsonl")
     assert File.file?(status_file), "no batch status; process said:\n#{said}"
-    out = { said: said, status: File.readlines(status_file).map { |l| JSON.parse(l) } }
+    out = { said: said, status: File.readlines(status_file).map { |l| JSON.parse(l) }, lines: {}, own: {} }
+    timing = File.join(@out, "batch", "output.jsonl")
+    out[:output] = File.file?(timing) ? File.readlines(timing).map { |l| JSON.parse(l) } : []
     ids.each do |id|
       f = File.join(@out, "#{Digest::SHA256.hexdigest(id)}.jsonl")
-      out[id] = File.readlines(f).map { |l| JSON.parse(l) } if File.file?(f)
+      next unless File.file?(f)
+      out[:own][id] = File.readlines(f)
+      out[:lines][id] = merged(out[:own][id])
+      out[id] = out[:lines][id].map { |l| JSON.parse(l) }
     end
     out
+  end
+
+  # A batch file's output lines as vci reads them (rails.rs, read_batch):
+  # when they name the lines the files of their boot share, those lines
+  # (their content as named, but those dropped), then the file's own.
+  def merged(own)
+    refs = own.select { |l| JSON.parse(l)["kind"] == "shared" }
+    return own if refs.empty?
+    assert_equal 1, refs.size
+    ref = JSON.parse(refs[0])
+    assert_match(/\Ashared-\d+\.jsonl\z/, ref["base"])
+    text = File.read(File.join(@out, "batch", ref["base"]))
+    assert_equal ref["sha256"], Digest::SHA256.hexdigest(text)
+    drop = ref["drop"].to_h { |i| [i, true] }
+    text.lines.each_with_index.reject { |_, i| drop[i] }.map(&:first) + (own - refs)
   end
 end

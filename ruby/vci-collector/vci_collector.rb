@@ -55,7 +55,20 @@ module VciCollector
   # test files (`bin/rails test <files>`, `rspec <files>`); the variable names
   # a file listing their test ids, one per line. Read here, before any hook
   # is installed. See Batch.
-  BATCH = ENV["VCI_RAILS_BATCH"]
+  # The batch is the process vci started (or what it execs: the same
+  # process id, as a binstub or wrapper that execs Ruby again), never a
+  # child process a test starts (`ruby bin/rails runner`, `ruby -e`): it
+  # inherits RUBYOPT and VCI_RAILS_BATCH, and would otherwise take itself
+  # for the batch's driver: at its exit it said that every file of the
+  # batch must run again on its own, and a child `bin/rails test` of a file
+  # of the batch drove the whole batch again (vex-api's
+  # solid_queue_shutdown_test.rb runs `bin/rails runner`). The first process
+  # to load the collector names itself in VCI_RAILS_BATCH_PID; a process
+  # with another id is a process without a test id, which writes nothing.
+  # (Removing VCI_RAILS_BATCH instead lost the batch in a runner that execs
+  # Ruby again.)
+  ENV["VCI_RAILS_BATCH_PID"] ||= Process.pid.to_s if ENV["VCI_RAILS_BATCH"]
+  BATCH = (ENV["VCI_RAILS_BATCH"] if ENV["VCI_RAILS_BATCH_PID"] == Process.pid.to_s)
   BATCH_IDS = if BATCH && !BATCH.empty? && MODE == "collect"
                 begin
                   File.read(BATCH).split("\n").reject(&:empty?).freeze
@@ -63,6 +76,19 @@ module VciCollector
                   [].freeze
                 end
               end
+  # Batch mode: how many slots run a group's files at once (VCI_RAILS_SLOTS,
+  # set by vci: VCI_RAILS_JOBS, else PARALLEL_WORKERS above 1, else
+  # VCI_JOBS, else the processor count; 1 when vci's PARALLEL_WORKERS is 1),
+  # and what decided that number (VCI_RAILS_SLOTS_ASKED): "1", VCI_RAILS_JOBS
+  # (any project); "workers", PARALLEL_WORKERS (as in Rails, it overrides
+  # the project's `parallelize(workers:)`). See Batch.slots_for.
+  SLOTS = [ENV["VCI_RAILS_SLOTS"].to_i, 1].max
+  SLOTS_ASKED = ENV["VCI_RAILS_SLOTS_ASKED"] == "1"
+  SLOTS_WORKERS = ENV["VCI_RAILS_SLOTS_ASKED"] == "workers"
+  # Batch mode: whether the lines every file of a boot (or slot) shares are
+  # written once for them all (Batch.share!; VCI_RAILS_SHARED_OUTPUT=0:
+  # each file's process writes all of its output, as a one-file run does).
+  SHARED_OUTPUT = ENV["VCI_RAILS_SHARED_OUTPUT"] != "0"
   # The fresh temp dir vci gave this process (TMPDIR), read once here: a test
   # that later sets ENV["TMPDIR"] (to "/tmp", HOME, "/") changes where its
   # own temp files go, never which reads the collector treats as vci's
@@ -410,6 +436,7 @@ module VciCollector
       abs = follow ? resolve(abs) : resolve_parent(abs)
       @records[[:write, abs]] = true
       @written[abs] = true
+      Batch.slot_wrote(abs) if Batch.slot
       if produced
         @produced[abs] = true
       elsif gone
@@ -485,6 +512,7 @@ module VciCollector
       if writes
         @records[[:write, abs]] = true
         @written[abs] = true
+        Batch.slot_wrote(abs) if Batch.slot
         parent_observed(abs)
         # Truncated or created: what it holds from now on is the process's
         # own. A read before this point (recorded then) stays an input.
@@ -772,9 +800,33 @@ module VciCollector
   # `require_relative "x"`, `require File.expand_path("x", __dir__)`) has
   # no boot in common with others: its process requires everything itself.
   #
+  # Slots: when the project runs its tests in Rails' parallel worker
+  # processes (`parallelize`, with: :processes), or VCI_RAILS_JOBS asks for
+  # it, a group of several files runs in W slots at once (SLOTS, at most one
+  # per file). After the boot, the group's process runs Rails' before-fork
+  # hooks and forks one long-lived process per slot, which does what a Rails
+  # parallel worker does after its fork: `parallel_worker_id = i` and every
+  # after-fork hook with its index (Rails' own creates and loads the
+  # database `<db>_<i>` and reconnects to it; `parallelize_setup` blocks,
+  # Oaken's `load_seed`). Then the slot forks one process per file, one at a
+  # time: slot i's first file is the group's i-th, the rest come from a
+  # queue the slots share, in the group's order. A file's process is the
+  # same one-file run as above, against its slot's database, which it does
+  # not seed again: Minitest's executor says the run is parallel
+  # (`should_parallelize?`, which Oaken's first `before_setup` asks), as in
+  # a Rails worker. Each slot has a temp dir of its own (TMPDIR), cleaned
+  # after each file's process as above; at its end the slot runs the
+  # cleanup hooks (`parallelize_teardown`). What the files of different
+  # slots share is what Rails' workers share: the file system, the database
+  # server, and vci's temp dir outside the slots' own (any change there
+  # sends every file of the group back to run on its own).
+  #
   # $VCI_OUT/batch/files.jsonl gets a line per file: {id, exit} (its
-  # process's exit status; null: a signal killed it), or {id, why}: vci must
-  # run it again on its own. The driver ends with {done: true}.
+  # process's exit status; null: a signal killed it; with `slot`: the slot
+  # that ran it), or {id, why}: vci must run it again on its own (a later
+  # {id, why} overrides an earlier {id, exit}). A slot that could not set up
+  # or stopped says so in a line {slot, why} with no id. The driver ends
+  # with {done: true}.
   module Batch
     # The loaders of the test runners (the frame that asks for a test file).
     LOADERS = %r{/(rails/test_unit/runner|rspec/core/configuration)\.rb\z}
@@ -789,12 +841,49 @@ module VciCollector
        :expand]
     ].freeze
 
+    # Extends Minitest's executor in a slot (Batch.parallel_executor!):
+    # `should_parallelize?` is true, except to the executor's own `start`
+    # (Rails' ParallelizeExecutor forks its workers when it says so).
+    module SlotExecutor
+      def start(*args, **kw, &blk)
+        @vci_own_start = true
+        super if defined?(super)
+      ensure
+        @vci_own_start = false
+      end
+
+      def should_parallelize?
+        return super if @vci_own_start && defined?(super)
+        true
+      end
+    end
+
+    # Records what ActiveSupport::TestCase.parallelize was asked for
+    # (Batch.install_parallelize).
+    module ParallelizeCall
+      def parallelize(*args, **kw, &blk)
+        VciCollector::Batch.parallelize_called(kw.fetch(:workers, :number_of_processors))
+        super
+      end
+    end
+
     @target = nil
     @own_fork = false
+    @slot = nil
+    @slot_tmp = nil
 
     class << self
       # The test id this process runs (a file's process), or nil.
       attr_reader :target
+      # The index of the slot this process belongs to (a slot's process or
+      # a file's process forked from it), or nil; its temp dir, or nil.
+      attr_reader :slot, :slot_tmp
+
+      # Whether this process is a slot running Rails' after-fork hooks
+      # (creating and loading its database).
+      def slot_setup?
+        @slot_setup == true
+      end
 
       def on?
         !BATCH_IDS.nil?
@@ -856,7 +945,7 @@ module VciCollector
         p = VciCollector.pathify(path)
         return :load unless p.is_a?(String) && names.key?(VciCollector.quiet { Real.basename(p, ".rb") })
         id = id_of(p)
-        return :load unless id && loader_call?
+        return :load if @preloading || !(id && loader_call?)
         drive! if @target.nil?
         id == @target ? :load : :skip
       end
@@ -868,13 +957,30 @@ module VciCollector
         VciCollector.quiet { Dir.mkdir(status_dir) unless Real.directory?(status_dir) }
         groups = BATCH_IDS.uniq.group_by { |f| boot_of(f) }
         code = 0
+        why = nil
         groups.each do |boot, files|
+          if why
+            files.each { |f| status(id: f, why: why) }
+            next
+          end
+          # What a group's processes leave in vci's temp dir (its boot's
+          # files, its slots' dirs and what their hooks wrote there) is
+          # removed before the next group boots, as each one-file run gets
+          # a fresh temp dir; a change to what was there before it (the
+          # runner's own files) would be seen by the next groups: they run
+          # on their own.
+          before = tmp_entries
           pid = fork_own
           return become(run_group(boot, files)) if pid.nil?
           _, st = Process.wait2(pid)
           c = st.exitstatus || 1
           code = c if code.zero?
           unsaid(files, st)
+          changed = tmp_cleanup(before)
+          unless changed.empty?
+            why = "the group of #{files.first} changed #{changed.first(3).join(", ")} in vci's temp directory, " \
+                  "which the files of the groups after it would see: they run on their own"
+          end
         end
         status(done: true)
         flush
@@ -897,6 +1003,10 @@ module VciCollector
                   "it runs on its own"
           end
         end
+        if why.nil? && (w = slots_for(files, boot)) > 1
+          return run_slots(files, w)
+        end
+        share!(write: true) if why.nil? && files.size > 1
         first = 0
         files.each do |f|
           if why
@@ -922,6 +1032,346 @@ module VciCollector
         raise if @target
         $stderr.puts "vci_collector: batch boot: #{e.class}: #{e.message}"
         Process.exit!(1)
+      end
+
+      # --- slots --------------------------------------------------------------
+
+      # How many slots run the group's `files` (1: one file at a time, as
+      # above): SLOTS, at most one per file, when the project runs its tests
+      # in Rails' parallel worker processes (at most as many as its
+      # `parallelize(workers:)` asks for, unless vci's PARALLEL_WORKERS says
+      # how many: `workers: 1` is a project whose tests must not run at
+      # once) or VCI_RAILS_JOBS asked for it. Never for a group without a
+      # boot (`boot` nil): nothing is loaded when the slots fork, so no
+      # after-fork hook gives a slot its database (the files' own
+      # `require "test_helper"` registers Rails' only after the fork), and
+      # its files would run at once on one database.
+      def slots_for(files, boot)
+        w = [SLOTS, files.size].min
+        return 1 if w < 2 || boot.nil?
+        return w if SLOTS_ASKED
+        return 1 unless rails_parallel?
+        return w if SLOTS_WORKERS
+        n = workers_asked
+        n.nil? ? w : [w, n].min.clamp(1, w)
+      end
+
+      # The number of workers the boot's `parallelize(workers:)` asked for
+      # (an Integer), or nil (`:number_of_processors`, the default, or not
+      # seen). Recorded by ParallelizeCall: under vci's PARALLEL_WORKERS=1,
+      # Rails' executor always has size 1.
+      def workers_asked
+        v = @workers
+        return nil if v.nil? || v == :number_of_processors
+        Integer(v.is_a?(String) ? v.strip : v)
+      rescue ArgumentError, TypeError
+        nil
+      end
+
+      # ActiveSupport::TestCase.parallelize was called with `workers`.
+      def parallelize_called(workers)
+        @workers = workers
+      end
+
+      # Hook ActiveSupport::TestCase.parallelize (VciCollector::HOOKS), in
+      # batch mode only: what it was asked for decides the slots
+      # (workers_asked).
+      def install_parallelize
+        return true unless on?
+        return false unless defined?(::ActiveSupport::TestCase)
+        return false if ::ActiveSupport.respond_to?(:autoload?) && !::ActiveSupport.autoload?(:TestCase).nil?
+        return false unless ::ActiveSupport::TestCase.respond_to?(:parallelize)
+        ::ActiveSupport::TestCase.singleton_class.prepend(ParallelizeCall)
+        true
+      end
+
+      # Whether the boot called Rails' `parallelize` with processes (its
+      # executor is Rails' and forks workers): the project's test setup is
+      # made for processes with a database each.
+      def rails_parallel?
+        return false unless defined?(::Minitest) && ::Minitest.respond_to?(:parallel_executor)
+        return false unless defined?(::ActiveSupport::Testing::ParallelizeExecutor)
+        ex = ::Minitest.parallel_executor
+        ex.is_a?(::ActiveSupport::Testing::ParallelizeExecutor) && ex.parallelize_with == :processes
+      rescue StandardError
+        false
+      end
+
+      # Rails' parallelization hooks of `kind` (:before_fork_hooks,
+      # :after_fork_hooks, :run_cleanup_hooks), or none.
+      def rails_hooks(kind)
+        return [] unless defined?(::ActiveSupport::Testing::Parallelization)
+        p = ::ActiveSupport::Testing::Parallelization
+        p.respond_to?(kind) ? Array(p.public_send(kind)) : []
+      rescue StandardError
+        []
+      end
+
+      # The directory holding the slots' temp dirs, in vci's temp dir.
+      def slots_root
+        TMP.nil? || TMP.empty? ? nil : File.join(TMP, "vci-slots")
+      end
+
+      # In a group's process after the boot: `w` slots run the files (returns
+      # the file in that file's process; exits in the group's). The group's
+      # process waits for every slot, then says why of each file no slot ran,
+      # and sends every file back when something changed in vci's temp dir
+      # outside the slots' own (a file the boot opened there, a cache another
+      # file's process could have read: who changed it, and who saw it, is
+      # unknown).
+      def run_slots(files, w)
+        root = slots_root
+        VciCollector.quiet do
+          Dir.mkdir(root) unless Real.directory?(root)
+          w.times { |i| Dir.mkdir(File.join(root, i.to_s)) unless Real.directory?(File.join(root, i.to_s)) }
+        end if root
+        queue = File.join(OUT.to_s, "batch", "queue-#{Process.pid}")
+        VciCollector.quiet { File.write(queue, w.to_s) }
+        if root
+          @tmp_mark = File.join(OUT.to_s, "batch", "tmp-shared-#{Process.pid}")
+          @shared_dirs = VciCollector.quiet { Output.both(TMP) }
+        end
+        begin
+          rails_hooks(:before_fork_hooks).each(&:call)
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          why = "Rails' before-fork hooks failed in the batch's boot (#{e.class}: " \
+                "#{e.message.to_s.lines.first.to_s.strip}): it runs on its own"
+          files.each { |f| status(id: f, why: why) }
+          flush
+          Process.exit!(0)
+        end
+        # What the boot recorded, classified once for every slot (each
+        # slot's own shared output then only classifies what its setup
+        # recorded).
+        share!(write: false)
+        disconnect
+        shared = shared_tmp_entries
+        pids = []
+        w.times do |i|
+          pid = fork_own
+          return run_slot(i, files, queue, shared) if pid.nil?
+          pids << pid
+        end
+        first = 0
+        died = []
+        pids.each_with_index do |pid, i|
+          _, st = Process.wait2(pid)
+          first = st.exitstatus || 1 if first.zero? && !st.success?
+          died << "slot #{i} ended (signal #{st.termsig})" if st.signaled?
+        end
+        said, stopped = said_lines
+        stopped += died
+        # A change there that is gone by now (written and removed while
+        # other slots ran) was seen by a slot after a file, or noted when a
+        # process of a slot wrote there (slot_wrote).
+        changed = (shared_tmp_changes(shared) | tmp_marked).sort
+        files.each do |f|
+          if !changed.empty?
+            status(id: f, why: "a process of the batch changed #{changed.first(3).join(", ")} in vci's temp " \
+                               "directory, outside its slot's, which any file of its group could have read: " \
+                               "it runs on its own")
+          elsif !said.include?(Json.str(f)[1..-2])
+            how = stopped.empty? ? "every slot stopped" : stopped.uniq.first(2).join("; ")
+            status(id: f, why: "no slot of the batch ran it (#{how}): it runs on its own")
+          end
+        end
+        flush
+        Process.exit!(first)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        raise if @target
+        $stderr.puts "vci_collector: batch slots: #{e.class}: #{e.message}"
+        Process.exit!(1)
+      end
+
+      # A slot's process: set up as a Rails parallel worker `i` is, then one
+      # process per file (returns the file in that file's process; exits in
+      # the slot's).
+      def run_slot(i, files, queue, shared)
+        @slot = i
+        if (root = slots_root)
+          @slot_tmp = File.join(root, i.to_s)
+          VciCollector.quiet { ENV["TMPDIR"] = @slot_tmp }
+          @own_dirs = VciCollector.quiet { Output.both(@slot_tmp) }
+          RSpecSupport.slot_moved!
+        end
+        begin
+          if defined?(::ActiveSupport::TestCase) && ::ActiveSupport::TestCase.respond_to?(:parallel_worker_id=)
+            ::ActiveSupport::TestCase.parallel_worker_id = i
+          end
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          @slot_setup = true
+          rails_hooks(:after_fork_hooks).each { |cb| cb.call(i) }
+          @slot_setup = false
+          status(slot: i, setup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round)
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          status(slot: i, why: "slot #{i}'s setup (Rails' after-fork hooks: its database, parallelize_setup) " \
+                               "failed: #{e.class}: #{e.message.to_s.lines.first.to_s.strip}")
+          take(queue, files.size, back: i)
+          cleanup_slot(i)
+          flush
+          Process.exit!(0)
+        end
+        parallel_executor!
+        share!(write: true)
+        first = 0
+        nxt = i
+        while nxt && nxt < files.size
+          f = files[nxt]
+          before = tmp_entries(@slot_tmp)
+          disconnect
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          pid = fork_own
+          return f if pid.nil?
+          _, st = Process.wait2(pid)
+          status(id: f, exit: st.exitstatus, slot: i,
+                 ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round)
+          first = st.exitstatus || 1 if first.zero? && !st.success?
+          changed = @slot_tmp ? tmp_cleanup(before, @slot_tmp) : []
+          unless changed.empty?
+            status(slot: i, why: "the process of #{f} changed #{changed.first(3).join(", ")} in slot #{i}'s temp " \
+                                 "directory: the slot takes no more files")
+            break
+          end
+          seen = shared_tmp_changes(shared)
+          unless seen.empty? && tmp_marked.empty?
+            # The group's process sends every file back for this, even when
+            # the change is gone by the time the slots end.
+            seen.each { |p| mark_tmp(p) }
+            status(slot: i, why: "vci's temp directory changed outside the slots' own: slot #{i} takes no more files")
+            break
+          end
+          nxt = take(queue, files.size)
+        end
+        cleanup_slot(i)
+        flush
+        Process.exit!(first)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        raise if @target
+        $stderr.puts "vci_collector: batch slot #{i}: #{e.class}: #{e.message}"
+        Process.exit!(1)
+      end
+
+      # Rails' cleanup hooks (parallelize_teardown), as a worker runs them
+      # before it exits.
+      def cleanup_slot(i)
+        rails_hooks(:run_cleanup_hooks).each { |cb| cb.call(i) }
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        $stderr.puts "vci_collector: slot #{i}'s cleanup hooks (parallelize_teardown): #{e.class}: #{e.message}"
+      end
+
+      # The slots' shared queue (a file: the index of the next file, then
+      # those given back): the next file's index, or nil. With `back`:
+      # gives that index back instead (a slot that cannot run its first
+      # file), for the next slot that asks.
+      def take(queue, n, back: nil)
+        VciCollector.quiet do
+          File.open(queue, File::RDWR) do |q|
+            q.flock(File::LOCK_EX)
+            nxt, *given = q.read.split(",").map(&:to_i)
+            nxt ||= n
+            i = nil
+            if back
+              given << back
+            elsif !given.empty?
+              i = given.shift
+            elsif nxt < n
+              i = nxt
+              nxt += 1
+            end
+            q.rewind
+            q.truncate(0)
+            q.write([nxt, *given].join(","))
+            q.flush
+            i
+          end
+        end
+      rescue StandardError
+        nil
+      end
+
+      # Minitest's executor in a slot says the run is parallel (Oaken's
+      # TestSetup asks `should_parallelize?` in the first `before_setup` of a
+      # process and reseeds the database unless it is: the slot seeded it
+      # once, as a Rails worker does). The executor is left as it is
+      # otherwise: Rails' own (`is_a?` as before; under vci's
+      # PARALLEL_WORKERS=1 it forks no worker, and its own `start` still gets
+      # its own answer) or Minitest's.
+      def parallel_executor!
+        return unless defined?(::Minitest) && ::Minitest.respond_to?(:parallel_executor)
+        ex = ::Minitest.parallel_executor or return
+        ex.extend(SlotExecutor)
+      rescue StandardError
+        nil
+      end
+
+      # In a slot's process, or a file's process forked from it: the process
+      # wrote `abs` (VciCollector.wrote, .opened). In vci's temp dir outside
+      # its slot's own (a path computed before the slots forked, as
+      # `BOOT_TMP = Dir.tmpdir` in a helper), a process of another slot
+      # running at the same time could have read it, which nothing records
+      # (reads in vci's temp dir are not inputs): noted for the group's
+      # process, which sends every file of the group back, even when the
+      # write is undone before any snapshot of the temp dir sees it. Writes
+      # vci cannot see (a C extension's) are caught only by the snapshots.
+      def slot_wrote(abs)
+        return if @slot.nil? || @tmp_mark.nil? || @shared_dirs.nil?
+        return unless @shared_dirs.any? { |d| VciCollector.inside?(abs, d) }
+        return if (@own_dirs || []).any? { |d| VciCollector.inside?(abs, d) }
+        mark_tmp(abs)
+      end
+
+      # Note `path` (a change in vci's temp dir outside the slots' own) for
+      # the group's process.
+      def mark_tmp(path)
+        return if @tmp_mark.nil? || (@marked ||= {}).key?(path)
+        @marked[path] = true
+        VciCollector.quiet { File.open(@tmp_mark, "a") { |f| f.write("#{path}\n") } }
+      rescue StandardError
+        nil
+      end
+
+      # What the slots' processes noted (mark_tmp) so far.
+      def tmp_marked
+        return [] if @tmp_mark.nil?
+        VciCollector.quiet { Real.exist?(@tmp_mark) ? File.read(@tmp_mark).split("\n").reject(&:empty?).uniq : [] }
+      rescue StandardError
+        []
+      end
+
+      # Every entry of vci's temp dir outside the slots' temp dirs.
+      def shared_tmp_entries
+        root = slots_root
+        tmp_entries.reject { |p, _| root && (p == root || p.start_with?("#{root}/")) }
+      end
+
+      # The entries of vci's temp dir outside the slots' that are not what
+      # they were in `before` (a directory's mtime aside).
+      def shared_tmp_changes(before)
+        after = shared_tmp_entries
+        (before.keys | after.keys).select do |p|
+          b = before[p]
+          a = after[p]
+          b.nil? || a.nil? || (b[0] != "directory" && a != b)
+        end.sort
+      end
+
+      # What files.jsonl says so far: the ids it has a line of (as Json.str
+      # spells them, without the quotes) and the slots' {slot, why} lines.
+      def said_lines
+        ids = []
+        stops = []
+        VciCollector.quiet do
+          File.readlines(File.join(OUT.to_s, "batch", "files.jsonl")).each do |l|
+            if (id = l[/"id":"((?:[^"\\]|\\.)*)"/, 1])
+              ids << id
+            elsif l.include?("\"slot\":") && (why = l[/"why":"((?:[^"\\]|\\.)*)"/, 1])
+              stops << why
+            end
+          end
+        end
+        [ids, stops]
+      rescue StandardError
+        [ids || [], stops || []]
       end
 
       # The runner's handling of its arguments (Rails' extract_filters,
@@ -987,7 +1437,9 @@ module VciCollector
       # A line of $VCI_OUT/batch/files.jsonl.
       def status(line)
         VciCollector.quiet do
-          File.open(File.join(OUT.to_s, "batch", "files.jsonl"), "a") { |f| f.write(Json.dump(line), "\n") }
+          # One write of the whole line: the slots' processes append to the
+          # same file.
+          File.open(File.join(OUT.to_s, "batch", "files.jsonl"), "a") { |f| f.write("#{Json.dump(line)}\n") }
         end
       end
 
@@ -1039,17 +1491,172 @@ module VciCollector
       end
 
       # Run a boot as the file's first statement does (recorded as anything
-      # else the process loads).
+      # else the process loads). A boot may be another test file of the
+      # batch (`require_relative "queue_result_reuse_test"`, vex-api's
+      # ci/batch_queue_result_reuse_test.rb): it loads as the first
+      # statement loads it in a one-file run (its tests with it), and is not
+      # the runner's request for a file of the batch, which the boot runs
+      # inside of (gate: before this, the group's process drove the whole
+      # batch again from there).
       def preload(boot)
+        @preloading = true
         require boot[1]
+      ensure
+        @preloading = false
+      end
+
+      # --- the output its files share ---------------------------------------
+
+      # The shared output this process's files' processes refer to (see
+      # share!), or nil: {name:, sha256:, index: {line => its index}}.
+      attr_reader :shared
+
+      # In a group's or slot's process, before it forks its files'
+      # processes: everything recorded so far is in each of them, and most
+      # of what each writes at exit is the same (on vex-api ~14,000 lines a
+      # file, 2 to 4 s of classifying them, checking the gems' files against
+      # their archives and writing them). A child process writes those lines
+      # once (`write`), as Output.lines_of makes them in a process that ends
+      # now (`shared: true`), to $VCI_OUT/batch/shared-<pid>.jsonl, and gives
+      # this process back how it classified each path and what it found in
+      # the gems' archives (inherited by every file's process, so its own
+      # output costs only what it observed itself) and the lines (this
+      # process keeps their index, see split). The child does all of it:
+      # what Output and GemVerify load or remember (the zone data source,
+      # Active Record's database tasks, rubygems/package) must not be in
+      # the processes of the files, whose own runs load it themselves, or
+      # not.
+      #
+      # Sound by construction: the shared lines hold only what this process
+      # recorded before any file's process forked from it, which every one
+      # of them inherits; each file's process still makes all of its lines
+      # at exit and writes those that are not shared, and the shared lines
+      # that are not its own (split), so the two together are its lines
+      # whatever happened after the fork. Anything that fails here leaves
+      # each file's process writing all of its output.
+      def share!(write:)
+        @shared = nil
+        return unless SHARED_OUTPUT && OUT
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        name = "shared-#{Process.pid}.jsonl"
+        r, w = VciCollector.quiet { IO.pipe }
+        disconnect
+        pid = fork_own
+        if pid.nil?
+          code = 1
+          begin
+            r.close
+            w.binmode
+            w.write(Marshal.dump(VciCollector.quiet { shared_output(write ? name : nil) }))
+            w.close
+            code = 0
+          rescue Exception => e # rubocop:disable Lint/RescueException
+            $stderr.puts "vci_collector: batch: the files' shared output: #{e.class}: #{e.message}"
+          ensure
+            Process.exit!(code)
+          end
+        end
+        w.close
+        r.binmode
+        blob = r.read
+        r.close
+        _, st = Process.wait2(pid)
+        raise "its process ended (#{st.signaled? ? "signal #{st.termsig}" : "exit #{st.exitstatus}"})" unless st.success?
+        data = Marshal.load(blob) # rubocop:disable Security/MarshalLoad
+        Output.learn(data[:classified])
+        GemVerify.learn(data[:gems])
+        return unless write
+        index = {}
+        data[:lines].each_with_index { |l, i| index[l] = i }
+        @shared = { name: name, sha256: data[:sha256], index: index, size: data[:lines].size }
+        output_line(shared: name, lines: index.size,
+                    ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round)
+      rescue StandardError => e
+        @shared = nil
+        $stderr.puts "vci_collector: batch: the lines its files share were not written once (#{e.class}: " \
+                     "#{e.message}); each file's process writes all of its output"
+      end
+
+      # In share!'s child: the shared lines (written to `name` in
+      # $VCI_OUT/batch, if given), with what the child learnt making them.
+      # The runner's checks of the batch's files (loader_check) are left
+      # out: each file's process keeps its own file's only.
+      def shared_output(name)
+        vc = VciCollector
+        (@loader_checks || {}).each_key { |k| vc.records.delete(k) }
+        DB.schema_files.each { |f| vc.schema_input(f) }
+        lines = Output.lines_of(0, shared: true)
+        out = { classified: Output.classified, gems: GemVerify.done }
+        return out unless name
+        require "digest/sha2"
+        text = lines.map { |l| "#{Json.dump(l)}\n" }.join
+        path = File.join(OUT, "batch", name)
+        File.write("#{path}.tmp", text)
+        File.rename("#{path}.tmp", path)
+        out.merge(lines: lines, sha256: Digest::SHA256.hexdigest(text))
+      end
+
+      # A file's process at exit, its output's `lines` (Output.lines_of):
+      # when its boot or slot wrote the shared lines, the lines to write
+      # instead: meta, {kind: "shared", base: <its name>, sha256: <of its
+      # content>, drop: [the indexes of its lines that are not this file's]},
+      # then every line of `lines` that is not one of the shared lines (a
+      # line twice: once more). vci reads the shared lines but those
+      # dropped, and these (read_batch). nil: write `lines` as they are.
+      def split(lines)
+        sh = @shared
+        return nil unless sh && @target
+        index = sh[:index]
+        used = Array.new(sh[:size], false)
+        own = []
+        lines.each do |l|
+          i = index[l]
+          if i.nil? || used[i]
+            own << l
+          else
+            used[i] = true
+          end
+        end
+        meta = own.shift
+        raise "no meta line first" unless meta.is_a?(Hash) && meta[:kind] == "meta"
+        drop = []
+        used.each_with_index { |u, i| drop << i unless u }
+        [meta, { kind: "shared", base: sh[:name], sha256: sh[:sha256], drop: drop }, *own]
+      rescue StandardError => e
+        $stderr.puts "vci_collector: batch: #{e.class}: #{e.message}; the file's process writes all of its output"
+        nil
+      end
+
+      # A file's process wrote its output: how long that took (from the
+      # start of Output.write!), and how much of it was its own.
+      def wrote_output(lines, split, started)
+        return unless on? && @target
+        line = { file: @target, ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round,
+                 lines: lines }
+        if split
+          line[:own] = split.size - 2
+          line[:drop] = split[1][:drop].size
+        end
+        output_line(line)
+      end
+
+      # A line of $VCI_OUT/batch/output.jsonl (timings of the files'
+      # output; read by vci for its log only).
+      def output_line(line)
+        VciCollector.quiet do
+          File.open(File.join(OUT.to_s, "batch", "output.jsonl"), "a") { |f| f.write("#{Json.dump(line)}\n") }
+        end
+      rescue StandardError
+        nil
       end
 
       # --- vci's temp dir -----------------------------------------------------
 
-      # Everything under vci's temp dir: path => [type, size, mtime].
-      def tmp_entries
+      # Everything under vci's temp dir (or `dir` in it): path => [type,
+      # size, mtime].
+      def tmp_entries(dir = TMP)
         out = {}
-        return out if TMP.nil? || TMP.empty?
+        return out if dir.nil? || dir.empty?
         VciCollector.quiet do
           walk = lambda do |d|
             (Real.dir_children(d) rescue []).each do |c|
@@ -1059,7 +1666,7 @@ module VciCollector
               walk.call(p) if st.directory?
             end
           end
-          walk.call(TMP)
+          walk.call(dir)
         end
         out
       end
@@ -1068,8 +1675,8 @@ module VciCollector
       # dir per process, as one-file runs get). Returns the files it found
       # there before and changed or removed (the next file's process would
       # see that).
-      def tmp_cleanup(before)
-        after = tmp_entries
+      def tmp_cleanup(before, dir = TMP)
+        after = tmp_entries(dir)
         VciCollector.quiet do
           (after.keys - before.keys).sort_by { |p| -p.length }.each do |p|
             after[p][0] == "directory" ? (Dir.rmdir(p) rescue nil) : (File.unlink(p) rescue nil)
@@ -2016,6 +2623,7 @@ module VciCollector
     simplecov: -> { defined?(::SimpleCov) && ::SimpleCov.respond_to?(:coverage_path) && RSpecSupport.install_simplecov },
     code_stats: -> { defined?(::Rails::CodeStatistics) && ::Rails::CodeStatistics.respond_to?(:directories) && install_code_stats },
     rails_config: -> { defined?(::Rails::Application::Configuration) && install_rails_config },
+    parallelize: -> { Batch.install_parallelize },
     socket: -> { defined?(::BasicSocket) && install_socket },
     pty: -> { defined?(::PTY) && install_pty },
     fiddle: -> { defined?(::Fiddle::Function) && defined?(::Fiddle::Handle) && install_fiddle },
@@ -3255,16 +3863,24 @@ module VciCollector
       # database_tasks: false entries included), from the remembered
       # config/database.yml: what a test assigns to
       # ActiveRecord::Base.configurations later changes nothing.
+      #
+      # In a batch's slot, each also as Rails' parallel worker of that index
+      # has it (database `<database>_<i>`: ActiveRecord::TestDatabases), the
+      # slot's own database.
       def server_configs
-        return @server_configs if @server_configs
-        return [] unless @yaml && defined?(::ActiveRecord::DatabaseConfigurations)
-        all = ::ActiveRecord::DatabaseConfigurations.new(@yaml)
-        list = begin
-          all.configs_for(env_name: env_name, include_hidden: true)
-        rescue ArgumentError
-          all.configs_for(env_name: env_name)
+        base = @server_configs ||= begin
+          return [] unless @yaml && defined?(::ActiveRecord::DatabaseConfigurations)
+          all = ::ActiveRecord::DatabaseConfigurations.new(@yaml)
+          list = begin
+            all.configs_for(env_name: env_name, include_hidden: true)
+          rescue ArgumentError
+            all.configs_for(env_name: env_name)
+          end
+          list.map { |c| c.configuration_hash.to_h.transform_keys(&:to_sym) }
         end
-        @server_configs = list.map { |c| c.configuration_hash.to_h.transform_keys(&:to_sym) }
+        i = Batch.slot
+        return base unless i
+        base + base.filter_map { |c| c.merge(database: "#{c[:database]}_#{i}") unless c[:database].to_s.empty? }
       end
 
       TARGET_KEYS = %i[host hostaddr port socket database service default_file default_group].freeze
@@ -3310,9 +3926,19 @@ module VciCollector
         t = client_target(name, args, kw)
         return "a server vci cannot tell from the arguments" unless t
         return true if server_configs.any? { |c| config_target(name, c) == t }
+        return true if Batch.slot_setup? && server_level?(name, t)
         where = [t[:socket], t[:host], t[:hostaddr]].reject(&:empty?).first || "localhost"
         where = "#{where}:#{t[:port]}" unless t[:port].empty?
         "#{where}/#{t[:database]}"
+      end
+
+      # A connection to a configured server without its database, as
+      # Active Record's database tasks make one to create or purge a
+      # database (MySQL: no database; PostgreSQL: "postgres"). Allowed only
+      # while a batch's slot sets up its database (Batch.slot_setup?).
+      def server_level?(name, t)
+        return false unless ["", "postgres"].include?(t[:database])
+        server_configs.any? { |c| config_target(name, c).merge(database: t[:database]) == t }
       end
 
       # A SQLite database name as SQLite opens it: [path, in_memory]. A
@@ -3354,9 +3980,12 @@ module VciCollector
       # Absolute paths of the SQLite files config/database.yml configures
       # for the test environment (relative to the application root, as
       # Active Record resolves them). An in-memory database has none.
+      # In a batch's slot, each also with the slot's suffix (`<path>_<i>`,
+      # the file Rails' parallel worker of that index uses).
       def sqlite_files
         root = VciCollector.root
-        yaml_configs.filter_map do |c|
+        i = Batch.slot
+        yaml_configs.flat_map do |c|
           url = c["url"].to_s
           db = if url.empty?
                  c["adapter"].to_s.start_with?("sqlite") ? c["database"] : nil
@@ -3364,7 +3993,9 @@ module VciCollector
                  m[1]
                end
           path = sqlite_path(db)
-          path && VciCollector.quiet { Real.expand_path(path, root) }
+          next [] unless path
+          abs = VciCollector.quiet { Real.expand_path(path, root) }
+          i ? [abs, "#{abs}_#{i}"] : [abs]
         end.uniq
       end
 
@@ -3577,8 +4208,20 @@ module VciCollector
       end
 
       def tmpdir
-        d = TMP.to_s
+        d = (Batch.slot_tmp || TMP).to_s
         d.empty? ? "/tmp" : d
+      end
+
+      # In a batch's slot (Batch.run_slot): the example status file the boot
+      # configured moves to the slot's temp dir, as the boot's own would be
+      # shared by the slots' processes.
+      def slot_moved!
+        return unless rspec? && defined?(::RSpec) && ::RSpec.respond_to?(:configuration)
+        c = ::RSpec.configuration
+        was = c.example_status_persistence_file_path
+        c.example_status_persistence_file_path = was if was
+      rescue StandardError
+        nil
       end
 
       def status_file
@@ -3981,6 +4624,11 @@ module VciCollector
       nil
     end
 
+    # The loaded gem of that full name, or nil.
+    def named(full_name)
+      (@named ||= specs.to_h { |s| [s.full_name, s] })[full_name]
+    end
+
     def under_root?(abs)
       roots.any? { |r| VciCollector.inside?(abs, r) }
     end
@@ -4214,7 +4862,47 @@ module VciCollector
     # that file (VciCollector.resolve recorded it so when it was used, as
     # the link may be gone now), and one leading anywhere else is classified
     # as what it leads to (a read outside the repository: refused).
+    #
+    # Each path is classified once per process (classified), and a batch's
+    # file process starts with what its boot (or slot) had classified for
+    # every path recorded before the file's process forked (Batch.share!).
     def classify(abs, depth = 0)
+      return classify_now(abs, depth) unless depth.zero?
+      known = classified[abs]
+      if known
+        c = unpack(known)
+        return c unless c == :miss
+      end
+      c = classify_now(abs, 0)
+      classified[abs] = pack(c)
+      c
+    end
+
+    # abs => a classification as pack makes it (Marshal can carry it from a
+    # batch's shared-output process back to its parent: a gem by its full
+    # name, looked up again where it is used).
+    def classified
+      @classified ||= {}
+    end
+
+    def learn(classifications)
+      classified.merge!(classifications) if classifications.is_a?(Hash)
+    end
+
+    def pack(c)
+      return :none if c.nil?
+      c[0] == :external ? [:external, c[1].full_name] : c
+    end
+
+    # A packed classification, or :miss (a gem this process does not have).
+    def unpack(m)
+      return nil if m == :none
+      return m unless m[0] == :external
+      s = Gems.named(m[1])
+      s ? [:external, s] : :miss
+    end
+
+    def classify_now(abs, depth)
       return nil if device?(abs)
       vc = VciCollector
       inside = vc.inside?(abs, vc.repo)
@@ -4253,13 +4941,14 @@ module VciCollector
         $stderr.puts "vci_collector: VCI_OUT or VCI_TEST_ID not set; nothing written"
         return
       end
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       # The schema files of the test databases (DB.schema_files).
       VciCollector.quiet { DB.schema_files }.each { |f| VciCollector.schema_input(f) }
       # First: what is written below requires libraries (and would hook them).
       unhooked = VciCollector.unhooked
       TP_COMPILED.disable
       TP_RAISE.disable
-      VciCollector.quiet { write_records(status, unhooked) }
+      VciCollector.quiet { write_records(status, unhooked, started) }
     end
 
     # A record under a gem root (classify: :outside_bundle) that is not an
@@ -4294,10 +4983,32 @@ module VciCollector
       end
     end
 
-    def write_records(status, unhooked = [])
+    # The output file: every line of `lines_of`, or, in a batch's file
+    # process whose boot (or slot) wrote the lines its files share
+    # (Batch.share!), the lines that are not among them, the shared part's
+    # name and which of its lines are not this file's (Batch.split). vci
+    # puts the two together again (rails.rs, read_batch).
+    def write_records(status, unhooked = [], started = nil)
+      lines = lines_of(status, unhooked)
+      split = Batch.split(lines)
+      require "digest/sha2"
+      File.open(File.join(OUT, "#{Digest::SHA256.hexdigest(VciCollector.test_id)}.jsonl"), "w") do |f|
+        (split || lines).each { |l| f.write(Json.dump(l), "\n") }
+      end
+      Batch.wrote_output(lines.size, split, started) if started
+    end
+
+    # Every line of the output of this process if it ended now (with exit
+    # status `status`): meta, what it observed, its taints and its result.
+    # `shared`: the lines a batch's files share (Batch.share!), as the
+    # process their processes fork from has them: no meta, no taints (all
+    # of a file's taints stay in its own output, in their order) and no
+    # result, each line once; the gems' files are checked against their
+    # archives (GemVerify.check remembers it for the files' processes).
+    def lines_of(status, unhooked = [], shared: false)
       vc = VciCollector
       taints = vc.taints.dup + unhooked
-      lines = [meta]
+      lines = shared ? [] : [meta]
       vc.enumerations.each do |where, meth|
         next if Env.allowed_enumeration?(where, meth)
         lines << { kind: "env", key: "*", where: "ENV.#{meth} at #{where}" }
@@ -4370,7 +5081,7 @@ module VciCollector
         lines << { kind: "exclude", path: x }
       end
       written.each_key { |p| lines << { kind: "write", path: p } if vc.inside?(p, vc.repo) && !dbx.key?(p) }
-      taints.concat(DB.taints)
+      taints.concat(DB.taints) unless shared
       taints.concat(GemVerify.check(externals.values.uniq, gem_files))
       externals.each do |(name, version), s|
         rec = { kind: "external", name: name, version: version, platform: s.platform.to_s }
@@ -4384,6 +5095,7 @@ module VciCollector
       keys = vc.env_keys.dup
       Env::ALWAYS_READ.each { |k| keys[k] ||= { "ruby" => true } }
       keys.each { |k, w| lines << { kind: "env", key: k, where: w.keys.first(3).join(" | ") } }
+      return lines.uniq if shared
       taints.concat(Checks.run)
       taints.concat(RSpecSupport.taints) if RUNNER == "rspec"
       res = result(status)
@@ -4393,10 +5105,6 @@ module VciCollector
       end
       taints.uniq.each { |t| lines << { kind: "taint", reason: t } }
       lines << res
-      require "digest/sha2"
-      File.open(File.join(OUT, "#{Digest::SHA256.hexdigest(VciCollector.test_id)}.jsonl"), "w") do |f|
-        lines.each { |l| f.write(Json.dump(l), "\n") }
-      end
     end
 
     def meta
@@ -4472,6 +5180,21 @@ module VciCollector
       end
     end
 
+    # What earlier checks in this process found (a batch's file process
+    # starts with its boot's or slot's, Batch.share!): a gem's own problems
+    # (full name => taints: no archive, a checksum Gemfile.lock does not
+    # have) and its files' ([full name, path] => [taint or nil, the file's
+    # place in the archive or nil]). A file is compared once.
+    def done
+      @done ||= { gems: {}, files: {} }
+    end
+
+    def learn(found)
+      return unless found.is_a?(Hash)
+      done[:gems].merge!(found[:gems] || {})
+      done[:files].merge!(found[:files] || {})
+    end
+
     def check(specs, files_by_gem)
       return [] if specs.empty?
       require "rubygems/package"
@@ -4488,33 +5211,51 @@ module VciCollector
         end
         files = (files_by_gem[s.full_name] || []).uniq
         next if files.empty?
-        archive = s.respond_to?(:cache_file) ? s.cache_file : nil
-        unless archive && File.file?(archive)
-          out << "ruby:gem-unverifiable:#{s.full_name} (no #{s.full_name}.gem in the RubyGems cache to check its installed files against; reinstall it with `gem install --local` or `bundle install --redownload`)"
+        own = (done[:gems][s.full_name] ||= gem_problems(s))
+        unless own.empty?
+          out.concat(own)
           next
         end
-        want = lock_checksums[s.full_name]
-        if want && Digest::SHA256.file(archive).hexdigest != want
-          out << "ruby:gem-checksum:#{s.full_name} (#{archive} does not have the sha256 Gemfile.lock records)"
-          next
-        end
-        out.concat(compare(s, archive, files))
+        known = done[:files]
+        todo = files.reject { |f| known.key?([s.full_name, f]) }
+        compare(s, s.cache_file, todo).each { |f, r| known[[s.full_name, f]] = r } unless todo.empty?
+        # In the order of a comparison of all of them at once: the files
+        # that differ, in the archive's order, then those it lacks.
+        found = files.filter_map { |f| known[[s.full_name, f]] }.select { |t, _| t }
+        out.concat(found.select { |_, at| at }.sort_by { |_, at| at }.map(&:first))
+        out.concat(found.reject { |_, at| at }.map(&:first))
       end
       out
     rescue StandardError, LoadError => e
       ["ruby:gem-verify:#{e.class}: #{e.message}"]
     end
 
+    # What is wrong with a gem's archive itself, before any of its files is
+    # compared with it: [] or [taint].
+    def gem_problems(s)
+      archive = s.respond_to?(:cache_file) ? s.cache_file : nil
+      unless archive && File.file?(archive)
+        return ["ruby:gem-unverifiable:#{s.full_name} (no #{s.full_name}.gem in the RubyGems cache to check its installed files against; reinstall it with `gem install --local` or `bundle install --redownload`)"]
+      end
+      want = lock_checksums[s.full_name]
+      if want && Digest::SHA256.file(archive).hexdigest != want
+        return ["ruby:gem-checksum:#{s.full_name} (#{archive} does not have the sha256 Gemfile.lock records)"]
+      end
+      []
+    end
+
+    # Each of `files` => [taint or nil, its place in the archive or nil].
     def compare(spec, archive, files)
       root = File.expand_path(spec.full_gem_path)
+      res = files.to_h { |f| [f, [nil, nil]] }
       want = {}
       files.each do |f|
         next unless VciCollector.inside?(f, root) && File.file?(f)
         want[f.delete_prefix("#{root}/")] = f
       end
-      return [] if want.empty?
+      return res if want.empty?
       found = {}
-      out = []
+      at = 0
       File.open(archive, "rb") do |io|
         ::Gem::Package::TarReader.new(io) do |tar|
           tar.each do |entry|
@@ -4522,23 +5263,26 @@ module VciCollector
             ::Zlib::GzipReader.wrap(entry) do |gz|
               ::Gem::Package::TarReader.new(gz) do |data|
                 data.each do |f|
+                  at += 1
                   path = want[f.full_name]
                   next unless path && f.file?
                   found[f.full_name] = true
-                  out << "ruby:gem-modified:#{spec.full_name}:#{f.full_name} (differs from #{File.basename(archive)})" if f.read != File.binread(path)
+                  if f.read != File.binread(path)
+                    res[path] = ["ruby:gem-modified:#{spec.full_name}:#{f.full_name} (differs from #{File.basename(archive)})", at]
+                  end
                 end
               end
             end
           end
         end
       end
-      want.each_key do |rel|
+      want.each do |rel, path|
         next if found[rel]
         # Built at install time (an extension compiled from source), or added.
         next if rel.end_with?(*DLEXTS) || rel.end_with?("gem.build_complete")
-        out << "ruby:gem-modified:#{spec.full_name}:#{rel} (not in #{File.basename(archive)})"
+        res[path] = ["ruby:gem-modified:#{spec.full_name}:#{rel} (not in #{File.basename(archive)})", nil]
       end
-      out
+      res
     end
   end
 

@@ -641,6 +641,30 @@ that fails in the boot, a process that writes no output, a runner whose loader v
 process per file, and `vci run` says so. Details and measurements: [`docs/spike-rails.md`](spike-rails.md) ("Batch
 mode").
 
+**Slots (vci 2.1).** When the project runs its tests in Rails' parallel worker processes (`parallelize` in
+`test_helper.rb`, with processes, as `rails new` writes it), a group's files run W at a time: W is `VCI_RAILS_JOBS`,
+else `PARALLEL_WORKERS` above 1 (in vci's environment; the test processes still get 1), else `VCI_JOBS` or the
+number of CPUs, at most as many as `parallelize(workers: n)` asks for, and at most one per file. `PARALLEL_WORKERS=1`
+in vci's environment or `parallelize(workers: 1)` turns Rails' workers off, and the slots with them. A group whose
+files' first statement is not a require of a shared helper has no boot and runs one file at a time. After the boot, vci forks one process per slot and sets it up exactly as Rails
+sets up a parallel worker: Rails' before-fork hooks once, then in each slot `parallel_worker_id = i` and every
+after-fork hook (Rails' own creates and loads the database `<database>_<i>`, as `bin/rails test` does with workers;
+`parallelize_setup` blocks; Oaken's seed load). Each slot then forks one process per file, as above, against its own
+database, which a file's process does not seed again (Minitest's executor answers `should_parallelize?` as in a
+worker), and runs `parallelize_teardown` at its end. Files share a slot's database with the files the slot ran
+before them, as tests share a worker's: what the database holds is not an input either way. `VCI_RAILS_JOBS` set to
+a number applies to any project (`1`: one file at a time, as in vci 2.0); without `parallelize` and without it, a
+batch runs one file at a time. RSpec has no parallel workers: slots there share the test database (set
+`VCI_RAILS_JOBS` only if your specs can share it). Details: [`docs/spike-rails.md`](spike-rails.md) ("Slots").
+
+**Shared output (vci 2.1).** Most of what a file's process records is its boot's (on vex-api about 14,400 of 14,500
+lines). The boot (or each slot, after its setup) writes those lines once, before any file's process forks from it;
+each file's process then writes only the lines that are not among them, and names the shared lines it does not have
+(a path it wrote that the boot found absent, an environment variable read from another place too). vci reads the two
+together: the same lines a file's process writes when nothing is shared, so the attestations are the same.
+`VCI_RAILS_SHARED_OUTPUT=0` (in vci's environment) makes each file's process write all of its output. Details:
+[`docs/spike-rails.md`](spike-rails.md) ("Shared output").
+
 The collector (`ruby/vci-collector/vci_collector.rb`, plain Ruby, nothing is installed into your project) is loaded
 through `RUBYOPT` before `bin/rails`, Bundler and Rails. It sets these run conditions:
 
@@ -924,8 +948,10 @@ The rules:
   `bin/rails db:test:prepare` from the project dir) is the engine's and is not refused: it runs with
   `VCI_RAILS_MODE=engine`, in which the collector records nothing, and its only effect is the database's state. Every
   other child process a test starts is refused, including the same command run by the test itself.
-- **One file at a time**: the files of a project share the database, as in `bin/rails test`, so `vci run` runs them
-  one after another (`VCI_JOBS` does not apply; `PARALLEL_WORKERS=1` as always). `vci ci` runs the remaining files of a
+- **One file at a time, or one slot's database each**: the files of a project share the database, as in `bin/rails
+  test`, so `vci run` runs them one after another, unless the project runs Rails' parallel workers (or
+  `VCI_RAILS_JOBS` asks): then each slot has a database of its own, as each worker has (see "Slots" above;
+  `PARALLEL_WORKERS=1` as always inside each process). `vci ci` runs the remaining files of a
   project the engine's own way, in one `bin/rails test <files> --seed 0` (or `rspec --options .rspec <files>`) process
   per runner: the files share one process and one order, so a file that passes only on its own can fail there, the
   verdict a plain `bin/rails test` gives. `vci ci --key` runs each file it attests on its own, as `vci run` does.
@@ -1292,7 +1318,7 @@ Environment: `VCI_JS_PLUGIN` (path of the `@vci/vitest` package; default `node_m
 project; for node:test, then `js/vitest-plugin` or `share/vci/vitest-plugin` above the `vci` executable), `VCI_NODE` (node binary), `VCI_PY_PLUGIN` (the `py/pytest-plugin` directory holding `vci_pytest`; default:
 `py/pytest-plugin` or `share/vci/pytest-plugin` above the `vci` executable, then the source checkout `vci` was built
 from, then `py/pytest-plugin` above the project; a clear error names the variable when none is found), `VCI_UV` (uv
-binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`; Rails files run one at a time), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_GO`
+binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`; for Rails, the slots of a batch when neither `VCI_RAILS_JOBS` nor `PARALLEL_WORKERS` sets them), `VCI_RAILS_JOBS` (the slots of a Rails batch: files at once, each slot with a database of its own as Rails' parallel workers have; `1`: one at a time; default: `PARALLEL_WORKERS` above 1, `VCI_JOBS`, or the number of CPUs, capped by `parallelize(workers:)`, for projects that call Rails' `parallelize`; `PARALLEL_WORKERS=1` or `workers: 1` turns them off), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_RAILS_SHARED_OUTPUT` (`0`: in a Rails batch, each file's process writes all of its output instead of only what it does not share with the other files of its boot), `VCI_GO`
 (go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_CARGO_JOBS` (Cargo test
 executables run at once in `vci run` and `vci ci`; default: the number of CPUs; cargo itself runs one build at a
 time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory

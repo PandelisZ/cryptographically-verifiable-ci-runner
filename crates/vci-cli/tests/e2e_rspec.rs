@@ -2153,6 +2153,16 @@ fn rspec_batch_mode_gives_what_one_process_per_file_gives() {
         "{err}"
     );
     assert!(!err.contains("run again one process per file"), "{err}");
+    // What the files of a boot (or slot) share was written once for them,
+    // and each file's process wrote the rest of its output: the inputs
+    // compared below are those two read together.
+    assert!(
+        err.lines().any(
+            |l| l.starts_with("vci: a file's process wrote its output in ")
+                && l.contains("what the files of a boot share written ")
+        ),
+        "{err}"
+    );
     assert_ne!(code, Some(0), "F fails the run");
     assert_eq!(code, code_alone);
     let (want, got) = (outcomes(&err_alone), outcomes(&err));

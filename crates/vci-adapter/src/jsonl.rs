@@ -181,6 +181,12 @@ fn u64_field(v: &Value, k: &str) -> Option<u64> {
 /// Parse one collector output file.
 pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
     let text = std::fs::read_to_string(path)?;
+    Ok(parse_jsonl_text(&text, path))
+}
+
+/// Parse a collector output's `text`, as if read from the file `path`
+/// (whose name must be `sha256(testId).jsonl`).
+pub fn parse_jsonl_text(text: &str, path: &Utf8Path) -> Observed {
     let mut o = Observed::default();
     let mut saw_meta = false;
     for (i, line) in text.lines().enumerate() {
@@ -322,7 +328,7 @@ pub fn parse_jsonl_file(path: &Utf8Path) -> Result<Observed, AdapterError> {
     if path.file_stem() != Some(expected.as_str()) {
         o.taints.push("vci:jsonl-name-mismatch".into());
     }
-    Ok(o)
+    o
 }
 
 /// Parse every top-level `*.jsonl` in `dir` (worker parts under
