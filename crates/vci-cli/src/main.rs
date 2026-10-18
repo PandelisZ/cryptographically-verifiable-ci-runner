@@ -1,5 +1,13 @@
 //! `vci`: cryptographically verifiable CI test selection.
 
+// The static musl release builds (Linux) serialize threads on musl's
+// allocator: on vex's 16-core runners a plan decoded a 1.9 MB manifest in 2 s
+// and checked it for case collisions in 2.5 s, 250 times this Mac's time,
+// with 16 verifying threads (vci 2.1.1's VCI_TIMING breakdown). mimalloc is
+// per-thread and scales; it is what every build uses now.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cmds;
 mod config;
 mod ctx;

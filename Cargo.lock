@@ -1789,6 +1789,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,6 +1842,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -2731,7 +2749,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vci-adapter"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "base64",
  "camino",
@@ -2747,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "vci-attest"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "base64",
  "camino",
@@ -2768,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "vci-cli"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2778,6 +2796,7 @@ dependencies = [
  "git-meta-lib",
  "hex",
  "jiff",
+ "mimalloc",
  "predicates",
  "rayon",
  "serde",
@@ -2793,10 +2812,11 @@ dependencies = [
 
 [[package]]
 name = "vci-core"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "blake3",
  "camino",
+ "mimalloc",
  "rayon",
  "serde",
  "serde_json",
@@ -2806,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "vci-git"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "base64",
  "camino",

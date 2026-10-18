@@ -14,6 +14,11 @@ use std::time::Instant;
 use camino::Utf8PathBuf;
 use vci_core::{CheckoutCache, InputManifest};
 
+// The CLI's allocator (crates/vci-cli/src/main.rs), so the benchmark measures
+// what the binary does: musl's own allocator serializes threads.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[test]
 #[ignore = "measures a real manifest named by VCI_BENCH_MANIFEST against VCI_BENCH_ROOT"]
 fn rehash_one_manifest_many_times() {

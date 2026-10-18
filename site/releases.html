@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-2">2.1.2</a></td><td>19 Oct 2026</td><td>The Linux binaries use mimalloc: on a 16-core runner a plan's verdicts phase was 20 times slower than on a laptop because musl's allocator serializes threads</td></tr>
 <tr><td><a href="#v2-1-1">2.1.1</a></td><td>19 Oct 2026</td><td>Rails on CI: the plan reads manifests in parallel, load-path probes fold into one listing, and timing shows every part</td></tr>
 <tr><td><a href="#v2-1-0">2.1.0</a></td><td>18 Oct 2026</td><td>Rails runs its files in parallel slots, one seeded database each; a plan reads the checkout once (minutes to seconds); units are checked and signed in parallel</td></tr>
 <tr><td><a href="#v2-0-4">2.0.4</a></td><td>18 Oct 2026</td><td>No more warning about <code>.DS_Store</code> in a listing git ignores it in</td></tr>
@@ -46,6 +47,16 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-2">2.1.2</h2>
+<p><em>19 October 2026.</em> The third Rails run on vex's 16-core runners, with 2.1.1's per-part timing, said where the plan's 10 to 16 minutes went: decoding a candidate's manifest took about 2 seconds of thread time and checking it for case collisions about 2.5, for each of 2,000 candidates, 250 times what the same binary's work costs on a laptop; the rehash itself was cheap. The Linux releases are static musl binaries, and musl's allocator takes one lock for every allocation, so sixteen verifying threads decoding 1.9 MB manifests spent their time waiting on each other. A benchmark that rehashes one real CI manifest 160 times on 8 threads, in an Ubuntu container on this Mac, reproduces it:</p>
+<table>
+<tr><th>build</th><th>per pass</th></tr>
+<tr><td>musl (the 2.1.1 release)</td><td>13.6 ms</td></tr>
+<tr><td>glibc</td><td>0.7 ms</td></tr>
+<tr><td>musl with mimalloc (2.1.2)</td><td>0.6 ms</td></tr>
+</table>
+<p><strong>Every build of <code>vci</code> now uses mimalloc</strong> as its global allocator, which keeps a heap per thread. The releases stay static musl binaries; nothing else changes. On the Mac, where the system allocator already scales, the suites run as before. The benchmark is <code>crates/vci-core/tests/bench_rehash.rs</code> (ignored; <code>VCI_BENCH_MANIFEST</code>, <code>VCI_BENCH_ROOT</code>, <code>VCI_BENCH_N</code>, <code>VCI_BENCH_THREADS</code>).</p>
 
 <h2 id="v2-1-1">2.1.1</h2>
 <p><em>19 October 2026.</em> The first Rails pull request runs on vex's 16-core runners (vci 2.1.0) showed two costs that this Mac had not: the second run's plan spent 19 to 20 minutes in its verdicts phase for 2,004 candidates (5 seconds here), and the first run's check-and-sign phase ran at one unit a second (25 a second here). Both come from the shape of a Rails attestation on that application: 13,800 inputs a file, 10,000 of them Ruby's load-path probes (<code>vex-api/lib/&lt;feature&gt;.rb</code>, <code>vex-api/vendor/&lt;feature&gt;.rb</code>, <code>.so</code>, <code>.bundle</code>, absent, one per <code>require</code> per load-path directory ahead of the gem's), 1.9 MB a manifest.</p>
