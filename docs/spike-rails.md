@@ -1027,6 +1027,74 @@ whole output's; another sha256, a missing index, a missing file, two references 
 back; the timings). `e2e_rails.rs`/`e2e_rspec.rs`: the batch tests now also check that the shared lines were used; the
 manifests they compare, batch against one process per file, are the merged ones.
 
+## Load path probes folded into a listing (vci 2.1)
+
+Date: 2026-10-18. vex-api's manifests in CI had ~13,800 entries a file, ~10,000 of them `absent`: 5,031 under
+`vex-api/lib/...` and 4,942 under `vex-api/vendor/...` (`vendor/abstract_controller/asset_paths.rb`, `.so`,
+`.bundle`, ...). Rails puts `lib` and `vendor` on `$LOAD_PATH` ahead of the gems, so every `require "x/y"` stats
+`lib/x/y.{rb,so,bundle}` and `vendor/x/y.{rb,so,bundle}` first, and `VciCollector.lookup` records each as a probe (a
+file created there would be loaded instead). 1.9 MB a manifest, a 5 GB store for 2,850 attestations, and every plan
+and `vci run` check paying for 13,800 entries a candidate.
+
+**P1. What changes.** At exit (`Output.lines_of`, after classification, so the hooks and the shared-output split are
+unchanged) `Output.fold_probes` groups the probe lines by `fold_target`: the deepest real directory D above the
+path such that the path's component just below D (its child: the path itself, or the first missing directory,
+`lib/abstract_controller` for `lib/abstract_controller/asset_paths.rb`) is absent. A group of 50 or more
+(`FOLD_MIN`) becomes one `readdir` line for D, in place of its first probe; vci turns it into D's `DirListing`, hashed
+at the end of the run like every listing.
+
+**P2. Why it is sound.** For any folded probe to come to exist, its child must be created: a new name in D's listing.
+So D's listing changes whenever one of the probes would; it can only re-run more (a new name no probe named), never
+less. Not folded, left as probes:
+- a path that exists now (or is a dangling symlink), or whose way down from D runs through a file or a symlink (a
+  symlink's target can change without D's listing changing), or any directory from the repository to D that is a
+  symlink;
+- D under vci's temp dirs, a directory this process wrote in (`written`: its listing changes during the run), or one
+  whose listing `DB.exempt?` exempts;
+- D holding a test file of the process (a batch's: any of its files), unless the process lists D anyway: RSpec puts
+  `spec/` first on the load path, and a listing of `spec/` (or `test/`, or the root) would run every test whenever a
+  test file is added (`e2e_rspec`'s step 10 caught this);
+- a probe whose child git ignores, as a file or as a directory (`git check-ignore --stdin -z`, once a process for the
+  children not asked before; a batch's file processes inherit the boot's answers through `share!`). vci leaves
+  git-ignored children out of a listing (2.0.3), so creating one would not change D's listing. If git does not answer
+  (not a repository, no git) nothing is folded.
+
+Absent paths that are not load path probes (a test's own `File.exist?("lib/x")`) are folded too when they share D:
+the records do not say who made them, and folding is as sound for them. `VciCollector::VERSION` stays 0.5.0: what is
+recorded means more, never less, so an older collector's attestation (probes) is no weaker than a new one.
+
+**P3. What it costs in precision.** A new name in D runs the tests that fold into D. On vex-api `lib/` is already
+listed (Zeitwerk's `autoload_lib`), so folding there costs nothing; `vendor/` was a type-only entry and is now a
+listing (a new file directly in `vendor/` runs every test that boots Rails; vex-api's `vendor/` holds only `.keep`).
+
+**P4. Measured on vex-api** (the `vex-k` clone, lazy loading, `VCI_RAILS_JOBS=4 VCI_TIMING=1 mise exec -- vci run
+<5 files of test/models> --key <throwaway>`, release build of this tree, collector before and after):
+
+| file | inputs before | after | manifest before | after |
+|---|---|---|---|---|
+| agent_swarm_event_test.rb | 2,343 (1,965 absent) | 473 (95 absent) | 311,714 B | 61,495 B |
+| agent_trigger_subscription_test.rb | 2,285 | 457 | 304,868 B | 59,520 B |
+| alert_event_test.rb | 2,306 | 454 | 307,490 B | 59,069 B |
+| alert_rule_test.rb | 2,305 | 453 | 307,374 B | 58,953 B |
+| app_config_variable_test.rb | 2,336 | 460 | 311,701 B | 59,828 B |
+
+All five attested both times (`vci: 5 attested, 0 not attested`); a file's output 0.09 s before, 0.11 s after
+(average). Locally vex-api loads lazily (CI eager-loads, hence 10,000 probes there); one of vex's CI manifests (13,848 entries,
+1,880,266 bytes) folded the same way offline (lib and vendor, against the clone's tree) has 3,875 entries and
+516,572 bytes. Then `vci plan --project vex-api` (base: a commit of the working tree, whose `vci.toml`
+names the clone's database) skipped the five with the new attestations; with `lib/zz_probe_test.rb` added all five ran
+(`best failed inputs: entry:vex-api/lib`); with `vendor/abstract_controller/base.rb` (a path the old manifests probe)
+all five ran, the new attestation failing on `entry:vex-api/vendor` (`dirListing entries=1` -> `2`) and the old on
+the absent path; removed, all five skipped again.
+
+**Tests.** `collector_test.rb`: `test_many_probes_under_a_directory_become_its_listing` (vendor's and lib's probes,
+including ones under missing directories and a test's own `File.exist?`, become one listing each; children git
+ignores as a directory and as a file, probes through a symlink, and a few under `data/` or a missing top directory
+stay probes) and `test_probes_stay_without_git_or_when_the_directory_is_written` (not a git repository; a directory
+the process wrote in; a directory holding the test file). `e2e_rails`/`e2e_rspec` `*_bundle_installed_in_the_repository`:
+vendor's listing now leaves the git-ignored `vendor/bundle` out as an `excluded` entry (not an input), which the
+"nothing under vendor/bundle" assertion accepts.
+
 ## Not done
 
 - **Slots for RSpec with a database each**: rspec-rails has no parallel workers; a project using parallel_tests

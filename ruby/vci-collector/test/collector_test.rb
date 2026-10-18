@@ -39,15 +39,15 @@ class CollectorTest < Minitest::Test
 
   # Run `script` (Ruby source) in the repository with the collector on;
   # returns the parsed records.
-  def collect(script, env: {}, args: [])
+  def collect(script, env: {}, args: [], id: "script.rb")
     put("script.rb", script)
     e = {
       "RUBYOPT" => "-r#{COLLECTOR}", "VCI_RAILS_MODE" => "collect", "VCI_OUT" => @out,
-      "VCI_TEST_ID" => "script.rb", "VCI_ROOT" => @repo, "VCI_REPO" => @repo, "TMPDIR" => @tmpdir,
+      "VCI_TEST_ID" => id, "VCI_ROOT" => @repo, "VCI_REPO" => @repo, "TMPDIR" => @tmpdir,
       "RUBYLIB" => nil, "BUNDLE_GEMFILE" => nil
     }.merge(env)
     out = IO.popen(e, [RbConfig.ruby, "script.rb", *args], chdir: @repo, err: %i[child out], &:read)
-    file = File.join(@out, "#{Digest::SHA256.hexdigest("script.rb")}.jsonl")
+    file = File.join(@out, "#{Digest::SHA256.hexdigest(id)}.jsonl")
     assert File.file?(file), "no collector output; process said:\n#{out}"
     File.readlines(file).map { |l| JSON.parse(l) }
   ensure
@@ -122,6 +122,92 @@ class CollectorTest < Minitest::Test
     %w[data/nope.txt data/also_nope data/test_nope data/gone.txt].each { |p| assert_includes probes, p }
     assert_includes paths(recs, "stat"), "data/x.txt"
     assert_empty taints(recs)
+  end
+
+  # Load path probes: many absent paths under one directory are recorded as
+  # its listing (Output.fold_probes); a few stay probes, as do those whose
+  # child git ignores, a path under a symlink, and a directory the process
+  # wrote in.
+  FOLD_SCRIPT = <<~RUBY
+    $LOAD_PATH.unshift(File.expand_path("lib"))
+    $LOAD_PATH.unshift(File.expand_path("vendor"))
+    $LOAD_PATH.unshift(File.expand_path("linked"))
+    require "real"
+    20.times do |i|
+      begin
+        require "nope_\#{i}/deep/x"
+      rescue LoadError
+      end
+    end
+    %w[ign/x ign2].each do |f|
+      begin
+        require f
+      rescue LoadError
+      end
+    end
+    File.exist?("data/nope.txt")
+    File.exist?("gone/deep/x.txt")
+    File.exist?("lib/own_check.txt")
+  RUBY
+
+  def fold_setup
+    put("lib/real.rb", "REAL = 1\n")
+    put("vendor/.keep")
+    put("data/.keep")
+    put("elsewhere/.keep")
+    File.symlink(File.join(@repo, "elsewhere"), File.join(@repo, "linked"))
+    put(".gitignore", "/lib/ign/\n/lib/ign2.rb\n")
+  end
+
+  def test_many_probes_under_a_directory_become_its_listing
+    fold_setup
+    assert system("git", "init", "-q", @repo)
+    recs = collect(FOLD_SCRIPT)
+    probes = paths(recs, "probe")
+    listed = paths(recs, "readdir")
+    assert_empty taints(recs)
+    assert_includes paths(recs, "module"), "lib/real.rb"
+    # vendor: 60 probes (20 features x 3 candidates) -> one listing.
+    assert_includes listed, "vendor"
+    assert_empty probes.grep(%r{\Avendor/})
+    # lib: 60 + the test's own File.exist? -> its listing, except those
+    # under a child git ignores (as a directory, and as a file).
+    assert_includes listed, "lib"
+    refute_includes probes, "lib/nope_0/deep/x.rb"
+    refute_includes probes, "lib/own_check.txt"
+    %w[lib/ign/x.rb lib/ign/x.bundle lib/ign2.rb].each { |p| assert_includes probes, p }
+    # Through a symlink (linked -> elsewhere): left as probes.
+    assert_includes probes, "linked/nope_0/deep/x.rb"
+    refute_includes listed, "linked"
+    refute_includes listed, "elsewhere"
+    # Few under a directory: probes. A probe whose directory is itself
+    # absent folds into the deepest existing one only when enough do.
+    assert_includes probes, "data/nope.txt"
+    assert_includes probes, "gone/deep/x.txt"
+    refute_includes listed, "data"
+    refute_includes listed, "."
+    assert_equal 1, listed.count("lib")
+  end
+
+  def test_probes_stay_without_git_or_when_the_directory_is_written
+    fold_setup
+    # Not a git repository: git does not answer, nothing is folded.
+    recs = collect(FOLD_SCRIPT)
+    assert_includes paths(recs, "probe"), "vendor/nope_0/deep/x.rb"
+    refute_includes paths(recs, "readdir"), "vendor"
+    assert_empty taints(recs)
+    # A directory the process wrote in: its probes stay.
+    assert system("git", "init", "-q", @repo)
+    recs = collect("#{FOLD_SCRIPT}File.write('vendor/made.txt', 'x')\n")
+    assert_includes paths(recs, "probe"), "vendor/nope_0/deep/x.rb"
+    refute_includes paths(recs, "readdir"), "vendor"
+    assert_includes paths(recs, "readdir"), "lib"
+    # A directory holding the test file (spec/ under RSpec): its probes stay
+    # (a new test file there would otherwise run every test).
+    recs = collect(FOLD_SCRIPT, id: "vendor/models/x_test.rb")
+    assert_includes paths(recs, "probe"), "vendor/nope_0/deep/x.rb"
+    refute_includes paths(recs, "readdir"), "vendor"
+    assert_includes paths(recs, "readdir"), "lib"
   end
 
   # Entry points that open files in C.

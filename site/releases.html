@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-1">2.1.1</a></td><td>19 Oct 2026</td><td>Rails on CI: the plan reads manifests in parallel, load-path probes fold into one listing, and timing shows every part</td></tr>
 <tr><td><a href="#v2-1-0">2.1.0</a></td><td>18 Oct 2026</td><td>Rails runs its files in parallel slots, one seeded database each; a plan reads the checkout once (minutes to seconds); units are checked and signed in parallel</td></tr>
 <tr><td><a href="#v2-0-4">2.0.4</a></td><td>18 Oct 2026</td><td>No more warning about <code>.DS_Store</code> in a listing git ignores it in</td></tr>
 <tr><td><a href="#v2-0-3">2.0.3</a></td><td>18 Oct 2026</td><td>Directory listings leave out what git ignores, so an attestation made on a laptop verifies in CI</td></tr>
@@ -45,6 +46,14 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-1">2.1.1</h2>
+<p><em>19 October 2026.</em> The first Rails pull request runs on vex's 16-core runners (vci 2.1.0) showed two costs that this Mac had not: the second run's plan spent 19 to 20 minutes in its verdicts phase for 2,004 candidates (5 seconds here), and the first run's check-and-sign phase ran at one unit a second (25 a second here). Both come from the shape of a Rails attestation on that application: 13,800 inputs a file, 10,000 of them Ruby's load-path probes (<code>vex-api/lib/&lt;feature&gt;.rb</code>, <code>vex-api/vendor/&lt;feature&gt;.rb</code>, <code>.so</code>, <code>.bundle</code>, absent, one per <code>require</code> per load-path directory ahead of the gem's), 1.9 MB a manifest.</p>
+<ul>
+<li><strong>The plan reads manifests in parallel.</strong> It read each candidate's manifest from the store behind one lock, with one <code>git cat-file</code> process, so sixteen verifying threads waited on one reader (a sampler showed the plan in <code>mutexwait</code>). Each verifying thread now has a reader of its own. On this Mac the same plan went from 44 s to 9.4 s.</li>
+<li><strong>Load-path probes fold into one listing.</strong> When fifty or more absent probes fall under one existing directory (the deepest one on the way to each probe), the collector records that directory's listing instead of the probes: a folded probe can only come to exist by a new name appearing in that listing, so this re-runs more, never less. Probes under a directory that holds one of the test files, that is git-ignored, written during the run, under a symlink or under vci's temp dirs stay as they are; without an answer from <code>git check-ignore</code> nothing is folded. On five vex-api model tests a manifest went from about 2,300 entries and 310 KB to about 460 and 60 KB (locally, lazy loading); the CI sample, 13,848 entries and 1.9 MB, folds to 3,875 and 517 KB, which projects vex's 5 GB store to about 1.4 GB. The plan skips the five files, re-runs them when a file is added under <code>lib/</code> or <code>vendor/</code>, and skips them again once it is removed.</li>
+<li><strong><code>VCI_TIMING=1</code> shows every part.</strong> After the verdicts phase, the plan prints per project how many candidates were checked and rehashed and the thread-seconds spent on signatures, global inputs, manifest reads, decoding, case-collision checks, ignored children, rehashing, externals and env; <code>vci run</code> prints the same for its check, sign and store phase. These are what will say where a slow runner's time goes.</li>
+</ul>
 
 <h2 id="v2-1-0">2.1.0</h2>
 <p><em>18 October 2026.</em> What it took for CI to attest a Rails application the size of vex-api (2,000 test files, a seeded MySQL database, 16-core runners that run the suite in 5 minutes with Rails' parallel workers), measured on it throughout. Three costs, each removed; the arithmetic is in <code>docs/notes-rails-rollout.md</code>.</p>

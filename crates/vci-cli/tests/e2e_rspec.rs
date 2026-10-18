@@ -1961,6 +1961,9 @@ fn rspec_bundle_installed_in_the_repository() {
             .unwrap()
             .iter()
             .filter(|e| e["path"].as_str().unwrap().starts_with("vendor/bundle"))
+            // vendor/'s listing (the require probes Rails' load path makes
+            // there, folded) leaves the git-ignored bundle out: not an input.
+            .filter(|e| !(e["kind"] == "excluded" && e["path"] == "vendor/bundle"))
             .collect();
         assert!(inside.is_empty(), "{id}: {inside:?}");
         assert!(

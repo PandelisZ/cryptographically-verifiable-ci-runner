@@ -134,3 +134,23 @@ per-file output (~3.3 s of each file's 5.5 s).
 - The input roots of request and controller tests differ between two runs of the same tree with either binary (30
   of 30 sampled files differed between two runs of the old binary); an old-binary `vci plan` skips all 926 files the
   new binary attested, so the cached manifests are what the uncached checks see.
+
+## Load path probes recorded as one listing
+
+- Rails puts `lib/` and `vendor/` on `$LOAD_PATH` ahead of the gems, so every `require` stats
+  `lib/<feature>.{rb,so,bundle}` and `vendor/<feature>.{rb,so,bundle}` first, each an `absent` entry: on vex-api in CI
+  ~10,000 of a file's ~13,800 entries (1.9 MB a manifest, a 5 GB store for 2,850 attestations, 13,800 entries checked
+  per candidate in every plan).
+- The collector now records 50 or more absent paths under one directory D (the deepest real directory above each, the
+  path's component just below D absent) as D's listing instead. Sound (fails open): making any of them exist creates a
+  new name in D. Left as probes: fewer than 50; a path through a file or symlink; D under vci's temp dirs, written by
+  the process, or holding one of its test files (`spec/` under RSpec, unless already listed); a child git ignores (vci
+  leaves those out of listings); everything when `git check-ignore` does not answer. Collector version unchanged
+  (0.5.0): the inputs mean more, never less. Details: `docs/spike-rails.md`, "Load path probes folded into a listing".
+- Cost: a new name directly in such a D runs the tests that list it. vex-api's `lib/` was already listed (Zeitwerk);
+  `vendor/` becomes a listing (it holds `.keep`).
+- Measured on vex-api (5 model tests, lazy loading, W=4): 2,285 to 2,343 inputs a file before, **453 to 473** after;
+  manifest 305 to 312 KB before, **59 to 61 KB** after; all five attested both times; the plan skips them, runs them
+  when `lib/zz_probe_test.rb` or `vendor/abstract_controller/base.rb` (an old probe) is added, and skips again once
+  removed. A CI (eager-loading) manifest folded the same way offline: 13,848 entries and 1.88 MB to 3,875 entries and
+  0.52 MB.

@@ -2394,13 +2394,18 @@ fn rails_bundle_installed_in_the_repository() {
     }
 
     // Nothing under vendor/bundle is an input; gems of the bundle are
-    // externals (hashids: required by D, read by gem_read).
+    // externals (hashids: required by D, read by gem_read). Rails puts
+    // vendor/ on the load path, and its many require probes there are
+    // recorded as vendor/'s listing (the collector's fold_probes), which
+    // leaves the git-ignored vendor/bundle out: an `excluded` entry, which
+    // says it is not an input.
     for id in [D, gem_read] {
         let pred = stored_predicate(&work, id);
         let entries = pred["manifest"]["entries"].as_array().unwrap().clone();
         let inside: Vec<&Value> = entries
             .iter()
             .filter(|e| e["path"].as_str().unwrap().starts_with("vendor/bundle"))
+            .filter(|e| !(e["kind"] == "excluded" && e["path"] == "vendor/bundle"))
             .collect();
         assert!(inside.is_empty(), "{id}: {inside:?}");
         let externals = pred["manifest"]["externals"].as_array().unwrap();

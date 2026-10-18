@@ -146,8 +146,15 @@ module VciCollector
     FILE = %i[exist? directory? symlink? file? expand_path realpath stat lstat join dirname basename extname
               fnmatch binread].to_h { |m| [m, FS.instance_method(m)] }.freeze
     DIR = %i[children pwd].to_h { |m| [m, DS.instance_method(m)] }.freeze
+    # IO.popen, for the collector's own `git check-ignore` at exit
+    # (Output.ignored_children).
+    POPEN = ::IO.singleton_class.instance_method(:popen)
 
     class << self
+      def popen(*args, **kw, &blk)
+        POPEN.bind_call(::IO, *args, **kw, &blk)
+      end
+
       FILE.each_key do |m|
         define_method(m) { |*args| FILE[m].bind_call(::File, *args) }
       end
@@ -1577,6 +1584,7 @@ module VciCollector
         raise "its process ended (#{st.signaled? ? "signal #{st.termsig}" : "exit #{st.exitstatus}"})" unless st.success?
         data = Marshal.load(blob) # rubocop:disable Security/MarshalLoad
         Output.learn(data[:classified])
+        Output.learn_ignored(data[:ignored])
         GemVerify.learn(data[:gems])
         return unless write
         index = {}
@@ -1599,7 +1607,7 @@ module VciCollector
         (@loader_checks || {}).each_key { |k| vc.records.delete(k) }
         DB.schema_files.each { |f| vc.schema_input(f) }
         lines = Output.lines_of(0, shared: true)
-        out = { classified: Output.classified, gems: GemVerify.done }
+        out = { classified: Output.classified, gems: GemVerify.done, ignored: Output.ignore_memo }
         return out unless name
         require "digest/sha2"
         text = lines.map { |l| "#{Json.dump(l)}\n" }.join
@@ -5231,6 +5239,9 @@ module VciCollector
         listed[p] = true if kind == :readdir
         lines << { kind: kind.to_s, path: p }
       end
+      # Many absent paths under one directory (load path probes): its
+      # listing instead (fold_probes).
+      lines = fold_probes(lines, seen, listed, written)
       # A listing of the directory holding one leaves it out (it is not in
       # a fresh checkout, and comes and goes with the database's journal).
       dbx.each_key do |x|
@@ -5263,6 +5274,180 @@ module VciCollector
       end
       taints.uniq.each { |t| lines << { kind: "taint", reason: t } }
       lines << res
+    end
+
+    # --- absent paths folded into a listing ----------------------------------
+    #
+    # `require "x/y"` makes Ruby stat <entry>/x/y.rb, .so and .bundle in
+    # every $LOAD_PATH entry ahead of the one that has it, and
+    # VciCollector.lookup / missing_feature record each one inside the
+    # repository as a probe (a file created there later would be loaded
+    # instead). An application with lib/ and vendor/ on its load path gets
+    # thousands: vex-api about 10,000 a file (5,000 under lib, 5,000 under
+    # vendor), 70 % of its manifest's entries.
+    #
+    # Probes whose fold_target is the same directory D, FOLD_MIN or more of
+    # them, are recorded as D's listing instead. D is the deepest real
+    # directory above the probe, and the path's component just below D (its
+    # `child`: the probe itself, or the first missing directory on the way
+    # to it, lib/abstract_controller for lib/abstract_controller/
+    # asset_paths.rb) is absent. Any change that makes such a path exist
+    # creates that child, a new name in D's listing, so the listing changes
+    # whenever one of the probes would: it can only re-run more (a file
+    # added to D that no probe named), never less. It is listed at exit, as
+    # every listing is (vci hashes what D holds when it builds the manifest).
+    #
+    # Every absent path in the repository counts, a test's own
+    # File.exist?("lib/x") as much as a load path probe: the records do not
+    # say who made them, and folding one into a listing D already gets is
+    # as sound for one as for the other. Not folded (left as probes):
+    # - fewer than FOLD_MIN under D (a few probes are cheaper, and re-run
+    #   less, than a listing);
+    # - a probe whose path exists now, or whose path below D runs through a
+    #   file or a symlink (a symlink's target can change without D's listing
+    #   changing), or any directory from the repository to D that is a
+    #   symlink;
+    # - D under vci's temp dirs, a directory this process wrote in (its
+    #   listing changes during the run), or one whose listing is exempt
+    #   (DB.exempt?);
+    # - D holding a test file of this process (a batch's: any of its files),
+    #   unless the process lists D anyway: RSpec puts spec/ first on the load
+    #   path (thousands of probes there), and a listing of spec/ (or test/,
+    #   or the repository's root) would run every test whenever a test file
+    #   is added, the most common change there is. lib/ and vendor/ (Rails
+    #   puts both on the load path) hold none; lib/ is usually listed
+    #   already (Zeitwerk's autoload_lib), so folding there costs nothing;
+    # - a probe whose child git ignores (as a file or as a directory): vci
+    #   leaves git-ignored children out of a listing (2.0.3), so creating it
+    #   would not change D's listing. One `git check-ignore` a process for
+    #   the children it has not asked about; when git does not answer
+    #   nothing is folded.
+    FOLD_MIN = 50
+
+    def fold_probes(lines, seen, listed, written)
+      vc = VciCollector
+      repo = vc.repo
+      return lines unless repo && !repo.empty?
+      lstats = {}
+      groups = {}
+      lines.each_with_index do |l, i|
+        next unless l[:kind] == "probe"
+        d, child = fold_target(l[:path], repo, lstats)
+        (groups[d] ||= []) << [i, child] if d
+      end
+      groups.select! { |d, ps| ps.size >= FOLD_MIN && foldable_dir?(d, repo, written, lstats, seen) }
+      return lines if groups.empty?
+      ignored = ignored_children(groups.values.flat_map { |ps| ps.map(&:last) }.uniq, repo)
+      return lines unless ignored
+      drop = {}
+      insert = {}
+      groups.each do |d, ps|
+        ps = ps.reject { |_, c| ignored[c] }
+        next if ps.size < FOLD_MIN
+        ps.each { |i, _| drop[i] = true }
+        listed[d] = true
+        next if seen[[:readdir, d]]
+        seen[[:readdir, d]] = true
+        insert[ps[0][0]] = { kind: "readdir", path: d }
+      end
+      return lines if drop.empty?
+      out = []
+      lines.each_with_index do |l, i|
+        out << insert[i] if insert[i]
+        out << l unless drop[i]
+      end
+      out
+    end
+
+    # [D, child] for an absent path `p` in the repository (see fold_probes),
+    # or nil.
+    def fold_target(p, repo, lstats)
+      vc = VciCollector
+      return nil unless p != repo && vc.inside?(p, repo)
+      return nil if lstat_of(p, lstats)
+      child = p
+      loop do
+        parent = Real.dirname(child)
+        return nil if parent == child || !vc.inside?(parent, repo)
+        st = lstat_of(parent, lstats)
+        return st.directory? ? [parent, child] : nil if st
+        child = parent
+      end
+    end
+
+    def foldable_dir?(d, repo, written, lstats, seen)
+      vc = VciCollector
+      return false unless classify(d) == [:path, d]
+      return false if !seen[[:readdir, d]] && test_files.any? { |t| vc.inside?(t, d) }
+      return false if DB.exempt?(:readdir, d) || ignored_prefixes.any? { |x| vc.inside?(d, x) }
+      return false if written.each_key.any? { |w| vc.inside?(w, d) }
+      cur = d
+      while vc.inside?(cur, repo)
+        st = lstat_of(cur, lstats)
+        return false unless st&.directory?
+        break if cur == repo
+        cur = Real.dirname(cur)
+      end
+      true
+    end
+
+    # The test files of this process (a batch's: all of them), absolute.
+    def test_files
+      @test_files ||= ((BATCH_IDS || []) + [VciCollector.test_id]).compact.uniq.map do |id|
+        Real.expand_path(id, VciCollector.root)
+      end
+    end
+
+    def lstat_of(p, lstats)
+      lstats.fetch(p) do
+        lstats[p] = begin
+          Real.lstat(p)
+        rescue SystemCallError
+          nil
+        end
+      end
+    end
+
+    # child => whether git ignores it (as a file or as a directory), for
+    # every child asked about so far in this process (and, in a batch's
+    # file process, by the process it forked from: Batch.share!); nil when
+    # git did not answer.
+    def ignored_children(children, repo)
+      ask = children.reject { |c| ignore_memo.key?(c) }
+      unless ask.empty?
+        got = git_check_ignore(repo, ask.flat_map { |c| [c, "#{c}/"] })
+        return nil unless got
+        ask.each { |c| ignore_memo[c] = got.key?(c) || got.key?("#{c}/") }
+      end
+      ignore_memo
+    end
+
+    def ignore_memo
+      @ignore_memo ||= {}
+    end
+
+    def learn_ignored(memo)
+      ignore_memo.merge!(memo) if memo.is_a?(Hash)
+    end
+
+    # The `paths` (absolute, in the repository) git ignores, as a Hash of
+    # path => true; nil unless git answered (exit 0: some, 1: none).
+    def git_check_ignore(repo, paths)
+      out = nil
+      Real.popen(["git", "-C", repo, "check-ignore", "--stdin", "-z"], "r+", err: File::NULL) do |io|
+        writer = Thread.new do
+          VciCollector.quiet do
+            io.write(paths.map { |p| "#{p}\0" }.join)
+            io.close_write
+          end
+        end
+        out = io.read
+        writer.join
+      end
+      return nil unless [0, 1].include?($?&.exitstatus)
+      out.to_s.split("\0").to_h { |p| [p, true] }
+    rescue StandardError, NotImplementedError
+      nil
     end
 
     def meta
