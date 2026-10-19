@@ -225,6 +225,52 @@ fn a_fresh_clone_fetches_keys_only_and_reads_what_it_hydrates() {
     assert!(!has_object(&f, &values[5]));
 }
 
+/// A plan fetches the manifests of the attestations it chooses (each unit's
+/// newest) and the rest in a later round, for the units that need them: the
+/// first round downloads the unit's attestations and only the chosen
+/// manifest, the second the other.
+#[test]
+fn a_plan_fetches_the_chosen_manifests_first_and_the_rest_in_a_later_round() {
+    let w = lazy_world(1);
+    let a = repo(&w.clones[0]);
+    let st = AttestStore::new(&a);
+    let (r1, r2) = (hex64(0xe1), hex64(0xe2));
+    st.put_manifest(&r1, &manifest("one")).unwrap();
+    st.put_manifest(&r2, &manifest("two")).unwrap();
+    st.put(A, S1, &hex64(1), &env("a1", &r1)).unwrap();
+    st.put(A, S2, &hex64(2), &env("a2", &r2)).unwrap();
+    st.put(B, S1, &hex64(3), &env("b1", &r2)).unwrap();
+    assert_eq!(st.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    assert!(sf.fetch(Some("origin")).unwrap().found);
+    // Choose A's attestation by S2 (the one referencing r2): A's two
+    // attestations and r2 are fetched, r1 is not.
+    let h = sf
+        .hydrate_units_choosing([A], |c| {
+            c.iter()
+                .enumerate()
+                .filter(|(_, e)| e.signer == S2)
+                .map(|(i, _)| i)
+                .collect()
+        })
+        .unwrap();
+    assert_eq!((h.resolved, h.unresolved, h.fetched), (3, 0, 3), "{h:?}");
+    assert!(sf.list(Some(A)).unwrap().iter().all(|e| e.error.is_none()));
+    assert_eq!(sf.manifest(&r2).unwrap().unwrap().bytes, manifest("two"));
+    let m1 = sf.manifest(&r1).unwrap().unwrap();
+    assert!(m1.not_fetched(), "{m1:?}");
+    assert!(!has_object(&f, &manifest_blob(&w, &r1)));
+    // The later round takes r1 alone.
+    let h = sf.hydrate_manifests([r1.as_str()]).unwrap();
+    assert_eq!((h.resolved, h.fetched), (1, 1), "{h:?}");
+    assert_eq!(sf.manifest(&r1).unwrap().unwrap().bytes, manifest("one"));
+    // B's value was never asked for.
+    assert!(sf.list(Some(B)).unwrap()[0].not_fetched());
+}
+
 #[test]
 fn a_push_from_a_blobless_clone_fetches_nothing_and_drops_nothing() {
     let w = lazy_world(1);

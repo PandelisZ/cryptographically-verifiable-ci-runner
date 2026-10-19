@@ -1476,7 +1476,11 @@ index, `HEAD` and work tree are never touched) and is exchanged on the remote's 
   keys, so the store gets a row per key without reading a value: a value whose blob is already here is stored as a
   reference to it, any other one as a git-meta *promised* row (not fetched). Only deletion records (tiny) are
   downloaded and read. `vci plan` (and `vci ci`, `vci explain`) then fetches the values it reads in one `git fetch
-  --stdin` of blob ids each: the attestations of the units it verifies, then the input manifests they reference;
+  --stdin` of blob ids each: the attestations of the units it verifies, then the input manifests of each unit's
+  newest attestation (since 2.1.13; every candidate's before, six times as many on vex), and after its first pass,
+  in one more batch, the manifests of the other attestations of the units it could not skip, which are checked
+  again (`VCI_TIMING=1` prints `round 2: fetch N more manifest(s)`). The store's promised rows and the local
+  metadata tree are listed once for all of a plan's batches (2.1.13: listing them for each took 12 of a vex job's 24 s);
   `vci verify` fetches the one manifest it reads, `vci run` the attestations of the units it attests (supersession
   reads them), and `vci prune` every attestation (on a large store, what a fetch downloaded before 2.0). A value that
   cannot be fetched (offline) reads as ``value not fetched: run `vci fetch` online`` and makes its unit run (a

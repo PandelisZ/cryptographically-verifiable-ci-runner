@@ -498,6 +498,10 @@ struct ManifestLoader {
     /// a time behind one reader serialized the plan (2.1.0: on vex's runners,
     /// 2,004 manifests of 1.9 MB took 1,124 s under one lock).
     readers: Vec<Mutex<Option<Result<Reader, String>>>>,
+    /// Roots (a manifest's, or its base's) a read found not fetched yet: the
+    /// plan fetches them after its first pass and checks their units again
+    /// (see `hydrate_for_plan`).
+    not_fetched: Mutex<BTreeSet<String>>,
 }
 
 impl ManifestLoader {
@@ -505,7 +509,23 @@ impl ManifestLoader {
         ManifestLoader {
             cache: Mutex::default(),
             readers: (0..readers.max(1)).map(|_| Mutex::new(None)).collect(),
+            not_fetched: Mutex::default(),
         }
+    }
+
+    /// The roots reads found not fetched since the last call.
+    fn take_not_fetched(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.not_fetched.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Forget what was read for these roots (and for the manifests whose
+    /// base is one of them): the next read goes to the store again.
+    fn evict(&self, roots: &BTreeSet<String>) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.retain(|root, r| {
+            !roots.contains(root)
+                && !matches!(r, Err((_, detail)) if roots.iter().any(|b| detail.contains(b.as_str())))
+        });
     }
 
     /// The manifest is read with a reader no other thread is using and
@@ -552,6 +572,25 @@ impl ManifestLoader {
             Ok((m, base)) => (Ok(m), base),
             Err(e) => (Err(e), None),
         };
+        {
+            let mut missing = Vec::new();
+            if let Ok(Some(m)) = &stored
+                && m.not_fetched()
+            {
+                missing.push(root.to_owned());
+            }
+            if let Some((b, Ok(Some(s)))) = &base
+                && s.not_fetched()
+            {
+                missing.push(b.clone());
+            }
+            if !missing.is_empty() {
+                self.not_fetched
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend(missing);
+            }
+        }
         let r = load_manifest(root, stored, |b| match base {
             Some((root, stored)) if root == b => stored,
             _ => Ok(None),
@@ -1328,6 +1367,8 @@ fn plan_with(
             .collect()
     });
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
+    let mut verdicts = verdicts;
+    hydrate_more(&ctx, &files, &verifiers, &by_id, &mut verdicts, res);
     for (pi, (verifier, verdicts)) in verifiers.iter().zip(verdicts).enumerate() {
         match verifier {
             Err(r) => {
@@ -1358,7 +1399,22 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
                 .is_some_and(|p| p.run_all.is_none())
         })
         .map(|f| f.test_id.as_str());
-    let warning = match AttestStore::new(repo).hydrate_units(ids) {
+    // The manifests of each unit's newest attestation(s) only: the
+    // verdict checks the newest first and reads another's manifest only
+    // when it fails (`hydrate_more`, after the first pass).
+    let newest = |cands: &[StoredEnvelope]| -> Vec<usize> {
+        let hints: Vec<Option<i64>> = cands.iter().map(issued_hint).collect();
+        let Some(max) = hints.iter().flatten().max().copied() else {
+            return (0..cands.len()).collect();
+        };
+        hints
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| **h == Some(max))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let warning = match AttestStore::new(repo).hydrate_units_choosing(ids, newest) {
         Ok(h) => h.error.map(|e| {
             format!(
                 "could not fetch {} stored attestation value(s): {e}; their units run",
@@ -1374,6 +1430,105 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
         res.warnings.push(w);
     }
     timing("fetch the stored values the plan reads", t);
+}
+
+/// The second round of a lazy plan: the units the first pass could not
+/// skip because a candidate's input manifest was not fetched yet (only the
+/// newest's was, `hydrate_for_plan`) have those manifests fetched, in one
+/// batch, and are checked again. A unit whose newest attestation matches
+/// never gets here; one whose older attestation matches (an input edited
+/// and reverted, a branch rebased onto what was attested) is skipped as
+/// with every value fetched. Bounded: a round that fetches nothing new
+/// ends it.
+fn hydrate_more(
+    ctx: &Ctx,
+    files: &[TestFile],
+    verifiers: &[Result<Verifier<'_>, String>],
+    by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
+    verdicts: &mut [Vec<FileVerdict>],
+    res: &mut PlanResult,
+) {
+    let mut fetched_before: BTreeSet<String> = BTreeSet::new();
+    for round in 2..=4 {
+        let roots: BTreeSet<String> = verifiers
+            .iter()
+            .flatten()
+            .flat_map(|v| v.manifests.take_not_fetched())
+            .filter(|r| !fetched_before.contains(r))
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let h = AttestStore::new(&ctx.repo).hydrate_manifests(roots.iter().map(String::as_str));
+        let warning = match &h {
+            Ok(h) => h.error.as_ref().map(|e| {
+                format!(
+                    "could not fetch {} stored input manifest(s) (round {round}): {e}; their units run",
+                    h.unresolved
+                )
+            }),
+            Err(e) => Some(format!(
+                "could not fetch the stored input manifests the plan reads (round {round}): {e:#}; their units run"
+            )),
+        };
+        if let Some(w) = warning {
+            eprintln!("vci: warning: {w}");
+            res.warnings.push(w);
+        }
+        let resolved = h.map(|h| h.resolved).unwrap_or(0);
+        fetched_before.extend(roots.iter().cloned());
+        if resolved == 0 {
+            timing(
+                &format!(
+                    "round {round}: {} manifest(s) still not fetched",
+                    roots.len()
+                ),
+                t,
+            );
+            return;
+        }
+        for v in verifiers.iter().flatten() {
+            v.manifests.evict(&roots);
+        }
+        // The units not skipped that have candidates: checked again with
+        // the manifests now here (the checkout cache keeps their rehashes).
+        let mut rechecked = 0usize;
+        in_plan_pool(|| {
+            verifiers
+                .par_iter()
+                .zip(verdicts.par_iter_mut())
+                .enumerate()
+                .for_each(|(pi, (verifier, verdicts))| {
+                    let Ok(v) = verifier else { return };
+                    let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
+                    mine.par_iter()
+                        .zip(verdicts.par_iter_mut())
+                        .filter(|(_, out)| !out.skip && !out.candidates.is_empty())
+                        .for_each(|(f, out)| {
+                            let cands = by_id
+                                .get(f.test_id.as_str())
+                                .map(Vec::as_slice)
+                                .unwrap_or_default();
+                            *out = v.verdict(f, cands);
+                        });
+                });
+        });
+        for (pi, verdicts) in verdicts.iter().enumerate() {
+            if verifiers[pi].is_ok() {
+                rechecked += verdicts
+                    .iter()
+                    .filter(|o| !o.skip && !o.candidates.is_empty())
+                    .count();
+            }
+        }
+        timing(
+            &format!(
+                "round {round}: fetch {resolved} more manifest(s), check the units not skipped again ({rechecked} still not)"
+            ),
+            t,
+        );
+    }
 }
 
 /// Fill in project names on verdicts; set the top-level `run_all` when every

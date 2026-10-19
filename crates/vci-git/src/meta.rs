@@ -217,6 +217,26 @@ pub struct StoredManifest {
     pub error: Option<String>,
 }
 
+impl StoredManifest {
+    /// Whether the value is unread only because it has not been fetched
+    /// yet ([`StoredEnvelope::not_fetched`]).
+    pub fn not_fetched(&self) -> bool {
+        self.error.as_deref() == Some(NOT_FETCHED)
+    }
+}
+
+/// What the hydrations of one exchange share (see
+/// [`AttestStore::hydrate_ctx`]).
+struct HydrateCtx {
+    /// The store's rows whose values are not fetched yet, less those a
+    /// round of this exchange resolved.
+    promised: BTreeSet<Key>,
+    local_ref: String,
+    /// The local metadata tree's keys and blobs, listed by the first round
+    /// that fetches anything.
+    snap: Option<KeySnapshot>,
+}
+
 /// What [`AttestStore::fetch`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchOutcome {
@@ -1219,6 +1239,22 @@ impl<'a> AttestStore<'a> {
         &self,
         test_ids: impl IntoIterator<Item = &'s str>,
     ) -> Result<Hydration, GitError> {
+        self.hydrate_units_choosing(test_ids, |c| (0..c.len()).collect())
+    }
+
+    /// [`AttestStore::hydrate_units`], fetching the input manifests of only
+    /// the attestations `choose` picks among each unit's (by index into the
+    /// unit's stored attestations, every one fetched by then): a plan checks
+    /// a unit's newest attestation first and reads the others' manifests
+    /// only when it fails, so it fetches the newest's here and the rest in a
+    /// second round ([`AttestStore::hydrate_manifests`]) for the units that
+    /// need them (2.1.13: vex's Rails jobs fetched 12,000 manifests to read
+    /// 2,000).
+    pub fn hydrate_units_choosing<'s>(
+        &self,
+        test_ids: impl IntoIterator<Item = &'s str>,
+        choose: impl Fn(&[StoredEnvelope]) -> Vec<usize>,
+    ) -> Result<Hydration, GitError> {
         let ids: BTreeSet<&str> = test_ids.into_iter().collect();
         if ids.is_empty() || self.reader()?.promised()? == 0 {
             return Ok(Hydration::default());
@@ -1236,7 +1272,8 @@ impl<'a> AttestStore<'a> {
             .collect();
         let _lock = self.exchange_lock()?;
         let remote = self.value_remote()?;
-        let mut out = self.hydrate_locked(&remote, |k| {
+        let mut ctx = self.hydrate_ctx()?;
+        let mut out = self.hydrate_with(&mut ctx, &remote, |k| {
             parse_key(&k.key).is_some_and(|(tk, _, _)| {
                 wanted.contains(&(
                     k.target_type.as_str().to_owned(),
@@ -1248,8 +1285,10 @@ impl<'a> AttestStore<'a> {
         let reader = self.reader()?;
         let mut roots = BTreeSet::new();
         for id in &ids {
-            for e in reader.candidates(id)? {
-                if e.error.is_none()
+            let cands = reader.candidates(id)?;
+            for i in choose(&cands) {
+                if let Some(e) = cands.get(i)
+                    && e.error.is_none()
                     && let Some(r) = envelope_manifest_ref(&e.bytes)
                 {
                     roots.insert(r);
@@ -1258,11 +1297,11 @@ impl<'a> AttestStore<'a> {
         }
         drop(reader);
         if !roots.is_empty() {
-            out.add(self.hydrate_locked(&remote, |k| {
+            out.add(self.hydrate_with(&mut ctx, &remote, |k| {
                 k.target_type == TargetType::Project
                     && parse_manifest_key(&k.key).is_some_and(|r| roots.contains(r))
             })?);
-            out.add(self.hydrate_bases_locked(&remote, &roots)?);
+            out.add(self.hydrate_bases_with(&mut ctx, &remote, &roots)?);
         }
         Ok(out)
     }
@@ -1270,8 +1309,9 @@ impl<'a> AttestStore<'a> {
     /// Fetch the base manifests (vci 2.1.8: the entries a run's units share,
     /// stored once and named by each unit's manifest) of the stored
     /// manifests among `roots` that have one, when not fetched yet.
-    fn hydrate_bases_locked(
+    fn hydrate_bases_with(
         &self,
+        ctx: &mut HydrateCtx,
         remote: &str,
         roots: &BTreeSet<String>,
     ) -> Result<Hydration, GitError> {
@@ -1289,7 +1329,7 @@ impl<'a> AttestStore<'a> {
         if bases.is_empty() {
             return Ok(Hydration::default());
         }
-        self.hydrate_locked(remote, |k| {
+        self.hydrate_with(ctx, remote, |k| {
             k.target_type == TargetType::Project
                 && parse_manifest_key(&k.key).is_some_and(|r| bases.contains(r))
         })
@@ -1307,12 +1347,13 @@ impl<'a> AttestStore<'a> {
         }
         let _lock = self.exchange_lock()?;
         let remote = self.value_remote()?;
-        let mut out = self.hydrate_locked(&remote, |k| {
+        let mut ctx = self.hydrate_ctx()?;
+        let mut out = self.hydrate_with(&mut ctx, &remote, |k| {
             k.target_type == TargetType::Project
                 && parse_manifest_key(&k.key).is_some_and(|r| roots.contains(r))
         })?;
         let owned: BTreeSet<String> = roots.iter().map(|r| (*r).to_owned()).collect();
-        out.add(self.hydrate_bases_locked(&remote, &owned)?);
+        out.add(self.hydrate_bases_with(&mut ctx, &remote, &owned)?);
         Ok(out)
     }
 
@@ -1421,24 +1462,45 @@ impl<'a> AttestStore<'a> {
         remote: &str,
         wanted: impl Fn(&Key) -> bool,
     ) -> Result<Hydration, GitError> {
+        let mut ctx = self.hydrate_ctx()?;
+        self.hydrate_with(&mut ctx, remote, wanted)
+    }
+
+    /// What the hydrations of one exchange read once (2.1.13: each of a
+    /// plan's three rounds listed the store's promised rows and the whole
+    /// local metadata tree, 12 s of a vex Rails job's 24 s value fetch).
+    fn hydrate_ctx(&self) -> Result<HydrateCtx, GitError> {
+        Ok(HydrateCtx {
+            promised: self.promised_keys()?,
+            local_ref: format!("refs/{}/local/main", self.namespace()?),
+            snap: None,
+        })
+    }
+
+    /// [`AttestStore::hydrate_locked`] with the rows and tree `ctx` holds;
+    /// the rows resolved leave `ctx` (a later round does not ask for them).
+    fn hydrate_with(
+        &self,
+        ctx: &mut HydrateCtx,
+        remote: &str,
+        wanted: impl Fn(&Key) -> bool,
+    ) -> Result<Hydration, GitError> {
         let started = std::time::Instant::now();
-        let promised: Vec<Key> = self
-            .promised_keys()?
-            .into_iter()
-            .filter(|k| wanted(k))
-            .collect();
+        let promised: Vec<Key> = ctx.promised.iter().filter(|k| wanted(k)).cloned().collect();
         if promised.is_empty() {
             return Ok(Hydration::default());
         }
-        let local_ref = format!("refs/{}/local/main", self.namespace()?);
-        let Some(local) = self.read_ref(&local_ref)? else {
-            return Ok(Hydration {
-                unresolved: promised.len(),
-                error: Some(format!("{local_ref} does not exist")),
-                ..Default::default()
-            });
-        };
-        let snap = self.snapshot_keys(&local)?;
+        if ctx.snap.is_none() {
+            let Some(local) = self.read_ref(&ctx.local_ref)? else {
+                return Ok(Hydration {
+                    unresolved: promised.len(),
+                    error: Some(format!("{} does not exist", ctx.local_ref)),
+                    ..Default::default()
+                });
+            };
+            ctx.snap = Some(self.snapshot_keys(&local)?);
+        }
+        let snap = ctx.snap.as_ref().expect("snapshot read above");
         let blobs: BTreeMap<&Key, &String> = promised
             .iter()
             .filter_map(|k| snap.value_blobs.get(k).map(|o| (k, o)))
@@ -1468,6 +1530,10 @@ impl<'a> AttestStore<'a> {
                     .map_err(|e| sql_err(&path, e))?;
             }
             tx.commit().map_err(|e| sql_err(&path, e))?;
+        }
+        let resolved: Vec<Key> = resolve.iter().map(|(k, _)| (*k).clone()).collect();
+        for k in &resolved {
+            ctx.promised.remove(k);
         }
         if std::env::var_os("VCI_TIMING").is_some() {
             eprintln!(

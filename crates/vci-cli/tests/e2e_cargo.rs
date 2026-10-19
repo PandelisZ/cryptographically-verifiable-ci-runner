@@ -2550,6 +2550,31 @@ fn cargo_blobless_clone_fetches_only_what_the_plan_reads() {
         assert!(has_object(&fresh, oid), "c's {oid} not fetched");
     }
 
+    // Two attestations of b, the newer for inputs the checkout no longer
+    // has (an edit attested, then reverted): a fresh clone's plan fetches
+    // the manifest of b's newest attestation first, finds it does not
+    // match, fetches the older's in a second round and skips b.
+    let b_src = std::fs::read_to_string(work.join("b/src/lib.rs")).unwrap();
+    std::fs::write(work.join("b/src/lib.rs"), format!("{b_src}\n// edited\n")).unwrap();
+    w.run(&work, &[B], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    std::fs::write(work.join("b/src/lib.rs"), b_src).unwrap();
+    let again = clone("again");
+    w.vci_ok(&again, &["fetch", "--remote", "origin"]);
+    let out = w.vci_env(
+        &again,
+        &["plan", "--base-ref", "main", "--format", "json"],
+        &[("VCI_TIMING", "1")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("round 2: fetch 1 more manifest(s)"),
+        "the older attestation's manifest is fetched in a second round: {stderr}"
+    );
+    let p = Plan::from_json(&serde_json::from_slice(&out.stdout).unwrap());
+    assert_eq!(p.skip, set(&[B, C]), "{stderr}");
+
     // Attest and publish from the blobless clone; the first clone reads it.
     w.run(&fresh, &[D], &w.trusted);
     w.vci_ok(&fresh, &["push", "--remote", "origin"]);
