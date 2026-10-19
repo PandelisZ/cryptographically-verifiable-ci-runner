@@ -354,6 +354,7 @@ mod tests {
             repo_id: "r".into(),
             commit: "c".into(),
             tree_dirty: true,
+            tree: None,
             toolchain: Toolchain {
                 node: "26.9.0".into(),
                 vitest: "5.0.2".into(),
