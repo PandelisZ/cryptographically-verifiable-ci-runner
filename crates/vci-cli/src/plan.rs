@@ -351,6 +351,9 @@ fn current_refs(repo: &Repo) -> Vec<String> {
 /// Everything computed once per project.
 struct Verifier<'a> {
     ctx: &'a Ctx,
+    /// This checkout's tree (clean checkout), to check candidates made on
+    /// it first.
+    head_tree: Option<String>,
     project: &'a Project,
     allowed: &'a AllowedSigners,
     /// Keyless trust from the base commit (`None`: no identities.toml).
@@ -516,6 +519,13 @@ impl ManifestLoader {
     /// The roots reads found not fetched since the last call.
     fn take_not_fetched(&self) -> BTreeSet<String> {
         std::mem::take(&mut *self.not_fetched.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Forget every read that failed: the next read goes to the store
+    /// again (after a round fetched more values).
+    fn evict_errors(&self) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.retain(|_, r| r.is_ok());
     }
 
     /// Forget what was read for these roots (and for the manifests whose
@@ -740,6 +750,9 @@ fn best_failure<'a>(failed: impl IntoIterator<Item = (usize, &'a Failure)>) -> O
 /// check, only to check the newest candidates first (each is still checked
 /// in full); `None` when it cannot be read.
 fn issued_hint(s: &StoredEnvelope) -> Option<i64> {
+    if let Some(i) = s.issued {
+        return Some(i);
+    }
     #[derive(serde::Deserialize)]
     struct Statement {
         predicate: Issued,
@@ -1300,6 +1313,7 @@ fn plan_with(
     // for every candidate of every file (and every project).
     let checkout = CheckoutCache::new(&ctx.root);
     let ignored = IgnoredChildren::default();
+    let head_tree = ctx.repo.head_tree().ok();
     let verifiers: Vec<Result<Verifier<'_>, String>> = ctx
         .projects
         .iter()
@@ -1312,6 +1326,7 @@ fn plan_with(
                 (None, true, None) => Err("internal: the project was not resolved".to_owned()),
                 (None, true, Some(r)) => r.map(|r| Verifier {
                     ctx: &ctx,
+                    head_tree: head_tree.clone(),
                     project,
                     allowed: allowed.as_ref().unwrap_or(&no_ssh_signers),
                     keyless: keyless.as_ref(),
@@ -1399,22 +1414,16 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
                 .is_some_and(|p| p.run_all.is_none())
         })
         .map(|f| f.test_id.as_str());
-    // The manifests of each unit's newest attestation(s) only: the
-    // verdict checks the newest first and reads another's manifest only
-    // when it fails (`hydrate_more`, after the first pass).
-    let newest = |cands: &[StoredEnvelope]| -> Vec<usize> {
-        let hints: Vec<Option<i64>> = cands.iter().map(issued_hint).collect();
-        let Some(max) = hints.iter().flatten().max().copied() else {
-            return (0..cands.len()).collect();
-        };
-        hints
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| **h == Some(max))
-            .map(|(i, _)| i)
-            .collect()
-    };
-    let warning = match AttestStore::new(repo).hydrate_units_choosing(ids, newest) {
+    // The envelopes and manifests of each unit's likeliest attestation(s)
+    // only, chosen from the keys (vci 2.2 keys say when an attestation was
+    // issued and on which tree): one made on this checkout's tree, else the
+    // newest; keys without a hint (older) are fetched too. The verdict
+    // checks those first and the plan fetches the rest only for the units
+    // it could not skip (`hydrate_more`).
+    let head = repo.head_tree().ok();
+    let choose =
+        move |cands: &[StoredEnvelope]| -> Vec<usize> { choose_candidates(cands, head.as_deref()) };
+    let warning = match AttestStore::new(repo).hydrate_units_choosing(ids, choose) {
         Ok(h) => h.error.map(|e| {
             format!(
                 "could not fetch {} stored attestation value(s): {e}; their units run",
@@ -1448,28 +1457,41 @@ fn hydrate_more(
     verdicts: &mut [Vec<FileVerdict>],
     res: &mut PlanResult,
 ) {
-    let mut fetched_before: BTreeSet<String> = BTreeSet::new();
-    for round in 2..=4 {
+    for round in 2..=3 {
+        // The units the first pass could not skip that have candidates
+        // whose value or manifest was not read: every candidate of theirs
+        // is fetched (envelopes, manifests, bases) in one batch each.
+        let mut ids: BTreeSet<&str> = BTreeSet::new();
+        for (pi, verdicts) in verdicts.iter().enumerate() {
+            if verifiers[pi].is_err() {
+                continue;
+            }
+            let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
+            for (f, out) in mine.iter().zip(verdicts.iter()) {
+                if !out.skip && !out.candidates.is_empty() {
+                    ids.insert(f.test_id.as_str());
+                }
+            }
+        }
         let roots: BTreeSet<String> = verifiers
             .iter()
             .flatten()
             .flat_map(|v| v.manifests.take_not_fetched())
-            .filter(|r| !fetched_before.contains(r))
             .collect();
-        if roots.is_empty() {
+        if ids.is_empty() {
             return;
         }
         let t = std::time::Instant::now();
-        let h = AttestStore::new(&ctx.repo).hydrate_manifests(roots.iter().map(String::as_str));
+        let h = AttestStore::new(&ctx.repo).hydrate_units(ids.iter().copied());
         let warning = match &h {
             Ok(h) => h.error.as_ref().map(|e| {
                 format!(
-                    "could not fetch {} stored input manifest(s) (round {round}): {e}; their units run",
+                    "could not fetch {} stored attestation value(s) (round {round}): {e}; their units run",
                     h.unresolved
                 )
             }),
             Err(e) => Some(format!(
-                "could not fetch the stored input manifests the plan reads (round {round}): {e:#}; their units run"
+                "could not fetch the stored attestation values the plan reads (round {round}): {e:#}; their units run"
             )),
         };
         if let Some(w) = warning {
@@ -1477,12 +1499,11 @@ fn hydrate_more(
             res.warnings.push(w);
         }
         let resolved = h.map(|h| h.resolved).unwrap_or(0);
-        fetched_before.extend(roots.iter().cloned());
         if resolved == 0 {
             timing(
                 &format!(
-                    "round {round}: {} manifest(s) still not fetched",
-                    roots.len()
+                    "round {round}: nothing more to fetch for {} unit(s) not skipped",
+                    ids.len()
                 ),
                 t,
             );
@@ -1490,9 +1511,18 @@ fn hydrate_more(
         }
         for v in verifiers.iter().flatten() {
             v.manifests.evict(&roots);
+            v.manifests.evict_errors();
         }
-        // The units not skipped that have candidates: checked again with
-        // the manifests now here (the checkout cache keeps their rehashes).
+        // Checked again with every candidate readable: the store's rows are
+        // re-read for these units (their candidates' values are new).
+        let fresh: BTreeMap<String, Vec<StoredEnvelope>> =
+            match AttestStore::new(&ctx.repo).reader() {
+                Ok(r) => ids
+                    .iter()
+                    .filter_map(|id| r.candidates(id).ok().map(|c| ((*id).to_owned(), c)))
+                    .collect(),
+                Err(_) => BTreeMap::new(),
+            };
         let mut rechecked = 0usize;
         in_plan_pool(|| {
             verifiers
@@ -1504,10 +1534,11 @@ fn hydrate_more(
                     let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
                     mine.par_iter()
                         .zip(verdicts.par_iter_mut())
-                        .filter(|(_, out)| !out.skip && !out.candidates.is_empty())
+                        .filter(|(f, out)| !out.skip && ids.contains(f.test_id.as_str()))
                         .for_each(|(f, out)| {
-                            let cands = by_id
+                            let cands = fresh
                                 .get(f.test_id.as_str())
+                                .or_else(|| by_id.get(f.test_id.as_str()))
                                 .map(Vec::as_slice)
                                 .unwrap_or_default();
                             *out = v.verdict(f, cands);
@@ -1524,11 +1555,40 @@ fn hydrate_more(
         }
         timing(
             &format!(
-                "round {round}: fetch {resolved} more manifest(s), check the units not skipped again ({rechecked} still not)"
+                "round {round}: fetch {resolved} more value(s) for {} unit(s) not skipped, check them again ({rechecked} still not)",
+                ids.len()
             ),
             t,
         );
     }
+}
+
+/// A candidate in the order it is checked: (made on this checkout's tree,
+/// issued), its place in the store's order, the envelope.
+type RankedCandidate<'a> = ((bool, Option<i64>), usize, &'a StoredEnvelope);
+
+/// Which of a unit's stored attestations a plan reads first (by index): the
+/// ones whose key says they were made on `head` (this checkout's tree),
+/// else the newest by the key's issue time (ties: all), plus every key
+/// without a hint. A unit with no hinted key reads them all, as before 2.2.
+fn choose_candidates(cands: &[StoredEnvelope], head: Option<&str>) -> Vec<usize> {
+    let head16: Option<String> = head.map(|t| t.chars().take(16).collect());
+    let mut out: Vec<usize> = (0..cands.len())
+        .filter(|&i| cands[i].issued.is_none())
+        .collect();
+    let same_tree: Vec<usize> = (0..cands.len())
+        .filter(|&i| {
+            cands[i].issued.is_some() && cands[i].tree.is_some() && cands[i].tree == head16
+        })
+        .collect();
+    if !same_tree.is_empty() {
+        out.extend(same_tree);
+    } else if let Some(max) = cands.iter().filter_map(|c| c.issued).max() {
+        out.extend((0..cands.len()).filter(|&i| cands[i].issued == Some(max)));
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Fill in project names on verdicts; set the top-level `run_all` when every
@@ -1625,10 +1685,17 @@ impl Verifier<'_> {
         // Newest first (by the issuedAt each says, unread ones last; ties
         // in store order): the first that passes is used, and a newer
         // attestation is the likelier to match this checkout.
-        let mut cands: Vec<(Option<i64>, usize, &StoredEnvelope)> = cands
+        let head16: Option<String> = self
+            .head_tree
+            .as_deref()
+            .map(|t| t.chars().take(16).collect());
+        let mut cands: Vec<RankedCandidate<'_>> = cands
             .iter()
             .enumerate()
-            .map(|(i, s)| (issued_hint(s), i, s))
+            .map(|(i, s)| {
+                let same_tree = s.tree.is_some() && s.tree == head16;
+                ((same_tree, issued_hint(s)), i, s)
+            })
             .collect();
         cands.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
         // Each checked candidate's place in the store's order.

@@ -1893,7 +1893,7 @@ fn run_record(w: &World, files: &[&str], jobs: &str, tag: &str) -> RunRecord {
             .any(|p| l.starts_with(p))
                 || l.ends_with(" not attested")
         })
-        .map(str::to_owned)
+        .map(strip_key_hints)
         .collect();
     let summary: Value = serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
     let repo = store_for(dir);
@@ -1912,11 +1912,23 @@ fn run_record(w: &World, files: &[&str], jobs: &str, tag: &str) -> RunRecord {
             assert!(o.remove("expiresAt").is_some(), "{st}");
             let r = o["result"].as_object_mut().unwrap();
             assert!(r.remove("durationMs").is_some(), "{st}");
-            (s.key.clone(), p)
+            (strip_key_hints(&s.key), p)
         })
         .collect();
     stored.sort_by(|a, b| a.0.cmp(&b.0));
     (lines, out.status.code(), summary, stored)
+}
+
+/// `text` with every attestation key's hint (vci 2.2: when it was issued,
+/// which differs between two runs) left out.
+fn strip_key_hints(text: &str) -> String {
+    text.split(' ')
+        .map(|w| match vci_git::parse_key_hint(w) {
+            Some(_) => w.rsplit_once(':').map_or(w, |(k, _)| k).to_owned(),
+            None => w.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Units are checked and signed several at a time (`VCI_JOBS`), and stored

@@ -246,8 +246,9 @@ fn a_plan_fetches_the_chosen_manifests_first_and_the_rest_in_a_later_round() {
     let rf = repo(&f);
     let sf = AttestStore::new(&rf);
     assert!(sf.fetch(Some("origin")).unwrap().found);
-    // Choose A's attestation by S2 (the one referencing r2): A's two
-    // attestations and r2 are fetched, r1 is not.
+    // Choose A's attestation by S2 (the one referencing r2): that envelope
+    // and r2 are fetched (vci 2.2: the chosen envelopes only), S1's and r1
+    // are not.
     let h = sf
         .hydrate_units_choosing([A], |c| {
             c.iter()
@@ -257,8 +258,10 @@ fn a_plan_fetches_the_chosen_manifests_first_and_the_rest_in_a_later_round() {
                 .collect()
         })
         .unwrap();
-    assert_eq!((h.resolved, h.unresolved, h.fetched), (3, 0, 3), "{h:?}");
-    assert!(sf.list(Some(A)).unwrap().iter().all(|e| e.error.is_none()));
+    assert_eq!((h.resolved, h.unresolved, h.fetched), (2, 0, 2), "{h:?}");
+    let a_list = sf.list(Some(A)).unwrap();
+    assert!(a_list.iter().any(|e| e.signer == S2 && e.error.is_none()));
+    assert!(a_list.iter().any(|e| e.signer == S1 && e.not_fetched()));
     assert_eq!(sf.manifest(&r2).unwrap().unwrap().bytes, manifest("two"));
     let m1 = sf.manifest(&r1).unwrap().unwrap();
     assert!(m1.not_fetched(), "{m1:?}");
@@ -269,6 +272,91 @@ fn a_plan_fetches_the_chosen_manifests_first_and_the_rest_in_a_later_round() {
     assert_eq!(sf.manifest(&r1).unwrap().unwrap().bytes, manifest("one"));
     // B's value was never asked for.
     assert!(sf.list(Some(B)).unwrap()[0].not_fetched());
+}
+
+/// A plan fetches the envelopes of the candidates it chooses (vci 2.2:
+/// chosen from the keys' hints, nothing read), not every candidate's, and
+/// an attestation of the same inputs stored again under a newer hint
+/// replaces the old key.
+#[test]
+fn a_plan_fetches_only_the_chosen_envelopes_and_a_rewrite_replaces_the_key() {
+    use vci_git::KeyHint;
+    let w = lazy_world(1);
+    let a = repo(&w.clones[0]);
+    let st = AttestStore::new(&a);
+    let (r1, r2) = (hex64(0xe1), hex64(0xe2));
+    st.put_manifest(&r1, &manifest("one")).unwrap();
+    st.put_manifest(&r2, &manifest("two")).unwrap();
+    let old = KeyHint {
+        issued: 100,
+        tree: None,
+    };
+    let new = KeyHint {
+        issued: 200,
+        tree: Some("0123456789abcdef".to_owned()),
+    };
+    // Two attestations of A by one signer with different inputs (storage
+    // keys), one older; the same inputs attested again replace their key.
+    st.put_hinted(A, S1, &hex64(1), Some(&old), &env("a-old", &r1))
+        .unwrap();
+    st.put_hinted(A, S1, &hex64(2), Some(&old), &env("a-new-first", &r2))
+        .unwrap();
+    st.put_hinted(A, S1, &hex64(2), Some(&new), &env("a-new", &r2))
+        .unwrap();
+    let keys: Vec<String> = st
+        .list(Some(A))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.key)
+        .collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(
+        keys.iter().any(|k| k.ends_with(":c8.0123456789abcdef")),
+        "{keys:?}"
+    );
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k.ends_with(":64.-") && k.contains(&hex64(2))),
+        "{keys:?}"
+    );
+    assert_eq!(st.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    assert!(sf.fetch(Some("origin")).unwrap().found);
+    // The keys say which is newest before any value is read.
+    let cands = sf.list(Some(A)).unwrap();
+    assert!(cands.iter().all(|e| e.not_fetched()));
+    let newest: Vec<&vci_git::StoredEnvelope> =
+        cands.iter().filter(|e| e.issued == Some(200)).collect();
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].tree.as_deref(), Some("0123456789abcdef"));
+    // Choosing the newest fetches its envelope and manifest only: 2 blobs.
+    let h = sf
+        .hydrate_units_choosing([A], |c| {
+            c.iter()
+                .enumerate()
+                .filter(|(_, e)| e.issued == Some(200))
+                .map(|(i, _)| i)
+                .collect()
+        })
+        .unwrap();
+    assert_eq!((h.resolved, h.fetched), (2, 2), "{h:?}");
+    let after = sf.list(Some(A)).unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|e| e.issued == Some(200) && e.error.is_none())
+    );
+    assert!(
+        after
+            .iter()
+            .any(|e| e.issued == Some(100) && e.not_fetched())
+    );
+    assert_eq!(sf.manifest(&r2).unwrap().unwrap().bytes, manifest("two"));
+    assert!(sf.manifest(&r1).unwrap().unwrap().not_fetched());
 }
 
 /// A blobless clone's push when the remote's tip moved since its fetch

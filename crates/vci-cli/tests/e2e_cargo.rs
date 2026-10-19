@@ -2568,9 +2568,11 @@ fn cargo_blobless_clone_fetches_only_what_the_plan_reads() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
+    // vci 2.2: the key says which attestation was made on this checkout's
+    // tree, so that one is read first and matches: no second round.
     assert!(
-        stderr.contains("round 2: fetch 1 more manifest(s)"),
-        "the older attestation's manifest is fetched in a second round: {stderr}"
+        !stderr.contains("round 2: fetch "),
+        "the same-tree attestation is chosen first: {stderr}"
     );
     let p = Plan::from_json(&serde_json::from_slice(&out.stdout).unwrap());
     assert_eq!(p.skip, set(&[B, C]), "{stderr}");
@@ -2748,6 +2750,64 @@ fn cargo_two_blobless_clones_supersede_the_same_attestation_and_both_push() {
     let st = AttestStore::new(&repo);
     let b: Vec<_> = st.list(Some(B)).unwrap();
     assert_eq!(b.len(), 2, "{b:?}");
+}
+
+/// `vci prune --keep N` (vci 2.2) keeps a unit's N newest attestations by
+/// a signer, and any made on a tree some ref still has at its tip: three
+/// attestations of b on three branches stay while the branches do, become
+/// two once the oldest branch is gone, then one with `--superseded` once
+/// the next is, and the manifests only they referenced go with them.
+#[test]
+fn cargo_prune_keeps_the_newest_n_per_signer() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    for v in [2, 3, 4] {
+        w.git(&work, &["checkout", "-q", "-b", &format!("b{v}"), "main"]);
+        w.put(
+            "b/tests/data/b.json",
+            &format!("{{\"greeting\": \"hello\", \"v\": {v}}}\n"),
+        );
+        w.git(&work, &["commit", "-qam", "b's data changes"]);
+        let err = w.run(&work, &[B], &w.trusted);
+        assert!(!err.contains("superseded"), "{err}");
+        // issuedAt has second resolution: the next one is newer.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    assert_eq!(raw_statements(&work, B).len(), 3);
+    // Every tree is at a branch tip: nothing to prune.
+    let removals = |out: &str| {
+        out.lines()
+            .filter(|l| l.starts_with("would remove") && l.contains("vci:attestation"))
+            .count()
+    };
+    let out = w.vci_ok(&work, &["prune", "--dry-run"]);
+    assert_eq!(removals(&out), 0, "{out}");
+    w.git(&work, &["branch", "-D", "b2"]);
+    let out = w.vci_ok(&work, &["prune", "--dry-run"]);
+    assert_eq!(removals(&out), 1, "{out}");
+    w.vci_ok(&work, &["prune"]);
+    let left = raw_statements(&work, B);
+    assert_eq!(left.len(), 2, "{left:?}");
+    let roots: Vec<String> = left
+        .iter()
+        .map(|(_, st)| st["predicate"]["inputRoot"].as_str().unwrap().to_owned())
+        .collect();
+    let store_repo = store_for(&work);
+    let st = AttestStore::new(&store_repo);
+    let manifests = st.manifests().unwrap();
+    assert!(roots.iter().all(|r| manifests.contains(r)), "{manifests:?}");
+    assert_eq!(
+        manifests.len(),
+        2,
+        "the pruned attestation's manifest went: {manifests:?}"
+    );
+    // `--keep 1` keeps b3's too while its branch is there; `--superseded`
+    // keeps only the newest, whatever the branch.
+    w.vci_ok(&work, &["prune", "--keep", "1"]);
+    assert_eq!(raw_statements(&work, B).len(), 2);
+    w.vci_ok(&work, &["prune", "--superseded"]);
+    assert_eq!(raw_statements(&work, B).len(), 1);
+    assert_eq!(st.manifests().unwrap().len(), 1);
 }
 
 // ---- manifests by reference (vci 1.9.0) -----------------------------------

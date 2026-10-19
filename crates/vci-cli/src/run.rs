@@ -2287,7 +2287,14 @@ pub fn run_units(
                 store
                     .put_manifest(&p.core.input_root, compact.as_bytes())
                     .context("storing the input manifest")?;
-                let stored = store.put(&p.core.test_id, &signer, &skey, &env)?;
+                let hint = crate::util::parse_rfc3339(&p.core.issued_at)
+                    .ok()
+                    .map(|issued| vci_git::KeyHint {
+                        issued,
+                        tree: p.core.tree.as_ref().map(|t| t.chars().take(16).collect()),
+                    });
+                let stored =
+                    store.put_hinted(&p.core.test_id, &signer, &skey, hint.as_ref(), &env)?;
                 // Never the one just stored (the same storage key: the same
                 // inputs, replaced).
                 let doomed: Vec<_> = doomed.into_iter().filter(|e| e.key != stored.key).collect();

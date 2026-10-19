@@ -1408,14 +1408,26 @@ pub fn fetch_messages(repo: &vci_git::Repo, remote: Option<&str>) -> Result<Vec<
 /// its manifest inline references none), unless an attestation's value, or
 /// the `manifestRef` of one left alone, cannot be read (what it references
 /// is then unknown).
-pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
+pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let store = AttestStore::new(&repo);
     let now = now_unix();
     let (mut expired, mut kept, mut unreadable, mut older) = (0usize, 0usize, 0usize, 0usize);
-    // Of a unit's attestations by one signer, the one issued last: an older
-    // one vouches for inputs that tree no longer has (or soon will not).
-    let mut newest: BTreeMap<(String, String), (i64, String)> = BTreeMap::new();
+    // Of a unit's attestations by one signer, the `keep` issued last are
+    // kept (`--superseded`: one), and any made on a tree some ref still has
+    // at its tip (2.1.12); an older one vouches for inputs the tree no
+    // longer has (or soon will not), and every stored attestation costs
+    // each plan a download (vci 2.2: vex kept five per file).
+    // `--superseded` keeps the documented meaning: only the newest, whatever
+    // the branch; `--keep` also keeps one made on a tree some ref still has
+    // at its tip, as `vci run`'s supersession does (2.1.12).
+    let keep = if superseded { 1 } else { keep.max(1) };
+    let live_trees = if superseded {
+        BTreeSet::new()
+    } else {
+        repo.live_trees().unwrap_or_default()
+    };
+    let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
     let mut current = Vec::new();
     // Manifests the remaining attestations reference; `None` once one of
     // them cannot be read.
@@ -1448,19 +1460,11 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
             }
             Some(m) => {
                 kept += 1;
-                if !superseded && let (Some(r), Some(set)) = (&m.manifest_ref, referenced.as_mut())
-                {
-                    set.insert(r.clone());
-                }
-                if superseded {
-                    let slot = newest
-                        .entry((m.test_id.clone(), e.signer.clone()))
-                        .or_insert((m.issued_at, e.key.clone()));
-                    if (m.issued_at, &e.key) > (slot.0, &slot.1) {
-                        *slot = (m.issued_at, e.key.clone());
-                    }
-                    current.push((m, e));
-                }
+                by_unit
+                    .entry((m.test_id.clone(), e.signer.clone()))
+                    .or_default()
+                    .push((m.issued_at, e.key.clone()));
+                current.push((m, e));
             }
             None => {
                 unreadable += 1;
@@ -1485,12 +1489,15 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
             }
         }
     }
+    // The keys kept per unit and signer: the `keep` newest.
+    let mut keep_keys: BTreeSet<String> = BTreeSet::new();
+    for list in by_unit.values_mut() {
+        list.sort_by(|a, b| b.cmp(a));
+        keep_keys.extend(list.iter().take(keep).map(|(_, k)| k.clone()));
+    }
     for (m, e) in current {
-        if newest
-            .get(&(m.test_id.clone(), e.signer.clone()))
-            .map(|n| &n.1)
-            == Some(&e.key)
-        {
+        let live = m.tree.as_deref().is_some_and(|t| live_trees.contains(t));
+        if keep_keys.contains(&e.key) || live {
             if let (Some(r), Some(set)) = (&m.manifest_ref, referenced.as_mut()) {
                 set.insert(r.clone());
             }

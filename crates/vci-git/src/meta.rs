@@ -12,13 +12,19 @@
 //!   unit whose path git-meta cannot hold as a path target (the repository root
 //!   `.`, or a value shorter than git-meta's minimum of three bytes) is stored
 //!   on the `project` target instead.
-//! * Key: `vci:attestation:<test key>:<signer id>:<storage key>`, where the
+//! * Key: `vci:attestation:<test key>:<signer id>:<storage key>[:<hint>]`,
+//!   where the
 //!   test key is BLAKE3 of the test id (it separates units sharing a path,
 //!   such as the cargo targets of one package), the signer id names the
 //!   signing key (so two signers never write the same key), and the storage
 //!   key hashes everything that makes two attestations interchangeable (input
 //!   root, toolchain, argv, ...). The same signer re-attesting the same unit
-//!   and inputs therefore rewrites the same key.
+//!   and inputs therefore rewrites the same key. Since vci 2.2 the key ends
+//!   with a hint, `<issuedAt seconds, hex>.<first 16 hex digits of the tree
+//!   the attestation records, or ->`, so a plan picks the candidates to
+//!   download without reading any (a vci before 2.2 does not read such keys:
+//!   their units run there). The same inputs re-attested replace the key
+//!   whatever its hint.
 //! * Value: the signed DSSE envelope, byte for byte.
 //! * Input manifests (since vci 1.9.0 an attestation references its manifest
 //!   by input root instead of embedding it): target `project`, key
@@ -189,6 +195,11 @@ pub struct StoredEnvelope {
     pub signer: String,
     /// Storage key (see the module docs).
     pub storage_key: String,
+    /// When the key says the attestation was issued (seconds since the
+    /// epoch; vci 2.2 keys), read without the value.
+    pub issued: Option<i64>,
+    /// The first 16 hex digits of the tree the key says it was made on.
+    pub tree: Option<String>,
     /// The stored bytes, exactly as passed to `put` (empty when `error` is
     /// set).
     pub bytes: Vec<u8>,
@@ -306,9 +317,66 @@ pub fn target_label(t: &Target) -> String {
     t.to_string()
 }
 
-/// The key an attestation is stored under.
+/// The key an attestation is stored under (without a hint, as before 2.2).
 pub fn attestation_key(test_key: &str, signer: &str, storage_key: &str) -> String {
     format!("{KEY_PREFIX}:{test_key}:{signer}:{storage_key}")
+}
+
+/// What a key says about its attestation without the value (vci 2.2): when
+/// it was issued and, when known, the git tree it was made on. A plan
+/// chooses which candidates to download from this; before, it downloaded
+/// every candidate of every unit to find the newest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyHint {
+    /// `issuedAt`, seconds since the epoch.
+    pub issued: i64,
+    /// The first 16 hex digits of the tree the attestation records.
+    pub tree: Option<String>,
+}
+
+/// The key an attestation is stored under, with its hint:
+/// `vci:attestation:<test key>:<signer>:<storage key>:<issued hex>.<tree16 | ->`.
+pub fn attestation_key_hinted(
+    test_key: &str,
+    signer: &str,
+    storage_key: &str,
+    hint: &KeyHint,
+) -> String {
+    let tree = hint
+        .tree
+        .as_deref()
+        .map(|t| t.chars().take(16).collect::<String>())
+        .filter(|t| t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| "-".to_owned());
+    format!(
+        "{KEY_PREFIX}:{test_key}:{signer}:{storage_key}:{:x}.{tree}",
+        hint.issued.max(0)
+    )
+}
+
+fn parse_hint(part: &str) -> Option<KeyHint> {
+    let (issued, tree) = part.split_once('.')?;
+    if issued.is_empty() || issued.len() > 16 || !issued.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let issued = i64::from_str_radix(issued, 16).ok()?;
+    let tree = match tree {
+        "-" => None,
+        t if t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit()) => Some(t.to_owned()),
+        _ => return None,
+    };
+    Some(KeyHint { issued, tree })
+}
+
+/// The hint a key carries, if any (keys written before 2.2 carry none).
+pub fn parse_key_hint(key: &str) -> Option<KeyHint> {
+    let rest = key.strip_prefix(KEY_PREFIX)?.strip_prefix(':')?;
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() == 4 {
+        parse_hint(parts[3])
+    } else {
+        None
+    }
 }
 
 /// The key the input manifest with this root is stored under (target
@@ -368,15 +436,19 @@ fn tombstone_blob_id(t: &Tombstone, like: &str) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-/// Split a key into (test key, signer, storage key) if it has vci's shape.
+/// Split a key into (test key, signer, storage key) if it has vci's shape,
+/// with or without a hint (vci 2.2).
 pub fn parse_key(key: &str) -> Option<(&str, &str, &str)> {
     let rest = key.strip_prefix(KEY_PREFIX)?.strip_prefix(':')?;
     let mut parts = rest.split(':');
-    let (Some(tk), Some(signer), Some(sk), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
+    let (Some(tk), Some(signer), Some(sk)) = (parts.next(), parts.next(), parts.next()) else {
         return None;
     };
+    match (parts.next(), parts.next()) {
+        (None, _) => {}
+        (Some(h), None) if parse_hint(h).is_some() => {}
+        _ => return None,
+    }
     (validate::is_hex_id(tk) && validate::is_signer_id(signer) && validate::is_hex_id(sk))
         .then_some((tk, signer, sk))
 }
@@ -636,12 +708,15 @@ impl Reader {
         if row.value_type != "string" {
             return None;
         }
+        let hint = parse_key_hint(&row.key);
         let mut env = StoredEnvelope {
             target: target_label(&row.target),
             key: row.key.clone(),
             test_key: tk.to_owned(),
             signer: signer.to_owned(),
             storage_key: sk.to_owned(),
+            issued: hint.as_ref().map(|h| h.issued),
+            tree: hint.and_then(|h| h.tree),
             bytes: Vec::new(),
             error: None,
         };
@@ -1043,6 +1118,22 @@ impl<'a> AttestStore<'a> {
         storage_key: &str,
         bytes: &[u8],
     ) -> Result<StoredEnvelope, GitError> {
+        self.put_hinted(test_id, signer, storage_key, None, bytes)
+    }
+
+    /// [`AttestStore::put`] with the key's hint (vci 2.2: when the
+    /// attestation was issued and the tree it was made on). An attestation
+    /// of the same unit, signer and storage key stored under another hint
+    /// (an earlier one of the same inputs) is replaced, as the same key was
+    /// before.
+    pub fn put_hinted(
+        &self,
+        test_id: &str,
+        signer: &str,
+        storage_key: &str,
+        hint: Option<&KeyHint>,
+        bytes: &[u8],
+    ) -> Result<StoredEnvelope, GitError> {
         validate::signer_id(signer)?;
         validate::hex_id("storage_key", storage_key)?;
         let text = std::str::from_utf8(bytes).map_err(|_| GitError::Invalid {
@@ -1051,8 +1142,28 @@ impl<'a> AttestStore<'a> {
             reason: "must be UTF-8",
         })?;
         let tk = vci_core::test_key(test_id);
-        let key = attestation_key(&tk, signer, storage_key);
         let target = target_for(test_id);
+        let same_inputs: Vec<StoredEnvelope> = self
+            .reader()?
+            .candidates(test_id)?
+            .into_iter()
+            .filter(|e| e.signer == signer && e.storage_key == storage_key)
+            .collect();
+        let key = match hint {
+            Some(h) => attestation_key_hinted(&tk, signer, storage_key, h),
+            // No hint: the same inputs' existing key, whatever its hint
+            // (a rewrite in place), else the plain key.
+            None => same_inputs
+                .first()
+                .map(|e| e.key.clone())
+                .unwrap_or_else(|| attestation_key(&tk, signer, storage_key)),
+        };
+        // The same inputs stored under another hint: replaced.
+        let others: Vec<StoredEnvelope> =
+            same_inputs.into_iter().filter(|e| e.key != key).collect();
+        if !others.is_empty() {
+            self.remove_envelopes(others)?;
+        }
         let session = self.session()?;
         let handle = session.target(&target);
         let current = handle.get_value(&key).ok().flatten();
@@ -1066,6 +1177,8 @@ impl<'a> AttestStore<'a> {
             test_key: tk,
             signer: signer.to_owned(),
             storage_key: storage_key.to_owned(),
+            issued: hint.map(|h| h.issued),
+            tree: hint.and_then(|h| h.tree.clone()),
             bytes: bytes.to_vec(),
             error: None,
         })
@@ -1288,6 +1401,24 @@ impl<'a> AttestStore<'a> {
         let _lock = self.exchange_lock()?;
         let remote = self.value_remote()?;
         let mut ctx = self.hydrate_ctx()?;
+        // `choose` sees the candidates as stored (values not read): keys
+        // with a hint (vci 2.2) say enough to pick the newest.
+        let reader = self.reader()?;
+        let mut chosen_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for id in &ids {
+            let cands = reader.candidates(id)?;
+            for i in choose(&cands) {
+                if let Some(e) = cands.get(i) {
+                    let t = target_for(id);
+                    chosen_keys.insert((
+                        t.target_type().as_str().to_owned(),
+                        t.value().unwrap_or("").to_owned(),
+                        e.key.clone(),
+                    ));
+                }
+            }
+        }
+        drop(reader);
         let mut out = self.hydrate_with(&mut ctx, &remote, |k| {
             parse_key(&k.key).is_some_and(|(tk, _, _)| {
                 wanted.contains(&(
@@ -1295,15 +1426,23 @@ impl<'a> AttestStore<'a> {
                     k.target_value.clone(),
                     tk.to_owned(),
                 ))
-            })
+            }) && chosen_keys.contains(&(
+                k.target_type.as_str().to_owned(),
+                k.target_value.clone(),
+                k.key.clone(),
+            ))
         })?;
         let reader = self.reader()?;
         let mut roots = BTreeSet::new();
         for id in &ids {
-            let cands = reader.candidates(id)?;
-            for i in choose(&cands) {
-                if let Some(e) = cands.get(i)
-                    && e.error.is_none()
+            let t = target_for(id);
+            for e in reader.candidates(id)? {
+                if e.error.is_none()
+                    && chosen_keys.contains(&(
+                        t.target_type().as_str().to_owned(),
+                        t.value().unwrap_or("").to_owned(),
+                        e.key.clone(),
+                    ))
                     && let Some(r) = envelope_manifest_ref(&e.bytes)
                 {
                     roots.insert(r);
@@ -4788,6 +4927,55 @@ mod tests {
             AttestStore::classify_change("A", "000000", "100644", b"project/k\xff/__value")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn hinted_keys_parse_and_plain_ones_still_do() {
+        let (tk, signer, sk) = ("ab".repeat(32), "0123456789abcdef", "cd".repeat(32));
+        let plain = attestation_key(&tk, signer, &sk);
+        assert_eq!(parse_key(&plain), Some((tk.as_str(), signer, sk.as_str())));
+        assert_eq!(parse_key_hint(&plain), None);
+        let hint = KeyHint {
+            issued: 1_792_430_181,
+            tree: Some("0123456789abcdef".to_owned()),
+        };
+        let k = attestation_key_hinted(&tk, signer, &sk, &hint);
+        assert!(k.ends_with(":6ad65065.0123456789abcdef"), "{k}");
+        assert_eq!(parse_key(&k), Some((tk.as_str(), signer, sk.as_str())));
+        assert_eq!(parse_key_hint(&k), Some(hint.clone()));
+        let no_tree = attestation_key_hinted(
+            &tk,
+            signer,
+            &sk,
+            &KeyHint {
+                issued: 7,
+                tree: None,
+            },
+        );
+        assert!(no_tree.ends_with(":7.-"), "{no_tree}");
+        assert_eq!(parse_key_hint(&no_tree).unwrap().tree, None);
+        // A 40-digit tree is cut to 16; a bad one reads as none.
+        let long = attestation_key_hinted(
+            &tk,
+            signer,
+            &sk,
+            &KeyHint {
+                issued: 1,
+                tree: Some("f".repeat(40)),
+            },
+        );
+        assert_eq!(
+            parse_key_hint(&long).unwrap().tree.as_deref(),
+            Some("ffffffffffffffff")
+        );
+        for bad in [
+            format!("{plain}:zz.-"),
+            format!("{plain}:1.abc"),
+            format!("{plain}:1.-:more"),
+            format!("{plain}:"),
+        ] {
+            assert_eq!(parse_key(&bad), None, "{bad}");
+        }
     }
 
     #[test]

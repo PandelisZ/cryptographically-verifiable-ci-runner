@@ -176,9 +176,12 @@ enum Cmd {
         /// Only list what would be deleted.
         #[arg(long)]
         dry_run: bool,
-        /// Also delete attestations superseded by a newer one of the same unit by the same signer (their inputs no longer match the current tree, or soon will not).
+        /// Keep only the newest one of a unit's attestations by the same signer (the same as `--keep 1`).
         #[arg(long)]
         superseded: bool,
+        /// How many of a unit's attestations by the same signer to keep, newest first; one made on a tree some branch or tag still has at its tip is always kept. Every stored attestation costs each plan a download.
+        #[arg(long, default_value_t = 2)]
+        keep: usize,
     },
     /// Print the effective environment policy of each project: what vci sets, hashes, ignores and removes (docs/ENV.md).
     Env {
@@ -348,7 +351,8 @@ fn main() {
         Cmd::Prune {
             dry_run,
             superseded,
-        } => cmds::prune(dry_run, superseded),
+            keep,
+        } => cmds::prune(dry_run, superseded, keep),
         Cmd::Env {
             base_ref,
             project,
