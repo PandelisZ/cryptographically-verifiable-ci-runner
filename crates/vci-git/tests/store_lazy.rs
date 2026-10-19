@@ -289,15 +289,17 @@ fn a_blobless_push_retries_when_the_remote_moves_underneath() {
     sf.put(D, S2, &hex64(9), &env("d2", &hex64(0xe2))).unwrap();
 
     let mut attempts = Vec::new();
-    sf.push_with_hook(Some("origin"), |attempt| {
-        attempts.push(attempt);
-        if attempt == 1 {
-            sa.put(D, S1, &hex64(8), &env("d1", &hex64(0xe1))).unwrap();
-            assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
-        }
-    })
-    .unwrap();
+    let outcome = sf
+        .push_with_hook(Some("origin"), |attempt| {
+            attempts.push(attempt);
+            if attempt == 1 {
+                sa.put(D, S1, &hex64(8), &env("d1", &hex64(0xe1))).unwrap();
+                assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+            }
+        })
+        .unwrap();
     assert_eq!(attempts, vec![1, 2], "first push failed, second succeeded");
+    eprintln!("push notes: {:?}", outcome.notes);
     // Both writers' values are on the remote; the blobless clone still has
     // not fetched the others' values.
     assert!(sa.fetch(Some("origin")).unwrap().found);

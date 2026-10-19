@@ -4173,7 +4173,18 @@ impl<'a> AttestStore<'a> {
             // merge), and they are fetched first; pack-objects would
             // otherwise try the lazy fetch vci disables and fail.
             let t = std::time::Instant::now();
-            let missing = self.missing_for_push(&pushed, tip.as_deref())?;
+            // The tip's tree must be complete here, not only when it was
+            // fetched: git excludes the tip's objects from the pack by
+            // walking its tree, and stops silently under a subtree it
+            // cannot read, so the values under it would be packed, and a
+            // value this clone never fetched fails the push (2.1.16: three
+            // vex jobs lost their attestations to `could not fetch <a
+            // concurrent job's deletion record> from promisor remote`).
+            if let Some(tip) = tip.as_deref() {
+                self.complete_tree(&name, tip)?;
+            }
+            let mut missing = self.missing_for_push(&pushed, tip.as_deref())?;
+            missing.extend(self.changed_blobs_missing(&pushed, tip.as_deref())?);
             if !missing.is_empty() {
                 let (have, fetched, error) = self.ensure_blobs(&name, &missing)?;
                 let still: Vec<&String> = missing.iter().filter(|o| !have.contains(*o)).collect();
@@ -4251,8 +4262,9 @@ impl<'a> AttestStore<'a> {
                 if stderr.contains("promisor remote") && attempt < PUSH_ATTEMPTS {
                     let moved = self.remote_tip_moved(&name, &remote_ref, tip.as_deref())?;
                     last = format!(
-                        "the pack needed an object this clone could not read ({remote_ref} {} since this round's fetch)",
-                        if moved { "moved" } else { "did not move" }
+                        "the pack needed an object this clone could not read ({remote_ref} {} since this round's fetch; {})",
+                        if moved { "moved" } else { "did not move" },
+                        self.push_diagnosis(&pushed, tip.as_deref(), &stderr)
                     );
                     report.note(format!(
                         "push attempt {attempt}: {last}; fetching and trying again"
@@ -4273,6 +4285,97 @@ impl<'a> AttestStore<'a> {
             attempts: PUSH_ATTEMPTS,
             detail: last,
         })
+    }
+
+    /// The blobs `pushed`'s tree holds at paths where it differs from
+    /// `tip`'s (every blob of the tree without a tip) that this clone does
+    /// not have: what the pack must send, found by comparing the trees
+    /// (`git diff-tree`) rather than by git's object walk, which stops
+    /// silently under a subtree it cannot read.
+    fn changed_blobs_missing(
+        &self,
+        pushed: &str,
+        tip: Option<&str>,
+    ) -> Result<BTreeSet<String>, GitError> {
+        let mut git =
+            self.repo
+                .git()
+                .args(["diff-tree", "-r", "--no-commit-id", "--diff-filter=AM"]);
+        git = match tip {
+            Some(t) => git.arg(t).arg(pushed),
+            None => git.arg("--root").arg(pushed),
+        };
+        let out = git.env("GIT_NO_LAZY_FETCH", "1").run_str()?;
+        let blobs: BTreeSet<String> = out
+            .lines()
+            .filter_map(|l| {
+                // :<mode> <mode> <old> <new> <status>\t<path>
+                let mut f = l.strip_prefix(':')?.split_whitespace();
+                let (_, _, _, new) = (f.next()?, f.next()?, f.next()?, f.next()?);
+                is_oid(new).then(|| new.to_owned())
+            })
+            .collect();
+        if blobs.is_empty() {
+            return Ok(blobs);
+        }
+        let have = self.present(&blobs)?;
+        Ok(blobs.difference(&have).cloned().collect())
+    }
+
+    /// For the note of a push whose pack needed an object this clone could
+    /// not read: which object git named, whether this clone can read it
+    /// now, whether `tip`'s tree is complete, and how many objects of
+    /// `pushed` are missing here when nothing is excluded.
+    fn push_diagnosis(&self, pushed: &str, tip: Option<&str>, stderr: &str) -> String {
+        let named = stderr
+            .lines()
+            .find_map(|l| l.strip_prefix("fatal: could not fetch "))
+            .and_then(|l| l.split_whitespace().next())
+            .filter(|o| is_oid(o))
+            .map(str::to_owned);
+        let readable = named.as_deref().map(|o| {
+            self.repo
+                .git()
+                .args(["cat-file", "-t", o])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run_str()
+                .map(|t| t.trim().to_owned())
+                .unwrap_or_else(|_| "unreadable".to_owned())
+        });
+        let tip_complete = tip.map(|t| {
+            self.repo
+                .git()
+                .args(["ls-tree", "-r", "-d", "--full-tree", t])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run()
+                .is_ok()
+        });
+        let missing_all = self
+            .repo
+            .git()
+            .args([
+                "rev-list",
+                "--objects",
+                "--missing=print",
+                "--no-object-names",
+                pushed,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()
+            .map(|o| o.lines().filter(|l| l.starts_with('?')).count());
+        format!(
+            "object {}: {}; the tip's tree is {}; {} object(s) of the pushed commit are not here",
+            named.as_deref().unwrap_or("?"),
+            readable.as_deref().unwrap_or("?"),
+            match tip_complete {
+                Some(true) => "complete",
+                Some(false) => "INCOMPLETE",
+                None => "absent",
+            },
+            missing_all
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "?".to_owned())
+        )
     }
 
     /// Whether `remote_ref` on `remote` is no longer at `tip` (one
