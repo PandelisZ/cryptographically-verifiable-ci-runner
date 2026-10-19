@@ -1467,6 +1467,33 @@ impl<'a> AttestStore<'a> {
         Ok(out)
     }
 
+    /// The objects reachable from `commit` but not from `tip` (the remote's,
+    /// when it has one) that this clone does not have: what a push of
+    /// `commit` would have to send without being able to read it.
+    fn missing_for_push(
+        &self,
+        commit: &str,
+        tip: Option<&str>,
+    ) -> Result<BTreeSet<String>, GitError> {
+        let mut git = self.repo.git().args([
+            "rev-list",
+            "--objects",
+            "--missing=print",
+            "--no-object-names",
+            commit,
+        ]);
+        if let Some(t) = tip {
+            git = git.arg(format!("^{t}"));
+        }
+        let out = git.env("GIT_NO_LAZY_FETCH", "1").run_str()?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.strip_prefix('?'))
+            .map(|o| o.trim().to_owned())
+            .filter(|o| !o.is_empty())
+            .collect())
+    }
+
     /// A read-write connection to the store, `None` when there is none yet.
     fn db_rw(&self) -> Result<Option<(Utf8PathBuf, rusqlite::Connection)>, GitError> {
         let path = self.db_path()?;
@@ -3925,6 +3952,32 @@ impl<'a> AttestStore<'a> {
                     "vci: timing: push: put the local metadata on top of {name}'s: {:.2}s",
                     t.elapsed().as_secs_f64()
                 );
+            }
+            // What the pack sends must be readable here: git asked which
+            // objects of the commit the remote's tip does not reach are
+            // missing (a value or deletion record this clone holds as a key
+            // only, which the remote's tip no longer reaches after a round's
+            // merge), and they are fetched first; pack-objects would
+            // otherwise try the lazy fetch vci disables and fail.
+            let t = std::time::Instant::now();
+            let missing = self.missing_for_push(&pushed, tip.as_deref())?;
+            if !missing.is_empty() {
+                let (have, fetched, error) = self.ensure_blobs(&name, &missing)?;
+                let still: Vec<&String> = missing.iter().filter(|o| !have.contains(*o)).collect();
+                if let Some(first) = still.first() {
+                    return Err(GitError::Meta(format!(
+                        "the push needs {} object(s) this clone never fetched that {name} did not serve (first: {first}){}; not pushing (`vci fetch` and push again)",
+                        still.len(),
+                        error.map(|e| format!(": {e}")).unwrap_or_default()
+                    )));
+                }
+                if timing {
+                    eprintln!(
+                        "vci: timing: push: fetch {} object(s) the pack needs ({fetched} downloaded): {:.2}s",
+                        missing.len(),
+                        t.elapsed().as_secs_f64()
+                    );
+                }
             }
             let t = std::time::Instant::now();
             before_push(attempt);
