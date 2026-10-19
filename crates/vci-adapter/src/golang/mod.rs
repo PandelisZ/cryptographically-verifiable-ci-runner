@@ -500,6 +500,7 @@ impl GoAdapter {
         // business (`result:skipped`).
         let passed_all = result.state == "passed" && result.failed == 0;
         let mut o = Observed {
+            shared_group: None,
             test_id: rel.to_owned(),
             root: self.project_dir.to_string(),
             adapter: "go".into(),

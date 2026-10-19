@@ -141,6 +141,7 @@ impl CargoAdapter {
                     // Defensive: a worker that panicked panics the scope
                     // above, so every unit has a result here.
                     let mut o = Observed {
+                        shared_group: None,
                         test_id: f.clone(),
                         ..Default::default()
                     };
@@ -306,6 +307,7 @@ impl CargoAdapter {
         let mut p = Prepared {
             idx,
             o: Observed {
+                shared_group: None,
                 test_id: unit.to_owned(),
                 root: self.project_dir.to_string(),
                 adapter: "cargo".into(),

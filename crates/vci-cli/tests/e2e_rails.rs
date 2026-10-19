@@ -3235,6 +3235,41 @@ fn batch_gives_what_one_process_per_file_gives(batch: &[(&str, &str)]) {
         "{p:?}"
     );
     assert!(refused.is_subset(&p.run), "{p:?}");
+    // In slots, each slot's files share the boot's and the slot's
+    // observations: their manifests are stored on one base per slot (vci
+    // 2.1.8), never more bases than slots, and decode to the whole.
+    if in_slots {
+        let repo = store_for(&w.work);
+        let store = AttestStore::new(&repo);
+        let mut bases = BTreeSet::new();
+        for id in &attested {
+            let pred = stored_predicate(&w.work, id);
+            let root = pred["inputRoot"].as_str().unwrap().to_owned();
+            let bytes = store.manifest(&root).unwrap().unwrap().bytes;
+            if let Some(b) = vci_core::InputManifest::compact_base(&bytes).unwrap() {
+                bases.insert(b);
+            }
+            assert_eq!(
+                store
+                    .manifest_decoded(&root)
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .root(),
+                root
+            );
+        }
+        assert!(!bases.is_empty() && bases.len() <= 3, "{bases:?}");
+        for b in &bases {
+            let bytes = store.manifest(b).unwrap().unwrap().bytes;
+            let base = vci_core::InputManifest::from_compact(&bytes).unwrap();
+            assert!(
+                base.entries.len() > 10,
+                "{b}: {} entries",
+                base.entries.len()
+            );
+        }
+    }
     // A change to what one file read runs that file (and the files that
     // read it too).
     for (path, text, runs) in [

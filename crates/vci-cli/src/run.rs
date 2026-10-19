@@ -2211,17 +2211,25 @@ pub fn run_units(
         let mut verdicts: Vec<Option<Verdict>> = (0..units.len()).map(|_| None).collect();
         in_order(&units, jobs, verdict, |i, v| verdicts[i] = Some(v));
         let t = std::time::Instant::now();
-        let manifest_base = shared_manifest_base(&verdicts);
-        if let Some(b) = &manifest_base {
-            match store.put_manifest(&b.root(), b.to_compact().as_bytes()) {
-                Ok(_) => {}
-                Err(e) => eprintln!("vci: warning: storing the units' shared input manifest: {e}"),
+        let manifest_bases = shared_manifest_bases(&verdicts, &units);
+        if !manifest_bases.is_empty() {
+            let mut stored_roots = BTreeSet::new();
+            for b in manifest_bases.values() {
+                if !stored_roots.insert(b.root()) {
+                    continue;
+                }
+                if let Err(e) = store.put_manifest(&b.root(), b.to_compact().as_bytes()) {
+                    eprintln!("vci: warning: storing the units' shared input manifest: {e}");
+                }
             }
+            let sizes: Vec<usize> = manifest_bases.values().map(|b| b.entries.len()).collect();
             crate::plan::timing(
                 &format!(
-                    "{}: shared input manifest: {} entries every attestable unit has, stored once",
+                    "{}: shared input manifests: {} group(s) of units, {} to {} entries each stored once",
                     project.label(),
-                    b.entries.len()
+                    manifest_bases.len(),
+                    sizes.iter().min().copied().unwrap_or(0),
+                    sizes.iter().max().copied().unwrap_or(0)
                 ),
                 t,
             );
@@ -2260,7 +2268,7 @@ pub fn run_units(
                 // The manifest first: an attestation is never stored without
                 // the manifest it references.
                 let t = std::time::Instant::now();
-                let compact = match &manifest_base {
+                let compact = match manifest_bases.get(&group_key(units[i].0)) {
                     Some(b) => a.manifest.to_compact_on(b),
                     None => a.manifest.to_compact(),
                 };
@@ -2513,38 +2521,58 @@ fn remove_superseded(
     }
 }
 
-/// The input manifest base of a run (vci 2.1.8): the entries every
-/// attestable, signed unit of the project has, as one plain manifest
-/// (no externals, no env), stored once; each unit's manifest is then stored
-/// as the entries it adds (`InputManifest::to_compact_on`). A Rails batch's
-/// files share the boot's observations, most of each manifest. `None` with
-/// fewer than two such units or nothing shared.
-fn shared_manifest_base(verdicts: &[Option<Verdict>]) -> Option<InputManifest> {
-    let mut shared: Option<BTreeSet<&vci_core::InputEntry>> = None;
-    let mut units = 0;
-    for v in verdicts.iter().flatten() {
-        let Verdict::Attestable {
+/// The group a unit's manifest shares a base with: the units whose
+/// outputs shared lines (a Rails slot's or boot's), else the run.
+fn group_key(o: &Observed) -> String {
+    o.shared_group.clone().unwrap_or_default()
+}
+
+/// The input manifest bases of a run (vci 2.1.8), by group: for the units
+/// of each group (see [`group_key`]) with two or more attestable, signed
+/// units, the entries they all have, as one plain manifest (no externals,
+/// no env), stored once; each unit's manifest is then stored as the
+/// entries it adds (`InputManifest::to_compact_on`). A Rails slot's files
+/// share the boot's and the slot's observations, most of each manifest.
+/// Units outside any group share the run's, when two or more of them have
+/// entries in common.
+fn shared_manifest_bases(
+    verdicts: &[Option<Verdict>],
+    units: &[(&Observed, Option<&TestFile>, String)],
+) -> BTreeMap<String, InputManifest> {
+    let mut shared: BTreeMap<String, (usize, BTreeSet<&vci_core::InputEntry>)> = BTreeMap::new();
+    for (i, v) in verdicts.iter().enumerate() {
+        let Some(Verdict::Attestable {
             a, signed: Ok(_), ..
-        } = v
+        }) = v
         else {
             continue;
         };
-        units += 1;
         let mine: BTreeSet<&vci_core::InputEntry> = a.manifest.entries.iter().collect();
-        shared = Some(match shared {
-            None => mine,
-            Some(s) => s.intersection(&mine).copied().collect(),
-        });
+        let key = group_key(units[i].0);
+        match shared.get_mut(&key) {
+            None => {
+                shared.insert(key, (1, mine));
+            }
+            Some((n, s)) => {
+                *n += 1;
+                *s = s.intersection(&mine).copied().collect();
+            }
+        }
     }
-    let shared = shared?;
-    if units < 2 || shared.is_empty() {
-        return None;
-    }
-    Some(InputManifest {
-        entries: shared.into_iter().cloned().collect(),
-        externals: Vec::new(),
-        env: Vec::new(),
-    })
+    shared
+        .into_iter()
+        .filter(|(_, (n, s))| *n >= 2 && !s.is_empty())
+        .map(|(k, (_, s))| {
+            (
+                k,
+                InputManifest {
+                    entries: s.into_iter().cloned().collect(),
+                    externals: Vec::new(),
+                    env: Vec::new(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// The last recorded duration (`result.durationMs`) of each of these units:
@@ -3379,6 +3407,7 @@ mod tests {
         write(&root, "src/atk/tsc/cls.ts", "export class A {}\n");
         write(&root, "src/atk/x.ts", "export {};\n");
         let o = Observed {
+            shared_group: None,
             modules: [
                 "packages/lib/a.js",
                 "src/atk/pkgimp/imp.test.ts",

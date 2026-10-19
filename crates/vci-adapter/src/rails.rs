@@ -1262,7 +1262,11 @@ fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
         let text = std::fs::read_to_string(&p)?;
         match merge_shared(&text, out, &mut shared) {
             Ok(merged) => {
-                let o = parse_jsonl_text(merged.as_deref().unwrap_or(&text), &p);
+                let mut o = parse_jsonl_text(
+                    merged.as_ref().map(|(_, m)| m.as_str()).unwrap_or(&text),
+                    &p,
+                );
+                o.shared_group = merged.map(|(name, _)| name);
                 own.insert(o.test_id.clone(), o);
             }
             Err(why) => {
@@ -1300,12 +1304,13 @@ type SharedLines = BTreeMap<String, Result<(String, Vec<String>), String>>;
 /// shared, line for line (in another order); `None` when `own` names no
 /// shared lines (it is whole). An error says why the two cannot be put
 /// together (a missing or changed file, a bad name or index, two `shared`
-/// lines).
+/// lines). With the merged output comes the shared file's name: the
+/// group of files that share it.
 fn merge_shared(
     own: &str,
     out: &Utf8Path,
     cache: &mut SharedLines,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, String)>, String> {
     let mut refs = own.lines().filter(|l| l.contains(r#""kind":"shared""#));
     let Some(line) = refs.next() else {
         return Ok(None);
@@ -1375,7 +1380,7 @@ fn merge_shared(
         text.push_str(l);
         text.push('\n');
     }
-    Ok(Some(text))
+    Ok(Some((name.to_owned(), text)))
 }
 
 /// A result that failed (a test failed or errored).
@@ -2268,6 +2273,7 @@ mod tests {
     #[test]
     fn a_pass_with_a_non_zero_exit_is_tainted() {
         let pass = |state: &str| Observed {
+            shared_group: None,
             result: Some(vci_core::TestResult {
                 state: state.into(),
                 tests: 1,
@@ -2584,11 +2590,11 @@ mod tests {
             result.to_owned(),
         ]
         .join("\n");
-        assert_eq!(
-            obs[0],
-            parse_jsonl_text(&whole, &out.join(name(files[0]))),
-            "{obs:?}"
-        );
+        let mut want = parse_jsonl_text(&whole, &out.join(name(files[0])));
+        // A shared its slot's lines: that file names its group.
+        want.shared_group = Some("shared-7.jsonl".into());
+        assert_eq!(obs[0], want, "{obs:?}");
+        assert_eq!(obs[1].shared_group, None, "g shared nothing");
         assert!(obs[0].probes.is_empty());
         assert_eq!(obs[0].taints, ["its own"]);
         assert_eq!(obs[0].env_keys.len(), 1);

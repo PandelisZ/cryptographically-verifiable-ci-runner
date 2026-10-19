@@ -24,6 +24,11 @@ use crate::AdapterError;
 pub struct Observed {
     /// Test id relative to the runner root, `/` separators.
     pub test_id: String,
+    /// The group of units whose outputs share lines (a Rails batch's slot
+    /// or boot: the name of the shared lines' file), when this one's does
+    /// (vci 2.1.8): their manifests are stored on one base, the entries
+    /// the group's units share.
+    pub shared_group: Option<String>,
     pub project: String,
     /// Runner root reported by the collector (absolute).
     pub root: String,
@@ -371,6 +376,7 @@ mod tests {
         std::os::unix::fs::symlink(cellar.join("src/late.js"), repo.join("src/link.js")).unwrap();
         let linked = base.join("opt/vci/share/vci/plugin");
         let mut o = Observed {
+            shared_group: None,
             modules: [
                 linked.join("src/late.js"),
                 cellar.join("src/late.js"),
@@ -417,6 +423,7 @@ mod tests {
         std::os::unix::fs::symlink(repo.join("test/fixtures/dirx"), coll.join("fx1")).unwrap();
         std::os::unix::fs::symlink(base.join("elsewhere"), coll.join("out1")).unwrap();
         let mut o = Observed {
+            shared_group: None,
             reads: [
                 coll.join("vci_collector.rb"),
                 coll.join("fx1/x.png"),
