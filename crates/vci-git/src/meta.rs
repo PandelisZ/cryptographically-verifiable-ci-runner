@@ -120,6 +120,19 @@ const PRUNE_KEYS: &[&str] = &["meta:prune:max-keys", "meta:prune:max-size"];
 /// Blobs asked for in one `git fetch --stdin` (git-meta's batch size: GitHub
 /// rejects very large want lists).
 const FETCH_BLOB_BATCH: usize = 4000;
+/// Below this many blobs a fetch runs alone; above, in parallel batches of
+/// at least this many.
+const FETCH_BLOB_PARALLEL_MIN: usize = 500;
+
+/// How many `git fetch` processes [`AttestStore`] runs at once for values:
+/// `VCI_FETCH_JOBS`, default 4.
+fn fetch_jobs() -> usize {
+    std::env::var("VCI_FETCH_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
+}
 /// The repository's promisor remote (see the module docs): no URL, so git
 /// never downloads an object it misses (the metadata values vci fetches
 /// itself). `skipFetchAll`/`skipDefaultUpdate` keep `git fetch --all` and
@@ -1785,10 +1798,45 @@ impl<'a> AttestStore<'a> {
     /// Download the blobs `oids` from `remote` as a blobless clone fetches a
     /// value it reads (`git fetch --filter=blob:none --stdin`, in batches).
     fn fetch_blobs(&self, remote: &str, oids: &[&String]) -> Result<(), GitError> {
-        for batch in oids.chunks(FETCH_BLOB_BATCH) {
-            self.fetch_objects(remote, batch)?;
+        // Several `git fetch` processes at once (since 2.1.11): the server
+        // packs each want list on its own, so a plan's 8,000 values come in
+        // a quarter of the time with four connections. VCI_FETCH_JOBS sets
+        // how many (1: one after the other, as before).
+        let jobs = fetch_jobs();
+        if jobs <= 1 || oids.len() <= FETCH_BLOB_PARALLEL_MIN {
+            for batch in oids.chunks(FETCH_BLOB_BATCH) {
+                self.fetch_objects(remote, batch)?;
+            }
+            return Ok(());
         }
-        Ok(())
+        self.ensure_no_lazy_fetch_remote()?;
+        let per = oids
+            .len()
+            .div_ceil(jobs)
+            .clamp(FETCH_BLOB_PARALLEL_MIN, FETCH_BLOB_BATCH);
+        let batches: Vec<&[&String]> = oids.chunks(per).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<Result<(), GitError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..jobs.min(batches.len()))
+                .map(|_| {
+                    let (next, batches) = (&next, &batches);
+                    s.spawn(move || {
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(b) = batches.get(i) else {
+                                return Ok(());
+                            };
+                            self.fetch_objects(remote, b)?;
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        results.into_iter().collect()
     }
 
     /// `git fetch --stdin` of the objects `oids` (blobs, or a tree with its

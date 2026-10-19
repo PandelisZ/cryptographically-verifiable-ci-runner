@@ -984,3 +984,47 @@ fn a_manifest_on_a_base_is_fetched_with_its_base() {
     let err = sg.manifest_decoded(&rfull).unwrap().unwrap().unwrap_err();
     assert!(err.contains("not in the store"), "{err}");
 }
+
+/// Values are fetched several `git fetch` processes at once (vci 2.1.11,
+/// above a few hundred of them): every one of 1,200 arrives, readable, and
+/// `VCI_FETCH_JOBS=1` fetches them one batch after the other as before.
+#[test]
+fn many_values_are_fetched_in_parallel() {
+    let w = lazy_world(1);
+    let (a, [r1, _]) = publish(&w);
+    let sa = AttestStore::new(&a);
+    for i in 0..1200u64 {
+        sa.put(
+            A,
+            S1,
+            &format!("{:064x}", 0x1000 + i),
+            &env(&format!("v{i}"), &r1),
+        )
+        .unwrap();
+    }
+    sa.push(None).unwrap();
+    for (name, jobs) in [("par", "4"), ("seq", "1")] {
+        let f = fresh_clone(&w, name);
+        let rf = repo(&f);
+        let sf = AttestStore::new(&rf);
+        sf.fetch(Some("origin")).unwrap();
+        let before = sf.list(Some(A)).unwrap();
+        assert!(before.iter().filter(|e| e.not_fetched()).count() >= 1200);
+        // SAFETY: the test's own process, before any thread reads it.
+        unsafe { std::env::set_var("VCI_FETCH_JOBS", jobs) };
+        let h = sf.hydrate_units([A]).unwrap();
+        unsafe { std::env::remove_var("VCI_FETCH_JOBS") };
+        assert_eq!(h.unresolved, 0, "{name}: {h:?}");
+        assert!(h.resolved >= 1200, "{name}: {h:?}");
+        let after = sf.list(Some(A)).unwrap();
+        let mut seen = 0;
+        for e in &after {
+            assert!(e.error.is_none(), "{name}: {e:?}");
+            if e.bytes.windows(2).any(|w| w == b"v1") {
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "{name}");
+        assert_eq!(sf.manifest(&r1).unwrap().unwrap().bytes, manifest("one"));
+    }
+}

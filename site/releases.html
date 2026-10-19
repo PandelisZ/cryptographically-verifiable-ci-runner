@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-11">2.1.11</a></td><td>19 Oct 2026</td><td>Values are fetched by four git processes at once: a plan's fetch halves</td></tr>
 <tr><td><a href="#v2-1-10">2.1.10</a></td><td>19 Oct 2026</td><td>A push fetches the objects its pack needs before pushing (a job's push failed on a deletion record it held as a key only)</td></tr>
 <tr><td><a href="#v2-1-9">2.1.9</a></td><td>19 Oct 2026</td><td>The shared base is per slot: what a Rails file shares is its slot's boot, not the whole run's</td></tr>
 <tr><td><a href="#v2-1-8">2.1.8</a></td><td>19 Oct 2026</td><td>The entries a run's units share are stored once: a Rails file's manifest shrinks from about 60 KB to the few it adds, and so does what every job fetches</td></tr>
@@ -55,6 +56,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-11">2.1.11</h2>
+<p><em>19 October 2026.</em> With 2.1.9's shared bases a job's manifests weigh a tenth, and the plan's fetch did not get faster: 30 to 34 s for about 16,000 values on vex's runners, because git serves each want list of 4,000 blobs at about 1.5 ms a blob whatever its size. <strong>The values are now fetched by several <code>git fetch</code> processes at once</strong>, <code>VCI_FETCH_JOBS</code> of them (default 4, <code>1</code> as before): on one laptop against GitHub the same 16,400 values came in 20 s instead of 37 (eight processes: 14 s). Each process fetches its own batch by object id, writes its own pack, and updates no ref, so they do not interfere; the store's tests fetch 1,200 values both ways.</p>
 
 <h2 id="v2-1-10">2.1.10</h2>
 <p><em>19 October 2026.</em> One of two jobs of a vex run lost its 987 attestations: its push failed with <code>could not fetch 71a69c57... from promisor remote</code>, an attestation's deletion record the clone held as a key only (a blobless fetch) which <code>git push</code> had to send and could not read, since vci disables git's lazy fetch; the job printed a warning and the next run re-attested the files. <strong>Before pushing, vci now asks git which objects of the commit the remote's tip does not reach are missing here, fetches them from the metadata remote, and pushes</strong>; what the remote cannot serve is a clear error naming the first object, as a value never fetched already was. <code>VCI_TIMING=1</code> prints <code>push: fetch N object(s) the pack needs</code> when it happens.</p>
