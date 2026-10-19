@@ -2931,6 +2931,68 @@ fn cargo_missing_or_forged_manifest_makes_the_unit_run() {
     assert!(w.plan(&work, "main").skip.contains(B));
 }
 
+/// An attestation made on a commit no ref contains is kept while some ref's
+/// tip still has that commit's tree (vci 2.1.12): a pull request's merge
+/// commit after a squash merge, whose tree is master's. Once no tip has
+/// the tree, it is superseded as before.
+#[test]
+fn cargo_supersession_keeps_an_attestation_whose_tree_a_ref_still_has() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    // A detached commit with main's tree, like a pull request's merge
+    // commit: attested there; `keep` points at a commit with that tree.
+    w.git(&work, &["branch", "keep", "main"]);
+    w.git(&work, &["checkout", "-q", "--detach", "main"]);
+    w.git(
+        &work,
+        &["commit", "-q", "--allow-empty", "-m", "same tree, no ref"],
+    );
+    let detached = w.git(&work, &["rev-parse", "HEAD"]);
+    w.run(&work, &[B], &w.trusted);
+    let stmts = raw_statements(&work, B);
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0].1["predicate"]["commit"], detached.trim());
+    assert_eq!(
+        stmts[0].1["predicate"]["tree"],
+        w.git(&work, &["rev-parse", "HEAD^{tree}"]).trim()
+    );
+    // On a branch whose tree differs: the detached commit is on no ref,
+    // but `keep`'s tip has its tree, so the attestation stays.
+    w.git(&work, &["checkout", "-q", "feature"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(!err.contains("superseded"), "{err}");
+    assert_eq!(raw_statements(&work, B).len(), 2);
+    // No tip has that tree any more (`keep` goes; `main`, here and on
+    // origin, moves on to feature's commit): the detached one is
+    // superseded on the next run; feature's earlier one stays, since
+    // `main` now contains its commit.
+    w.git(&work, &["branch", "-D", "keep"]);
+    w.git(&work, &["branch", "-f", "main", "feature"]);
+    w.git(&work, &["push", "-q", "-f", "origin", "main"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 3}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes again"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(
+        err.contains("vci: removed 1 superseded attestation(s)"),
+        "{err}"
+    );
+    let left = raw_statements(&work, B);
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(
+        left.iter()
+            .all(|(_, v)| v["predicate"]["commit"] != detached.trim()),
+        "the detached one is gone: {left:?}"
+    );
+}
+
 /// Supersession on store: re-attesting a unit on a later commit of the same
 /// line of work deletes the signer's earlier attestation of it (same
 /// platform) and the manifest only it referenced, so the store keeps one

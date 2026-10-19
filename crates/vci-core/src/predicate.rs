@@ -287,6 +287,13 @@ pub struct Predicate {
     pub repo_id: String,
     pub commit: String,
     pub tree_dirty: bool,
+    /// The git tree id of the checkout the unit ran in, when the working
+    /// tree was clean (since vci 2.1.12; informational, like `commit`):
+    /// what supersession keeps while any ref's tip still has that tree (a
+    /// pull request's merge commit is on no ref once the pull request is
+    /// squash-merged, but master's tip has its tree).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
     pub toolchain: Toolchain,
     pub global_input_root: String,
     pub input_root: String,

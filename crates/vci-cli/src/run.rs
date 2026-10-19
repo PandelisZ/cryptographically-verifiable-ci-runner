@@ -1091,6 +1091,7 @@ fn check_one(
         repo_id: base.repo_id.clone(),
         commit: base.commit.clone(),
         tree_dirty: base.dirty,
+        tree: base.tree.clone(),
         toolchain: toolchain_for(adapter.name(), versions),
         global_input_root: gm.root(),
         input_root: manifest.root(),
@@ -1520,6 +1521,8 @@ struct PredicateBase {
     repo_id: String,
     commit: String,
     dirty: bool,
+    /// HEAD's tree, when the working tree is clean.
+    tree: Option<String>,
     issued: i64,
     ttl: i64,
 }
@@ -1778,8 +1781,13 @@ pub fn run_units(
             .context("repo id (needs at least one commit)")?,
         commit: ctx.repo.head_commit()?,
         dirty: ctx.repo.is_dirty()?,
+        tree: None,
         issued: now_unix(),
         ttl,
+    };
+    let base = PredicateBase {
+        tree: (!base.dirty).then(|| ctx.repo.head_tree().ok()).flatten(),
+        ..base
     };
     let children: Vec<ChildEnvMap> = ctx.projects.iter().map(|p| p.child_env()).collect();
     let locks: Vec<_> = ctx
@@ -2002,6 +2010,9 @@ pub fn run_units(
     // Supersession's answers per earlier commit, and the input roots of the
     // attestations it deleted.
     let moved_on = std::sync::Mutex::new(BTreeMap::new());
+    // The trees every ref's tip has now: an attestation made on one of them
+    // is never superseded, whatever its commit (vci 2.1.12).
+    let live_trees: BTreeSet<String> = ctx.repo.live_trees().unwrap_or_default();
     let mut dropped_roots = BTreeSet::new();
     let mut outcomes: Vec<UnitOutcome> = Vec::new();
     let mut exit: Option<i32> = Some(0);
@@ -2191,6 +2202,7 @@ pub fn run_units(
                             &a.manifest,
                             &signer,
                             &moved_on,
+                            &live_trees,
                         )
                     } else {
                         Vec::new()
@@ -2417,7 +2429,11 @@ pub fn run_units(
 /// differ), one with the same entries (another environment or toolchain on
 /// this tree), and one whose payload or manifest cannot be read. Read only
 /// (several units at once); [`remove_superseded`] deletes them once the new
-/// one is stored. `moved_on` caches git's answer per earlier commit.
+/// one is stored. `moved_on` caches git's answer per earlier commit. Kept
+/// too (since 2.1.12): one made on a tree some ref's tip still has
+/// (`live_trees`): a pull request's merge commit is on no ref once the pull
+/// request is squash-merged, yet master's tip has its tree, and master's
+/// next run skips with it; another pull request's run must not delete it.
 fn superseded_by(
     store: &AttestStore,
     repo: &vci_git::Repo,
@@ -2425,6 +2441,7 @@ fn superseded_by(
     manifest: &InputManifest,
     signer: &str,
     moved_on: &std::sync::Mutex<BTreeMap<String, bool>>,
+    live_trees: &BTreeSet<String>,
 ) -> Vec<vci_git::StoredEnvelope> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
     let tc = &p.core.toolchain;
@@ -2442,6 +2459,7 @@ fn superseded_by(
             || m.os != tc.os
             || m.arch != tc.arch
             || issued.is_none_or(|i| m.issued_at > i)
+            || m.tree.as_deref().is_some_and(|t| live_trees.contains(t))
         {
             return true;
         }

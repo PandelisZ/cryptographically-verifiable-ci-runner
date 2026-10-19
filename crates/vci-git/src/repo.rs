@@ -2,6 +2,8 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 
+use std::collections::BTreeSet;
+
 use crate::GitError;
 use crate::cmd::{Git, command_error};
 use crate::validate;
@@ -132,6 +134,69 @@ impl Repo {
             .ok_or_else(|| GitError::Parse("rev-list reported no root commits".into()))
     }
 
+    /// The tree HEAD's commit points at.
+    pub fn head_tree(&self) -> Result<String, GitError> {
+        let out = self
+            .git()
+            .args(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"])
+            .run()?;
+        parse_oid(&out)
+    }
+
+    /// The trees at the tips of every branch, remote-tracking branch and
+    /// tag: the trees that can be checked out by name now. The current
+    /// branch's namesakes on the remotes (`origin/<branch>` behind it) do
+    /// not count, as for [`Self::moved_on`]: the same line of work, not yet
+    /// pushed; nor does a remote's `HEAD`.
+    pub fn live_trees(&self) -> Result<BTreeSet<String>, GitError> {
+        let namesakes = self.branch_namesakes()?;
+        let out = self
+            .git()
+            .args([
+                "for-each-ref",
+                "--format=%(refname)%09%(tree)%09%(*tree)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ])
+            .env(NO_LAZY_FETCH, "1")
+            .run_str()?;
+        let mut trees = BTreeSet::new();
+        for line in out.lines() {
+            let mut parts = line.split('\t');
+            let Some(name) = parts.next() else { continue };
+            if name.ends_with("/HEAD") || namesakes.iter().any(|n| n == name) {
+                continue;
+            }
+            for t in parts.map(str::trim).filter(|t| is_oid(t)) {
+                trees.insert(t.to_owned());
+            }
+        }
+        Ok(trees)
+    }
+
+    /// `refs/remotes/<remote>/<branch>` for every remote, when HEAD is on a
+    /// branch: the branch's own line on the remotes.
+    fn branch_namesakes(&self) -> Result<Vec<String>, GitError> {
+        let (_, out) = self
+            .git()
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .output_described()?;
+        let branch = out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .filter(|b| !b.is_empty());
+        let Some(b) = branch else {
+            return Ok(Vec::new());
+        };
+        let remotes = self.git().args(["remote"]).run_str()?;
+        Ok(remotes
+            .lines()
+            .map(|r| format!("refs/remotes/{}/{b}", r.trim()))
+            .collect())
+    }
+
     /// The commit HEAD points at.
     pub fn head_commit(&self) -> Result<String, GitError> {
         let (describe, out) = self
@@ -227,27 +292,7 @@ impl Repo {
         if !out.status.success() {
             return Ok(!self.is_shallow()?);
         }
-        let branch = {
-            let (_, out) = self
-                .git()
-                .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-                .output_described()?;
-            out.status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-                .filter(|b| !b.is_empty())
-        };
-        let remotes = match &branch {
-            Some(_) => self.git().args(["remote"]).run_str()?,
-            None => String::new(),
-        };
-        let namesakes: Vec<String> = match &branch {
-            Some(b) => remotes
-                .lines()
-                .map(|r| format!("refs/remotes/{}/{b}", r.trim()))
-                .collect(),
-            None => Vec::new(),
-        };
+        let namesakes = self.branch_namesakes()?;
         let counts = |r: &str| namesakes.iter().any(|n| n == r) || r.ends_with("/HEAD");
         let holders = self
             .git()

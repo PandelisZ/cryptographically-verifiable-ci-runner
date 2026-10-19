@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-12">2.1.12</a></td><td>19 Oct 2026</td><td>An attestation whose tree is still at some ref's tip is never superseded: another pull request's run deleted a merged pull request's attestations, and master re-ran every file</td></tr>
 <tr><td><a href="#v2-1-11">2.1.11</a></td><td>19 Oct 2026</td><td>Values are fetched by four git processes at once: a plan's fetch halves</td></tr>
 <tr><td><a href="#v2-1-10">2.1.10</a></td><td>19 Oct 2026</td><td>A push fetches the objects its pack needs before pushing (a job's push failed on a deletion record it held as a key only)</td></tr>
 <tr><td><a href="#v2-1-9">2.1.9</a></td><td>19 Oct 2026</td><td>The shared base is per slot: what a Rails file shares is its slot's boot, not the whole run's</td></tr>
@@ -56,6 +57,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-12">2.1.12</h2>
+<p><em>19 October 2026.</em> Minutes after a vex pull request was squash-merged, master's attest run skipped all 2,023 files on the pull request's attestations; thirteen minutes later, on a commit that changed only a workflow file, it ran all 2,006 again (11 minutes). In between, another pull request's run had re-attested the same units with the shared pull request key and, finding the merged pull request's attestations made on a commit no ref contained (its merge commit, gone with the squash), had superseded 2,011 of them, though master's tip had exactly their tree. <strong>An attestation now records the checkout's git tree</strong> (when clean), and supersession keeps one whose tree some branch, remote-tracking branch or tag still has at its tip, whatever its commit; without the tree (older attestations, a dirty checkout) the rule is as before. An end-to-end test makes a detached commit with a branch's tree, attests there, and checks the attestation survives until the branch goes.</p>
 
 <h2 id="v2-1-11">2.1.11</h2>
 <p><em>19 October 2026.</em> With 2.1.9's shared bases a job's manifests weigh a tenth, and the plan's fetch did not get faster: 30 to 34 s for about 16,000 values on vex's runners, because git serves each want list of 4,000 blobs at about 1.5 ms a blob whatever its size. <strong>The values are now fetched by several <code>git fetch</code> processes at once</strong>, <code>VCI_FETCH_JOBS</code> of them (default 4, <code>1</code> as before): on one laptop against GitHub the same 16,400 values came in 20 s instead of 37 (eight processes: 14 s). Each process fetches its own batch by object id, writes its own pack, and updates no ref, so they do not interfere; the store's tests fetch 1,200 values both ways.</p>

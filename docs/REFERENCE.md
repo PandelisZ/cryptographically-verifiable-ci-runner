@@ -1439,8 +1439,11 @@ line); or, since 2.1.3, a commit on no branch, remote-tracking branch or tag at 
 a full clone does not have: no name can check its files out), as a pull request's earlier pushes are after a rebase.
 Kept: one made on a sibling branch or pull request, on a commit `main` (or a tag, or another branch) still
 contains, such as an attestation of `main`'s tip when a feature branch re-attests the unit, one made on the same
-commit (work in progress), one of the same files under another environment or toolchain, and one on a commit a shallow
-clone does not have. The published tree so keeps one attestation per unit and signer as a line of work moves on,
+commit (work in progress), one of the same files under another environment or toolchain, one on a commit a shallow
+clone does not have, and (since 2.1.12) one made on a tree some branch, remote-tracking branch or tag still has at its
+tip, whatever its commit (an attestation records the checkout's git tree when the working tree was clean): a pull
+request's merge commit is on no ref once the pull request is squash-merged, yet master's tip has its tree and master's
+next run skips with it, so another pull request's run must not delete it. The published tree so keeps one attestation per unit and signer as a line of work moves on,
 without deleting what other branches still use (`vci prune --superseded` keeps only the newest, whatever the branch).
 The manifests only the deleted attestations referenced are deleted with them, and `vci prune` deletes the stored
 manifests no remaining attestation references. A clone that still references a deleted manifest (it attested, or

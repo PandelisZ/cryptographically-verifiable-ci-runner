@@ -1592,6 +1592,8 @@ pub(crate) struct EnvelopeMeta {
     pub manifest_ref: Option<String>,
     /// How long the unit's tests took (`result.durationMs`), when recorded.
     pub duration_ms: Option<u64>,
+    /// The checkout's git tree (`tree`, since 2.1.12), when recorded.
+    pub tree: Option<String>,
 }
 
 /// An envelope's statement (unverified).
@@ -1624,6 +1626,7 @@ pub(crate) fn envelope_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
         arch: s(&p["toolchain"]["arch"]),
         manifest_ref: p["manifestRef"].as_str().map(str::to_owned),
         duration_ms: p["result"]["durationMs"].as_u64(),
+        tree: p["tree"].as_str().map(str::to_owned),
     })
 }
 
