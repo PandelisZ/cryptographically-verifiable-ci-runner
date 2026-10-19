@@ -5,7 +5,7 @@
 //! (the test is then not attestable and simply runs); anything that differs
 //! during verification is a [`Mismatch`] or an error (the test runs).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -258,6 +258,12 @@ pub enum ManifestError {
     InvalidEnvKey(String),
     #[error("not a compact input manifest: {0}")]
     Compact(String),
+    #[error(
+        "compact input manifest lists its entries on top of base manifest {0}, which must be read first"
+    )]
+    NeedsBase(String),
+    #[error("base input manifest {0} is not in the store")]
+    MissingBase(String),
 }
 
 fn io_err(path: &Utf8Path, source: io::Error) -> ManifestError {
@@ -975,16 +981,82 @@ impl InputManifest {
     /// manifest must equal the signed input root, and it hashes the entries,
     /// not this encoding.
     pub fn to_compact(&self) -> String {
+        self.compact_with(None)
+    }
+
+    /// [`Self::to_compact`] on top of a base manifest (since vci 2.1.8): a
+    /// `"base"` member names the base's root, and only the entries the
+    /// base does not have are listed (`"entries"`); externals and env are
+    /// always this manifest's own. The base must have every one of its
+    /// entries in this manifest (as the entries a run's units share do),
+    /// else the plain encoding is written. Decoding
+    /// ([`Self::from_compact_with`]) puts the base's entries back, so the
+    /// decoded manifest and its root are exactly this one's. A base is
+    /// itself a plain manifest (no base of its own), stored under its own
+    /// root like any other.
+    pub fn to_compact_on(&self, base: &InputManifest) -> String {
+        let mine: HashSet<&InputEntry> = self.entries.iter().collect();
+        if base.entries.is_empty()
+            || !base.entries.iter().all(|e| mine.contains(e))
+            || base.has_base_marker()
+            || base.root() == self.root()
+        {
+            // Nothing to share, or the base is this manifest itself (it
+            // would name its own root).
+            return self.compact_with(None);
+        }
+        let shared: HashSet<&InputEntry> = base.entries.iter().collect();
+        self.compact_with(Some((&base.root(), &shared)))
+    }
+
+    /// Whether this manifest, encoded plainly, could stand as a base: it
+    /// never is one with externals or env (those are a unit's own).
+    fn has_base_marker(&self) -> bool {
+        !self.externals.is_empty() || !self.env.is_empty()
+    }
+
+    /// The root of the base manifest a compact encoding lists its entries on
+    /// top of, if any, without decoding the rest.
+    pub fn compact_base(bytes: &[u8]) -> Result<Option<String>, ManifestError> {
+        #[derive(Deserialize)]
+        struct Head {
+            v: u32,
+            #[serde(default)]
+            base: Option<String>,
+        }
+        let h: Head =
+            serde_json::from_slice(bytes).map_err(|e| ManifestError::Compact(e.to_string()))?;
+        if h.v != 2 {
+            return Err(ManifestError::Compact(format!(
+                "version {} (expected 2)",
+                h.v
+            )));
+        }
+        Ok(h.base)
+    }
+
+    fn compact_with(&self, base: Option<(&str, &HashSet<&InputEntry>)>) -> String {
         fn s(out: &mut String, v: &str) {
             // Serializing a str cannot fail.
             out.push_str(&serde_json::to_string(v).unwrap_or_default());
         }
         let mut out = String::with_capacity(64 + self.entries.len() * 120);
-        out.push_str("{\"v\":2,\"entries\":[");
-        for (i, e) in self.entries.iter().enumerate() {
+        out.push_str("{\"v\":2,");
+        if let Some((root, _)) = base {
+            out.push_str("\"base\":");
+            s(&mut out, root);
+            out.push(',');
+        }
+        out.push_str("\"entries\":[");
+        let mut i = 0;
+        for e in &self.entries {
+            if base.is_some_and(|(_, shared)| shared.contains(e)) {
+                continue;
+            }
             if i > 0 {
                 out.push(',');
             }
+            i += 1;
             out.push('[');
             s(&mut out, e.path.as_str());
             out.push_str(",\"");
@@ -1030,12 +1102,38 @@ impl InputManifest {
 
     /// Decode [`Self::to_compact`]'s encoding. Anything else (another
     /// version, an unknown kind or field, a path that is not a canonical
-    /// [`RepoPath`]) is an error.
+    /// [`RepoPath`]) is an error; an encoding on top of a base
+    /// ([`Self::to_compact_on`]) is [`ManifestError::NeedsBase`]: decode it
+    /// with [`Self::from_compact_with`].
     pub fn from_compact(bytes: &[u8]) -> Result<Self, ManifestError> {
+        Self::from_compact_with(bytes, |root| Err(ManifestError::NeedsBase(root.to_owned())))
+    }
+
+    /// [`Self::from_compact`], reading the base manifest an encoding lists
+    /// its entries on top of through `base` (the base's stored bytes, or
+    /// why there are none). The base must be a plain manifest whose root is
+    /// the one named; the result has the base's entries and this one's.
+    pub fn from_compact_with(
+        bytes: &[u8],
+        base: impl FnOnce(&str) -> Result<Vec<u8>, ManifestError>,
+    ) -> Result<Self, ManifestError> {
+        let mut base = Some(base);
+        Self::decode_compact(bytes, &mut |root| match base.take() {
+            Some(f) => f(root),
+            None => Err(ManifestError::NeedsBase(root.to_owned())),
+        })
+    }
+
+    fn decode_compact(
+        bytes: &[u8],
+        base: &mut dyn FnMut(&str) -> Result<Vec<u8>, ManifestError>,
+    ) -> Result<Self, ManifestError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Compact {
             v: u32,
+            #[serde(default)]
+            base: Option<String>,
             entries: Vec<Vec<serde_json::Value>>,
             externals: Vec<(String, String)>,
             env: Vec<(String, Option<String>)>,
@@ -1045,6 +1143,24 @@ impl InputManifest {
         if c.v != 2 {
             return Err(bad(format!("version {} (expected 2)", c.v)));
         }
+        let shared = match &c.base {
+            None => Vec::new(),
+            Some(root) => {
+                let b = base(root)?;
+                let b = Self::decode_compact(&b, &mut |inner| {
+                    Err(bad(format!(
+                        "base manifest {root} has a base of its own ({inner})"
+                    )))
+                })?;
+                if b.root() != *root {
+                    return Err(bad(format!(
+                        "base manifest {root}'s entries hash to {}",
+                        b.root()
+                    )));
+                }
+                b.entries
+            }
+        };
         let mut entries = Vec::with_capacity(c.entries.len());
         for (i, e) in c.entries.into_iter().enumerate() {
             let at = |what: &str| bad(format!("entry {i}: {what}"));
@@ -1074,8 +1190,14 @@ impl InputManifest {
                 hash,
             });
         }
+        let own: HashSet<&RepoPath> = entries.iter().map(|e| &e.path).collect();
+        let mut all: Vec<InputEntry> = shared
+            .into_iter()
+            .filter(|e| !own.contains(&e.path))
+            .collect();
+        all.extend(entries);
         Ok(InputManifest {
-            entries,
+            entries: all,
             externals: c
                 .externals
                 .into_iter()

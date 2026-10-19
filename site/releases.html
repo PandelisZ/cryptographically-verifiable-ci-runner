@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-8">2.1.8</a></td><td>19 Oct 2026</td><td>The entries a run's units share are stored once: a Rails file's manifest shrinks from about 60 KB to the few it adds, and so does what every job fetches</td></tr>
 <tr><td><a href="#v2-1-7">2.1.7</a></td><td>19 Oct 2026</td><td>Rails files with skipped tests can be waived like pytest's; <code>result:no-tests</code> is waivable; two absent probes do not collide under case folding; the slot retry proven on a real collision</td></tr>
 <tr><td><a href="#v2-1-6">2.1.6</a></td><td>19 Oct 2026</td><td><code>VCI_TIMING=1</code> times the Rails batch's Ruby process and the reading of its outputs</td></tr>
 <tr><td><a href="#v2-1-5">2.1.5</a></td><td>19 Oct 2026</td><td>A Rails file that fails in a slot runs again on its own, and the retry's result is the file's</td></tr>
@@ -52,6 +53,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-8">2.1.8</h2>
+<p><em>19 October 2026.</em> On vex's runners a job's plan fetched about 10,000 values in 20 to 31 seconds: 5,000 attestation envelopes in 6 to 8 s and 5,000 manifests in 19 to 21 s, each manifest about 60 KB (449 entries, 9 KB packed) of which almost all is the Rails boot's observations, repeated in every file's manifest. <strong>A run now stores the entries every unit it attests shares once</strong>, as a plain manifest under its own root, and each unit's manifest on top of it (<code>"base"</code> plus the entries the unit adds). Reading a manifest puts the base's entries back, so the decoded manifest and its signed root are exactly what they were; a blobless clone's plan fetches the attestations, their manifests, then the bases; <code>vci prune</code> keeps a base while a manifest names it and deletes it with the other unreferenced manifests after. The run prints <code>shared input manifest: N entries every attestable unit has, stored once</code> under <code>VCI_TIMING=1</code>. vci before 2.1.8 cannot read a manifest on a base (the unit runs there), and a <code>vci prune</code> before 2.1.8 would delete the bases: every clone that prunes must be on 2.1.8 or later.</p>
 
 <h2 id="v2-1-7">2.1.7</h2>
 <p><em>19 October 2026.</em> On vex, 13 of 2,021 Rails files could never be attested, so every job of every push booted Rails to run them (about 25 s a job) and planned "13 to run" forever: nine with a test skipped under CI, two benchmark files with no test outside a benchmark run, two that probe <code>public/</code> under two spellings of an organization's slug. All three are now a policy decision instead of a refusal:</p>

@@ -924,3 +924,63 @@ fn a_server_refusing_tree_filters_still_serves_keys_only() {
     assert_eq!(sf.reader().unwrap().promised().unwrap(), 6);
     assert_eq!(sf.hydrate_units([A]).unwrap().resolved, 3);
 }
+
+/// A manifest stored on top of a base (vci 2.1.8: the entries a run's
+/// units share, stored once) is read with its base: a fresh lazy clone's
+/// plan read of the unit fetches the manifest and then the base, and the
+/// decoded manifest is the whole one.
+#[test]
+fn a_manifest_on_a_base_is_fetched_with_its_base() {
+    let w = lazy_world(1);
+    let a = repo(&w.clones[0]);
+    let sa = AttestStore::new(&a);
+    let (rbase, mbase) = real_manifest(&["lib/shared.rb", "config/boot.rb"]);
+    let base = vci_core::InputManifest::from_compact(&mbase).unwrap();
+    let (rfull, _) = real_manifest(&["lib/shared.rb", "config/boot.rb", A]);
+    let full = {
+        let (_, bytes) = real_manifest(&["lib/shared.rb", "config/boot.rb", A]);
+        vci_core::InputManifest::from_compact(&bytes).unwrap()
+    };
+    let delta = full.to_compact_on(&base);
+    assert!(
+        delta.contains(&rbase) && !delta.contains("lib/shared.rb"),
+        "{delta}"
+    );
+    sa.put_manifest(&rbase, &mbase).unwrap();
+    sa.put_manifest(&rfull, delta.as_bytes()).unwrap();
+    sa.put(A, S1, &hex64(1), &env("a", &rfull)).unwrap();
+    assert_eq!(
+        sa.manifest_decoded(&rfull)
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .root(),
+        rfull
+    );
+    sa.push(Some("origin")).unwrap();
+
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    sf.fetch(Some("origin")).unwrap();
+    assert!(sf.manifest(&rfull).unwrap().unwrap().error.is_some());
+    assert!(sf.manifest(&rbase).unwrap().unwrap().error.is_some());
+    // Without the base: the manifest cannot be decoded, never a manifest
+    // with fewer entries.
+    let h = sf.hydrate_units([A]).unwrap();
+    assert_eq!(h.resolved, 3, "the attestation, the manifest, its base");
+    assert_eq!(sf.manifest(&rbase).unwrap().unwrap().bytes, mbase);
+    let m = sf.manifest_decoded(&rfull).unwrap().unwrap().unwrap();
+    assert_eq!(m.root(), rfull);
+    assert_eq!(m.entries.len(), 3);
+
+    // A clone that fetched the manifest but lost its base cannot decode it.
+    let g = fresh_clone(&w, "nobase");
+    let rg = repo(&g);
+    let sg = AttestStore::new(&rg);
+    sg.fetch(Some("origin")).unwrap();
+    sg.hydrate_manifests([rfull.as_str()]).unwrap();
+    assert!(sg.remove_manifest(&rbase).unwrap());
+    let err = sg.manifest_decoded(&rfull).unwrap().unwrap().unwrap_err();
+    assert!(err.contains("not in the store"), "{err}");
+}

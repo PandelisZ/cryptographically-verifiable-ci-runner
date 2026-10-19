@@ -457,6 +457,7 @@ pub(crate) type ManifestUnavailable = (String, String);
 pub(crate) fn load_manifest(
     root: &str,
     stored: Result<Option<StoredManifest>, vci_git::GitError>,
+    base: impl FnOnce(&str) -> Result<Option<StoredManifest>, vci_git::GitError>,
 ) -> Result<InputManifest, ManifestUnavailable> {
     match stored {
         Err(e) => Err((
@@ -469,8 +470,18 @@ pub(crate) fn load_manifest(
         )),
         Ok(Some(m)) => match m.error {
             Some(e) => Err((format!("manifest {root} unreadable"), e)),
-            None => InputManifest::from_compact(&m.bytes)
-                .map_err(|e| (format!("manifest {root} corrupt"), e.to_string())),
+            None => InputManifest::from_compact_with(&m.bytes, |b| match base(b) {
+                Ok(Some(s)) if s.error.is_none() => Ok(s.bytes),
+                Ok(Some(s)) => Err(vci_core::ManifestError::Compact(format!(
+                    "base manifest {b} unreadable: {}",
+                    s.error.unwrap_or_default()
+                ))),
+                Ok(None) => Err(vci_core::ManifestError::MissingBase(b.to_owned())),
+                Err(e) => Err(vci_core::ManifestError::Compact(format!(
+                    "base manifest {b}: {e}"
+                ))),
+            })
+            .map_err(|e| (format!("manifest {root} corrupt"), e.to_string())),
         },
     }
 }
@@ -522,13 +533,30 @@ impl ManifestLoader {
             let reader = guard
                 .get_or_insert_with(|| AttestStore::new(repo).reader().map_err(|e| e.to_string()));
             match reader {
-                Ok(r) => r.manifest(root),
+                // The base too (vci 2.1.8), read with the same reader
+                // while it is this thread's.
+                Ok(r) => r.manifest(root).map(|m| {
+                    let base = m
+                        .as_ref()
+                        .filter(|m| m.error.is_none())
+                        .and_then(|m| InputManifest::compact_base(&m.bytes).ok().flatten())
+                        .map(|b| (b.clone(), r.manifest(&b)));
+                    (m, base)
+                }),
                 Err(e) => Err(vci_git::GitError::Store(e.clone())),
             }
         };
         Timers::add(&timers.manifest_read, t_read);
         let t_decode = std::time::Instant::now();
-        let r = load_manifest(root, stored).map(Arc::new);
+        let (stored, base) = match stored {
+            Ok((m, base)) => (Ok(m), base),
+            Err(e) => (Err(e), None),
+        };
+        let r = load_manifest(root, stored, |b| match base {
+            Some((root, stored)) if root == b => stored,
+            _ => Ok(None),
+        })
+        .map(Arc::new);
         Timers::add(&timers.manifest_decode, t_decode);
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.entry(root.to_owned()).or_insert(r).clone()

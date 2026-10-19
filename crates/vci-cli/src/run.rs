@@ -2205,7 +2205,29 @@ pub fn run_units(
                 }
             }
         };
-        in_order(&units, jobs, verdict, |i, v| {
+        // Every unit's verdict first, in parallel; then the manifest base
+        // (the entries all attestable units share, stored once: vci
+        // 2.1.8), then each unit stored and reported in order.
+        let mut verdicts: Vec<Option<Verdict>> = (0..units.len()).map(|_| None).collect();
+        in_order(&units, jobs, verdict, |i, v| verdicts[i] = Some(v));
+        let t = std::time::Instant::now();
+        let manifest_base = shared_manifest_base(&verdicts);
+        if let Some(b) = &manifest_base {
+            match store.put_manifest(&b.root(), b.to_compact().as_bytes()) {
+                Ok(_) => {}
+                Err(e) => eprintln!("vci: warning: storing the units' shared input manifest: {e}"),
+            }
+            crate::plan::timing(
+                &format!(
+                    "{}: shared input manifest: {} entries every attestable unit has, stored once",
+                    project.label(),
+                    b.entries.len()
+                ),
+                t,
+            );
+        }
+        for (i, v) in verdicts.into_iter().enumerate() {
+            let Some(v) = v else { continue };
             let label = &units[i].2;
             let (a, signed, doomed) = match v {
                 Verdict::Refused {
@@ -2218,7 +2240,7 @@ pub fn run_units(
                     let mut out = UnitOutcome::refused(label, project, reason, reasons);
                     out.taints = taints;
                     outcomes.push(out);
-                    return;
+                    continue;
                 }
                 Verdict::Attestable {
                     a,
@@ -2238,8 +2260,12 @@ pub fn run_units(
                 // The manifest first: an attestation is never stored without
                 // the manifest it references.
                 let t = std::time::Instant::now();
+                let compact = match &manifest_base {
+                    Some(b) => a.manifest.to_compact_on(b),
+                    None => a.manifest.to_compact(),
+                };
                 store
-                    .put_manifest(&p.core.input_root, a.manifest.to_compact().as_bytes())
+                    .put_manifest(&p.core.input_root, compact.as_bytes())
                     .context("storing the input manifest")?;
                 let stored = store.put(&p.core.test_id, &signer, &skey, &env)?;
                 // Never the one just stored (the same storage key: the same
@@ -2264,7 +2290,7 @@ pub fn run_units(
                         why,
                         vec!["signing or storing failed".to_owned()],
                     ));
-                    return;
+                    continue;
                 }
             };
             attested += 1;
@@ -2290,7 +2316,7 @@ pub fn run_units(
                 stored.target,
                 stored.key
             );
-        });
+        }
         crate::plan::timing(
             &format!(
                 "check, sign and store {} unit(s) of {} ({jobs} at a time)",
@@ -2413,11 +2439,10 @@ fn superseded_by(
         }
         let old = match &m.manifest_ref {
             Some(r) => store
-                .manifest(r)
+                .manifest_decoded(r)
                 .ok()
                 .flatten()
-                .filter(|s| s.error.is_none())
-                .and_then(|s| InputManifest::from_compact(&s.bytes).ok())
+                .and_then(Result::ok)
                 .filter(|o| o.root() == *r),
             None => crate::cmds::envelope_inline_manifest(&e.bytes),
         };
@@ -2486,6 +2511,40 @@ fn remove_superseded(
             0
         }
     }
+}
+
+/// The input manifest base of a run (vci 2.1.8): the entries every
+/// attestable, signed unit of the project has, as one plain manifest
+/// (no externals, no env), stored once; each unit's manifest is then stored
+/// as the entries it adds (`InputManifest::to_compact_on`). A Rails batch's
+/// files share the boot's observations, most of each manifest. `None` with
+/// fewer than two such units or nothing shared.
+fn shared_manifest_base(verdicts: &[Option<Verdict>]) -> Option<InputManifest> {
+    let mut shared: Option<BTreeSet<&vci_core::InputEntry>> = None;
+    let mut units = 0;
+    for v in verdicts.iter().flatten() {
+        let Verdict::Attestable {
+            a, signed: Ok(_), ..
+        } = v
+        else {
+            continue;
+        };
+        units += 1;
+        let mine: BTreeSet<&vci_core::InputEntry> = a.manifest.entries.iter().collect();
+        shared = Some(match shared {
+            None => mine,
+            Some(s) => s.intersection(&mine).copied().collect(),
+        });
+    }
+    let shared = shared?;
+    if units < 2 || shared.is_empty() {
+        return None;
+    }
+    Some(InputManifest {
+        entries: shared.into_iter().cloned().collect(),
+        externals: Vec::new(),
+        env: Vec::new(),
+    })
 }
 
 /// The last recorded duration (`result.durationMs`) of each of these units:

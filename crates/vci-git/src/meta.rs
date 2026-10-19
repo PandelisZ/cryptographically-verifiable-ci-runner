@@ -287,6 +287,25 @@ pub fn parse_manifest_key(key: &str) -> Option<&str> {
     validate::is_hex_id(root).then_some(root)
 }
 
+/// Decode a stored input manifest's bytes, reading the base manifest it
+/// lists its entries on top of (vci 2.1.8) from the store through
+/// `reader`. The bytes carry no trust: the caller compares the result's
+/// root with the signed input root.
+pub fn decode_manifest(reader: &Reader, bytes: &[u8]) -> Result<vci_core::InputManifest, String> {
+    vci_core::InputManifest::from_compact_with(bytes, |base| match reader.manifest(base) {
+        Ok(Some(b)) if b.error.is_none() => Ok(b.bytes),
+        Ok(Some(b)) => Err(vci_core::ManifestError::Compact(format!(
+            "base manifest {base} unreadable: {}",
+            b.error.unwrap_or_default()
+        ))),
+        Ok(None) => Err(vci_core::ManifestError::MissingBase(base.to_owned())),
+        Err(e) => Err(vci_core::ManifestError::Compact(format!(
+            "base manifest {base}: {e}"
+        ))),
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// The `manifestRef` of a stored DSSE envelope's vci predicate (unverified:
 /// only which stored manifest it names), if it has one.
 fn envelope_manifest_ref(bytes: &[u8]) -> Option<String> {
@@ -1107,6 +1126,23 @@ impl<'a> AttestStore<'a> {
         self.reader()?.manifest_roots()
     }
 
+    /// The stored input manifest with this root, decoded (its base manifest
+    /// read from the store when it has one): `None` when not stored, `Err`
+    /// with why when it cannot be read or decoded.
+    pub fn manifest_decoded(
+        &self,
+        root: &str,
+    ) -> Result<Option<Result<vci_core::InputManifest, String>>, GitError> {
+        let reader = self.reader()?;
+        let Some(m) = reader.manifest(root)? else {
+            return Ok(None);
+        };
+        Ok(Some(match m.error {
+            Some(e) => Err(e),
+            None => decode_manifest(&reader, &m.bytes),
+        }))
+    }
+
     /// Delete the stored input manifest with this root (a tombstone, which
     /// `push` publishes). Returns whether it existed.
     pub fn remove_manifest(&self, root: &str) -> Result<bool, GitError> {
@@ -1213,8 +1249,37 @@ impl<'a> AttestStore<'a> {
                 k.target_type == TargetType::Project
                     && parse_manifest_key(&k.key).is_some_and(|r| roots.contains(r))
             })?);
+            out.add(self.hydrate_bases_locked(&remote, &roots)?);
         }
         Ok(out)
+    }
+
+    /// Fetch the base manifests (vci 2.1.8: the entries a run's units share,
+    /// stored once and named by each unit's manifest) of the stored
+    /// manifests among `roots` that have one, when not fetched yet.
+    fn hydrate_bases_locked(
+        &self,
+        remote: &str,
+        roots: &BTreeSet<String>,
+    ) -> Result<Hydration, GitError> {
+        let reader = self.reader()?;
+        let mut bases = BTreeSet::new();
+        for r in roots {
+            if let Some(m) = reader.manifest(r)?
+                && m.error.is_none()
+                && let Ok(Some(b)) = vci_core::InputManifest::compact_base(&m.bytes)
+            {
+                bases.insert(b);
+            }
+        }
+        drop(reader);
+        if bases.is_empty() {
+            return Ok(Hydration::default());
+        }
+        self.hydrate_locked(remote, |k| {
+            k.target_type == TargetType::Project
+                && parse_manifest_key(&k.key).is_some_and(|r| bases.contains(r))
+        })
     }
 
     /// Fetch the stored input manifests with these roots that were not
@@ -1229,10 +1294,13 @@ impl<'a> AttestStore<'a> {
         }
         let _lock = self.exchange_lock()?;
         let remote = self.value_remote()?;
-        self.hydrate_locked(&remote, |k| {
+        let mut out = self.hydrate_locked(&remote, |k| {
             k.target_type == TargetType::Project
                 && parse_manifest_key(&k.key).is_some_and(|r| roots.contains(r))
-        })
+        })?;
+        let owned: BTreeSet<String> = roots.iter().map(|r| (*r).to_owned()).collect();
+        out.add(self.hydrate_bases_locked(&remote, &owned)?);
+        Ok(out)
     }
 
     /// Fetch every stored attestation not fetched yet (input manifests
@@ -1279,7 +1347,7 @@ impl<'a> AttestStore<'a> {
             let decoded = reader
                 .manifest(r)?
                 .filter(|m| m.error.is_none())
-                .and_then(|m| vci_core::InputManifest::from_compact(&m.bytes).ok());
+                .and_then(|m| decode_manifest(&reader, &m.bytes).ok());
             let Some(m) = decoded else {
                 undecided.insert(r.clone());
                 continue;
@@ -3530,8 +3598,11 @@ impl<'a> AttestStore<'a> {
                 let Ok(bytes) = self.repo.git().args(["cat-file", "blob", &src]).run() else {
                     continue;
                 };
-                let ok =
-                    vci_core::InputManifest::from_compact(&bytes).is_ok_and(|m| m.root() == *root);
+                let ok = self
+                    .reader()
+                    .ok()
+                    .and_then(|reader| decode_manifest(&reader, &bytes).ok())
+                    .is_some_and(|m| m.root() == *root);
                 let Ok(text) = String::from_utf8(bytes) else {
                     continue;
                 };

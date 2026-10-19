@@ -1460,3 +1460,104 @@ fn checkout_cache_gives_the_uncached_mismatches_and_captures() {
     }
     r.chmod("src/a.rs", 0o644);
 }
+
+// ------------------------------------------------------- base manifests --
+
+/// A manifest encoded on top of a base lists only its own entries; decoded
+/// with the base it is the same manifest, with the same root.
+#[test]
+fn compact_on_a_base_round_trips() {
+    let file = |p: &str, h: &str| InputEntry {
+        path: rp(p),
+        kind: EntryKind::File,
+        exec: false,
+        size: 3,
+        hash: h.to_owned(),
+    };
+    let base = InputManifest {
+        entries: vec![file("lib/a.rb", "a1"), file("lib/b.rb", "b1")],
+        externals: vec![],
+        env: vec![],
+    };
+    let unit = InputManifest {
+        entries: vec![
+            file("lib/a.rb", "a1"),
+            file("test/u_test.rb", "u1"),
+            file("lib/b.rb", "b1"),
+        ],
+        externals: vec![External {
+            name: "rails".into(),
+            version: "8".into(),
+        }],
+        env: vec![],
+    };
+    let delta = unit.to_compact_on(&base);
+    assert!(
+        delta.contains(&format!("\"base\":\"{}\"", base.root())),
+        "{delta}"
+    );
+    assert!(
+        delta.contains("test/u_test.rb") && !delta.contains("lib/a.rb"),
+        "{delta}"
+    );
+    assert_eq!(
+        InputManifest::compact_base(delta.as_bytes())
+            .unwrap()
+            .as_deref(),
+        Some(base.root().as_str())
+    );
+    assert_eq!(
+        InputManifest::compact_base(unit.to_compact().as_bytes()).unwrap(),
+        None
+    );
+    // Without the base: an error naming it, never a manifest with fewer
+    // entries.
+    assert!(matches!(
+        InputManifest::from_compact(delta.as_bytes()),
+        Err(ManifestError::NeedsBase(r)) if r == base.root()
+    ));
+    let base_bytes = base.to_compact();
+    let back = InputManifest::from_compact_with(delta.as_bytes(), |r| {
+        assert_eq!(r, base.root());
+        Ok(base_bytes.clone().into_bytes())
+    })
+    .unwrap();
+    assert_eq!(back.root(), unit.root());
+    let mut want: Vec<_> = unit.entries.clone();
+    want.sort();
+    let mut got = back.entries.clone();
+    got.sort();
+    assert_eq!(got, want);
+    assert_eq!(back.externals, unit.externals);
+    // A base that is not all in the manifest, or that carries externals,
+    // gives the plain encoding.
+    let other = InputManifest {
+        entries: vec![file("lib/c.rb", "c1")],
+        externals: vec![],
+        env: vec![],
+    };
+    assert_eq!(unit.to_compact_on(&other), unit.to_compact());
+    assert_eq!(unit.to_compact_on(&unit), unit.to_compact());
+    // A manifest that is its base (no externals, the same entries) is
+    // written plainly: it would otherwise name its own root.
+    assert_eq!(base.to_compact_on(&base), base.to_compact());
+    let plain = InputManifest::from_compact(base.to_compact_on(&base).as_bytes()).unwrap();
+    assert_eq!(plain.root(), base.root());
+    // A base whose bytes hash to another root, or with a base of its own,
+    // is refused.
+    let wrong = other.to_compact();
+    assert!(matches!(
+        InputManifest::from_compact_with(delta.as_bytes(), |_| Ok(wrong.clone().into_bytes())),
+        Err(ManifestError::Compact(m)) if m.contains("hash to")
+    ));
+    assert!(matches!(
+        InputManifest::from_compact_with(delta.as_bytes(), |_| Ok(delta.clone().into_bytes())),
+        Err(ManifestError::Compact(m)) if m.contains("base of its own")
+    ));
+    assert!(matches!(
+        InputManifest::from_compact_with(delta.as_bytes(), |r| Err(ManifestError::MissingBase(
+            r.to_owned()
+        ))),
+        Err(ManifestError::MissingBase(_))
+    ));
+}

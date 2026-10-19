@@ -3042,6 +3042,45 @@ fn rails_slot_failure_from_an_earlier_file_passes_on_its_own() {
         "{stderr}"
     );
     assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    // The three manifests are stored on top of one base (vci 2.1.8): the
+    // entries all three share, stored once; each unit's manifest lists its
+    // own, and decodes to the whole.
+    let repo = store_for(&w.work);
+    let store = AttestStore::new(&repo);
+    let roots = store.manifests().unwrap();
+    assert_eq!(roots.len(), 4, "{roots:?}");
+    let mut bases = BTreeSet::new();
+    for f in files {
+        let pred = stored_predicate(&w.work, f);
+        let root = pred["inputRoot"].as_str().unwrap().to_owned();
+        let bytes = store.manifest(&root).unwrap().unwrap().bytes;
+        let base = vci_core::InputManifest::compact_base(&bytes).unwrap();
+        assert!(base.is_some(), "{f}: {}", String::from_utf8_lossy(&bytes));
+        bases.extend(base);
+        let decoded = store.manifest_decoded(&root).unwrap().unwrap().unwrap();
+        assert_eq!(decoded.root(), root);
+        assert_eq!(
+            decoded.entries.len(),
+            pred["manifest"]["entries"].as_array().unwrap().len()
+        );
+    }
+    assert_eq!(bases.len(), 1, "{bases:?}");
+    let base = bases.into_iter().next().unwrap();
+    let base_bytes = store.manifest(&base).unwrap().unwrap().bytes;
+    assert_eq!(
+        vci_core::InputManifest::compact_base(&base_bytes).unwrap(),
+        None
+    );
+    let p = w.plan(&w.work, "main");
+    for f in files {
+        assert!(p.skip.contains(f), "{f}: {p:?}");
+    }
+    // Prune keeps the base while a manifest lists its entries on it.
+    let out = w.vci_env(&w.work, &["prune"], &[]);
+    let err = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(err.contains("0 unreferenced input manifest(s)"), "{err}");
+    assert_eq!(store.manifests().unwrap().len(), 4);
 }
 
 /// [`rails_batch_mode_gives_what_one_process_per_file_gives`] with `batch`

@@ -950,9 +950,21 @@ fn verify_manifest(p: &VciPredicate, file: Option<&Utf8Path>) -> Result<String, 
         (None, Some(r)) => match file {
             Some(f) => {
                 let bytes = std::fs::read(f).map_err(|e| format!("reading {f}: {e}"))?;
-                let m = vci_core::InputManifest::from_compact(&bytes)
-                    .or_else(|e| serde_json::from_slice(&bytes).map_err(|_| e))
-                    .map_err(|e| format!("{f}: {e}"))?;
+                // A file on top of a base (vci 2.1.8) reads the base from
+                // the repository's store when there is one.
+                let m = vci_core::InputManifest::from_compact_with(&bytes, |b| {
+                    let (repo, _) = open_repo().map_err(|e| {
+                        vci_core::ManifestError::Compact(format!("base manifest {b}: {e:#}"))
+                    })?;
+                    let store = AttestStore::new(&repo);
+                    let _ = store.hydrate_manifests([b]);
+                    match store.manifest(b) {
+                        Ok(Some(s)) if s.error.is_none() => Ok(s.bytes),
+                        _ => Err(vci_core::ManifestError::MissingBase(b.to_owned())),
+                    }
+                })
+                .or_else(|e| serde_json::from_slice(&bytes).map_err(|_| e))
+                .map_err(|e| format!("{f}: {e}"))?;
                 (m, f.to_string())
             }
             None => {
@@ -963,7 +975,7 @@ fn verify_manifest(p: &VciPredicate, file: Option<&Utf8Path>) -> Result<String, 
                 // Fetched lazily (see `vci fetch`); a failure reads as not fetched.
                 let _ = store.hydrate_manifests([r.as_str()]);
                 let stored = store.manifest(r);
-                let m = crate::plan::load_manifest(r, stored)
+                let m = crate::plan::load_manifest(r, stored, |b| store.manifest(b))
                     .map_err(|(what, actual)| format!("{what} ({actual})"))?;
                 (m, format!("git-meta project {}", vci_git::manifest_key(r)))
             }
@@ -1491,6 +1503,35 @@ pub fn prune(dry_run: bool, superseded: bool) -> Result<i32> {
         } else {
             store.remove(&e)?;
             println!("removed {} {} (superseded)", e.target, e.key);
+        }
+    }
+    // The base manifests the referenced ones list their entries on top of
+    // (vci 2.1.8) are referenced too; one that cannot be read keeps every
+    // manifest (its base is unknown).
+    if let Some(set) = referenced.as_mut() {
+        let _ = store.hydrate_manifests(set.iter().map(String::as_str));
+        let mut bases = BTreeSet::new();
+        for r in set.iter() {
+            let base = store
+                .manifest(r)?
+                .filter(|m| m.error.is_none())
+                .map(|m| vci_core::InputManifest::compact_base(&m.bytes));
+            match base {
+                Some(Ok(Some(b))) => {
+                    bases.insert(b);
+                }
+                Some(Ok(None)) => {}
+                _ => {
+                    eprintln!(
+                        "vci prune: input manifest {r} could not be read (run `vci fetch`), so no input manifest is removed"
+                    );
+                    referenced = None;
+                    break;
+                }
+            }
+        }
+        if let Some(set) = referenced.as_mut() {
+            set.extend(bases);
         }
     }
     let mut manifests = 0usize;

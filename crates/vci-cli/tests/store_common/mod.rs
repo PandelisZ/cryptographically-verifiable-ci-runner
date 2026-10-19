@@ -24,7 +24,11 @@ pub fn inline_manifest(repo: &Repo, mut predicate: Value) -> Value {
         .unwrap()
         .unwrap_or_else(|| panic!("manifest {root} is not stored"));
     assert_eq!(stored.error, None);
-    let m = vci_core::InputManifest::from_compact(&stored.bytes).unwrap();
+    let m = AttestStore::new(repo)
+        .manifest_decoded(&root)
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(m.root(), root, "the stored manifest's root");
     assert_eq!(predicate["inputRoot"], root.as_str());
     predicate["manifest"] = serde_json::to_value(m).unwrap();

@@ -2714,23 +2714,44 @@ fn cargo_manifests_are_stored_once_by_reference() {
     let store_repo = store_for(&work);
     let store = AttestStore::new(&store_repo);
     let stored: BTreeSet<String> = store.manifests().unwrap().into_iter().collect();
-    assert_eq!(stored, roots, "one manifest per distinct input root");
+    // One manifest per distinct input root, plus, when the run's units
+    // share entries (vci 2.1.8; these packages share none: their common
+    // inputs are global), one base nothing references by `manifestRef`.
+    let bases: BTreeSet<String> = stored.difference(&roots).cloned().collect();
+    assert!(bases.len() <= 1, "{stored:?} against {roots:?}");
+    assert!(roots.is_subset(&stored), "{stored:?} against {roots:?}");
     // Two units of the same package share their manifest: it is stored once.
     assert!(roots.len() < units.len(), "{roots:?}");
+    for b in &bases {
+        let bytes = store.manifest(b).unwrap().unwrap().bytes;
+        assert!(
+            String::from_utf8_lossy(&bytes).starts_with(r#"{"v":2,"entries":[["#),
+            "the base is a plain manifest"
+        );
+    }
     for r in &roots {
         let m = store.manifest(r).unwrap().unwrap();
         let text = String::from_utf8(m.bytes).unwrap();
-        assert!(text.starts_with(r#"{"v":2,"entries":[["#), "{text}");
+        match bases.iter().next() {
+            Some(base) => assert!(
+                text.starts_with(&format!(r#"{{"v":2,"base":"{base}","entries":["#)),
+                "{text}"
+            ),
+            None => assert!(text.starts_with(r#"{"v":2,"entries":[["#), "{text}"),
+        }
         assert_eq!(
-            vci_core::InputManifest::from_compact(text.as_bytes())
-                .unwrap()
-                .root(),
+            store.manifest_decoded(r).unwrap().unwrap().unwrap().root(),
             *r
         );
     }
-    // Attesting again stores nothing new: the same keys, the same values.
+    // Attesting again stores the same keys and values; the only value it
+    // may add is this run's base (two units with the same entries share
+    // them all, and a base has no externals, so it is its own value).
     w.run(&work, &[A_LIB, A_DOC], &w.trusted);
-    assert_eq!(store.manifests().unwrap().len(), roots.len());
+    let again: BTreeSet<String> = store.manifests().unwrap().into_iter().collect();
+    assert!(again.is_superset(&stored), "{again:?}");
+    assert!(again.len() <= stored.len() + 1, "{again:?}");
+    let stored = again;
     // Published once each, next to the attestations.
     w.git(&work, &["push", "-q", "origin", "feature"]);
     w.vci_ok(&work, &["push", "--remote", "origin"]);
@@ -2739,7 +2760,7 @@ fn cargo_manifests_are_stored_once_by_reference() {
         .iter()
         .filter(|(p, _)| p.starts_with("project/vci/manifest/") && p.ends_with("/__value"))
         .collect();
-    assert_eq!(manifests.len(), roots.len(), "{tree:?}");
+    assert_eq!(manifests.len(), stored.len(), "{tree:?}");
     let attestations = tree
         .iter()
         .filter(|(p, _)| p.contains("/vci/attestation/") && p.ends_with("/__value"))
