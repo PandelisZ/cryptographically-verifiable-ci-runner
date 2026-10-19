@@ -504,6 +504,10 @@ pub const WROTE_INSIDE_REPOSITORY_TAINT: &str = "wrote-inside-repository: ";
 /// `result:skipped:<skipped> of <tests>`, key `result:skipped`. A failed
 /// result is never a taint.
 pub const RESULT_SKIPPED_TAINT: &str = "result:skipped:";
+/// A passing run in which no test ran (every test filtered out, as a
+/// benchmark file gated by an environment variable): `result:no-tests`,
+/// waivable; a run with tests that were filtered out is not.
+pub const RESULT_NO_TESTS_TAINT: &str = "result:no-tests";
 
 /// Directories inside `node_modules` that tools write caches to while tests
 /// run (Vite's dependency optimizer, `.vite-temp` for bundled configs, the
@@ -557,6 +561,9 @@ pub fn refusal_key(msg: &str) -> String {
     }
     if msg.starts_with("result passed (0 failed, ") && msg.contains(" skipped or xfailed of ") {
         return taint_key(RESULT_SKIPPED_TAINT);
+    }
+    if msg.starts_with("result no-tests (") {
+        return RESULT_NO_TESTS_TAINT.to_owned();
     }
     if msg.contains(" is built from a local directory") {
         return "external built from a local directory".into();
@@ -914,11 +921,20 @@ fn check_one(
         not_inputs.extend(written.iter().map(|w| ctx.root.join(w)));
     }
     let result = o.result.clone().ok_or("no result")?;
+    // No test ran: refused unless `result:no-tests` is waived (a file whose
+    // tests are all gated by an environment variable); tests filtered out
+    // of a run never are.
+    let mut no_tests_waived = false;
     if !result.is_pass() && matches!(result.state.as_str(), "no-tests" | "filtered") {
-        return Err(format!(
-            "result {} ({} tests; no test ran or some were filtered out, so the run cannot vouch for the unit)",
-            result.state, result.tests
-        ));
+        if result.state == "no-tests" && result.failed == 0 && waives(RESULT_NO_TESTS_TAINT) {
+            waived.push(RESULT_NO_TESTS_TAINT.to_owned());
+            no_tests_waived = true;
+        } else {
+            return Err(format!(
+                "result {} ({} tests; no test ran or some were filtered out, so the run cannot vouch for the unit)",
+                result.state, result.tests
+            ));
+        }
     }
     if result.state == "no-assertions" {
         return Err(format!(
@@ -939,7 +955,7 @@ fn check_one(
             skips_waived = true;
         }
     }
-    if !result.is_pass() && !skips_waived {
+    if !result.is_pass() && !skips_waived && !no_tests_waived {
         return Err(if result.skipped > 0 {
             format!(
                 "result {} ({} failed, {} skipped or xfailed of {}; a skipped test did not run, so it cannot be vouched for elsewhere)",
@@ -2786,6 +2802,14 @@ mod tests {
             (
                 "result passed (0 failed, 1 skipped or xfailed of 2; a skipped test did not run)",
                 "result:skipped",
+            ),
+            (
+                "result no-tests (0 tests; no test ran or some were filtered out, so the run cannot vouch for the unit)",
+                "result:no-tests",
+            ),
+            (
+                "result filtered (0 tests; no test ran or some were filtered out, so the run cannot vouch for the unit)",
+                "result filtered",
             ),
             // A failed result with skips is a failure, never waivable.
             (

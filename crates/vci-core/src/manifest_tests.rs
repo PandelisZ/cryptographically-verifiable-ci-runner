@@ -998,12 +998,50 @@ mod symlinks {
 
 // ------------------------------------------------------- case folding ----
 
+/// A manifest of files at these paths (an absent probe is a different case:
+/// see `absent_probes_do_not_collide`).
 fn manifest_of(paths: &[&str]) -> InputManifest {
     InputManifest {
-        entries: paths.iter().map(|p| InputEntry::absent(rp(p))).collect(),
+        entries: paths
+            .iter()
+            .map(|p| {
+                let mut e = InputEntry::absent(rp(p));
+                e.kind = EntryKind::File;
+                e
+            })
+            .collect(),
         externals: vec![],
         env: vec![],
     }
+}
+
+/// Two paths under which nothing exists do not collide; one that exists
+/// and one that does not still do, as do two that exist.
+#[test]
+fn absent_probes_do_not_collide() {
+    let absent = |paths: &[&str]| InputManifest {
+        entries: paths.iter().map(|p| InputEntry::absent(rp(p))).collect(),
+        externals: vec![],
+        env: vec![],
+    };
+    assert!(
+        absent(&["public/ACME", "public/acme"])
+            .check_case_collisions()
+            .is_ok()
+    );
+    assert!(
+        absent(&["public/ACME/index.html", "public/acme/index.html"])
+            .check_case_collisions()
+            .is_ok()
+    );
+    let mut mixed = absent(&["public/ACME", "public/acme"]);
+    mixed.entries[0].kind = EntryKind::File;
+    assert!(mixed.check_case_collisions().is_err());
+    // A present file under one spelling of a directory, a probe under the
+    // other: the directory exists under one spelling, so they collide.
+    let mut under = absent(&["Public/a.txt", "public/b.txt"]);
+    under.entries[0].kind = EntryKind::File;
+    assert!(under.check_case_collisions().is_err());
 }
 
 #[test]

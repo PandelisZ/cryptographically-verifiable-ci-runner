@@ -1872,7 +1872,12 @@ impl Verifier<'_> {
             && p.waived
                 .iter()
                 .any(|w| w.starts_with(crate::run::RESULT_SKIPPED_TAINT));
-        if !(r.is_pass() || skips_waived) || !p.core.tainted.is_empty() {
+        let no_tests_waived = r.state == "no-tests"
+            && r.failed == 0
+            && p.waived
+                .iter()
+                .any(|w| w == crate::run::RESULT_NO_TESTS_TAINT);
+        if !(r.is_pass() || skips_waived || no_tests_waived) || !p.core.tainted.is_empty() {
             return Err(Failure::one(
                 "result",
                 12,

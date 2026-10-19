@@ -4567,7 +4567,7 @@ module VciCollector
         state = if failed.positive? || status != 0 then "failed"
                 elsif run.zero? then declared.positive? ? "filtered" : "no-tests"
                 elsif run < declared then "filtered"
-                elsif c[:pending].positive? then "failed"
+                elsif c[:pending].positive? then "passed"
                 else "passed"
                 end
         { kind: "result", state: state, tests: run, failed: failed.positive? || status.zero? ? failed : 1,
@@ -5490,7 +5490,7 @@ module VciCollector
       failed = mt.failures + mt.errors
       state = if failed.positive? || status != 0 then "failed"
               elsif mt.count.zero? then "no-tests"
-              elsif mt.skips.positive? then "failed"
+              elsif mt.skips.positive? then "passed"
               elsif mt.no_assertions.positive? || mt.assertions.zero? then "no-assertions"
               else "passed"
               end

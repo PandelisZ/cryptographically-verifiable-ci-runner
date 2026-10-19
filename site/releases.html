@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-7">2.1.7</a></td><td>19 Oct 2026</td><td>Rails files with skipped tests can be waived like pytest's; <code>result:no-tests</code> is waivable; two absent probes do not collide under case folding; the slot retry proven on a real collision</td></tr>
 <tr><td><a href="#v2-1-6">2.1.6</a></td><td>19 Oct 2026</td><td><code>VCI_TIMING=1</code> times the Rails batch's Ruby process and the reading of its outputs</td></tr>
 <tr><td><a href="#v2-1-5">2.1.5</a></td><td>19 Oct 2026</td><td>A Rails file that fails in a slot runs again on its own, and the retry's result is the file's</td></tr>
 <tr><td><a href="#v2-1-4">2.1.4</a></td><td>19 Oct 2026</td><td>The manifests a run orphans are deleted in one session (a minute, before); the Rails batch says when its slots' last file ended and how busy the slots were</td></tr>
@@ -51,6 +52,15 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-7">2.1.7</h2>
+<p><em>19 October 2026.</em> On vex, 13 of 2,021 Rails files could never be attested, so every job of every push booted Rails to run them (about 25 s a job) and planned "13 to run" forever: nine with a test skipped under CI, two benchmark files with no test outside a benchmark run, two that probe <code>public/</code> under two spellings of an organization's slug. All three are now a policy decision instead of a refusal:</p>
+<ul>
+<li><strong>Minitest and RSpec report a skipped or pending test as a passed result with skips</strong>, as pytest does, so <code>policy.ignore_taints = ["result:skipped"]</code> waives it for them too (before it was a failed result, which nothing waived; without the waiver it is refused as before).</li>
+<li><strong><code>result:no-tests</code> is waivable</strong>: a file in which no test ran (every test gated by an environment variable) attests with the waiver recorded, and the plan accepts it while the base policy still waives it. A run with tests filtered out never is.</li>
+<li><strong>Two absent probes do not collide under case folding</strong>: there is no file to be the same one, and should either come to exist, at least one probe finds it on any filesystem and the unit runs again. A present file still collides with anything.</li>
+</ul>
+<p>And the slot retry of 2.1.5 is proven on a real collision by an end-to-end test: two files leave rows in their slots' databases, a third fails in whichever slot takes it, runs again on its own, passes, and is attested with exit 0.</p>
 
 <h2 id="v2-1-6">2.1.6</h2>
 <p><em>19 October 2026.</em> On vex's runners one job's slots were done 470 s after they started while its files added up to 240 s a slot; to say whether the rest is the slots' or vci's after them, <code>VCI_TIMING=1</code> now prints <code>rails batch: the Ruby process (boot, slots, files)</code> and <code>rails batch: read the files' outputs</code>, beside 2.1.4's line on the slots.</p>

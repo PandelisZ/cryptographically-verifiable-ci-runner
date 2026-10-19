@@ -2990,6 +2990,60 @@ fn rails_batch_mode_gives_what_one_process_per_file_gives() {
     batch_gives_what_one_process_per_file_gives(BATCH);
 }
 
+/// A file that fails in its slot because an earlier file of the slot left
+/// rows behind (non-transactional, no cleanup: what a Rails worker would
+/// also meet) runs again on its own, from a fresh boot and database, and
+/// the retry's result is the file's: attested, exit 0.
+#[test]
+fn rails_slot_failure_from_an_earlier_file_passes_on_its_own() {
+    const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
+    let Some(w) = World::new() else { return };
+    // A table of its own: fixture tables are reloaded before each
+    // non-transactional test, so a leftover row in `widgets` would not be
+    // seen; a table the schema does not have persists in the slot's
+    // database (DDL in SQLite is transactional, hence no transaction).
+    let leaves = |n: &str| {
+        format!(
+            "require \"test_helper\"\n\nclass Leaves{n}Test < ActiveSupport::TestCase\n  self.use_transactional_tests = false\n\n  test \"leaves a table\" do\n    c = ActiveRecord::Base.connection\n    c.create_table(:leftovers, if_not_exists: true) {{ |t| t.integer :n }}\n    c.execute(\"insert into leftovers (n) values ({n})\")\n    sleep 1\n    assert c.table_exists?(:leftovers)\n  end\nend\n"
+        )
+    };
+    let files = [
+        "test/slots/l1_test.rb",
+        "test/slots/l2_test.rb",
+        "test/slots/v_test.rb",
+    ];
+    w.put(files[0], &leaves("1"));
+    w.put(files[1], &leaves("2"));
+    w.put(
+        files[2],
+        "require \"test_helper\"\n\nclass VTest < ActiveSupport::TestCase\n  test \"starts clean\" do\n    assert_not ActiveRecord::Base.connection.table_exists?(:leftovers)\n  end\nend\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "slot files"]);
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", key.as_str()]);
+    let out = w.vci_env(&w.work, &args, SLOTS);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    // The two slots take l1 and l2 first; v then runs in a slot whose
+    // database holds a row, fails there, and passes on its own.
+    assert!(
+        stderr.contains("1 of 3 file(s) of the batch run again one process per file")
+            && stderr.contains("v_test.rb: its process failed in slot"),
+        "{stderr}"
+    );
+    let got = outcomes(&stderr);
+    for f in files {
+        assert_eq!(got.get(f), Some(&None), "{f} not attested:\n{stderr}");
+    }
+    assert!(
+        stderr.contains("vci: 3 attested, 0 not attested"),
+        "{stderr}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+}
+
 /// [`rails_batch_mode_gives_what_one_process_per_file_gives`] with `batch`
 /// (vci's environment for the batch runs).
 fn batch_gives_what_one_process_per_file_gives(batch: &[(&str, &str)]) {

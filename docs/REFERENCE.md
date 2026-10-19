@@ -2116,8 +2116,9 @@ mismatch, ...) cannot.
   conditional (platform, `CI`, an optional import), and the skipped test did not run, so the attestation cannot
   vouch for it where the condition differs (`vci: not attesting <unit>: result passed (0 failed, 1 skipped or
   xfailed of 4; a skipped test did not run, so it cannot be vouched for elsewhere)`, key `result:skipped`; waivable,
-  recorded as `result:skipped:1 of 4`; a failed result never is. Minitest and RSpec report a skipped or pending
-  test as a failed result, which stays a refusal);
+  recorded as `result:skipped:1 of 4`; a failed result never is. Since 2.1.7 Minitest and RSpec report a skipped
+  or pending test the same way, so the waiver applies to them too; before, as a failed result, which no policy
+  waived). A run in which no test ran (`result no-tests`) is refused unless `result:no-tests` is waived (2.1.7);
 - any input lies outside the repository (e.g. a read of `/etc/hosts`, `/proc/sys/net/core/somaxconn`,
   `/etc/lsb-release` or an unowned temp file): `vci: not attesting <unit>: input outside the repository: <path>`,
   key `outside-repository`; waivable, and then the path is not hashed, only recorded as
@@ -2132,7 +2133,8 @@ mismatch, ...) cannot.
   before the run and every attested entry must be untouched afterwards, and the global inputs (including snapshot
   files) are hashed before and after. Hard-linking a repository file (`fs.link`) changes its ctime and link count, so
   a test that links a fixture into a temp dir is refused;
-- two inputs collide under case folding, a symlink leaves the repo, the collector's toolchain differs from the
+- two inputs collide under case folding (since 2.1.7 not when nothing exists under either: two absent probes such as
+  `public/ACME` and `public/acme` are no file to be the same one), a symlink leaves the repo, the collector's toolchain differs from the
   project's, or the test file is listed under more than one Vitest project (or by more than one vci project).
 
 pytest specifics:
@@ -2362,10 +2364,11 @@ ignore_taints = ["process:*", "child_process.*", "fetch", "go:syscall", "externa
   | `outside-repository` | `input outside the repository: /proc/sys/net/core/somaxconn` | `outside-repository:/proc/sys/net/core/somaxconn`, one per path | the path is not hashed |
   | `wrote-inside-repository` | `wrote inside the repository: web/node_modules/other.txt` | `wrote-inside-repository: web/node_modules/other.txt` (every path, comma-separated) | the written paths are not inputs |
   | `result:skipped` | `result passed (0 failed, 1 skipped or xfailed of 4; ...)` | `result:skipped:1 of 4` | `vci plan` accepts the passed-with-skips result |
+  | `result:no-tests` (since 2.1.7) | `result no-tests (0 tests; no test ran ...)` | `result:no-tests` | `vci plan` accepts the result in which no test ran (a file whose tests are all gated by an environment variable); a run with tests filtered out (`result filtered`) is never waived |
 
   The key is the category: `ignore_taints = ["outside-repository"]` waives every read outside the repository, and
   a path pattern such as `"outside-repository:/proc/*"` matches nothing (patterns match the key, never the path).
-  `"result"` is `"result:*"`, which is only `result:skipped`. `"*"` waives all three. Writes to `node_modules/.vite`,
+  `"result"` is `"result:*"`: `result:skipped` and `result:no-tests`. `"*"` waives them all. Writes to `node_modules/.vite`,
   `node_modules/.vite-temp` and `node_modules/.cache` need no waiver (tool caches, never writes).
 - `go_allow_net = true` is the same waiver as `ignore_taints = ["go:net"]`.
 

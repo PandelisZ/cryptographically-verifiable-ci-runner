@@ -1222,11 +1222,27 @@ impl InputManifest {
 
     /// Err if two distinct paths (or directory prefixes of paths) are equal
     /// under case folding, which would make them the same file on a
-    /// case-insensitive filesystem.
+    /// case-insensitive filesystem. Two paths under which nothing exists
+    /// (absent probes, such as `public/ACME` and `public/acme` for one
+    /// request's two spellings) do not collide: there is no file to be the
+    /// same one, and should either come to exist, on any filesystem at least
+    /// one of the two probes finds it and the unit runs again.
     pub fn check_case_collisions(&self) -> Result<(), ManifestError> {
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         let mut paths: Vec<&str> = self.entries.iter().map(|e| e.path.as_str()).collect();
         paths.sort_unstable();
+        let all_absent = |prefix: &str| {
+            self.entries
+                .iter()
+                .filter(|e| {
+                    e.path.as_str() == prefix
+                        || e.path
+                            .as_str()
+                            .strip_prefix(prefix)
+                            .is_some_and(|r| r.starts_with('/'))
+                })
+                .all(|e| e.kind == EntryKind::Absent)
+        };
         for p in paths {
             let mut end = 0;
             loop {
@@ -1237,12 +1253,13 @@ impl InputManifest {
                 let prefix = &p[..end];
                 let folded = fold(prefix);
                 match seen.get(&folded) {
-                    Some(prev) if prev != prefix => {
+                    Some(prev) if prev != prefix && !(all_absent(prev) && all_absent(prefix)) => {
                         return Err(ManifestError::CaseCollision {
                             a: prev.clone(),
                             b: prefix.to_owned(),
                         });
                     }
+                    Some(prev) if prev != prefix => {}
                     Some(_) => {}
                     None => {
                         seen.insert(folded, prefix.to_owned());

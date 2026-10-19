@@ -348,7 +348,7 @@ class CollectorTest < Minitest::Test
       end
     RUBY
     r = skipped.find { |x| x["kind"] == "result" }
-    refute_equal "passed", r["state"]
+    assert_equal "passed", r["state"]
     assert_equal 1, r["skipped"]
     empty = collect(<<~RUBY)
       require "minitest/autorun"
@@ -1371,7 +1371,7 @@ class CollectorTest < Minitest::Test
 
     recs = run.call("spec/pending_spec.rb")
     result = recs.find { |r| r["kind"] == "result" }
-    assert_equal ["failed", 1, 1], [result["state"], result["skipped"], result["tests"] - 1], result.inspect
+    assert_equal ["passed", 1, 1], [result["state"], result["skipped"], result["tests"] - 1], result.inspect
 
     recs = run.call("spec/focus_spec.rb")
     assert(taints(recs).any? { |t| t.start_with?("rspec:filtered:1 of 2 examples did not run") }, taints(recs).inspect)
