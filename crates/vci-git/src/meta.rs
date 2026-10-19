@@ -4336,6 +4336,7 @@ impl<'a> AttestStore<'a> {
             }
             let mut missing = self.missing_for_push(&pushed, tip.as_deref())?;
             missing.extend(self.changed_blobs_missing(&pushed, tip.as_deref())?);
+            missing.extend(self.changed_targets_blobs_missing(&pushed, tip.as_deref())?);
             if !missing.is_empty() {
                 let (have, fetched, error) = self.ensure_blobs(&name, &missing)?;
                 let still: Vec<&String> = missing.iter().filter(|o| !have.contains(*o)).collect();
@@ -4505,6 +4506,84 @@ impl<'a> AttestStore<'a> {
             .collect();
         if blobs.is_empty() {
             return Ok(blobs);
+        }
+        let have = self.present(&blobs)?;
+        Ok(blobs.difference(&have).cloned().collect())
+    }
+
+    /// Every deletion record `pushed` holds under the targets (or, outside
+    /// a target, the key directories) where it differs from `tip` that this
+    /// clone does not have, unchanged entries included.
+    ///
+    /// vci 2.2.1: two jobs that supersede the same attestations each write a
+    /// deletion record for the same keys; the second to push merges the
+    /// first's records, which it never downloaded, into targets its own
+    /// attestations changed, and `git push` then failed on one of them
+    /// (`could not fetch <record> from promisor remote`) although the
+    /// remote's tip holds it: every vex master attest that lost its
+    /// attestations, and pull request jobs racing another full run. A
+    /// retry that fetched the object it named fixed one record per attempt
+    /// of about a thousand. A changed target's deletion records are few
+    /// and tiny: all of them are made present before the push.
+    fn changed_targets_blobs_missing(
+        &self,
+        pushed: &str,
+        tip: Option<&str>,
+    ) -> Result<BTreeSet<String>, GitError> {
+        let Some(tip) = tip else {
+            return Ok(BTreeSet::new());
+        };
+        let out = self
+            .repo
+            .git()
+            .args([
+                "diff-tree",
+                "-r",
+                "--no-commit-id",
+                "--name-only",
+                "-z",
+                tip,
+                pushed,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run()?;
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        for p in out.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let p = String::from_utf8_lossy(p);
+            let dir = match p.find("/__target__/") {
+                Some(i) => p[..i + "/__target__".len()].to_owned(),
+                None => match p.rsplit_once('/') {
+                    Some((d, _)) => d.to_owned(),
+                    None => continue,
+                },
+            };
+            dirs.insert(dir);
+        }
+        if dirs.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let dirs: Vec<String> = dirs.into_iter().collect();
+        let mut blobs: BTreeSet<String> = BTreeSet::new();
+        for chunk in dirs.chunks(500) {
+            let listing = self
+                .repo
+                .git()
+                .args(["ls-tree", "-r", "-z", "--full-tree", pushed, "--"])
+                .args(chunk)
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run()?;
+            for (_, kind, oid, path) in split_ls_tree(&listing) {
+                // Deletion records only (every object such a push failed
+                // on was one): other attestations' envelopes in the target
+                // stay unread.
+                let tombstone = path.windows(14).any(|w| w == b"/__tombstones/");
+                if kind == b"blob" && tombstone {
+                    let o = String::from_utf8_lossy(oid).into_owned();
+                    if is_oid(&o) {
+                        blobs.insert(o);
+                    }
+                }
+            }
         }
         let have = self.present(&blobs)?;
         Ok(blobs.difference(&have).cloned().collect())

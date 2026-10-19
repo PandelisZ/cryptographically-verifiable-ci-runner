@@ -359,6 +359,54 @@ fn a_plan_fetches_only_the_chosen_envelopes_and_a_rewrite_replaces_the_key() {
     assert!(sf.manifest(&r1).unwrap().unwrap().not_fetched());
 }
 
+/// Two blobless clones delete the same attestation (two jobs superseding
+/// the same older one), in either order of their deletion records' stamps;
+/// the second to push also stores a new value in that target. Its push must
+/// not need the other's deletion record from the remote (vci 2.2.1: vex
+/// jobs failed `could not fetch <record> from promisor remote`).
+#[test]
+fn two_blobless_clones_deleting_the_same_value_both_push() {
+    for later_first in [true, false] {
+        let w = lazy_world(1);
+        publish(&w);
+        let open = |name: &str| {
+            let dir = fresh_clone(&w, name);
+            let r = repo(&dir);
+            assert!(AttestStore::new(&r).fetch(Some("origin")).unwrap().found);
+            r
+        };
+        let (r1, r2) = (open("one"), open("two"));
+        let (s1, s2) = (AttestStore::new(&r1), AttestStore::new(&r2));
+        let doomed = |s: &AttestStore| {
+            s.list(Some(A))
+                .unwrap()
+                .into_iter()
+                .find(|e| e.signer == S1)
+                .unwrap()
+        };
+        let (d1, d2) = (doomed(&s1), doomed(&s2));
+        if later_first {
+            s2.remove(&d2).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s1.remove(&d1).unwrap();
+        } else {
+            s1.remove(&d1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s2.remove(&d2).unwrap();
+        }
+        s1.put(A, S1, &hex64(0x51), &env("a-one", &hex64(0xe1)))
+            .unwrap();
+        assert_eq!(s1.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+        s2.put(A, S1, &hex64(0x52), &env("a-two", &hex64(0xe1)))
+            .unwrap();
+        let out = s2.push(Some("origin"));
+        assert!(
+            matches!(&out, Ok(o) if o.status == PushStatus::Pushed),
+            "later_first={later_first}: {out:?}"
+        );
+    }
+}
+
 /// A blobless clone's push when the remote's tip moved since its fetch
 /// (another writer's push landed in between): git has no commit of the
 /// remote's to build the pack against, so it would walk the whole tree into
