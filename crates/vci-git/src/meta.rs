@@ -4208,7 +4208,20 @@ impl<'a> AttestStore<'a> {
             // `--no-thin`: a thin pack deltifies against the remote's
             // versions of the values, which a blobless clone does not have
             // (git would try to download each).
+            //
+            // `pack.useSparse=false` (2.1.17): git builds a push's pack with
+            // `pack-objects --sparse` by default (since 2.27), a path-based
+            // walk of the tip's tree that git documents as packing extra
+            // objects in some tree shapes, while the check above walks the
+            // objects fully (`rev-list`) and so found nothing missing. On
+            // vex's 100,000-entry metadata tree every master attest job
+            // since 2.1.15 failed all ten attempts on a value the tip held
+            // and this clone never fetched (`could not fetch ... from
+            // promisor remote`); pull request jobs, whose trees differ
+            // less, pushed. The full walk takes about a second here.
             let mut git = self.repo.git().args([
+                "-c",
+                "pack.useSparse=false",
                 "push",
                 "--porcelain",
                 "--no-thin",
@@ -4273,6 +4286,16 @@ impl<'a> AttestStore<'a> {
                     continue;
                 }
                 // Not a ref rejection (unreachable remote, auth...): no retry.
+                // The last of the attempts above ends here too: its
+                // diagnosis goes with the error (the notes of a push that
+                // fails are never printed).
+                if stderr.contains("promisor remote") {
+                    return Err(GitError::Meta(format!(
+                        "{} ({})",
+                        command_error(&describe, &out),
+                        self.push_diagnosis(&pushed, tip.as_deref(), &stderr)
+                    )));
+                }
                 return Err(command_error(&describe, &out));
             }
             last = rejected.join("; ");
