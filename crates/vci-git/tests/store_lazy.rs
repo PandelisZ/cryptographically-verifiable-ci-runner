@@ -1017,14 +1017,11 @@ fn many_values_are_fetched_in_parallel() {
         assert_eq!(h.unresolved, 0, "{name}: {h:?}");
         assert!(h.resolved >= 1200, "{name}: {h:?}");
         let after = sf.list(Some(A)).unwrap();
-        let mut seen = 0;
+        assert!(after.len() >= 1200, "{name}: {}", after.len());
         for e in &after {
-            assert!(e.error.is_none(), "{name}: {e:?}");
-            if e.bytes.windows(2).any(|w| w == b"v1") {
-                seen += 1;
-            }
+            assert!(e.error.is_none() && !e.not_fetched(), "{name}: {e:?}");
+            assert!(e.bytes.starts_with(b"{"), "{name}: {e:?}");
         }
-        assert!(seen > 0, "{name}");
         assert_eq!(sf.manifest(&r1).unwrap().unwrap().bytes, manifest("one"));
     }
 }
