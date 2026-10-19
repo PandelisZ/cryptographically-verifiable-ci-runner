@@ -951,6 +951,18 @@ fn is_unavailable_object(text: &str) -> bool {
         || text.contains("no such object")
 }
 
+/// The object a failed `git push` named as one it could not read (git
+/// tried its lazy fetch, which vci disables): `fatal: could not fetch <oid>
+/// from promisor remote`.
+fn unreadable_object(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("fatal: could not fetch "))
+        .and_then(|l| l.split_whitespace().next())
+        .filter(|o| is_oid(o))
+        .map(str::to_owned)
+}
+
 fn is_ref_race(e: &GitError) -> bool {
     let text = e.to_string();
     text.contains("cannot lock ref")
@@ -4279,6 +4291,20 @@ impl<'a> AttestStore<'a> {
                         if moved { "moved" } else { "did not move" },
                         self.push_diagnosis(&pushed, tip.as_deref(), &stderr)
                     );
+                    // 2.1.18: the object git named is fetched by id (every
+                    // such object on vex was served by id afterwards) and
+                    // the push tried again at once; only an object the
+                    // remote does not serve waits for another round.
+                    if let Some(o) = unreadable_object(&stderr) {
+                        let one: BTreeSet<String> = [o.clone()].into_iter().collect();
+                        let (have, fetched, _) = self.ensure_blobs(&name, &one)?;
+                        if have.contains(&o) {
+                            report.note(format!(
+                                "push attempt {attempt}: {last}; fetched {o} ({fetched} downloaded) and trying again"
+                            ));
+                            continue;
+                        }
+                    }
                     report.note(format!(
                         "push attempt {attempt}: {last}; fetching and trying again"
                     ));
@@ -4350,20 +4376,28 @@ impl<'a> AttestStore<'a> {
     /// now, whether `tip`'s tree is complete, and how many objects of
     /// `pushed` are missing here when nothing is excluded.
     fn push_diagnosis(&self, pushed: &str, tip: Option<&str>, stderr: &str) -> String {
-        let named = stderr
-            .lines()
-            .find_map(|l| l.strip_prefix("fatal: could not fetch "))
-            .and_then(|l| l.split_whitespace().next())
-            .filter(|o| is_oid(o))
-            .map(str::to_owned);
+        let named = unreadable_object(stderr);
         let readable = named.as_deref().map(|o| {
-            self.repo
+            let read = self
+                .repo
                 .git()
                 .args(["cat-file", "-t", o])
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .run_str()
                 .map(|t| t.trim().to_owned())
-                .unwrap_or_else(|_| "unreadable".to_owned())
+                .unwrap_or_else(|e| format!("unreadable ({})", e.to_string().replace('\n', " ")));
+            // A loose object file git cannot read is corrupt or still
+            // being written; none at all means the object was never here.
+            let loose = self
+                .repo
+                .git_dir()
+                .map(|d| d.join("objects").join(&o[..2]).join(&o[2..]))
+                .ok()
+                .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()));
+            match loose {
+                Some(n) => format!("{read}; a loose object file of {n} bytes exists"),
+                None => format!("{read}; no loose object file"),
+            }
         });
         let tip_complete = tip.map(|t| {
             self.repo

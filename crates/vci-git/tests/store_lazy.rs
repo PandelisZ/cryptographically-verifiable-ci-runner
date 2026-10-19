@@ -317,6 +317,71 @@ fn a_blobless_push_retries_when_the_remote_moves_underneath() {
     assert!(sf.list(Some(B)).unwrap()[0].not_fetched());
 }
 
+/// Storing a manifest whose key the store holds as a promised row (the
+/// same bytes, pushed by someone else, fetched as a key only) must leave
+/// the value readable here: a row that stays promised is serialized at the
+/// blob id the previous commit held, and when the remote has since deleted
+/// that manifest the push must send a blob this clone never fetched (vex,
+/// 2.1.13 to 2.1.17: every master attest job's push failed on such a
+/// manifest).
+#[test]
+fn storing_the_bytes_of_a_promised_manifest_makes_it_readable() {
+    let w = lazy_world(1);
+    let (a, [r1, _r2]) = publish(&w);
+    let sa = AttestStore::new(&a);
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    assert!(sf.fetch(Some("origin")).unwrap().found);
+    assert!(sf.manifest(&r1).unwrap().unwrap().not_fetched());
+    // The same bytes the remote holds, stored here without fetching them.
+    let wrote = sf.put_manifest(&r1, &manifest("one")).unwrap();
+    let m = sf.manifest(&r1).unwrap().unwrap();
+    assert!(
+        m.error.is_none() && m.bytes == manifest("one"),
+        "wrote={wrote}: the manifest stays unreadable after storing its bytes: {m:?}"
+    );
+    // The remote drops that manifest; this clone's push must still work
+    // (it carries the manifest, and has its bytes).
+    sa.remove_manifests([r1.as_str()]).unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    sf.put(D, S2, &hex64(9), &env("d2", &r1)).unwrap();
+    let out = sf.push(Some("origin")).unwrap();
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+}
+
+/// As above, with a manifest too large to be stored inline (a blob
+/// reference in the store), the size of a Rails file's manifest.
+#[test]
+fn storing_the_bytes_of_a_promised_large_manifest_makes_it_readable() {
+    let w = lazy_world(1);
+    let a = repo(&w.clones[0]);
+    let sa = AttestStore::new(&a);
+    let big: Vec<u8> = format!("manifest big {}", "x".repeat(200_000)).into_bytes();
+    let r = hex64(0xb1);
+    sa.put_manifest(&r, &big).unwrap();
+    sa.put(A, S1, &hex64(1), &env("a1", &r)).unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    assert!(sf.fetch(Some("origin")).unwrap().found);
+    assert!(sf.manifest(&r).unwrap().unwrap().not_fetched());
+    let wrote = sf.put_manifest(&r, &big).unwrap();
+    let m = sf.manifest(&r).unwrap().unwrap();
+    assert!(
+        m.error.is_none() && m.bytes == big,
+        "wrote={wrote}: large manifest unreadable after storing its bytes: {:?} {}",
+        m.error,
+        m.bytes.len()
+    );
+    sa.remove_manifests([r.as_str()]).unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    sf.put(D, S2, &hex64(9), &env("d2", &r)).unwrap();
+    let out = sf.push(Some("origin")).unwrap();
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+}
+
 #[test]
 fn a_push_from_a_blobless_clone_fetches_nothing_and_drops_nothing() {
     let w = lazy_world(1);
