@@ -271,6 +271,50 @@ fn a_plan_fetches_the_chosen_manifests_first_and_the_rest_in_a_later_round() {
     assert!(sf.list(Some(B)).unwrap()[0].not_fetched());
 }
 
+/// A blobless clone's push when the remote's tip moved since its fetch
+/// (another writer's push landed in between): git has no commit of the
+/// remote's to build the pack against, so it would walk the whole tree into
+/// values this clone never fetched (and, lazy fetch disabled, fail). The
+/// push notices the tip moved, fetches it, merges and pushes on top.
+#[test]
+fn a_blobless_push_retries_when_the_remote_moves_underneath() {
+    let w = lazy_world(1);
+    let (a, _) = publish(&w);
+    let sa = AttestStore::new(&a);
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    assert!(sf.fetch(Some("origin")).unwrap().found);
+    assert!(sf.reader().unwrap().promised().unwrap() > 0);
+    sf.put(D, S2, &hex64(9), &env("d2", &hex64(0xe2))).unwrap();
+
+    let mut attempts = Vec::new();
+    sf.push_with_hook(Some("origin"), |attempt| {
+        attempts.push(attempt);
+        if attempt == 1 {
+            sa.put(D, S1, &hex64(8), &env("d1", &hex64(0xe1))).unwrap();
+            assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+        }
+    })
+    .unwrap();
+    assert_eq!(attempts, vec![1, 2], "first push failed, second succeeded");
+    // Both writers' values are on the remote; the blobless clone still has
+    // not fetched the others' values.
+    assert!(sa.fetch(Some("origin")).unwrap().found);
+    sa.hydrate_units([D]).unwrap();
+    let d: BTreeSet<Vec<u8>> = sa
+        .list(Some(D))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.bytes)
+        .collect();
+    let want: BTreeSet<Vec<u8>> = [env("d1", &hex64(0xe1)), env("d2", &hex64(0xe2))]
+        .into_iter()
+        .collect();
+    assert_eq!(d, want);
+    assert!(sf.list(Some(B)).unwrap()[0].not_fetched());
+}
+
 #[test]
 fn a_push_from_a_blobless_clone_fetches_nothing_and_drops_nothing() {
     let w = lazy_world(1);

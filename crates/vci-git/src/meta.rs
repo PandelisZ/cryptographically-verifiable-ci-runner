@@ -113,6 +113,9 @@ pub const DEFAULT_REMOTE_NAME: &str = "meta";
 /// git-meta's minimum target value length.
 const MIN_TARGET_LEN: usize = 3;
 const PUSH_ATTEMPTS: u32 = 10;
+/// How many times [`AttestStore::complete_tree`] asks for the subtrees a
+/// fetch of a tree's id left out.
+const COMPLETE_TREE_ROUNDS: usize = 5;
 /// Attempts of a fetch that loses a ref-lock race to another git process.
 const FETCH_ATTEMPTS: u32 = 5;
 /// Project-target settings that make every `git meta serialize` prune.
@@ -1870,8 +1873,13 @@ impl<'a> AttestStore<'a> {
         // how many (1: one after the other, as before).
         let jobs = fetch_jobs();
         if jobs <= 1 || oids.len() <= FETCH_BLOB_PARALLEL_MIN {
+            let mut batches = 0;
             for batch in oids.chunks(FETCH_BLOB_BATCH) {
                 self.fetch_objects(remote, batch)?;
+                batches += 1;
+            }
+            if batches > 1 {
+                self.consolidate_packs();
             }
             return Ok(());
         }
@@ -1902,7 +1910,35 @@ impl<'a> AttestStore<'a> {
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         });
-        results.into_iter().collect()
+        let out: Result<(), GitError> = results.into_iter().collect();
+        if batches.len() > 1 {
+            self.consolidate_packs();
+        }
+        out
+    }
+
+    /// Merge the packs a batched fetch left (one per `git fetch`) into
+    /// fewer, as git-meta does after its own batched fetches: gix (which
+    /// git-meta reads the object database with) sizes its pack slots when
+    /// a repository is opened, 32 at least, and once the packs outnumber
+    /// them every read fails with "The slotmap turned out to be too small"
+    /// (2.1.15: a laptop clone with 74 packs after a fetch of 10,000
+    /// values could not materialize what it had just downloaded). A
+    /// geometric repack is proportional to what was added; a git without
+    /// it, or one that cannot repack, is not a reason to fail the fetch.
+    fn consolidate_packs(&self) {
+        let repack = |args: &[&str]| {
+            self.repo
+                .git()
+                .args(["-c", "gc.auto=0", "repack"])
+                .args(args)
+                .output_described()
+                .map(|(_, out)| out.status.success())
+                .unwrap_or(false)
+        };
+        if !repack(&["--geometric=2", "-d", "-q"]) {
+            let _ = repack(&["-a", "-d", "-q"]);
+        }
     }
 
     /// `git fetch --stdin` of the objects `oids` (blobs, or a tree with its
@@ -1940,11 +1976,16 @@ impl<'a> AttestStore<'a> {
     /// first so `git gc` and `git fsck` accept the objects left out.
     fn filtered_fetch(&self, remote: &str, filter: &str) -> Result<crate::cmd::Git, GitError> {
         self.ensure_no_lazy_fetch_remote()?;
+        // No `gc --auto` after a metadata fetch (2.1.15): it detaches and
+        // repacks the object database while the serialization and push that
+        // follow read and write it; the user's own git runs it later.
         Ok(self.repo.git().args([
             "-c".to_owned(),
             format!("remote.{remote}.promisor=true"),
             "-c".to_owned(),
             format!("remote.{remote}.partialclonefilter={filter}"),
+            "-c".to_owned(),
+            "gc.auto=0".to_owned(),
         ]))
     }
 
@@ -1993,6 +2034,20 @@ impl<'a> AttestStore<'a> {
             .ok_or_else(|| GitError::Parse(format!("no tree in commit {commit}")))?
             .to_owned();
         self.fetch_objects(remote, &[&tree])?;
+        // A fetch of the tree's id can leave subtrees out (2.1.15: GitHub
+        // served vex's 108,000-tree tip without 12 of them, twice in CI and
+        // on a laptop, and served each of the 12 when asked by id): ask git
+        // which are missing and fetch those by id, until none is.
+        for _ in 0..COMPLETE_TREE_ROUNDS {
+            if complete()? {
+                return Ok(());
+            }
+            let missing = self.missing_trees(&tree)?;
+            if missing.is_empty() {
+                break;
+            }
+            self.fetch_objects(remote, &missing.iter().collect::<Vec<_>>())?;
+        }
         if complete()? {
             Ok(())
         } else {
@@ -2000,6 +2055,29 @@ impl<'a> AttestStore<'a> {
                 "the tree of metadata commit {commit} is incomplete after fetching it from {remote}"
             )))
         }
+    }
+
+    /// The subtrees of `tree` this clone does not have (values left out).
+    fn missing_trees(&self, tree: &str) -> Result<BTreeSet<String>, GitError> {
+        let out = self
+            .repo
+            .git()
+            .args([
+                "rev-list",
+                "--objects",
+                "--missing=print",
+                "--no-object-names",
+                "--filter=blob:none",
+                tree,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.strip_prefix('?'))
+            .map(|o| o.trim().to_owned())
+            .filter(|o| is_oid(o))
+            .collect())
     }
 
     /// Make the blobs `oids` present, fetching the missing ones from
@@ -4161,6 +4239,27 @@ impl<'a> AttestStore<'a> {
             // A pack that could not be built or unpacked (an object missing
             // here) fails the same way on every attempt.
             if rejected.is_empty() || rejected.iter().any(|l| l.contains("unpacker error")) {
+                // git builds the pack against the remote's refs this clone
+                // has: when the remote's tip moved since this round's fetch
+                // (another job's push landed in between), it has none, so
+                // the pack would hold the whole tree, and pack-objects
+                // walks into a value this clone never fetched (2.1.15: a vex
+                // job lost 1,025 attestations to `could not fetch ... from
+                // promisor remote`). Another round fetches the new tip,
+                // merges and pushes on top of it, as after a rejection.
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if stderr.contains("promisor remote") && attempt < PUSH_ATTEMPTS {
+                    let moved = self.remote_tip_moved(&name, &remote_ref, tip.as_deref())?;
+                    last = format!(
+                        "the pack needed an object this clone could not read ({remote_ref} {} since this round's fetch)",
+                        if moved { "moved" } else { "did not move" }
+                    );
+                    report.note(format!(
+                        "push attempt {attempt}: {last}; fetching and trying again"
+                    ));
+                    backoff(attempt, 20, 1000);
+                    continue;
+                }
                 // Not a ref rejection (unreachable remote, auth...): no retry.
                 return Err(command_error(&describe, &out));
             }
@@ -4174,6 +4273,27 @@ impl<'a> AttestStore<'a> {
             attempts: PUSH_ATTEMPTS,
             detail: last,
         })
+    }
+
+    /// Whether `remote_ref` on `remote` is no longer at `tip` (one
+    /// `ls-remote` round trip).
+    fn remote_tip_moved(
+        &self,
+        remote: &str,
+        remote_ref: &str,
+        tip: Option<&str>,
+    ) -> Result<bool, GitError> {
+        let out = self
+            .repo
+            .git()
+            .args(["ls-remote", "--", remote, remote_ref])
+            .run_str()?;
+        let now = out
+            .lines()
+            .find_map(|l| l.split_whitespace().next())
+            .filter(|o| is_oid(o))
+            .map(str::to_owned);
+        Ok(now.as_deref() != tip)
     }
 
     /// The values of `ours` (the local metadata commit's tree) a push would

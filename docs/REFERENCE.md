@@ -1469,7 +1469,7 @@ index, `HEAD` and work tree are never touched) and is exchanged on the remote's 
 - `vci fetch` fetches `refs/meta/main` into `refs/meta/remotes/main`, serializes local values and materializes the
   remote's (git-meta's merge) into the store, like `git meta pull`. Since 2.0 it downloads keys, not values: `git
   fetch --filter=blob:none` (commits and trees), and for the first fetch of `refs/meta/remotes/main` `--filter=tree:0`
-  (every commit of the metadata history, no tree) followed by the tip's tree alone, fetched by object id, so a fresh
+  (every commit of the metadata history, no tree) followed by the tip's tree alone, fetched by object id (and, since 2.1.15, the subtrees that fetch left out, by id, in up to five more rounds: GitHub served vex's 108,000-subtree tip without 12 of them), so a fresh
   clone's download does not grow with the length of the history; later fetches take the commits since, with their
   trees, so merges keep their base (a merge base whose tree was never fetched gets it first). The repository is never
   made shallow. A tree's paths are its
