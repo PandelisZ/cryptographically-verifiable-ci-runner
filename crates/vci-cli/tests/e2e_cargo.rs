@@ -2682,6 +2682,74 @@ fn cargo_supersession_in_a_blobless_clone_removes_the_orphan_manifest() {
     );
 }
 
+/// Two blobless clones that supersede the same older attestation and push
+/// one after the other (vex, 2.1.13: two branches' jobs re-attested the
+/// same files; the second to push lost its attestations to `could not
+/// fetch <the first's deletion record> from promisor remote`). The second
+/// clone fetches the first's tip at its push, merges the first's deletion
+/// record it never fetched into its tree, and must still push.
+#[test]
+fn cargo_two_blobless_clones_supersede_the_same_attestation_and_both_push() {
+    let Some(w) = World::new() else { return };
+    w.git(&w.remote, &["config", "uploadpack.allowFilter", "true"]);
+    let work = w.work.clone();
+    // feature's tree must differ from main's: an attestation made on a tree
+    // some ref still has is never superseded (2.1.12).
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    w.run(&work, &[B, C], &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+
+    let clone = |name: &str| {
+        let dir = w.base.join(name);
+        w.git(
+            &w.base,
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                w.remote.to_str().unwrap(),
+                dir.to_str().unwrap(),
+            ],
+        );
+        w.git(&dir, &["checkout", "-q", "feature"]);
+        w.vci_ok(&dir, &["fetch", "--remote", "origin"]);
+        dir
+    };
+    // Both clones fetch before either pushes.
+    let f1 = clone("f1");
+    let f2 = clone("f2");
+    for (dir, v) in [(&f1, 3), (&f2, 4)] {
+        std::fs::write(
+            dir.join("b/tests/data/b.json"),
+            format!("{{\"greeting\": \"hello\", \"v\": {v}}}\n"),
+        )
+        .unwrap();
+        w.git(dir, &["commit", "-qam", "b's data changes"]);
+        let err = w.run(dir, &[B], &w.trusted);
+        assert!(
+            err.contains("vci: removed 1 superseded attestation(s)"),
+            "{err}"
+        );
+    }
+    w.vci_ok(&f1, &["push", "--remote", "origin"]);
+    let out = w.vci_env(&f2, &["push", "--remote", "origin"], &[("VCI_TIMING", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the second push failed: {stderr}");
+    assert!(stderr.contains("pushed git-meta metadata"), "{stderr}");
+    // The remote holds both new attestations and neither the old one nor
+    // its manifest.
+    w.vci_ok(&work, &["fetch", "--remote", "origin"]);
+    let repo = store_for(&work);
+    let st = AttestStore::new(&repo);
+    let b: Vec<_> = st.list(Some(B)).unwrap();
+    assert_eq!(b.len(), 2, "{b:?}");
+}
+
 // ---- manifests by reference (vci 1.9.0) -----------------------------------
 
 /// The stored statements of `test_id`, as signed (no manifest inlined).
