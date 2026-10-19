@@ -1496,7 +1496,7 @@ index, `HEAD` and work tree are never touched) and is exchanged on the remote's 
   values (its rules only compare them), as a merge commit; a clone's first fetch takes the tip's entries. A side
   remote, and any entry it does not read the way git-meta does (a set or list value, an unexpected path or mode: a
   `vci: note:` says so), go through git-meta's full merge after fetching every value of the trees it reads
-  (`VCI_TIMING=1` prints `materialize (from paths, ...)` or `materialize (full)`). A serialization rebuilds a changed
+  (`VCI_TIMING=1` prints `materialize (from paths, ...)` or `materialize (full)`, and since 2.1.14 each step before it: `fetch: git fetch (commits and trees)`, `complete the tip's tree`, `list the tip's keys`, `cover the local ref`, `serialize the local metadata`). A serialization rebuilds a changed
   target's subtree from the values it holds and puts the values not fetched back at the blob ids the previous commit
   held, so a push from such a clone sends only what it wrote (a pack that is not thin, `git push --no-thin`: a thin
   one would be deltified against the remote's values, which the clone does not have); a value whose blob the clone

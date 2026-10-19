@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-1-14">2.1.14</a></td><td>19 Oct 2026</td><td><code>VCI_TIMING=1</code> times each step of a metadata fetch (a job's push spent 28 s fetching before a 3.5 s materialize, in no step the log named)</td></tr>
 <tr><td><a href="#v2-1-13">2.1.13</a></td><td>19 Oct 2026</td><td>A plan fetches the manifests of each unit's newest attestation first and the rest only for the units it could not skip; the store is listed once per plan, not once per batch</td></tr>
 <tr><td><a href="#v2-1-12">2.1.12</a></td><td>19 Oct 2026</td><td>An attestation whose tree is still at some ref's tip is never superseded: another pull request's run deleted a merged pull request's attestations, and master re-ran every file</td></tr>
 <tr><td><a href="#v2-1-11">2.1.11</a></td><td>19 Oct 2026</td><td>Values are fetched by four git processes at once: a plan's fetch halves</td></tr>
@@ -58,6 +59,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-1-14">2.1.14</h2>
+<p><em>19 October 2026.</em> A vex Rails job that attested 33 files spent 31.6 s in <code>push: fetch and materialize meta's metadata</code>, of which the materialize was 3.5 s; the plan's own fetch of the same remote, minutes earlier, had taken 17 s with a 14 s materialize inside it. Nothing in the log says where the other 28 s went. <strong><code>VCI_TIMING=1</code> now prints each step of a metadata fetch</strong>: <code>fetch: git fetch (commits and trees)</code>, <code>complete the tip's tree</code>, <code>list the tip's keys</code>, <code>cover the local ref</code>, <code>serialize the local metadata</code> (the run's attestations written as a metadata commit, the likely cost), then the materialize line as before. No behaviour changes.</p>
 
 <h2 id="v2-1-13">2.1.13</h2>
 <p><em>19 October 2026.</em> On vex's Rails jobs, with every file attested, the plan still took 41 s: 24 s fetching values, 12,308 attestation envelopes and 12,153 manifests (about six attestations per file are stored, from branches still alive) to check 2,036 candidates, one per file. Two causes. The three batches (envelopes, manifests, bases) each listed the store's promised rows and the whole local metadata tree, 12 s of the 24. And the plan fetched every candidate's manifest though it checks a unit's newest attestation first and reads another's only when that fails. <strong>The store and tree are now listed once per plan, and the first batch fetches the manifests of each unit's newest attestation only</strong>; after the first pass the plan fetches, in one more batch, the manifests of the other attestations of the units it could not skip, and checks those units again, so a unit whose older attestation matches (an edit attested and reverted, a branch rebased onto what was attested) is skipped as before. <code>VCI_TIMING=1</code> prints <code>round 2: fetch N more manifest(s), check the units not skipped again</code>. On a laptop against vex's store the fetch phase of a whole-repository plan went from 21 s to 4 s with the same verdicts; the store's tests fetch a chosen manifest first and the other in a later round, and the cargo end-to-end test attests an edit, reverts it, and checks a fresh clone's plan skips the unit through the second round.</p>

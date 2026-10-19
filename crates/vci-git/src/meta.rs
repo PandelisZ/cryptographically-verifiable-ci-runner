@@ -2989,6 +2989,18 @@ impl<'a> AttestStore<'a> {
                 .arg(&refspec)
                 .run()
         };
+        // Each step's time under VCI_TIMING (2.1.14: a job's push spent 28 s
+        // here before its 3.5 s materialize, in no step the log named).
+        let timed = std::env::var_os("VCI_TIMING").is_some();
+        let step = |what: &str, since: std::time::Instant| {
+            if timed {
+                eprintln!(
+                    "vci: timing: fetch: {what}: {:.2}s",
+                    since.elapsed().as_secs_f64()
+                );
+            }
+        };
+        let t = std::time::Instant::now();
         let mut fetched = fetch(if first { "tree:0" } else { "blob:none" });
         if first && matches!(&fetched, Err(e) if e.to_string().contains("filter")) {
             // A server that refuses tree filters (`uploadpackfilter.tree.allow
@@ -3000,8 +3012,11 @@ impl<'a> AttestStore<'a> {
             Err(e) if is_missing_remote_ref(&e) => false,
             Err(e) => return Err(e),
         };
+        step("git fetch (commits and trees)", t);
         if found && let Some(tip) = self.read_ref(&tracking)? {
+            let t = std::time::Instant::now();
             self.complete_tree(name, &tip)?;
+            step("complete the tip's tree", t);
         }
         let purged = self.purge_unserializable_rows()?;
         if purged > 0 {
@@ -3015,7 +3030,9 @@ impl<'a> AttestStore<'a> {
         let mut remote_deleted = BTreeSet::new();
         let mut tip_snap: Option<KeySnapshot> = None;
         if found && let Some(tip) = self.read_ref(&tracking)? {
+            let t = std::time::Instant::now();
             let snap = self.snapshot_keys(&tip)?;
+            step("list the tip's keys", t);
             if let Some(clean) = &snap.clean_tree {
                 // Merge a copy of the tip without what git-meta cannot read:
                 // a commit on top of it, so a push stays a fast-forward. It is
@@ -3062,7 +3079,9 @@ impl<'a> AttestStore<'a> {
             .as_ref()
             .map(|s| s.manifest_blobs.clone())
             .unwrap_or_default();
+        let t = std::time::Instant::now();
         let restored = self.cover_local_ref(&session, name, &local_ref)?;
+        step("cover the local ref", t);
         if restored > 0 {
             report.note(format!(
                 "restored {restored} entr{} of {local_ref} into this repository's git-meta store, which did not hold them (a new or replaced .git/git-meta.sqlite, or a linked worktree)",
@@ -3072,7 +3091,9 @@ impl<'a> AttestStore<'a> {
         let deleted_here = self.deletion_records(&session)?;
         // Taken before the serialization reads the store (see below).
         let serialized_as_of = now_ms();
+        let t = std::time::Instant::now();
         self.serialize_checked(&session, &local_ref)?;
+        step("serialize the local metadata", t);
         // Materializing is skipped when the fetched tip is the one
         // materialized into this store last time (and nothing had to be
         // restored into the store, which would mean it is not that store any
