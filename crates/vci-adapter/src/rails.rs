@@ -874,7 +874,15 @@ impl RailsAdapter {
         if cfg!(target_os = "macos") {
             cmd.env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
         }
+        let timing = std::env::var_os("VCI_TIMING").is_some();
+        let t = std::time::Instant::now();
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
+        if timing {
+            eprintln!(
+                "vci: timing: rails batch: the Ruby process (boot, slots, files): {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
         let shown = match runner {
             RailsRunner::Minitest => format!(
                 "ruby bin/rails test <{} files> --seed {RAILS_SEED}",
@@ -882,7 +890,14 @@ impl RailsAdapter {
             ),
             RailsRunner::Rspec => format!("rspec --options .rspec <{} files>", files.len()),
         };
+        let t = std::time::Instant::now();
         let (observed, fallback, code, slots) = read_batch(&dirs.out, files)?;
+        if timing {
+            eprintln!(
+                "vci: timing: rails batch: read the files' outputs: {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
         let mut log = format!(
             "vci: {shown}, booted once, one process per file (exit {}){}\n",
             out.status
