@@ -1761,6 +1761,12 @@ impl<'a> AttestStore<'a> {
         let db = rusqlite::Connection::open(&path).map_err(|e| sql_err(&path, e))?;
         db.busy_timeout(Duration::from_secs(5))
             .map_err(|e| sql_err(&path, e))?;
+        // As git-meta's own connection (WAL, so safe): without it every
+        // stamp after a write synced the disk, twice or more per unit
+        // stored (2.4.1: a vex job's store took 9.6 s on one runner, 35.8
+        // on another).
+        db.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| sql_err(&path, e))?;
         let tables: i64 = db
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'metadata'",
