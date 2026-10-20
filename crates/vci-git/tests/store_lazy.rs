@@ -451,6 +451,56 @@ fn a_lost_deletion_record_blob_is_written_back_from_the_store() {
     }
 }
 
+/// As above, but the store no longer holds the deletion record's row
+/// either: the push still goes through, and the remote ends with the value
+/// deleted (vci 2.2.8).
+#[test]
+fn a_lost_deletion_record_without_its_row_is_replaced() {
+    let w = lazy_world(1);
+    publish(&w);
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    assert!(sf.fetch(Some("origin")).unwrap().found);
+    let doomed = sf
+        .list(Some(A))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.signer == S1)
+        .unwrap();
+    sf.remove(&doomed).unwrap();
+    let db = f.join(".git/git-meta.sqlite");
+    let mut lost = Vec::new();
+    let out = sf
+        .push_with_hook(Some("origin"), |attempt| {
+            if attempt != 1 {
+                return;
+            }
+            let tree = git(&f, &["ls-tree", "-r", "refs/meta/local/main"]);
+            for line in tree.lines().filter(|l| l.contains("__tombstones")) {
+                let oid = line.split_whitespace().nth(2).unwrap().to_owned();
+                let loose = f.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+                if loose.exists() {
+                    std::fs::remove_file(&loose).unwrap();
+                    lost.push(oid);
+                }
+            }
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute("DELETE FROM tombstones", []).unwrap();
+        })
+        .unwrap();
+    assert!(!lost.is_empty(), "the test removed no deletion record blob");
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    // Either repair may do it: the store's row restored from the local
+    // commit and its blob written back, or the record replaced.
+    // The remote holds the deletion: a fresh clone does not see the value.
+    let g = fresh_clone(&w, "after");
+    let rg = repo(&g);
+    let sg = AttestStore::new(&rg);
+    assert!(sg.fetch(Some("origin")).unwrap().found);
+    assert!(sg.list(Some(A)).unwrap().iter().all(|e| e.signer != S1));
+}
+
 /// A blobless clone's push when the remote's tip moved since its fetch
 /// (another writer's push landed in between): git has no commit of the
 /// remote's to build the pack against, so it would walk the whole tree into

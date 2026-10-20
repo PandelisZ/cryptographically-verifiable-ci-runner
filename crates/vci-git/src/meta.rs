@@ -4468,6 +4468,12 @@ impl<'a> AttestStore<'a> {
                             ));
                             continue;
                         }
+                        if !rewrite && self.replace_lost_tombstone(&local_ref, &pushed, &o)? {
+                            report.note(format!(
+                                "push attempt {attempt}: {last}; replaced the lost deletion record {o} with a new one for the same key and trying again"
+                            ));
+                            continue;
+                        }
                         let (have, fetched, _) = self.ensure_blobs(&name, &one)?;
                         if have.contains(&o) {
                             report.note(format!(
@@ -4540,6 +4546,104 @@ impl<'a> AttestStore<'a> {
         }
         let have = self.present(&blobs)?;
         Ok(blobs.difference(&have).cloned().collect())
+    }
+
+    /// Replace, in `pushed` (the tip of `local_ref`), a deletion record
+    /// whose blob `oid` this clone lost and the store no longer holds, with
+    /// a new deletion record of the same keys (stamped now): the same
+    /// deletion, later, which git-meta's merge treats alike (2.2.8: a vex
+    /// job failed ten pushes on its own deletion record of minutes before,
+    /// with no row left to write it back from). Only when every path that
+    /// holds `oid` is a deletion record's; moves `local_ref` only if it is
+    /// still at `pushed`. Returns whether it replaced anything.
+    fn replace_lost_tombstone(
+        &self,
+        local_ref: &str,
+        pushed: &str,
+        oid: &str,
+    ) -> Result<bool, GitError> {
+        if self.read_ref(local_ref)?.as_deref() != Some(pushed) {
+            return Ok(false);
+        }
+        let listing = self
+            .repo
+            .git()
+            .args(["ls-tree", "-r", "-z", "--full-tree", pushed])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run()?;
+        let paths: Vec<String> = split_ls_tree(&listing)
+            .into_iter()
+            .filter(|(_, kind, o, _)| *kind == b"blob" && *o == oid.as_bytes())
+            .map(|(_, _, _, p)| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        if paths.is_empty() || paths.iter().any(|p| !p.contains("/__tombstones/")) {
+            return Ok(false);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let t = Tombstone {
+            timestamp: now,
+            email: "unknown".to_owned(),
+        };
+        let bytes = serde_json::to_vec(&t).map_err(|e| GitError::Parse(e.to_string()))?;
+        let blob = parse_oid(
+            &self
+                .repo
+                .git()
+                .args(["hash-object", "-w", "--stdin"])
+                .run_with_stdin(&bytes)?,
+        )?;
+        let dir = tempfile::tempdir()?;
+        let index = dir.path().join("index");
+        self.repo
+            .git()
+            .args(["read-tree", pushed])
+            .env("GIT_INDEX_FILE", &index)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run()?;
+        for p in &paths {
+            self.repo
+                .git()
+                .args(["update-index", "--add", "--cacheinfo"])
+                .arg(format!("100644,{blob},{p}"))
+                .env("GIT_INDEX_FILE", &index)
+                .run()?;
+        }
+        let tree = parse_oid(
+            &self
+                .repo
+                .git()
+                .args(["write-tree", "--missing-ok"])
+                .env("GIT_INDEX_FILE", &index)
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run()?,
+        )?;
+        let parents = self
+            .repo
+            .git()
+            .args(["rev-list", "--parents", "-n", "1", pushed])
+            .run_str()?;
+        let mut git = self
+            .repo
+            .git()
+            .args(["commit-tree", "--no-gpg-sign", &tree]);
+        for p in parents.split_whitespace().skip(1) {
+            git = git.arg("-p").arg(p);
+        }
+        git = git.args(["-m", "vci: replace a deletion record this clone lost"]);
+        for (k, v) in IDENTITY {
+            git = git.env(k, v);
+        }
+        let commit = parse_oid(&git.run()?)?;
+        self.cas_ref(
+            local_ref,
+            Some(&commit),
+            pushed,
+            "vci: replace a deletion record this clone lost",
+        )?;
+        Ok(true)
     }
 
     /// Write back, from the store's rows, the blobs of the deletion records
