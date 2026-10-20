@@ -4816,6 +4816,7 @@ impl<'a> AttestStore<'a> {
                         if moved { "moved" } else { "did not move" },
                         self.push_diagnosis(&pushed, tip.as_deref(), &stderr)
                     );
+                    vci_core::timing_line!("push attempt {attempt} failed: {last}: 0s");
                     // 2.1.18: the object git named is fetched by id (every
                     // such object on vex was served by id afterwards) and
                     // the push tried again at once; only an object the
@@ -5238,6 +5239,75 @@ impl<'a> AttestStore<'a> {
     /// now, whether `tip`'s tree is complete, and how many objects of
     /// `pushed` are missing here when nothing is excluded.
     fn push_diagnosis(&self, pushed: &str, tip: Option<&str>, stderr: &str) -> String {
+        let base = self.push_diagnosis_base(pushed, tip, stderr);
+        // 2.6.4: what the remote says its tip is, against what this round
+        // merged onto (a vex job's pack held objects the tip it merged onto
+        // already had, ten attempts running).
+        let remote = self.value_remote().unwrap_or_default();
+        let advertised = self
+            .repo
+            .git()
+            .args(["ls-remote", "--", &remote, "refs/meta/main"])
+            .run_str()
+            .ok()
+            .and_then(|o| o.split_whitespace().next().map(str::to_owned))
+            .filter(|o| is_oid(o));
+        let about_remote = match &advertised {
+            None => "the remote's tip could not be listed".to_owned(),
+            Some(a) => {
+                let here = self.repo.has_object(a).unwrap_or(false);
+                let same = tip == Some(a.as_str());
+                let below = here && self.is_ancestor(a, pushed).unwrap_or(false);
+                let needs = if here {
+                    self.repo
+                        .git()
+                        .args([
+                            "rev-list",
+                            "--objects",
+                            "--missing=print",
+                            "--no-object-names",
+                            pushed,
+                            "--not",
+                            a,
+                        ])
+                        .env("GIT_NO_LAZY_FETCH", "1")
+                        .run_str()
+                        .map(|o| {
+                            let lines: Vec<&str> = o.lines().collect();
+                            format!(
+                                "{} object(s) to send against it, {} of them not here",
+                                lines.len(),
+                                lines.iter().filter(|l| l.starts_with('?')).count()
+                            )
+                        })
+                        .unwrap_or_else(|e| format!("rev-list failed: {e}"))
+                } else {
+                    "not here".to_owned()
+                };
+                format!(
+                    "the remote's refs/meta/main is {a} ({}, {}, {}; {needs})",
+                    if here {
+                        "present here"
+                    } else {
+                        "NOT present here"
+                    },
+                    if same {
+                        "the tip this round merged onto"
+                    } else {
+                        "NOT the tip this round merged onto"
+                    },
+                    if below {
+                        "an ancestor of the pushed commit"
+                    } else {
+                        "NOT an ancestor of the pushed commit"
+                    },
+                )
+            }
+        };
+        format!("{base}; {about_remote}")
+    }
+
+    fn push_diagnosis_base(&self, pushed: &str, tip: Option<&str>, stderr: &str) -> String {
         let named = unreadable_object(stderr);
         let readable = named.as_deref().map(|o| {
             // Not `git cat-file -t`: git before 2.44 asks the promisor for

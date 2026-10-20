@@ -85,6 +85,9 @@ pub fn autoload_name(s: &str) -> String {
         .collect()
 }
 
+/// Children of autoload directories by [`autoload_name`] (paths).
+type AutoloadIndex = HashMap<String, Vec<String>>;
+
 /// The directory component that marks an [`EntryKind::AutoloadMiss`] path.
 pub const AUTOLOAD_MARK: &str = ".vci-autoload";
 
@@ -489,29 +492,50 @@ impl Source<'_> {
         })
     }
 
+    /// The children of the autoload directories `dirs` (their marker
+    /// paths, `<dir>/.vci-autoload`) by [`autoload_name`]: listed and
+    /// normalized once per manifest, not once per name (2.6.4: once per
+    /// name took 1,061 thread-seconds of a vex job).
+    fn autoload_index(&self, dirs: &[RepoPath]) -> Result<AutoloadIndex, ManifestError> {
+        let mut idx = AutoloadIndex::new();
+        for marker in dirs {
+            let dir = marker
+                .parent()
+                .ok_or_else(|| ManifestError::ConflictingEntries(marker.to_string()))?;
+            for n in self.child_names(&dir)? {
+                let key = if n.starts_with(AUTOLOAD_MARK) {
+                    // A symlinked directory: every name matches it.
+                    String::new()
+                } else {
+                    autoload_name(&n)
+                };
+                idx.entry(key)
+                    .or_default()
+                    .push(format!("{}/{n}", dir.as_str()));
+            }
+        }
+        Ok(idx)
+    }
+
     /// [`EntryKind::AutoloadMiss`] for `path` (`.vci-autoload/<name>`): the
-    /// children of the autoload directories `dirs` (their marker paths,
-    /// `<dir>/.vci-autoload`) whose [`autoload_name`] is `<name>`.
+    /// children of the autoload directories (`idx`, [`Source::autoload_index`])
+    /// whose [`autoload_name`] is `<name>`.
     fn autoload_miss(
         &self,
         path: &RepoPath,
-        dirs: &[RepoPath],
+        idx: &AutoloadIndex,
     ) -> Result<InputEntry, ManifestError> {
-        let bad = || ManifestError::ConflictingEntries(path.to_string());
         let comps: Vec<&str> = path.components().collect();
         if comps.len() != 2 || comps[0] != AUTOLOAD_MARK {
-            return Err(bad());
+            return Err(ManifestError::ConflictingEntries(path.to_string()));
         }
-        let name = comps[1];
-        let mut hits: Vec<String> = Vec::new();
-        for marker in dirs {
-            let dir = marker.parent().ok_or_else(bad)?;
-            for n in self.child_names(&dir)? {
-                if n.starts_with(AUTOLOAD_MARK) || autoload_name(&n) == name {
-                    hits.push(format!("{}/{n}", dir.as_str()));
-                }
-            }
-        }
+        let mut hits: Vec<String> = idx
+            .get(comps[1])
+            .into_iter()
+            .chain(idx.get(""))
+            .flatten()
+            .cloned()
+            .collect();
         hits.sort();
         hits.dedup();
         let hash = if hits.is_empty() {
@@ -1050,9 +1074,10 @@ impl InputManifest {
             .map(|e| e.path.clone())
             .collect();
         if !dirs.is_empty() {
+            let idx = src.autoload_index(&dirs)?;
             for (p, o) in observed {
                 if *o == Observation::AutoloadMiss {
-                    entries.push(src.autoload_miss(p, &dirs)?);
+                    entries.push(src.autoload_miss(p, &idx)?);
                 }
             }
         }
@@ -1455,6 +1480,11 @@ impl InputManifest {
             .filter(|e| e.kind == EntryKind::AutoloadDir)
             .map(|e| e.path.clone())
             .collect();
+        let autoload_idx = if autoload_dirs.is_empty() {
+            AutoloadIndex::new()
+        } else {
+            src.autoload_index(&autoload_dirs)?
+        };
         let entry_results: Vec<Option<Mismatch>> = self
             .entries
             .par_iter()
@@ -1468,7 +1498,7 @@ impl InputManifest {
                     return Ok(None);
                 }
                 let act = if exp.kind == EntryKind::AutoloadMiss {
-                    src.autoload_miss(&exp.path, &autoload_dirs)?
+                    src.autoload_miss(&exp.path, &autoload_idx)?
                 } else {
                     src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?
                 };
