@@ -1849,9 +1849,11 @@ class CollectorTest < Minitest::Test
     out = batch(ids)
     # A and C require "test_helper" first (one boot), B require_relative's
     # it (a boot of its own).
-    assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/c_test.rb", "exit" => 0 },
-                  { "id" => "test/b_test.rb", "exit" => 1 }, { "done" => true }],
-                 out[:status], out[:said]
+    # Groups run at once (2.2.12): their lines come in either order.
+    lines = out[:status].select { |l| l["id"] }.sort_by { |l| l["id"] }
+    assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/b_test.rb", "exit" => 1 },
+                  { "id" => "test/c_test.rb", "exit" => 0 }], lines, out[:said]
+    assert_equal({ "done" => true }, out[:status].last, out[:said])
     a, b, c = out.values_at(*ids)
     assert_equal %w[test/boot.txt test/data/a.txt], paths(a, "read").sort
     assert_equal %w[test/boot.txt test/data/b.txt], paths(b, "read").sort
@@ -1863,7 +1865,8 @@ class CollectorTest < Minitest::Test
     assert_equal({ "state" => "failed", "tests" => 1, "failed" => 1 }, b.last.slice("state", "tests", "failed"))
     assert_equal "passed", c.last["state"]
     [a, b, c].each { |r| assert_empty taints(r) }
-    assert_empty Dir.children(@tmpdir)
+    # Each group's own temp directory is left for vci to remove (2.2.12).
+    assert_empty Dir.children(@tmpdir).reject { |c| c.start_with?("vci-group-") }
 
     # A's output is what a run of A on its own writes.
     alone = collect(<<~'RUBY', env: { "VCI_TEST_ID" => "script.rb" }, args: ["test/a_test.rb", "--seed", "0"])
@@ -2151,9 +2154,9 @@ class CollectorTest < Minitest::Test
       assert_equal ids.map { |id| [id, 0] }, out[:status].filter_map { |l| [l["id"], l["exit"]] if l["id"] }.sort,
                    out[:said]
       ids.each { |id| assert_equal "passed", out[id].last["state"], "#{env}: #{id}\n#{out[:said]}" }
-      # Earlier groups' leftovers are removed; the last group's slot dirs
-      # are left for vci (2.2.10).
-      assert_empty Dir.children(@tmpdir) - ["vci-slots"]
+      # Each group ran in a temp directory of its own (2.2.12), left for
+      # vci to remove with the rest.
+      assert_empty Dir.children(@tmpdir).reject { |c| c == "vci-slots" || c.start_with?("vci-group-") }
     end
   end
 

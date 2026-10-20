@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-2-12">2.2.12</a></td><td>20 Oct 2026</td><td>A Rails batch runs its boot groups at once, each in a temp directory of its own (a vex job waited 94 s for one file's group)</td></tr>
 <tr><td><a href="#v2-2-11">2.2.11</a></td><td>20 Oct 2026</td><td>A Rails batch with several boot groups says how long each took</td></tr>
 <tr><td><a href="#v2-2-10">2.2.10</a></td><td>20 Oct 2026</td><td>A Rails batch no longer walks and removes its tests' temp files one by one after its last group</td></tr>
 <tr><td><a href="#v2-2-9">2.2.9</a></td><td>20 Oct 2026</td><td>A push that fails on an unreadable object first fetches every deletion record of the pushed tree the clone lacks, in one batch</td></tr>
@@ -75,6 +76,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-2-12">2.2.12</h2>
+<p><em>20 October 2026.</em> 2.2.11's timing found the slower vex job's 90 s: <code>the batch ran 2 group(s) of files one after the other: test_helper (1032 file(s), 255.3 s), queue_result_reuse_test (1 file(s), 94.0 s)</code>. One test file starts with <code>require_relative "queue_result_reuse_test"</code>, so it boots on its own, and its group ran after the main group's. <strong>The groups of a batch now run at once</strong>, each in a temp directory of its own under vci's, so no group sees another's files (they share only an empty parent); the main group's slots each have their own database, so the base test database is free for the others. <code>VCI_RAILS_GROUPS_IN_TURN=1</code> runs them one after the other as before. Reads anywhere under vci's temp dir stay scratch space in every group, and RSpec's example status file moves to the group's own directory, so no group reads what another wrote there. The collector's tests cover groups that must not see each other's temp files, now running at once.</p>
 
 <h2 id="v2-2-11">2.2.11</h2>
 <p><em>20 October 2026.</em> 2.2.10's run showed the temp files were not it either (0.00 s to remove). The slots' timing covers only the group of files that share the Rails boot; files whose first statement differs (on vex, 17 of 2,034 start with <code>require "minitest/autorun"</code>, <code>require "json"</code> or a <code>require_relative</code>) form groups of their own, run one after the other, one file at a time. <strong>A batch with more than one group now prints <code>the batch ran N group(s) of files one after the other</code></strong> with each group's first statement, file count and time.</p>

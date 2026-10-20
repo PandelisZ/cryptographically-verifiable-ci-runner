@@ -110,6 +110,10 @@ module VciCollector
   # own temp files go, never which reads the collector treats as vci's
   # scratch space (it would otherwise hide every read under that directory).
   TMP = ENV["TMPDIR"]
+  # vci's temp dir itself: TMP, unless a group running beside others
+  # (Batch#drive_together!) points TMP at a directory of its own inside it.
+  # Reads anywhere under it are vci's scratch space, never inputs.
+  TMP_ROOT = TMP
   DLEXTS = %w[.so .bundle].freeze
   RBEXTS = %w[.rb .so .bundle].freeze
   # Code of RubyGems and Bundler. What they look up decides which gems are
@@ -981,6 +985,14 @@ module VciCollector
         groups = BATCH_IDS.uniq.group_by { |f| boot_of(f) }
         code = 0
         why = nil
+        # Several groups run at once (2.2.12), each with a temp directory of
+        # its own (so no group sees another's files): on
+        # vex one file with a boot of its own ran 94 s after the main
+        # group's 255 s. VCI_RAILS_GROUPS_IN_TURN=1 runs them one after the
+        # other, as before.
+        if groups.size > 1 && VciCollector.quiet { ENV["VCI_RAILS_GROUPS_IN_TURN"] }.to_s != "1"
+          return drive_together!(groups)
+        end
         groups.each_with_index do |(boot, files), gi|
           last = gi == groups.size - 1
           if why
@@ -1023,6 +1035,42 @@ module VciCollector
         raise if @target
         $stderr.puts "vci_collector: batch driver: #{e.class}: #{e.message}"
         Process.exit!(1)
+      end
+
+      # drive! with every group running at once, each in a temp directory of
+      # its own under vci's (TMPDIR and the collector's own view of it, in
+      # that group's processes only): groups share only an empty parent.
+      def drive_together!(groups)
+        running = []
+        groups.each_with_index do |(boot, files), gi|
+          own = File.join(TMP, "vci-group-#{gi}")
+          VciCollector.quiet { Dir.mkdir(own) unless Real.directory?(own) }
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          pid = fork_own
+          if pid.nil?
+            VciCollector.quiet { ENV["TMPDIR"] = own }
+            VciCollector.send(:remove_const, :TMP)
+            VciCollector.const_set(:TMP, own)
+            # RSpec's example status file, configured before the fork in
+            # vci's temp dir, moves to the group's: the groups' processes
+            # would otherwise read what the others wrote there.
+            RSpecSupport.slot_moved!
+            return become(run_group(boot, files))
+          end
+          running << [pid, boot, files, started]
+        end
+        code = 0
+        running.each do |pid, boot, files, started|
+          _, st = Process.wait2(pid)
+          status(group: { boot: boot.nil? ? "" : Array(boot).last.to_s, files: files.size,
+                          ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round })
+          c = st.exitstatus || 1
+          code = c if code.zero?
+          unsaid(files, st)
+        end
+        status(done: true)
+        flush
+        Process.exit!(code)
       end
 
       # In a group's process: the boot, then one process per file (returns
@@ -4286,7 +4334,7 @@ module VciCollector
       # environment's databases nor in vci's temp dir.
       def taints
         ok = sqlite_files.flat_map { |f| [f, VciCollector.real_of(f)] }
-        tmp = TMP && !TMP.empty? ? Output.both(TMP) : []
+        tmp = TMP_ROOT && !TMP_ROOT.empty? ? Output.both(TMP_ROOT) : []
         @opened.filter_map do |given, real|
           next if real && (ok.include?(real) || tmp.any? { |d| VciCollector.inside?(real, d) })
           "rails:sqlite-file:#{real || given} (a SQLite database that is not one of the test environment's " \
@@ -4998,7 +5046,7 @@ module VciCollector
 
     # vci's temp dirs, as given and as real paths.
     def ignored_prefixes
-      @ignored_prefixes ||= [TMP, OUT].compact.reject(&:empty?).flat_map do |p|
+      @ignored_prefixes ||= [TMP_ROOT, OUT].compact.reject(&:empty?).flat_map do |p|
         both(p)
       end.uniq
     end

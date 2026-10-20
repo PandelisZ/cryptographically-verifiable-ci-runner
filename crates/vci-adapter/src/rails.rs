@@ -1011,7 +1011,7 @@ impl RailsAdapter {
         }
         if slots.groups.len() > 1 {
             let mut g = slots.groups.clone();
-            g.sort_by(|a, b| b.2.cmp(&a.2));
+            g.sort_by_key(|x| std::cmp::Reverse(x.2));
             let parts: Vec<String> = g
                 .iter()
                 .take(6)
