@@ -193,6 +193,21 @@ fn show_file_symlink_yields_target() {
     assert_eq!(repo.show_file("HEAD", "link").unwrap().unwrap(), b"a.txt");
 }
 
+/// `Repo::moved_on`, checked against `Repo::moved_on_given` with
+/// `Repo::only_on` (2.3.5: one walk of the refs for every earlier commit):
+/// the same answer.
+fn moved_on_both(repo: &Repo, old: &str, new: &str) -> Result<bool, vci_git::GitError> {
+    let one = repo.moved_on(old, new)?;
+    if let Ok(only) = repo.only_on(new) {
+        assert_eq!(
+            repo.moved_on_given(old, new, &only).unwrap(),
+            one,
+            "moved_on_given({old}, {new})"
+        );
+    }
+    Ok(one)
+}
+
 #[test]
 fn moved_on_only_along_one_line_of_history() {
     let w = world(1);
@@ -209,29 +224,32 @@ fn moved_on_only_along_one_line_of_history() {
     let f2 = commit("f2");
     // main (and origin/main) still contain main's commit; feature's own
     // earlier commit is contained by nothing else.
-    assert!(!repo.moved_on(&main, &f2).unwrap());
-    assert!(repo.moved_on(&f1, &f2).unwrap());
-    assert!(!repo.moved_on(&f2, &f2).unwrap(), "the same commit");
-    assert!(!repo.moved_on(&f2, &f1).unwrap(), "backwards");
+    assert!(!moved_on_both(&repo, &main, &f2).unwrap());
+    assert!(moved_on_both(&repo, &f1, &f2).unwrap());
+    assert!(!moved_on_both(&repo, &f2, &f2).unwrap(), "the same commit");
+    assert!(!moved_on_both(&repo, &f2, &f1).unwrap(), "backwards");
     // The branch's own remote-tracking branch, behind it: the same line.
     git(dir, &["push", "-q", "origin", "feature"]);
     let f3 = commit("f3");
-    assert!(repo.moved_on(&f2, &f3).unwrap());
-    assert!(repo.moved_on(&f1, &f3).unwrap());
+    assert!(moved_on_both(&repo, &f2, &f3).unwrap());
+    assert!(moved_on_both(&repo, &f1, &f3).unwrap());
     // Another branch or a tag containing it: still needed.
     git(dir, &["branch", "other", &f1]);
-    assert!(!repo.moved_on(&f1, &f3).unwrap());
-    assert!(repo.moved_on(&f2, &f3).unwrap());
+    assert!(!moved_on_both(&repo, &f1, &f3).unwrap());
+    assert!(moved_on_both(&repo, &f2, &f3).unwrap());
     git(dir, &["tag", "v1", &f2]);
-    assert!(!repo.moved_on(&f2, &f3).unwrap());
+    assert!(!moved_on_both(&repo, &f2, &f3).unwrap());
     // A sibling branch's commit: not an ancestor.
     git(dir, &["checkout", "-q", "-b", "sibling", &main]);
     let s1 = commit("s1");
-    assert!(!repo.moved_on(&f3, &s1).unwrap());
+    assert!(!moved_on_both(&repo, &f3, &s1).unwrap());
     // Detached: every ref counts, a namesake included.
     git(dir, &["checkout", "-q", "--detach", "feature"]);
     let d = commit("detached");
-    assert!(!repo.moved_on(&f3, &d).unwrap(), "feature contains f3");
+    assert!(
+        !moved_on_both(&repo, &f3, &d).unwrap(),
+        "feature contains f3"
+    );
     // Rebased away: a commit still in the object database but on no ref
     // (its remote namesake aside) can be checked out by no name.
     git(dir, &["checkout", "-q", "feature"]);
@@ -239,19 +257,19 @@ fn moved_on_only_along_one_line_of_history() {
     let f4 = commit("f4");
     git(dir, &["reset", "-q", "--hard", &f3]);
     let f4b = commit("f4 again");
-    assert!(repo.moved_on(&f4, &f4b).unwrap(), "f4 is on no ref");
+    assert!(moved_on_both(&repo, &f4, &f4b).unwrap(), "f4 is on no ref");
     git(dir, &["push", "-q", "--force", "origin", "feature"]);
-    assert!(repo.moved_on(&f4, &f4b).unwrap());
+    assert!(moved_on_both(&repo, &f4, &f4b).unwrap());
     git(dir, &["branch", "keeps-f4", &f4]);
     assert!(
-        !repo.moved_on(&f4, &f4b).unwrap(),
+        !moved_on_both(&repo, &f4, &f4b).unwrap(),
         "a branch holds f4 again"
     );
     // A commit this full clone does not have is on none of its refs; a
     // shallow clone may just lack it, and concludes nothing. Not a commit
     // id: nothing either.
-    assert!(repo.moved_on(&"0".repeat(40), &d).unwrap());
-    assert!(!repo.moved_on("HEAD", &d).unwrap());
+    assert!(moved_on_both(&repo, &"0".repeat(40), &d).unwrap());
+    assert!(!moved_on_both(&repo, "HEAD", &d).unwrap());
     let base = w.remote.parent().unwrap();
     let shallow_dir = base.join("shallow");
     git(

@@ -282,6 +282,75 @@ impl Repo {
         Err(command_error(&describe, &out))
     }
 
+    /// The commits only `new`'s line of history holds: reachable from
+    /// `new` and from no branch, remote-tracking branch or tag that does
+    /// not contain `new` (the current branch's namesakes on the remotes
+    /// and remote `HEAD`s aside, as in [`Repo::moved_on`]). An ancestor
+    /// `old` of `new` was moved on from exactly when it is among them, so
+    /// one walk of the refs answers [`Repo::moved_on`] for every such
+    /// `old` (2.3.5: vex has thousands of remote branches, and asking
+    /// about each earlier commit walked them all every time).
+    pub fn only_on(&self, new: &str) -> Result<std::collections::BTreeSet<String>, GitError> {
+        if !is_oid(new) {
+            return Err(GitError::Invalid {
+                what: "commit",
+                value: new.to_owned(),
+                reason: "not an object id",
+            });
+        }
+        let namesakes = self.branch_namesakes()?;
+        let refs = self
+            .git()
+            .args(["for-each-ref", "--format=%(refname)", "--no-contains", new])
+            .args(["refs/heads", "refs/remotes", "refs/tags"])
+            .env(NO_LAZY_FETCH, "1")
+            .run_str()?;
+        let mut input = format!("{new}\n--not\n");
+        for r in refs
+            .lines()
+            .filter(|r| !r.is_empty() && !namesakes.iter().any(|n| n == r) && !r.ends_with("/HEAD"))
+        {
+            input.push_str(r);
+            input.push('\n');
+        }
+        let out = self
+            .git()
+            .args(["rev-list", "--stdin"])
+            .env(NO_LAZY_FETCH, "1")
+            .run_with_stdin(input.as_bytes())?;
+        Ok(String::from_utf8_lossy(&out)
+            .lines()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| is_oid(l))
+            .collect())
+    }
+
+    /// [`Repo::moved_on`], given [`Repo::only_on`] of `new`: an `old` among
+    /// them was moved on from; another ancestor of `new` was not; anything
+    /// else is asked as `moved_on` asks.
+    pub fn moved_on_given(
+        &self,
+        old: &str,
+        new: &str,
+        only: &std::collections::BTreeSet<String>,
+    ) -> Result<bool, GitError> {
+        if !is_oid(old) || !is_oid(new) || old == new {
+            return Ok(false);
+        }
+        if only.contains(old) {
+            return Ok(true);
+        }
+        let (_, out) = self
+            .git()
+            .args(["merge-base", "--is-ancestor", old, new])
+            .env(NO_LAZY_FETCH, "1")
+            .output_described()?;
+        if out.status.code() == Some(0) {
+            return Ok(false);
+        }
+        self.moved_on(old, new)
+    }
+
     /// Whether a line of history has moved on from `old` to `new`, so that
     /// nothing else still needs `old`: no branch, remote-tracking branch or
     /// tag contains `old` without containing `new`, except the current

@@ -2009,7 +2009,7 @@ pub fn run_units(
     let mut superseded = 0usize;
     // Supersession's answers per earlier commit, and the input roots of the
     // attestations it deleted.
-    let moved_on = std::sync::Mutex::new(BTreeMap::new());
+    let moved_on = MovedOn::default();
     // The trees every ref's tip has now: an attestation made on one of them
     // is never superseded, whatever its commit (vci 2.1.12).
     let live_trees: BTreeSet<String> = ctx.repo.live_trees().unwrap_or_default();
@@ -2462,6 +2462,16 @@ pub fn run_units(
 /// (`live_trees`): a pull request's merge commit is on no ref once the pull
 /// request is squash-merged, yet master's tip has its tree, and master's
 /// next run skips with it; another pull request's run must not delete it.
+/// What supersession learns about commits during a run: whether each
+/// earlier commit was moved on from (asked once per commit, other threads
+/// waiting for the answer), and the commits only the run's commit holds
+/// ([`vci_git::Repo::only_on`]), found once, when first needed.
+#[derive(Default)]
+struct MovedOn {
+    commits: std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::OnceLock<bool>>>>,
+    only_on: std::sync::OnceLock<Option<BTreeSet<String>>>,
+}
+
 /// Where supersession spends its time (`VCI_TIMING=1`), nanoseconds summed
 /// over threads: listing a unit's attestations, reading their payloads,
 /// asking git whether their commits were moved on from, and decoding their
@@ -2486,7 +2496,7 @@ fn superseded_by(
     p: &VciPredicate,
     manifest: &InputManifest,
     signer: &str,
-    moved_on: &std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::OnceLock<bool>>>>,
+    moved_on: &MovedOn,
     live_trees: &BTreeSet<String>,
 ) -> Vec<vci_git::StoredEnvelope> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
@@ -2521,11 +2531,21 @@ fn superseded_by(
         // for its answer (16 threads used to ask about the same commits at
         // once, each walking every ref's history).
         let cell = moved_on
+            .commits
             .lock()
             .map(|mut c| c.entry(m.commit.clone()).or_default().clone())
             .unwrap_or_default();
         let t = std::time::Instant::now();
-        let moved = *cell.get_or_init(|| repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false));
+        let moved = *cell.get_or_init(|| {
+            match moved_on
+                .only_on
+                .get_or_init(|| repo.only_on(&p.core.commit).ok())
+            {
+                Some(only) => repo.moved_on_given(&m.commit, &p.core.commit, only),
+                None => repo.moved_on(&m.commit, &p.core.commit),
+            }
+            .unwrap_or(false)
+        });
         supersede_add(2, t);
         if !moved {
             return true;
