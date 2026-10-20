@@ -2994,6 +2994,43 @@ fn rails_batch_mode_gives_what_one_process_per_file_gives() {
 /// rows behind (non-transactional, no cleanup: what a Rails worker would
 /// also meet) runs again on its own, from a fresh boot and database, and
 /// the retry's result is the file's: attested, exit 0.
+/// A test that leaves a process running in the background with the batch's
+/// output inherited (a server, a helper) no longer holds the run up: vci
+/// waits for the batch's Ruby process, not for its output to close
+/// (2.2.6: about 90 s a full vex job).
+#[test]
+fn rails_batch_does_not_wait_for_a_leftover_background_process() {
+    const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
+    let Some(w) = World::new() else { return };
+    let files = ["test/slots/bg_test.rb", "test/slots/plain_test.rb"];
+    w.put(
+        files[0],
+        "require \"test_helper\"\n\nclass BgTest < ActiveSupport::TestCase\n  test \"leaves a process behind\" do\n    pid = Process.spawn(\"sleep\", \"40\")\n    Process.detach(pid)\n    assert pid.positive?\n  end\nend\n",
+    );
+    w.put(
+        files[1],
+        "require \"test_helper\"\n\nclass PlainTest < ActiveSupport::TestCase\n  test \"passes\" do\n    assert true\n  end\nend\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "slot files"]);
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", key.as_str()]);
+    let started = std::time::Instant::now();
+    let out = w.vci_env(&w.work, &args, SLOTS);
+    let took = started.elapsed();
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        took < std::time::Duration::from_secs(35),
+        "the run waited for the background process ({took:?}):\n{stderr}"
+    );
+    assert!(
+        stderr.contains("passes") || stderr.contains("plain_test.rb"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn rails_slot_failure_from_an_earlier_file_passes_on_its_own() {
     const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];

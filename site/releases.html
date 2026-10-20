@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-2-6">2.2.6</a></td><td>20 Oct 2026</td><td>A Rails batch no longer waits for a process a test left running in the background (about 90 s of a full vex job)</td></tr>
 <tr><td><a href="#v2-2-5">2.2.5</a></td><td>20 Oct 2026</td><td>A Rails batch says when its slots had all exited and how long its own work after them took</td></tr>
 <tr><td><a href="#v2-2-4">2.2.4</a></td><td>20 Oct 2026</td><td>A push writes back, from the store, a deletion record whose blob the clone lost, instead of failing ten times</td></tr>
 <tr><td><a href="#v2-2-3">2.2.3</a></td><td>20 Oct 2026</td><td>A Rails batch says how long it booted before its slots and how long the slots' cleanup took</td></tr>
@@ -69,6 +70,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-2-6">2.2.6</h2>
+<p><em>20 October 2026.</em> 2.2.5's timing closed the case of the 90 s: in a full vex job the boot took 2.9 s, the slots 264.6 s and the batch's own work after them 0 s, yet vci measured the Ruby process at 357 s. vci ran the batch with <code>output()</code>, which returns when the process's stdout and stderr close, not when it exits; a test that leaves a process running in the background (a server, a helper) holds an inherited copy of those pipes, and vci waited for it to end. <strong>The batch's output now goes to files and vci waits for the Ruby process itself.</strong> An end-to-end test runs a Rails file that leaves <code>sleep 40</code> running: the run took 44 s before, and now finishes without it.</p>
 
 <h2 id="v2-2-5">2.2.5</h2>
 <p><em>20 October 2026.</em> 2.2.3's timing showed the boot (3 s) and the slots' cleanup (0 s) do not explain why one full vex job's Ruby process ran about 90 s longer than its slots, twice. What is left is the batch's own process after its slots: waiting for them to exit, reading their lines, checking the shared temp directory. <strong>A Rails batch now prints <code>every slot had exited N s after the slots started; then reading the slots' lines took N s, checking the shared temp directory N s</code></strong>. No behaviour changes. 2.2.4's write-back was not needed on its first full vex run: both jobs published on the first attempt.</p>

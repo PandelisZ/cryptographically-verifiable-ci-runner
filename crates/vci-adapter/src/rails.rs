@@ -876,7 +876,29 @@ impl RailsAdapter {
         }
         let timing = std::env::var_os("VCI_TIMING").is_some();
         let t = std::time::Instant::now();
-        let out = cmd.output().map_err(|e| self.not_installed(e))?;
+        // The batch's output goes to files and vci waits for the Ruby
+        // process itself, not for its pipes to close (2.2.6): a test that
+        // leaves a process running in the background (a server, a helper)
+        // keeps an inherited pipe open, and `output()` waited for it, about
+        // 90 s a full vex job, after every slot had exited.
+        let out = {
+            let stdout_path = dirs.base.join("batch-stdout");
+            let stderr_path = dirs.base.join("batch-stderr");
+            let stdout = std::fs::File::create(&stdout_path)?;
+            let stderr = std::fs::File::create(&stderr_path)?;
+            let status = cmd
+                .stdin(std::process::Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn()
+                .map_err(|e| self.not_installed(e))?
+                .wait()?;
+            std::process::Output {
+                status,
+                stdout: std::fs::read(&stdout_path)?,
+                stderr: std::fs::read(&stderr_path)?,
+            }
+        };
         if timing {
             eprintln!(
                 "vci: timing: rails batch: the Ruby process (boot, slots, files): {:.2}s",
