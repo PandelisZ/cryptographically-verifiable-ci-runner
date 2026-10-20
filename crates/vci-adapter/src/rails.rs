@@ -1009,6 +1009,26 @@ impl RailsAdapter {
                 );
             }
         }
+        if slots.groups.len() > 1 {
+            let mut g = slots.groups.clone();
+            g.sort_by(|a, b| b.2.cmp(&a.2));
+            let parts: Vec<String> = g
+                .iter()
+                .take(6)
+                .map(|(boot, n, ms)| {
+                    let name = boot.rsplit('/').next().unwrap_or(boot);
+                    format!("{name} ({n} file(s), {:.1} s)", *ms as f64 / 1000.0)
+                })
+                .collect();
+            log.extend_from_slice(
+                format!(
+                    "vci: the batch ran {} group(s) of files one after the other: {}\n",
+                    slots.groups.len(),
+                    parts.join(", ")
+                )
+                .as_bytes(),
+            );
+        }
         if !slots.output_ms.is_empty() {
             let n = slots.output_ms.len() as f64;
             let sum: u64 = slots.output_ms.iter().sum();
@@ -1115,6 +1135,9 @@ struct SlotStats {
     /// exited (ms after the slots started), and how long reading the slots'
     /// lines and checking the shared temp directory took (ms).
     after_slots: Option<(u64, u64, u64)>,
+    /// Each group of the batch (files sharing a boot), in the order run:
+    /// its boot's first statement, its file count, its time (ms).
+    groups: Vec<(String, u64, u64)>,
     output_ms: Vec<u64>,
     shared_ms: Vec<u64>,
 }
@@ -1227,6 +1250,16 @@ fn read_batch(
             }
             if let Some(at) = v.get("cleanup_end_at").and_then(Value::as_u64) {
                 stats.cleanup_end_at = stats.cleanup_end_at.max(at);
+            }
+            if let Some(g) = v.get("group") {
+                stats.groups.push((
+                    g.get("boot")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    g.get("files").and_then(Value::as_u64).unwrap_or(0),
+                    g.get("ms").and_then(Value::as_u64).unwrap_or(0),
+                ));
             }
             if let Some(a) = v.get("after_slots") {
                 let g = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);

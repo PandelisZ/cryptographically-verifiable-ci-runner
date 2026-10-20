@@ -1851,7 +1851,7 @@ class CollectorTest < Minitest::Test
     # it (a boot of its own).
     assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/c_test.rb", "exit" => 0 },
                   { "id" => "test/b_test.rb", "exit" => 1 }, { "done" => true }],
-                 out[:status].reject { |l| l.key?("group_cleanup_ms") }, out[:said]
+                 out[:status], out[:said]
     a, b, c = out.values_at(*ids)
     assert_equal %w[test/boot.txt test/data/a.txt], paths(a, "read").sort
     assert_equal %w[test/boot.txt test/data/b.txt], paths(b, "read").sort
@@ -2404,7 +2404,11 @@ class CollectorTest < Minitest::Test
     said = IO.popen(e, [RbConfig.ruby, "script.rb", *ids, "--seed", "0"], chdir: @repo, err: %i[child out], &:read)
     status_file = File.join(@out, "batch", "files.jsonl")
     assert File.file?(status_file), "no batch status; process said:\n#{said}"
-    out = { said: said, status: File.readlines(status_file).map { |l| JSON.parse(l) }, lines: {}, own: {} }
+    # Timing-only lines (what a group, the boot or the slots' end took) are
+    # left out: tests compare what was said of the files.
+    timing = %w[group group_cleanup_ms boot_ms spawn_to_slots_ms after_slots]
+    status = File.readlines(status_file).map { |l| JSON.parse(l) }.reject { |l| (l.keys & timing).any? }
+    out = { said: said, status: status, lines: {}, own: {} }
     timing = File.join(@out, "batch", "output.jsonl")
     out[:output] = File.file?(timing) ? File.readlines(timing).map { |l| JSON.parse(l) } : []
     ids.each do |id|

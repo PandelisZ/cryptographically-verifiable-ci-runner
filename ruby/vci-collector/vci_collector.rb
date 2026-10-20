@@ -994,9 +994,12 @@ module VciCollector
           # runner's own files) would be seen by the next groups: they run
           # on their own.
           before = tmp_entries
+          group_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           pid = fork_own
           return become(run_group(boot, files)) if pid.nil?
           _, st = Process.wait2(pid)
+          status(group: { boot: boot.nil? ? "" : Array(boot).last.to_s, files: files.size,
+                          ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - group_started) * 1000).round })
           c = st.exitstatus || 1
           code = c if code.zero?
           unsaid(files, st)
