@@ -28,6 +28,32 @@ pub struct Repo {
     git_dir: std::sync::OnceLock<Utf8PathBuf>,
 }
 
+/// How many of `oids` the object database at `root` holds, asked without
+/// fetching any (`git rev-list --missing=allow-any`, any git version).
+pub(crate) fn present_count(root: &Utf8Path, oids: &[String]) -> usize {
+    let mut input = Vec::new();
+    for o in oids.iter().filter(|o| is_oid(o)) {
+        input.extend_from_slice(o.as_bytes());
+        input.push(b'\n');
+    }
+    if input.is_empty() {
+        return 0;
+    }
+    Git::at(root)
+        .args([
+            "rev-list",
+            "--objects",
+            "--no-walk",
+            "--missing=allow-any",
+            "--ignore-missing",
+            "--stdin",
+        ])
+        .env(NO_LAZY_FETCH, "1")
+        .run_with_stdin(&input)
+        .map(|out| String::from_utf8_lossy(&out).lines().count())
+        .unwrap_or(0)
+}
+
 impl PartialEq for Repo {
     fn eq(&self, other: &Self) -> bool {
         self.root == other.root

@@ -4824,8 +4824,28 @@ impl<'a> AttestStore<'a> {
                     // every deletion record of the pushed tree this clone
                     // lacks (another job's, merged in; a vex job hit
                     // thousands, one per attempt), then tries again.
+                    // 2.6.3: every object the pack needs that this clone
+                    // lacks, as git itself lists them (`rev-list --objects
+                    // --missing=print <pushed> --not <tip>`), fetched by
+                    // id in batches until none is missing. The deletion
+                    // records alone (2.2.9) left a vex job failing ten
+                    // attempts, one record each, on records the store held
+                    // only as placeholders.
                     if !fetched_tombstones {
                         fetched_tombstones = true;
+                        let t = std::time::Instant::now();
+                        let fetched =
+                            self.fetch_missing_for_push(&name, &pushed, tip.as_deref())?;
+                        vci_core::timing_line!(
+                            "push: fetch the {fetched} object(s) the pack needs: {:.2}s",
+                            t.elapsed().as_secs_f64()
+                        );
+                        if fetched > 0 {
+                            report.note(format!(
+                                "push attempt {attempt}: {last}; fetched the {fetched} object(s) the push needed that this clone lacked and trying again"
+                            ));
+                            continue;
+                        }
                         let missing = self.missing_tombstone_blobs(&pushed)?;
                         if !missing.is_empty() {
                             let (_, fetched, _) = self.ensure_blobs(&name, &missing)?;
@@ -4928,6 +4948,55 @@ impl<'a> AttestStore<'a> {
 
     /// The blobs of every deletion record in `pushed`'s tree that this
     /// clone does not have.
+    /// The objects a push of `pushed` needs that this clone lacks (reachable
+    /// from it, not from `tip`, the remote's tip as last fetched), listed by
+    /// git without fetching any, then fetched by id from `remote`; again
+    /// while a round finds more (a fetched tree names its own objects), at
+    /// most four rounds. Returns how many were fetched.
+    fn fetch_missing_for_push(
+        &self,
+        remote: &str,
+        pushed: &str,
+        tip: Option<&str>,
+    ) -> Result<usize, GitError> {
+        let mut total = 0;
+        for _ in 0..4 {
+            let mut git = self.repo.git().args([
+                "rev-list",
+                "--objects",
+                "--missing=print",
+                "--no-object-names",
+                pushed,
+            ]);
+            if let Some(t) = tip {
+                git = git.args(["--not", t]);
+            }
+            let out = git.env("GIT_NO_LAZY_FETCH", "1").run_str()?;
+            let missing: Vec<String> = out
+                .lines()
+                .filter_map(|l| l.strip_prefix('?'))
+                .filter(|o| is_oid(o))
+                .map(str::to_owned)
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            let refs: Vec<&String> = missing.iter().collect();
+            if self.fetch_blobs(remote, &refs).is_err() {
+                break;
+            }
+            let wanted: BTreeSet<String> = missing.iter().cloned().collect();
+            let now: Vec<String> = wanted.iter().cloned().collect();
+            let still = now.len() - crate::repo::present_count(self.repo.root(), &now);
+            let got = missing.len() - still;
+            total += got;
+            if got == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     fn missing_tombstone_blobs(&self, pushed: &str) -> Result<BTreeSet<String>, GitError> {
         let listing = self
             .repo
@@ -5171,14 +5240,13 @@ impl<'a> AttestStore<'a> {
     fn push_diagnosis(&self, pushed: &str, tip: Option<&str>, stderr: &str) -> String {
         let named = unreadable_object(stderr);
         let readable = named.as_deref().map(|o| {
-            let read = self
-                .repo
-                .git()
-                .args(["cat-file", "-t", o])
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .run_str()
-                .map(|t| t.trim().to_owned())
-                .unwrap_or_else(|e| format!("unreadable ({})", e.to_string().replace('\n', " ")));
+            // Not `git cat-file -t`: git before 2.44 asks the promisor for
+            // an object it lacks (18 s a time on vex's runners).
+            let read = match self.repo.has_object(o) {
+                Ok(true) => "present".to_owned(),
+                Ok(false) => "unreadable (not in this clone's object database)".to_owned(),
+                Err(e) => format!("unreadable ({})", e.to_string().replace('\n', " ")),
+            };
             // A loose object file git cannot read is corrupt or still
             // being written; none at all means the object was never here.
             let loose = self

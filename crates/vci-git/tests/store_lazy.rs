@@ -1412,3 +1412,48 @@ fn many_values_are_fetched_in_parallel() {
         assert_eq!(sf.manifest(&r1).unwrap().unwrap().bytes, manifest("one"));
     }
 }
+
+/// vex, 2.6.2 (20 Oct): two jobs each deleting input manifests (on the
+/// `project` target, beside thousands of earlier deletion records); the
+/// second to push merges the first's deletion records, which it never
+/// downloaded, and every push failed (`could not fetch <a deletion
+/// record's blob> from promisor remote`, ten attempts).
+#[test]
+fn blobless_clones_deleting_manifests_both_push() {
+    let w = lazy_world(1);
+    let a = repo(&w.clones[0]);
+    let st = AttestStore::new(&a);
+    let roots: Vec<String> = (0..40).map(|i| hex64(0x10 + i)).collect();
+    for (i, r) in roots.iter().enumerate() {
+        st.put_manifest(r, &manifest(&format!("m{i}"))).unwrap();
+    }
+    st.put(A, S1, &hex64(1), &env("a1", &roots[0])).unwrap();
+    assert_eq!(st.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    // Earlier deletion records, published.
+    for r in &roots[30..40] {
+        st.remove_manifest(r).unwrap();
+    }
+    assert_eq!(st.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    let open = |name: &str| {
+        let dir = fresh_clone(&w, name);
+        let r = repo(&dir);
+        assert!(AttestStore::new(&r).fetch(Some("origin")).unwrap().found);
+        r
+    };
+    let (r1, r2) = (open("one"), open("two"));
+    let (s1, s2) = (AttestStore::new(&r1), AttestStore::new(&r2));
+    for r in &roots[1..10] {
+        s1.remove_manifest(r).unwrap();
+    }
+    s1.put_manifest(&hex64(0xa1), &manifest("new-one")).unwrap();
+    for r in &roots[10..20] {
+        s2.remove_manifest(r).unwrap();
+    }
+    s2.put_manifest(&hex64(0xa2), &manifest("new-two")).unwrap();
+    assert_eq!(s1.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    let out = s2.push(Some("origin"));
+    assert!(
+        matches!(&out, Ok(o) if o.status == PushStatus::Pushed),
+        "{out:?}"
+    );
+}
