@@ -143,7 +143,12 @@ const PRUNE_KEYS: &[&str] = &["meta:prune:max-keys", "meta:prune:max-size"];
 const FETCH_BLOB_BATCH: usize = 4000;
 /// Below this many blobs a fetch runs alone; above, in parallel batches of
 /// at least this many.
-const FETCH_BLOB_PARALLEL_MIN: usize = 500;
+///
+/// 2.3.9: 4,000 (was 500). A plan's 2,018 values came in four packs, which
+/// pushed a restored store past [`PACKS_BEFORE_REPACK`] and into a 6.7 s
+/// repack on git 2.43; one `git fetch` of 2,000 values from GitHub takes
+/// about as long as four (1.6 s against 1.4 s on a laptop).
+const FETCH_BLOB_PARALLEL_MIN: usize = 4000;
 
 /// Packs in the object database from which a batched fetch merges them
 /// (gix, which git-meta reads it with, has 32 pack slots at least).
@@ -2044,14 +2049,11 @@ impl<'a> AttestStore<'a> {
         // how many (1: one after the other, as before).
         let jobs = fetch_jobs();
         if jobs <= 1 || oids.len() <= FETCH_BLOB_PARALLEL_MIN {
-            let mut batches = 0;
             for batch in oids.chunks(FETCH_BLOB_BATCH) {
                 self.fetch_objects(remote, batch)?;
-                batches += 1;
             }
-            if batches > 1 {
-                self.consolidate_packs();
-            }
+            // Each fetch adds a pack: merged once they near gix's slots.
+            self.consolidate_packs();
             return Ok(());
         }
         self.ensure_no_lazy_fetch_remote()?;
@@ -2082,9 +2084,7 @@ impl<'a> AttestStore<'a> {
                 .collect()
         });
         let out: Result<(), GitError> = results.into_iter().collect();
-        if batches.len() > 1 {
-            self.consolidate_packs();
-        }
+        self.consolidate_packs();
         out
     }
 

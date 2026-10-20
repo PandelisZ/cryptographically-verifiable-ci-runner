@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-3-9">2.3.9</a></td><td>20 Oct 2026</td><td>Up to 4,000 values are fetched in one request instead of four, so a plan's fetches no longer push a restored store into a full repack</td></tr>
 <tr><td><a href="#v2-3-8">2.3.8</a></td><td>20 Oct 2026</td><td>Supersession checks that an earlier commit is present without asking the remote for it (12.7 s per git command on vex's git 2.43)</td></tr>
 <tr><td><a href="#v2-3-7">2.3.7</a></td><td>20 Oct 2026</td><td>With VCI_TIMING, a git command that took 2 s or more is reported, and so is each question supersession asks about a commit</td></tr>
 <tr><td><a href="#v2-3-6">2.3.6</a></td><td>20 Oct 2026</td><td>Supersession writes a commit-graph first when the repository has none, so each question about history reads commits from it</td></tr>
@@ -86,6 +87,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-3-9">2.3.9</h2>
+<p><em>20 October 2026.</em> 2.3.8 on vex: supersession's questions about commits took 2.5 thread-seconds instead of 330 to 450, and checking, signing and storing a job's units took 20 s instead of 34 to 67. The jobs took 5.8 and 7.2 min. The plan still spent 6.7 s in <code>git repack -A -d</code>. A fetch of more than 500 values was split into four <code>git fetch</code> processes, each leaving a pack, so a store restored from the cache passed 16 packs, and git 2.43 can only repack a partial clone whole. One <code>git fetch</code> of 2,000 values from GitHub takes about as long as four (1.6 s against 1.4 s on a laptop). <strong>Up to 4,000 values now come in one request</strong>, and the pack count is checked after every fetch, not only after a split one.</p>
 
 <h2 id="v2-3-8">2.3.8</h2>
 <p><em>20 October 2026.</em> 2.3.7's timing found supersession's 25 s on vex: <code>slow git: cat-file -e f1c14bcf…^{commit}: 12.67s</code> and <code>slow git: merge-base --is-ancestor f1c14bcf… c78386b7…: 12.70s</code>, for an earlier pull request commit the checkout does not have. Asked about an object it lacks, git asks the promisor remote for it, and git before 2.44 ignores <code>GIT_NO_LAZY_FETCH</code>: Ubuntu's 2.43 went to GitHub several times for each, and every thread checking units waited for the answer. <strong>vci now checks that the commit is present with <code>git rev-list --no-walk --missing=print</code></strong>, which never fetches on any version (vci's store already checked values that way), before any other question about it. A commit the clone lacks is answered as before, without asking git about its history.</p>
