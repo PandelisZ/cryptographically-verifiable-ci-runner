@@ -145,6 +145,10 @@ const FETCH_BLOB_BATCH: usize = 4000;
 /// at least this many.
 const FETCH_BLOB_PARALLEL_MIN: usize = 500;
 
+/// Packs in the object database from which a batched fetch merges them
+/// (gix, which git-meta reads it with, has 32 pack slots at least).
+const PACKS_BEFORE_REPACK: usize = 16;
+
 /// How many `git fetch` processes [`AttestStore`] runs at once for values:
 /// `VCI_FETCH_JOBS`, default 4.
 fn fetch_jobs() -> usize {
@@ -2094,6 +2098,13 @@ impl<'a> AttestStore<'a> {
     /// geometric repack is proportional to what was added; a git without
     /// it, or one that cannot repack, is not a reason to fail the fetch.
     fn consolidate_packs(&self) {
+        // Only when the packs come near gix's 32 slots (2.3.1): a git
+        // without a geometric repack (2.43, Ubuntu's) repacks the whole
+        // repository instead, several seconds on vex's runners after each
+        // batched fetch of a plan, which added a few packs at a time.
+        if self.pack_count().is_some_and(|n| n < PACKS_BEFORE_REPACK) {
+            return;
+        }
         let repack = |args: &[&str]| {
             self.repo
                 .git()
@@ -2106,6 +2117,22 @@ impl<'a> AttestStore<'a> {
         if !repack(&["--geometric=2", "-d", "-q"]) {
             let _ = repack(REPACK_FALLBACK);
         }
+    }
+
+    /// How many packs the object database has, when that can be read.
+    fn pack_count(&self) -> Option<usize> {
+        let dir = self
+            .repo
+            .git()
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "objects/pack"])
+            .run_str()
+            .ok()?;
+        let n = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".pack"))
+            .count();
+        Some(n)
     }
 
     /// `git fetch --stdin` of the objects `oids` (blobs, or a tree with its
@@ -3009,13 +3036,43 @@ impl<'a> AttestStore<'a> {
         // object id); a full serialization hashes every value of the store
         // again, most of the cost of a fetch or push on a large store. The
         // check below still refuses a commit that drops a value.
-        let _ = guarded("serializing the git-meta store", || {
-            if full {
-                session.serialize_full()
-            } else {
-                session.serialize()
+        let t = std::time::Instant::now();
+        let fast = if full {
+            Ok(None)
+        } else {
+            self.serialize_changed(session, local_ref)
+        };
+        match fast {
+            Ok(Some(n)) => {
+                if std::env::var_os("VCI_TIMING").is_some() {
+                    eprintln!(
+                        "vci: timing: serialize {n} changed entr{} onto the local metadata: {:.2}s",
+                        if n == 1 { "y" } else { "ies" },
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                // Only keys with a row or a deletion record were written:
+                // no value was dropped without one, and no value not fetched
+                // fell out (the check below is for git-meta's rebuild).
+                return Ok(());
             }
-        })?;
+            other => {
+                if let Err(e) = other
+                    && std::env::var_os("VCI_TIMING").is_some()
+                {
+                    eprintln!(
+                        "vci: serializing the changed entries failed ({e}); git-meta serializes"
+                    );
+                }
+                let _ = guarded("serializing the git-meta store", || {
+                    if full {
+                        session.serialize_full()
+                    } else {
+                        session.serialize()
+                    }
+                })?;
+            }
+        }
         let new = self.read_ref(local_ref)?;
         let (Some(prev), Some(mut new)) = (prev, new) else {
             return Ok(());
@@ -3057,6 +3114,189 @@ impl<'a> AttestStore<'a> {
             target_label(&dropped[0].to_target()),
             dropped[0].key
         )))
+    }
+
+    /// git-meta's incremental serialization, for the entries vci writes,
+    /// without rebuilding every changed target: the local metadata commit's
+    /// tree with only the keys modified since the last serialization
+    /// written again, each as git-meta writes it (a value's path holds the
+    /// row's string, or the blob it names; a deletion record's path holds
+    /// `{"timestamp","email"}`; a path without a row or record is
+    /// removed), then the store marked serialized as of before it read.
+    ///
+    /// git-meta rebuilds a changed target's subtree from every row it
+    /// holds: one new input manifest made it read and write every manifest
+    /// on the `project` target (18 s a push on vex, with thousands). The
+    /// result is the same tree when the local ref holds what the store
+    /// held at the last serialization, which git-meta's incremental mode
+    /// assumes too. Returns how many entries were written, or `None` when
+    /// git-meta must serialize (no local metadata commit or marker yet,
+    /// prune rules, a set or list value, a value not fetched, a row gone
+    /// without a deletion record; or `VCI_SERIALIZE=git-meta`).
+    fn serialize_changed(
+        &self,
+        session: &Session,
+        local_ref: &str,
+    ) -> Result<Option<usize>, GitError> {
+        if std::env::var_os("VCI_SERIALIZE").is_some_and(|v| v == "git-meta") {
+            return Ok(None);
+        }
+        let Some(prev) = self.read_ref(local_ref)? else {
+            return Ok(None);
+        };
+        let store = session.store();
+        let Some(since) = guarded("reading the store", || store.get_last_materialized())? else {
+            return Ok(None);
+        };
+        if guarded("reading git-meta prune rules", || {
+            git_meta_lib::prune::read_prune_rules(store)
+        })?
+        .is_some()
+        {
+            return Ok(None);
+        }
+        // As git-meta does: the marker is the time before the store is
+        // read, so a row stored meanwhile stays newer than it.
+        let now = now_ms();
+        let modified = guarded("reading the store", || store.get_modified_since(since))?;
+        let keys: BTreeSet<(TargetType, String, String)> = modified
+            .into_iter()
+            .map(|m| (m.target_type, m.target_value, m.key))
+            .collect();
+        let deleted: BTreeMap<(TargetType, String, String), Tombstone> =
+            guarded("reading the store", || store.get_all_tombstones())?
+                .into_iter()
+                .map(|t| {
+                    (
+                        (t.target_type, t.target_value, t.key),
+                        Tombstone {
+                            timestamp: t.timestamp,
+                            email: t.email,
+                        },
+                    )
+                })
+                .collect();
+        let Some((db_path, db)) = self.db_rw()? else {
+            return Ok(None);
+        };
+        let mut stmt = db
+            .prepare(
+                "SELECT value, value_type, is_git_ref, is_promised FROM metadata
+                 WHERE target_type = ?1 AND target_value = ?2 AND key = ?3",
+            )
+            .map_err(|e| sql_err(&db_path, e))?;
+        // Paths and their blob (an object id, or bytes to write), and the
+        // paths to remove.
+        let mut by_oid: Vec<(String, String)> = Vec::new();
+        let mut by_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut removed: Vec<String> = Vec::new();
+        for (tt, tv, key) in &keys {
+            let target = if *tt == TargetType::Project {
+                Target::project()
+            } else {
+                match Target::parse(&format!("{}:{tv}", tt.as_str())) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(None),
+                }
+            };
+            let (Ok(vpath), Ok(dpath)) = (
+                git_meta_lib::tree_paths::tree_path(&target, key),
+                git_meta_lib::tree_paths::tombstone_path(&target, key),
+            ) else {
+                return Ok(None);
+            };
+            let row: Option<(String, String, i64, i64)> = stmt
+                .query_row(rusqlite::params![tt.as_str(), tv, key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })
+                .map_err(|e| sql_err(&db_path, e))?;
+            match row {
+                Some((value, vt, git_ref, promised)) => {
+                    if vt != "string" || promised != 0 {
+                        return Ok(None);
+                    }
+                    if git_ref != 0 {
+                        if !is_oid(&value) {
+                            return Ok(None);
+                        }
+                        by_oid.push((vpath, value));
+                    } else {
+                        let raw = serde_json::from_str::<String>(&value).unwrap_or(value);
+                        by_bytes.push((vpath, raw.into_bytes()));
+                    }
+                }
+                // A row gone without a deletion record (purged): git-meta
+                // serializes, and the check after it decides.
+                None if !deleted.contains_key(&(tt.clone(), tv.clone(), key.clone())) => {
+                    return Ok(None);
+                }
+                None => removed.push(vpath),
+            }
+            match deleted.get(&(tt.clone(), tv.clone(), key.clone())) {
+                Some(t) => {
+                    let Ok(bytes) = serde_json::to_vec(t) else {
+                        return Ok(None);
+                    };
+                    by_bytes.push((dpath, bytes));
+                }
+                None => removed.push(dpath),
+            }
+        }
+        drop(stmt);
+        drop(db);
+        // The new blobs and the trees on their paths, written through gix
+        // (only the subtrees that change; 2,000 entries through a git
+        // index took 5 s on a laptop).
+        let n = by_oid.len() + by_bytes.len() + removed.len();
+        let repo = session.repo();
+        let gerr =
+            |e: &dyn std::fmt::Display| GitError::Meta(format!("writing the metadata tree: {e}"));
+        let prev_tree_id = repo
+            .rev_parse_single(format!("{prev}^{{tree}}").as_str())
+            .map_err(|e| gerr(&e))?
+            .detach();
+        let mut editor = repo.edit_tree(prev_tree_id).map_err(|e| gerr(&e))?;
+        for path in &removed {
+            // A path the tree does not have is left alone.
+            let _ = editor.remove(path.as_str());
+        }
+        for (path, oid) in &by_oid {
+            let id = gix::ObjectId::from_hex(oid.as_bytes()).map_err(|e| gerr(&e))?;
+            editor
+                .upsert(path.as_str(), gix::objs::tree::EntryKind::Blob, id)
+                .map_err(|e| gerr(&e))?;
+        }
+        for (path, bytes) in &by_bytes {
+            let id = repo.write_blob(bytes).map_err(|e| gerr(&e))?.detach();
+            editor
+                .upsert(path.as_str(), gix::objs::tree::EntryKind::Blob, id)
+                .map_err(|e| gerr(&e))?;
+        }
+        let tree = editor.write().map_err(|e| gerr(&e))?.detach().to_string();
+        let prev_tree = prev_tree_id.to_string();
+        if tree != prev_tree {
+            let mut git = self.repo.git().args([
+                "commit-tree",
+                "--no-gpg-sign",
+                &tree,
+                "-p",
+                &prev,
+                "-m",
+                &format!("vci: serialize {n} change(s)"),
+            ]);
+            for (k, v) in IDENTITY {
+                git = git.env(k, v);
+            }
+            let commit = parse_oid(&git.run()?)?;
+            self.cas_ref(local_ref, Some(&commit), &prev, "vci: serialize")?;
+        }
+        guarded("writing the store", || store.set_last_materialized(now))?;
+        Ok(Some(n))
     }
 
     /// Rewrite `commit` (the tip of `local_ref`) with `entries` (key -> blob
@@ -3353,15 +3593,27 @@ impl<'a> AttestStore<'a> {
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| is_oid(s));
-        let materialized = tip_now
-            .as_deref()
-            .is_some_and(|tip| restored == 0 && previous.as_deref() == Some(tip));
+        // Nor is there anything to merge when the local metadata commit
+        // descends from the fetched tip (this clone pushed it, or merged it
+        // before, and stored more since): a merge took 5 s on a laptop to
+        // change nothing.
+        let local_now = self.read_ref(&local_ref)?;
+        let descends = match (tip_now.as_deref(), local_now.as_deref()) {
+            (Some(tip), Some(l)) if restored == 0 => {
+                tip == l || self.is_ancestor(tip, l).unwrap_or(false)
+            }
+            _ => false,
+        };
         // git-meta imports a side remote's values as rows of their own
         // (never serialized, the local ref left alone), not as a merge.
         let side = self
             .remotes()?
             .iter()
             .any(|r| r.3 && tracking == format!("refs/{ns}/remotes/{}/main", r.0));
+        let materialized = (descends && !side)
+            || tip_now
+                .as_deref()
+                .is_some_and(|tip| restored == 0 && previous.as_deref() == Some(tip));
         if found && !materialized {
             let before = self.attestation_keys()?;
             let manifests_before: BTreeSet<String> = if side {

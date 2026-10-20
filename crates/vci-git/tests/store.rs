@@ -862,3 +862,70 @@ fn interop_with_the_git_meta_cli() {
     let lb = AttestStore::new(&rb).list(None).unwrap();
     assert_eq!(rows(&lb), rows(&sa.list(None).unwrap()));
 }
+
+/// vci 2.3.1 writes only the changed entries onto the local metadata
+/// commit instead of git-meta's rebuild of every changed target: after
+/// puts, deletions, puts again over deletions, large values (stored as git
+/// blobs) and exchanges, the tree is the one git-meta's full serialization
+/// builds from the same store.
+#[test]
+fn serializing_the_changed_entries_builds_git_meta_s_tree() {
+    let w = world(2);
+    let (r0, root0) = store(&w.clones[0]);
+    let (r1, _) = store(&w.clones[1]);
+    let s0 = AttestStore::new(&r0);
+    let s1 = AttestStore::new(&r1);
+    let hex = |i: usize| format!("{i:064x}");
+    for i in 0..30 {
+        let id = format!("src/t{i}.test.ts");
+        s0.put(&id, S1, &hex(i + 1), format!("{{\"n\":{i}}}").as_bytes())
+            .unwrap();
+        s0.put_manifest(&hex(1000 + i), &big(&format!("m{i}"), 40_000))
+            .unwrap();
+    }
+    s0.push(None).unwrap();
+    s1.fetch(None).unwrap();
+    s1.put("src/other.test.ts", S2, &hex(77), b"{\"o\":1}")
+        .unwrap();
+    s1.push(None).unwrap();
+    // Deletions, values replaced, a key deleted then stored again, more
+    // manifests, and a merge of the other clone's push.
+    for i in 0..10 {
+        let id = format!("src/t{i}.test.ts");
+        for e in s0.list(Some(&id)).unwrap() {
+            s0.remove(&e).unwrap();
+        }
+    }
+    s0.put("src/t3.test.ts", S1, &hex(4), b"{\"again\":3}")
+        .unwrap();
+    s0.put("src/t20.test.ts", S1, &hex(21), b"{\"n\":\"replaced\"}")
+        .unwrap();
+    for i in 30..40 {
+        s0.put_manifest(&hex(1000 + i), &big(&format!("m{i}"), 40_000))
+            .unwrap();
+    }
+    s0.fetch(None).unwrap();
+    s0.put("src/late.test.ts", S1, &hex(88), b"{\"late\":1}")
+        .unwrap();
+    s0.push(None).unwrap();
+
+    let tree = |dir: &Utf8Path| {
+        let out = Command::new("git")
+            .args(["rev-parse", "refs/meta/local/main^{tree}"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let ours = tree(&root0);
+    // git-meta's own full serialization of a copy of the same store.
+    let copy = w.clones[0].parent().unwrap().join("copy");
+    let st = Command::new("cp")
+        .args(["-R", w.clones[0].as_str(), copy.as_str()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let session = Session::open(copy.as_std_path()).unwrap();
+    let _ = session.serialize_full().unwrap();
+    assert_eq!(tree(&copy), ours, "git-meta's full serialization differs");
+}
