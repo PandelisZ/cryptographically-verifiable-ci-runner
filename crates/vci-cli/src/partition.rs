@@ -1,10 +1,12 @@
 //! `vci ci --partition I/N`: N CI jobs share what a plan leaves to run.
 //!
 //! Every unit the plan runs belongs to exactly one partition, chosen from
-//! its test id alone: the first 8 bytes of its storage key (BLAKE3 of the
-//! test id, [`vci_core::test_key`]), big-endian, modulo N. So the split is
-//! the same on every machine and in every job, whatever the order of the
-//! plan or what the other partitions do. Units the plan skips are skipped
+//! the checkout alone. A project whose units are all files is split by
+//! size (2.4.0, [`Split::balanced`]); any other unit by its test id: the
+//! first 8 bytes of its storage key (BLAKE3 of the test id,
+//! [`vci_core::test_key`]), big-endian, modulo N. So the split is the same
+//! on every machine and in every job, whatever the order of the plan,
+//! what it skips, or what the other partitions do. Units the plan skips are skipped
 //! in every partition. A project that runs everything and could not be
 //! listed (no units to split) runs whole in every partition that cannot
 //! list it: each job decides from its own listing and cannot know whether
@@ -91,7 +93,9 @@ pub struct Split {
 }
 
 impl Split {
-    pub fn new(res: &PlanResult, part: Partition) -> Self {
+    /// `root`: the repository root, where each project's files are weighed
+    /// (see [`Split::from_weighed`]).
+    pub fn new(res: &PlanResult, part: Partition, root: &std::path::Path) -> Self {
         let run_all: Vec<bool> = res
             .projects
             .iter()
@@ -102,12 +106,79 @@ impl Split {
             .iter()
             .map(|f| (f.project_idx, f.test_id.as_str(), f.skip))
             .collect();
-        Self::from_parts(part, &run_all, &files)
+        let by_hash = std::env::var("VCI_PARTITION_BY").is_ok_and(|v| v == "hash");
+        let weights: Vec<Option<u64>> = res
+            .files
+            .iter()
+            .map(|f| {
+                if by_hash {
+                    return None;
+                }
+                let dir = res
+                    .projects
+                    .get(f.project_idx)
+                    .map(|p| root.join(&p.path))
+                    .unwrap_or_else(|| root.to_path_buf());
+                std::fs::metadata(dir.join(&f.file))
+                    .ok()
+                    .filter(std::fs::Metadata::is_file)
+                    .map(|m| m.len())
+            })
+            .collect();
+        Self::from_weighed(part, &run_all, &files, &weights)
     }
 
     /// `run_all`: per project, whether it runs everything; `files`: the
     /// plan's units as (project, test id, skip).
+    #[cfg(test)]
     fn from_parts(part: Partition, run_all: &[bool], files: &[(usize, &str, bool)]) -> Self {
+        Self::from_weighed(part, run_all, files, &vec![None; files.len()])
+    }
+
+    /// The partition of each listed unit of a project whose units are all
+    /// files (`weights[k]`: the file's size), by test id (2.4.0): every
+    /// listed unit, skipped or not, largest first, goes to the partition
+    /// with the least weight so far (ties: the lowest), so the split is
+    /// the same in every job that lists the same checkout, whatever each
+    /// job's plan skips (a job run again after the others pushed their
+    /// attestations agrees with them). A file's size stands for how long
+    /// its tests take: on vex's Rails tests the hash split gave the two
+    /// jobs 2,762 and 3,231 seconds of tests, this one 3,047 and 2,946.
+    /// `None` for a project with a unit that is not a file (a cargo unit):
+    /// its units are split by [`bucket`].
+    fn balanced(
+        count: u32,
+        pi: usize,
+        files: &[(usize, &str, bool)],
+        weights: &[Option<u64>],
+    ) -> Option<std::collections::BTreeMap<String, u32>> {
+        let mut mine: Vec<(u64, &str)> = Vec::new();
+        for (k, (p, id, _)) in files.iter().enumerate() {
+            if *p == pi {
+                mine.push((weights.get(k).copied().flatten()?, id));
+            }
+        }
+        mine.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        let mut load = vec![0u64; count.max(1) as usize];
+        let mut out = std::collections::BTreeMap::new();
+        for (w, id) in mine {
+            let (i, _) = load
+                .iter()
+                .enumerate()
+                .min_by_key(|(i, l)| (**l, *i))
+                .expect("at least one partition");
+            load[i] += w.max(1);
+            out.insert(id.to_owned(), i as u32);
+        }
+        Some(out)
+    }
+
+    fn from_weighed(
+        part: Partition,
+        run_all: &[bool],
+        files: &[(usize, &str, bool)],
+        weights: &[Option<u64>],
+    ) -> Self {
         let shares = run_all
             .iter()
             .enumerate()
@@ -127,9 +198,13 @@ impl Split {
                     return Share::Whole;
                 }
                 let of = to_run.len();
+                let owners = Self::balanced(part.count, pi, files, weights);
                 let mine = to_run
                     .into_iter()
-                    .filter(|&k| part.owns(files[k].1))
+                    .filter(|&k| match owners.as_ref().and_then(|o| o.get(files[k].1)) {
+                        Some(&i) => i == part.index - 1,
+                        None => part.owns(files[k].1),
+                    })
                     .collect();
                 Share::Units { mine, of }
             })
@@ -251,6 +326,70 @@ mod tests {
         // One partition: everything the plan runs.
         let s = Split::from_parts(Partition { index: 1, count: 1 }, &run_all, &files);
         assert_eq!(s.units(), s.total());
+    }
+
+    /// Projects whose units are all files are split by size: each listed
+    /// unit in exactly one partition, the same whatever the plan skips, and
+    /// the partitions' sizes close; a project with a unit that is not a
+    /// file is split by test id as before.
+    #[test]
+    fn files_are_split_by_size_whatever_the_plan_skips() {
+        let ids: Vec<String> = (0..60).map(|i| format!("test/t{i}_test.rb")).collect();
+        let weights: Vec<Option<u64>> = (0..60).map(|i| Some(100 + (i * 37 % 1000))).collect();
+        let n = 3;
+        let total: u64 = weights.iter().map(|w| w.unwrap()).sum();
+        for skips in [0usize, 2, 7] {
+            let files: Vec<(usize, &str, bool)> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (0, id.as_str(), skips > 0 && i % skips == 0))
+                .collect();
+            let mut owner = vec![0usize; ids.len()];
+            let mut size = vec![0u64; n as usize];
+            for index in 1..=n {
+                let s =
+                    Split::from_weighed(Partition { index, count: n }, &[false], &files, &weights);
+                let Share::Units { mine, .. } = &s.shares[0] else {
+                    panic!()
+                };
+                for &k in mine {
+                    owner[k] = index as usize;
+                    size[index as usize - 1] += weights[k].unwrap();
+                }
+            }
+            for (k, f) in files.iter().enumerate() {
+                assert_eq!(owner[k] != 0, !f.2, "{f:?}");
+            }
+            if skips == 0 {
+                let (lo, hi) = (*size.iter().min().unwrap(), *size.iter().max().unwrap());
+                assert!(hi - lo <= 1100, "{size:?} of {total}");
+            }
+            // The same owner as with nothing skipped.
+            let all: Vec<(usize, &str, bool)> =
+                ids.iter().map(|id| (0, id.as_str(), false)).collect();
+            for index in 1..=n {
+                let s =
+                    Split::from_weighed(Partition { index, count: n }, &[false], &all, &weights);
+                let Share::Units { mine, .. } = &s.shares[0] else {
+                    panic!()
+                };
+                for &k in mine {
+                    assert!(owner[k] == 0 || owner[k] == index as usize, "{}", ids[k]);
+                }
+            }
+        }
+        // One unit without a size: the project is split by test id.
+        let mut w2 = weights.clone();
+        w2[5] = None;
+        let files: Vec<(usize, &str, bool)> =
+            ids.iter().map(|id| (0, id.as_str(), false)).collect();
+        let s = Split::from_weighed(Partition { index: 2, count: n }, &[false], &files, &w2);
+        let Share::Units { mine, .. } = &s.shares[0] else {
+            panic!()
+        };
+        for &k in mine {
+            assert_eq!(bucket(&ids[k], n), 1);
+        }
     }
 
     /// Each job lists on its own: a job that listed a project runs its

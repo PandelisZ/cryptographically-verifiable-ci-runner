@@ -134,7 +134,7 @@ enum Cmd {
         /// Only this `[[projects]]` entry (by name; repeatable): the other projects are not listed, probed, verified or run. Not for the single-project form.
         #[arg(long = "project", value_name = "NAME")]
         project: Vec<String>,
-        /// Run only partition I of N (1-based) of the units the plan runs: a unit belongs to the partition its test id hashes to, the same in every job. Skips are the same in every partition; a project that cannot be listed runs whole in every partition that cannot list it (a `::warning`), so it runs at least once. N jobs with `--key --push` each attest their own share.
+        /// Run only partition I of N (1-based) of the units the plan runs: a project of files is split by size (every listed file, largest first, to the partition with the fewest bytes; VCI_PARTITION_BY=hash: by test id), any other by test id; the same in every job. Skips are the same in every partition; a project that cannot be listed runs whole in every partition that cannot list it (a `::warning`), so it runs at least once. N jobs with `--key --push` each attest their own share.
         #[arg(long, value_name = "I/N")]
         partition: Option<partition::Partition>,
     },

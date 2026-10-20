@@ -1629,6 +1629,11 @@ fn ids_of(v: &Value) -> BTreeSet<String> {
         .collect()
 }
 
+/// The test id split (`VCI_PARTITION_BY=hash`): this fixture's partitions
+/// are known by test id. The split by size since 2.4.0 has unit tests in
+/// `partition.rs`.
+const BY_HASH: &[(&str, Option<&str>)] = &[("VCI_PARTITION_BY", Some("hash"))];
+
 /// `vci ci --partition I/3 --key --push` from three clones at once: every
 /// unit the plan runs is run and attested by exactly one partition (the one
 /// its test id hashes to), the skipped one is skipped by all, a partition
@@ -1671,7 +1676,7 @@ fn ci_partitions_cover_every_unit_once() {
                 s.spawn(move || {
                     let part = format!("{}/3", i + 1);
                     let audit = w.base.join(format!("audit-{}.json", i + 1));
-                    let out = w.vci(
+                    let out = w.vci_env(
                         dir,
                         &[
                             "ci",
@@ -1689,6 +1694,7 @@ fn ci_partitions_cover_every_unit_once() {
                             "--audit-log",
                             audit.to_str().unwrap(),
                         ],
+                        BY_HASH,
                     );
                     let log: Value =
                         serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
@@ -1772,7 +1778,7 @@ fn ci_partitions_cover_every_unit_once() {
     for index in 1..=3u32 {
         let audit = w.base.join("audit-plain.json");
         let part = format!("{index}/3");
-        let out = w.vci(
+        let out = w.vci_env(
             &fresh,
             &[
                 "ci",
@@ -1783,6 +1789,7 @@ fn ci_partitions_cover_every_unit_once() {
                 "--audit-log",
                 audit.to_str().unwrap(),
             ],
+            BY_HASH,
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);

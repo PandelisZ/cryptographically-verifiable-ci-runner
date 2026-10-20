@@ -58,13 +58,15 @@ pub fn ci(args: CiArgs) -> Result<i32> {
         github_warning(w);
     }
     print(&res, "text")?;
-    let split = args.partition.map(|p| Split::new(&res, p));
+    let (repo, root) = open_repo()?;
+    let split = args
+        .partition
+        .map(|p| Split::new(&res, p, root.as_std_path()));
     if let Some(s) = &split {
         print_split(&res, s);
     }
     // `1/1` runs what `vci ci` without `--partition` runs, the same way.
     let run_split = split.as_ref().filter(|s| s.part.count > 1);
-    let (repo, root) = open_repo()?;
     let mut attested: Vec<crate::run::AttestedUnit> = Vec::new();
     let mut attest_errors: Vec<String> = Vec::new();
     // Why nothing was attested on purpose (and nothing is pushed).
