@@ -523,6 +523,13 @@ pub struct Reader {
     db: Option<(Utf8PathBuf, rusqlite::Connection)>,
     root: Utf8PathBuf,
     blobs: RefCell<Option<CatFile>>,
+    /// After `git cat-file` first died on a value: which of the store's
+    /// fetched values the object database holds (2.6.2). A value it lacks
+    /// is then unreadable at once, without starting `git cat-file` again
+    /// (each start reads the pack indexes: about 3 s with 1.9 million
+    /// objects, once per value, which made a plan or a push on a laptop
+    /// run for tens of minutes).
+    present: RefCell<Option<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for Reader {
@@ -557,7 +564,19 @@ impl CatFile {
         })
     }
 
-    fn blob(&mut self, oid: &str) -> Result<Vec<u8>, String> {
+    /// The blob `oid`. An `Err` with `true` leaves the process usable (git
+    /// answered: missing, or not a blob); with `false` it is not (it died:
+    /// git before 2.44 asked about an object the clone lacks tries the
+    /// promisor remote, which vci's has no URL for, and exits).
+    fn blob(&mut self, oid: &str) -> Result<Vec<u8>, (bool, String)> {
+        self.blob_inner(oid).map_err(|e| {
+            let usable =
+                e.contains(" is missing from the object database") || e.contains(", not a blob");
+            (usable, e)
+        })
+    }
+
+    fn blob_inner(&mut self, oid: &str) -> Result<Vec<u8>, String> {
         if !is_oid(oid) {
             return Err(format!("not an object id: {oid:?}"));
         }
@@ -584,9 +603,40 @@ impl CatFile {
                 }
                 Err(format!("{oid} is a {kind}, not a blob"))
             }
+            [] => Err("git cat-file ended (an object the clone lacks?)".to_owned()),
             _ => Err(format!("unexpected git cat-file output {header:?}")),
         }
     }
+}
+
+/// Which of `oids` the object database at `root` holds, asked without
+/// fetching any (`git rev-list --missing=allow-any`, as
+/// `AttestStore::present_sizes` asks; any git version).
+fn present_objects(root: &Utf8Path, oids: &[String]) -> Result<BTreeSet<String>, GitError> {
+    let mut input = Vec::new();
+    for o in oids.iter().filter(|o| is_oid(o)) {
+        input.extend_from_slice(o.as_bytes());
+        input.push(b'\n');
+    }
+    if input.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let listed = crate::cmd::Git::at(root)
+        .args([
+            "rev-list",
+            "--objects",
+            "--no-walk",
+            "--missing=allow-any",
+            "--ignore-missing",
+            "--stdin",
+        ])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .run_with_stdin(&input)?;
+    Ok(String::from_utf8_lossy(&listed)
+        .lines()
+        .filter_map(|l| l.split(' ').next())
+        .map(str::to_owned)
+        .collect())
 }
 
 impl Drop for CatFile {
@@ -612,6 +662,7 @@ impl Reader {
             db: None,
             root: root.to_owned(),
             blobs: RefCell::new(None),
+            present: RefCell::new(None),
         };
         match std::fs::metadata(&db_path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(empty(root)),
@@ -670,6 +721,7 @@ impl Reader {
                 db: Some((db_path, c)),
                 root: root.to_owned(),
                 blobs: RefCell::new(None),
+                present: RefCell::new(None),
             }),
             (_, false) => Ok(empty(root)),
         }
@@ -755,6 +807,15 @@ impl Reader {
         let raw = if row.is_promised {
             Err(NOT_FETCHED.to_owned())
         } else if row.is_git_ref {
+            let oid = row.value.trim();
+            if self
+                .present
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.contains(oid))
+            {
+                return Err(format!("blob {oid} is missing from the object database"));
+            }
             let mut blobs = self.blobs.borrow_mut();
             if blobs.is_none() {
                 match CatFile::start(&self.root) {
@@ -762,12 +823,18 @@ impl Reader {
                     Err(e) => return Err(format!("reading blob {}: {e}", row.value)),
                 }
             }
-            let r = blobs.as_mut().expect("started").blob(row.value.trim());
-            if r.is_err() {
-                // The stream may be out of sync after an error.
-                *blobs = None;
+            let r = blobs.as_mut().expect("started").blob(oid);
+            match r {
+                Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+                Err((usable, e)) => {
+                    if !usable {
+                        *blobs = None;
+                        drop(blobs);
+                        self.learn_present();
+                    }
+                    Err(e)
+                }
             }
-            r.map(|b| String::from_utf8_lossy(&b).into_owned())
         } else {
             Ok(row.value)
         };
@@ -775,6 +842,29 @@ impl Reader {
             let s: String = serde_json::from_str(&s).unwrap_or(s);
             s.into_bytes()
         })
+    }
+
+    /// Fill [`Reader::present`] once: the store's fetched values the object
+    /// database holds. Best effort: when it cannot be found, every read
+    /// still asks `git cat-file`.
+    fn learn_present(&self) {
+        if self.present.borrow().is_some() {
+            return;
+        }
+        let Some((_, db)) = &self.db else { return };
+        let oids: Vec<String> = db
+            .prepare("SELECT value FROM metadata WHERE is_git_ref = 1 AND is_promised = 0")
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.trim().to_owned())
+            .collect();
+        if let Ok(p) = present_objects(&self.root, &oids) {
+            *self.present.borrow_mut() = Some(p);
+        }
     }
 
     /// The stored input manifest with this root (see the module docs), or
@@ -2314,13 +2404,19 @@ impl<'a> AttestStore<'a> {
         if oids.is_empty() {
             return Ok(out);
         }
+        // Only what the object database holds is asked for (2.6.2): `git
+        // cat-file` before 2.44 dies on an object the clone lacks, and each
+        // start costs seconds in a large repository.
+        let wanted: Vec<String> = oids.iter().cloned().collect();
+        let present = present_objects(self.repo.root(), &wanted)?;
         let mut cat = CatFile::start(self.repo.root())?;
-        for o in oids {
+        for o in oids.iter().filter(|o| present.contains(*o)) {
             match cat.blob(o) {
                 Ok(b) => {
                     out.insert(o.clone(), b);
                 }
-                Err(_) => cat = CatFile::start(self.repo.root())?,
+                Err((true, _)) => {}
+                Err((false, _)) => cat = CatFile::start(self.repo.root())?,
             }
         }
         Ok(out)
@@ -5531,6 +5627,131 @@ mod tests {
             git(&["cat-file", "-t", &v], None),
             "blob",
             "the value was deleted"
+        );
+    }
+
+    /// 2.6.2: a stored value whose blob the object database lacks (an
+    /// interrupted fetch, a refetch) is unreadable without restarting `git
+    /// cat-file` for every such value: "missing" keeps the process, and once
+    /// the process has died (git before 2.44 dies trying the promisor), the
+    /// values the database holds are known and the others fail at once.
+    #[test]
+    fn values_missing_from_the_object_database_do_not_restart_cat_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(root.join("a"), "a").unwrap();
+        run(&["add", "a"]);
+        run(&["commit", "-q", "-m", "a"]);
+        let repo = Repo::discover(&root).unwrap();
+        let st = AttestStore::new(&repo);
+        let ids: Vec<String> = (0..6).map(|i| format!("src/t{i}.test.ts")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let v = format!("{{\"v\":{i}}}");
+            st.put(
+                id,
+                "0123456789abcdef",
+                &format!("{:064x}", i + 1),
+                v.as_bytes(),
+            )
+            .unwrap();
+        }
+        // As a fetch leaves them: each value a blob the row names. The
+        // first three name blobs the object database lacks.
+        let db = rusqlite::Connection::open(root.join(".git/git-meta.sqlite")).unwrap();
+        let rows: Vec<(i64, String)> = db
+            .prepare("SELECT rowid, value FROM metadata WHERE key LIKE 'vci:attestation:%' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |x| Ok((x.get(0)?, x.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), ids.len());
+        for (n, (rowid, value)) in rows.iter().enumerate() {
+            let raw: String = serde_json::from_str(value).unwrap_or(value.clone());
+            let oid = if n < 3 {
+                format!("{:040x}", n + 1)
+            } else {
+                let out = std::process::Command::new("git")
+                    .current_dir(&root)
+                    .args(["hash-object", "-w", "--stdin"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .and_then(|mut c| {
+                        use std::io::Write as _;
+                        c.stdin.take().unwrap().write_all(raw.as_bytes())?;
+                        c.wait_with_output()
+                    })
+                    .unwrap();
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            };
+            db.execute(
+                "UPDATE metadata SET value = ?1, is_git_ref = 1 WHERE rowid = ?2",
+                rusqlite::params![oid, rowid],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let missing: BTreeSet<String> = {
+            let r = st.reader().unwrap();
+            ids.iter()
+                .filter(|id| r.candidates(id).unwrap()[0].error.is_some())
+                .cloned()
+                .collect()
+        };
+        assert_eq!(missing.len(), 3, "{missing:?}");
+        let r = st.reader().unwrap();
+        for id in &ids {
+            let c = r.candidates(id).unwrap();
+            assert_eq!(
+                c[0].error.is_some(),
+                missing.contains(id),
+                "{id}: {:?}",
+                c[0].error
+            );
+        }
+        assert!(
+            r.blobs.borrow().is_some(),
+            "one git cat-file served every read"
+        );
+        assert!(r.present.borrow().is_none());
+        // A process that died: the present values are learnt once, and a
+        // missing one then fails without a new process.
+        if let Some(c) = r.blobs.borrow_mut().as_mut() {
+            let _ = c.child.kill();
+            let _ = c.child.wait();
+        }
+        assert!(
+            r.candidates(&ids[4]).unwrap()[0].error.is_some(),
+            "the dead process"
+        );
+        assert!(
+            r.present.borrow().is_some(),
+            "learnt after the process died"
+        );
+        assert!(r.blobs.borrow().is_none());
+        assert!(r.candidates(&ids[0]).unwrap()[0].error.is_some());
+        assert!(
+            r.blobs.borrow().is_none(),
+            "no process started for a missing value"
+        );
+        assert!(
+            r.candidates(&ids[5]).unwrap()[0].error.is_none(),
+            "a present value still reads"
         );
     }
 
