@@ -2124,7 +2124,12 @@ impl<'a> AttestStore<'a> {
         let dir = self
             .repo
             .git()
-            .args(["rev-parse", "--path-format=absolute", "--git-path", "objects/pack"])
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects/pack",
+            ])
             .run_str()
             .ok()?;
         let n = std::fs::read_dir(dir)

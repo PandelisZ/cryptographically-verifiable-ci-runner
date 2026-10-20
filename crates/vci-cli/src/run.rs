@@ -2481,7 +2481,28 @@ fn superseded_by(
         {
             return true;
         }
+        // Whether its commit was moved on from: one answer per commit (two
+        // threads may ask about the same commit at once; same answer), so
+        // before reading its manifest (2.3.1: decoding every older
+        // attestation's manifest first took about 215 thread-seconds of a
+        // full vex job, where most were made on commits others contain).
+        let cached = moved_on
+            .lock()
+            .map(|c| c.get(&m.commit).copied())
+            .unwrap_or(None);
+        let moved = cached.unwrap_or_else(|| {
+            let moved = repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false);
+            if let Ok(mut c) = moved_on.lock() {
+                c.insert(m.commit.clone(), moved);
+            }
+            moved
+        });
+        if !moved {
+            return true;
+        }
         let old = match &m.manifest_ref {
+            // The same root: the same inputs.
+            Some(r) if *r == p.core.input_root => return true,
             Some(r) => store
                 .manifest_decoded(r)
                 .ok()
@@ -2495,23 +2516,7 @@ fn superseded_by(
         };
         let mut old_entries: Vec<&vci_core::InputEntry> = old.entries.iter().collect();
         old_entries.sort();
-        if old_entries == entries {
-            return true;
-        }
-        // Last, as the only check that runs git: one answer per commit
-        // (two threads may ask about the same commit at once; same answer).
-        let cached = moved_on
-            .lock()
-            .map(|c| c.get(&m.commit).copied())
-            .unwrap_or(None);
-        let moved = cached.unwrap_or_else(|| {
-            let moved = repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false);
-            if let Ok(mut c) = moved_on.lock() {
-                c.insert(m.commit.clone(), moved);
-            }
-            moved
-        });
-        !moved
+        old_entries == entries
     };
     match store.list(Some(&p.core.test_id)) {
         Ok(all) => all
