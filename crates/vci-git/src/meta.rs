@@ -4191,6 +4191,9 @@ impl<'a> AttestStore<'a> {
         let mut last = String::new();
         // Notes of a round that started over (see below).
         let mut carried: Vec<String> = Vec::new();
+        // Whether a failed push already fetched every deletion record of
+        // the pushed tree this clone lacks (see below).
+        let mut fetched_tombstones = false;
         let done = |status, report: Report| PushOutcome {
             remote: name.clone(),
             status,
@@ -4460,6 +4463,24 @@ impl<'a> AttestStore<'a> {
                     // such object on vex was served by id afterwards) and
                     // the push tried again at once; only an object the
                     // remote does not serve waits for another round.
+                    // 2.2.9: the first such failure fetches, in one batch,
+                    // every deletion record of the pushed tree this clone
+                    // lacks (another job's, merged in; a vex job hit
+                    // thousands, one per attempt), then tries again.
+                    if !fetched_tombstones {
+                        fetched_tombstones = true;
+                        let missing = self.missing_tombstone_blobs(&pushed)?;
+                        if !missing.is_empty() {
+                            let (_, fetched, _) = self.ensure_blobs(&name, &missing)?;
+                            if fetched > 0 {
+                                report.note(format!(
+                                    "push attempt {attempt}: {last}; fetched {fetched} of the {} deletion record(s) this clone lacked and trying again",
+                                    missing.len()
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(o) = unreadable_object(&stderr) {
                         let one: BTreeSet<String> = [o.clone()].into_iter().collect();
                         if self.rewrite_tombstone_blobs(&one)?.contains(&o) {
@@ -4544,6 +4565,27 @@ impl<'a> AttestStore<'a> {
         if blobs.is_empty() {
             return Ok(blobs);
         }
+        let have = self.present(&blobs)?;
+        Ok(blobs.difference(&have).cloned().collect())
+    }
+
+    /// The blobs of every deletion record in `pushed`'s tree that this
+    /// clone does not have.
+    fn missing_tombstone_blobs(&self, pushed: &str) -> Result<BTreeSet<String>, GitError> {
+        let listing = self
+            .repo
+            .git()
+            .args(["ls-tree", "-r", "-z", "--full-tree", pushed])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run()?;
+        let blobs: BTreeSet<String> = split_ls_tree(&listing)
+            .into_iter()
+            .filter(|(_, kind, _, p)| {
+                *kind == b"blob" && p.windows(14).any(|w| w == b"/__tombstones/")
+            })
+            .map(|(_, _, o, _)| String::from_utf8_lossy(o).into_owned())
+            .filter(|o| is_oid(o))
+            .collect();
         let have = self.present(&blobs)?;
         Ok(blobs.difference(&have).cloned().collect())
     }

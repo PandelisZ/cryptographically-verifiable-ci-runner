@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-2-9">2.2.9</a></td><td>20 Oct 2026</td><td>A push that fails on an unreadable object first fetches every deletion record of the pushed tree the clone lacks, in one batch</td></tr>
 <tr><td><a href="#v2-2-8">2.2.8</a></td><td>20 Oct 2026</td><td>A push whose own deletion record was lost, with no row left to write it from, replaces it with a new one for the same key</td></tr>
 <tr><td><a href="#v2-2-7">2.2.7</a></td><td>20 Oct 2026</td><td>A Rails batch says how long its process took to reach its slots from the moment vci started it</td></tr>
 <tr><td><a href="#v2-2-6">2.2.6</a></td><td>20 Oct 2026</td><td>A Rails batch no longer waits for a process a test left running in the background (about 90 s of a full vex job)</td></tr>
@@ -72,6 +73,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-2-9">2.2.9</h2>
+<p><em>20 October 2026.</em> On 2.2.8's first full vex run one job's push failed ten times again, on a deletion record GitHub serves (another job's, merged into this job's tree), while the pushed commit had 31,734 objects this clone never fetched. Each attempt fixed the one object git named, and there are thousands. <strong>The first time a push fails on an unreadable object, vci now fetches every deletion record of the pushed tree it lacks, in one batch (they are tiny), and tries again</strong>; the per-object repairs follow as before.</p>
 
 <h2 id="v2-2-8">2.2.8</h2>
 <p><em>20 October 2026.</em> A full vex run on 2.2.7 lost one job's push again, on a deletion record stamped during that job; 2.2.4's write-back did not apply because the store no longer held the record's row. A deletion record carries only when and by whom; any record for the same key deletes the same value. <strong>When a push fails on a deletion record this clone cannot read and cannot write back, vci replaces it in the commit being pushed with a new record for the same keys, stamped now</strong>, and pushes again; it does this only when every path holding that object is a deletion record, and only while the local metadata ref is still at that commit. A store test removes a deletion record's blob and every row of the store's deletion records right before <code>git push</code>: the push goes through and a fresh clone no longer sees the value. 2.2.7's timing narrowed the 90 s of the slower vex job further: the process reaches its slots 2.7 s after vci starts it and its slots have all exited at 241.6 s, so the time is spent after the batch's last status line.</p>
