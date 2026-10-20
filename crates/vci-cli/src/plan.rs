@@ -1457,19 +1457,37 @@ fn hydrate_more(
     verdicts: &mut [Vec<FileVerdict>],
     res: &mut PlanResult,
 ) {
+    // The candidates as last read (the store's rows are re-read for the
+    // units a round fetched for).
+    let mut current: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
     for round in 2..=3 {
-        // The units the first pass could not skip that have candidates
-        // whose value or manifest was not read: every candidate of theirs
-        // is fetched (envelopes, manifests, bases) in one batch each.
+        // The units the first pass could not skip that have a candidate
+        // whose value was not fetched: every candidate of theirs is fetched
+        // (envelopes, manifests, bases) in one batch each. A unit whose
+        // candidates were all read needs only the manifests (or bases) its
+        // check found not fetched (`roots`): reading every candidate's
+        // manifest again to look for them took 13 s on a full vex run with
+        // nothing to fetch.
         let mut ids: BTreeSet<&str> = BTreeSet::new();
+        let mut unread: BTreeSet<&str> = BTreeSet::new();
         for (pi, verdicts) in verdicts.iter().enumerate() {
             if verifiers[pi].is_err() {
                 continue;
             }
             let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
             for (f, out) in mine.iter().zip(verdicts.iter()) {
-                if !out.skip && !out.candidates.is_empty() {
-                    ids.insert(f.test_id.as_str());
+                if out.skip || out.candidates.is_empty() {
+                    continue;
+                }
+                let id = f.test_id.as_str();
+                ids.insert(id);
+                let cands = current
+                    .get(id)
+                    .or_else(|| by_id.get(id))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if cands.iter().any(StoredEnvelope::not_fetched) {
+                    unread.insert(id);
                 }
             }
         }
@@ -1478,11 +1496,17 @@ fn hydrate_more(
             .flatten()
             .flat_map(|v| v.manifests.take_not_fetched())
             .collect();
-        if ids.is_empty() {
+        if ids.is_empty() || (unread.is_empty() && roots.is_empty()) {
             return;
         }
         let t = std::time::Instant::now();
-        let h = AttestStore::new(&ctx.repo).hydrate_units(ids.iter().copied());
+        let store = AttestStore::new(&ctx.repo);
+        let h = store
+            .hydrate_units(unread.iter().copied())
+            .and_then(|mut h| {
+                h.add(store.hydrate_manifests(roots.iter().map(String::as_str))?);
+                Ok(h)
+            });
         let warning = match &h {
             Ok(h) => h.error.as_ref().map(|e| {
                 format!(
@@ -1515,14 +1539,14 @@ fn hydrate_more(
         }
         // Checked again with every candidate readable: the store's rows are
         // re-read for these units (their candidates' values are new).
-        let fresh: BTreeMap<String, Vec<StoredEnvelope>> =
-            match AttestStore::new(&ctx.repo).reader() {
-                Ok(r) => ids
-                    .iter()
-                    .filter_map(|id| r.candidates(id).ok().map(|c| ((*id).to_owned(), c)))
-                    .collect(),
-                Err(_) => BTreeMap::new(),
-            };
+        if let Ok(r) = AttestStore::new(&ctx.repo).reader() {
+            for id in &unread {
+                if let Ok(c) = r.candidates(id) {
+                    current.insert((*id).to_owned(), c);
+                }
+            }
+        }
+        let fresh = &current;
         let mut rechecked = 0usize;
         in_plan_pool(|| {
             verifiers

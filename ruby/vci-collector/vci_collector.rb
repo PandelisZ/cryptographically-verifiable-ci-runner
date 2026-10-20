@@ -1060,9 +1060,13 @@ module VciCollector
           running << [pid, boot, files, started]
         end
         code = 0
-        running.each do |pid, boot, files, started|
-          _, st = Process.wait2(pid)
-          status(group: { boot: boot.nil? ? "" : Array(boot).last.to_s, files: files.size,
+        # Each group as it ends (its own time, not the slowest's).
+        until running.empty?
+          pid, st = Process.wait2(-1)
+          i = running.index { |r| r[0] == pid }
+          next if i.nil?
+          _, boot, files, started = running.delete_at(i)
+          status(group: { boot: boot.nil? ? "" : Array(boot).last.to_s, files: files.size, at_once: true,
                           ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round })
           c = st.exitstatus || 1
           code = c if code.zero?

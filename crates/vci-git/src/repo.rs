@@ -19,10 +19,22 @@ const NO_LAZY_FETCH: &str = "GIT_NO_LAZY_FETCH";
 
 /// A git repository, identified by its root directory (the work tree root, or
 /// the git directory for a bare repository).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Repo {
     root: Utf8PathBuf,
+    /// The git directory, asked of git once ([`Repo::git_dir`]: storing an
+    /// attestation asked about eight times, a `git rev-parse` each, most of
+    /// the 20 ms each unit took to store on vex's runners).
+    git_dir: std::sync::OnceLock<Utf8PathBuf>,
 }
+
+impl PartialEq for Repo {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for Repo {}
 
 impl Repo {
     /// Find the repository containing `start` (a directory or a file).
@@ -57,6 +69,7 @@ impl Repo {
         }
         Ok(Repo {
             root: Utf8PathBuf::from(root),
+            git_dir: std::sync::OnceLock::new(),
         })
     }
 
@@ -71,11 +84,14 @@ impl Repo {
 
     /// The repository's git directory (for a linked worktree, its own).
     pub fn git_dir(&self) -> Result<Utf8PathBuf, GitError> {
+        if let Some(d) = self.git_dir.get() {
+            return Ok(d.clone());
+        }
         let dir = self
             .git()
             .args(["rev-parse", "--absolute-git-dir"])
             .run_str()?;
-        Ok(Utf8PathBuf::from(dir))
+        Ok(self.git_dir.get_or_init(|| Utf8PathBuf::from(dir)).clone())
     }
 
     /// For a linked worktree (`git worktree add`), the repository's common

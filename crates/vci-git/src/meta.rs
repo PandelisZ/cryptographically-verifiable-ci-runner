@@ -184,7 +184,8 @@ pub struct Hydration {
 }
 
 impl Hydration {
-    fn add(&mut self, o: Hydration) {
+    /// This hydration and `o` together (the first error kept).
+    pub fn add(&mut self, o: Hydration) {
         self.resolved += o.resolved;
         self.unresolved += o.unresolved;
         self.fetched += o.fetched;

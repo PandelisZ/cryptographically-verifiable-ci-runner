@@ -1022,8 +1022,13 @@ impl RailsAdapter {
                 .collect();
             log.extend_from_slice(
                 format!(
-                    "vci: the batch ran {} group(s) of files one after the other: {}\n",
+                    "vci: the batch ran {} group(s) of files {}: {}\n",
                     slots.groups.len(),
+                    if slots.groups_at_once {
+                        "at once"
+                    } else {
+                        "one after the other"
+                    },
                     parts.join(", ")
                 )
                 .as_bytes(),
@@ -1138,6 +1143,8 @@ struct SlotStats {
     /// Each group of the batch (files sharing a boot), in the order run:
     /// its boot's first statement, its file count, its time (ms).
     groups: Vec<(String, u64, u64)>,
+    /// Whether the groups ran at once (2.2.12) rather than in turn.
+    groups_at_once: bool,
     output_ms: Vec<u64>,
     shared_ms: Vec<u64>,
 }
@@ -1260,6 +1267,7 @@ fn read_batch(
                     g.get("files").and_then(Value::as_u64).unwrap_or(0),
                     g.get("ms").and_then(Value::as_u64).unwrap_or(0),
                 ));
+                stats.groups_at_once |= g.get("at_once").and_then(Value::as_bool) == Some(true);
             }
             if let Some(a) = v.get("after_slots") {
                 let g = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);

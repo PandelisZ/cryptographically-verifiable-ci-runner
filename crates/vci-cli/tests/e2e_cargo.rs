@@ -2558,7 +2558,7 @@ fn cargo_blobless_clone_fetches_only_what_the_plan_reads() {
     std::fs::write(work.join("b/src/lib.rs"), format!("{b_src}\n// edited\n")).unwrap();
     w.run(&work, &[B], &w.trusted);
     w.vci_ok(&work, &["push", "--remote", "origin"]);
-    std::fs::write(work.join("b/src/lib.rs"), b_src).unwrap();
+    std::fs::write(work.join("b/src/lib.rs"), &b_src).unwrap();
     let again = clone("again");
     w.vci_ok(&again, &["fetch", "--remote", "origin"]);
     let out = w.vci_env(
@@ -2576,6 +2576,22 @@ fn cargo_blobless_clone_fetches_only_what_the_plan_reads() {
     );
     let p = Plan::from_json(&serde_json::from_slice(&out.stdout).unwrap());
     assert_eq!(p.skip, set(&[B, C]), "{stderr}");
+    // A unit that runs with every candidate read and no manifest missing
+    // has nothing for a second round to fetch: none is attempted (2.2.13:
+    // looking for one read every candidate's manifest again, 13 s on vex).
+    std::fs::write(again.join("b/src/lib.rs"), format!("{b_src}\n// new\n")).unwrap();
+    w.vci_ok(&again, &["plan", "--base-ref", "main"]);
+    let out = w.vci_env(
+        &again,
+        &["plan", "--base-ref", "main", "--format", "json"],
+        &[("VCI_TIMING", "1")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("round 2"), "{stderr}");
+    let p = Plan::from_json(&serde_json::from_slice(&out.stdout).unwrap());
+    assert_eq!(p.skip, set(&[C]), "{stderr}");
+    std::fs::write(again.join("b/src/lib.rs"), &b_src).unwrap();
 
     // Attest and publish from the blobless clone; the first clone reads it.
     w.run(&fresh, &[D], &w.trusted);
