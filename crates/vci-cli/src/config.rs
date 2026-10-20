@@ -139,6 +139,7 @@ pub struct PolicyOverride {
     pub removed_rails_allow_db: Option<bool>,
     pub node_exact: Option<bool>,
     pub allow_superuser_mismatch: Option<bool>,
+    pub rails_autoload_lookups: Option<bool>,
 }
 
 /// Per-project env keys; each one given replaces the top-level key.
@@ -431,6 +432,24 @@ pub struct Policy {
     /// Read from the base commit.
     #[serde(default)]
     pub allow_superuser_mismatch: bool,
+    /// Rails (2.5.0): a directory Zeitwerk lists only to define constants
+    /// (to set up autoloads; never to eager load) is not an input as a
+    /// listing. What is recorded instead are the constants the test's
+    /// process looked up and did not find in that directory's namespace
+    /// (`const_missing`, `const_get`, `const_defined?`): the unit runs
+    /// again only when the directory gains a file or directory defining one
+    /// of them. A namespace whose constants are enumerated
+    /// (`Module#constants`) keeps its listings. A file added to an autoload
+    /// directory (by the change, or on the base branch since the
+    /// attestation) otherwise made every test that booted the application
+    /// run again. Risky where a test asks with `defined?(Constant)`, which
+    /// Ruby answers without any method vci can see: such a test may pass
+    /// without having seen a constant a new file defines. Read from the
+    /// base commit, which must allow it for `vci plan` to accept such an
+    /// attestation; the collector records lookups only when the policy
+    /// `vci run` reads allows it.
+    #[serde(default)]
+    pub rails_autoload_lookups: bool,
 }
 
 fn default_max_ttl() -> String {
@@ -457,6 +476,7 @@ impl Default for Policy {
             removed_rails_allow_db: None,
             node_exact: false,
             allow_superuser_mismatch: false,
+            rails_autoload_lookups: false,
         }
     }
 }
@@ -1015,6 +1035,9 @@ impl Config {
                     }
                     if let Some(v) = o.allow_superuser_mismatch {
                         policy.allow_superuser_mismatch = v;
+                    }
+                    if let Some(v) = o.rails_autoload_lookups {
+                        policy.rails_autoload_lookups = v;
                     }
                 }
                 let mut env = self.env.clone();

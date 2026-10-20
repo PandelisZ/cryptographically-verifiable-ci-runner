@@ -67,6 +67,15 @@ pub const RAILS_PER_FILE_ENV: &str = "VCI_RAILS_PER_FILE";
 /// a batch run, one per line: the collector's batch mode.
 const RAILS_BATCH_ENV: &str = "VCI_RAILS_BATCH";
 
+/// Set by vci (2.5.0, `policy.rails_autoload_lookups`): the collector
+/// records the constants looked up in autoload directories instead of their
+/// listings. Never inherited.
+const RAILS_AUTOLOAD_ENV: &str = "VCI_RAILS_AUTOLOAD_LOOKUPS";
+
+/// Whether the run in progress asked for [`RAILS_AUTOLOAD_ENV`] (projects
+/// run one after another).
+static AUTOLOAD_LOOKUPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set by vci for a batch (2.3.0): the files to run as several processes,
 /// each a share of the file's test methods, as lines `<k>\t<test id>`
 /// (see [`shard_counts`]).
@@ -640,9 +649,13 @@ impl RailsAdapter {
             "VCI_RAILS_BATCH",
             "VCI_RAILS_BATCH_PID",
             RAILS_SHARDS_ENV,
+            RAILS_AUTOLOAD_ENV,
             "SPRING_SERVER_COMMAND",
         ] {
             c.env_remove(k);
+        }
+        if mode == "collect" && AUTOLOAD_LOOKUPS.load(std::sync::atomic::Ordering::Relaxed) {
+            c.env(RAILS_AUTOLOAD_ENV, "1");
         }
         c.env("RUBYOPT", format!("-r{collector}"))
             .env("VCI_RAILS_MODE", mode)
@@ -934,7 +947,7 @@ impl RailsAdapter {
         if cfg!(target_os = "macos") {
             cmd.env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
         }
-        let timing = std::env::var_os("VCI_TIMING").is_some();
+        let timing = vci_core::metrics::on();
         // When the process starts (wall clock, ms): the collector reports
         // how long the process took to reach its slots from here, which
         // includes what runs before the collector is loaded.
@@ -966,8 +979,8 @@ impl RailsAdapter {
             }
         };
         if timing {
-            eprintln!(
-                "vci: timing: rails batch: the Ruby process (boot, slots, files): {:.2}s",
+            vci_core::timing_line!(
+                "rails batch: the Ruby process (boot, slots, files): {:.2}s",
                 t.elapsed().as_secs_f64()
             );
         }
@@ -981,8 +994,8 @@ impl RailsAdapter {
         let t = std::time::Instant::now();
         let (observed, fallback, code, slots) = read_batch(&dirs.out, files)?;
         if timing {
-            eprintln!(
-                "vci: timing: rails batch: read the files' outputs: {:.2}s",
+            vci_core::timing_line!(
+                "rails batch: read the files' outputs: {:.2}s",
                 t.elapsed().as_secs_f64()
             );
         }
@@ -991,8 +1004,8 @@ impl RailsAdapter {
         let t = std::time::Instant::now();
         let _ = std::fs::remove_dir_all(dirs.tmpdir.as_std_path());
         if timing {
-            eprintln!(
-                "vci: timing: rails batch: remove what the tests left in the temp directory: {:.2}s",
+            vci_core::timing_line!(
+                "rails batch: remove what the tests left in the temp directory: {:.2}s",
                 t.elapsed().as_secs_f64()
             );
         }
@@ -2198,15 +2211,20 @@ impl Adapter for RailsAdapter {
     /// code: the first non-zero one of the files' own processes (`None`: one
     /// died from a signal), never that of a batch's own process.
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {
-        self.run_collect_timed(files, env, &BTreeMap::new())
+        self.run_collect_timed(files, env, &crate::RunHints::default())
     }
 
     fn run_collect_timed(
         &self,
         files: &[String],
         env: &ChildEnv,
-        last_ms: &BTreeMap<String, u64>,
+        hints: &crate::RunHints,
     ) -> Result<RunOutput, AdapterError> {
+        AUTOLOAD_LOOKUPS.store(
+            hints.rails_autoload_lookups,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let last_ms = &hints.last_ms;
         let collector = self.collector_file()?;
         if files.len() < 2 || per_file_forced() {
             return per_file_jobs(files, self.jobs(), |f| self.run_one(&collector, f, env));

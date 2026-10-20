@@ -10,10 +10,11 @@ pub mod manifest;
 pub mod path;
 pub mod predicate;
 
+pub mod metrics;
 pub use hash::{ABSENT_HASH, blake3_hex};
 pub use manifest::{
-    CheckoutCache, EntryKind, EnvEntry, External, InputEntry, InputManifest, ManifestError,
-    Mismatch, Observation, env_value_hash,
+    AUTOLOAD_MARK, CheckoutCache, EntryKind, EnvEntry, External, InputEntry, InputManifest,
+    ManifestError, Mismatch, Observation, autoload_name, env_value_hash,
 };
 pub use path::{PathError, RepoPath};
 pub use predicate::{

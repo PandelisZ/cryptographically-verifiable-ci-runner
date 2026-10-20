@@ -179,13 +179,14 @@ fn observations_in(
 ) -> Result<Vec<(RepoPath, Observation)>, String> {
     let root = checkout.root;
     let mut out = Vec::new();
-    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 6] = [
+    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 7] = [
         (&o.modules, Observation::Read),
         (&o.reads, Observation::Read),
         (&o.probes, Observation::Probe),
         (&o.readdirs, Observation::ReadDir),
         (&o.stats, Observation::Stat),
         (&o.excluded, Observation::Exclude),
+        (&o.autoload_misses, Observation::AutoloadMiss),
     ];
     for (set, kind) in groups {
         for p in set {
@@ -221,6 +222,7 @@ fn outside_repository<'a>(root: &Utf8Path, o: &'a Observed) -> BTreeSet<&'a Utf8
         &o.readdirs,
         &o.stats,
         &o.excluded,
+        &o.autoload_misses,
     ]
     .into_iter()
     .flatten()
@@ -240,6 +242,7 @@ fn without_paths(o: &Observed, paths: &[Utf8PathBuf]) -> Observed {
         &mut o.readdirs,
         &mut o.stats,
         &mut o.excluded,
+        &mut o.autoload_misses,
     ] {
         set.retain(keep);
     }
@@ -2057,9 +2060,14 @@ pub fn run_units(
             } else {
                 None
             };
-            let out = project
-                .adapter
-                .run_collect_timed(&rels, &child.to_child_env(), &last_ms)?;
+            let out = project.adapter.run_collect_timed(
+                &rels,
+                &child.to_child_env(),
+                &vci_adapter::RunHints {
+                    last_ms: last_ms.clone(),
+                    rails_autoload_lookups: project.policy.rails_autoload_lookups,
+                },
+            )?;
             Ok((go_tree, out))
         })();
         // A project whose run could not be started or collected has no
@@ -2363,12 +2371,12 @@ pub fn run_units(
             ),
             t_check,
         );
-        if std::env::var_os("VCI_TIMING").is_some() {
+        if vci_core::metrics::on() {
             let g = |f: &std::sync::atomic::AtomicU64| {
                 f.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
             };
-            eprintln!(
-                "vci: timing: {}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}, find superseded {:.1}; store and remove superseded (one at a time) {:.1}",
+            vci_core::timing_line!(
+                "{}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}, find superseded {:.1}; store and remove superseded (one at a time) {:.1}",
                 project.label(),
                 g(&tm_check),
                 g(&tm_warn),
@@ -2378,8 +2386,8 @@ pub fn run_units(
             );
             let ns =
                 |i: usize| SUPERSEDE_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
-            eprintln!(
-                "vci: timing: {}: supersession thread-seconds: list {:.1}, read payloads {:.1}, moved on {:.1}, manifests {:.1}; {} earlier commit(s) asked about",
+            vci_core::timing_line!(
+                "{}: supersession thread-seconds: list {:.1}, read payloads {:.1}, moved on {:.1}, manifests {:.1}; {} earlier commit(s) asked about",
                 project.label(),
                 ns(0),
                 ns(1),
@@ -2544,9 +2552,9 @@ fn superseded_by(
                 let graph = t.elapsed().as_secs_f64();
                 let t = std::time::Instant::now();
                 let only = repo.only_on(&p.core.commit).ok();
-                if std::env::var_os("VCI_TIMING").is_some() {
-                    eprintln!(
-                        "vci: timing: supersession: {} commit-graph {graph:.2}s; {} commit(s) only this run's commit holds: {:.2}s",
+                if vci_core::metrics::on() {
+                    vci_core::timing_line!(
+                        "supersession: {} commit-graph {graph:.2}s; {} commit(s) only this run's commit holds: {:.2}s",
                         if wrote { "wrote a" } else { "no new" },
                         only.as_ref().map_or_else(|| "?".to_owned(), |o| o.len().to_string()),
                         t.elapsed().as_secs_f64()
@@ -2560,9 +2568,9 @@ fn superseded_by(
                 None => repo.moved_on(&m.commit, &p.core.commit),
             }
             .unwrap_or(false);
-            if std::env::var_os("VCI_TIMING").is_some() {
-                eprintln!(
-                    "vci: timing: supersession: whether {} was moved on from ({moved}): {:.2}s",
+            if vci_core::metrics::on() {
+                vci_core::timing_line!(
+                    "supersession: whether {} was moved on from ({moved}): {:.2}s",
                     &m.commit[..m.commit.len().min(12)],
                     t.elapsed().as_secs_f64()
                 );

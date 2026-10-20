@@ -427,14 +427,14 @@ impl Timers {
     }
 
     fn report(&self, label: &str) {
-        if std::env::var_os("VCI_TIMING").is_none() {
+        if !vci_core::metrics::on() {
             return;
         }
         let g = |f: &std::sync::atomic::AtomicU64| {
             f.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
         };
-        eprintln!(
-            "vci: timing: {label}: {} candidate(s) checked, {} rehashed; thread-seconds: signature {:.1}, globals {:.1}, manifest read {:.1}, manifest decode {:.1}, case collisions {:.1}, ignored children {:.1}, rehash {:.1}, externals {:.1}, env {:.1}",
+        vci_core::timing_line!(
+            "{label}: {} candidate(s) checked, {} rehashed; thread-seconds: signature {:.1}, globals {:.1}, manifest read {:.1}, manifest decode {:.1}, case collisions {:.1}, ignored children {:.1}, rehash {:.1}, externals {:.1}, env {:.1}",
             self.candidates.load(std::sync::atomic::Ordering::Relaxed),
             self.rehashed.load(std::sync::atomic::Ordering::Relaxed),
             g(&self.signature),
@@ -1031,8 +1031,8 @@ struct Resolved {
 
 /// `VCI_TIMING=1`: print how long a phase of the plan took, on stderr.
 pub(crate) fn timing(what: &str, since: std::time::Instant) {
-    if std::env::var_os("VCI_TIMING").is_some() {
-        eprintln!("vci: timing: {what}: {:.2}s", since.elapsed().as_secs_f64());
+    if vci_core::metrics::on() {
+        vci_core::timing_line!("{what}: {:.2}s", since.elapsed().as_secs_f64());
     }
 }
 
@@ -2342,6 +2342,19 @@ impl Verifier<'_> {
                 "inputRoot",
                 p.core.input_root.clone(),
                 format!("{} (recomputed from the attested manifest)", m.root()),
+            ));
+        }
+        // Lookups instead of listings (2.5.0) only where the base policy
+        // accepts what they leave out.
+        if !self.project.policy.rails_autoload_lookups
+            && m.entries.iter().any(|e| e.kind == EntryKind::AutoloadMiss)
+        {
+            return Err(Failure::one(
+                "inputs",
+                15,
+                "autoload lookups",
+                "directory listings (policy.rails_autoload_lookups = true in the base branch's vci.toml accepts lookups)",
+                "the attestation records the constants its tests looked up in autoload directories, not their listings",
             ));
         }
         let t = std::time::Instant::now();

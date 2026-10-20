@@ -211,7 +211,7 @@ impl SlowGit {
             let s = t.elapsed().as_secs_f64();
             if s >= 2.0 {
                 let what: String = what.chars().take(200).collect();
-                eprintln!("vci: timing: slow git: {what}: {s:.2}s");
+                vci_core::timing_line!("slow git: {what}: {s:.2}s");
             }
         }
     }

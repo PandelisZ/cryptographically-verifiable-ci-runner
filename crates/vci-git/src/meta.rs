@@ -1714,9 +1714,9 @@ impl<'a> AttestStore<'a> {
         for k in &resolved {
             ctx.promised.remove(k);
         }
-        if std::env::var_os("VCI_TIMING").is_some() {
-            eprintln!(
-                "vci: timing: fetch {} value(s) ({} blob(s) downloaded): {:.2}s",
+        if vci_core::metrics::on() {
+            vci_core::timing_line!(
+                "fetch {} value(s) ({} blob(s) downloaded): {:.2}s",
                 out.resolved,
                 out.fetched,
                 started.elapsed().as_secs_f64()
@@ -3055,9 +3055,9 @@ impl<'a> AttestStore<'a> {
         };
         match fast {
             Ok(Some(n)) => {
-                if std::env::var_os("VCI_TIMING").is_some() {
-                    eprintln!(
-                        "vci: timing: serialize {n} changed entr{} onto the local metadata: {:.2}s",
+                if vci_core::metrics::on() {
+                    vci_core::timing_line!(
+                        "serialize {n} changed entr{} onto the local metadata: {:.2}s",
                         if n == 1 { "y" } else { "ies" },
                         t.elapsed().as_secs_f64()
                     );
@@ -3487,13 +3487,10 @@ impl<'a> AttestStore<'a> {
         };
         // Each step's time under VCI_TIMING (2.1.14: a job's push spent 28 s
         // here before its 3.5 s materialize, in no step the log named).
-        let timed = std::env::var_os("VCI_TIMING").is_some();
+        let timed = vci_core::metrics::on();
         let step = |what: &str, since: std::time::Instant| {
             if timed {
-                eprintln!(
-                    "vci: timing: fetch: {what}: {:.2}s",
-                    since.elapsed().as_secs_f64()
-                );
+                vci_core::timing_line!("fetch: {what}: {:.2}s", since.elapsed().as_secs_f64());
             }
         };
         let t = std::time::Instant::now();
@@ -3691,7 +3688,7 @@ impl<'a> AttestStore<'a> {
                 drop(pinned);
                 session = self.session()?;
             }
-            if std::env::var_os("VCI_TIMING").is_some() {
+            if vci_core::metrics::on() {
                 let how = match &lazy {
                     Some(m) => format!(
                         "from paths{}, {} changed entr{}, {} not fetched",
@@ -3702,8 +3699,8 @@ impl<'a> AttestStore<'a> {
                     ),
                     None => "full".to_owned(),
                 };
-                eprintln!(
-                    "vci: timing: materialize ({how}): {:.2}s",
+                vci_core::timing_line!(
+                    "materialize ({how}): {:.2}s",
                     started.elapsed().as_secs_f64()
                 );
             }
@@ -4469,7 +4466,7 @@ impl<'a> AttestStore<'a> {
                 notes: std::mem::take(&mut carried),
                 ..Report::default()
             };
-            let timing = std::env::var_os("VCI_TIMING").is_some();
+            let timing = vci_core::metrics::on();
             let t = std::time::Instant::now();
             let round = match self.fetch_named(&name, &mut report) {
                 Ok(r) => r,
@@ -4481,8 +4478,8 @@ impl<'a> AttestStore<'a> {
                 Err(e) => return Err(e),
             };
             if timing {
-                eprintln!(
-                    "vci: timing: push: fetch and materialize {name}'s metadata: {:.2}s",
+                vci_core::timing_line!(
+                    "push: fetch and materialize {name}'s metadata: {:.2}s",
                     t.elapsed().as_secs_f64()
                 );
             }
@@ -4572,8 +4569,8 @@ impl<'a> AttestStore<'a> {
                 continue;
             }
             if timing {
-                eprintln!(
-                    "vci: timing: push: check what the push would delete and what it sends: {:.2}s",
+                vci_core::timing_line!(
+                    "push: check what the push would delete and what it sends: {:.2}s",
                     t.elapsed().as_secs_f64()
                 );
             }
@@ -4594,8 +4591,8 @@ impl<'a> AttestStore<'a> {
                 pushed = self.orphan_of(&local_ref, &pushed)?;
             }
             if timing {
-                eprintln!(
-                    "vci: timing: push: put the local metadata on top of {name}'s: {:.2}s",
+                vci_core::timing_line!(
+                    "push: put the local metadata on top of {name}'s: {:.2}s",
                     t.elapsed().as_secs_f64()
                 );
             }
@@ -4640,8 +4637,8 @@ impl<'a> AttestStore<'a> {
                     )));
                 }
                 if timing {
-                    eprintln!(
-                        "vci: timing: push: fetch {} object(s) the pack needs ({fetched} downloaded): {:.2}s",
+                    vci_core::timing_line!(
+                        "push: fetch {} object(s) the pack needs ({fetched} downloaded): {:.2}s",
                         missing.len(),
                         t.elapsed().as_secs_f64()
                     );
@@ -4684,8 +4681,8 @@ impl<'a> AttestStore<'a> {
                 .arg(format!("{pushed}:{remote_ref}"))
                 .output_described()?;
             if timing {
-                eprintln!(
-                    "vci: timing: push: git push (attempt {attempt}): {:.2}s",
+                vci_core::timing_line!(
+                    "push: git push (attempt {attempt}): {:.2}s",
                     t.elapsed().as_secs_f64()
                 );
             }

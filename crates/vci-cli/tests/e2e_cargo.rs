@@ -4010,3 +4010,58 @@ fn cargo_ci_partitions_cover_every_unit_once() {
     }
     assert_eq!(covered, all, "every unit runs in some job");
 }
+
+/// The metrics log (2.5.0): every command appends a line with its steps'
+/// times, its flags by name only, and how it ended; `vci metrics`
+/// summarizes them and logs nothing itself; `VCI_METRICS=0` writes nothing.
+#[test]
+fn every_command_appends_its_steps_to_the_metrics_log() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let log = w.base.join("metrics.jsonl");
+    let env = [("VCI_METRICS", log.to_str().unwrap())];
+    w.run(&work, &[B], &w.trusted);
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let out = w.vci_env(&work, &["run", B, "--key", &key], &env);
+    assert!(out.status.success());
+    let out = w.vci_env(&work, &["plan", "--base-ref", "main"], &env);
+    assert!(out.status.success());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(lines[0]["cmd"], "run");
+    assert_eq!(lines[0]["flags"], serde_json::json!(["--key"]));
+    assert!(!text.contains(&key), "a flag's value is never recorded");
+    assert_eq!(lines[0]["exit"], 0);
+    assert!(
+        lines[0]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["step"]
+                .as_str()
+                .unwrap()
+                .starts_with("check, sign and store")),
+        "{text}"
+    );
+    assert_eq!(lines[1]["cmd"], "plan");
+    assert!(text.contains("\"plan total\""), "{text}");
+    let out = w.vci_env(&work, &["metrics"], &env);
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{report}");
+    assert!(
+        report.contains("2 run(s)") && report.contains("plan total"),
+        "{report}"
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+    let off = [("VCI_METRICS", "0")];
+    assert!(
+        w.vci_env(&work, &["plan", "--base-ref", "main"], &off)
+            .status
+            .success()
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+}

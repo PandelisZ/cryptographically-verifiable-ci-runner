@@ -16,6 +16,7 @@ mod envpolicy;
 mod externals;
 mod global;
 mod keys;
+mod metrics;
 mod partition;
 mod plan;
 mod run;
@@ -200,6 +201,17 @@ enum Cmd {
         #[arg(long)]
         base_ref: Option<String>,
     },
+    /// Summarize the metrics log: how long recent vci commands and each of their steps took (median, 95th percentile, max). Every command appends a line to <git common dir>/vci-metrics.jsonl (VCI_METRICS=<file> elsewhere, VCI_METRICS=0 off).
+    Metrics {
+        /// How many of the most recent commands to summarize.
+        #[arg(long, default_value_t = 50)]
+        last: usize,
+        /// Only this command (run, ci, plan, push, fetch, ...).
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: EnvFormat,
+    },
 }
 
 fn explain_id(arg: &str) -> Result<String> {
@@ -245,6 +257,8 @@ fn fetch_remote(arg: Option<String>) -> Option<Option<String>> {
 }
 
 fn main() {
+    let started = std::time::Instant::now();
+    let argv: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
     let r = match cli.cmd {
         Cmd::Init {
@@ -374,7 +388,17 @@ fn main() {
             })?;
             plan::explain(&res, &id)
         }),
+        Cmd::Metrics {
+            last,
+            command,
+            format,
+        } => metrics::report(last, command.as_deref(), matches!(format, EnvFormat::Json)),
     };
+    let exit = match &r {
+        Ok(code) => *code,
+        Err(_) => 2,
+    };
+    metrics::write(&argv, exit, started.elapsed().as_secs_f64());
     match r {
         Ok(code) => std::process::exit(code),
         Err(e) => {

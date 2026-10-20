@@ -49,7 +49,35 @@ pub enum EntryKind {
     /// checkout has no `target/`, and the listing must still match. Whether
     /// it exists is not compared; `hash` is [`excluded_hash`], `size` 0.
     Excluded,
+    /// Rails, `policy.rails_autoload_lookups` (2.5.0): a constant the test's
+    /// process looked up and did not find, in the namespace an autoload
+    /// directory (Zeitwerk's) defines. The path is
+    /// `<directory>/.vci-autoload/<name>` (the name normalized by
+    /// [`autoload_name`]); what matters is whether the directory now has a
+    /// child of that name, which would define the constant: `hash` is
+    /// [`ABSENT_HASH`] when it has none, else the BLAKE3 of the matching
+    /// children's names; `size` is their number. The directory's other
+    /// children are not inputs (a file added there defines a constant no
+    /// lookup of the test asked for).
+    AutoloadMiss,
 }
+
+/// The name an autoload directory's child defines, or a missed constant,
+/// normalized so the two compare: a `.rb` suffix removed, ASCII lower case,
+/// underscores removed (`html_parser.rb`, `HTMLParser` and `HtmlParser` are
+/// all `htmlparser`). Two names that normalize alike count as the same,
+/// which only ever runs a unit that need not have run.
+pub fn autoload_name(s: &str) -> String {
+    s.strip_suffix(".rb")
+        .unwrap_or(s)
+        .chars()
+        .filter(|c| *c != '_')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The directory component that marks an [`EntryKind::AutoloadMiss`] path.
+pub const AUTOLOAD_MARK: &str = ".vci-autoload";
 
 impl EntryKind {
     /// One-letter code of the compact manifest encoding
@@ -62,6 +90,7 @@ impl EntryKind {
             EntryKind::DirListing => "d",
             EntryKind::Dir => "t",
             EntryKind::Excluded => "x",
+            EntryKind::AutoloadMiss => "m",
         }
     }
 
@@ -74,6 +103,7 @@ impl EntryKind {
             "d" => EntryKind::DirListing,
             "t" => EntryKind::Dir,
             "x" => EntryKind::Excluded,
+            "m" => EntryKind::AutoloadMiss,
             _ => return None,
         })
     }
@@ -87,6 +117,7 @@ impl EntryKind {
             EntryKind::DirListing => "dirListing",
             EntryKind::Dir => "dir",
             EntryKind::Excluded => "excluded",
+            EntryKind::AutoloadMiss => "autoloadMiss",
         }
     }
 }
@@ -149,6 +180,13 @@ impl InputEntry {
             }
             EntryKind::Dir => "directory".to_owned(),
             EntryKind::Excluded => "excluded (build output, not an input)".to_owned(),
+            EntryKind::AutoloadMiss if self.size == 0 => {
+                "no file or directory defines the constant".to_owned()
+            }
+            EntryKind::AutoloadMiss => format!(
+                "{} file(s) or directories define the constant, blake3={}",
+                self.size, self.hash
+            ),
         }
     }
 
@@ -203,6 +241,10 @@ pub enum Observation {
     /// as [`EntryKind::Excluded`], whether it exists or not, and left out of
     /// its parent directory's listing.
     Exclude,
+    /// Rails (2.5.0): a constant looked up and not found in an autoload
+    /// directory's namespace; the path is `<directory>/.vci-autoload/<name>`
+    /// ([`EntryKind::AutoloadMiss`]).
+    AutoloadMiss,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -395,6 +437,69 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
+    /// [`EntryKind::AutoloadMiss`] for `path` (`<dir>/.vci-autoload/<name>`):
+    /// the children of `<dir>` whose [`autoload_name`] is `<name>`.
+    fn autoload_miss(&self, path: &RepoPath) -> Result<InputEntry, ManifestError> {
+        let bad = || ManifestError::ConflictingEntries(path.to_string());
+        let mark = path.parent().ok_or_else(bad)?;
+        if mark.components().last() != Some(AUTOLOAD_MARK) {
+            return Err(bad());
+        }
+        let dir = mark.parent().ok_or_else(bad)?;
+        let name = path.components().last().ok_or_else(bad)?.to_owned();
+        let names: Vec<String> = match self {
+            Source::Fs(root) => {
+                let abs = dir.to_abs(root);
+                match fs::symlink_metadata(&abs) {
+                    Ok(md) if md.file_type().is_dir() => {
+                        let mut v = Vec::new();
+                        for ent in fs::read_dir(&abs).map_err(|e| io_err(&abs, e))? {
+                            let ent = ent.map_err(|e| io_err(&abs, e))?;
+                            v.push(
+                                ent.file_name()
+                                    .into_string()
+                                    .map_err(|_| ManifestError::NonUtf8Name(abs.to_string()))?,
+                            );
+                        }
+                        v
+                    }
+                    Ok(md) if md.file_type().is_symlink() => {
+                        vec![format!("{AUTOLOAD_MARK}:symlink")]
+                    }
+                    Ok(_) => Vec::new(),
+                    Err(e) if is_absent_error(&e) => Vec::new(),
+                    Err(e) => return Err(io_err(&abs, e)),
+                }
+            }
+            Source::Cache(c) => match &*c.node(&dir)? {
+                Node::Dir(d) => c
+                    .children(&dir, d)?
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect(),
+                Node::Symlink { .. } => vec![format!("{AUTOLOAD_MARK}:symlink")],
+                _ => Vec::new(),
+            },
+        };
+        let mut hits: Vec<String> = names
+            .into_iter()
+            .filter(|n| n.starts_with(AUTOLOAD_MARK) || autoload_name(n) == name)
+            .collect();
+        hits.sort();
+        let hash = if hits.is_empty() {
+            ABSENT_HASH.to_owned()
+        } else {
+            blake3_hex(hits.join("\0").as_bytes())
+        };
+        Ok(InputEntry {
+            path: path.clone(),
+            kind: EntryKind::AutoloadMiss,
+            exec: false,
+            size: hits.len() as u64,
+            hash,
+        })
+    }
+
     fn root(&self) -> &Utf8Path {
         match self {
             Source::Fs(root) => root,
@@ -759,6 +864,9 @@ fn capture_one(
     obs: Observation,
     excl: &Exclusions,
 ) -> Result<Vec<InputEntry>, ManifestError> {
+    if obs == Observation::AutoloadMiss {
+        return Ok(vec![src.autoload_miss(path)?]);
+    }
     if obs == Observation::Exclude {
         if path.is_root() {
             return Err(ManifestError::ConflictingEntries(path.to_string()));
@@ -769,6 +877,9 @@ fn capture_one(
     let fin = resolve_chain(src, path, &mut out)?;
     let e = src.observe(&fin, obs == Observation::Stat, excl.get(&fin))?;
     match (obs, e.kind) {
+        (Observation::AutoloadMiss, _) | (_, EntryKind::AutoloadMiss) => {
+            return Err(ManifestError::ConflictingEntries(fin.to_string()));
+        }
         (Observation::Exclude, _) | (_, EntryKind::Excluded) => {
             return Err(ManifestError::ConflictingEntries(fin.to_string()));
         }
@@ -1291,8 +1402,11 @@ impl InputManifest {
                     // Not an input: only its parent's listing leaves it out.
                     return Ok(None);
                 }
-                let act =
-                    src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?;
+                let act = if exp.kind == EntryKind::AutoloadMiss {
+                    src.autoload_miss(&exp.path)?
+                } else {
+                    src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?
+                };
                 Ok(if exp.same_state(&act) {
                     None
                 } else {

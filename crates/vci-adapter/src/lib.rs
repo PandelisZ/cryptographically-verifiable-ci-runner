@@ -31,6 +31,7 @@ pub use golang::{
     GO_ALWAYS_READ_ENV, GO_BIN_ENV, GO_HASH, GO_IGNORE, GO_LOOSE_HASH, GO_NET_TAINT, GoAdapter,
 };
 pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file, parse_jsonl_text};
+
 pub use nodetest::{
     Invocation as NodeTestInvocation, NODE_TEST_HASH, NODE_TEST_LOOSE_HASH, NODE_TEST_RUN_VARS,
     NODE_TEST_TS_LOADERS, NodeTestAdapter, NodeTestOptions, Preload as NodeTestPreload,
@@ -143,6 +144,19 @@ pub enum AdapterError {
 /// Environment for a child process. `None` inherits the parent environment;
 /// `Some(vars)` clears it and sets exactly `vars` (strict env mode).
 pub type ChildEnv = Option<Vec<(OsString, OsString)>>;
+
+/// What [`Adapter::run_collect_timed`] is told besides the files.
+#[derive(Debug, Clone, Default)]
+pub struct RunHints {
+    /// How long each file's tests took last time (project-relative path ->
+    /// ms, when recorded): the Rails adapter runs a long file's test
+    /// methods in several processes (2.3.0).
+    pub last_ms: std::collections::BTreeMap<String, u64>,
+    /// `policy.rails_autoload_lookups` (2.5.0): the Rails collector records
+    /// the constants looked up in autoload directories instead of their
+    /// listings.
+    pub rails_autoload_lookups: bool,
+}
 
 /// A test file as reported by the runner's list command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,17 +342,16 @@ pub trait Adapter: Send + Sync {
     fn snapshot_candidates(&self, test_abs: &camino::Utf8Path) -> Vec<Utf8PathBuf>;
     /// Run `files` (project-relative) with dependency collection on.
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError>;
-    /// [`Adapter::run_collect`], told how long each file's tests took last
-    /// time (`last_ms`: project-relative path -> ms, when recorded): the
-    /// Rails adapter runs a long file's test methods in several processes
-    /// (2.3.0). Other adapters ignore it.
+    /// [`Adapter::run_collect`] with [`RunHints`]: how long each file took
+    /// last time, and what the policy allows the collector to record.
+    /// Adapters that use none of it run as `run_collect`.
     fn run_collect_timed(
         &self,
         files: &[String],
         env: &ChildEnv,
-        last_ms: &std::collections::BTreeMap<String, u64>,
+        hints: &RunHints,
     ) -> Result<RunOutput, AdapterError> {
-        let _ = last_ms;
+        let _ = hints;
         self.run_collect(files, env)
     }
     /// Run `files` (project-relative; empty = everything) without collection.
