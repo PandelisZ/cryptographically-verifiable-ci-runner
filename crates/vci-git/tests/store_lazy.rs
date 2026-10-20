@@ -407,6 +407,50 @@ fn two_blobless_clones_deleting_the_same_value_both_push() {
     }
 }
 
+/// A deletion record whose blob this clone lost before the push (vex,
+/// 2.2.2 and 2.2.3: ten failed pushes on the job's own deletion record) is
+/// written back from the store's row, and the push goes through.
+#[test]
+fn a_lost_deletion_record_blob_is_written_back_from_the_store() {
+    let w = lazy_world(1);
+    publish(&w);
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    assert!(sf.fetch(Some("origin")).unwrap().found);
+    let doomed = sf
+        .list(Some(A))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.signer == S1)
+        .unwrap();
+    sf.remove(&doomed).unwrap();
+    let mut lost = Vec::new();
+    let out = sf
+        .push_with_hook(Some("origin"), |attempt| {
+            if attempt != 1 {
+                return;
+            }
+            // The serialized commit is in place: drop its deletion records'
+            // loose blobs.
+            let tree = git(&f, &["ls-tree", "-r", "refs/meta/local/main"]);
+            for line in tree.lines().filter(|l| l.contains("__tombstones")) {
+                let oid = line.split_whitespace().nth(2).unwrap().to_owned();
+                let loose = f.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+                if loose.exists() {
+                    std::fs::remove_file(&loose).unwrap();
+                    lost.push(oid);
+                }
+            }
+        })
+        .unwrap();
+    assert!(!lost.is_empty(), "the test removed no deletion record blob");
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    for oid in &lost {
+        assert!(has_object(&f, oid), "{oid} was not written back");
+    }
+}
+
 /// A blobless clone's push when the remote's tip moved since its fetch
 /// (another writer's push landed in between): git has no commit of the
 /// remote's to build the pack against, so it would walk the whole tree into

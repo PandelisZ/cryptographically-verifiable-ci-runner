@@ -1044,7 +1044,10 @@ fn is_unavailable_object(text: &str) -> bool {
 fn unreadable_object(stderr: &str) -> Option<String> {
     stderr
         .lines()
-        .find_map(|l| l.strip_prefix("fatal: could not fetch "))
+        .find_map(|l| {
+            l.strip_prefix("fatal: could not fetch ")
+                .or_else(|| l.strip_prefix("fatal: unable to read "))
+        })
         .and_then(|l| l.split_whitespace().next())
         .filter(|o| is_oid(o))
         .map(str::to_owned)
@@ -4349,6 +4352,16 @@ impl<'a> AttestStore<'a> {
             let mut missing = self.missing_for_push(&pushed, tip.as_deref())?;
             missing.extend(self.changed_blobs_missing(&pushed, tip.as_deref())?);
             missing.extend(self.changed_targets_blobs_missing(&pushed, tip.as_deref())?);
+            // Deletion records the store holds are written back first: their
+            // content is the store's row, so a record whose blob this clone
+            // lost (2.2.4: vex jobs failed ten pushes on their own deletion
+            // records, stamped minutes earlier and absent from the remote)
+            // is rewritten instead of fetched from a remote that never had it.
+            if !missing.is_empty() {
+                for o in self.rewrite_tombstone_blobs(&missing)? {
+                    missing.remove(&o);
+                }
+            }
             if !missing.is_empty() {
                 let (have, fetched, error) = self.ensure_blobs(&name, &missing)?;
                 let still: Vec<&String> = missing.iter().filter(|o| !have.contains(*o)).collect();
@@ -4436,7 +4449,7 @@ impl<'a> AttestStore<'a> {
                 // promisor remote`). Another round fetches the new tip,
                 // merges and pushes on top of it, as after a rejection.
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                if stderr.contains("promisor remote") && attempt < PUSH_ATTEMPTS {
+                if unreadable_object(&stderr).is_some() && attempt < PUSH_ATTEMPTS {
                     let moved = self.remote_tip_moved(&name, &remote_ref, tip.as_deref())?;
                     last = format!(
                         "the pack needed an object this clone could not read ({remote_ref} {} since this round's fetch; {})",
@@ -4449,6 +4462,12 @@ impl<'a> AttestStore<'a> {
                     // remote does not serve waits for another round.
                     if let Some(o) = unreadable_object(&stderr) {
                         let one: BTreeSet<String> = [o.clone()].into_iter().collect();
+                        if self.rewrite_tombstone_blobs(&one)?.contains(&o) {
+                            report.note(format!(
+                                "push attempt {attempt}: {last}; wrote {o} back from the store's deletion record and trying again"
+                            ));
+                            continue;
+                        }
                         let (have, fetched, _) = self.ensure_blobs(&name, &one)?;
                         if have.contains(&o) {
                             report.note(format!(
@@ -4467,7 +4486,7 @@ impl<'a> AttestStore<'a> {
                 // The last of the attempts above ends here too: its
                 // diagnosis goes with the error (the notes of a push that
                 // fails are never printed).
-                if stderr.contains("promisor remote") {
+                if unreadable_object(&stderr).is_some() {
                     return Err(GitError::Meta(format!(
                         "{} ({})",
                         command_error(&describe, &out),
@@ -4521,6 +4540,47 @@ impl<'a> AttestStore<'a> {
         }
         let have = self.present(&blobs)?;
         Ok(blobs.difference(&have).cloned().collect())
+    }
+
+    /// Write back, from the store's rows, the blobs of the deletion records
+    /// among `wanted` that this clone does not have: a deletion record's
+    /// blob is exactly its row (`{"timestamp":..,"email":..}`, as git-meta
+    /// serializes it). Returns the object ids written.
+    fn rewrite_tombstone_blobs(
+        &self,
+        wanted: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, GitError> {
+        let mut written = BTreeSet::new();
+        let Some(like) = wanted.iter().next() else {
+            return Ok(written);
+        };
+        let session = self.session()?;
+        let records = guarded("reading the store", || session.store().get_all_tombstones())?;
+        drop(session);
+        for r in records {
+            let t = Tombstone {
+                timestamp: r.timestamp,
+                email: r.email.clone(),
+            };
+            let Some(id) = tombstone_blob_id(&t, like) else {
+                continue;
+            };
+            if !wanted.contains(&id) || written.contains(&id) {
+                continue;
+            }
+            let Ok(bytes) = serde_json::to_vec(&t) else {
+                continue;
+            };
+            let out = self
+                .repo
+                .git()
+                .args(["hash-object", "-w", "--stdin"])
+                .run_with_stdin(&bytes)?;
+            if String::from_utf8_lossy(&out).trim() == id {
+                written.insert(id);
+            }
+        }
+        Ok(written)
     }
 
     /// Every deletion record `pushed` holds under the targets (or, outside
