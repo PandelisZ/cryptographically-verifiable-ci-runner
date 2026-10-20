@@ -981,7 +981,8 @@ module VciCollector
         groups = BATCH_IDS.uniq.group_by { |f| boot_of(f) }
         code = 0
         why = nil
-        groups.each do |boot, files|
+        groups.each_with_index do |(boot, files), gi|
+          last = gi == groups.size - 1
           if why
             files.each { |f| status(id: f, why: why) }
             next
@@ -999,7 +1000,14 @@ module VciCollector
           c = st.exitstatus || 1
           code = c if code.zero?
           unsaid(files, st)
+          # The last group's leftovers need no removal here: no group runs
+          # after it, and vci removes the whole temp directory when the batch
+          # ends (2.2.10: walking and unlinking a full vex job's leftovers
+          # one entry at a time took about 80 s).
+          next if last
+          t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           changed = tmp_cleanup(before)
+          status(group_cleanup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round)
           unless changed.empty?
             why = "the group of #{files.first} changed #{changed.first(3).join(", ")} in vci's temp directory, " \
                   "which the files of the groups after it would see: they run on their own"

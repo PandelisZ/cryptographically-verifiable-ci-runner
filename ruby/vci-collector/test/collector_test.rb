@@ -1850,7 +1850,8 @@ class CollectorTest < Minitest::Test
     # A and C require "test_helper" first (one boot), B require_relative's
     # it (a boot of its own).
     assert_equal [{ "id" => "test/a_test.rb", "exit" => 0 }, { "id" => "test/c_test.rb", "exit" => 0 },
-                  { "id" => "test/b_test.rb", "exit" => 1 }, { "done" => true }], out[:status], out[:said]
+                  { "id" => "test/b_test.rb", "exit" => 1 }, { "done" => true }],
+                 out[:status].reject { |l| l.key?("group_cleanup_ms") }, out[:said]
     a, b, c = out.values_at(*ids)
     assert_equal %w[test/boot.txt test/data/a.txt], paths(a, "read").sort
     assert_equal %w[test/boot.txt test/data/b.txt], paths(b, "read").sort
@@ -2024,7 +2025,9 @@ class CollectorTest < Minitest::Test
     %w[0 1].each do |i|
       assert_equal "[[:before_fork], [\"cleanup-#{i}\"]]", File.read(File.join(@repo, "cleanup-#{i}"))
     end
-    assert_empty Dir.children(@tmpdir)
+    # The last group's own slot dirs are left for vci, which removes the
+    # whole temp directory (2.2.10).
+    assert_empty Dir.children(@tmpdir) - ["vci-slots"]
   end
 
   # Slots fall back: without Rails' parallel workers and without
@@ -2148,7 +2151,9 @@ class CollectorTest < Minitest::Test
       assert_equal ids.map { |id| [id, 0] }, out[:status].filter_map { |l| [l["id"], l["exit"]] if l["id"] }.sort,
                    out[:said]
       ids.each { |id| assert_equal "passed", out[id].last["state"], "#{env}: #{id}\n#{out[:said]}" }
-      assert_empty Dir.children(@tmpdir)
+      # Earlier groups' leftovers are removed; the last group's slot dirs
+      # are left for vci (2.2.10).
+      assert_empty Dir.children(@tmpdir) - ["vci-slots"]
     end
   end
 

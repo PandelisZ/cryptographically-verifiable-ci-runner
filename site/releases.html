@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-2-10">2.2.10</a></td><td>20 Oct 2026</td><td>A Rails batch no longer walks and removes its tests' temp files one by one after its last group</td></tr>
 <tr><td><a href="#v2-2-9">2.2.9</a></td><td>20 Oct 2026</td><td>A push that fails on an unreadable object first fetches every deletion record of the pushed tree the clone lacks, in one batch</td></tr>
 <tr><td><a href="#v2-2-8">2.2.8</a></td><td>20 Oct 2026</td><td>A push whose own deletion record was lost, with no row left to write it from, replaces it with a new one for the same key</td></tr>
 <tr><td><a href="#v2-2-7">2.2.7</a></td><td>20 Oct 2026</td><td>A Rails batch says how long its process took to reach its slots from the moment vci started it</td></tr>
@@ -73,6 +74,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-2-10">2.2.10</h2>
+<p><em>20 October 2026.</em> The last place left for the slower vex job's 80 s, after 2.2.3 to 2.2.7 ruled out the boot, the slots, their cleanup and the slot parent's own work, was the batch driver's work after a group: it walked vci's temp directory, stat-ing every entry, and removed what the group's tests had left there one entry at a time, so that the next group started clean. A vex Rails run has one group, and vci removes that whole temp directory when the batch ends anyway. <strong>After the last group the driver no longer cleans up; vci removes the directory in one call</strong>, timed under <code>VCI_TIMING=1</code> as <code>rails batch: remove what the tests left in the temp directory</code>; a group followed by another still cleans up, and its time is reported.</p>
 
 <h2 id="v2-2-9">2.2.9</h2>
 <p><em>20 October 2026.</em> On 2.2.8's first full vex run one job's push failed ten times again, on a deletion record GitHub serves (another job's, merged into this job's tree), while the pushed commit had 31,734 objects this clone never fetched. Each attempt fixed the one object git named, and there are thousands. <strong>The first time a push fails on an unreadable object, vci now fetches every deletion record of the pushed tree it lacks, in one batch (they are tiny), and tries again</strong>; the per-object repairs follow as before.</p>

@@ -926,6 +926,16 @@ impl RailsAdapter {
                 t.elapsed().as_secs_f64()
             );
         }
+        // The batch's temp directory (what its tests left there) goes now,
+        // and its cost shows under VCI_TIMING.
+        let t = std::time::Instant::now();
+        let _ = std::fs::remove_dir_all(dirs.tmpdir.as_std_path());
+        if timing {
+            eprintln!(
+                "vci: timing: rails batch: remove what the tests left in the temp directory: {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
         let mut log = format!(
             "vci: {shown}, booted once, one process per file (exit {}){}\n",
             out.status
