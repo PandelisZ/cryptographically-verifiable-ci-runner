@@ -2538,7 +2538,7 @@ fn superseded_by(
             .unwrap_or_default();
         let t = std::time::Instant::now();
         let moved = *cell.get_or_init(|| {
-            match moved_on.only_on.get_or_init(|| {
+            let only = moved_on.only_on.get_or_init(|| {
                 let t = std::time::Instant::now();
                 let wrote = repo.ensure_commit_graph();
                 let graph = t.elapsed().as_secs_f64();
@@ -2553,11 +2553,21 @@ fn superseded_by(
                     );
                 }
                 only
-            }) {
+            });
+            let t = std::time::Instant::now();
+            let moved = match only {
                 Some(only) => repo.moved_on_given(&m.commit, &p.core.commit, only),
                 None => repo.moved_on(&m.commit, &p.core.commit),
             }
-            .unwrap_or(false)
+            .unwrap_or(false);
+            if std::env::var_os("VCI_TIMING").is_some() {
+                eprintln!(
+                    "vci: timing: supersession: whether {} was moved on from ({moved}): {:.2}s",
+                    &m.commit[..m.commit.len().min(12)],
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            moved
         });
         supersede_add(2, t);
         if !moved {

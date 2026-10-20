@@ -95,6 +95,7 @@ impl Git {
 
     /// Run and return the raw output whatever the exit status.
     pub fn output(mut self) -> Result<Output, GitError> {
+        let slow = SlowGit::start(&self);
         self.cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -112,6 +113,7 @@ impl Git {
         out_pipe.read_to_end(&mut stdout)?;
         stderr.extend(err_reader.join().unwrap_or_default());
         let status = child.wait()?;
+        slow.done();
         Ok(Output {
             status,
             stdout,
@@ -151,12 +153,14 @@ impl Git {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let slow = SlowGit::start(&self);
         let mut child = self.cmd.spawn()?;
         let mut stdin = child.stdin.take().expect("stdin piped");
         let input = input.to_vec();
         let writer = std::thread::spawn(move || stdin.write_all(&input));
         let out = child.wait_with_output()?;
         let _ = writer.join();
+        slow.done();
         let out = Output {
             status: out.status,
             stdout: out.stdout,
@@ -185,5 +189,30 @@ pub(crate) fn command_error(describe: &str, out: &Output) -> GitError {
         args: describe.to_owned(),
         status: out.status.to_string(),
         stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+    }
+}
+
+/// With `VCI_TIMING`, a git command that took 2 s or more is reported
+/// (2.3.7: one question about history took about 25 s on vex's runners and
+/// nothing else said which command).
+struct SlowGit(Option<(String, std::time::Instant)>);
+
+impl SlowGit {
+    fn start(git: &Git) -> Self {
+        SlowGit(
+            std::env::var_os("VCI_TIMING")
+                .is_some()
+                .then(|| (git.describe(), std::time::Instant::now())),
+        )
+    }
+
+    fn done(self) {
+        if let Some((what, t)) = self.0 {
+            let s = t.elapsed().as_secs_f64();
+            if s >= 2.0 {
+                let what: String = what.chars().take(200).collect();
+                eprintln!("vci: timing: slow git: {what}: {s:.2}s");
+            }
+        }
     }
 }
