@@ -442,9 +442,11 @@ pub struct Policy {
     /// (`Module#constants`) keeps its listings. A file added to an autoload
     /// directory (by the change, or on the base branch since the
     /// attestation) otherwise made every test that booted the application
-    /// run again. Risky where a test asks with `defined?(Constant)`, which
-    /// Ruby answers without any method vci can see: such a test may pass
-    /// without having seen a constant a new file defines. Read from the
+    /// run again. `defined?(Constant)`, which Ruby answers without any
+    /// method vci can see, is found in the source of the repository files
+    /// the test loaded (2.6.1); a gem asking that about an application
+    /// constant is not, and such a test may pass without having seen a
+    /// constant a new file defines. Read from the
     /// base commit, which must allow it for `vci plan` to accept such an
     /// attestation; the collector records lookups only when the policy
     /// `vci run` reads allows it.

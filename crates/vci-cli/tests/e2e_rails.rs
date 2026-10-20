@@ -3494,7 +3494,8 @@ fn rails_slots_give_what_one_process_per_file_gives() {
 /// autoload directory is not an input; the constant names a test looked up
 /// without loading are. A file added to app/models that defines a constant
 /// no test asked for runs nothing again; one defining a constant a test
-/// asked `const_defined?` about runs that test again, and only it. Without
+/// asked `const_defined?` about, or that its code asks `defined?` about,
+/// runs that test again, and only it. Without
 /// the policy in the base commit, such attestations are not accepted.
 #[test]
 fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
@@ -3510,7 +3511,7 @@ fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
     let plain = "test/models/plain_test.rb";
     w.put(
         asks,
-        "require \"test_helper\"\n\nclass AsksTest < ActiveSupport::TestCase\n  test \"no sprocket model yet\" do\n    assert_not Object.const_defined?(\"Sprocket\")\n    assert_equal 0, Widget.where(name: \"none\").count\n  end\nend\n",
+        "require \"test_helper\"\n\nclass AsksTest < ActiveSupport::TestCase\n  test \"no sprocket model yet\" do\n    assert_not Object.const_defined?(\"Sprocket\")\n    assert_nil defined?(Cog)\n    assert_equal 0, Widget.where(name: \"none\").count\n  end\nend\n",
     );
     w.put(
         plain,
@@ -3566,6 +3567,16 @@ fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
     let ex = w.explain(&work, asks, "main");
     assert!(ex.contains(".vci-autoload/sprocket"), "{ex}");
     std::fs::remove_file(work.join("app/models/sprocket.rb")).unwrap();
+    // A constant its code asks `defined?` about, which no method sees:
+    // found in the test file's source (2.6.1).
+    w.put(
+        "app/models/cog.rb",
+        "class Cog < ApplicationRecord\n  self.table_name = \"widgets\"\nend\n",
+    );
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(asks), "{p:?}");
+    assert!(p.skip.contains(plain), "{p:?}");
+    std::fs::remove_file(work.join("app/models/cog.rb")).unwrap();
     std::fs::remove_file(work.join("app/models/thing.rb")).unwrap();
 
     // A base policy without the key does not accept them.

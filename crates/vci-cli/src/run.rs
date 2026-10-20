@@ -204,7 +204,16 @@ fn observations_in(
         }
     }
     if !o.autoload_dirs.is_empty() {
-        for n in &o.autoload_names {
+        // The names the process looked up, and those its repository code
+        // asks about with `defined?(...)`, which Ruby answers without any
+        // method the collector can hook (2.6.1).
+        let mut names: BTreeSet<String> = o.autoload_names.clone();
+        for m in &o.modules {
+            if m.extension() == Some("rb") && m.starts_with(root) {
+                names.extend(defined_names(m).iter().cloned());
+            }
+        }
+        for n in &names {
             let rp = RepoPath::new(&format!("{}/{n}", vci_core::AUTOLOAD_MARK))
                 .map_err(|e| format!("autoload name {n:?}: {e}"))?;
             out.push((rp, Observation::AutoloadMiss));
@@ -224,6 +233,60 @@ fn observations_in(
         out.extend(ctx);
     }
     Ok(out)
+}
+
+/// The constant names a Ruby source file asks about with `defined?`
+/// (`defined?(::Agent::Swarms::LandingHolds)` gives `agent`, `swarms` and
+/// `landingholds`, normalized by [`vci_core::autoload_name`]), read once
+/// per file and run. A file that cannot be read gives none (it is an input
+/// anyway, and its unit is refused if it changed).
+fn defined_names(path: &Utf8Path) -> std::sync::Arc<Vec<String>> {
+    type Cache =
+        std::sync::Mutex<std::collections::HashMap<Utf8PathBuf, std::sync::Arc<Vec<String>>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(v) = cache.lock().ok().and_then(|c| c.get(path).cloned()) {
+        return v;
+    }
+    let v = std::sync::Arc::new(
+        std::fs::read(path)
+            .map(|b| scan_defined_names(&b))
+            .unwrap_or_default(),
+    );
+    if let Ok(mut c) = cache.lock() {
+        c.insert(path.to_owned(), v.clone());
+    }
+    v
+}
+
+/// Every constant path after `defined?` (with or without parentheses) in
+/// `src`, split into its names, normalized.
+fn scan_defined_names(src: &[u8]) -> Vec<String> {
+    const KEY: &[u8] = b"defined?";
+    let mut out = BTreeSet::new();
+    let mut i = 0;
+    while let Some(off) = src[i..].windows(KEY.len()).position(|w| w == KEY) {
+        let mut j = i + off + KEY.len();
+        i = j;
+        while j < src.len() && (src[j] == b' ' || src[j] == b'(' || src[j] == b'\t') {
+            j += 1;
+        }
+        let start = j;
+        while j < src.len() && (src[j].is_ascii_alphanumeric() || src[j] == b'_' || src[j] == b':')
+        {
+            j += 1;
+        }
+        let path = String::from_utf8_lossy(&src[start..j]);
+        for seg in path.split("::") {
+            if seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                let n = vci_core::autoload_name(seg);
+                if !n.is_empty() {
+                    out.insert(n);
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// The paths of `o`'s observations (reads, modules, probes, listings, stats)
@@ -2870,6 +2933,15 @@ fn select_units(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defined_names_are_every_constant_path_after_defined() {
+        let src = b"x = defined?(::Agent::Swarms::LandingHolds) && y\nreturn unless defined? SignalIntegration\nz = defined?(@ivar) || defined?(foo)\n";
+        assert_eq!(
+            scan_defined_names(src),
+            ["agent", "landingholds", "signalintegration", "swarms"]
+        );
+    }
 
     #[test]
     fn longest_first_puts_unknown_then_longest() {
