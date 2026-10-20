@@ -2347,7 +2347,9 @@ impl Verifier<'_> {
         // Lookups instead of listings (2.5.0) only where the base policy
         // accepts what they leave out.
         if !self.project.policy.rails_autoload_lookups
-            && m.entries.iter().any(|e| e.kind == EntryKind::AutoloadMiss)
+            && m.entries
+                .iter()
+                .any(|e| matches!(e.kind, EntryKind::AutoloadMiss | EntryKind::AutoloadDir))
         {
             return Err(Failure::one(
                 "inputs",

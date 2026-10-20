@@ -3489,3 +3489,97 @@ fn rails_slots_give_what_one_process_per_file_gives() {
         );
     }
 }
+
+/// `policy.rails_autoload_lookups` (2.6.0): Zeitwerk's listing of an
+/// autoload directory is not an input; the constant names a test looked up
+/// without loading are. A file added to app/models that defines a constant
+/// no test asked for runs nothing again; one defining a constant a test
+/// asked `const_defined?` about runs that test again, and only it. Without
+/// the policy in the base commit, such attestations are not accepted.
+#[test]
+fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
+    let toml = VCI_TOML.replace(
+        "platform = \"any\"",
+        "platform = \"any\"\nrails_autoload_lookups = true",
+    );
+    let Some(w) = World::build(&toml, copy_rails_fixture) else {
+        return;
+    };
+    let work = w.work.clone();
+    let asks = "test/models/asks_test.rb";
+    let plain = "test/models/plain_test.rb";
+    w.put(
+        asks,
+        "require \"test_helper\"\n\nclass AsksTest < ActiveSupport::TestCase\n  test \"no sprocket model yet\" do\n    assert_not Object.const_defined?(\"Sprocket\")\n    assert_equal 0, Widget.where(name: \"none\").count\n  end\nend\n",
+    );
+    w.put(
+        plain,
+        "require \"test_helper\"\n\nclass PlainTest < ActiveSupport::TestCase\n  test \"gadget\" do\n    assert_equal \"NUT\", Gadget.new(name: \"nut\").shout\n  end\nend\n",
+    );
+    w.git(&work, &["add", "-A"]);
+    w.git(&work, &["commit", "-q", "-m", "tests"]);
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let out = w.vci(&work, &["run", asks, plain, "--key", &key]);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let got = outcomes(&stderr);
+    for f in [asks, plain] {
+        assert_eq!(got.get(f), Some(&None), "{f} not attested:\n{stderr}");
+    }
+    let entries = manifest_entries(&stored_predicate(&work, plain));
+    assert!(
+        entries
+            .iter()
+            .any(|(p, k)| p == "app/models/.vci-autoload" && k == "autoloadDir"),
+        "{entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|(p, k)| p == "app/models" && k == "dirListing"),
+        "app/models' listing is not an input: {entries:?}"
+    );
+    let asked = manifest_entries(&stored_predicate(&work, asks));
+    assert!(
+        asked
+            .iter()
+            .any(|(p, k)| p == ".vci-autoload/sprocket" && k == "autoloadMiss"),
+        "{asked:?}"
+    );
+    assert_eq!(w.plan(&work, "main").skip, set(&[asks, plain]));
+
+    // A model no test asked for: nothing runs again.
+    w.put(
+        "app/models/thing.rb",
+        "class Thing < ApplicationRecord\n  self.table_name = \"widgets\"\nend\n",
+    );
+    let p = w.plan(&work, "main");
+    assert!(p.skip.contains(asks) && p.skip.contains(plain), "{p:?}");
+    // The constant a test asked about: that test runs again, only it.
+    w.put(
+        "app/models/sprocket.rb",
+        "class Sprocket < ApplicationRecord\n  self.table_name = \"widgets\"\nend\n",
+    );
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(asks), "{p:?}");
+    assert!(p.skip.contains(plain), "{p:?}");
+    let ex = w.explain(&work, asks, "main");
+    assert!(ex.contains(".vci-autoload/sprocket"), "{ex}");
+    std::fs::remove_file(work.join("app/models/sprocket.rb")).unwrap();
+    std::fs::remove_file(work.join("app/models/thing.rb")).unwrap();
+
+    // A base policy without the key does not accept them.
+    let base = std::fs::read_to_string(work.join("vci.toml")).unwrap();
+    w.git(&work, &["checkout", "-q", "main"]);
+    std::fs::write(
+        work.join("vci.toml"),
+        base.replace("rails_autoload_lookups = true\n", ""),
+    )
+    .unwrap();
+    w.git(&work, &["commit", "-q", "-am", "policy off"]);
+    w.git(&work, &["checkout", "-q", "feature"]);
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(plain), "{p:?}");
+    let ex = w.explain(&work, plain, "main");
+    assert!(ex.contains("autoload lookups"), "{ex}");
+}

@@ -179,14 +179,13 @@ fn observations_in(
 ) -> Result<Vec<(RepoPath, Observation)>, String> {
     let root = checkout.root;
     let mut out = Vec::new();
-    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 7] = [
+    let groups: [(&BTreeSet<Utf8PathBuf>, Observation); 6] = [
         (&o.modules, Observation::Read),
         (&o.reads, Observation::Read),
         (&o.probes, Observation::Probe),
         (&o.readdirs, Observation::ReadDir),
         (&o.stats, Observation::Stat),
         (&o.excluded, Observation::Exclude),
-        (&o.autoload_misses, Observation::AutoloadMiss),
     ];
     for (set, kind) in groups {
         for p in set {
@@ -194,6 +193,21 @@ fn observations_in(
                 Ok(rp) => out.push((rp, kind)),
                 Err(_) => return Err(format!("input outside the repository: {p}")),
             }
+        }
+    }
+    // Rails autoload lookups (2.6.0): each autoload directory marked, and
+    // each name looked up checked against them all.
+    for p in &o.autoload_dirs {
+        match RepoPath::from_abs(root, &p.join(vci_core::AUTOLOAD_MARK)) {
+            Ok(rp) => out.push((rp, Observation::AutoloadDir)),
+            Err(_) => return Err(format!("input outside the repository: {p}")),
+        }
+    }
+    if !o.autoload_dirs.is_empty() {
+        for n in &o.autoload_names {
+            let rp = RepoPath::new(&format!("{}/{n}", vci_core::AUTOLOAD_MARK))
+                .map_err(|e| format!("autoload name {n:?}: {e}"))?;
+            out.push((rp, Observation::AutoloadMiss));
         }
     }
     let ignored = ignored_children(checkout, &out);
@@ -222,7 +236,7 @@ fn outside_repository<'a>(root: &Utf8Path, o: &'a Observed) -> BTreeSet<&'a Utf8
         &o.readdirs,
         &o.stats,
         &o.excluded,
-        &o.autoload_misses,
+        &o.autoload_dirs,
     ]
     .into_iter()
     .flatten()
@@ -242,7 +256,7 @@ fn without_paths(o: &Observed, paths: &[Utf8PathBuf]) -> Observed {
         &mut o.readdirs,
         &mut o.stats,
         &mut o.excluded,
-        &mut o.autoload_misses,
+        &mut o.autoload_dirs,
     ] {
         set.retain(keep);
     }

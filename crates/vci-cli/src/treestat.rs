@@ -292,6 +292,29 @@ impl TreeStat {
         if e.kind == EntryKind::Excluded {
             return Ok(());
         }
+        // Rails autoload lookups (2.6.0): a name's answer depends only on
+        // the autoload directories, each checked as unchanged during the run
+        // (its own metadata, as a listing's is).
+        if e.kind == EntryKind::AutoloadMiss {
+            return Ok(());
+        }
+        if e.kind == EntryKind::AutoloadDir {
+            let Some(dir) = e.path.parent() else {
+                return Err(Unverified::Changed(format!(
+                    "{}: not an autoload directory",
+                    e.path
+                )));
+            };
+            let abs = dir.to_abs(&self.root);
+            let now = std::fs::symlink_metadata(&abs).ok().map(|m| key(&m));
+            return match (self.map.get(&abs), now) {
+                (None, None) => Ok(()),
+                (Some(b), Some(n)) if *b == n => Ok(()),
+                _ => Err(Unverified::Changed(format!(
+                    "{dir}: modified during the run"
+                ))),
+            };
+        }
         let rel = e.path.as_str();
         if rel.split('/').any(|c| SKIP_DIRS.contains(&c)) {
             return Err(Unverified::Untracked(format!(

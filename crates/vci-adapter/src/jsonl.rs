@@ -100,14 +100,15 @@ pub struct Observed {
     /// Reasons this file is not attestable.
     pub taints: Vec<String>,
     pub result: Option<TestResult>,
-    /// Rails, `policy.rails_autoload_lookups` (2.5.0): for each autoload
-    /// directory whose listing only defined constants, the constants the
-    /// process looked up and missed in its namespace, as
-    /// `<dir>/.vci-autoload/<name>` (absolute; see
-    /// `vci_core::EntryKind::AutoloadMiss`). Such a directory's listing is
-    /// not an input; one whose namespace's constants were enumerated
-    /// (`Module#constants`) is in `readdirs`.
-    pub autoload_misses: BTreeSet<Utf8PathBuf>,
+    /// Rails, `policy.rails_autoload_lookups` (2.6.0): the directories
+    /// Zeitwerk listed only to define constants (absolute; their listings
+    /// are not inputs, see `vci_core::EntryKind::AutoloadDir`). A directory
+    /// whose namespace's constants were enumerated (`Module#constants`) is
+    /// in `readdirs` instead.
+    pub autoload_dirs: BTreeSet<Utf8PathBuf>,
+    /// The constant names looked up without being loaded, normalized
+    /// (`vci_core::autoload_name`; see `vci_core::EntryKind::AutoloadMiss`).
+    pub autoload_names: BTreeSet<String>,
     /// Rails batch (2.3.0): this output is shard `.0` of `.1` of its file
     /// (its process ran that share of the file's test methods); vci puts a
     /// file's shards together ([`Observed::merge_shards`]).
@@ -221,7 +222,8 @@ impl Observed {
             m.reads.extend(o.reads);
             m.probes.extend(o.probes);
             m.readdirs.extend(o.readdirs);
-            m.autoload_misses.extend(o.autoload_misses);
+            m.autoload_dirs.extend(o.autoload_dirs);
+            m.autoload_names.extend(o.autoload_names);
             m.stats.extend(o.stats);
             m.externals.extend(o.externals);
             m.env_keys.extend(o.env_keys);
@@ -313,7 +315,6 @@ pub fn parse_jsonl_text(text: &str, path: &Utf8Path) -> Observed {
     // Rails autoload records (2.5.0): directory -> namespace, namespace ->
     // missed names, namespaces whose constants were listed.
     let mut autoload_dirs: BTreeMap<Utf8PathBuf, String> = BTreeMap::new();
-    let mut autoload_missed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut autoload_listed: BTreeSet<String> = BTreeSet::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -451,15 +452,14 @@ pub fn parse_jsonl_text(text: &str, path: &Utf8Path) -> Observed {
                 }
                 o.result = Some(r);
             }
-            "autoload_dir" => match (path_of(&mut o), str_field(&v, "ns")) {
-                (Some(p), Some(ns)) => {
-                    autoload_dirs.insert(p, ns);
+            "autoload_dir" => {
+                if let Some(p) = path_of(&mut o) {
+                    autoload_dirs.insert(p, str_field(&v, "ns").unwrap_or_default());
                 }
-                _ => o.taints.push(format!("vci:bad-autoload:{line}")),
-            },
-            "autoload_miss" => match (str_field(&v, "ns"), str_field(&v, "name")) {
-                (Some(ns), Some(name)) if !name.is_empty() => {
-                    autoload_missed.entry(ns).or_default().insert(name);
+            }
+            "autoload_miss" => match str_field(&v, "name").map(|n| vci_core::autoload_name(&n)) {
+                Some(n) if !n.is_empty() && !n.contains('/') && !n.starts_with('.') => {
+                    o.autoload_names.insert(n);
                 }
                 _ => o.taints.push(format!("vci:bad-autoload:{line}")),
             },
@@ -473,18 +473,10 @@ pub fn parse_jsonl_text(text: &str, path: &Utf8Path) -> Observed {
         }
     }
     for (dir, ns) in autoload_dirs {
-        if autoload_listed.contains(&ns) {
+        if autoload_listed.contains(&ns) || o.readdirs.contains(&dir) {
             o.readdirs.insert(dir);
-            continue;
-        }
-        for name in autoload_missed.get(&ns).into_iter().flatten() {
-            let n = vci_core::autoload_name(name);
-            if n.is_empty() || n.contains('/') || n.starts_with('.') {
-                o.readdirs.insert(dir.clone());
-                break;
-            }
-            o.autoload_misses
-                .insert(dir.join(vci_core::AUTOLOAD_MARK).join(n));
+        } else {
+            o.autoload_dirs.insert(dir);
         }
     }
     if !saw_meta || o.test_id.is_empty() {

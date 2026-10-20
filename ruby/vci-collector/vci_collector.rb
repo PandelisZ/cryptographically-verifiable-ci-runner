@@ -115,6 +115,13 @@ module VciCollector
     {}.freeze
   end
   SLOTS_ASKED = ENV["VCI_RAILS_SLOTS_ASKED"] == "1"
+  # policy.rails_autoload_lookups (2.6.0, set by vci): a directory Zeitwerk
+  # lists to define autoloads is recorded as an autoload directory (its
+  # listing is not an input), and the constant names looked up without
+  # loading them (const_missing, const_defined?) as names: the unit runs
+  # again only when an autoload directory gains a child defining one. See
+  # AutoloadLookups.
+  AUTOLOAD_LOOKUPS = ENV["VCI_RAILS_AUTOLOAD_LOOKUPS"] == "1"
   SLOTS_WORKERS = ENV["VCI_RAILS_SLOTS_ASKED"] == "workers"
   # Batch mode: whether the lines every file of a boot (or slot) shares are
   # written once for them all (Batch.share!; VCI_RAILS_SHARED_OUTPUT=0:
@@ -207,9 +214,13 @@ module VciCollector
   @enumerations = [] # [where, method]
   @lp_memo = {}
   @hooks_done = {}
+  @autoload_ns = {}     # autoload directory (abs) => namespace name
+  @autoload_names = {}  # constant name looked up without loading => true
+  @autoload_listed = {} # namespace name whose constants were enumerated => true
 
   class << self
-    attr_reader :records, :taints, :written, :produced, :env_keys, :enumerations, :reals, :pid, :test_id
+    attr_reader :records, :taints, :written, :produced, :env_keys, :enumerations, :reals, :pid, :test_id,
+                :autoload_ns, :autoload_names, :autoload_listed
 
     def collect?
       MODE == "collect"
@@ -336,6 +347,12 @@ module VciCollector
           return
         end
         Batch.loader_check(kind, abs, where) if Batch.on?
+      end
+      if kind == :readdir && AUTOLOAD_LOOKUPS && (ns = Thread.current[:vci_autoload_ns])
+        # Zeitwerk listing a directory to define its autoloads.
+        @autoload_ns[abs] ||= ns
+        @records[[:autoload_dir, abs]] = true
+        return
       end
       @records[[kind, abs]] = true
     end
@@ -2933,6 +2950,106 @@ end
 
 # require/load are hooked in every mode: they install the Rails and Minitest
 # integration as those libraries load (recording only in collect mode).
+# policy.rails_autoload_lookups (2.6.0). Zeitwerk lists a directory to set
+# up an autoload for each constant it defines; with this policy that listing
+# is not an input. What a test depends on instead is the constant names it
+# looked up without loading them, which a file added to an autoload
+# directory could start to define: a miss (const_missing, which a reference,
+# const_get and constantize reach) and const_defined? answering false, or
+# true for an autoload not loaded yet. Names are kept whatever namespace
+# asked (a lookup from Api::V1::FooController that misses `Bar` would find a
+# new app/models/bar.rb lexically). A namespace whose constants are listed
+# (Module#constants) keeps its directories' listings as inputs. Ruby's
+# `defined?(Constant)` is answered without any method vci can hook: the gap
+# the policy documents.
+module VciCollector
+  module AutoloadLookups
+    module ConstHooks
+      def const_missing(name)
+        AutoloadLookups.looked_up(name)
+        super
+      end
+
+      def const_defined?(name, *rest)
+        found = super
+        AutoloadLookups.asked(self, name, found, rest)
+        found
+      end
+
+      def constants(*args)
+        AutoloadLookups.listed(self)
+        super
+      end
+    end
+
+    module ZeitwerkHook
+      private
+
+      def define_autoloads_for_dir(*args, **kw, &blk)
+        prev = Thread.current[:vci_autoload_ns]
+        mod = args[1]
+        Thread.current[:vci_autoload_ns] =
+          VciCollector.quiet { mod.is_a?(Module) ? (Module.instance_method(:name).bind_call(mod) || "?") : "?" }
+        super
+      ensure
+        Thread.current[:vci_autoload_ns] = prev
+      end
+    end
+
+    class << self
+      def recording?
+        AUTOLOAD_LOOKUPS && VciCollector.collect? && !VciCollector.busy?
+      end
+
+      def install
+        return unless AUTOLOAD_LOOKUPS && VciCollector.collect?
+        Module.prepend(ConstHooks)
+      end
+
+      def install_zeitwerk
+        return true unless VciCollector.collect?
+        return false unless ::Zeitwerk::Loader.private_method_defined?(:define_autoloads_for_dir)
+        ::Zeitwerk::Loader.prepend(ZeitwerkHook)
+        true
+      end
+
+      def looked_up(name)
+        return unless recording?
+        VciCollector.quiet { keep(name) }
+      end
+
+      def asked(mod, name, found, rest)
+        return unless recording?
+        VciCollector.quiet do
+          n = name.to_s
+          if !found
+            keep(n) if n.match?(/\A(::)?[A-Z]/)
+          elsif !n.include?("::") && n.match?(/\A[A-Z]/)
+            inherit = rest.empty? ? true : rest[0]
+            keep(n) if Module.instance_method(:autoload?).bind_call(mod, n.to_sym, inherit)
+          end
+        end
+      rescue StandardError
+        nil
+      end
+
+      # Each segment of a constant path, as a name looked up.
+      def keep(name)
+        name.to_s.split("::").each { |seg| VciCollector.autoload_names[seg] = true unless seg.empty? }
+      end
+
+      def listed(mod)
+        return unless recording?
+        VciCollector.quiet do
+          n = Module.instance_method(:name).bind_call(mod)
+          VciCollector.autoload_listed[n] = true if n
+        end
+      end
+    end
+  end
+end
+VciCollector::AutoloadLookups.install
+
 VciCollector.install_kernel_hooks
 
 # ---------------------------------------------------------------------------
@@ -2958,6 +3075,7 @@ module VciCollector
     socket: -> { defined?(::BasicSocket) && install_socket },
     pty: -> { defined?(::PTY) && install_pty },
     fiddle: -> { defined?(::Fiddle::Function) && defined?(::Fiddle::Handle) && install_fiddle },
+    zeitwerk: -> { !AUTOLOAD_LOOKUPS || (defined?(::Zeitwerk::Loader) && AutoloadLookups.install_zeitwerk) },
     ffi: -> { defined?(::FFI::Library) && defined?(::FFI::DynamicLibrary) && install_ffi },
     ffi_variadic: -> { defined?(::FFI::VariadicInvoker) && install_ffi_variadic },
     vips: lambda {
@@ -5404,8 +5522,14 @@ module VciCollector
         next if seen[[kind, p]]
         seen[[kind, p]] = true
         listed[p] = true if kind == :readdir
-        lines << { kind: kind.to_s, path: p }
+        lines << if kind == :autoload_dir
+                   { kind: "autoload_dir", path: p, ns: vc.autoload_ns[abs] || vc.autoload_ns[p] || "" }
+                 else
+                   { kind: kind.to_s, path: p }
+                 end
       end
+      vc.autoload_names.each_key { |n| lines << { kind: "autoload_miss", name: n } }
+      vc.autoload_listed.each_key { |n| lines << { kind: "autoload_listed", ns: n } }
       # Many absent paths under one directory (load path probes): its
       # listing instead (fold_probes).
       lines = fold_probes(lines, seen, listed, written)

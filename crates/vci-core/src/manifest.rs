@@ -49,17 +49,26 @@ pub enum EntryKind {
     /// checkout has no `target/`, and the listing must still match. Whether
     /// it exists is not compared; `hash` is [`excluded_hash`], `size` 0.
     Excluded,
-    /// Rails, `policy.rails_autoload_lookups` (2.5.0): a constant the test's
-    /// process looked up and did not find, in the namespace an autoload
-    /// directory (Zeitwerk's) defines. The path is
-    /// `<directory>/.vci-autoload/<name>` (the name normalized by
-    /// [`autoload_name`]); what matters is whether the directory now has a
-    /// child of that name, which would define the constant: `hash` is
-    /// [`ABSENT_HASH`] when it has none, else the BLAKE3 of the matching
-    /// children's names; `size` is their number. The directory's other
-    /// children are not inputs (a file added there defines a constant no
-    /// lookup of the test asked for).
+    /// Rails, `policy.rails_autoload_lookups` (2.6.0): a constant name the
+    /// test's process looked up without loading it (missed, or asked about
+    /// with `const_defined?`). The path is `.vci-autoload/<name>` (the name
+    /// normalized by [`autoload_name`]); what matters is which children of
+    /// the manifest's autoload directories ([`EntryKind::AutoloadDir`])
+    /// would define it: `hash` is [`ABSENT_HASH`] when none does, else the
+    /// BLAKE3 of their paths; `size` is their number. A file added to an
+    /// autoload directory defines a constant; it matters only when a lookup
+    /// asked for that name.
     AutoloadMiss,
+    /// Rails (2.6.0): a directory Zeitwerk listed only to define constants;
+    /// the path is `<directory>/.vci-autoload`. Its listing is not an input
+    /// (the [`EntryKind::AutoloadMiss`] entries are); `hash` is
+    /// [`autoload_dir_hash`], `size` 0.
+    AutoloadDir,
+}
+
+/// `hash` of an [`EntryKind::AutoloadDir`] entry: BLAKE3 of `autoload-dir`.
+pub fn autoload_dir_hash() -> String {
+    blake3_hex(b"autoload-dir")
 }
 
 /// The name an autoload directory's child defines, or a missed constant,
@@ -91,6 +100,7 @@ impl EntryKind {
             EntryKind::Dir => "t",
             EntryKind::Excluded => "x",
             EntryKind::AutoloadMiss => "m",
+            EntryKind::AutoloadDir => "u",
         }
     }
 
@@ -104,6 +114,7 @@ impl EntryKind {
             "t" => EntryKind::Dir,
             "x" => EntryKind::Excluded,
             "m" => EntryKind::AutoloadMiss,
+            "u" => EntryKind::AutoloadDir,
             _ => return None,
         })
     }
@@ -118,6 +129,7 @@ impl EntryKind {
             EntryKind::Dir => "dir",
             EntryKind::Excluded => "excluded",
             EntryKind::AutoloadMiss => "autoloadMiss",
+            EntryKind::AutoloadDir => "autoloadDir",
         }
     }
 }
@@ -180,6 +192,9 @@ impl InputEntry {
             }
             EntryKind::Dir => "directory".to_owned(),
             EntryKind::Excluded => "excluded (build output, not an input)".to_owned(),
+            EntryKind::AutoloadDir => {
+                "an autoload directory (its listing is not an input)".to_owned()
+            }
             EntryKind::AutoloadMiss if self.size == 0 => {
                 "no file or directory defines the constant".to_owned()
             }
@@ -241,10 +256,12 @@ pub enum Observation {
     /// as [`EntryKind::Excluded`], whether it exists or not, and left out of
     /// its parent directory's listing.
     Exclude,
-    /// Rails (2.5.0): a constant looked up and not found in an autoload
-    /// directory's namespace; the path is `<directory>/.vci-autoload/<name>`
-    /// ([`EntryKind::AutoloadMiss`]).
+    /// Rails (2.6.0): a constant name looked up without loading it; the
+    /// path is `.vci-autoload/<name>` ([`EntryKind::AutoloadMiss`]).
     AutoloadMiss,
+    /// Rails (2.6.0): a directory Zeitwerk listed to define constants; the
+    /// path is `<directory>/.vci-autoload` ([`EntryKind::AutoloadDir`]).
+    AutoloadDir,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -437,17 +454,10 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
-    /// [`EntryKind::AutoloadMiss`] for `path` (`<dir>/.vci-autoload/<name>`):
-    /// the children of `<dir>` whose [`autoload_name`] is `<name>`.
-    fn autoload_miss(&self, path: &RepoPath) -> Result<InputEntry, ManifestError> {
-        let bad = || ManifestError::ConflictingEntries(path.to_string());
-        let mark = path.parent().ok_or_else(bad)?;
-        if mark.components().last() != Some(AUTOLOAD_MARK) {
-            return Err(bad());
-        }
-        let dir = mark.parent().ok_or_else(bad)?;
-        let name = path.components().last().ok_or_else(bad)?.to_owned();
-        let names: Vec<String> = match self {
+    /// The child names of `dir` (none when it is not a directory; a marker
+    /// when it is a symlink, so that its replacement shows).
+    fn child_names(&self, dir: &RepoPath) -> Result<Vec<String>, ManifestError> {
+        Ok(match self {
             Source::Fs(root) => {
                 let abs = dir.to_abs(root);
                 match fs::symlink_metadata(&abs) {
@@ -471,21 +481,39 @@ impl Source<'_> {
                     Err(e) => return Err(io_err(&abs, e)),
                 }
             }
-            Source::Cache(c) => match &*c.node(&dir)? {
-                Node::Dir(d) => c
-                    .children(&dir, d)?
-                    .iter()
-                    .map(|(n, _)| n.clone())
-                    .collect(),
+            Source::Cache(c) => match &*c.node(dir)? {
+                Node::Dir(d) => c.children(dir, d)?.iter().map(|(n, _)| n.clone()).collect(),
                 Node::Symlink { .. } => vec![format!("{AUTOLOAD_MARK}:symlink")],
                 _ => Vec::new(),
             },
-        };
-        let mut hits: Vec<String> = names
-            .into_iter()
-            .filter(|n| n.starts_with(AUTOLOAD_MARK) || autoload_name(n) == name)
-            .collect();
+        })
+    }
+
+    /// [`EntryKind::AutoloadMiss`] for `path` (`.vci-autoload/<name>`): the
+    /// children of the autoload directories `dirs` (their marker paths,
+    /// `<dir>/.vci-autoload`) whose [`autoload_name`] is `<name>`.
+    fn autoload_miss(
+        &self,
+        path: &RepoPath,
+        dirs: &[RepoPath],
+    ) -> Result<InputEntry, ManifestError> {
+        let bad = || ManifestError::ConflictingEntries(path.to_string());
+        let comps: Vec<&str> = path.components().collect();
+        if comps.len() != 2 || comps[0] != AUTOLOAD_MARK {
+            return Err(bad());
+        }
+        let name = comps[1];
+        let mut hits: Vec<String> = Vec::new();
+        for marker in dirs {
+            let dir = marker.parent().ok_or_else(bad)?;
+            for n in self.child_names(&dir)? {
+                if n.starts_with(AUTOLOAD_MARK) || autoload_name(&n) == name {
+                    hits.push(format!("{}/{n}", dir.as_str()));
+                }
+            }
+        }
         hits.sort();
+        hits.dedup();
         let hash = if hits.is_empty() {
             ABSENT_HASH.to_owned()
         } else {
@@ -864,8 +892,22 @@ fn capture_one(
     obs: Observation,
     excl: &Exclusions,
 ) -> Result<Vec<InputEntry>, ManifestError> {
+    if obs == Observation::AutoloadDir {
+        let bad = || ManifestError::ConflictingEntries(path.to_string());
+        if path.components().last() != Some(AUTOLOAD_MARK) || path.parent().is_none() {
+            return Err(bad());
+        }
+        return Ok(vec![InputEntry {
+            path: path.clone(),
+            kind: EntryKind::AutoloadDir,
+            exec: false,
+            size: 0,
+            hash: autoload_dir_hash(),
+        }]);
+    }
     if obs == Observation::AutoloadMiss {
-        return Ok(vec![src.autoload_miss(path)?]);
+        // Captured once every autoload directory is known (capture_from).
+        return Ok(vec![]);
     }
     if obs == Observation::Exclude {
         if path.is_root() {
@@ -877,7 +919,8 @@ fn capture_one(
     let fin = resolve_chain(src, path, &mut out)?;
     let e = src.observe(&fin, obs == Observation::Stat, excl.get(&fin))?;
     match (obs, e.kind) {
-        (Observation::AutoloadMiss, _) | (_, EntryKind::AutoloadMiss) => {
+        (Observation::AutoloadMiss | Observation::AutoloadDir, _)
+        | (_, EntryKind::AutoloadMiss | EntryKind::AutoloadDir) => {
             return Err(ManifestError::ConflictingEntries(fin.to_string()));
         }
         (Observation::Exclude, _) | (_, EntryKind::Excluded) => {
@@ -1001,6 +1044,18 @@ impl InputManifest {
             .map(|(p, o)| capture_one(src, p, *o, &excl))
             .collect::<Result<_, _>>()?;
         let mut entries: Vec<InputEntry> = per_obs.into_iter().flatten().collect();
+        let dirs: Vec<RepoPath> = entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::AutoloadDir)
+            .map(|e| e.path.clone())
+            .collect();
+        if !dirs.is_empty() {
+            for (p, o) in observed {
+                if *o == Observation::AutoloadMiss {
+                    entries.push(src.autoload_miss(p, &dirs)?);
+                }
+            }
+        }
         // A type-only `Dir` is implied by a listing of the same directory.
         let listed: BTreeSet<RepoPath> = entries
             .iter()
@@ -1394,16 +1449,26 @@ impl InputManifest {
         for (parent, names) in exclusions(extra_excluded.iter()) {
             excl.entry(parent).or_default().extend(names);
         }
+        let autoload_dirs: Vec<RepoPath> = self
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::AutoloadDir)
+            .map(|e| e.path.clone())
+            .collect();
         let entry_results: Vec<Option<Mismatch>> = self
             .entries
             .par_iter()
             .map(|exp| {
+                if exp.kind == EntryKind::AutoloadDir {
+                    // Only marks the directory for the lookups.
+                    return Ok(None);
+                }
                 if exp.kind == EntryKind::Excluded {
                     // Not an input: only its parent's listing leaves it out.
                     return Ok(None);
                 }
                 let act = if exp.kind == EntryKind::AutoloadMiss {
-                    src.autoload_miss(&exp.path)?
+                    src.autoload_miss(&exp.path, &autoload_dirs)?
                 } else {
                     src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?
                 };
