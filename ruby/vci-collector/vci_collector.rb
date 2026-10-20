@@ -54,6 +54,9 @@ if ENV.fetch("VCI_RAILS_MODE", "collect") == "collect" && ENV["VCI_OUT"] && !ENV
 end
 
 module VciCollector
+  # When the collector was loaded (the Ruby process's start, near enough):
+  # a batch reports its boot time from here.
+  LOADED_AT = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   # Part of the toolchain (Probe.libs): bumped whenever what the collector
   # records or refuses changes, so an attestation made by an older collector
   # (which may have missed an input) is not accepted where a newer one runs.
@@ -1149,6 +1152,7 @@ module VciCollector
         VciCollector.quiet { File.write(queue, w.to_s) }
         # Every slot's lines say when they were written, from here (ms).
         @batch_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        status(boot_ms: ((@batch_started - VciCollector::LOADED_AT) * 1000).round)
         if root
           @tmp_mark = File.join(OUT.to_s, "batch", "tmp-shared-#{Process.pid}")
           @shared_dirs = VciCollector.quiet { Output.both(TMP) }
@@ -1282,7 +1286,10 @@ module VciCollector
       # Rails' cleanup hooks (parallelize_teardown), as a worker runs them
       # before it exits.
       def cleanup_slot(i)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         rails_hooks(:run_cleanup_hooks).each { |cb| cb.call(i) }
+        status(slot: i, cleanup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round,
+               cleanup_end_at: batch_at)
       rescue Exception => e # rubocop:disable Lint/RescueException
         $stderr.puts "vci_collector: slot #{i}'s cleanup hooks (parallelize_teardown): #{e.class}: #{e.message}"
       end

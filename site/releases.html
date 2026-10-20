@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-2-3">2.2.3</a></td><td>20 Oct 2026</td><td>A Rails batch says how long it booted before its slots and how long the slots' cleanup took</td></tr>
 <tr><td><a href="#v2-2-2">2.2.2</a></td><td>20 Oct 2026</td><td>The cause of the lost pushes: on git before 2.45 the pack consolidation deleted values the job had just written; it now keeps them</td></tr>
 <tr><td><a href="#v2-2-1">2.2.1</a></td><td>19 Oct 2026</td><td>A push first downloads the deletion records in the targets it changes, so one another job wrote for the same key never stops it</td></tr>
 <tr><td><a href="#v2-2-0">2.2.0</a></td><td>19 Oct 2026</td><td>The key says when an attestation was issued and on which tree: a plan downloads one candidate per unit instead of five; <code>vci prune --keep N</code> keeps a unit's newest N per signer</td></tr>
@@ -66,6 +67,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-2-3">2.2.3</h2>
+<p><em>20 October 2026.</em> In a full vex Rails run, one job's Ruby process took 334 s while its slots' last file ended 242 s after the slots started; the other job's took 199 s for 195 s. The 92 s are either the boot before the slots or the slots' cleanup after their last file (Rails' <code>parallelize_teardown</code>, such as dropping each slot's database), and nothing said which. <strong>A Rails batch now prints <code>the batch booted in N s before the slots started; a slot's cleanup took N s at most, the last ending N s after the slots started</code></strong>. No behaviour changes.</p>
 
 <h2 id="v2-2-2">2.2.2</h2>
 <p><em>20 October 2026.</em> 2.2.1 did not stop the lost pushes, and its diagnosis showed why: the object a failing push could not read was a value the job itself had written minutes earlier (its own deletion record, stamped during the run, or a manifest), absent from the remote and from the job's own object database, with no loose file left. The cause is 2.1.15's pack consolidation. After a batched value fetch vci runs <code>git repack --geometric=2 -d</code>, which on git before 2.45 always fails in a partial clone (<code>cannot use internal rev list with --stdin-packs</code>; GitHub's Ubuntu runners have 2.43), so vci fell back to <code>git repack -a -d</code> on every such fetch in CI. That packs a value while vci's local metadata commit reaches it, and the next one deletes it once vci has rewritten that commit (a merge, an undo) but not yet pushed the commit that still holds it. Reproduced on git 2.43 in a partial clone of vex's store: the value is gone after the second repack. <strong>The fallback is now <code>git repack -A -d</code></strong>, which turns such objects loose instead of deleting them; nothing prunes them, since vci runs git with <code>gc.auto=0</code>. A unit test packs a referenced value, moves the ref away and repacks again: it fails with the old fallback and passes with the new one. Git 2.45 and later (laptops) never took this path.</p>

@@ -939,6 +939,17 @@ impl RailsAdapter {
                     .as_bytes(),
                 );
             }
+            // The rest of the Ruby process's time: the boot before the
+            // slots, and the slots' cleanup after their last file.
+            log.extend_from_slice(
+                format!(
+                    "vci: the batch booted in {:.1} s before the slots started; a slot's cleanup took {:.1} s at most, the last ending {:.1} s after the slots started\n",
+                    slots.boot_ms as f64 / 1000.0,
+                    slots.cleanup_ms as f64 / 1000.0,
+                    slots.cleanup_end_at as f64 / 1000.0
+                )
+                .as_bytes(),
+            );
         }
         if !slots.output_ms.is_empty() {
             let n = slots.output_ms.len() as f64;
@@ -1033,6 +1044,12 @@ struct SlotStats {
     file_ms: Vec<u64>,
     slot_ms: BTreeMap<u64, u64>,
     last_at: u64,
+    /// From the Ruby process's start to the slots' start (the boot).
+    boot_ms: u64,
+    /// The longest slot cleanup (parallelize_teardown), and when the last
+    /// one ended (ms after the slots started).
+    cleanup_ms: u64,
+    cleanup_end_at: u64,
     output_ms: Vec<u64>,
     shared_ms: Vec<u64>,
 }
@@ -1133,6 +1150,15 @@ fn read_batch(
         let Some(id) = v.get("id").and_then(Value::as_str) else {
             if let Some(ms) = v.get("setup_ms").and_then(Value::as_u64) {
                 stats.setup_ms = stats.setup_ms.max(ms);
+            }
+            if let Some(ms) = v.get("boot_ms").and_then(Value::as_u64) {
+                stats.boot_ms = stats.boot_ms.max(ms);
+            }
+            if let Some(ms) = v.get("cleanup_ms").and_then(Value::as_u64) {
+                stats.cleanup_ms = stats.cleanup_ms.max(ms);
+            }
+            if let Some(at) = v.get("cleanup_end_at").and_then(Value::as_u64) {
+                stats.cleanup_end_at = stats.cleanup_end_at.max(at);
             }
             continue;
         };
