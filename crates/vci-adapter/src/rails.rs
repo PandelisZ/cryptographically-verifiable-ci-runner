@@ -950,6 +950,17 @@ impl RailsAdapter {
                 )
                 .as_bytes(),
             );
+            if let Some((waited, said, tmp)) = slots.after_slots {
+                log.extend_from_slice(
+                    format!(
+                        "vci: every slot had exited {:.1} s after the slots started; then reading the slots' lines took {:.1} s, checking the shared temp directory {:.1} s\n",
+                        waited as f64 / 1000.0,
+                        said as f64 / 1000.0,
+                        tmp as f64 / 1000.0
+                    )
+                    .as_bytes(),
+                );
+            }
         }
         if !slots.output_ms.is_empty() {
             let n = slots.output_ms.len() as f64;
@@ -1050,6 +1061,10 @@ struct SlotStats {
     /// one ended (ms after the slots started).
     cleanup_ms: u64,
     cleanup_end_at: u64,
+    /// After the slots, in the batch's own process: when every slot had
+    /// exited (ms after the slots started), and how long reading the slots'
+    /// lines and checking the shared temp directory took (ms).
+    after_slots: Option<(u64, u64, u64)>,
     output_ms: Vec<u64>,
     shared_ms: Vec<u64>,
 }
@@ -1159,6 +1174,10 @@ fn read_batch(
             }
             if let Some(at) = v.get("cleanup_end_at").and_then(Value::as_u64) {
                 stats.cleanup_end_at = stats.cleanup_end_at.max(at);
+            }
+            if let Some(a) = v.get("after_slots") {
+                let g = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);
+                stats.after_slots = Some((g("waited_at"), g("said_ms"), g("tmp_ms")));
             }
             continue;
         };

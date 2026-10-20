@@ -1185,12 +1185,18 @@ module VciCollector
           first = st.exitstatus || 1 if first.zero? && !st.success?
           died << "slot #{i} ended (signal #{st.termsig})" if st.signaled?
         end
+        waited_at = batch_at
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         said, stopped = said_lines
+        said_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round
         stopped += died
         # A change there that is gone by now (written and removed while
         # other slots ran) was seen by a slot after a file, or noted when a
         # process of a slot wrote there (slot_wrote).
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         changed = (shared_tmp_changes(shared) | tmp_marked).sort
+        status(after_slots: { waited_at: waited_at, said_ms: said_ms,
+                              tmp_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round })
         files.each do |f|
           if !changed.empty?
             status(id: f, why: "a process of the batch changed #{changed.first(3).join(", ")} in vci's temp " \
