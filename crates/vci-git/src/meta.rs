@@ -122,6 +122,18 @@ const PUSH_ATTEMPTS: u32 = 10;
 /// How many times [`AttestStore::complete_tree`] asks for the subtrees a
 /// fetch of a tree's id left out.
 const COMPLETE_TREE_ROUNDS: usize = 5;
+/// The repack [`AttestStore::consolidate_packs`] runs when the geometric one
+/// fails, as it always does in a partial clone on git before 2.45
+/// (`cannot use internal rev list with --stdin-packs`; Ubuntu 24.04's
+/// 2.43, GitHub's runners). `-A`, never `-a` (2.2.2): `-a -d` deletes the
+/// packed objects no ref reaches, and a value vci wrote is packed while
+/// its local metadata commit reaches it, then unreferenced when vci
+/// rewrites that commit (a merge, an undo) before the push that sends it:
+/// every vex job that lost its attestations to `could not fetch <its own
+/// value> from promisor remote` (no loose object file left) did so this
+/// way. `-A` turns such objects loose instead; nothing prunes them (vci's
+/// git runs with `gc.auto=0`).
+const REPACK_FALLBACK: &[&str] = &["-A", "-d", "-q"];
 /// Attempts of a fetch that loses a ref-lock race to another git process.
 const FETCH_ATTEMPTS: u32 = 5;
 /// Project-target settings that make every `git meta serialize` prune.
@@ -2088,7 +2100,7 @@ impl<'a> AttestStore<'a> {
                 .unwrap_or(false)
         };
         if !repack(&["--geometric=2", "-d", "-q"]) {
-            let _ = repack(&["-a", "-d", "-q"]);
+            let _ = repack(REPACK_FALLBACK);
         }
     }
 
@@ -5005,6 +5017,53 @@ mod tests {
         assert!(
             AttestStore::classify_change("A", "000000", "100644", b"project/k\xff/__value")
                 .is_err()
+        );
+    }
+
+    /// The fallback repack keeps a value that was packed while a ref
+    /// reached it and unreferenced after (2.2.2; `-a -d` deleted it).
+    #[test]
+    fn the_fallback_repack_keeps_a_value_whose_ref_moved_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let git = |args: &[&str], input: Option<&str>| -> String {
+            use std::io::Write;
+            let mut c = std::process::Command::new("git");
+            c.current_dir(d)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped());
+            let mut ch = c.spawn().unwrap();
+            if let Some(i) = input {
+                ch.stdin.take().unwrap().write_all(i.as_bytes()).unwrap();
+            }
+            let out = ch.wait_with_output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"], None);
+        let base = git(
+            &["commit-tree", &git(&["mktree"], Some("")), "-m", "base"],
+            None,
+        );
+        git(&["update-ref", "refs/meta/local/main", &base], None);
+        let v = git(&["hash-object", "-w", "--stdin"], Some("a value vci wrote"));
+        let t = git(&["mktree"], Some(&format!("100644 blob {v}\tv\n")));
+        let c = git(&["commit-tree", &t, "-p", &base, "-m", "serialized"], None);
+        git(&["update-ref", "refs/meta/local/main", &c], None);
+        let mut args = vec!["-c", "gc.auto=0", "repack"];
+        args.extend(REPACK_FALLBACK);
+        git(&args, None);
+        git(&["update-ref", "refs/meta/local/main", &base], None);
+        git(&args, None);
+        assert_eq!(
+            git(&["cat-file", "-t", &v], None),
+            "blob",
+            "the value was deleted"
         );
     }
 
