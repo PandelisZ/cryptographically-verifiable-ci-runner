@@ -2376,6 +2376,16 @@ pub fn run_units(
                 g(&tm_supersede),
                 g(&tm_store)
             );
+            let ns =
+                |i: usize| SUPERSEDE_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+            eprintln!(
+                "vci: timing: {}: supersession thread-seconds: list {:.1}, read payloads {:.1}, moved on {:.1}, manifests {:.1}",
+                project.label(),
+                ns(0),
+                ns(1),
+                ns(2),
+                ns(3)
+            );
         }
         for f in &mine {
             if !seen.contains(f.test_id.as_str()) {
@@ -2452,6 +2462,24 @@ pub fn run_units(
 /// (`live_trees`): a pull request's merge commit is on no ref once the pull
 /// request is squash-merged, yet master's tip has its tree, and master's
 /// next run skips with it; another pull request's run must not delete it.
+/// Where supersession spends its time (`VCI_TIMING=1`), nanoseconds summed
+/// over threads: listing a unit's attestations, reading their payloads,
+/// asking git whether their commits were moved on from, and decoding their
+/// manifests.
+static SUPERSEDE_NS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn supersede_add(i: usize, t: std::time::Instant) {
+    SUPERSEDE_NS[i].fetch_add(
+        t.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn superseded_by(
     store: &AttestStore,
     repo: &vci_git::Repo,
@@ -2469,7 +2497,10 @@ fn superseded_by(
         if e.error.is_some() {
             return true;
         }
-        let Some(m) = crate::cmds::envelope_meta(&e.bytes) else {
+        let t = std::time::Instant::now();
+        let meta = crate::cmds::envelope_meta(&e.bytes);
+        supersede_add(1, t);
+        let Some(m) = meta else {
             return true;
         };
         if m.test_id != p.core.test_id
@@ -2493,10 +2524,13 @@ fn superseded_by(
             .lock()
             .map(|mut c| c.entry(m.commit.clone()).or_default().clone())
             .unwrap_or_default();
+        let t = std::time::Instant::now();
         let moved = *cell.get_or_init(|| repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false));
+        supersede_add(2, t);
         if !moved {
             return true;
         }
+        let t = std::time::Instant::now();
         let old = match &m.manifest_ref {
             // The same root: the same inputs.
             Some(r) if *r == p.core.input_root => return true,
@@ -2508,6 +2542,7 @@ fn superseded_by(
                 .filter(|o| o.root() == *r),
             None => crate::cmds::envelope_inline_manifest(&e.bytes),
         };
+        supersede_add(3, t);
         let Some(old) = old else {
             return true;
         };
@@ -2515,7 +2550,10 @@ fn superseded_by(
         old_entries.sort();
         old_entries == entries
     };
-    match store.list(Some(&p.core.test_id)) {
+    let t = std::time::Instant::now();
+    let listed = store.list(Some(&p.core.test_id));
+    supersede_add(0, t);
+    match listed {
         Ok(all) => all
             .into_iter()
             .filter(|e| e.signer == signer && !keep(e))

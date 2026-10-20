@@ -505,6 +505,12 @@ struct ManifestLoader {
     /// plan fetches them after its first pass and checks their units again
     /// (see `hydrate_for_plan`).
     not_fetched: Mutex<BTreeSet<String>>,
+    /// Base manifests as read from the store, by root: a base is shared by
+    /// a run's units, so every candidate of a full vex plan read the same
+    /// few bases again (2.3.3: half of 150 to 270 thread-seconds of
+    /// manifest reads).
+    #[allow(clippy::type_complexity)]
+    bases: Mutex<BTreeMap<String, Result<Option<StoredManifest>, String>>>,
 }
 
 impl ManifestLoader {
@@ -513,7 +519,34 @@ impl ManifestLoader {
             cache: Mutex::default(),
             readers: (0..readers.max(1)).map(|_| Mutex::new(None)).collect(),
             not_fetched: Mutex::default(),
+            bases: Mutex::default(),
         }
+    }
+
+    /// The base manifest `root`, read once (`read` reads it from the store).
+    fn base(
+        &self,
+        root: &str,
+        read: impl FnOnce() -> Result<Option<StoredManifest>, vci_git::GitError>,
+    ) -> Result<Option<StoredManifest>, vci_git::GitError> {
+        if let Some(b) = self
+            .bases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(root)
+        {
+            return b.clone().map_err(vci_git::GitError::Store);
+        }
+        let got = read();
+        // A base not fetched yet is read again after the plan fetches it.
+        let keep = !matches!(&got, Ok(Some(m)) if m.not_fetched());
+        if keep {
+            self.bases.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                root.to_owned(),
+                got.as_ref().map(Clone::clone).map_err(ToString::to_string),
+            );
+        }
+        got
     }
 
     /// The roots reads found not fetched since the last call.
@@ -524,6 +557,10 @@ impl ManifestLoader {
     /// Forget every read that failed: the next read goes to the store
     /// again (after a round fetched more values).
     fn evict_errors(&self) {
+        self.bases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, b| matches!(b, Ok(Some(m)) if m.error.is_none()));
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.retain(|_, r| r.is_ok());
     }
@@ -531,6 +568,10 @@ impl ManifestLoader {
     /// Forget what was read for these roots (and for the manifests whose
     /// base is one of them): the next read goes to the store again.
     fn evict(&self, roots: &BTreeSet<String>) {
+        self.bases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|root, _| !roots.contains(root));
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.retain(|root, r| {
             !roots.contains(root)
@@ -570,7 +611,10 @@ impl ManifestLoader {
                         .as_ref()
                         .filter(|m| m.error.is_none())
                         .and_then(|m| InputManifest::compact_base(&m.bytes).ok().flatten())
-                        .map(|b| (b.clone(), r.manifest(&b)));
+                        .map(|b| {
+                            let got = self.base(&b, || r.manifest(&b));
+                            (b, got)
+                        });
                     (m, base)
                 }),
                 Err(e) => Err(vci_git::GitError::Store(e.clone())),

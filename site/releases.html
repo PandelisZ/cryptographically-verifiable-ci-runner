@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-3-4">2.3.4</a></td><td>20 Oct 2026</td><td>A plan reads each base manifest once; supersession reports where its time goes</td></tr>
 <tr><td><a href="#v2-3-3">2.3.3</a></td><td>20 Oct 2026</td><td>Supersession asks git about each earlier commit once, with one walk of the refs instead of two</td></tr>
 <tr><td><a href="#v2-3-2">2.3.2</a></td><td>20 Oct 2026</td><td>Supersession checks an older attestation's commit before reading its manifest; a batched fetch merges packs only when they near gix's limit (git 2.43 repacked the whole repository after each)</td></tr>
 <tr><td><a href="#v2-3-1">2.3.1</a></td><td>20 Oct 2026</td><td>Serializing the local metadata writes only the changed entries (git-meta rewrote every input manifest: 18 s a vex push); no merge when the local metadata already descends from the fetched tip</td></tr>
@@ -81,6 +82,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-3-4">2.3.4</h2>
+<p><em>20 October 2026.</em> 2.3.3 on a full vex run did not shorten supersession: 188 and 233 thread-seconds, so asking git about commits was not where its time went. With <code>VCI_TIMING</code>, vci now prints supersession's own parts: listing a unit's attestations, reading their payloads, asking git about their commits, and decoding their manifests. <strong>A plan reads each base manifest once.</strong> A base holds the entries a run's units share; every candidate's manifest names one, and the plan read the same few bases again for each of the 10,283 candidates of a full vex plan, half of its 150 to 270 thread-seconds of manifest reads.</p>
 
 <h2 id="v2-3-3">2.3.3</h2>
 <p><em>20 October 2026.</em> 2.3.2 on a full vex run: serializing the local metadata took 2.2 s and 3.9 s instead of 14 to 18 s, the first job's push needed 6 s before sending instead of 22 s, and the plan's first fetch of 2,018 values took 1.9 s instead of 10 s. The slower job's Rails step took 373 s, down from 436 s. Supersession still took about 210 thread-seconds a job, and not to read manifests. Whether an earlier attestation's commit was moved on from is answered with <code>git for-each-ref --contains</code>, which walks the history of every branch: vex has thousands of remote branches. It ran twice per commit, and the 16 threads that check units at once each asked about the same commits before any answer was cached. <strong>Each commit is now asked about once</strong> (a thread that finds the question being asked waits for the answer), and the cheap ancestry test runs first. When the new commit descends from the old one, the refs holding the old commit but not the new one decide alone, so one walk of the refs replaces two. The answers are the same.</p>
