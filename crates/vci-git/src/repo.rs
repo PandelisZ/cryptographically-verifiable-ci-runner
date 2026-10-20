@@ -282,6 +282,39 @@ impl Repo {
         Err(command_error(&describe, &out))
     }
 
+    /// Write a commit-graph of every commit the refs reach when the
+    /// repository has none (a fresh CI checkout): `git for-each-ref
+    /// --contains` and `git merge-base` then read commits from it instead
+    /// of parsing each one (on vex's history, 0.35 s a question instead of
+    /// 0.04 s). What `git maintenance` or `git gc` keeps anyway; a failure
+    /// (a shallow clone, an old git) only leaves the questions slower.
+    /// Returns whether one was written.
+    pub fn ensure_commit_graph(&self) -> bool {
+        let Ok(info) = self
+            .git()
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects/info",
+            ])
+            .run_str()
+        else {
+            return false;
+        };
+        let info = Utf8PathBuf::from(info);
+        if info.join("commit-graph").exists()
+            || info.join("commit-graphs/commit-graph-chain").exists()
+        {
+            return false;
+        }
+        self.git()
+            .args(["commit-graph", "write", "--reachable", "--no-progress"])
+            .env(NO_LAZY_FETCH, "1")
+            .output_described()
+            .is_ok_and(|(_, out)| out.status.success())
+    }
+
     /// The commits only `new`'s line of history holds: reachable from
     /// `new` and from no branch, remote-tracking branch or tag that does
     /// not contain `new` (the current branch's namesakes on the remotes

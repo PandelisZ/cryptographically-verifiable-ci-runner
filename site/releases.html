@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-3-6">2.3.6</a></td><td>20 Oct 2026</td><td>Supersession writes a commit-graph first when the repository has none, so each question about history reads commits from it</td></tr>
 <tr><td><a href="#v2-3-5">2.3.5</a></td><td>20 Oct 2026</td><td>Supersession finds the commits only this run's commit holds with one walk of the refs, not one per earlier commit</td></tr>
 <tr><td><a href="#v2-3-4">2.3.4</a></td><td>20 Oct 2026</td><td>A plan reads each base manifest once; supersession reports where its time goes</td></tr>
 <tr><td><a href="#v2-3-3">2.3.3</a></td><td>20 Oct 2026</td><td>Supersession asks git about each earlier commit once, with one walk of the refs instead of two</td></tr>
@@ -83,6 +84,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-3-6">2.3.6</h2>
+<p><em>20 October 2026.</em> 2.3.5 did not shorten supersession on vex: its probe ran on a slow runner (checkout alone took 140 s) and spent 400 to 440 thread-seconds asking about commits. vex has 137 branches, not thousands as 2.3.5's notes said, and many earlier attestations were made on other pull requests' commits, which are not ancestors of this one and are still asked about one at a time. What makes each question slow is a fresh checkout with no commit-graph: git then parses every commit it walks. On vex's history, <code>git for-each-ref --contains</code> took 0.35 s without one and 0.04 s with one. <strong>Supersession now writes a commit-graph</strong> (<code>git commit-graph write --reachable</code>) when the repository has none, before its first question; <code>git maintenance</code> and <code>git gc</code> keep one anyway. A failure (a shallow clone, an old git) only leaves the questions as slow as before. With <code>VCI_TIMING</code>, vci prints how long that took, how many commits only this run's commit holds, and how many earlier commits were asked about.</p>
 
 <h2 id="v2-3-5">2.3.5</h2>
 <p><em>20 October 2026.</em> 2.3.4's timing showed where supersession spent its time on a full vex run: <code>supersession thread-seconds: list 11.6, read payloads 0.4, moved on 162.6, manifests 22.8</code>. Asking whether an earlier commit was moved on from walked the history of every branch, remote-tracking branch and tag: vex has thousands. Even asked once per commit, that took most of a job's 200 thread-seconds. <strong>One walk now answers it for every earlier commit.</strong> <code>git for-each-ref --no-contains &lt;commit&gt;</code> lists the refs that do not hold this run's commit, and <code>git rev-list &lt;commit&gt; --not &lt;those refs&gt;</code> lists the commits only this run's line of history holds. An earlier commit that is an ancestor of this one was moved on from exactly when it is among them. Anything else (a commit rebased away, a sibling's) is asked as before. A test checks the two answers agree for every case <code>moved_on</code>'s tests cover.</p>

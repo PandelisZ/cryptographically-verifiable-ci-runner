@@ -2379,12 +2379,13 @@ pub fn run_units(
             let ns =
                 |i: usize| SUPERSEDE_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
             eprintln!(
-                "vci: timing: {}: supersession thread-seconds: list {:.1}, read payloads {:.1}, moved on {:.1}, manifests {:.1}",
+                "vci: timing: {}: supersession thread-seconds: list {:.1}, read payloads {:.1}, moved on {:.1}, manifests {:.1}; {} earlier commit(s) asked about",
                 project.label(),
                 ns(0),
                 ns(1),
                 ns(2),
-                ns(3)
+                ns(3),
+                moved_on.commits.lock().map(|c| c.len()).unwrap_or(0)
             );
         }
         for f in &mine {
@@ -2537,10 +2538,22 @@ fn superseded_by(
             .unwrap_or_default();
         let t = std::time::Instant::now();
         let moved = *cell.get_or_init(|| {
-            match moved_on
-                .only_on
-                .get_or_init(|| repo.only_on(&p.core.commit).ok())
-            {
+            match moved_on.only_on.get_or_init(|| {
+                let t = std::time::Instant::now();
+                let wrote = repo.ensure_commit_graph();
+                let graph = t.elapsed().as_secs_f64();
+                let t = std::time::Instant::now();
+                let only = repo.only_on(&p.core.commit).ok();
+                if std::env::var_os("VCI_TIMING").is_some() {
+                    eprintln!(
+                        "vci: timing: supersession: {} commit-graph {graph:.2}s; {} commit(s) only this run's commit holds: {:.2}s",
+                        if wrote { "wrote a" } else { "no new" },
+                        only.as_ref().map_or_else(|| "?".to_owned(), |o| o.len().to_string()),
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                only
+            }) {
                 Some(only) => repo.moved_on_given(&m.commit, &p.core.commit, only),
                 None => repo.moved_on(&m.commit, &p.core.commit),
             }
