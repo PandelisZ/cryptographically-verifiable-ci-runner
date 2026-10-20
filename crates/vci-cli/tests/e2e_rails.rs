@@ -3046,7 +3046,7 @@ fn rails_long_file_runs_as_shards() {
         String::from("require \"test_helper\"\n\nclass LongTest < ActiveSupport::TestCase\n");
     for i in 1..=6 {
         body.push_str(&format!(
-            "  test \"m{i}\" do\n    sleep 0.05\n    assert true\n  end\n"
+            "  test \"m{i}\" do\n    sleep 0.3\n    assert true\n  end\n"
         ));
     }
     // One method reads a file no other method reads.
@@ -3071,7 +3071,7 @@ fn rails_long_file_runs_as_shards() {
     let sharded: Vec<(&str, &str)> = SLOTS
         .iter()
         .copied()
-        .chain([("VCI_RAILS_SHARD_SECONDS", "0.1"), ("VCI_TIMING", "1")])
+        .chain([("VCI_RAILS_SHARD_SECONDS", "0.5"), ("VCI_TIMING", "1")])
         .collect();
     let out = w.vci_env(&w.work, &args, &sharded);
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));

@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-3-8">2.3.8</a></td><td>20 Oct 2026</td><td>Supersession checks that an earlier commit is present without asking the remote for it (12.7 s per git command on vex's git 2.43)</td></tr>
 <tr><td><a href="#v2-3-7">2.3.7</a></td><td>20 Oct 2026</td><td>With VCI_TIMING, a git command that took 2 s or more is reported, and so is each question supersession asks about a commit</td></tr>
 <tr><td><a href="#v2-3-6">2.3.6</a></td><td>20 Oct 2026</td><td>Supersession writes a commit-graph first when the repository has none, so each question about history reads commits from it</td></tr>
 <tr><td><a href="#v2-3-5">2.3.5</a></td><td>20 Oct 2026</td><td>Supersession finds the commits only this run's commit holds with one walk of the refs, not one per earlier commit</td></tr>
@@ -85,6 +86,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-3-8">2.3.8</h2>
+<p><em>20 October 2026.</em> 2.3.7's timing found supersession's 25 s on vex: <code>slow git: cat-file -e f1c14bcf…^{commit}: 12.67s</code> and <code>slow git: merge-base --is-ancestor f1c14bcf… c78386b7…: 12.70s</code>, for an earlier pull request commit the checkout does not have. Asked about an object it lacks, git asks the promisor remote for it, and git before 2.44 ignores <code>GIT_NO_LAZY_FETCH</code>: Ubuntu's 2.43 went to GitHub several times for each, and every thread checking units waited for the answer. <strong>vci now checks that the commit is present with <code>git rev-list --no-walk --missing=print</code></strong>, which never fetches on any version (vci's store already checked values that way), before any other question about it. A commit the clone lacks is answered as before, without asking git about its history.</p>
 
 <h2 id="v2-3-7">2.3.7</h2>
 <p><em>20 October 2026.</em> 2.3.6 on vex: writing the commit-graph took 0.12 s, finding the commits only the run's commit holds took 0.01 s, and one or two earlier commits were asked about. Yet the threads waiting for those answers spent 330 to 450 thread-seconds, so one answer took about 25 s. The same git commands on a copy of vex take 0.03 s each. With <code>VCI_TIMING</code>, vci now reports any git command that took 2 s or more, and how long each question about an earlier commit took, so the next run says where those 25 s go. Nothing else changes. vex's store cache was also fixed this release cycle (the attest job now keeps loose objects; vex pull request 1862): since 2.3.2 every restore had found the cached store incomplete and rebuilt it.</p>

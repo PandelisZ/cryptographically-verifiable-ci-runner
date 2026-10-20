@@ -282,6 +282,28 @@ impl Repo {
         Err(command_error(&describe, &out))
     }
 
+    /// Whether the object database holds `oid`, asked without fetching it:
+    /// `git cat-file -e` (and `merge-base`) of a commit the clone lacks asks
+    /// the promisor remote for it, and git before 2.44 ignores
+    /// `GIT_NO_LAZY_FETCH` (vex's runners, 2.43: 12.7 s each, two per
+    /// earlier pull request commit supersession asked about). `git rev-list
+    /// --missing=print` never fetches on any version.
+    pub fn has_object(&self, oid: &str) -> Result<bool, GitError> {
+        if !is_oid(oid) {
+            return Ok(false);
+        }
+        let out = self
+            .git()
+            .args(["rev-list", "--no-walk", "--missing=print", oid])
+            .env(NO_LAZY_FETCH, "1")
+            .output_described()?
+            .1;
+        Ok(out.status.success()
+            && String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.trim() == oid))
+    }
+
     /// Write a commit-graph of every commit the refs reach when the
     /// repository has none (a fresh CI checkout): `git for-each-ref
     /// --contains` and `git merge-base` then read commits from it instead
@@ -373,6 +395,9 @@ impl Repo {
         if only.contains(old) {
             return Ok(true);
         }
+        if !self.has_object(old)? {
+            return self.moved_on(old, new);
+        }
         let (_, out) = self
             .git()
             .args(["merge-base", "--is-ancestor", old, new])
@@ -401,13 +426,7 @@ impl Repo {
         if !is_oid(old) || !is_oid(new) || old == new {
             return Ok(false);
         }
-        let (_, out) = self
-            .git()
-            .args(["cat-file", "-e"])
-            .arg(format!("{old}^{{commit}}"))
-            .env(NO_LAZY_FETCH, "1")
-            .output_described()?;
-        if !out.status.success() {
+        if !self.has_object(old)? {
             return Ok(!self.is_shallow()?);
         }
         let namesakes = self.branch_namesakes()?;
