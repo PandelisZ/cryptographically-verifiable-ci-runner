@@ -2031,6 +2031,15 @@ pub fn run_units(
             .iter()
             .map(|f| f.project_rel.clone())
             .collect();
+        // The same durations by project-relative path, for the runner.
+        let last_ms: BTreeMap<String, u64> = mine
+            .iter()
+            .filter_map(|f| {
+                durations
+                    .get(f.test_id.as_str())
+                    .map(|d| (f.project_rel.clone(), *d))
+            })
+            .collect();
         if ctx.projects.len() > 1 {
             eprintln!(
                 "vci: running {} test file(s) of {} ({})",
@@ -2048,7 +2057,9 @@ pub fn run_units(
             } else {
                 None
             };
-            let out = project.adapter.run_collect(&rels, &child.to_child_env())?;
+            let out = project
+                .adapter
+                .run_collect_timed(&rels, &child.to_child_env(), &last_ms)?;
             Ok((go_tree, out))
         })();
         // A project whose run could not be started or collected has no

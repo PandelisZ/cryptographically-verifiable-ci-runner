@@ -3031,6 +3031,90 @@ fn rails_batch_does_not_wait_for_a_leftover_background_process() {
     );
 }
 
+/// A long Minitest file (2.3.0) runs as shards, each a process running a
+/// share of its test methods, when its last run took at least twice
+/// `VCI_RAILS_SHARD_SECONDS`: every method runs once between them, the
+/// file's attestation has every shard's inputs, and a method failing in
+/// one shard fails the file.
+#[test]
+fn rails_long_file_runs_as_shards() {
+    const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
+    let Some(w) = World::new() else { return };
+    let long = "test/slots/long_test.rb";
+    let files = [long, "test/slots/plain_test.rb"];
+    let mut body =
+        String::from("require \"test_helper\"\n\nclass LongTest < ActiveSupport::TestCase\n");
+    for i in 1..=6 {
+        body.push_str(&format!(
+            "  test \"m{i}\" do\n    sleep 0.05\n    assert true\n  end\n"
+        ));
+    }
+    // One method reads a file no other method reads.
+    body.push_str("  test \"reads\" do\n    assert_equal \"ok\", File.read(File.expand_path(\"../fixtures/files/shard_only.txt\", __dir__)).strip\n  end\nend\n");
+    w.put(long, &body);
+    w.put("test/fixtures/files/shard_only.txt", "ok\n");
+    w.put(
+        files[1],
+        "require \"test_helper\"\n\nclass PlainTest < ActiveSupport::TestCase\n  test \"passes\" do\n    assert true\n  end\nend\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "long file"]);
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", key.as_str()]);
+    // The first run records how long the file took.
+    let out = w.vci_env(&w.work, &args, SLOTS);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("run as shards"), "{stderr}");
+    let sharded: Vec<(&str, &str)> = SLOTS
+        .iter()
+        .copied()
+        .chain([("VCI_RAILS_SHARD_SECONDS", "0.1"), ("VCI_TIMING", "1")])
+        .collect();
+    let out = w.vci_env(&w.work, &args, &sharded);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("1 long file(s) run as shards: test/slots/long_test.rb (2)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("run again one process per file"),
+        "{stderr}"
+    );
+    let got = outcomes(&stderr);
+    for f in files {
+        assert_eq!(got.get(f), Some(&None), "{f} not attested:\n{stderr}");
+    }
+    let pred = stored_predicate(&w.work, long);
+    assert_eq!(
+        pred["result"]["tests"], 7,
+        "every method once between the shards: {}",
+        pred["result"]
+    );
+    assert!(
+        manifest_entries(&pred)
+            .iter()
+            .any(|(p, _)| p == "test/fixtures/files/shard_only.txt"),
+        "the shard that read it gave the file the input"
+    );
+    // A method failing in one shard fails the file (it runs again on its
+    // own, and fails there too).
+    w.put("test/fixtures/files/shard_only.txt", "no\n");
+    let out = w.vci_env(&w.work, &args, &sharded);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("run as shards"), "{stderr}");
+    let got = outcomes(&stderr);
+    assert!(
+        got.get(long)
+            .is_some_and(|w| w.as_deref().is_some_and(|w| w.contains("failed"))),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn rails_slot_failure_from_an_earlier_file_passes_on_its_own() {
     const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];

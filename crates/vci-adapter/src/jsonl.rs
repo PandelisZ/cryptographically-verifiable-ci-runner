@@ -100,6 +100,10 @@ pub struct Observed {
     /// Reasons this file is not attestable.
     pub taints: Vec<String>,
     pub result: Option<TestResult>,
+    /// Rails batch (2.3.0): this output is shard `.0` of `.1` of its file
+    /// (its process ran that share of the file's test methods); vci puts a
+    /// file's shards together ([`Observed::merge_shards`]).
+    pub shard: Option<(u32, u32)>,
 }
 
 impl Observed {
@@ -155,6 +159,109 @@ impl Observed {
         }
         n
     }
+}
+
+impl Observed {
+    /// One output for a file run as shards (2.3.0: a Rails batch ran its
+    /// test methods in `k` processes, `shards` their outputs): what any of
+    /// them observed (the union of their inputs, writes and taints) and one
+    /// result (passed only when every shard passed; counts and durations
+    /// added up). `Err` says why they cannot stand for the file: not
+    /// exactly shards `0..k` of one `k`, or outputs that disagree about the
+    /// test id or the toolchain.
+    pub fn merge_shards(mut shards: Vec<Observed>) -> Result<Observed, String> {
+        shards.sort_by_key(|o| o.shard.map(|(s, _)| s));
+        let k = match shards.first().and_then(|o| o.shard) {
+            Some((_, k)) => k,
+            None => return Err("an output without a shard among its shards".into()),
+        };
+        let got: Vec<Option<(u32, u32)>> = shards.iter().map(|o| o.shard).collect();
+        let want: Vec<Option<(u32, u32)>> = (0..k).map(|s| Some((s, k))).collect();
+        if got != want {
+            return Err(format!(
+                "its shards' outputs are {} of {k} (shards {:?})",
+                got.len(),
+                got.iter()
+                    .map(|g| g.map_or_else(|| "none".to_owned(), |(s, k)| format!("{s}/{k}")))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let mut it = shards.into_iter();
+        let mut m = it.next().expect("k >= 1 shards");
+        for o in it {
+            let same = |a: &str, b: &str, what: &str| -> Result<(), String> {
+                if a == b {
+                    Ok(())
+                } else {
+                    Err(format!("its shards disagree about {what} ({a:?}, {b:?})"))
+                }
+            };
+            same(&m.test_id, &o.test_id, "the test id")?;
+            same(&m.project, &o.project, "the project")?;
+            same(&m.root, &o.root, "the root")?;
+            same(&m.adapter, &o.adapter, "the adapter")?;
+            same(&m.runner_version, &o.runner_version, "the runner version")?;
+            same(&m.collector, &o.collector, "the collector")?;
+            same(&m.ruby, &o.ruby, "the Ruby version")?;
+            same(&m.ruby_engine, &o.ruby_engine, "the Ruby engine")?;
+            same(&m.rails, &o.rails, "the Rails version")?;
+            same(&m.ruby_bundler, &o.ruby_bundler, "the Bundler version")?;
+            same(&m.platform, &o.platform, "the platform")?;
+            same(&m.arch, &o.arch, "the architecture")?;
+            m.writes.extend(o.writes);
+            m.modules.extend(o.modules);
+            m.reads.extend(o.reads);
+            m.probes.extend(o.probes);
+            m.readdirs.extend(o.readdirs);
+            m.stats.extend(o.stats);
+            m.externals.extend(o.externals);
+            m.env_keys.extend(o.env_keys);
+            m.platform_files.extend(o.platform_files);
+            m.arch_specific.extend(o.arch_specific);
+            m.cfg_predicates.extend(o.cfg_predicates);
+            for (p, w) in o.path_refs {
+                m.path_refs.entry(p).or_insert(w);
+            }
+            m.excluded.extend(o.excluded);
+            for t in o.taints {
+                if !m.taints.contains(&t) {
+                    m.taints.push(t);
+                }
+            }
+            m.result = match (m.result.take(), o.result) {
+                (Some(a), Some(b)) => Some(TestResult {
+                    state: merged_state(&a.state, &b.state),
+                    tests: a.tests.saturating_add(b.tests),
+                    failed: a.failed.saturating_add(b.failed),
+                    skipped: a.skipped.saturating_add(b.skipped),
+                    duration_ms: a.duration_ms.saturating_add(b.duration_ms),
+                }),
+                _ => None,
+            };
+            if m.shared_group != o.shared_group {
+                m.shared_group = None;
+            }
+        }
+        if m.result.is_none() && !m.taints.iter().any(|t| t == "vci:missing-result") {
+            m.taints.push("vci:missing-result".into());
+        }
+        m.shard = None;
+        Ok(m)
+    }
+}
+
+/// The state of two shards' results together: `failed` if either failed;
+/// a shard that ran no test method (`no-tests`: its share of the file was
+/// empty) counts for nothing; any other state but `passed` (`no-assertions`,
+/// which the file run whole would report too) stands over `passed`.
+fn merged_state(a: &str, b: &str) -> String {
+    let s = match (a, b) {
+        ("failed", _) | (_, "failed") => "failed",
+        ("no-tests", x) | (x, "no-tests") => x,
+        ("passed", x) | (x, "passed") => x,
+        (x, _) => x,
+    };
+    s.to_owned()
 }
 
 /// The real path of `p`, or of its nearest existing ancestor joined with
@@ -243,6 +350,17 @@ pub fn parse_jsonl_text(text: &str, path: &Utf8Path) -> Observed {
                 o.implementation = str_field(&v, "implementation").unwrap_or_default();
                 o.platform = str_field(&v, "platform").unwrap_or_default();
                 o.arch = str_field(&v, "arch").unwrap_or_default();
+                if let Some(sh) = v.get("shard") {
+                    let n = |i: usize| {
+                        sh.get(i)
+                            .and_then(Value::as_u64)
+                            .and_then(|x| u32::try_from(x).ok())
+                    };
+                    match (n(0), n(1)) {
+                        (Some(s), Some(k)) if s < k => o.shard = Some((s, k)),
+                        _ => o.taints.push(format!("vci:bad-shard:{sh}")),
+                    }
+                }
             }
             "write" => {
                 if let Some(p) = path_of(&mut o) {
@@ -329,7 +447,10 @@ pub fn parse_jsonl_text(text: &str, path: &Utf8Path) -> Observed {
         o.taints.push("vci:missing-result".into());
     }
     // The file name must be sha256(testId); anything else is suspicious.
-    let expected = hex::encode(Sha256::digest(o.test_id.as_bytes()));
+    let mut expected = hex::encode(Sha256::digest(o.test_id.as_bytes()));
+    if let Some((s, _)) = o.shard {
+        expected.push_str(&format!(".shard-{s}"));
+    }
     if path.file_stem() != Some(expected.as_str()) {
         o.taints.push("vci:jsonl-name-mismatch".into());
     }
@@ -357,6 +478,70 @@ pub fn parse_jsonl_dir(dir: &Utf8Path) -> Result<Vec<Observed>, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shard(s: u32, k: u32, state: &str, tests: u32, read: &str) -> Observed {
+        Observed {
+            test_id: "test/a_test.rb".into(),
+            shard: Some((s, k)),
+            reads: [Utf8PathBuf::from(read)].into_iter().collect(),
+            result: Some(TestResult {
+                state: state.into(),
+                tests,
+                failed: u32::from(state == "failed"),
+                skipped: 0,
+                duration_ms: 10,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A file's shards stand for it only when they are exactly shards
+    /// 0..k of one k; together they have every shard's inputs and one
+    /// result (a shard with no test method counts for nothing, a failure
+    /// fails the file).
+    #[test]
+    fn shards_merge_only_when_complete() {
+        let m = Observed::merge_shards(vec![
+            shard(1, 3, "passed", 2, "/r/b"),
+            shard(0, 3, "passed", 3, "/r/a"),
+            shard(2, 3, "no-tests", 0, "/r/c"),
+        ])
+        .unwrap();
+        assert_eq!(m.reads.len(), 3);
+        let r = m.result.unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.tests, r.duration_ms),
+            ("passed", 5, 30)
+        );
+        assert_eq!(m.shard, None);
+
+        let m = Observed::merge_shards(vec![
+            shard(0, 2, "passed", 3, "/r/a"),
+            shard(1, 2, "failed", 2, "/r/b"),
+        ])
+        .unwrap();
+        assert_eq!(m.result.unwrap().state, "failed");
+
+        for parts in [
+            vec![
+                shard(0, 3, "passed", 1, "/r/a"),
+                shard(1, 3, "passed", 1, "/r/b"),
+            ],
+            vec![
+                shard(0, 2, "passed", 1, "/r/a"),
+                shard(0, 2, "passed", 1, "/r/b"),
+            ],
+            vec![
+                shard(0, 2, "passed", 1, "/r/a"),
+                shard(1, 3, "passed", 1, "/r/b"),
+            ],
+        ] {
+            assert!(Observed::merge_shards(parts).is_err());
+        }
+        let mut other = shard(1, 2, "passed", 1, "/r/b");
+        other.ruby = "3.4.1".into();
+        assert!(Observed::merge_shards(vec![shard(0, 2, "passed", 1, "/r/a"), other]).is_err());
+    }
 
     /// A collector file reached through a symlinked install prefix is
     /// dropped whichever spelling the collector used; repository files (and

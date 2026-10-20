@@ -99,6 +99,21 @@ module VciCollector
   # (any project); "workers", PARALLEL_WORKERS (as in Rails, it overrides
   # the project's `parallelize(workers:)`). See Batch.slots_for.
   SLOTS = [ENV["VCI_RAILS_SLOTS"].to_i, 1].max
+  # Batch mode (2.3.0): the files vci asks to run as several processes
+  # each, its shards, when a slot runs them (Minitest only): shard s of k
+  # runs the file's test methods whose place in their class's sorted list
+  # (offset by the class) is s modulo k. VCI_RAILS_SHARDS: lines
+  # "<k>\t<test id>", set by vci for a file whose last run took long (one
+  # vex file took 258 s in one process, the end of its job's batch). vci
+  # attests the file only when every shard's output is there and passed.
+  SHARDS = begin
+    (ENV["VCI_RAILS_SHARDS"] || "").split("\n").each_with_object({}) do |l, h|
+      k, id = l.split("\t", 2)
+      h[id] = k.to_i if id && !id.empty? && k.to_i > 1
+    end.freeze
+  rescue StandardError
+    {}.freeze
+  end
   SLOTS_ASKED = ENV["VCI_RAILS_SLOTS_ASKED"] == "1"
   SLOTS_WORKERS = ENV["VCI_RAILS_SLOTS_ASKED"] == "workers"
   # Batch mode: whether the lines every file of a boot (or slot) shares are
@@ -898,6 +913,7 @@ module VciCollector
     @own_fork = false
     @slot = nil
     @slot_tmp = nil
+    @shard = nil
 
     class << self
       # The test id this process runs (a file's process), or nil.
@@ -905,6 +921,8 @@ module VciCollector
       # The index of the slot this process belongs to (a slot's process or
       # a file's process forked from it), or nil; its temp dir, or nil.
       attr_reader :slot, :slot_tmp
+      # In a shard's process: [s, k] (shard s of k of its file), else nil.
+      attr_reader :shard
 
       # Whether this process is a slot running Rails' after-fork hooks
       # (creating and loading its database).
@@ -1213,6 +1231,12 @@ module VciCollector
         end if root
         queue = File.join(OUT.to_s, "batch", "queue-#{Process.pid}")
         VciCollector.quiet { File.write(queue, w.to_s) }
+        # What the slots take, in order: a file, or each shard of a file
+        # vci asked to shard ([file, s, k]).
+        work = files.flat_map do |f|
+          k = RUNNER == "rspec" ? 0 : SHARDS[f].to_i
+          k > 1 ? (0...k).map { |sh| [f, sh, k] } : [[f, nil, nil]]
+        end
         # Every slot's lines say when they were written, from here (ms).
         @batch_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         status(boot_ms: ((@batch_started - VciCollector::LOADED_AT) * 1000).round)
@@ -1242,7 +1266,7 @@ module VciCollector
         pids = []
         w.times do |i|
           pid = fork_own
-          return run_slot(i, files, queue, shared) if pid.nil?
+          return run_slot(i, work, queue, shared) if pid.nil?
           pids << pid
         end
         first = 0
@@ -1264,7 +1288,9 @@ module VciCollector
         changed = (shared_tmp_changes(shared) | tmp_marked).sort
         status(after_slots: { waited_at: waited_at, said_ms: said_ms,
                               tmp_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round })
+        shards_said = shard_lines
         files.each do |f|
+          k = work.count { |w| w[0] == f && w[2] }
           if !changed.empty?
             status(id: f, why: "a process of the batch changed #{changed.first(3).join(", ")} in vci's temp " \
                                "directory, outside its slot's, which any file of its group could have read: " \
@@ -1272,6 +1298,10 @@ module VciCollector
           elsif !said.include?(Json.str(f)[1..-2])
             how = stopped.empty? ? "every slot stopped" : stopped.uniq.first(2).join("; ")
             status(id: f, why: "no slot of the batch ran it (#{how}): it runs on its own")
+          elsif k > 1 && (shards_said[Json.str(f)[1..-2]] || []).uniq.size != k
+            how = stopped.empty? ? "" : " (#{stopped.uniq.first(2).join("; ")})"
+            status(id: f, why: "#{k - (shards_said[Json.str(f)[1..-2]] || []).uniq.size} of its #{k} shards " \
+                               "did not run#{how}: it runs on its own")
           end
         end
         flush
@@ -1316,15 +1346,23 @@ module VciCollector
         first = 0
         nxt = i
         while nxt && nxt < files.size
-          f = files[nxt]
+          f, sh, k = files[nxt]
           before = tmp_entries(@slot_tmp)
           disconnect
           started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           pid = fork_own
-          return f if pid.nil?
+          if pid.nil?
+            if k
+              @shard = [sh, k]
+              shard_methods!
+            end
+            return f
+          end
           _, st = Process.wait2(pid)
-          status(id: f, exit: st.exitstatus, slot: i,
-                 ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round, at: batch_at)
+          line = { id: f, exit: st.exitstatus, slot: i,
+                   ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round, at: batch_at }
+          line[:shard] = [sh, k] if k
+          status(line)
           first = st.exitstatus || 1 if first.zero? && !st.success?
           changed = @slot_tmp ? tmp_cleanup(before, @slot_tmp) : []
           unless changed.empty?
@@ -1465,6 +1503,45 @@ module VciCollector
 
       # What files.jsonl says so far: the ids it has a line of (as Json.str
       # spells them, without the quotes) and the slots' {slot, why} lines.
+      # A shard's test methods (Batch.shard: [s, k]): of each Minitest class,
+      # the methods whose place in the sorted list, offset by a hash of the
+      # class's name, is s modulo k (the k shards of a file run each method
+      # once between them). In Minitest's own order.
+      module ShardMethods
+        def runnable_methods
+          all = super
+          sh = Batch.shard
+          return all unless sh && all.is_a?(Array)
+          s, k = sh
+          off = name.to_s.each_byte.reduce(0) { |a, b| ((a * 31) + b) % 1_000_003 } % k
+          keep = all.sort.each_with_index.filter_map { |m, i| m if (i + off) % k == s }
+          all & keep
+        end
+      end
+
+      # In a shard's process: Minitest runs only its share of the file's
+      # test methods. Without Minitest::Test (nothing to filter) every shard
+      # runs every method: redundant, never short.
+      def shard_methods!
+        return unless defined?(::Minitest::Test) && ::Minitest::Test.respond_to?(:runnable_methods)
+        ::Minitest::Test.singleton_class.prepend(ShardMethods)
+      end
+
+      # The shards each sharded file's processes said they ran, by id (as in
+      # the lines: JSON-escaped): {id => [s, ...]}.
+      def shard_lines
+        out = Hash.new { |h, k| h[k] = [] }
+        VciCollector.quiet do
+          File.readlines(File.join(OUT.to_s, "batch", "files.jsonl")).each do |l|
+            next unless (id = l[/"id":"((?:[^"\\]|\\.)*)"/, 1]) && (sh = l[/"shard":\[(\d+),\d+\]/, 1])
+            out[id] << sh.to_i
+          end
+        end
+        out
+      rescue StandardError
+        {}
+      end
+
       def said_lines
         ids = []
         stops = []
@@ -5246,7 +5323,9 @@ module VciCollector
       lines = lines_of(status, unhooked)
       split = Batch.split(lines)
       require "digest/sha2"
-      File.open(File.join(OUT, "#{Digest::SHA256.hexdigest(VciCollector.test_id)}.jsonl"), "w") do |f|
+      sh = Batch.shard
+      name = "#{Digest::SHA256.hexdigest(VciCollector.test_id)}#{sh ? ".shard-#{sh[0]}" : ""}.jsonl"
+      File.open(File.join(OUT, name), "w") do |f|
         (split || lines).each { |l| f.write(Json.dump(l), "\n") }
       end
       Batch.wrote_output(lines.size, split, started) if started
@@ -5545,7 +5624,7 @@ module VciCollector
         rails: Probe.rails_version, bundler: Probe.bundler_version, runner: Probe.runner_version,
         root: VciCollector.root, platform: RUBY_PLATFORM, collector: "vci_collector@#{VERSION}",
         db: DB.adapters, tz: Tz.source
-      }
+      }.tap { |m| m[:shard] = Batch.shard if Batch.shard }
     end
 
     # The test framework reported results and no failure or error among

@@ -67,6 +67,47 @@ pub const RAILS_PER_FILE_ENV: &str = "VCI_RAILS_PER_FILE";
 /// a batch run, one per line: the collector's batch mode.
 const RAILS_BATCH_ENV: &str = "VCI_RAILS_BATCH";
 
+/// Set by vci for a batch (2.3.0): the files to run as several processes,
+/// each a share of the file's test methods, as lines `<k>\t<test id>`
+/// (see [`shard_counts`]).
+const RAILS_SHARDS_ENV: &str = "VCI_RAILS_SHARDS";
+
+/// In vci's environment: a Minitest file whose last run took at least
+/// twice this many seconds runs as shards of about this long each, at most
+/// one per slot (default 30; 0 turns sharding off).
+const RAILS_SHARD_SECONDS_ENV: &str = "VCI_RAILS_SHARD_SECONDS";
+
+/// How many shards each of `files` runs as (only those with more than one):
+/// a file whose last run (`last_ms`) took at least twice the target
+/// (`VCI_RAILS_SHARD_SECONDS`, default 30 s) runs as `ceil(ms / target)`
+/// shards, at most `slots`. One vex file of 46 tests took 258 s in one
+/// process, the end of its job's batch, where the other 1,032 files had
+/// ended well before.
+fn shard_counts(
+    files: &[&str],
+    last_ms: &BTreeMap<String, u64>,
+    slots: usize,
+) -> BTreeMap<String, u32> {
+    let target = std::env::var(RAILS_SHARD_SECONDS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(30.0);
+    let mut out = BTreeMap::new();
+    if !target.is_finite() || target <= 0.0 || slots < 2 {
+        return out;
+    }
+    let target_ms = target * 1000.0;
+    for f in files {
+        let Some(&ms) = last_ms.get(*f) else { continue };
+        if (ms as f64) < 2.0 * target_ms {
+            continue;
+        }
+        let k = ((ms as f64 / target_ms).ceil() as usize).clamp(2, slots);
+        out.insert((*f).to_owned(), k as u32);
+    }
+    out
+}
+
 /// Set (in vci's environment) to a number: how many slots a batch runs at
 /// once, each a process set up as a Rails parallel worker is (a database of
 /// its own) that forks one process per file. Without it: `PARALLEL_WORKERS`
@@ -598,6 +639,7 @@ impl RailsAdapter {
             "VCI_TEST_ID",
             "VCI_RAILS_BATCH",
             "VCI_RAILS_BATCH_PID",
+            RAILS_SHARDS_ENV,
             "SPRING_SERVER_COMMAND",
         ] {
             c.env_remove(k);
@@ -847,6 +889,7 @@ impl RailsAdapter {
         runner: RailsRunner,
         files: &[&str],
         env: &ChildEnv,
+        shards: &BTreeMap<String, u32>,
     ) -> Result<BatchRun, AdapterError> {
         let dirs = RunDirs::new()?;
         let list = dirs.base.join("batch-files.txt");
@@ -863,6 +906,23 @@ impl RailsAdapter {
         }
         if let Ok(v) = std::env::var(RAILS_SHARED_OUTPUT_ENV) {
             cmd.env(RAILS_SHARED_OUTPUT_ENV, v);
+        }
+        if !shards.is_empty() {
+            let lines: Vec<String> = shards.iter().map(|(f, k)| format!("{k}\t{f}")).collect();
+            cmd.env(RAILS_SHARDS_ENV, lines.join("\n"));
+            if std::env::var_os("VCI_TIMING").is_some() {
+                let mut v: Vec<(&String, &u32)> = shards.iter().collect();
+                v.sort_by_key(|(_, k)| std::cmp::Reverse(**k));
+                eprintln!(
+                    "vci: {} long file(s) run as shards: {}",
+                    shards.len(),
+                    v.iter()
+                        .take(5)
+                        .map(|(f, k)| format!("{f} ({k})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
         // macOS's Objective-C runtime kills a forked process that touches a
         // class another thread was initializing at the fork (vex-api's
@@ -1295,7 +1355,12 @@ fn read_batch(
                     .get("exit")
                     .and_then(Value::as_i64)
                     .and_then(|c| i32::try_from(c).ok());
-                said.entry(id.to_owned()).or_insert(Ok(c));
+                // A sharded file has a line per shard: the first failure
+                // stands.
+                let e = said.entry(id.to_owned()).or_insert(Ok(c));
+                if matches!(e, Ok(Some(0))) && c != Some(0) {
+                    *e = Ok(c);
+                }
             }
         }
     }
@@ -1397,6 +1462,8 @@ fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
     let mut shared = BTreeMap::new();
     let mut own = BTreeMap::new();
     let mut broken = BTreeMap::new();
+    // A sharded file's outputs (2.3.0), put together below.
+    let mut shards: BTreeMap<String, Vec<Observed>> = BTreeMap::new();
     for p in names {
         let text = std::fs::read_to_string(&p)?;
         match merge_shared(&text, out, &mut shared) {
@@ -1406,7 +1473,16 @@ fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
                     &p,
                 );
                 o.shared_group = merged.map(|(name, _)| name);
-                own.insert(o.test_id.clone(), o);
+                if o.shard.is_some() {
+                    shards.entry(o.test_id.clone()).or_default().push(o);
+                } else if own.contains_key(&o.test_id) {
+                    broken.insert(
+                        o.test_id.clone(),
+                        "the batch wrote two outputs of it".to_owned(),
+                    );
+                } else {
+                    own.insert(o.test_id.clone(), o);
+                }
             }
             Err(why) => {
                 let o = parse_jsonl_text(&text, &p);
@@ -1416,6 +1492,23 @@ fn read_batch_outputs(out: &Utf8Path) -> Result<BatchOutputs, AdapterError> {
                         "its output names lines it shares with the other files of its boot, which vci could not read ({why})"
                     ),
                 );
+            }
+        }
+    }
+    for (id, parts) in shards {
+        if own.remove(&id).is_some() {
+            broken.insert(
+                id,
+                "the batch wrote an output of it whole and of its shards".to_owned(),
+            );
+            continue;
+        }
+        match Observed::merge_shards(parts) {
+            Ok(o) => {
+                own.insert(id, o);
+            }
+            Err(why) => {
+                broken.insert(id, why);
             }
         }
     }
@@ -2105,6 +2198,15 @@ impl Adapter for RailsAdapter {
     /// code: the first non-zero one of the files' own processes (`None`: one
     /// died from a signal), never that of a batch's own process.
     fn run_collect(&self, files: &[String], env: &ChildEnv) -> Result<RunOutput, AdapterError> {
+        self.run_collect_timed(files, env, &BTreeMap::new())
+    }
+
+    fn run_collect_timed(
+        &self,
+        files: &[String],
+        env: &ChildEnv,
+        last_ms: &BTreeMap<String, u64>,
+    ) -> Result<RunOutput, AdapterError> {
         let collector = self.collector_file()?;
         if files.len() < 2 || per_file_forced() {
             return per_file_jobs(files, self.jobs(), |f| self.run_one(&collector, f, env));
@@ -2130,7 +2232,12 @@ impl Adapter for RailsAdapter {
                 again.extend(group.iter().map(|f| f.to_string()));
                 continue;
             }
-            let b = self.run_batch(&collector, *runner, group, env)?;
+            let shards = if *runner == RailsRunner::Minitest {
+                shard_counts(group, last_ms, rails_slots().0)
+            } else {
+                BTreeMap::new()
+            };
+            let b = self.run_batch(&collector, *runner, group, env, &shards)?;
             {
                 use std::io::Write as _;
                 let _ = std::io::stderr().write_all(&b.log);
