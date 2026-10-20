@@ -875,6 +875,12 @@ impl RailsAdapter {
             cmd.env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
         }
         let timing = std::env::var_os("VCI_TIMING").is_some();
+        // When the process starts (wall clock, ms): the collector reports
+        // how long the process took to reach its slots from here, which
+        // includes what runs before the collector is loaded.
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            cmd.env("VCI_BATCH_SPAWNED_MS", d.as_millis().to_string());
+        }
         let t = std::time::Instant::now();
         // The batch's output goes to files and vci waits for the Ruby
         // process itself, not for its pipes to close (2.2.6): a test that
@@ -972,6 +978,15 @@ impl RailsAdapter {
                 )
                 .as_bytes(),
             );
+            if let Some(ms) = slots.spawn_to_slots_ms {
+                log.extend_from_slice(
+                    format!(
+                        "vci: the batch's process reached its slots {:.1} s after vci started it\n",
+                        ms as f64 / 1000.0
+                    )
+                    .as_bytes(),
+                );
+            }
             if let Some((waited, said, tmp)) = slots.after_slots {
                 log.extend_from_slice(
                     format!(
@@ -1077,8 +1092,11 @@ struct SlotStats {
     file_ms: Vec<u64>,
     slot_ms: BTreeMap<u64, u64>,
     last_at: u64,
-    /// From the Ruby process's start to the slots' start (the boot).
+    /// From the collector's load to the slots' start (the boot).
     boot_ms: u64,
+    /// From vci starting the Ruby process to the slots' start (wall
+    /// clock): the boot plus what ran before the collector was loaded.
+    spawn_to_slots_ms: Option<u64>,
     /// The longest slot cleanup (parallelize_teardown), and when the last
     /// one ended (ms after the slots started).
     cleanup_ms: u64,
@@ -1190,6 +1208,9 @@ fn read_batch(
             }
             if let Some(ms) = v.get("boot_ms").and_then(Value::as_u64) {
                 stats.boot_ms = stats.boot_ms.max(ms);
+            }
+            if let Some(ms) = v.get("spawn_to_slots_ms").and_then(Value::as_u64) {
+                stats.spawn_to_slots_ms = Some(ms);
             }
             if let Some(ms) = v.get("cleanup_ms").and_then(Value::as_u64) {
                 stats.cleanup_ms = stats.cleanup_ms.max(ms);

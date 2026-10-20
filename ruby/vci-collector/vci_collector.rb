@@ -1153,6 +1153,10 @@ module VciCollector
         # Every slot's lines say when they were written, from here (ms).
         @batch_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         status(boot_ms: ((@batch_started - VciCollector::LOADED_AT) * 1000).round)
+        spawned = VciCollector.quiet { ENV["VCI_BATCH_SPAWNED_MS"] }.to_s
+        if spawned.match?(/\A\d+\z/)
+          status(spawn_to_slots_ms: [(Time.now.to_f * 1000).round - spawned.to_i, 0].max)
+        end
         if root
           @tmp_mark = File.join(OUT.to_s, "batch", "tmp-shared-#{Process.pid}")
           @shared_dirs = VciCollector.quiet { Output.both(TMP) }
