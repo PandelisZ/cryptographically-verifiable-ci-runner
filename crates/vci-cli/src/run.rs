@@ -2458,7 +2458,7 @@ fn superseded_by(
     p: &VciPredicate,
     manifest: &InputManifest,
     signer: &str,
-    moved_on: &std::sync::Mutex<BTreeMap<String, bool>>,
+    moved_on: &std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::OnceLock<bool>>>>,
     live_trees: &BTreeSet<String>,
 ) -> Vec<vci_git::StoredEnvelope> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
@@ -2486,17 +2486,14 @@ fn superseded_by(
         // before reading its manifest (2.3.1: decoding every older
         // attestation's manifest first took about 215 thread-seconds of a
         // full vex job, where most were made on commits others contain).
-        let cached = moved_on
+        // Asked once per commit: a thread that finds another asking waits
+        // for its answer (16 threads used to ask about the same commits at
+        // once, each walking every ref's history).
+        let cell = moved_on
             .lock()
-            .map(|c| c.get(&m.commit).copied())
-            .unwrap_or(None);
-        let moved = cached.unwrap_or_else(|| {
-            let moved = repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false);
-            if let Ok(mut c) = moved_on.lock() {
-                c.insert(m.commit.clone(), moved);
-            }
-            moved
-        });
+            .map(|mut c| c.entry(m.commit.clone()).or_default().clone())
+            .unwrap_or_default();
+        let moved = *cell.get_or_init(|| repo.moved_on(&m.commit, &p.core.commit).unwrap_or(false));
         if !moved {
             return true;
         }

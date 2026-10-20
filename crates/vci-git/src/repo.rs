@@ -310,23 +310,25 @@ impl Repo {
         }
         let namesakes = self.branch_namesakes()?;
         let counts = |r: &str| namesakes.iter().any(|n| n == r) || r.ends_with("/HEAD");
-        let holders = self
-            .git()
-            .args(["for-each-ref", "--format=%(refname)", "--contains", old])
-            .args(["refs/heads", "refs/remotes", "refs/tags"])
-            .env(NO_LAZY_FETCH, "1")
-            .run_str()?;
-        if holders.lines().all(counts) {
-            // On no ref (namesakes aside): rebased or amended away.
-            return Ok(true);
-        }
+        // The ancestry test first (cheap): when `new` descends from `old`,
+        // the refs holding `old` but not `new` decide alone (were none of
+        // them holding `old` at all, none holds it without `new` either),
+        // so one walk of every ref's history instead of two (vex has
+        // thousands of remote branches: 2.3.2).
         let (_, out) = self
             .git()
             .args(["merge-base", "--is-ancestor", old, new])
             .env(NO_LAZY_FETCH, "1")
             .output_described()?;
         if out.status.code() != Some(0) {
-            return Ok(false);
+            let holders = self
+                .git()
+                .args(["for-each-ref", "--format=%(refname)", "--contains", old])
+                .args(["refs/heads", "refs/remotes", "refs/tags"])
+                .env(NO_LAZY_FETCH, "1")
+                .run_str()?;
+            // On no ref (namesakes aside): rebased or amended away.
+            return Ok(holders.lines().all(counts));
         }
         let others = self
             .git()
