@@ -4917,6 +4917,15 @@ impl<'a> AttestStore<'a> {
     /// not have: what the pack must send, found by comparing the trees
     /// (`git diff-tree`) rather than by git's object walk, which stops
     /// silently under a subtree it cannot read.
+    ///
+    /// And `tip`'s blobs at the paths `pushed` modifies (2.6.5): a push over
+    /// https always builds a thin pack (git's https helper ignores
+    /// `--no-thin`), whose delta search takes the tip's object at each
+    /// modified path as a base and first fetches every one this clone
+    /// lacks from the promisor, which vci's has no URL. Every vex full run
+    /// since 2.6.2 rewrote a few thousand deletion records and failed ten
+    /// pushes on `could not fetch <the tip's old record> from promisor
+    /// remote`, one record an attempt.
     fn changed_blobs_missing(
         &self,
         pushed: &str,
@@ -4936,9 +4945,18 @@ impl<'a> AttestStore<'a> {
             .filter_map(|l| {
                 // :<mode> <mode> <old> <new> <status>\t<path>
                 let mut f = l.strip_prefix(':')?.split_whitespace();
-                let (_, _, _, new) = (f.next()?, f.next()?, f.next()?, f.next()?);
-                is_oid(new).then(|| new.to_owned())
+                let (_, _, old, new) = (f.next()?, f.next()?, f.next()?, f.next()?);
+                let based = f.next() == Some("M") && is_oid(old);
+                Some(
+                    [
+                        is_oid(new).then(|| new.to_owned()),
+                        based.then(|| old.to_owned()),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )
             })
+            .flatten()
             .collect();
         if blobs.is_empty() {
             return Ok(blobs);

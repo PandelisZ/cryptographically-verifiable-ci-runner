@@ -2749,7 +2749,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vci-adapter"
-version = "2.6.4"
+version = "2.6.5"
 dependencies = [
  "base64",
  "camino",
@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "vci-attest"
-version = "2.6.4"
+version = "2.6.5"
 dependencies = [
  "base64",
  "camino",
@@ -2786,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "vci-cli"
-version = "2.6.4"
+version = "2.6.5"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2812,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "vci-core"
-version = "2.6.4"
+version = "2.6.5"
 dependencies = [
  "blake3",
  "camino",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "vci-git"
-version = "2.6.4"
+version = "2.6.5"
 dependencies = [
  "base64",
  "camino",
