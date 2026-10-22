@@ -122,6 +122,14 @@ module VciCollector
   # again only when an autoload directory gains a child defining one. See
   # AutoloadLookups.
   AUTOLOAD_LOOKUPS = ENV["VCI_RAILS_AUTOLOAD_LOOKUPS"] == "1"
+
+  # Batch mode (2.7.2): seconds a file's process may run in a slot before
+  # it is stopped (VCI_RAILS_FILE_TIMEOUT, default 600; 0: no limit). A file
+  # past it is reported as timed out (not attested, not run again); a file
+  # still running after two minutes is named on stderr. Before, one hung
+  # file held a job with no output until the job's own timeout (vex's
+  # master attest, Oct 22: 75 minutes).
+  FILE_TIMEOUT = Integer(ENV.fetch("VCI_RAILS_FILE_TIMEOUT", "600"), exception: false) || 600
   SLOTS_WORKERS = ENV["VCI_RAILS_SLOTS_ASKED"] == "workers"
   # Batch mode: whether the lines every file of a boot (or slot) shares are
   # written once for them all (Batch.share!; VCI_RAILS_SHARED_OUTPUT=0:
@@ -1375,9 +1383,12 @@ module VciCollector
             end
             return f
           end
+          watch = watch_file(pid, f)
           _, st = Process.wait2(pid)
+          watch&.dig(:thread)&.kill
           line = { id: f, exit: st.exitstatus, slot: i,
                    ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round, at: batch_at }
+          line[:timed_out] = FILE_TIMEOUT if watch&.dig(:fired)
           line[:shard] = [sh, k] if k
           status(line)
           first = st.exitstatus || 1 if first.zero? && !st.success?
@@ -1404,6 +1415,34 @@ module VciCollector
         raise if @target
         $stderr.puts "vci_collector: batch slot #{i}: #{e.class}: #{e.message}"
         Process.exit!(1)
+      end
+
+      # A thread that names the file `pid` runs after two minutes and stops
+      # it after FILE_TIMEOUT seconds (TERM, then KILL ten seconds later);
+      # `fired` says it did. Nil without a limit.
+      def watch_file(pid, f)
+        return nil unless FILE_TIMEOUT.positive?
+
+        state = { fired: false }
+        slot = @slot
+        state[:thread] = Thread.new do
+          warn_at = [120, FILE_TIMEOUT].min
+          sleep warn_at
+          if warn_at < FILE_TIMEOUT
+            $stderr.puts "vci_collector: #{f} still running after #{warn_at}s (slot #{slot})"
+            sleep FILE_TIMEOUT - warn_at
+          end
+          state[:fired] = true
+          $stderr.puts "vci_collector: #{f} ran past #{FILE_TIMEOUT}s (VCI_RAILS_FILE_TIMEOUT) in slot #{slot}; stopping it"
+          begin
+            Process.kill("TERM", pid)
+            sleep 10
+            Process.kill("KILL", pid)
+          rescue Errno::ESRCH
+            nil
+          end
+        end
+        state
       end
 
       # Milliseconds since the slots were started (`run_slots`).

@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-2">2.7.2</a></td><td>22 Oct 2026</td><td>A Rails test file that runs past <code>VCI_RAILS_FILE_TIMEOUT</code> (default 10 min) is stopped, fails and is not attested, instead of holding the job with no output until the job times out</td></tr>
 <tr><td><a href="#v2-7-1">2.7.1</a></td><td>22 Oct 2026</td><td>A push onto a tip the remote has moved past is skipped after one <code>ls-remote</code> instead of sending the whole history to be rejected (about 70 s each on vex); a CI job no longer repacks the whole repository before it pushes</td></tr>
 <tr><td><a href="#v2-7-0">2.7.0</a></td><td>22 Oct 2026</td><td>Editing <code>vci.toml</code> no longer runs every test again: only a project's own settings are an input of its units. A project the checkout lacks is left out instead of running everything, and a restored store whose local commit lacks trees gets them from the remote</td></tr>
 <tr><td><a href="#v2-6-5">2.6.5</a></td><td>20 Oct 2026</td><td>A push over https first fetches the tip's versions of the values it changes: git's https helper always builds a thin pack, which takes them as delta bases (every vex full run since 19:48 failed ten pushes)</td></tr>
@@ -98,6 +99,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-2">2.7.2</h2>
+<p><em>22 October 2026.</em> vex's master attest of its 2,033 Rails files printed "running 2033 test file(s)" and then nothing for 75 minutes, until the step's timeout ended it: a test process that never finished holds its slot, and the batch waits for every slot. The pull request jobs, about 1,000 files each, run in about 5 minutes. <strong>A file's process now has a limit</strong>, <code>VCI_RAILS_FILE_TIMEOUT</code> seconds (default 600, <code>0</code>: none), in a batch's slot (a watchdog thread in the slot names a file still running after two minutes and stops it at the limit) and when it runs on its own (vci stops its process group). A stopped file fails, is not attested and is not run again on its own, where it would hang the same way; the batch's other files finish and are attested.</p>
 
 <h2 id="v2-7-1">2.7.1</h2>
 <p><em>22 October 2026.</em> Two costs in vex's Rails jobs, after a week in which a job with vci took a median 6.7 min against 4.2 without. <strong>A push the remote was going to reject took about 70 s</strong>, one that landed 7 s: when another job pushed after this one's fetch, git does not have the remote's new tip, cannot use it as the common base, and sends the whole metadata history before GitHub refuses the update. With two partitions and master's attest job finishing together, the jobs spent minutes in such attempts, and one ran out its time. Now vci asks the remote for its tip (one <code>ls-remote</code>) right before pushing and, when it moved, merges onto the new one at once. <strong>A job repacked the whole repository before pushing</strong> (17 to 19 s on git 2.43): it starts with a restored store's packs and adds one per value fetch, so it crossed the 16 packs at which vci merges them. That limit is now 24, still clear of the 32 pack slots gix opens a repository with.</p>

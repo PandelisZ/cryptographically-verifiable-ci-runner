@@ -131,6 +131,67 @@ pub const RAILS_JOBS_ENV: &str = "VCI_RAILS_JOBS";
 /// Env vars (of the Ruby process): the slots of a batch run (see
 /// [`RAILS_JOBS_ENV`]), and what asked for them ([`rails_slots`]).
 const RAILS_SLOTS_ENV: &str = "VCI_RAILS_SLOTS";
+/// Seconds a test file's process may run before it is stopped (2.7.2;
+/// default 600, 0: no limit): in a batch's slot (the collector's watchdog)
+/// and when it runs on its own. A stopped file fails and is not attested.
+const RAILS_FILE_TIMEOUT_ENV: &str = "VCI_RAILS_FILE_TIMEOUT";
+
+fn file_timeout_secs() -> u64 {
+    std::env::var(RAILS_FILE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(600)
+}
+
+/// `cmd`'s output, stopping it (its whole process group) after `secs`
+/// seconds (0: no limit); whether it was stopped.
+fn output_within(cmd: &mut Command, secs: u64) -> std::io::Result<(std::process::Output, bool)> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    if secs == 0 {
+        return cmd.output().map(|o| (o, false));
+    }
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn()?;
+    let pipe = |r: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut b);
+            }
+            b
+        })
+    };
+    let out = pipe(child.stdout.take().map(|r| Box::new(r) as _));
+    let err = pipe(child.stderr.take().map(|r| Box::new(r) as _));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut stopped = false;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if std::time::Instant::now() >= deadline {
+            stopped = true;
+            // The group: a test's own children would keep the pipes open.
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{}", child.id())])
+                .status();
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    Ok((
+        std::process::Output {
+            status,
+            stdout: out.join().unwrap_or_default(),
+            stderr: err.join().unwrap_or_default(),
+        },
+        stopped,
+    ))
+}
 const RAILS_SLOTS_ASKED_ENV: &str = "VCI_RAILS_SLOTS_ASKED";
 
 /// Set to `0` (in vci's environment; passed on to the Ruby process): in a
@@ -846,7 +907,8 @@ impl RailsAdapter {
         let mut cmd = self.test_cmd(env, "collect", &dirs, collector, runner, &[file]);
         cmd.env("VCI_OUT", dirs.out.as_str())
             .env("VCI_TEST_ID", file);
-        let out = cmd.output().map_err(|e| self.not_installed(e))?;
+        let limit = file_timeout_secs();
+        let (out, stopped) = output_within(&mut cmd, limit).map_err(|e| self.not_installed(e))?;
         let mut log = format!(
             "vci: {} (exit {})\n",
             describe(&cmd),
@@ -857,6 +919,13 @@ impl RailsAdapter {
         .into_bytes();
         log.extend_from_slice(&out.stdout);
         log.extend_from_slice(&out.stderr);
+        if stopped {
+            log.extend_from_slice(
+                format!("vci: {file}: its process ran past {limit} s and was stopped ({RAILS_FILE_TIMEOUT_ENV}); not attested\n")
+                    .as_bytes(),
+            );
+            return Ok((None, Vec::new(), log));
+        }
         let mut files = parse_jsonl_dir(&dirs.out)?;
         exit_code_must_agree(&mut files, out.status.code());
         Ok((out.status.code(), files, log))
@@ -913,7 +982,8 @@ impl RailsAdapter {
         let (slots, asked) = rails_slots();
         cmd.env("VCI_OUT", dirs.out.as_str())
             .env(RAILS_BATCH_ENV, list.as_str())
-            .env(RAILS_SLOTS_ENV, slots.to_string());
+            .env(RAILS_SLOTS_ENV, slots.to_string())
+            .env(RAILS_FILE_TIMEOUT_ENV, file_timeout_secs().to_string());
         if let Some(asked) = asked {
             cmd.env(RAILS_SLOTS_ASKED_ENV, asked);
         }
@@ -1305,6 +1375,8 @@ fn read_batch(
     // id => the slot that ran it.
     let mut slot_of: BTreeMap<String, u64> = BTreeMap::new();
     let mut slots: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // id => the limit its process ran past (VCI_RAILS_FILE_TIMEOUT, 2.7.2).
+    let mut timed_out: BTreeMap<String, u64> = BTreeMap::new();
     let mut stats = SlotStats::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -1348,6 +1420,9 @@ fn read_batch(
             }
             continue;
         };
+        if let Some(t) = v.get("timed_out").and_then(Value::as_u64) {
+            timed_out.insert(id.to_owned(), t);
+        }
         match v.get("why").and_then(Value::as_str) {
             // A why stands, whatever was said of the file before.
             Some(why) => {
@@ -1397,6 +1472,17 @@ fn read_batch(
     let mut fallback = Vec::new();
     let mut code = Some(0);
     for f in files {
+        // A file stopped for running too long fails, is not attested and
+        // does not run again on its own (it would hang there too).
+        if let Some(t) = timed_out.get(*f) {
+            eprintln!(
+                "vci: {f}: its process ran past {t} s and was stopped (VCI_RAILS_FILE_TIMEOUT); not attested"
+            );
+            code = None;
+            said.remove(*f);
+            own.remove(*f);
+            continue;
+        }
         let c = match said.remove(*f) {
             None => {
                 fallback.push((

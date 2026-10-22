@@ -3594,3 +3594,56 @@ fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
     let ex = w.explain(&work, plain, "main");
     assert!(ex.contains("autoload lookups"), "{ex}");
 }
+
+/// A file whose process runs past `VCI_RAILS_FILE_TIMEOUT` (2.7.2) is
+/// stopped in its slot, fails, is not attested and does not run again on
+/// its own; the batch's other files finish and are attested. Before, one
+/// hung file held the job with no output until the job's own timeout.
+#[test]
+fn rails_file_past_the_timeout_is_stopped() {
+    let Some(w) = World::new() else { return };
+    let hung = "test/slots/hung_test.rb";
+    let files = [hung, "test/slots/fine_test.rb"];
+    w.put(
+        hung,
+        "require \"test_helper\"\n\nclass HungTest < ActiveSupport::TestCase\n  test \"hangs\" do\n    sleep 60\n  end\nend\n",
+    );
+    w.put(
+        files[1],
+        "require \"test_helper\"\n\nclass FineTest < ActiveSupport::TestCase\n  test \"passes\" do\n    assert true\n  end\nend\n",
+    );
+    w.git(&w.work, &["add", "-A"]);
+    w.git(&w.work, &["commit", "-q", "-m", "hung file"]);
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let mut args = vec!["run"];
+    args.extend(files);
+    args.extend(["--key", key.as_str()]);
+    let t = std::time::Instant::now();
+    let out = w.vci_env(
+        &w.work,
+        &args,
+        &[
+            ("VCI_RAILS_PER_FILE", "0"),
+            ("VCI_RAILS_JOBS", "2"),
+            ("VCI_RAILS_FILE_TIMEOUT", "3"),
+        ],
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        t.elapsed().as_secs() < 45,
+        "took {:?}:\n{stderr}",
+        t.elapsed()
+    );
+    assert_ne!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("test/slots/hung_test.rb: its process ran past 3 s and was stopped"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("run again one process per file"),
+        "{stderr}"
+    );
+    let got = outcomes(&stderr);
+    assert_eq!(got.get(files[1]), Some(&None), "{stderr}");
+    assert_ne!(got.get(hung), Some(&None), "{stderr}");
+}
