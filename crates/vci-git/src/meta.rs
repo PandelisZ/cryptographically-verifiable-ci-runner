@@ -152,7 +152,13 @@ const FETCH_BLOB_PARALLEL_MIN: usize = 4000;
 
 /// Packs in the object database from which a batched fetch merges them
 /// (gix, which git-meta reads it with, has 32 pack slots at least).
-const PACKS_BEFORE_REPACK: usize = 16;
+///
+/// 2.7.1: 24 (was 16). A vex CI job starts with a restored store's packs
+/// and adds one per value fetch, so it crossed 16 before its push and spent
+/// 17 to 19 s in a whole-repository repack (git 2.43) minutes before the
+/// job ended. A batched fetch adds at most a few packs, so 24 still keeps
+/// clear of 32.
+const PACKS_BEFORE_REPACK: usize = 24;
 
 /// How many `git fetch` processes [`AttestStore`] runs at once for values:
 /// `VCI_FETCH_JOBS`, default 4.
@@ -4756,6 +4762,27 @@ impl<'a> AttestStore<'a> {
                         t.elapsed().as_secs_f64()
                     );
                 }
+            }
+            // 2.7.1: a push onto a tip the remote has moved past is rejected,
+            // but only after git sent the whole metadata history: git takes
+            // the remote's advertised tip as the common base only when this
+            // clone has it, and it does not have a tip pushed since its
+            // fetch (vex: about 70 s for each such attempt, 7 s for a push
+            // that lands). One `ls-remote` first; when the tip moved, merge
+            // onto the new one straight away.
+            if attempt < PUSH_ATTEMPTS
+                && self
+                    .remote_tip_moved(&name, &remote_ref, tip.as_deref())
+                    .unwrap_or(false)
+            {
+                last = format!("{name}'s {remote_ref} moved since this round's fetch");
+                if timing {
+                    vci_core::timing_line!(
+                        "push: attempt {attempt}: {remote_ref} moved since the fetch; merging again before pushing"
+                    );
+                }
+                carried = std::mem::take(&mut report.notes);
+                continue;
             }
             let t = std::time::Instant::now();
             before_push(attempt);
