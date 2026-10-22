@@ -1,6 +1,6 @@
 //! Global inputs of a test file: things every test depends on that the
 //! collectors do not report per file (lockfiles, package.json, tsconfig chain,
-//! runner config and what it imports, vci.toml) plus the test's own snapshot
+//! runner config and what it imports) plus the test's own snapshot
 //! files. Present files are recorded as reads, missing ones as probes, so that
 //! creating one later also changes the global input root.
 //!
@@ -17,7 +17,6 @@ use serde_json::Value;
 use vci_adapter::Adapter;
 use vci_core::{Observation, RepoPath};
 
-use crate::config::CONFIG_FILE;
 use crate::util::strip_jsonc;
 
 const PACKAGE_FILES: &[&str] = &[
@@ -312,7 +311,7 @@ pub fn module_context_with<'a>(
 /// (a uv workspace keeps `uv.lock` at its root).
 const PYTHON_PROJECT_FILES: &[&str] = &["pyproject.toml", "uv.lock", ".python-version", "uv.toml"];
 
-/// Global observations for a pytest test file: `vci.toml`; `pyproject.toml`,
+/// Global observations for a pytest test file: `pyproject.toml`,
 /// `uv.lock`, `.python-version` and `uv.toml` from the project dir up to
 /// the repo root; and, in every directory from the test file's directory up
 /// to the project dir, every pytest config file name and `conftest.py`.
@@ -357,7 +356,7 @@ fn pytest_observations(
 /// change which modules are used.
 const GO_PROJECT_FILES: &[&str] = &["go.mod", "go.sum", "go.work", "go.work.sum"];
 
-/// Global observations for a Go package: `vci.toml`; `go.mod`, `go.sum`,
+/// Global observations for a Go package: `go.mod`, `go.sum`,
 /// `go.work`, `go.work.sum` from the project dir up to the repo root; and
 /// `vendor/modules.txt` in the project dir (its presence switches the build
 /// to the vendor directory). Present files are reads, missing ones probes.
@@ -388,7 +387,7 @@ const CARGO_PROJECT_FILES: &[&str] = &[
 ];
 
 /// Global observations for a Cargo unit (`<package dir>#<target>`):
-/// `vci.toml`; `Cargo.toml` in every directory from the package dir up to
+/// `Cargo.toml` in every directory from the package dir up to
 /// the repo root (cargo walks up to find the workspace); `Cargo.lock`,
 /// `rust-toolchain(.toml)` and `.cargo/config(.toml)` from the project dir
 /// up to the repo root. Present files are reads, missing ones probes.
@@ -438,7 +437,7 @@ const RUBY_VERSION_FILES: &[&str] = &[
     ".config/mise/config.toml",
 ];
 
-/// Global observations for a Rails test file: `vci.toml`; in the project dir
+/// Global observations for a Rails test file: in the project dir
 /// the files every test boots through (`Gemfile`, `Gemfile.lock`, `gems.rb`,
 /// `gems.locked`, `config/application.rb`, `config/boot.rb`,
 /// `config/environment.rb`, `config/environments/test.rb`, `config.ru`,
@@ -469,7 +468,7 @@ fn rails_observations(
     Ok(())
 }
 
-/// Global observations for a node:test file: `vci.toml`; `package.json`,
+/// Global observations for a node:test file: `package.json`,
 /// lockfiles, `pnpm-workspace.yaml`, `.npmrc` and the `patches/` tree
 /// (patch-package, pnpm patches) from the project dir up to the repo root;
 /// the files the test command preloads (`--import`,
@@ -533,7 +532,8 @@ pub fn observations(
         out: BTreeMap::new(),
         visited: BTreeSet::new(),
     };
-    c.observe(&repo_root.join(CONFIG_FILE))?;
+    // vci.toml is not a file input since 2.7.0: what of it a test runs
+    // under is recorded as the `vci:config` external (ctx::CONFIG_EXTERNAL).
     match adapter.name() {
         "vitest" => {}
         "node-test" => {
@@ -697,7 +697,6 @@ mod tests {
         let adapter = vci_adapter::PytestAdapter::new(&root.join("py"));
         let obs = observations(&root, &adapter, &root.join("py/tests/unit/test_x.py")).unwrap();
         for (p, want) in [
-            ("vci.toml", Observation::Probe),
             ("py/pyproject.toml", Observation::Read),
             ("py/uv.lock", Observation::Read),
             ("py/.python-version", Observation::Probe),
@@ -729,7 +728,6 @@ mod tests {
         let adapter = vci_adapter::GoAdapter::new(&root.join("svc"));
         let obs = observations(&root, &adapter, &root.join("svc/b")).unwrap();
         for (p, want) in [
-            ("vci.toml", Observation::Probe),
             ("svc/go.mod", Observation::Read),
             ("svc/go.sum", Observation::Read),
             ("svc/go.work", Observation::Probe),
@@ -762,7 +760,6 @@ mod tests {
         let adapter = vci_adapter::CargoAdapter::new(&root.join("rs"));
         let obs = observations(&root, &adapter, &root.join("rs/crates/a#lib")).unwrap();
         for (p, want) in [
-            ("vci.toml", Observation::Probe),
             ("rs/crates/a/Cargo.toml", Observation::Read),
             ("rs/crates/Cargo.toml", Observation::Probe),
             ("rs/Cargo.toml", Observation::Read),
@@ -793,7 +790,6 @@ mod tests {
         let adapter = vci_adapter::RailsAdapter::new(&root.join("app"));
         let obs = observations(&root, &adapter, &root.join("app/test/models/b_test.rb")).unwrap();
         for (p, want) in [
-            ("vci.toml", Observation::Probe),
             ("app/Gemfile", Observation::Read),
             ("app/Gemfile.lock", Observation::Read),
             ("app/gems.rb", Observation::Probe),

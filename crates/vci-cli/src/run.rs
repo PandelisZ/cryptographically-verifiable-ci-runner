@@ -1105,7 +1105,7 @@ fn check_one(
     platform_specific.sort();
     let fenv = project.file_env(&file.project_rel);
     let keys = fenv.hashed_keys(child, &o.env_keys);
-    let externals: Vec<External> = o
+    let mut externals: Vec<External> = o
         .externals
         .iter()
         .map(|(n, v)| External {
@@ -1113,6 +1113,10 @@ fn check_one(
             version: v.clone(),
         })
         .collect();
+    externals.push(External {
+        name: crate::ctx::CONFIG_EXTERNAL.to_owned(),
+        version: project.config_hash.clone(),
+    });
     let manifest = checkout
         .capture(&obs, externals, &keys, lookup(child))
         .map_err(|e| format!("capturing inputs: {e}"))?;

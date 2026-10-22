@@ -201,7 +201,7 @@ creating one of them is noticed. A package that is a **copy of a repository dire
 `install-links` and yarn 1 install them) is not identified by its version: the file is refused
 (`external-local-directory:<name>`).
 
-Global inputs of every file: `vci.toml`; `package.json`, lockfiles (`package-lock.json`, `pnpm-lock.yaml`,
+Global inputs of every file: the project's settings in `vci.toml` (the `vci:config` external, 2.7.0); `package.json`, lockfiles (`package-lock.json`, `pnpm-lock.yaml`,
 `yarn.lock`, `bun.lock`), `pnpm-workspace.yaml`, `.npmrc` and every `patches/` directory (its listing and files:
 what patch-package applies to installed packages) from the project dir up to the repository root; the
 `--import`/`--require` files of the command, with the files they name by relative path; the `--env-file`s; the test's
@@ -748,7 +748,7 @@ it loads (`require "net/http"` does that), is not an input; any other read of it
   their own variables (`HOME`, `PATH`, `GEM_*`, `BUNDLE_*`, ...) while they set up the bundle are not inputs: their
   outcome, the bundle, is.
 
-Global inputs of every file: `vci.toml`; in the project dir `Gemfile`, `Gemfile.lock` (or `gems.rb`/`gems.locked`),
+Global inputs of every file: the project's settings in `vci.toml` (the `vci:config` external, 2.7.0); in the project dir `Gemfile`, `Gemfile.lock` (or `gems.rb`/`gems.locked`),
 `config/application.rb`, `config/boot.rb`, `config/environment.rb`, `config/environments/test.rb`, `config.ru`,
 `bin/rails`, `test/test_helper.rb` and `Rakefile`; and `.ruby-version`, `.tool-versions`, `mise.toml` (and its
 variants) from the project dir up to the repository root. Missing ones are recorded as absent. **Any `Gemfile.lock`
@@ -1983,7 +1983,7 @@ list, docs/ENV.md). Also:
 - the modules the collector itself imports (`sqlite3`): the lookups a plain run would make for them through every
   `sys.path` entry in the repository, so a shadowing `src/sqlite3.py` is noticed.
 
-Global inputs of every pytest file: `vci.toml`; `pyproject.toml`, `uv.lock`, `.python-version` and `uv.toml` from the
+Global inputs of every pytest file: the project's settings in `vci.toml` (the `vci:config` external, 2.7.0); `pyproject.toml`, `uv.lock`, `.python-version` and `uv.toml` from the
 project dir up to the repo root; and in every directory from the test file up to the project dir, every pytest config
 file name (`pytest.toml`, `.pytest.toml`, `pytest.ini`, `.pytest.ini`, `pyproject.toml`, `tox.ini`, `setup.cfg`) and
 `conftest.py`. Missing candidates are recorded as absent, so creating a `conftest.py` or a config file that would move
@@ -2070,7 +2070,7 @@ build scripts, proc macros and dev-dependencies, with the features actually enab
   include_str!("../README.md")]`, whose doctests run), data, and the code build scripts generate into `OUT_DIR`;
 - `[[inputs]]` files declared for the unit.
 
-Global inputs of every unit: `vci.toml`; `Cargo.toml` in every directory from the package dir up to the repo root (the
+Global inputs of every unit: the project's settings in `vci.toml` (the `vci:config` external, 2.7.0); `Cargo.toml` in every directory from the package dir up to the repo root (the
 workspace root and its `[workspace.dependencies]`, `[patch]`, `[profile.*]`); `Cargo.lock`, `rust-toolchain`,
 `rust-toolchain.toml`, `.cargo/config.toml` and `.cargo/config` from the project dir up to the repo root (missing ones
 as absent, so creating one runs everything). **Any `Cargo.lock` change runs everything.** Cargo config files outside the
@@ -2105,7 +2105,7 @@ the one exception, `#[cfg_attr(target_os = "linux", ignore)]`, is a target cfg a
 runs where it evaluates differently). A test that returns early based on the environment is covered by the literal
 `env::var` rule above.
 
-Global inputs of every Go package: `vci.toml`; `go.mod`, `go.sum`, `go.work` and `go.work.sum` from the project dir
+Global inputs of every Go package: the project's settings in `vci.toml` (the `vci:config` external, 2.7.0); `go.mod`, `go.sum`, `go.work` and `go.work.sum` from the project dir
 up to the repo root (missing ones as absent, so creating a `go.work` invalidates); `vendor/modules.txt` in the
 project dir (present or absent: it switches the build to `vendor/`). A module version change touches `go.mod` and
 `go.sum`, so it runs everything.
@@ -2419,6 +2419,15 @@ base commit, like every other key), so a pull request cannot widen it for itself
 `no_skip_refs` so the default branch still runs everything, and list units whose waived behaviour does matter in
 `never_skip`. Agents must not add `ignore_taints` to a repository's policy on their own: it is the maintainers'
 decision.
+
+### What of `vci.toml` is an input
+
+Since 2.7.0 a unit's attestation records its project's settings as one external, `vci:config`: a hash of the
+project's directory, adapter and adapter settings (`runner`, the node:test command), its effective `[env]` and its
+`[[inputs]]`. Nothing else of the file is an input: not `[policy]` (read from the base commit when planning), not
+comments or formatting, not other projects. Before 2.7.0 the whole file was a global input of every unit, so any
+edit to it ran every unit of every project again. A project whose directory the checkout does not have is left out
+with a warning (2.7.0; it has no units), instead of every project running.
 
 ## Verification (`vci plan`)
 

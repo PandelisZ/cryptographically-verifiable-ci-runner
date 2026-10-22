@@ -218,6 +218,35 @@ pub struct Project {
     pub adapter: Box<dyn Adapter>,
     /// The settings the adapter was made with (`vci ci` makes it again).
     pub adapter_options: vci_adapter::AdapterOptions,
+    /// [`Project::config_hash`], computed once.
+    pub config_hash: String,
+}
+
+/// The external a unit's attestation records its project's configuration
+/// under (2.7.0), version [`Project::config_hash`].
+pub const CONFIG_EXTERNAL: &str = "vci:config";
+
+impl Project {
+    /// What of `vci.toml` a test of this project runs under: its directory,
+    /// adapter and adapter settings, environment and declared inputs. Not
+    /// the policy (who may skip what, read from the base commit at plan
+    /// time), not comments or formatting, not other projects. Before 2.7.0
+    /// the whole file was an input of every test, so any edit to it ran
+    /// every test of every project again.
+    pub fn config_hash_of(
+        rel: &str,
+        adapter: &str,
+        options: &vci_adapter::AdapterOptions,
+        env: &EnvConfig,
+        inputs: &[InputsConfig],
+    ) -> String {
+        let text = format!(
+            "vci-config-v1\n{rel}\n{adapter}\n{options:?}\n{}\n{}",
+            serde_json::to_string(env).unwrap_or_default(),
+            serde_json::to_string(inputs).unwrap_or_default()
+        );
+        vci_core::blake3_hex(text.as_bytes())
+    }
 }
 
 impl Project {
@@ -383,8 +412,18 @@ impl Ctx {
             } else {
                 format!("project {:?} dir", spec.name)
             };
+            // A project this checkout does not have (a branch from before
+            // the base's config added it) has no test files to run or skip:
+            // the others are planned as usual. 2.6.5 ran everything of every
+            // project when one directory was missing.
+            if !dir.exists() {
+                eprintln!(
+                    "vci: warning: {what} {dir} is not in this checkout; its tests are not listed"
+                );
+                continue;
+            }
             if !dir.is_dir() {
-                bail!("{what} {dir} does not exist");
+                bail!("{what} {dir} is not a directory");
             }
             let dir = dir.canonicalize_utf8()?;
             if !dir.starts_with(&root) {
@@ -392,7 +431,15 @@ impl Ctx {
             }
             let options = spec.adapter_options();
             let adapter = vci_adapter::adapter_for_with(&spec.adapter, &dir, &options)?;
+            let config_hash = Project::config_hash_of(
+                &spec.rel,
+                &spec.adapter,
+                &options,
+                &spec.env,
+                &spec.inputs,
+            );
             projects.push(Project {
+                config_hash,
                 adapter_options: options,
                 name: spec.name,
                 rel: spec.rel,

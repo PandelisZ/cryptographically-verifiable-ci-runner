@@ -2108,3 +2108,41 @@ fn a_failed_git_check_ignore_answers_as_before_whatever_came_first() {
         assert!(p.skip.contains(I1) && p.skip.contains(I2), "{p:?}");
     }
 }
+
+/// A project in the config this checkout does not have (a branch from
+/// before the base added it) lists no files; the others are planned as
+/// usual instead of everything running (2.6.5).
+#[test]
+fn a_project_missing_from_the_checkout_does_not_run_everything() {
+    let toml = r#"[[projects]]
+name = "web"
+path = "apps/web"
+adapter = "node-test"
+
+[[projects]]
+name = "bootstrap"
+path = "packages/bootstrap"
+adapter = "node-test"
+
+[env]
+hash = ["TZ"]
+"#;
+    let w = World::new_with(Fixture::Pnpm, &[], toml);
+    let work = w.work.clone();
+    let lib = "apps/web/src/lib.test.ts";
+    let ms = "apps/web/src/ms.test.ts";
+    let out = w.run(&work, &[lib, ms], &w.trusted);
+    assert!(out.contains("vci: 2 attested, 0 not attested"), "{out}");
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[lib, ms]), "{p:?}");
+    assert!(p.run.is_empty(), "{p:?}");
+
+    // 2.7.0: a comment or a policy line in vci.toml is not an input.
+    let cfg = w.read("vci.toml");
+    w.write(
+        "vci.toml",
+        &format!("# a comment\n[policy]\nmax_ttl = \"14d\"\n{cfg}"),
+    );
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[lib, ms]), "{p:?}");
+}

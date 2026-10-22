@@ -1457,3 +1457,79 @@ fn blobless_clones_deleting_manifests_both_push() {
         "{out:?}"
     );
 }
+
+/// A store restored from a cache that left out trees of the local metadata
+/// commit (vex, Oct 21-22: every pull request job's fetch and push failed on
+/// `ls-tree` of the cached commit for 18 hours): the commit was pushed, so
+/// a fetch gets its trees from the remote, and the next push goes through.
+#[test]
+fn a_local_commit_missing_trees_is_completed_from_the_remote() {
+    let w = lazy_world(1);
+    let dir = fresh_clone(&w, "cached");
+    let r = repo(&dir);
+    let st = AttestStore::new(&r);
+    st.fetch(Some("origin")).unwrap();
+    for i in 0..5u8 {
+        st.put_manifest(&hex64(0x40 + i), &manifest(&format!("c{i}")))
+            .unwrap();
+    }
+    st.put(A, S1, &hex64(1), &env("c1", &hex64(0x40))).unwrap();
+    assert_eq!(st.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    // Drop every loose tree of the local commit (the cache's loss).
+    let local = git(&dir, &["rev-parse", "refs/meta/local/main"])
+        .trim()
+        .to_owned();
+    let mut gone = 0;
+    for oid in git(
+        &dir,
+        &["rev-list", "--objects", "--no-object-names", &local],
+    )
+    .lines()
+    .filter(|o| git(&dir, &["cat-file", "-t", o]).trim() == "tree")
+    {
+        let p = dir.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        if std::fs::remove_file(&p).is_ok() {
+            gone += 1;
+        }
+    }
+    assert!(gone > 0, "no loose tree to remove");
+    let complete = || {
+        Command::new("git")
+            .args([
+                "-C",
+                dir.as_str(),
+                "ls-tree",
+                "-r",
+                "-d",
+                "--full-tree",
+                &local,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(!complete(), "the trees are still here");
+    // The remote moves on, as vex's did between the cache and the job.
+    let other = fresh_clone(&w, "other");
+    let ro = repo(&other);
+    let so = AttestStore::new(&ro);
+    so.fetch(Some("origin")).unwrap();
+    so.put(C, S2, &hex64(3), &env("o1", &hex64(0x42))).unwrap();
+    assert_eq!(so.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    let r2 = repo(&dir);
+    let st = AttestStore::new(&r2);
+    let out = st.fetch(Some("origin"));
+    assert!(out.is_ok(), "{out:?}");
+    assert!(
+        complete(),
+        "the fetch did not complete the local commit's tree"
+    );
+    st.put(B, S1, &hex64(2), &env("c2", &hex64(0x41))).unwrap();
+    let out = st.push(Some("origin"));
+    assert!(
+        matches!(&out, Ok(o) if o.status == PushStatus::Pushed),
+        "{out:?}"
+    );
+}

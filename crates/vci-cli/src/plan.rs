@@ -2415,6 +2415,19 @@ impl Verifier<'_> {
         let t_ext = std::time::Instant::now();
         let mut ext_diff = vec![];
         for e in &m.externals {
+            if e.name == crate::ctx::CONFIG_EXTERNAL {
+                if e.version != self.project.config_hash {
+                    ext_diff.push(Detail {
+                        what: format!("external:{}", e.name),
+                        expected: e.version.clone(),
+                        actual: format!(
+                            "{} (this project's settings in vci.toml changed: path, adapter, env or [[inputs]])",
+                            self.project.config_hash
+                        ),
+                    });
+                }
+                continue;
+            }
             let found = match (
                 &self.python_externals,
                 &self.go_modules,

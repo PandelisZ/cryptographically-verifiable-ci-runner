@@ -3589,6 +3589,23 @@ impl<'a> AttestStore<'a> {
                 vci_core::timing_line!("fetch: {what}: {:.2}s", since.elapsed().as_secs_f64());
             }
         };
+        // The local metadata commit's tree first (2.7.0): a store restored
+        // from a CI cache that left out trees vci wrote (vex, Oct 21-22:
+        // every pull request job's fetch and push failed for 18 hours on
+        // `ls-tree` of the cached local commit, `could not fetch <tree> from
+        // promisor remote`). A commit that was pushed is on the remote, so
+        // its trees are fetched by id like the tip's, before the fetch
+        // (git 2.56's fetch itself dies on them: `should_include_obj should
+        // only be called on existing objects`).
+        if let Some(local) = self.read_ref(&local_ref)? {
+            let t = std::time::Instant::now();
+            if let Err(e) = self.complete_tree(name, &local) {
+                report.warn(format!(
+                    "the local metadata commit {local} names trees this clone lacks and {name} did not serve: {e}"
+                ));
+            }
+            step("complete the local commit's tree", t);
+        }
         let t = std::time::Instant::now();
         let mut fetched = fetch(if first { "tree:0" } else { "blob:none" });
         if first && matches!(&fetched, Err(e) if e.to_string().contains("filter")) {
