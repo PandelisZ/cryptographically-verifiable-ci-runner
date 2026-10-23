@@ -1871,10 +1871,11 @@ module VciCollector
 
       # A file's process wrote its output: how long that took (from the
       # start of Output.write!), and how much of it was its own.
-      def wrote_output(lines, split, started)
+      def wrote_output(lines, split, started, parts = nil)
         return unless on? && @target
         line = { file: @target, ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round,
                  lines: lines }
+        line.merge!(parts) if parts
         if split
           line[:own] = split.size - 2
           line[:drop] = split[1][:drop].size
@@ -5477,15 +5478,24 @@ module VciCollector
     # name and which of its lines are not this file's (Batch.split). vci
     # puts the two together again (rails.rs, read_batch).
     def write_records(status, unhooked = [], started = nil)
+      clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      t0 = clock.call
       lines = lines_of(status, unhooked)
+      t1 = clock.call
       split = Batch.split(lines)
+      t2 = clock.call
       require "digest/sha2"
       sh = Batch.shard
       name = "#{Digest::SHA256.hexdigest(VciCollector.test_id)}#{sh ? ".shard-#{sh[0]}" : ""}.jsonl"
       File.open(File.join(OUT, name), "w") do |f|
         (split || lines).each { |l| f.write(Json.dump(l), "\n") }
       end
-      Batch.wrote_output(lines.size, split, started) if started
+      t3 = clock.call
+      # Each part's milliseconds (2.7.13: a vex file's output took 0.41 s
+      # on average, about a tenth of its process).
+      parts = { lines_ms: ((t1 - t0) * 1000).round, split_ms: ((t2 - t1) * 1000).round,
+                write_ms: ((t3 - t2) * 1000).round, before_ms: ((t0 - started) * 1000).round } if started
+      Batch.wrote_output(lines.size, split, started, parts) if started
     end
 
     # Every line of the output of this process if it ended now (with exit

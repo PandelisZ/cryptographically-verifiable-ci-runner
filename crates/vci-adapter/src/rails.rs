@@ -1198,6 +1198,19 @@ impl RailsAdapter {
                 )
                 .as_bytes(),
             );
+            let p = slots.output_parts_ms;
+            if p.iter().any(|x| *x > 0) {
+                log.extend_from_slice(
+                    format!(
+                        "vci: of which on average: before building the lines {:.2} s, building them {:.2} s, splitting off what the boot shares {:.2} s, writing {:.2} s\n",
+                        p[0] as f64 / 1000.0 / n,
+                        p[1] as f64 / 1000.0 / n,
+                        p[2] as f64 / 1000.0 / n,
+                        p[3] as f64 / 1000.0 / n
+                    )
+                    .as_bytes(),
+                );
+            }
         }
         log.extend_from_slice(&out.stdout);
         log.extend_from_slice(&out.stderr);
@@ -1289,6 +1302,10 @@ struct SlotStats {
     /// Whether the groups ran at once (2.2.12) rather than in turn.
     groups_at_once: bool,
     output_ms: Vec<u64>,
+    /// Sums over the files of their output's parts (2.7.13): from the
+    /// tests' end to building the lines, building them, splitting off what
+    /// the boot shares, writing.
+    output_parts_ms: [u64; 4],
     shared_ms: Vec<u64>,
 }
 
@@ -1462,6 +1479,14 @@ fn read_batch(
             };
             if v.get("file").is_some() {
                 stats.output_ms.push(ms);
+                for (i, k) in ["before_ms", "lines_ms", "split_ms", "write_ms"]
+                    .iter()
+                    .enumerate()
+                {
+                    if let Some(x) = v.get(*k).and_then(Value::as_u64) {
+                        stats.output_parts_ms[i] += x;
+                    }
+                }
             } else if v.get("shared").is_some() {
                 stats.shared_ms.push(ms);
             }
