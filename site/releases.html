@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-8">2.7.8</a></td><td>23 Oct 2026</td><td>A plan no longer reads every stored attestation of every unit twice to choose which to fetch; with <code>VCI_TIMING</code>, the plan's fetch of stored values and a metadata merge report their parts</td></tr>
 <tr><td><a href="#v2-7-7">2.7.7</a></td><td>23 Oct 2026</td><td>The record of the local commit a store covers survives a merge of fetched metadata, so a push after a fetch skips the coverage check too</td></tr>
 <tr><td><a href="#v2-7-6">2.7.6</a></td><td>23 Oct 2026</td><td>Checking that a fetched metadata tree is complete no longer asks the promisor for a missing subtree on git before 2.44 (about 11 s each time, twice a fetch on vex)</td></tr>
 <tr><td><a href="#v2-7-5">2.7.5</a></td><td>23 Oct 2026</td><td>A fetch no longer re-reads the whole store and local tree to check that the store covers the local metadata commit when the store has recorded that it does (up to 26 s a fetch in CI)</td></tr>
@@ -104,6 +105,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-8">2.7.8</h2>
+<p><em>23 October 2026.</em> A vex plan spent 23 s fetching the stored values it reads, about 5 of them downloading. To choose which attestations of each unit to fetch, it read the stored value of every candidate it had (through <code>git cat-file</code>), though the choice needs only the keys; then, to find the chosen ones' manifests, it read them all again. <strong>Choosing now reads no values, and finding the manifests reads only the chosen attestations.</strong> With <code>VCI_TIMING</code>, that step and a merge of fetched metadata (applying deletion records, recording the merge) report each of their parts.</p>
 
 <h2 id="v2-7-7">2.7.7</h2>
 <p><em>23 October 2026.</em> 2.7.5's record of the commit a store covers was lost at every merge of fetched metadata (which moves the local commit), so the push after a fetch still ran the full coverage check (4.6 s on vex). A merge of the tree's paths writes every entry the merged commit has that the local one did not into the store, as a row or a deletion record, and shares the rest with the local commit: <strong>a store that covered the local commit is recorded as covering the merged one</strong>.</p>

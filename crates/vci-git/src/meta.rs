@@ -787,6 +787,12 @@ impl Reader {
     /// Decode one row the way git-meta's `get_value` does. Read errors
     /// belong to the row, not to the lookup.
     fn decode(&self, row: Row) -> Option<StoredEnvelope> {
+        self.decode_reading(row, |_| true)
+    }
+
+    /// [`Reader::decode`], reading the value only when `read` says so for
+    /// the row's key (otherwise `bytes` stays empty and `error` unset).
+    fn decode_reading(&self, row: Row, read: impl Fn(&str) -> bool) -> Option<StoredEnvelope> {
         let (tk, signer, sk) = parse_key(&row.key)?;
         if row.value_type != "string" {
             return None;
@@ -803,9 +809,11 @@ impl Reader {
             bytes: Vec::new(),
             error: None,
         };
-        match self.value_bytes(row) {
-            Ok(b) => env.bytes = b,
-            Err(e) => env.error = Some(e),
+        if read(&row.key) {
+            match self.value_bytes(row) {
+                Ok(b) => env.bytes = b,
+                Err(e) => env.error = Some(e),
+            }
         }
         Some(env)
     }
@@ -934,6 +942,18 @@ impl Reader {
     /// whose value cannot be read are returned with [`StoredEnvelope::error`]
     /// set.
     pub fn candidates(&self, test_id: &str) -> Result<Vec<StoredEnvelope>, GitError> {
+        self.candidates_reading(test_id, |_| true)
+    }
+
+    /// [`Reader::candidates`], reading only the values whose key `read`
+    /// accepts (2.7.8: a plan's choice of candidates needs their keys alone,
+    /// and reading every candidate's envelope twice cost a vex plan about
+    /// 18 s).
+    pub fn candidates_reading(
+        &self,
+        test_id: &str,
+        read: impl Fn(&str) -> bool,
+    ) -> Result<Vec<StoredEnvelope>, GitError> {
         let tk = vci_core::test_key(test_id);
         let target = target_for(test_id);
         let prefix = format!("{KEY_PREFIX}:{tk}:");
@@ -947,7 +967,7 @@ impl Reader {
         )?;
         let mut out: Vec<StoredEnvelope> = rows
             .into_iter()
-            .filter_map(|r| self.decode(r))
+            .filter_map(|r| self.decode_reading(r, &read))
             .filter(|e| e.test_key == tk)
             .collect();
         out.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1522,15 +1542,27 @@ impl<'a> AttestStore<'a> {
                 )
             })
             .collect();
+        // Each part's time under VCI_TIMING (2.7.8: 23 s a vex plan, about
+        // 5 of them fetching).
+        let timed = vci_core::metrics::on();
+        let mut t = std::time::Instant::now();
+        let mut part = |what: &str| {
+            if timed {
+                vci_core::timing_line!("hydrate: {what}: {:.2}s", t.elapsed().as_secs_f64());
+            }
+            t = std::time::Instant::now();
+        };
         let _lock = self.exchange_lock()?;
+        part("wait for the exchange lock");
         let remote = self.value_remote()?;
         let mut ctx = self.hydrate_ctx()?;
+        part("read the promised rows");
         // `choose` sees the candidates as stored (values not read): keys
         // with a hint (vci 2.2) say enough to pick the newest.
         let reader = self.reader()?;
         let mut chosen_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
         for id in &ids {
-            let cands = reader.candidates(id)?;
+            let cands = reader.candidates_reading(id, |_| false)?;
             for i in choose(&cands) {
                 if let Some(e) = cands.get(i) {
                     let t = target_for(id);
@@ -1543,6 +1575,7 @@ impl<'a> AttestStore<'a> {
             }
         }
         drop(reader);
+        part("choose the candidates");
         let mut out = self.hydrate_with(&mut ctx, &remote, |k| {
             parse_key(&k.key).is_some_and(|(tk, _, _)| {
                 wanted.contains(&(
@@ -1556,11 +1589,17 @@ impl<'a> AttestStore<'a> {
                 k.key.clone(),
             ))
         })?;
+        part("fetch the chosen envelopes");
         let reader = self.reader()?;
         let mut roots = BTreeSet::new();
         for id in &ids {
             let t = target_for(id);
-            for e in reader.candidates(id)? {
+            let tt = t.target_type().as_str().to_owned();
+            let tv = t.value().unwrap_or("").to_owned();
+            let cands = reader.candidates_reading(id, |key| {
+                chosen_keys.contains(&(tt.clone(), tv.clone(), key.to_owned()))
+            })?;
+            for e in cands {
                 if e.error.is_none()
                     && chosen_keys.contains(&(
                         t.target_type().as_str().to_owned(),
@@ -1574,12 +1613,15 @@ impl<'a> AttestStore<'a> {
             }
         }
         drop(reader);
+        part("read the chosen envelopes' manifest names");
         if !roots.is_empty() {
             out.add(self.hydrate_with(&mut ctx, &remote, |k| {
                 k.target_type == TargetType::Project
                     && parse_manifest_key(&k.key).is_some_and(|r| roots.contains(r))
             })?);
+            part("fetch the manifests");
             out.add(self.hydrate_bases_with(&mut ctx, &remote, &roots)?);
+            part("fetch the base manifests");
         }
         Ok(out)
     }
@@ -4218,6 +4260,12 @@ impl<'a> AttestStore<'a> {
                 store.apply_tombstone(&k.to_target(), &k.key, &email, now)
             })?;
         }
+        part(&format!(
+            "apply {} deletion record(s), {} restamped, {} deleted",
+            tombstones.len(),
+            restamped.len(),
+            legacy.len()
+        ));
         match &local {
             Some(l) if *l == to_commit => {}
             Some(l) => self.cas_ref(local_ref, Some(&to_commit), l, "vci: materialize")?,
@@ -4255,6 +4303,7 @@ impl<'a> AttestStore<'a> {
                 store.set_last_materialized(now)
             })?;
         }
+        part("move the ref and record the materialization");
         Ok(Some(Materialized {
             changed,
             merged,
