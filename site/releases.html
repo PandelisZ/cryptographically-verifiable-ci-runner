@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-19">2.7.19</a></td><td>23 Oct 2026</td><td>A plan reuses what it learnt before: what each attestation and manifest blob names, which metadata commits have complete trees, and the tip it last merged; a vex plan went from 10-28 s to 2-7 s on a laptop</td></tr>
 <tr><td><a href="#v2-7-18">2.7.18</a></td><td>23 Oct 2026</td><td>A push asks again whether the remote moved right before <code>git push</code>, so the run's other job pushing during the pre-push checks no longer costs a rejected push</td></tr>
 <tr><td><a href="#v2-7-17">2.7.17</a></td><td>23 Oct 2026</td><td>A push asks whether the remote moved before its pre-push checks and fetches, not after (about 18 s saved on each round that has to merge again)</td></tr>
 <tr><td><a href="#v2-7-16">2.7.16</a></td><td>23 Oct 2026</td><td>With <code>VCI_TIMING</code>, a Rails batch compares how long a file's tests took with how long its process took</td></tr>
@@ -115,6 +116,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-19">2.7.19</h2>
+<p><em>23 October 2026.</em> A vex Rails plan took 48 s on CI, most of it re-learning the same things every time: it read 2,000 attestations to find the manifests they name, checked the whole 490,000-object metadata tree for missing subtrees, and listed the fetched tip's 200,000 keys even when that tip had been merged before. <strong>The store now remembers what each blob names</strong> (a blob never changes), which metadata commits it found complete (a new tip is checked by its difference from one of them, about 0.1 s instead of 1.3-4.9 s), and skips listing a tip it already merged. Putting back manifests a merge deleted reads only the attestations it has not seen. On a laptop the plan went from 10-28 s to about 4 s when the remote has not moved and 2 s without <code>--fetch</code>. With <code>VCI_TIMING</code>, every step of the fetch is now timed.</p>
 
 <h2 id="v2-7-18">2.7.18</h2>
 <p><em>23 October 2026.</em> 2.7.17 asks whether the remote moved before its pre-push checks; those checks and the fetch of what the pack needs then take about 18 s on vex, long enough for the run's other job to push, and the next probe's push was rejected after sending its pack (26 s). <strong>vci now asks again right before <code>git push</code></strong> (one more <code>ls-remote</code>, under a second).</p>

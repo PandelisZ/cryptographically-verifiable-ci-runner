@@ -1657,29 +1657,68 @@ impl<'a> AttestStore<'a> {
             ))
         })?;
         part("fetch the chosen envelopes");
-        let reader = self.reader()?;
+        // The manifest each chosen attestation names, remembered by its
+        // blob id when read before (2.7.19); only the others are read.
+        let blob_of = self.value_blob_ids(&chosen_keys);
+        part("find the chosen attestations' blobs");
+        let oids: BTreeSet<String> = blob_of.values().cloned().collect();
+        let known = self.blob_refs("manifest", &oids);
+        part("look up the manifests they name");
         let mut roots = BTreeSet::new();
-        for id in &ids {
-            let t = target_for(id);
-            let tt = t.target_type().as_str().to_owned();
-            let tv = t.value().unwrap_or("").to_owned();
-            let cands = reader.candidates_reading(id, |key| {
-                chosen_keys.contains(&(tt.clone(), tv.clone(), key.to_owned()))
-            })?;
-            for e in cands {
-                if e.error.is_none()
-                    && chosen_keys.contains(&(
-                        t.target_type().as_str().to_owned(),
-                        t.value().unwrap_or("").to_owned(),
-                        e.key.clone(),
-                    ))
-                    && let Some(r) = envelope_manifest_ref(&e.bytes)
-                {
-                    roots.insert(r);
+        let mut unread: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for k in &chosen_keys {
+            match blob_of.get(k).and_then(|o| known.get(o)) {
+                // "" records an envelope that names no manifest.
+                Some(r) if r.is_empty() => {}
+                Some(r) => {
+                    roots.insert(r.clone());
+                }
+                None => {
+                    unread.insert(k.clone());
                 }
             }
         }
-        drop(reader);
+        let unread_targets: BTreeSet<(String, String)> =
+            unread.iter().map(|k| (k.0.clone(), k.1.clone())).collect();
+        let mut learnt = BTreeMap::new();
+        if !unread_targets.is_empty() {
+            let reader = self.reader()?;
+            part("open the reader");
+            if vci_core::metrics::on() {
+                vci_core::timing_line!(
+                    "hydrate: {} chosen, {} named by a blob read before, {} to read",
+                    chosen_keys.len(),
+                    chosen_keys.len() - unread.len(),
+                    unread.len()
+                );
+            }
+            for id in &ids {
+                let t = target_for(id);
+                let tt = t.target_type().as_str().to_owned();
+                let tv = t.value().unwrap_or("").to_owned();
+                if !unread_targets.contains(&(tt.clone(), tv.clone())) {
+                    continue;
+                }
+                let cands = reader.candidates_reading(id, |key| {
+                    unread.contains(&(tt.clone(), tv.clone(), key.to_owned()))
+                })?;
+                for e in cands {
+                    let k = (tt.clone(), tv.clone(), e.key.clone());
+                    if e.error.is_some() || !unread.contains(&k) {
+                        continue;
+                    }
+                    let r = envelope_manifest_ref(&e.bytes);
+                    if let Some(o) = blob_of.get(&k) {
+                        learnt.insert(o.clone(), r.clone().unwrap_or_default());
+                    }
+                    if let Some(r) = r {
+                        roots.insert(r);
+                    }
+                }
+            }
+            drop(reader);
+        }
+        self.put_blob_refs("manifest", &learnt);
         part("read the chosen envelopes' manifest names");
         if !roots.is_empty() {
             out.add(self.hydrate_with(&mut ctx, &remote, |k| {
@@ -1702,17 +1741,40 @@ impl<'a> AttestStore<'a> {
         remote: &str,
         roots: &BTreeSet<String>,
     ) -> Result<Hydration, GitError> {
+        // Remembered by the manifest's blob id when read before (2.7.19).
+        let project = TargetType::Project.as_str().to_owned();
+        let keys: BTreeSet<(String, String, String)> = roots
+            .iter()
+            .map(|r| (project.clone(), String::new(), manifest_key(r)))
+            .collect();
+        let blob_of = self.value_blob_ids(&keys);
+        let oids: BTreeSet<String> = blob_of.values().cloned().collect();
+        let known = self.blob_refs("base", &oids);
         let reader = self.reader()?;
         let mut bases = BTreeSet::new();
+        let mut learnt = BTreeMap::new();
         for r in roots {
+            let oid = blob_of.get(&(project.clone(), String::new(), manifest_key(r)));
+            if let Some(b) = oid.and_then(|o| known.get(o)) {
+                if !b.is_empty() {
+                    bases.insert(b.clone());
+                }
+                continue;
+            }
             if let Some(m) = reader.manifest(r)?
                 && m.error.is_none()
-                && let Ok(Some(b)) = vci_core::InputManifest::compact_base(&m.bytes)
+                && let Ok(b) = vci_core::InputManifest::compact_base(&m.bytes)
             {
-                bases.insert(b);
+                if let Some(o) = oid {
+                    learnt.insert(o.clone(), b.clone().unwrap_or_default());
+                }
+                if let Some(b) = b {
+                    bases.insert(b);
+                }
             }
         }
         drop(reader);
+        self.put_blob_refs("base", &learnt);
         if bases.is_empty() {
             return Ok(Hydration::default());
         }
@@ -2012,6 +2074,107 @@ impl<'a> AttestStore<'a> {
         let _ = db.execute_batch("BEGIN; DELETE FROM vci_cover;");
         let _ = db.execute("INSERT INTO vci_cover (local) VALUES (?1)", [commit]);
         let _ = db.execute_batch("COMMIT;");
+    }
+
+    /// The blob id each of `keys` (target type, target value, key) is
+    /// stored as, for those stored as a git blob reference and fetched.
+    fn value_blob_ids(
+        &self,
+        keys: &BTreeSet<(String, String, String)>,
+    ) -> BTreeMap<(String, String, String), String> {
+        let mut out = BTreeMap::new();
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return out;
+        };
+        if keys.is_empty() {
+            return out;
+        }
+        // One scan of the blob-reference rows, filtered here: a lookup per
+        // key cost about 0.2 ms each (2.7.19).
+        let Ok(mut stmt) = db.prepare(
+            "SELECT target_type, target_value, key, value FROM metadata \
+             WHERE is_git_ref = 1 AND is_promised = 0",
+        ) else {
+            return out;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        }) else {
+            return out;
+        };
+        for (t, v, k, val) in rows.flatten() {
+            let key = (t, v, k);
+            if keys.contains(&key) && is_oid(val.trim()) {
+                out.insert(key, val.trim().to_owned());
+            }
+        }
+        out
+    }
+
+    /// What blobs name, remembered by blob id (2.7.19): `kind` "manifest"
+    /// maps an attestation's blob to its input manifest's root, "base" a
+    /// manifest's blob to its base manifest's root ("" for none). A blob
+    /// never changes, so neither does what it names; a plan read 2,000
+    /// envelopes and 2,000 manifests only for these (6 s on vex's runners).
+    fn blob_refs(&self, kind: &str, oids: &BTreeSet<String>) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return out;
+        };
+        if Self::blob_ref_schema(&db).is_err() {
+            return out;
+        }
+        if oids.is_empty() {
+            return out;
+        }
+        let Ok(mut stmt) = db.prepare("SELECT oid, ref FROM vci_blob_ref WHERE kind = ?1") else {
+            return out;
+        };
+        let Ok(rows) = stmt.query_map([kind], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) else {
+            return out;
+        };
+        for (o, r) in rows.flatten() {
+            if oids.contains(&o) {
+                out.insert(o, r);
+            }
+        }
+        out
+    }
+
+    fn put_blob_refs(&self, kind: &str, refs: &BTreeMap<String, String>) {
+        if refs.is_empty() {
+            return;
+        }
+        let Ok(Some((_, mut db))) = self.db_rw() else {
+            return;
+        };
+        if Self::blob_ref_schema(&db).is_err() {
+            return;
+        }
+        let Ok(tx) = db.transaction() else { return };
+        if let Ok(mut stmt) = tx.prepare_cached(
+            "INSERT OR REPLACE INTO vci_blob_ref (oid, kind, ref) VALUES (?1, ?2, ?3)",
+        ) {
+            for (o, r) in refs {
+                let _ = stmt.execute(rusqlite::params![o, kind, r]);
+            }
+        }
+        let _ = tx.commit();
+    }
+
+    fn blob_ref_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vci_blob_ref (
+               oid TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL,
+               PRIMARY KEY (oid, kind));",
+        )
     }
 
     fn cover_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -2557,6 +2720,116 @@ impl<'a> AttestStore<'a> {
     /// trees this clone never fetched, gets its tree and subtrees in one
     /// fetch of the tree's id. Nothing is fetched when they are here.
     fn complete_tree(&self, remote: &str, commit: &str) -> Result<(), GitError> {
+        // Checked complete before (2.7.19): trees the refs reach stay.
+        if self.known_complete(commit) {
+            return Ok(());
+        }
+        if self.complete_by_diff(commit) {
+            self.mark_complete(commit);
+            return Ok(());
+        }
+        self.complete_tree_walk(remote, commit)?;
+        self.mark_complete(commit);
+        Ok(())
+    }
+
+    /// Whether `commit`'s tree is complete, read from its difference with a
+    /// commit recorded complete that a metadata ref still names (a CI cache
+    /// keeps the refs' trees, not every tree it once had): the trees they
+    /// share are complete, and `diff-tree` reads every tree that differs,
+    /// failing on one that is not here (2.7.19: listing the whole tree took
+    /// 1.3-4.9 s a fetch on vex's 490,000 objects; the difference takes
+    /// about 0.1 s). `false` sends the caller to the full check.
+    fn complete_by_diff(&self, commit: &str) -> bool {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return false;
+        };
+        if Self::complete_schema(&db).is_err() {
+            return false;
+        }
+        let Ok(mut stmt) = db.prepare("SELECT commit_id FROM vci_complete ORDER BY at DESC") else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+            return false;
+        };
+        let complete: Vec<String> = rows.flatten().filter(|c| is_oid(c)).collect();
+        drop(stmt);
+        drop(db);
+        if complete.is_empty() {
+            return false;
+        }
+        let Ok(refs) = self
+            .repo
+            .git()
+            .args(["for-each-ref", "--format=%(objectname)", "refs/meta/"])
+            .run_str()
+        else {
+            return false;
+        };
+        let named: BTreeSet<&str> = refs.lines().map(str::trim).collect();
+        let Some(base) = complete.iter().find(|c| named.contains(c.as_str())) else {
+            return false;
+        };
+        self.repo
+            .git()
+            .args([
+                "diff-tree",
+                "-r",
+                "-t",
+                "--no-renames",
+                "-z",
+                "--raw",
+                base,
+                commit,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run()
+            .is_ok()
+    }
+
+    /// Whether this store recorded `commit`'s tree as complete.
+    fn known_complete(&self, commit: &str) -> bool {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return false;
+        };
+        if Self::complete_schema(&db).is_err() {
+            return false;
+        }
+        db.query_row(
+            "SELECT 1 FROM vci_complete WHERE commit_id = ?1",
+            [commit],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    fn mark_complete(&self, commit: &str) {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return;
+        };
+        if Self::complete_schema(&db).is_err() {
+            return;
+        }
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO vci_complete (commit_id, at) VALUES (?1, ?2)",
+            rusqlite::params![commit, now_ms()],
+        );
+        // The newest few are what later fetches ask about.
+        let _ = db.execute(
+            "DELETE FROM vci_complete WHERE commit_id NOT IN \
+             (SELECT commit_id FROM vci_complete ORDER BY at DESC LIMIT 64)",
+            [],
+        );
+    }
+
+    fn complete_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vci_complete (commit_id TEXT PRIMARY KEY, at INTEGER NOT NULL);",
+        )
+    }
+
+    fn complete_tree_walk(&self, remote: &str, commit: &str) -> Result<(), GitError> {
         // The commit's own record (`<commit>^{tree}` wants the tree there).
         let raw = self
             .repo
@@ -3922,7 +4195,25 @@ impl<'a> AttestStore<'a> {
         let mut session = self.session()?;
         let mut remote_deleted = BTreeSet::new();
         let mut tip_snap: Option<KeySnapshot> = None;
-        if found && let Some(tip) = self.read_ref(&tracking)? {
+        // A tip materialized into this store last time needs no listing
+        // (1.7 s for vex's 200k entries, on every plan): it was clean, or
+        // the marker would name the sanitized commit made on top of it. It
+        // is listed below when the merge runs after all.
+        let marker = self.materialized_marker(&tracking)?;
+        let previous = std::fs::read_to_string(&marker)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| is_oid(s));
+        let raw_tip = if found {
+            self.read_ref(&tracking)?
+        } else {
+            None
+        };
+        let unchanged = raw_tip.is_some() && raw_tip == previous;
+        if found
+            && !unchanged
+            && let Some(tip) = raw_tip.clone()
+        {
             let t = std::time::Instant::now();
             let snap = self.snapshot_keys(&tip)?;
             step("list the tip's keys", t);
@@ -3968,10 +4259,6 @@ impl<'a> AttestStore<'a> {
             remote_deleted = snap.tombstones.clone();
             tip_snap = Some(snap);
         }
-        let remote_manifest_blobs = tip_snap
-            .as_ref()
-            .map(|s| s.manifest_blobs.clone())
-            .unwrap_or_default();
         let t = std::time::Instant::now();
         let restored = self.cover_local_ref(&session, name, &local_ref)?;
         step("cover the local ref", t);
@@ -3981,7 +4268,9 @@ impl<'a> AttestStore<'a> {
                 if restored == 1 { "y" } else { "ies" }
             ));
         }
+        let t = std::time::Instant::now();
         let deleted_here = self.deletion_records(&session)?;
+        step("read the store's deletion records", t);
         // Taken before the serialization reads the store (see below).
         let serialized_as_of = now_ms();
         let t = std::time::Instant::now();
@@ -3996,11 +4285,6 @@ impl<'a> AttestStore<'a> {
         } else {
             None
         };
-        let marker = self.materialized_marker(&tracking)?;
-        let previous = std::fs::read_to_string(&marker)
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| is_oid(s));
         // Nor is there anything to merge when the local metadata commit
         // descends from the fetched tip (this clone pushed it, or merged it
         // before, and stored more since): a merge took 5 s on a laptop to
@@ -4023,12 +4307,29 @@ impl<'a> AttestStore<'a> {
                 .as_deref()
                 .is_some_and(|tip| restored == 0 && previous.as_deref() == Some(tip));
         if found && !materialized {
+            if tip_snap.is_none()
+                && let Some(tip) = &tip_now
+            {
+                let t = std::time::Instant::now();
+                let snap = self.snapshot_keys(tip)?;
+                step("list the tip's keys", t);
+                remote_deleted = snap.tombstones.clone();
+                tip_snap = Some(snap);
+            }
+            let remote_manifest_blobs = tip_snap
+                .as_ref()
+                .map(|s| s.manifest_blobs.clone())
+                .unwrap_or_default();
+            let t = std::time::Instant::now();
             let before = self.attestation_keys()?;
+            step("list the store's attestation keys", t);
+            let t = std::time::Instant::now();
             let manifests_before: BTreeSet<String> = if side {
                 BTreeSet::new()
             } else {
                 self.reader()?.manifest_roots()?.into_iter().collect()
             };
+            step("list the store's manifests", t);
             let local_before = self.read_ref(&local_ref)?;
             let started = std::time::Instant::now();
             // From the trees' paths (see `materialize_lazy`); git-meta's
@@ -4104,11 +4405,14 @@ impl<'a> AttestStore<'a> {
                     started.elapsed().as_secs_f64()
                 );
             }
+            let t = std::time::Instant::now();
             if self.purge_unserializable_rows()? > 0 {
                 report.warn(
                     "removed entries the merge wrote that git-meta cannot serialize".to_owned(),
                 );
             }
+            step("purge what git-meta cannot serialize", t);
+            let t = std::time::Instant::now();
             if !side {
                 let back = self.restore_referenced_manifests(
                     &session,
@@ -4123,15 +4427,22 @@ impl<'a> AttestStore<'a> {
                     ));
                 }
             }
+            step("put back manifests attestations reference", t);
             // Materialize may have applied tombstones or legacy deletes.
+            let t = std::time::Instant::now();
             self.serialize_checked(&session, &local_ref)?;
+            step("serialize after the merge", t);
+            let t = std::time::Instant::now();
             if lazy.as_ref().is_none_or(|m| m.merged)
                 && !side
                 && let Some(tip) = &tip_now
             {
                 self.adopt_equal_tip(&local_ref, tip)?;
             }
+            step("adopt an equal tip", t);
+            let t = std::time::Instant::now();
             let after = self.attestation_keys()?;
+            step("list the store's attestation keys again", t);
             let implicit = before
                 .difference(&after)
                 .filter(|k| !remote_deleted.contains(*k))
@@ -4145,7 +4456,9 @@ impl<'a> AttestStore<'a> {
                 let _ = std::fs::write(&marker, format!("{tip}\n"));
             }
         }
+        let t = std::time::Instant::now();
         self.settings_warnings(&session, report);
+        step("settings warnings", t);
         Ok(Round {
             found,
             deleted_here,
@@ -4794,16 +5107,10 @@ impl<'a> AttestStore<'a> {
         // manifest). One that still cannot be read might reference any of
         // them, so then every candidate is put back (an unreferenced
         // manifest only takes space until `vci prune`).
-        let fetched = self.hydrate_locked(remote, |k| parse_key(&k.key).is_some());
-        let all = self.list(None)?;
-        let referenced: BTreeSet<String> =
-            if fetched.is_err() || all.iter().any(|e| e.error.is_some()) {
-                candidates.clone()
-            } else {
-                all.iter()
-                    .filter_map(|e| envelope_manifest_ref(&e.bytes))
-                    .collect()
-            };
+        // What an attestation's blob names is cached (2.7.19); only the
+        // attestations not seen before are fetched and read (all of them
+        // cost vex's plans 5.7 s whenever master pruned a manifest).
+        let referenced = self.referenced_manifests(remote, &candidates)?;
         let mut back = 0;
         let project = Target::project();
         let mut put_back: Vec<String> = Vec::new();
@@ -4844,6 +5151,88 @@ impl<'a> AttestStore<'a> {
         }
         self.stamp_written(put_back.iter().map(|k| (&project, k.as_str())))?;
         Ok(back)
+    }
+
+    /// The input manifests among `candidates` that a stored attestation
+    /// references: every candidate when an attestation cannot be read (it
+    /// might reference any of them).
+    fn referenced_manifests(
+        &self,
+        remote: &str,
+        candidates: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, GitError> {
+        type K = (String, String, String);
+        let triple = |r: &Row| -> K {
+            (
+                r.target.target_type().as_str().to_owned(),
+                r.target.value().unwrap_or("").to_owned(),
+                r.key.clone(),
+            )
+        };
+        let prefix = format!("{KEY_PREFIX}:");
+        let len = prefix.len() as i64;
+        let sql = "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised \
+                   FROM metadata WHERE substr(key, 1, ?1) = ?2";
+        let keys: BTreeSet<K> = self
+            .reader()?
+            .rows(sql, &[&len, &prefix])?
+            .iter()
+            .filter(|r| r.value_type == "string" && parse_key(&r.key).is_some())
+            .map(triple)
+            .collect();
+        let blob_of = self.value_blob_ids(&keys);
+        let oids: BTreeSet<String> = blob_of.values().cloned().collect();
+        let known = self.blob_refs("manifest", &oids);
+        let mut referenced = BTreeSet::new();
+        let mut unread: BTreeSet<K> = BTreeSet::new();
+        for k in &keys {
+            match blob_of.get(k).and_then(|o| known.get(o)) {
+                Some(r) if r.is_empty() => {}
+                Some(r) => {
+                    referenced.insert(r.clone());
+                }
+                None => {
+                    unread.insert(k.clone());
+                }
+            }
+        }
+        if unread.is_empty() {
+            return Ok(referenced);
+        }
+        let fetched = self.hydrate_locked(remote, |k| {
+            unread.contains(&(
+                k.target_type.as_str().to_owned(),
+                k.target_value.clone(),
+                k.key.clone(),
+            ))
+        });
+        if fetched.is_err() {
+            return Ok(candidates.clone());
+        }
+        let reader = self.reader()?;
+        let mut learnt = BTreeMap::new();
+        for row in reader.rows(sql, &[&len, &prefix])? {
+            let k = triple(&row);
+            if !unread.contains(&k) {
+                continue;
+            }
+            let Some(e) = reader.decode_reading(row, |_| true) else {
+                continue;
+            };
+            if e.error.is_some() {
+                return Ok(candidates.clone());
+            }
+            let r = envelope_manifest_ref(&e.bytes);
+            if let Some(o) = blob_of.get(&k) {
+                learnt.insert(o.clone(), r.clone().unwrap_or_default());
+            }
+            if let Some(r) = r {
+                referenced.insert(r);
+            }
+        }
+        drop(reader);
+        self.put_blob_refs("manifest", &learnt);
+        Ok(referenced)
     }
 
     /// After git-meta merged `tip` into the local metadata commit: when the
