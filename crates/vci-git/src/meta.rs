@@ -5051,6 +5051,38 @@ impl<'a> AttestStore<'a> {
                 return Ok(done(PushStatus::NothingStored, report));
             };
             let tip = self.read_ref(&tracking)?;
+            // Checked before the checks and the fetch of what the pack needs
+            // (2.7.17: about 18 s on vex, wasted on every round that then
+            // found the tip moved).
+            //
+            // 2.7.1: a push onto a tip the remote has moved past is rejected,
+            // but only after git sent the whole metadata history: git takes
+            // the remote's advertised tip as the common base only when this
+            // clone has it, and it does not have a tip pushed since its
+            // fetch (vex: about 70 s for each such attempt, 7 s for a push
+            // that lands). One `ls-remote` first; when the tip moved, merge
+            // onto the new one straight away.
+            //
+            // 2.7.3: such a round is not an attempt (a busy evening's jobs
+            // pushed faster than a round's fetch and merge, 40 to 75 s, and
+            // a job gave up after ten rounds without one rejected push);
+            // after MOVED_SKIPS of them it pushes anyway.
+            if moved_skips < MOVED_SKIPS
+                && self
+                    .remote_tip_moved(&name, &remote_ref, tip.as_deref())
+                    .unwrap_or(false)
+            {
+                moved_skips += 1;
+                attempt -= 1;
+                last = format!("{name}'s {remote_ref} moved since this round's fetch");
+                if timing {
+                    vci_core::timing_line!(
+                        "push: {remote_ref} moved since the fetch ({moved_skips} of {MOVED_SKIPS}); merging again before pushing"
+                    );
+                }
+                carried = std::mem::take(&mut report.notes);
+                continue;
+            }
             let mut theirs_snap = None;
             // Listed once for both checks below (2.7.12: twice before,
             // about 3.5 s each on vex's 180,000-entry tree).
@@ -5207,34 +5239,6 @@ impl<'a> AttestStore<'a> {
                         t.elapsed().as_secs_f64()
                     );
                 }
-            }
-            // 2.7.1: a push onto a tip the remote has moved past is rejected,
-            // but only after git sent the whole metadata history: git takes
-            // the remote's advertised tip as the common base only when this
-            // clone has it, and it does not have a tip pushed since its
-            // fetch (vex: about 70 s for each such attempt, 7 s for a push
-            // that lands). One `ls-remote` first; when the tip moved, merge
-            // onto the new one straight away.
-            //
-            // 2.7.3: such a round is not an attempt (a busy evening's jobs
-            // pushed faster than a round's fetch and merge, 40 to 75 s, and
-            // a job gave up after ten rounds without one rejected push);
-            // after MOVED_SKIPS of them it pushes anyway.
-            if moved_skips < MOVED_SKIPS
-                && self
-                    .remote_tip_moved(&name, &remote_ref, tip.as_deref())
-                    .unwrap_or(false)
-            {
-                moved_skips += 1;
-                attempt -= 1;
-                last = format!("{name}'s {remote_ref} moved since this round's fetch");
-                if timing {
-                    vci_core::timing_line!(
-                        "push: {remote_ref} moved since the fetch ({moved_skips} of {MOVED_SKIPS}); merging again before pushing"
-                    );
-                }
-                carried = std::mem::take(&mut report.notes);
-                continue;
             }
             let t = std::time::Instant::now();
             before_push(attempt);

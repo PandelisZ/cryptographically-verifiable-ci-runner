@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-17">2.7.17</a></td><td>23 Oct 2026</td><td>A push asks whether the remote moved before its pre-push checks and fetches, not after (about 18 s saved on each round that has to merge again)</td></tr>
 <tr><td><a href="#v2-7-16">2.7.16</a></td><td>23 Oct 2026</td><td>With <code>VCI_TIMING</code>, a Rails batch compares how long a file's tests took with how long its process took</td></tr>
 <tr><td><a href="#v2-7-15">2.7.15</a></td><td>23 Oct 2026</td><td>Storing a run's attestations shares one store session instead of opening three per unit, and no longer reads the unit's earlier attestations to replace them</td></tr>
 <tr><td><a href="#v2-7-14">2.7.14</a></td><td>23 Oct 2026</td><td>With <code>VCI_TIMING</code>, a Rails batch reports each part of building a file's recorded inputs</td></tr>
@@ -113,6 +114,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-17">2.7.17</h2>
+<p><em>23 October 2026.</em> The two jobs of a vex Rails run finish within seconds of each other, so one of them usually finds that the other has pushed and merges again before its own push. 2.7.1 checks for that with one <code>ls-remote</code>, but only after the round had checked what the push deletes and sends (8 s) and fetched what the pack needs (10 s), all wasted when the tip had moved. <strong>The check now comes first.</strong></p>
 
 <h2 id="v2-7-16">2.7.16</h2>
 <p><em>23 October 2026.</em> 2.7.15 took storing a full vex Rails run's attestations from 42 s to 23 s. The batch itself still takes about 270 s against about 170 s for Rails' own parallel workers. With <code>VCI_TIMING</code>, the batch's log now gives the time a file's tests took by the test framework's own clock next to its process's time, so the time spent outside the tests (the process's start, the application's per-process setup, recording) is visible.</p>
