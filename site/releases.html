@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-12">2.7.12</a></td><td>23 Oct 2026</td><td>A push lists the local metadata commit's keys once for its two checks instead of twice</td></tr>
 <tr><td><a href="#v2-7-11">2.7.11</a></td><td>23 Oct 2026</td><td>2.7.10's fast merge also applies when both sides made the same change to a path (both jobs of a run write the same deletion records)</td></tr>
 <tr><td><a href="#v2-7-10">2.7.10</a></td><td>23 Oct 2026</td><td>Merging fetched metadata when the two sides changed different keys lets git build the merged tree from the changed subtrees alone (18 s a push round on vex)</td></tr>
 <tr><td><a href="#v2-7-9">2.7.9</a></td><td>23 Oct 2026</td><td>Looking up a stored input manifest uses the store's index instead of scanning every project row (a plan looks up about 2,000); a merge applies its deletion records in one transaction</td></tr>
@@ -108,6 +109,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-12">2.7.12</h2>
+<p><em>23 October 2026.</em> 2.7.11's fast merge took a full vex Rails run's merge from 18 s to 2 s. Before each push vci also checks that the push deletes no value of the remote's tip and that every value it sends is here; both checks listed every key of the local metadata commit, about 3.5 s each on vex's tree. <strong>The keys are now listed once</strong> for both.</p>
 
 <h2 id="v2-7-11">2.7.11</h2>
 <p><em>23 October 2026.</em> On a full vex Rails run, 2.7.10's fast merge still fell back to git-meta's (18 s): the run's two jobs had both deleted some of the same superseded entries, writing identical deletion records, so the same paths changed on both sides. A path both sides changed to the same blob is no conflict, and <code>git merge-tree</code> merges it cleanly; <strong>only a path left different on the two sides now takes git-meta's merge</strong>. With <code>VCI_TIMING</code>, vci says why it fell back.</p>

@@ -4973,6 +4973,9 @@ impl<'a> AttestStore<'a> {
             };
             let tip = self.read_ref(&tracking)?;
             let mut theirs_snap = None;
+            // Listed once for both checks below (2.7.12: twice before,
+            // about 3.5 s each on vex's 180,000-entry tree).
+            let ours_snap = self.snapshot_keys(&local)?;
             if let Some(tip) = &tip {
                 if *tip == local && round.found && !rewrite {
                     return Ok(done(PushStatus::UpToDate, report));
@@ -4989,9 +4992,8 @@ impl<'a> AttestStore<'a> {
                 // this store deleted it (vci prune, git meta rm).
                 let theirs_keys = self.snapshot_keys(tip)?;
                 let theirs = &theirs_keys.values;
-                let ours = self.snapshot_keys(&local)?.values;
                 let dropped: Vec<&Key> = theirs
-                    .difference(&ours)
+                    .difference(&ours_snap.values)
                     .filter(|k| !round.deleted_here.contains(*k))
                     .collect();
                 if let Some(first) = dropped.first() {
@@ -5009,7 +5011,6 @@ impl<'a> AttestStore<'a> {
             // longer has (deleted and garbage-collected there) cannot be
             // published by anyone, so it is deleted here (a deletion record,
             // as the remote's own history says) and the round starts over.
-            let ours_snap = self.snapshot_keys(&local)?;
             // A commit without parents (`--rewrite-history`) sends its
             // whole tree: every value must be here.
             let unsendable = self.unsendable(&name, &ours_snap, theirs_snap.as_ref(), !rewrite)?;
