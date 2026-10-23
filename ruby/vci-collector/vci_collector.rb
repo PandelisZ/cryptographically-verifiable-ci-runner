@@ -5493,8 +5493,11 @@ module VciCollector
       t3 = clock.call
       # Each part's milliseconds (2.7.13: a vex file's output took 0.41 s
       # on average, about a tenth of its process).
-      parts = { lines_ms: ((t1 - t0) * 1000).round, split_ms: ((t2 - t1) * 1000).round,
-                write_ms: ((t3 - t2) * 1000).round, before_ms: ((t0 - started) * 1000).round } if started
+      if started
+        parts = { lines_ms: ((t1 - t0) * 1000).round, split_ms: ((t2 - t1) * 1000).round,
+                  write_ms: ((t3 - t2) * 1000).round, before_ms: ((t0 - started) * 1000).round }
+        lines_parts.each { |k, v| parts[:"lines_#{k}"] = v }
+      end
       Batch.wrote_output(lines.size, split, started, parts) if started
     end
 
@@ -5507,6 +5510,14 @@ module VciCollector
     # archives (GemVerify.check remembers it for the files' processes).
     def lines_of(status, unhooked = [], shared: false)
       vc = VciCollector
+      clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      tick = clock.call
+      lap = lambda do |k|
+        now = clock.call
+        (@lines_parts ||= Hash.new(0))[k] += ((now - tick) * 1000).round
+        tick = now
+      end
+      @lines_parts = Hash.new(0)
       taints = vc.taints.dup + unhooked
       lines = shared ? [] : [meta]
       vc.enumerations.each do |where, meth|
@@ -5577,11 +5588,13 @@ module VciCollector
                    { kind: kind.to_s, path: p }
                  end
       end
+      lap.call(:records_ms)
       vc.autoload_names.each_key { |n| lines << { kind: "autoload_miss", name: n } }
       vc.autoload_listed.each_key { |n| lines << { kind: "autoload_listed", ns: n } }
       # Many absent paths under one directory (load path probes): its
       # listing instead (fold_probes).
       lines = fold_probes(lines, seen, listed, written)
+      lap.call(:fold_ms)
       # A listing of the directory holding one leaves it out (it is not in
       # a fresh checkout, and comes and goes with the database's journal).
       dbx.each_key do |x|
@@ -5591,7 +5604,9 @@ module VciCollector
       end
       written.each_key { |p| lines << { kind: "write", path: p } if vc.inside?(p, vc.repo) && !dbx.key?(p) }
       taints.concat(DB.taints) unless shared
+      lap.call(:db_ms)
       taints.concat(GemVerify.check(externals.values.uniq, gem_files))
+      lap.call(:gems_ms)
       externals.each do |(name, version), s|
         rec = { kind: "external", name: name, version: version, platform: s.platform.to_s }
         src = Gems.source_of(s)
@@ -5605,7 +5620,9 @@ module VciCollector
       Env::ALWAYS_READ.each { |k| keys[k] ||= { "ruby" => true } }
       keys.each { |k, w| lines << { kind: "env", key: k, where: w.keys.first(3).join(" | ") } }
       return lines.uniq if shared
+      lap.call(:externals_env_ms)
       taints.concat(Checks.run)
+      lap.call(:checks_ms)
       taints.concat(RSpecSupport.taints) if RUNNER == "rspec"
       res = result(status)
       if status != 0 && framework_clean?
@@ -5613,7 +5630,13 @@ module VciCollector
                   "an at_exit handler such as SimpleCov's minimum_coverage failed the run)"
       end
       taints.uniq.each { |t| lines << { kind: "taint", reason: t } }
+      lap.call(:result_ms)
       lines << res
+    end
+
+    # The milliseconds of each part of the last lines_of (2.7.14).
+    def lines_parts
+      @lines_parts || {}
     end
 
     # --- absent paths folded into a listing ----------------------------------

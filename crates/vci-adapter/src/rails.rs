@@ -1211,6 +1211,20 @@ impl RailsAdapter {
                     .as_bytes(),
                 );
             }
+            if !slots.lines_parts_ms.is_empty() {
+                let parts: Vec<String> = slots
+                    .lines_parts_ms
+                    .iter()
+                    .map(|(k, v)| format!("{k} {:.3} s", *v as f64 / 1000.0 / n))
+                    .collect();
+                log.extend_from_slice(
+                    format!(
+                        "vci: building the lines, on average: {}\n",
+                        parts.join(", ")
+                    )
+                    .as_bytes(),
+                );
+            }
         }
         log.extend_from_slice(&out.stdout);
         log.extend_from_slice(&out.stderr);
@@ -1306,6 +1320,8 @@ struct SlotStats {
     /// tests' end to building the lines, building them, splitting off what
     /// the boot shares, writing.
     output_parts_ms: [u64; 4],
+    /// Sums over the files of each part of building their lines (2.7.14).
+    lines_parts_ms: BTreeMap<String, u64>,
     shared_ms: Vec<u64>,
 }
 
@@ -1485,6 +1501,16 @@ fn read_batch(
                 {
                     if let Some(x) = v.get(*k).and_then(Value::as_u64) {
                         stats.output_parts_ms[i] += x;
+                    }
+                }
+                if let Some(o) = v.as_object() {
+                    for (k, x) in o {
+                        if let (Some(part), Some(x)) = (
+                            k.strip_prefix("lines_").and_then(|r| r.strip_suffix("_ms")),
+                            x.as_u64(),
+                        ) {
+                            *stats.lines_parts_ms.entry(part.to_owned()).or_insert(0) += x;
+                        }
                     }
                 }
             } else if v.get("shared").is_some() {

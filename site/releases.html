@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-14">2.7.14</a></td><td>23 Oct 2026</td><td>With <code>VCI_TIMING</code>, a Rails batch reports each part of building a file's recorded inputs</td></tr>
 <tr><td><a href="#v2-7-13">2.7.13</a></td><td>23 Oct 2026</td><td>With <code>VCI_TIMING</code>, a Rails batch reports what part of writing each file's output takes the time</td></tr>
 <tr><td><a href="#v2-7-12">2.7.12</a></td><td>23 Oct 2026</td><td>A push lists the local metadata commit's keys once for its two checks instead of twice</td></tr>
 <tr><td><a href="#v2-7-11">2.7.11</a></td><td>23 Oct 2026</td><td>2.7.10's fast merge also applies when both sides made the same change to a path (both jobs of a run write the same deletion records)</td></tr>
@@ -110,6 +111,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-14">2.7.14</h2>
+<p><em>23 October 2026.</em> 2.7.13 showed that building the lines takes 0.37 s of the 0.40 s a vex file's process spends on its output. With <code>VCI_TIMING</code>, the batch's log now splits that into its parts: the recorded paths, folding the load path's absent paths, the database, the gems' files, externals and environment, the checks and the result.</p>
 
 <h2 id="v2-7-13">2.7.13</h2>
 <p><em>23 October 2026.</em> A full vex Rails run's batch takes about 270 s against about 180 s for the same files in Rails' own parallel workers; writing each file's recorded inputs takes 0.41 s of a file's 3.8 s. With <code>VCI_TIMING</code>, the batch's log now splits that into building the lines, splitting off what the boot shares, and writing them.</p>
