@@ -4026,6 +4026,15 @@ impl<'a> AttestStore<'a> {
             Ok(None)
         };
         let local = self.read_ref(local_ref)?;
+        // Every entry the merged commit has that the local one did not is
+        // written into the store below (a row, or a deletion record), and
+        // the rest it shares with the local commit: a store that covered
+        // that one covers the merged one too (2.7.7; see
+        // [`AttestStore::covered_commit`]).
+        let was_covered = match &local {
+            Some(l) => self.covered_commit().as_deref() == Some(l.as_str()),
+            None => true,
+        };
         // A fast-forward takes only what changed (a changed set or list entry
         // falls back below); taking a whole tree or merging two reads them
         // all.
@@ -4213,6 +4222,9 @@ impl<'a> AttestStore<'a> {
             Some(l) if *l == to_commit => {}
             Some(l) => self.cas_ref(local_ref, Some(&to_commit), l, "vci: materialize")?,
             None => self.cas_ref(local_ref, Some(&to_commit), "", "vci: materialize")?,
+        }
+        if was_covered {
+            self.set_covered_commit(&to_commit);
         }
         // Marked materialized (git-meta's next serialization then skips
         // what this merge wrote, which the tree already holds) only when every
