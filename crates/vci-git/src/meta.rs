@@ -3959,6 +3959,16 @@ impl<'a> AttestStore<'a> {
         // falls back below); taking a whole tree or merging two reads them
         // all.
         let set_or_list = |first: &String| format!("{first} (a git-meta set or list entry)");
+        // Each part's time under VCI_TIMING (2.7.4: a merge of 27 changed
+        // entries took 23 s on vex's runners, as long as one of thousands).
+        let timed = vci_core::metrics::on();
+        let mut t = std::time::Instant::now();
+        let mut part = |what: &str| {
+            if timed {
+                vci_core::timing_line!("materialize: {what}: {:.2}s", t.elapsed().as_secs_f64());
+            }
+            t = std::time::Instant::now();
+        };
         let (from_tree, to_commit, merged) = match &local {
             None if !tip_snap.others.is_empty() => {
                 return fallback(set_or_list(&tip_snap.others[0]));
@@ -3972,6 +3982,7 @@ impl<'a> AttestStore<'a> {
                 Ok(m) => (format!("{l}^{{tree}}"), m, true),
             },
         };
+        part(if merged { "merge commit" } else { "base" });
         let merged_snap;
         let to_snap = if merged {
             merged_snap = self.snapshot_keys(&to_commit)?;
@@ -3979,6 +3990,7 @@ impl<'a> AttestStore<'a> {
         } else {
             tip_snap
         };
+        part("list the merged tree's keys");
         let raw = self
             .repo
             .git()
@@ -4023,6 +4035,7 @@ impl<'a> AttestStore<'a> {
         // and email, git-meta's legacy delete below, until the next merge.)
         // Compared by blob id first, the blob git-meta writes for the stored
         // record, so only a record that differs is read.
+        part("diff-tree and classify");
         let held: BTreeMap<Key, Tombstone> =
             guarded("reading the store", || store.get_all_tombstones())?
                 .into_iter()
@@ -4060,6 +4073,7 @@ impl<'a> AttestStore<'a> {
             .chain(restamp.values())
             .cloned()
             .collect();
+        part("read the stored deletion records and compare");
         let (have, _, error) = self.ensure_blobs(remote, &oids)?;
         if let Some(e) = error
             && changed_tombstones.values().any(|o| !have.contains(o))
@@ -4092,7 +4106,9 @@ impl<'a> AttestStore<'a> {
             .collect();
         let changed = values.len() + tombstones.len() + removed.len();
         let inline_max = guarded("reading the store", || store.object_max_size())?;
+        part("fetch and read changed deletion records");
         let promised = self.mark_values(&values, &to_commit, now, inline_max)?;
+        part("mark the changed values");
         let email = session.email().to_owned();
         if !tombstones.is_empty() {
             guarded("applying fetched metadata", || {

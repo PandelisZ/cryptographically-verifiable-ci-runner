@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-4">2.7.4</a></td><td>23 Oct 2026</td><td>With <code>VCI_TIMING</code>, merging fetched metadata reports each of its parts</td></tr>
 <tr><td><a href="#v2-7-3">2.7.3</a></td><td>23 Oct 2026</td><td>A push that merges again because the remote moved no longer uses up an attempt (up to 30 such rounds), so a busy hour no longer makes a job give up without one rejected push</td></tr>
 <tr><td><a href="#v2-7-2">2.7.2</a></td><td>22 Oct 2026</td><td>A Rails test file that runs past <code>VCI_RAILS_FILE_TIMEOUT</code> (default 10 min) is stopped, fails and is not attested, instead of holding the job with no output until the job times out</td></tr>
 <tr><td><a href="#v2-7-1">2.7.1</a></td><td>22 Oct 2026</td><td>A push onto a tip the remote has moved past is skipped after one <code>ls-remote</code> instead of sending the whole history to be rejected (about 70 s each on vex); a CI job no longer repacks the whole repository before it pushes</td></tr>
@@ -100,6 +101,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-4">2.7.4</h2>
+<p><em>23 October 2026.</em> A vex pull request job that ran 50 of 2,051 Rails files (54 s of tests) took 334 s in all, about 170 of them in three push rounds of which each spent about 23 s merging the remote's metadata, whether 27 entries had changed or thousands. With <code>VCI_TIMING</code>, that merge now reports each part: the merge commit, listing the merged tree's keys, comparing the trees, reading the stored deletion records, fetching changed ones and marking the changed values.</p>
 
 <h2 id="v2-7-3">2.7.3</h2>
 <p><em>23 October 2026.</em> 2.7.1 skips a push onto a tip the remote has moved past and merges again instead. On a busy evening a vex job did that eight times in ten attempts: each round's fetch and merge takes 40 to 75 s, other jobs pushed more often than that, and after ten rounds, with two pushes in all, the job gave up (<code>still rejected after 10 attempts</code>). <strong>A round that merged again without pushing is no longer an attempt</strong>; after 30 of them vci pushes regardless. Ten attempts still means ten pushes.</p>
