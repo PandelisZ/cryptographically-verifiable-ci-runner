@@ -119,6 +119,9 @@ pub const DEFAULT_REMOTE_NAME: &str = "meta";
 /// git-meta's minimum target value length.
 const MIN_TARGET_LEN: usize = 3;
 const PUSH_ATTEMPTS: u32 = 10;
+/// Rounds a push may merge again because the remote moved since its fetch
+/// before it pushes regardless (2.7.3; they do not count as attempts).
+const MOVED_SKIPS: u32 = 30;
 /// How many times [`AttestStore::complete_tree`] asks for the subtrees a
 /// fetch of a tree's id left out.
 const COMPLETE_TREE_ROUNDS: usize = 5;
@@ -4580,7 +4583,12 @@ impl<'a> AttestStore<'a> {
             warnings: report.warnings,
             notes: report.notes,
         };
-        for attempt in 1..=PUSH_ATTEMPTS {
+        let mut attempt: u32 = 0;
+        // Rounds that merged again because the remote moved, without
+        // pushing (2.7.3: they no longer count as attempts).
+        let mut moved_skips: u32 = 0;
+        while attempt < PUSH_ATTEMPTS {
+            attempt += 1;
             let mut report = Report {
                 notes: std::mem::take(&mut carried),
                 ..Report::default()
@@ -4770,15 +4778,22 @@ impl<'a> AttestStore<'a> {
             // fetch (vex: about 70 s for each such attempt, 7 s for a push
             // that lands). One `ls-remote` first; when the tip moved, merge
             // onto the new one straight away.
-            if attempt < PUSH_ATTEMPTS
+            //
+            // 2.7.3: such a round is not an attempt (a busy evening's jobs
+            // pushed faster than a round's fetch and merge, 40 to 75 s, and
+            // a job gave up after ten rounds without one rejected push);
+            // after MOVED_SKIPS of them it pushes anyway.
+            if moved_skips < MOVED_SKIPS
                 && self
                     .remote_tip_moved(&name, &remote_ref, tip.as_deref())
                     .unwrap_or(false)
             {
+                moved_skips += 1;
+                attempt -= 1;
                 last = format!("{name}'s {remote_ref} moved since this round's fetch");
                 if timing {
                     vci_core::timing_line!(
-                        "push: attempt {attempt}: {remote_ref} moved since the fetch; merging again before pushing"
+                        "push: {remote_ref} moved since the fetch ({moved_skips} of {MOVED_SKIPS}); merging again before pushing"
                     );
                 }
                 carried = std::mem::take(&mut report.notes);
