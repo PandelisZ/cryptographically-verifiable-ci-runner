@@ -835,3 +835,43 @@ fn a_changed_entry_the_incremental_merge_does_not_read_is_merged_in_full() {
     assert!(!merged_in_full(&out), "{out:?}");
     assert_eq!(contents(&sb), fresh_contents(&w));
 }
+
+/// 2.7.5: a fetch skips the coverage check when the store recorded that it
+/// covers the local ref, but a row deleted behind vci's back (raw SQL, as a
+/// purge does) clears that record, so the next fetch restores the value and
+/// a push never drops it.
+#[test]
+fn a_row_deleted_after_coverage_is_restored_before_a_push() {
+    let w = world(1);
+    let c = &w.clones[0];
+    let r = repo(c);
+    let st = AttestStore::new(&r);
+    for (i, id) in [A, B].iter().enumerate() {
+        st.put(id, S1, &hex64(i as u8 + 1), &big(id)).unwrap();
+    }
+    st.push(Some("origin")).unwrap();
+    st.fetch(None).unwrap();
+    {
+        let db = rusqlite::Connection::open(c.join(".git/git-meta.sqlite")).unwrap();
+        let covered: Option<String> = db
+            .query_row("SELECT local FROM vci_cover LIMIT 1", [], |r| r.get(0))
+            .ok();
+        assert!(covered.is_some(), "a fetch records the covered commit");
+        let n = db
+            .execute(
+                "DELETE FROM metadata WHERE key LIKE ?1",
+                [format!("%{}%", vci_core::test_key(A))],
+            )
+            .unwrap();
+        assert!(n > 0, "deleted A's row");
+        let after: Option<String> = db
+            .query_row("SELECT local FROM vci_cover LIMIT 1", [], |r| r.get(0))
+            .ok();
+        assert!(after.is_none(), "the trigger clears the record");
+    }
+    st.fetch(None).unwrap();
+    assert_eq!(ids(&st), tk(&[A, B]), "the fetch restores A");
+    st.put(C, S1, &hex64(3), b"c").unwrap();
+    st.push(None).unwrap();
+    assert_eq!(remote_keys(&w), tk(&[A, B, C]));
+}

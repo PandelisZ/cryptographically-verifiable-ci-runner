@@ -1876,6 +1876,45 @@ impl<'a> AttestStore<'a> {
         Ok((tables > 0).then_some((path, db)))
     }
 
+    /// The local commit the store is known to cover (2.7.5): every value of
+    /// it is a row or a deletion record here. Recorded in the store itself,
+    /// so a new or replaced store has none, and cleared by triggers on any
+    /// deletion of a row or a deletion record (the only ways the store stops
+    /// covering a commit it covered). `None` when unknown.
+    fn covered_commit(&self) -> Option<String> {
+        let (_, db) = self.db_rw().ok()??;
+        Self::cover_schema(&db).ok()?;
+        db.query_row("SELECT local FROM vci_cover LIMIT 1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .filter(|o| is_oid(o))
+    }
+
+    /// Record that the store covers `commit` (see
+    /// [`AttestStore::covered_commit`]).
+    fn set_covered_commit(&self, commit: &str) {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return;
+        };
+        if Self::cover_schema(&db).is_err() {
+            return;
+        }
+        let _ = db.execute_batch("BEGIN; DELETE FROM vci_cover;");
+        let _ = db.execute("INSERT INTO vci_cover (local) VALUES (?1)", [commit]);
+        let _ = db.execute_batch("COMMIT;");
+    }
+
+    fn cover_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vci_cover (local TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS vci_cover_rows AFTER DELETE ON metadata
+               BEGIN DELETE FROM vci_cover; END;
+             CREATE TRIGGER IF NOT EXISTS vci_cover_tombstones AFTER DELETE ON tombstones
+               BEGIN DELETE FROM vci_cover; END;",
+        )
+    }
+
     /// Stamps the store's log entry of each key just written (its latest)
     /// with the time now, after the write was committed.
     ///
@@ -2939,6 +2978,24 @@ impl<'a> AttestStore<'a> {
         let Some(local) = self.read_ref(local_ref)? else {
             return Ok(0);
         };
+        // 2.7.5: known to cover it already (a vex job restoring a cached
+        // store spent up to 26 s here finding nothing to restore).
+        if self.covered_commit().as_deref() == Some(local.as_str()) {
+            return Ok(0);
+        }
+        let n = self.cover_local_ref_full(session, remote, local_ref, &local)?;
+        self.set_covered_commit(&local);
+        Ok(n)
+    }
+
+    fn cover_local_ref_full(
+        &self,
+        session: &Session,
+        remote: &str,
+        local_ref: &str,
+        local: &str,
+    ) -> Result<usize, GitError> {
+        let local = local.to_owned();
         let store = session.store();
         // Promised rows are rows: the store holds those values, unread.
         let rows: BTreeMap<Key, i64> = self
@@ -3120,6 +3177,26 @@ impl<'a> AttestStore<'a> {
     /// everyone.
     fn serialize_checked(&self, session: &Session, local_ref: &str) -> Result<(), GitError> {
         let prev = self.read_ref(local_ref)?;
+        // A commit built from a store that covered the previous one (its
+        // values from the store's rows, the subtrees it reuses from that
+        // commit) is covered too (2.7.5).
+        let covered = prev.is_some() && self.covered_commit() == prev;
+        let r = self.serialize_checked_inner(session, local_ref, prev);
+        if r.is_ok()
+            && covered
+            && let Ok(Some(now)) = self.read_ref(local_ref)
+        {
+            self.set_covered_commit(&now);
+        }
+        r
+    }
+
+    fn serialize_checked_inner(
+        &self,
+        session: &Session,
+        local_ref: &str,
+        prev: Option<String>,
+    ) -> Result<(), GitError> {
         // With filter rules (meta:filter, local:meta:filter), git-meta's
         // incremental serialization keeps the untouched targets' subtrees as
         // they are, so a rule that excludes vci's keys would leave the
