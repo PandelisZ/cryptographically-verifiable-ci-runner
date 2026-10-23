@@ -5240,6 +5240,26 @@ impl<'a> AttestStore<'a> {
                     );
                 }
             }
+            // Again right before pushing (2.7.18): the checks and the fetch
+            // above take about 18 s on vex, long enough for a run's other
+            // job to push in between, and a push that is then rejected has
+            // already sent its pack.
+            if moved_skips < MOVED_SKIPS
+                && self
+                    .remote_tip_moved(&name, &remote_ref, tip.as_deref())
+                    .unwrap_or(false)
+            {
+                moved_skips += 1;
+                attempt -= 1;
+                last = format!("{name}'s {remote_ref} moved since this round's fetch");
+                if timing {
+                    vci_core::timing_line!(
+                        "push: {remote_ref} moved while checking ({moved_skips} of {MOVED_SKIPS}); merging again before pushing"
+                    );
+                }
+                carried = std::mem::take(&mut report.notes);
+                continue;
+            }
             let t = std::time::Instant::now();
             before_push(attempt);
             // `--no-thin`: a thin pack deltifies against the remote's

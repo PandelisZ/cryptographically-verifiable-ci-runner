@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-18">2.7.18</a></td><td>23 Oct 2026</td><td>A push asks again whether the remote moved right before <code>git push</code>, so the run's other job pushing during the pre-push checks no longer costs a rejected push</td></tr>
 <tr><td><a href="#v2-7-17">2.7.17</a></td><td>23 Oct 2026</td><td>A push asks whether the remote moved before its pre-push checks and fetches, not after (about 18 s saved on each round that has to merge again)</td></tr>
 <tr><td><a href="#v2-7-16">2.7.16</a></td><td>23 Oct 2026</td><td>With <code>VCI_TIMING</code>, a Rails batch compares how long a file's tests took with how long its process took</td></tr>
 <tr><td><a href="#v2-7-15">2.7.15</a></td><td>23 Oct 2026</td><td>Storing a run's attestations shares one store session instead of opening three per unit, and no longer reads the unit's earlier attestations to replace them</td></tr>
@@ -114,6 +115,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-18">2.7.18</h2>
+<p><em>23 October 2026.</em> 2.7.17 asks whether the remote moved before its pre-push checks; those checks and the fetch of what the pack needs then take about 18 s on vex, long enough for the run's other job to push, and the next probe's push was rejected after sending its pack (26 s). <strong>vci now asks again right before <code>git push</code></strong> (one more <code>ls-remote</code>, under a second).</p>
 
 <h2 id="v2-7-17">2.7.17</h2>
 <p><em>23 October 2026.</em> The two jobs of a vex Rails run finish within seconds of each other, so one of them usually finds that the other has pushed and merges again before its own push. 2.7.1 checks for that with one <code>ls-remote</code>, but only after the round had checked what the push deletes and sends (8 s) and fetched what the pack needs (10 s), all wasted when the tip had moved. <strong>The check now comes first.</strong></p>
