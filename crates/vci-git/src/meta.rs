@@ -893,11 +893,22 @@ impl Reader {
         }
         let key = manifest_key(root);
         let ty = TargetType::Project.as_str().to_owned();
-        let rows = self.rows(
+        // With the (empty) project target value the store's index finds the
+        // row (2.7.9: without it each lookup scanned every project row, and
+        // a vex plan looks up some 2,000 manifests, 11.6 s); the old query
+        // only when that finds nothing.
+        let mut rows = self.rows(
             "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised
-             FROM metadata WHERE target_type = ?1 AND key = ?2",
+             FROM metadata WHERE target_type = ?1 AND target_value = '' AND key = ?2",
             &[&ty, &key],
         )?;
+        if rows.is_empty() {
+            rows = self.rows(
+                "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised
+                 FROM metadata WHERE target_type = ?1 AND key = ?2",
+                &[&ty, &key],
+            )?;
+        }
         let Some(row) = rows.into_iter().find(|r| r.key == key) else {
             return Ok(None);
         };
@@ -1955,6 +1966,81 @@ impl<'a> AttestStore<'a> {
              CREATE TRIGGER IF NOT EXISTS vci_cover_tombstones AFTER DELETE ON tombstones
                BEGIN DELETE FROM vci_cover; END;",
         )
+    }
+
+    /// git-meta's `apply_tombstone` for each of `items` (key, email,
+    /// timestamp), in order, in one transaction on this store's own
+    /// connection (2.7.9: called once per record, each its own commit, a vex
+    /// plan's merge applied 8,500 in 8.4 s). The same statements as
+    /// git-meta's. `false` when the store could not be opened directly (the
+    /// caller then applies them through git-meta).
+    fn apply_tombstones_batch(&self, items: &[(&Key, &str, i64)]) -> Result<bool, GitError> {
+        let Some((path, mut db)) = self.db_rw()? else {
+            return Ok(false);
+        };
+        let e = |err| sql_err(&path, err);
+        let tx = db.transaction().map_err(e)?;
+        {
+            let mut find = tx
+                .prepare_cached(
+                    "SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3",
+                )
+                .map_err(e)?;
+            let mut del_list = tx
+                .prepare_cached("DELETE FROM list_values WHERE metadata_id = ?1")
+                .map_err(e)?;
+            let mut del_set = tx
+                .prepare_cached("DELETE FROM set_values WHERE metadata_id = ?1")
+                .map_err(e)?;
+            let mut del_row = tx
+                .prepare_cached("DELETE FROM metadata WHERE rowid = ?1")
+                .map_err(e)?;
+            let mut del_members = tx
+                .prepare_cached(
+                    "DELETE FROM tombstones WHERE tombstone_type = 'set_member' AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+                )
+                .map_err(e)?;
+            let mut put = tx
+                .prepare_cached(
+                    "INSERT INTO tombstones (tombstone_type, target_type, target_value, key, entry_id, value, timestamp, email)
+                     VALUES ('metadata', ?1, ?2, ?3, '', '', ?4, ?5)
+                     ON CONFLICT(tombstone_type, target_type, target_value, key, entry_id) DO UPDATE
+                     SET timestamp = excluded.timestamp, email = excluded.email",
+                )
+                .map_err(e)?;
+            let mut log = tx
+                .prepare_cached(
+                    "INSERT INTO metadata_log (target_type, target_value, key, value, value_type, operation, email, timestamp)
+                     VALUES (?1, ?2, ?3, '', '', 'rm', ?4, ?5)",
+                )
+                .map_err(e)?;
+            for (k, email, ts) in items {
+                let ty = k.target_type.as_str();
+                let value = k.target_value.as_str();
+                let id: Option<i64> = find
+                    .query_row(rusqlite::params![ty, value, k.key], |r| r.get(0))
+                    .map(Some)
+                    .or_else(|err| match err {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(other),
+                    })
+                    .map_err(e)?;
+                if let Some(id) = id {
+                    del_list.execute([id]).map_err(e)?;
+                    del_set.execute([id]).map_err(e)?;
+                    del_row.execute([id]).map_err(e)?;
+                }
+                del_members
+                    .execute(rusqlite::params![ty, value, k.key])
+                    .map_err(e)?;
+                put.execute(rusqlite::params![ty, value, k.key, ts, email])
+                    .map_err(e)?;
+                log.execute(rusqlite::params![ty, value, k.key, email, ts])
+                    .map_err(e)?;
+            }
+        }
+        tx.commit().map_err(e)?;
+        Ok(true)
     }
 
     /// Stamps the store's log entry of each key just written (its latest)
@@ -4232,33 +4318,30 @@ impl<'a> AttestStore<'a> {
         let promised = self.mark_values(&values, &to_commit, now, inline_max)?;
         part("mark the changed values");
         let email = session.email().to_owned();
-        if !tombstones.is_empty() {
-            guarded("applying fetched metadata", || {
-                store.apply_tree(
-                    &BTreeMap::new(),
-                    &tombstones,
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    &email,
-                    now,
-                )
-            })?;
-        }
-        for (k, t) in &restamped {
-            guarded("applying a deletion record", || {
-                store.apply_tombstone(&k.to_target(), &k.key, &t.email, t.timestamp)
-            })?;
-        }
         // The values deleted now are stamped after the tree's records, as
         // git-meta does; a merge keeps the deletion record its tree holds.
         let legacy: Vec<&Key> = removed
             .iter()
             .filter(|k| !(merged && to_snap.tombstones.contains(*k)))
             .collect();
-        for k in &legacy {
-            guarded("applying a deletion", || {
-                store.apply_tombstone(&k.to_target(), &k.key, &email, now)
-            })?;
+        // In git-meta's order: the tree's records, the restamped ones, then
+        // the values deleted now; in one transaction (2.7.9).
+        let batch: Vec<(&Key, &str, i64)> = tombstones
+            .iter()
+            .map(|(k, t)| (k, t.email.as_str(), t.timestamp))
+            .chain(
+                restamped
+                    .iter()
+                    .map(|(k, t)| (k, t.email.as_str(), t.timestamp)),
+            )
+            .chain(legacy.iter().map(|k| (*k, email.as_str(), now)))
+            .collect();
+        if !batch.is_empty() && !self.apply_tombstones_batch(&batch)? {
+            for (k, mail, ts) in &batch {
+                guarded("applying a deletion record", || {
+                    store.apply_tombstone(&k.to_target(), &k.key, mail, *ts)
+                })?;
+            }
         }
         part(&format!(
             "apply {} deletion record(s), {} restamped, {} deleted",
