@@ -1211,6 +1211,19 @@ impl RailsAdapter {
                     .as_bytes(),
                 );
             }
+            if !slots.tests_ms.is_empty() && !slots.file_ms.is_empty() {
+                let t = slots.tests_ms.iter().sum::<u64>() as f64 / slots.tests_ms.len() as f64;
+                let f = slots.file_ms.iter().sum::<u64>() as f64 / slots.file_ms.len() as f64;
+                log.extend_from_slice(
+                    format!(
+                        "vci: a file's tests took {:.2} s on average by the test framework's clock, its process {:.2} s: {:.2} s a file outside the tests\n",
+                        t / 1000.0,
+                        f / 1000.0,
+                        (f - t) / 1000.0
+                    )
+                    .as_bytes(),
+                );
+            }
             if !slots.lines_parts_ms.is_empty() {
                 let parts: Vec<String> = slots
                     .lines_parts_ms
@@ -1320,6 +1333,9 @@ struct SlotStats {
     /// tests' end to building the lines, building them, splitting off what
     /// the boot shares, writing.
     output_parts_ms: [u64; 4],
+    /// Each file's tests' own time as the test framework measured it
+    /// (2.7.16), against its process's time (`file_ms`).
+    tests_ms: Vec<u64>,
     /// Sums over the files of each part of building their lines (2.7.14).
     lines_parts_ms: BTreeMap<String, u64>,
     shared_ms: Vec<u64>,
@@ -1589,6 +1605,9 @@ fn read_batch(
             (Some(0), c) => code = c,
             (Some(_), None) => code = None,
             _ => {}
+        }
+        if let Some(r) = &o.result {
+            stats.tests_ms.push(r.duration_ms);
         }
         observed.push(o);
     }
