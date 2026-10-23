@@ -327,6 +327,31 @@ pub struct AttestStore<'a> {
     repo: &'a Repo,
 }
 
+/// The session and store connection a batch of writes on this thread
+/// shares ([`AttestStore::batch`], 2.7.15), for the repository whose root
+/// is the first field.
+struct BatchConns {
+    root: Utf8PathBuf,
+    session: std::rc::Rc<Session>,
+    db: Option<(Utf8PathBuf, rusqlite::Connection)>,
+}
+
+thread_local! {
+    static BATCH: std::cell::RefCell<Option<BatchConns>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, [`AttestStore`]'s writes on this thread share one git-meta
+/// session and one store connection; dropping it closes them.
+pub struct BatchGuard {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        BATCH.with(|b| b.borrow_mut().take());
+    }
+}
+
 /// The git-meta target for a test id.
 pub fn target_for(test_id: &str) -> Target {
     let path = test_id.split('#').next().unwrap_or(test_id);
@@ -1206,6 +1231,35 @@ impl<'a> AttestStore<'a> {
         AttestStore { repo }
     }
 
+    /// Share one git-meta session and one store connection among the writes
+    /// made while the guard lives (2.7.15: storing a vex Rails run's 1,018
+    /// units opened three sessions and three connections each, and read
+    /// every earlier attestation of the unit, 33 s in all).
+    pub fn batch(&self) -> Result<BatchGuard, GitError> {
+        let session = std::rc::Rc::new(self.session()?);
+        let db = self.db_rw()?;
+        let root = self.repo.root().to_owned();
+        BATCH.with(|b| *b.borrow_mut() = Some(BatchConns { root, session, db }));
+        Ok(BatchGuard {
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// The batch's session (this repository's, on this thread), or a new
+    /// one.
+    fn write_session(&self) -> Result<std::rc::Rc<Session>, GitError> {
+        let shared = BATCH.with(|b| {
+            b.borrow()
+                .as_ref()
+                .filter(|c| c.root == self.repo.root())
+                .map(|c| c.session.clone())
+        });
+        match shared {
+            Some(s) => Ok(s),
+            None => Ok(std::rc::Rc::new(self.session()?)),
+        }
+    }
+
     fn db_path(&self) -> Result<Utf8PathBuf, GitError> {
         Ok(self.repo.git_dir()?.join("git-meta.sqlite"))
     }
@@ -1298,9 +1352,11 @@ impl<'a> AttestStore<'a> {
         })?;
         let tk = vci_core::test_key(test_id);
         let target = target_for(test_id);
+        // Keys alone (2.7.15: their values, read through a new `git
+        // cat-file`, were never used).
         let same_inputs: Vec<StoredEnvelope> = self
             .reader()?
-            .candidates(test_id)?
+            .candidates_reading(test_id, |_| false)?
             .into_iter()
             .filter(|e| e.signer == signer && e.storage_key == storage_key)
             .collect();
@@ -1319,7 +1375,7 @@ impl<'a> AttestStore<'a> {
         if !others.is_empty() {
             self.remove_envelopes(others)?;
         }
-        let session = self.session()?;
+        let session = self.write_session()?;
         let handle = session.target(&target);
         let current = handle.get_value(&key).ok().flatten();
         if current != Some(MetaValue::String(text.to_owned())) {
@@ -1389,7 +1445,7 @@ impl<'a> AttestStore<'a> {
         if doomed.is_empty() {
             return Ok(doomed);
         }
-        let session = self.session()?;
+        let session = self.write_session()?;
         let mut removed = Vec::new();
         let mut targets = Vec::new();
         for e in doomed {
@@ -1421,7 +1477,7 @@ impl<'a> AttestStore<'a> {
             reason: "must be UTF-8",
         })?;
         let key = manifest_key(root);
-        let session = self.session()?;
+        let session = self.write_session()?;
         let handle = session.target(&Target::project());
         let current = handle.get_value(&key).ok().flatten();
         if current == Some(MetaValue::String(text.to_owned())) {
@@ -1490,7 +1546,7 @@ impl<'a> AttestStore<'a> {
         if keys.is_empty() {
             return Ok(0);
         }
-        let session = self.session()?;
+        let session = self.write_session()?;
         let project = Target::project();
         let mut removed = Vec::new();
         for key in keys {
@@ -2067,13 +2123,36 @@ impl<'a> AttestStore<'a> {
         if written.peek().is_none() {
             return Ok(());
         }
+        let written: Vec<(&Target, &str)> = written.collect();
+        // The batch's connection when there is one (2.7.15).
+        let shared = BATCH.with(|b| {
+            let mut b = b.borrow_mut();
+            match b.as_mut() {
+                Some(c) if c.root == self.repo.root() => {
+                    c.db.as_mut()
+                        .map(|(path, db)| Self::stamp_on(path, db, &written))
+                }
+                _ => None,
+            }
+        });
+        if let Some(r) = shared {
+            return r;
+        }
         let Some((path, mut db)) = self.db_rw()? else {
             return Err(GitError::Store(
                 "the git-meta store is gone right after a write".to_owned(),
             ));
         };
+        Self::stamp_on(&path, &mut db, &written)
+    }
+
+    fn stamp_on(
+        path: &Utf8Path,
+        db: &mut rusqlite::Connection,
+        written: &[(&Target, &str)],
+    ) -> Result<(), GitError> {
         let now = now_ms();
-        let tx = db.transaction().map_err(|e| sql_err(&path, e))?;
+        let tx = db.transaction().map_err(|e| sql_err(path, e))?;
         {
             let mut stmt = tx
                 .prepare(
@@ -2084,7 +2163,7 @@ impl<'a> AttestStore<'a> {
                          ORDER BY timestamp DESC, rowid DESC LIMIT 1
                      ) AND timestamp < ?1",
                 )
-                .map_err(|e| sql_err(&path, e))?;
+                .map_err(|e| sql_err(path, e))?;
             for (target, key) in written {
                 stmt.execute(rusqlite::params![
                     now,
@@ -2092,10 +2171,10 @@ impl<'a> AttestStore<'a> {
                     target.value().unwrap_or(""),
                     key
                 ])
-                .map_err(|e| sql_err(&path, e))?;
+                .map_err(|e| sql_err(path, e))?;
             }
         }
-        tx.commit().map_err(|e| sql_err(&path, e))
+        tx.commit().map_err(|e| sql_err(path, e))
     }
 
     /// The store's value rows (promised ones included, side-remote imports

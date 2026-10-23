@@ -2346,6 +2346,9 @@ pub fn run_units(
                 t,
             );
         }
+        // One git-meta session and store connection for every unit's writes
+        // (2.7.15); without it each write opens its own.
+        let _batch = store.batch().ok();
         for (i, v) in verdicts.into_iter().enumerate() {
             let Some(v) = v else { continue };
             let label = &units[i].2;
