@@ -4563,7 +4563,8 @@ impl<'a> AttestStore<'a> {
         local: &str,
         tip: &str,
     ) -> Result<Option<String>, GitError> {
-        let changed = |to: &str| -> Result<Option<BTreeSet<Vec<u8>>>, GitError> {
+        // path -> the blob id it has after the change (all zeros: deleted).
+        let changed = |to: &str| -> Result<Option<BTreeMap<Vec<u8>, String>>, GitError> {
             let (_, out) = self
                 .repo
                 .git()
@@ -4572,7 +4573,6 @@ impl<'a> AttestStore<'a> {
                     "-r",
                     "-z",
                     "--no-renames",
-                    "--name-only",
                     "--no-commit-id",
                     base,
                     to,
@@ -4582,18 +4582,37 @@ impl<'a> AttestStore<'a> {
             if !out.status.success() {
                 return Ok(None);
             }
-            Ok(Some(
-                out.stdout
-                    .split(|b| *b == 0)
-                    .filter(|p| !p.is_empty())
-                    .map(<[u8]>::to_vec)
-                    .collect(),
-            ))
+            // `:<mode> <mode> <old> <new> <status>\0<path>\0` per entry.
+            let mut m = BTreeMap::new();
+            let mut it = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty());
+            while let Some(meta) = it.next() {
+                let Some(path) = it.next() else {
+                    return Ok(None);
+                };
+                let meta = String::from_utf8_lossy(meta);
+                let Some(new) = meta.split_whitespace().nth(3) else {
+                    return Ok(None);
+                };
+                m.insert(path.to_vec(), new.to_owned());
+            }
+            Ok(Some(m))
         };
         let (Some(ours), Some(theirs)) = (changed(local)?, changed(tip)?) else {
             return Ok(None);
         };
-        if !ours.is_disjoint(&theirs) {
+        // A path both sides changed the same way (2.7.11: both of a run's
+        // jobs write the same deletion records) merges cleanly; one they
+        // left different takes git-meta's merge.
+        let both = ours
+            .iter()
+            .filter(|(p, o)| theirs.get(*p).is_some_and(|t| t != *o))
+            .count();
+        if both > 0 {
+            if vci_core::metrics::on() {
+                vci_core::timing_line!(
+                    "materialize: {both} path(s) changed differently on both sides; git-meta merges"
+                );
+            }
             return Ok(None);
         }
         let (_, out) = self
@@ -4611,6 +4630,15 @@ impl<'a> AttestStore<'a> {
             .env("GIT_NO_LAZY_FETCH", "1")
             .output_described()?;
         if !out.status.success() {
+            if vci_core::metrics::on() {
+                vci_core::timing_line!(
+                    "materialize: git merge-tree did not merge ({}); git-meta merges",
+                    String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("no message")
+                );
+            }
             return Ok(None);
         }
         let Some(tree) = String::from_utf8_lossy(&out.stdout)
