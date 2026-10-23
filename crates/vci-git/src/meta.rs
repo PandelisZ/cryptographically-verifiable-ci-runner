@@ -2350,18 +2350,6 @@ impl<'a> AttestStore<'a> {
     /// trees this clone never fetched, gets its tree and subtrees in one
     /// fetch of the tree's id. Nothing is fetched when they are here.
     fn complete_tree(&self, remote: &str, commit: &str) -> Result<(), GitError> {
-        let complete = || -> Result<bool, GitError> {
-            let (_, out) = self
-                .repo
-                .git()
-                .args(["ls-tree", "-r", "-d", "-z", "--full-tree", commit])
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .output_described()?;
-            Ok(out.status.success())
-        };
-        if complete()? {
-            return Ok(());
-        }
         // The commit's own record (`<commit>^{tree}` wants the tree there).
         let raw = self
             .repo
@@ -2376,28 +2364,34 @@ impl<'a> AttestStore<'a> {
             .filter(|t| is_oid(t))
             .ok_or_else(|| GitError::Parse(format!("no tree in commit {commit}")))?
             .to_owned();
-        self.fetch_objects(remote, &[&tree])?;
+        // Which trees are missing, by `rev-list --missing=print`, which never
+        // asks the promisor (2.7.6: `ls-tree -r -d` did on git before 2.44,
+        // about 11 s each time it met a missing subtree on vex's runners,
+        // twice a fetch).
+        // (A root tree that is not here fails the walk.)
+        let missing = || -> Result<BTreeSet<String>, GitError> {
+            Ok(self
+                .missing_trees(&tree)
+                .unwrap_or_else(|_| BTreeSet::from([tree.clone()])))
+        };
+        let mut gone = missing()?;
+        if gone.is_empty() {
+            return Ok(());
+        }
         // A fetch of the tree's id can leave subtrees out (2.1.15: GitHub
         // served vex's 108,000-tree tip without 12 of them, twice in CI and
-        // on a laptop, and served each of the 12 when asked by id): ask git
-        // which are missing and fetch those by id, until none is.
-        for _ in 0..COMPLETE_TREE_ROUNDS {
-            if complete()? {
+        // on a laptop, and served each of the 12 when asked by id): fetch
+        // the missing ones by id until none is.
+        for _ in 0..=COMPLETE_TREE_ROUNDS {
+            self.fetch_objects(remote, &gone.iter().collect::<Vec<_>>())?;
+            gone = missing()?;
+            if gone.is_empty() {
                 return Ok(());
             }
-            let missing = self.missing_trees(&tree)?;
-            if missing.is_empty() {
-                break;
-            }
-            self.fetch_objects(remote, &missing.iter().collect::<Vec<_>>())?;
         }
-        if complete()? {
-            Ok(())
-        } else {
-            Err(GitError::Meta(format!(
-                "the tree of metadata commit {commit} is incomplete after fetching it from {remote}"
-            )))
-        }
+        Err(GitError::Meta(format!(
+            "the tree of metadata commit {commit} is incomplete after fetching it from {remote}"
+        )))
     }
 
     /// The subtrees of `tree` this clone does not have (values left out).
