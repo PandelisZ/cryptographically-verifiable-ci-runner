@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-10">2.7.10</a></td><td>23 Oct 2026</td><td>Merging fetched metadata when the two sides changed different keys lets git build the merged tree from the changed subtrees alone (18 s a push round on vex)</td></tr>
 <tr><td><a href="#v2-7-9">2.7.9</a></td><td>23 Oct 2026</td><td>Looking up a stored input manifest uses the store's index instead of scanning every project row (a plan looks up about 2,000); a merge applies its deletion records in one transaction</td></tr>
 <tr><td><a href="#v2-7-8">2.7.8</a></td><td>23 Oct 2026</td><td>A plan no longer reads every stored attestation of every unit twice to choose which to fetch; with <code>VCI_TIMING</code>, the plan's fetch of stored values and a metadata merge report their parts</td></tr>
 <tr><td><a href="#v2-7-7">2.7.7</a></td><td>23 Oct 2026</td><td>The record of the local commit a store covers survives a merge of fetched metadata, so a push after a fetch skips the coverage check too</td></tr>
@@ -106,6 +107,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-10">2.7.10</h2>
+<p><em>23 October 2026.</em> Before a push, vci merges what other jobs published into its own metadata commit. That merge read every key of three trees (the merge base, this commit and the remote's tip, about 180,000 entries each on vex), merged them in memory and wrote the whole tree again: 18 s each push round of a full Rails run, though only a few thousand keys differed. <strong>When no path changed on both sides since the merge base, git now builds the merged tree</strong> (<code>git merge-tree --write-tree</code>), touching only the changed subtrees. git-meta's merge gives the same result there: a key only one side touched takes that side's state. When any path changed on both sides, or git cannot merge, git-meta's merge runs as before.</p>
 
 <h2 id="v2-7-9">2.7.9</h2>
 <p><em>23 October 2026.</em> 2.7.8's timings showed a vex plan spending 11.6 s finding the base manifests of the 2,035 manifests it reads, and its verdicts about 20 thread-seconds reading manifests. Each lookup of a manifest asked the store for the project row with that key without giving the project target's (empty) value, so SQLite could use only the first column of its index and scanned every project row, about 13,000 on vex, for each lookup. <strong>The lookup now names the empty target value</strong>, so the index finds the row directly (the old query still runs if that finds nothing). <strong>A merge of fetched metadata applies its deletion records in one transaction</strong>: git-meta applies each in a commit of its own, and the same plan's merge spent 8.4 s on 6,314 records and 2,212 deletions. vci runs git-meta's own statements, in the same order, on its connection to the store.</p>

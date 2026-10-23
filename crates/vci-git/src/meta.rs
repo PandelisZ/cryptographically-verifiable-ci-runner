@@ -4411,6 +4411,17 @@ impl<'a> AttestStore<'a> {
             merge_tombstones, three_way_merge, two_way_merge_no_common_ancestor,
         };
         let base = self.merge_base(local, tip)?;
+        // 2.7.10: when no path changed on both sides since the merge base,
+        // the merge is each side's changes on the base (git-meta's merge
+        // agrees: a key only one side touched takes that side's state), and
+        // git builds it from the changed subtrees alone. A vex job spent
+        // 18 s a round reading every key of three trees for a few thousand
+        // changes. Any path both sides changed takes git-meta's merge below.
+        if let Some(b) = &base
+            && let Some(commit) = self.merge_disjoint(b, local, tip)?
+        {
+            return Ok(Ok(commit));
+        }
         let ours = self.snapshot_keys(local)?;
         let base_snap = match &base {
             Some(b) => {
@@ -4539,6 +4550,93 @@ impl<'a> AttestStore<'a> {
             git = git.env(k, v);
         }
         Ok(Ok(parse_oid(&git.run()?)?))
+    }
+
+    /// [`AttestStore::merge_from_paths`] when `local` and `tip` changed
+    /// disjoint sets of paths since `base`: the merge commit (parents
+    /// `local`, `tip`) of `git merge-tree`'s tree, or `None` when a path
+    /// changed on both sides or git could not merge (git-meta's merge
+    /// then decides).
+    fn merge_disjoint(
+        &self,
+        base: &str,
+        local: &str,
+        tip: &str,
+    ) -> Result<Option<String>, GitError> {
+        let changed = |to: &str| -> Result<Option<BTreeSet<Vec<u8>>>, GitError> {
+            let (_, out) = self
+                .repo
+                .git()
+                .args([
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-renames",
+                    "--name-only",
+                    "--no-commit-id",
+                    base,
+                    to,
+                ])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .output_described()?;
+            if !out.status.success() {
+                return Ok(None);
+            }
+            Ok(Some(
+                out.stdout
+                    .split(|b| *b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect(),
+            ))
+        };
+        let (Some(ours), Some(theirs)) = (changed(local)?, changed(tip)?) else {
+            return Ok(None);
+        };
+        if !ours.is_disjoint(&theirs) {
+            return Ok(None);
+        }
+        let (_, out) = self
+            .repo
+            .git()
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "--merge-base",
+                base,
+                local,
+                tip,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output_described()?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let Some(tree) = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|t| is_oid(t))
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let mut git = self.repo.git().args([
+            "commit-tree",
+            "--no-gpg-sign",
+            &tree,
+            "-p",
+            local,
+            "-p",
+            tip,
+            "-m",
+            "materialize",
+        ]);
+        for (k, v) in IDENTITY {
+            git = git.env(k, v);
+        }
+        Ok(Some(parse_oid(&git.run()?)?))
     }
 
     /// Put back the stored input manifests this merge left deleted although
