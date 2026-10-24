@@ -185,6 +185,16 @@ impl Repo {
         parse_oid(&out)
     }
 
+    /// The tree of commit `rev`.
+    pub fn tree_of(&self, rev: &str) -> Result<String, GitError> {
+        let out = self
+            .git()
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("{rev}^{{tree}}"))
+            .run()?;
+        parse_oid(&out)
+    }
+
     /// The trees at the tips of every branch, remote-tracking branch and
     /// tag: the trees that can be checked out by name now. The current
     /// branch's namesakes on the remotes (`origin/<branch>` behind it) do

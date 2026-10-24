@@ -1377,11 +1377,16 @@ fn plan_with(
             // (2.7.23: a vex store held 18,700 fetched candidates, 340 MB,
             // for 4,100 the verdicts needed).
             let head = ctx.repo.head_tree().ok();
+            let base = res
+                .base_commit
+                .as_deref()
+                .and_then(|b| ctx.repo.tree_of(b).ok());
             let mut read: Vec<&mut StoredEnvelope> = Vec::new();
             for cands in m.values_mut() {
-                let mut chosen: BTreeSet<usize> = choose_candidates(cands, head.as_deref())
-                    .into_iter()
-                    .collect();
+                let mut chosen: BTreeSet<usize> =
+                    choose_candidates(cands, head.as_deref(), base.as_deref())
+                        .into_iter()
+                        .collect();
                 // And the few newest after them: when the newest fails (a
                 // pull request attested the file on its own tree), the
                 // one before it usually passes, without a second round.
@@ -1525,8 +1530,13 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
     // checks those first and the plan fetches the rest only for the units
     // it could not skip (`hydrate_more`).
     let head = repo.head_tree().ok();
-    let choose =
-        move |cands: &[StoredEnvelope]| -> Vec<usize> { choose_candidates(cands, head.as_deref()) };
+    let base = res
+        .base_commit
+        .as_deref()
+        .and_then(|b| repo.tree_of(b).ok());
+    let choose = move |cands: &[StoredEnvelope]| -> Vec<usize> {
+        choose_candidates(cands, head.as_deref(), base.as_deref())
+    };
     let warning = match AttestStore::new(repo).hydrate_units_choosing(ids, choose) {
         Ok(h) => h.error.map(|e| {
             format!(
@@ -1703,18 +1713,39 @@ type RankedCandidate<'a> = ((bool, Option<i64>), usize, &'a StoredEnvelope);
 /// ones whose key says they were made on `head` (this checkout's tree),
 /// else the newest by the key's issue time (ties: all), plus every key
 /// without a hint. A unit with no hinted key reads them all, as before 2.2.
-fn choose_candidates(cands: &[StoredEnvelope], head: Option<&str>) -> Vec<usize> {
-    let head16: Option<String> = head.map(|t| t.chars().take(16).collect());
+fn choose_candidates(
+    cands: &[StoredEnvelope],
+    head: Option<&str>,
+    base: Option<&str>,
+) -> Vec<usize> {
+    let first16 = |t: &str| -> String { t.chars().take(16).collect() };
+    let on_tree = |tree: Option<&str>| -> Vec<usize> {
+        let Some(t16) = tree.map(first16) else {
+            return Vec::new();
+        };
+        (0..cands.len())
+            .filter(|&i| {
+                cands[i].issued.is_some() && cands[i].tree.as_deref() == Some(t16.as_str())
+            })
+            .collect()
+    };
     let mut out: Vec<usize> = (0..cands.len())
         .filter(|&i| cands[i].issued.is_none())
         .collect();
-    let same_tree: Vec<usize> = (0..cands.len())
-        .filter(|&i| {
-            cands[i].issued.is_some() && cands[i].tree.is_some() && cands[i].tree == head16
-        })
-        .collect();
-    if !same_tree.is_empty() {
-        out.extend(same_tree);
+    let same_head = on_tree(head);
+    // 2.7.27: a pull request's likeliest attestation is the one made on
+    // its base commit's tree (master's), not the newest, which another
+    // branch made on its own tree: a vex plan fetched 2,000 of those first,
+    // then 6,000 more values in a second round (25 s).
+    let same_base = if same_head.is_empty() {
+        on_tree(base)
+    } else {
+        Vec::new()
+    };
+    if !same_head.is_empty() {
+        out.extend(same_head);
+    } else if !same_base.is_empty() {
+        out.extend(same_base);
     } else if let Some(max) = cands.iter().filter_map(|c| c.issued).max() {
         out.extend((0..cands.len()).filter(|&i| cands[i].issued == Some(max)));
     }

@@ -2147,7 +2147,18 @@ impl<'a> AttestStore<'a> {
         // stamp after a write synced the disk, twice or more per unit
         // stored (2.4.1: a vex job's store took 9.6 s on one runner, 35.8
         // on another).
-        db.pragma_update(None, "synchronous", "NORMAL")
+        // On CI (`CI` set, as GitHub Actions does) or with
+        // VCI_STORE_SYNC=off, no sync at all (2.7.27): the store is a cache
+        // there, and a merge's commit of 15,000 rows waited 6 s for the
+        // runner's disk.
+        let sync = if std::env::var_os("VCI_STORE_SYNC").is_some_and(|v| v == "off")
+            || std::env::var_os("CI").is_some_and(|v| !v.is_empty())
+        {
+            "OFF"
+        } else {
+            "NORMAL"
+        };
+        db.pragma_update(None, "synchronous", sync)
             .map_err(|e| sql_err(&path, e))?;
         let tables: i64 = db
             .query_row(
@@ -2972,13 +2983,12 @@ impl<'a> AttestStore<'a> {
         Ok(())
     }
 
-    /// Whether `commit`'s tree is complete, read from its difference with a
-    /// commit recorded complete that a metadata ref still names (a CI cache
-    /// keeps the refs' trees, not every tree it once had): the trees they
-    /// share are complete, and `diff-tree` reads every tree that differs,
-    /// failing on one that is not here (2.7.19: listing the whole tree took
-    /// 1.3-4.9 s a fetch on vex's 490,000 objects; the difference takes
-    /// about 0.1 s). `false` sends the caller to the full check.
+    /// Whether `commit`'s tree is complete, from a walk of the objects it
+    /// reaches that the commits recorded complete (and still named by a
+    /// metadata ref: a CI cache keeps the refs' trees, not every tree it once
+    /// had) do not reach: only the new trees are visited (2.7.19: listing
+    /// the whole tree took 1.3-4.9 s a fetch on vex's 490,000 objects).
+    /// `false` sends the caller to the full check.
     fn complete_by_diff(&self, commit: &str) -> bool {
         let Ok(Some((_, db))) = self.db_rw() else {
             return false;
@@ -3007,28 +3017,36 @@ impl<'a> AttestStore<'a> {
             return false;
         };
         let named: BTreeSet<&str> = refs.lines().map(str::trim).collect();
-        let Some(base) = complete.iter().find(|c| named.contains(c.as_str())) else {
+        // Ancestors only: a descendant's trees being complete says nothing
+        // about this commit's (a first fetch takes the older commits without
+        // their trees).
+        let known: Vec<&String> = complete
+            .iter()
+            .filter(|c| named.contains(c.as_str()))
+            .filter(|c| c.as_str() != commit && self.is_ancestor(c, commit).unwrap_or(false))
+            .collect();
+        if known.is_empty() {
             return false;
-        };
-        self.repo
-            .git()
-            .args([
-                "diff-tree",
-                "-r",
-                "-t",
-                "--no-renames",
-                "-z",
-                "--raw",
-                // Only the new side's trees need reading; listing what was
-                // deleted printed 262 MB after a drop of old deletion
-                // records (22 s).
-                "--diff-filter=AMT",
-                base,
-                commit,
-            ])
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .run()
-            .is_ok()
+        }
+        // The objects `commit` reaches that the complete commits do not:
+        // its new trees, however many; a `diff-tree` against one of them
+        // took 14 s on vex once hundreds of pushes separated them (2.7.27).
+        let mut git = self.repo.git().args([
+            "rev-list",
+            "--objects",
+            "--missing=print",
+            "--no-object-names",
+            "--filter=blob:none",
+            commit,
+            "--not",
+        ]);
+        for c in known {
+            git = git.arg(c);
+        }
+        match git.env("GIT_NO_LAZY_FETCH", "1").run_str() {
+            Ok(out) => !out.lines().any(|l| l.starts_with('?')),
+            Err(_) => false,
+        }
     }
 
     /// Whether this store recorded `commit`'s tree as complete.
