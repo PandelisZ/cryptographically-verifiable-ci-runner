@@ -539,6 +539,26 @@ fn utf8_tmp(t: &tempfile::TempDir) -> Result<Utf8PathBuf, AdapterError> {
 }
 
 /// Fresh temp dirs of one Ruby process.
+/// The arguments that run `script` as a Ruby program: a file `name` in the
+/// run's directory, so that Bundler may restart the process with the
+/// version the lockfile names, as it does for `bin/rails test` (2.7.20:
+/// Bundler never restarts `ruby -e`, so when vex's lockfile moved to Bundler
+/// 4.0.23, installed in the bundle path only, the toolchain probe saw the
+/// default 2.6.9 and the tests 4.0.23, and no file was attested). The
+/// collector is told its path (`VCI_SCRIPT`): vci's program, not an input.
+/// `-e` when the file cannot be written.
+fn script_args(cmd: &mut Command, dirs: &RunDirs, name: &str, script: &str) {
+    let path = dirs.base.join(name);
+    match std::fs::write(&path, script) {
+        Ok(()) => {
+            cmd.env("VCI_SCRIPT", path.as_str()).arg(path.as_str());
+        }
+        Err(_) => {
+            cmd.args(["-e", script, "--"]);
+        }
+    }
+}
+
 struct RunDirs {
     _tmp: tempfile::TempDir,
     /// Holds `tmp` and `out` (and a batch run's file list).
@@ -814,7 +834,7 @@ impl RailsAdapter {
         let collector = self.collector_file()?;
         let dirs = RunDirs::new()?;
         let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
-        cmd.args(["-e", script]);
+        script_args(&mut cmd, &dirs, "vci-probe.rb", script);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         if !out.status.success() {
             return Err(AdapterError::Command {
@@ -878,7 +898,8 @@ impl RailsAdapter {
                 cmd.args(["--seed", RAILS_SEED]);
             }
             RailsRunner::Rspec => {
-                cmd.args(["-e", RSPEC_RUN_SCRIPT, "--"]).args(RSPEC_ARGS);
+                script_args(&mut cmd, dirs, "vci-rspec.rb", RSPEC_RUN_SCRIPT);
+                cmd.args(RSPEC_ARGS);
                 cmd.args(files.iter().map(|f| file_arg(f)));
             }
         }
@@ -2097,7 +2118,8 @@ impl RailsAdapter {
         let collector = self.collector_file()?;
         let dirs = RunDirs::new()?;
         let mut cmd = self.ruby_cmd_for(env, "plain", &dirs, &collector, RailsRunner::Rspec);
-        cmd.args(["-e", RSPEC_LIST_SCRIPT, "--"]).args(RSPEC_ARGS);
+        script_args(&mut cmd, &dirs, "vci-rspec-list.rb", RSPEC_LIST_SCRIPT);
+        cmd.args(RSPEC_ARGS);
         let out = cmd.output().map_err(|e| self.not_installed(e))?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let fail = |detail: String| AdapterError::Command {

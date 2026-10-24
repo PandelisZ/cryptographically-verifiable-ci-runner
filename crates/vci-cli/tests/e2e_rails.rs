@@ -2619,6 +2619,8 @@ fn logging_ruby(w: &World) -> PathBuf {
         r#"#!/bin/sh
 echo "$*" >> '{log}'
 for a in "$@"; do
+  # vci runs its probes from a file (2.7.20): log and match its program.
+  case "$a" in */vci-*.rb) a=$(cat "$a"); echo "$a" >> '{log}';; esac
   if [ "$a" = 'require File.expand_path("config/environment")' ]; then
     if [ -e '{fails}' ]; then
       exec '{ruby}' -e 'raise LoadError, "simulated: bigdecimal.bundle is not a valid extension"'

@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-21">2.7.21</a></td><td>24 Oct 2026</td><td>The Rails toolchain probe runs from a file, so Bundler switches it to the lockfile's version as it does the tests: after vex moved to Bundler 4.0.23 no file was attested; includes 2.7.20</td></tr>
 <tr><td><a href="#v2-7-20">2.7.20</a></td><td>23 Oct 2026</td><td>A push drops deletion records older than a day (431,000 of vex's 465,000 metadata entries), and putting back manifests reads them in one batch: and the store keeps its coverage record through superseded attestations: a vex plan 13-15 s after master moved, 3 s when it has not</td></tr>
 <tr><td><a href="#v2-7-19">2.7.19</a></td><td>23 Oct 2026</td><td>A plan reuses what it learnt before: what each attestation and manifest blob names, which metadata commits have complete trees, and the tip it last merged; a vex plan went from 10-28 s to 2-7 s on a laptop</td></tr>
 <tr><td><a href="#v2-7-18">2.7.18</a></td><td>23 Oct 2026</td><td>A push asks again whether the remote moved right before <code>git push</code>, so the run's other job pushing during the pre-push checks no longer costs a rejected push</td></tr>
@@ -117,6 +118,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-21">2.7.21</h2>
+<p><em>24 October 2026.</em> vex's lockfile moved to Bundler 4.0.23 on 23 October. CI installs that version in the bundle path only, and Bundler switches a process to the locked version by restarting it with the same arguments, which it never does for <code>ruby -e</code>. vci's toolchain probe was a <code>ruby -e</code> script and saw the default Bundler 2.6.9 while the tests (<code>bin/rails test</code>) ran under 4.0.23, so every file was refused ("toolchain seen by the collector differs from the project's"): master attested nothing and no pull request skipped anything. <strong>The probes and vci's RSpec runner now run from a script file</strong> (the collector is told its path, <code>VCI_SCRIPT</code>, and does not count it as an input), so they resolve Bundler as the tests do. 2.7.21 also carries 2.7.20, which was built but not published.</p>
 
 <h2 id="v2-7-20">2.7.20</h2>
 <p><em>23 October 2026.</em> vex's metadata tree held 465,000 entries, 431,000 of them deletion records written in the week before (each run supersedes the last run's attestations and manifests), and every fetch, merge and push listed, fetched and checked all of them. <strong>A push now drops the deletion records older than a day</strong> once there are 20,000 of them (<code>VCI_DELETION_RECORDS_KEEP_SECS</code>, <code>VCI_DELETION_RECORDS_DROP_AT</code>), and another clone's fetch drops them from its store rather than stamping them as new deletions. A record only stops a clone that never saw the deletion from bringing the value back; git's history already deletes it in a merge with any clone that saw the value, and a value that comes back anyway is an expired or superseded attestation or a manifest, which is harmless.</p>

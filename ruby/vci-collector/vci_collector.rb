@@ -66,6 +66,9 @@ module VciCollector
   # `bin/rails test <file>`) or "rspec" (`rspec <file>`, see RSpecSupport).
   RUNNER = ENV["VCI_RAILS_RUNNER"] == "rspec" ? "rspec" : "minitest"
   OUT = ENV["VCI_OUT"]
+  # vci's own program (a probe or the RSpec runner, run from a file so that
+  # Bundler may switch to the locked version, 2.7.20): not an input.
+  SCRIPT = ENV["VCI_SCRIPT"].to_s.freeze
   TEST_ID = ENV["VCI_TEST_ID"]
   # Batch mode (collect mode with VCI_RAILS_BATCH): one process for several
   # test files (`bin/rails test <files>`, `rspec <files>`); the variable names
@@ -2973,6 +2976,7 @@ if VciCollector.collect?
     next if VciCollector.busy? || tp.eval_script
     iseq = tp.instruction_sequence
     path = iseq.absolute_path || iseq.path
+    next if !VciCollector::SCRIPT.empty? && path == VciCollector::SCRIPT
     VciCollector.records[[:module, path]] = true if path.is_a?(String) && path.start_with?("/")
     VciCollector.after_require
   end
