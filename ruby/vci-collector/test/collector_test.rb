@@ -1391,6 +1391,10 @@ class CollectorTest < Minitest::Test
     home = File.join(@tmp, "home").tap { |d| FileUtils.mkdir_p(d) }
     File.write(File.join(home, ".simplecov"), "raise 'the global SimpleCov config was loaded'\n")
     File.write(File.join(@tmp, ".simplecov"), "raise 'a .simplecov above the repository was loaded'\n")
+    git = { "GIT_CONFIG_GLOBAL" => File::NULL, "GIT_CONFIG_NOSYSTEM" => "1" }
+    assert system(git, "git", "-C", @repo, "init", "-q") &&
+           system(git, "git", "-C", @repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                  "--allow-empty", "-m", "c"), "git init"
     script = %(require "simplecov"; SimpleCov.start; require "rspec/core"; $0 = "rspec"; RSpec::Core::Runner.invoke\n)
     recs = collect(script, env: { "VCI_RAILS_RUNNER" => "rspec", "HOME" => home },
                            args: ["--options", ".rspec", "spec/a_spec.rb"])
@@ -1400,7 +1404,23 @@ class CollectorTest < Minitest::Test
     assert_includes paths(recs, "probe"), ".simplecov"
     outside = recs.select { |r| r["path"].to_s.end_with?("/.simplecov") && !r["path"].start_with?(@repo) }
     assert_empty outside
+    # SimpleCov 1.x asks git for the branch (its history's, which picks the
+    # maximum_coverage_drop baseline) and the commit (the history's and the
+    # JSON report's): in a git checkout, no git runs and both are nil.
+    if Gem::Specification.find_by_name("simplecov").version >= Gem::Version.new("1")
+      history = File.join(@tmpdir, "vci-coverage", ".history.json")
+      entries = JSON.parse(File.read(history)).dig("simplecov_history", "entries")
+      assert_equal [[nil, nil]], entries.map { |e| [e["branch"], e["commit"]] }
+      json = File.join(@tmpdir, "vci-coverage", "coverage.json")
+      assert_nil JSON.parse(File.read(json)).dig("meta", "commit") if File.exist?(json)
+    end
     assert_empty taints(recs)
+
+    # A spawn of the test's own still taints the file.
+    put("spec/git_spec.rb", "RSpec.describe('g') { it('one') { expect(system('git', '--version', out: File::NULL)).to be(true) } }\n")
+    recs = collect(script, env: { "VCI_RAILS_RUNNER" => "rspec", "HOME" => home },
+                           args: ["--options", ".rspec", "spec/git_spec.rb"])
+    assert_includes taints(recs), "process:system"
   end
 
   # An at_exit handler that changes the exit code after RSpec reported its
