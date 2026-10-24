@@ -1164,6 +1164,8 @@ struct Materialized {
     merged: bool,
     /// Values taken whose blobs are not here (promised rows).
     promised: usize,
+    /// Attestations the tree dropped without a deletion record.
+    without_record: usize,
 }
 
 /// Messages collected along an exchange.
@@ -1409,6 +1411,84 @@ impl<'a> AttestStore<'a> {
             Some(id) => r.candidates(id),
             None => r.all(),
         }
+    }
+
+    /// Read the values of `envs` (listed without them, see
+    /// [`Reader::candidates_reading`]) in one pass: one scan of the store for
+    /// their rows and one `git cat-file` batch for their blobs (2.7.23: a
+    /// plan read vex's 4,100 candidates one by one, about 3 s). An envelope
+    /// whose value cannot be read gets [`StoredEnvelope::error`], as a read
+    /// one by one would.
+    pub fn read_values<'e>(
+        &self,
+        envs: impl IntoIterator<Item = &'e mut StoredEnvelope>,
+    ) -> Result<(), GitError> {
+        let envs: Vec<&mut StoredEnvelope> = envs.into_iter().collect();
+        if envs.is_empty() {
+            return Ok(());
+        }
+        let mut keys: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for e in &envs {
+            let t = Target::parse(&e.target).map_err(meta_err)?;
+            keys.insert((
+                t.target_type().as_str().to_owned(),
+                t.value().unwrap_or("").to_owned(),
+                e.key.clone(),
+            ));
+        }
+        // (is_git_ref, is_promised, value) by key, through the reader's
+        // connection (read-only: a plan runs from a read-only .git too).
+        let mut rows: BTreeMap<(String, String, String), (bool, bool, String)> = BTreeMap::new();
+        for row in self.reader()?.rows(
+            "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised \
+             FROM metadata WHERE value_type = 'string'",
+            &[],
+        )? {
+            let key = (
+                row.target.target_type().as_str().to_owned(),
+                row.target.value().unwrap_or("").to_owned(),
+                row.key.clone(),
+            );
+            if keys.contains(&key) {
+                rows.insert(key, (row.is_git_ref, row.is_promised, row.value));
+            }
+        }
+        let oids: BTreeSet<String> = rows
+            .values()
+            .filter(|(is_ref, promised, _)| *is_ref && !*promised)
+            .map(|(_, _, v)| v.trim().to_owned())
+            .filter(|o| is_oid(o))
+            .collect();
+        let blobs = self.read_blobs(&oids)?;
+        for e in envs {
+            let t = Target::parse(&e.target).map_err(meta_err)?;
+            let key = (
+                t.target_type().as_str().to_owned(),
+                t.value().unwrap_or("").to_owned(),
+                e.key.clone(),
+            );
+            let raw: Result<String, String> = match rows.get(&key) {
+                None => Err("the store no longer holds this key".to_owned()),
+                Some((_, true, _)) => Err(NOT_FETCHED.to_owned()),
+                Some((true, _, v)) => match blobs.get(v.trim()) {
+                    Some(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+                    None => Err(format!(
+                        "blob {} is missing from the object database",
+                        v.trim()
+                    )),
+                },
+                Some((false, _, v)) => Ok(v.clone()),
+            };
+            match raw {
+                Ok(s) => {
+                    let s: String = serde_json::from_str(&s).unwrap_or(s);
+                    e.bytes = s.into_bytes();
+                    e.error = None;
+                }
+                Err(err) => e.error = Some(err),
+            }
+        }
+        Ok(())
     }
 
     /// Delete one envelope (git-meta writes a tombstone, which `push`
@@ -2090,6 +2170,40 @@ impl<'a> AttestStore<'a> {
         Some(local)
     }
 
+    /// Whether `name` was flagged in this store (see [`AttestStore::set_flag`]).
+    pub fn flag(&self, name: &str) -> bool {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return false;
+        };
+        if Self::flag_schema(&db).is_err() {
+            return false;
+        }
+        db.query_row(
+            "SELECT 1 FROM vci_flags WHERE name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Remember `name` in this store (2.7.22): a fact about this checkout's
+    /// plans that a later plan reads before it has read any attestation (a
+    /// CI cache carries the store), such as that a plan needed the
+    /// application booted.
+    pub fn set_flag(&self, name: &str) {
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return;
+        };
+        if Self::flag_schema(&db).is_err() {
+            return;
+        }
+        let _ = db.execute("INSERT OR IGNORE INTO vci_flags (name) VALUES (?1)", [name]);
+    }
+
+    fn flag_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+        db.execute_batch("CREATE TABLE IF NOT EXISTS vci_flags (name TEXT PRIMARY KEY);")
+    }
+
     /// Record that the store covers `commit` (see
     /// [`AttestStore::covered_commit`]).
     fn set_covered_commit(&self, commit: &str) {
@@ -2286,9 +2400,17 @@ impl<'a> AttestStore<'a> {
                      VALUES (?1, ?2, ?3, '', '', 'rm', ?4, ?5)",
                 )
                 .map_err(e)?;
+            let timed = vci_core::metrics::on();
+            let mut spent = [0f64; 5];
+            let mut clock = |i: usize, since: std::time::Instant| {
+                if timed {
+                    spent[i] += since.elapsed().as_secs_f64();
+                }
+            };
             for (k, email, ts) in items {
                 let ty = k.target_type.as_str();
                 let value = k.target_value.as_str();
+                let t = std::time::Instant::now();
                 let id: Option<i64> = find
                     .query_row(rusqlite::params![ty, value, k.key], |r| r.get(0))
                     .map(Some)
@@ -2297,21 +2419,44 @@ impl<'a> AttestStore<'a> {
                         other => Err(other),
                     })
                     .map_err(e)?;
+                clock(0, t);
+                let t = std::time::Instant::now();
                 if let Some(id) = id {
                     del_list.execute([id]).map_err(e)?;
                     del_set.execute([id]).map_err(e)?;
                     del_row.execute([id]).map_err(e)?;
                 }
+                clock(1, t);
+                let t = std::time::Instant::now();
                 del_members
                     .execute(rusqlite::params![ty, value, k.key])
                     .map_err(e)?;
+                clock(2, t);
+                let t = std::time::Instant::now();
                 put.execute(rusqlite::params![ty, value, k.key, ts, email])
                     .map_err(e)?;
+                clock(3, t);
+                let t = std::time::Instant::now();
                 log.execute(rusqlite::params![ty, value, k.key, email, ts])
                     .map_err(e)?;
+                clock(4, t);
+            }
+            if timed {
+                vci_core::timing_line!(
+                    "apply records: find {:.2}s, delete rows {:.2}s, delete members {:.2}s, put {:.2}s, log {:.2}s",
+                    spent[0],
+                    spent[1],
+                    spent[2],
+                    spent[3],
+                    spent[4]
+                );
             }
         }
+        let t = std::time::Instant::now();
         tx.commit().map_err(e)?;
+        if vci_core::metrics::on() {
+            vci_core::timing_line!("apply records: commit {:.2}s", t.elapsed().as_secs_f64());
+        }
         Ok(true)
     }
 
@@ -4018,6 +4163,12 @@ impl<'a> AttestStore<'a> {
             }
             let commit = parse_oid(&git.run()?)?;
             self.cas_ref(local_ref, Some(&commit), &prev, "vci: serialize")?;
+            // Its tree is the previous commit's with blobs written here:
+            // complete when that one was (2.7.23: the next fetch checked it
+            // by its difference, 0.7-2 s on vex).
+            if self.known_complete(&prev) {
+                self.mark_complete(&commit);
+            }
         }
         guarded("writing the store", || store.set_last_materialized(now))?;
         Ok(Some(n))
@@ -4149,7 +4300,7 @@ impl<'a> AttestStore<'a> {
         loop {
             attempt += 1;
             let mut report = Report::default();
-            match self.fetch_named(&name, &mut report) {
+            match self.fetch_named(&name, &mut report, false) {
                 Ok(round) => {
                     return Ok(FetchOutcome {
                         remote: name,
@@ -4166,7 +4317,12 @@ impl<'a> AttestStore<'a> {
         }
     }
 
-    fn fetch_named(&self, name: &str, report: &mut Report) -> Result<Round, GitError> {
+    fn fetch_named(
+        &self,
+        name: &str,
+        report: &mut Report,
+        for_push: bool,
+    ) -> Result<Round, GitError> {
         let ns = self.namespace()?;
         let remote_ref = format!("refs/{ns}/main");
         let local_ref = format!("refs/{ns}/local/main");
@@ -4325,8 +4481,14 @@ impl<'a> AttestStore<'a> {
                 if restored == 1 { "y" } else { "ies" }
             ));
         }
+        // Only a push reads them (2.7.23: 0.4-2.5 s on vex's runners, for
+        // the push's check of what it would delete).
         let t = std::time::Instant::now();
-        let deleted_here = self.deletion_records(&session)?;
+        let deleted_here = if for_push {
+            self.deletion_records(&session)?
+        } else {
+            BTreeSet::new()
+        };
         step("read the store's deletion records", t);
         // Taken before the serialization reads the store (see below).
         let serialized_as_of = now_ms();
@@ -4377,8 +4539,14 @@ impl<'a> AttestStore<'a> {
                 .as_ref()
                 .map(|s| s.manifest_blobs.clone())
                 .unwrap_or_default();
+            // The merge from paths knows what it dropped; only git-meta's
+            // full merge needs the store's attestation keys listed before
+            // and after (2.7.23: 1.1-1.9 s each on vex's runners).
+            let full = std::env::var_os("VCI_MATERIALIZE").is_some_and(|v| v == "full");
             let t = std::time::Instant::now();
-            let before = self.attestation_keys()?;
+            let before = (side || full || tip_snap.is_none())
+                .then(|| self.attestation_keys())
+                .transpose()?;
             step("list the store's attestation keys", t);
             let t = std::time::Instant::now();
             let manifests_before: BTreeSet<String> = if side {
@@ -4394,7 +4562,6 @@ impl<'a> AttestStore<'a> {
             // imports side remotes and is the fallback for anything else.
             // `VCI_MATERIALIZE=full` (tests): git-meta's merge, every value
             // fetched and read, to compare with.
-            let full = std::env::var_os("VCI_MATERIALIZE").is_some_and(|v| v == "full");
             let lazy = match (&tip_now, &tip_snap) {
                 (Some(tip), Some(snap)) if !side && !full => match self
                     .materialize_lazy(&session, name, &local_ref, &tracking, tip, snap, report)
@@ -4498,12 +4665,18 @@ impl<'a> AttestStore<'a> {
             }
             step("adopt an equal tip", t);
             let t = std::time::Instant::now();
-            let after = self.attestation_keys()?;
+            let implicit = match (&lazy, &before) {
+                (Some(m), _) => m.without_record,
+                (None, Some(before)) => {
+                    let after = self.attestation_keys()?;
+                    before
+                        .difference(&after)
+                        .filter(|k| !remote_deleted.contains(*k))
+                        .count()
+                }
+                (None, None) => 0,
+            };
             step("list the store's attestation keys again", t);
-            let implicit = before
-                .difference(&after)
-                .filter(|k| !remote_deleted.contains(*k))
-                .count();
             if implicit > 0 {
                 report.warn(format!(
                     "{implicit} attestation(s) were dropped from {name}'s {remote_ref} without a deletion record (git-meta's auto-prune does this) and are gone from this store too; their units run until attested again"
@@ -4952,10 +5125,20 @@ impl<'a> AttestStore<'a> {
         let email = session.email().to_owned();
         // The values deleted now are stamped after the tree's records, as
         // git-meta does; a merge keeps the deletion record its tree holds.
+        // (A fast-forward stamps them with this merge's time and email even
+        // when the tree holds a record, as git-meta's does, and the next
+        // merge sets them back to the tree's: 3,099 records on every vex
+        // plan, which 2.7.22 makes a cheap update.)
         let legacy: Vec<&Key> = removed
             .iter()
             .filter(|k| !(merged && to_snap.tombstones.contains(*k)))
             .collect();
+        // (A fast-forward stamps a value whose record the tree holds too,
+        // as git-meta's does; that one was not dropped without a record.)
+        let without_record = legacy
+            .iter()
+            .filter(|k| !to_snap.tombstones.contains(*k) && parse_key(&k.key).is_some())
+            .count();
         // In git-meta's order: the tree's records, the restamped ones, then
         // the values deleted now; in one transaction (2.7.9).
         let batch: Vec<(&Key, &str, i64)> = tombstones
@@ -4989,6 +5172,11 @@ impl<'a> AttestStore<'a> {
             Some(l) if *l == to_commit => {}
             Some(l) => self.cas_ref(local_ref, Some(&to_commit), l, "vci: materialize")?,
             None => self.cas_ref(local_ref, Some(&to_commit), "", "vci: materialize")?,
+        }
+        // The tip itself, or a commit git built from the tip's and the
+        // local commit's trees: complete when they are (2.7.23).
+        if self.known_complete(tip) && local.as_deref().is_none_or(|l| self.known_complete(l)) {
+            self.mark_complete(&to_commit);
         }
         if was_covered {
             self.set_covered_commit(&to_commit);
@@ -5027,6 +5215,7 @@ impl<'a> AttestStore<'a> {
             changed,
             merged,
             promised,
+            without_record,
         }))
     }
 
@@ -5468,26 +5657,54 @@ impl<'a> AttestStore<'a> {
         let len = prefix.len() as i64;
         let sql = "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised \
                    FROM metadata WHERE substr(key, 1, ?1) = ?2";
-        let keys: BTreeSet<K> = self
-            .reader()?
-            .rows(sql, &[&len, &prefix])?
-            .iter()
-            .filter(|r| r.value_type == "string" && parse_key(&r.key).is_some())
-            .map(triple)
-            .collect();
-        let blob_of = self.value_blob_ids(&keys);
-        let oids: BTreeSet<String> = blob_of.values().cloned().collect();
-        let known = self.blob_refs("manifest", &oids);
+        // What each attestation names, from the cache in one indexed join
+        // (2.7.23: two scans of the store, 0.7-1.4 s a fetch on vex's
+        // runners); only the ones not cached are read below.
         let mut referenced = BTreeSet::new();
         let mut unread: BTreeSet<K> = BTreeSet::new();
-        for k in &keys {
-            match blob_of.get(k).and_then(|o| known.get(o)) {
-                Some(r) if r.is_empty() => {}
-                Some(r) => {
-                    referenced.insert(r.clone());
+        let mut blob_of: BTreeMap<K, String> = BTreeMap::new();
+        if let Some((path, db)) = self.db_rw()? {
+            let _ = Self::blob_ref_schema(&db);
+            let mut stmt = db
+                .prepare(
+                    "SELECT m.target_type, m.target_value, m.key, m.value, m.is_git_ref, m.is_promised, b.ref \
+                     FROM metadata m LEFT JOIN vci_blob_ref b \
+                       ON m.is_git_ref = 1 AND b.kind = 'manifest' AND b.oid = trim(m.value) \
+                     WHERE substr(m.key, 1, ?1) = ?2 AND m.value_type = 'string'",
+                )
+                .map_err(|e| sql_err(&path, e))?;
+            let rows = stmt
+                .query_map(rusqlite::params![len, prefix], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, bool>(4)?,
+                        r.get::<_, bool>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                })
+                .map_err(|e| sql_err(&path, e))?;
+            for row in rows {
+                let (t, v, k, value, is_ref, promised, named) =
+                    row.map_err(|e| sql_err(&path, e))?;
+                if parse_key(&k).is_none() {
+                    continue;
                 }
-                None => {
-                    unread.insert(k.clone());
+                match named {
+                    Some(r) if r.is_empty() => {}
+                    Some(r) => {
+                        referenced.insert(r);
+                    }
+                    None if promised => {}
+                    None => {
+                        let key = (t, v, k);
+                        if is_ref && is_oid(value.trim()) {
+                            blob_of.insert(key.clone(), value.trim().to_owned());
+                        }
+                        unread.insert(key);
+                    }
                 }
             }
         }
@@ -5710,7 +5927,7 @@ impl<'a> AttestStore<'a> {
             };
             let timing = vci_core::metrics::on();
             let t = std::time::Instant::now();
-            let round = match self.fetch_named(&name, &mut report) {
+            let round = match self.fetch_named(&name, &mut report, true) {
                 Ok(r) => r,
                 Err(e) if is_ref_race(&e) && attempt < PUSH_ATTEMPTS => {
                     last = e.to_string();

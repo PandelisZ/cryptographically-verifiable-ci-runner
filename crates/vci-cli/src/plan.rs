@@ -841,6 +841,7 @@ impl Verifier<'_> {
     /// [`Verifier::natives`], from the booted application.
     fn natives(&self) -> &Result<vci_adapter::InstalledExternals, String> {
         self.natives.get_or_init(|| {
+            AttestStore::new(&self.ctx.repo).set_flag(&natives_flag(&self.project.name));
             self.project
                 .adapter
                 .native_externals(&self.child.to_child_env())
@@ -1036,6 +1037,11 @@ pub(crate) fn timing(what: &str, since: std::time::Instant) {
     }
 }
 
+/// The store flag saying a plan of `project` compared native libraries.
+fn natives_flag(project: &str) -> String {
+    format!("plan:natives:{project}")
+}
+
 /// List a project's test files and, with `resolve`, resolve its toolchain
 /// and externals at the same time (both may shell out: uv, go, cargo, ruby;
 /// pytest and Minitest files are listed without a process).
@@ -1060,6 +1066,26 @@ fn probe_project(
                 r
             })
         });
+        // 2.7.22: a plan that compared native libraries last time booted the
+        // application for them in the verdicts (about 5 s on vex), with
+        // every verdict thread waiting; this one boots it here, beside the
+        // fetch, and the verdicts find it booted.
+        let booting = (resolve
+            && project.adapter.name() == "rails"
+            && AttestStore::new(&ctx.repo).flag(&natives_flag(&project.name)))
+        .then(|| {
+            s.spawn(|| {
+                let t = std::time::Instant::now();
+                let _ = project.adapter.native_externals(&env);
+                timing(
+                    &format!(
+                        "{}: boot the application for native libraries (beside the fetch)",
+                        project.name
+                    ),
+                    t,
+                );
+            })
+        });
         let t = std::time::Instant::now();
         let files = project
             .adapter
@@ -1072,6 +1098,9 @@ fn probe_project(
         // the runner `runner` does not select), as `vci run` prints it.
         let warnings = project.adapter.warnings(&env);
         let resolved = resolving.map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+        if let Some(h) = booting {
+            let _ = h.join();
+        }
         Probed {
             files,
             warnings,
@@ -1134,6 +1163,7 @@ fn plan_with(
     fetch: &mut PendingFetch,
 ) -> Result<()> {
     // 1. Policy and trust roots from the BASE commit.
+    let t_base = std::time::Instant::now();
     let (base_ref, base) = match resolve_base(&repo, opts.base_ref.as_deref()) {
         Ok(x) => x,
         Err(e) => {
@@ -1207,6 +1237,7 @@ fn plan_with(
     res.allowed = allowed.clone();
     // Someone is trusted: an SSH key or a CI identity.
     let trusted = allowed.is_some() || keyless.as_ref().is_some_and(|k| k.identities.is_ok());
+    timing("read the base commit's policy and signers", t_base);
     let no_ssh_signers = AllowedSigners::default();
 
     // 2. Projects (base config), their test files and, for the projects
@@ -1327,6 +1358,7 @@ fn plan_with(
         // reads (the candidates of the units it verifies, then the input
         // manifests they reference) in one batch each.
         hydrate_for_plan(&ctx.repo, &files, res);
+        let t_lookup = std::time::Instant::now();
         let looked_up = AttestStore::new(&ctx.repo).reader().and_then(|r| {
         if !r.has_store() {
             let w = "no git-meta store in this repository: no attestations are available (run `vci fetch` first)".to_owned();
@@ -1337,11 +1369,19 @@ fn plan_with(
         for f in &files {
             let id = f.test_id.as_str();
             if !m.contains_key(id) {
-                m.insert(id.to_owned(), r.candidates(id)?);
+                // Keys first; the values in one batch below (2.7.23).
+                m.insert(id.to_owned(), r.candidates_reading(id, |_| false)?);
             }
         }
         Ok(m)
     });
+        timing("look up the candidates", t_lookup);
+        let looked_up = looked_up.and_then(|mut m| {
+            let t = std::time::Instant::now();
+            AttestStore::new(&ctx.repo).read_values(m.values_mut().flatten())?;
+            timing("read the candidates", t);
+            Ok(m)
+        });
         match looked_up {
             Ok(m) => by_id = m,
             Err(e) => {
@@ -1427,7 +1467,9 @@ fn plan_with(
     });
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
     let mut verdicts = verdicts;
+    let t = std::time::Instant::now();
     hydrate_more(&ctx, &files, &verifiers, &by_id, &mut verdicts, res);
+    timing("verdicts again for what was fetched meanwhile", t);
     for (pi, (verifier, verdicts)) in verifiers.iter().zip(verdicts).enumerate() {
         match verifier {
             Err(r) => {
