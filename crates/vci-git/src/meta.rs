@@ -2222,6 +2222,70 @@ impl<'a> AttestStore<'a> {
         });
     }
 
+    /// The attestations that passed for units on the tree whose id starts
+    /// with `tree16`, as a plan run on that tree remembered them (2.7.29):
+    /// test key -> the git-meta key of the passing attestation. A plan whose
+    /// base commit has that tree (a pull request's: master's plan ran on
+    /// it) reads those first: the job whose cache it restored fetched them,
+    /// and they are the likeliest to pass. A hint for the order of reading
+    /// only; every candidate is verified as before.
+    pub fn passing_on(&self, tree16: &str) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return out;
+        };
+        if Self::memo_schema(&db).is_err() {
+            return out;
+        }
+        let Ok(mut stmt) = db.prepare("SELECT test_key, key FROM vci_memo WHERE tree16 = ?1")
+        else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map([tree16], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            out.extend(rows.flatten());
+        }
+        out
+    }
+
+    /// Remember the attestations that passed on tree `tree16` (see
+    /// [`AttestStore::passing_on`]): (test key, git-meta key) pairs.
+    pub fn remember_passing(&self, tree16: &str, items: &[(String, String)]) {
+        if items.is_empty() {
+            return;
+        }
+        let Ok(Some((_, mut db))) = self.db_rw() else {
+            return;
+        };
+        if Self::memo_schema(&db).is_err() {
+            return;
+        }
+        let now = now_ms();
+        let Ok(tx) = db.transaction() else { return };
+        if let Ok(mut stmt) = tx.prepare_cached(
+            "INSERT OR REPLACE INTO vci_memo (tree16, test_key, key, at) VALUES (?1, ?2, ?3, ?4)",
+        ) {
+            for (tk, key) in items {
+                let _ = stmt.execute(rusqlite::params![tree16, tk, key, now]);
+            }
+        }
+        // A week of trees is plenty: a base older than that is rare.
+        let _ = tx.execute(
+            "DELETE FROM vci_memo WHERE at < ?1",
+            [now - 7 * 24 * 60 * 60 * 1000],
+        );
+        let _ = tx.commit();
+    }
+
+    fn memo_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vci_memo (
+               tree16 TEXT NOT NULL, test_key TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL,
+               PRIMARY KEY (tree16, test_key));",
+        )
+    }
+
     /// Whether `name` was flagged in this store (see [`AttestStore::set_flag`]).
     pub fn flag(&self, name: &str) -> bool {
         let Ok(Some((_, db))) = self.db_rw() else {

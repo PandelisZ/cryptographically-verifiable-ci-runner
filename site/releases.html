@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-29">2.7.29</a></td><td>24 Oct 2026</td><td>A plan remembers which attestation passed for each unit on its tree, and a plan whose base commit has that tree reads those first: a pull request's plan no longer downloads other branches' attestations before master's</td></tr>
 <tr><td><a href="#v2-7-28">2.7.28</a></td><td>24 Oct 2026</td><td>A run's publish writes its metadata commit with one <code>git fast-import</code> (10 s of loose objects on vex's runners), and a merge resolves deletion records both jobs wrote differently itself (6 s)</td></tr>
 <tr><td><a href="#v2-7-27">2.7.27</a></td><td>24 Oct 2026</td><td>A pull request's plan reads the attestations made on its base commit's tree first (not another branch's newest), the tree check walks only the new objects (14 s once), and the store does not sync to disk on CI (a 6 s commit)</td></tr>
 <tr><td><a href="#v2-7-26">2.7.26</a></td><td>24 Oct 2026</td><td>A Rails plan starts the application's boot for the native-library check as a child process and no longer waits for it before reading its candidates and starting the verdicts</td></tr>
@@ -125,6 +126,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-29">2.7.29</h2>
+<p><em>24 October 2026.</em> 2.7.27 reads the attestations made on a pull request's base commit's tree first, but master's own runs skip every unit and so attest nothing on master's tree: the attestations that pass for a pull request are the ones master's plan found passing, made on earlier trees, and a plan had no way to know which. <strong>A plan now remembers, in the store, which attestation passed for each unit on its tree</strong> (<code>vci_memo</code>, a week of trees), and a plan whose base commit (or own commit) has that tree reads those first. Master's plan runs on every push and its cache carries the store, so a pull request's plan finds the hints and the attestations' values already fetched: no download of other branches' newest attestations (6 s), no second round. The hints only order the reading; every candidate is verified as before.</p>
 
 <h2 id="v2-7-28">2.7.28</h2>
 <p><em>24 October 2026.</em> After a full vex Rails run, publishing took about 80 s. Serializing the run's 8,000 changed entries wrote each blob and each tree on git-meta's deep paths as a loose object through gix, tens of thousands of files (10.5 s on the runner); <strong>one <code>git fast-import</code> now writes them as a single pack</strong>, gix remaining the fallback. The two jobs of a run delete the same superseded attestations, each stamping the deletion record with its own time, so every push found 2,000 paths changed differently on both sides and fell back to git-meta's merge of three listed trees (6.3 s); <strong>deletion records of one key that differ now take ours</strong>, as git-meta's merge does, and the merge stays on the fast path. With <code>VCI_TIMING</code> the store phase reports the time of storing manifests and removing superseded attestations separately (16 s of the 24 s check-sign-store phase is that serial loop).</p>

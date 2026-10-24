@@ -1038,6 +1038,20 @@ pub(crate) fn timing(what: &str, since: std::time::Instant) {
     }
 }
 
+/// The attestations a plan remembered passing on `head`'s tree, else on
+/// `base`'s (test key -> git-meta key; see [`AttestStore::passing_on`]).
+fn passing_memos(repo: &Repo, head: Option<&str>, base: Option<&str>) -> BTreeMap<String, String> {
+    let store = AttestStore::new(repo);
+    let first16 = |t: &str| -> String { t.chars().take(16).collect() };
+    let mut memos = base
+        .map(|b| store.passing_on(&first16(b)))
+        .unwrap_or_default();
+    if let Some(h) = head {
+        memos.extend(store.passing_on(&first16(h)));
+    }
+    memos
+}
+
 /// How many of a unit's newest candidates a plan reads before its first
 /// verdict, besides the ones `choose_candidates` picks.
 const READ_FIRST: usize = 2;
@@ -1381,10 +1395,15 @@ fn plan_with(
                 .base_commit
                 .as_deref()
                 .and_then(|b| ctx.repo.tree_of(b).ok());
+            let memos = passing_memos(&ctx.repo, head.as_deref(), base.as_deref());
             let mut read: Vec<&mut StoredEnvelope> = Vec::new();
             for cands in m.values_mut() {
+                let memo = cands
+                    .first()
+                    .and_then(|c| memos.get(&c.test_key))
+                    .map(String::as_str);
                 let mut chosen: BTreeSet<usize> =
-                    choose_candidates(cands, head.as_deref(), base.as_deref())
+                    choose_candidates(cands, head.as_deref(), base.as_deref(), memo)
                         .into_iter()
                         .collect();
                 // And the few newest after them: when the newest fails (a
@@ -1493,6 +1512,27 @@ fn plan_with(
     let t = std::time::Instant::now();
     hydrate_more(&ctx, &files, &verifiers, &by_id, &mut verdicts, res);
     timing("verdicts again for what was fetched meanwhile", t);
+    // What passed on this tree, for the plans whose base commit it is
+    // (2.7.29; see `passing_memos`).
+    if let Some(head) = head_tree.as_deref() {
+        let t = std::time::Instant::now();
+        let passed: Vec<(String, String)> = verdicts
+            .iter()
+            .flatten()
+            .filter(|v| v.skip)
+            .filter_map(|v| {
+                v.by.as_ref()
+                    .map(|b| (vci_core::test_key(&v.test_id), b.meta_key.clone()))
+            })
+            .collect();
+        let n = passed.len();
+        let head16: String = head.chars().take(16).collect();
+        AttestStore::new(&ctx.repo).remember_passing(&head16, &passed);
+        timing(
+            &format!("remember the {n} attestation(s) that passed on this tree"),
+            t,
+        );
+    }
     for (pi, (verifier, verdicts)) in verifiers.iter().zip(verdicts).enumerate() {
         match verifier {
             Err(r) => {
@@ -1534,8 +1574,13 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
         .base_commit
         .as_deref()
         .and_then(|b| repo.tree_of(b).ok());
+    let memos = passing_memos(repo, head.as_deref(), base.as_deref());
     let choose = move |cands: &[StoredEnvelope]| -> Vec<usize> {
-        choose_candidates(cands, head.as_deref(), base.as_deref())
+        let memo = cands
+            .first()
+            .and_then(|c| memos.get(&c.test_key))
+            .map(String::as_str);
+        choose_candidates(cands, head.as_deref(), base.as_deref(), memo)
     };
     let warning = match AttestStore::new(repo).hydrate_units_choosing(ids, choose) {
         Ok(h) => h.error.map(|e| {
@@ -1717,8 +1762,22 @@ fn choose_candidates(
     cands: &[StoredEnvelope],
     head: Option<&str>,
     base: Option<&str>,
+    memo: Option<&str>,
 ) -> Vec<usize> {
     let first16 = |t: &str| -> String { t.chars().take(16).collect() };
+    // The attestation a plan on this tree (or the base commit's) found
+    // passing (2.7.29): read first, and alone among the hinted ones.
+    if let Some(k) = memo
+        && let Some(i) = cands.iter().position(|c| c.key == k)
+    {
+        let mut out: Vec<usize> = (0..cands.len())
+            .filter(|&i| cands[i].issued.is_none())
+            .collect();
+        out.push(i);
+        out.sort_unstable();
+        out.dedup();
+        return out;
+    }
     let on_tree = |tree: Option<&str>| -> Vec<usize> {
         let Some(t16) = tree.map(first16) else {
             return Vec::new();
