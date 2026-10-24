@@ -1072,25 +1072,16 @@ fn probe_project(
             })
         });
         // 2.7.22: a plan that compared native libraries last time booted the
-        // application for them in the verdicts (about 5 s on vex), with
-        // every verdict thread waiting; this one boots it here, beside the
-        // fetch, and the verdicts find it booted.
-        let booting = (resolve
+        // application for them in the verdicts (about 3 s on vex), with
+        // every verdict thread waiting; the boot is started here, beside
+        // the fetch, and not waited for (2.7.26): the verdicts that need it
+        // wait for what is left of it.
+        if resolve
             && project.adapter.name() == "rails"
-            && AttestStore::new(&ctx.repo).flag(&natives_flag(&project.name)))
-        .then(|| {
-            s.spawn(|| {
-                let t = std::time::Instant::now();
-                let _ = project.adapter.native_externals(&env);
-                timing(
-                    &format!(
-                        "{}: boot the application for native libraries (beside the fetch)",
-                        project.name
-                    ),
-                    t,
-                );
-            })
-        });
+            && AttestStore::new(&ctx.repo).flag(&natives_flag(&project.name))
+        {
+            project.adapter.start_native_externals(&env);
+        }
         let t = std::time::Instant::now();
         let files = project
             .adapter
@@ -1103,9 +1094,6 @@ fn probe_project(
         // the runner `runner` does not select), as `vci run` prints it.
         let warnings = project.adapter.warnings(&env);
         let resolved = resolving.map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
-        if let Some(h) = booting {
-            let _ = h.join();
-        }
         Probed {
             files,
             warnings,

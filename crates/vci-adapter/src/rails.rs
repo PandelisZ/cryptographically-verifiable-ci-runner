@@ -456,6 +456,9 @@ struct Probe {
     db_error: Option<String>,
 }
 
+/// The script of the probe that boots the application.
+const BOOT_SCRIPT: &str = "require File.expand_path(\"config/environment\")";
+
 /// The `-e` script of the probe that does not boot the application.
 fn light_script(rails_app: bool) -> String {
     format!("require \"bundler/setup\"; VciCollector::Probe.light!({rails_app})")
@@ -474,6 +477,23 @@ pub struct RailsAdapter {
     light: OnceLock<Result<Probe, String>>,
     /// The probe of the booted application.
     probe: OnceLock<Result<Probe, String>>,
+    /// A boot started ahead of time ([`Adapter::start_native_externals`]),
+    /// taken by the first probe of the booted application.
+    started: std::sync::Mutex<Option<StartedProbe>>,
+}
+
+/// A probe process started without waiting for it.
+struct StartedProbe {
+    child: std::process::Child,
+    describe: String,
+    /// Its run directory, kept until it has finished.
+    _dirs: RunDirs,
+}
+
+impl std::fmt::Debug for StartedProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StartedProbe({})", self.describe)
+    }
 }
 
 fn collector_ok(dir: &Utf8Path) -> bool {
@@ -601,6 +621,7 @@ impl RailsAdapter {
             mode: OnceLock::new(),
             light: OnceLock::new(),
             probe: OnceLock::new(),
+            started: std::sync::Mutex::new(None),
         }
     }
 
@@ -816,11 +837,40 @@ impl RailsAdapter {
         // boot: its bundle is the toolchain.
         let rails_app = !self.plain_ruby();
         let script = if rails_app {
-            "require File.expand_path(\"config/environment\")"
+            BOOT_SCRIPT
         } else {
             "require \"bundler/setup\""
         };
         self.run_probe_script(env, script, rails_app)
+    }
+
+    /// Start the boot probe without waiting for it (see
+    /// [`Adapter::start_native_externals`]); nothing when one ran or started
+    /// already, or for a project without an application to boot.
+    fn start_boot_probe(&self, env: &ChildEnv) {
+        if self.plain_ruby() || self.probe.get().is_some() {
+            return;
+        }
+        let Ok(mut slot) = self.started.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let (Ok(collector), Ok(dirs)) = (self.collector_file(), RunDirs::new()) else {
+            return;
+        };
+        let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
+        script_args(&mut cmd, &dirs, "vci-probe.rb", BOOT_SCRIPT);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let describe = describe(&cmd);
+        if let Ok(child) = cmd.spawn() {
+            *slot = Some(StartedProbe {
+                child,
+                describe,
+                _dirs: dirs,
+            });
+        }
     }
 
     /// A probe process: `ruby -e <script>` with the collector in probe mode,
@@ -835,10 +885,27 @@ impl RailsAdapter {
         let dirs = RunDirs::new()?;
         let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
         script_args(&mut cmd, &dirs, "vci-probe.rb", script);
-        let out = cmd.output().map_err(|e| self.not_installed(e))?;
+        // A boot started ahead of time (2.7.26) is waited for instead.
+        let started = if rails_app && script == BOOT_SCRIPT {
+            self.started.lock().ok().and_then(|mut s| s.take())
+        } else {
+            None
+        };
+        let (out, described) = match started {
+            Some(sp) => (
+                sp.child
+                    .wait_with_output()
+                    .map_err(|e| self.not_installed(e))?,
+                sp.describe,
+            ),
+            None => (
+                cmd.output().map_err(|e| self.not_installed(e))?,
+                describe(&cmd),
+            ),
+        };
         if !out.status.success() {
             return Err(AdapterError::Command {
-                cmd: describe(&cmd),
+                cmd: described,
                 status: out.status.to_string(),
                 stderr: format!(
                     "{}{}",
@@ -2277,6 +2344,10 @@ impl Adapter for RailsAdapter {
 
     /// The native libraries the booted application opened through FFI (a
     /// project without Rails: what `require "bundler/setup"` opened).
+    fn start_native_externals(&self, env: &ChildEnv) {
+        self.start_boot_probe(env);
+    }
+
     fn native_externals(&self, env: &ChildEnv) -> Result<Option<InstalledExternals>, AdapterError> {
         let p = if self.plain_ruby() {
             self.light_probe(env)?

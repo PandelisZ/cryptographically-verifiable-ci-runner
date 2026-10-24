@@ -317,6 +317,13 @@ pub trait Adapter: Send + Sync {
         let _ = env;
         Ok(None)
     }
+    /// Start whatever [`Adapter::native_externals`] needs (Rails: the boot
+    /// of the application, about 3 s on vex) without waiting for it, so a
+    /// plan does other work meanwhile and the later call finds it done or
+    /// waits for the rest. Nothing by default.
+    fn start_native_externals(&self, env: &ChildEnv) {
+        let _ = env;
+    }
     /// What `vci run` checks before running anything it attests, beyond
     /// [`Adapter::tool_versions_with_env`] (Rails: the application boots
     /// under vci's run conditions, passes the probe's checks and reports the
