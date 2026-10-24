@@ -1037,6 +1037,10 @@ pub(crate) fn timing(what: &str, since: std::time::Instant) {
     }
 }
 
+/// How many of a unit's newest candidates a plan reads before its first
+/// verdict, besides the ones `choose_candidates` picks.
+const READ_FIRST: usize = 3;
+
 /// The store flag saying a plan of `project` compared native libraries.
 fn natives_flag(project: &str) -> String {
     format!("plan:natives:{project}")
@@ -1378,7 +1382,32 @@ fn plan_with(
         timing("look up the candidates", t_lookup);
         let looked_up = looked_up.and_then(|mut m| {
             let t = std::time::Instant::now();
-            AttestStore::new(&ctx.repo).read_values(m.values_mut().flatten())?;
+            // Only the candidates the verdict checks first are read (the
+            // ones `hydrate_for_plan` chose); the rest are marked not read,
+            // and `hydrate_more` reads them for the units not skipped
+            // (2.7.23: a vex store held 18,700 fetched candidates, 340 MB,
+            // for 4,100 the verdicts needed).
+            let head = ctx.repo.head_tree().ok();
+            let mut read: Vec<&mut StoredEnvelope> = Vec::new();
+            for cands in m.values_mut() {
+                let mut chosen: BTreeSet<usize> = choose_candidates(cands, head.as_deref())
+                    .into_iter()
+                    .collect();
+                // And the few newest after them: when the newest fails (a
+                // pull request attested the file on its own tree), the
+                // one before it usually passes, without a second round.
+                let mut by_age: Vec<usize> = (0..cands.len()).collect();
+                by_age.sort_by_key(|&i| std::cmp::Reverse(cands[i].issued));
+                chosen.extend(by_age.into_iter().take(READ_FIRST));
+                for (i, c) in cands.iter_mut().enumerate() {
+                    if chosen.contains(&i) {
+                        read.push(c);
+                    } else {
+                        c.mark_not_fetched();
+                    }
+                }
+            }
+            AttestStore::new(&ctx.repo).read_values(read)?;
             timing("read the candidates", t);
             Ok(m)
         });
@@ -1623,14 +1652,18 @@ fn hydrate_more(
             v.manifests.evict(&roots);
             v.manifests.evict_errors();
         }
-        // Checked again with every candidate readable: the store's rows are
-        // re-read for these units (their candidates' values are new).
-        if let Ok(r) = AttestStore::new(&ctx.repo).reader() {
-            for id in &unread {
-                if let Ok(c) = r.candidates(id) {
-                    current.insert((*id).to_owned(), c);
-                }
-            }
+        // Checked again with every candidate readable: these units'
+        // candidates are read again, in one batch (2.7.23: one unit at a
+        // time took 9 s for 2,000 units on a laptop).
+        let mut again: Vec<(String, Vec<StoredEnvelope>)> = unread
+            .iter()
+            .filter_map(|id| by_id.get(*id).map(|c| ((*id).to_owned(), c.clone())))
+            .collect();
+        if AttestStore::new(&ctx.repo)
+            .read_values(again.iter_mut().flat_map(|(_, c)| c.iter_mut()))
+            .is_ok()
+        {
+            current.extend(again);
         }
         let fresh = &current;
         let mut rechecked = 0usize;

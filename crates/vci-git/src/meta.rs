@@ -241,6 +241,13 @@ pub struct StoredEnvelope {
 }
 
 impl StoredEnvelope {
+    /// Mark the value as not read (a plan reads only the candidates it
+    /// checks first, and fetches the rest for the units it could not skip).
+    pub fn mark_not_fetched(&mut self) {
+        self.bytes = Vec::new();
+        self.error = Some(NOT_FETCHED.to_owned());
+    }
+
     /// Whether the value is unread only because it has not been fetched
     /// yet (a git-meta promised entry, see the module docs).
     pub fn not_fetched(&self) -> bool {
@@ -1427,6 +1434,14 @@ impl<'a> AttestStore<'a> {
         if envs.is_empty() {
             return Ok(());
         }
+        let timed = vci_core::metrics::on();
+        let mut t = std::time::Instant::now();
+        let mut part = |what: &str| {
+            if timed {
+                vci_core::timing_line!("read values: {what}: {:.2}s", t.elapsed().as_secs_f64());
+            }
+            t = std::time::Instant::now();
+        };
         let mut keys: BTreeSet<(String, String, String)> = BTreeSet::new();
         for e in &envs {
             let t = Target::parse(&e.target).map_err(meta_err)?;
@@ -1439,10 +1454,15 @@ impl<'a> AttestStore<'a> {
         // (is_git_ref, is_promised, value) by key, through the reader's
         // connection (read-only: a plan runs from a read-only .git too).
         let mut rows: BTreeMap<(String, String, String), (bool, bool, String)> = BTreeMap::new();
+        // Attestation rows only: the input manifests are string rows too,
+        // with their value inline (up to 150 KB each on vex), and a scan
+        // that returned them read hundreds of megabytes (2.7.23).
+        let prefix = format!("{KEY_PREFIX}:");
+        let len = prefix.len() as i64;
         for row in self.reader()?.rows(
             "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised \
-             FROM metadata WHERE value_type = 'string'",
-            &[],
+             FROM metadata WHERE value_type = 'string' AND substr(key, 1, ?1) = ?2",
+            &[&len, &prefix],
         )? {
             let key = (
                 row.target.target_type().as_str().to_owned(),
@@ -1453,6 +1473,7 @@ impl<'a> AttestStore<'a> {
                 rows.insert(key, (row.is_git_ref, row.is_promised, row.value));
             }
         }
+        part("scan the store's rows");
         let oids: BTreeSet<String> = rows
             .values()
             .filter(|(is_ref, promised, _)| *is_ref && !*promised)
@@ -1460,6 +1481,7 @@ impl<'a> AttestStore<'a> {
             .filter(|o| is_oid(o))
             .collect();
         let blobs = self.read_blobs(&oids)?;
+        part(&format!("read {} blobs", blobs.len()));
         for e in envs {
             let t = Target::parse(&e.target).map_err(meta_err)?;
             let key = (
@@ -1488,6 +1510,7 @@ impl<'a> AttestStore<'a> {
                 Err(err) => e.error = Some(err),
             }
         }
+        part("decode");
         Ok(())
     }
 
