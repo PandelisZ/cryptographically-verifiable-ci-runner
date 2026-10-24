@@ -1089,6 +1089,13 @@ struct KeySnapshot {
     clean_tree: Option<String>,
 }
 
+/// How long a deletion record is kept before a push drops it (see
+/// [`AttestStore::drop_old_deletion_records`]); `VCI_DELETION_RECORDS_KEEP_SECS`.
+const DELETION_RECORDS_KEEP_SECS: i64 = 24 * 60 * 60;
+/// How many deletion records past that make a push drop them;
+/// `VCI_DELETION_RECORDS_DROP_AT`.
+const DELETION_RECORDS_DROP_AT: i64 = 20_000;
+
 /// git-meta's tree layout names (pinned with the crate version).
 const VALUE_BLOB: &str = "__value";
 const TOMBSTONE_DIR: &str = "__tombstones";
@@ -2055,11 +2062,32 @@ impl<'a> AttestStore<'a> {
     fn covered_commit(&self) -> Option<String> {
         let (_, db) = self.db_rw().ok()??;
         Self::cover_schema(&db).ok()?;
-        db.query_row("SELECT local FROM vci_cover LIMIT 1", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
-        .filter(|o| is_oid(o))
+        let local = db
+            .query_row("SELECT local FROM vci_cover LIMIT 1", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .filter(|o| is_oid(o))?;
+        // A key deleted since that has neither a row nor a deletion record
+        // now: the store no longer covers the commit.
+        let lost: bool = db
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM vci_cover_gone g \
+                 WHERE NOT EXISTS (SELECT 1 FROM metadata m WHERE m.target_type = g.target_type \
+                   AND m.target_value = g.target_value AND m.key = g.key) \
+                 AND NOT EXISTS (SELECT 1 FROM tombstones t WHERE t.tombstone_type = 'metadata' \
+                   AND t.target_type = g.target_type AND t.target_value = g.target_value \
+                   AND t.key = g.key))",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        if lost {
+            let _ = db.execute_batch("DELETE FROM vci_cover; DELETE FROM vci_cover_gone;");
+            return None;
+        }
+        let _ = db.execute("DELETE FROM vci_cover_gone", []);
+        Some(local)
     }
 
     /// Record that the store covers `commit` (see
@@ -2071,7 +2099,7 @@ impl<'a> AttestStore<'a> {
         if Self::cover_schema(&db).is_err() {
             return;
         }
-        let _ = db.execute_batch("BEGIN; DELETE FROM vci_cover;");
+        let _ = db.execute_batch("BEGIN; DELETE FROM vci_cover; DELETE FROM vci_cover_gone;");
         let _ = db.execute("INSERT INTO vci_cover (local) VALUES (?1)", [commit]);
         let _ = db.execute_batch("COMMIT;");
     }
@@ -2177,12 +2205,37 @@ impl<'a> AttestStore<'a> {
         )
     }
 
+    /// 2.7.20: a deleted row or deletion record is noted in `vci_cover_gone`
+    /// rather than clearing the cover outright: git-meta's removal deletes
+    /// the row and writes its deletion record in one savepoint, so a store
+    /// that supersedes attestations (every vex master run) still covers its
+    /// commit, and each pull request job restoring that store spent 25 s
+    /// checking it again. The cover holds while every noted key still has a
+    /// row or a deletion record (see [`AttestStore::covered_commit`]).
     fn cover_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
+        let old: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' \
+             AND name IN ('vci_cover_rows', 'vci_cover_tombstones')",
+            [],
+            |r| r.get(0),
+        )?;
+        if old > 0 {
+            db.execute_batch(
+                "DROP TRIGGER IF EXISTS vci_cover_rows;
+                 DROP TRIGGER IF EXISTS vci_cover_tombstones;",
+            )?;
+        }
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS vci_cover (local TEXT NOT NULL);
-             CREATE TRIGGER IF NOT EXISTS vci_cover_rows AFTER DELETE ON metadata
-               BEGIN DELETE FROM vci_cover; END;
-             CREATE TRIGGER IF NOT EXISTS vci_cover_tombstones AFTER DELETE ON tombstones
+             CREATE TABLE IF NOT EXISTS vci_cover_gone (
+               target_type TEXT NOT NULL, target_value TEXT NOT NULL, key TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS vci_cover_gone_rows AFTER DELETE ON metadata
+               BEGIN INSERT INTO vci_cover_gone VALUES (OLD.target_type, OLD.target_value, OLD.key); END;
+             CREATE TRIGGER IF NOT EXISTS vci_cover_gone_records AFTER DELETE ON tombstones
+               WHEN OLD.tombstone_type = 'metadata'
+               BEGIN INSERT INTO vci_cover_gone VALUES (OLD.target_type, OLD.target_value, OLD.key); END;
+             CREATE TRIGGER IF NOT EXISTS vci_cover_other_records AFTER DELETE ON tombstones
+               WHEN OLD.tombstone_type != 'metadata'
                BEGIN DELETE FROM vci_cover; END;",
         )
     }
@@ -2780,6 +2833,10 @@ impl<'a> AttestStore<'a> {
                 "--no-renames",
                 "-z",
                 "--raw",
+                // Only the new side's trees need reading; listing what was
+                // deleted printed 262 MB after a drop of old deletion
+                // records (22 s).
+                "--diff-filter=AMT",
                 base,
                 commit,
             ])
@@ -4465,6 +4522,180 @@ impl<'a> AttestStore<'a> {
         })
     }
 
+    /// Delete the store's deletion records of `keys` (in one transaction).
+    fn delete_deletion_records(&self, keys: &[Key]) -> Result<(), GitError> {
+        let Some((path, mut db)) = self.db_rw()? else {
+            return Ok(());
+        };
+        let e = |err| sql_err(&path, err);
+        let tx = db.transaction().map_err(e)?;
+        {
+            let mut del = tx
+                .prepare_cached(
+                    "DELETE FROM tombstones WHERE tombstone_type = 'metadata' \
+                     AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+                )
+                .map_err(e)?;
+            for k in keys {
+                del.execute(rusqlite::params![
+                    k.target_type.as_str(),
+                    k.target_value,
+                    k.key
+                ])
+                .map_err(e)?;
+            }
+        }
+        tx.commit().map_err(e)
+    }
+
+    /// Remove the deletion records older than the retention window from the
+    /// store and from the tree of `local` (the tip of `local_ref`), as a
+    /// commit on top of it, once there are at least
+    /// [`DELETION_RECORDS_DROP_AT`] of them: `(the new commit, how many)`.
+    ///
+    /// 2.7.20: vex's metadata tree held 465,000 entries, 431,000 of them
+    /// deletion records written in the week before (each run's superseded
+    /// attestations and manifests), and every fetch, merge and push listed,
+    /// fetched and checked all of them. A record only keeps a stale clone
+    /// from bringing the deleted value back; git's history already deletes
+    /// it in a merge with any clone that saw the value (three-way, and
+    /// git-meta's own merge drops a record one side dropped). A value that
+    /// comes back anyway is an attestation that has expired or been
+    /// superseded, or a manifest: harmless, and deleted again by the next
+    /// `vci prune`.
+    fn drop_old_deletion_records(
+        &self,
+        local_ref: &str,
+        local: &str,
+    ) -> Result<Option<(String, usize)>, GitError> {
+        let env = |name: &str, default: i64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(default)
+        };
+        let keep_ms =
+            env("VCI_DELETION_RECORDS_KEEP_SECS", DELETION_RECORDS_KEEP_SECS).max(0) * 1000;
+        let at = env("VCI_DELETION_RECORDS_DROP_AT", DELETION_RECORDS_DROP_AT).max(1) as usize;
+        let cutoff = now_ms() - keep_ms;
+        let Some((path, mut db)) = self.db_rw()? else {
+            return Ok(None);
+        };
+        let e = |err| sql_err(&path, err);
+        let old: Vec<Key> = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT target_type, target_value, key FROM tombstones \
+                     WHERE tombstone_type = 'metadata' AND timestamp < ?1",
+                )
+                .map_err(e)?;
+            let rows = stmt
+                .query_map([cutoff], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(e)?;
+            rows.flatten()
+                .filter_map(|(ty, value, key)| {
+                    Some(Key {
+                        target_type: TargetType::from_str(&ty).ok()?,
+                        target_value: value,
+                        key,
+                    })
+                })
+                .collect()
+        };
+        if old.len() < at {
+            return Ok(None);
+        }
+        let was_covered = self.covered_commit().as_deref() == Some(local);
+        let session = self.session()?;
+        let repo = session.repo();
+        let gerr = |err: &dyn std::fmt::Display| {
+            GitError::Meta(format!("writing the metadata tree: {err}"))
+        };
+        let prev_tree = repo
+            .rev_parse_single(format!("{local}^{{tree}}").as_str())
+            .map_err(|err| gerr(&err))?
+            .detach();
+        let mut editor = repo.edit_tree(prev_tree).map_err(|err| gerr(&err))?;
+        for k in &old {
+            let Ok(p) = git_meta_lib::tree_paths::tombstone_path(&k.to_target(), &k.key) else {
+                continue;
+            };
+            // A path the tree does not have is left alone.
+            let _ = editor.remove(p.as_str());
+        }
+        let tree = editor
+            .write()
+            .map_err(|err| gerr(&err))?
+            .detach()
+            .to_string();
+        drop(editor);
+        drop(session);
+        let tx = db.transaction().map_err(e)?;
+        {
+            let mut del = tx
+                .prepare_cached(
+                    "DELETE FROM tombstones WHERE tombstone_type = 'metadata' \
+                     AND target_type = ?1 AND target_value = ?2 AND key = ?3 AND timestamp < ?4",
+                )
+                .map_err(e)?;
+            for k in &old {
+                del.execute(rusqlite::params![
+                    k.target_type.as_str(),
+                    k.target_value,
+                    k.key,
+                    cutoff
+                ])
+                .map_err(e)?;
+            }
+        }
+        tx.commit().map_err(e)?;
+        drop(db);
+        if tree == prev_tree.to_string().as_str() {
+            if was_covered {
+                self.set_covered_commit(local);
+            }
+            return Ok(None);
+        }
+        let mut git = self.repo.git().args([
+            "commit-tree",
+            "--no-gpg-sign",
+            &tree,
+            "-p",
+            local,
+            "-m",
+            &format!(
+                "vci: drop {} deletion record(s) older than the retention window",
+                old.len()
+            ),
+        ]);
+        for (k, v) in IDENTITY {
+            git = git.env(k, v);
+        }
+        let commit = parse_oid(&git.run()?)?;
+        self.cas_ref(
+            local_ref,
+            Some(&commit),
+            local,
+            "vci: drop old deletion records",
+        )?;
+        // Built from a complete tree, so complete: checked by its difference
+        // from an older commit, it would list every record dropped (25 s for
+        // vex's 360,000).
+        if self.known_complete(local) {
+            self.mark_complete(&commit);
+        }
+        if was_covered {
+            self.set_covered_commit(&commit);
+        }
+        Ok(Some((commit, old.len())))
+    }
+
     /// The merge base of two commits, `None` when they share no history.
     fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>, GitError> {
         let (describe, out) = self
@@ -4604,13 +4835,22 @@ impl<'a> AttestStore<'a> {
         let mut values: BTreeMap<Key, String> = BTreeMap::new();
         let mut changed_tombstones: BTreeMap<Key, String> = BTreeMap::new();
         let mut removed: Vec<Key> = Vec::new();
+        let mut dropped_records: Vec<Key> = Vec::new();
         for ([status, old_mode, new_mode, oid], path) in changes {
             let (key, tombstone) = match Self::classify_change(status, old_mode, new_mode, path) {
                 Err(why) => return fallback(why),
                 Ok(None) => continue,
                 Ok(Some(c)) => c,
             };
-            if status == "D" {
+            if status == "D" && tombstone {
+                // A deletion record the tree no longer has: the value is set
+                // again (the value's own change sets it), or the record was
+                // dropped (2.7.20: a push drops the old ones), and is dropped
+                // here too rather than stamped as a new deletion.
+                if !to_snap.values.contains(&key) {
+                    dropped_records.push(key);
+                }
+            } else if status == "D" {
                 // The tree no longer has the value. Still holding it (under
                 // another spelling of its path) is not something to guess.
                 if to_snap.values.contains(&key) {
@@ -4704,7 +4944,7 @@ impl<'a> AttestStore<'a> {
             .filter_map(|(k, oid)| tombstone(oid).map(|t| (k.clone(), t)))
             .filter(|(k, t)| held.get(k) != Some(t))
             .collect();
-        let changed = values.len() + tombstones.len() + removed.len();
+        let changed = values.len() + tombstones.len() + removed.len() + dropped_records.len();
         let inline_max = guarded("reading the store", || store.object_max_size())?;
         part("fetch and read changed deletion records");
         let promised = self.mark_values(&values, &to_commit, now, inline_max)?;
@@ -4735,11 +4975,15 @@ impl<'a> AttestStore<'a> {
                 })?;
             }
         }
+        if !dropped_records.is_empty() {
+            self.delete_deletion_records(&dropped_records)?;
+        }
         part(&format!(
-            "apply {} deletion record(s), {} restamped, {} deleted",
+            "apply {} deletion record(s), {} restamped, {} deleted, {} dropped",
             tombstones.len(),
             restamped.len(),
-            legacy.len()
+            legacy.len(),
+            dropped_records.len()
         ));
         match &local {
             Some(l) if *l == to_commit => {}
@@ -5081,6 +5325,14 @@ impl<'a> AttestStore<'a> {
         local_before: Option<&str>,
         tip_blobs: &BTreeMap<String, String>,
     ) -> Result<usize, GitError> {
+        let timed = vci_core::metrics::on();
+        let mut t = std::time::Instant::now();
+        let mut part = |what: &str| {
+            if timed {
+                vci_core::timing_line!("put back: {what}: {:.2}s", t.elapsed().as_secs_f64());
+            }
+            t = std::time::Instant::now();
+        };
         let store = session.store();
         let deleted: BTreeSet<String> =
             guarded("reading the store", || store.get_all_tombstones())?
@@ -5092,6 +5344,10 @@ impl<'a> AttestStore<'a> {
         if deleted.is_empty() {
             return Ok(0);
         }
+        part(&format!(
+            "read the deletion records ({} manifests)",
+            deleted.len()
+        ));
         let handle = session.target(&Target::project());
         let mut candidates = BTreeSet::new();
         for r in deleted {
@@ -5110,46 +5366,85 @@ impl<'a> AttestStore<'a> {
         // What an attestation's blob names is cached (2.7.19); only the
         // attestations not seen before are fetched and read (all of them
         // cost vex's plans 5.7 s whenever master pruned a manifest).
+        part(&format!("find the deleted ones ({})", candidates.len()));
         let referenced = self.referenced_manifests(remote, &candidates)?;
+        part(&format!(
+            "read what attestations reference ({})",
+            referenced.len()
+        ));
         let mut back = 0;
         let project = Target::project();
         let mut put_back: Vec<String> = Vec::new();
-        for root in candidates.intersection(&referenced) {
-            let key = manifest_key(root);
-            let mut sources: Vec<String> = Vec::new();
-            if let Some(oid) = tip_blobs.get(root) {
-                sources.push(oid.clone());
-            }
-            if let Some(local) = local_before {
-                let path = guarded("building a git-meta tree path", || {
-                    git_meta_lib::tree_paths::tree_path(&Target::project(), &key)
-                })?;
-                sources.push(format!("{local}:{path}"));
-            }
-            for src in sources {
-                let Ok(bytes) = self.repo.git().args(["cat-file", "blob", &src]).run() else {
-                    continue;
-                };
-                let ok = self
-                    .reader()
-                    .ok()
-                    .and_then(|reader| decode_manifest(&reader, &bytes).ok())
-                    .is_some_and(|m| m.root() == *root);
-                let Ok(text) = String::from_utf8(bytes) else {
-                    continue;
-                };
-                if !ok {
+        // Each manifest's blob in the tip and in the local commit before the
+        // merge, read in one batch with one store reader (2.7.20: a process
+        // and a store open per manifest took vex's CI jobs about 44 s when
+        // master's prune deleted manifests attestations still reference).
+        let wanted: Vec<&String> = candidates.intersection(&referenced).collect();
+        let mut local_blobs: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(local) = local_before
+            && !wanted.is_empty()
+        {
+            let prefix = guarded("building a git-meta tree path", || {
+                git_meta_lib::tree_paths::tree_path(&Target::project(), &manifest_key(wanted[0]))
+            })?;
+            // project/<key path>/__value: list the manifests' directory.
+            let dir = prefix
+                .trim_end_matches(&format!("/{VALUE_BLOB}"))
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_owned())
+                .unwrap_or_default();
+            let listing = self
+                .repo
+                .git()
+                .args(["ls-tree", "-r", "-z", local, "--"])
+                .arg(&dir)
+                .run()?;
+            for (_, kind, oid, path) in split_ls_tree(&listing) {
+                if kind != b"blob" {
                     continue;
                 }
+                let path = String::from_utf8_lossy(path);
+                if let Some(rest) = path.strip_prefix(&format!("{dir}/"))
+                    && let Some(root) = rest.strip_suffix(&format!("/{VALUE_BLOB}"))
+                {
+                    local_blobs.insert(root.to_owned(), String::from_utf8_lossy(oid).into_owned());
+                }
+            }
+        }
+        let oids: BTreeSet<String> = wanted
+            .iter()
+            .flat_map(|r| [tip_blobs.get(*r), local_blobs.get(*r)])
+            .flatten()
+            .cloned()
+            .collect();
+        let bytes = self.read_blobs(&oids)?;
+        let reader = self.reader()?;
+        for root in wanted {
+            let key = manifest_key(root);
+            for oid in [tip_blobs.get(root), local_blobs.get(root)]
+                .into_iter()
+                .flatten()
+            {
+                let Some(b) = bytes.get(oid) else {
+                    continue;
+                };
+                if !decode_manifest(&reader, b).is_ok_and(|m| m.root() == *root) {
+                    continue;
+                }
+                let Ok(text) = String::from_utf8(b.clone()) else {
+                    continue;
+                };
                 guarded("putting back an input manifest", || {
                     handle.set(&key, text.as_str())
                 })?;
-                put_back.push(key);
+                put_back.push(key.clone());
                 back += 1;
                 break;
             }
         }
+        drop(reader);
         self.stamp_written(put_back.iter().map(|k| (&project, k.as_str())))?;
+        part(&format!("put back {back}"));
         Ok(back)
     }
 
@@ -5199,28 +5494,24 @@ impl<'a> AttestStore<'a> {
         if unread.is_empty() {
             return Ok(referenced);
         }
-        let fetched = self.hydrate_locked(remote, |k| {
-            unread.contains(&(
-                k.target_type.as_str().to_owned(),
-                k.target_value.clone(),
-                k.key.clone(),
-            ))
-        });
-        if fetched.is_err() {
-            return Ok(candidates.clone());
-        }
+        // Only the attestations this clone holds are read: one it never
+        // fetched (a promised row, or a blob not here) is not one its plans
+        // relied on, and a manifest it references that is not put back only
+        // makes its unit run (2.7.20: fetching them cost a CI plan 2 s or
+        // more whenever master deleted a manifest).
+        let _ = (remote, candidates);
         let reader = self.reader()?;
         let mut learnt = BTreeMap::new();
         for row in reader.rows(sql, &[&len, &prefix])? {
             let k = triple(&row);
-            if !unread.contains(&k) {
+            if !unread.contains(&k) || row.is_promised {
                 continue;
             }
             let Some(e) = reader.decode_reading(row, |_| true) else {
                 continue;
             };
             if e.error.is_some() {
-                return Ok(candidates.clone());
+                continue;
             }
             let r = envelope_manifest_ref(&e.bytes);
             if let Some(o) = blob_of.get(&k) {
@@ -5340,8 +5631,7 @@ impl<'a> AttestStore<'a> {
         }
         match (status, old_mode, new_mode) {
             ("A", "000000", "100644") | ("M", "100644", "100644") => Ok(Some((key, tombstone))),
-            ("D", "100644", "000000") if tombstone => Ok(None),
-            ("D", "100644", "000000") => Ok(Some((key, false))),
+            ("D", "100644", "000000") => Ok(Some((key, tombstone))),
             _ => Err(format!("{p} ({status} {old_mode} -> {new_mode})")),
         }
     }
@@ -5472,6 +5762,19 @@ impl<'a> AttestStore<'a> {
                 carried = std::mem::take(&mut report.notes);
                 continue;
             }
+            let local = match self.drop_old_deletion_records(&local_ref, &local) {
+                Ok(Some((commit, n))) => {
+                    report.note(format!(
+                        "dropped {n} deletion record(s) older than the retention window from the metadata tree"
+                    ));
+                    commit
+                }
+                Ok(None) => local,
+                Err(e) => {
+                    report.warn(format!("dropping old deletion records failed: {e}"));
+                    local
+                }
+            };
             let mut theirs_snap = None;
             // Listed once for both checks below (2.7.12: twice before,
             // about 3.5 s each on vex's 180,000-entry tree).
@@ -6607,7 +6910,10 @@ mod tests {
             c("A", "000000", "100644", &deleted),
             Ok(Some((k.clone(), true)))
         );
-        assert_eq!(c("D", "100644", "000000", &deleted), Ok(None));
+        assert_eq!(
+            c("D", "100644", "000000", &deleted),
+            Ok(Some((k.clone(), true)))
+        );
         let project = git_meta_lib::tree_paths::tree_path(&Target::project(), "owner").unwrap();
         assert_eq!(
             c("A", "000000", "100644", &project),

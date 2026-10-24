@@ -838,8 +838,8 @@ fn a_changed_entry_the_incremental_merge_does_not_read_is_merged_in_full() {
 
 /// 2.7.5: a fetch skips the coverage check when the store recorded that it
 /// covers the local ref, but a row deleted behind vci's back (raw SQL, as a
-/// purge does) clears that record, so the next fetch restores the value and
-/// a push never drops it.
+/// purge does, without a deletion record) voids that record, so the next
+/// fetch restores the value and a push never drops it.
 #[test]
 fn a_row_deleted_after_coverage_is_restored_before_a_push() {
     let w = world(1);
@@ -864,10 +864,12 @@ fn a_row_deleted_after_coverage_is_restored_before_a_push() {
             )
             .unwrap();
         assert!(n > 0, "deleted A's row");
-        let after: Option<String> = db
-            .query_row("SELECT local FROM vci_cover LIMIT 1", [], |r| r.get(0))
-            .ok();
-        assert!(after.is_none(), "the trigger clears the record");
+        // 2.7.20: the trigger notes the deleted key; the record holds only
+        // while each noted key has a row or a deletion record.
+        let gone: i64 = db
+            .query_row("SELECT count(*) FROM vci_cover_gone", [], |r| r.get(0))
+            .unwrap();
+        assert!(gone > 0, "the trigger notes the deleted row");
     }
     st.fetch(None).unwrap();
     assert_eq!(ids(&st), tk(&[A, B]), "the fetch restores A");
