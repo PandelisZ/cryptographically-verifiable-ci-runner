@@ -1039,7 +1039,7 @@ pub(crate) fn timing(what: &str, since: std::time::Instant) {
 
 /// How many of a unit's newest candidates a plan reads before its first
 /// verdict, besides the ones `choose_candidates` picks.
-const READ_FIRST: usize = 3;
+const READ_FIRST: usize = 2;
 
 /// The store flag saying a plan of `project` compared native libraries.
 fn natives_flag(project: &str) -> String {

@@ -964,12 +964,14 @@ impl Reader {
     /// The roots of every stored input manifest, sorted (values not read).
     pub fn manifest_roots(&self) -> Result<Vec<String>, GitError> {
         let prefix = format!("{MANIFEST_PREFIX}:");
-        let len = prefix.len() as i64;
+        // A key range on the store's (target, key) index: `substr` scanned
+        // every row (1.2 s a fetch on vex's runners, 2.7.24).
+        let upper = format!("{MANIFEST_PREFIX};");
         let ty = TargetType::Project.as_str().to_owned();
         let rows = self.rows(
             "SELECT target_type, target_value, key, '', value_type, is_git_ref, is_promised
-             FROM metadata WHERE target_type = ?1 AND substr(key, 1, ?2) = ?3",
-            &[&ty, &len, &prefix],
+             FROM metadata WHERE target_type = ?1 AND target_value = '' AND key >= ?2 AND key < ?3",
+            &[&ty, &prefix, &upper],
         )?;
         let mut out: Vec<String> = rows
             .iter()
@@ -4445,7 +4447,12 @@ impl<'a> AttestStore<'a> {
         } else {
             None
         };
-        let unchanged = raw_tip.is_some() && raw_tip == previous;
+        // Also when the tip is the local metadata commit (this clone, or the
+        // job whose cache it restored, pushed it): nothing to merge, so
+        // nothing to list (2.7.24: the marker named the tip before that
+        // push, and every CI plan listed the tip, 0.85 s).
+        let unchanged =
+            raw_tip.is_some() && (raw_tip == previous || raw_tip == self.read_ref(&local_ref)?);
         if found
             && !unchanged
             && let Some(tip) = raw_tip.clone()

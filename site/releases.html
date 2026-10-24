@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-24">2.7.24</a></td><td>24 Oct 2026</td><td>A fetch lists the store's manifests through the key index (1.2 s), skips listing a tip this clone pushed (0.85 s), and a plan reads two of each unit's newest candidates instead of three</td></tr>
 <tr><td><a href="#v2-7-23">2.7.23</a></td><td>24 Oct 2026</td><td>A plan reads only the few newest candidates of each unit before its first verdict (4,100 of 18,700 stored on vex), reads attestation rows alone, and reads the second round's candidates in one batch</td></tr>
 <tr><td><a href="#v2-7-22">2.7.22</a></td><td>24 Oct 2026</td><td>A Rails plan boots the application for the native-library check beside the fetch instead of in the verdicts (5.8 s on vex), reads its candidates in one batch instead of one by one, and skips two store scans only a push needs (2-4 s)</td></tr>
 <tr><td><a href="#v2-7-21">2.7.21</a></td><td>24 Oct 2026</td><td>The Rails toolchain probe runs from a file, so Bundler switches it to the lockfile's version as it does the tests: after vex moved to Bundler 4.0.23 no file was attested; includes 2.7.20</td></tr>
@@ -120,6 +121,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-24">2.7.24</h2>
+<p><em>24 October 2026.</em> Two master plans on 2.7.23 took 9.3 s (master unchanged) and 13.4 s (master moved). Of the latter, listing the store's input manifests took 1.2 s with a <code>substr</code> over every row; <strong>a key range on the store's index</strong> lists them in 0.06 s. Every CI plan listed the fetched tip's 50,000 keys (0.85 s) although the tip was the commit the job that saved its cache had pushed: <strong>a tip equal to the local metadata commit is not listed</strong>. A plan reads two of each unit's newest candidates before its first verdict instead of three (6,300 blobs instead of 8,400 on vex); the second round, now one batch, covers the rest.</p>
 
 <h2 id="v2-7-23">2.7.23</h2>
 <p><em>24 October 2026.</em> With 2.7.22 a master plan on vex took 10.6 s, 3.1 s of it reading the candidates: every fetched attestation of every unit, 18,700 of them (340 MB), when the verdicts check about two per unit, and the scan that found them returned the input manifests' rows too, with their values inline. <strong>A plan now reads only the candidates it checks first</strong> (the ones chosen for fetching, plus the three newest of each unit, so a unit whose newest attestation was made on another branch still passes on the one before it without a second round), from the attestation rows alone; the second round reads what the units not skipped still need in one batch instead of one unit at a time (9 s for 2,000 units on a laptop). On a laptop the plan takes 4.8-7 s after master moved.</p>
