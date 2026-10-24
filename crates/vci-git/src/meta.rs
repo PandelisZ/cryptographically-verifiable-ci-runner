@@ -4177,10 +4177,42 @@ impl<'a> AttestStore<'a> {
         }
         drop(stmt);
         drop(db);
+        let n = by_oid.len() + by_bytes.len() + removed.len();
+        // One `git fast-import` writes the blobs, the trees on their paths
+        // and the commit as a single pack (2.7.28: through gix each was a
+        // loose object, tens of thousands for a run's 8,000 entries on
+        // git-meta's deep paths, 10 s on vex's runners); gix when it fails.
+        let t = std::time::Instant::now();
+        let imported = self.fast_import_commit(&prev, &by_oid, &by_bytes, &removed, n);
+        if vci_core::metrics::on() {
+            vci_core::timing_line!(
+                "serialize: fast-import {}: {:.2}s",
+                match &imported {
+                    Ok(Some(_)) => "wrote the commit",
+                    Ok(None) => "had nothing to write",
+                    Err(_) => "failed; gix writes",
+                },
+                t.elapsed().as_secs_f64()
+            );
+        }
+        match imported {
+            Ok(Some(commit)) => {
+                self.cas_ref(local_ref, Some(&commit), &prev, "vci: serialize")?;
+                if self.known_complete(&prev) {
+                    self.mark_complete(&commit);
+                }
+                guarded("writing the store", || store.set_last_materialized(now))?;
+                return Ok(Some(n));
+            }
+            Ok(None) => {
+                guarded("writing the store", || store.set_last_materialized(now))?;
+                return Ok(Some(n));
+            }
+            Err(_) => {}
+        }
         // The new blobs and the trees on their paths, written through gix
         // (only the subtrees that change; 2,000 entries through a git
         // index took 5 s on a laptop).
-        let n = by_oid.len() + by_bytes.len() + removed.len();
         let repo = session.repo();
         let gerr =
             |e: &dyn std::fmt::Display| GitError::Meta(format!("writing the metadata tree: {e}"));
@@ -4231,6 +4263,126 @@ impl<'a> AttestStore<'a> {
         }
         guarded("writing the store", || store.set_last_materialized(now))?;
         Ok(Some(n))
+    }
+
+    /// Write a commit on `prev` with `by_oid` (path -> existing blob),
+    /// `by_bytes` (path -> content) and `removed` applied, through one `git
+    /// fast-import`: `Ok(None)` when the tree is unchanged, `Err` when
+    /// fast-import failed (the caller writes through gix instead).
+    fn fast_import_commit(
+        &self,
+        prev: &str,
+        by_oid: &[(String, String)],
+        by_bytes: &[(String, Vec<u8>)],
+        removed: &[String],
+        n: usize,
+    ) -> Result<Option<String>, GitError> {
+        use std::io::Write as _;
+        // C-quoted when fast-import needs it (a quote, a backslash, a
+        // control character, or a leading/trailing space).
+        fn quote(p: &str) -> String {
+            let plain = !p.is_empty()
+                && !p.starts_with(' ')
+                && !p.ends_with(' ')
+                && p.bytes()
+                    .all(|b| b >= 0x20 && b != b'"' && b != b'\\' && b != 0x7f);
+            if plain {
+                return p.to_owned();
+            }
+            let mut q = String::from("\"");
+            for b in p.bytes() {
+                match b {
+                    b'"' => q.push_str("\\\""),
+                    b'\\' => q.push_str("\\\\"),
+                    b'\n' => q.push_str("\\n"),
+                    0x20..=0x7e => q.push(b as char),
+                    _ => q.push_str(&format!("\\{b:03o}")),
+                }
+            }
+            q.push('"');
+            q
+        }
+        let tmp_ref = format!("refs/vci/serialize-{}", std::process::id());
+        let (name, email) = {
+            let get = |k: &str| IDENTITY.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
+            (
+                get("GIT_COMMITTER_NAME").unwrap_or("vci"),
+                get("GIT_COMMITTER_EMAIL").unwrap_or("vci@localhost"),
+            )
+        };
+        let when = now_ms() / 1000;
+        let msg = format!("vci: serialize {n} change(s)");
+        let mut input: Vec<u8> = Vec::with_capacity(
+            by_bytes.iter().map(|(_, b)| b.len() + 80).sum::<usize>()
+                + 128 * (by_oid.len() + removed.len())
+                + 256,
+        );
+        let _ = write!(
+            input,
+            "commit {tmp_ref}\ncommitter {name} <{email}> {when} +0000\ndata {}\n{msg}\nfrom {prev}\n",
+            msg.len()
+        );
+        for path in removed {
+            let _ = writeln!(input, "D {}", quote(path));
+        }
+        for (path, oid) in by_oid {
+            let _ = writeln!(input, "M 100644 {oid} {}", quote(path));
+        }
+        for (path, bytes) in by_bytes {
+            let _ = write!(
+                input,
+                "M 100644 inline {}\ndata {}\n",
+                quote(path),
+                bytes.len()
+            );
+            input.extend_from_slice(bytes);
+            input.push(b'\n');
+        }
+        input.extend_from_slice(b"done\n");
+        let mut child = std::process::Command::new("git")
+            .args(["-c", "gc.auto=0", "fast-import", "--quiet", "--done"])
+            .current_dir(self.repo.root())
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| GitError::Meta(format!("starting git fast-import: {e}")))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| GitError::Meta("git fast-import: no stdin".to_owned()))?;
+            stdin
+                .write_all(&input)
+                .map_err(|e| GitError::Meta(format!("feeding git fast-import: {e}")))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| GitError::Meta(format!("waiting for git fast-import: {e}")))?;
+        if !out.status.success() {
+            return Err(GitError::Meta(format!(
+                "git fast-import failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let commit = self.read_ref(&tmp_ref)?;
+        let _ = self.repo.git().args(["update-ref", "-d", &tmp_ref]).run();
+        let Some(commit) = commit else {
+            return Err(GitError::Meta("git fast-import wrote no commit".to_owned()));
+        };
+        let tree = |c: &str| {
+            self.repo
+                .git()
+                .args(["rev-parse", "--verify"])
+                .arg(format!("{c}^{{tree}}"))
+                .run()
+                .and_then(|o| parse_oid(&o))
+        };
+        if tree(&commit)? == tree(prev)? {
+            return Ok(None);
+        }
+        Ok(Some(commit))
     }
 
     /// Rewrite `commit` (the tip of `local_ref`) with `entries` (key -> blob
@@ -5492,14 +5644,23 @@ impl<'a> AttestStore<'a> {
         // A path both sides changed the same way (2.7.11: both of a run's
         // jobs write the same deletion records) merges cleanly; one they
         // left different takes git-meta's merge.
-        let both = ours
+        let conflicts: Vec<(&Vec<u8>, &String)> = ours
             .iter()
             .filter(|(p, o)| theirs.get(*p).is_some_and(|t| t != *o))
-            .count();
-        if both > 0 {
+            .collect();
+        // Both of a run's jobs delete the same superseded attestations, each
+        // stamping the record with its own time: deletion records of one
+        // key that differ take ours, as git-meta's merge does (2.7.28:
+        // 2,054 such paths sent every push of a vex run to git-meta's merge
+        // of three listed trees, 6 s). Any other path both sides changed
+        // differently takes git-meta's merge.
+        let is_record =
+            |p: &[u8]| p.ends_with(b"/__deleted") && p.windows(14).any(|w| w == b"/__tombstones/");
+        if conflicts.iter().any(|(p, _)| !is_record(p)) {
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
-                    "materialize: {both} path(s) changed differently on both sides; git-meta merges"
+                    "materialize: {} path(s) changed differently on both sides; git-meta merges",
+                    conflicts.len()
                 );
             }
             return Ok(None);
@@ -5518,7 +5679,11 @@ impl<'a> AttestStore<'a> {
             ])
             .env("GIT_NO_LAZY_FETCH", "1")
             .output_described()?;
-        if !out.status.success() {
+        // Exit status 1: conflicts, the tree written with markers at those
+        // paths; only the deletion records found above may conflict, and
+        // they are replaced below.
+        let conflicted = out.status.code() == Some(1) && !conflicts.is_empty();
+        if !out.status.success() && !conflicted {
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
                     "materialize: git merge-tree did not merge ({}); git-meta merges",
@@ -5530,7 +5695,7 @@ impl<'a> AttestStore<'a> {
             }
             return Ok(None);
         }
-        let Some(tree) = String::from_utf8_lossy(&out.stdout)
+        let Some(mut tree) = String::from_utf8_lossy(&out.stdout)
             .lines()
             .next()
             .map(str::trim)
@@ -5539,6 +5704,33 @@ impl<'a> AttestStore<'a> {
         else {
             return Ok(None);
         };
+        if !conflicts.is_empty() {
+            let session = self.session()?;
+            let repo = session.repo();
+            let gerr = |e: &dyn std::fmt::Display| {
+                GitError::Meta(format!("resolving deletion records in the merge: {e}"))
+            };
+            let id = gix::ObjectId::from_hex(tree.as_bytes()).map_err(|e| gerr(&e))?;
+            let mut editor = repo.edit_tree(id).map_err(|e| gerr(&e))?;
+            for (p, o) in &conflicts {
+                let path = String::from_utf8_lossy(p).into_owned();
+                if o.chars().all(|c| c == '0') {
+                    let _ = editor.remove(path.as_str());
+                } else {
+                    let blob = gix::ObjectId::from_hex(o.as_bytes()).map_err(|e| gerr(&e))?;
+                    editor
+                        .upsert(path.as_str(), gix::objs::tree::EntryKind::Blob, blob)
+                        .map_err(|e| gerr(&e))?;
+                }
+            }
+            tree = editor.write().map_err(|e| gerr(&e))?.detach().to_string();
+            if vci_core::metrics::on() {
+                vci_core::timing_line!(
+                    "materialize: {} deletion record(s) both sides wrote differently take ours",
+                    conflicts.len()
+                );
+            }
+        }
         let mut git = self.repo.git().args([
             "commit-tree",
             "--no-gpg-sign",

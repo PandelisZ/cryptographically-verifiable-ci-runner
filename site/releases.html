@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-28">2.7.28</a></td><td>24 Oct 2026</td><td>A run's publish writes its metadata commit with one <code>git fast-import</code> (10 s of loose objects on vex's runners), and a merge resolves deletion records both jobs wrote differently itself (6 s)</td></tr>
 <tr><td><a href="#v2-7-27">2.7.27</a></td><td>24 Oct 2026</td><td>A pull request's plan reads the attestations made on its base commit's tree first (not another branch's newest), the tree check walks only the new objects (14 s once), and the store does not sync to disk on CI (a 6 s commit)</td></tr>
 <tr><td><a href="#v2-7-26">2.7.26</a></td><td>24 Oct 2026</td><td>A Rails plan starts the application's boot for the native-library check as a child process and no longer waits for it before reading its candidates and starting the verdicts</td></tr>
 <tr><td><a href="#v2-7-25">2.7.25</a></td><td>24 Oct 2026</td><td>A plan reads the store file through in the background at its start, so the scans of a store a CI job just restored from its cache find it in memory</td></tr>
@@ -124,6 +125,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-28">2.7.28</h2>
+<p><em>24 October 2026.</em> After a full vex Rails run, publishing took about 80 s. Serializing the run's 8,000 changed entries wrote each blob and each tree on git-meta's deep paths as a loose object through gix, tens of thousands of files (10.5 s on the runner); <strong>one <code>git fast-import</code> now writes them as a single pack</strong>, gix remaining the fallback. The two jobs of a run delete the same superseded attestations, each stamping the deletion record with its own time, so every push found 2,000 paths changed differently on both sides and fell back to git-meta's merge of three listed trees (6.3 s); <strong>deletion records of one key that differ now take ours</strong>, as git-meta's merge does, and the merge stays on the fast path. With <code>VCI_TIMING</code> the store phase reports the time of storing manifests and removing superseded attestations separately (16 s of the 24 s check-sign-store phase is that serial loop).</p>
 
 <h2 id="v2-7-27">2.7.27</h2>
 <p><em>24 October 2026.</em> Pull request plans on vex took 10-62 s where master's took 6-9 s. One of 61 s: the check that the fetched tip's trees are all here diffed it against a commit recorded complete hours earlier, across hundreds of pushes (14 s); <strong>it now walks only the objects the tip reaches that a complete ancestor does not</strong>. The merge's commit of 15,000 store rows waited 6 s for the runner's disk; <strong>on CI (<code>CI</code> set, or <code>VCI_STORE_SYNC=off</code>) the store no longer syncs to disk</strong>, which it need not, being a cache there. And the plan fetched each unit's newest attestations first, made by other branches on their own trees (2,000 envelopes and manifests, 8 s), found them failing, and fetched 6,000 more values in a second round (17 s): <strong>a plan now reads the attestations made on its base commit's tree first</strong>, master's for a pull request, and only then the newest.</p>

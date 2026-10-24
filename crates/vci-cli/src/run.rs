@@ -2225,6 +2225,8 @@ pub fn run_units(
         let tm_warn = std::sync::atomic::AtomicU64::new(0);
         let tm_sign = std::sync::atomic::AtomicU64::new(0);
         let tm_store = std::sync::atomic::AtomicU64::new(0);
+        let tm_store_manifest = std::sync::atomic::AtomicU64::new(0);
+        let tm_store_remove = std::sync::atomic::AtomicU64::new(0);
         let tm_supersede = std::sync::atomic::AtomicU64::new(0);
         let add = |f: &std::sync::atomic::AtomicU64, since: std::time::Instant| {
             f.fetch_add(
@@ -2390,6 +2392,7 @@ pub fn run_units(
                 store
                     .put_manifest(&p.core.input_root, compact.as_bytes())
                     .context("storing the input manifest")?;
+                add(&tm_store_manifest, t);
                 let hint = crate::util::parse_rfc3339(&p.core.issued_at)
                     .ok()
                     .map(|issued| vci_git::KeyHint {
@@ -2401,8 +2404,10 @@ pub fn run_units(
                 // Never the one just stored (the same storage key: the same
                 // inputs, replaced).
                 let doomed: Vec<_> = doomed.into_iter().filter(|e| e.key != stored.key).collect();
+                let t_remove = std::time::Instant::now();
                 superseded +=
                     remove_superseded(&store, &p.core.test_id, doomed, &mut dropped_roots);
+                add(&tm_store_remove, t_remove);
                 add(&tm_store, t);
                 Ok(stored)
             });
@@ -2460,13 +2465,15 @@ pub fn run_units(
                 f.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
             };
             vci_core::timing_line!(
-                "{}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}, find superseded {:.1}; store and remove superseded (one at a time) {:.1}",
+                "{}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}, find superseded {:.1}; store and remove superseded (one at a time) {:.1} (manifests {:.1}, removals {:.1})",
                 project.label(),
                 g(&tm_check),
                 g(&tm_warn),
                 g(&tm_sign),
                 g(&tm_supersede),
-                g(&tm_store)
+                g(&tm_store),
+                g(&tm_store_manifest),
+                g(&tm_store_remove)
             );
             let ns =
                 |i: usize| SUPERSEDE_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
