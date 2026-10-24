@@ -937,6 +937,7 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
 
 fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
     let (repo, root) = open_repo()?;
+    AttestStore::new(&repo).warm_in_background();
     // `--fetch`: fetch attestations while the projects are probed; joined
     // before the store is read (and before returning, whatever happens).
     let mut fetch = opts.fetch.clone().map(|remote| {

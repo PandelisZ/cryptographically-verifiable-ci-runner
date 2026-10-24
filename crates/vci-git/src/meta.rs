@@ -2195,6 +2195,22 @@ impl<'a> AttestStore<'a> {
         Some(local)
     }
 
+    /// Read the store file through once, in the background (2.7.25): a CI
+    /// job restores it from a cache, cold, and the first scans of it paid
+    /// about a second each on vex's runners (150 MB) while the fetch's
+    /// network round trips left the disk idle.
+    pub fn warm_in_background(&self) {
+        let Ok(path) = self.db_path() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            if let Ok(mut f) = std::fs::File::open(path) {
+                let mut buf = vec![0u8; 1 << 20];
+                while matches!(f.read(&mut buf), Ok(n) if n > 0) {}
+            }
+        });
+    }
+
     /// Whether `name` was flagged in this store (see [`AttestStore::set_flag`]).
     pub fn flag(&self, name: &str) -> bool {
         let Ok(Some((_, db))) = self.db_rw() else {
