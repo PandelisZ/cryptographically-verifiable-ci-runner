@@ -13,7 +13,10 @@ use serde::Serialize;
 use vci_attest::keyless::{IDENTITIES_FILE, Identities, TRUSTED_ROOT_FILE, TrustedRoot};
 use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
 use vci_core::{CheckoutCache, EntryKind, InputManifest, Observation, PREDICATE_TYPE, RepoPath};
-use vci_git::{AttestStore, Reader, Repo, StoredEnvelope, StoredManifest};
+use vci_git::Repo;
+use vci_store::{
+    AttestationStore, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest,
+};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
 use crate::ctx::{Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo};
@@ -201,6 +204,10 @@ pub struct PlanResult {
     /// stored locally were used.
     #[serde(skip)]
     pub fetch_failed: Option<String>,
+    /// [`AttestationStore::kind`] of the store the candidates were read
+    /// from, for `explain`.
+    #[serde(skip)]
+    pub store_kind: &'static str,
 }
 
 impl PlanResult {
@@ -351,6 +358,8 @@ fn current_refs(repo: &Repo) -> Vec<String> {
 /// Everything computed once per project.
 struct Verifier<'a> {
     ctx: &'a Ctx,
+    /// Where the candidates and their input manifests are stored.
+    store: &'a dyn AttestationStore,
     /// This checkout's tree (clean checkout), to check candidates made on
     /// it first.
     head_tree: Option<String>,
@@ -457,21 +466,27 @@ impl Timers {
 pub(crate) type ManifestUnavailable = (String, String);
 
 /// Decode the input manifest an attestation references (`manifestRef`)
-/// from what the store returned for it. Its root is not checked here: the
+/// from what `store` returned for it. Its root is not checked here: the
 /// caller compares it with the signed `inputRoot`.
 pub(crate) fn load_manifest(
+    store: &dyn AttestationStore,
     root: &str,
-    stored: Result<Option<StoredManifest>, vci_git::GitError>,
-    base: impl FnOnce(&str) -> Result<Option<StoredManifest>, vci_git::GitError>,
+    stored: Result<Option<StoredManifest>, StoreError>,
+    base: impl FnOnce(&str) -> Result<Option<StoredManifest>, StoreError>,
 ) -> Result<InputManifest, ManifestUnavailable> {
     match stored {
         Err(e) => Err((
             format!("manifest {root} cannot be read from the store"),
             e.to_string(),
         )),
-        Ok(None) => Err((
+        // A lazy store may hold it elsewhere: `vci fetch` brings it.
+        Ok(None) if store.caps().lazy_values => Err((
             format!("manifest {root} not in the store: run `vci fetch`"),
-            "missing from the local git-meta store".to_owned(),
+            format!("missing from the local {} store", store.kind()),
+        )),
+        Ok(None) => Err((
+            format!("manifest {root} not in the store"),
+            format!("missing from the {} store", store.kind()),
         )),
         Ok(Some(m)) => match m.error {
             Some(e) => Err((format!("manifest {root} unreadable"), e)),
@@ -491,18 +506,16 @@ pub(crate) fn load_manifest(
     }
 }
 
-/// Reads (once each) the input manifests a project's candidates reference,
-/// through one store reader opened on first use.
+/// Reads (once each) the input manifests a project's candidates reference.
+/// The verifying threads read them from the store at once: the store is
+/// called from many threads (git-meta keeps a reader per concurrent caller:
+/// a manifest of a large application is megabytes, and reading them one at
+/// a time behind one reader serialized the plan; 2.1.0: on vex's runners,
+/// 2,004 manifests of 1.9 MB took 1,124 s under one lock).
 #[derive(Default)]
 struct ManifestLoader {
     #[allow(clippy::type_complexity)]
     cache: Mutex<BTreeMap<String, Result<Arc<InputManifest>, ManifestUnavailable>>>,
-    /// One store reader per verifying thread, opened on first use: a reader
-    /// holds a SQLite connection and a `git cat-file --batch` process, and a
-    /// manifest of a large application is megabytes, so reading them one at
-    /// a time behind one reader serialized the plan (2.1.0: on vex's runners,
-    /// 2,004 manifests of 1.9 MB took 1,124 s under one lock).
-    readers: Vec<Mutex<Option<Result<Reader, String>>>>,
     /// Roots (a manifest's, or its base's) a read found not fetched yet: the
     /// plan fetches them after its first pass and checks their units again
     /// (see `hydrate_for_plan`).
@@ -520,30 +533,19 @@ struct ManifestLoader {
 }
 
 impl ManifestLoader {
-    fn new(readers: usize) -> Self {
-        ManifestLoader {
-            cache: Mutex::default(),
-            readers: (0..readers.max(1)).map(|_| Mutex::new(None)).collect(),
-            not_fetched: Mutex::default(),
-            bases: Mutex::default(),
-            base_of: Mutex::default(),
-            decoded_bases: Mutex::default(),
-        }
-    }
-
     /// The base manifest `root`, read once (`read` reads it from the store).
     fn base(
         &self,
         root: &str,
-        read: impl FnOnce() -> Result<Option<StoredManifest>, vci_git::GitError>,
-    ) -> Result<Option<StoredManifest>, vci_git::GitError> {
+        read: impl FnOnce() -> Result<Option<StoredManifest>, StoreError>,
+    ) -> Result<Option<StoredManifest>, StoreError> {
         if let Some(b) = self
             .bases
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(root)
         {
-            return b.clone().map_err(vci_git::GitError::Store);
+            return b.clone().map_err(StoreError::Other);
         }
         let got = read();
         // A base not fetched yet is read again after the plan fetches it.
@@ -630,13 +632,12 @@ impl ManifestLoader {
         });
     }
 
-    /// The manifest is read with a reader no other thread is using and
-    /// decoded with the cache unlocked (files are verified in parallel);
-    /// two threads asking for the same root at once both read it, and the
-    /// first decoding wins.
+    /// The manifest is read from `store` and decoded with the cache
+    /// unlocked (files are verified in parallel); two threads asking for the
+    /// same root at once both read it, and the first decoding wins.
     fn load(
         &self,
-        repo: &Repo,
+        store: &dyn AttestationStore,
         root: &str,
         timers: &Timers,
     ) -> Result<Arc<InputManifest>, ManifestUnavailable> {
@@ -649,28 +650,18 @@ impl ManifestLoader {
             return r.clone();
         }
         let t_read = std::time::Instant::now();
-        let stored = {
-            let slot = self.reader_slot();
-            let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-            let reader = guard
-                .get_or_insert_with(|| AttestStore::new(repo).reader().map_err(|e| e.to_string()));
-            match reader {
-                // The base too (vci 2.1.8), read with the same reader
-                // while it is this thread's.
-                Ok(r) => r.manifest(root).map(|m| {
-                    let base = m
-                        .as_ref()
-                        .filter(|m| m.error.is_none())
-                        .and_then(|m| InputManifest::compact_base(&m.bytes).ok().flatten())
-                        .map(|b| {
-                            let got = self.base(&b, || r.manifest(&b));
-                            (b, got)
-                        });
-                    (m, base)
-                }),
-                Err(e) => Err(vci_git::GitError::Store(e.clone())),
-            }
-        };
+        // The base too (vci 2.1.8).
+        let stored = store.manifest(root).map(|m| {
+            let base = m
+                .as_ref()
+                .filter(|m| m.error.is_none())
+                .and_then(|m| InputManifest::compact_base(&m.bytes).ok().flatten())
+                .map(|b| {
+                    let got = self.base(&b, || store.manifest(&b));
+                    (b, got)
+                });
+            (m, base)
+        });
         Timers::add(&timers.manifest_read, t_read);
         let t_decode = std::time::Instant::now();
         let (stored, base) = match stored {
@@ -702,7 +693,7 @@ impl ManifestLoader {
                     .extend(missing);
             }
         }
-        let r = load_manifest(root, stored, |b| match base {
+        let r = load_manifest(store, root, stored, |b| match base {
             Some((root, stored)) if root == b => stored,
             _ => Ok(None),
         })
@@ -710,18 +701,6 @@ impl ManifestLoader {
         Timers::add(&timers.manifest_decode, t_decode);
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         cache.entry(root.to_owned()).or_insert(r).clone()
-    }
-
-    /// A reader slot: the first one not in use, else this thread's own.
-    fn reader_slot(&self) -> &Mutex<Option<Result<Reader, String>>> {
-        for slot in &self.readers {
-            if let Ok(guard) = slot.try_lock() {
-                drop(guard);
-                return slot;
-            }
-        }
-        let i = rayon::current_thread_index().unwrap_or(0) % self.readers.len();
-        &self.readers[i]
     }
 }
 
@@ -931,15 +910,6 @@ fn issued_hint(s: &StoredEnvelope) -> Option<i64> {
 
 /// Run `f` (which verifies files in parallel) on `VCI_JOBS` threads, by
 /// default one per CPU; on the global pool if a pool cannot be made.
-/// `VCI_JOBS`, else one per CPU: how many files are verified at once.
-fn plan_jobs() -> usize {
-    std::env::var("VCI_JOBS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-}
-
 fn in_plan_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     let jobs = std::env::var("VCI_JOBS")
         .ok()
@@ -956,7 +926,7 @@ impl Verifier<'_> {
     /// [`Verifier::natives`], from the booted application.
     fn natives(&self) -> &Result<vci_adapter::InstalledExternals, String> {
         self.natives.get_or_init(|| {
-            AttestStore::new(&self.ctx.repo).set_flag(&natives_flag(&self.project.name));
+            self.store.set_flag(&natives_flag(&self.project.name));
             self.project
                 .adapter
                 .native_externals(&self.child.to_child_env())
@@ -1107,19 +1077,8 @@ pub fn plan(opts: &PlanOptions) -> Result<PlanResult> {
 
 fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
     let (repo, root) = open_repo()?;
-    AttestStore::new(&repo).warm_in_background();
-    // `--fetch`: fetch attestations while the projects are probed; joined
-    // before the store is read (and before returning, whatever happens).
-    let mut fetch = opts.fetch.clone().map(|remote| {
-        let (repo, from) = (repo.clone(), remote.clone());
-        let handle = std::thread::spawn(move || {
-            let t = std::time::Instant::now();
-            let r = crate::cmds::fetch_messages(&repo, from.as_deref());
-            timing("fetch attestations (--fetch, in the background)", t);
-            r
-        });
-        (remote, handle)
-    });
+    let store = crate::store::for_repo(&repo);
+    store.warm();
     let mut res = PlanResult {
         base_ref: None,
         base_commit: None,
@@ -1131,8 +1090,35 @@ fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
         config: None,
         allowed: None,
         fetch_failed: None,
+        store_kind: store.kind(),
     };
-    let out = plan_with(opts, repo, root, &mut res, &mut fetch);
+    // `--fetch`: fetch attestations while the projects are probed; joined
+    // before the store is read (and before returning, whatever happens).
+    // A store without an exchange has nothing to fetch.
+    let mut fetch = match (opts.fetch.clone(), store.exchange().is_some()) {
+        (Some(remote), true) => {
+            let (store, from) = (store.clone(), remote.clone());
+            let handle = std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let r = crate::cmds::fetch_messages(&*store, from.as_deref());
+                timing("fetch attestations (--fetch, in the background)", t);
+                r
+            });
+            Some((remote, handle))
+        }
+        (Some(Some(remote)), false) => {
+            let w = format!(
+                "the {} store has no remote: --fetch {} is ignored",
+                store.kind(),
+                crate::cmds::redact_userinfo(&remote)
+            );
+            eprintln!("vci: warning: {w}");
+            res.warnings.push(w);
+            None
+        }
+        (_, false) | (None, true) => None,
+    };
+    let out = plan_with(opts, repo, root, &*store, &mut res, &mut fetch);
     join_fetch(&mut fetch, &mut res);
     out.map(|()| res)
 }
@@ -1209,9 +1195,13 @@ pub(crate) fn timing(what: &str, since: std::time::Instant) {
 }
 
 /// The attestations a plan remembered passing on `head`'s tree, else on
-/// `base`'s (test key -> git-meta key; see [`AttestStore::passing_on`]).
-fn passing_memos(repo: &Repo, head: Option<&str>, base: Option<&str>) -> BTreeMap<String, String> {
-    let store = AttestStore::new(repo);
+/// `base`'s (test key -> attestation key; see
+/// [`AttestationStore::passing_on`]).
+fn passing_memos(
+    store: &dyn AttestationStore,
+    head: Option<&str>,
+    base: Option<&str>,
+) -> BTreeMap<String, String> {
     let first16 = |t: &str| -> String { t.chars().take(16).collect() };
     let mut memos = base
         .map(|b| store.passing_on(&first16(b)))
@@ -1236,6 +1226,7 @@ fn natives_flag(project: &str) -> String {
 /// pytest and Minitest files are listed without a process).
 fn probe_project(
     ctx: &Ctx,
+    store: &dyn AttestationStore,
     idx: usize,
     project: &Project,
     child: &ChildEnvMap,
@@ -1260,9 +1251,7 @@ fn probe_project(
         // every verdict thread waiting; the boot is started here, beside
         // the fetch, and not waited for (2.7.26): the verdicts that need it
         // wait for what is left of it.
-        if resolve
-            && project.adapter.name() == "rails"
-            && AttestStore::new(&ctx.repo).flag(&natives_flag(&project.name))
+        if resolve && project.adapter.name() == "rails" && store.flag(&natives_flag(&project.name))
         {
             project.adapter.start_native_externals(&env);
         }
@@ -1336,6 +1325,7 @@ fn plan_with(
     opts: &PlanOptions,
     repo: Repo,
     root: camino::Utf8PathBuf,
+    store: &dyn AttestationStore,
     res: &mut PlanResult,
     fetch: &mut PendingFetch,
 ) -> Result<()> {
@@ -1477,7 +1467,7 @@ fn plan_with(
             .map(|(i, (p, start))| {
                 let resolve = start.run_all.is_none() && trusted;
                 let (ctx, repo_id) = (&ctx, &repo_id);
-                s.spawn(move || probe_project(ctx, i, p, &start.child, resolve, repo_id))
+                s.spawn(move || probe_project(ctx, store, i, p, &start.child, resolve, repo_id))
             })
             .collect();
         handles
@@ -1525,33 +1515,34 @@ fn plan_with(
         files.retain(|f| f.test_id.as_str() == id);
     }
 
-    // 3. Stored candidates from the local git-meta store (`vci fetch`, or
-    // `--fetch` above, materializes the remote's), looked up per unit, then
-    // per project: toolchain, repo identity, and the checks.
+    // 3. Stored candidates from the store (git-meta: the local store, which
+    // `vci fetch`, or `--fetch` above, materializes the remote's into),
+    // looked up per unit, then per project: toolchain, repo identity, and
+    // the checks.
     join_fetch(fetch, res);
     let mut by_id: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
     if !res.projects.iter().all(|p| p.run_all.is_some()) {
         // A fetch downloads keys, not values: fetch the values this plan
         // reads (the candidates of the units it verifies, then the input
         // manifests they reference) in one batch each.
-        hydrate_for_plan(&ctx.repo, &files, res);
+        hydrate_for_plan(store, &ctx.repo, &files, res);
         let t_lookup = std::time::Instant::now();
-        let looked_up = AttestStore::new(&ctx.repo).reader().and_then(|r| {
-        if !r.has_store() {
-            let w = "no git-meta store in this repository: no attestations are available (run `vci fetch` first)".to_owned();
-            eprintln!("vci: warning: {w}");
-            res.warnings.push(w);
-        }
-        let mut m = BTreeMap::new();
-        for f in &files {
-            let id = f.test_id.as_str();
-            if !m.contains_key(id) {
-                // Keys first; the values in one batch below (2.7.23).
-                m.insert(id.to_owned(), r.candidates_reading(id, |_| false)?);
+        let looked_up = (|| -> Result<BTreeMap<String, Vec<StoredEnvelope>>, StoreError> {
+            if let StoreStatus::Absent { advice } = store.status()? {
+                let w = absent_warning(store, &advice);
+                eprintln!("vci: warning: {w}");
+                res.warnings.push(w);
             }
-        }
-        Ok(m)
-    });
+            // Keys first; the values in one batch below (2.7.23).
+            let mut seen = BTreeSet::new();
+            let ids: Vec<&str> = files
+                .iter()
+                .map(|f| f.test_id.as_str())
+                .filter(|id| seen.insert(*id))
+                .collect();
+            let listed = store.list_units(&ids)?;
+            Ok(ids.into_iter().map(str::to_owned).zip(listed).collect())
+        })();
         timing("look up the candidates", t_lookup);
         let looked_up = looked_up.and_then(|mut m| {
             let t = std::time::Instant::now();
@@ -1565,7 +1556,7 @@ fn plan_with(
                 .base_commit
                 .as_deref()
                 .and_then(|b| ctx.repo.tree_of(b).ok());
-            let memos = passing_memos(&ctx.repo, head.as_deref(), base.as_deref());
+            let memos = passing_memos(store, head.as_deref(), base.as_deref());
             let mut read: Vec<&mut StoredEnvelope> = Vec::new();
             for cands in m.values_mut() {
                 let memo = cands
@@ -1590,14 +1581,14 @@ fn plan_with(
                     }
                 }
             }
-            AttestStore::new(&ctx.repo).read_values(read)?;
+            store.read_values(&mut read)?;
             timing("read the candidates", t);
             Ok(m)
         });
         match looked_up {
             Ok(m) => by_id = m,
             Err(e) => {
-                let e = format!("reading attestations from git-meta: {e:#}");
+                let e = format!("reading attestations from {}: {e:#}", store.kind());
                 for p in res.projects.iter_mut() {
                     p.run_all.get_or_insert_with(|| e.clone());
                 }
@@ -1622,6 +1613,7 @@ fn plan_with(
                 (None, true, None) => Err("internal: the project was not resolved".to_owned()),
                 (None, true, Some(r)) => r.map(|r| Verifier {
                     ctx: &ctx,
+                    store,
                     head_tree: head_tree.clone(),
                     project,
                     allowed: allowed.as_ref().unwrap_or(&no_ssh_signers),
@@ -1637,7 +1629,7 @@ fn plan_with(
                     cargo_lock: r.cargo_lock,
                     rails_gems: r.rails_gems,
                     natives: std::sync::OnceLock::new(),
-                    manifests: ManifestLoader::new(plan_jobs()),
+                    manifests: ManifestLoader::default(),
                     checkout: &checkout,
                     ignored: &ignored,
                     globals: Mutex::default(),
@@ -1686,9 +1678,17 @@ fn plan_with(
             .base_commit
             .as_deref()
             .and_then(|b| ctx.repo.tree_of(b).ok());
-        passing_memos(&ctx.repo, head_tree.as_deref(), base.as_deref())
+        passing_memos(store, head_tree.as_deref(), base.as_deref())
     };
-    hydrate_more(&ctx, &files, &verifiers, &by_id, &memos, &mut verdicts, res);
+    hydrate_more(
+        store,
+        &files,
+        &verifiers,
+        &by_id,
+        &memos,
+        &mut verdicts,
+        res,
+    );
     timing("verdicts again for what was fetched meanwhile", t);
     // What passed on this tree, for the plans whose base commit it is
     // (2.7.29; see `passing_memos`).
@@ -1705,7 +1705,7 @@ fn plan_with(
             .collect();
         let n = passed.len();
         let head16: String = head.chars().take(16).collect();
-        AttestStore::new(&ctx.repo).remember_passing(&head16, &passed);
+        store.remember_passing(&head16, &passed);
         timing(
             &format!("remember the {n} attestation(s) that passed on this tree"),
             t,
@@ -1726,21 +1726,40 @@ fn plan_with(
     Ok(())
 }
 
+/// The warning for a store that does not exist yet (`advice`: what creates
+/// it). A lazy store's (git-meta's) is the one vci always printed.
+fn absent_warning(store: &dyn AttestationStore, advice: &str) -> String {
+    let kind = store.kind();
+    if store.caps().lazy_values {
+        format!(
+            "no {kind} store in this repository: no attestations are available ({advice} first)"
+        )
+    } else {
+        format!("no attestations are available in the {kind} store ({advice})")
+    }
+}
+
 /// Fetch the stored values a plan of `files` reads that were not fetched yet
 /// (lazy metadata: `vci fetch` downloads the keys only): the candidates of
 /// the units of every project that is verified, and the manifests they
 /// reference. A failure is a warning: the values not fetched read as such,
 /// and their units run.
-fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
+fn hydrate_for_plan(
+    store: &dyn AttestationStore,
+    repo: &Repo,
+    files: &[TestFile],
+    res: &mut PlanResult,
+) {
     let t = std::time::Instant::now();
-    let ids = files
+    let ids: Vec<&str> = files
         .iter()
         .filter(|f| {
             res.projects
                 .get(f.project)
                 .is_some_and(|p| p.run_all.is_none())
         })
-        .map(|f| f.test_id.as_str());
+        .map(|f| f.test_id.as_str())
+        .collect();
     // The envelopes and manifests of each unit's likeliest attestation(s)
     // only, chosen from the keys (vci 2.2 keys say when an attestation was
     // issued and on which tree): one made on this checkout's tree, else the
@@ -1752,7 +1771,7 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
         .base_commit
         .as_deref()
         .and_then(|b| repo.tree_of(b).ok());
-    let memos = passing_memos(repo, head.as_deref(), base.as_deref());
+    let memos = passing_memos(store, head.as_deref(), base.as_deref());
     let choose = move |cands: &[StoredEnvelope]| -> Vec<usize> {
         let memo = cands
             .first()
@@ -1760,7 +1779,10 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
             .map(String::as_str);
         choose_candidates(cands, head.as_deref(), base.as_deref(), memo)
     };
-    let warning = match AttestStore::new(repo).hydrate_units_choosing(ids, choose) {
+    let warning = match store.prefetch(Prefetch::Units {
+        test_ids: &ids,
+        choose: Some(&choose),
+    }) {
         Ok(h) => h.error.map(|e| {
             format!(
                 "could not fetch {} stored attestation value(s): {e}; their units run",
@@ -1787,7 +1809,7 @@ fn hydrate_for_plan(repo: &Repo, files: &[TestFile], res: &mut PlanResult) {
 /// with every value fetched. Bounded: a round that fetches nothing new
 /// ends it.
 fn hydrate_more(
-    ctx: &Ctx,
+    store: &dyn AttestationStore,
     files: &[TestFile],
     verifiers: &[Result<Verifier<'_>, String>],
     by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
@@ -1855,11 +1877,15 @@ fn hydrate_more(
             return;
         }
         let t = std::time::Instant::now();
-        let store = AttestStore::new(&ctx.repo);
+        let unread_ids: Vec<&str> = unread.iter().copied().collect();
+        let root_ids: Vec<&str> = roots.iter().map(String::as_str).collect();
         let h = store
-            .hydrate_units(unread.iter().copied())
+            .prefetch(Prefetch::Units {
+                test_ids: &unread_ids,
+                choose: None,
+            })
             .and_then(|mut h| {
-                h.add(store.hydrate_manifests(roots.iter().map(String::as_str))?);
+                h.add(store.prefetch(Prefetch::Manifests { roots: &root_ids })?);
                 Ok(h)
             });
         let warning = match &h {
@@ -1899,10 +1925,12 @@ fn hydrate_more(
             .iter()
             .filter_map(|id| by_id.get(*id).map(|c| ((*id).to_owned(), c.clone())))
             .collect();
-        if AttestStore::new(&ctx.repo)
-            .read_values(again.iter_mut().flat_map(|(_, c)| c.iter_mut()))
-            .is_ok()
-        {
+        let read = {
+            let mut refs: Vec<&mut StoredEnvelope> =
+                again.iter_mut().flat_map(|(_, c)| c.iter_mut()).collect();
+            store.read_values(&mut refs)
+        };
+        if read.is_ok() {
             current.extend(again);
         }
         let fresh = &current;
@@ -2220,7 +2248,7 @@ impl Verifier<'_> {
             return Err(Failure::one(
                 "envelope",
                 1,
-                "value in the git-meta store",
+                format!("value in the {} store", self.store.kind()),
                 format!("unreadable: {e}"),
                 "a readable DSSE envelope",
             ));
@@ -2658,21 +2686,21 @@ impl Verifier<'_> {
         let m: &InputManifest = match (&p.core.manifest, &p.core.manifest_ref) {
             (Some(m), _) => m,
             (None, Some(r)) => {
-                loaded = self
-                    .manifests
-                    .load(&self.ctx.repo, r, &self.timers)
-                    .map_err(|(what, actual)| {
+                loaded = self.manifests.load(self.store, r, &self.timers).map_err(
+                    |(what, actual)| {
                         Failure::one(
                             "inputs",
                             15,
                             what,
                             format!(
-                                "the input manifest, git-meta project {}",
-                                vci_git::manifest_key(r)
+                                "the input manifest, {} project {}",
+                                self.store.kind(),
+                                vci_store::manifest_key(r)
                             ),
                             actual,
                         )
-                    })?;
+                    },
+                )?;
                 &loaded
             }
             (None, None) => {
@@ -3232,8 +3260,9 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
     }
     for (i, c) in f.candidates.iter().enumerate() {
         println!(
-            "candidate {}: git-meta {} {}",
+            "candidate {}: {} {} {}",
             i + 1,
+            res.store_kind,
             c.info.target,
             c.info.meta_key
         );
@@ -3916,6 +3945,7 @@ mod tests {
             config: None,
             allowed: None,
             fetch_failed: None,
+            store_kind: "git-meta",
         };
         let line = summary_line(&res);
         assert!(line.contains("running everything"), "{line}");
@@ -4020,9 +4050,11 @@ mod tests {
             config: None,
             allowed: None,
             fetch_failed: None,
+            store_kind: "git-meta",
         };
         let repo = Repo::discover(root).unwrap();
-        plan_with(&opts, repo, root.to_owned(), &mut res, &mut None).map(|()| res)
+        let store = crate::store::for_repo(&repo);
+        plan_with(&opts, repo, root.to_owned(), &*store, &mut res, &mut None).map(|()| res)
     }
 
     /// `--project b` of three projects: only b is listed and planned (a, a

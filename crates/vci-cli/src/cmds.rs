@@ -8,6 +8,7 @@ use serde_json::json;
 use vci_adapter::Adapter;
 use vci_attest::{AllowedSigners, Envelope, verify_envelope};
 use vci_git::{AttestStore, SETUP_FILE};
+use vci_store::{AttestationStore, Exchange, Prefetch, PushMode, PushStatus, StoreError};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, template_for};
 use crate::ctx::{VciPredicate, open_repo};
@@ -132,7 +133,8 @@ pub fn ci(args: CiArgs) -> Result<i32> {
     }
     let pushed = if push_wanted {
         // Best effort: CI's result is the tests', never the publication's.
-        match push(args.remote.as_deref(), false) {
+        let store = crate::store::for_repo(&repo);
+        match push_with(&*store, args.remote.as_deref(), false, OnRemote::Ignore) {
             Ok(_) => Some(true),
             Err(e) => {
                 github_warning(&format!(
@@ -958,8 +960,8 @@ fn verify_manifest(p: &VciPredicate, file: Option<&Utf8Path>) -> Result<String, 
                     let (repo, _) = open_repo().map_err(|e| {
                         vci_core::ManifestError::Compact(format!("base manifest {b}: {e:#}"))
                     })?;
-                    let store = AttestStore::new(&repo);
-                    let _ = store.hydrate_manifests([b]);
+                    let store = crate::store::for_repo(&repo);
+                    let _ = store.prefetch(Prefetch::Manifests { roots: &[b] });
                     match store.manifest(b) {
                         Ok(Some(s)) if s.error.is_none() => Ok(s.bytes),
                         _ => Err(vci_core::ManifestError::MissingBase(b.to_owned())),
@@ -973,13 +975,18 @@ fn verify_manifest(p: &VciPredicate, file: Option<&Utf8Path>) -> Result<String, 
                 let (repo, _) = open_repo().map_err(|e| {
                     format!("manifest {r} is stored in the repository's git-meta store, and {e:#} (pass --manifest FILE)")
                 })?;
-                let store = AttestStore::new(&repo);
+                let store = crate::store::for_repo(&repo);
                 // Fetched lazily (see `vci fetch`); a failure reads as not fetched.
-                let _ = store.hydrate_manifests([r.as_str()]);
+                let _ = store.prefetch(Prefetch::Manifests {
+                    roots: &[r.as_str()],
+                });
                 let stored = store.manifest(r);
-                let m = crate::plan::load_manifest(r, stored, |b| store.manifest(b))
+                let m = crate::plan::load_manifest(&*store, r, stored, |b| store.manifest(b))
                     .map_err(|(what, actual)| format!("{what} ({actual})"))?;
-                (m, format!("git-meta project {}", vci_git::manifest_key(r)))
+                (
+                    m,
+                    format!("{} project {}", store.kind(), vci_store::manifest_key(r)),
+                )
             }
         },
         (Some(_), Some(_)) => return Err("both manifest and manifestRef are set".to_owned()),
@@ -1052,7 +1059,9 @@ pub fn init(
         }
     }
     std::fs::write(&signers, existing)?;
-    setup_git_meta(&repo, &root, meta_url.as_deref())?;
+    if crate::store::for_repo(&repo).kind() == "git-meta" {
+        setup_git_meta(&repo, &root, meta_url.as_deref())?;
+    }
     if oidc {
         init_oidc(&root)?;
     }
@@ -1314,11 +1323,20 @@ fn print_exchange_messages(warnings: &[String], notes: &[String]) {
 
 /// Say which URL a metadata remote resolved without `--remote` points at:
 /// it may come from `.git-meta` in the checkout.
-fn print_default_remote(store: &AttestStore, remote: Option<&str>, name: &str) {
+fn print_default_remote(kind: &str, ex: &dyn Exchange, remote: Option<&str>, name: &str) {
     if remote.is_none()
-        && let Ok(Some(url)) = store.remote_url(name)
+        && let Some(location) = ex.remote_location(name)
     {
-        eprintln!("vci: git-meta remote {name} is {}", redact_userinfo(&url));
+        eprintln!("vci: {kind} remote {name} is {location}");
+    }
+}
+
+/// "local" or "shared", for the messages of a store without an exchange.
+fn sharing(store: &dyn AttestationStore) -> &'static str {
+    if store.caps().shared_writes {
+        "shared"
+    } else {
+        "local"
     }
 }
 
@@ -1334,28 +1352,78 @@ pub(crate) fn redact_userinfo(url: &str) -> String {
     }
 }
 
+/// What `vci push` and `vci ci --push` do with `--remote` on a store that
+/// has no remote ([`AttestationStore::exchange`] is `None`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnRemote {
+    /// Refuse it (`vci push`, exit 2).
+    Refuse,
+    /// Warn and go on (`vci ci --push`: a workflow that changes store keeps
+    /// working).
+    Ignore,
+}
+
 pub fn push(remote: Option<&str>, rewrite_history: bool) -> Result<i32> {
     let (repo, _) = open_repo()?;
-    let store = AttestStore::new(&repo);
-    let out = if rewrite_history {
-        store.push_rewriting_history(remote)?
-    } else {
-        store.push(remote)?
+    let store = crate::store::for_repo(&repo);
+    push_with(&*store, remote, rewrite_history, OnRemote::Refuse)
+}
+
+/// `vci push`'s work (also `vci ci --push`): publish the store's local
+/// writes through its exchange; a store without one says that there is
+/// nothing to push.
+fn push_with(
+    store: &dyn AttestationStore,
+    remote: Option<&str>,
+    rewrite_history: bool,
+    on_remote: OnRemote,
+) -> Result<i32> {
+    let kind = store.kind();
+    let Some(ex) = store.exchange() else {
+        if let Some(r) = remote {
+            if on_remote == OnRemote::Refuse {
+                return Err(StoreError::Unsupported {
+                    backend: kind,
+                    operation: "a remote",
+                }
+                .into());
+            }
+            eprintln!(
+                "vci: warning: the {kind} store has no remote: --remote {} is ignored",
+                redact_userinfo(r)
+            );
+        }
+        if rewrite_history {
+            return Err(StoreError::Unsupported {
+                backend: kind,
+                operation: "rewriting history",
+            }
+            .into());
+        }
+        eprintln!(
+            "vci: nothing to push: the {kind} store is {}; attestations were stored when vci run made them",
+            sharing(store)
+        );
+        return Ok(0);
     };
-    print_default_remote(&store, remote, &out.remote);
+    let mode = if rewrite_history {
+        PushMode::RewriteHistory
+    } else {
+        PushMode::Merge
+    };
+    let out = ex.push(remote, mode)?;
+    let point = ex.exchange_point();
+    print_default_remote(kind, ex, remote, &out.remote);
     print_exchange_messages(&out.warnings, &out.notes);
     match out.status {
-        vci_git::PushStatus::Pushed => {
-            eprintln!(
-                "vci: pushed git-meta metadata (refs/meta/main) to {}",
-                out.remote
-            )
+        PushStatus::Pushed => {
+            eprintln!("vci: pushed {kind} metadata ({point}) to {}", out.remote)
         }
-        vci_git::PushStatus::UpToDate => eprintln!(
-            "vci: nothing to push: {}'s refs/meta/main already has every local attestation",
+        PushStatus::UpToDate => eprintln!(
+            "vci: nothing to push: {}'s {point} already has every local attestation",
             out.remote
         ),
-        vci_git::PushStatus::NothingStored => eprintln!(
+        PushStatus::NothingStored => eprintln!(
             "vci: nothing to push: no attestations are stored locally (run `vci run` first)"
         ),
         // The status is vci-store's, non-exhaustive: git-meta's push never
@@ -1367,7 +1435,8 @@ pub fn push(remote: Option<&str>, rewrite_history: bool) -> Result<i32> {
 
 pub fn fetch(remote: Option<&str>) -> Result<i32> {
     let (repo, _) = open_repo()?;
-    for l in fetch_messages(&repo, remote)? {
+    let store = crate::store::for_repo(&repo);
+    for l in fetch_messages(&*store, remote)? {
         eprintln!("{l}");
     }
     Ok(0)
@@ -1375,32 +1444,45 @@ pub fn fetch(remote: Option<&str>) -> Result<i32> {
 
 /// `vci fetch`'s work (also `vci plan --fetch` and `vci ci --fetch`): fetch
 /// and materialize the remote's attestations; what `vci fetch` prints, as
-/// lines for stderr.
-pub fn fetch_messages(repo: &vci_git::Repo, remote: Option<&str>) -> Result<Vec<String>> {
-    let store = AttestStore::new(repo);
-    let out = store.fetch(remote)?;
+/// lines for stderr. A store without an exchange has nothing to fetch: it
+/// says so (a `--remote` is refused).
+pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Result<Vec<String>> {
+    let kind = store.kind();
+    let Some(ex) = store.exchange() else {
+        if remote.is_some() {
+            return Err(StoreError::Unsupported {
+                backend: kind,
+                operation: "a remote",
+            }
+            .into());
+        }
+        let n = store.count()?;
+        return Ok(vec![format!(
+            "vci: the {kind} store at {} is {}: nothing to fetch ({n} attestations stored)",
+            store.location(),
+            sharing(store)
+        )]);
+    };
+    let out = ex.fetch(remote)?;
     let mut lines = Vec::new();
     if remote.is_none()
-        && let Ok(Some(url)) = store.remote_url(&out.remote)
+        && let Some(location) = ex.remote_location(&out.remote)
     {
-        lines.push(format!(
-            "vci: git-meta remote {} is {}",
-            out.remote,
-            redact_userinfo(&url)
-        ));
+        lines.push(format!("vci: {kind} remote {} is {location}", out.remote));
     }
     lines.extend(out.notes.iter().map(|n| format!("vci: note: {n}")));
     lines.extend(out.warnings.iter().map(|w| format!("vci: warning: {w}")));
     let n = store.count()?;
     if out.found {
         lines.push(format!(
-            "vci: fetched git-meta metadata from {} ({n} attestations stored locally)",
+            "vci: fetched {kind} metadata from {} ({n} attestations stored locally)",
             out.remote
         ));
     } else {
         lines.push(format!(
-            "vci: {} has no git-meta metadata yet (refs/meta/main); {n} attestations stored locally",
-            out.remote
+            "vci: {} has no {kind} metadata yet ({}); {n} attestations stored locally",
+            out.remote,
+            ex.exchange_point()
         ));
     }
     Ok(lines)
@@ -1415,7 +1497,13 @@ pub fn fetch_messages(repo: &vci_git::Repo, remote: Option<&str>) -> Result<Vec<
 /// is then unknown).
 pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     let (repo, _) = open_repo()?;
-    let store = AttestStore::new(&repo);
+    let store = crate::store::for_repo(&repo);
+    // What to say about a value the store does not hold here yet.
+    let fetch_hint = if store.caps().lazy_values {
+        " (run `vci fetch`)"
+    } else {
+        ""
+    };
     let now = now_unix();
     let (mut expired, mut kept, mut unreadable, mut older) = (0usize, 0usize, 0usize, 0usize);
     // Of a unit's attestations by one signer, the `keep` issued last are
@@ -1440,7 +1528,7 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     // Every attestation's payload is read: fetch the ones not fetched yet
     // (on a large store, what a fetch downloaded before vci 2.0). One that
     // cannot be fetched is unreadable, and left alone.
-    match store.hydrate_attestations() {
+    match store.prefetch(Prefetch::Attestations) {
         Ok(h) if h.unresolved > 0 => eprintln!(
             "vci prune: warning: {} attestation value(s) could not be fetched{}",
             h.unresolved,
@@ -1449,7 +1537,7 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
         Ok(_) => {}
         Err(e) => eprintln!("vci prune: warning: could not fetch the attestations' values: {e:#}"),
     }
-    for e in store.list(None)? {
+    for e in store.read_all()? {
         if e.error.is_some() {
             referenced = None;
         }
@@ -1459,7 +1547,7 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
                 if dry_run {
                     println!("would remove {} {}", e.target, e.key);
                 } else {
-                    store.remove(&e)?;
+                    store.remove(vec![e.clone()])?;
                     println!("removed {} {}", e.target, e.key);
                 }
             }
@@ -1513,7 +1601,7 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
         if dry_run {
             println!("would remove {} {} (superseded)", e.target, e.key);
         } else {
-            store.remove(&e)?;
+            store.remove(vec![e.clone()])?;
             println!("removed {} {} (superseded)", e.target, e.key);
         }
     }
@@ -1521,7 +1609,8 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     // (vci 2.1.8) are referenced too; one that cannot be read keeps every
     // manifest (its base is unknown).
     if let Some(set) = referenced.as_mut() {
-        let _ = store.hydrate_manifests(set.iter().map(String::as_str));
+        let roots: Vec<&str> = set.iter().map(String::as_str).collect();
+        let _ = store.prefetch(Prefetch::Manifests { roots: &roots });
         let mut bases = BTreeSet::new();
         for r in set.iter() {
             let base = store
@@ -1535,7 +1624,7 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
                 Some(Ok(None)) => {}
                 _ => {
                     eprintln!(
-                        "vci prune: input manifest {r} could not be read (run `vci fetch`), so no input manifest is removed"
+                        "vci prune: input manifest {r} could not be read{fetch_hint}, so no input manifest is removed"
                     );
                     referenced = None;
                     break;
@@ -1549,7 +1638,7 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     let mut manifests = 0usize;
     match &referenced {
         Some(set) => {
-            for root in store.manifests()? {
+            for root in store.manifest_roots()? {
                 if set.contains(&root) {
                     continue;
                 }
@@ -1558,13 +1647,13 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
                 if dry_run {
                     println!("would remove project {key} (unreferenced manifest)");
                 } else {
-                    store.remove_manifest(&root)?;
+                    store.remove_manifests(&[root.as_str()])?;
                     println!("removed project {key} (unreferenced manifest)");
                 }
             }
         }
         None => eprintln!(
-            "vci prune: an attestation could not be read (run `vci fetch`), so no input manifest is removed"
+            "vci prune: an attestation could not be read{fetch_hint}, so no input manifest is removed"
         ),
     }
     eprintln!(

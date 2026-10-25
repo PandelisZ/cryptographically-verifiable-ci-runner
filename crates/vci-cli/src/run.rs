@@ -12,7 +12,7 @@ use vci_attest::{Statement, Subject, sign_statement};
 use vci_core::{
     External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain,
 };
-use vci_git::AttestStore;
+use vci_store::{AttestationStore, KeyHint, Prefetch, StoredEnvelope};
 
 use crate::ctx::{
     Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo, storage_key,
@@ -744,7 +744,7 @@ enum Verdict {
         /// The same signer's stored attestations of the unit it supersedes
         /// (found in parallel; removed, one unit at a time, once it is
         /// stored).
-        doomed: Vec<vci_git::StoredEnvelope>,
+        doomed: Vec<StoredEnvelope>,
     },
 }
 
@@ -2096,15 +2096,23 @@ pub fn run_units(
         pre_global.insert(f.test_id.as_str().to_owned(), r);
     }
 
-    let store = AttestStore::new(&ctx.repo);
+    let store = crate::store::for_repo(&ctx.repo);
+    let store = &*store;
+    let selected_ids: Vec<&str> = selected
+        .iter()
+        .map(|&i| files[i].test_id.as_str())
+        .collect();
     // [lazy metadata] Supersession below reads these units' stored
     // attestations: fetch the values not fetched yet, in one batch (best
     // effort: one not fetched is kept, never superseded).
-    let _ = store.hydrate_units(selected.iter().map(|&i| files[i].test_id.as_str()));
+    let _ = store.prefetch(Prefetch::Units {
+        test_ids: &selected_ids,
+        choose: None,
+    });
     // What the units took last time (any signer's newest attestation), to
     // hand the runner the longest first.
     let t = std::time::Instant::now();
-    let durations = last_durations(&store, selected.iter().map(|&i| files[i].test_id.as_str()));
+    let durations = last_durations(store, &selected_ids);
     crate::plan::timing(
         &format!(
             "read the last duration of {} unit(s) ({} recorded)",
@@ -2323,7 +2331,7 @@ pub fn run_units(
                     let t = std::time::Instant::now();
                     let doomed = if signed.is_ok() {
                         superseded_by(
-                            &store,
+                            store,
                             &ctx.repo,
                             &a.predicate,
                             &a.manifest,
@@ -2374,7 +2382,8 @@ pub fn run_units(
             );
         }
         // One git-meta session and store connection for every unit's writes
-        // (2.7.15); without it each write opens its own.
+        // (2.7.15; whatever the store shares between writes); without it
+        // each write opens its own.
         let _batch = store.batch().ok();
         for (i, v) in verdicts.into_iter().enumerate() {
             let Some(v) = v else { continue };
@@ -2420,18 +2429,17 @@ pub fn run_units(
                 add(&tm_store_manifest, t);
                 let hint = crate::util::parse_rfc3339(&p.core.issued_at)
                     .ok()
-                    .map(|issued| vci_git::KeyHint {
+                    .map(|issued| KeyHint {
                         issued,
                         tree: p.core.tree.as_ref().map(|t| t.chars().take(16).collect()),
                     });
                 let stored =
-                    store.put_hinted(&p.core.test_id, &signer, &skey, hint.as_ref(), &env)?;
+                    store.put_for_test(&p.core.test_id, &signer, &skey, hint.as_ref(), &env)?;
                 // Never the one just stored (the same storage key: the same
                 // inputs, replaced).
                 let doomed: Vec<_> = doomed.into_iter().filter(|e| e.key != stored.key).collect();
                 let t_remove = std::time::Instant::now();
-                superseded +=
-                    remove_superseded(&store, &p.core.test_id, doomed, &mut dropped_roots);
+                superseded += remove_superseded(store, &p.core.test_id, doomed, &mut dropped_roots);
                 add(&tm_store_remove, t_remove);
                 add(&tm_store, t);
                 Ok(stored)
@@ -2470,9 +2478,10 @@ pub fn run_units(
                 format!(" (waived: {})", waived_note(&p.waived))
             };
             eprintln!(
-                "vci: attested {label}{waived} ({} inputs, root {}) as git-meta {} {}",
+                "vci: attested {label}{waived} ({} inputs, root {}) as {} {} {}",
                 a.manifest.entries.len(),
                 &p.core.input_root[..16],
+                store.kind(),
                 stored.target,
                 stored.key
             );
@@ -2500,15 +2509,9 @@ pub fn run_units(
                 g(&tm_store_manifest),
                 g(&tm_store_remove)
             );
-            let pm = vci_git::AttestStore::put_manifest_seconds();
-            vci_core::timing_line!(
-                "{}: put_manifest seconds: session {:.1}, read current {:.1}, set {:.1}, stamp {:.1}",
-                project.label(),
-                pm[0],
-                pm[1],
-                pm[2],
-                pm[3]
-            );
+            for line in store.timing_report() {
+                vci_core::timing_line!("{}: {line}", project.label());
+            }
             let ns =
                 |i: usize| SUPERSEDE_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
             vci_core::timing_line!(
@@ -2540,7 +2543,7 @@ pub fn run_units(
         eprintln!(
             "vci: removed {superseded} superseded attestation(s) (earlier ones of the same units by the same signer and platform, made on a commit this one descends from that no other branch or tag contains, of files the tree no longer has)"
         );
-        let orphans = drop_orphan_manifests(&store, &dropped_roots);
+        let orphans = drop_orphan_manifests(store, &dropped_roots);
         if orphans > 0 {
             eprintln!(
                 "vci: removed {orphans} input manifest(s) no attestation references any more"
@@ -2625,19 +2628,19 @@ fn supersede_add(i: usize, t: std::time::Instant) {
 }
 
 fn superseded_by(
-    store: &AttestStore,
+    store: &dyn AttestationStore,
     repo: &vci_git::Repo,
     p: &VciPredicate,
     manifest: &InputManifest,
     signer: &str,
     moved_on: &MovedOn,
     live_trees: &BTreeSet<String>,
-) -> Vec<vci_git::StoredEnvelope> {
+) -> Vec<StoredEnvelope> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
     let tc = &p.core.toolchain;
     let mut entries: Vec<&vci_core::InputEntry> = manifest.entries.iter().collect();
     entries.sort();
-    let keep = |e: &vci_git::StoredEnvelope| {
+    let keep = |e: &StoredEnvelope| {
         if e.error.is_some() {
             return true;
         }
@@ -2727,7 +2730,9 @@ fn superseded_by(
         old_entries == entries
     };
     let t = std::time::Instant::now();
-    let listed = store.list(Some(&p.core.test_id));
+    let listed = store
+        .read_units(&[p.core.test_id.as_str()])
+        .map(|mut units| units.pop().unwrap_or_default());
     supersede_add(0, t);
     match listed {
         Ok(all) => all
@@ -2749,15 +2754,15 @@ fn superseded_by(
 /// any other. Returns how many were deleted, and adds the input roots they
 /// referenced to `dropped_roots`.
 fn remove_superseded(
-    store: &AttestStore,
+    store: &dyn AttestationStore,
     test_id: &str,
-    doomed: Vec<vci_git::StoredEnvelope>,
+    doomed: Vec<StoredEnvelope>,
     dropped_roots: &mut BTreeSet<String>,
 ) -> usize {
     if doomed.is_empty() {
         return 0;
     }
-    match store.remove_envelopes(doomed) {
+    match store.remove(doomed) {
         Ok(removed) => {
             for e in &removed {
                 if let Some(r) = crate::cmds::envelope_meta(&e.bytes).and_then(|m| m.manifest_ref) {
@@ -2830,18 +2835,12 @@ fn shared_manifest_bases(
 /// The last recorded duration (`result.durationMs`) of each of these units:
 /// its newest stored attestation's, by any signer, when one records it.
 /// Best effort: a unit that cannot be read has none.
-fn last_durations<'s>(
-    store: &AttestStore,
-    test_ids: impl IntoIterator<Item = &'s str>,
-) -> BTreeMap<String, u64> {
+fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
-    let Ok(reader) = store.reader() else {
+    let Ok(units) = store.read_units(test_ids) else {
         return out;
     };
-    for id in test_ids {
-        let Ok(cands) = reader.candidates(id) else {
-            continue;
-        };
+    for (id, cands) in test_ids.iter().zip(units) {
         let newest = cands
             .iter()
             .filter(|e| e.error.is_none())
@@ -2849,7 +2848,7 @@ fn last_durations<'s>(
             .filter_map(|m| m.duration_ms.map(|d| (m.issued_at, d)))
             .max_by_key(|(issued, _)| *issued);
         if let Some((_, d)) = newest {
-            out.insert(id.to_owned(), d);
+            out.insert((*id).to_owned(), d);
         }
     }
     out
@@ -2881,59 +2880,32 @@ fn longest_first<'a, T>(
 }
 
 /// After supersession: delete the stored input manifests in `roots` that no
-/// attestation left in the store references (a tombstone each, published by
-/// the next `vci push`), so the published tree does not keep one orphan
-/// manifest per changed unit and commit. None is deleted when an
-/// attestation's value or payload cannot be read (what it references is
-/// then unknown), except one not fetched yet in a lazy clone, which is
-/// fetched first when it could reference one of them (see
-/// `AttestStore::hydrate_manifest_referrers`). A clone that still holds an
+/// attestation left in the store references (git-meta: a tombstone each,
+/// published by the next `vci push`), so the published tree does not keep
+/// one orphan manifest per changed unit and commit. None is deleted when
+/// what an attestation references is unknown (its value or payload cannot
+/// be read), except one not fetched yet in a lazy clone, which is fetched
+/// first when it could reference one of them
+/// ([`AttestationStore::orphan_manifests`]). A clone that still holds an
 /// attestation referencing one of them (made, or fetched, before it sees
-/// the deletion) puts the manifest
-/// back when it merges the deletion in (see `vci fetch`). Returns how many
-/// were deleted.
-fn drop_orphan_manifests(store: &AttestStore, roots: &BTreeSet<String>) -> usize {
+/// the deletion) puts the manifest back when it merges the deletion in (see
+/// `vci fetch`). Returns how many were deleted.
+fn drop_orphan_manifests(store: &dyn AttestationStore, roots: &BTreeSet<String>) -> usize {
     if roots.is_empty() {
         return 0;
     }
-    // [lazy metadata] Fetch the attestations not fetched yet that could
-    // reference these manifests; keep the roots still undecided.
-    let undecided = match store.hydrate_manifest_referrers(roots) {
-        Ok(u) => u,
+    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+    let orphans = match store.orphan_manifests(&roots) {
+        Ok(o) => o,
         Err(e) => {
             eprintln!("vci: warning: cannot read the store to remove unreferenced manifests: {e}");
             return 0;
         }
     };
-    let all = match store.list(None) {
-        Ok(all) => all,
-        Err(e) => {
-            eprintln!("vci: warning: cannot read the store to remove unreferenced manifests: {e}");
-            return 0;
-        }
-    };
-    let mut referenced = BTreeSet::new();
-    for e in &all {
-        if e.not_fetched() {
-            // [lazy metadata] It cannot reference a root `undecided` lacks.
-            continue;
-        }
-        if e.error.is_some() {
-            return 0;
-        }
-        match crate::cmds::envelope_meta(&e.bytes) {
-            Some(m) => referenced.extend(m.manifest_ref),
-            None => return 0,
-        }
-    }
-    let orphans: Vec<&str> = roots
-        .difference(&referenced)
-        .filter(|r| !undecided.contains(*r))
-        .map(String::as_str)
-        .collect();
+    let orphans: Vec<&str> = orphans.iter().map(String::as_str).collect();
     // One session for all of them: a Rails run that superseded 2,400
     // attestations took a minute deleting their manifests one by one.
-    match store.remove_manifests(orphans) {
+    match store.remove_manifests(&orphans) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("vci: warning: cannot remove the unreferenced input manifests: {e}");

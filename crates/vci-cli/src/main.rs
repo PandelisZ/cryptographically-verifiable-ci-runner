@@ -20,6 +20,7 @@ mod metrics;
 mod partition;
 mod plan;
 mod run;
+mod store;
 mod treestat;
 mod util;
 
@@ -214,6 +215,25 @@ enum Cmd {
     },
 }
 
+impl Cmd {
+    /// The subcommand's name, as typed.
+    fn name(&self) -> &'static str {
+        match self {
+            Cmd::Init { .. } => "init",
+            Cmd::Run { .. } => "run",
+            Cmd::Plan { .. } => "plan",
+            Cmd::Ci { .. } => "ci",
+            Cmd::Verify { .. } => "verify",
+            Cmd::Push { .. } => "push",
+            Cmd::Fetch { .. } => "fetch",
+            Cmd::Prune { .. } => "prune",
+            Cmd::Env { .. } => "env",
+            Cmd::Explain { .. } => "explain",
+            Cmd::Metrics { .. } => "metrics",
+        }
+    }
+}
+
 fn explain_id(arg: &str) -> Result<String> {
     // Accept a path relative to cwd (if it exists) or a repo-relative test id.
     let (_, root) = ctx::open_repo()?;
@@ -257,9 +277,13 @@ fn fetch_remote(arg: Option<String>) -> Option<Option<String>> {
 }
 
 fn main() {
+    // SAFETY: nothing has started a thread yet (this is the first thing
+    // `main` does), so changing the environment cannot race a read.
+    unsafe { store::take_secrets() };
     let started = std::time::Instant::now();
     let argv: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
+    store::set_command(cli.cmd.name());
     let r = match cli.cmd {
         Cmd::Init {
             key,
@@ -398,6 +422,7 @@ fn main() {
         Ok(code) => *code,
         Err(_) => 2,
     };
+    store::close_all();
     metrics::write(&argv, exit, started.elapsed().as_secs_f64());
     match r {
         Ok(code) => std::process::exit(code),
