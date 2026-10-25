@@ -3008,19 +3008,26 @@ impl<'a> AttestStore<'a> {
             input.extend_from_slice(o.as_bytes());
             input.push(b'\n');
         }
-        self.filtered_fetch(remote, "blob:none")?
-            .args(["-c", "fetch.negotiationAlgorithm=noop"])
-            .args([
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--recurse-submodules=no",
-                "--filter=blob:none",
-                "--stdin",
-                remote,
-            ])
-            .run_with_stdin(&input)?;
+        let fetch = || {
+            self.filtered_fetch(remote, "blob:none")?
+                .args(["-c", "fetch.negotiationAlgorithm=noop"])
+                .args([
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--recurse-submodules=no",
+                    "--filter=blob:none",
+                    "--stdin",
+                    remote,
+                ])
+                .run_with_stdin(&input)
+        };
+        // Once more after a transfer given up as crawling (see
+        // `filtered_fetch`) or any other failure.
+        if fetch().is_err() {
+            fetch()?;
+        }
         Ok(())
     }
 
@@ -3036,6 +3043,9 @@ impl<'a> AttestStore<'a> {
         // No `gc --auto` after a metadata fetch (2.1.15): it detaches and
         // repacks the object database while the serialization and push that
         // follow read and write it; the user's own git runs it later.
+        // A transfer that crawls (under 4 KB/s for 30 s) is given up (2.7.31:
+        // one fetch of 2,055 manifests from GitHub took 218 s on a master
+        // plan that otherwise takes 7 s); the callers that can retry do.
         Ok(self.repo.git().args([
             "-c".to_owned(),
             format!("remote.{remote}.promisor=true"),
@@ -3043,6 +3053,10 @@ impl<'a> AttestStore<'a> {
             format!("remote.{remote}.partialclonefilter={filter}"),
             "-c".to_owned(),
             "gc.auto=0".to_owned(),
+            "-c".to_owned(),
+            "http.lowSpeedLimit=4096".to_owned(),
+            "-c".to_owned(),
+            "http.lowSpeedTime=30".to_owned(),
         ]))
     }
 
@@ -5168,11 +5182,20 @@ impl<'a> AttestStore<'a> {
         };
         let e = |err| sql_err(&path, err);
         let tx = db.transaction().map_err(e)?;
+        let _ = Self::cover_schema(&tx);
         {
             let mut del = tx
                 .prepare_cached(
                     "DELETE FROM tombstones WHERE tombstone_type = 'metadata' \
                      AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+                )
+                .map_err(e)?;
+            // A record dropped on purpose (the tree dropped it too) does not
+            // end the store's coverage of its commit (2.7.31: every fetch
+            // after a drop checked the whole store again, 1.6 s on vex).
+            let mut forget = tx
+                .prepare_cached(
+                    "DELETE FROM vci_cover_gone WHERE target_type = ?1 AND target_value = ?2 AND key = ?3",
                 )
                 .map_err(e)?;
             for k in keys {
@@ -5182,6 +5205,13 @@ impl<'a> AttestStore<'a> {
                     k.key
                 ])
                 .map_err(e)?;
+                forget
+                    .execute(rusqlite::params![
+                        k.target_type.as_str(),
+                        k.target_value,
+                        k.key
+                    ])
+                    .map_err(e)?;
             }
         }
         tx.commit().map_err(e)
@@ -5276,11 +5306,19 @@ impl<'a> AttestStore<'a> {
         drop(editor);
         drop(session);
         let tx = db.transaction().map_err(e)?;
+        let _ = Self::cover_schema(&tx);
         {
             let mut del = tx
                 .prepare_cached(
                     "DELETE FROM tombstones WHERE tombstone_type = 'metadata' \
                      AND target_type = ?1 AND target_value = ?2 AND key = ?3 AND timestamp < ?4",
+                )
+                .map_err(e)?;
+            // Dropped on purpose: not a loss of coverage (see
+            // `delete_deletion_records`).
+            let mut forget = tx
+                .prepare_cached(
+                    "DELETE FROM vci_cover_gone WHERE target_type = ?1 AND target_value = ?2 AND key = ?3",
                 )
                 .map_err(e)?;
             for k in &old {
@@ -5291,6 +5329,13 @@ impl<'a> AttestStore<'a> {
                     cutoff
                 ])
                 .map_err(e)?;
+                forget
+                    .execute(rusqlite::params![
+                        k.target_type.as_str(),
+                        k.target_value,
+                        k.key
+                    ])
+                    .map_err(e)?;
             }
         }
         tx.commit().map_err(e)?;
