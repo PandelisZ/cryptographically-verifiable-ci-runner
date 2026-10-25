@@ -29,6 +29,7 @@
 <tr><td><a href="#env"><code>vci env</code></a></td><td class="wrap">Show which environment variables vci sets, hashes, ignores and removes</td></tr>
 <tr><td><a href="#prune"><code>vci prune</code></a></td><td class="wrap">Delete expired attestations</td></tr>
 <tr><td><a href="#verify"><code>vci verify</code></a></td><td class="wrap">Verify one attestation envelope and print its claims</td></tr>
+<tr><td><a href="#update"><code>vci update</code></a></td><td class="wrap">Install the latest release the way vci was installed</td></tr>
 </table>
 
 <h3 id="init">vci init</h3>
@@ -139,6 +140,18 @@ vci prune &amp;&amp; vci push</code></pre>
 <li><code>--identities F</code>, <code>--trusted-root F</code>: the trust for a keyless (<code>--oidc</code>) envelope. Default: <code>.vci/identities.toml</code> and <code>.vci/sigstore-trusted-root.json</code> at <code>--base-ref</code>, or at HEAD.</li>
 <li>Trust given on the command line is the only trust: once any of these is given, an envelope whose kind needs a file that was not given is INVALID.</li>
 </ul>
+
+<h3 id="update">vci update</h3>
+<pre data-nocopy><code>vci update [--check] [--version X.Y.Z] [--keep-old]</code></pre>
+<p>Since 2.7.33. Finds the latest release (where GitHub's <code>releases/latest</code> redirects; no token) and, when it is newer than this <code>vci</code>, installs it the way this one was installed. <code>vci upgrade</code> is the same command.</p>
+<ul>
+<li>Homebrew (the binary is under <code>Cellar/vci/</code>): runs <code>brew update</code> and <code>brew upgrade pandelisz/tap/vci</code>.</li>
+<li>The install script (<code>~/.cargo/bin/vci</code> with the clone in <code>~/.local/share/vci</code>, or <code>VCI_HOME</code>): runs the clone's <code>scripts/install.sh</code> with <code>VCI_REF</code> set to the release's tag; without a clone, prints the command that installs it.</li>
+<li>A release binary anywhere else: downloads <code>vci-&lt;target&gt;.tar.gz</code> and its <code>SHA256SUMS-&lt;target&gt;</code>, checks the SHA-256, and renames the new binary over the old one from a temporary file beside it. A directory it cannot write to is refused with the <code>sudo</code> command to run. <code>--keep-old</code> keeps the old binary as <code>vci.old</code>. Collectors in a <code>share/vci</code> beside it are not updated.</li>
+<li><code>--check</code>: only prints the installed and the latest version; exit 0 when current, 1 when there is an update. <code>--version X.Y.Z</code>: that release instead of the latest (not for Homebrew).</li>
+<li>A lookup or download that fails is an error (exit 2). <code>VCI_UPDATE_REPO</code> and <code>VCI_UPDATE_BASE_URL</code> point it at other releases.</li>
+</ul>
+<pre><code>vci update --check || vci update</code></pre>
 
 <h2>Signing key</h2>
 <p>vci signs with an SSH key. It uses the first of:</p>
