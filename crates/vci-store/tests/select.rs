@@ -629,6 +629,140 @@ fn redact_removes_credentials() {
     }
 }
 
+/// A password holding an unencoded `@`, `/` or `?`, in any order, or
+/// percent-encoded, or in a libpq string: no fragment of it survives
+/// `redact` or `scrub`, not even the `ss@host` the PostgreSQL client would
+/// take for the host. The passwords are built of the tokens `Xq7pa`,
+/// `Zk9ss`, `Wm8rr` and `Yv3qq`, so a fragment shows as one of them.
+#[test]
+fn a_password_holding_at_slash_or_question_mark_leaves_no_fragment() {
+    const TOKENS: [&str; 4] = ["Xq7pa", "Zk9ss", "Wm8rr", "Yv3qq"];
+    let clean = |what: &str, text: &str| {
+        for t in TOKENS {
+            assert!(!text.contains(t), "{what}: {t} shows in {text:?}");
+        }
+    };
+    // (the string, its redaction, what a client library could print: the
+    // password as it reads it, decoded, and the host it would see)
+    for (input, want, printed) in [
+        // pa@ss: the client reads password `Xq7pa` and host `Zk9ss@db`.
+        (
+            "postgres://u:Xq7pa@Zk9ss@db/ci",
+            "postgres://***@db/ci",
+            &["Xq7pa@Zk9ss", "Xq7pa", "Zk9ss@db", "Zk9ss"][..],
+        ),
+        // p@a@ss
+        (
+            "postgres://u:Xq7pa@Wm8rr@Zk9ss@db:5432/ci?sslmode=disable",
+            "postgres://***@db:5432/ci?sslmode=disable",
+            &["Xq7pa@Wm8rr@Zk9ss", "Xq7pa", "Wm8rr@Zk9ss@db", "Zk9ss"],
+        ),
+        // pa/ss and pa?ss
+        (
+            "postgres://u:Xq7pa/Zk9ss@db/ci",
+            "postgres://***@db/ci",
+            &["Xq7pa/Zk9ss"],
+        ),
+        (
+            "postgres://u:Xq7pa?Zk9ss@db/ci?sslmode=require",
+            "postgres://***@db/ci?sslmode=require",
+            &["Xq7pa?Zk9ss"],
+        ),
+        // `@` then `/` then `@`: the first `/` is inside the password.
+        (
+            "postgres://u:Xq7pa@Zk9ss/Wm8rr@Yv3qq@db/ci",
+            "postgres://***@db/ci",
+            // The client reads host `Zk9ss` and database
+            // `Wm8rr@Yv3qq@db/ci`.
+            &[
+                "Xq7pa",
+                "Zk9ss",
+                "Wm8rr@Yv3qq@db/ci",
+                "Xq7pa@Zk9ss/Wm8rr@Yv3qq",
+            ],
+        ),
+        (
+            "postgres://u:Xq7pa?Zk9ss/Wm8rr@db",
+            "postgres://***@db",
+            &["Xq7pa?Zk9ss/Wm8rr"],
+        ),
+        // Several hosts.
+        (
+            "postgres://u:Xq7pa@Zk9ss@h1:1,h2:5432/ci",
+            "postgres://***@h1:1,h2:5432/ci",
+            &["Xq7pa", "Zk9ss@h1:1,h2:5432", "Zk9ss@h1"],
+        ),
+        // Percent-encoded forms.
+        (
+            "postgres://u:Xq7pa%40Zk9ss@db/ci",
+            "postgres://***@db/ci",
+            &["Xq7pa%40Zk9ss", "Xq7pa@Zk9ss"],
+        ),
+        (
+            "postgres://u:Xq7pa%2FZk9ss%3FWm8rr@db/ci",
+            "postgres://***@db/ci",
+            &["Xq7pa%2FZk9ss%3FWm8rr", "Xq7pa/Zk9ss?Wm8rr"],
+        ),
+        (
+            "postgres://db/ci?password=Xq7pa%40Zk9ss&x=1",
+            "postgres://db/ci?password=***&x=1",
+            &["Xq7pa%40Zk9ss", "Xq7pa@Zk9ss"],
+        ),
+        (
+            "postgres://db/ci?pass%77ord=Xq7pa%40Zk9ss",
+            "postgres://db/ci?pass%77ord=***",
+            &["Xq7pa@Zk9ss"],
+        ),
+        // A query password holding `@` or `?`.
+        (
+            "postgres://db/ci?password=Xq7pa@Zk9ss",
+            "postgres://***",
+            // The client takes `db/ci?password=Xq7pa` for the user and
+            // `Zk9ss` for the host.
+            &["Xq7pa@Zk9ss", "db/ci?password=Xq7pa", "Zk9ss"],
+        ),
+        (
+            "postgres://db/ci?x=1&password=Xq7pa?Zk9ss&y=2",
+            "postgres://db/ci?x=1&password=***&y=2",
+            &["Xq7pa?Zk9ss"],
+        ),
+        (
+            "postgres://db/ci?a=b@c&pass%77ord=Xq7pa",
+            "postgres://***@c&pass%77ord=***",
+            &["Xq7pa"],
+        ),
+        // libpq strings.
+        (
+            "host=db user=u password='Xq7pa@Zk9ss' dbname=ci",
+            "host=db user=u password=*** dbname=ci",
+            &["Xq7pa@Zk9ss"],
+        ),
+        (
+            "host=db password=Xq7pa@Zk9ss dbname=ci",
+            "host=db password=*** dbname=ci",
+            &["Xq7pa@Zk9ss"],
+        ),
+        (
+            "host=db password = 'Xq7pa@Zk9ss/Wm8rr?Yv3qq' dbname=ci",
+            "host=db password = *** dbname=ci",
+            &["Xq7pa@Zk9ss/Wm8rr?Yv3qq"],
+        ),
+    ] {
+        let got = redact(input);
+        assert_eq!(got, want, "{input}");
+        clean(input, &got);
+        let s = Secret::new(input);
+        let msg = format!("connecting to {input}: {}", printed.join("; "));
+        clean(input, &s.scrub(&msg));
+        clean(input, &format!("{s:?} {s}"));
+        // What a server says about the user stays.
+        assert_eq!(
+            s.scrub("password authentication failed for user \"u\""),
+            "password authentication failed for user \"u\""
+        );
+    }
+}
+
 #[test]
 fn secrets_are_scrubbed_from_every_message() {
     // Userinfo, raw and percent-decoded, and the URL itself.

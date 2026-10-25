@@ -709,6 +709,14 @@ the git-specific assertions.
   copies.
 - `Secret`'s `Debug` and `Display` print it redacted, and `Secret::scrub` removes the URL and its password (raw and
   percent-decoded) from every library error.
+- `select::redact` masks a URL's userinfo as everything between `//` and the **last** `@`, so a password holding an
+  unencoded `@`, `/` or `?`, in any order, is masked whole; where a path or query holds an `@` instead, more is
+  masked than needed, never less. A secret query value that runs past that `@` (`?password=a@b`) is masked with it.
+  The PostgreSQL client library ends a password at the *first* `@` and takes what follows, up to `/` or `?`, for the
+  host (`postgres://u:pa@ss@host/db` connects to host `ss@host`), so for a URL with more than one `@`
+  `Secret::scrub` also removes every `@`-, `/`- and `?`-separated piece of the password, the host and database that
+  client would read, and each `@`-separated piece of a secret query value. Strings under 3 bytes are left (they would
+  scrub ordinary words); the whole secret still goes.
 - The metrics log records only the store kind (`"store": "<kind>"`, or `null` when the command opened no store), never
   the location.
 - The CLI test `store_select::the_store_url_reaches_no_test_and_no_output` runs a Go test that writes
@@ -891,7 +899,8 @@ warnings and its `run_all` reason, run's refusals, the exit 2 of fetch, push, pr
 **Bounded time.** A hung store would block `vci plan`; an erroring one only makes units run. Every backend therefore
 bounds every wait:
 
-- PostgreSQL: connect (5 s, the whole connection: TCP, TLS, startup and authentication), statement (30 s; 600 s
+- PostgreSQL: connect (5 s per host named, the whole connection: TCP, TLS, startup and authentication; each host
+  tried in turn within its share), statement (30 s; 600 s
   for `vci prune`), lock (10 s), idle-in-transaction (60 s), TCP
   keepalives and `tcp_user_timeout` (30 s), and a pool checkout bounded by the connect timeout.
 - SQLite: `busy_timeout`, the store timeout (30 s).
@@ -1280,8 +1289,9 @@ how it differs from 2.7 for malformed envelopes).
 
 - `exchange_point` is `"refs/meta/main"`.
 - `remote_location(name)` is `remote_url(name)` passed through `select::redact`. On ordinary remote URLs that is the
-  text 2.7's `redact_userinfo` gave. They differ when the authority ends at `?` rather than `/`, and `redact` also
-  masks `password=`, `sslpassword=` and `sslkey=` values in a query. `redact_userinfo` is still used for remotes the
+  text 2.7's `redact_userinfo` gave. They differ when the authority ends at `?` rather than `/`, and when the path or
+  query holds an `@` (`redact` masks up to the last `@`), and `redact` also masks `password=`, `sslpassword=` and
+  `sslkey=` values in a query. `redact_userinfo` is still used for remotes the
   user typed, in warnings.
 - `fetch` is `AttestStore::fetch`.
 - `push(Merge)` is `push`, and `push(RewriteHistory)` is `push_rewriting_history`. A future `PushMode` is
@@ -1514,13 +1524,14 @@ by default), `PgStore` (`open(&Selection, &OpenContext)`, which does no I/O; `Cl
 `__sleep_for_test` and `__connection_for_test` for its tests), `PgError` (the payload of `StoreError::Backend` for
 unexpected errors, with `message()` and `code()`), and the testkit (section 14). The modules are `conn` (URL, TLS,
 session settings, pool, circuit breaker, error classification and scrubbing), `schema`, `cache`, `read`, `write` and
-`batch`. Its tests are `tests/pg.rs` (fifteen cases: an unreachable server failing fast with no secret shown; URL
-handling; round trips and slot replacement; bytewise order, through an ICU linguistic collation when libc's is
+`batch`. Its tests are `tests/pg.rs` (an unreachable server failing fast with no secret shown; a server that never
+answers given up on in time; no piece of a password holding `@`, `/` or `?` in `location()`, `Debug` or an error;
+URL handling; a first host that never answers not blocking a working second one; round trips and slot replacement; bytewise order, through an ICU linguistic collation when libc's is
 bytewise; concurrent first writers creating the schema once; absent, not initialized and incompatible schemas; a
 statement timeout latching the breaker; the plan's statement budget; reads after a prefetch seeing the handle's
 writes; deferred batches; `remove_manifests` keeping referenced, base and recent roots; `orphan_manifests` with an
-unknown reference; namespace isolation; a read-only role; `application_name`), nine unit tests and the conformance
-suite. Two mutation checks showed the tests
+unknown reference; namespace isolation; a read-only role; `application_name`), unit tests in the modules and the
+conformance suite. Two mutation checks showed the tests
 catch real faults: dropping `COLLATE "C"` fails test 4, and not caching prefetched values fails test 8.
 
 **Crate.** `vci-store-postgres` depends on `vci-store`, `vci-core`, `serde_json`, and these exact pins (each published
@@ -1560,10 +1571,13 @@ absolute sizes may differ there.)
 
 - **Source of the URL.** It comes only from `VCI_STORE_URL` (`Selection::url`, a `Secret`).
 - **What vci strips before parsing.** vci removes `sslrootcert`, which it handles itself, and maps `sslmode`, before
-  handing the rest to `postgres::Config::from_str`. In a libpq `key=value` string only unquoted `sslrootcert=` and
-  `sslmode=` tokens are rewritten; a quoted `sslrootcert` reaches the client library and is a `Config` error. A parse
-  error becomes `Config` **without the string**, not even redacted (libpq quoting such as `password='a b'` could defeat
-  `select::redact`): only the scrubbed client-library message is shown.
+  handing the rest to `postgres::Config::from_str`. In a URL the query starts where the client library starts it, at
+  the first `?` after the first `@`, so a `?` in a password does not hide `sslmode`. In a libpq `key=value` string
+  only unquoted `sslrootcert=` and `sslmode=` tokens are rewritten; a quoted `sslrootcert` reaches the client library
+  and is a `Config` error. A parse error becomes `Config` **without the string**, not even redacted (libpq quoting
+  such as `password='a b'` could defeat `select::redact`): only the scrubbed client-library message is shown, and not
+  even that when it quotes text from the string (an unknown option's name, an unexpected character), which may be a
+  piece of a password the library split differently.
 - **TLS.**
   - Without an `sslmode` in the URL, vci uses `require`. For hosts `localhost`, `127.0.0.1`, `::1` and unix sockets
     it uses `prefer`. `verify-ca` and `verify-full` map to `require`, `allow` to `prefer`.
@@ -1576,8 +1590,15 @@ absolute sizes may differ there.)
 - **Session settings.**
   - `connect_timeout` from the selection, unless the URL sets one. The client library applies it to the TCP connect
     only, so vci connects on a thread of its own and gives up when the whole connection (TLS request, startup and
-    authentication included) has taken the connect timeout for each host named: `Timeout{operation: "connecting"}`,
-    latched. A thread given up on ends with its socket and drops a connection that arrives too late.
+    authentication included) has taken too long: `Timeout{operation: "connecting"}`, latched. A thread given up on
+    ends with its socket and drops a connection that arrives too late.
+  - **Several hosts** (`postgres://u:p@h1:1,h2:5432/db`). The deadline is the connect timeout for each host named.
+    vci tries the hosts one at a time, in order, each with every other setting of the URL and on a thread of its own,
+    and gives each the time left divided by the hosts left (never less than 1 s, or the connect timeout if that is
+    shorter). A first host that accepts the TCP connection and never answers is therefore given up on after its
+    share, and the next is still tried; the last host's error is the result. With `load_balance_hosts=random` the
+    client library shuffles the hosts itself and tries them within one attempt bounded by the whole deadline, so
+    there a host that hangs can use up the time of the others.
   - TCP keepalives on (idle 10 s), and `tcp_user_timeout` 30 s unless the URL sets one.
   - `application_name = 'vci <version> <command>'`.
   - `options = "-c statement_timeout=<timeout> -c lock_timeout=10s -c idle_in_transaction_session_timeout=60s"`,
@@ -1598,9 +1619,13 @@ absolute sizes may differ there.)
 - **Errors.** No privilege is `Denied` (`operation` "read" on a read, "write" on a write); a missing schema on a write
   by a role that cannot create it is `NotInitialized`; a newer schema `Incompatible`; anything unexpected
   `Backend(PgError)`.
-- **Redaction.** Every error message passes through `Secret::scrub`. `location()` is built from the parsed
-  configuration, never from the string: `postgres://[***@]host:port/db schema <s> namespace <ns>` (the port shows
-  even when the URL left it out).
+- **Redaction.** Every error message passes through `Secret::scrub`. Nothing the client library parsed from a URL
+  with a userinfo section is ever printed: it ends a password at the first `@`, so for `postgres://u:pa@ss@host/db`
+  its host is `ss@host`, a piece of the password. `location()` (and `Debug`, and "cannot connect to …") is then
+  the URL as written, passed through `select::redact` (userinfo masked up to the last `@`) and without its query:
+  `postgres://***@host[:port]/db schema <s> namespace <ns>`. A URL without userinfo, and a libpq `key=value` string
+  (whose quoting the client library parses exactly), are described from the parsed configuration:
+  `postgres://[***@]host:port/db …`, the port showing even when the string left it out.
 - **Namespace.** Every row carries `ns`. Its value is `VCI_STORE_NAMESPACE`, else `[store.postgres] namespace`, else
   `OpenContext::repo_id()`, the smallest root commit, computed lazily. Forks and mirrors share it, and unrelated
   repositories never do. Without a namespace, `vci prune` in one repository would delete another repository's rows,
@@ -1982,7 +2007,12 @@ Decided while building it:
 18. **A PostgreSQL connection is bounded as a whole.** The client library bounds only the TCP connect; a peer that
     accepts and never answers (a frozen or failing-over server, a stuck proxy, another service on the port) would hold
     the TLS request and startup exchange forever. vci connects on a thread of its own and gives up after the connect
-    timeout (per host named), which latches the breaker.
+    timeout (per host named), which latches the breaker. With several hosts each is tried in turn within its share of
+    that deadline, so one that hangs does not keep a working one from being reached (section 17).
+19. **A password holding an unencoded `@` leaves no piece behind.** `select::redact` masks up to the last `@`, the
+    PostgreSQL store never prints a host or database the client library parsed from a URL with userinfo, and
+    `Secret::scrub` removes every reading of such a password (section 9). The client library still connects such a
+    URL to the wrong host: percent-encode the `@` as `%40`.
 
 Still open:
 

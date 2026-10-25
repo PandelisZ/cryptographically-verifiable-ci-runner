@@ -373,7 +373,11 @@ impl AttestationStore for PgStore {
         KIND
     }
 
-    /// `postgres://***@<host>:<port>/<database> schema <s> namespace <ns>`.
+    /// `postgres://***@<host>[:<port>]/<database> schema <s> namespace <ns>`:
+    /// a URL with userinfo as written, redacted up to its last `@` and
+    /// without its query (never a host the client library parsed from it,
+    /// which may be a piece of a password holding an unencoded `@`);
+    /// anything else from the parsed settings, with the port.
     fn location(&self) -> String {
         self.inner.location(true)
     }

@@ -10,7 +10,7 @@ use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
 use common::{cx, cx_for, pg, selection};
-use vci_store::select::{Source, Sourced};
+use vci_store::select::{Secret, Source, Sourced};
 use vci_store::{
     AttestationStore, KeyHint, ManifestRef, Prefetch, StoreError, StoreStatus, StoredEnvelope,
     ValueState, key,
@@ -224,6 +224,70 @@ fn a_server_that_never_answers_is_given_up_on_in_time() {
     }
 }
 
+/// A password holding an unencoded `@` (the client library ends it at the
+/// first `@` and takes the rest for the host, so its host is a piece of the
+/// password), `/` or `?`, percent-encoded, or quoted in a libpq string: no
+/// piece of it reaches `location()`, `Debug` or an error, the first
+/// connection's or the breaker's. The passwords are built of the tokens
+/// below, so any piece of one, `Zk9ss@127.0.0.1` included, shows as one.
+#[test]
+fn no_piece_of_a_password_shows_not_even_as_a_host() {
+    const TOKENS: [&str; 4] = ["Xq7pa", "Zk9ss", "Wm8rr", "Yv3qq"];
+    let clean = |url: &str, text: &str| {
+        for t in TOKENS {
+            assert!(!text.contains(t), "{url}: {t} shows in {text:?}");
+        }
+    };
+    for url in [
+        "postgres://u:Xq7pa@Zk9ss@127.0.0.1:1/x",
+        "postgres://u:Xq7pa@Wm8rr@Zk9ss@127.0.0.1:1/x?sslmode=disable",
+        "postgres://u:Xq7pa@Zk9ss/Wm8rr@Yv3qq@127.0.0.1:1/x",
+        "postgres://u:Xq7pa/Zk9ss@127.0.0.1:1/x",
+        "postgres://u:Xq7pa?Zk9ss@127.0.0.1:1/x?sslmode=disable",
+        "postgres://u:Xq7pa%40Zk9ss@127.0.0.1:1/x",
+        "postgres://u:Xq7pa%2FZk9ss%3FWm8rr@127.0.0.1:1/x",
+        "postgres://u:Xq7pa@Zk9ss@127.0.0.1:1,127.0.0.1:2/x",
+        "host=127.0.0.1 port=1 user=u password='Xq7pa@Zk9ss' dbname=x",
+        "host=127.0.0.1 port=1 user=u password = 'Xq7pa@Zk9ss/Wm8rr?Yv3qq' dbname=x",
+    ] {
+        let mut sel = selection(url, "vci", "t");
+        sel.connect_timeout = Sourced {
+            value: Duration::from_secs(1),
+            source: Source::Env("VCI_STORE_CONNECT_TIMEOUT_SECS"),
+        };
+        let s = PgStore::open(&sel, &cx()).unwrap();
+        let first = s.status().unwrap_err();
+        let again = s.list_units(&[UNIT_A]).unwrap_err();
+        for t in [
+            s.location(),
+            format!("{s:?}"),
+            first.to_string(),
+            format!("{first:?}"),
+            again.to_string(),
+            format!("{again:?}"),
+        ] {
+            clean(url, &t);
+        }
+        assert!(
+            s.location().starts_with("postgres://***@127.0.0.1:1"),
+            "{url}: {}",
+            s.location()
+        );
+    }
+    // A string the client library cannot parse, where the option it would
+    // name is a piece of the password.
+    for url in [
+        "postgres://u:Xq7pa@Zk9ss?Yv3qq=1@127.0.0.1:1/x",
+        "host=127.0.0.1 user=u password=Xq7pa Zk9ss=1",
+    ] {
+        match PgStore::open(&selection(url, "vci", "t"), &cx()) {
+            Err(StoreError::Config(m)) => clean(url, &m),
+            Err(e) => panic!("{url}: expected Config, got {e:?}"),
+            Ok(_) => panic!("{url}: expected Config, got a store"),
+        }
+    }
+}
+
 /// Test 2: what vci does to the URL before the client library sees it.
 #[test]
 fn url_handling() {
@@ -296,6 +360,50 @@ fn url_handling() {
 }
 
 // ---- 3 to 15: with a server ----------------------------------------------------------
+
+/// Several hosts, the first accepting connections and never answering: it
+/// is given up on after its share of the connect deadline, and the second,
+/// a working server, is connected to within the deadline.
+#[test]
+fn a_first_host_that_never_answers_does_not_block_the_next() {
+    let Some(db) = pg() else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hang = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in listener.incoming() {
+            held.push(c);
+        }
+    });
+    let (scheme, rest) = db.url.split_once("://").expect("a postgres:// URL");
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let (userinfo, server) = match authority.rsplit_once('@') {
+        Some((u, h)) => (format!("{u}@"), h),
+        None => (String::new(), authority),
+    };
+    let url = format!("{scheme}://{userinfo}127.0.0.1:{hang},{server}{tail}");
+    let s = db.open_with(|sel| {
+        sel.url = Some(Sourced {
+            value: Secret::new(url),
+            source: Source::Env("VCI_STORE_URL"),
+        });
+        sel.connect_timeout = Sourced {
+            value: Duration::from_secs(2),
+            source: Source::Env("VCI_STORE_CONNECT_TIMEOUT_SECS"),
+        };
+    });
+    let t = Instant::now();
+    assert_eq!(s.list_units(&[UNIT_A]).unwrap(), vec![vec![]]);
+    let took = t.elapsed();
+    // Its share is 2 s of the 4 s deadline; the rest is the second host's.
+    assert!(took >= Duration::from_millis(1900), "{took:?}");
+    assert!(took < Duration::from_millis(3900), "{took:?}");
+    // The handle keeps that connection: the next call needs no new one.
+    let t = Instant::now();
+    s.count().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+}
 
 /// Test 3: values come back byte for byte; one record per slot.
 #[test]

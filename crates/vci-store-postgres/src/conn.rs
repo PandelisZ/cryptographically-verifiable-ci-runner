@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use postgres::config::{Host, SslMode};
+use postgres::config::{Host, LoadBalanceHosts, SslMode};
 use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, Row, Transaction};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -77,6 +77,8 @@ pub(crate) type P<'a> = (&'a (dyn ToSql + Sync), Type);
 /// How to connect, parsed once when the store is opened (no I/O).
 pub(crate) struct ConnSpec {
     config: postgres::Config,
+    /// One configuration per host, tried in order (see [`attempts`]).
+    attempts: Vec<postgres::Config>,
     ssl_mode: SslMode,
     root_cert: Option<PathBuf>,
     display: String,
@@ -142,8 +144,11 @@ fn strip(s: &str) -> Stripped {
     let mut root_cert = None;
     let mut ssl_mode_given = false;
     if is_url(s) {
-        let (head, query) = match s.split_once('?') {
-            Some((h, q)) => (h, Some(q)),
+        // The query starts where the client library starts it: at the
+        // first `?` after the first `@` (a password may hold a `?`).
+        let from = s.find('@').map_or(0, |a| a + 1);
+        let (head, query) = match s[from..].find('?') {
+            Some(q) => (&s[..from + q], Some(&s[from + q + 1..])),
             None => (s, None),
         };
         let mut kept: Vec<String> = Vec::new();
@@ -239,6 +244,23 @@ fn host_text(h: &Host) -> String {
     }
 }
 
+/// Where the server is, never with a credential. A URL with a userinfo
+/// section is shown as written, redacted ([`vci_store::select::redact`],
+/// which masks up to its last `@`) and without its query: the client
+/// library ends the password at the first `@`, so a host it parsed may be
+/// a piece of a password holding an unencoded `@`. Anything else is
+/// described from the parsed settings ([`display_of`]).
+fn display(text: &str, config: &postgres::Config) -> String {
+    if is_url(text) && text.contains('@') {
+        let r = vci_store::select::redact(text);
+        return match r.split_once('?') {
+            Some((head, _)) => head.to_owned(),
+            None => r,
+        };
+    }
+    display_of(config)
+}
+
 /// `postgres://[***@]host[:port][,host[:port]]/db`: built from the parsed
 /// settings, so it can never carry a password.
 fn display_of(config: &postgres::Config) -> String {
@@ -281,6 +303,70 @@ fn display_of(config: &postgres::Config) -> String {
     )
 }
 
+/// One configuration per host named, each with every other setting of
+/// `c`, so that each host is tried within a bound of its own: a host that
+/// accepts and never answers cannot use up the time of the next. With one
+/// host, or with `load_balance_hosts=random` (the client library shuffles
+/// the hosts itself), `c` alone.
+fn attempts(c: &postgres::Config) -> Vec<postgres::Config> {
+    let n = c.get_hosts().len().max(c.get_hostaddrs().len());
+    if n <= 1 || matches!(c.get_load_balance_hosts(), LoadBalanceHosts::Random) {
+        return vec![c.clone()];
+    }
+    (0..n)
+        .map(|i| {
+            let mut o = postgres::Config::new();
+            match c.get_hosts().get(i) {
+                Some(Host::Tcp(h)) => o.host(h),
+                #[cfg(unix)]
+                Some(Host::Unix(p)) => o.host_path(p),
+                None => &mut o,
+            };
+            if let Some(a) = c.get_hostaddrs().get(i) {
+                o.hostaddr(*a);
+            }
+            let ports = c.get_ports();
+            if let Some(p) = ports.get(i).or(ports.first()) {
+                o.port(*p);
+            }
+            if let Some(v) = c.get_user() {
+                o.user(v);
+            }
+            if let Some(v) = c.get_password() {
+                o.password(v);
+            }
+            if let Some(v) = c.get_dbname() {
+                o.dbname(v);
+            }
+            if let Some(v) = c.get_options() {
+                o.options(v);
+            }
+            if let Some(v) = c.get_application_name() {
+                o.application_name(v);
+            }
+            if let Some(v) = c.get_connect_timeout() {
+                o.connect_timeout(*v);
+            }
+            if let Some(v) = c.get_tcp_user_timeout() {
+                o.tcp_user_timeout(*v);
+            }
+            if let Some(v) = c.get_keepalives_interval() {
+                o.keepalives_interval(v);
+            }
+            if let Some(v) = c.get_keepalives_retries() {
+                o.keepalives_retries(v);
+            }
+            o.ssl_mode(c.get_ssl_mode())
+                .ssl_negotiation(c.get_ssl_negotiation())
+                .keepalives(c.get_keepalives())
+                .keepalives_idle(c.get_keepalives_idle())
+                .target_session_attrs(c.get_target_session_attrs())
+                .channel_binding(c.get_channel_binding());
+            o
+        })
+        .collect()
+}
+
 fn millis(d: Duration) -> u128 {
     d.as_millis().max(1)
 }
@@ -297,9 +383,19 @@ impl ConnSpec {
         // `password='a b'` would defeat the redaction.
         let s = strip(secret.expose().trim());
         let mut config: postgres::Config = s.text.parse().map_err(|e: postgres::Error| {
+            // The client library quotes text from the string only for an
+            // unknown option and an unexpected character, either of which
+            // may be a piece of a password it split differently.
+            let text = error_text(secret, &e);
+            let text = if text.contains("unknown option") {
+                "an unknown option (its name is not printed)".to_owned()
+            } else if text.contains("unexpected character") {
+                "an unexpected character (not printed)".to_owned()
+            } else {
+                text
+            };
             StoreError::Config(format!(
-                "$VCI_STORE_URL is not a PostgreSQL connection string (it was not printed): {}",
-                error_text(secret, &e)
+                "$VCI_STORE_URL is not a PostgreSQL connection string (it was not printed): {text}"
             ))
         })?;
         if config.get_hosts().is_empty() && config.get_hostaddrs().is_empty() {
@@ -345,7 +441,8 @@ impl ConnSpec {
             .copied()
             .unwrap_or(connect_timeout);
         Ok(ConnSpec {
-            display: display_of(&config),
+            display: display(&s.text, &config),
+            attempts: attempts(&config),
             config,
             ssl_mode,
             root_cert: s.root_cert.filter(|p| !p.is_empty()).map(PathBuf::from),
@@ -710,16 +807,41 @@ impl Conn {
     /// connect: a peer that accepts and then never answers (a frozen or
     /// failing-over server, a stuck proxy, another service on the port)
     /// would hold the TLS and startup exchange forever, because its kernel
-    /// acknowledges every packet. So the connection is made on a thread of
-    /// its own, and given up after the connect timeout (per host named); a
-    /// thread given up on ends with its socket, and drops a connection that
-    /// arrives too late.
+    /// acknowledges every packet. So each host named is tried in turn on a
+    /// thread of its own, given up after its share of what is left of the
+    /// connect deadline (the connect timeout per host): the time left
+    /// divided by the hosts left, never less than 1 s (or the connect
+    /// timeout, if shorter). A host that hangs therefore does not keep the
+    /// next from being tried. A thread given up on ends with its socket,
+    /// and drops a connection that arrives too late. The last host's error
+    /// is the result, as with the client library's own failover.
     fn connect(&self) -> Result<Client, StoreError> {
         let tls = match self.spec.ssl_mode {
             SslMode::Disable => None,
             _ => Some(self.tls()?),
         };
-        let config = self.spec.config.clone();
+        let deadline = Instant::now() + self.spec.connect_deadline();
+        let floor = self.spec.connect_timeout.min(Duration::from_secs(1));
+        let n = self.spec.attempts.len();
+        let mut last = None;
+        for (i, config) in self.spec.attempts.iter().enumerate() {
+            let left = u32::try_from(n - i).unwrap_or(u32::MAX);
+            let share = deadline.saturating_duration_since(Instant::now()) / left;
+            match self.attempt(config.clone(), tls.clone(), share.max(floor)) {
+                Ok(c) => return Ok(c),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(self.latch(last.expect("at least one host")))
+    }
+
+    /// One connection attempt, given up after `bound`.
+    fn attempt(
+        &self,
+        config: postgres::Config,
+        tls: Option<MakeRustlsConnect>,
+        bound: Duration,
+    ) -> Result<Client, StoreError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("vci-postgres-connect".into())
@@ -738,38 +860,38 @@ impl Conn {
                 format!("cannot start a thread to connect: {e}"),
             ));
         }
-        let r = match rx.recv_timeout(self.spec.connect_deadline()) {
+        let r = match rx.recv_timeout(bound) {
             Ok(r) => r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(self.latch(StoreError::Timeout {
+                return Err(StoreError::Timeout {
                     backend: KIND,
                     operation: "connecting",
-                    after: self.spec.connect_deadline(),
-                }));
+                    after: bound,
+                });
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(self.latch(StoreError::unavailable(
+                return Err(StoreError::unavailable(
                     KIND,
                     format!(
                         "cannot connect to {}: the attempt failed",
                         self.spec.display
                     ),
-                )));
+                ));
             }
         };
         r.map_err(|e| {
             let text = error_text(&self.secret, &e);
             if io_cause(&e) == Some(std::io::ErrorKind::TimedOut) {
-                self.latch(StoreError::Timeout {
+                StoreError::Timeout {
                     backend: KIND,
                     operation: "connecting",
                     after: self.spec.connect_timeout,
-                })
+                }
             } else {
-                self.latch(StoreError::unavailable(
+                StoreError::unavailable(
                     KIND,
                     format!("cannot connect to {}: {text}", self.spec.display),
-                ))
+                )
             }
         })
     }
@@ -993,5 +1115,54 @@ mod tests {
         assert_eq!(s.summary().ssl_mode, "prefer");
         assert_eq!(s.display(), "postgres://***@localhost/d");
         assert!(spec("postgres:///x").is_err());
+    }
+
+    /// A password holding an unencoded `@`: the client library takes the
+    /// host to be `Zk9ss@db.example`, a piece of the password, so the
+    /// display is the redacted URL, never a parsed host.
+    #[test]
+    fn a_url_with_userinfo_is_displayed_redacted_never_as_parsed() {
+        let s = spec("postgres://u:Xq7pa@Zk9ss@db.example/ci?sslmode=disable").unwrap();
+        assert_eq!(s.display(), "postgres://***@db.example/ci");
+        let s = spec("postgres://u:Xq7pa?Zk9ss@db.example:6543/ci").unwrap();
+        assert_eq!(s.display(), "postgres://***@db.example:6543/ci");
+        let s = spec("host=db.example user=u password='Xq7pa@Zk9ss' dbname=ci").unwrap();
+        assert_eq!(s.display(), "postgres://***@db.example/ci");
+        // The query starts after the first `@`, as the client library
+        // reads it: a `?` in the password does not hide `sslmode`.
+        let t = strip("postgres://u:Xq7pa?Zk9ss@h/db?sslmode=verify-ca&sslrootcert=%2Fca.pem");
+        assert_eq!(t.text, "postgres://u:Xq7pa?Zk9ss@h/db?sslmode=require");
+        assert_eq!(t.root_cert.as_deref(), Some("/ca.pem"));
+        assert!(t.ssl_mode_given);
+    }
+
+    /// Each host of a list is its own attempt, with every other setting.
+    #[test]
+    fn several_hosts_are_tried_one_by_one() {
+        let s = spec("postgres://u:pw@h1:1,h2/ci?sslmode=disable&target_session_attrs=read-write")
+            .unwrap();
+        assert_eq!(s.connect_deadline(), Duration::from_secs(10));
+        assert_eq!(s.attempts.len(), 2);
+        for (a, (host, port)) in s.attempts.iter().zip([("h1", 1), ("h2", 5432)]) {
+            assert_eq!(a.get_hosts(), &[Host::Tcp(host.to_owned())]);
+            assert_eq!(a.get_ports(), &[port]);
+            assert_eq!(a.get_user(), Some("u"));
+            assert_eq!(a.get_password(), Some(&b"pw"[..]));
+            assert_eq!(a.get_dbname(), Some("ci"));
+            assert_eq!(a.get_options(), s.config.get_options());
+            assert_eq!(a.get_application_name(), s.config.get_application_name());
+            assert_eq!(a.get_connect_timeout(), Some(&Duration::from_secs(5)));
+            assert_eq!(a.get_tcp_user_timeout(), s.config.get_tcp_user_timeout());
+            assert!(matches!(a.get_ssl_mode(), SslMode::Disable));
+            assert!(a.get_keepalives());
+            assert!(matches!(
+                a.get_target_session_attrs(),
+                postgres::config::TargetSessionAttrs::ReadWrite
+            ));
+        }
+        assert_eq!(spec("postgres://u@h/ci").unwrap().attempts.len(), 1);
+        let random = spec("postgres://u@h1,h2/ci?load_balance_hosts=random").unwrap();
+        assert_eq!(random.attempts.len(), 1);
+        assert_eq!(random.attempts[0].get_hosts().len(), 2);
     }
 }

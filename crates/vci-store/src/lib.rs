@@ -2236,9 +2236,17 @@ pub mod select {
         /// redacted form, then its password (as written and
         /// percent-decoded, when at least 3 bytes) by `***`. Backends pass
         /// every message from their libraries through this.
+        ///
+        /// A URL password holding an unencoded `@` is read differently by
+        /// different parsers (the PostgreSQL client ends it at the first
+        /// `@` and takes the rest, up to `/` or `?`, as the host), so every
+        /// reading is removed: the password up to each `@`, each of its
+        /// `@`-separated pieces, and the host such a client would see.
         pub fn scrub(&self, text: &str) -> String {
             let mut out = text.replace(&self.0, &self.redacted());
-            for p in self.passwords() {
+            let mut found = self.passwords();
+            found.sort_by_key(|p| std::cmp::Reverse(p.len()));
+            for p in found {
                 if p.len() >= 3 {
                     out = out.replace(&p, "***");
                 }
@@ -2258,16 +2266,41 @@ pub mod select {
                 }
             };
             if let Some((_, rest)) = split_url(s) {
-                if let Some(at) = userinfo_end(rest)
-                    && let Some((_, p)) = rest[..at].split_once(':')
+                let ats: Vec<usize> = rest.match_indices('@').map(|(i, _)| i).collect();
+                let ambiguous = ats.len() > 1;
+                if let Some(&last) = ats.last()
+                    && let Some(colon) = rest[..last].find(':')
                 {
+                    let p = &rest[colon + 1..last];
                     add(p);
+                    if ambiguous {
+                        for piece in p.split(['@', '/', '?']) {
+                            add(piece);
+                        }
+                        for &at in ats.iter().filter(|&&at| at > colon) {
+                            add(&rest[colon + 1..at]);
+                        }
+                    }
                 }
-                for kv in rest.split(['&', '?']) {
-                    if let Some((k, v)) = kv.split_once('=')
-                        && is_secret_key(&percent_decode(k))
-                    {
-                        add(v);
+                if ambiguous {
+                    // What the PostgreSQL client reads as the host (after
+                    // the first `@`, up to `/` or `?`) and the database (up
+                    // to `?`): a server may name either.
+                    let from = ats[0] + 1;
+                    let host = rest[from..]
+                        .find(['/', '?'])
+                        .map_or(rest.len(), |i| from + i);
+                    add(&rest[from..host]);
+                    if rest[host..].starts_with('/') {
+                        let db = rest[host..].find('?').map_or(rest.len(), |i| host + i);
+                        add(&rest[host + 1..db]);
+                    }
+                }
+                for (from, to) in query_secret_values(rest) {
+                    let v = &rest[from..to];
+                    add(v);
+                    for piece in v.split('@') {
+                        add(piece);
                     }
                 }
             }
@@ -2331,16 +2364,47 @@ pub mod select {
 
     /// Where the userinfo of a URL ends (`rest` follows `scheme://`): the
     /// `@` before the host, or `None` without one. A password may hold an
-    /// unencoded `/`, `?` or `@` (the PostgreSQL client takes everything
-    /// before the first `@` as the userinfo), so this is the last `@` before
-    /// the first `/` or `?` that follows the first `@`. Where a path or
-    /// query holds an `@` instead, more is masked than needed, never less.
+    /// unencoded `/`, `?` or `@`, in any order (`pa@ss/x@y` included), and
+    /// a host never holds an `@`, so this is the last `@` of all. Where a
+    /// path or query holds an `@` instead, more is masked than needed,
+    /// never less (the PostgreSQL client itself takes everything before the
+    /// first `@` as userinfo, so it cannot use such a URL as meant either).
     fn userinfo_end(rest: &str) -> Option<usize> {
-        let first = rest.find('@')?;
-        let end = rest[first..]
-            .find(['/', '?'])
-            .map_or(rest.len(), |i| first + i);
-        rest[..end].rfind('@')
+        rest.rfind('@')
+    }
+
+    /// The byte ranges of the values of secret keys in the query of a URL
+    /// (`rest` follows `scheme://`), keys percent-decoded. Any `?` or `&`
+    /// may start a key (a password holding `?` cannot hide one), and a value
+    /// runs to the next `&` (it may hold `?`): more is masked than needed,
+    /// never less.
+    fn query_secret_values(rest: &str) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        for seg in rest.split(['?', '&']) {
+            if let Some((k, _)) = seg.split_once('=')
+                && is_secret_key(&percent_decode(k))
+            {
+                let from = i + k.len() + 1;
+                let to = rest[from..].find('&').map_or(rest.len(), |e| from + e);
+                out.push((from, to));
+            }
+            i += seg.len() + 1;
+        }
+        out
+    }
+
+    /// `spans` sorted, with overlapping and touching ranges joined.
+    fn merge_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        spans.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+        for (from, to) in spans {
+            match out.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => out.push((from, to)),
+            }
+        }
+        out
     }
 
     /// Where the value starting at `from` ends: after its closing quote when
@@ -2440,36 +2504,25 @@ pub mod select {
         out
     }
 
-    /// `s` without credentials: a URL's userinfo becomes `***`
-    /// (`postgres://***@host/db`, as `vci fetch` already prints git remotes,
-    /// even when the password holds an unencoded `/`, `?` or `@`), and so do
-    /// the values of `password`, `sslpassword` and `sslkey`, in a query
-    /// string (keys percent-decoded) or in a libpq `key=value` string
-    /// (spaces around `=` and quoted values included).
+    /// `s` without credentials: a URL's userinfo, everything between `//`
+    /// and the last `@`, becomes `***` (`postgres://***@host/db`, as `vci
+    /// fetch` already prints git remotes, even when the password holds an
+    /// unencoded `/`, `?` or `@`), and so do the values of `password`,
+    /// `sslpassword` and `sslkey`, in a query string (keys
+    /// percent-decoded) or in a libpq `key=value` string (spaces around `=`
+    /// and quoted values included). A secret value that runs past the last
+    /// `@` (`?password=a@b`) is masked whole, its `@` with it.
     pub fn redact(s: &str) -> String {
         let Some((scheme, rest)) = split_url(s) else {
             return mask_spans(s, &secret_values(s, false));
         };
-        let (authority, tail) = match userinfo_end(rest) {
-            Some(at) => ("***@", &rest[at + 1..]),
-            None => ("", rest),
-        };
-        let tail = match tail.split_once('?') {
-            Some((path, query)) => {
-                let query = query
-                    .split('&')
-                    .map(|kv| match kv.split_once('=') {
-                        Some((k, _)) if is_secret_key(&percent_decode(k)) => format!("{k}=***"),
-                        _ => kv.to_owned(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("&");
-                format!("{path}?{query}")
-            }
-            None => tail.to_owned(),
-        };
-        let tail = mask_spans(&tail, &secret_values(&tail, true));
-        format!("{scheme}://{authority}{tail}")
+        let at = userinfo_end(rest);
+        let mut spans = secret_values(rest, true);
+        if let Some(at) = at {
+            spans.push((0, at));
+        }
+        spans.extend(query_secret_values(rest));
+        format!("{scheme}://{}", mask_spans(rest, &merge_spans(spans)))
     }
 
     /// `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"`, or a bare number of
