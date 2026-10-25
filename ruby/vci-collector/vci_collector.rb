@@ -1330,7 +1330,8 @@ module VciCollector
       # --- slots --------------------------------------------------------------
 
       # How many slots run the group's `files` (1: one file at a time, as
-      # above): SLOTS, at most one per file, when the project runs its tests
+      # above): SLOTS, at most one per piece of work (a file, or a shard of
+      # one; slots_for), when the project runs its tests
       # in Rails' parallel worker processes (at most as many as its
       # `parallelize(workers:)` asks for, unless vci's PARALLEL_WORKERS says
       # how many: `workers: 1` is a project whose tests must not run at
@@ -1339,8 +1340,12 @@ module VciCollector
       # after-fork hook gives a slot its database (the files' own
       # `require "test_helper"` registers Rails' only after the fork), and
       # its files would run at once on one database.
+      # At most one slot per piece of work: a file, or each shard of a file
+      # vci asked to shard (2.7.34: a job that ran 8 files, four of them as
+      # 3 to 5 shards each, ran its 20 pieces on 8 slots).
       def slots_for(files, boot)
-        w = [SLOTS, files.size].min
+        work = files.sum { |f| RUNNER == "rspec" ? 1 : [SHARDS[f].to_i, 1].max }
+        w = [SLOTS, work].min
         return 1 if w < 2 || boot.nil?
         return w if SLOTS_ASKED
         return 1 unless rails_parallel?

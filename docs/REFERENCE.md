@@ -646,7 +646,9 @@ and measurements: [`docs/spike-rails.md`](spike-rails.md) ("Batch mode").
 **Slots (vci 2.1).** When the project runs its tests in Rails' parallel worker processes (`parallelize` in
 `test_helper.rb`, with processes, as `rails new` writes it), a group's files run W at a time: W is `VCI_RAILS_JOBS`,
 else `PARALLEL_WORKERS` above 1 (in vci's environment; the test processes still get 1), else `VCI_JOBS` or the
-number of CPUs, at most as many as `parallelize(workers: n)` asks for, and at most one per file. `PARALLEL_WORKERS=1`
+number of CPUs, at most as many as `parallelize(workers: n)` asks for, and at most one per piece of work (a file, or
+each shard of a file that runs as shards; before 2.7.34, one per file: a job with 8 files, four of them 3 to 5 shards
+each, ran its 20 pieces on 8 slots). `PARALLEL_WORKERS=1`
 in vci's environment or `parallelize(workers: 1)` turns Rails' workers off, and the slots with them. A group whose
 files' first statement is not a require of a shared helper has no boot and runs one file at a time. After the boot, vci forks one process per slot and sets it up exactly as Rails
 sets up a parallel worker: Rails' before-fork hooks once, then in each slot `parallel_worker_id = i` and every
