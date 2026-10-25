@@ -209,17 +209,33 @@ jobs:
           path: ${{ runner.temp }}/keyless-envelope.json
           if-no-files-found: ignore
 
-  # Proves on a real runner that a commit of the action with no published
-  # binary fails at once (scripts/action-binary.sh) instead of compiling vci.
-  # On a commit whose sources match release/manifest.txt the gate passes and
-  # action-v1 already proves the download, so the check is skipped there.
-  # The git-meta store against the git a stock Ubuntu 24.04 ships (2.43):
-  # GitHub's runner images carry a newer git, and 2.0.0's presence check of
-  # values not yet downloaded died only on the older one (fixed in 2.0.1).
-  # Self-hosted runners (vex's) run the stock one.
+  # The attestation stores (docs/STORE-BACKENDS.md): the store crates' own
+  # tests and the conformance suite on git-meta, SQLite and PostgreSQL.
+  # git-meta runs against the git a stock Ubuntu 24.04 ships (2.43): GitHub's
+  # runner images carry a newer git, and 2.0.0's presence check of values not
+  # yet downloaded died only on the older one (fixed in 2.0.1). Self-hosted
+  # runners (vex's) run the stock one. The job runs as root in its container,
+  # where initdb refuses to run, so PostgreSQL is a service container, reached
+  # by its name (the server has no TLS: sslmode=disable, which vci would
+  # otherwise refuse for a host that is not this machine). The tests that
+  # need a non-root user (unwritable files) skip as root; store-pg-initdb
+  # covers the throwaway cluster.
   store-stock-git:
     runs-on: ubuntu-latest
     container: ubuntu:24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: vci
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      VCI_TEST_POSTGRES_URL: postgres://postgres:vci@postgres:5432/postgres?sslmode=disable
+      VCI_TEST_POSTGRES: require
     steps:
       - name: Stock git and a Rust toolchain
         run: |
@@ -234,8 +250,91 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --global user.email ci@vci.invalid
           git config --global user.name vci
-          cargo test --locked -p vci-git
+          cargo test --locked -p vci-store --features vci-store/conformance -p vci-git -p vci-store-sqlite -p vci-store-postgres
 
+  # The store crates' rustdoc: vci-store is the contract a backend implements
+  # (its rustdoc is authoritative), and every public item is documented.
+  store-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rustdoc of the store crates, warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps --locked -p vci-store -p vci-store-sqlite -p vci-store-postgres
+          cargo doc --no-deps --locked -p vci-store --features conformance
+
+  # The command line on each store, end to end (crates/vci-cli/tests/
+  # store_select.rs and store_backends.rs): selection, secrets that never
+  # reach a test, fail open, and run, plan, explain, prune, fetch, push and
+  # ci on SQLite and PostgreSQL against a copy of fixtures/go-abcd. The
+  # PostgreSQL service is reached on localhost, where vci does not require
+  # TLS. Without go the tests would skip, so the module is downloaded first.
+  store-cli:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: vci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      VCI_TEST_POSTGRES_URL: postgres://postgres:vci@localhost:5432/postgres
+      VCI_TEST_POSTGRES: require
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: fixtures/go-abcd/go.mod
+          cache-dependency-path: fixtures/go-abcd/go.sum
+      - name: The fixture's Go modules
+        run: cd fixtures/go-abcd && go mod download
+      - name: Store selection and the stores end to end
+        run: cargo test --locked -p vci-cli --test store_select --test store_backends
+
+  # The temporary-PostgreSQL helper's own path: no server is given, so
+  # vci_store_postgres::testkit starts a throwaway cluster with the runner's
+  # initdb (as the non-root runner user; initdb refuses root) in en_US.UTF-8,
+  # whose linguistic collation the conformance suite's byte-order scenario
+  # needs to catch a missing COLLATE "C", and stops and deletes it when the
+  # test process exits.
+  store-pg-initdb:
+    runs-on: ubuntu-latest
+    env:
+      VCI_TEST_POSTGRES: require
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: PostgreSQL's initdb and the en_US.UTF-8 locale
+        run: |
+          if ! ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql
+          fi
+          ls /usr/lib/postgresql/*/bin/initdb
+          if ! locale -a | grep -qix 'en_US.utf8'; then
+            sudo locale-gen en_US.UTF-8
+          fi
+          locale -a | grep -ix 'en_US.utf8'
+          id -u
+      - name: The testkit and the conformance suite on a throwaway cluster
+        run: |
+          unset VCI_TEST_POSTGRES_URL
+          cargo test --locked -p vci-store-postgres --test testkit --test conformance
+
+  # Proves on a real runner that a commit of the action with no published
+  # binary fails at once (scripts/action-binary.sh) instead of compiling vci.
+  # On a commit whose sources match release/manifest.txt the gate passes and
+  # action-v1 already proves the download, so the check is skipped there.
   action-gate:
     runs-on: ubuntu-latest
     steps:

@@ -7,14 +7,18 @@ uses a store, and each backend's design.
 
 ## Status
 
-Built and in use:
+Built and in use (vci 2.8.0):
 
 - **The trait and its types**, in the crate `vci-store`: `AttestationStore`, `Exchange`, the records, `StoreError`,
   `FailedStore`, the factory registry (`BackendFactory`, `OpenContext`, `MissingBackend`, `open`), `select`, `timing`
-  and the harness of the conformance suite (feature `conformance`).
+  and the conformance suite (feature `conformance`).
 - **git-meta as an implementation of the trait**: `vci_git::GitMetaStore` and `vci_git::GitMetaFactory` (section 15).
   git-meta is the default store. Its output is byte-identical to vci 2.7.32 on an output-diff harness (run, plan,
   explain and push in one clone; fetch, plan, prune and verify in a second) and on every end-to-end suite.
+- **The SQLite backend** (`vci-store-sqlite`, section 16): one file in the git common directory, selected with
+  `VCI_STORE=sqlite`.
+- **The PostgreSQL backend** (`vci-store-postgres`, section 17): a shared server, selected with a `postgres://`
+  `VCI_STORE_URL`. Both are in vci-cli's default features, so the release binaries carry them (section 17, "Crate").
 - **The command line on the trait** (section 13): every command reaches the store through one
   `Arc<dyn AttestationStore>` per repository, selected from the environment and `[store]` (section 9). Deferred write
   batches are reported only once they finish (section 6), `vci ci` has the publication gate for shared stores
@@ -22,17 +26,11 @@ Built and in use:
 - **The plan reads the candidates it set aside** even when a round fetched nothing (section 5).
 - **The conformance suite** (section 14): its 34 scenarios, run against git-meta, SQLite and PostgreSQL from each
   backend's `tests/conformance.rs`.
+- **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14) and the CI jobs that run all of
+  the above (`store-stock-git`, `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`).
 
-Not built yet:
-
-- **The SQLite and PostgreSQL backends.** Sections 16 and 17 are their designs. The crates `vci-store-sqlite` and
-  `vci-store-postgres` are skeletons: their factories are registered in every default build, and their `open` returns
-  `StoreError::Config("the sqlite store is not implemented yet")` (and likewise for postgres). Selecting either today
-  therefore gives a `FailedStore` (section 10): the plan runs everything, and `vci run` refuses to store each unit
-  while keeping the tests' exit code. Their dependencies are already pinned in `Cargo.lock`.
-- **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`): `available()` always returns `false`.
-- **Later commands**: `vci store init`, `vci store copy`, `vci init --store`, and the action inputs `store` and
-  `store-url` (section 9).
+Not built yet: `vci store init`, `vci store copy`, `vci init --store`, and the action inputs `store` and `store-url`
+(section 9). The questions still open are in section 20.
 
 Contents
 
@@ -51,8 +49,8 @@ Contents
 13. The command line on the trait
 14. The conformance suite
 15. Backend: git-meta
-16. Backend: SQLite (design)
-17. Backend: PostgreSQL (design)
+16. Backend: SQLite
+17. Backend: PostgreSQL
 18. Notes for an HTTP or gRPC backend
 19. Decisions and why
 20. Decided questions, and what is still open
@@ -66,8 +64,8 @@ manifest the attestation's `manifestRef` names. `vci plan` lists the stored atte
 the ones it chooses, and skips a unit when one of them proves the inputs unchanged. The **store** is where those two
 kinds of records live. git-meta is the default store: `.git/git-meta.sqlite`, mirrored into `refs/meta/main` trees
 and exchanged with `vci fetch` and `vci push`. It is one implementation of the trait
-`vci_store::AttestationStore`. SQLite (a local file) and PostgreSQL (a shared server) are designed as the next two
-(sections 16 and 17), and an HTTP or gRPC service can follow (section 18).
+`vci_store::AttestationStore`. SQLite (a local file) and PostgreSQL (a shared server) are the other two (sections 16
+and 17), and an HTTP or gRPC service can follow (section 18).
 
 ### The store is never trusted
 
@@ -397,8 +395,8 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
     thread-seconds fell from 1.1-1.2 to 0.1-0.2, because pooled readers are reused instead of opened per call.
 - **`read_all()`**: `list_all` followed by `read_values`. git-meta serves it in one pass (`AttestStore::list(None)`).
 - **`count()`**: values are not read, and promised values count.
-- **`manifests(roots)`**: the batch form. No command calls it yet. git-meta answers it on one pooled reader;
-  PostgreSQL is designed to override it with `root = ANY`.
+- **`manifests(roots)`**: the batch form. No command calls it yet. git-meta answers it on one pooled reader, SQLite
+  on one connection, PostgreSQL with `root = ANY` (cache first).
 - **`manifest_decoded(root)`**: returns `None`, `Some(Err(why))` or `Some(Ok(manifest))`, with the base read from
   this store. The nested shape is that of vci-git's `AttestStore::manifest_decoded`, which the e2e helper
   `store_common::inline_manifest` calls.
@@ -412,8 +410,8 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
     predicate. They differ only on malformed envelopes: one without `testId` or its times but with a hex
     `manifestRef` now counts as referencing that root (2.7 emptied the answer), and a `manifestRef` that is not hex
     now empties the answer (2.7 counted it as a reference to nothing).
-  - SQL backends are designed to override it with one indexed query and answer empty if any row has `ref_state = 0`
-    (unknown).
+  - The SQL backends override it with one indexed query (no value is read) and answer empty if any row has
+    `ref_state = 0` (unknown).
   - Fail open: the run warns (`vci: warning: cannot read the store to remove unreferenced manifests: …`) and removes
     nothing.
 
@@ -441,8 +439,8 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
 ### `warm()`
 
 Starts background work that makes the first reads fast: git-meta reads `.git/git-meta.sqlite` through once on a
-thread (`warm_in_background`); SQLite is designed to read its file into the page cache; PostgreSQL to open its first
-connection and TLS session. It never blocks and never fails. The plan calls it first.
+thread (`warm_in_background`); SQLite reads its file through once on a thread, into the page cache; PostgreSQL opens
+its first connection and TLS session on a thread. It never blocks and never fails. The plan calls it first.
 
 ---
 
@@ -511,14 +509,14 @@ been measured on one yet.
   writes shared.
   - git-meta shares one git-meta session and one SQLite connection (2.7.15's speed-up). `finish` drops the
     thread-local guard and never fails.
-  - SQLite is designed to pin one connection with cached statements, each write committing.
-- **`WriteBatch::deferred(end)`**: writes become durable only when `finish` returns `Ok`. PostgreSQL is designed to
-  use this kind:
+  - SQLite pins one pooled connection to the thread, each write committing.
+- **`WriteBatch::deferred(end)`**: writes become durable only when `finish` returns `Ok`. PostgreSQL uses this kind:
   - `put`, `put_manifest` and `remove` are queued and deduplicated (by slot, root or key; the last call wins).
   - `finish` flushes them in **one transaction**: manifests (one UNNEST upsert), then attestations (one UNNEST
     upsert), then removals (one `DELETE … = ANY`).
-  - A large batch flushes every 2,000 writes or 32 MiB. Each flush is its own transaction, and a failed flush fails
-    `finish`.
+  - A large batch flushes early at 2,000 attestations and removals or 32 MiB (manifests count only toward the bytes),
+    so 1,000 units with their manifests stay one transaction. Each flush is its own transaction, and a failed flush
+    fails `finish`.
   - Inside a deferred batch, `put` returns the entry it will store. An unhinted put first looks up the slot's existing
     key (one read). `vci run` always passes a hint.
 
@@ -634,8 +632,8 @@ So on a store with `Caps::shared_writes` (`cmds::store_mode(shared_writes, push)
 Per backend:
 
 - git-meta uses `vci_memo` and `vci_flags` in `.git/git-meta.sqlite`. A CI cache carries them, as in 2.7.
-- SQLite is designed to use `memo` and `flags` tables in its file.
-- PostgreSQL is designed to use server-side tables per namespace. A pull-request plan then reads master's memo with no
+- SQLite uses `memo` and `flags` tables in its file; hint writes do nothing while the file does not exist.
+- PostgreSQL uses server-side tables per namespace, and never creates the schema for a hint. A pull-request plan then reads master's memo with no
   cache, and flags become shared facts about the repository (a global `plan:natives:<project>` flag is acceptable).
 - A backend that keeps no hints leaves the defaults: plans still work, just without the memo's head start.
 - A `FailedStore` keeps no hints.
@@ -676,9 +674,9 @@ share one handle, one pool and one circuit breaker. On any error, selecting or o
 | `VCI_STORE_NAMESPACE` | a shared server's namespace | the repository id (smallest root commit) |
 | `VCI_STORE_CONNECT_TIMEOUT_SECS` | bound on connecting, in seconds (a number, more than 0 and at most 3600) | 5 |
 | `VCI_STORE_TIMEOUT_SECS` | bound on one statement or request, same form | 30 (a network backend lifts it to 10 min for `vci prune`, `OpenContext::long_running`) |
-| `VCI_STORE_SYNC` | existing knob: `off` disables SQLite `synchronous` (git-meta's store; the SQLite backend will read it too) | unchanged |
+| `VCI_STORE_SYNC` | `off` disables SQLite `synchronous`, in git-meta's store (which also turns it off when `CI` is set) and in the SQLite backend (which does not look at `CI`) | unchanged |
 | unchanged, git-meta only | `VCI_FETCH_JOBS`, `VCI_LOCK_TIMEOUT_SECS`, `VCI_DELETION_RECORDS_DROP_AT`, `VCI_DELETION_RECORDS_KEEP_SECS` | |
-| tests only (planned) | `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require`, `VCI_TEST_PG_BINDIR` | |
+| tests only | `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require`, `VCI_TEST_PG_BINDIR` (section 14) | |
 
 `vci_store::select::ENV_VARS` lists the five `VCI_STORE*` variables `resolve` reads (not `VCI_STORE_SYNC`). Every e2e
 harness removes them from the environment of the commands it starts, so a developer's exported store never reaches
@@ -880,12 +878,14 @@ warnings and its `run_all` reason, run's refusals, the exit 2 of fetch, push, pr
 **Bounded time.** A hung store would block `vci plan`; an erroring one only makes units run. Every backend therefore
 bounds every wait:
 
-- PostgreSQL (design): connect (5 s), statement (30 s), lock (10 s), idle-in-transaction (60 s), TCP keepalives.
-- SQLite (design): `busy_timeout`.
+- PostgreSQL: connect (5 s), statement (30 s; 600 s for `vci prune`), lock (10 s), idle-in-transaction (60 s), TCP
+  keepalives and `tcp_user_timeout` (30 s), and a pool checkout bounded by the connect timeout.
+- SQLite: `busy_timeout`, the store timeout (30 s).
 - git-meta: `VCI_LOCK_TIMEOUT_SECS`.
 
-**Circuit breaker** (network backends, design). After the first `Unavailable` or `Timeout`, a network backend latches
-it, and every later call in the process returns the same error at once. A store that is down costs one timeout per
+**Circuit breaker** (network backends). After the first `Unavailable` or `Timeout` of reaching the server, a network
+backend latches it, and every later call of that handle returns `Unavailable` at once (PostgreSQL's handle is the
+CLI's one per repository, so in practice per process). A store that is down costs one timeout per
 command, not one per call (4,000 listings would otherwise each wait). Conformance scenario c16 checks that the first
 failure takes at most the connect timeout plus 1 s and the next 40 calls take under 2 s.
 
@@ -906,8 +906,8 @@ The store is called concurrently by:
 
 Hence `AttestationStore: Send + Sync`.
 
-- **Non-`Sync` resources are pooled inside the backend.** git-meta pools `Reader`s (section 15). SQLite is designed to
-  pool `rusqlite::Connection`s (`Send`, not `Sync`), and PostgreSQL `postgres::Client`s (`Send`, not `Sync`; each runs
+- **Non-`Sync` resources are pooled inside the backend.** git-meta pools `Reader`s (section 15). SQLite pools
+  `rusqlite::Connection`s (`Send`, not `Sync`), and PostgreSQL `postgres::Client`s (`Send`, not `Sync`; each runs
   a private current-thread tokio runtime that is invisible to vci). The pool hands one resource to each concurrent
   caller and takes it back afterwards, so concurrency matches the per-thread readers of 2.7.
 - **`WriteBatch` is `!Send`.** It ends on the thread that opened it, and only that thread's writes join it.
@@ -924,7 +924,7 @@ Hence `AttestationStore: Send + Sync`.
   or `.done(label)`. This emits `store: <kind>: <step>: <secs>s` through `vci_core::timing_line!`, so the line is
   recorded in the metrics log (`vci metrics` groups steps with numbers replaced by `#`) and printed under
   `VCI_TIMING`. Labels carry counts, never paths, test ids, hosts or URLs, and stay stable because metric history is
-  keyed by them. No backend uses `Step` yet: git-meta keeps its own lines.
+  keyed by them. SQLite and PostgreSQL use `Step`; git-meta keeps its own lines.
 - **git-meta** keeps every line it printed in 2.7 (`fetch: …`, `hydrate: …`, `read values: …`, `push: …`).
 - **`put_manifest` seconds.** The static `AttestStore::put_manifest_seconds()` call in run.rs became
   `timing_report()`. git-meta returns `"put_manifest seconds: session …, read current …, set …, stamp …"`, and run.rs
@@ -934,8 +934,11 @@ Hence `AttestationStore: Send + Sync`.
   again (R still not)`; one that fetched nothing but read set-aside candidates prints `round N: read K candidate(s)
   set aside for U unit(s) not skipped, check them again (R still not)`; `round N: nothing more to fetch for U unit(s)
   not skipped` is unchanged.
-- **PostgreSQL** (design) labels include statement counts (`store: postgres: prefetch 4100 unit(s), 3
-  statement(s): 0.21s`). It also exposes an inherent `PgStore::statements()` counter for tests, and sets
+- **SQLite** prints `store: sqlite: list N unit(s)`, `store: sqlite: read N value(s)` and, when a batch finishes,
+  `store: sqlite: write N record(s)`; its `timing_report()` adds the handle's total, `store: sqlite: N write(s): S s`.
+- **PostgreSQL** labels include statement counts (`store: postgres: prefetch N unit(s), M value(s), K statement(s)`,
+  `prefetch N manifest(s), K statement(s)`, `write batch: N manifest(s), M attestation(s), K removal(s), S
+  statement(s)`, `list N unit(s)`, `read N value(s)`). It also exposes an inherent `PgStore::statements()` counter for tests, and sets
   `application_name` to `vci <version> <command>` so `pg_stat_activity` shows which command each connection serves.
 - **The metrics log** has `"store": "<kind>"` (the first store the command opened), or `null`.
 
@@ -1128,33 +1131,46 @@ Backends keep their own tests for what is theirs:
   `state()`, `NOT_FETCHED` byte for byte, `StoreError` display, `FailedStore`) and `tests/select.rs` (the precedence
   matrix, refused keys, timeouts and bounds, `redact` and `Secret::scrub`).
 
-### The temporary-PostgreSQL test helper (design)
+### The temporary-PostgreSQL test helper
 
 `vci-store-postgres/src/testkit.rs` is a `#[doc(hidden)]` module for tests only. It is always compiled, so
-integration tests need no self dev-dependency. Today it holds only `available()`, which returns `false`. `pg()` is to
-find a server once per test process:
+integration tests (the crate's own, and vci-cli's through a dev-dependency) need no feature. `pg()` finds a server
+once per test process (a `OnceLock`):
 
-1. **`VCI_TEST_POSTGRES_URL`**, if set. This is CI's `services: postgres`, or any server where the role may `CREATE
-   SCHEMA`.
-2. **Otherwise, a throwaway cluster.**
-   - `initdb` is looked for in `VCI_TEST_PG_BINDIR`, then `PATH`, then `pg_config --bindir`, then the newest
-     `/usr/lib/postgresql/*/bin`, `/opt/homebrew/opt/postgresql@*/bin` and `/usr/local/opt/postgresql@*/bin`.
-   - It runs `initdb -U vci -A trust -E UTF8 --locale=en_US.UTF-8 --no-sync`, so a missing `COLLATE "C"` fails c05,
+1. **`VCI_TEST_POSTGRES_URL`**, if set: CI's `services: postgres`, or any server where the role may create schemas,
+   roles and databases. `sslmode=prefer` is appended when the URL names none, since vci requires TLS for a host that is
+   not this machine and a service container has none.
+2. **Otherwise, one throwaway cluster.**
+   - `initdb` and `pg_ctl` are looked for in `VCI_TEST_PG_BINDIR`, then `PATH`, then `pg_config --bindir`, then the
+     newest `/usr/lib/postgresql/*/bin`, `/opt/homebrew/opt/postgresql@*/bin` and `/usr/local/opt/postgresql@*/bin`.
+   - It runs `initdb -U vci -A trust -E UTF8 --no-sync --locale=en_US.UTF-8`, so a missing `COLLATE "C"` fails c05,
      falling back to `--locale=C`.
-   - It configures TCP only on 127.0.0.1 with `unix_socket_directories=''`, because macOS caps socket paths at about
-     104 bytes; plus `fsync=off`, `synchronous_commit=off`, `full_page_writes=off` and `max_connections=300`.
-   - It binds a free port, retrying up to 5 times.
-   - A watcher process (`sh -c 'cat >/dev/null; pg_ctl stop -m immediate; rm -rf <dir>'`) holds the read end of a
-     pipe that only the test process writes. When the test process exits for any reason (panic, abort, SIGKILL), the
-     watcher stops and deletes the cluster.
-3. **Otherwise, skip** with a message, or **panic under `VCI_TEST_POSTGRES=require`** (set in CI).
+   - `postgresql.conf` gets TCP only on 127.0.0.1 with `unix_socket_directories=''` (macOS caps socket paths at about
+     104 bytes), `fsync`, `synchronous_commit` and `full_page_writes` off, and `max_connections=300`.
+   - It starts on a free port with `pg_ctl -w -t 60`, retrying up to 5 ports, with `LC_ALL` set to the locale (the
+     macOS postmaster refuses to start without it: "postmaster became multithreaded during startup").
+   - Before `initdb` runs, a watcher is spawned: `/bin/sh` in its own process group, ignoring INT and HUP, running
+     `cat >/dev/null; pg_ctl stop -m immediate; rm -rf <dir>`. The test process holds its stdin pipe in a static and
+     never writes it, so when the process ends for any reason (exit, panic, abort, SIGKILL) the watcher stops and
+     deletes the cluster. A failed `initdb` or start is cleaned up the same way.
+   - The admin URL is `postgres://vci@127.0.0.1:<port>/postgres?sslmode=disable`.
+3. **Otherwise, skip** with a message on stderr, or **panic under `VCI_TEST_POSTGRES=require`** (set in CI).
+   `available()` follows the same rules.
 
 Other rules:
 
-- `initdb` refuses to run as root (the CI container runs as root). It is detected and skipped, and CI uses a service
-  container instead.
-- Each world gets a fresh schema `vci_t_<pid>_<n>`, dropped with `DROP SCHEMA … CASCADE` on drop.
-- Under cargo-nextest (one process per test), set `VCI_TEST_POSTGRES_URL`.
+- `initdb` refuses to run as root, which is detected (`id -u`) and skipped. CI's root container job
+  (`store-stock-git`) uses a service container; `store-pg-initdb` runs the initdb path as the runner user.
+- Each `PgDb` has a schema of its own, `vci_t_<pid>_<n>` (not created until a store writes), and drops it with the
+  roles (`role(suffix, grants)`) and databases (`database(suffix, options)`) it made, on drop.
+- `PgDb` also has `selection()` (namespace `test`), `open()`, `open_with(f)`, `open_as(url)`, `sql`, `query`, `count` and
+  `schema_exists()`; free functions `cx()`, `cx_for(command, long_running)`, `selection(url, schema, ns)`,
+  `with_user` and `with_database`; and introspection for its own tests (`clusters_started()`, `cluster_data_dir()`,
+  `cluster_port()`, `cluster_locale()`, `bindir()`, `running_as_root()`).
+- `tests/testkit.rs` checks one cluster per process, the dropped schemas and roles, and that a child test process
+  that panics or is killed leaves no postmaster and no directory behind within 10 s.
+- Under cargo-nextest (one process per test), set `VCI_TEST_POSTGRES_URL`; otherwise every test starts a cluster
+  (about a second each on a laptop).
 
 ---
 
@@ -1298,11 +1314,15 @@ keeping `put_hinted`'s keys, and the factory.
 
 ---
 
-## 16. Backend: SQLite (design)
+## 16. Backend: SQLite
 
-**Not implemented yet.** `vci-store-sqlite` holds `SqliteFactory` (kind `sqlite`, registered under the cargo feature
-`sqlite`, on by default), whose `open` returns `Config("the sqlite store is not implemented yet")`, and an empty
-`SqliteStore`. This section is the design it is to follow.
+`vci-store-sqlite` holds `SqliteFactory` (kind `sqlite`, registered under vci-cli's cargo feature `sqlite`, on by
+default; `SqliteFactory::path(sel, cx)` says which file a selection names), `SqliteStore` (`open_path(path,
+SqliteOptions)`, which opens nothing until the first call; `path()`, `options()`) and `SqliteOptions { busy_timeout,
+sync_off, read_only }` (default 30 s, false, false). Its tests are `tests/sqlite.rs` (the design's fourteen cases
+plus a read-only file beside a live WAL, readers racing a writer, a lock held past the busy timeout, an unwritable
+directory and a copy between two files; 1,200 units of 18 KB listed and read in about 8 ms in a release build) and the
+conformance suite.
 
 **Crate.** `vci-store-sqlite` depends on `vci-store`, `vci-core`, `serde_json` and `rusqlite = { version = "=0.39.0",
 default-features = false, features = ["bundled"] }`.
@@ -1311,15 +1331,15 @@ default-features = false, features = ["bundled"] }`.
   link only one copy, and git-meta-lib resolves to 0.39.0.
 - `bundled` is enabled explicitly so `cargo test -p vci-store-sqlite` builds without git-meta-lib in the graph.
 
-**What the command line already expects** of it:
+**What the command line relies on**:
 
 - `status()` is ``Absent{advice: "the first `vci run` creates it"}`` when there is no file; the plan then warns `no
   attestations are available in the sqlite store (the first `vci run` creates it)`.
 - `exchange()` is `None` (`vci fetch`: `vci: the sqlite store at <location> is local: nothing to fetch (N
   attestations stored)`).
 - `prefetch` is the default; the plan's round 2 reads the set-aside candidates anyway (section 5).
-- Conditions that mean the store cannot be used are `Unavailable`, `Denied`, `Incompatible` or `Config`, never
-  `Backend` (section 10).
+- Conditions that mean the store cannot be used are `Unavailable`, `Denied`, `Incompatible`, `Timeout` or `Config`,
+  never `Backend` (section 10). The backend returns no other variant.
 
 **File.**
 
@@ -1339,10 +1359,23 @@ default-features = false, features = ["bundled"] }`.
   milliseconds), `synchronous=NORMAL` (`OFF` under `VCI_STORE_SYNC=off`, read once by the factory),
   `foreign_keys=OFF`.
 - `PRAGMA application_id = 0x76636931` ('vci1') and `PRAGMA user_version = 1`.
-- A newer `user_version` gives `Incompatible`. A file that is not a database gives `Unavailable`.
-- A file that is not writable is opened read-only, then retried with `immutable=1` in a read-only directory, as
-  git-meta's Reader does.
-- Connections live in a `Mutex<Vec<Connection>>` pool, using `prepare_cached`.
+- The schema's state (application id, user version, tables) is read in one read transaction: read as three
+  statements, it raced a concurrent creator (c21 and the crate's test 10 caught it).
+- A newer `user_version` with application id 'vci1' gives `Incompatible{found, supported: 1}`.
+- **Files it refuses.** A file with tables but `user_version` 0, or another `application_id`, is
+  `Unavailable("<path>: not a vci store: …")` and is never written: pointing the store at `.git/git-meta.sqlite` fails
+  this way and leaves the file untouched. SQLite's NOTADB or CORRUPT is `Unavailable` at once, without trying the
+  other opens.
+- **Open fallbacks**, each probed with `SELECT count(*) FROM sqlite_master`: a plain read-write open of the path, then
+  `file:<percent-encoded path>?mode=ro`, then `?immutable=1` (a read-only directory), as git-meta's Reader does.
+- **Errors.** BUSY or LOCKED is `Timeout{operation: "waiting for another writer", after: busy_timeout}`; READONLY,
+  PERM or AUTH is `Denied{operation: "write" | "create the schema" | "remember a hint"}`; the first write in a
+  directory that cannot be written (CANTOPEN on create, or `create_dir_all` refused) is `Denied{operation: "create
+  the store"}`; anything else is `Unavailable("<path>: <sqlite message>")`. A handle opened with `read_only` returns
+  `Denied` before it opens anything.
+- Connections live in a `Mutex<Vec<Connection>>` pool. Statements are prepared once per call and reused for each row
+  of it: `prepare_cached` needs rusqlite's `cache` feature, which only git-meta-lib turns on, so this crate built on
+  its own does not have it.
 
 **Schema v1.**
 
@@ -1389,9 +1422,12 @@ The default `BINARY` collation is bytewise, as the contract requires.
 - `list_all`: `ORDER BY target, key`.
 - `read_values`: `SELECT value, encoding FROM attestations WHERE key = ?1` per entry inside one transaction. A
   missing key gets `GONE` and an unknown encoding is unreadable. `NOT_FETCHED` never occurs.
-- `read_units`: the default (list, then read), which is already a targeted read here.
-- `manifest`: `SELECT value FROM manifests WHERE root = ?1`. `manifest_roots`: `ORDER BY root`. `count`:
-  `count(*)`.
+- `read_units`: the default (list, then read), which is already a targeted read here. `list_units` answers a
+  duplicate id with a copy of its first answer (one index seek per distinct unit).
+- `manifest`: `SELECT value FROM manifests WHERE root = ?1`. `manifest_roots`: `ORDER BY root`. `count`: a key-only
+  scan counting the keys `parse_key` accepts, not `count(*)`, so a foreign row (c23) is not counted.
+- A missing file reads as empty everywhere; `orphan_manifests` on it returns every given root, sorted and
+  deduplicated.
 - `orphan_manifests`: empty if any row has `ref_state = 0`; otherwise the given roots with no row where
   `manifest_ref = root`.
 
@@ -1407,6 +1443,7 @@ The default `BINARY` collation is bytewise, as the contract requires.
     manifest_ref = excluded.manifest_ref, ref_state = excluded.ref_state, stored_at = excluded.stored_at,
     encoding = 0, value = excluded.value
   WHERE attestations.key IS NOT excluded.key OR attestations.value IS NOT excluded.value
+     OR attestations.encoding <> 0
   RETURNING key;
   ```
 
@@ -1414,41 +1451,63 @@ The default `BINARY` collation is bytewise, as the contract requires.
   - A conflict on the primary key alone implies the same slot, because the key encodes the slot.
   - Without a hint, the update keeps `key`, `issued` and `tree16`. When nothing changed (no row returned), the stored
     key is read back.
-- `put_manifest`: compare the stored value, then insert or update in the same transaction. It refreshes `put_at`
-  always and returns whether the value changed. `base` comes from `compact_base`.
-- `remove`: `DELETE FROM attestations WHERE key = ?1 RETURNING key` per entry, in one transaction. It returns the
-  entries that existed, with their given bytes. There are no tombstones: nothing propagates.
+  - `encoding <> 0` lets a put of identical bytes repair a row this vci cannot read; otherwise identical bytes under
+    the same key change nothing, `stored_at` included.
+- `put_manifest`: compares inside SQL (`SELECT value = ?2 AND encoding = 0`), then only refreshes `put_at` when equal
+  or upserts the value otherwise, in the same transaction, and returns whether the value changed. `base` comes from
+  `compact_base`, kept only when it is a hex id.
+- `remove`: `DELETE FROM attestations WHERE key = ?1` per entry, in one transaction, using the changed-row count. It
+  returns the entries that existed, with their given bytes. There are no tombstones: nothing propagates.
+- Writes that cannot change anything never create the file: `remove` and `remove_manifests` on a missing file return
+  nothing, and `remember_passing` and `set_flag` do nothing there. A file without a schema gets one on its first
+  write, a hint included.
 - `remove_manifests`: validate all roots, then in one `BEGIN IMMEDIATE` transaction delete only roots that no
   attestation references and no manifest uses as its base. SQLite has one writer, so this check is atomic and needs
   no grace period.
 
-**Batch.** `WriteBatch::immediate`: it pins one pooled connection to the thread, with cached statements, and each
-write still commits. Under WAL with `synchronous=NORMAL` a commit costs tens of microseconds, so about 3,000 writes
+**Batch.** `WriteBatch::immediate`: it pins one pooled connection to the thread (a thread-local keyed by the handle),
+and each write still commits. Under WAL with `synchronous=NORMAL` a commit costs tens of microseconds, so about 3,000 writes
 take well under a second. If measurement says otherwise, the follow-up is chunked transactions with a deferred batch.
 
 **Other methods.**
 
 - `prefetch` is the default (nothing to do).
-- `warm` reads the file into the page cache on a thread.
-- Hints use the `memo` and `flags` tables; `remember_passing` deletes memo rows older than 7 days.
+- `warm` reads the file through once on a thread, into the page cache.
+- Hints use the `memo` and `flags` tables; `remember_passing` upserts by `(tree16, test_key)` and deletes memo rows
+  older than 7 days. Timestamps are unix seconds.
+- `synchronous` is `OFF` only under `VCI_STORE_SYNC=off`, read once at open. Unlike git-meta's store (2.7.27), it does
+  not turn syncing off when `CI` is set.
 - `exchange` is `None`.
 - `caps` is `LOCAL.with_hints(true)`.
-- On drop of the last connection, the store runs `PRAGMA wal_checkpoint(TRUNCATE)` (best effort), so a CI cache of
-  the file captures one consistent file without `-wal` and `-shm`. `store::close_all()` drops the store at the end of
-  every command.
-- Timing lines: `store: sqlite: list N unit(s)`, `store: sqlite: read N value(s)`, `store: sqlite: write`.
+- On drop of the last connection, the store runs `PRAGMA wal_checkpoint(TRUNCATE)` (best effort, 100 ms busy wait),
+  so a CI cache of the file captures one consistent file without `-wal` and `-shm`. `store::close_all()` drops the
+  store at the end of every command. (macOS's `/usr/bin/sqlite3` keeps the WAL files after reading such a file:
+  tests that look for them must not use it.)
+- Timing lines (section 12): `store: sqlite: list N unit(s)`, `store: sqlite: read N value(s)`, `store: sqlite: write
+  N record(s)` per finished batch, and `timing_report()` with the handle's total writes.
 
 **Uses.** Local development loops, single-runner CI with a cache, the reference implementation for new backends
-(about 700 lines, no special cases), and a possible later outbox for shared stores.
+(about 1,500 lines with its schema, reads and writes; no special cases), and a possible later outbox for shared
+stores.
 
 ---
 
-## 17. Backend: PostgreSQL (design)
+## 17. Backend: PostgreSQL
 
-**Not implemented yet.** `vci-store-postgres` holds `PostgresFactory` (kind `postgres`, registered under the cargo
-feature `postgres`, on by default), whose `open` returns `Config("the postgres store is not implemented yet")`, an
-empty `PgStore`, and `#[doc(hidden)] pub mod testkit` with `available() -> false`. This section is the design it is
-to follow.
+`vci-store-postgres` holds `PostgresFactory` (kind `postgres`, registered under vci-cli's cargo feature `postgres`, on
+by default), `PgStore` (`open(&Selection, &OpenContext)`, which does no I/O; `Clone`, sharing one handle;
+`statements()`, every statement sent including `BEGIN` and `COMMIT`; `schema()`; `namespace()`; doc-hidden
+`__sleep_for_test` and `__connection_for_test` for its tests), `PgError` (the payload of `StoreError::Backend` for
+unexpected errors, with `message()` and `code()`), and the testkit (section 14). The modules are `conn` (URL, TLS,
+session settings, pool, circuit breaker, error classification and scrubbing), `schema`, `cache`, `read`, `write` and
+`batch`. Its tests are `tests/pg.rs` (fifteen cases: an unreachable server failing fast with no secret shown; URL
+handling; round trips and slot replacement; bytewise order, through an ICU linguistic collation when libc's is
+bytewise; concurrent first writers creating the schema once; absent, not initialized and incompatible schemas; a
+statement timeout latching the breaker; the plan's statement budget; reads after a prefetch seeing the handle's
+writes; deferred batches; `remove_manifests` keeping referenced, base and recent roots; `orphan_manifests` with an
+unknown reference; namespace isolation; a read-only role; `application_name`), nine unit tests and the conformance
+suite. Two mutation checks showed the tests
+catch real faults: dropping `COLLATE "C"` fails test 4, and not caching prefetched values fails test 8.
 
 **Crate.** `vci-store-postgres` depends on `vci-store`, `vci-core`, `serde_json`, and these exact pins (each published
 at least two weeks before 25 October 2026; one `rustls` and one `tokio-postgres` resolve, and `cargo tree -i
@@ -1461,9 +1520,13 @@ aws-lc-rs` is empty):
 - `webpki-roots = "=1.0.9"` for trust roots.
 
 The CLI enables it with feature `postgres`, which is on by default and in the release binaries. A build without it
-registers `MissingBackend`.
+registers `MissingBackend`. It costs the static x86_64 musl binary about 2.8 MiB: 18,356,448 bytes with the default
+features against 15,401,440 with `--no-default-features --features sqlite` (15,179,488 with neither backend);
+compressed with `gzip -9`, 7.9 MB against 6.6 MB. (Measured with `cargo zigbuild --release --locked --target
+x86_64-unknown-linux-musl`, Rust 1.95.0 and zig 0.16.0 on macOS, not with the release workflow's `musl-gcc`, so the
+absolute sizes may differ there.)
 
-**What the command line already expects** of it:
+**What the command line relies on**:
 
 - `caps()` is `LOCAL.with_shared_writes(true).with_hints(true)`, so `vci ci` without `--push` signs only (section 7),
   and `exchange()` is `None` (`vci fetch`: `vci: the postgres store at <location> is shared: nothing to fetch (N
@@ -1476,37 +1539,59 @@ registers `MissingBackend`.
 - The plan calls `prefetch(Units{choose: Some})` in round 1 and, in round 2, `prefetch(Units{choose: None})` for the
   units with set-aside candidates, then `read_values` of those candidates, then `Manifests` for the roots found not
   fetched; the per-handle cache and the statement budget below must cover that.
-- `OpenContext::long_running` is true for `vci prune`.
+- `OpenContext::long_running` is true for `vci prune`, and means a statement timeout of at least 600 s and a manifest
+  grace of 0 (no trait change; this settled section 20's question).
 
 ### Connection handling
 
 - **Source of the URL.** It comes only from `VCI_STORE_URL` (`Selection::url`, a `Secret`).
-- **What vci strips before parsing.** vci removes `sslrootcert`, which it handles itself, before handing the rest to
-  `postgres::Config::from_str`. A parse error becomes `Config`, with the URL scrubbed.
+- **What vci strips before parsing.** vci removes `sslrootcert`, which it handles itself, and maps `sslmode`, before
+  handing the rest to `postgres::Config::from_str`. In a libpq `key=value` string only unquoted `sslrootcert=` and
+  `sslmode=` tokens are rewritten; a quoted `sslrootcert` reaches the client library and is a `Config` error. A parse
+  error becomes `Config` **without the string**, not even redacted (libpq quoting such as `password='a b'` could defeat
+  `select::redact`): only the scrubbed client-library message is shown.
 - **TLS.**
   - Without an `sslmode` in the URL, vci uses `require`. For hosts `localhost`, `127.0.0.1`, `::1` and unix sockets
-    it uses `prefer`.
-  - With TLS, certificates are always verified (webpki roots, plus `sslrootcert` when given).
+    it uses `prefer`. `verify-ca` and `verify-full` map to `require`, `allow` to `prefer`.
+  - With TLS, certificates are always verified (rustls with the `ring` provider, the webpki roots, plus `sslrootcert`
+    when given). So `prefer` against a TLS server whose certificate cannot be verified fails the connection instead of
+    falling back to plain text as libpq's `prefer` would: a local server with a self-signed certificate needs
+    `sslrootcert` or `sslmode=disable`.
+  - The TLS configuration is built at the first connection, so `open` reads no file; a bad `sslrootcert` is a
+    `Config` error on the first call, cached for every later one.
 - **Session settings.**
   - `connect_timeout` from the selection, unless the URL sets one.
-  - TCP keepalives on (idle 10 s), and `tcp_user_timeout` where the platform supports it.
+  - TCP keepalives on (idle 10 s), and `tcp_user_timeout` 30 s unless the URL sets one.
   - `application_name = 'vci <version> <command>'`.
   - `options = "-c statement_timeout=<timeout> -c lock_timeout=10s -c idle_in_transaction_session_timeout=60s"`,
     appended to any options the URL gives. For `long_running` commands the statement timeout is 600 s.
 - **Encoding.** Values are `bytea`, so the server encoding does not matter.
 - **Pool.** A `Mutex<Vec<Client>>` plus a `Condvar`, with at most `pool` clients (default 8) and checkout bounded by
   the connect timeout. A client returned after an error is dropped if `is_closed()`.
-- **Circuit breaker.** The first `Unavailable` or `Timeout` is latched in a `OnceLock<String>`, and every later call
-  in the process returns `Unavailable` at once.
-- **Retries.** Idempotent single statements are retried once on connection loss, serialization failure (40001) or
-  deadlock (40P01).
-- **Redaction.** Every error message passes through `Secret::scrub`.
+- **Circuit breaker.** Per handle, not a process-wide static (tests in one process must stay independent; the CLI
+  memoizes one handle per repository, so it acts per process there). The first failure to reach the server is latched
+  in a `OnceLock<String>`: a connection failure, an authentication error, a missing database, SQLSTATE classes 08 and
+  57P, 53300, a statement timeout (57014) and a lock timeout (55P03). Every later call then returns `Unavailable` with
+  "… (failed earlier in this process; not retried)" at once. Not latched: a pool checkout that waited too long
+  (`Timeout{operation: "a connection from the pool"}`), 40001 and 40P01 after their retries, 53100 and 53200
+  (`Unavailable`), `Denied`, `Config` and `Backend`.
+- **Retries.** A lost connection once, on a new connection; serialization failure (40001) and deadlock (40P01) up to
+  twice; a unique violation (23505) up to three times for puts and batch flushes, because concurrent first inserts of
+  one key can collide on the primary key `(ns, key)`, which is not the upsert's arbiter.
+- **Errors.** No privilege is `Denied` (`operation` "read" on a read, "write" on a write); a missing schema on a write
+  by a role that cannot create it is `NotInitialized`; a newer schema `Incompatible`; anything unexpected
+  `Backend(PgError)`.
+- **Redaction.** Every error message passes through `Secret::scrub`. `location()` is built from the parsed
+  configuration, never from the string: `postgres://[***@]host:port/db schema <s> namespace <ns>` (the port shows
+  even when the URL left it out).
 - **Namespace.** Every row carries `ns`. Its value is `VCI_STORE_NAMESPACE`, else `[store.postgres] namespace`, else
   `OpenContext::repo_id()`, the smallest root commit, computed lazily. Forks and mirrors share it, and unrelated
   repositories never do. Without a namespace, `vci prune` in one repository would delete another repository's rows,
   because none of their trees are live in the first. In a shallow clone with no root commit there is no repository
   id: the store then requires an explicit namespace, and the plan fails open with a message naming
-  `VCI_STORE_NAMESPACE`.
+  `VCI_STORE_NAMESPACE`. As built, `Repo::repo_id()` does not fail in a shallow clone (it returns the commit where the
+  clone was cut, which differs by depth), so the backend refuses the default namespace itself whenever
+  `<git common dir>/shallow` exists.
 - **Schema name.** The schema name is validated as `[a-z_][a-z0-9_]{0,62}` and always quoted. Every value is a bound
   parameter; `search_path` is never relied on. One schema per server deployment; v1 has no row-level security per
   namespace.
@@ -1573,14 +1658,19 @@ missing would be refused) and would add a retry path. Ordering, grace and NOT EX
   "the first vci run with a role allowed to create schema <s> creates it"}`, so a SELECT-only role works.
 - A `schema_version.version` above the supported one gives `Incompatible`, and the plan fails open.
 - A write that cannot create the schema (42501) gives `NotInitialized`. A write refused by privileges gives `Denied`.
+- A `schema_version` table without its row counts as absent: a migration has not committed yet.
+- Hints never create the schema: `remember_passing` and `set_flag` do nothing while it is absent.
 
 ### Reads and the per-handle cache
 
 The cache lives in memory and is never persisted. It holds listings by `test_key`, attestation values by key, and
 manifests by root, including negative entries.
 
-- **Writes through the handle keep it current.** A put updates its unit's listing and value. A remove drops the
-  entry. A `put_manifest` sets the root and evicts a negative entry.
+- **Only `prefetch` and `read_values`' manifest read-ahead fill it.** `list_units` and `manifest` misses are not
+  cached.
+- **Writes through the handle keep it current.** A put updates its unit's listing and value only when that listing
+  is cached. A remove drops the entry. A `put_manifest` replaces a root only when it was cached (an absent answer
+  too), and `remove_manifests` marks removed roots absent.
 - **Values move out on read.** An attestation value leaves the cache on its first read, because the caller keeps it.
   Listings and manifests stay: bases are shared and re-read.
 - **Size cap.** The cache is capped at 256 MiB. Above that, nothing more is cached and reads go to the server.
@@ -1599,7 +1689,14 @@ The rest go to the server directly:
 - `list_all`: `ORDER BY target, key`.
 - `read_all`: streamed with `query_raw`.
 - `manifest_roots`: `ORDER BY root`.
-- `count`: `count(*)`.
+- `count`: reads every key of the namespace and counts those `parse_key` accepts, not `count(*)`, so foreign keys
+  (c23) are not counted.
+- `read_units` is overridden: fully cached units are answered from the cache, which keeps their values (`vci run`
+  reads its units twice, for the last durations and then for supersession, so supersession costs no statement after
+  run's prefetch); misses take one statement with values (`test_key = ANY`).
+- `read_values`, for the values it had to read from the server, reads ahead in one more statement the manifests and
+  bases they reference: the plan reads the newest candidates beyond `choose`, whose manifests `prefetch` did not
+  cover, and each verifying thread would otherwise issue single-row manifest statements.
 - `orphan_manifests`: one statement, answering empty if `EXISTS (… ref_state = 0)`, otherwise `SELECT r FROM
   unnest($2::text[]) r WHERE NOT EXISTS (SELECT 1 FROM vci.attestations a WHERE a.ns=$1 AND a.manifest_ref=r) ORDER
   BY r COLLATE "C"`.
@@ -1613,7 +1710,8 @@ The rest go to the server directly:
    `manifest_ref` column.
 
 `prefetch(Manifests)` reads roots and bases in one statement. `prefetch(Attestations)` does nothing. Prefetch returns
-`Hydration::default()`: nothing was ever "not fetched".
+`Hydration::default()`: nothing was ever "not fetched". Prefetch reuses the listings the handle already cached and
+reads only values and manifests not cached, so round 2 costs two statements (values, manifests), not three or four.
 
 **The plan's round-trip budget**:
 
@@ -1624,39 +1722,65 @@ The rest go to the server directly:
 | flags (every flag of the namespace, cached) | 1 |
 | memo (base and head trees) | 2 |
 | round 1 prefetch | 3 |
-| round 2 (the set-aside units' listing, values, manifests) | 3-4 |
-| remember_passing | 1 |
+| round 2 (the set-aside units' values and manifests; listings are cached) | 2 |
+| remember_passing (plus the 7-day memo prune, once per handle) | 1-2 |
 
-That is **about 12-13 in total, independent of the number of units**. The 4,000 listings, the batch read and the
-2,000 `manifest()` calls are cache hits. Gate: at most 15 statements for 1,200 units (`PgStore::statements()`).
-Measure the bytes transferred per plan as well; the per-handle cache stays unless they prove too many.
+That is **about a dozen in total, independent of the number of units**. The 4,000 listings, the batch read and the
+2,000 `manifest()` calls are cache hits. Gate: at most 15 statements for 1,200 units (`PgStore::statements()`);
+measured: 13 for a plan-shaped run of 1,200 units, and 0 more for 1,200 manifest reads from 8 threads.
+
+**Bytes per plan** (DECISIONS item 10), measured with a byte-counting TCP proxy and `pg_stat_statements` on a
+synthetic world of 600 Go units attested at three commits (1,800 attestations of about 3,100 bytes, 5.5 MB; 1,801
+manifests of about 490 bytes), one connection, debug build, two runs with identical bytes:
+
+| plan | client to server | server to client | statements | rows |
+|---|---|---|---|---|
+| unchanged (all 600 skip) | 510,857 B | 5,380,920 B (5.13 MiB, about 9.0 KB a unit) | 9 | 4,803 |
+| every unit edited (all run) | 741,399 B | 11,916,040 B (11.36 MiB, about 19.9 KB a unit) | 10 | 6,604 |
+| reverted to the oldest (all skip in round 2) | 897,879 B | 11,916,148 B | 12 | 7,204 |
+
+The unchanged plan reads the 1,800 listing rows, 1,200 values (the 600 `choose` picked, then the second-newest 600)
+and 1,202 manifests. When every unit runs, 3,000 value rows are sent for 1,800 distinct values: round 2's
+`prefetch(Units{choose: None})` fetches all 1,800 again because `read_values` moved the first 1,200 out of the cache
+(about 3.8 MB, a third of the bytes; section 20). The synthetic manifests are tiny; on a real repository input
+manifests, often megabytes, dominate. Not measured on vex.
 
 ### Writes
 
 **`put`** is one statement. The slot replacement is atomic, and concurrent writers of one slot leave one row:
 
 ```sql
-INSERT INTO vci.attestations AS a
-  (ns, key, test_key, signer, storage_key, target, issued, tree16, manifest_ref, ref_state, value)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-ON CONFLICT (ns, test_key, signer, storage_key) DO UPDATE SET
-  key = EXCLUDED.key, target = EXCLUDED.target, issued = EXCLUDED.issued, tree16 = EXCLUDED.tree16,
-  manifest_ref = EXCLUDED.manifest_ref, ref_state = EXCLUDED.ref_state, encoding = 0, value = EXCLUDED.value,
-  stored_at = now(), stored_by = session_user
-WHERE (a.key, a.value) IS DISTINCT FROM (EXCLUDED.key, EXCLUDED.value)
-RETURNING key;
+WITH up AS (
+  INSERT INTO vci.attestations AS a
+    (ns, key, test_key, signer, storage_key, target, issued, tree16, manifest_ref, ref_state, value)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  ON CONFLICT (ns, test_key, signer, storage_key) DO UPDATE SET
+    key = EXCLUDED.key, target = EXCLUDED.target, issued = EXCLUDED.issued, tree16 = EXCLUDED.tree16,
+    manifest_ref = EXCLUDED.manifest_ref, ref_state = EXCLUDED.ref_state, encoding = 0, value = EXCLUDED.value,
+    stored_at = now(), stored_by = session_user
+  WHERE (a.key, a.value, a.encoding) IS DISTINCT FROM (EXCLUDED.key, EXCLUDED.value, EXCLUDED.encoding)
+  RETURNING a.key)
+SELECT key FROM up
+UNION ALL
+SELECT key FROM vci.attestations
+WHERE ns = $1 AND test_key = $3 AND signer = $4 AND storage_key = $5 AND NOT EXISTS (SELECT 1 FROM up);
 ```
 
-A conflict on `(ns, key)` implies the same slot. The unhinted variant keeps `key`, `issued` and `tree16`, and reads
-the key back when no row is returned.
+A conflict on `(ns, key)` implies the same slot. The unhinted variant keeps `key`, `issued` and `tree16` and compares
+`(value, encoding)` only. Both read the kept key back in the same statement, so a put is one round trip (a second
+only in a concurrent race); comparing `encoding` lets identical bytes repair a row this vci cannot read. Concurrent
+first inserts of one key can collide on the primary key `(ns, key)`, which is not the arbiter, so a unique
+violation is retried (up to three times).
 
 **`put_manifest`** always refreshes `put_at` and reports a change. The CTE reads the snapshot before the upsert:
 
 ```sql
-WITH old AS (SELECT value FROM vci.manifests WHERE ns=$1 AND root=$2)
+WITH old AS (SELECT value, encoding FROM vci.manifests WHERE ns=$1 AND root=$2)
 INSERT INTO vci.manifests AS m (ns, root, base, value) VALUES ($1, $2, $3, $4)
-ON CONFLICT (ns, root) DO UPDATE SET value = EXCLUDED.value, base = EXCLUDED.base, put_at = now()
-RETURNING (SELECT value FROM old) IS DISTINCT FROM $4 AS changed;
+ON CONFLICT (ns, root) DO UPDATE SET
+  value = CASE WHEN m.value IS DISTINCT FROM EXCLUDED.value OR m.encoding <> 0 THEN EXCLUDED.value ELSE m.value END,
+  base = EXCLUDED.base, encoding = 0, put_at = now()
+RETURNING COALESCE((SELECT value FROM old) IS DISTINCT FROM $4 OR (SELECT encoding FROM old) <> 0, true) AS changed;
 ```
 
 **`remove`**: `DELETE FROM vci.attestations WHERE ns=$1 AND key = ANY($2) RETURNING key`. It is immediate and
@@ -1666,7 +1790,7 @@ global, with no records.
 
 ```sql
 DELETE FROM vci.manifests m
-WHERE m.ns=$1 AND m.root = ANY($2) AND m.put_at < now() - $3::interval
+WHERE m.ns=$1 AND m.root = ANY($2) AND m.put_at <= now() - make_interval(secs => $3)
   AND NOT EXISTS (SELECT 1 FROM vci.attestations a WHERE a.ns=$1 AND a.manifest_ref = m.root)
   AND NOT EXISTS (SELECT 1 FROM vci.manifests b WHERE b.ns=$1 AND b.base = m.root)
 RETURNING root;
@@ -1674,8 +1798,10 @@ RETURNING root;
 
 The grace period (`manifest_grace`, default 1 h, at most 30 days) must exceed the longest gap between a run's
 `put_manifest` and the `finish` of its batch. Another run's `put_manifest` either re-inserts the root or refreshes
-`put_at` before its attestation commits, so the root is never deleted from under it. `vci prune` is meant to remove
-with grace 0; how it asks for that is still open (section 20).
+`put_at` before its attestation commits, so the root is never deleted from under it. A handle opened with
+`OpenContext::long_running` (`vci prune`) uses grace 0; `manifest_grace = "0s"` does too. The comparison is `<=`, so
+grace 0 also removes a root put in the same instant. Referenced roots and other manifests' bases are kept whatever
+the grace, and not counted.
 
 **`batch`** is write-behind (`WriteBatch::deferred`), with `finish` flushing as section 6 describes:
 
@@ -1684,7 +1810,13 @@ with grace 0; how it asks for that is still open (section 20).
   twice in one statement;
 - then `DELETE … = ANY`.
 
-1,000 units cost about three statements instead of about 3,000 round trips.
+Measured: a 1,000-unit batch takes 5 statements (gate 6), the schema version check, `BEGIN` and `COMMIT` included,
+instead of about 3,000 round trips. Inside a deferred batch:
+
+- `put_manifest` returns `true` unless the batch already holds the same bytes;
+- `remove` returns every entry asked for, deduplicated by key;
+- an unhinted put looks up the slot's key: queued first, else stored (one read), else the plain key;
+- dropping the batch without `finish` also flushes it.
 
 ### fetch, push, hints, roles
 
@@ -1693,13 +1825,16 @@ with grace 0; how it asks for that is still open (section 20).
 - **`vci push`** prints `vci: nothing to push: the postgres store is shared; attestations were stored when vci run
   made them`.
 - **`--rewrite-history`** and **`--remote`** exit 2.
-- **Hints.** Hints live server-side per namespace. `passing_on` results are memoized for the process.
-  `remember_passing` is one UNNEST upsert and deletes rows older than 7 days at most once per process. Every hint
-  error is swallowed.
-- **Roles (recipe in the operator docs).**
-  - `vci_owner` runs DDL (the first write, later `vci store init`).
-  - `vci_writer` has SELECT, INSERT, UPDATE and DELETE on attestations and manifests, for protected-branch CI.
-  - `vci_reader` has SELECT, plus INSERT and UPDATE on memo and flags, for pull-request jobs and developers.
+- **Hints.** Hints live server-side per namespace. `passing_on` results are memoized per tree per handle, and the
+  flags are loaded once per handle (every flag of the namespace). `remember_passing` is one UNNEST upsert; the 7-day
+  memo prune is a statement of its own, once per handle, with its errors ignored (a single CTE would make a role
+  without DELETE on memo lose the upsert too). Every hint error is swallowed, and hints never create the schema.
+- **Roles** (the recipe is in docs/REFERENCE.md, "PostgreSQL", and was checked against a server: a writer before the
+  schema exists gets `NotInitialized`, a reader's write `Denied`).
+  - `vci_owner` runs DDL (`CREATE` on the database; its first write creates the schema, later `vci store init`).
+  - `vci_writer` has USAGE on the schema and SELECT, INSERT, UPDATE and DELETE on its tables, for protected-branch CI.
+  - `vci_reader` has USAGE and SELECT, plus INSERT and UPDATE on memo and flags, for pull-request jobs and
+    developers.
   - Optional RLS: `CREATE POLICY own_rows ON vci.attestations FOR ALL TO vci_writer USING (stored_by = session_user)
     WITH CHECK (stored_by = session_user)` plus a read-all SELECT policy, so a role can delete or replace only its own
     rows.
@@ -1752,8 +1887,8 @@ every write is idempotent, and `batch` is a bulk upload.
    stores and migrations can re-put records known only by key. `put_for_test` keeps run.rs simple.
 5. **`ValueState` is derived, not stored.** No new field to keep in step, and no struct literal breaks. The plan
    tracks its own deferrals (`SetAside`).
-6. **Deferred batches report after `finish`.** Output never claims a unit that was not stored. git-meta (and SQLite,
-   as designed) use immediate batches, so their output is unchanged.
+6. **Deferred batches report after `finish`.** Output never claims a unit that was not stored. git-meta and SQLite
+   use immediate batches, so their output is unchanged.
 7. **Secrets only in `VCI_STORE_URL`, removed from vci's own environment at start-up.** `VCI_*` reaches tests.
 8. **Working-tree selection, environment-only credentials, connection keys refused in `vci.toml`.** See section 9.
 9. **A factory registry.** A new backend is a crate plus one line, with no enum in vci-store to edit. `for_repo`
@@ -1794,32 +1929,44 @@ Decided on 25 October 2026, before the work was built:
 5. **Rollout.** One release, 2.8.0: `[store]` acceptance and the backends ship together, git-meta stays the default
    with byte-identical output.
 6. **PostgreSQL in the release binaries.** Yes: vci-cli's default features are `["sqlite", "postgres"]` with the
-   rustls `ring` provider. The musl binary size with and without `postgres` is to be recorded.
+   rustls `ring` provider. The musl binary size with and without `postgres` is recorded in section 17.
 7. **The `hydrate_more` fix** ships with the trait work, in 2.8.0, as its own commit (section 5).
 8. **Manifest grace.** 1 hour; `remove_manifests` keeps a root put less than an hour ago unless grace 0 is requested
    (prune).
 9. **`NOT_FETCHED` wording** stays byte-identical.
 10. **git-meta's lock wait during plan-time prefetch** is out of scope and unchanged (tracked separately as speed
     work).
-11. **PostgreSQL transfer per plan.** Keep the per-handle cache; the statement-count gates are the bound, and bytes
-    are to be measured.
+11. **PostgreSQL transfer per plan.** Keep the per-handle cache; the statement-count gates are the bound. The bytes
+    were measured (section 17).
 12. **SQLite exchange.** None in v1: `vci fetch` and `vci push` print the section 7 "local" messages and exit 0;
     `--remote` and `--rewrite-history` exit 2.
 13. **Dependency pins.** Exact pins published at least two weeks before 25 October 2026, `ring` only (section 17).
 
+Decided while building it:
+
+14. **How `vci prune` asks a shared store for grace 0.** `OpenContext::long_running` (true for `vci prune`) means grace
+    0 and a statement timeout of at least 600 s on PostgreSQL. No trait change.
+15. **The cost of PostgreSQL in the release binaries** (decision 6) is recorded in section 17: about 2.8 MiB of a
+    17.5 MiB static x86_64 musl binary.
+16. **The default namespace in a shallow clone** is refused by the PostgreSQL backend itself (section 17), because
+    `Repo::repo_id()` returns the shallow boundary there instead of failing.
+
 Still open:
 
-1. **How `vci prune` asks a shared store for grace 0.** `remove_manifests(&[&str])` has no grace argument, and the
-   selection's `manifest_grace` is a per-store setting. Candidates: `OpenContext::long_running` implies grace 0, or a
-   trait method or argument for it. To settle with the PostgreSQL backend.
-2. **`vci prune`'s messages on a store that keeps roots.** Prune removes one manifest root per call and prints
-   `removed project vci:manifest:<root> (unreferenced manifest)` whatever `remove_manifests` returns (and `removed
-   <target> <key>` whatever `remove` returns). That is exact for git-meta, but would claim removals a shared store
-   declined. Print from the returned count instead, before a backend with grace ships.
+1. **`vci prune`'s messages on a store without an exchange or that keeps roots.** Prune removes one manifest root per
+   call and prints `removed project vci:manifest:<root> (unreferenced manifest)` whatever `remove_manifests` returns
+   (and `removed <target> <key>` whatever `remove` returns). That is exact for git-meta and SQLite; PostgreSQL (grace
+   0 under prune) still keeps a root that became referenced or a base meanwhile and returns 0 for it. Prune also ends
+   with ``run `vci push` to publish the deletions`` on every store, though only git-meta has anything to publish.
+   Print from the returned count, and the hint only when `exchange()` is `Some` (a vci-cli change).
+2. **PostgreSQL re-reads values in round 2.** `read_values` moves values out of the per-handle cache, so a round-2
+   `prefetch(Units{choose: None})` fetches them again: a third of a plan's bytes when every unit runs (section 17).
+   Keep values handed out in the cache (memory), or let prefetch skip keys this handle already returned.
 3. **`VCI_STORE` in `NEVER_TO_CHILDREN`.** A URL put in `VCI_STORE` by mistake is refused and never printed, but as a
    `VCI_*` variable it still reaches test processes. Drop `VCI_STORE` from children when it contains `://`, or always.
-4. **Measurements on a large repository.** The supersession and plan timings above were taken on a synthetic 600-unit
-   store; round 2's added read on a fully fetched vex store has not been measured.
+4. **Measurements on a large repository.** The supersession and plan timings and PostgreSQL's bytes per plan were
+   taken on a synthetic 600-unit store; round 2's added read on a fully fetched vex store, and a vex-scale plan from
+   PostgreSQL, have not been measured.
 5. **The concrete git-meta API.** Keep `AttestStore` and `Reader` public long-term for the 62 tests and e2e helpers,
    or port the about 20 backend-neutral tests to the conformance suite and mark the concrete API `#[doc(hidden)]`?
 6. **Output naming.** Keep `by.metaKey` and `by.target` forever, or add `by.store` and later rename `metaKey` to
@@ -1836,3 +1983,8 @@ Still open:
 11. **Follow-ups.** `vci store init`, `vci store copy`, `vci init --store`, the action inputs `store` and `store-url`
     (exported as `VCI_STORE` and `VCI_STORE_URL`, masked; for stores without an exchange the action drops `--fetch`
     and `--remote`), and deleting `AttestStore::remove_for_signer`.
+12. **`Repo::repo_id()` in a shallow clone.** It returns the commit where the clone was cut rather than failing; the
+    PostgreSQL backend guards itself (decision 16), and other users of the repository id may need the same guard.
+13. **SQLite details.** Whether the SQLite backend should turn syncing off when `CI` is set, as git-meta's store does
+    since 2.7.27; and turning on rusqlite's `cache` feature in `vci-store-sqlite` so it can use `prepare_cached`
+    (`hashlink` is already in `Cargo.lock` through git-meta-lib).

@@ -124,10 +124,10 @@ enum Cmd {
         /// Attestation lifetime (with --key or --oidc).
         #[arg(long, default_value = "14d", requires = "signing")]
         ttl: String,
-        /// Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code).
+        /// Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code). On a shared store (PostgreSQL) this is what stores them: without --push they are signed but not stored.
         #[arg(long, requires = "signing")]
         push: bool,
-        /// git-meta remote, or a git remote / URL, to push to (as `vci push --remote`).
+        /// git-meta remote, or a git remote / URL, to push to (as `vci push --remote`; a store without a remote ignores it with a warning).
         #[arg(long, requires = "push")]
         remote: Option<String>,
         /// Fetch attestations first, as `vci fetch` does, while the projects are probed (a failure is a warning: only attestations already stored locally are used). REMOTE as in `vci fetch --remote`.
@@ -154,26 +154,26 @@ enum Cmd {
         trusted_root: Option<Utf8PathBuf>,
         #[arg(long)]
         base_ref: Option<String>,
-        /// The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the local git-meta store when run inside the repository.
+        /// The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the repository's attestation store (git-meta by default) when run inside the repository.
         #[arg(long, value_name = "FILE")]
         manifest: Option<Utf8PathBuf>,
     },
-    /// Publish local attestations: git-meta push (refs/meta/main) with merge and retry.
+    /// Publish local attestations from the attestation store (git-meta by default: push refs/meta/main with merge and retry; a SQLite or PostgreSQL store has nothing to push).
     Push {
-        /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin).
+        /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin). git-meta only: a store without a remote exits 2.
         #[arg(long)]
         remote: Option<String>,
-        /// Publish the metadata as one commit without history (after `vci prune`: what a fetch downloads is then the current attestations, not every version ever published). Other clones merge onto it at their next fetch.
+        /// Publish the metadata as one commit without history (after `vci prune`: what a fetch downloads is then the current attestations, not every version ever published). Other clones merge onto it at their next fetch. git-meta only: other stores exit 2.
         #[arg(long)]
         rewrite_history: bool,
     },
-    /// Fetch attestations: git-meta pull (fetch refs/meta/main and materialize it locally).
+    /// Fetch attestations into the attestation store (git-meta by default: pull refs/meta/main and materialize it locally; a SQLite or PostgreSQL store has nothing to fetch).
     Fetch {
-        /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin).
+        /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin). git-meta only: a store without a remote exits 2.
         #[arg(long)]
         remote: Option<String>,
     },
-    /// Delete expired attestations from the local git-meta store (publish with `vci push`).
+    /// Delete expired attestations from the attestation store (git-meta by default: the local store, publish with `vci push`).
     Prune {
         /// Only list what would be deleted.
         #[arg(long)]

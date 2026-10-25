@@ -12,8 +12,9 @@ to run it again. `vci` makes that safe:
    instead (see [Quick start (Cargo)](#quick-start-cargo)).
 2. Attestations are [git-meta](https://git-meta.com/) metadata on the test unit's path (`git meta get
    path:src/b.test.ts`), exchanged on `refs/meta/main` by ordinary git push and fetch (`vci push`, `vci fetch`, or
-   `git meta push` / `git meta pull`). vci adds no database or files of its own; git is the transport and the
-   authority. See [Where attestations live (git-meta)](#where-attestations-live-git-meta).
+   `git meta push` / `git meta pull`). With git-meta, the default, vci adds no database or files of its own; git is
+   the transport and the authority. Since 2.8.0 a repository can keep them in a local SQLite file or on a shared
+   PostgreSQL server instead. See [Where attestations live](#where-attestations-live).
 3. In CI, `vci plan` checks each attestation against the **base commit's** `.vci/allowed_signers` (SSH keys) or
    `.vci/identities.toml` (CI jobs that sign keylessly with their OIDC token, since 2.0) and `vci.toml`, re-hashes
    every recorded input from CI's own checkout, and skips a test file only when everything matches.
@@ -1304,12 +1305,13 @@ checkout, clock, policy and environment.
 | Command | Purpose |
 |---|---|
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL] [--oidc]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet. `--oidc` (since 2.0) also writes `.vci/identities.toml`, trusting pushes to origin's default branch by the repository's workflow (its only file under `.github/workflows`, else `*`, to narrow) as principal `github-actions` (an existing file is left alone), and `.vci/sigstore-trusted-root.json` from `gh attestation trusted-root` (refreshed each time; without `gh`, a note says to write it): see [Keyless signing (OIDC)](#keyless-signing-oidc) |
-| `vci run [FILES…] [--key PATH \| --oidc[=github\|public-good]] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON. Since 1.9.0 each distinct input manifest is stored once, as its own value (`vci:manifest:<input root>`), and the attestation references it; storing an attestation deletes the same signer's attestations of that unit it supersedes (an earlier commit of this line of history, other files: see "Where attestations live (git-meta)"), printing `vci: removed N superseded attestation(s) ...` and how many manifests nothing references any more (since 2.0 it first fetches, in one batch, the stored attestations of those units that were not fetched yet; one that cannot be fetched is kept). `--oidc` (since 2.0; GitHub Actions with `permissions: id-token: write`) signs keylessly with the job's OIDC token instead of a key, through GitHub's Sigstore instance or, with `--oidc=public-good`, sigstore.dev's; the instance needs the `=` (`vci run --oidc a_test.go` runs `a_test.go`). See [Keyless signing (OIDC)](#keyless-signing-oidc). Since 2.1, once a project's tests have finished, its units are checked and signed in parallel (`$VCI_JOBS` at a time, default one per CPU; `ssh-keygen` processes, or keyless signatures, several at once), and each path of the checkout is read once for the whole run (its contents hash, a directory's children, git's answer to whether it is ignored), since the tree no longer changes (each unit still compares its inputs with the snapshot taken before the tests ran); the lines, `--summary` and the exit code are as before, in the units' order, and the store is written one unit at a time in that order. Since 2.1.3 the units are handed to the runner longest first, by the duration their newest stored attestation records (units without one first, in the listing's order), so that a runner that takes several at once does not end on its longest file; the lines, summary and store keep the listing's order. The attestations a new one supersedes are found in parallel too, and removed as it is stored. `VCI_TIMING=1` prints `read the last duration of N unit(s)`, `check, sign and store N unit(s) of P (J at a time)` and the thread-seconds of each part |
+| `vci run [FILES…] [--key PATH \| --oidc[=github\|public-good]] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON. Since 1.9.0 each distinct input manifest is stored once, as its own value (`vci:manifest:<input root>`), and the attestation references it; storing an attestation deletes the same signer's attestations of that unit it supersedes (an earlier commit of this line of history, other files: see [git-meta](#git-meta); every store does the same), printing `vci: removed N superseded attestation(s) ...` and how many manifests nothing references any more (since 2.0 it first fetches, in one batch, the stored attestations of those units that were not fetched yet; one that cannot be fetched is kept). `--oidc` (since 2.0; GitHub Actions with `permissions: id-token: write`) signs keylessly with the job's OIDC token instead of a key, through GitHub's Sigstore instance or, with `--oidc=public-good`, sigstore.dev's; the instance needs the `=` (`vci run --oidc a_test.go` runs `a_test.go`). See [Keyless signing (OIDC)](#keyless-signing-oidc). Since 2.1, once a project's tests have finished, its units are checked and signed in parallel (`$VCI_JOBS` at a time, default one per CPU; `ssh-keygen` processes, or keyless signatures, several at once), and each path of the checkout is read once for the whole run (its contents hash, a directory's children, git's answer to whether it is ignored), since the tree no longer changes (each unit still compares its inputs with the snapshot taken before the tests ran); the lines, `--summary` and the exit code are as before, in the units' order, and the store is written one unit at a time in that order. Since 2.1.3 the units are handed to the runner longest first, by the duration their newest stored attestation records (units without one first, in the listing's order), so that a runner that takes several at once does not end on its longest file; the lines, summary and store keep the listing's order. The attestations a new one supersedes are found in parallel too, and removed as it is stored. `VCI_TIMING=1` prints `read the last duration of N unit(s)`, `check, sign and store N unit(s) of P (J at a time)` and the thread-seconds of each part |
 | `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]] [--project NAME]...` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally. `--project NAME` (repeatable) plans only those `[[projects]]` entries (by `name`, as the base commit's vci.toml names them): the other projects are not listed, probed or verified (their toolchains need not be installed) and are absent from the output. An unknown name is an error (exit 2) naming the configured projects; the single-project form has no names, so `--project` is an error there. Since 2.1 files are verified in parallel (`$VCI_JOBS` threads, default one per CPU), each file's candidates newest first, and each path of the checkout is read once per plan (see [Verification](#verification-vci-plan), "Cost") |
-| `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--partition I/N] [--key PATH \| --oidc[=INSTANCE] [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). `--project` as for `vci plan`: only those projects are planned, run (and with `--key` attested), and only they appear in the printed plan and in the audit log's `projects`, `skipped` and `ran`; one CI job per suite (`vci ci --fetch origin --base-ref "$BASE" --project web`). `--partition I/N` (since 2.0; `1 <= I <= N`, anything else is a usage error, exit 2) splits a suite over N jobs: of the units the plan runs (for a project that runs everything, every unit it lists), this job runs only those in partition I. Since 2.4, a project whose units are all files is split by size: every unit it lists, skipped or not, largest file first, goes to the partition with the fewest bytes so far (ties: the lowest partition, then the smaller test id), so the jobs get about the same amount of tests (a file's size stands for how long it takes; vex's two Rails jobs had 2,762 and 3,231 s of tests split by test id, 3,047 and 2,946 s by size). Any other project (a unit that is not a file, such as a cargo unit), and every project with `VCI_PARTITION_BY=hash`, is split by test id: the first 8 bytes of the unit's storage key, BLAKE3 of the test id, big-endian, modulo N, plus one. Either way the split depends only on the checkout, never on what the plan skips or on the order or the other jobs, so every unit runs in exactly one partition, and a job run again after the others pushed agrees with them. What the plan skips is skipped in every partition. A project that runs everything and whose units cannot be listed runs whole in every partition that cannot list it, with a `::warning` (each job lists on its own and cannot know whether another listed it, so such a project may run in more than one job, never in none); without any readable project every partition runs the default project. After the plan it prints `partition 2/3: 41 of 120 units to run`; the exit code is this partition's tests'; the audit log's `ran` holds this partition's units and `partition` is `{index, count, units, total, unlisted}` (`units`: this partition's, `total`: all partitions', `unlisted`: projects this partition runs whole because it could not list them), `null` without the flag. With `--key --push` each job attests and publishes its own share (concurrent pushes merge and retry), so the next plan skips every partition's units: `vci ci --fetch origin --base-ref "$BASE" --project rust --partition ${{ matrix.part }}/3 --key ci-key --push --remote origin`. `--partition 1/1` runs what `vci ci` without it runs. Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list, or name the principal in `policy.attest_on_any_ref` (since 1.9.2) to let pull requests attest with it on purpose. `--oidc[=INSTANCE]` (since 2.0) attests as `--key` does, keylessly as `vci run --oidc` signs, and refuses on the same terms with the principals of the base `.vci/identities.toml` entries the job's identity matches (or when that file cannot be read there); a job without a token (no `permissions: id-token: write`) fails before anything runs, and an identity that matches no entry attests with a `::warning` that nothing will trust it. `--key` and `--oidc` exclude each other; `--ttl` and `--push` need one of them. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose) |
+| `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--partition I/N] [--key PATH \| --oidc[=INSTANCE] [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). `--project` as for `vci plan`: only those projects are planned, run (and with `--key` attested), and only they appear in the printed plan and in the audit log's `projects`, `skipped` and `ran`; one CI job per suite (`vci ci --fetch origin --base-ref "$BASE" --project web`). `--partition I/N` (since 2.0; `1 <= I <= N`, anything else is a usage error, exit 2) splits a suite over N jobs: of the units the plan runs (for a project that runs everything, every unit it lists), this job runs only those in partition I. Since 2.4, a project whose units are all files is split by size: every unit it lists, skipped or not, largest file first, goes to the partition with the fewest bytes so far (ties: the lowest partition, then the smaller test id), so the jobs get about the same amount of tests (a file's size stands for how long it takes; vex's two Rails jobs had 2,762 and 3,231 s of tests split by test id, 3,047 and 2,946 s by size). Any other project (a unit that is not a file, such as a cargo unit), and every project with `VCI_PARTITION_BY=hash`, is split by test id: the first 8 bytes of the unit's storage key, BLAKE3 of the test id, big-endian, modulo N, plus one. Either way the split depends only on the checkout, never on what the plan skips or on the order or the other jobs, so every unit runs in exactly one partition, and a job run again after the others pushed agrees with them. What the plan skips is skipped in every partition. A project that runs everything and whose units cannot be listed runs whole in every partition that cannot list it, with a `::warning` (each job lists on its own and cannot know whether another listed it, so such a project may run in more than one job, never in none); without any readable project every partition runs the default project. After the plan it prints `partition 2/3: 41 of 120 units to run`; the exit code is this partition's tests'; the audit log's `ran` holds this partition's units and `partition` is `{index, count, units, total, unlisted}` (`units`: this partition's, `total`: all partitions', `unlisted`: projects this partition runs whole because it could not list them), `null` without the flag. With `--key --push` each job attests and publishes its own share (concurrent pushes merge and retry), so the next plan skips every partition's units: `vci ci --fetch origin --base-ref "$BASE" --project rust --partition ${{ matrix.part }}/3 --key ci-key --push --remote origin`. `--partition 1/1` runs what `vci ci` without it runs. Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list, or name the principal in `policy.attest_on_any_ref` (since 1.9.2) to let pull requests attest with it on purpose. `--oidc[=INSTANCE]` (since 2.0) attests as `--key` does, keylessly as `vci run --oidc` signs, and refuses on the same terms with the principals of the base `.vci/identities.toml` entries the job's identity matches (or when that file cannot be read there); a job without a token (no `permissions: id-token: write`) fails before anything runs, and an identity that matches no entry attests with a `::warning` that nothing will trust it. `--key` and `--oidc` exclude each other; `--ttl` and `--push` need one of them. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose). On a shared store (PostgreSQL, since 2.8.0) `--push` is what stores: without it `vci ci` signs but stores nothing, its `attested` entries carry `"stored": false` and `pushed` is `false` (the publication gate, see [PostgreSQL](#postgresql)); on SQLite `--push` has nothing to do |
 | `vci verify <envelope\|-> [--allowed-signers F] [--identities F --trusted-root F] [--base-ref R] [--manifest FILE]` | Verify one DSSE envelope against `.vci/allowed_signers` (SSH-signed) or `.vci/identities.toml` and `.vci/sigstore-trusted-root.json` (keyless) at `--base-ref` or HEAD, or against the files given: once any trust file is given, an envelope whose kind needs one that was not is INVALID (the repository's files are then not used). It prints its claims, including the input manifest: inline (before 1.9.0) or the one it references, read from `--manifest FILE` (its compact encoding, as `git meta get project vci:manifest:<root>` prints it) or else from the git-meta store of the repository it runs in (since 2.0 fetched from the metadata remote when it was not fetched yet); its root must be the signed input root (exit 1 otherwise, or when it is not available). A keyless envelope prints the identity, the principal it matched, the timestamp authority and the run URL |
-| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history. Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed; since 2.0 a fetch downloads keys, not values (blobless; values are fetched when a plan, verify, run or prune reads them), and every merge is done from the trees' paths (`VCI_TIMING=1` prints `materialize (from paths, N changed entries, M not fetched)` or `materialize (full)`); and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against". Since 2.1.3 `VCI_TIMING=1` prints a push's parts: fetch and materialize the remote's metadata, check what the push would delete and what it sends, put the local metadata on top of the remote's, `git push`. Since 2.1.11 the values a plan or run reads are fetched by several `git fetch` processes at once, `VCI_FETCH_JOBS` of them (default 4; `1` fetches one batch after the other): a plan's 16,000 values came in 20 s instead of 37 on one laptop |
-| `vci prune [--dry-run] [--superseded] [--keep N]` | Delete attestations whose claimed expiry has passed from the local git-meta store (tombstones; `vci push` publishes them), and (since 2.2) per unit and signer every attestation but the `N` issued last (default 2; `--superseded`, since 1.8.2, is `--keep 1`), except one made on a tree some branch, remote-tracking branch or tag still has at its tip (2.1.12's rule): an older one vouches for inputs the tree no longer has, or soon will not, and every stored attestation costs each plan a download. Since 1.9.0 it then deletes the stored input manifests (`vci:manifest:<root>`) no remaining attestation references (none while an attestation, or the manifest reference of one it leaves alone, cannot be read), and prints how many (since 2.1.8 the base manifests the kept manifests list their entries on top of count as referenced, and a kept manifest that cannot be read keeps every manifest). Since 2.0 it reads every attestation, so it first fetches the ones a blobless fetch left out (one batch; on a large store most of what a fetch downloaded before 2.0); one that cannot be fetched is left alone, with a warning |
+| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | On SQLite and PostgreSQL (since 2.8.0) there is nothing to exchange: both say so, `vci fetch` with the number of attestations stored, and exit 0, and `--remote` and `--rewrite-history` exit 2 (see [Where attestations live](#where-attestations-live)). On git-meta, the default: git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history. Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed; since 2.0 a fetch downloads keys, not values (blobless; values are fetched when a plan, verify, run or prune reads them), and every merge is done from the trees' paths (`VCI_TIMING=1` prints `materialize (from paths, N changed entries, M not fetched)` or `materialize (full)`); and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against". Since 2.1.3 `VCI_TIMING=1` prints a push's parts: fetch and materialize the remote's metadata, check what the push would delete and what it sends, put the local metadata on top of the remote's, `git push`. Since 2.1.11 the values a plan or run reads are fetched by several `git fetch` processes at once, `VCI_FETCH_JOBS` of them (default 4; `1` fetches one batch after the other): a plan's 16,000 values came in 20 s instead of 37 on one laptop |
+| `vci prune [--dry-run] [--superseded] [--keep N]` | Delete attestations whose claimed expiry has passed from the attestation store (git-meta: the local store, as tombstones `vci push` publishes; SQLite and PostgreSQL: at once, and PostgreSQL removes the unreferenced manifests without its hour of grace), and (since 2.2) per unit and signer every attestation but the `N` issued last (default 2; `--superseded`, since 1.8.2, is `--keep 1`), except one made on a tree some branch, remote-tracking branch or tag still has at its tip (2.1.12's rule): an older one vouches for inputs the tree no longer has, or soon will not, and every stored attestation costs each plan a download. Since 1.9.0 it then deletes the stored input manifests (`vci:manifest:<root>`) no remaining attestation references (none while an attestation, or the manifest reference of one it leaves alone, cannot be read), and prints how many (since 2.1.8 the base manifests the kept manifests list their entries on top of count as referenced, and a kept manifest that cannot be read keeps every manifest). Since 2.0 it reads every attestation, so it first fetches the ones a blobless fetch left out (one batch; on a large store most of what a fetch downloaded before 2.0); one that cannot be fetched is left alone, with a warning |
+| `vci store info [--format text\|json]` | Since 2.8.0: which attestation store the repository uses (git-meta, SQLite or PostgreSQL) and how it was chosen: its location (never a password), every setting with its source (`$VCI_STORE_URL`, `vci.toml`, the default), what it can do, whether it exists and how many attestations it holds. Exit 0 when the store can be read (also when nothing is stored yet), 2 otherwise, after the error. See [Choosing a store](#choosing-a-store) |
 | `vci explain <test-file> [--base-ref R]` | Every candidate attestation checked (newest first since 2.1, up to the first that passes) and the first check it failed, with expected vs actual (an env failure names the variable and its class under the base policy, `env:DATABASE_URL (hash)`, never its value). It plans as `vci plan` does, fetching the values it reads; one that could not be fetched fails its candidate's `envelope` check with ``unreadable: value not fetched: run `vci fetch` online`` |
 | `vci env [--base-ref R] [--project NAME] [--format text\|json]` | Print the effective environment policy of each project: every variable `[env]` and the runner's built-in lists name, its class (`set`, `hash`, `ignore`, `built-in hash`, `built-in ignore`, `stripped`), where the rule comes from (`vci.toml set`, `vci.toml hash`, an old key name, `built-in <adapter>`, `test script`) and what it is here (the value vci sets; `present (<hash prefix>)` or `absent`); variables present here that the tests will not see are listed as removed. With `--base-ref`, a `BASE` column says where the base commit's policy differs (CI judges with it). Runs nothing (docs/ENV.md, "vci env") |
 
@@ -1333,7 +1335,9 @@ binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`, and th
 (go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_CARGO_JOBS` (Cargo test
 executables run at once in `vci run` and `vci ci`; default: the number of CPUs; cargo itself runs one build at a
 time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory
-holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`).
+holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`). The attestation store: `VCI_STORE`, `VCI_STORE_URL`,
+`VCI_STORE_NAMESPACE`, `VCI_STORE_CONNECT_TIMEOUT_SECS`, `VCI_STORE_TIMEOUT_SECS` (since 2.8.0; see [Choosing a
+store](#choosing-a-store)).
 
 Every collector directory is resolved to its real path before use, and what a test process reads of vci's own
 collector files is never an input, whichever path reached them: Homebrew installs them in
@@ -1407,7 +1411,42 @@ The old key names `global` (now `hash`), `pass_through` (now `ignore`) and `env`
 work, with one warning naming each key to rename; `mode = "strict"` is accepted silently and `mode = "loose"` with a
 deprecation warning. Attestations made before vci 1.6.0 re-run once: the env config digest changed (docs/ENV.md).
 
-## Where attestations live (git-meta)
+## Where attestations live
+
+An attestation (the signed DSSE envelope) and the input manifest it references are kept in the repository's
+**attestation store**. Since 2.8.0 there are three; git-meta stays the default, and a repository that configures
+nothing behaves exactly as before:
+
+| store | where | shared how | selected by |
+|---|---|---|---|
+| [git-meta](#git-meta) (the default) | `.git/git-meta.sqlite`, exchanged on `refs/meta/main` of a git remote | `vci push` and `vci fetch` (`vci ci --push`, `--fetch`) | nothing, or `VCI_STORE=git-meta` |
+| [SQLite](#sqlite) | one file, `<git common dir>/vci-store.sqlite` | not shared: the clone and its worktrees (a CI cache can carry the file) | `VCI_STORE=sqlite` |
+| [PostgreSQL](#postgresql) | tables in schema `vci` of a server, one namespace per repository | at once: every write is seen by every reader | `VCI_STORE_URL=postgres://…` |
+
+[Choosing a store](#choosing-a-store) says how one is selected and configured, and `vci store info` which one a
+repository uses. [docs/STORE-BACKENDS.md](STORE-BACKENDS.md) is the design: the store contract every backend
+implements, how the commands use it, each backend's internals, and the guide for writing another.
+
+What every store has in common:
+
+- **The store is never trusted.** `vci plan` verifies every envelope against the base commit's allowed signers and
+  identities and recomputes every manifest's root, so a record that is forged, altered, replayed, missing or
+  deleted can only make a unit run, never skip. Write access to a store (push rights on `refs/meta/main`, a
+  PostgreSQL role with INSERT and DELETE, a writable SQLite file) is an availability privilege, not an integrity one.
+- **The same keys everywhere.** An attestation is stored under `vci:attestation:<test key>:<signer id>:<storage
+  key>[:<hint>]` on its unit's target and a manifest under `vci:manifest:<input root>` (described under
+  [git-meta](#git-meta)), whatever the store, so `by.metaKey` and `by.target` in `vci plan --format json` read the same
+  way and `vci explain` prints `candidate 1: <store> <target> <key>` (`candidate 1: sqlite project
+  vci:attestation:…`). A re-attestation of the same unit and inputs by the same signer replaces the earlier one;
+  supersession and `vci prune` work the same on every store.
+- **Failing open.** When the store cannot be used (a server that cannot be reached, a file that is not a vci store,
+  a role without the privilege, a schema newer than this vci, a `[store]` that cannot be read), `vci plan` and `vci
+  explain` warn and run every test; `vci run` and `vci ci` still run the tests, refuse to attest each unit with the
+  reason (`vci: not attesting b: signing or storing failed: postgres store unavailable: …`) and keep the tests' exit
+  code; `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2 with the error. An error of git-meta's own
+  is a problem of the run, as before 2.8.0 (`vci run` exits 2).
+
+### git-meta
 
 vci keeps no storage format of its own. Every attestation is one [git-meta](https://git-meta.com/) string value:
 
@@ -1492,8 +1531,10 @@ index, `HEAD` and work tree are never touched) and is exchanged on the remote's 
   downloaded and read. `vci plan` (and `vci ci`, `vci explain`) then fetches the values it reads in one `git fetch
   --stdin` of blob ids each: the attestations of the units it verifies, then the input manifests of each unit's
   newest attestation (since 2.1.13; every candidate's before, six times as many on vex), and after its first pass,
-  in one more batch, the manifests of the other attestations of the units it could not skip, which are checked
-  again (`VCI_TIMING=1` prints `round 2: fetch N more manifest(s)`). The store's promised rows and the local
+  in one more batch, the other candidates of the units it could not skip and their manifests, which are checked
+  again (`VCI_TIMING=1` prints `round 2: fetch N more value(s) for M unit(s) not skipped, ...`; since 2.8.0 a round
+  that fetched nothing still reads the candidates the plan set aside when they are already here, see
+  [Verification](#verification-vci-plan)). The store's promised rows and the local
   metadata tree are listed once for all of a plan's batches (2.1.13: listing them for each took 12 of a vex job's 24 s);
   `vci verify` fetches the one manifest it reads, `vci run` the attestations of the units it attests (supersession
   reads them), and `vci prune` every attestation (on a large store, what a fetch downloaded before 2.0). A value that
@@ -1580,6 +1621,171 @@ Interoperability, checked by the tests against `git-meta` 0.1.13 when it is inst
 readable with `git meta pull` + `git meta get`; values set (`git meta set`) or deleted (`git meta rm`) with the CLI and
 `git meta push`ed are what `vci fetch` + `vci plan` see.
 
+### SQLite
+
+`VCI_STORE=sqlite` (since 2.8.0) keeps the attestations of one repository in one SQLite file, by default
+`<git common dir>/vci-store.sqlite` (`.git/vci-store.sqlite`): the clone's linked worktrees share it, unlike
+git-meta's store. `[store.sqlite] path` (relative to the git common directory, without `..`) or
+`VCI_STORE_URL=sqlite:<path>` (absolute, or relative to the git common directory) puts it elsewhere. It is never
+`.git/git-meta.sqlite`. Keep it off network file systems: SQLite's WAL mode needs shared memory.
+
+- **Created by the first write.** Reading a missing file (`vci plan`, `vci fetch`, `vci store info`) creates nothing:
+  the store is absent, and the plan warns `no attestations are available in the sqlite store (the first `vci run`
+  creates it)` and runs everything. The first `vci run` creates the file and its schema (version 1).
+- **Writes** commit one by one (WAL, `synchronous=NORMAL`; `VCI_STORE_SYNC=off` turns syncing off, and unlike
+  git-meta's store it does not do so on its own when `CI` is set). Two vci processes writing at once wait for each
+  other, at most the store timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`, default 30 s), after which the unit is
+  refused. A removal (supersession, `vci prune`) is immediate, and a manifest is removed only when no attestation
+  references it and no other manifest is built on it.
+- **Nothing to exchange.** `vci fetch` prints `vci: the sqlite store at <path> is local: nothing to fetch (N
+  attestations stored)`, `vci push` prints `vci: nothing to push: the sqlite store is local; attestations were stored
+  when vci run made them`, and both exit 0, so a workflow that switches store keeps working; `--remote` and `vci push
+  --rewrite-history` exit 2. To share the file, copy it, for example as a CI cache; parallel jobs writing copies of
+  one file lose each other's writes (the last cache saved wins).
+- **One consistent file.** Each command checkpoints the write-ahead log when it closes the store, so no `-wal` or
+  `-shm` file is left behind and a cache of the file captures everything.
+- **Files it will not use.** A read-only file, or one in a read-only directory, is read, and writes to it are refused
+  (`sqlite store refused to write: …`). A file that is not a vci store (another SQLite database, git-meta's store, a
+  file that is not a database) is never written, and the store is unavailable; a vci store of a newer schema says to
+  upgrade vci. Both fail open.
+- **Hints.** The plan's memo of passing attestations and its flags are kept in the file (memo entries older than a
+  week are forgotten), as git-meta keeps them in its store.
+
+### PostgreSQL
+
+`VCI_STORE_URL=postgres://<user>:<password>@<host>[:<port>]/<database>` (since 2.8.0; also `postgresql://`, or a
+libpq `key=value` string) keeps the attestations on a PostgreSQL server that every machine reads and writes at once:
+no push, no fetch, no cache.
+
+- **The URL is a secret** and comes only from `VCI_STORE_URL`. vci removes it from its own environment as it
+  starts, so no test, probe or hook it runs ever sees it (`VCI_*` variables otherwise reach every test process), and
+  never prints it: `vci store info`, errors and `vci fetch` show `postgres://***@db.example.com:5432/ci`, and the
+  metrics log records only the store's kind. In GitHub Actions, put it in a secret of an environment; pull requests
+  from forks get no secrets, so their jobs cannot read the store and run every test.
+- **TLS.** Without `sslmode`, TLS is required, except for `localhost`, `127.0.0.1`, `::1` and Unix sockets, where it is
+  preferred. Certificates are always verified, against the webpki roots plus the CA file of
+  `?sslrootcert=/path/to/ca.pem`, which vci reads itself; `verify-ca` and `verify-full` mean `require`, `allow` means
+  `prefer`. A server whose certificate cannot be verified fails even under `prefer` (no fall back to plain text): give
+  a self-signed local server `sslrootcert`, or `sslmode=disable`.
+- **Schema and namespace.** The tables live in schema `vci` (`[store.postgres] schema`), which the first write of a
+  role allowed to create it creates (under an advisory lock, so concurrent first writers are safe). Until then reads
+  answer as an empty store, and a role that may not create it gets `postgres store is not set up: the first vci run
+  with a role allowed to create schema vci creates it`. Every row carries the repository's namespace: by default its
+  repository id (its first commit), so forks and mirrors share their attestations and unrelated repositories never
+  do; `VCI_STORE_NAMESPACE` or `[store.postgres] namespace` sets another. A shallow clone cannot give the repository
+  id (its first commit is where the clone was cut), so there the store needs `VCI_STORE_NAMESPACE`, with the same
+  value everywhere, and fails open without it.
+- **Bounded time.** Connecting waits at most 5 s (`VCI_STORE_CONNECT_TIMEOUT_SECS`, `[store] connect_timeout`), a
+  statement at most 30 s (`VCI_STORE_TIMEOUT_SECS`, `[store] timeout`; ten minutes for `vci prune`), a lock at most
+  10 s. After the first failure to connect, or the first wait that ran out, every later call of the command fails at
+  once, so a server that is down costs one connect timeout per command, and the plan runs everything. Each vci process
+  opens at most 8 connections (`[store.postgres] pool`, 1 to 64), named `vci <version> <command>` in
+  `pg_stat_activity`.
+- **The publication gate.** On git-meta nothing leaves a CI job unless it runs `vci ci --push`. A shared store would
+  publish every write at once, so on PostgreSQL `vci ci` without `--push` signs but stores and removes nothing: it
+  prints `vci: not storing N attestation(s): the postgres store is shared and vci ci was not given --push`, its
+  `attested` line adds `(not stored: the postgres store is shared and --push was not given)`, and the audit log's
+  `attested` entries carry `"stored": false` and `pushed` is `false`. `vci ci --push` stores (`pushed: true` means
+  stored), as does a plain `vci run`: a developer publishing directly. Give pull request jobs and developers who should
+  not publish a role that cannot write (below).
+- **Batches.** A project's attestations are written in one transaction once its units are signed (in a few for more
+  than 2,000 writes), and each `vci: attested …` line is printed only once that transaction committed. A transaction
+  that fails refuses every unit it held (`signing or storing failed: storing the batch: …`), and nothing claims an
+  attestation that was not stored.
+- **Manifests.** A manifest nothing references is kept for an hour after it was last stored
+  (`[store.postgres] manifest_grace`, at most 30 days), so another run storing the same manifest at that moment does
+  not lose it; `vci prune` removes such manifests at once.
+- **Hints.** The memo and the flags are tables on the server, per namespace, shared by everyone: a pull request's plan
+  reads what main's plans remembered without any cache. They never fail: a role that cannot write them just leaves
+  them alone.
+- **Cost.** A plan reads with about a dozen statements, whatever the number of units (13 for 1,200 units in the
+  tests), from a cache the handle fills in a few statements; a run writes 1,000 units in 5. Transfer, measured on a
+  synthetic store of 600 Go units with three attestations of about 3 KB each and small manifests: 5.1 MiB for a plan
+  that skips every unit and 11.4 MiB for one that runs every unit. On a real repository the input manifests (often
+  megabytes) dominate.
+- **Nothing to exchange.** `vci fetch` and `vci push` say the store is shared (`vci: the postgres store at
+  postgres://***@…/ci schema vci namespace <id> is shared: nothing to fetch (N attestations stored)`) and exit 0;
+  `--remote` and `--rewrite-history` exit 2.
+
+Roles (one schema per deployment; there is no row-level security per namespace in this version, so any role that can
+write the schema can write or delete any repository's rows on it, which only ever makes units run):
+
+```sql
+-- as an administrator
+CREATE ROLE vci_owner  LOGIN PASSWORD '...';   -- creates the schema: its first `vci run` does
+CREATE ROLE vci_writer LOGIN PASSWORD '...';   -- protected-branch CI (vci ci --push)
+CREATE ROLE vci_reader LOGIN PASSWORD '...';   -- pull request jobs and developers: plan, explain
+GRANT CREATE ON DATABASE ci TO vci_owner;
+-- once vci_owner's first `vci run` created schema vci
+GRANT USAGE ON SCHEMA vci TO vci_writer, vci_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vci TO vci_writer;
+GRANT SELECT ON ALL TABLES IN SCHEMA vci TO vci_reader;
+GRANT INSERT, UPDATE ON vci.memo, vci.flags TO vci_reader;  -- optional: the plan's hints
+```
+
+A reader's `vci run` refuses each unit (`postgres store refused to write: permission denied for table manifests`)
+and keeps the tests' exit code. Back up with `pg_dump -n vci`; `vci prune` keeps the tables small.
+
+### Choosing a store
+
+The store is chosen once per command, from the first of:
+
+1. **`VCI_STORE`**: `git-meta`, `sqlite` or `postgres` (also `gitmeta`, `sqlite3`, `postgresql`, `pg`). Never a URL:
+   a value with `://` is refused and not printed.
+2. **The scheme of `VCI_STORE_URL`**: `postgres://` or `postgresql://` is PostgreSQL, `sqlite:` is SQLite.
+3. **`[store] backend`** in the working tree's `vci.toml` (see [`vci.toml`](#vcitoml)).
+4. **git-meta.**
+
+Empty variables count as unset. `VCI_STORE` that disagrees with the scheme of `VCI_STORE_URL`, PostgreSQL without
+`VCI_STORE_URL`, an unknown backend or one this vci was built without, and a value out of range are errors: the store
+is then unusable and every command fails open as above. A `[store] backend` the environment overrides, and settings
+for a backend that is not selected, are warnings (on stderr, and in the plan's `warnings`). The environment variables
+are listed in [docs/ENV.md](ENV.md#store-selection).
+
+- **Secrets only in the environment.** `vci.toml` is in every checkout, a pull request's included, so it may name a
+  kind and tune it but never say where: `url`, `host`, `user`, `password` and `dbname` are refused there (the error
+  names the keys, never their values). A pull request can pick a store kind for its own jobs, never an address or a
+  credential; since no store is trusted, the most it can do is make its own units run.
+- **`[store]` is never an input**: switching store invalidates no attestation. A new store starts empty, though, so
+  its units run (and are attested) once; there is no command that copies a store yet.
+- **The working tree's `vci.toml`.** The store is chosen from the checkout, not from the base commit, so that `vci
+  plan --fetch` can start before the base is resolved and the plan and run of one `vci ci` agree. Only `[store]` is
+  read from it; a `[store]` that cannot be read, or a `vci.toml` that is not TOML at all, makes the store unusable
+  (fail open), with an error naming the file and line, never values.
+- **Rolling out.** A vci before 2.8.0 rejects a `vci.toml` with `[store]` (an unknown key), so at a base commit with it
+  that vci runs every test. Introduce a store with `VCI_STORE` and `VCI_STORE_URL` in the CI jobs and developers'
+  environments first, and add `[store]` only once every runner and developer has 2.8.0 or later.
+- **CI.** git-meta jobs keep `vci ci --fetch origin ... --push --remote origin`. On SQLite and PostgreSQL `--fetch`'s
+  remote and `--push`'s `--remote` are ignored with a warning, so the same command works; on PostgreSQL `--push` is
+  what stores (the publication gate above), and the job needs `VCI_STORE_URL` from a secret and, with a shallow
+  checkout, `VCI_STORE_NAMESPACE`.
+
+`vci store info [--format json]` prints the store, its location (password hidden), every setting with where it came
+from, what the store can do, whether it exists and how many attestations it holds:
+
+```
+store: postgres
+location: postgres://***@127.0.0.1:55451/postgres schema vci namespace a72c5449cd64e8837a3a4dd8c75a6334c5d70de9
+settings:
+  backend: postgres ($VCI_STORE_URL)
+  url: postgres://***@127.0.0.1:55451/postgres ($VCI_STORE_URL)
+  schema: vci (the default)
+  namespace: (the repository id) (the default)
+  pool: 8 (the default)
+  manifest_grace: 3600s (the default)
+  connect_timeout: 5s (the default)
+  timeout: 30s (the default)
+capabilities: shared writes yes, lazy values no, keeps hints yes
+exchange: none (vci fetch and vci push have nothing to do)
+status: absent: nothing is stored yet (the first vci run with a role allowed to create schema vci creates it)
+attestations: 0
+```
+
+It exits 0 when the store can be read (also before anything is stored) and 2 otherwise, after printing what it knows
+and the error: run it first when a plan says `reading attestations from postgres: …`. The JSON form has `kind`,
+`location`, `settings` (`name`, `value`, `source`), `caps`, `exchange`, `status` (`ready`, `absent` or
+`unavailable`), `advice`, `schemaVersion`, `count`, `error` (`code`, `transient`, `message`) and `warnings`.
+
 ## CI attests its own runs
 
 Without a key, `vci ci` only consumes attestations, so a commit whose only change is a README still runs every unit
@@ -1591,8 +1797,8 @@ own behind, and the next commit's CI skips every unit whose inputs did not chang
    attestation for every unit that passed and is attestable, stores them locally and publishes them on
    `refs/meta/main`.
 2. **Commit B** changes `src/b.ts`, which only `src/b.test.ts` reads. Its CI fetches A's attestations. They are keyed
-   by unit, signer and input root, not by commit (see [Where attestations live
-   (git-meta)](#where-attestations-live-git-meta)), so every unit whose recorded inputs hash the same in B's checkout
+   by unit, signer and input root, not by commit (see [Where attestations
+   live](#where-attestations-live)), so every unit whose recorded inputs hash the same in B's checkout
    skips. `src/b.test.ts` fails the `inputs` check (`entry:src/b.ts`), runs, is attested and pushed.
 3. **Commit C** changes only `README.md`, which no test reads. Every unit skips: `vci ci` prints `vci ci: every test
    file is covered by a valid attestation; nothing to run` and exits 0 without starting the test runner. The job
@@ -1816,7 +2022,28 @@ ignore = ["PGPASSWORD"]
 [[inputs]]             # extra inputs of matching test ids (any adapter; needed by Cargo, see above)
 match = ["crates/b#test:*"]
 extra = ["testdata/**"]
+
+# [store]                # since 2.8.0; read from the working tree, never an input (see "Choosing a store")
+# backend = "sqlite"     # "git-meta" (default) | "sqlite" | "postgres"; VCI_STORE and VCI_STORE_URL win
+# connect_timeout = "5s" # a network store's connect bound (VCI_STORE_CONNECT_TIMEOUT_SECS wins)
+# timeout = "30s"        # one statement or wait (VCI_STORE_TIMEOUT_SECS wins)
+
+# [store.sqlite]
+# path = "vci-store.sqlite"   # relative to the git common directory, no `..` (absolute: VCI_STORE_URL=sqlite:<path>)
+
+# [store.postgres]       # tuning only: an address or a credential here is an error (VCI_STORE_URL carries them)
+# schema = "vci"
+# namespace = "acme-web" # default: the repository id; VCI_STORE_NAMESPACE wins
+# pool = 8               # connections per vci process, 1 to 64
+# manifest_grace = "1h"  # keep an unreferenced manifest stored this recently (at most 30 days; vci prune: none)
 ```
+
+**`[store]`** (since 2.8.0) chooses the attestation store, after `VCI_STORE` and `VCI_STORE_URL`: see [Choosing a
+store](#choosing-a-store). Unlike the rest of the file it is read from the **working tree**, not the base commit, and
+it is never an input. Durations are `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"` or a number of seconds. `url` (in
+`[store]` or `[store.postgres]`) and `host`, `user`, `password` and `dbname` are refused, naming the keys and never
+their values. **A vci before 2.8.0 rejects a `vci.toml` with `[store]`** and so runs every test against such a base
+commit: select the store with `VCI_STORE` or `VCI_STORE_URL` until every runner and developer has 2.8.0.
 
 **`policy.allow_superuser_mismatch`** (default `false`). Every toolchain records whether the tests ran as root
 (`superuser`), and `vci plan` normally requires the same: a CI job that runs as root (a GitHub `container:` job, many
@@ -2427,7 +2654,8 @@ project's directory, adapter and adapter settings (`runner`, the node:test comma
 `[[inputs]]`. Nothing else of the file is an input: not `[policy]` (read from the base commit when planning), not
 comments or formatting, not other projects. Before 2.7.0 the whole file was a global input of every unit, so any
 edit to it ran every unit of every project again. A project whose directory the checkout does not have is left out
-with a warning (2.7.0; it has no units), instead of every project running.
+with a warning (2.7.0; it has no units), instead of every project running. `[store]` (2.8.0) is never an input either:
+switching the attestation store invalidates no attestation.
 
 ## Verification (`vci plan`)
 
@@ -2509,13 +2737,25 @@ git cannot answer about this way is not cached, and a manifest that lists one is
 first. `vci run` does the same: when git stops, a unit's answer is git's for that unit's paths alone. `VCI_TIMING=1`
 prints the phase as `verdicts (rehash inputs, check candidates)`.
 
-Since 2.0 `vci fetch` downloads the store's keys, not its values (see [Where attestations live
-(git-meta)](#where-attestations-live-git-meta)). Before the checks, the plan fetches the values it reads that are not
+Since 2.0 `vci fetch` downloads the store's keys, not its values (see [git-meta](#git-meta); SQLite and PostgreSQL
+hold every value, and nothing is fetched). Before the checks, the plan fetches the values it reads that are not
 here yet: the candidates of every unit of the projects it verifies (not of projects that run everything), in one `git
 fetch` of blob ids, then the input manifests they reference, in a second. A fetch that fails is a warning (`could not
 fetch N stored attestation value(s): ...; their units run`); a value that still cannot be read fails only its own
 candidate, at the `envelope` check (``unreadable: value not fetched: run `vci fetch` online``), or, for a manifest,
 the `inputs` check.
+
+**Candidates set aside** (since 2.8.0). Before its first verdicts the plan reads only a few candidates of each unit
+(the one its memo names, those made on this tree, the newest) and sets the others aside. For the units it could not
+skip it then reads those too and checks the units again (round 2, and round 3 when round 2 made more of them
+readable); a lazy git-meta store fetches them first. Before 2.8.0 a round ended as soon as its fetch found nothing more
+to download, so on a store that already held every value (a fully fetched git-meta clone, and SQLite and PostgreSQL
+always) the candidates set aside were never checked, and a unit whose two newest attestations failed while an older
+one passed ran. A round now ends only when it fetched nothing and its read made no candidate readable. A unit whose
+remembered attestation failed on its inputs is still not read again (2.7.30). `VCI_TIMING=1` prints `round N: read K
+candidate value(s) of U unit(s) again` and `round N: read K candidate(s) set aside for U unit(s) not skipped, check
+them again (R still not)`. On a synthetic, fully fetched store of 600 Go units with three attestations each, the
+added read took 0.02 to 0.03 s and the whole round, which checks the units not skipped again, 0.16 to 0.21 s.
 
 ## Threat model (v1)
 
@@ -2723,8 +2963,14 @@ crates/vci-core       repo paths, input manifests, input roots, predicate types
 crates/vci-attest     in-toto Statement, DSSE + PAE, SSHSIG verification, allowed_signers, ssh-keygen signing;
                       src/keyless/: keyless (Sigstore) signing through curl, offline verification of the certificate,
                       RFC 3161 timestamp and identity, identities.toml, the trust root
-crates/vci-git        attestation storage on git-meta (git-meta-lib): blobless fetch, values fetched on demand,
+crates/vci-store      the attestation store contract (AttestationStore, its records and errors), store selection
+                      (VCI_STORE, VCI_STORE_URL, [store]), the key format, and the conformance suite (feature
+                      conformance) every backend runs; docs/STORE-BACKENDS.md is its design
+crates/vci-git        the git-meta store (git-meta-lib): blobless fetch, values fetched on demand,
                       merges from paths; base-commit file reads, repo identity
+crates/vci-store-sqlite    the SQLite store (one file in the git common directory)
+crates/vci-store-postgres  the PostgreSQL store (rustls with the ring provider), and testkit: a throwaway
+                      PostgreSQL cluster for tests
 crates/vci-adapter    Adapter trait + Vitest, node:test, pytest, Go, Cargo and Rails adapters (list, run, JSONL / go test log
                       parsing; src/golang/vci_testlog.go is the logger overlaid into Go's internal/testlog; src/cargo/
                       reads cargo's JSON messages, rustc dep-info and build script output, and scans sources;
@@ -2752,7 +2998,8 @@ fixtures/rails-vips   Rails 8.1 with Active Storage, image_processing and ruby-v
                       storage, one that attaches and analyses test/fixtures/files/pixel.png, one that calls C through FFI)
 docs/                 PLAN.md (design), CONTRACTS.md (interfaces), ENV.md (env vars), spike.md (Vitest findings),
                       spike-pytest.md (pytest findings), spike-go.md (Go findings), spike-cargo.md (Cargo findings),
-                      spike-rails.md (Rails findings), spike-oidc.md (keyless signing findings)
+                      spike-rails.md (Rails findings), spike-oidc.md (keyless signing findings),
+                      STORE-BACKENDS.md (the attestation store and its backends)
 ```
 
 ## Development
@@ -2768,7 +3015,30 @@ uv run --project fixtures/pytest-abcd pytest py/pytest-plugin/tests   # pytest c
 (cd fixtures/rails-rspec-abcd && bundle install) # the RSpec fixture's bundle (rspec-rails, factory_bot_rails)
 (cd fixtures/rails-vips && bundle install) # Active Storage with image_processing/ruby-vips (libvips: brew install vips)
 ruby ruby/vci-collector/test/collector_test.rb   # Ruby collector tests (also run by cargo test)
+cargo test --locked -p vci-store --features vci-store/conformance -p vci-git -p vci-store-sqlite -p vci-store-postgres
+                                           # the attestation stores and the conformance suite on all three
+cargo test --locked -p vci-cli --test store_select --test store_backends   # the command line on each store (go)
 ```
+
+**The attestation stores** (since 2.8.0). `crates/vci-store` holds the contract and a conformance suite of 34
+scenarios (feature `conformance`; docs/STORE-BACKENDS.md section 14), which each backend runs from its own
+`tests/conformance.rs`: git-meta (a bare remote and blobless clones synced by push and fetch), SQLite (handles on one
+file) and PostgreSQL (handles on a schema of their own). Each backend keeps its own tests as well
+(`crates/vci-git/tests/store*.rs`, `crates/vci-store-sqlite/tests/sqlite.rs`,
+`crates/vci-store-postgres/tests/pg.rs`). `crates/vci-cli/tests/store_select.rs` checks the store's selection and that
+`VCI_STORE_URL` reaches no test and no output, and `store_backends.rs` runs `run`, `plan`, `explain`, supersession,
+`prune`, `fetch`, `push` and `ci` on SQLite and PostgreSQL against a copy of `fixtures/go-abcd`.
+
+The PostgreSQL tests take their server from `vci_store_postgres::testkit`: `VCI_TEST_POSTGRES_URL` when it is set (a
+role that may create schemas, roles and databases; `sslmode=prefer` is added when the URL names none), otherwise one
+throwaway cluster per test process, made with `initdb` (from `VCI_TEST_PG_BINDIR`, `PATH`, `pg_config --bindir`,
+`/usr/lib/postgresql/*/bin` or Homebrew's `postgresql@*`) in `en_US.UTF-8` (else `C`), listening on 127.0.0.1 only,
+and stopped and deleted by a watcher process when the test process exits, however it exits. Each test gets a schema
+of its own, dropped with its roles and databases. Without a server, or as root (`initdb` refuses root), the tests say
+`skipping` and pass; `VCI_TEST_POSTGRES=require` makes them fail instead. CI (`.github/workflows/ci.yml`) runs the
+store crates against a `postgres:16` service container with stock Ubuntu's git (`store-stock-git`), the store crates'
+rustdoc (`store-docs`), the two CLI suites with Go and a service container (`store-cli`), and the testkit and the
+PostgreSQL conformance suite on a cluster `initdb` starts (`store-pg-initdb`).
 
 Every runner's end-to-end suite (`e2e.rs` for Vitest, `e2e_node_test.rs`, `e2e_pytest.rs`, `e2e_go.rs`,
 `e2e_cargo.rs`, `e2e_rails.rs`, `e2e_rspec.rs`) has one environment policy test built on
@@ -2974,8 +3244,7 @@ word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
   `@vci/vitest` version is not part of the attestation (like the other collectors).
 - Attestation metadata grows; `vci prune` deletes expired attestations (`--superseded`: and those a newer one of the
   same unit by the same signer replaced) and, since 1.9.0, the input manifests nothing references any more; `vci run`
-  deletes the attestations a re-attestation supersedes on the same line of history (see "Where attestations live
-  (git-meta)"); `vci push --rewrite-history` drops what was deleted from the published history, and git-meta's own auto-prune (`meta:prune:max-keys`) may drop the least recently written keys (those units
+  deletes the attestations a re-attestation supersedes on the same line of history (see [git-meta](#git-meta)); `vci push --rewrite-history` drops what was deleted from the published history, and git-meta's own auto-prune (`meta:prune:max-keys`) may drop the least recently written keys (those units
   then run). No spot-check re-runs or transparency log.
 - What `vci fetch` and `vci push` read: since 1.8.2 the keys of a metadata tree come from its paths, and the fetched
   tree is materialized into the store only when its tip changed since the last time (recorded in the git directory),
@@ -3067,6 +3336,15 @@ word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
 - Other adapters' collectors (Vitest, node:test, pytest) report paths as spelt; vci drops their reads of its own
   collector directory only when the real path is there, but a symlink in that directory created and removed by a test
   can no longer be resolved after the run (the Rails collector resolves paths when they are used).
+- Shared stores (PostgreSQL, since 2.8.0): GitHub does not pass secrets to workflows of pull requests from forks, so
+  their jobs cannot read the store and run every test. The default namespace is the repository's first commit, which
+  forks and mirrors share (they then share attestations, as they do through git-meta) and a shallow clone cannot
+  give (set `VCI_STORE_NAMESPACE`). There is no row-level security per namespace: a role that can write the schema can
+  write or delete every repository's rows on it, which can only make units run; use one schema per trust domain.
+- SQLite is not shared between machines: parallel CI jobs that each restore and save the file in a cache lose each
+  other's writes, and a store that switches kind starts empty (there is no command to copy one store into another
+  yet). `vci prune` on SQLite or PostgreSQL still ends by suggesting `vci push` to publish the deletions, which has
+  nothing to do there.
 - Only tested on macOS arm64 (Node 26, git 2.54, OpenSSH 10.3; CPython 3.14.7, uv 0.11.7; Go 1.26.2; Rust 1.96.0
   from Homebrew; Ruby 3.4.9 through mise), plus a `linux/amd64` container check of Rails attestations (Minitest and
   RSpec: `docs/spike-rails.md` F14, R14). Not run on a GitHub Actions runner. Windows paths compile but are untested.
