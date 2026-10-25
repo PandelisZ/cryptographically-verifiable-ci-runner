@@ -14,6 +14,7 @@ use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, template_for};
 use crate::ctx::{VciPredicate, open_repo};
 use crate::partition::{Partition, Share, Split};
 use crate::plan::{PlanOptions, plan, print};
+use crate::run::StoreMode;
 use crate::util::{now_unix, parse_rfc3339, rfc3339};
 
 pub const CI_SNIPPET: &str = include_str!("../../../examples/github-actions.yml");
@@ -78,9 +79,13 @@ pub fn ci(args: CiArgs) -> Result<i32> {
         (None, None) => None,
     };
     let attesting = how.is_some();
+    // The publication gate: on a shared store, nothing is stored without
+    // --push (docs/STORE-BACKENDS.md section 7).
+    let store = crate::store::for_repo(&repo);
+    let mode = store_mode(store.caps().shared_writes, args.push);
     let code = match how {
         None => run_plain(&res, &root, None, run_split)?,
-        Some(how) => match run_attested(&res, how, &args.ttl, run_split) {
+        Some(how) => match run_attested(&res, how, &args.ttl, run_split, mode) {
             Ok(Attempt::Ran(out)) => {
                 for e in &out.errors {
                     github_warning(&format!("attesting: {e}"));
@@ -119,6 +124,14 @@ pub fn ci(args: CiArgs) -> Result<i32> {
     };
     let push_wanted = args.push && not_attested.is_none();
     if attesting {
+        let kind = store.kind();
+        let stored_where = if mode == StoreMode::SignOnly {
+            format!(" (not stored: the {kind} store is shared and --push was not given)")
+        } else if store.exchange().is_none() {
+            format!(" (stored in the {kind} store)")
+        } else {
+            " (stored locally; publish with `vci push`)".to_owned()
+        };
         eprintln!(
             "vci ci: {} unit(s) attested{}",
             attested.len(),
@@ -127,13 +140,12 @@ pub fn ci(args: CiArgs) -> Result<i32> {
             } else if args.push {
                 " (nothing to push)"
             } else {
-                " (stored locally; publish with `vci push`)"
+                &stored_where
             }
         );
     }
     let pushed = if push_wanted {
         // Best effort: CI's result is the tests', never the publication's.
-        let store = crate::store::for_repo(&repo);
         match push_with(&*store, args.remote.as_deref(), false, OnRemote::Ignore) {
             Ok(_) => Some(true),
             Err(e) => {
@@ -147,6 +159,9 @@ pub fn ci(args: CiArgs) -> Result<i32> {
                 Some(false)
             }
         }
+    } else if attesting && mode == StoreMode::SignOnly {
+        // Signed, and published nowhere.
+        Some(false)
     } else {
         None
     };
@@ -178,7 +193,13 @@ pub fn ci(args: CiArgs) -> Result<i32> {
                 .filter(|(_, sh)| **sh == Share::Whole)
                 .map(|(p, _)| job_label(p)).collect::<Vec<_>>(),
         })),
-        "attested": attested.iter().map(|a| json!({"testId": a.test_id, "project": a.project})).collect::<Vec<_>>(),
+        "attested": attested.iter().map(|a| {
+            let mut u = json!({"testId": a.test_id, "project": a.project});
+            if !a.stored {
+                u["stored"] = false.into();
+            }
+            u
+        }).collect::<Vec<_>>(),
         "attestErrors": attest_errors,
         "notAttested": not_attested,
         "pushed": pushed,
@@ -328,6 +349,7 @@ fn run_attested(
     how: AttestWith<'_>,
     ttl: &str,
     split: Option<&Split>,
+    mode: StoreMode,
 ) -> Result<Attempt> {
     let Some(config) = res.config.clone().filter(|_| !res.projects.is_empty()) else {
         return Ok(Attempt::NotAttested("no project could be read".into()));
@@ -389,8 +411,21 @@ fn run_attested(
         signing,
         ttl,
         None,
+        mode,
     )
     .map(Attempt::Ran)
+}
+
+/// How `vci ci` uses the store: on a store whose writes every machine sees
+/// at once ([`vci_store::Caps::shared_writes`]), it signs but stores
+/// nothing unless `--push` was given, so that, as with git-meta, nothing
+/// leaves a CI job without `--push` (docs/STORE-BACKENDS.md section 7).
+pub(crate) fn store_mode(shared_writes: bool, push: bool) -> StoreMode {
+    if shared_writes && !push {
+        StoreMode::SignOnly
+    } else {
+        StoreMode::Write
+    }
 }
 
 /// [`attest_refusal`] for `vci ci --oidc`: the job's identity signs as the
@@ -1734,6 +1769,37 @@ pub(crate) fn envelope_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The publication gate: only a shared store without --push signs
+    /// without storing.
+    #[test]
+    fn vci_ci_stores_on_a_shared_store_only_with_push() {
+        assert_eq!(store_mode(true, false), StoreMode::SignOnly);
+        assert_eq!(store_mode(true, true), StoreMode::Write);
+        assert_eq!(store_mode(false, false), StoreMode::Write);
+        assert_eq!(store_mode(false, true), StoreMode::Write);
+    }
+
+    /// `vci ci --push` on a store without an exchange succeeds without
+    /// sending anything (its writes were stored when they were made); a
+    /// remote is ignored there and refused by `vci push`.
+    #[test]
+    fn pushing_a_store_without_an_exchange_sends_nothing() {
+        let s = crate::store::mem::MemStore::new();
+        assert_eq!(push_with(&s, None, false, OnRemote::Ignore).unwrap(), 0);
+        assert_eq!(
+            push_with(&s, Some("origin"), false, OnRemote::Ignore).unwrap(),
+            0
+        );
+        let e = push_with(&s, Some("origin"), false, OnRemote::Refuse).unwrap_err();
+        assert_eq!(e.to_string(), "the memory store does not support a remote");
+        let e = push_with(&s, None, true, OnRemote::Ignore).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "the memory store does not support rewriting history"
+        );
+        assert_eq!(s.writes(), 0);
+    }
 
     #[test]
     fn verify_trust_pinned_on_the_command_line_is_the_only_trust() {

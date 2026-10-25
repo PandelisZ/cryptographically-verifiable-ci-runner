@@ -12,7 +12,7 @@ use vci_attest::{Statement, Subject, sign_statement};
 use vci_core::{
     External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain,
 };
-use vci_store::{AttestationStore, KeyHint, Prefetch, StoredEnvelope};
+use vci_store::{AttestationStore, KeyHint, Prefetch, StoredEnvelope, WriteBatch};
 
 use crate::ctx::{
     Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo, storage_key,
@@ -42,6 +42,10 @@ struct UnitOutcome {
     project: Option<String>,
     adapter: &'static str,
     attested: bool,
+    /// Whether an attested unit's attestation was stored: false only when
+    /// the run signs without storing ([`StoreMode::SignOnly`]). Serialized
+    /// only when false, so the summary of a run that stores is unchanged.
+    stored: bool,
     /// Stable reason keys ([`taint_key`], [`refusal_key`]), most frequent
     /// taint first.
     reasons: Vec<String>,
@@ -54,13 +58,35 @@ struct UnitOutcome {
     waived: Vec<String>,
 }
 
-impl UnitOutcome {
-    fn refused(test_id: &str, project: &Project, detail: String, reasons: Vec<String>) -> Self {
-        Self {
-            test_id: test_id.to_owned(),
+/// The project a unit's outcome names: its `[[projects]]` name (none in
+/// the single-project form) and adapter.
+#[derive(Debug, Clone)]
+struct Owner {
+    project: Option<String>,
+    adapter: &'static str,
+}
+
+impl Owner {
+    fn of(project: &Project) -> Self {
+        Owner {
             project: (!project.name.is_empty()).then(|| project.name.clone()),
             adapter: project.adapter.name(),
+        }
+    }
+}
+
+impl UnitOutcome {
+    fn refused(test_id: &str, project: &Project, detail: String, reasons: Vec<String>) -> Self {
+        Self::refused_by(test_id, &Owner::of(project), detail, reasons)
+    }
+
+    fn refused_by(test_id: &str, owner: &Owner, detail: String, reasons: Vec<String>) -> Self {
+        Self {
+            test_id: test_id.to_owned(),
+            project: owner.project.clone(),
+            adapter: owner.adapter,
             attested: false,
+            stored: true,
             reasons,
             detail: Some(detail),
             taints: vec![],
@@ -95,18 +121,327 @@ fn summary_json(outcomes: &[UnitOutcome]) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "units": outcomes
             .iter()
-            .map(|o| serde_json::json!({
-                "testId": o.test_id,
-                "project": o.project,
-                "adapter": o.adapter,
-                "attested": o.attested,
-                "reasons": o.reasons,
-                "detail": o.detail,
-                "taints": o.taints,
-                "waived": o.waived,
-            }))
+            .map(|o| {
+                let mut u = serde_json::json!({
+                    "testId": o.test_id,
+                    "project": o.project,
+                    "adapter": o.adapter,
+                    "attested": o.attested,
+                    "reasons": o.reasons,
+                    "detail": o.detail,
+                    "taints": o.taints,
+                    "waived": o.waived,
+                });
+                if !o.stored {
+                    u["stored"] = false.into();
+                }
+                u
+            })
             .collect::<Vec<_>>(),
     })
+}
+
+/// How [`run_units`] uses the store: the publication gate of `vci ci` on a
+/// shared store (docs/STORE-BACKENDS.md section 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreMode {
+    /// Store every attestation and its input manifest, remove what each
+    /// supersedes, and then the manifests no attestation references any
+    /// more.
+    Write,
+    /// Sign every attestation but store nothing, supersede nothing and
+    /// collect nothing: `vci ci` without `--push` on a store whose writes
+    /// every machine sees at once (nothing leaves a CI job without
+    /// `--push`, as with git-meta).
+    SignOnly,
+}
+
+/// One signed unit for [`StoreLoop::attest`].
+struct ToStore<'a> {
+    /// The unit as its lines name it.
+    label: &'a str,
+    test_id: &'a str,
+    input_root: &'a str,
+    /// Its input manifest, stored before the attestation.
+    manifest: &'a InputManifest,
+    /// The shared manifest its own is stored on top of (vci 2.1.8).
+    base: Option<&'a InputManifest>,
+    storage_key: String,
+    hint: Option<KeyHint>,
+    envelope: Vec<u8>,
+    /// The same signer's attestations of the unit that storing this one
+    /// supersedes ([`superseded_by`]).
+    doomed: Vec<StoredEnvelope>,
+    /// The taints a policy waived.
+    waived: &'a [String],
+}
+
+/// One unit's place in [`StoreLoop`]'s report, in unit order.
+enum Slot {
+    /// Reported.
+    Done(UnitOutcome),
+    /// Stored inside a deferred batch: reported (its line, outcome,
+    /// supersession) only once the batch finishes.
+    Pending {
+        outcome: UnitOutcome,
+        line: String,
+        superseded: usize,
+        dropped: BTreeSet<String>,
+    },
+}
+
+/// What one project's [`StoreLoop`] did.
+#[derive(Default)]
+struct Stored {
+    attested: usize,
+    refused: usize,
+    /// Superseded attestations removed.
+    superseded: usize,
+    /// Units signed and not stored ([`StoreMode::SignOnly`]); also counted
+    /// in `attested`.
+    signed_only: usize,
+    /// In unit order.
+    outcomes: Vec<UnitOutcome>,
+    errors: Vec<String>,
+    /// The input roots the removed attestations referenced.
+    dropped_roots: BTreeSet<String>,
+    /// Seconds storing and removing (manifests, then attestations, then
+    /// removals), of which storing manifests and removing.
+    store_secs: f64,
+    manifest_secs: f64,
+    remove_secs: f64,
+}
+
+/// One project's store loop in [`run_units`]: each unit in order, refused
+/// or signed and stored, inside one write batch, and reported.
+///
+/// With an immediate batch (git-meta), each unit is reported as it is
+/// stored, as before. With a deferred one, a stored unit's "attested" line
+/// and outcome wait for the batch to finish: if it fails, nothing of the
+/// batch was stored and every unit it held is refused instead
+/// (docs/STORE-BACKENDS.md section 6), so no output claims a unit that was
+/// not stored.
+struct StoreLoop<'s> {
+    store: &'s dyn AttestationStore,
+    mode: StoreMode,
+    signer: &'s str,
+    owner: Owner,
+    batch: Option<WriteBatch>,
+    slots: Vec<Slot>,
+    done: Stored,
+    /// Where the lines go (stderr; a test collects them).
+    say: &'s mut dyn FnMut(&str),
+}
+
+impl<'s> StoreLoop<'s> {
+    fn new(
+        store: &'s dyn AttestationStore,
+        mode: StoreMode,
+        signer: &'s str,
+        owner: Owner,
+        say: &'s mut dyn FnMut(&str),
+    ) -> Self {
+        // One git-meta session and store connection for every unit's writes
+        // (2.7.15; whatever the store shares between writes); without it
+        // each write opens its own. Signing only writes nothing.
+        let batch = match mode {
+            StoreMode::Write => store.batch().ok(),
+            StoreMode::SignOnly => None,
+        };
+        StoreLoop {
+            store,
+            mode,
+            signer,
+            owner,
+            batch,
+            slots: Vec::new(),
+            done: Stored::default(),
+            say,
+        }
+    }
+
+    fn deferred(&self) -> bool {
+        self.batch.as_ref().is_some_and(WriteBatch::defers_writes)
+    }
+
+    /// A unit not attested; `reason` is its line's text.
+    fn refuse(&mut self, label: &str, reason: String, reasons: Vec<String>, taints: Vec<String>) {
+        self.done.refused += 1;
+        (self.say)(&format!("vci: not attesting {label}: {reason}"));
+        let mut out = UnitOutcome::refused_by(label, &self.owner, reason, reasons);
+        out.taints = taints;
+        self.slots.push(Slot::Done(out));
+    }
+
+    /// A unit that could not be signed or stored.
+    fn failed(&mut self, label: &str, e: &anyhow::Error) {
+        let msg = format!("{label}: {e:#}");
+        (self.say)(&format!("vci: error: not attesting {msg}"));
+        self.done.errors.push(msg);
+        self.done.refused += 1;
+        self.slots.push(Slot::Done(UnitOutcome::refused_by(
+            label,
+            &self.owner,
+            format!("signing or storing failed: {e:#}"),
+            vec!["signing or storing failed".to_owned()],
+        )));
+    }
+
+    /// A signed unit: store its manifest, then it, then remove what it
+    /// supersedes, and report it (with a deferred batch: once the batch
+    /// finishes). Signing only, it is counted and reported as not stored.
+    fn attest(&mut self, u: ToStore<'_>) {
+        let outcome = UnitOutcome {
+            test_id: u.label.to_owned(),
+            project: self.owner.project.clone(),
+            adapter: self.owner.adapter,
+            attested: true,
+            stored: self.mode == StoreMode::Write,
+            reasons: vec![],
+            detail: None,
+            taints: vec![],
+            waived: u.waived.to_vec(),
+        };
+        if self.mode == StoreMode::SignOnly {
+            self.done.attested += 1;
+            self.done.signed_only += 1;
+            self.slots.push(Slot::Done(outcome));
+            return;
+        }
+        let (label, entries, root, waived) = (
+            u.label,
+            u.manifest.entries.len(),
+            &u.input_root[..16.min(u.input_root.len())],
+            u.waived,
+        );
+        let (stored, superseded, dropped) = match self.write(u) {
+            Ok(x) => x,
+            Err(e) => return self.failed(label, &e),
+        };
+        self.done.attested += 1;
+        let waived = if waived.is_empty() {
+            String::new()
+        } else {
+            format!(" (waived: {})", waived_note(waived))
+        };
+        let line = format!(
+            "vci: attested {label}{waived} ({entries} inputs, root {root}) as {} {} {}",
+            self.store.kind(),
+            stored.target,
+            stored.key
+        );
+        if self.deferred() {
+            self.slots.push(Slot::Pending {
+                outcome,
+                line,
+                superseded,
+                dropped,
+            });
+        } else {
+            self.done.superseded += superseded;
+            self.done.dropped_roots.extend(dropped);
+            (self.say)(&line);
+            self.slots.push(Slot::Done(outcome));
+        }
+    }
+
+    /// Store `u` (the manifest first: an attestation is never stored
+    /// without the manifest it references) and remove what it supersedes:
+    /// the entry stored, how many were removed and the roots they
+    /// referenced.
+    fn write(&mut self, u: ToStore<'_>) -> Result<(StoredEnvelope, usize, BTreeSet<String>)> {
+        let t = std::time::Instant::now();
+        let compact = match u.base {
+            Some(b) => u.manifest.to_compact_on(b),
+            None => u.manifest.to_compact(),
+        };
+        self.store
+            .put_manifest(u.input_root, compact.as_bytes())
+            .context("storing the input manifest")?;
+        self.done.manifest_secs += t.elapsed().as_secs_f64();
+        let stored = self.store.put_for_test(
+            u.test_id,
+            self.signer,
+            &u.storage_key,
+            u.hint.as_ref(),
+            &u.envelope,
+        )?;
+        // Never the one just stored (the same storage key: the same
+        // inputs, replaced).
+        let doomed: Vec<_> = u
+            .doomed
+            .into_iter()
+            .filter(|e| e.key != stored.key)
+            .collect();
+        let t_remove = std::time::Instant::now();
+        let mut dropped = BTreeSet::new();
+        let superseded = remove_superseded(self.store, u.test_id, doomed, &mut dropped);
+        self.done.remove_secs += t_remove.elapsed().as_secs_f64();
+        self.done.store_secs += t.elapsed().as_secs_f64();
+        Ok((stored, superseded, dropped))
+    }
+
+    /// End the batch, then report every unit in order. A deferred batch
+    /// that fails stored nothing: each unit it held is refused ("signing
+    /// or storing failed") and counted as an error, and what it would have
+    /// superseded stays.
+    fn finish(self) -> Stored {
+        let StoreLoop {
+            store,
+            batch,
+            slots,
+            mut done,
+            say,
+            owner,
+            ..
+        } = self;
+        let deferred = batch.as_ref().is_some_and(WriteBatch::defers_writes);
+        let failed = match batch.map(WriteBatch::finish) {
+            Some(Err(e)) if deferred => Some(e),
+            Some(Err(e)) => {
+                // Every write was durable already.
+                say(&format!(
+                    "vci: warning: ending the {} store's write batch: {e}",
+                    store.kind()
+                ));
+                None
+            }
+            _ => None,
+        };
+        for slot in slots {
+            match slot {
+                Slot::Done(o) => done.outcomes.push(o),
+                Slot::Pending {
+                    outcome,
+                    line,
+                    superseded,
+                    dropped,
+                } => match &failed {
+                    None => {
+                        say(&line);
+                        done.superseded += superseded;
+                        done.dropped_roots.extend(dropped);
+                        done.outcomes.push(outcome);
+                    }
+                    Some(e) => {
+                        let label = outcome.test_id;
+                        let msg = format!("{label}: storing the batch: {e}");
+                        say(&format!("vci: error: not attesting {msg}"));
+                        done.errors.push(msg);
+                        done.attested -= 1;
+                        done.refused += 1;
+                        done.outcomes.push(UnitOutcome::refused_by(
+                            &label,
+                            &owner,
+                            format!("signing or storing failed: storing the batch: {e}"),
+                            vec!["signing or storing failed".to_owned()],
+                        ));
+                    }
+                },
+            }
+        }
+        done
+    }
 }
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1811,6 +2146,9 @@ pub struct AttestedUnit {
     pub test_id: String,
     /// `[[projects]]` name; empty in the single-project form.
     pub project: String,
+    /// Whether its attestation was stored: false when the run only signed
+    /// ([`StoreMode::SignOnly`]).
+    pub stored: bool,
 }
 
 /// What [`run_units`] did.
@@ -1850,6 +2188,7 @@ pub fn run(args: RunArgs) -> Result<i32> {
         signing,
         &args.ttl,
         args.summary.as_deref(),
+        StoreMode::Write,
     )?;
     if !out.errors.is_empty() {
         bail!(
@@ -1866,6 +2205,8 @@ pub fn run(args: RunArgs) -> Result<i32> {
 /// each unit's inputs, and sign and store an attestation for every unit that
 /// passed and is provably attestable. `config` decides the projects (`vci
 /// run`: the working tree's; `vci ci`: the one its plan was made from).
+/// `mode` says whether the attestations are stored ([`StoreMode`]).
+#[allow(clippy::too_many_arguments)]
 pub fn run_units(
     repo: vci_git::Repo,
     root: Utf8PathBuf,
@@ -1874,6 +2215,7 @@ pub fn run_units(
     signing: Signing<'_>,
     ttl_arg: &str,
     summary: Option<&Utf8Path>,
+    mode: StoreMode,
 ) -> Result<RunOutcome> {
     let ttl = parse_duration(ttl_arg).context("--ttl")?;
     let ctx = Ctx::new(repo, root.clone(), config)?;
@@ -2124,6 +2466,7 @@ pub fn run_units(
     let mut attested = 0;
     let mut refused = 0;
     let mut superseded = 0usize;
+    let mut signed_only = 0usize;
     // Supersession's answers per earlier commit, and the input roots of the
     // attestations it deleted.
     let moved_on = MovedOn::default();
@@ -2257,9 +2600,6 @@ pub fn run_units(
         let tm_check = std::sync::atomic::AtomicU64::new(0);
         let tm_warn = std::sync::atomic::AtomicU64::new(0);
         let tm_sign = std::sync::atomic::AtomicU64::new(0);
-        let tm_store = std::sync::atomic::AtomicU64::new(0);
-        let tm_store_manifest = std::sync::atomic::AtomicU64::new(0);
-        let tm_store_remove = std::sync::atomic::AtomicU64::new(0);
         let tm_supersede = std::sync::atomic::AtomicU64::new(0);
         let add = |f: &std::sync::atomic::AtomicU64, since: std::time::Instant| {
             f.fetch_add(
@@ -2329,7 +2669,8 @@ pub fn run_units(
                     let signed = sign_predicate(&key, &a.predicate);
                     add(&tm_sign, t);
                     let t = std::time::Instant::now();
-                    let doomed = if signed.is_ok() {
+                    // Signing only, nothing is superseded.
+                    let doomed = if signed.is_ok() && mode == StoreMode::Write {
                         superseded_by(
                             store,
                             &ctx.repo,
@@ -2359,7 +2700,7 @@ pub fn run_units(
         in_order(&units, jobs, verdict, |i, v| verdicts[i] = Some(v));
         let t = std::time::Instant::now();
         let manifest_bases = shared_manifest_bases(&verdicts, &units);
-        if !manifest_bases.is_empty() {
+        if !manifest_bases.is_empty() && mode == StoreMode::Write {
             let mut stored_roots = BTreeSet::new();
             for b in manifest_bases.values() {
                 if !stored_roots.insert(b.root()) {
@@ -2381,26 +2722,18 @@ pub fn run_units(
                 t,
             );
         }
-        // One git-meta session and store connection for every unit's writes
-        // (2.7.15; whatever the store shares between writes); without it
-        // each write opens its own.
-        let _batch = store.batch().ok();
+        // Each unit stored and reported in order, inside one write batch.
+        let mut say = |l: &str| eprintln!("{l}");
+        let mut stores = StoreLoop::new(store, mode, &signer, Owner::of(project), &mut say);
         for (i, v) in verdicts.into_iter().enumerate() {
             let Some(v) = v else { continue };
             let label = &units[i].2;
-            let (a, signed, doomed) = match v {
+            match v {
                 Verdict::Refused {
                     reason,
                     reasons,
                     taints,
-                } => {
-                    refused += 1;
-                    eprintln!("vci: not attesting {label}: {reason}");
-                    let mut out = UnitOutcome::refused(label, project, reason, reasons);
-                    out.taints = taints;
-                    outcomes.push(out);
-                    continue;
-                }
+                } => stores.refuse(label, reason, reasons, taints),
                 Verdict::Attestable {
                     a,
                     warnings,
@@ -2410,82 +2743,42 @@ pub fn run_units(
                     for w in &warnings {
                         eprintln!("{w}");
                     }
-                    (a, signed, doomed)
+                    let p = &a.predicate;
+                    match signed {
+                        Err(e) => stores.failed(label, &e),
+                        Ok(envelope) => stores.attest(ToStore {
+                            label,
+                            test_id: &p.core.test_id,
+                            input_root: &p.core.input_root,
+                            manifest: &a.manifest,
+                            base: manifest_bases.get(&group_key(units[i].0)),
+                            storage_key: storage_key(p),
+                            hint: crate::util::parse_rfc3339(&p.core.issued_at).ok().map(
+                                |issued| KeyHint {
+                                    issued,
+                                    tree: p
+                                        .core
+                                        .tree
+                                        .as_ref()
+                                        .map(|t| t.chars().take(16).collect()),
+                                },
+                            ),
+                            envelope,
+                            doomed,
+                            waived: &p.waived,
+                        }),
+                    }
                 }
-            };
-            let p = &a.predicate;
-            let skey = storage_key(p);
-            let stored = signed.and_then(|env| {
-                // The manifest first: an attestation is never stored without
-                // the manifest it references.
-                let t = std::time::Instant::now();
-                let compact = match manifest_bases.get(&group_key(units[i].0)) {
-                    Some(b) => a.manifest.to_compact_on(b),
-                    None => a.manifest.to_compact(),
-                };
-                store
-                    .put_manifest(&p.core.input_root, compact.as_bytes())
-                    .context("storing the input manifest")?;
-                add(&tm_store_manifest, t);
-                let hint = crate::util::parse_rfc3339(&p.core.issued_at)
-                    .ok()
-                    .map(|issued| KeyHint {
-                        issued,
-                        tree: p.core.tree.as_ref().map(|t| t.chars().take(16).collect()),
-                    });
-                let stored =
-                    store.put_for_test(&p.core.test_id, &signer, &skey, hint.as_ref(), &env)?;
-                // Never the one just stored (the same storage key: the same
-                // inputs, replaced).
-                let doomed: Vec<_> = doomed.into_iter().filter(|e| e.key != stored.key).collect();
-                let t_remove = std::time::Instant::now();
-                superseded += remove_superseded(store, &p.core.test_id, doomed, &mut dropped_roots);
-                add(&tm_store_remove, t_remove);
-                add(&tm_store, t);
-                Ok(stored)
-            });
-            let stored = match stored {
-                Ok(s) => s,
-                Err(e) => {
-                    let msg = format!("{label}: {e:#}");
-                    eprintln!("vci: error: not attesting {msg}");
-                    errors.push(msg);
-                    refused += 1;
-                    let why = format!("signing or storing failed: {e:#}");
-                    outcomes.push(UnitOutcome::refused(
-                        label,
-                        project,
-                        why,
-                        vec!["signing or storing failed".to_owned()],
-                    ));
-                    continue;
-                }
-            };
-            attested += 1;
-            outcomes.push(UnitOutcome {
-                test_id: label.clone(),
-                project: (!project.name.is_empty()).then(|| project.name.clone()),
-                adapter: project.adapter.name(),
-                attested: true,
-                reasons: vec![],
-                detail: None,
-                taints: vec![],
-                waived: p.waived.clone(),
-            });
-            let waived = if p.waived.is_empty() {
-                String::new()
-            } else {
-                format!(" (waived: {})", waived_note(&p.waived))
-            };
-            eprintln!(
-                "vci: attested {label}{waived} ({} inputs, root {}) as {} {} {}",
-                a.manifest.entries.len(),
-                &p.core.input_root[..16],
-                store.kind(),
-                stored.target,
-                stored.key
-            );
+            }
         }
+        let done = stores.finish();
+        attested += done.attested;
+        refused += done.refused;
+        superseded += done.superseded;
+        signed_only += done.signed_only;
+        outcomes.extend(done.outcomes);
+        errors.extend(done.errors);
+        dropped_roots.extend(done.dropped_roots);
         crate::plan::timing(
             &format!(
                 "check, sign and store {} unit(s) of {} ({jobs} at a time)",
@@ -2505,9 +2798,9 @@ pub fn run_units(
                 g(&tm_warn),
                 g(&tm_sign),
                 g(&tm_supersede),
-                g(&tm_store),
-                g(&tm_store_manifest),
-                g(&tm_store_remove)
+                done.store_secs,
+                done.manifest_secs,
+                done.remove_secs
             );
             for line in store.timing_report() {
                 vci_core::timing_line!("{}: {line}", project.label());
@@ -2537,6 +2830,12 @@ pub fn run_units(
                 ));
             }
         }
+    }
+    if signed_only > 0 {
+        eprintln!(
+            "vci: not storing {signed_only} attestation(s): the {} store is shared and vci ci was not given --push",
+            store.kind()
+        );
     }
     eprintln!("vci: {attested} attested, {refused} not attested");
     if superseded > 0 {
@@ -2573,6 +2872,7 @@ pub fn run_units(
             .map(|o| AttestedUnit {
                 test_id: o.test_id,
                 project: o.project.unwrap_or_default(),
+                stored: o.stored,
             })
             .collect(),
     })
@@ -3172,6 +3472,7 @@ mod tests {
             project: None,
             adapter: "rails",
             attested,
+            stored: true,
             reasons: reasons.iter().map(|r| (*r).to_owned()).collect(),
             detail: (!attested).then(|| "tainted: ...".to_owned()),
             taints: vec![],
@@ -3204,6 +3505,9 @@ mod tests {
         assert_eq!(v["reasons"][0]["files"], 2);
         assert_eq!(v["units"][0]["waived"][0], "process:system");
         assert_eq!(v["units"][1]["waived"].as_array().unwrap().len(), 0);
+        // Stored (or refused): no `stored` field, as before.
+        assert!(v["units"][0].get("stored").is_none(), "{v}");
+        assert!(v["units"][1].get("stored").is_none(), "{v}");
     }
 
     fn policy(toml: &str) -> crate::config::Policy {
@@ -3667,5 +3971,245 @@ mod tests {
         ] {
             assert_eq!(get(p), Some(want), "{p}: {obs:?}");
         }
+    }
+
+    // ---- the store loop (deferred batches, the publication gate) ----------
+
+    const SIGNER: &str = "0123456789abcdef";
+
+    fn owner() -> Owner {
+        Owner {
+            project: None,
+            adapter: "go",
+        }
+    }
+
+    fn root(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    fn unit<'a>(label: &'a str, manifest: &'a InputManifest, root: &'a str) -> ToStore<'a> {
+        ToStore {
+            label,
+            test_id: label,
+            input_root: root,
+            manifest,
+            base: None,
+            storage_key: "abcd".to_owned(),
+            hint: Some(KeyHint {
+                issued: 7,
+                tree: None,
+            }),
+            envelope: format!("{{\"unit\":\"{label}\"}}").into_bytes(),
+            doomed: vec![],
+            waived: &[],
+        }
+    }
+
+    /// An earlier attestation of `label` in `s`, by the same signer, for a
+    /// unit to supersede.
+    fn earlier(s: &crate::store::mem::MemStore, label: &str) -> StoredEnvelope {
+        s.put_for_test(label, SIGNER, "ef01", None, b"old").unwrap()
+    }
+
+    /// The lines a store loop says, collected.
+    #[derive(Default)]
+    struct Said(std::cell::RefCell<Vec<String>>);
+
+    impl Said {
+        fn lines(&self) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+    }
+
+    /// With a deferred batch, nothing is reported before the batch
+    /// finishes; then every stored unit is, in order, with what it
+    /// superseded, and the refusals keep their place in the outcomes.
+    #[test]
+    fn a_deferred_batch_reports_in_order_once_it_finishes() {
+        let s = crate::store::mem::MemStore::new().deferred(true);
+        let old = earlier(&s, "src/a.test.ts");
+        let m = InputManifest::default();
+        let (ra, rc) = (root('a'), root('c'));
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        let mut a = unit("src/a.test.ts", &m, &ra);
+        a.doomed = vec![old.clone()];
+        sl.attest(a);
+        sl.refuse(
+            "src/b.test.ts",
+            "result failed".into(),
+            vec!["result failed".into()],
+            vec![],
+        );
+        sl.attest(unit("src/c.test.ts", &m, &rc));
+        // Not stored yet, so not reported yet; the refusal is.
+        assert_eq!(s.keys(), std::slice::from_ref(&old.key));
+        assert_eq!(
+            said.lines(),
+            ["vci: not attesting src/b.test.ts: result failed"]
+        );
+        let done = sl.finish();
+        assert_eq!((done.attested, done.refused, done.superseded), (2, 1, 1));
+        assert!(done.errors.is_empty());
+        let lines = said.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[1].starts_with(&format!(
+                "vci: attested src/a.test.ts (0 inputs, root {}) as memory path:src/a.test.ts vci:attestation:",
+                &ra[..16]
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("vci: attested src/c.test.ts "),
+            "{lines:?}"
+        );
+        let ids: Vec<(&str, bool)> = done
+            .outcomes
+            .iter()
+            .map(|o| (o.test_id.as_str(), o.attested))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("src/a.test.ts", true),
+                ("src/b.test.ts", false),
+                ("src/c.test.ts", true)
+            ]
+        );
+        // Both stored, the superseded one removed, the manifests first.
+        let keys = s.keys();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(!keys.contains(&old.key));
+        assert_eq!(s.roots(), [ra, rc]);
+    }
+
+    /// A deferred batch that fails stored nothing: every unit it held is
+    /// refused and an error, the counts say so, the summary claims none of
+    /// them, and what they would have superseded stays.
+    #[test]
+    fn a_failed_deferred_batch_refuses_every_unit_it_held() {
+        let s = crate::store::mem::MemStore::new()
+            .deferred(true)
+            .failing(Some("the server went away"));
+        let old = earlier(&s, "src/a.test.ts");
+        let m = InputManifest::default();
+        let (ra, rc) = (root('a'), root('c'));
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        let mut a = unit("src/a.test.ts", &m, &ra);
+        a.doomed = vec![old.clone()];
+        sl.attest(a);
+        sl.refuse(
+            "src/b.test.ts",
+            "result failed".into(),
+            vec!["result failed".into()],
+            vec![],
+        );
+        sl.attest(unit("src/c.test.ts", &m, &rc));
+        let done = sl.finish();
+        assert_eq!((done.attested, done.refused, done.superseded), (0, 3, 0));
+        assert_eq!(done.errors.len(), 2, "{:?}", done.errors);
+        assert!(done.dropped_roots.is_empty());
+        let why = "storing the batch: memory store unavailable: the server went away";
+        assert_eq!(done.errors[0], format!("src/a.test.ts: {why}"));
+        let lines = said.lines();
+        assert!(
+            lines.iter().all(|l| !l.starts_with("vci: attested")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&format!("vci: error: not attesting src/c.test.ts: {why}")),
+            "{lines:?}"
+        );
+        let v = summary_json(&done.outcomes);
+        assert_eq!(v["attested"], 0);
+        assert_eq!(v["notAttested"], 3);
+        let units = v["units"].as_array().unwrap();
+        assert!(units.iter().all(|u| u["attested"] == false), "{v}");
+        assert_eq!(units[0]["testId"], "src/a.test.ts");
+        assert_eq!(
+            units[0]["detail"],
+            format!("signing or storing failed: {why}")
+        );
+        assert_eq!(units[0]["reasons"][0], "signing or storing failed");
+        // Nothing of the batch stored; the earlier attestation kept.
+        assert_eq!(s.keys(), [old.key]);
+        assert!(s.roots().is_empty());
+    }
+
+    /// With an immediate batch (git-meta's), each unit is stored and
+    /// reported at once, as before.
+    #[test]
+    fn an_immediate_batch_reports_each_unit_as_it_is_stored() {
+        let s = crate::store::mem::MemStore::new();
+        let m = InputManifest::default();
+        let ra = root('a');
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        sl.attest(unit("src/a.test.ts", &m, &ra));
+        assert_eq!(s.keys().len(), 1);
+        assert_eq!(said.lines().len(), 1);
+        assert!(said.lines()[0].starts_with("vci: attested src/a.test.ts "));
+        let done = sl.finish();
+        assert_eq!((done.attested, done.refused), (1, 0));
+        assert!(done.outcomes[0].stored);
+    }
+
+    /// Signing only (`vci ci` without --push on a shared store): no write
+    /// method is called and no batch opened; the units count as attested,
+    /// not stored, and nothing claims they were.
+    #[test]
+    fn signing_only_writes_nothing() {
+        let s = crate::store::mem::MemStore::new()
+            .shared(true)
+            .deferred(true);
+        let m = InputManifest::default();
+        let (ra, rc) = (root('a'), root('c'));
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::SignOnly, SIGNER, owner(), &mut say);
+        sl.attest(unit("src/a.test.ts", &m, &ra));
+        sl.refuse(
+            "src/b.test.ts",
+            "result failed".into(),
+            vec!["result failed".into()],
+            vec![],
+        );
+        let mut c = unit("src/c.test.ts", &m, &rc);
+        c.doomed = vec![
+            StoredEnvelope::from_key(
+                "path:src/c.test.ts",
+                &vci_store::attestation_key(&vci_core::test_key("src/c.test.ts"), SIGNER, "ef01"),
+            )
+            .unwrap(),
+        ];
+        sl.attest(c);
+        let done = sl.finish();
+        assert_eq!(s.writes(), 0, "no write method and no batch");
+        assert!(s.keys().is_empty() && s.roots().is_empty());
+        assert_eq!(
+            (
+                done.attested,
+                done.signed_only,
+                done.refused,
+                done.superseded
+            ),
+            (2, 2, 1, 0)
+        );
+        assert!(
+            said.lines().iter().all(|l| !l.starts_with("vci: attested")),
+            "{:?}",
+            said.lines()
+        );
+        let v = summary_json(&done.outcomes);
+        assert_eq!(v["units"][0]["attested"], true);
+        assert_eq!(v["units"][0]["stored"], false);
+        assert!(v["units"][1].get("stored").is_none());
+        assert_eq!(v["units"][2]["stored"], false);
     }
 }

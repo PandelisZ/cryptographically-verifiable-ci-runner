@@ -177,6 +177,312 @@ pub fn close_all() {
     drop(stores);
 }
 
+/// An in-memory [`AttestationStore`] for unit tests of the code that uses
+/// a store. Its batches can be deferred (writes applied only when the
+/// batch finishes, as PostgreSQL's are) and made to fail, and its
+/// capabilities can claim shared writes.
+#[cfg(test)]
+pub mod mem {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use vci_store::{
+        AttestationStore, BatchEnd, Caps, GONE, NewAttestation, StoreError, StoredEnvelope,
+        StoredManifest, WriteBatch, key,
+    };
+
+    /// What the store holds.
+    #[derive(Default)]
+    struct Data {
+        /// Attestations by key: (target, bytes).
+        attestations: BTreeMap<String, (String, Vec<u8>)>,
+        /// Manifests by root.
+        manifests: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl Data {
+        /// The keys of the slot `key` is in.
+        fn same_slot(&self, key: &str) -> Vec<String> {
+            let slot = key::parse_key(key);
+            self.attestations
+                .keys()
+                .filter(|k| key::parse_key(k) == slot)
+                .cloned()
+                .collect()
+        }
+
+        fn put(&mut self, key: String, target: String, bytes: Vec<u8>) {
+            for k in self.same_slot(&key) {
+                self.attestations.remove(&k);
+            }
+            self.attestations.insert(key, (target, bytes));
+        }
+    }
+
+    /// A write waiting for its deferred batch to finish.
+    enum Op {
+        Put(String, String, Vec<u8>),
+        Manifest(String, Vec<u8>),
+        Remove(String),
+    }
+
+    #[derive(Default)]
+    struct State {
+        data: Mutex<Data>,
+        /// The writes of the open deferred batch.
+        pending: Mutex<Option<Vec<Op>>>,
+        shared: AtomicBool,
+        deferred: AtomicBool,
+        fail: Mutex<Option<String>>,
+        writes: AtomicUsize,
+        batches: AtomicUsize,
+    }
+
+    impl State {
+        /// Queue `op` in the open deferred batch, or give it back.
+        fn queue(&self, op: Op) -> Option<Op> {
+            match self.pending.lock().unwrap().as_mut() {
+                Some(q) => {
+                    q.push(op);
+                    None
+                }
+                None => Some(op),
+            }
+        }
+
+        fn apply(&self, op: Op) {
+            let mut d = self.data.lock().unwrap();
+            match op {
+                Op::Put(k, t, b) => d.put(k, t, b),
+                Op::Manifest(r, b) => {
+                    d.manifests.insert(r, b);
+                }
+                Op::Remove(k) => {
+                    d.attestations.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// The in-memory store. Clones share their contents.
+    #[derive(Clone, Default)]
+    pub struct MemStore {
+        state: Arc<State>,
+    }
+
+    impl MemStore {
+        /// An empty store: local, immediate batches.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Claim [`Caps::shared_writes`] (a shared server).
+        pub fn shared(self, v: bool) -> Self {
+            self.state.shared.store(v, Ordering::SeqCst);
+            self
+        }
+
+        /// Make [`AttestationStore::batch`] deferred: writes are applied
+        /// when the batch finishes.
+        pub fn deferred(self, v: bool) -> Self {
+            self.state.deferred.store(v, Ordering::SeqCst);
+            self
+        }
+
+        /// Make every batch's `finish` fail with `why` (and lose its
+        /// writes), or succeed again with `None`.
+        pub fn failing(self, why: Option<&str>) -> Self {
+            *self.state.fail.lock().unwrap() = why.map(str::to_owned);
+            self
+        }
+
+        /// How many write methods were called (`put`, `put_manifest`,
+        /// `remove`, `remove_manifests`), and batches opened.
+        pub fn writes(&self) -> usize {
+            self.state.writes.load(Ordering::SeqCst) + self.state.batches.load(Ordering::SeqCst)
+        }
+
+        /// The stored attestations' keys.
+        pub fn keys(&self) -> Vec<String> {
+            let d = self.state.data.lock().unwrap();
+            d.attestations.keys().cloned().collect()
+        }
+
+        /// The stored manifests' roots.
+        pub fn roots(&self) -> Vec<String> {
+            let d = self.state.data.lock().unwrap();
+            d.manifests.keys().cloned().collect()
+        }
+
+        fn wrote(&self) {
+            self.state.writes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The end of a [`MemStore`] batch.
+    struct MemBatch(Arc<State>);
+
+    impl BatchEnd for MemBatch {
+        fn finish(self: Box<Self>) -> Result<(), StoreError> {
+            let Some(ops) = self.0.pending.lock().unwrap().take() else {
+                return Ok(());
+            };
+            if let Some(why) = self.0.fail.lock().unwrap().clone() {
+                return Err(StoreError::unavailable("memory", why));
+            }
+            // Manifests, then attestations, then removals (the contract's
+            // order for a deferred batch).
+            let (mut manifests, mut puts, mut removals) = (Vec::new(), Vec::new(), Vec::new());
+            for op in ops {
+                match op {
+                    Op::Manifest(..) => manifests.push(op),
+                    Op::Put(..) => puts.push(op),
+                    Op::Remove(..) => removals.push(op),
+                }
+            }
+            for op in manifests.into_iter().chain(puts).chain(removals) {
+                self.0.apply(op);
+            }
+            Ok(())
+        }
+    }
+
+    impl AttestationStore for MemStore {
+        fn kind(&self) -> &'static str {
+            "memory"
+        }
+
+        fn caps(&self) -> Caps {
+            Caps::LOCAL.with_shared_writes(self.state.shared.load(Ordering::SeqCst))
+        }
+
+        fn list_units(&self, test_ids: &[&str]) -> Result<Vec<Vec<StoredEnvelope>>, StoreError> {
+            let d = self.state.data.lock().unwrap();
+            Ok(test_ids
+                .iter()
+                .map(|id| {
+                    let prefix = key::unit_prefix(&key::test_key(id));
+                    d.attestations
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix))
+                        .filter_map(|(k, (t, _))| StoredEnvelope::from_key(t.clone(), k))
+                        .collect()
+                })
+                .collect())
+        }
+
+        fn list_all(&self) -> Result<Vec<StoredEnvelope>, StoreError> {
+            let d = self.state.data.lock().unwrap();
+            let mut all: Vec<StoredEnvelope> = d
+                .attestations
+                .iter()
+                .filter_map(|(k, (t, _))| StoredEnvelope::from_key(t.clone(), k))
+                .collect();
+            all.sort_by(|a, b| (&a.target, &a.key).cmp(&(&b.target, &b.key)));
+            Ok(all)
+        }
+
+        fn read_values(&self, envs: &mut [&mut StoredEnvelope]) -> Result<(), StoreError> {
+            let d = self.state.data.lock().unwrap();
+            for e in envs.iter_mut() {
+                match d.attestations.get(&e.key) {
+                    Some((_, b)) => e.set_value(b.clone()),
+                    None => e.set_error(GONE),
+                }
+            }
+            Ok(())
+        }
+
+        fn manifest(&self, root: &str) -> Result<Option<StoredManifest>, StoreError> {
+            let d = self.state.data.lock().unwrap();
+            Ok(d.manifests
+                .get(root)
+                .map(|b| StoredManifest::with_bytes(root, b.clone())))
+        }
+
+        fn manifest_roots(&self) -> Result<Vec<String>, StoreError> {
+            Ok(self.roots())
+        }
+
+        fn put(&self, att: &NewAttestation<'_>) -> Result<StoredEnvelope, StoreError> {
+            self.wrote();
+            att.validate()?;
+            let key = match att.hinted_key() {
+                Some(k) => k,
+                None => {
+                    let d = self.state.data.lock().unwrap();
+                    d.same_slot(&att.plain_key())
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| att.plain_key())
+                }
+            };
+            let op = Op::Put(key.clone(), att.target.clone(), att.envelope.to_vec());
+            if let Some(op) = self.state.queue(op) {
+                self.state.apply(op);
+            }
+            Ok(att.stored(key))
+        }
+
+        fn put_manifest(&self, root: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+            self.wrote();
+            key::check_hex("input root", root)?;
+            let changed =
+                self.state.data.lock().unwrap().manifests.get(root) != Some(&bytes.to_vec());
+            if let Some(op) = self
+                .state
+                .queue(Op::Manifest(root.to_owned(), bytes.to_vec()))
+            {
+                self.state.apply(op);
+            }
+            Ok(changed)
+        }
+
+        fn remove(&self, doomed: Vec<StoredEnvelope>) -> Result<Vec<StoredEnvelope>, StoreError> {
+            self.wrote();
+            let mut removed = Vec::new();
+            for e in doomed {
+                let existed = self
+                    .state
+                    .data
+                    .lock()
+                    .unwrap()
+                    .attestations
+                    .contains_key(&e.key);
+                let deferred = self.state.queue(Op::Remove(e.key.clone())).is_none();
+                if deferred {
+                    removed.push(e);
+                } else if existed {
+                    self.state.apply(Op::Remove(e.key.clone()));
+                    removed.push(e);
+                }
+            }
+            Ok(removed)
+        }
+
+        fn remove_manifests(&self, roots: &[&str]) -> Result<usize, StoreError> {
+            self.wrote();
+            let mut d = self.state.data.lock().unwrap();
+            Ok(roots
+                .iter()
+                .filter(|r| d.manifests.remove(**r).is_some())
+                .count())
+        }
+
+        fn batch(&self) -> Result<WriteBatch, StoreError> {
+            self.state.batches.fetch_add(1, Ordering::SeqCst);
+            let end = Box::new(MemBatch(self.state.clone()));
+            Ok(if self.state.deferred.load(Ordering::SeqCst) {
+                *self.state.pending.lock().unwrap() = Some(Vec::new());
+                WriteBatch::deferred(end)
+            } else {
+                WriteBatch::immediate(end)
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +550,40 @@ mod tests {
     fn env_lookup_reads_other_variables() {
         assert_eq!(env_lookup("PATH"), std::env::var("PATH").ok());
         assert_eq!(env_lookup("VCI_STORE_URL"), None);
+    }
+
+    /// The test store keeps one record per slot, and a deferred batch's
+    /// writes appear only when it finishes, or never when it fails.
+    #[test]
+    fn the_memory_store_defers_and_fails_batches() {
+        use vci_store::KeyHint;
+        let signer = "0123456789abcdef";
+        let h = |issued| KeyHint { issued, tree: None };
+        let s = mem::MemStore::new().deferred(true);
+        let b = s.batch().unwrap();
+        assert!(b.defers_writes());
+        s.put_manifest("aa", b"{}").unwrap();
+        s.put_for_test("src/a.test.ts", signer, "abcd", Some(&h(1)), b"one")
+            .unwrap();
+        assert!(s.keys().is_empty() && s.roots().is_empty());
+        b.finish().unwrap();
+        assert_eq!(s.keys().len(), 1);
+        assert_eq!(s.roots(), ["aa"]);
+        // The same slot again, with a newer hint: one record.
+        s.put_for_test("src/a.test.ts", signer, "abcd", Some(&h(2)), b"two")
+            .unwrap();
+        assert_eq!(s.keys().len(), 1);
+        assert!(s.keys()[0].ends_with(":2.-"), "{:?}", s.keys());
+
+        let s = s.failing(Some("down"));
+        let b = s.batch().unwrap();
+        s.put_for_test("src/b.test.ts", signer, "abcd", None, b"x")
+            .unwrap();
+        let e = b.finish().unwrap_err();
+        assert_eq!(e.to_string(), "memory store unavailable: down");
+        assert_eq!(s.keys().len(), 1, "a failed batch writes nothing");
+        assert!(s.writes() > 0);
+        assert!(!s.caps().shared_writes);
+        assert!(s.shared(true).caps().shared_writes);
     }
 }
