@@ -37,7 +37,7 @@ macOS and Linux. Installs a prebuilt binary with the collectors included, so the
 brew install pandelisz/tap/vci
 ```
 
-Upgrade with `brew upgrade vci`.
+Upgrade with `vci update` (it runs `brew update` and `brew upgrade pandelisz/tap/vci`), or `brew upgrade vci`.
 
 ### 2. Install script
 
@@ -81,6 +81,17 @@ export VCI_RUBY_COLLECTOR="$HOME/.local/share/vci/ruby/vci-collector"
 ```sh
 vci --version
 ```
+
+### Keep it current
+
+```sh
+vci update           # install the latest release the way vci was installed
+vci update --check   # only compare: exit 0 when current, 1 when there is an update
+```
+
+`vci update` uses Homebrew for a Homebrew install and re-runs the install script at the release's tag for the
+script's install. A release binary downloaded by hand is replaced in place after its SHA-256 is checked; collectors
+installed beside it are not updated.
 
 ## Set up a repository (once)
 
@@ -213,6 +224,7 @@ An agent uses the same commands. Give it:
 | `vci push` / `vci fetch` | git-meta push / pull of the attestations (`refs/meta/main`) |
 | `vci prune` | Delete expired attestations (publish with `vci push`) |
 | `vci verify <envelope>` | Verify one attestation |
+| `vci update [--check]` | Install the latest release the way vci was installed; `--check` only compares |
 
 Every flag: [CLI reference](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/cli.html).
 
