@@ -398,6 +398,22 @@ impl Drop for BatchGuard {
     }
 }
 
+thread_local! {
+    /// How the last merge of the local metadata with a fetched tip on this
+    /// thread was made: "git" (`git merge-tree` of the changed subtrees)
+    /// or "git-meta" (every key of three trees listed and merged).
+    static LAST_MERGE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// How the last merge of the local metadata with a fetched tip on this
+/// thread was made (tests): `Some("git")` for `git merge-tree` of the
+/// changed subtrees, `Some("git-meta")` for git-meta's merge of every key
+/// of three listed trees, `None` when no merge ran yet.
+#[doc(hidden)]
+pub fn last_merge_kind() -> Option<&'static str> {
+    LAST_MERGE.with(|m| m.get())
+}
+
 /// The git-meta target for a test id.
 pub fn target_for(test_id: &str) -> Target {
     let path = test_id.split('#').next().unwrap_or(test_id);
@@ -6004,6 +6020,7 @@ impl<'a> AttestStore<'a> {
         {
             return Ok(Ok(commit));
         }
+        LAST_MERGE.with(|m| m.set(Some("git-meta")));
         let ours = self.snapshot_keys(local)?;
         let base_snap = match &base {
             Some(b) => {
@@ -6206,52 +6223,33 @@ impl<'a> AttestStore<'a> {
             }
             return Ok(None);
         }
-        let (_, out) = self
-            .repo
-            .git()
-            .args([
-                "merge-tree",
-                "--write-tree",
-                "--no-messages",
-                "--merge-base",
-                base,
-                local,
-                tip,
-            ])
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .output_described()?;
-        // Exit status 1: conflicts, the tree written with markers at those
-        // paths; only the deletion records found above may conflict, and
-        // they are replaced below.
-        let conflicted = out.status.code() == Some(1) && !conflicts.is_empty();
-        if !out.status.success() && !conflicted {
-            if vci_core::metrics::on() {
-                vci_core::timing_line!(
-                    "materialize: git merge-tree did not merge ({}); git-meta merges",
-                    String::from_utf8_lossy(&out.stderr)
-                        .lines()
-                        .next()
-                        .unwrap_or("no message")
-                );
-            }
-            return Ok(None);
-        }
-        let Some(mut tree) = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|t| is_oid(t))
-            .map(str::to_owned)
-        else {
-            return Ok(None);
-        };
-        if !conflicts.is_empty() {
+        // The deletion records both sides wrote differently take ours, as
+        // git-meta's merge does, by giving the tip's tree ours' state at
+        // those paths before git merges: then no path differs on both
+        // sides, and git merges trees alone. Left to git, a path changed on
+        // both sides is merged by content, which reads both blobs, and a
+        // blobless clone has not fetched the tip's (2.7.34: on vex, every
+        // push whose other job had deleted the same superseded attestations
+        // spent 8 to 55 s in a merge-tree that then failed with "lazy
+        // fetching disabled", and 10 to 67 s more in git-meta's merge of
+        // three listed trees). `no-renames` for the same reason: finding
+        // where a deleted path went reads blobs too, and a metadata tree
+        // has no renames.
+        let theirs = if conflicts.is_empty() {
+            format!("{tip}^{{tree}}")
+        } else {
             let session = self.session()?;
             let repo = session.repo();
             let gerr = |e: &dyn std::fmt::Display| {
                 GitError::Meta(format!("resolving deletion records in the merge: {e}"))
             };
-            let id = gix::ObjectId::from_hex(tree.as_bytes()).map_err(|e| gerr(&e))?;
+            let tip_tree = self
+                .repo
+                .git()
+                .args(["rev-parse", &format!("{tip}^{{tree}}")])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run_str()?;
+            let id = gix::ObjectId::from_hex(tip_tree.trim().as_bytes()).map_err(|e| gerr(&e))?;
             let mut editor = repo.edit_tree(id).map_err(|e| gerr(&e))?;
             for (p, o) in &conflicts {
                 let path = String::from_utf8_lossy(p).into_owned();
@@ -6264,14 +6262,52 @@ impl<'a> AttestStore<'a> {
                         .map_err(|e| gerr(&e))?;
                 }
             }
-            tree = editor.write().map_err(|e| gerr(&e))?.detach().to_string();
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
                     "materialize: {} deletion record(s) both sides wrote differently take ours",
                     conflicts.len()
                 );
             }
+            editor.write().map_err(|e| gerr(&e))?.detach().to_string()
+        };
+        let (_, out) = self
+            .repo
+            .git()
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                "-X",
+                "no-renames",
+                "--merge-base",
+                base,
+                local,
+                &theirs,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output_described()?;
+        if !out.status.success() {
+            if vci_core::metrics::on() {
+                vci_core::timing_line!(
+                    "materialize: git merge-tree did not merge ({}); git-meta merges",
+                    String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .next()
+                        .unwrap_or("no message")
+                );
+            }
+            return Ok(None);
         }
+        let Some(tree) = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|t| is_oid(t))
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        LAST_MERGE.with(|m| m.set(Some("git")));
         let mut git = self.repo.git().args([
             "commit-tree",
             "--no-gpg-sign",

@@ -1078,6 +1078,13 @@ impl RailsAdapter {
         if let Ok(v) = std::env::var(RAILS_SHARED_OUTPUT_ENV) {
             cmd.env(RAILS_SHARED_OUTPUT_ENV, v);
         }
+        // Measurement switches of the collector (see its EXPERIMENT and
+        // Profile): passed on as set in vci's environment.
+        for k in ["VCI_RAILS_EXPERIMENT", "VCI_RAILS_PROFILE"] {
+            if let Ok(v) = std::env::var(k) {
+                cmd.env(k, v);
+            }
+        }
         if !shards.is_empty() {
             let lines: Vec<String> = shards.iter().map(|(f, k)| format!("{k}\t{f}")).collect();
             cmd.env(RAILS_SHARDS_ENV, lines.join("\n"));

@@ -126,6 +126,79 @@ module VciCollector
   # AutoloadLookups.
   AUTOLOAD_LOOKUPS = ENV["VCI_RAILS_AUTOLOAD_LOOKUPS"] == "1"
 
+  # Batch mode: experiments (VCI_RAILS_EXPERIMENT, a comma-separated list,
+  # read here before any hook is installed): "eager" eager-loads the
+  # application and draws its routes in the group's process before the
+  # slots fork (every file then records them as inputs: a measurement, not
+  # a mode to attest with); "routes" draws the routes only; "warmup" calls
+  # Process.warmup in each slot once it is set up, before its first file's
+  # process forks.
+  EXPERIMENT = ENV["VCI_RAILS_EXPERIMENT"].to_s.split(",").map(&:strip).reject(&:empty?).freeze
+
+  # A profile of each file's process (VCI_RAILS_PROFILE=1): how long its
+  # top-level requires took (autoloads included), the routes' first draw,
+  # the garbage collector, and the process from the fork to its exit, one
+  # `vci-profile` line on stdout per process.
+  module Profile
+    ON = ENV["VCI_RAILS_PROFILE"] == "1"
+    @req_ns = 0
+    @nreq = 0
+    @depth = 0
+    @routes_ns = 0
+    class << self
+      attr_accessor :req_ns, :nreq, :depth, :routes_ns, :started, :gc_ms0, :gc_n0
+
+      # Time `yield` as a require (nested requires count in the outermost).
+      def require
+        return yield unless ON
+        self.depth += 1
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        yield
+      ensure
+        if ON
+          self.depth -= 1
+          if depth.zero?
+            self.req_ns += Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - t
+            self.nreq += 1
+          end
+        end
+      end
+
+      # In a file's process: start counting from here, print at exit.
+      def start!(id)
+        return unless ON
+        self.req_ns = 0
+        self.nreq = 0
+        self.routes_ns = 0
+        self.started = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        self.gc_ms0 = (::GC.stat(:time) rescue 0)
+        self.gc_n0 = ::GC.stat(:count)
+        if defined?(::Rails::Application::RoutesReloader) && !::Rails::Application::RoutesReloader.ancestors.include?(Routes)
+          ::Rails::Application::RoutesReloader.prepend(Routes)
+        end
+        ::Kernel.at_exit do
+          ms = ->(ns) { (ns / 1_000_000.0).round(1) }
+          now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+          $stdout.puts "vci-profile id=#{id} proc_ms=#{ms.call(now - started)} req_ms=#{ms.call(req_ns)} nreq=#{nreq} " \
+                       "routes_ms=#{ms.call(routes_ns)} gc_ms=#{((::GC.stat(:time) rescue 0) - gc_ms0)} " \
+                       "gc_n=#{::GC.stat(:count) - gc_n0}"
+          $stdout.flush
+        end
+      end
+    end
+
+    # Times the routes' draw (Rails loads them lazily, on first use, when
+    # it does not eager-load).
+    module Routes
+      def execute(*args, **kw, &blk)
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        super
+      ensure
+        Profile.routes_ns += Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - t
+      end
+    end
+  end
+
   # Batch mode (2.7.2): seconds a file's process may run in a slot before
   # it is stopped (VCI_RAILS_FILE_TIMEOUT, default 600; 0: no limit). A file
   # past it is reported as timed out (not attested, not run again); a file
@@ -1276,6 +1349,7 @@ module VciCollector
           @tmp_mark = File.join(OUT.to_s, "batch", "tmp-shared-#{Process.pid}")
           @shared_dirs = VciCollector.quiet { Output.both(TMP) }
         end
+        experiment_preload!
         begin
           rails_hooks(:before_fork_hooks).each(&:call)
         rescue Exception => e # rubocop:disable Lint/RescueException
@@ -1361,6 +1435,11 @@ module VciCollector
           @slot_setup = false
           status(slot: i, setup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round,
                  at: batch_at)
+          if EXPERIMENT.include?("warmup") && Process.respond_to?(:warmup)
+            t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            Process.warmup
+            status(slot: i, warmup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round)
+          end
         rescue Exception => e # rubocop:disable Lint/RescueException
           status(slot: i, why: "slot #{i}'s setup (Rails' after-fork hooks: its database, parallelize_setup) " \
                                "failed: #{e.class}: #{e.message.to_s.lines.first.to_s.strip}")
@@ -1650,7 +1729,27 @@ module VciCollector
         # Minitest's at_exit (registered by the driver) sets the exit status
         # only in the process that registered it, unless forks may.
         ::Minitest.allow_fork = true if defined?(::Minitest) && ::Minitest.respond_to?(:allow_fork=)
+        Profile.start!(id)
         id
+      end
+
+      # VCI_RAILS_EXPERIMENT "eager" or "routes" (see EXPERIMENT): load in
+      # the group's process what every file's process would otherwise load
+      # on its own. What is loaded here is recorded as read by the boot.
+      def experiment_preload!
+        return unless defined?(::Rails) && ::Rails.respond_to?(:application) && ::Rails.application
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        if EXPERIMENT.include?("eager")
+          ::Rails.application.eager_load!
+        end
+        if (EXPERIMENT.include?("eager") || EXPERIMENT.include?("routes")) &&
+           ::Rails.application.respond_to?(:routes_reloader)
+          rr = ::Rails.application.routes_reloader
+          rr.respond_to?(:execute_unless_loaded) ? rr.execute_unless_loaded : rr.execute
+        end
+        status(experiment: EXPERIMENT.join(","), preload_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        $stderr.puts "vci_collector: experiment preload: #{e.class}: #{e.message}"
       end
 
       # Close the boot's database connections before a file's process forks,
@@ -1949,7 +2048,7 @@ module VciCollector
       f = pathify(path)
       lp = f && relative_feature?(f) ? expanded_load_path : nil
       n = $LOADED_FEATURES.size
-      r = yield
+      r = Profile.require { yield }
       if r && lp
         hit = $LOADED_FEATURES.size > n ? $LOADED_FEATURES.last : nil
         lookup(f, hit, lp)
