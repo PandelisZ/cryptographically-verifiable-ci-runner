@@ -392,6 +392,8 @@ struct Verifier<'a> {
     /// Whether a manifest's paths collide under case folding, per input root
     /// (a manifest is used only once its root is the signed one).
     collisions: Mutex<HashMap<String, Result<(), String>>>,
+    /// The checks of each shared base manifest, made once (see [`BaseCheck`]).
+    base_checks: Mutex<HashMap<String, Arc<BaseCheck>>>,
     /// Where the verdicts phase spends its time (`VCI_TIMING=1`).
     timers: Timers,
 }
@@ -511,6 +513,10 @@ struct ManifestLoader {
     /// manifest reads).
     #[allow(clippy::type_complexity)]
     bases: Mutex<BTreeMap<String, Result<Option<StoredManifest>, String>>>,
+    /// Each manifest's base root, as read (2.7.30).
+    base_of: Mutex<HashMap<String, String>>,
+    /// The bases decoded on their own, for [`BaseCheck`].
+    decoded_bases: Mutex<HashMap<String, Arc<InputManifest>>>,
 }
 
 impl ManifestLoader {
@@ -520,6 +526,8 @@ impl ManifestLoader {
             readers: (0..readers.max(1)).map(|_| Mutex::new(None)).collect(),
             not_fetched: Mutex::default(),
             bases: Mutex::default(),
+            base_of: Mutex::default(),
+            decoded_bases: Mutex::default(),
         }
     }
 
@@ -550,6 +558,49 @@ impl ManifestLoader {
     }
 
     /// The roots reads found not fetched since the last call.
+    /// The root of the base manifest `root`'s manifest shares, once read.
+    fn base_root_of(&self, root: &str) -> Option<String> {
+        self.base_of
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(root)
+            .cloned()
+    }
+
+    /// The base manifest `root`, decoded on its own (once).
+    fn base_manifest(&self, root: &str) -> Option<Arc<InputManifest>> {
+        if let Some(m) = self
+            .decoded_bases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(root)
+        {
+            return Some(m.clone());
+        }
+        let bytes = match self
+            .bases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(root)
+        {
+            Some(Ok(Some(s))) if s.error.is_none() => s.bytes.clone(),
+            _ => return None,
+        };
+        let m = InputManifest::from_compact_with(&bytes, |b| {
+            Err(vci_core::ManifestError::NeedsBase(b.to_owned()))
+        })
+        .ok()?;
+        if m.root() != root {
+            return None;
+        }
+        let m = Arc::new(m);
+        self.decoded_bases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(root.to_owned(), m.clone());
+        Some(m)
+    }
+
     fn take_not_fetched(&self) -> BTreeSet<String> {
         std::mem::take(&mut *self.not_fetched.lock().unwrap_or_else(|p| p.into_inner()))
     }
@@ -626,6 +677,12 @@ impl ManifestLoader {
             Ok((m, base)) => (Ok(m), base),
             Err(e) => (Err(e), None),
         };
+        if let Some((b, _)) = &base {
+            self.base_of
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(root.to_owned(), b.clone());
+        }
         {
             let mut missing = Vec::new();
             if let Ok(Some(m)) = &stored
@@ -741,6 +798,64 @@ impl IgnoredChildren {
                 &crate::run::Checkout::direct(cache.root()),
                 m,
             );
+        };
+        let seen: HashSet<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
+        let mut out: Vec<RepoPath> = dirs
+            .iter()
+            .zip(ignored)
+            .flat_map(|(d, names)| names.iter().map(|n| child_path(d, n)).collect::<Vec<_>>())
+            .filter(|c| !seen.contains(c.as_str()))
+            .filter_map(|c| RepoPath::new(&c).ok())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// [`IgnoredChildren::of`] for the directories listed by the entries
+    /// from index `from` on (a manifest's own, after a shared base's, whose
+    /// part the caller has): what `m` names is never left out.
+    fn of_from(&self, cache: &CheckoutCache, m: &InputManifest, from: usize) -> Vec<RepoPath> {
+        let dirs: Vec<&RepoPath> = m.entries[from.min(m.entries.len())..]
+            .iter()
+            .filter(|e| e.kind == EntryKind::DirListing)
+            .map(|e| &e.path)
+            .collect();
+        if dirs.is_empty() {
+            return vec![];
+        }
+        let ignored: Option<Vec<Arc<Vec<String>>>> = {
+            let mut known = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            let mut missing: Vec<&RepoPath> = dirs
+                .iter()
+                .copied()
+                .filter(|d| !known.contains_key(*d))
+                .collect();
+            missing.sort();
+            missing.dedup();
+            if !missing.is_empty() {
+                match Self::ask(cache, &missing) {
+                    Some(found) => {
+                        for (d, names) in missing.into_iter().zip(found) {
+                            known.insert(d.clone(), Some(Arc::new(names)));
+                        }
+                    }
+                    None => {
+                        for d in missing {
+                            let names = Self::ask(cache, &[d])
+                                .and_then(|f| f.into_iter().next())
+                                .map(Arc::new);
+                            known.insert(d.clone(), names);
+                        }
+                    }
+                }
+            }
+            dirs.iter()
+                .map(|d| known.get(*d).cloned().flatten())
+                .collect()
+        };
+        let Some(ignored) = ignored else {
+            return self.of(cache, m);
         };
         let seen: HashSet<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
         let mut out: Vec<RepoPath> = dirs
@@ -898,6 +1013,61 @@ impl Verifier<'_> {
             .unwrap_or_else(|p| p.into_inner())
             .insert(root.to_owned(), r.clone());
         r
+    }
+}
+
+/// The checks of a shared base manifest, made once for every unit sharing
+/// it (2.7.30): a vex unit's manifest is 2,700 shared entries and about 150
+/// of its own, and every check walked all of them for each of 4,000
+/// candidates (about 100 thread-seconds a plan). A unit's verdict checks
+/// its own entries and combines them with these. Anything unusual (a base
+/// that cannot be decoded, an own entry that shadows a base path) falls
+/// back to the full check or runs the unit.
+struct BaseCheck {
+    /// The base's entries (an own entry is never one of them).
+    set: HashSet<vci_core::InputEntry>,
+    /// The base's entries that differ from the checkout (`entry:` ones).
+    mismatches: Vec<vci_core::Mismatch>,
+    /// What git ignores under the base's listed directories.
+    extra: Vec<RepoPath>,
+    /// The base's case-folded prefixes ([`InputManifest::case_prefix_index`]).
+    prefixes: BTreeMap<String, String>,
+    /// The base's own case collisions.
+    collisions: Result<(), String>,
+}
+
+impl Verifier<'_> {
+    /// The checks of base manifest `root`, made once (see [`BaseCheck`]);
+    /// `None` when the base is not at hand (the full checks run).
+    fn base_check(&self, root: &str) -> Option<Arc<BaseCheck>> {
+        if let Some(b) = self
+            .base_checks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(root)
+        {
+            return Some(b.clone());
+        }
+        let base = self.manifests.base_manifest(root)?;
+        let extra = self.ignored.of(self.checkout, &base);
+        let mismatches: Vec<vci_core::Mismatch> = base
+            .diff_against_cache(self.checkout, lookup(&self.child), &extra)
+            .ok()?
+            .into_iter()
+            .filter(|m| m.what.starts_with("entry:"))
+            .collect();
+        let bc = Arc::new(BaseCheck {
+            set: base.entries.iter().cloned().collect(),
+            mismatches,
+            extra,
+            prefixes: base.case_prefix_index(),
+            collisions: base.check_case_collisions().map_err(|e| e.to_string()),
+        });
+        self.base_checks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(root.to_owned(), bc.clone());
+        Some(bc)
     }
 }
 
@@ -1472,6 +1642,7 @@ fn plan_with(
                     ignored: &ignored,
                     globals: Mutex::default(),
                     collisions: Mutex::default(),
+                    base_checks: Mutex::default(),
                     timers: Timers::default(),
                 }),
             },
@@ -1510,7 +1681,14 @@ fn plan_with(
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
     let mut verdicts = verdicts;
     let t = std::time::Instant::now();
-    hydrate_more(&ctx, &files, &verifiers, &by_id, &mut verdicts, res);
+    let memos = {
+        let base = res
+            .base_commit
+            .as_deref()
+            .and_then(|b| ctx.repo.tree_of(b).ok());
+        passing_memos(&ctx.repo, head_tree.as_deref(), base.as_deref())
+    };
+    hydrate_more(&ctx, &files, &verifiers, &by_id, &memos, &mut verdicts, res);
     timing("verdicts again for what was fetched meanwhile", t);
     // What passed on this tree, for the plans whose base commit it is
     // (2.7.29; see `passing_memos`).
@@ -1613,9 +1791,27 @@ fn hydrate_more(
     files: &[TestFile],
     verifiers: &[Result<Verifier<'_>, String>],
     by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
+    memos: &BTreeMap<String, String>,
     verdicts: &mut [Vec<FileVerdict>],
     res: &mut PlanResult,
 ) {
+    // A unit whose remembered attestation (the one that passed on the base
+    // commit's tree, see `passing_memos`) was read and failed on its inputs
+    // has changed inputs: it runs, and no older attestation is fetched for
+    // it (2.7.32; a run's units not skipped cost 5-17 s of fetching here
+    // for the rare reverted input). Units without a remembered attestation
+    // are fetched for as before.
+    let inputs_changed = |f: &TestFile, out: &FileVerdict| -> bool {
+        let Some(k) = memos.get(&vci_core::test_key(f.test_id.as_str())) else {
+            return false;
+        };
+        out.candidates.iter().any(|c| {
+            c.info.meta_key == *k
+                && c.failure.as_ref().is_some_and(|fl| {
+                    fl.check == "inputs" && fl.details.iter().any(|d| d.what.starts_with("entry:"))
+                })
+        })
+    };
     // The candidates as last read (the store's rows are re-read for the
     // units a round fetched for).
     let mut current: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
@@ -1635,7 +1831,7 @@ fn hydrate_more(
             }
             let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
             for (f, out) in mine.iter().zip(verdicts.iter()) {
-                if out.skip || out.candidates.is_empty() {
+                if out.skip || out.candidates.is_empty() || inputs_changed(f, out) {
                     continue;
                 }
                 let id = f.test_id.as_str();
@@ -2513,18 +2709,66 @@ impl Verifier<'_> {
                 "the attestation records the constants its tests looked up in autoload directories, not their listings",
             ));
         }
+        // The shared base's part of the checks, made once (2.7.30, see
+        // `BaseCheck`); the entries after the base's are this unit's own.
+        let base_check = self
+            .manifests
+            .base_root_of(&p.core.input_root)
+            .and_then(|b| self.base_check(&b));
+        let own_from = base_check
+            .as_ref()
+            .map(|bc| m.entries.iter().take_while(|e| bc.set.contains(e)).count())
+            .unwrap_or(0);
         let t = std::time::Instant::now();
-        let collisions = self.case_collisions(&p.core.input_root, m);
+        let collisions = match &base_check {
+            Some(bc) if bc.collisions.is_err() => bc.collisions.clone(),
+            Some(bc) if !m.prefixes_collide_with(own_from, &bc.prefixes) => Ok(()),
+            _ => self.case_collisions(&p.core.input_root, m),
+        };
         Timers::add(&self.timers.collisions, t);
         collisions.map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
         let t = std::time::Instant::now();
-        let extra = self.ignored.of(self.checkout, m);
+        // (The base's part is borrowed: cloning its thousand paths for each
+        // of 4,000 candidates cost more than the check.)
+        let extra: std::borrow::Cow<'_, [RepoPath]> = match &base_check {
+            Some(bc) => {
+                let own = self.ignored.of_from(self.checkout, m, own_from);
+                if own.is_empty() {
+                    std::borrow::Cow::Borrowed(&bc.extra)
+                } else {
+                    let mut e = bc.extra.clone();
+                    e.extend(own);
+                    e.sort();
+                    e.dedup();
+                    std::borrow::Cow::Owned(e)
+                }
+            }
+            None => std::borrow::Cow::Owned(self.ignored.of(self.checkout, m)),
+        };
         Timers::add(&self.timers.ignored, t);
         Timers::count(&self.timers.rehashed);
         let t = std::time::Instant::now();
-        let diff = m
-            .diff_against_cache(self.checkout, lookup(&self.child), &extra)
+        let mut diff = m
+            .diff_against_cache_from(self.checkout, lookup(&self.child), &extra, own_from)
             .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
+        if let Some(bc) = &base_check {
+            // The base's differences, except at paths this unit's own
+            // entries took over.
+            let own: HashSet<&str> = m.entries[own_from..]
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect();
+            diff.extend(
+                bc.mismatches
+                    .iter()
+                    .filter(|mm| {
+                        mm.what
+                            .strip_prefix("entry:")
+                            .is_none_or(|p| !own.contains(p))
+                    })
+                    .cloned(),
+            );
+        }
         Timers::add(&self.timers.rehash, t);
         let (env_diff, file_diff): (Vec<_>, Vec<_>) =
             diff.into_iter().partition(|m| m.what.starts_with("env:"));

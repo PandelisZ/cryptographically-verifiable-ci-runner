@@ -1493,6 +1493,11 @@ struct Caches {
     children: std::sync::Mutex<std::collections::HashMap<Utf8PathBuf, Option<Arc<Vec<String>>>>>,
     /// `git check-ignore` per repo-relative path.
     ignored: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    /// The paths git tracks (`git ls-files`), read once: never ignored, so
+    /// never asked about (2.7.32: every unit's warnings asked about its
+    /// 150 own input paths, one `git check-ignore` per unit, 36
+    /// thread-seconds of a full vex run).
+    tracked: std::sync::OnceLock<Option<std::collections::HashSet<String>>>,
 }
 
 fn locked<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1514,6 +1519,7 @@ impl<'a> Checkout<'a> {
                 files: vci_core::CheckoutCache::new(root),
                 children: Default::default(),
                 ignored: Default::default(),
+                tracked: Default::default(),
             }),
         }
     }
@@ -1523,17 +1529,36 @@ impl<'a> Checkout<'a> {
         let Some(c) = &self.cache else {
             return git_ignored(self.root, paths);
         };
+        let tracked = c.tracked.get_or_init(|| {
+            let out = std::process::Command::new("git")
+                .args(["-C", self.root.as_str(), "ls-files", "-z"])
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            out.status.success().then(|| {
+                out.stdout
+                    .split(|b| *b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect()
+            })
+        });
         let mut ask: Vec<String> = {
             let known = locked(&c.ignored);
             paths
                 .iter()
                 .filter(|p| !known.contains_key(p.as_str()))
+                .filter(|p| !tracked.as_ref().is_some_and(|t| t.contains(p.as_str())))
                 .cloned()
                 .collect()
         };
         ask.sort();
         ask.dedup();
-        let (found, answered) = git_check_ignore(self.root, &ask);
+        let (found, answered) = if ask.is_empty() {
+            (vec![], true)
+        } else {
+            git_check_ignore(self.root, &ask)
+        };
         if !answered {
             // git stopped before answering about every path (it exits 128 on
             // a path inside a submodule or beyond a symbolic link, after
@@ -2474,6 +2499,15 @@ pub fn run_units(
                 g(&tm_store),
                 g(&tm_store_manifest),
                 g(&tm_store_remove)
+            );
+            let pm = vci_git::AttestStore::put_manifest_seconds();
+            vci_core::timing_line!(
+                "{}: put_manifest seconds: session {:.1}, read current {:.1}, set {:.1}, stamp {:.1}",
+                project.label(),
+                pm[0],
+                pm[1],
+                pm[2],
+                pm[3]
             );
             let ns =
                 |i: usize| SUPERSEDE_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;

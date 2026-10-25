@@ -1441,7 +1441,7 @@ impl InputManifest {
     where
         F: Fn(&str) -> Option<OsString> + Sync,
     {
-        self.diff_from(Source::Fs(repo_root), env, extra_excluded)
+        self.diff_from(Source::Fs(repo_root), env, extra_excluded, 0)
     }
 
     /// [`Self::diff_against_checkout_excluding`] observing the checkout
@@ -1458,7 +1458,25 @@ impl InputManifest {
     where
         F: Fn(&str) -> Option<OsString> + Sync,
     {
-        self.diff_from(Source::Cache(cache), env, extra_excluded)
+        self.diff_from(Source::Cache(cache), env, extra_excluded, 0)
+    }
+
+    /// [`Self::diff_against_cache`] observing only the entries from index
+    /// `from` on (the manifest's own, after the ones a shared base
+    /// contributed, which the caller checked once for every manifest sharing
+    /// it); the exclusions and autoload directories come from every entry.
+    /// Env keys are compared as always.
+    pub fn diff_against_cache_from<F>(
+        &self,
+        cache: &CheckoutCache,
+        env: F,
+        extra_excluded: &[RepoPath],
+        from: usize,
+    ) -> Result<Vec<Mismatch>, ManifestError>
+    where
+        F: Fn(&str) -> Option<OsString> + Sync,
+    {
+        self.diff_from(Source::Cache(cache), env, extra_excluded, from)
     }
 
     fn diff_from<F>(
@@ -1466,6 +1484,7 @@ impl InputManifest {
         src: Source<'_>,
         env: F,
         extra_excluded: &[RepoPath],
+        from: usize,
     ) -> Result<Vec<Mismatch>, ManifestError>
     where
         F: Fn(&str) -> Option<OsString> + Sync,
@@ -1485,8 +1504,7 @@ impl InputManifest {
         } else {
             src.autoload_index(&autoload_dirs)?
         };
-        let entry_results: Vec<Option<Mismatch>> = self
-            .entries
+        let entry_results: Vec<Option<Mismatch>> = self.entries[from.min(self.entries.len())..]
             .par_iter()
             .map(|exp| {
                 if exp.kind == EntryKind::AutoloadDir {
@@ -1549,6 +1567,68 @@ impl InputManifest {
                 .filter(|e| e.kind == EntryKind::Excluded)
                 .map(|e| &e.path),
         )
+    }
+
+    /// Every directory prefix and path of this manifest, case-folded, with
+    /// the spelling seen first: what [`Self::prefixes_collide_with`] checks
+    /// another manifest's entries against.
+    pub fn case_prefix_index(&self) -> BTreeMap<String, String> {
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for e in &self.entries {
+            let p = e.path.as_str();
+            let mut end = 0;
+            loop {
+                end = match p[end..].find('/') {
+                    Some(i) => end + i,
+                    None => p.len(),
+                };
+                let prefix = &p[..end];
+                seen.entry(fold(prefix))
+                    .or_insert_with(|| prefix.to_owned());
+                if end == p.len() {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        seen
+    }
+
+    /// Whether the entries from index `from` on might collide under case
+    /// folding with each other or with the paths `index` describes (a
+    /// shared base's, see [`Self::case_prefix_index`]): `true` sends the
+    /// caller to [`Self::check_case_collisions`] over everything, which also
+    /// knows which collisions are harmless; `false` means that check would
+    /// find none the base's own check did not.
+    pub fn prefixes_collide_with(&self, from: usize, index: &BTreeMap<String, String>) -> bool {
+        let mut own: BTreeMap<String, &str> = BTreeMap::new();
+        for e in &self.entries[from.min(self.entries.len())..] {
+            let p = e.path.as_str();
+            let mut end = 0;
+            loop {
+                end = match p[end..].find('/') {
+                    Some(i) => end + i,
+                    None => p.len(),
+                };
+                let prefix = &p[..end];
+                let folded = fold(prefix);
+                if index.get(&folded).is_some_and(|b| b != prefix) {
+                    return true;
+                }
+                match own.get(&folded) {
+                    Some(prev) if *prev != prefix => return true,
+                    Some(_) => {}
+                    None => {
+                        own.insert(folded, prefix);
+                    }
+                }
+                if end == p.len() {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        false
     }
 
     /// Err if two distinct paths (or directory prefixes of paths) are equal
