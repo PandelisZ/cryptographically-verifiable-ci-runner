@@ -1104,6 +1104,99 @@ fn go_other_go_version_runs() {
     }
 }
 
+/// One package attested at three states S0, S1 and S2 (each a tagged
+/// commit, so supersession keeps the earlier attestations), then a fourth
+/// commit whose package file is S0's again (an edit attested twice, then
+/// reverted; another package changes too, so the tree is not S0's). The
+/// clone that attested them holds every value, so a plan's later rounds
+/// fetch nothing. The plan reads the two newest candidates first: both fail
+/// on their inputs. It must read the oldest, which it set aside after the
+/// lookup, in a second round and skip the package through it (2.8.0:
+/// before, a round that fetched nothing ended the plan, and the package
+/// ran).
+#[test]
+fn deferred_candidates_are_read_when_present_locally() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let src = w.read("d/d.go");
+    let state = |n: usize| format!("{src}\n// state {n}\n");
+    let mut trees: Vec<String> = Vec::new();
+    for n in 0..3 {
+        if n > 0 {
+            // A key's hint has whole seconds; the plan reads the newest by
+            // them, all of them on a tie.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+        w.put("d/d.go", &state(n));
+        w.git(&work, &["commit", "-q", "-am", &format!("S{n}")]);
+        w.git(&work, &["tag", &format!("s{n}")]);
+        trees.push(w.git(&work, &["rev-parse", "HEAD^{tree}"]));
+        w.run(&work, D, &w.trusted);
+    }
+    // Every value is here, and each key names its state's tree.
+    let repo = store_for(&work);
+    let stored = AttestStore::new(&repo).list(Some(D)).unwrap();
+    assert_eq!(stored.len(), 3, "supersession kept every state: {stored:?}");
+    assert!(
+        stored
+            .iter()
+            .all(|s| s.error.is_none() && !s.bytes.is_empty())
+    );
+    let key_of = |n: usize| -> String {
+        let t16: String = trees[n].chars().take(16).collect();
+        stored
+            .iter()
+            .find(|s| s.tree.as_deref() == Some(t16.as_str()))
+            .unwrap_or_else(|| panic!("no attestation of S{n}: {stored:?}"))
+            .key
+            .clone()
+    };
+    let keys: Vec<String> = (0..3).map(key_of).collect();
+    let issued: BTreeSet<Option<i64>> = stored.iter().map(|s| s.issued).collect();
+    assert_eq!(issued.len(), 3, "three issue times: {stored:?}");
+
+    w.put("d/d.go", &state(0));
+    let a_src = w.read("a/a.go");
+    w.put("a/a.go", &format!("{a_src}\n// unrelated\n"));
+    w.git(&work, &["commit", "-q", "-am", "d as at S0, a edited"]);
+    assert_ne!(w.git(&work, &["rev-parse", "HEAD^{tree}"]), trees[0]);
+
+    let out = w.vci_env(
+        &work,
+        &["plan", "--base-ref", "main", "--format", "json"],
+        &[("VCI_TIMING", "1")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let d = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["testId"] == D)
+        .unwrap();
+    assert_eq!(d["skip"], true, "d skips through S0: {d:#}\n{stderr}");
+    assert_eq!(d["by"]["metaKey"], keys[0].as_str(), "{d:#}");
+    assert!(
+        stderr.contains("round 2: read 1 candidate(s) set aside"),
+        "S0 is read in the second round: {stderr}"
+    );
+
+    let ex = w.explain(&work, D, "main");
+    assert!(ex.contains("d: SKIP"), "{ex}");
+    let candidates: Vec<&str> = ex.split("\ncandidate ").skip(1).collect();
+    assert_eq!(candidates.len(), 3, "{ex}");
+    for (block, n) in candidates.iter().zip([2, 1, 0]) {
+        assert!(block.contains(&keys[n]), "newest first: S{n}\n{ex}");
+        if n == 0 {
+            assert!(block.contains("all checks passed"), "{ex}");
+        } else {
+            assert!(block.contains("failed check: inputs"), "{ex}");
+            assert!(block.contains("entry:d/d.go"), "{ex}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Regression tests for adversarial findings against the Go adapter. Each one
 // was a false skip (or an over-invalidation) before the fix.

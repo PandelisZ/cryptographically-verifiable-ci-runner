@@ -15,7 +15,7 @@ use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
 use vci_core::{CheckoutCache, EntryKind, InputManifest, Observation, PREDICATE_TYPE, RepoPath};
 use vci_git::Repo;
 use vci_store::{
-    AttestationStore, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest,
+    AttestationStore, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, ValueState,
 };
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
@@ -1523,6 +1523,9 @@ fn plan_with(
     // the checks.
     join_fetch(fetch, res);
     let mut by_id: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
+    // The candidates read only for the units the first pass cannot skip
+    // (`hydrate_more`), by unit.
+    let mut set_aside = SetAside::new();
     if !res.projects.iter().all(|p| p.run_all.is_some()) {
         // A fetch downloads keys, not values: fetch the values this plan
         // reads (the candidates of the units it verifies, then the input
@@ -1560,7 +1563,7 @@ fn plan_with(
                 .and_then(|b| ctx.repo.tree_of(b).ok());
             let memos = passing_memos(store, head.as_deref(), base.as_deref());
             let mut read: Vec<&mut StoredEnvelope> = Vec::new();
-            for cands in m.values_mut() {
+            for (id, cands) in m.iter_mut() {
                 let memo = cands
                     .first()
                     .and_then(|c| memos.get(&c.test_key))
@@ -1580,6 +1583,10 @@ fn plan_with(
                         read.push(c);
                     } else {
                         c.mark_not_fetched();
+                        set_aside
+                            .entry(id.clone())
+                            .or_default()
+                            .insert(c.key.clone());
                     }
                 }
             }
@@ -1590,6 +1597,7 @@ fn plan_with(
         match looked_up {
             Ok(m) => by_id = m,
             Err(e) => {
+                set_aside.clear();
                 let e = format!("reading attestations from {}: {e:#}", store.kind());
                 for p in res.projects.iter_mut() {
                     p.run_all.get_or_insert_with(|| e.clone());
@@ -1687,6 +1695,7 @@ fn plan_with(
         &files,
         &verifiers,
         &by_id,
+        set_aside,
         &memos,
         &mut verdicts,
         res,
@@ -1802,29 +1811,43 @@ fn hydrate_for_plan(
     timing("fetch the stored values the plan reads", t);
 }
 
-/// The second round of a lazy plan: the units the first pass could not
-/// skip because a candidate's input manifest was not fetched yet (only the
-/// newest's was, `hydrate_for_plan`) have those manifests fetched, in one
-/// batch, and are checked again. A unit whose newest attestation matches
-/// never gets here; one whose older attestation matches (an input edited
-/// and reverted, a branch rebased onto what was attested) is skipped as
-/// with every value fetched. Bounded: a round that fetches nothing new
-/// ends it.
+/// The candidates a plan set aside after its lookup
+/// ([`StoredEnvelope::mark_not_fetched`]): it checks a unit's likeliest
+/// candidates first and reads the others only for the units it cannot skip
+/// (`hydrate_more`). Test id -> the keys set aside and not read yet.
+type SetAside = BTreeMap<String, BTreeSet<String>>;
+
+/// The rounds after the first pass (2, then at most 3), for the units it
+/// could not skip. A round fetches what a lazy store does not hold here yet
+/// (every candidate of a unit with one not fetched, and the input manifests
+/// and bases the checks found not fetched; one batch each), reads again the
+/// candidates without a value (the ones the plan set aside, and the ones
+/// just fetched), and checks those units again. A unit whose newest
+/// attestations fail and an older one matches (an input edited and
+/// reverted, a branch rebased onto what was attested) is then skipped as
+/// with every value read, whether the older value had to be fetched or was
+/// here all along (a git-meta clone with its values fetched, SQLite,
+/// PostgreSQL: 2.8.0; before, a round that fetched nothing ended the plan,
+/// and those units ran). A unit whose newest attestation matches never gets
+/// here. Bounded: a round that fetched nothing and whose read made no
+/// candidate readable ends it.
+#[allow(clippy::too_many_arguments)]
 fn hydrate_more(
     store: &dyn AttestationStore,
     files: &[TestFile],
     verifiers: &[Result<Verifier<'_>, String>],
     by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
+    mut set_aside: SetAside,
     memos: &BTreeMap<String, String>,
     verdicts: &mut [Vec<FileVerdict>],
     res: &mut PlanResult,
 ) {
     // A unit whose remembered attestation (the one that passed on the base
     // commit's tree, see `passing_memos`) was read and failed on its inputs
-    // has changed inputs: it runs, and no older attestation is fetched for
-    // it (2.7.32; a run's units not skipped cost 5-17 s of fetching here
-    // for the rare reverted input). Units without a remembered attestation
-    // are fetched for as before.
+    // has changed inputs: it runs, and no older attestation is fetched or
+    // read for it (2.7.32; a run's units not skipped cost 5-17 s of fetching
+    // here for the rare reverted input). Units without a remembered
+    // attestation are fetched for and read as before.
     let inputs_changed = |f: &TestFile, out: &FileVerdict| -> bool {
         let Some(k) = memos.get(&vci_core::test_key(f.test_id.as_str())) else {
             return false;
@@ -1837,16 +1860,16 @@ fn hydrate_more(
         })
     };
     // The candidates as last read (the store's rows are re-read for the
-    // units a round fetched for).
+    // units a round read again).
     let mut current: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
     for round in 2..=3 {
         // The units the first pass could not skip that have a candidate
-        // whose value was not fetched: every candidate of theirs is fetched
-        // (envelopes, manifests, bases) in one batch each. A unit whose
-        // candidates were all read needs only the manifests (or bases) its
-        // check found not fetched (`roots`): reading every candidate's
-        // manifest again to look for them took 13 s on a full vex run with
-        // nothing to fetch.
+        // without its value: set aside by the plan, or not fetched by a lazy
+        // store. Every candidate of theirs is fetched (envelopes, manifests,
+        // bases) in one batch each. A unit whose candidates were all read
+        // needs only the manifests (or bases) its check found not fetched
+        // (`roots`): reading every candidate's manifest again to look for
+        // them took 13 s on a full vex run with nothing to fetch.
         let mut ids: BTreeSet<&str> = BTreeSet::new();
         let mut unread: BTreeSet<&str> = BTreeSet::new();
         for (pi, verdicts) in verdicts.iter().enumerate() {
@@ -1865,7 +1888,7 @@ fn hydrate_more(
                     .or_else(|| by_id.get(id))
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                if cands.iter().any(StoredEnvelope::not_fetched) {
+                if set_aside.contains_key(id) || cands.iter().any(StoredEnvelope::not_fetched) {
                     unread.insert(id);
                 }
             }
@@ -1906,7 +1929,29 @@ fn hydrate_more(
             res.warnings.push(w);
         }
         let resolved = h.map(|h| h.resolved).unwrap_or(0);
-        if resolved == 0 {
+        if resolved > 0 {
+            for v in verifiers.iter().flatten() {
+                v.manifests.evict(&roots);
+                v.manifests.evict_errors();
+            }
+        }
+        // Read again: after a fetch, every candidate without a value of the
+        // units fetched for; with nothing fetched, the candidates the plan
+        // set aside and has not read yet. A store that holds every value
+        // here fetches nothing, and `resolved` counts only values that were
+        // not fetched before (`Hydration`), so nothing fetched does not mean
+        // nothing more is readable.
+        let again: Vec<&str> = unread
+            .iter()
+            .copied()
+            .filter(|id| resolved > 0 || set_aside.contains_key(*id))
+            .collect();
+        let only = (resolved == 0).then_some(&set_aside);
+        let readable = read_again(store, &again, only, by_id, &mut current, round);
+        for id in &again {
+            set_aside.remove(*id);
+        }
+        if resolved == 0 && readable == 0 {
             timing(
                 &format!(
                     "round {round}: nothing more to fetch for {} unit(s) not skipped",
@@ -1916,25 +1961,7 @@ fn hydrate_more(
             );
             return;
         }
-        for v in verifiers.iter().flatten() {
-            v.manifests.evict(&roots);
-            v.manifests.evict_errors();
-        }
-        // Checked again with every candidate readable: these units'
-        // candidates are read again, in one batch (2.7.23: one unit at a
-        // time took 9 s for 2,000 units on a laptop).
-        let mut again: Vec<(String, Vec<StoredEnvelope>)> = unread
-            .iter()
-            .filter_map(|id| by_id.get(*id).map(|c| ((*id).to_owned(), c.clone())))
-            .collect();
-        let read = {
-            let mut refs: Vec<&mut StoredEnvelope> =
-                again.iter_mut().flat_map(|(_, c)| c.iter_mut()).collect();
-            store.read_values(&mut refs)
-        };
-        if read.is_ok() {
-            current.extend(again);
-        }
+        // Checked again with every candidate readable.
         let fresh = &current;
         let mut rechecked = 0usize;
         in_plan_pool(|| {
@@ -1966,14 +1993,82 @@ fn hydrate_more(
                     .count();
             }
         }
+        let what = if resolved > 0 {
+            format!("fetch {resolved} more value(s)")
+        } else {
+            format!("read {readable} candidate(s) set aside")
+        };
         timing(
             &format!(
-                "round {round}: fetch {resolved} more value(s) for {} unit(s) not skipped, check them again ({rechecked} still not)",
+                "round {round}: {what} for {} unit(s) not skipped, check them again ({rechecked} still not)",
                 ids.len()
             ),
             t,
         );
     }
+}
+
+/// Read again, in one batch (2.7.23: one unit at a time took 9 s for 2,000
+/// units on a laptop), the candidates of the units `ids` that hold no value
+/// (as last read: `current`, else the lookup's `by_id`), only the ones
+/// `only` holds for their unit when given, and keep them in `current`.
+/// Returns how many became readable: none when the store cannot be read
+/// (those units' verdicts stand, and they run).
+fn read_again(
+    store: &dyn AttestationStore,
+    ids: &[&str],
+    only: Option<&SetAside>,
+    by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
+    current: &mut BTreeMap<String, Vec<StoredEnvelope>>,
+    round: usize,
+) -> usize {
+    let t = std::time::Instant::now();
+    let mut again: Vec<(String, Vec<StoredEnvelope>)> = ids
+        .iter()
+        .filter_map(|id| {
+            current
+                .get(*id)
+                .or_else(|| by_id.get(*id))
+                .map(|c| ((*id).to_owned(), c.clone()))
+        })
+        .collect();
+    let readable = |c: &StoredEnvelope| matches!(c.state(), ValueState::Read(_));
+    let count = |again: &[(String, Vec<StoredEnvelope>)]| -> usize {
+        again
+            .iter()
+            .flat_map(|(_, c)| c)
+            .filter(|c| readable(c))
+            .count()
+    };
+    let before = count(&again);
+    let mut refs: Vec<&mut StoredEnvelope> = again
+        .iter_mut()
+        .flat_map(|(id, c)| {
+            let keys = only.map(|o| o.get(id.as_str()));
+            c.iter_mut().filter(move |c| {
+                !readable(c) && keys.is_none_or(|k| k.is_some_and(|k| k.contains(&c.key)))
+            })
+        })
+        .collect();
+    if refs.is_empty() {
+        return 0;
+    }
+    let asked = refs.len();
+    let read = store.read_values(&mut refs);
+    drop(refs);
+    timing(
+        &format!(
+            "round {round}: read {asked} candidate value(s) of {} unit(s) again",
+            again.len()
+        ),
+        t,
+    );
+    if read.is_err() {
+        return 0;
+    }
+    let after = count(&again);
+    current.extend(again);
+    after.saturating_sub(before)
 }
 
 /// A candidate in the order it is checked: (made on this checkout's tree,
@@ -4156,6 +4251,83 @@ adapter = "pytest"
             "signer: policy.no_skip_refs matches refs/heads/main and signer dev is not in no_skip_refs_except"
         );
         assert!(f.details[0].actual.contains("github-actions"));
+    }
+
+    /// On a store that holds every value (nothing for a prefetch to fetch),
+    /// the candidates the plan set aside are read again and counted as made
+    /// readable; a key removed meanwhile reads as gone and counts for
+    /// nothing; values already read are not read again; with the set-aside
+    /// keys given, no other candidate is read; without them, every candidate
+    /// without a value is.
+    #[test]
+    fn set_aside_candidates_are_read_again() {
+        use vci_store::KeyHint;
+        let store = crate::store::mem::MemStore::new();
+        let id = "src/a.test.ts";
+        for (issued, sk) in [(1, "aa"), (2, "bb"), (3, "cc"), (4, "dd")] {
+            let hint = KeyHint { issued, tree: None };
+            let envelope = format!("{{\"n\":{issued}}}");
+            store
+                .put_for_test(id, "0123456789abcdef", sk, Some(&hint), envelope.as_bytes())
+                .unwrap();
+        }
+        // The two newest read (the older of them then unreadable), the two
+        // oldest set aside.
+        let mut listed = store.list_units(&[id]).unwrap().remove(0);
+        assert_eq!(listed.len(), 4);
+        let mut set_aside = SetAside::new();
+        for (i, c) in listed.iter_mut().enumerate() {
+            if i < 2 {
+                c.mark_not_fetched();
+                set_aside
+                    .entry(id.to_owned())
+                    .or_default()
+                    .insert(c.key.clone());
+            } else {
+                store.read_values(&mut [c]).unwrap();
+            }
+        }
+        listed[2].set_error("a blob missing");
+        let gone = listed[1].clone();
+        assert_eq!(store.remove(vec![gone.clone()]).unwrap().len(), 1);
+        let by_id = BTreeMap::from([(id.to_owned(), listed)]);
+        let mut current = BTreeMap::new();
+        let read = |only, current: &mut BTreeMap<String, Vec<StoredEnvelope>>| {
+            read_again(&store, &[id], only, &by_id, current, 2)
+        };
+        assert_eq!(
+            read_again(&store, &[], Some(&set_aside), &by_id, &mut current, 2),
+            0
+        );
+        assert!(current.is_empty());
+        assert_eq!(read(Some(&set_aside), &mut current), 1);
+        let states = |current: &BTreeMap<String, Vec<StoredEnvelope>>| -> Vec<String> {
+            current[id]
+                .iter()
+                .map(|c| format!("{:?}", c.state()))
+                .collect()
+        };
+        assert_eq!(
+            states(&current),
+            [
+                format!("{:?}", ValueState::Read(b"{\"n\":1}")),
+                format!("{:?}", ValueState::Unreadable(vci_store::GONE)),
+                format!("{:?}", ValueState::Unreadable("a blob missing")),
+                format!("{:?}", ValueState::Read(b"{\"n\":4}")),
+            ]
+        );
+        assert_eq!(current[id][1].key, gone.key);
+        // From what was last read, every candidate without a value: the
+        // unreadable one reads now, the gone one is still gone.
+        assert_eq!(read(None, &mut current), 1);
+        assert_eq!(
+            states(&current)[1..3],
+            [
+                format!("{:?}", ValueState::Unreadable(vci_store::GONE)),
+                format!("{:?}", ValueState::Read(b"{\"n\":3}")),
+            ]
+        );
+        assert_eq!(read(None, &mut current), 0);
     }
 
     /// Candidates are checked newest first since 2.1, but the reason still
