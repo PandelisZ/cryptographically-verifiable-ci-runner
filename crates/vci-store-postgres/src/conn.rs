@@ -356,6 +356,19 @@ impl ConnSpec {
         })
     }
 
+    /// How long one connection may take in all (TCP, TLS, startup and
+    /// authentication): the connect timeout for each host the string names.
+    pub(crate) fn connect_deadline(&self) -> Duration {
+        let hosts = self
+            .config
+            .get_hosts()
+            .len()
+            .max(self.config.get_hostaddrs().len())
+            .max(1);
+        self.connect_timeout
+            .saturating_mul(u32::try_from(hosts).unwrap_or(u32::MAX))
+    }
+
     /// Where the server is, without credentials.
     pub(crate) fn display(&self) -> &str {
         &self.display
@@ -693,10 +706,56 @@ impl Conn {
         }
     }
 
+    /// Connect, bounded as a whole. The client library bounds only the TCP
+    /// connect: a peer that accepts and then never answers (a frozen or
+    /// failing-over server, a stuck proxy, another service on the port)
+    /// would hold the TLS and startup exchange forever, because its kernel
+    /// acknowledges every packet. So the connection is made on a thread of
+    /// its own, and given up after the connect timeout (per host named); a
+    /// thread given up on ends with its socket, and drops a connection that
+    /// arrives too late.
     fn connect(&self) -> Result<Client, StoreError> {
-        let r = match self.spec.ssl_mode {
-            SslMode::Disable => self.spec.config.connect(NoTls),
-            _ => self.spec.config.connect(self.tls()?),
+        let tls = match self.spec.ssl_mode {
+            SslMode::Disable => None,
+            _ => Some(self.tls()?),
+        };
+        let config = self.spec.config.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("vci-postgres-connect".into())
+            .spawn(move || {
+                let r = match tls {
+                    None => config.connect(NoTls),
+                    Some(t) => config.connect(t),
+                };
+                // Nobody waits any more after a timeout: the client is
+                // dropped, closing the connection.
+                let _ = tx.send(r);
+            });
+        if let Err(e) = spawned {
+            return Err(StoreError::unavailable(
+                KIND,
+                format!("cannot start a thread to connect: {e}"),
+            ));
+        }
+        let r = match rx.recv_timeout(self.spec.connect_deadline()) {
+            Ok(r) => r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(self.latch(StoreError::Timeout {
+                    backend: KIND,
+                    operation: "connecting",
+                    after: self.spec.connect_deadline(),
+                }));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(self.latch(StoreError::unavailable(
+                    KIND,
+                    format!(
+                        "cannot connect to {}: the attempt failed",
+                        self.spec.display
+                    ),
+                )));
+            }
         };
         r.map_err(|e| {
             let text = error_text(&self.secret, &e);

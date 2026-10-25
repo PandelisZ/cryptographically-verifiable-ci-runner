@@ -54,7 +54,7 @@ use postgres::types::Type;
 use vci_store::select::Selection;
 use vci_store::{
     AttestationStore, BackendFactory, Caps, Hydration, KeyHint, NewAttestation, OpenContext,
-    Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, WriteBatch,
+    Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, WriteBatch, key,
 };
 
 pub use conn::PgError;
@@ -433,9 +433,24 @@ impl AttestationStore for PgStore {
     /// Keeps (and does not count) a root that an attestation or another
     /// manifest (as its base) references, or that was put within the grace
     /// period (`[store.postgres] manifest_grace`, one hour by default; none
-    /// for a long-running command such as `vci prune`).
+    /// for a long-running command such as `vci prune`). While a deferred
+    /// batch is open on this thread, the roots it will write or reference
+    /// are kept too.
     fn remove_manifests(&self, roots: &[&str]) -> Result<usize, StoreError> {
-        write::remove_manifests(&self.inner, roots)
+        match batch::queued_roots(&self.inner) {
+            Some(queued) if roots.iter().any(|r| queued.contains(*r)) => {
+                let rest: Vec<&str> = roots
+                    .iter()
+                    .copied()
+                    .filter(|r| !queued.contains(*r))
+                    .collect();
+                for r in roots {
+                    key::check_hex("input root", r)?;
+                }
+                write::remove_manifests(&self.inner, &rest)
+            }
+            _ => write::remove_manifests(&self.inner, roots),
+        }
     }
 
     fn read_units(&self, test_ids: &[&str]) -> Result<Vec<Vec<StoredEnvelope>>, StoreError> {

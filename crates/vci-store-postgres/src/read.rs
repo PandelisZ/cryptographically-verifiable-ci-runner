@@ -548,7 +548,7 @@ pub(crate) fn prefetch(inner: &Inner, what: Prefetch<'_>) -> Result<Hydration, S
                 let set: BTreeSet<&str> = roots
                     .iter()
                     .copied()
-                    .filter(|r| key::is_hex_id(r) && !c.has_manifest(r))
+                    .filter(|r| key::is_hex_id(r) && !c.has_stored_manifest(r))
                     .collect();
                 set.into_iter().map(str::to_owned).collect()
             };
@@ -569,9 +569,10 @@ pub(crate) fn prefetch(inner: &Inner, what: Prefetch<'_>) -> Result<Hydration, S
     }
 }
 
-/// The listings of these units, the values `choose` picks (all without
-/// it), and the manifests those values reference with their bases: at most
-/// three statements, whatever the number of units.
+/// The listings of these units (always read again), the values `choose`
+/// picks (all without it) that are not cached, and the manifests those
+/// values reference with their bases: at most three statements, whatever
+/// the number of units.
 fn prefetch_units(
     inner: &Inner,
     test_ids: &[&str],
@@ -591,27 +592,19 @@ fn prefetch_units(
             tks.push(tk);
         }
     }
-    // 1. The listings not cached yet.
+    // 1. The listings, from the server even when cached: a prefetch is
+    // where other writers' changes are picked up. A cached value stays
+    // valid while its key is listed (a value never changes under its key
+    // but to repair an unreadable row); one whose key went is dropped.
     let mut listings: HashMap<String, Vec<StoredEnvelope>> = HashMap::new();
-    let mut missing: Vec<&str> = Vec::new();
     {
-        let c = inner.cache();
-        for tk in &tks {
-            match c.listing(tk) {
-                Some(l) => {
-                    listings.insert(tk.clone(), l);
-                }
-                None => missing.push(tk),
-            }
-        }
-    }
-    if !missing.is_empty() {
-        let mut listed = query_listings(inner, ns, &missing)?;
+        let all: Vec<&str> = tks.iter().map(String::as_str).collect();
+        let mut listed = query_listings(inner, ns, &all)?;
         let mut c = inner.cache();
-        for tk in missing {
-            let l = listed.remove(tk).unwrap_or_default();
-            listings.insert(tk.to_owned(), entries(&l));
-            c.set_listing(tk.to_owned(), l);
+        for tk in &tks {
+            let l = listed.remove(tk.as_str()).unwrap_or_default();
+            listings.insert(tk.clone(), entries(&l));
+            c.refresh_listing(tk.clone(), l);
         }
     }
     // 2. The values chosen (here, with no lock held), not cached yet.
@@ -653,10 +646,12 @@ fn prefetch_units(
             }
         }
     }
-    // 3. Their manifests and bases, not cached yet.
+    // 3. Their manifests and bases, not cached as stored yet.
     let refs: Vec<String> = {
         let c = inner.cache();
-        refs.into_iter().filter(|r| !c.has_manifest(r)).collect()
+        refs.into_iter()
+            .filter(|r| !c.has_stored_manifest(r))
+            .collect()
     };
     if !refs.is_empty() {
         fetch_manifests(inner, ns, &refs)?;

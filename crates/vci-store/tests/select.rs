@@ -134,6 +134,15 @@ fn the_environment_wins_over_the_url_scheme_over_vci_toml_over_the_default() {
         "redis"
     );
     assert!(config_err(&[(ENV_STORE, "no such!")], None).contains("is not a store backend name"));
+    // Only a value shaped like a name is quoted back.
+    assert!(config_err(&[(ENV_STORE, "Redis_2")], None).contains("\"Redis_2\""));
+    for v in [
+        "host=h password=Vst0reKvQ",
+        "host=h password = 'Vst0re KvQ'",
+    ] {
+        let m = config_err(&[(ENV_STORE, v)], None);
+        assert!(m.contains("not printed") && !m.contains("Vst0re"), "{m}");
+    }
 }
 
 #[test]
@@ -578,6 +587,41 @@ fn redact_removes_credentials() {
         ),
         ("host=db sslkey=/keys/k.pem", "host=db sslkey=***"),
         ("postgres://db.internal/ci", "postgres://db.internal/ci"),
+        // A password holding an unencoded `/`, `?` or `@`.
+        (
+            "postgres://slash:Sl/sh9Pwq@127.0.0.1:55481/postgres?sslmode=disable",
+            "postgres://***@127.0.0.1:55481/postgres?sslmode=disable",
+        ),
+        (
+            "postgres://qmark:Qm?rk9Pwq@127.0.0.1:55481/postgres?sslmode=disable",
+            "postgres://***@127.0.0.1:55481/postgres?sslmode=disable",
+        ),
+        ("postgres://u:a/b@c@db/ci", "postgres://***@db/ci"),
+        (
+            "postgress://u:Ty/poLeakQ@db.example/x",
+            "postgress://***@db.example/x",
+        ),
+        // A percent-encoded key in the query.
+        (
+            "postgres://db/ci?pass%77ord=s3cret&x=1",
+            "postgres://db/ci?pass%77ord=***&x=1",
+        ),
+        // libpq spacing and quoting.
+        (
+            "host=127.0.0.1 user=vci password = Zq9pw0rdX dbname=postgres",
+            "host=127.0.0.1 user=vci password = *** dbname=postgres",
+        ),
+        (
+            "host=h password='Sp ce9Pwq' dbname=postgres",
+            "host=h password=*** dbname=postgres",
+        ),
+        (
+            r"host=h password='it\'s q' sslmode=disable",
+            "host=h password=*** sslmode=disable",
+        ),
+        ("host=h PASSWORD=Up9 x=1", "host=h PASSWORD=*** x=1"),
+        ("host=h password=a://b@c", "host=h password=***"),
+        ("host=h password='unterminated x", "host=h password=***"),
         ("git@github.com:o/r.git", "git@github.com:o/r.git"),
         ("/srv/meta.git", "/srv/meta.git"),
     ] {
@@ -608,6 +652,19 @@ fn secrets_are_scrubbed_from_every_message() {
     let s = Secret::new("host=db user=ci password=s3cret-kv");
     assert_eq!(s.scrub("bad password s3cret-kv"), "bad password ***");
     assert_eq!(s.redacted(), "host=db user=ci password=***");
+    // Passwords the URL parser of the client reads differently from a
+    // naive one: an unencoded `/` or `?`, libpq spacing and quoting.
+    for (url, pw) in [
+        ("postgres://slash:Sl/sh9Pwq@h/postgres", "Sl/sh9Pwq"),
+        ("postgres://qmark:Qm?rk9Pwq@h/postgres", "Qm?rk9Pwq"),
+        ("host=h password = Zq9pw0rdX", "Zq9pw0rdX"),
+        ("host=h password='Sp ce9Pwq'", "Sp ce9Pwq"),
+    ] {
+        let s = Secret::new(url);
+        let m = s.scrub(&format!("failed for {pw}; url {url}"));
+        assert!(!m.contains(pw), "{m}");
+        assert!(!s.redacted().contains(pw), "{}", s.redacted());
+    }
     // Passwords under 3 bytes are left (they would scrub ordinary words),
     // but the whole secret still goes.
     let s = Secret::new("postgres://u:ab@h/d");

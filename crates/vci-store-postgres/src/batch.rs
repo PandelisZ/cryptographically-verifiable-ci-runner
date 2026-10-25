@@ -1,13 +1,17 @@
 //! The deferred write batch (`docs/STORE-BACKENDS.md` sections 6 and 17).
 //!
 //! While a batch of a store is open on a thread, that thread's `put`,
-//! `put_manifest` and `remove` through the store are queued, deduplicated
-//! (by slot, root and key; the last call wins), and written at
-//! [`WriteBatch::finish`] in one transaction: the manifests (one UNNEST
-//! upsert), then the attestations (one UNNEST upsert), then the removals
-//! (one `DELETE … = ANY`). A queue of [`FLUSH_WRITES`] attestations and
-//! removals, or of [`FLUSH_BYTES`], is written early in a transaction of
-//! its own; a failed early write fails `finish`.
+//! `put_manifest` and `remove` through the store are queued and written at
+//! [`WriteBatch::finish`] in one transaction, ending in the state the same
+//! calls made one by one would reach. The queue keeps, per slot, the last
+//! put (which replaces every stored key of its slot), whether a later
+//! removal took that put's key away again (the slot ends empty), and the
+//! keys removed otherwise; per root, the last manifest. It is written as
+//! the manifests (one UNNEST upsert), the removed keys (one `DELETE … =
+//! ANY`), the emptied slots (one `DELETE`, only when there are some), then
+//! the attestations (one UNNEST upsert). A queue of [`FLUSH_WRITES`]
+//! attestations and removals, or of [`FLUSH_BYTES`], is written early in a
+//! transaction of its own; a failed early write fails `finish`.
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
@@ -33,6 +37,7 @@ pub(crate) struct Sql {
     manifests: String,
     attestations: String,
     remove: String,
+    remove_slots: String,
 }
 
 impl Sql {
@@ -67,6 +72,12 @@ impl Sql {
                    (EXCLUDED.key, EXCLUDED.value, EXCLUDED.encoding)"
             ),
             remove: format!("DELETE FROM {a} WHERE ns = $1 AND key = ANY($2)"),
+            remove_slots: format!(
+                "DELETE FROM {a} AS a USING unnest($2::text[], $3::text[], $4::text[]) \
+                   AS u(test_key, signer, storage_key) \
+                 WHERE a.ns = $1 AND a.test_key = u.test_key AND a.signer = u.signer \
+                   AND a.storage_key = u.storage_key"
+            ),
         }
     }
 }
@@ -88,6 +99,8 @@ type Slot = (String, String, String);
 struct Pending {
     manifests: BTreeMap<String, (Option<String>, Vec<u8>)>,
     attestations: BTreeMap<Slot, Row>,
+    /// Slots whose queued put was removed again: they end empty.
+    emptied: BTreeSet<Slot>,
     removals: BTreeSet<String>,
     bytes: usize,
     /// An early write failed: the batch fails, and later writes are
@@ -97,11 +110,15 @@ struct Pending {
 
 impl Pending {
     fn is_empty(&self) -> bool {
-        self.manifests.is_empty() && self.attestations.is_empty() && self.removals.is_empty()
+        self.manifests.is_empty()
+            && self.attestations.is_empty()
+            && self.emptied.is_empty()
+            && self.removals.is_empty()
     }
 
     fn full(&self) -> bool {
-        self.attestations.len() + self.removals.len() >= FLUSH_WRITES || self.bytes >= FLUSH_BYTES
+        self.attestations.len() + self.emptied.len() + self.removals.len() >= FLUSH_WRITES
+            || self.bytes >= FLUSH_BYTES
     }
 
     /// The queue, leaving an empty one (and the failure) in place.
@@ -109,6 +126,7 @@ impl Pending {
         Pending {
             manifests: std::mem::take(&mut self.manifests),
             attestations: std::mem::take(&mut self.attestations),
+            emptied: std::mem::take(&mut self.emptied),
             removals: std::mem::take(&mut self.removals),
             bytes: std::mem::take(&mut self.bytes),
             failed: None,
@@ -131,6 +149,25 @@ fn with_pending<T>(inner: &Inner, f: impl FnOnce(&mut Pending) -> T) -> Option<T
 /// Whether a batch of `inner` is open on this thread.
 pub(crate) fn is_open(inner: &Inner) -> bool {
     with_pending(inner, |_| ()).is_some()
+}
+
+/// The roots the open batch of `inner` on this thread will reference once
+/// written (its attestations' manifests, its manifests and their bases),
+/// or `None` without an open batch. `remove_manifests` keeps them: the
+/// server cannot see them yet.
+pub(crate) fn queued_roots(inner: &Inner) -> Option<BTreeSet<String>> {
+    with_pending(inner, |p| {
+        let mut roots: BTreeSet<String> = p
+            .attestations
+            .values()
+            .filter_map(|r| r.manifest_ref.clone())
+            .collect();
+        for (root, (base, _)) in &p.manifests {
+            roots.insert(root.clone());
+            roots.extend(base.clone());
+        }
+        roots
+    })
 }
 
 /// Open a deferred batch on this thread. A batch already open on this
@@ -200,12 +237,24 @@ pub(crate) fn put(inner: &Inner, att: &NewAttestation<'_>) -> Result<StoredEnvel
         Some(k) => k,
         None => {
             // Without a hint the slot keeps its key: the one queued, else
-            // the one stored (one read), else the plain key.
-            let queued =
-                with_pending(inner, |p| p.attestations.get(&slot).map(|r| r.key.clone())).flatten();
+            // the one stored (one read) unless the batch removes it, else
+            // the plain key.
+            let queued = with_pending(inner, |p| {
+                if let Some(r) = p.attestations.get(&slot) {
+                    Some(Some(r.key.clone()))
+                } else if p.emptied.contains(&slot) {
+                    Some(None)
+                } else {
+                    None
+                }
+            })
+            .flatten();
             match queued {
-                Some(k) => k,
-                None => slot_key(inner, ns, att)?.unwrap_or_else(|| att.plain_key()),
+                Some(Some(k)) => k,
+                Some(None) => att.plain_key(),
+                None => slot_key(inner, ns, att)?
+                    .filter(|k| !with_pending(inner, |p| p.removals.contains(k)).unwrap_or(false))
+                    .unwrap_or_else(|| att.plain_key()),
             }
         }
     };
@@ -221,7 +270,9 @@ pub(crate) fn put(inner: &Inner, att: &NewAttestation<'_>) -> Result<StoredEnvel
         if p.failed.is_some() {
             return;
         }
+        // The put replaces the slot whatever was queued for it.
         p.removals.remove(&key);
+        p.emptied.remove(&slot);
         p.bytes += row.value.len() + row.key.len();
         if let Some(old) = p.attestations.insert(slot, row) {
             p.bytes = p.bytes.saturating_sub(old.value.len() + old.key.len());
@@ -272,7 +323,12 @@ pub(crate) fn remove(
                 if p.attestations.get(&slot).is_some_and(|r| r.key == e.key)
                     && let Some(old) = p.attestations.remove(&slot)
                 {
+                    // The queued put already replaced every stored key of
+                    // its slot, and this removes its own: the slot ends
+                    // empty.
                     p.bytes = p.bytes.saturating_sub(old.value.len() + old.key.len());
+                    p.emptied.insert(slot);
+                    continue;
                 }
             }
             p.removals.insert(e.key.clone());
@@ -295,6 +351,9 @@ fn write(inner: &Inner, p: Pending) -> Result<(), StoreError> {
     let step = Step::start(KIND);
     let n0 = inner.conn.statements();
     let only_removals = p.manifests.is_empty() && p.attestations.is_empty();
+    let e_tks: Vec<&str> = p.emptied.iter().map(|(t, _, _)| t.as_str()).collect();
+    let e_signers: Vec<&str> = p.emptied.iter().map(|(_, s, _)| s.as_str()).collect();
+    let e_sks: Vec<&str> = p.emptied.iter().map(|(_, _, k)| k.as_str()).collect();
     if !only_removals {
         schema::ensure(inner)?;
     }
@@ -339,6 +398,25 @@ fn write(inner: &Inner, p: Pending) -> Result<(), StoreError> {
                 ],
             )?;
         }
+        // Removals before the upsert: a put queued after a removal of its
+        // slot replaces the slot anyway, and an emptied slot has no put.
+        if !removals.is_empty() {
+            tx.execute(
+                &sql.remove,
+                &[(&ns, Type::TEXT), (&removals, Type::TEXT_ARRAY)],
+            )?;
+        }
+        if !e_tks.is_empty() {
+            tx.execute(
+                &sql.remove_slots,
+                &[
+                    (&ns, Type::TEXT),
+                    (&e_tks, Type::TEXT_ARRAY),
+                    (&e_signers, Type::TEXT_ARRAY),
+                    (&e_sks, Type::TEXT_ARRAY),
+                ],
+            )?;
+        }
         if !a_keys.is_empty() {
             tx.execute(
                 &sql.attestations,
@@ -355,12 +433,6 @@ fn write(inner: &Inner, p: Pending) -> Result<(), StoreError> {
                     (&a_states, Type::INT2_ARRAY),
                     (&a_values, Type::BYTEA_ARRAY),
                 ],
-            )?;
-        }
-        if !removals.is_empty() {
-            tx.execute(
-                &sql.remove,
-                &[(&ns, Type::TEXT), (&removals, Type::TEXT_ARRAY)],
             )?;
         }
         tx.commit()
@@ -381,21 +453,24 @@ fn write(inner: &Inner, p: Pending) -> Result<(), StoreError> {
         "write batch: {} manifest(s), {} attestation(s), {} removal(s), {} statement(s)",
         m_roots.len(),
         a_keys.len(),
-        removals.len(),
+        removals.len() + e_tks.len(),
         inner.conn.statements() - n0
     ));
     let mut c = inner.cache();
     for (root, (_, bytes)) in &p.manifests {
         c.manifest_put(root, bytes);
     }
+    for k in &p.removals {
+        c.removed(k);
+    }
+    for (tk, signer, sk) in &p.emptied {
+        c.removed_slot(tk, signer, sk);
+    }
     for r in p.attestations.into_values() {
         if let Some(mut e) = StoredEnvelope::from_key(r.target, &r.key) {
             e.set_value(r.value);
             c.put(&e);
         }
-    }
-    for k in &p.removals {
-        c.removed(k);
     }
     Ok(())
 }

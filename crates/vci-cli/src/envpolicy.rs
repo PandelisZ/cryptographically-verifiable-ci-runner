@@ -438,7 +438,7 @@ impl ChildEnvMap {
 /// Strict mode keeps the variables of every class but stripped; loose mode
 /// keeps everything. Then every `set` variable gets its declared value.
 /// The store's secrets ([`vci_store::select::NEVER_TO_CHILDREN`],
-/// `VCI_STORE_URL`) never reach a test, in either mode: vci removes them
+/// `VCI_STORE_URL` and `VCI_STORE`) never reach a test, in either mode: vci removes them
 /// from its own environment at start-up, and this drops them again.
 pub fn build_child_env(
     policy: &FileEnv,
@@ -600,27 +600,31 @@ mod tests {
         assert_eq!(keys(&child), ["CI", "TZ"]);
     }
 
-    /// `VCI_STORE_URL` (a store's password) reaches no test, whatever the
-    /// mode and even when vci.toml sets it; other `VCI_*` variables pass
-    /// through as built-in ignore.
+    /// `VCI_STORE_URL` (a store's password) and `VCI_STORE` (where one
+    /// may be put by mistake) reach no test, whatever the mode and even when
+    /// vci.toml sets them; other `VCI_*` variables pass through as built-in
+    /// ignore.
     #[test]
     fn store_secrets_never_reach_a_test() {
         let with_url = || {
             let mut p = parent();
             p.push(("VCI_STORE_URL".into(), "postgres://u:s3cret@h/db".into()));
-            p.push(("VCI_STORE".into(), "postgres".into()));
+            p.push(("VCI_STORE".into(), "host=h password=s3cret".into()));
+            p.push(("VCI_STORE_NAMESPACE".into(), "ns".into()));
             p
         };
         for mode in [EnvMode::Strict, EnvMode::Loose] {
             let mut c = cfg(mode);
             c.set
                 .insert("VCI_STORE_URL".into(), "postgres://u:s3cret@h/db".into());
+            c.set.insert("VCI_STORE".into(), "postgres".into());
             c.hash.push("VCI_STORE_URL".into());
             let child = build_child_env(&vitest(&c), with_url());
             assert!(child.get("VCI_STORE_URL").is_none(), "{mode:?}");
+            assert!(child.get("VCI_STORE").is_none(), "{mode:?}");
             assert_eq!(
-                child.get("VCI_STORE").as_deref(),
-                Some(std::ffi::OsStr::new("postgres")),
+                child.get("VCI_STORE_NAMESPACE").as_deref(),
+                Some(std::ffi::OsStr::new("ns")),
                 "{mode:?}"
             );
         }

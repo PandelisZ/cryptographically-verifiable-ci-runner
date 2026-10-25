@@ -41,7 +41,7 @@ struct Opened {
     selection: Option<Selection>,
 }
 
-/// Take every [`select::NEVER_TO_CHILDREN`] variable (`VCI_STORE_URL`) out
+/// Take every [`select::NEVER_TO_CHILDREN`] variable (`VCI_STORE`, `VCI_STORE_URL`) out
 /// of this process's environment, keeping its value in memory, so that no
 /// test, adapter probe, hook or git command vci starts can see it. Later
 /// calls do nothing.
@@ -660,6 +660,30 @@ mod tests {
             let e = o.store.status().unwrap_err().to_string();
             let all = format!("{e} {} {:?}", o.store.location(), o.selection);
             assert!(!all.contains("s3cret"), "{all}");
+        }
+        // A libpq string in VCI_STORE is refused without being quoted back.
+        let o = open(
+            &repo,
+            &env_of(&[("VCI_STORE", "host=127.0.0.1 password='s3cret x'")]),
+        );
+        let e = o.store.status().unwrap_err().to_string();
+        assert!(e.contains("not printed") && !e.contains("s3cret"), "{e}");
+        // With git-meta selected, the warning about an ignored VCI_STORE_URL
+        // shows no part of a password, however the string writes it.
+        for url in [
+            "host=db.example password = s3cret-kv",
+            "host=db.example password='s3cret kv'",
+            "postgress://u:s3cr/et@db.example/x",
+            "postgress://u:s3cr?et@db.example/x",
+        ] {
+            let o = open(&repo, &env_of(&[("VCI_STORE_URL", url)]));
+            assert_eq!(o.store.kind(), "git-meta");
+            let sel = o.selection.unwrap();
+            let all = format!("{:?} {sel:?}", sel.warnings);
+            assert_eq!(sel.warnings.len(), 1, "{all}");
+            for part in ["s3cr", " kv", "et@"] {
+                assert!(!all.contains(part), "{part} in {all}");
+            }
         }
 
         std::fs::write(

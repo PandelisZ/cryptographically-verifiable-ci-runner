@@ -10,7 +10,11 @@
 //!   handle's own writes: a put updates its unit's listing and value, a
 //!   removal drops the key, a `put_manifest` replaces a cached root (an
 //!   absent one included). Other writers' changes are missed until the next
-//!   prefetch, which only makes units run.
+//!   prefetch of the units, which lists them again from the server (and
+//!   drops the values of keys no longer listed); missing them only makes
+//!   units run. Values and stored manifests are not read again while
+//!   cached (a key names one attestation, a root one manifest); a manifest
+//!   cached as absent is asked for again by the next prefetch of it.
 //! * An attestation value leaves the cache when `read_values` reads it (the
 //!   caller keeps it). Listings and manifests stay: bases are shared and
 //!   read again.
@@ -146,10 +150,31 @@ impl Cache {
             .map(|l| l.iter().map(Listed::size).sum::<usize>() + test_key.len())
             .unwrap_or(0);
         if !self.fits(size.saturating_sub(old)) {
+            // A listing that cannot be brought up to date is not kept.
+            if self.listings.remove(&test_key).is_some() {
+                self.bytes = self.bytes.saturating_sub(old);
+            }
             return;
         }
         self.bytes = self.bytes - old + size;
         self.listings.insert(test_key, listed);
+    }
+
+    /// A unit's listing as the server has it now: the values of keys it no
+    /// longer lists leave the cache, and the listing replaces the cached
+    /// one.
+    pub(crate) fn refresh_listing(&mut self, test_key: String, listed: Vec<Listed>) {
+        if let Some(old) = self.listings.get(&test_key) {
+            let gone: Vec<String> = old
+                .iter()
+                .filter(|o| !listed.iter().any(|n| n.key == o.key))
+                .map(|o| o.key.clone())
+                .collect();
+            for k in gone {
+                self.take_value(&k);
+            }
+        }
+        self.set_listing(test_key, listed);
     }
 
     /// Whether a value is cached for `key`.
@@ -182,6 +207,14 @@ impl Cache {
     /// Whether `root` is cached (an absent manifest too).
     pub(crate) fn has_manifest(&self, root: &str) -> bool {
         self.manifests.contains_key(root)
+    }
+
+    /// Whether `root` is cached as stored (readable or not): a prefetch
+    /// asks the server again about a root cached as absent.
+    pub(crate) fn has_stored_manifest(&self, root: &str) -> bool {
+        self.manifests
+            .get(root)
+            .is_some_and(|m| !matches!(m, Manifest::Absent))
     }
 
     /// The cached answer for `root`: `None` when it is not cached,
@@ -250,6 +283,23 @@ impl Cache {
             if l.len() < before {
                 self.bytes = self.bytes.saturating_sub(key.len() + 48);
             }
+        }
+    }
+
+    /// This handle removed every key of a slot.
+    pub(crate) fn removed_slot(&mut self, test_key: &str, signer: &str, storage_key: &str) {
+        let Some(l) = self.listings.get(test_key) else {
+            return;
+        };
+        let doomed: Vec<String> = l
+            .iter()
+            .filter(|x| {
+                key::parse_key(&x.key).is_some_and(|(_, s, k)| s == signer && k == storage_key)
+            })
+            .map(|x| x.key.clone())
+            .collect();
+        for k in doomed {
+            self.removed(&k);
         }
     }
 

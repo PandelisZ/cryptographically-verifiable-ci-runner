@@ -1675,7 +1675,9 @@ no push, no fetch, no cache.
   do; `VCI_STORE_NAMESPACE` or `[store.postgres] namespace` sets another. A shallow clone cannot give the repository
   id (its first commit is where the clone was cut), so there the store needs `VCI_STORE_NAMESPACE`, with the same
   value everywhere, and fails open without it.
-- **Bounded time.** Connecting waits at most 5 s (`VCI_STORE_CONNECT_TIMEOUT_SECS`, `[store] connect_timeout`), a
+- **Bounded time.** Connecting waits at most 5 s (`VCI_STORE_CONNECT_TIMEOUT_SECS`, `[store] connect_timeout`), the
+  TLS request, startup and authentication included, so a server or proxy that accepts and never answers costs the
+  same as one that refuses; a
   statement at most 30 s (`VCI_STORE_TIMEOUT_SECS`, `[store] timeout`; ten minutes for `vci prune`), a lock at most
   10 s. After the first failure to connect, or the first wait that ran out, every later call of the command fails at
   once, so a server that is down costs one connect timeout per command, and the plan runs everything. Each vci process
@@ -1698,7 +1700,7 @@ no push, no fetch, no cache.
 - **Hints.** The memo and the flags are tables on the server, per namespace, shared by everyone: a pull request's plan
   reads what main's plans remembered without any cache. They never fail: a role that cannot write them just leaves
   them alone.
-- **Cost.** A plan reads with about a dozen statements, whatever the number of units (13 for 1,200 units in the
+- **Cost.** A plan reads with about a dozen statements, whatever the number of units (14 for 1,200 units in the
   tests), from a cache the handle fills in a few statements; a run writes 1,000 units in 5. Transfer, measured on a
   synthetic store of 600 Go units with three attestations of about 3 KB each and small manifests: 5.1 MiB for a plan
   that skips every unit and 11.4 MiB for one that runs every unit. On a real repository the input manifests (often

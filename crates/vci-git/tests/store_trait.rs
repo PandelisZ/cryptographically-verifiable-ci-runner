@@ -810,6 +810,45 @@ fn put_keeps_semantics() {
     assert!(!keys.iter().any(|k| k.ends_with(":64.-")));
 }
 
+/// git-meta's put is not one atomic step (the put contract says so):
+/// concurrent puts of one slot may leave several records, and the slot's
+/// next put collapses them to one.
+#[test]
+fn racing_puts_of_one_slot_collapse_on_the_next_put() {
+    let (_t, x) = init_repo();
+    let gs = GitMetaStore::new(repo(&x));
+    let sk = hex64(9);
+    let threads = 6;
+    let barrier = std::sync::Barrier::new(threads);
+    std::thread::scope(|sc| {
+        for i in 0..threads {
+            let (gs, sk, barrier) = (&gs, &sk, &barrier);
+            sc.spawn(move || {
+                barrier.wait();
+                let h = hint(100 + i as i64, None);
+                // A racing put may also fail ("database is locked").
+                let _ = gs.put_for_test(A, S1, sk, Some(&h), format!("w{i}").as_bytes());
+            });
+        }
+    });
+    let raced = gs.list_units(&[A]).unwrap().remove(0).len();
+    assert!((1..=threads).contains(&raced), "{raced}");
+    let last = gs
+        .put_for_test(A, S1, &sk, Some(&hint(1000, None)), b"last")
+        .unwrap();
+    let mut l = gs.list_units(&[A]).unwrap().remove(0);
+    assert_eq!(
+        l.len(),
+        1,
+        "{:?}",
+        l.iter().map(|e| &e.key).collect::<Vec<_>>()
+    );
+    assert_eq!(l[0].key, last.key);
+    gs.read_values(&mut l.iter_mut().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(l[0].bytes, b"last");
+}
+
 /// The factory opens git-meta for its repository, whatever the selection
 /// says beyond the name.
 #[test]

@@ -175,6 +175,55 @@ fn an_unreachable_server_fails_fast_and_shows_no_secret() {
     );
 }
 
+/// A peer that accepts connections and never answers (a frozen server, a
+/// stuck proxy, another service on the port): the whole connection,
+/// startup and TLS request included, is bounded by the connect timeout,
+/// and the breaker then answers every call at once.
+#[test]
+fn a_server_that_never_answers_is_given_up_on_in_time() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in listener.incoming() {
+            // Keep each connection open, unread and unanswered.
+            held.push(c);
+        }
+    });
+    for mode in ["?sslmode=disable", "", "?sslmode=require"] {
+        let url = format!("postgres://u:s3cret-silent@127.0.0.1:{port}/x{mode}");
+        let mut sel = selection(&url, "vci", "t");
+        sel.connect_timeout = Sourced {
+            value: Duration::from_secs(1),
+            source: Source::Env("VCI_STORE_CONNECT_TIMEOUT_SECS"),
+        };
+        let s = PgStore::open(&sel, &cx()).unwrap();
+        let t = Instant::now();
+        let first = s.list_units(&[UNIT_A]).unwrap_err();
+        assert!(
+            matches!(first, StoreError::Timeout { .. }),
+            "{mode}: {first:?}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "{mode}: {:?}",
+            t.elapsed()
+        );
+        let t = Instant::now();
+        for _ in 0..20 {
+            let e = s.status().unwrap_err();
+            assert!(matches!(e, StoreError::Unavailable { .. }), "{e:?}");
+            assert!(!e.to_string().contains("s3cret-silent"), "{e}");
+        }
+        assert!(
+            s.put_for_test(UNIT_A, S1, &hex64(1), Some(&hint(1)), b"x")
+                .is_err()
+        );
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(!first.to_string().contains("s3cret-silent"), "{first}");
+    }
+}
+
 /// Test 2: what vci does to the URL before the client library sees it.
 #[test]
 fn url_handling() {
@@ -847,6 +896,144 @@ fn reads_see_this_handles_writes_after_a_prefetch() {
     batch.finish().unwrap();
     assert_eq!(read_bytes(&p, UNIT_B), vec![(c.key.clone(), b"c".to_vec())]);
     assert_eq!(read_bytes(&db.open(), UNIT_B), vec![(c.key, b"c".to_vec())]);
+}
+
+/// A later prefetch picks up other writers' changes: a record added, a
+/// slot's key replaced, and a manifest that was absent.
+#[test]
+fn a_second_prefetch_sees_other_writers() {
+    let Some(db) = pg() else { return };
+    let w = db.open();
+    let old = w
+        .put_for_test(UNIT_A, S1, &hex64(1), Some(&hint(1)), b"old")
+        .unwrap();
+    let h = db.open();
+    let later = hex64(70);
+    let units = Prefetch::Units {
+        test_ids: &[UNIT_A],
+        choose: None,
+    };
+    h.prefetch(units).unwrap();
+    h.prefetch(Prefetch::Manifests { roots: &[&later] })
+        .unwrap();
+    assert!(h.manifest(&later).unwrap().is_none());
+    assert_eq!(keys(&h.list_units(&[UNIT_A]).unwrap()[0]), vec![old.key]);
+    let added = w
+        .put_for_test(UNIT_A, S2, &hex64(2), Some(&hint(5)), b"added")
+        .unwrap();
+    let replaced = w
+        .put_for_test(UNIT_A, S1, &hex64(1), Some(&hint(9)), b"replaced")
+        .unwrap();
+    w.put_manifest(&later, &manifest("later", None)).unwrap();
+    h.prefetch(Prefetch::Units {
+        test_ids: &[UNIT_A],
+        choose: None,
+    })
+    .unwrap();
+    h.prefetch(Prefetch::Manifests { roots: &[&later] })
+        .unwrap();
+    let mut want = vec![
+        (added.key.clone(), b"added".to_vec()),
+        (replaced.key.clone(), b"replaced".to_vec()),
+    ];
+    want.sort();
+    let units = h.read_units(&[UNIT_A]).unwrap().remove(0);
+    let got: Vec<(String, Vec<u8>)> = units.into_iter().map(|e| (e.key, e.bytes)).collect();
+    assert_eq!(got, want);
+    assert_eq!(read_bytes(&h, UNIT_A), want);
+    assert!(h.manifest(&later).unwrap().is_some());
+}
+
+/// A deferred batch ends in the state the same calls reach one by one:
+/// a put whose new key is then removed empties its slot, a removal then an
+/// unhinted put stores under the plain key, and repeated puts keep the
+/// slot's key as plain calls do.
+#[test]
+fn a_deferred_batch_applies_its_calls_in_order() {
+    let Some(db) = pg() else { return };
+    let run = |batched: bool| -> Vec<(String, Vec<u8>)> {
+        let ns = if batched { "batched" } else { "plain" };
+        let s = PgStore::open(&selection(&db.url, &db.schema, ns), &cx()).unwrap();
+        s.put_for_test(UNIT_A, S1, &hex64(10), Some(&hint(1)), b"k0")
+            .unwrap();
+        let k5 = s
+            .put_for_test(UNIT_A, S1, &hex64(15), Some(&hint(1)), b"k5")
+            .unwrap();
+        let batch = batched.then(|| s.batch().unwrap());
+        if let Some(b) = &batch {
+            assert!(b.defers_writes());
+        }
+        // Slot 10: a new key, then that key removed.
+        let k2 = s
+            .put_for_test(UNIT_A, S1, &hex64(10), Some(&hint(2)), b"k2")
+            .unwrap();
+        s.remove(vec![k2]).unwrap();
+        // Slot 11: two keys, the first removed afterwards.
+        let x1 = s
+            .put_for_test(UNIT_A, S1, &hex64(11), Some(&hint(1)), b"x1")
+            .unwrap();
+        s.put_for_test(UNIT_A, S1, &hex64(11), Some(&hint(2)), b"x2")
+            .unwrap();
+        s.remove(vec![x1]).unwrap();
+        // Slot 15: the stored key removed, then an unhinted put.
+        s.remove(vec![k5]).unwrap();
+        s.put_for_test(UNIT_A, S1, &hex64(15), None, b"k5 plain")
+            .unwrap();
+        // Slot 16: unhinted, hinted, unhinted.
+        s.put_for_test(UNIT_A, S1, &hex64(16), None, b"p1").unwrap();
+        s.put_for_test(UNIT_A, S1, &hex64(16), Some(&hint(3)), b"p2")
+            .unwrap();
+        s.put_for_test(UNIT_A, S1, &hex64(16), None, b"p3").unwrap();
+        if let Some(b) = batch {
+            b.finish().unwrap();
+        }
+        let mine = read_bytes(&s, UNIT_A);
+        let fresh = read_bytes(
+            &PgStore::open(&selection(&db.url, &db.schema, ns), &cx()).unwrap(),
+            UNIT_A,
+        );
+        assert_eq!(
+            mine, fresh,
+            "{ns}: this handle's cache agrees with the server"
+        );
+        fresh
+    };
+    let plain = run(false);
+    let batched = run(true);
+    assert_eq!(batched, plain);
+    let values: Vec<&[u8]> = plain.iter().map(|(_, v)| v.as_slice()).collect();
+    assert_eq!(values, [&b"x2"[..], b"k5 plain", b"p3"]);
+    assert!(
+        plain[1].0.ends_with(&format!(":{}", hex64(15))),
+        "{plain:?}"
+    );
+}
+
+/// `remove_manifests` while a deferred batch is open keeps the roots the
+/// batch will reference, even with no grace period.
+#[test]
+fn remove_manifests_keeps_what_an_open_batch_references() {
+    let Some(db) = pg() else { return };
+    let s = PgStore::open(&db.selection(), &cx_for("prune", true)).unwrap();
+    let (r, free) = (hex64(31), hex64(32));
+    s.put_manifest(&r, &manifest("r", None)).unwrap();
+    s.put_manifest(&free, &manifest("free", None)).unwrap();
+    let b = s.batch().unwrap();
+    s.put_for_test(
+        UNIT_A,
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(Some(&r), 10),
+    )
+    .unwrap();
+    assert_eq!(s.remove_manifests(&[&r]).unwrap(), 0);
+    assert_eq!(s.remove_manifests(&[&r, &free]).unwrap(), 1);
+    b.finish().unwrap();
+    let fresh = db.open();
+    assert!(fresh.manifest(&r).unwrap().is_some());
+    assert!(fresh.manifest(&free).unwrap().is_none());
+    assert_eq!(fresh.list_units(&[UNIT_A]).unwrap()[0].len(), 1);
 }
 
 /// Test 10: deferred batches.

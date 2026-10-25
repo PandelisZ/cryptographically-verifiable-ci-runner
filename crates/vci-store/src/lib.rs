@@ -1129,9 +1129,14 @@ pub trait AttestationStore: Send + Sync {
     ///   existing key of the same (test key, signer, storage key) (a rewrite
     ///   in place), else [`NewAttestation::plain_key`].
     /// * Every other key of the same (test key, signer, storage key) is
-    ///   removed **in the same atomic step**: concurrent puts of the same
-    ///   inputs leave exactly one record (an [`Exchange`] store may hold two
-    ///   after a merge; its next write collapses them).
+    ///   removed. A [`Caps::shared_writes`] store does it **in the same
+    ///   atomic step** as the write, so concurrent puts of the same inputs
+    ///   leave exactly one record (SQLite does too). A store may instead
+    ///   list, remove and write as separate steps: git-meta does, so puts
+    ///   of one slot racing in one repository (threads, or two `vci run`s)
+    ///   may leave several records, as an [`Exchange`] store may after a
+    ///   merge. Readers tolerate them (every record is verified), and the
+    ///   slot's next put collapses them.
     /// * Identical bytes under the same key are a no-op.
     /// * Outside a deferred [`WriteBatch`], the write is durable and visible
     ///   to this store's later reads when the call returns (to every reader
@@ -1254,11 +1259,24 @@ pub trait AttestationStore: Send + Sync {
     }
 
     /// Of these roots, the ones no stored attestation references, sorted.
-    /// When what some attestation references is unknown (a value that is
-    /// unreadable or not fetched, a payload that does not parse), the answer
-    /// is empty: nothing is removed. The default reads every value. A
-    /// backend with an index of `manifestRef` answers in one query; a lazy
-    /// backend first fetches the values that could reference these roots.
+    /// An attestation references the root its value's `manifestRef` names
+    /// ([`key::envelope_manifest_ref`]). A backend may answer from that
+    /// reference as recorded when the attestation was stored (an index),
+    /// even when the value cannot be read now.
+    ///
+    /// When some attestation's reference is unknown (a payload that does
+    /// not parse or names no hex root; without a recorded reference, a value
+    /// that is unreadable or not fetched), the answer is empty and nothing
+    /// is removed, unless the backend can tell that this attestation cannot
+    /// reference any of these roots. git-meta can: a value not fetched,
+    /// stored on a path target that is neither a path the manifests list
+    /// nor a directory above one, is not waited for (a unit's manifest lists
+    /// its own path); offline it answers empty. Removing a manifest that is still referenced only
+    /// makes its unit run again.
+    ///
+    /// The default reads every value. A backend with an index of
+    /// `manifestRef` answers in one query; a lazy backend first fetches the
+    /// values that could reference these roots.
     ///
     /// Used by: run.rs after supersession (`drop_orphan_manifests`), then
     /// [`AttestationStore::remove_manifests`].
@@ -1338,8 +1356,10 @@ pub trait AttestationStore: Send + Sync {
     /// snapshot taken at prefetch time. That snapshot always reflects this
     /// handle's own later writes and removals (a put evicts or updates what
     /// it touches, including a cached "no such manifest"). Other writers'
-    /// changes may be missed until the next prefetch, which is safe: a stale
-    /// record only makes a unit run, and every record is verified.
+    /// changes may be missed until the next prefetch of the same data, which
+    /// picks them up (a later prefetch of units lists them again). Missing
+    /// them is safe: a stale record only makes a unit run, and every record
+    /// is verified.
     ///
     /// Failing to fetch some values is reported in [`Hydration::error`] and
     /// [`Hydration::unresolved`] (their units run). `Err` is for a store
@@ -1966,9 +1986,9 @@ pub mod select {
     //! `VCI_STORE_URL`, never from `vci.toml`, which every checkout carries
     //! (a pull request's too): a URL, host, user, password or database name
     //! there is refused, naming the key and never its value. The command
-    //! line reads `VCI_STORE_URL` once at start-up and removes it from its
-    //! own environment, so no test process, adapter or hook ever sees it
-    //! ([`NEVER_TO_CHILDREN`]).
+    //! line reads `VCI_STORE_URL` and `VCI_STORE` once at start-up and
+    //! removes them from its own environment, so no test process, adapter
+    //! or hook ever sees them ([`NEVER_TO_CHILDREN`]).
     //!
     //! This module only parses and validates. The command line turns a
     //! [`Selection`] into a store through the registered
@@ -2006,8 +2026,10 @@ pub mod select {
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
     /// again, so that they never reach a test, an adapter or a hook (other
-    /// `VCI_*` variables pass through as built-in ignore).
-    pub const NEVER_TO_CHILDREN: &[&str] = &[ENV_STORE_URL];
+    /// `VCI_*` variables pass through as built-in ignore). `VCI_STORE` is
+    /// one of them because a connection string put there by mistake would
+    /// otherwise reach every test.
+    pub const NEVER_TO_CHILDREN: &[&str] = &[ENV_STORE, ENV_STORE_URL];
     /// The backend when nothing chooses one.
     pub const DEFAULT_BACKEND: &str = "git-meta";
     /// The SQLite store's file name in the git common directory.
@@ -2227,22 +2249,30 @@ pub mod select {
         fn passwords(&self) -> Vec<String> {
             let mut found = Vec::new();
             let s = self.0.as_str();
-            if let Some((_, rest)) = s.split_once("://") {
-                let end = rest.find(['/', '?']).unwrap_or(rest.len());
-                if let Some((userinfo, _)) = rest[..end].rsplit_once('@')
-                    && let Some((_, p)) = userinfo.split_once(':')
-                {
-                    found.push(p.to_owned());
-                    found.push(percent_decode(p));
+            let mut add = |p: &str| {
+                found.push(p.to_owned());
+                found.push(percent_decode(p));
+                let unquoted = unquote_value(p);
+                if unquoted != p {
+                    found.push(unquoted);
                 }
-            }
-            for kv in s.split(['&', '?', ' ']) {
-                for k in ["password=", "sslpassword="] {
-                    if let Some(p) = kv.strip_prefix(k) {
-                        found.push(p.to_owned());
-                        found.push(percent_decode(p));
+            };
+            if let Some((_, rest)) = split_url(s) {
+                if let Some(at) = userinfo_end(rest)
+                    && let Some((_, p)) = rest[..at].split_once(':')
+                {
+                    add(p);
+                }
+                for kv in rest.split(['&', '?']) {
+                    if let Some((k, v)) = kv.split_once('=')
+                        && is_secret_key(&percent_decode(k))
+                    {
+                        add(v);
                     }
                 }
+            }
+            for (from, to) in secret_values(s, split_url(s).is_some()) {
+                add(&s[from..to]);
             }
             found
         }
@@ -2280,38 +2310,165 @@ pub mod select {
         }
     }
 
+    /// The keys whose values are credentials, in any case.
+    fn is_secret_key(k: &str) -> bool {
+        let k = k.trim();
+        k.eq_ignore_ascii_case("password")
+            || k.eq_ignore_ascii_case("sslpassword")
+            || k.eq_ignore_ascii_case("sslkey")
+    }
+
+    /// `s` as `(scheme, rest)` when it is a URL: a scheme (a letter, then
+    /// letters, digits, `+`, `-` or `.`) and `://`. A libpq string whose
+    /// value holds `://` is not one.
+    fn split_url(s: &str) -> Option<(&str, &str)> {
+        let (scheme, rest) = s.split_once("://")?;
+        let mut b = scheme.bytes();
+        let ok = b.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && b.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'));
+        ok.then_some((scheme, rest))
+    }
+
+    /// Where the userinfo of a URL ends (`rest` follows `scheme://`): the
+    /// `@` before the host, or `None` without one. A password may hold an
+    /// unencoded `/`, `?` or `@` (the PostgreSQL client takes everything
+    /// before the first `@` as the userinfo), so this is the last `@` before
+    /// the first `/` or `?` that follows the first `@`. Where a path or
+    /// query holds an `@` instead, more is masked than needed, never less.
+    fn userinfo_end(rest: &str) -> Option<usize> {
+        let first = rest.find('@')?;
+        let end = rest[first..]
+            .find(['/', '?'])
+            .map_or(rest.len(), |i| first + i);
+        rest[..end].rfind('@')
+    }
+
+    /// Where the value starting at `from` ends: after its closing quote when
+    /// it is single-quoted (libpq's `\'` and `\\` escapes kept), else at
+    /// the first whitespace (or `&` in a URL), a backslash escaping the
+    /// next byte. An unterminated quote runs to the end.
+    fn value_end(b: &[u8], from: usize, in_url: bool) -> usize {
+        let mut i = from;
+        if b.get(i) == Some(&b'\'') {
+            i += 1;
+            while i < b.len() {
+                match b[i] {
+                    b'\\' => i += 2,
+                    b'\'' => return i + 1,
+                    _ => i += 1,
+                }
+            }
+            return b.len();
+        }
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                c if c.is_ascii_whitespace() || (in_url && c == b'&') => return i,
+                _ => i += 1,
+            }
+        }
+        b.len()
+    }
+
+    /// The byte ranges of every value given to a secret key in `s`, as libpq
+    /// reads a `key = value` string: the key in any case, wherever it stands
+    /// (so more is masked than needed, never less), spaces allowed around
+    /// `=`, the value quoted or not.
+    fn secret_values(s: &str, in_url: bool) -> Vec<(usize, usize)> {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let Some(k) = ["password", "sslpassword", "sslkey"].into_iter().find(|k| {
+                b.len() - i >= k.len() && b[i..i + k.len()].eq_ignore_ascii_case(k.as_bytes())
+            }) else {
+                i += 1;
+                continue;
+            };
+            let mut j = i + k.len();
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if b.get(j) != Some(&b'=') {
+                i += k.len();
+                continue;
+            }
+            j += 1;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let end = value_end(b, j, in_url).min(b.len());
+            if end > j {
+                out.push((j, end));
+            }
+            i = end.max(j);
+        }
+        out
+    }
+
+    /// A libpq value without its quotes and backslash escapes.
+    fn unquote_value(v: &str) -> String {
+        let inner = v
+            .strip_prefix('\'')
+            .map(|x| x.strip_suffix('\'').unwrap_or(x))
+            .unwrap_or(v);
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// `text` with each range of `spans` (sorted, disjoint) replaced by
+    /// `***`.
+    fn mask_spans(text: &str, spans: &[(usize, usize)]) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut last = 0;
+        for &(from, to) in spans {
+            out.push_str(&text[last..from]);
+            out.push_str("***");
+            last = to;
+        }
+        out.push_str(&text[last..]);
+        out
+    }
+
     /// `s` without credentials: a URL's userinfo becomes `***`
-    /// (`postgres://***@host/db`, as `vci fetch` already prints git remotes),
-    /// and so do the values of `password`, `sslpassword` and `sslkey`, in a
-    /// query string or in a libpq `key=value` string.
+    /// (`postgres://***@host/db`, as `vci fetch` already prints git remotes,
+    /// even when the password holds an unencoded `/`, `?` or `@`), and so do
+    /// the values of `password`, `sslpassword` and `sslkey`, in a query
+    /// string (keys percent-decoded) or in a libpq `key=value` string
+    /// (spaces around `=` and quoted values included).
     pub fn redact(s: &str) -> String {
-        let secret_key = |k: &str| {
-            k.eq_ignore_ascii_case("password")
-                || k.eq_ignore_ascii_case("sslpassword")
-                || k.eq_ignore_ascii_case("sslkey")
+        let Some((scheme, rest)) = split_url(s) else {
+            return mask_spans(s, &secret_values(s, false));
         };
-        let mask = |part: &str, sep: char| -> String {
-            part.split(sep)
-                .map(|kv| match kv.split_once('=') {
-                    Some((k, _)) if secret_key(k.trim()) => format!("{k}=***"),
-                    _ => kv.to_owned(),
-                })
-                .collect::<Vec<_>>()
-                .join(&sep.to_string())
-        };
-        let Some((scheme, rest)) = s.split_once("://") else {
-            return mask(s, ' ');
-        };
-        let end = rest.find(['/', '?']).unwrap_or(rest.len());
-        let (authority, tail) = rest.split_at(end);
-        let authority = match authority.rfind('@') {
-            Some(at) => format!("***@{}", &authority[at + 1..]),
-            None => authority.to_owned(),
+        let (authority, tail) = match userinfo_end(rest) {
+            Some(at) => ("***@", &rest[at + 1..]),
+            None => ("", rest),
         };
         let tail = match tail.split_once('?') {
-            Some((path, query)) => format!("{path}?{}", mask(query, '&')),
+            Some((path, query)) => {
+                let query = query
+                    .split('&')
+                    .map(|kv| match kv.split_once('=') {
+                        Some((k, _)) if is_secret_key(&percent_decode(k)) => format!("{k}=***"),
+                        _ => kv.to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&");
+                format!("{path}?{query}")
+            }
             None => tail.to_owned(),
         };
+        let tail = mask_spans(&tail, &secret_values(&tail, true));
         format!("{scheme}://{authority}{tail}")
     }
 
@@ -2501,12 +2658,21 @@ pub mod select {
             && n.bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
         if ok {
-            Ok(n)
-        } else {
-            Err(StoreError::Config(format!(
-                "{name:?} (from {source}) is not a store backend name"
-            )))
+            return Ok(n);
         }
+        // Only a value that looks like a name is quoted back: a connection
+        // string put here by mistake (a libpq `password=...`) is not.
+        let shown = name.trim();
+        let printable = !shown.is_empty()
+            && shown.len() <= 40
+            && shown
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        Err(StoreError::Config(if printable {
+            format!("{shown:?} (from {source}) is not a store backend name")
+        } else {
+            format!("{source} is not a store backend name (it was not printed)")
+        }))
     }
 
     /// The backend the user asked for, without validating anything else,

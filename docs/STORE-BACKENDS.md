@@ -22,7 +22,7 @@ Built and in use (vci 2.8.0):
 - **The command line on the trait** (section 13): every command reaches the store through one
   `Arc<dyn AttestationStore>` per repository, selected from the environment and `[store]` (section 9). Deferred write
   batches are reported only once they finish (section 6), `vci ci` has the publication gate for shared stores
-  (section 7), `vci store info` exists, and `VCI_STORE_URL` never reaches a child process.
+  (section 7), `vci store info` exists, and neither `VCI_STORE_URL` nor `VCI_STORE` reaches a child process.
 - **The plan reads the candidates it set aside** even when a round fetched nothing (section 5).
 - **The conformance suite** (section 14): its 34 scenarios, run against git-meta, SQLite and PostgreSQL from each
   backend's `tests/conformance.rs`.
@@ -324,9 +324,11 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
    `envelope` (non-empty, UTF-8). Nothing is written on failure.
 2. The key is the hinted key. Without a hint, it is the existing key of the same slot (a rewrite in place), else the
    plain key.
-3. **Atomically**, every other key of the same slot is removed and this value is written. Concurrent puts of one slot
-   leave exactly one record. An exchanged store (git-meta) can hold two keys of one slot after merging two peers'
-   writes; the next put of that slot collapses them, and readers tolerate duplicates.
+3. Every other key of the same slot is removed and this value is written. SQLite and PostgreSQL do both **in one
+   atomic step** (an upsert on the slot), so concurrent puts of one slot leave exactly one record. git-meta does not:
+   as in 2.7, it lists the slot, removes the other keys, then sets the new one, so puts of one slot racing in one
+   repository (threads on one handle, or two `vci run`s) can leave several records, and so can merging two peers'
+   writes. Readers tolerate duplicates (every record is verified), and the next put of that slot collapses them.
 4. Identical bytes under the same key are a no-op: no write, no timestamp, no log entry.
 5. Outside a deferred batch, the write is durable and visible to this store's later reads when the call returns.
    With `Caps::shared_writes`, it is visible to every reader.
@@ -401,8 +403,10 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
   this store. The nested shape is that of vci-git's `AttestStore::manifest_decoded`, which the e2e helper
   `store_common::inline_manifest` calls.
 - **`orphan_manifests(roots)`**: the roots no stored attestation references. If what any attestation references is
-  unknown (`ManifestRef::Unknown`: an unreadable, not-fetched or unparseable value, or a `manifestRef` that is not a
-  hex id), the answer is **empty**.
+  unknown (`ManifestRef::Unknown`: an unparseable value or a `manifestRef` that is not a hex id; and, where the store
+  recorded no reference when it stored the value, an unreadable or not-fetched value), the answer is **empty**,
+  unless the backend can tell that attestation cannot reference these roots. Removing a manifest still referenced
+  only makes its unit run.
   - The default reads every value.
   - git-meta overrides it: `hydrate_manifest_referrers` first (the roots it cannot decide are kept), then the scan
     that skips values still not fetched. This is vci 2.7's `drop_orphan_manifests` moved into the store, with one
@@ -410,8 +414,12 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
     predicate. They differ only on malformed envelopes: one without `testId` or its times but with a hex
     `manifestRef` now counts as referencing that root (2.7 emptied the answer), and a `manifestRef` that is not hex
     now empties the answer (2.7 counted it as a reference to nothing).
+  - git-meta waits only for the not-fetched values that could reference a root: those on the `project` target or on
+    a path target that is a path the manifest lists or a directory above one (a unit's manifest lists its own path).
+    A not-fetched value elsewhere does not empty the answer; offline, the answer is empty.
   - The SQL backends override it with one indexed query (no value is read) and answer empty if any row has
-    `ref_state = 0` (unknown).
+    `ref_state = 0` (unknown). The reference is recorded when the value is stored, so a value that became unreadable
+    later (an unknown `encoding`) still counts as the reference it was stored with.
   - Fail open: the run warns (`vci: warning: cannot read the store to remove unreferenced manifests: …`) and removes
     nothing.
 
@@ -426,8 +434,9 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
   - A store that always holds its values does nothing.
 - **Snapshot**: after a prefetch, reads may be served from a snapshot taken at prefetch time. That snapshot **always
   reflects this handle's own later writes and removals**: a put updates or evicts what it touches, including a
-  cached "no such manifest". Other writers' changes may be missed until the next prefetch. That is safe, because a
-  stale record only makes a unit run.
+  cached "no such manifest". Other writers' changes may be missed until the next prefetch of the same data, which
+  must pick them up (PostgreSQL lists the units again and asks again about roots it found absent). That is safe,
+  because a stale record only makes a unit run.
 - **Errors**: partial failure goes in `Hydration.error` and `unresolved`, and those units run. `Err` is for a store
   that cannot be used. Callers warn on both and read afterwards anyway (`vci run` and `vci verify` ignore both).
 - `Hydration.resolved` counts only values that went from not-fetched to readable. A non-lazy store returns zeros, so
@@ -511,9 +520,11 @@ been measured on one yet.
     thread-local guard and never fails.
   - SQLite pins one pooled connection to the thread, each write committing.
 - **`WriteBatch::deferred(end)`**: writes become durable only when `finish` returns `Ok`. PostgreSQL uses this kind:
-  - `put`, `put_manifest` and `remove` are queued and deduplicated (by slot, root or key; the last call wins).
-  - `finish` flushes them in **one transaction**: manifests (one UNNEST upsert), then attestations (one UNNEST
-    upsert), then removals (one `DELETE … = ANY`).
+  - `put`, `put_manifest` and `remove` are queued so that `finish` reaches the state the same calls made one by one
+    would: per slot the last put (it replaces every stored key of its slot), whether a later removal took that put's
+    own key away (the slot then ends empty), and the keys removed otherwise; per root the last manifest.
+  - `finish` flushes them in **one transaction**: manifests (one UNNEST upsert), the removed keys (one `DELETE … =
+    ANY`), the emptied slots (one `DELETE`, only when there are some), then attestations (one UNNEST upsert).
   - A large batch flushes early at 2,000 attestations and removals or 32 MiB (manifests count only toward the bytes),
     so 1,000 units with their manifests stay one transaction. Each flush is its own transaction, and a failed flush
     fails `finish`.
@@ -687,13 +698,15 @@ the git-specific assertions.
 - **Only `VCI_STORE_URL` carries a connection string.**
 - `VCI_*` variables are built-in *ignore*: they reach every test process (`COMMON_IGNORE` in vci-adapter/src/lib.rs).
   Pull-request code runs in those tests, so vci-cli's `main` handles the URL specially. Its first statement is
-  `unsafe { store::take_secrets() }`: it reads every name in `select::NEVER_TO_CHILDREN` (today only `VCI_STORE_URL`),
+  `unsafe { store::take_secrets() }`: it reads every name in `select::NEVER_TO_CHILDREN` (`VCI_STORE_URL`, and
+  `VCI_STORE`, where a connection string may be put by mistake),
   keeps the values in a process-wide map of `Secret`s (a value that is not UTF-8 is kept lossily), and removes them
   from its own environment (`std::env::remove_var`, sound while the process has one thread). No test, adapter probe,
   hook or git command it starts can see the URL.
 - `envpolicy::build_child_env` also drops those names, in loose mode too and even when `[env] set` names them, as
   defence in depth.
-- The env closure passed to `resolve` (`store::env_lookup`) answers `VCI_STORE_URL` from the kept copy.
+- The env closure passed to `resolve` (`store::env_lookup`) answers `VCI_STORE_URL` and `VCI_STORE` from the kept
+  copies.
 - `Secret`'s `Debug` and `Display` print it redacted, and `Secret::scrub` removes the URL and its password (raw and
   percent-decoded) from every library error.
 - The metrics log records only the store kind (`"store": "<kind>"`, or `null` when the command opened no store), never
@@ -878,7 +891,8 @@ warnings and its `run_all` reason, run's refusals, the exit 2 of fetch, push, pr
 **Bounded time.** A hung store would block `vci plan`; an erroring one only makes units run. Every backend therefore
 bounds every wait:
 
-- PostgreSQL: connect (5 s), statement (30 s; 600 s for `vci prune`), lock (10 s), idle-in-transaction (60 s), TCP
+- PostgreSQL: connect (5 s, the whole connection: TCP, TLS, startup and authentication), statement (30 s; 600 s
+  for `vci prune`), lock (10 s), idle-in-transaction (60 s), TCP
   keepalives and `tcp_user_timeout` (30 s), and a pool checkout bounded by the connect timeout.
 - SQLite: `busy_timeout`, the store timeout (30 s).
 - git-meta: `VCI_LOCK_TIMEOUT_SECS`.
@@ -1560,7 +1574,10 @@ absolute sizes may differ there.)
   - The TLS configuration is built at the first connection, so `open` reads no file; a bad `sslrootcert` is a
     `Config` error on the first call, cached for every later one.
 - **Session settings.**
-  - `connect_timeout` from the selection, unless the URL sets one.
+  - `connect_timeout` from the selection, unless the URL sets one. The client library applies it to the TCP connect
+    only, so vci connects on a thread of its own and gives up when the whole connection (TLS request, startup and
+    authentication included) has taken the connect timeout for each host named: `Timeout{operation: "connecting"}`,
+    latched. A thread given up on ends with its socket and drops a connection that arrives too late.
   - TCP keepalives on (idle 10 s), and `tcp_user_timeout` 30 s unless the URL sets one.
   - `application_name = 'vci <version> <command>'`.
   - `options = "-c statement_timeout=<timeout> -c lock_timeout=10s -c idle_in_transaction_session_timeout=60s"`,
@@ -1710,8 +1727,12 @@ The rest go to the server directly:
    `manifest_ref` column.
 
 `prefetch(Manifests)` reads roots and bases in one statement. `prefetch(Attestations)` does nothing. Prefetch returns
-`Hydration::default()`: nothing was ever "not fetched". Prefetch reuses the listings the handle already cached and
-reads only values and manifests not cached, so round 2 costs two statements (values, manifests), not three or four.
+`Hydration::default()`: nothing was ever "not fetched". Every prefetch of units lists them from the server again,
+even when their listings are cached: that is where other writers' changes are picked up, as the trait promises (a
+cached value whose key is no longer listed is dropped). It reads only values and stored manifests not cached (a key
+names one attestation, a root one manifest; a root cached as absent is asked for again), so round 2 costs three
+statements (listing, values, manifests), and a second prefetch of the same units in `vci ci`'s run costs one
+listing statement.
 
 **The plan's round-trip budget**:
 
@@ -1722,12 +1743,13 @@ reads only values and manifests not cached, so round 2 costs two statements (val
 | flags (every flag of the namespace, cached) | 1 |
 | memo (base and head trees) | 2 |
 | round 1 prefetch | 3 |
-| round 2 (the set-aside units' values and manifests; listings are cached) | 2 |
+| round 2 (the set-aside units' listings again, their values and manifests) | 3 |
 | remember_passing (plus the 7-day memo prune, once per handle) | 1-2 |
 
 That is **about a dozen in total, independent of the number of units**. The 4,000 listings, the batch read and the
 2,000 `manifest()` calls are cache hits. Gate: at most 15 statements for 1,200 units (`PgStore::statements()`);
-measured: 13 for a plan-shaped run of 1,200 units, and 0 more for 1,200 manifest reads from 8 threads.
+measured: 14 for a plan-shaped run of 1,200 units (13 before round 2 listed again), and 0 more for 1,200 manifest
+reads from 8 threads.
 
 **Bytes per plan** (DECISIONS item 10), measured with a byte-counting TCP proxy and `pg_stat_statements` on a
 synthetic world of 600 Go units attested at three commits (1,800 attestations of about 3,100 bytes, 5.5 MB; 1,801
@@ -1806,16 +1828,20 @@ the grace, and not counted.
 **`batch`** is write-behind (`WriteBatch::deferred`), with `finish` flushing as section 6 describes:
 
 - `INSERT … SELECT * FROM unnest($roots, $bases, $values) ON CONFLICT DO UPDATE …`;
-- then the attestation upsert from unnest arrays, deduplicated by slot, because `ON CONFLICT` cannot touch one row
-  twice in one statement;
-- then `DELETE … = ANY`.
+- then `DELETE … = ANY` of the removed keys, and a `DELETE … USING unnest(...)` of the slots a removal emptied (a put
+  whose own key was removed afterwards in the same batch);
+- then the attestation upsert from unnest arrays, one row per slot, because `ON CONFLICT` cannot touch one row twice
+  in one statement. Removals go first: a put queued after a removal in its slot replaces the slot anyway.
 
 Measured: a 1,000-unit batch takes 5 statements (gate 6), the schema version check, `BEGIN` and `COMMIT` included,
 instead of about 3,000 round trips. Inside a deferred batch:
 
 - `put_manifest` returns `true` unless the batch already holds the same bytes;
 - `remove` returns every entry asked for, deduplicated by key;
-- an unhinted put looks up the slot's key: queued first, else stored (one read), else the plain key;
+- an unhinted put looks up the slot's key: queued first; the plain key when the batch empties the slot or removes the
+  stored key; else stored (one read), else the plain key;
+- `remove_manifests` (not queued) keeps the roots the batch will write or reference (its attestations' manifests, its
+  manifests and their bases), whatever the grace, because the server cannot see them yet;
 - dropping the batch without `finish` also flushes it.
 
 ### fetch, push, hints, roles
@@ -1950,6 +1976,13 @@ Decided while building it:
     17.5 MiB static x86_64 musl binary.
 16. **The default namespace in a shallow clone** is refused by the PostgreSQL backend itself (section 17), because
     `Repo::repo_id()` returns the shallow boundary there instead of failing.
+17. **`VCI_STORE` never reaches a test either.** It is in `NEVER_TO_CHILDREN` with `VCI_STORE_URL`, so a connection
+    string put there by mistake reaches no child process; and a value that is not shaped like a backend name is
+    refused without being quoted back.
+18. **A PostgreSQL connection is bounded as a whole.** The client library bounds only the TCP connect; a peer that
+    accepts and never answers (a frozen or failing-over server, a stuck proxy, another service on the port) would hold
+    the TLS request and startup exchange forever. vci connects on a thread of its own and gives up after the connect
+    timeout (per host named), which latches the breaker.
 
 Still open:
 
@@ -1962,8 +1995,10 @@ Still open:
 2. **PostgreSQL re-reads values in round 2.** `read_values` moves values out of the per-handle cache, so a round-2
    `prefetch(Units{choose: None})` fetches them again: a third of a plan's bytes when every unit runs (section 17).
    Keep values handed out in the cache (memory), or let prefetch skip keys this handle already returned.
-3. **`VCI_STORE` in `NEVER_TO_CHILDREN`.** A URL put in `VCI_STORE` by mistake is refused and never printed, but as a
-   `VCI_*` variable it still reaches test processes. Drop `VCI_STORE` from children when it contains `://`, or always.
+3. **A PostgreSQL server that stops answering mid-session.** Connecting is bounded (decision 18), but a statement on
+   an open connection is bounded by the server's `statement_timeout` and by TCP: a server frozen after the connection
+   was made (its kernel still acknowledging) blocks that statement. (`VCI_STORE` in `NEVER_TO_CHILDREN`, once item 3,
+   is decision 17.)
 4. **Measurements on a large repository.** The supersession and plan timings and PostgreSQL's bytes per plan were
    taken on a synthetic 600-unit store; round 2's added read on a fully fetched vex store, and a vex-scale plan from
    PostgreSQL, have not been measured.

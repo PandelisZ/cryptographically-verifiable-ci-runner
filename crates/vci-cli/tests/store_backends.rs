@@ -1003,6 +1003,188 @@ fn unreachable_postgres_fails_open_and_keeps_its_secret() {
     assert!(!w.remote_has_meta());
 }
 
+/// A port on 127.0.0.1 where something accepts connections and never
+/// answers (a frozen server, a stuck proxy).
+fn silent_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for c in l.incoming() {
+            held.push(c);
+        }
+    });
+    port
+}
+
+/// A PostgreSQL URL whose server accepts and never answers: every command
+/// gives up within the connect timeout. The plan exits 0 and runs
+/// everything, `vci run` runs the tests and refuses to store, and store
+/// info, fetch, push and prune exit 2; no output shows the password.
+#[test]
+fn a_postgres_server_that_never_answers_fails_open_in_time() {
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let url = format!(
+        "postgres://u:{SECRET}@127.0.0.1:{}/x?sslmode=disable",
+        silent_port()
+    );
+    let mut outs = Vec::new();
+    // The default connect timeout (5 s).
+    let env = [("VCI_STORE_URL", url.as_str())];
+    let t = Instant::now();
+    let (plan, out) = w.plan(&env);
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    assert_eq!(plan.run, set(UNITS), "{plan:?}");
+    assert!(stderr(&out).contains("postgres"), "{}", text(&out));
+    outs.push(out);
+    // The rest with a 1 s timeout, to keep the test short.
+    let env = [
+        ("VCI_STORE_URL", url.as_str()),
+        ("VCI_STORE_CONNECT_TIMEOUT_SECS", "1"),
+    ];
+    let key = w.key.to_str().unwrap().to_owned();
+    let t = Instant::now();
+    let out = w.vci(&["run", "--key", &key], &env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    for u in UNITS {
+        assert!(
+            stderr(&out).contains(&format!(
+                "vci: not attesting {u}: signing or storing failed: "
+            )),
+            "{u}: {}",
+            text(&out)
+        );
+    }
+    assert!(t.elapsed() < Duration::from_secs(60), "{:?}", t.elapsed());
+    outs.push(out);
+    for args in [
+        &["store", "info"][..],
+        &["store", "info", "--format", "json"],
+        &["fetch"],
+        &["push"],
+        &["prune"],
+    ] {
+        let t = Instant::now();
+        let out = w.vci(args, &env);
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "{args:?}: {:?}",
+            t.elapsed()
+        );
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
+        outs.push(out);
+    }
+    for out in &outs {
+        assert!(!text(out).contains(SECRET), "{}", text(out));
+    }
+}
+
+/// A connection string put in `VCI_STORE` by mistake is refused, never
+/// printed (in any output, the plan, the audit log) and never reaches a
+/// test process.
+#[test]
+fn a_connection_string_in_vci_store_reaches_no_test_and_no_output() {
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let dump = w.base.join("env-dump.txt");
+    w.put("envdump/envdump_test.go", &envdump_test(&dump));
+    w.commit("envdump");
+    let all = set(&["a", "b", "c", "d", "envdump"]);
+    let key = w.key.to_str().unwrap().to_owned();
+    for (i, value) in [
+        format!("postgres://vci:{SECRET}@127.0.0.1:{}/x", closed_port()),
+        format!("host=127.0.0.1 password = '{SECRET} x'"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let env = [("VCI_STORE", value.as_str())];
+        let mut outs = Vec::new();
+        let (plan, out) = w.plan(&env);
+        assert_eq!(plan.run, all, "{plan:?}");
+        outs.push(out);
+        let _ = std::fs::remove_file(&dump);
+        let out = w.vci(&["run", "--key", &key], &env);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        outs.push(out);
+        let dumped = std::fs::read_to_string(&dump).expect("the envdump test ran");
+        assert!(
+            !dumped.lines().any(|l| l.starts_with("VCI_STORE=")),
+            "{dumped}"
+        );
+        assert!(!dumped.contains(SECRET), "{dumped}");
+        let (out, audit) = w.ci(&[], &env, &format!("audit-{i}.json"));
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let audit_text = serde_json::to_string(&audit).unwrap();
+        assert!(!audit_text.contains(SECRET), "{audit_text}");
+        outs.push(out);
+        for args in [
+            &["store", "info"][..],
+            &["store", "info", "--format", "json"],
+            &["fetch"],
+        ] {
+            let out = w.vci(args, &env);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
+            outs.push(out);
+        }
+        for out in &outs {
+            assert!(!text(out).contains(SECRET), "{}", text(out));
+        }
+    }
+}
+
+/// With git-meta selected, a libpq `VCI_STORE_URL` is ignored with a
+/// warning that shows no part of its password, however the string writes
+/// it (spaces around `=`, quotes), in any output, the plan or the audit
+/// log.
+#[test]
+fn a_password_git_meta_ignores_is_never_printed() {
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let key = w.key.to_str().unwrap().to_owned();
+    for (i, url) in [
+        "host=db.example password = Gm3taLeakQ",
+        "host=db.example password='Gm3taLeakQ x'",
+        "postgress://u:Gm3ta/LeakQ@db.example/x",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let env = [("VCI_STORE_URL", *url)];
+        let mut outs = Vec::new();
+        let (plan, out) = w.plan(&env);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|m| m.contains("is ignored by the git-meta store")),
+            "{plan:?}"
+        );
+        outs.push(out);
+        let out = w.vci(&["run", "--key", &key], &env);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        outs.push(out);
+        let (out, audit) = w.ci(&[], &env, &format!("audit-{i}.json"));
+        let audit_text = serde_json::to_string(&audit).unwrap();
+        assert!(!audit_text.contains("Gm3ta"), "{audit_text}");
+        assert!(!audit_text.contains("LeakQ"), "{audit_text}");
+        outs.push(out);
+        for args in [
+            &["store", "info"][..],
+            &["store", "info", "--format", "json"],
+        ] {
+            outs.push(w.vci(args, &env));
+        }
+        for out in &outs {
+            assert!(!text(out).contains("Gm3ta"), "{}", text(out));
+            assert!(!text(out).contains("LeakQ"), "{}", text(out));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 7. SQLite that cannot be used.
 

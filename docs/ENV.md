@@ -379,7 +379,7 @@ exports from the workflow and from your shell setup, and run `vci env --base-ref
 A hash of a low-entropy value can be brute-forced by anyone who can read the attestations (git-meta metadata on
 `refs/meta/main`, or the store's file or database). Put secrets in `ignore`, never in `hash`: `vci run` warns when a `hash` name matches `*TOKEN*`,
 `*SECRET*`, `*PASSWORD*`, `*KEY*`. `set` values are in `vci.toml` in plain text: never put a secret there.
-`VCI_STORE_URL` is the one secret vci itself reads, and it never reaches a test ([Store
+`VCI_STORE_URL` is the one secret vci itself reads, and it never reaches a test, nor does `VCI_STORE` ([Store
 selection](#store-selection)).
 
 ## Store selection
@@ -389,15 +389,16 @@ store"). The environment wins over `[store]` in the working tree's `vci.toml`; a
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `VCI_STORE` | the store: `git-meta`, `sqlite` or `postgres` (also `gitmeta`, `sqlite3`, `postgresql`, `pg`). Never a URL: a value with `://` is refused and not printed | the scheme of `VCI_STORE_URL`, else `[store] backend`, else `git-meta` |
+| `VCI_STORE` | the store: `git-meta`, `sqlite` or `postgres` (also `gitmeta`, `sqlite3`, `postgresql`, `pg`). Never a URL: a value with `://`, or one not shaped like a name, is refused and not printed. Like `VCI_STORE_URL` it never reaches a test (since 2.8.0) | the scheme of `VCI_STORE_URL`, else `[store] backend`, else `git-meta` |
 | `VCI_STORE_URL` | where the store is: `postgres://user:password@host:port/database[?sslmode=...&sslrootcert=...]` (or `postgresql://`, or a libpq `key=value` string), or `sqlite:<path>` (absolute, or relative to the git common directory). Its scheme selects the store when `VCI_STORE` is unset. **A secret**: vci removes it from its own environment as it starts, so no test, probe or hook sees it, and never prints it (passwords show as `***`) | none (PostgreSQL requires it) |
 | `VCI_STORE_NAMESPACE` | PostgreSQL: the namespace of this repository's rows. Required in a shallow clone, with the same value wherever the store is shared | `[store.postgres] namespace`, else the repository id (its first commit) |
 | `VCI_STORE_CONNECT_TIMEOUT_SECS` | seconds a connection may take (more than 0, at most 3600) | `[store] connect_timeout`, else 5 |
 | `VCI_STORE_TIMEOUT_SECS` | seconds one statement or wait may take (more than 0, at most 3600); `vci prune` gives PostgreSQL ten minutes | `[store] timeout`, else 30 |
 | `VCI_STORE_SYNC` | `off`: the SQLite stores (git-meta's and the SQLite backend) do not sync to disk after a write | git-meta's store does not sync when `CI` is set; the SQLite backend syncs |
 
-`VCI_STORE`, `VCI_STORE_NAMESPACE` and the timeouts are ordinary `VCI_*` variables: they reach the test processes
-(built-in ignore) and are never hashed. Put `VCI_STORE_URL` in a CI secret; a job without the secret (a pull request
+`VCI_STORE_NAMESPACE` and the timeouts are ordinary `VCI_*` variables: they reach the test processes (built-in
+ignore) and are never hashed. `VCI_STORE` is removed like `VCI_STORE_URL`, so a connection string put there by mistake
+reaches no test either. Put `VCI_STORE_URL` in a CI secret; a job without the secret (a pull request
 from a fork) cannot reach the store and runs every test. `vci store info` prints the store and every setting with
 where it came from. The test suites read `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require` and
 `VCI_TEST_PG_BINDIR` (docs/REFERENCE.md, "Development").
