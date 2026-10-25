@@ -549,6 +549,7 @@ impl Reader {
         let Some((path, db)) = &self.db else {
             return Ok(Vec::new());
         };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
         let mut stmt = db.prepare(sql).map_err(|e| sql_err(path, e))?;
         let rows = stmt
             .query_map(params, |r| {
@@ -587,14 +588,10 @@ impl Reader {
         Ok(out)
     }
 
-    /// Decode one row the way git-meta's `get_value` does. Read errors
-    /// belong to the row, not to the lookup.
-    fn decode(&self, row: Row) -> Option<StoredEnvelope> {
-        self.decode_reading(row, |_| true)
-    }
-
-    /// [`Reader::decode`], reading the value only when `read` says so for
-    /// the row's key (otherwise `bytes` stays empty and `error` unset).
+    /// Decode one row the way git-meta's `get_value` does, reading the value
+    /// only when `read` says so for the row's key (otherwise `bytes` stays
+    /// empty and `error` unset). Read errors belong to the row, not to the
+    /// lookup.
     fn decode_reading(&self, row: Row, read: impl Fn(&str) -> bool) -> Option<StoredEnvelope> {
         let (tk, signer, sk) = parse_key(&row.key)?;
         if row.value_type != "string" {
@@ -770,8 +767,17 @@ impl Reader {
         test_id: &str,
         read: impl Fn(&str) -> bool,
     ) -> Result<Vec<StoredEnvelope>, GitError> {
-        let tk = vci_core::test_key(test_id);
-        let target = target_for(test_id);
+        self.candidates_on(&target_for(test_id), &vci_core::test_key(test_id), read)
+    }
+
+    /// [`Reader::candidates_reading`] for the unit with test key `tk` on
+    /// `target` (a unit known by its key alone, as `put` gets it).
+    fn candidates_on(
+        &self,
+        target: &Target,
+        tk: &str,
+        read: impl Fn(&str) -> bool,
+    ) -> Result<Vec<StoredEnvelope>, GitError> {
         let prefix = format!("{KEY_PREFIX}:{tk}:");
         let ty = target.target_type().as_str().to_owned();
         let value = target.value().unwrap_or("").to_owned();
@@ -821,6 +827,16 @@ impl Reader {
 
     /// Every stored attestation on any target.
     pub fn all(&self) -> Result<Vec<StoredEnvelope>, GitError> {
+        self.all_reading(|_| true)
+    }
+
+    /// [`Reader::all`], reading only the values whose key `read` accepts
+    /// (the others are listed with `bytes` empty and `error` unset), sorted
+    /// by (target, key).
+    pub fn all_reading(
+        &self,
+        read: impl Fn(&str) -> bool,
+    ) -> Result<Vec<StoredEnvelope>, GitError> {
         let prefix = format!("{KEY_PREFIX}:");
         let len = prefix.len() as i64;
         let rows = self.rows(
@@ -828,11 +844,26 @@ impl Reader {
              FROM metadata WHERE substr(key, 1, ?1) = ?2",
             &[&len, &prefix],
         )?;
-        let mut out: Vec<StoredEnvelope> =
-            rows.into_iter().filter_map(|r| self.decode(r)).collect();
+        let mut out: Vec<StoredEnvelope> = rows
+            .into_iter()
+            .filter_map(|r| self.decode_reading(r, &read))
+            .collect();
         out.sort_by(|a, b| (&a.target, &a.key).cmp(&(&b.target, &b.key)));
         Ok(out)
     }
+}
+
+thread_local! {
+    /// The queries [`Reader`]s ran on this thread ([`reader_queries`]).
+    static READER_QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many store queries [`Reader`]s have run on the calling thread so far
+/// (one per unit listed, one per whole-store scan). For tests that check a
+/// read is targeted rather than a scan; not part of the API.
+#[doc(hidden)]
+pub fn reader_queries() -> u64 {
+    READER_QUERIES.with(|n| n.get())
 }
 
 // ---- tree snapshots -----------------------------------------------------------
@@ -1205,45 +1236,9 @@ impl<'a> AttestStore<'a> {
         hint: Option<&KeyHint>,
         bytes: &[u8],
     ) -> Result<StoredEnvelope, GitError> {
-        validate::signer_id(signer)?;
-        validate::hex_id("storage_key", storage_key)?;
-        let text = std::str::from_utf8(bytes).map_err(|_| GitError::Invalid {
-            what: "envelope",
-            value: String::new(),
-            reason: "must be UTF-8",
-        })?;
         let tk = vci_core::test_key(test_id);
         let target = target_for(test_id);
-        // Keys alone (2.7.15: their values, read through a new `git
-        // cat-file`, were never used).
-        let same_inputs: Vec<StoredEnvelope> = self
-            .reader()?
-            .candidates_reading(test_id, |_| false)?
-            .into_iter()
-            .filter(|e| e.signer == signer && e.storage_key == storage_key)
-            .collect();
-        let key = match hint {
-            Some(h) => attestation_key_hinted(&tk, signer, storage_key, h),
-            // No hint: the same inputs' existing key, whatever its hint
-            // (a rewrite in place), else the plain key.
-            None => same_inputs
-                .first()
-                .map(|e| e.key.clone())
-                .unwrap_or_else(|| attestation_key(&tk, signer, storage_key)),
-        };
-        // The same inputs stored under another hint: replaced.
-        let others: Vec<StoredEnvelope> =
-            same_inputs.into_iter().filter(|e| e.key != key).collect();
-        if !others.is_empty() {
-            self.remove_envelopes(others)?;
-        }
-        let session = self.write_session()?;
-        let handle = session.target(&target);
-        let current = handle.get_value(&key).ok().flatten();
-        if current != Some(MetaValue::String(text.to_owned())) {
-            handle.set(&key, text).map_err(meta_err)?;
-            self.stamp_written([(&target, key.as_str())])?;
-        }
+        let key = self.put_keyed(&target, &tk, signer, storage_key, hint, bytes)?;
         Ok(StoredEnvelope {
             target: target_label(&target),
             key,
@@ -1255,6 +1250,59 @@ impl<'a> AttestStore<'a> {
             bytes: bytes.to_vec(),
             error: None,
         })
+    }
+
+    /// [`AttestStore::put_hinted`] for the unit with test key `test_key` on
+    /// `target` (a unit known by its key alone: the attestation store
+    /// trait's `put`). Returns the key the value is stored under.
+    pub(crate) fn put_keyed(
+        &self,
+        target: &Target,
+        test_key: &str,
+        signer: &str,
+        storage_key: &str,
+        hint: Option<&KeyHint>,
+        bytes: &[u8],
+    ) -> Result<String, GitError> {
+        validate::signer_id(signer)?;
+        validate::hex_id("storage_key", storage_key)?;
+        let text = std::str::from_utf8(bytes).map_err(|_| GitError::Invalid {
+            what: "envelope",
+            value: String::new(),
+            reason: "must be UTF-8",
+        })?;
+        validate::hex_id("test_key", test_key)?;
+        // Keys alone (2.7.15: their values, read through a new `git
+        // cat-file`, were never used).
+        let same_inputs: Vec<StoredEnvelope> = self
+            .reader()?
+            .candidates_on(target, test_key, |_| false)?
+            .into_iter()
+            .filter(|e| e.signer == signer && e.storage_key == storage_key)
+            .collect();
+        let key = match hint {
+            Some(h) => attestation_key_hinted(test_key, signer, storage_key, h),
+            // No hint: the same inputs' existing key, whatever its hint
+            // (a rewrite in place), else the plain key.
+            None => same_inputs
+                .first()
+                .map(|e| e.key.clone())
+                .unwrap_or_else(|| attestation_key(test_key, signer, storage_key)),
+        };
+        // The same inputs stored under another hint: replaced.
+        let others: Vec<StoredEnvelope> =
+            same_inputs.into_iter().filter(|e| e.key != key).collect();
+        if !others.is_empty() {
+            self.remove_envelopes(others)?;
+        }
+        let session = self.write_session()?;
+        let handle = session.target(target);
+        let current = handle.get_value(&key).ok().flatten();
+        if current != Some(MetaValue::String(text.to_owned())) {
+            handle.set(&key, text).map_err(meta_err)?;
+            self.stamp_written([(target, key.as_str())])?;
+        }
+        Ok(key)
     }
 
     /// All stored envelopes, or only those for one test id.

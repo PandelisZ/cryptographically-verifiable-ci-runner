@@ -6,6 +6,9 @@
 //!   [`meta`] for the layout), exchanged on `refs/meta/main` by ordinary git
 //!   push and fetch. It never touches the user's index, `HEAD` or working
 //!   tree.
+//! * [`GitMetaStore`] is the same store as a [`vci_store::AttestationStore`]
+//!   (with its [`vci_store::Exchange`]), and [`GitMetaFactory`] opens it by
+//!   name (`git-meta`, the default backend).
 //!
 //! Every identifier that ends up in a git-meta key (signer id, storage key)
 //! is validated as lowercase hex first, so callers cannot inject key
@@ -16,6 +19,7 @@
 mod cmd;
 pub mod meta;
 mod repo;
+mod store;
 mod validate;
 
 pub use meta::{
@@ -24,6 +28,7 @@ pub use meta::{
     manifest_key, parse_key_hint, parse_manifest_key,
 };
 pub use repo::Repo;
+pub use store::{GitMetaFactory, GitMetaStore};
 
 /// Errors from git operations.
 #[derive(Debug, thiserror::Error)]

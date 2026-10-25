@@ -1,0 +1,481 @@
+//! git-meta as a [`vci_store::AttestationStore`]: the store every vci has
+//! used so far, behind the trait every backend implements.
+//!
+//! [`GitMetaStore`] delegates to [`AttestStore`], whose behaviour and messages
+//! are unchanged, and adds what the trait asks of a store shared by many
+//! threads: a pool of [`Reader`]s (a reader owns a SQLite connection and a
+//! `git cat-file` process, so it is `Send` but not `Sync`). Each concurrent
+//! caller takes one reader from the pool and gives it back, so a plan's
+//! verifying threads keep one reader each, as the plan's own per-thread
+//! readers did before.
+//!
+//! Pool rules:
+//!
+//! * a reader opened while the repository has no git-meta store
+//!   ([`Reader::has_store`] false) is dropped, never pooled: it would read
+//!   nothing for the rest of the process, even after a fetch creates the
+//!   store;
+//! * the pool is emptied after every [`AttestationStore::prefetch`],
+//!   [`Exchange::fetch`] and [`Exchange::push`]: a reader keeps a
+//!   `git cat-file` process, and what it learnt about the object database,
+//!   from before the download;
+//! * a reader in use while the pool is emptied is dropped when it comes
+//!   back.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use git_meta_lib::Target;
+use vci_store::select::Selection;
+use vci_store::{
+    AttestationStore, BackendFactory, BatchEnd, Caps, EMPTY_VALUE, Exchange, FetchOutcome,
+    Hydration, ManifestRef, NewAttestation, OpenContext, Prefetch, PushMode, PushOutcome,
+    StoreError, StoreStatus, StoredEnvelope, StoredManifest, WriteBatch,
+};
+
+use crate::GitError;
+use crate::meta::{AttestStore, BatchGuard, Reader};
+use crate::repo::Repo;
+
+/// The backend's name ([`AttestationStore::kind`]).
+const KIND: &str = "git-meta";
+
+/// Where the attestations are exchanged ([`Exchange::exchange_point`]).
+const EXCHANGE_POINT: &str = "refs/meta/main";
+
+impl From<GitError> for StoreError {
+    /// [`GitError::Invalid`] becomes [`StoreError::Invalid`] field for field;
+    /// every other error is kept whole as [`StoreError::Backend`], so its
+    /// text is unchanged and [`StoreError::downcast_backend`] gets it back
+    /// (for example [`GitError::NoMetaRemote`]).
+    fn from(e: GitError) -> Self {
+        match e {
+            GitError::Invalid {
+                what,
+                value,
+                reason,
+            } => StoreError::Invalid {
+                what,
+                value,
+                reason,
+            },
+            other => StoreError::Backend(Box::new(other)),
+        }
+    }
+}
+
+/// The readers not in use, and the pool's generation: emptying the pool
+/// starts a new one, and a reader taken out in an older generation is not
+/// put back.
+#[derive(Default)]
+struct Pool {
+    generation: u64,
+    readers: Vec<Reader>,
+}
+
+/// The attestation store of one repository, kept by git-meta in
+/// `.git/git-meta.sqlite` and exchanged on `refs/meta/main` (see
+/// [`crate::meta`]). One value serves every thread of a process.
+pub struct GitMetaStore {
+    repo: Repo,
+    readers: Mutex<Pool>,
+}
+
+impl std::fmt::Debug for GitMetaStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitMetaStore")
+            .field("root", &self.repo.root())
+            .field("pooled_readers", &self.pooled_readers())
+            .finish()
+    }
+}
+
+impl GitMetaStore {
+    /// The store of `repo`. Nothing is opened or created until it is used.
+    pub fn new(repo: Repo) -> Self {
+        GitMetaStore {
+            repo,
+            readers: Mutex::new(Pool::default()),
+        }
+    }
+
+    /// The repository whose store this is.
+    pub fn repo(&self) -> &Repo {
+        &self.repo
+    }
+
+    /// The concrete git-meta store, for what the trait does not cover
+    /// (`vci init`'s remote set-up, the e2e helpers).
+    pub fn attest_store(&self) -> AttestStore<'_> {
+        AttestStore::new(&self.repo)
+    }
+
+    /// How many readers the pool holds now (for tests).
+    #[doc(hidden)]
+    pub fn pooled_readers(&self) -> usize {
+        self.pool().readers.len()
+    }
+
+    fn pool(&self) -> MutexGuard<'_, Pool> {
+        self.readers.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Run `f` with a reader from the pool (or a new one), and give the
+    /// reader back afterwards when it read a store and `f` succeeded.
+    fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&Reader) -> Result<T, GitError>,
+    ) -> Result<T, StoreError> {
+        let (generation, pooled) = {
+            let mut pool = self.pool();
+            (pool.generation, pool.readers.pop())
+        };
+        let reader = match pooled {
+            Some(r) => r,
+            None => self.attest_store().reader()?,
+        };
+        let out = f(&reader);
+        if out.is_ok() && reader.has_store() {
+            let mut pool = self.pool();
+            if pool.generation == generation {
+                pool.readers.push(reader);
+            }
+        }
+        Ok(out?)
+    }
+
+    /// Drop every pooled reader (after a download: see the module docs).
+    fn refresh_readers(&self) {
+        let old = {
+            let mut pool = self.pool();
+            pool.generation += 1;
+            std::mem::take(&mut pool.readers)
+        };
+        // Their `git cat-file` processes end outside the lock.
+        drop(old);
+    }
+}
+
+/// The trait's "either bytes or an error" for an entry a git-meta read
+/// filled in: an error leaves no bytes, and empty bytes are
+/// [`EMPTY_VALUE`] (vci never stores them).
+fn settle(e: &mut StoredEnvelope) {
+    match &e.error {
+        Some(_) => e.bytes.clear(),
+        None if e.bytes.is_empty() => e.set_error(EMPTY_VALUE),
+        None => {}
+    }
+}
+
+impl AttestationStore for GitMetaStore {
+    fn kind(&self) -> &'static str {
+        KIND
+    }
+
+    fn location(&self) -> String {
+        format!(".git/git-meta.sqlite (exchanged on {EXCHANGE_POINT})")
+    }
+
+    fn caps(&self) -> Caps {
+        Caps::LOCAL.with_lazy_values(true).with_hints(true)
+    }
+
+    fn status(&self) -> Result<StoreStatus, StoreError> {
+        let exists = self.with_reader(|r| Ok(r.has_store()))?;
+        Ok(if exists {
+            StoreStatus::Ready {
+                schema_version: None,
+            }
+        } else {
+            StoreStatus::Absent {
+                advice: "run `vci fetch`".to_owned(),
+            }
+        })
+    }
+
+    fn list_units(&self, test_ids: &[&str]) -> Result<Vec<Vec<StoredEnvelope>>, StoreError> {
+        self.with_reader(|r| {
+            test_ids
+                .iter()
+                .map(|id| r.candidates_reading(id, |_| false))
+                .collect()
+        })
+    }
+
+    fn list_all(&self) -> Result<Vec<StoredEnvelope>, StoreError> {
+        self.with_reader(|r| r.all_reading(|_| false))
+    }
+
+    fn read_values(&self, envs: &mut [&mut StoredEnvelope]) -> Result<(), StoreError> {
+        self.attest_store()
+            .read_values(envs.iter_mut().map(|e| &mut **e))?;
+        for e in envs.iter_mut() {
+            settle(e);
+        }
+        Ok(())
+    }
+
+    fn manifest(&self, root: &str) -> Result<Option<StoredManifest>, StoreError> {
+        self.with_reader(|r| r.manifest(root))
+    }
+
+    fn manifest_roots(&self) -> Result<Vec<String>, StoreError> {
+        self.with_reader(Reader::manifest_roots)
+    }
+
+    fn put(&self, att: &NewAttestation<'_>) -> Result<StoredEnvelope, StoreError> {
+        att.validate()?;
+        let target = match att.target.strip_prefix("path:") {
+            Some(p) => Target::path(p),
+            None => Target::project(),
+        };
+        let key = self.attest_store().put_keyed(
+            &target,
+            &att.test_key,
+            att.signer,
+            att.storage_key,
+            att.hint,
+            att.envelope,
+        )?;
+        Ok(att.stored(key))
+    }
+
+    fn put_manifest(&self, root: &str, bytes: &[u8]) -> Result<bool, StoreError> {
+        vci_store::key::check_hex("input root", root)?;
+        if bytes.is_empty() {
+            return Err(StoreError::invalid("manifest", "", "must not be empty"));
+        }
+        Ok(self.attest_store().put_manifest(root, bytes)?)
+    }
+
+    fn remove(&self, doomed: Vec<StoredEnvelope>) -> Result<Vec<StoredEnvelope>, StoreError> {
+        Ok(self.attest_store().remove_envelopes(doomed)?)
+    }
+
+    fn remove_manifests(&self, roots: &[&str]) -> Result<usize, StoreError> {
+        Ok(self
+            .attest_store()
+            .remove_manifests(roots.iter().copied())?)
+    }
+
+    /// One pooled reader and one targeted query per unit, values read with
+    /// it (what `AttestStore::list(Some(id))` does), never the default's
+    /// scan of every row plus a `git cat-file` per call: supersession calls
+    /// this once per unit from worker threads.
+    fn read_units(&self, test_ids: &[&str]) -> Result<Vec<Vec<StoredEnvelope>>, StoreError> {
+        let mut units = self.with_reader(|r| {
+            test_ids
+                .iter()
+                .map(|id| r.candidates_reading(id, |_| true))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        units.iter_mut().flatten().for_each(settle);
+        Ok(units)
+    }
+
+    /// Every record and its value in one pass (`AttestStore::list(None)`).
+    fn read_all(&self) -> Result<Vec<StoredEnvelope>, StoreError> {
+        let mut all = self.attest_store().list(None)?;
+        all.iter_mut().for_each(settle);
+        Ok(all)
+    }
+
+    fn count(&self) -> Result<usize, StoreError> {
+        self.with_reader(Reader::count)
+    }
+
+    fn manifests(&self, roots: &[&str]) -> Result<Vec<Option<StoredManifest>>, StoreError> {
+        self.with_reader(|r| roots.iter().map(|root| r.manifest(root)).collect())
+    }
+
+    /// vci's supersession clean-up as it was (`drop_orphan_manifests`):
+    /// first fetch the attestations not fetched yet that could reference
+    /// one of `roots` ([`AttestStore::hydrate_manifest_referrers`]; the roots
+    /// it cannot decide are kept), then read every attestation. One that is
+    /// still not fetched cannot reference a decided root and is skipped; any
+    /// other unreadable value, or a payload whose `manifestRef` is unknown,
+    /// makes the answer empty.
+    fn orphan_manifests(&self, roots: &[&str]) -> Result<Vec<String>, StoreError> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: BTreeSet<String> = roots.iter().map(|r| (*r).to_owned()).collect();
+        let st = self.attest_store();
+        let undecided = st.hydrate_manifest_referrers(&wanted);
+        self.refresh_readers();
+        let undecided = undecided?;
+        let mut referenced = BTreeSet::new();
+        for e in st.list(None)? {
+            if e.not_fetched() {
+                continue;
+            }
+            if e.error.is_some() {
+                return Ok(Vec::new());
+            }
+            match vci_store::key::envelope_manifest_ref(&e.bytes) {
+                ManifestRef::Root(r) => {
+                    referenced.insert(r);
+                }
+                ManifestRef::Inline => {}
+                ManifestRef::Unknown => return Ok(Vec::new()),
+            }
+        }
+        Ok(wanted
+            .difference(&referenced)
+            .filter(|r| !undecided.contains(*r))
+            .cloned()
+            .collect())
+    }
+
+    /// Writes share one git-meta session and one store connection until
+    /// the batch finishes; each is durable when its call returns.
+    fn batch(&self) -> Result<WriteBatch, StoreError> {
+        Ok(WriteBatch::immediate(Box::new(GitBatch(
+            self.attest_store().batch()?,
+        ))))
+    }
+
+    /// The values not fetched yet that `what` names, in batched `git fetch`
+    /// of object ids (`AttestStore::hydrate_*`); then the reader pool is
+    /// emptied.
+    fn prefetch(&self, what: Prefetch<'_>) -> Result<Hydration, StoreError> {
+        let st = self.attest_store();
+        let out = match what {
+            Prefetch::Units {
+                test_ids,
+                choose: Some(choose),
+            } => st.hydrate_units_choosing(test_ids.iter().copied(), |c| choose(c)),
+            Prefetch::Units {
+                test_ids,
+                choose: None,
+            } => st.hydrate_units(test_ids.iter().copied()),
+            Prefetch::Manifests { roots } => st.hydrate_manifests(roots.iter().copied()),
+            Prefetch::Attestations => st.hydrate_attestations(),
+            _ => Ok(Hydration::default()),
+        };
+        self.refresh_readers();
+        Ok(out?)
+    }
+
+    /// Reads `.git/git-meta.sqlite` through once on a thread.
+    fn warm(&self) {
+        self.attest_store().warm_in_background();
+    }
+
+    fn passing_on(&self, tree16: &str) -> BTreeMap<String, String> {
+        self.attest_store().passing_on(tree16)
+    }
+
+    fn remember_passing(&self, tree16: &str, items: &[(String, String)]) {
+        self.attest_store().remember_passing(tree16, items);
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.attest_store().flag(name)
+    }
+
+    fn set_flag(&self, name: &str) {
+        self.attest_store().set_flag(name);
+    }
+
+    /// `put_manifest seconds: session …, read current …, set …, stamp …`
+    /// (since the process started), the line vci has always printed.
+    fn timing_report(&self) -> Vec<String> {
+        let pm = AttestStore::put_manifest_seconds();
+        vec![format!(
+            "put_manifest seconds: session {:.1}, read current {:.1}, set {:.1}, stamp {:.1}",
+            pm[0], pm[1], pm[2], pm[3]
+        )]
+    }
+
+    fn exchange(&self) -> Option<&dyn Exchange> {
+        Some(self)
+    }
+}
+
+impl Exchange for GitMetaStore {
+    fn exchange_point(&self) -> &str {
+        EXCHANGE_POINT
+    }
+
+    /// The remote's URL without credentials ([`vci_store::select::redact`]).
+    fn remote_location(&self, remote: &str) -> Option<String> {
+        self.attest_store()
+            .remote_url(remote)
+            .ok()
+            .flatten()
+            .map(|u| vci_store::select::redact(&u))
+    }
+
+    /// [`AttestStore::fetch`]; then the reader pool is emptied.
+    fn fetch(&self, remote: Option<&str>) -> Result<FetchOutcome, StoreError> {
+        let out = self.attest_store().fetch(remote);
+        self.refresh_readers();
+        Ok(out?)
+    }
+
+    /// [`AttestStore::push`], or [`AttestStore::push_rewriting_history`];
+    /// then the reader pool is emptied.
+    fn push(&self, remote: Option<&str>, mode: PushMode) -> Result<PushOutcome, StoreError> {
+        let st = self.attest_store();
+        let out = match mode {
+            PushMode::Merge => st.push(remote),
+            PushMode::RewriteHistory => st.push_rewriting_history(remote),
+            _ => {
+                return Err(StoreError::Unsupported {
+                    backend: KIND,
+                    operation: "this kind of push",
+                });
+            }
+        };
+        self.refresh_readers();
+        Ok(out?)
+    }
+}
+
+/// An open git-meta write batch ([`AttestStore::batch`]): while it lives,
+/// this thread's writes share one session and one store connection.
+struct GitBatch(BatchGuard);
+
+impl BatchEnd for GitBatch {
+    /// Closes the shared session and connection. Every write was durable
+    /// already, so this never fails.
+    fn finish(self: Box<Self>) -> Result<(), StoreError> {
+        drop(self);
+        Ok(())
+    }
+}
+
+/// Opens the git-meta store of one repository (`VCI_STORE=git-meta`, the
+/// default).
+#[derive(Debug, Clone)]
+pub struct GitMetaFactory {
+    repo: Repo,
+}
+
+impl GitMetaFactory {
+    /// The factory for `repo`'s store.
+    pub fn new(repo: Repo) -> Self {
+        GitMetaFactory { repo }
+    }
+}
+
+impl BackendFactory for GitMetaFactory {
+    fn kind(&self) -> &'static str {
+        KIND
+    }
+
+    fn summary(&self) -> &'static str {
+        "git-meta in .git/git-meta.sqlite, exchanged on refs/meta/main by vci fetch and vci push (the default)"
+    }
+
+    /// The store of the factory's repository. git-meta has no settings of
+    /// its own in the selection; nothing is opened until the first call.
+    fn open(
+        &self,
+        _sel: &Selection,
+        _cx: &OpenContext,
+    ) -> Result<Arc<dyn AttestationStore>, StoreError> {
+        Ok(Arc::new(GitMetaStore::new(self.repo.clone())))
+    }
+}
