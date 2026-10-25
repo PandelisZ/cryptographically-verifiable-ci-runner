@@ -188,6 +188,9 @@ pub struct PushOutcome { pub remote: String, pub status: PushStatus, pub warning
 pub struct AttestStore<'a> { /* &Repo */ }
 impl<'a> AttestStore<'a> {
     pub fn new(repo: &'a Repo) -> Self;
+    /// `<common git dir>/git-meta.sqlite` (2.7.33): one store per repository, shared by its linked worktrees
+    /// (`.git/git-meta.sqlite` in the main worktree, as before).
+    pub fn store_path(&self) -> Result<Utf8PathBuf, GitError>;
     /// Sets the git-meta string value in the local store (.git/git-meta.sqlite); no serialize, no push,
     /// never touches the index or working tree. Identical bytes: no write.
     pub fn put(&self, test_id: &str, signer: &str, storage_key: &str, bytes: &[u8]) -> Result<StoredEnvelope, GitError>;
@@ -229,8 +232,9 @@ another git process wins a ref lock):
 
 - Before serializing, the store is made to cover `refs/<ns>/local/main`: values of that ref the store has no row and
   no deletion record for are copied in, and its deletion records newer than the store's row are applied. (git-meta
-  serializes the store alone as a commit on top of that ref; a new, emptied or replaced `.git/git-meta.sqlite`, or a
-  linked worktree, whose store is its own while the refs are shared, would otherwise publish deletions.)
+  serializes the store alone as a commit on top of that ref; a new, emptied or replaced `.git/git-meta.sqlite` would
+  otherwise publish deletions. Since 2.7.33 the store is one per repository, in the common git directory, shared by
+  its linked worktrees.)
 - A serialization that drops a value the previous local commit held, without a deletion record in the store, is
   undone and is an error (a `meta:filter` rule excluding or routing the key). A push that drops a value of the remote
   tip that this store did not delete is refused.
