@@ -1113,6 +1113,14 @@ static PUT_NS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// A tree entry's mode, kind and object id, owned.
+type OwnedTreeEntry = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// How many commits the kept tree listing may be behind the tree to list
+/// for its difference to be taken instead of listing anew (see
+/// [`AttestStore::cached_tree_listing`]).
+const TREE_CACHE_MAX_BEHIND: u64 = 40;
+
 /// git-meta's tree layout names (pinned with the crate version).
 const VALUE_BLOB: &str = "__value";
 const TOMBSTONE_DIR: &str = "__tombstones";
@@ -1291,14 +1299,71 @@ impl<'a> AttestStore<'a> {
     }
 
     fn lock_file(&self, path: Utf8PathBuf) -> Result<std::fs::File, GitError> {
-        let lock = std::fs::OpenOptions::new()
+        use std::io::Write as _;
+        let mut lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
+            .read(true)
             .write(true)
             .open(&path)
             .map_err(|e| GitError::Store(format!("cannot create lock file {path}: {e}")))?;
-        lock.lock()
-            .map_err(|e| GitError::Store(format!("cannot lock {path}: {e}")))?;
+        // Who holds it is written into the file once held (2.7.32: an agent
+        // in another worktree waited on a push for minutes, told nothing);
+        // waiting is announced, repeated, and bounded (VCI_LOCK_TIMEOUT_SECS,
+        // default 600; 0 waits forever).
+        let name = path.file_name().unwrap_or("lock").to_owned();
+        let holder = || {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        let timeout = std::env::var("VCI_LOCK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(600);
+        let started = std::time::Instant::now();
+        let mut told = None::<std::time::Instant>;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(GitError::Store(format!("cannot lock {path}: {e}")));
+                }
+            }
+            let waited = started.elapsed().as_secs();
+            if timeout > 0 && waited >= timeout {
+                return Err(GitError::Store(format!(
+                    "gave up after {waited} s waiting for the lock {name} held by another vci in this repository ({}); VCI_LOCK_TIMEOUT_SECS sets the wait",
+                    holder()
+                )));
+            }
+            if told.is_none_or(|t| t.elapsed().as_secs() >= 30) {
+                eprintln!(
+                    "vci: waiting for another vci in this repository to finish its fetch or push ({}){}",
+                    holder(),
+                    if waited > 0 {
+                        format!("; {waited} s so far")
+                    } else {
+                        String::new()
+                    }
+                );
+                told = Some(std::time::Instant::now());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let exe = std::env::args().next().unwrap_or_else(|| "vci".to_owned());
+        let args: Vec<String> = std::env::args().skip(1).take(3).collect();
+        let _ = lock.set_len(0);
+        let _ = write!(
+            lock,
+            "pid {} {exe} {} since {}",
+            std::process::id(),
+            args.join(" "),
+            now_ms() / 1000
+        );
+        let _ = lock.flush();
         Ok(lock)
     }
 
@@ -3617,24 +3682,19 @@ impl<'a> AttestStore<'a> {
         // the difference between the two (2.7.31: `ls-tree -r` of vex's
         // 50,000 entries took about a second on every fetch; the entries
         // that change between two fetches are a few hundred).
-        let listing;
-        let cached = self.cached_tree_records(&tree);
-        let records: Vec<TreeRecord<'_>> = match &cached {
-            Some(rows) => rows
-                .iter()
-                .map(|(m, k, o, p)| (m.as_slice(), k.as_slice(), o.as_slice(), p.as_slice()))
-                .collect(),
+        let listing = match self.cached_tree_listing(commit, &tree) {
+            Some(l) => l,
             None => {
-                listing = self
+                let l = self
                     .repo
                     .git()
                     .args(["ls-tree", "-r", "-z", "--full-tree", &tree])
                     .run()?;
-                let r = split_ls_tree(&listing);
-                self.store_tree_records(&tree, &r);
-                r
+                self.store_tree_listing(commit, &tree, &l);
+                l
             }
         };
+        let records = split_ls_tree(&listing);
         let mut bad = Vec::new();
         let mut keep: Vec<u8> = Vec::new();
         let mut values = BTreeSet::new();
@@ -3732,143 +3792,125 @@ impl<'a> AttestStore<'a> {
         })
     }
 
-    /// The records (`mode`, `kind`, `oid`, `path`) of `tree`, from the
-    /// listing kept in the store (see [`AttestStore::snapshot_keys`]): as
-    /// kept when it is `tree`'s, else brought up to date by `git diff-tree`
-    /// from the tree it is of, and kept as `tree`'s. `None` when there is
-    /// none, or the difference cannot be taken (that tree is gone): the
-    /// caller lists the tree.
-    #[allow(clippy::type_complexity)]
-    fn cached_tree_records(&self, tree: &str) -> Option<Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>> {
-        let (_, mut db) = self.db_rw().ok()??;
+    /// The `ls-tree -r -z` listing of `tree` (`commit`'s), from the one the
+    /// store keeps (see [`AttestStore::snapshot_keys`]): as kept when it is
+    /// `tree`'s, else brought up to date by `git diff-tree` from the tree it
+    /// is of, when that one's commit is within [`TREE_CACHE_MAX_BEHIND`]
+    /// commits (2.7.32: a diff across an evening of pushes took 6 s where a
+    /// listing takes 0.9), and kept as `tree`'s. `None` when there is none
+    /// or the difference is not worth taking: the caller lists the tree.
+    fn cached_tree_listing(&self, commit: &str, tree: &str) -> Option<Vec<u8>> {
+        let (_, db) = self.db_rw().ok()??;
         Self::tree_cache_schema(&db).ok()?;
-        let at: String = db
-            .query_row("SELECT tree FROM vci_tree_at LIMIT 1", [], |r| r.get(0))
+        let (at_commit, at_tree, listing): (String, String, Vec<u8>) = db
+            .query_row(
+                "SELECT commit_id, tree, listing FROM vci_tree_listing LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .ok()?;
-        if !is_oid(&at) {
+        drop(db);
+        if !is_oid(&at_tree) || listing.is_empty() {
             return None;
         }
-        let mut rows: BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeMap::new();
-        {
-            let mut stmt = db
-                .prepare("SELECT path, mode, kind, oid FROM vci_tree")
-                .ok()?;
-            let found = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })
-                .ok()?;
-            for r in found {
-                let (p, m, k, o) = r.ok()?;
-                rows.insert(p, (m.into_bytes(), k.into_bytes(), o.into_bytes()));
-            }
+        if at_tree == tree {
+            return Some(listing);
         }
-        if rows.is_empty() {
+        // Close enough to diff?
+        let behind = self
+            .repo
+            .git()
+            .args(["rev-list", "--count"])
+            .arg(format!("{at_commit}..{commit}"))
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        if behind > TREE_CACHE_MAX_BEHIND {
             return None;
         }
-        if at != tree {
-            let raw = self
-                .repo
-                .git()
-                .args(["diff-tree", "-r", "-z", "--raw", "--no-renames", &at, tree])
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .run()
-                .ok()?;
-            let changes = Self::tree_changes(&raw)?;
-            let tx = db.transaction().ok()?;
-            {
-                let mut del = tx
-                    .prepare_cached("DELETE FROM vci_tree WHERE path = ?1")
-                    .ok()?;
-                let mut put = tx
-                    .prepare_cached(
-                        "INSERT OR REPLACE INTO vci_tree (path, mode, kind, oid) VALUES (?1, ?2, ?3, ?4)",
-                    )
-                    .ok()?;
-                for ([status, _, new_mode, oid], p) in changes {
-                    if status == "D" {
-                        rows.remove(p);
-                        del.execute([p]).ok()?;
-                        continue;
-                    }
-                    if !is_oid(oid) {
-                        return None;
-                    }
-                    let kind = if new_mode == "160000" {
-                        "commit"
-                    } else {
-                        "blob"
-                    };
-                    put.execute(rusqlite::params![p, new_mode, kind, oid])
-                        .ok()?;
-                    rows.insert(
-                        p.to_vec(),
-                        (
-                            new_mode.as_bytes().to_vec(),
-                            kind.as_bytes().to_vec(),
-                            oid.as_bytes().to_vec(),
-                        ),
-                    );
-                }
-                tx.execute("UPDATE vci_tree_at SET tree = ?1", [tree])
-                    .ok()?;
+        let raw = self
+            .repo
+            .git()
+            .args([
+                "diff-tree",
+                "-r",
+                "-z",
+                "--raw",
+                "--no-renames",
+                &at_tree,
+                tree,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run()
+            .ok()?;
+        let changes = Self::tree_changes(&raw)?;
+        // path -> (mode, kind, oid)
+        let mut rows: BTreeMap<Vec<u8>, OwnedTreeEntry> = split_ls_tree(&listing)
+            .into_iter()
+            .map(|(m, k, o, p)| (p.to_vec(), (m.to_vec(), k.to_vec(), o.to_vec())))
+            .collect();
+        for ([status, _, new_mode, oid], p) in changes {
+            if status == "D" {
+                rows.remove(p);
+                continue;
             }
-            tx.commit().ok()?;
+            if !is_oid(oid) {
+                return None;
+            }
+            let kind: &[u8] = if new_mode == "160000" {
+                b"commit"
+            } else {
+                b"blob"
+            };
+            rows.insert(
+                p.to_vec(),
+                (
+                    new_mode.as_bytes().to_vec(),
+                    kind.to_vec(),
+                    oid.as_bytes().to_vec(),
+                ),
+            );
         }
-        Some(
-            rows.into_iter()
-                .map(|(p, (m, k, o))| (m, k, o, p))
-                .collect(),
-        )
+        let mut out = Vec::with_capacity(listing.len() + 1024);
+        for (p, (m, k, o)) in &rows {
+            out.extend_from_slice(m);
+            out.push(b' ');
+            out.extend_from_slice(k);
+            out.push(b' ');
+            out.extend_from_slice(o);
+            out.push(b'\t');
+            out.extend_from_slice(p);
+            out.push(0);
+        }
+        self.store_tree_listing(commit, tree, &out);
+        Some(out)
     }
 
-    /// Keep `tree`'s listing `records` in the store (see
-    /// [`AttestStore::cached_tree_records`]), replacing the one kept.
-    fn store_tree_records(&self, tree: &str, records: &[TreeRecord<'_>]) {
-        let Ok(Some((_, mut db))) = self.db_rw() else {
+    /// Keep `tree`'s (`commit`'s) `ls-tree -r -z` listing in the store (see
+    /// [`AttestStore::cached_tree_listing`]), replacing the one kept.
+    fn store_tree_listing(&self, commit: &str, tree: &str, listing: &[u8]) {
+        let Ok(Some((_, db))) = self.db_rw() else {
             return;
         };
         if Self::tree_cache_schema(&db).is_err() {
             return;
         }
-        let Ok(tx) = db.transaction() else { return };
-        let ok = tx
-            .execute_batch("DELETE FROM vci_tree; DELETE FROM vci_tree_at;")
-            .is_ok()
-            && tx
-                .prepare_cached(
-                    "INSERT INTO vci_tree (path, mode, kind, oid) VALUES (?1, ?2, ?3, ?4)",
-                )
-                .map(|mut put| {
-                    records.iter().all(|(m, k, o, p)| {
-                        put.execute(rusqlite::params![
-                            p,
-                            String::from_utf8_lossy(m).as_ref(),
-                            String::from_utf8_lossy(k).as_ref(),
-                            String::from_utf8_lossy(o).as_ref()
-                        ])
-                        .is_ok()
-                    })
-                })
-                .unwrap_or(false)
-            && tx
-                .execute("INSERT INTO vci_tree_at (tree) VALUES (?1)", [tree])
-                .is_ok();
-        if ok {
-            let _ = tx.commit();
-        }
+        let _ = db.execute_batch("DELETE FROM vci_tree_listing;");
+        let _ = db.execute(
+            "INSERT INTO vci_tree_listing (commit_id, tree, listing) VALUES (?1, ?2, ?3)",
+            rusqlite::params![commit, tree, listing],
+        );
     }
 
     fn tree_cache_schema(db: &rusqlite::Connection) -> rusqlite::Result<()> {
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS vci_tree (
-               path BLOB PRIMARY KEY, mode TEXT NOT NULL, kind TEXT NOT NULL, oid TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS vci_tree_at (tree TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS vci_tree_listing (
+               commit_id TEXT NOT NULL, tree TEXT NOT NULL, listing BLOB NOT NULL);
+             DROP TABLE IF EXISTS vci_tree;
+             DROP TABLE IF EXISTS vci_tree_at;",
         )
     }
 
@@ -7110,6 +7152,10 @@ impl<'a> AttestStore<'a> {
             pushed,
             "vci: replace a deletion record this clone lost",
         )?;
+        // `pushed`'s tree with blobs written here: complete when it was.
+        if self.known_complete(pushed) {
+            self.mark_complete(&commit);
+        }
         Ok(true)
     }
 
@@ -7499,6 +7545,9 @@ impl<'a> AttestStore<'a> {
             local,
             "vci push --rewrite-history",
         )?;
+        if self.known_complete(local) {
+            self.mark_complete(&commit);
+        }
         Ok(commit)
     }
 
@@ -7549,7 +7598,14 @@ impl<'a> AttestStore<'a> {
             Some(&commit),
             local,
             "vci: rebase metadata for push",
-        )
+        )?;
+        // `local`'s tree exactly: complete when it was (2.7.32: this is
+        // the commit a job's cache leaves as the local metadata commit, and
+        // every job restoring the cache walked its tree, 1.9 s on vex).
+        if self.known_complete(local) {
+            self.mark_complete(&commit);
+        }
+        Ok(())
     }
 }
 

@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-32">2.7.32</a></td><td>25 Oct 2026</td><td>A vci waiting for another's fetch or push in the same repository says so, names it, and gives up after VCI_LOCK_TIMEOUT_SECS (600); the kept tree listing is one blob, brought up to date only from a nearby commit; a push marks the commit it writes as complete</td></tr>
 <tr><td><a href="#v2-7-31">2.7.31</a></td><td>25 Oct 2026</td><td>Dropping old deletion records no longer makes the store forget that it covers its metadata commit (a 1.6 s check on every fetch after a drop)</td></tr>
 <tr><td><a href="#v2-7-30">2.7.30</a></td><td>25 Oct 2026</td><td>Verdicts check a shared base manifest once for the units sharing it; a fetch lists the tip from the kept listing plus the difference; no second round for a unit whose remembered attestation failed on its inputs; a run's warnings no longer ask git about tracked paths</td></tr>
 <tr><td><a href="#v2-7-29">2.7.29</a></td><td>24 Oct 2026</td><td>A plan remembers which attestation passed for each unit on its tree, and a plan whose base commit has that tree reads those first: a pull request's plan no longer downloads other branches' attestations before master's</td></tr>
@@ -128,6 +129,9 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-32">2.7.32</h2>
+<p><em>25 October 2026.</em> Fetches and pushes of one repository take turns (a lock in its common git directory, shared by its worktrees), and a vci that found the lock taken waited in silence, as long as it took: an agent pushing from one worktree waited minutes on another's push without being told. <strong>It now says what it is waiting for</strong> (<code>vci: waiting for another vci in this repository to finish its fetch or push (pid 1234 vci push ... since ...)</code>), repeats every 30 s, and <strong>gives up after <code>VCI_LOCK_TIMEOUT_SECS</code></strong> (600 by default; 0 waits forever) with an error naming the holder. The kept tree listing (2.7.30) was 50,000 rows and was brought up to date by a <code>diff-tree</code> however far behind it was: 8.7 s on a pull request job whose cache came from an evening earlier. <strong>It is one blob now, brought up to date only when within 40 commits</strong>, else listed anew (0.9 s). A push also marks the metadata commit it writes as complete, so the next plan in that clone has no completeness walk to do. 2.7.31 also added a guard on value fetches: a transfer under 4 KB/s for 30 s is given up and retried once (one fetch of 2,055 manifests took 218 s).</p>
 
 <h2 id="v2-7-31">2.7.31</h2>
 <p><em>25 October 2026.</em> The store records the metadata commit it is known to cover (2.7.5) and, since 2.7.20, notes every deleted row and deletion record to check that each still has one or the other. Dropping deletion records older than a day (also 2.7.20) deletes records on purpose, and the tree drops them too; the note then found those keys with neither, and the store forgot its coverage: every fetch after a drop checked the whole store again (1.6 s on vex's runners). <strong>A record dropped on purpose is no longer noted as lost.</strong></p>
