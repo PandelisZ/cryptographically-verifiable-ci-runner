@@ -20,6 +20,17 @@ use vci_git::{AttestStore, Repo};
 mod env_common;
 mod store_common;
 
+/// `vci` without the store selection variables
+/// ([`vci_store::select::ENV_VARS`]): a store a developer exported
+/// (`VCI_STORE`, `VCI_STORE_URL`, ...) must not reach these git-meta tests.
+fn vci_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("vci").unwrap();
+    for k in vci_store::select::ENV_VARS {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -229,7 +240,7 @@ impl World {
     fn cargo_raw(&self, dir: &Path, args: &[&str], offline: bool) -> Output {
         let mut cmd = Command::new("cargo");
         cmd.args(args).current_dir(dir);
-        for k in SCRUB {
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
         for (k, v) in &self.env {
@@ -257,7 +268,7 @@ impl World {
             .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("NO_COLOR", "1");
-        for k in SCRUB {
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
         for (k, v) in &self.env {
@@ -1108,8 +1119,7 @@ fn cargo_init_writes_config_and_prints_the_cargo_workflow() {
     assert!(st.success());
     let key = dir.join("k");
     keygen(&key, "k");
-    let out = Command::cargo_bin("vci")
-        .unwrap()
+    let out = vci_cmd()
         .current_dir(&dir)
         .args([
             "init",

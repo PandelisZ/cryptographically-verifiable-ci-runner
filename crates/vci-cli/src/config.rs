@@ -15,7 +15,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
+use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
+use vci_store::StoreError;
+use vci_store::select::StoreSettings;
 
 use crate::util::{glob_match, name_match, parse_duration};
 
@@ -55,6 +58,15 @@ pub struct Config {
     /// Extra inputs declared for test ids (`[[inputs]]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputsConfig>,
+    /// `[store]`: which attestation store vci uses, and its tuning
+    /// (docs/STORE-BACKENDS.md section 9). Accepted here so that a base
+    /// commit's `vci.toml` with `[store]` still parses for its policy. It
+    /// is never an input of a test (not part of
+    /// [`crate::ctx::Project::config_hash_of`]), and the store is chosen
+    /// from the working tree's file ([`working_tree_store`]), never from
+    /// this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<StoreSettings>,
     /// Deprecated env keys this file used (`env.global`, ...), with their
     /// new names, for the warning ([`Config::warnings`]).
     #[serde(skip)]
@@ -1441,9 +1453,162 @@ pub fn template_for(adapter: &str) -> &'static str {
     }
 }
 
+/// `[store]` of the working tree's `vci.toml` in `root`, for choosing the
+/// attestation store; `None` when there is no file or no `[store]`. Only
+/// `[store]` is read (leniently: no other key is checked), so a broken
+/// `[policy]` cannot stop a store from being chosen, while a broken
+/// `[store]`, or a file that is not TOML, is an error naming the file.
+/// Errors never print the file's values (a refused `password` may hold
+/// one): only the line, and the key of an unknown one.
+pub fn working_tree_store(root: &Utf8Path) -> Result<Option<StoreSettings>, StoreError> {
+    #[derive(Deserialize)]
+    struct OnlyStore {
+        #[serde(default)]
+        store: Option<StoreSettings>,
+    }
+    let path = root.join(CONFIG_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StoreError::Config(format!("reading {path}: {e}"))),
+    };
+    toml::from_str::<OnlyStore>(&text)
+        .map(|o| o.store)
+        .map_err(|e| {
+            let line = e
+                .span()
+                .map(|r| text[..r.start.min(text.len())].matches('\n').count() + 1);
+            let at = line.map(|l| format!(" (line {l})")).unwrap_or_default();
+            // serde's other messages quote the value ("invalid type: string
+            // \"...\""); an unknown key's names only keys.
+            let what = if e.message().starts_with("unknown field") {
+                format!(": {}", e.message())
+            } else {
+                String::new()
+            };
+            StoreError::Config(format!(
+                "{path}{at}: [store] cannot be read{what} (its values are not printed)"
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STORE_TOML: &str = "adapter = \"go\"\n\n[store]\nbackend = \"sqlite\"\ntimeout = \"10s\"\n\n[store.sqlite]\npath = \"vci.sqlite\"\n\n[store.postgres]\nschema = \"ci\"\n";
+
+    /// A base commit's `vci.toml` with `[store]` parses (for its policy).
+    #[test]
+    fn store_settings_parse_at_the_base_commit() {
+        let c = Config::parse(STORE_TOML).unwrap();
+        let s = c.store.as_ref().unwrap();
+        assert_eq!(s.backend.as_deref(), Some("sqlite"));
+        assert_eq!(s.timeout.as_deref(), Some("10s"));
+        assert_eq!(
+            s.sqlite.as_ref().unwrap().path.as_deref(),
+            Some("vci.sqlite")
+        );
+        assert!(c.warnings("vci.toml").is_empty());
+        // Unknown keys in [store] are errors, as everywhere in vci.toml.
+        assert!(Config::parse("[store]\nbackedn = \"sqlite\"\n").is_err());
+        assert!(Config::parse("[store.sqlite]\nfile = \"x\"\n").is_err());
+        // A refused key still parses (the store, not the policy, refuses it).
+        let c = Config::parse("[store.postgres]\npassword = \"planted\"\n").unwrap();
+        assert!(!format!("{c:?}").contains("planted"));
+    }
+
+    /// `[store]` is never an input: each project's configuration hash is
+    /// the same with and without it.
+    #[test]
+    fn store_settings_are_not_an_input() {
+        let plain = Config::parse("adapter = \"go\"\n").unwrap();
+        let with = Config::parse(STORE_TOML).unwrap();
+        let hash = |c: &Config| {
+            c.project_specs()
+                .iter()
+                .map(|s| {
+                    crate::ctx::Project::config_hash_of(
+                        &s.rel,
+                        &s.adapter,
+                        &s.adapter_options(),
+                        &s.env,
+                        &s.inputs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hash(&plain), hash(&with));
+        // Nor does a config without [store] serialize differently.
+        assert!(!serde_json::to_string(&plain).unwrap().contains("store"));
+    }
+
+    fn tree(text: &str) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join(CONFIG_FILE), text).unwrap();
+        t
+    }
+
+    fn utf8(t: &tempfile::TempDir) -> &Utf8Path {
+        Utf8Path::from_path(t.path()).unwrap()
+    }
+
+    /// The working tree's `[store]` is read leniently: the rest of the
+    /// file is not checked.
+    #[test]
+    fn the_working_tree_store_ignores_the_rest_of_the_file() {
+        let t = tree("[policy]\nno_such_key = 1\nmax_ttl = 5\n\n[store]\nbackend = \"sqlite\"\n");
+        assert!(
+            Config::parse(&std::fs::read_to_string(t.path().join(CONFIG_FILE)).unwrap()).is_err()
+        );
+        let s = working_tree_store(utf8(&t)).unwrap().unwrap();
+        assert_eq!(s.backend.as_deref(), Some("sqlite"));
+        // No [store], no file: nothing chosen.
+        let t = tree("[policy]\nwhatever = true\n");
+        assert_eq!(working_tree_store(utf8(&t)).unwrap(), None);
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(working_tree_store(utf8(&empty)).unwrap(), None);
+    }
+
+    /// A broken `[store]` is an error naming the file, never its values.
+    #[test]
+    fn a_broken_working_tree_store_is_an_error_naming_the_file() {
+        for (text, line, names) in [
+            (
+                "[store]\nbackend = \"sqlite\"\npool = \"planted\"\n",
+                3,
+                None,
+            ),
+            ("[store.postgres]\npool = \"planted\"\n", 2, None),
+            (
+                "[store]\nbackend = \"planted\"\nbakend = 1\n",
+                3,
+                Some("bakend"),
+            ),
+            ("[store]\nbackend = \"planted\n", 2, None),
+        ] {
+            let t = tree(text);
+            let e = working_tree_store(utf8(&t)).unwrap_err();
+            let msg = e.to_string();
+            assert!(matches!(e, StoreError::Config(_)), "{msg}");
+            assert!(
+                msg.contains(&format!("{}/{CONFIG_FILE} (line {line})", utf8(&t))),
+                "{text:?}: {msg}"
+            );
+            assert!(!msg.contains("planted"), "{text:?}: {msg}");
+            if let Some(k) = names {
+                assert!(msg.contains(k), "{msg}");
+            }
+        }
+        // A refused key parses here; selection refuses it (by name only).
+        let t = tree("[store.postgres]\npassword = \"planted\"\n");
+        let s = working_tree_store(utf8(&t)).unwrap().unwrap();
+        let e = s.check().unwrap_err().to_string();
+        assert!(
+            e.contains("store.postgres.password") && !e.contains("planted"),
+            "{e}"
+        );
+    }
 
     /// Regression: the templates wrote `no_skip_refs = []`, so a push to main
     /// (where the example workflow's base ref is the pushed commit itself)

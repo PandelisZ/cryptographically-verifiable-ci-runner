@@ -437,6 +437,9 @@ impl ChildEnvMap {
 /// project-wide policy ([`FileEnv::for_project`] with its built-in lists).
 /// Strict mode keeps the variables of every class but stripped; loose mode
 /// keeps everything. Then every `set` variable gets its declared value.
+/// The store's secrets ([`vci_store::select::NEVER_TO_CHILDREN`],
+/// `VCI_STORE_URL`) never reach a test, in either mode: vci removes them
+/// from its own environment at start-up, and this drops them again.
 pub fn build_child_env(
     policy: &FileEnv,
     parent: impl IntoIterator<Item = (OsString, OsString)>,
@@ -456,6 +459,9 @@ pub fn build_child_env(
     }
     for (k, v) in &policy.set {
         vars.insert(k.clone(), OsString::from(v));
+    }
+    for k in vci_store::select::NEVER_TO_CHILDREN {
+        vars.remove(*k);
     }
     ChildEnvMap {
         vars,
@@ -592,6 +598,32 @@ mod tests {
         // A set variable absent from the machine is added.
         let child = build_child_env(&vitest(&cfg(EnvMode::Strict)), vec![]);
         assert_eq!(keys(&child), ["CI", "TZ"]);
+    }
+
+    /// `VCI_STORE_URL` (a store's password) reaches no test, whatever the
+    /// mode and even when vci.toml sets it; other `VCI_*` variables pass
+    /// through as built-in ignore.
+    #[test]
+    fn store_secrets_never_reach_a_test() {
+        let with_url = || {
+            let mut p = parent();
+            p.push(("VCI_STORE_URL".into(), "postgres://u:s3cret@h/db".into()));
+            p.push(("VCI_STORE".into(), "postgres".into()));
+            p
+        };
+        for mode in [EnvMode::Strict, EnvMode::Loose] {
+            let mut c = cfg(mode);
+            c.set
+                .insert("VCI_STORE_URL".into(), "postgres://u:s3cret@h/db".into());
+            c.hash.push("VCI_STORE_URL".into());
+            let child = build_child_env(&vitest(&c), with_url());
+            assert!(child.get("VCI_STORE_URL").is_none(), "{mode:?}");
+            assert_eq!(
+                child.get("VCI_STORE").as_deref(),
+                Some(std::ffi::OsStr::new("postgres")),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

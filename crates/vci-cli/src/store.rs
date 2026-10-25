@@ -3,10 +3,12 @@
 //! use the same one).
 //!
 //! The backends this vci was built with are registered in [`factories`].
-//! The store is git-meta for now; choosing another backend
-//! (`VCI_STORE`, `VCI_STORE_URL`, `[store]` in `vci.toml`) comes later.
-//! A store that cannot be opened is a [`FailedStore`], whose every call
-//! fails, so commands fail open through their usual error paths.
+//! Which one a repository uses is resolved once per process
+//! ([`vci_store::select::resolve`]): `VCI_STORE`, else the scheme of
+//! `VCI_STORE_URL`, else `[store] backend` in the working tree's
+//! `vci.toml`, else git-meta. A store that cannot be selected or opened is
+//! a [`FailedStore`], whose every call fails, so commands fail open
+//! through their usual error paths.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,8 +27,19 @@ static SECRETS: OnceLock<BTreeMap<&'static str, Secret>> = OnceLock::new();
 static COMMAND: OnceLock<&'static str> = OnceLock::new();
 
 /// The store of each repository this process opened, by root.
-static STORES: Mutex<BTreeMap<Utf8PathBuf, Arc<dyn AttestationStore>>> =
-    Mutex::new(BTreeMap::new());
+static STORES: Mutex<BTreeMap<Utf8PathBuf, Opened>> = Mutex::new(BTreeMap::new());
+
+/// The kind of the first store this process opened, for the metrics log.
+static USED: OnceLock<&'static str> = OnceLock::new();
+
+/// A repository's store, and the selection it was opened with.
+#[derive(Clone)]
+struct Opened {
+    store: Arc<dyn AttestationStore>,
+    /// `None` when the selection could not be resolved (the store is then
+    /// a [`FailedStore`]).
+    selection: Option<Selection>,
+}
 
 /// Take every [`select::NEVER_TO_CHILDREN`] variable (`VCI_STORE_URL`) out
 /// of this process's environment, keeping its value in memory, so that no
@@ -55,7 +68,6 @@ pub unsafe fn take_secrets() {
 /// The environment as store selection reads it: the variables
 /// [`take_secrets`] took out answer from the kept values, every other one
 /// from the environment.
-#[allow(dead_code)] // store selection reads it once it honours the environment
 pub fn env_lookup(name: &str) -> Option<String> {
     if select::NEVER_TO_CHILDREN.contains(&name) {
         return SECRETS
@@ -146,27 +158,83 @@ fn jobs() -> usize {
 }
 
 /// The attestation store of `repo`, opened once per process and shared.
-/// Opening never fails: a store that cannot be opened is a
-/// [`FailedStore`].
+/// Opening never fails: a store that cannot be selected or opened is a
+/// [`FailedStore`]. The selection's warnings are printed when it is
+/// opened.
 pub fn for_repo(repo: &Repo) -> Arc<dyn AttestationStore> {
-    let mut stores = STORES.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(s) = stores.get(repo.root()) {
-        return s.clone();
-    }
-    let store = open(repo);
-    stores.insert(repo.root().to_owned(), store.clone());
-    store
+    opened(repo).store
 }
 
-fn open(repo: &Repo) -> Arc<dyn AttestationStore> {
+/// The settings `repo`'s store was opened with ([`for_repo`]), with where
+/// each came from; `None` when they could not be resolved.
+pub fn selection_of(repo: &Repo) -> Option<Selection> {
+    opened(repo).selection
+}
+
+/// The warnings about `repo`'s store selection (settings overridden or
+/// ignored), for the plan's warnings: [`for_repo`] printed them.
+pub fn warnings_of(repo: &Repo) -> Vec<String> {
+    selection_of(repo).map(|s| s.warnings).unwrap_or_default()
+}
+
+/// The kind of the first store this process opened, if it opened one.
+pub fn used_kind() -> Option<&'static str> {
+    USED.get().copied()
+}
+
+fn opened(repo: &Repo) -> Opened {
+    let mut stores = STORES.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(o) = stores.get(repo.root()) {
+        return o.clone();
+    }
+    let o = open(repo, &env_lookup);
+    for w in o.selection.iter().flat_map(|s| &s.warnings) {
+        eprintln!("vci: warning: {w}");
+    }
+    let _ = USED.set(o.store.kind());
+    stores.insert(repo.root().to_owned(), o.clone());
+    o
+}
+
+/// Resolve `repo`'s store from `env` and the working tree's `[store]`, and
+/// open it.
+fn open(repo: &Repo, env: &dyn Fn(&str) -> Option<String>) -> Opened {
     // The context first: it asks git for the git directory once, and the
     // factories' copies of `repo` keep the answer.
     let cx = open_context(repo, COMMAND.get().copied().unwrap_or("vci"));
     let factories = factories(repo);
     let factories: Vec<&dyn BackendFactory> = factories.iter().map(AsRef::as_ref).collect();
-    let sel = Selection::for_backend(select::DEFAULT_BACKEND);
-    vci_store::open(&factories, &sel, &cx)
-        .unwrap_or_else(|e| Arc::new(FailedStore::for_request(&factories, &sel.kind.value, &e)))
+    let file = crate::config::working_tree_store(repo.root());
+    // The backend asked for, to name a store that fails: an unreadable
+    // `[store]` names none unless the environment does.
+    let wanted = match &file {
+        Ok(f) => select::requested_kind(env, f.as_ref()),
+        Err(_) => {
+            let named = [select::ENV_STORE, select::ENV_STORE_URL]
+                .iter()
+                .any(|k| env(k).is_some_and(|v| !v.trim().is_empty()));
+            if named {
+                select::requested_kind(env, None)
+            } else {
+                "unknown".to_owned()
+            }
+        }
+    };
+    let sel = match file.and_then(|f| select::resolve(env, f.as_ref())) {
+        Ok(sel) => sel,
+        Err(e) => {
+            return Opened {
+                store: Arc::new(FailedStore::for_request(&factories, &wanted, &e)),
+                selection: None,
+            };
+        }
+    };
+    let store = vci_store::open(&factories, &sel, &cx)
+        .unwrap_or_else(|e| Arc::new(FailedStore::for_request(&factories, &sel.kind.value, &e)));
+    Opened {
+        store,
+        selection: Some(sel),
+    }
 }
 
 /// Close every store this process opened (their pooled connections and
@@ -550,6 +618,80 @@ mod tests {
     fn env_lookup_reads_other_variables() {
         assert_eq!(env_lookup("PATH"), std::env::var("PATH").ok());
         assert_eq!(env_lookup("VCI_STORE_URL"), None);
+    }
+
+    fn env_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: BTreeMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |k| vars.get(k).cloned()
+    }
+
+    /// Selection: the environment over the working tree's `[store]` over
+    /// git-meta; what cannot be selected or opened is a failed store that
+    /// says why and never prints a URL's password.
+    #[test]
+    fn the_store_is_selected_from_the_environment_and_vci_toml() {
+        let (t, repo) = git_repo();
+        let o = open(&repo, &env_of(&[]));
+        assert_eq!(o.store.kind(), "git-meta");
+        let sel = o.selection.unwrap();
+        assert_eq!(sel.kind.source, select::Source::Default);
+        assert!(sel.warnings.is_empty());
+
+        let o = open(&repo, &env_of(&[("VCI_STORE", "nope")]));
+        assert_eq!(o.store.kind(), "unknown");
+        let e = o.store.status().unwrap_err().to_string();
+        assert!(
+            e.contains("\"nope\"") && e.contains("git-meta, sqlite, postgres"),
+            "{e}"
+        );
+
+        let o = open(&repo, &env_of(&[("VCI_STORE", "postgres")]));
+        assert_eq!(o.store.kind(), "postgres");
+        assert!(o.selection.is_none());
+        let e = o.store.status().unwrap_err().to_string();
+        assert!(e.contains("VCI_STORE_URL"), "{e}");
+
+        let url = "postgres://u:s3cret@127.0.0.1:1/x";
+        for env in [vec![("VCI_STORE", url)], vec![("VCI_STORE_URL", url)]] {
+            let o = open(&repo, &env_of(&env));
+            let e = o.store.status().unwrap_err().to_string();
+            let all = format!("{e} {} {:?}", o.store.location(), o.selection);
+            assert!(!all.contains("s3cret"), "{all}");
+        }
+
+        std::fs::write(
+            t.path().join("vci.toml"),
+            "[policy]\nbroken = 1\n\n[store]\nbackend = \"sqlite\"\n",
+        )
+        .unwrap();
+        let o = open(&repo, &env_of(&[("VCI_STORE", "git-meta")]));
+        assert_eq!(o.store.kind(), "git-meta");
+        let sel = o.selection.unwrap();
+        assert_eq!(sel.kind.source, select::Source::Env("VCI_STORE"));
+        assert_eq!(sel.warnings.len(), 1, "{:?}", sel.warnings);
+        assert!(sel.warnings[0].contains("overridden"), "{:?}", sel.warnings);
+
+        std::fs::write(
+            t.path().join("vci.toml"),
+            "[store.postgres]\npassword = \"planted\"\n",
+        )
+        .unwrap();
+        let o = open(&repo, &env_of(&[]));
+        assert!(o.selection.is_none());
+        let e = o.store.status().unwrap_err().to_string();
+        assert!(
+            e.contains("store.postgres.password") && !e.contains("planted"),
+            "{e}"
+        );
+
+        std::fs::write(t.path().join("vci.toml"), "[store]\nbackend = 5\n").unwrap();
+        let o = open(&repo, &env_of(&[]));
+        assert_eq!(o.store.kind(), "unknown");
+        let e = o.store.status().unwrap_err().to_string();
+        assert!(e.contains("vci.toml (line 2)"), "{e}");
     }
 
     /// The test store keeps one record per slot, and a deferred batch's

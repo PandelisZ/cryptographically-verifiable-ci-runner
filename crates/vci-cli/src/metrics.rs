@@ -3,10 +3,11 @@
 //!
 //! Each line holds what the command measured about itself (every step vci
 //! times, the lines `VCI_TIMING` prints: [`vci_core::metrics`]), how long it
-//! took and how it ended, and the machine (OS, architecture, CPUs, whether
-//! it ran in CI). Flags are recorded by name only, never their values (a key
-//! path), and no file name or test id is: a step's label can name a count, a
-//! project or a git command. The log is the repository's
+//! took and how it ended, the attestation store's kind (`git-meta`,
+//! `sqlite`, ...; never its location), and the machine (OS, architecture,
+//! CPUs, whether it ran in CI). Flags are recorded by name only, never their
+//! values (a key path), and no file name or test id is: a step's label can
+//! name a count, a project or a git command. The log is the repository's
 //! `<git common dir>/vci-metrics.jsonl`, or the file `VCI_METRICS` names;
 //! `VCI_METRICS=0` writes nothing. It keeps about the last 4 MB.
 
@@ -39,7 +40,8 @@ pub fn log_path() -> Option<Utf8PathBuf> {
 }
 
 /// Append this command's line (best effort: the log never fails a command).
-pub fn write(args: &[String], exit: i32, secs: f64) {
+/// `store`: the kind of the attestation store it used, if it used one.
+pub fn write(args: &[String], exit: i32, secs: f64, store: Option<&str>) {
     let lines = vci_core::metrics::take();
     let Some(path) = log_path() else { return };
     let cmd = args.get(1).cloned().unwrap_or_default();
@@ -73,6 +75,7 @@ pub fn write(args: &[String], exit: i32, secs: f64) {
         "arch": std::env::consts::ARCH,
         "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         "ci": ci,
+        "store": store,
         "steps": steps,
         "notes": notes,
     });

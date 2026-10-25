@@ -12,7 +12,7 @@ use vci_attest::{Statement, Subject, sign_statement};
 use vci_core::{
     External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain,
 };
-use vci_store::{AttestationStore, KeyHint, Prefetch, StoredEnvelope, WriteBatch};
+use vci_store::{AttestationStore, KeyHint, Prefetch, StoreError, StoredEnvelope, WriteBatch};
 
 use crate::ctx::{
     Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo, storage_key,
@@ -156,6 +156,26 @@ pub enum StoreMode {
     SignOnly,
 }
 
+/// Whether a failure to store says that the store cannot be used (it
+/// could not be selected or opened, cannot be reached, is not set up,
+/// refuses this writer, is too new, or lacks the operation) rather than
+/// that something went wrong. The unit is then refused like any other and
+/// the exit code stays the tests' (docs/STORE-BACKENDS.md section 10). A
+/// backend's own errors (every one of git-meta's) and invalid arguments
+/// remain problems of the run, as in vci 2.7.
+fn store_unusable(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::Config(_)
+            | StoreError::Unavailable { .. }
+            | StoreError::Timeout { .. }
+            | StoreError::NotInitialized { .. }
+            | StoreError::Incompatible { .. }
+            | StoreError::Denied { .. }
+            | StoreError::Unsupported { .. }
+    )
+}
+
 /// One signed unit for [`StoreLoop::attest`].
 struct ToStore<'a> {
     /// The unit as its lines name it.
@@ -203,6 +223,8 @@ struct Stored {
     /// In unit order.
     outcomes: Vec<UnitOutcome>,
     errors: Vec<String>,
+    /// [`RunOutcome::store_failures`].
+    store_failures: Vec<String>,
     /// The input roots the removed attestations referenced.
     dropped_roots: BTreeSet<String>,
     /// Seconds storing and removing (manifests, then attestations, then
@@ -273,11 +295,20 @@ impl<'s> StoreLoop<'s> {
         self.slots.push(Slot::Done(out));
     }
 
-    /// A unit that could not be signed or stored.
+    /// A unit that could not be signed or stored: a problem of the run,
+    /// or, when the store cannot be used ([`store_unusable`]), a refusal
+    /// that leaves the exit code to the tests.
     fn failed(&mut self, label: &str, e: &anyhow::Error) {
         let msg = format!("{label}: {e:#}");
-        (self.say)(&format!("vci: error: not attesting {msg}"));
-        self.done.errors.push(msg);
+        if e.downcast_ref::<StoreError>().is_some_and(store_unusable) {
+            (self.say)(&format!(
+                "vci: not attesting {label}: signing or storing failed: {e:#}"
+            ));
+            self.done.store_failures.push(msg);
+        } else {
+            (self.say)(&format!("vci: error: not attesting {msg}"));
+            self.done.errors.push(msg);
+        }
         self.done.refused += 1;
         self.slots.push(Slot::Done(UnitOutcome::refused_by(
             label,
@@ -426,8 +457,15 @@ impl<'s> StoreLoop<'s> {
                     Some(e) => {
                         let label = outcome.test_id;
                         let msg = format!("{label}: storing the batch: {e}");
-                        say(&format!("vci: error: not attesting {msg}"));
-                        done.errors.push(msg);
+                        if store_unusable(e) {
+                            say(&format!(
+                                "vci: not attesting {label}: signing or storing failed: storing the batch: {e}"
+                            ));
+                            done.store_failures.push(msg);
+                        } else {
+                            say(&format!("vci: error: not attesting {msg}"));
+                            done.errors.push(msg);
+                        }
                         done.attested -= 1;
                         done.refused += 1;
                         done.outcomes.push(UnitOutcome::refused_by(
@@ -2163,6 +2201,13 @@ pub struct RunOutcome {
     /// problem here instead of failing, so what it already signed and
     /// stored is always in [`RunOutcome::attested`].
     pub errors: Vec<String>,
+    /// Units signed but not stored because the store cannot be used (it
+    /// could not be selected, opened or reached, is not set up, or refuses
+    /// this writer), in order. Like refusals, and unlike
+    /// [`RunOutcome::errors`], they leave `vci run`'s exit code to the
+    /// tests (docs/STORE-BACKENDS.md section 10); `vci ci` reports them
+    /// with the errors.
+    pub store_failures: Vec<String>,
     /// Projects (indexes into the configuration's projects) whose tests did
     /// not run because listing or starting them failed: no verdict, nothing
     /// attested. `vci ci` runs them without attesting.
@@ -2257,6 +2302,7 @@ pub fn run_units(
     };
     let mut files: Vec<TestFile> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut store_failures: Vec<String> = Vec::new();
     let mut unrun: BTreeSet<usize> = BTreeSet::new();
     let listing: Vec<bool> = ctx
         .projects
@@ -2351,6 +2397,7 @@ pub fn run_units(
                 exit: 0,
                 attested: vec![],
                 errors,
+                store_failures,
                 unrun,
             });
         }
@@ -2778,6 +2825,7 @@ pub fn run_units(
         signed_only += done.signed_only;
         outcomes.extend(done.outcomes);
         errors.extend(done.errors);
+        store_failures.extend(done.store_failures);
         dropped_roots.extend(done.dropped_roots);
         crate::plan::timing(
             &format!(
@@ -2865,6 +2913,7 @@ pub fn run_units(
     Ok(RunOutcome {
         exit: exit.unwrap_or(1),
         errors,
+        store_failures,
         unrun,
         attested: outcomes
             .into_iter()
@@ -4087,8 +4136,9 @@ mod tests {
     }
 
     /// A deferred batch that fails stored nothing: every unit it held is
-    /// refused and an error, the counts say so, the summary claims none of
-    /// them, and what they would have superseded stays.
+    /// refused, the counts say so, the summary claims none of them, and
+    /// what they would have superseded stays. (A store that went away is
+    /// one that cannot be used: a store failure, not an error of the run.)
     #[test]
     fn a_failed_deferred_batch_refuses_every_unit_it_held() {
         let s = crate::store::mem::MemStore::new()
@@ -4112,17 +4162,20 @@ mod tests {
         sl.attest(unit("src/c.test.ts", &m, &rc));
         let done = sl.finish();
         assert_eq!((done.attested, done.refused, done.superseded), (0, 3, 0));
-        assert_eq!(done.errors.len(), 2, "{:?}", done.errors);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(done.store_failures.len(), 2, "{:?}", done.store_failures);
         assert!(done.dropped_roots.is_empty());
         let why = "storing the batch: memory store unavailable: the server went away";
-        assert_eq!(done.errors[0], format!("src/a.test.ts: {why}"));
+        assert_eq!(done.store_failures[0], format!("src/a.test.ts: {why}"));
         let lines = said.lines();
         assert!(
             lines.iter().all(|l| !l.starts_with("vci: attested")),
             "{lines:?}"
         );
         assert!(
-            lines.contains(&format!("vci: error: not attesting src/c.test.ts: {why}")),
+            lines.contains(&format!(
+                "vci: not attesting src/c.test.ts: signing or storing failed: {why}"
+            )),
             "{lines:?}"
         );
         let v = summary_json(&done.outcomes);
@@ -4139,6 +4192,59 @@ mod tests {
         // Nothing of the batch stored; the earlier attestation kept.
         assert_eq!(s.keys(), [old.key]);
         assert!(s.roots().is_empty());
+    }
+
+    /// A store that cannot be used refuses its units without failing the
+    /// run; any other failure to sign or store (git-meta's own errors,
+    /// signing) is an error of the run, as before.
+    #[test]
+    fn failures_of_a_store_that_cannot_be_used_keep_the_exit_code() {
+        let s = crate::store::mem::MemStore::new();
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        let unusable = [
+            StoreError::unavailable("postgres", "not implemented yet"),
+            StoreError::Config("no URL".into()),
+            StoreError::Denied {
+                backend: "postgres",
+                operation: "write",
+                detail: "read-only role".into(),
+            },
+        ];
+        for e in unusable {
+            sl.failed(
+                "src/a.test.ts",
+                &anyhow::Error::from(e).context("storing the input manifest"),
+            );
+        }
+        sl.failed("src/b.test.ts", &anyhow::anyhow!("ssh-keygen failed"));
+        sl.failed(
+            "src/c.test.ts",
+            &anyhow::Error::from(StoreError::Other("git-meta store: locked".into())),
+        );
+        sl.failed(
+            "src/d.test.ts",
+            &anyhow::Error::from(StoreError::invalid("signer_id", "x", "bad")),
+        );
+        let lines = said.lines();
+        let done = sl.finish();
+        assert_eq!(done.refused, 6);
+        assert_eq!(done.store_failures.len(), 3, "{:?}", done.store_failures);
+        assert_eq!(done.errors.len(), 3, "{:?}", done.errors);
+        assert_eq!(
+            lines[0],
+            "vci: not attesting src/a.test.ts: signing or storing failed: storing the input manifest: postgres store unavailable: not implemented yet"
+        );
+        assert_eq!(
+            lines[3],
+            "vci: error: not attesting src/b.test.ts: ssh-keygen failed"
+        );
+        assert!(
+            done.outcomes
+                .iter()
+                .all(|o| o.reasons == ["signing or storing failed"])
+        );
     }
 
     /// With an immediate batch (git-meta's), each unit is stored and

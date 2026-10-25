@@ -239,7 +239,7 @@ impl World {
             .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("NO_COLOR", "1");
-        for k in SCRUB {
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
         for (k, v) in env {
@@ -1594,7 +1594,7 @@ fn collector_behind_a_symlinked_install_prefix() {
         .env("GIT_CONFIG_GLOBAL", &w.gitconfig)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("VCI_PY_PLUGIN");
-    for k in SCRUB {
+    for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
         cmd.env_remove(k);
     }
     let out = cmd.output().unwrap();
@@ -1710,7 +1710,7 @@ fn pytest_collected(dir: &Path) -> BTreeSet<PathBuf> {
         .args(["pytest", "--collect-only", "-q", "-p", "no:cacheprovider"])
         .current_dir(dir)
         .env("PYTHONDONTWRITEBYTECODE", "1");
-    for k in SCRUB {
+    for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
         cmd.env_remove(k);
     }
     let out = cmd.output().unwrap();

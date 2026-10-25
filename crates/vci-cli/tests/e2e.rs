@@ -17,6 +17,17 @@ use vci_git::{AttestStore, Repo};
 
 mod env_common;
 
+/// `vci` without the store selection variables
+/// ([`vci_store::select::ENV_VARS`]): a store a developer exported
+/// (`VCI_STORE`, `VCI_STORE_URL`, ...) must not reach these git-meta tests.
+fn vci_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("vci").unwrap();
+    for k in vci_store::select::ENV_VARS {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -221,7 +232,10 @@ impl World {
             "VCI_SIGNING_KEY",
             "VCI_OUT",
             "NODE_OPTIONS",
-        ] {
+        ]
+        .iter()
+        .chain(vci_store::select::ENV_VARS)
+        {
             cmd.env_remove(k);
         }
         let out = cmd.output().unwrap();
@@ -525,7 +539,7 @@ fn end_to_end_verification_steps() {
     w.write("package-lock.json", &lock);
 
     // Strict env: a declared variable with a different value invalidates.
-    let mut cmd = Command::cargo_bin("vci").unwrap();
+    let mut cmd = vci_cmd();
     let out = cmd
         .current_dir(&work)
         .args(["plan", "--base-ref", "main", "--format", "json"])
@@ -736,7 +750,7 @@ fn run_refuses_unattestable_test_files() {
     let mut args = vec!["run"];
     args.extend(files.iter().map(|(rel, _)| *rel));
     args.extend(["--key", w.trusted.to_str().unwrap()]);
-    let mut cmd = Command::cargo_bin("vci").unwrap();
+    let mut cmd = vci_cmd();
     // VCI_* is built-in pass-through, so the outside path reaches the test.
     let out = cmd
         .current_dir(&work)
@@ -790,8 +804,7 @@ fn init_writes_policy_and_trust_root() {
         .unwrap();
     assert!(st.success());
     let repo = base.join("repo");
-    let out = Command::cargo_bin("vci")
-        .unwrap()
+    let out = vci_cmd()
         .current_dir(&repo)
         .args(["init", "--key", key.with_extension("pub").to_str().unwrap()])
         .args(["--principal", "dev@example.com", "--no-install"])
@@ -859,7 +872,10 @@ impl World {
             "VCI_SIGNING_KEY",
             "VCI_OUT",
             "NODE_OPTIONS",
-        ] {
+        ]
+        .iter()
+        .chain(vci_store::select::ENV_VARS)
+        {
             cmd.env_remove(k);
         }
         for (k, v) in env {
@@ -1699,8 +1715,7 @@ fn init_configures_git_meta() {
         "origin",
         base.join("remote.git").to_str().unwrap(),
     ]);
-    let out = Command::cargo_bin("vci")
-        .unwrap()
+    let out = vci_cmd()
         .current_dir(&repo)
         .args(["init", "--no-install", "--adapter", "pytest"])
         .output()
@@ -2028,8 +2043,7 @@ fn init_in_a_linked_worktree_notes_the_shared_config() {
         ],
     );
     let init = |dir: &Path| {
-        let out = Command::cargo_bin("vci")
-            .unwrap()
+        let out = vci_cmd()
             .current_dir(dir)
             .args(["init", "--no-install", "--adapter", "pytest"])
             .env("GIT_CONFIG_NOSYSTEM", "1")

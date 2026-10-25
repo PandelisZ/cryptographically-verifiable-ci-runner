@@ -8,7 +8,9 @@ use serde_json::json;
 use vci_adapter::Adapter;
 use vci_attest::{AllowedSigners, Envelope, verify_envelope};
 use vci_git::{AttestStore, SETUP_FILE};
-use vci_store::{AttestationStore, Exchange, Prefetch, PushMode, PushStatus, StoreError};
+use vci_store::{
+    AttestationStore, Exchange, Prefetch, PushMode, PushStatus, StoreError, StoreStatus,
+};
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, template_for};
 use crate::ctx::{VciPredicate, open_repo};
@@ -86,7 +88,9 @@ pub fn ci(args: CiArgs) -> Result<i32> {
     let code = match how {
         None => run_plain(&res, &root, None, run_split)?,
         Some(how) => match run_attested(&res, how, &args.ttl, run_split, mode) {
-            Ok(Attempt::Ran(out)) => {
+            Ok(Attempt::Ran(mut out)) => {
+                // Units the store could not take are reported as errors are.
+                out.errors.append(&mut out.store_failures);
                 for e in &out.errors {
                     github_warning(&format!("attesting: {e}"));
                 }
@@ -1415,6 +1419,9 @@ fn push_with(
 ) -> Result<i32> {
     let kind = store.kind();
     let Some(ex) = store.exchange() else {
+        // A store that cannot be used (it could not be selected or opened,
+        // or is unreachable) has not stored anything either: say so.
+        store.status()?;
         if let Some(r) = remote {
             if on_remote == OnRemote::Refuse {
                 return Err(StoreError::Unsupported {
@@ -1484,6 +1491,7 @@ pub fn fetch(remote: Option<&str>) -> Result<i32> {
 pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Result<Vec<String>> {
     let kind = store.kind();
     let Some(ex) = store.exchange() else {
+        store.status()?;
         if remote.is_some() {
             return Err(StoreError::Unsupported {
                 backend: kind,
@@ -1523,6 +1531,102 @@ pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Res
     Ok(lines)
 }
 
+/// `vci store info`: which store this repository uses, each setting with
+/// where it came from (secrets redacted), what the store can do, whether it
+/// exists and how many attestations it holds, as text or JSON on stdout.
+/// Exits 0 when the store can be read (also when nothing is stored yet);
+/// otherwise prints what it knows and fails (exit 2) with the reason.
+pub fn store_info(json_out: bool) -> Result<i32> {
+    let (repo, _) = open_repo()?;
+    let store = crate::store::for_repo(&repo);
+    let sel = crate::store::selection_of(&repo);
+    let settings = sel
+        .as_ref()
+        .map(vci_store::select::Selection::describe)
+        .unwrap_or_default();
+    let caps = store.caps();
+    let exchange = store.exchange().map(|e| e.exchange_point().to_owned());
+    let status = store.status();
+    let (count, count_error) = match status.as_ref().map(|_| store.count()) {
+        Ok(Ok(n)) => (Some(n), None),
+        Ok(Err(e)) => (None, Some(e)),
+        Err(_) => (None, None),
+    };
+    let error = status.as_ref().err().or(count_error.as_ref());
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    if json_out {
+        let (state, advice, version) = match &status {
+            Ok(StoreStatus::Ready { schema_version }) => ("ready", None, *schema_version),
+            Ok(StoreStatus::Absent { advice }) => ("absent", Some(advice.clone()), None),
+            Err(_) => ("unavailable", None, None),
+        };
+        let doc = json!({
+            "kind": store.kind(),
+            "location": store.location(),
+            "settings": settings.iter().map(|l| json!({
+                "name": l.name,
+                "value": l.value,
+                "source": l.source.to_string(),
+            })).collect::<Vec<_>>(),
+            "caps": {
+                "sharedWrites": caps.shared_writes,
+                "lazyValues": caps.lazy_values,
+                "keepsHints": caps.keeps_hints,
+            },
+            "exchange": exchange,
+            "status": state,
+            "advice": advice,
+            "schemaVersion": version,
+            "count": count,
+            "error": error.map(|e| json!({
+                "code": e.code(),
+                "transient": e.is_transient(),
+                "message": e.to_string(),
+            })),
+            "warnings": sel.as_ref().map(|s| s.warnings.clone()).unwrap_or_default(),
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+    } else {
+        println!("store: {}", store.kind());
+        println!("location: {}", store.location());
+        if settings.is_empty() {
+            println!("settings: not resolved (see the error)");
+        } else {
+            println!("settings:");
+            for l in &settings {
+                println!("  {}: {} ({})", l.name, l.value, l.source);
+            }
+        }
+        println!(
+            "capabilities: shared writes {}, lazy values {}, keeps hints {}",
+            yes(caps.shared_writes),
+            yes(caps.lazy_values),
+            yes(caps.keeps_hints)
+        );
+        match &exchange {
+            Some(point) => println!("exchange: vci fetch and vci push, on {point}"),
+            None => println!("exchange: none (vci fetch and vci push have nothing to do)"),
+        }
+        match &status {
+            Ok(StoreStatus::Ready {
+                schema_version: Some(v),
+            }) => println!("status: ready (schema version {v})"),
+            Ok(StoreStatus::Ready { .. }) => println!("status: ready"),
+            Ok(StoreStatus::Absent { advice }) => {
+                println!("status: absent: nothing is stored yet ({advice})")
+            }
+            Err(_) => println!("status: unavailable"),
+        }
+        if let Some(n) = count {
+            println!("attestations: {n}");
+        }
+    }
+    match error {
+        Some(e) => Err(anyhow::anyhow!("{e}")),
+        None => Ok(0),
+    }
+}
+
 /// `vci prune`: delete attestations that have expired (git-meta tombstones,
 /// published by the next `vci push`). Only the claimed expiry is read; an
 /// envelope that cannot be parsed is left alone. Then delete the stored input
@@ -1533,6 +1637,8 @@ pub fn fetch_messages(store: &dyn AttestationStore, remote: Option<&str>) -> Res
 pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let store = crate::store::for_repo(&repo);
+    // A store that cannot be used fails here, before anything is read.
+    store.status()?;
     // What to say about a value the store does not hold here yet.
     let fetch_hint = if store.caps().lazy_values {
         " (run `vci fetch`)"

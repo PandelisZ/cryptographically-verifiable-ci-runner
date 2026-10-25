@@ -8,6 +8,17 @@ use std::process::Command;
 
 use assert_cmd::cargo::CommandCargoExt as _;
 
+/// `vci` without the store selection variables
+/// ([`vci_store::select::ENV_VARS`]): a store a developer exported
+/// (`VCI_STORE`, `VCI_STORE_URL`, ...) must not reach these git-meta tests.
+fn vci_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("vci").unwrap();
+    for k in vci_store::select::ENV_VARS {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../vci-attest/tests/fixtures/keyless")
 }
@@ -25,8 +36,7 @@ fn verify(ids: &str) -> (i32, String) {
     let t = tempfile::tempdir().unwrap();
     let ids_path = t.path().join("identities.toml");
     std::fs::write(&ids_path, ids).unwrap();
-    let out = Command::cargo_bin("vci")
-        .unwrap()
+    let out = vci_cmd()
         .current_dir(t.path())
         .arg("verify")
         .arg(fixtures().join("envelope.json"))
@@ -103,8 +113,7 @@ fn verify_with_pinned_allowed_signers_does_not_trust_heads_identities() {
     let empty = t.path().join("empty_allowed_signers");
     std::fs::write(&empty, "").unwrap();
     let verify = |extra: &[&std::ffi::OsStr]| {
-        let out = Command::cargo_bin("vci")
-            .unwrap()
+        let out = vci_cmd()
             .current_dir(t.path())
             .arg("verify")
             .arg(fixtures().join("envelope.json"))
@@ -165,7 +174,7 @@ fn run_oidc_without_a_token_fails_before_running_anything() {
     };
     git(&["init", "-q"]);
     std::fs::write(t.path().join("vci.toml"), "").unwrap();
-    let out = no_token(Command::cargo_bin("vci").unwrap().current_dir(t.path()))
+    let out = no_token(vci_cmd().current_dir(t.path()))
         .args(["run", "--oidc"])
         .output()
         .unwrap();
@@ -179,7 +188,7 @@ fn run_oidc_without_a_token_fails_before_running_anything() {
         &["run", "--oidc", "a/a_test.go"][..],
         &["run", "--oidc=public-good", "a/a_test.go"],
     ] {
-        let out = no_token(Command::cargo_bin("vci").unwrap().current_dir(t.path()))
+        let out = no_token(vci_cmd().current_dir(t.path()))
             .args(args)
             .output()
             .unwrap();
@@ -190,7 +199,7 @@ fn run_oidc_without_a_token_fails_before_running_anything() {
             "{args:?}: {err}"
         );
     }
-    let out = no_token(Command::cargo_bin("vci").unwrap().current_dir(t.path()))
+    let out = no_token(vci_cmd().current_dir(t.path()))
         .args(["run", "--oidc=a/a_test.go"])
         .output()
         .unwrap();
@@ -203,23 +212,17 @@ fn run_oidc_without_a_token_fails_before_running_anything() {
 
 #[test]
 fn oidc_and_key_are_exclusive_and_ttl_needs_one() {
-    let out = Command::cargo_bin("vci")
-        .unwrap()
+    let out = vci_cmd()
         .args(["ci", "--oidc", "--key", "k"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    let out = Command::cargo_bin("vci")
-        .unwrap()
+    let out = vci_cmd()
         .args(["run", "--oidc", "--key", "k"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    let out = Command::cargo_bin("vci")
-        .unwrap()
-        .args(["ci", "--ttl", "1d"])
-        .output()
-        .unwrap();
+    let out = vci_cmd().args(["ci", "--ttl", "1d"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--key") || err.contains("--oidc"), "{err}");

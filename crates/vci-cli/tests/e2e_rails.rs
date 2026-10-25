@@ -267,7 +267,7 @@ impl World {
         cmd.arg("check")
             .current_dir(dir)
             .env("PATH", self.path_env());
-        for k in SCRUB {
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
         let out = cmd.output().unwrap();
@@ -287,7 +287,7 @@ impl World {
     fn ruby_cmd(&self, dir: &Path, tool: &str, args: &[&str]) -> Output {
         let mut cmd = Command::new(self.ruby_bin.join(tool));
         cmd.args(args).current_dir(dir).env("PATH", self.path_env());
-        for k in SCRUB {
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
         cmd.output().unwrap()
@@ -361,7 +361,7 @@ end"##;
             .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("NO_COLOR", "1");
-        for k in SCRUB {
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
         // `vci run` of several files runs them in batch mode, as it does
@@ -1372,7 +1372,7 @@ fn copy_rails_fixture_with_mysql2(dir: &Path, mysql: Option<u16>) {
             paths.extend(std::env::split_paths(&p));
         }
         cmd.env("PATH", std::env::join_paths(paths).unwrap());
-        for k in SCRUB {
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
         let out = cmd.output().unwrap();
@@ -1986,7 +1986,7 @@ fn rails_collector_behind_a_symlinked_install_prefix() {
         .env("GIT_CONFIG_GLOBAL", &w.gitconfig)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("VCI_RUBY_COLLECTOR");
-    for k in SCRUB {
+    for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
         cmd.env_remove(k);
     }
     let out = cmd.output().unwrap();
@@ -2498,7 +2498,7 @@ fn booted_toolchain(w: &World, runner: &str) -> Value {
     cmd.args(["-e", "require File.expand_path(\"config/environment\")"])
         .current_dir(&w.work)
         .env("PATH", w.path_env());
-    for k in SCRUB {
+    for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
         cmd.env_remove(k);
     }
     cmd.env("RUBYOPT", format!("-r{}", collector.display()))

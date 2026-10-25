@@ -1092,6 +1092,8 @@ fn plan_timed(opts: &PlanOptions) -> Result<PlanResult> {
         fetch_failed: None,
         store_kind: store.kind(),
     };
+    // The store selection's warnings (printed when it was opened).
+    res.warnings.extend(crate::store::warnings_of(&repo));
     // `--fetch`: fetch attestations while the projects are probed; joined
     // before the store is read (and before returning, whatever happens).
     // A store without an exchange has nothing to fetch.

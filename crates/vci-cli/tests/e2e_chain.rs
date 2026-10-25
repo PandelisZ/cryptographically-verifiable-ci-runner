@@ -339,7 +339,10 @@ impl World {
             "VCI_SIGNING_KEY",
             "VCI_OUT",
             "NODE_OPTIONS",
-        ] {
+        ]
+        .iter()
+        .chain(vci_store::select::ENV_VARS)
+        {
             cmd.env_remove(k);
         }
         if self.multi {

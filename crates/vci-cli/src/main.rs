@@ -202,6 +202,11 @@ enum Cmd {
         #[arg(long)]
         base_ref: Option<String>,
     },
+    /// The attestation store: `vci store info` says which one this repository uses and how it is set up.
+    Store {
+        #[command(subcommand)]
+        cmd: StoreCmd,
+    },
     /// Summarize the metrics log: how long recent vci commands and each of their steps took (median, 95th percentile, max). Every command appends a line to <git common dir>/vci-metrics.jsonl (VCI_METRICS=<file> elsewhere, VCI_METRICS=0 off).
     Metrics {
         /// How many of the most recent commands to summarize.
@@ -210,6 +215,15 @@ enum Cmd {
         /// Only this command (run, ci, plan, push, fetch, ...).
         #[arg(long)]
         command: Option<String>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: EnvFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCmd {
+    /// Which attestation store this repository uses ($VCI_STORE, else the scheme of $VCI_STORE_URL, else `[store] backend` in the working tree's vci.toml, else git-meta), every setting and where it came from (secrets redacted), what the store can do, whether it exists and how many attestations it holds. Exits 0 when the store can be read (also before anything is stored), 2 otherwise.
+    Info {
         #[arg(long, value_enum, default_value = "text")]
         format: EnvFormat,
     },
@@ -229,6 +243,7 @@ impl Cmd {
             Cmd::Prune { .. } => "prune",
             Cmd::Env { .. } => "env",
             Cmd::Explain { .. } => "explain",
+            Cmd::Store { .. } => "store",
             Cmd::Metrics { .. } => "metrics",
         }
     }
@@ -412,6 +427,9 @@ fn main() {
             })?;
             plan::explain(&res, &id)
         }),
+        Cmd::Store {
+            cmd: StoreCmd::Info { format },
+        } => cmds::store_info(matches!(format, EnvFormat::Json)),
         Cmd::Metrics {
             last,
             command,
@@ -423,7 +441,12 @@ fn main() {
         Err(_) => 2,
     };
     store::close_all();
-    metrics::write(&argv, exit, started.elapsed().as_secs_f64());
+    metrics::write(
+        &argv,
+        exit,
+        started.elapsed().as_secs_f64(),
+        store::used_kind(),
+    );
     match r {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -487,6 +510,22 @@ mod tests {
             panic!("not env")
         };
         assert_eq!(project.as_deref(), Some("b"));
+    }
+
+    /// `vci store info [--format text|json]`.
+    #[test]
+    fn store_info_parses() {
+        let cli = Cli::try_parse_from(["vci", "store", "info", "--format", "json"]).unwrap();
+        assert_eq!(cli.cmd.name(), "store");
+        let Cmd::Store {
+            cmd: StoreCmd::Info { format },
+        } = cli.cmd
+        else {
+            panic!("not store info")
+        };
+        assert!(matches!(format, EnvFormat::Json));
+        assert!(Cli::try_parse_from(["vci", "store", "info"]).is_ok());
+        assert!(Cli::try_parse_from(["vci", "store"]).is_err());
     }
 
     /// `--partition I/N` (1 <= I <= N); anything else is a usage error.

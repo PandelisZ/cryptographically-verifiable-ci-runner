@@ -20,6 +20,17 @@ use vci_git::{AttestStore, Repo};
 mod env_common;
 mod store_common;
 
+/// `vci` without the store selection variables
+/// ([`vci_store::select::ENV_VARS`]): a store a developer exported
+/// (`VCI_STORE`, `VCI_STORE_URL`, ...) must not reach these git-meta tests.
+fn vci_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("vci").unwrap();
+    for k in vci_store::select::ENV_VARS {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -255,7 +266,10 @@ impl World {
             "NODE_ENV",
             "APP_MODE",
             "TEST_CONCURRENCY",
-        ] {
+        ]
+        .iter()
+        .chain(vci_store::select::ENV_VARS)
+        {
             cmd.env_remove(k);
         }
         // An unset TZ (the machine's zone) refuses every file.
@@ -1327,8 +1341,7 @@ fn init_writes_a_node_test_config() {
         &workspace_root().join("fixtures/node-test-abcd/package.json"),
         &repo.join("package.json"),
     );
-    let out = Command::cargo_bin("vci")
-        .unwrap()
+    let out = vci_cmd()
         .current_dir(&repo)
         .args(["init", "--adapter", "node-test", "--key"])
         .arg(key.with_extension("pub"))
