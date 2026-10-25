@@ -1,0 +1,1129 @@
+//! The command line on each attestation store backend, end to end
+//! (docs/STORE-BACKENDS.md sections 7, 9, 10, 16 and 17): `vci run`, `vci
+//! plan`, `vci explain`, supersession, `vci prune`, `vci fetch`, `vci push`
+//! and `vci ci` on SQLite (`VCI_STORE=sqlite`) and PostgreSQL
+//! (`VCI_STORE_URL`), the publication gate of a shared store, failing open
+//! when a store cannot be used, and git-meta when nothing is configured.
+//!
+//! A copy of `fixtures/go-abcd` in a throwaway git repository. Needs `go`,
+//! `git` and `ssh-keygen` on PATH; every test prints `SKIPPED:` and returns
+//! early when `go` is not installed or cannot download the fixture's
+//! modules. The PostgreSQL tests take their server from
+//! [`vci_store_postgres::testkit::pg`] (`VCI_TEST_POSTGRES_URL`, else a
+//! throwaway cluster started with `initdb`), each in a schema of its own
+//! named in the world's `vci.toml`, with `VCI_STORE_NAMESPACE=test`. They
+//! skip without a server, and fail under `VCI_TEST_POSTGRES=require`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
+
+use assert_cmd::cargo::CommandCargoExt;
+use serde_json::Value;
+use vci_store_postgres::testkit::{self, PgDb};
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .to_owned()
+}
+
+fn go_available() -> bool {
+    match Command::new("go").arg("version").output() {
+        Ok(o) if o.status.success() => true,
+        _ => {
+            eprintln!(
+                "SKIPPED: `go` is not installed; the store backend tests need the Go toolchain on PATH"
+            );
+            false
+        }
+    }
+}
+
+const VCI_TOML: &str = r#"project = "."
+adapter = "go"
+
+[policy]
+platform = "any"
+max_ttl = "30d"
+no_skip_refs = ["refs/heads/release/*"]
+"#;
+
+/// Variables removed from every `vci` and `go` invocation so the host
+/// environment cannot change the outcome (the store's own are added from
+/// [`vci_store::select::ENV_VARS`]).
+const SCRUB: &[&str] = &[
+    "VCI_E2E_BIN",
+    "VCI_BASE_REF",
+    "GITHUB_BASE_REF",
+    "GITHUB_REF",
+    "GITHUB_OUTPUT",
+    "GITHUB_ACTIONS",
+    "VCI_SIGNING_KEY",
+    "VCI_GO",
+    "VCI_JOBS",
+    "VCI_GO_TESTLOG",
+    "VCI_TIMING",
+    "VCI_STORE_SYNC",
+    "GOFLAGS",
+    "GOWORK",
+    "GOOS",
+    "GOARCH",
+    "CGO_ENABLED",
+    "GOEXPERIMENT",
+    "GODEBUG",
+    "GOTOOLCHAIN",
+    "NODE_OPTIONS",
+    "CI",
+    "GOMAXPROCS",
+];
+
+/// The fixture's packages; a run attests every one of them.
+const UNITS: &[&str] = &["a", "b", "c", "d"];
+
+/// A password planted in a URL: it must appear in no output.
+const SECRET: &str = "s3cret";
+
+/// The shape of an attestation key (docs/STORE-BACKENDS.md section 2), with
+/// the hint every key vci writes since 2.2 carries: `vci:attestation:<test
+/// key>:<signer>:<storage key>:<issued hex>.<tree16>`.
+fn key_has_vci_shape(key: &str) -> bool {
+    let hex = |s: &str, min: usize, max: usize| {
+        (min..=max).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let seg: Vec<&str> = key.split(':').collect();
+    let [vci, kind, tk, signer, sk, hint] = seg[..] else {
+        return false;
+    };
+    let Some((issued, tree)) = hint.split_once('.') else {
+        return false;
+    };
+    vci == "vci"
+        && kind == "attestation"
+        && hex(tk, 64, 64)
+        && hex(signer, 16, 16)
+        && hex(sk, 2, 128)
+        && hex(issued, 1, 16)
+        && (tree == "-" || hex(tree, 16, 16))
+}
+
+/// The slot of a key (`vci:attestation:<test key>:<signer>:<storage key>`)
+/// and the tree of its hint: what two stores holding the same attestation
+/// agree on (the issue time differs between two runs).
+fn slot_and_tree(key: &str) -> (String, String) {
+    let (slot, hint) = key.rsplit_once(':').unwrap();
+    let tree = hint.split_once('.').unwrap().1;
+    (slot.to_owned(), tree.to_owned())
+}
+
+/// The store a world's `vci` commands use.
+struct Backend {
+    kind: &'static str,
+    /// Added to the environment of every `vci` command of the world.
+    env: Vec<(String, String)>,
+    /// Added to the base commit's `vci.toml`.
+    toml: String,
+    /// The PostgreSQL schema's owner: dropping it drops the schema.
+    db: Option<PgDb>,
+}
+
+impl Backend {
+    /// Nothing configured: git-meta.
+    fn git_meta() -> Self {
+        Backend {
+            kind: "git-meta",
+            env: Vec::new(),
+            toml: String::new(),
+            db: None,
+        }
+    }
+
+    /// SQLite at its default path, `.git/vci-store.sqlite`.
+    fn sqlite() -> Self {
+        Backend {
+            kind: "sqlite",
+            env: vec![("VCI_STORE".into(), "sqlite".into())],
+            toml: String::new(),
+            db: None,
+        }
+    }
+
+    /// PostgreSQL from the testkit, in a schema of its own; `None` (test
+    /// skipped) without a server.
+    fn postgres() -> Option<Self> {
+        let db = testkit::pg()?;
+        Some(Backend {
+            kind: "postgres",
+            env: vec![
+                ("VCI_STORE_URL".into(), db.url.clone()),
+                ("VCI_STORE_NAMESPACE".into(), "test".into()),
+            ],
+            toml: format!("\n[store.postgres]\nschema = \"{}\"\n", db.schema),
+            db: Some(db),
+        })
+    }
+}
+
+struct World {
+    backend: Backend,
+    _tmp: tempfile::TempDir,
+    base: PathBuf,
+    work: PathBuf,
+    remote: PathBuf,
+    key: PathBuf,
+    gitconfig: PathBuf,
+    metrics: PathBuf,
+}
+
+fn keygen(path: &Path) {
+    let st = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "trusted", "-f"])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
+fn pubkey(path: &Path) -> String {
+    let t = std::fs::read_to_string(path.with_extension("pub")).unwrap();
+    t.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+}
+
+fn go(dir: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new("go");
+    cmd.args(args).current_dir(dir);
+    for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
+        cmd.env_remove(k);
+    }
+    cmd.output().unwrap()
+}
+
+/// A Go test that writes `os.Getenv("VCI_STORE_URL")` and its whole
+/// environment to `dump`.
+fn envdump_test(dump: &Path) -> String {
+    format!(
+        r#"package envdump
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestDumpEnvironment(t *testing.T) {{
+	text := "getenv:" + os.Getenv("VCI_STORE_URL") + "\n" + strings.Join(os.Environ(), "\n") + "\n"
+	if err := os.WriteFile({dump:?}, []byte(text), 0o644); err != nil {{
+		t.Fatal(err)
+	}}
+}}
+"#,
+        dump = dump.to_str().unwrap()
+    )
+}
+
+/// What a JSON plan says.
+#[derive(Debug, Default)]
+struct Plan {
+    skip: BTreeSet<String>,
+    run: BTreeSet<String>,
+    /// Of each skipped unit: `by.metaKey`, `by.target`.
+    by: BTreeMap<String, (String, String)>,
+    warnings: Vec<String>,
+    /// Why every unit runs, if so.
+    run_all: Option<String>,
+}
+
+fn set(ids: &[&str]) -> BTreeSet<String> {
+    ids.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn text(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The keys of `vci: attested <unit> (…) as <kind> <target> <key>` lines,
+/// by unit.
+fn attested_keys(out: &Output, kind: &str) -> BTreeMap<String, String> {
+    let mut keys = BTreeMap::new();
+    for line in stderr(out).lines() {
+        let Some(rest) = line.strip_prefix("vci: attested ") else {
+            continue;
+        };
+        let unit = rest.split_whitespace().next().unwrap().to_owned();
+        let (_, tail) = rest
+            .split_once(&format!(") as {kind} "))
+            .unwrap_or_else(|| panic!("attested as {kind}: {line}"));
+        let key = tail.split_whitespace().nth(1).unwrap().to_owned();
+        keys.insert(unit, key);
+    }
+    keys
+}
+
+impl World {
+    /// `None` (test skipped) when go is unavailable.
+    fn new(backend: Backend) -> Option<Self> {
+        if !go_available() {
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let gitconfig = base.join("gitconfig");
+        std::fs::write(
+            &gitconfig,
+            "[user]\n\tname = Test\n\temail = test@example.com\n[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n",
+        )
+        .unwrap();
+        let w = World {
+            work: base.join("work"),
+            remote: base.join("remote.git"),
+            key: base.join("trusted"),
+            metrics: base.join("metrics.jsonl"),
+            gitconfig,
+            base,
+            backend,
+            _tmp: tmp,
+        };
+        keygen(&w.key);
+        w.git(&w.base, &["init", "-q", "--bare", "remote.git"]);
+        w.git(&w.base, &["init", "-q", w.work.to_str().unwrap()]);
+        let fx = workspace_root().join("fixtures/go-abcd");
+        for name in ["go.mod", "go.sum", "a", "b", "c", "d", "internal"] {
+            let st = Command::new("cp")
+                .arg("-R")
+                .arg(fx.join(name))
+                .arg(w.work.join(name))
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        w.put(".gitignore", ".vci/out/\n");
+        w.put("vci.toml", &format!("{VCI_TOML}{}", w.backend.toml));
+        w.put(
+            ".vci/allowed_signers",
+            &format!(
+                "trusted@example.com namespaces=\"vci-attest\" {}\n",
+                pubkey(&w.key)
+            ),
+        );
+        w.git(&w.work, &["add", "-A"]);
+        w.git(&w.work, &["commit", "-q", "-m", "base commit"]);
+        w.git(
+            &w.work,
+            &["remote", "add", "origin", w.remote.to_str().unwrap()],
+        );
+        w.git(&w.work, &["push", "-q", "origin", "main"]);
+        w.git(&w.work, &["checkout", "-q", "-b", "feature"]);
+        let out = go(&w.work, &["mod", "download"]);
+        if !out.status.success() {
+            eprintln!(
+                "SKIPPED: `go mod download` failed for the Go fixture (offline without a module cache?): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return None;
+        }
+        Some(w)
+    }
+
+    fn put(&self, rel: &str, content: &str) {
+        let p = self.work.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.work.join(rel)).unwrap()
+    }
+
+    fn git(&self, dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Commit every change in the working tree.
+    fn commit(&self, msg: &str) {
+        self.git(&self.work, &["add", "-A"]);
+        self.git(&self.work, &["commit", "-q", "-m", msg]);
+    }
+
+    /// Append a comment to `rel` (its tests still pass; its inputs change).
+    fn touch(&self, rel: &str, note: &str) {
+        let src = self.read(rel);
+        self.put(rel, &format!("{src}\n// {note}\n"));
+    }
+
+    /// `vci <args>` in the repository on the world's store, with `env`
+    /// added (metrics go to the world's own log).
+    fn vci(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut all: Vec<(&str, &str)> = self
+            .backend
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        all.extend_from_slice(env);
+        self.vci_bare(args, &all)
+    }
+
+    /// `vci <args>` with only `env` added to a scrubbed environment: no
+    /// store configured unless `env` configures one.
+    fn vci_bare(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::cargo_bin("vci").unwrap();
+        cmd.current_dir(&self.work)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("NO_COLOR", "1")
+            .env("VCI_METRICS", &self.metrics);
+        for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        eprintln!(
+            "$ vci {} {env:?} -> {:?}\n{}{}",
+            args.join(" "),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    /// `vci run --key` of `units` (every unit when empty); it must exit 0.
+    fn run(&self, units: &[&str]) -> Output {
+        let key = self.key.to_str().unwrap().to_owned();
+        let mut args = vec!["run"];
+        args.extend_from_slice(units);
+        args.extend(["--key", &key]);
+        let out = self.vci(&args, &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        out
+    }
+
+    /// `vci ci --key` with an audit log, which it returns.
+    fn ci(&self, extra: &[&str], env: &[(&str, &str)], log: &str) -> (Output, Value) {
+        let key = self.key.to_str().unwrap().to_owned();
+        let log = self.base.join(log);
+        let mut args = vec![
+            "ci",
+            "--base-ref",
+            "main",
+            "--key",
+            &key,
+            "--audit-log",
+            log.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let out = self.vci(&args, env);
+        let audit: Value = serde_json::from_slice(
+            &std::fs::read(&log).unwrap_or_else(|e| panic!("audit log: {e}\n{}", text(&out))),
+        )
+        .unwrap();
+        (out, audit)
+    }
+
+    /// `vci plan` as JSON, with `env`; it must exit 0.
+    fn plan(&self, env: &[(&str, &str)]) -> (Plan, Output) {
+        let out = self.vci(&["plan", "--base-ref", "main", "--format", "json"], env);
+        (parse_plan(&out), out)
+    }
+
+    /// `vci explain <unit>` (stdout); it must exit 0.
+    fn explain(&self, unit: &str) -> String {
+        let out = self.vci(&["explain", unit, "--base-ref", "main"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        stdout(&out)
+    }
+
+    /// `vci store info --format json`; it must exit 0.
+    fn info(&self) -> Value {
+        let out = self.vci(&["store", "info", "--format", "json"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// Whether the bare remote has `refs/meta/main`.
+    fn remote_has_meta(&self) -> bool {
+        Command::new("git")
+            .args(["--git-dir"])
+            .arg(&self.remote)
+            .args(["rev-parse", "--verify", "-q", "refs/meta/main"])
+            .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+}
+
+fn parse_plan(out: &Output) -> Plan {
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vci plan fails open: {}",
+        text(out)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut p = Plan::default();
+    for f in v["files"].as_array().unwrap() {
+        let id = f["testId"].as_str().unwrap().to_owned();
+        if f["skip"].as_bool().unwrap() {
+            let key = f["by"]["metaKey"].as_str().unwrap().to_owned();
+            let target = f["by"]["target"].as_str().unwrap().to_owned();
+            p.by.insert(id.clone(), (key, target));
+            p.skip.insert(id);
+        } else {
+            p.run.insert(id);
+        }
+    }
+    // Absent when there are none.
+    p.warnings = v["warnings"]
+        .as_array()
+        .map(|a| a.iter().map(|w| w.as_str().unwrap().to_owned()).collect())
+        .unwrap_or_default();
+    p.run_all = v["runAll"].as_str().map(str::to_owned);
+    p
+}
+
+/// Every unit attested and stored in the world's store, and a plan that
+/// skips every one of them; returns the run's output.
+fn attest_all(w: &World) -> Output {
+    let out = w.run(&[]);
+    assert_eq!(
+        attested_keys(&out, w.backend.kind).len(),
+        UNITS.len(),
+        "{}",
+        text(&out)
+    );
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+    out
+}
+
+/// A port on 127.0.0.1 that nothing listens on.
+fn closed_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+// ---------------------------------------------------------------------------
+// 1. Run, plan and explain.
+
+/// `vci run` then `vci plan` skips every unit; `vci explain` names the
+/// store's kind; the plan's `by.metaKey` and `by.target` have git-meta's
+/// shape: the same slot, tree and target as git-meta stores for the same
+/// run of the same commit.
+fn run_plan_explain(backend: Backend) {
+    let kind = backend.kind;
+    let Some(w) = World::new(backend) else { return };
+    let run = attest_all(&w);
+    let keys = attested_keys(&run, kind);
+    let (plan, _) = w.plan(&[]);
+    for u in UNITS {
+        let (key, target) = &plan.by[*u];
+        assert!(key_has_vci_shape(key), "{u}: {key}");
+        assert_eq!(key, &keys[*u], "the plan skips with the stored key");
+        assert_eq!(target, "project", "one-letter units file under project");
+    }
+    let info = w.info();
+    assert_eq!(info["kind"], kind);
+    assert_eq!(info["status"], "ready");
+    assert_eq!(info["count"], UNITS.len());
+    assert!(info["exchange"].is_null(), "{info}");
+    let ex = w.explain("a");
+    assert!(ex.contains("a: SKIP"), "{ex}");
+    let (key, _) = &plan.by["a"];
+    assert!(
+        ex.contains(&format!("\ncandidate 1: {kind} project {key}\n")),
+        "{ex}"
+    );
+
+    // git-meta, for the same commit in the same clone: the same slots,
+    // trees and targets.
+    assert!(
+        !w.work.join(".git/git-meta.sqlite").exists(),
+        "the {kind} store left git-meta alone"
+    );
+    let out = w.vci_bare(&["run", "--key", w.key.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let gm = parse_plan(&w.vci_bare(&["plan", "--base-ref", "main", "--format", "json"], &[]));
+    assert_eq!(gm.skip, set(UNITS), "{gm:?}");
+    for u in UNITS {
+        let (key, target) = &plan.by[*u];
+        let (gm_key, gm_target) = &gm.by[*u];
+        assert!(key_has_vci_shape(gm_key), "{u}: {gm_key}");
+        assert_eq!(slot_and_tree(key), slot_and_tree(gm_key), "{u}");
+        assert_eq!(target, gm_target, "{u}");
+    }
+}
+
+#[test]
+fn sqlite_runs_plans_and_explains() {
+    run_plan_explain(Backend::sqlite());
+}
+
+#[test]
+fn postgres_runs_plans_and_explains() {
+    let Some(b) = Backend::postgres() else { return };
+    run_plan_explain(b);
+}
+
+// ---------------------------------------------------------------------------
+// 2. An edit, supersession, orphan manifests and prune.
+
+/// What `vci prune --dry-run` lists on stdout, and its summary on stderr.
+fn prune_dry_run(w: &World) -> (Vec<String>, String) {
+    let out = w.vci(&["prune", "--dry-run"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    (
+        stdout(&out).lines().map(str::to_owned).collect(),
+        stderr(&out),
+    )
+}
+
+/// Edit a file: the plan runs that unit only. Its second attestation on
+/// this branch supersedes the first, and the first one's manifest, which
+/// nothing references any more, is removed: by the run itself on SQLite;
+/// on PostgreSQL, which keeps an unreferenced manifest put less than an
+/// hour ago (`manifest_grace`), by `vci prune`. `vci prune --dry-run` lists
+/// nothing else.
+fn edit_supersede_prune(backend: Backend) {
+    let kind = backend.kind;
+    let Some(w) = World::new(backend) else { return };
+    attest_all(&w);
+
+    // An attestation on a commit of this branch only.
+    w.touch("a/a.go", "edit 1");
+    w.commit("edit a");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.run, set(&["a"]), "{plan:?}");
+    assert_eq!(plan.skip, set(&["b", "c", "d"]), "{plan:?}");
+    let out = w.run(&["a"]);
+    assert!(!stderr(&out).contains("superseded"), "{}", text(&out));
+    let first = attested_keys(&out, kind)["a"].clone();
+    let first_root = stderr(&out)
+        .lines()
+        .find(|l| l.starts_with("vci: attested a ("))
+        .and_then(|l| l.split(", root ").nth(1))
+        .map(|r| r[..16].to_owned())
+        .unwrap();
+    assert_eq!(w.info()["count"], UNITS.len() + 1);
+    let (listed, _) = prune_dry_run(&w);
+    assert!(
+        listed.is_empty(),
+        "every manifest is referenced: {listed:?}"
+    );
+
+    // The branch moves on: the new attestation supersedes it.
+    w.touch("a/a.go", "edit 2");
+    w.commit("edit a again");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.run, set(&["a"]), "{plan:?}");
+    let out = w.run(&["a"]);
+    assert!(
+        stderr(&out).contains("vci: removed 1 superseded attestation(s) "),
+        "{}",
+        text(&out)
+    );
+    let second = attested_keys(&out, kind)["a"].clone();
+    assert_ne!(first, second);
+    assert_eq!(w.info()["count"], UNITS.len() + 1, "one in, one out");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+    assert_eq!(plan.by["a"].0, second);
+    let ex = w.explain("a");
+    assert!(!ex.contains(&first), "the superseded one is gone: {ex}");
+    assert!(ex.contains(&second), "{ex}");
+
+    let (listed, summary) = prune_dry_run(&w);
+    assert!(
+        summary.contains(&format!(
+            "vci prune: 0 expired (dry run), {} current, 0 unreadable (left alone)",
+            UNITS.len() + 1
+        )),
+        "{summary}"
+    );
+    if kind == "postgres" {
+        // Within the grace period, the run kept the orphan; prune (no
+        // grace) removes it, and only it.
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let prefix = format!("would remove project vci:manifest:{first_root}");
+        assert!(listed[0].starts_with(&prefix), "{listed:?}");
+        assert!(
+            listed[0].ends_with(" (unreferenced manifest)"),
+            "{listed:?}"
+        );
+        let out = w.vci(&["prune"], &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        assert_eq!(
+            stdout(&out),
+            format!("{}\n", listed[0].replacen("would remove", "removed", 1))
+        );
+        let (listed, _) = prune_dry_run(&w);
+        assert!(listed.is_empty(), "{listed:?}");
+    } else {
+        assert!(listed.is_empty(), "the run removed the orphan: {listed:?}");
+    }
+    assert!(
+        summary.contains("unreferenced input manifest(s) (dry run)"),
+        "{summary}"
+    );
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "pruning removed nothing in use");
+}
+
+#[test]
+fn sqlite_supersedes_and_prunes() {
+    edit_supersede_prune(Backend::sqlite());
+}
+
+#[test]
+fn postgres_supersedes_and_prunes() {
+    let Some(b) = Backend::postgres() else { return };
+    edit_supersede_prune(b);
+}
+
+// ---------------------------------------------------------------------------
+// 3. The plan reads the candidates it set aside (A6) on SQLite.
+
+/// Package d attested at three tagged states S0, S1 and S2; then d is back
+/// at S0 while another file changed. The two newest candidates fail on
+/// their inputs and the oldest passes: the plan reads the set-aside one in
+/// its second round, with nothing to fetch (every value is local), and
+/// skips d with S0's attestation.
+#[test]
+fn sqlite_reads_the_candidates_it_set_aside() {
+    let Some(w) = World::new(Backend::sqlite()) else {
+        return;
+    };
+    let src = w.read("d/d.go");
+    let state = |n: usize| format!("{src}\n// state {n}\n");
+    let mut keys = Vec::new();
+    for n in 0..3 {
+        if n > 0 {
+            // A key's hint has whole seconds; the plan reads the newest by
+            // them, all of them on a tie.
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+        w.put("d/d.go", &state(n));
+        w.commit(&format!("S{n}"));
+        w.git(&w.work, &["tag", &format!("s{n}")]);
+        let out = w.run(&["d"]);
+        keys.push(attested_keys(&out, "sqlite")["d"].clone());
+    }
+    assert_eq!(w.info()["count"], 3, "the tags keep every state");
+
+    w.put("d/d.go", &state(0));
+    w.touch("a/a.go", "unrelated");
+    w.commit("d as at S0, a edited");
+
+    let (plan, out) = w.plan(&[("VCI_TIMING", "1")]);
+    let err = stderr(&out);
+    assert!(
+        plan.skip.contains("d"),
+        "d skips through S0: {plan:?}\n{err}"
+    );
+    assert_eq!(plan.by["d"].0, keys[0]);
+    assert!(
+        err.contains("round 2: read 1 candidate(s) set aside"),
+        "S0 is read in the second round: {err}"
+    );
+
+    let ex = w.explain("d");
+    assert!(ex.contains("d: SKIP"), "{ex}");
+    let candidates: Vec<&str> = ex.split("\ncandidate ").skip(1).collect();
+    assert_eq!(candidates.len(), 3, "{ex}");
+    for (block, n) in candidates.iter().zip([2, 1, 0]) {
+        assert!(
+            block.contains(&format!(": sqlite project {}", keys[n])),
+            "newest first: S{n}\n{ex}"
+        );
+        if n == 0 {
+            assert!(block.contains("all checks passed"), "{ex}");
+        } else {
+            assert!(block.contains("failed check: inputs"), "{ex}");
+            assert!(block.contains("entry:d/d.go"), "{ex}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Fetch and push on a store without an exchange.
+
+/// `vci fetch` and `vci push` say that there is nothing to exchange and
+/// exit 0; `--remote` and `--rewrite-history` exit 2; nothing reaches the
+/// git remote.
+fn fetch_and_push(backend: Backend) {
+    let kind = backend.kind;
+    let Some(w) = World::new(backend) else { return };
+    attest_all(&w);
+    let reach = if kind == "postgres" {
+        "shared"
+    } else {
+        "local"
+    };
+    let location = w.info()["location"].as_str().unwrap().to_owned();
+
+    let out = w.vci(&["fetch"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "vci: the {kind} store at {location} is {reach}: nothing to fetch ({} attestations stored)\n",
+            UNITS.len()
+        )
+    );
+    let out = w.vci(&["push"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "vci: nothing to push: the {kind} store is {reach}; attestations were stored when vci run made them\n"
+        )
+    );
+    for (args, says) in [
+        (&["fetch", "--remote", "x"][..], "a remote"),
+        (&["push", "--remote", "x"], "a remote"),
+        (&["push", "--rewrite-history"], "rewriting history"),
+    ] {
+        let out = w.vci(args, &[]);
+        assert_eq!(out.status.code(), Some(2), "vci {args:?}: {}", text(&out));
+        assert_eq!(
+            stderr(&out),
+            format!("vci: error: the {kind} store does not support {says}\n"),
+            "vci {args:?}"
+        );
+    }
+    assert!(!w.remote_has_meta(), "nothing was pushed to git");
+    assert_eq!(w.info()["count"], UNITS.len());
+    if kind == "postgres" {
+        let db = w.backend.db.as_ref().unwrap();
+        assert!(
+            location.contains(&format!(" schema {} namespace test", db.schema)),
+            "{location}"
+        );
+    } else {
+        assert_eq!(
+            Path::new(&location),
+            w.work.join(".git/vci-store.sqlite").as_path()
+        );
+    }
+}
+
+#[test]
+fn sqlite_has_nothing_to_fetch_or_push() {
+    fetch_and_push(Backend::sqlite());
+}
+
+#[test]
+fn postgres_has_nothing_to_fetch_or_push() {
+    let Some(b) = Backend::postgres() else { return };
+    fetch_and_push(b);
+}
+
+// ---------------------------------------------------------------------------
+// 5. The publication gate of a shared store.
+
+/// `vci ci` without `--push` on PostgreSQL signs but stores nothing, and
+/// says so; with `--push` it stores.
+#[test]
+fn postgres_ci_stores_only_with_push() {
+    let Some(b) = Backend::postgres() else { return };
+    let Some(w) = World::new(b) else { return };
+    let before = w.info();
+    assert_eq!(before["status"], "absent", "{before}");
+    assert_eq!(before["count"], 0, "{before}");
+
+    let (out, audit) = w.ci(&[], &[], "audit-1.json");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains(&format!(
+            "vci: not storing {} attestation(s): the postgres store is shared and vci ci was not given --push\n",
+            UNITS.len()
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "vci ci: {} unit(s) attested (not stored: the postgres store is shared and --push was not given)\n",
+            UNITS.len()
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("vci: attested "), "{err}");
+    let attested = audit["attested"].as_array().unwrap();
+    assert_eq!(attested.len(), UNITS.len(), "{audit:#}");
+    assert!(attested.iter().all(|a| a["stored"] == false), "{audit:#}");
+    assert_eq!(audit["pushed"], false, "{audit:#}");
+    assert_eq!(audit["exitCode"], 0, "{audit:#}");
+    let after = w.info();
+    assert_eq!(after["count"], 0, "nothing stored: {after}");
+    assert_eq!(after["status"], "absent", "nothing written: {after}");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.run, set(UNITS), "{plan:?}");
+
+    let (out, audit) = w.ci(&["--push"], &[], "audit-2.json");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let err = stderr(&out);
+    assert!(!err.contains("not storing"), "{err}");
+    assert_eq!(attested_keys(&out, "postgres").len(), UNITS.len(), "{err}");
+    assert!(
+        err.contains(&format!("vci ci: {} unit(s) attested\n", UNITS.len())),
+        "{err}"
+    );
+    let attested = audit["attested"].as_array().unwrap();
+    assert_eq!(attested.len(), UNITS.len(), "{audit:#}");
+    assert!(
+        attested.iter().all(|a| a.get("stored").is_none()),
+        "{audit:#}"
+    );
+    assert_eq!(audit["pushed"], true, "{audit:#}");
+    let after = w.info();
+    assert_eq!(after["count"], UNITS.len(), "{after}");
+    assert_eq!(after["status"], "ready", "{after}");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 6. PostgreSQL that cannot be reached.
+
+/// A PostgreSQL URL with a password on a closed port: the plan exits 0
+/// quickly and runs everything; the password appears in no output, log or
+/// test environment.
+#[test]
+fn unreachable_postgres_fails_open_and_keeps_its_secret() {
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let dump = w.base.join("env-dump.txt");
+    w.put("envdump/envdump_test.go", &envdump_test(&dump));
+    w.commit("envdump");
+    let all = set(&["a", "b", "c", "d", "envdump"]);
+    let url = format!("postgres://u:{SECRET}@127.0.0.1:{}/x", closed_port());
+    let env = [("VCI_STORE_URL", url.as_str())];
+
+    let t = Instant::now();
+    let (plan, out) = w.plan(&env);
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert_eq!(plan.run, all, "{plan:?}");
+    assert!(plan.skip.is_empty());
+    let err = stderr(&out);
+    assert!(err.contains("vci: warning: "), "{err}");
+    assert!(err.contains("postgres"), "{err}");
+    let mut outs = vec![out];
+
+    // The run: the tests run (exit 0), nothing is stored, and the test
+    // process never sees the URL.
+    let key = w.key.to_str().unwrap().to_owned();
+    let out = w.vci(&["run", "--key", &key], &env);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the tests' exit code: {}",
+        text(&out)
+    );
+    for u in UNITS {
+        assert!(
+            stderr(&out).contains(&format!(
+                "vci: not attesting {u}: signing or storing failed: "
+            )),
+            "{u}: {}",
+            text(&out)
+        );
+    }
+    assert!(!stderr(&out).contains("vci: attested "), "{}", text(&out));
+    outs.push(out);
+    let dumped = std::fs::read_to_string(&dump).expect("the envdump test ran");
+    assert!(dumped.starts_with("getenv:\n"), "{dumped}");
+    assert!(
+        !dumped.lines().any(|l| l.starts_with("VCI_STORE_URL=")),
+        "{dumped}"
+    );
+    assert!(!dumped.contains(SECRET), "{dumped}");
+
+    let (out, audit) = w.ci(&[], &env, "audit.json");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(audit["exitCode"], 0);
+    let audit_text = serde_json::to_string(&audit).unwrap();
+    assert!(!audit_text.contains(SECRET), "{audit_text}");
+    assert!(
+        audit_text.contains("postgres"),
+        "the errors say why: {audit_text}"
+    );
+    outs.push(out);
+    for args in [
+        &["env"][..],
+        &["store", "info"],
+        &["store", "info", "--format", "json"],
+        &["fetch"],
+        &["push"],
+    ] {
+        outs.push(w.vci(args, &env));
+    }
+    for out in &outs {
+        assert!(!text(out).contains(SECRET), "{}", text(out));
+    }
+    let log = std::fs::read_to_string(&w.metrics).unwrap();
+    assert!(!log.contains(SECRET), "{log}");
+    assert!(log.contains("\"store\":\"postgres\""), "{log}");
+    assert!(!w.remote_has_meta());
+}
+
+// ---------------------------------------------------------------------------
+// 7. SQLite that cannot be used.
+
+/// What a store that cannot be used does: the plan runs everything (exit
+/// 0), saying `says_plan` in a warning or as the reason it runs everything
+/// (`runAll`), and `vci run` refuses to store
+/// each unit saying `says_run`, with the tests' exit code.
+fn sqlite_fails_open(w: &World, env: &[(&str, &str)], says_plan: &str, says_run: &str) {
+    let (plan, out) = w.plan(env);
+    assert_eq!(plan.run, set(UNITS), "{plan:?}");
+    assert!(plan.skip.is_empty());
+    let said = format!("{}{}", stderr(&out), plan.run_all.unwrap_or_default());
+    assert!(said.contains(says_plan), "{says_plan:?}: {said}");
+    let key = w.key.to_str().unwrap().to_owned();
+    let out = w.vci(&["run", "--key", &key], env);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the tests' exit code: {}",
+        text(&out)
+    );
+    for u in UNITS {
+        let line = stderr(&out)
+            .lines()
+            .find(|l| l.starts_with(&format!("vci: not attesting {u}: ")))
+            .unwrap_or_else(|| panic!("{u} refused: {}", text(&out)))
+            .to_owned();
+        assert!(line.contains("signing or storing failed: "), "{line}");
+        assert!(line.contains(says_run), "{says_run:?}: {line}");
+    }
+    assert!(!stderr(&out).contains("vci: attested "), "{}", text(&out));
+    assert!(!stderr(&out).contains("vci: error"), "{}", text(&out));
+}
+
+/// A file that is not a database at the configured path: every use fails
+/// at once, and the file is left as it was.
+#[test]
+fn sqlite_on_a_garbage_file_fails_open() {
+    let Some(w) = World::new(Backend::sqlite()) else {
+        return;
+    };
+    let path = w.work.join(".git/vci-store.sqlite");
+    let garbage =
+        b"this is not a database, but it is long enough to look like one maybe\n".repeat(64);
+    std::fs::write(&path, &garbage).unwrap();
+    sqlite_fails_open(
+        &w,
+        &[],
+        "reading attestations from sqlite: sqlite store unavailable: ",
+        "sqlite store unavailable: ",
+    );
+    let out = w.vci(&["store", "info"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert_eq!(std::fs::read(&path).unwrap(), garbage, "left untouched");
+}
+
+/// A store in a directory vci may not write: reads find nothing (an
+/// absent store), and the first write is refused.
+#[test]
+fn sqlite_in_an_unwritable_directory_fails_open() {
+    if testkit::running_as_root() {
+        eprintln!("SKIPPED: running as root, which may write anywhere");
+        return;
+    }
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let dir = w.base.join("read-only");
+    std::fs::create_dir(&dir).unwrap();
+    let file = dir.join("store.sqlite");
+    let url = format!("sqlite:{}", file.to_str().unwrap());
+    let set_mode = |mode: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o555);
+    let env = [("VCI_STORE_URL", url.as_str())];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sqlite_fails_open(
+            &w,
+            &env,
+            "no attestations are available in the sqlite store (the first `vci run` creates it)",
+            "sqlite store refused to create the store",
+        );
+        assert!(!file.exists(), "nothing was created");
+    }));
+    set_mode(0o755);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Nothing configured.
+
+/// With no store configured the store is git-meta: `vci run` stores there,
+/// `vci push` publishes `refs/meta/main`, and no other store's file
+/// appears.
+#[test]
+fn nothing_configured_is_git_meta_and_pushes() {
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let out = w.vci(&["store", "info"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).starts_with("store: git-meta\n"),
+        "{}",
+        text(&out)
+    );
+    attest_all(&w);
+    let out = w.vci(&["push"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(w.remote_has_meta(), "refs/meta/main was pushed");
+    let info = w.info();
+    assert_eq!(info["kind"], "git-meta");
+    assert_eq!(info["exchange"], "refs/meta/main");
+    assert_eq!(info["count"], UNITS.len());
+    assert!(w.work.join(".git/git-meta.sqlite").exists());
+    assert!(!w.work.join(".git/vci-store.sqlite").exists());
+    let log = std::fs::read_to_string(&w.metrics).unwrap();
+    let last: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(last["store"], "git-meta");
+}
