@@ -594,3 +594,117 @@ fn signing_with_missing_key_fails_cleanly() {
     let r = sign_statement(&statement(1), &dir.join("does-not-exist"));
     assert!(matches!(r, Err(SignError::SshKeygen { .. })), "{r:?}");
 }
+
+/// The SSHSIG hash and signature algorithm names inside a PEM signature.
+fn sshsig_algorithms(pem: &str) -> (String, String) {
+    let sig = ssh_key::SshSig::from_pem(pem).unwrap();
+    (
+        sig.hash_alg().as_str().to_owned(),
+        sig.algorithm().as_str().to_owned(),
+    )
+}
+
+/// Every kind of key that signs in process makes a signature that OpenSSH
+/// (`ssh-keygen -Y verify`) and vci's own verifier both accept, with the
+/// hash ssh-keygen uses (sha512, as its signatures of the same key show);
+/// RSA keys keep signing with ssh-keygen and verify the same way.
+#[test]
+fn in_process_signatures_verify_with_openssh_and_vci_for_each_key_kind() {
+    let (_t, dir) = tempdir();
+    let kinds: [(&str, &[&str], bool, &str); 5] = [
+        ("ed25519", &["-t", "ed25519"], true, "ssh-ed25519"),
+        (
+            "p256",
+            &["-t", "ecdsa", "-b", "256"],
+            true,
+            "ecdsa-sha2-nistp256",
+        ),
+        (
+            "p384",
+            &["-t", "ecdsa", "-b", "384"],
+            true,
+            "ecdsa-sha2-nistp384",
+        ),
+        (
+            "p521",
+            &["-t", "ecdsa", "-b", "521"],
+            true,
+            "ecdsa-sha2-nistp521",
+        ),
+        ("rsa", &["-t", "rsa", "-b", "2048"], false, "rsa-sha2-512"),
+    ];
+    for (name, kind, in_process, algorithm) in kinds {
+        let key = keygen_kind(&dir, name, kind, "");
+        let signer = SshSigner::load(&key.private);
+        assert_eq!(signer.in_process(), in_process, "{name}");
+        let allowed_text = format!("{name}@example.com {}\n", key.pub_line);
+        let a = allowed(&allowed_text);
+        for n in 0..3 {
+            let st = statement(n);
+            let env = signer.sign_statement(&st).unwrap();
+            assert_eq!(env.signatures[0].keyid, key.fingerprint, "{name}");
+            let pem = sig_pem(&env, 0);
+            assert_eq!(
+                sshsig_algorithms(&pem),
+                ("sha512".to_owned(), algorithm.to_owned()),
+                "{name}"
+            );
+            // ssh-keygen's own signature with this key uses the same hash.
+            let theirs = raw_sign(&key, NAMESPACE, b"x", &[]);
+            assert_eq!(sshsig_algorithms(&theirs).0, "sha512", "{name}");
+
+            let env = Envelope::from_json(&env.to_json()).unwrap();
+            let v = verify_envelope(&env, &a, now()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(v.statement, st);
+            assert_eq!(v.fingerprint, key.fingerprint);
+            let message = pae(PAYLOAD_TYPE, &b64().decode(&env.payload).unwrap());
+            let principal = format!("{name}@example.com");
+            assert!(
+                openssh_verify(&dir, &allowed_text, &principal, NAMESPACE, &pem, &message),
+                "{name}: ssh-keygen -Y verify rejected it"
+            );
+            let mut tampered = message.clone();
+            *tampered.last_mut().unwrap() ^= 1;
+            assert!(
+                !openssh_verify(&dir, &allowed_text, &principal, NAMESPACE, &pem, &tampered),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// ed25519 signatures are deterministic, so the in-process one is exactly
+/// what `ssh-keygen -Y sign` makes, armor included: the stored envelope is
+/// the same bytes either way.
+#[test]
+fn in_process_ed25519_signature_is_ssh_keygens_byte_for_byte() {
+    let (_t, dir) = tempdir();
+    let key = keygen(&dir, "alice");
+    let signer = SshSigner::load(&key.private);
+    assert!(signer.in_process());
+    for n in 0..5 {
+        let env = signer.sign_statement(&statement(n)).unwrap();
+        let payload = b64().decode(&env.payload).unwrap();
+        let theirs = raw_sign(&key, NAMESPACE, &pae(PAYLOAD_TYPE, &payload), &[]);
+        assert_eq!(sig_pem(&env, 0), theirs);
+        assert_eq!(env, sign_statement(&statement(n), &key.private).unwrap());
+    }
+}
+
+/// Keys ssh-keygen must handle are not signed in process: an encrypted key
+/// (ssh-keygen asks for its passphrase), and a key file others can read
+/// (ssh-keygen refuses it, and still does).
+#[test]
+fn keys_only_ssh_keygen_can_judge_are_not_signed_in_process() {
+    let (_t, dir) = tempdir();
+    let encrypted = keygen_kind(&dir, "locked", &["-t", "ed25519"], "secret passphrase");
+    assert!(!SshSigner::load(&encrypted.private).in_process());
+
+    let open = keygen(&dir, "open");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&open.private, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let signer = SshSigner::load(&open.private);
+    assert!(!signer.in_process());
+    let r = signer.sign_statement(&statement(1));
+    assert!(matches!(r, Err(SignError::SshKeygen { .. })), "{r:?}");
+}

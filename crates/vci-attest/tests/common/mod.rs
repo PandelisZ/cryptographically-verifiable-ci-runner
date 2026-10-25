@@ -29,23 +29,22 @@ pub fn tempdir() -> (tempfile::TempDir, Utf8PathBuf) {
 
 /// Generate a throwaway, unencrypted ed25519 key with ssh-keygen.
 pub fn keygen(dir: &Utf8Path, name: &str) -> Key {
+    keygen_kind(dir, name, &["-t", "ed25519"], "")
+}
+
+/// Generate a throwaway key with ssh-keygen: `kind` names its type (and
+/// size), `passphrase` encrypts it unless empty.
+pub fn keygen_kind(dir: &Utf8Path, name: &str, kind: &[&str], passphrase: &str) -> Key {
     let private = dir.join(name);
     let st = Command::new("ssh-keygen")
-        .args([
-            "-q",
-            "-t",
-            "ed25519",
-            "-N",
-            "",
-            "-C",
-            &format!("{name}@test"),
-            "-f",
-        ])
+        .arg("-q")
+        .args(kind)
+        .args(["-N", passphrase, "-C", &format!("{name}@test"), "-f"])
         .arg(private.as_str())
         .stdin(Stdio::null())
         .status()
         .unwrap();
-    assert!(st.success(), "ssh-keygen -t ed25519 failed");
+    assert!(st.success(), "ssh-keygen {kind:?} failed");
     let public = Utf8PathBuf::from(format!("{private}.pub"));
     let pub_line = std::fs::read_to_string(&public).unwrap().trim().to_string();
     let out = Command::new("ssh-keygen")

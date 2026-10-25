@@ -515,11 +515,25 @@ been measured on one yet.
 `batch()` opens a `WriteBatch` on the calling thread (the batch is `!Send`). There are two kinds:
 
 - **`WriteBatch::immediate(end)`**: each write is durable when its call returns, and `finish` only releases what the
-  writes shared.
-  - git-meta shares one git-meta session and one SQLite connection (2.7.15's speed-up). `finish` drops the
-    thread-local guard and never fails.
-  - SQLite pins one pooled connection to the thread, each write committing.
-- **`WriteBatch::deferred(end)`**: writes become durable only when `finish` returns `Ok`. PostgreSQL uses this kind:
+  writes shared. No backend uses it since 2.8 (git-meta and SQLite did, each write committing on its own).
+- **`WriteBatch::deferred(end)`**: writes become durable only when `finish` returns `Ok`. Every backend uses this kind
+  since 2.8.
+- **git-meta** (2.8): the batch shares one git-meta session and one connection to git-meta's SQLite store, and its
+  writes are one `BEGIN IMMEDIATE` transaction on that connection, begun by the first write and committed by
+  `finish`; each write is a savepoint in it, so a write that fails leaves the others. Inside the batch vci writes
+  git-meta's tables itself, with the statements git-meta-lib 0.1.13 (pinned exactly) runs for `set` of a string and
+  for `remove`, keys checked with its `validate_key`; outside one, writes go through git-meta as before.
+  `a_batch_stores_what_the_calls_store_one_by_one` (vci-git) compares the rows, log entries and deletion records
+  either way. The written keys' log entries are stamped once the commit is done (`stamp_written`). A batch opened
+  inside the batch joins it. Writes on the batch's thread read the batch's own writes (the slot's keys, whether a
+  value is already there); other readers see none of them before `finish`, which the trait allows. Storing 1,200
+  units was 4,800 commits on two connections (0.7 s) before.
+- **SQLite** (2.8): the batch pins one pooled connection to the thread; the first write begins `BEGIN IMMEDIATE` on
+  it, each write is a savepoint, and `finish` commits (a dropped batch commits too). Reads on that thread use the
+  pinned connection inside the transaction, so they see the batch's writes; other connections see them after
+  `finish`, and another writer waits for it (at most the busy timeout). When SQLite ends the transaction itself (an
+  I/O error, a full disk) or the connection is lost, the batch is broken: later writes and `finish` fail.
+- **PostgreSQL**:
   - `put`, `put_manifest` and `remove` are queued so that `finish` reaches the state the same calls made one by one
     would: per slot the last put (it replaces every stored key of its slot), whether a later removal took that put's
     own key away (the slot then ends empty), and the keys removed otherwise; per root the last manifest.
@@ -533,21 +547,25 @@ been measured on one yet.
 
 **How `vci run` stores a project's units** (`StoreLoop` in run.rs):
 
-1. Every unit's verdict is decided first, in parallel, including the supersession reads (`read_units`) of the units
-   it will attest.
-2. The shared base manifests (vci 2.1.8) are stored with `put_manifest`, outside the batch. A failure is a warning.
-3. The batch is opened (`store.batch().ok()`: an `Err` from `batch()` is ignored, and the writes go unbatched). Then
-   each unit, in order, is refused or stored: its manifest, its attestation (`put_for_test`), then the removal of what
-   it supersedes.
+1. Every unit's verdict is decided first, in parallel: checked and signed. The shared base manifests (vci 2.1.8) are
+   the entries every signed unit of a group shares, so they are known only once every unit is signed.
+2. The shared base manifests are stored with `put_manifest`, outside the batch. A failure is a warning.
+3. (2.8) On the check pool, each unit is made ready to store: the supersession reads (`read_units`) of what it
+   supersedes, and its manifest encoded on its base. Each is handed in unit order to one writer thread, which opens
+   the batch (`store.batch().ok()`: an `Err` from `batch()` is ignored, and the writes go unbatched) and, as soon as
+   a unit and every unit before it are ready, refuses or stores it: its manifest, its attestation (`put_for_test`),
+   then the removal of what it supersedes. Readers on the pool see the store as it was before the batch.
 4. The batch is finished right after the project's units, before the project's timing lines.
 
 **Reporting rule.**
 
-- For an immediate batch (git-meta) each unit is reported as it is stored, as in 2.7: the `vci: attested …` line and
+- For an immediate batch each unit is reported as it is stored, as in 2.7: the `vci: attested …` line and
   `UnitOutcome{attested: true}`. A failure to finish is a warning (`vci: warning: ending the <kind> store's write
-  batch: …`), because every write was durable already; git-meta's never fails.
+  batch: …`), because every write was durable already.
 - For a deferred batch, the loop holds each stored unit's line, outcome, supersession count and dropped manifest roots
-  until `finish`:
+  until `finish`, and (2.8) every other line of the loop too (a unit's warnings, refusals, failed removals), so the
+  report comes out in unit order, as git-meta's and SQLite's did when their batches were immediate. (PostgreSQL's
+  refusals and warnings came first before 2.8.)
   - `Ok` prints and records them in unit order.
   - `Err` turns every held unit into a refusal, `signing or storing failed: storing the batch: <error>`, and rolls back
     the attested, refused and superseded counts and the dropped roots. The summary JSON, the audit log's `attested`
@@ -1079,7 +1097,7 @@ The table below is what each scenario checks. The three worlds:
 | `read_only` | `chmod -R a-w .git` (undone on drop) | `chmod 0444` the file, a new handle | a role with USAGE, SELECT, and INSERT and UPDATE on memo and flags |
 | `inject_raw` | a `git_meta_lib::Session` | a raw INSERT | a raw INSERT |
 | `make_unreadable` | the row points at a blob the object database does not hold | `encoding = 99` | `encoding = 99` |
-| `failing_batches` | none (immediate batches) | none (immediate batches) | a role without INSERT on attestations (INSERT on manifests) |
+| `failing_batches` | none (no way to make the transaction fail from outside) | none (no way to make the transaction fail from outside) | a role without INSERT on attestations (INSERT on manifests) |
 
 What the scenarios can and cannot check through the trait:
 
@@ -1093,7 +1111,7 @@ What the scenarios can and cannot check through the trait:
   referenced or a base from one kept because it is recent; PostgreSQL's own test 11 checks those with grace 0.
 - **c16** bounds the first failure at 4 s (worlds configure a connect timeout of at most 3 s) and 40 more calls at 2 s.
   With an exchange the first failing call is `fetch`, since reads of the local store still work.
-- **c29** and **c30** are skipped by every backend but PostgreSQL (not shared; immediate batches), and **c14** by
+- **c29** and **c30** are skipped by every backend but PostgreSQL (not shared; no failing batch hook), and **c14** by
   every backend but git-meta (no exchange). A skipped part says so on stderr.
 
 - **Branching.** Scenarios branch only on `Caps` and on `exchange().is_some()`.
@@ -1259,8 +1277,8 @@ impl From<GitError> for StoreError { … }
 - `put_manifest`: `key::check_hex("input root", root)`, empty bytes refused as `Invalid{manifest, "must not be
   empty"}`, then `AttestStore::put_manifest` (which checks UTF-8).
 - `remove` (`remove_envelopes`) and `remove_manifests` are unchanged.
-- `batch`: `WriteBatch::immediate(Box::new(GitBatch(AttestStore::batch()?)))`. `finish` drops the thread-local
-  guard and returns `Ok`.
+- `batch`: `WriteBatch::deferred(Box::new(GitBatch(AttestStore::batch()?)))` (2.8; immediate before). `finish`
+  commits the batch's transaction, stamps its writes and drops the thread-local guard (section 6).
 
 **Prefetch**:
 
@@ -1333,7 +1351,7 @@ from `vci_git`), so every import path still compiles: `KEY_PREFIX`, `MANIFEST_PR
 **Tests.** `crates/vci-git/tests/store_trait.rs` (11 tests) checks the implementation against `AttestStore` on lazy
 worlds with hinted, unhinted, promised and missing-blob entries: listings match, `read_values` matches, `read_units` is
 targeted and equal to the default, error mapping, the pool seeing a store created later and being refreshed after a
-prefetch, `orphan_manifests` against a re-implementation of 2.7's logic, the immediate batch, the timing line, `put`
+prefetch, `orphan_manifests` against a re-implementation of 2.7's logic, the batch (one transaction since 2.8), the timing line, `put`
 keeping `put_hinted`'s keys, and the factory.
 
 ---
@@ -1489,9 +1507,10 @@ The default `BINARY` collation is bytewise, as the contract requires.
   attestation references and no manifest uses as its base. SQLite has one writer, so this check is atomic and needs
   no grace period.
 
-**Batch.** `WriteBatch::immediate`: it pins one pooled connection to the thread (a thread-local keyed by the handle),
-and each write still commits. Under WAL with `synchronous=NORMAL` a commit costs tens of microseconds, so about 3,000 writes
-take well under a second. If measurement says otherwise, the follow-up is chunked transactions with a deferred batch.
+**Batch.** `WriteBatch::deferred` (2.8; immediate before): it pins one pooled connection to the thread (a
+thread-local keyed by the handle), and its writes are one `BEGIN IMMEDIATE` transaction on it, with a savepoint per
+write, committed by `finish` (section 6). `vci run` of 1,200 Go units on a heavily loaded machine wrote its 2,400
+records in 4.8 s with a commit each, and in 0.9 s as one transaction.
 
 **Other methods.**
 
@@ -1938,8 +1957,9 @@ every write is idempotent, and `batch` is a bulk upload.
    stores and migrations can re-put records known only by key. `put_for_test` keeps run.rs simple.
 5. **`ValueState` is derived, not stored.** No new field to keep in step, and no struct literal breaks. The plan
    tracks its own deferrals (`SetAside`).
-6. **Deferred batches report after `finish`.** Output never claims a unit that was not stored. git-meta and SQLite
-   use immediate batches, so their output is unchanged.
+6. **Deferred batches report after `finish`.** Output never claims a unit that was not stored. Since 2.8 git-meta and
+   SQLite use deferred batches too (one transaction per project); every line of the loop is held, so their output
+   keeps its lines and their order.
 7. **Secrets only in `VCI_STORE_URL`, removed from vci's own environment at start-up.** `VCI_*` reaches tests.
 8. **Working-tree selection, environment-only credentials, connection keys refused in `vci.toml`.** See section 9.
 9. **A factory registry.** A new backend is a crate plus one line, with no enum in vci-store to edit. `for_repo`

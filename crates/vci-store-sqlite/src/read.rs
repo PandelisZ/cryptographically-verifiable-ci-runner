@@ -40,9 +40,9 @@ pub(crate) fn list_units(
     conn: &Connection,
     test_ids: &[&str],
 ) -> rusqlite::Result<Vec<Vec<StoredEnvelope>>> {
-    let tx = conn.unchecked_transaction()?;
+    let _snapshot = snapshot(conn)?;
     let mut stmt =
-        tx.prepare("SELECT key, target FROM attestations WHERE test_key = ?1 ORDER BY key")?;
+        conn.prepare("SELECT key, target FROM attestations WHERE test_key = ?1 ORDER BY key")?;
     let mut by_key: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<Vec<StoredEnvelope>> = Vec::with_capacity(test_ids.len());
     for id in test_ids {
@@ -93,8 +93,8 @@ pub(crate) fn read_values(
     if envs.is_empty() {
         return Ok(());
     }
-    let tx = conn.unchecked_transaction()?;
-    let mut stmt = tx.prepare("SELECT value, encoding FROM attestations WHERE key = ?1")?;
+    let _snapshot = snapshot(conn)?;
+    let mut stmt = conn.prepare("SELECT value, encoding FROM attestations WHERE key = ?1")?;
     for e in envs.iter_mut() {
         let got = stmt
             .query_row([&e.key], |r| Ok(value(r.get_ref(0)?, r.get_ref(1)?)))
@@ -122,8 +122,8 @@ pub(crate) fn manifests(
     conn: &Connection,
     roots: &[&str],
 ) -> rusqlite::Result<Vec<Option<StoredManifest>>> {
-    let tx = conn.unchecked_transaction()?;
-    let mut stmt = tx.prepare("SELECT value, encoding FROM manifests WHERE root = ?1")?;
+    let _snapshot = snapshot(conn)?;
+    let mut stmt = conn.prepare("SELECT value, encoding FROM manifests WHERE root = ?1")?;
     roots
         .iter()
         .map(|root| {
@@ -190,8 +190,8 @@ pub(crate) fn orphan_manifests(conn: &Connection, roots: &[&str]) -> rusqlite::R
     if roots.is_empty() {
         return Ok(Vec::new());
     }
-    let tx = conn.unchecked_transaction()?;
-    let unknown: bool = tx.query_row(
+    let _snapshot = snapshot(conn)?;
+    let unknown: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM attestations WHERE ref_state = ?1)",
         [REF_UNKNOWN],
         |r| r.get(0),
@@ -200,7 +200,7 @@ pub(crate) fn orphan_manifests(conn: &Connection, roots: &[&str]) -> rusqlite::R
         return Ok(Vec::new());
     }
     let mut stmt =
-        tx.prepare("SELECT EXISTS (SELECT 1 FROM attestations WHERE manifest_ref = ?1)")?;
+        conn.prepare("SELECT EXISTS (SELECT 1 FROM attestations WHERE manifest_ref = ?1)")?;
     let wanted: BTreeSet<&str> = roots.iter().copied().collect();
     let mut out = Vec::new();
     for r in wanted {
@@ -235,4 +235,15 @@ pub(crate) fn flag(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
         [name],
         |r| r.get(0),
     )
+}
+
+/// One read transaction on `conn`, so that several statements see one
+/// snapshot; none when `conn` already has a transaction open (a write
+/// batch's, whose own writes the reads then see).
+fn snapshot(conn: &Connection) -> rusqlite::Result<Option<rusqlite::Transaction<'_>>> {
+    if conn.is_autocommit() {
+        conn.unchecked_transaction().map(Some)
+    } else {
+        Ok(None)
+    }
 }

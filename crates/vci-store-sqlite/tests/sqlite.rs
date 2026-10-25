@@ -918,15 +918,16 @@ fn concurrent_first_writers_create_the_store_once() {
     }
 }
 
-/// 11. A batch's writes are visible inside the batch, to this thread and
-///     to other handles and threads, and `finish()` is `Ok`.
+/// 11. A batch's writes are one transaction: this thread sees them inside
+///     the batch, other handles only once `finish()` has committed them; a
+///     batch inside the batch joins it, and a dropped batch commits too.
 #[test]
-fn batch_writes_are_visible_at_once() {
+fn batch_writes_are_one_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
     let other = store(dir.path());
     let batch = s.batch().unwrap();
-    assert!(!batch.defers_writes());
+    assert!(batch.defers_writes());
     assert!(!db_path(dir.path()).exists());
     let root = hex64(9);
     assert!(s.put_manifest(&root, b"{\"v\":2}").unwrap());
@@ -939,27 +940,30 @@ fn batch_writes_are_visible_at_once() {
         &envelope(Some(&root), 10),
     );
     assert_eq!(keys(&listed(&s, A)), vec![e.key.clone()]);
-    assert_eq!(keys(&listed(&other, A)), vec![e.key.clone()]);
-    assert!(other.manifest(&root).unwrap().is_some());
-    // A batch inside the batch shares it.
+    assert!(s.manifest(&root).unwrap().is_some());
+    assert!(listed(&other, A).is_empty());
+    assert!(other.manifest(&root).unwrap().is_none());
+    // A batch inside the batch joins it.
     let inner = s.batch().unwrap();
     put(&s, B, S1, &hex64(2), None, b"b");
     inner.finish().unwrap();
+    assert_eq!(other.count().unwrap(), 0);
     put(&s, CARGO, S1, &hex64(3), None, b"c");
-    // Another thread's writes do not join this thread's batch.
-    std::thread::scope(|t| {
-        t.spawn(|| put(&s, ROOT_UNIT, S1, &hex64(4), None, b"d"));
-    });
-    assert_eq!(other.count().unwrap(), 4);
     assert_eq!(s.remove(vec![e]).unwrap().len(), 1);
-    assert_eq!(other.count().unwrap(), 3);
+    assert_eq!(s.count().unwrap(), 2);
+    assert_eq!(other.count().unwrap(), 0);
     batch.finish().unwrap();
-    assert_eq!(s.count().unwrap(), 3);
+    assert_eq!(other.count().unwrap(), 2);
+    assert!(other.manifest(&root).unwrap().is_some());
     assert_eq!(s.timing_report().len(), 1);
     assert!(s.timing_report()[0].starts_with("store: sqlite: "));
-    // A dropped batch ends too.
-    drop(s.batch().unwrap());
+    // A dropped batch ends too, and commits.
+    let dropped = s.batch().unwrap();
     put(&s, A, S2, &hex64(1), None, b"later");
+    drop(dropped);
+    assert_eq!(other.count().unwrap(), 3);
+    // Writes after the batch commit one by one again.
+    put(&s, ROOT_UNIT, S1, &hex64(4), None, b"d");
     assert_eq!(other.count().unwrap(), 4);
 }
 

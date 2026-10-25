@@ -1317,7 +1317,12 @@ checkout, clock, policy and environment.
 
 Signing key: `--key`, else `$VCI_SIGNING_KEY`, else `git config user.signingkey` when `gpg.format = ssh` (a GPG
 signing key is never used). Errors name the source the key came from. A `.pub` path works when the private
-half is in `ssh-agent` (hardware keys included). The signer id (a segment of the git-meta key) is the first 16 hex chars of SHA-256 over the
+half is in `ssh-agent` (hardware keys included). Since 2.8 an unencrypted ed25519 or ECDSA (P-256, P-384, P-521)
+private key file that only its owner can read is read once per run and signs in process, making the signature
+`ssh-keygen -Y sign` makes (sha512; byte for byte for ed25519); a `.pub` signs through `ssh-agent` (`SSH_AUTH_SOCK`)
+over connections vci keeps open. RSA keys (the Rust `rsa` crate's private-key operation is not constant-time,
+RUSTSEC-2023-0071), encrypted, PEM-format and security keys, and any signature the agent does not make, sign with
+`ssh-keygen -Y sign` as before. Every signature is checked before it is stored. The signer id (a segment of the git-meta key) is the first 16 hex chars of SHA-256 over the
 public key blob. Keyless (since 2.0): `--oidc` instead of a key, in a GitHub Actions job with `permissions: id-token:
 write`; the signer id is then the first 16 hex chars of SHA-256 over the job's identity claims (see [Keyless signing
 (OIDC)](#keyless-signing-oidc)).
@@ -1621,6 +1626,11 @@ Interoperability, checked by the tests against `git-meta` 0.1.13 when it is inst
 readable with `git meta pull` + `git meta get`; values set (`git meta set`) or deleted (`git meta rm`) with the CLI and
 `git meta push`ed are what `vci fetch` + `vci plan` see.
 
+`vci run` writes a project's units into git-meta's local store (`.git/git-meta.sqlite`) in one transaction (since 2.8;
+before, a commit for each manifest, attestation and removal), with the statements git-meta's own `set` and `rm` run,
+and prints each `vci: attested …` line once it has committed: another `git meta` or vci command sees all of them or
+none, and a transaction that fails refuses every unit it held.
+
 ### SQLite
 
 `VCI_STORE=sqlite` (since 2.8.0) keeps the attestations of one repository in one SQLite file, by default
@@ -1632,10 +1642,11 @@ git-meta's store. `[store.sqlite] path` (relative to the git common directory, w
 - **Created by the first write.** Reading a missing file (`vci plan`, `vci fetch`, `vci store info`) creates nothing:
   the store is absent, and the plan warns `no attestations are available in the sqlite store (the first `vci run`
   creates it)` and runs everything. The first `vci run` creates the file and its schema (version 1).
-- **Writes** commit one by one (WAL, `synchronous=NORMAL`; `VCI_STORE_SYNC=off` turns syncing off, and unlike
-  git-meta's store it does not do so on its own when `CI` is set). Two vci processes writing at once wait for each
-  other, at most the store timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`, default 30 s), after which the unit is
-  refused. A removal (supersession, `vci prune`) is immediate, and a manifest is removed only when no attestation
+- **Writes** (WAL, `synchronous=NORMAL`; `VCI_STORE_SYNC=off` turns syncing off, and unlike git-meta's store it does
+  not do so on its own when `CI` is set): `vci run` writes a project's units in one transaction (since 2.8), and each
+  `vci: attested …` line is printed once it has committed; other writes commit one by one. Two vci processes writing
+  at once wait for each other, at most the store timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`, default 30 s),
+  after which the unit is refused. A removal (supersession, `vci prune`) is immediate, and a manifest is removed only when no attestation
   references it and no other manifest is built on it.
 - **Nothing to exchange.** `vci fetch` prints `vci: the sqlite store at <path> is local: nothing to fetch (N
   attestations stored)`, `vci push` prints `vci: nothing to push: the sqlite store is local; attestations were stored

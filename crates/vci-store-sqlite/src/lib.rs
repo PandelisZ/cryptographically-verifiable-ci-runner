@@ -37,8 +37,10 @@
 //! The pool hands each concurrent caller its own connection (a
 //! [`rusqlite::Connection`] is `Send` but not `Sync`). A write batch
 //! ([`AttestationStore::batch`]) pins one connection to the thread that
-//! opened it; each of its writes still commits on its own
-//! ([`WriteBatch::immediate`]).
+//! opened it, and its writes are one `BEGIN IMMEDIATE` transaction on it,
+//! opened by the first write and committed when the batch finishes
+//! ([`WriteBatch::deferred`]); each write is a savepoint in it, so a write
+//! that fails leaves the others.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -345,8 +347,9 @@ impl AttestationStore for SqliteStore {
         }))
     }
 
-    /// An immediate batch: this thread's writes share one connection until
-    /// it finishes, and each commits as its call returns.
+    /// A deferred batch: this thread's writes share one connection and are
+    /// one transaction on it, committed when the batch finishes (2.8: a
+    /// commit per write was most of the time `vci run` spent storing).
     fn batch(&self) -> Result<WriteBatch, StoreError> {
         let id = self.inner.id;
         PINNED.with(|p| {
@@ -359,10 +362,12 @@ impl AttestationStore for SqliteStore {
                     conn: None,
                     writes: 0,
                     nanos: 0,
+                    open: false,
+                    broken: None,
                 }),
             }
         });
-        Ok(WriteBatch::immediate(Box::new(SqliteBatch {
+        Ok(WriteBatch::deferred(Box::new(SqliteBatch {
             inner: Arc::clone(&self.inner),
         })))
     }
@@ -450,6 +455,10 @@ struct Pin {
     /// Writes made in the batch, and their nanoseconds.
     writes: u64,
     nanos: u64,
+    /// Whether the batch's transaction is open on `conn`.
+    open: bool,
+    /// Why the batch cannot commit: its transaction was lost.
+    broken: Option<String>,
 }
 
 /// A connection and whether its file is known to hold the schema.
@@ -515,7 +524,11 @@ impl Inner {
             });
         }
         let start = Instant::now();
+        let batched = self.pin_with(|_| ()).is_some();
         let out = self.with_conn(Mode::Write, |db| {
+            if batched {
+                return self.write_in_batch(operation, db, f);
+            }
             let tx = db
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| self.error(operation, e))?;
@@ -525,6 +538,71 @@ impl Inner {
         });
         self.count_write(start.elapsed());
         out?.ok_or_else(|| self.unavailable("its schema could not be created".to_owned()))
+    }
+
+    /// `f` as one write of this thread's batch: in the batch's transaction
+    /// (begun by its first write) on `db`, the batch's connection, inside a
+    /// savepoint that a failure rolls back. When SQLite ends the
+    /// transaction itself (an I/O error, a full disk), the batch is broken:
+    /// this and every later write fails, and so does its end.
+    fn write_in_batch<T>(
+        &self,
+        operation: &'static str,
+        db: &mut Connection,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, StoreError> {
+        let (open, broken) = self
+            .pin_with(|p| (p.open, p.broken.clone()))
+            .unwrap_or((false, None));
+        if let Some(why) = broken {
+            return Err(self.unavailable(why));
+        }
+        let begin = if open {
+            "SAVEPOINT vci_write"
+        } else {
+            "BEGIN IMMEDIATE; SAVEPOINT vci_write"
+        };
+        if let Err(e) = db.execute_batch(begin) {
+            if !open && !db.is_autocommit() {
+                let _ = db.execute_batch("ROLLBACK");
+            }
+            return Err(self.error(operation, e));
+        }
+        self.pin_with(|p| p.open = true);
+        let out = f(db).map_err(|e| self.error(operation, e));
+        let end = match &out {
+            Ok(_) => db.execute_batch("RELEASE vci_write"),
+            Err(_) => db.execute_batch("ROLLBACK TO vci_write; RELEASE vci_write"),
+        };
+        let out = match (out, end) {
+            (Ok(_), Err(e)) => Err(self.error(operation, e)),
+            (out, _) => out,
+        };
+        if db.is_autocommit() {
+            let why = format!(
+                "{}: the write batch's transaction was rolled back{}",
+                self.path.display(),
+                match &out {
+                    Err(e) => format!(" ({e})"),
+                    Ok(_) => String::new(),
+                }
+            );
+            self.pin_with(|p| {
+                p.open = false;
+                p.broken.get_or_insert(why.clone());
+            });
+            return Err(self.unavailable(why));
+        }
+        out
+    }
+
+    /// `f` on this thread's batch on this store, when one is open.
+    fn pin_with<R>(&self, f: impl FnOnce(&mut Pin) -> R) -> Option<R> {
+        let id = self.id;
+        PINNED
+            .try_with(|p| p.borrow_mut().iter_mut().find(|x| x.store == id).map(f))
+            .ok()
+            .flatten()
     }
 
     /// A hint's write: only into a file that exists, and never failing.
@@ -600,8 +678,21 @@ impl Inner {
             }
         }
         let out = f(&mut conn.db);
-        if !matches!(out, Err(StoreError::Unavailable { .. })) {
-            self.give_back(conn, to_pin);
+        match &out {
+            Err(StoreError::Unavailable { detail, .. }) => {
+                if to_pin {
+                    // The batch's connection is dropped, and its open
+                    // transaction with it: the batch cannot commit.
+                    let why = detail.clone();
+                    self.pin_with(|p| {
+                        if p.open {
+                            p.open = false;
+                            p.broken.get_or_insert(why);
+                        }
+                    });
+                }
+            }
+            _ => self.give_back(conn, to_pin),
         }
         out.map(Some)
     }
@@ -788,8 +879,9 @@ struct SqliteBatch {
 }
 
 impl BatchEnd for SqliteBatch {
-    /// Gives the shared connection back to the pool. Every write committed
-    /// already, so this never fails.
+    /// The outermost batch commits the transaction, then gives the shared
+    /// connection back to the pool. It fails when the commit does, or when
+    /// the transaction was lost; nothing of the batch is stored then.
     fn finish(self: Box<Self>) -> Result<(), StoreError> {
         let id = self.inner.id;
         let ended = PINNED
@@ -801,8 +893,28 @@ impl BatchEnd for SqliteBatch {
             })
             .ok()
             .flatten();
+        let mut result = Ok(());
         if let Some(pin) = ended {
+            if let Some(why) = pin.broken {
+                result = Err(self.inner.unavailable(why));
+            } else if pin.open && pin.conn.is_none() {
+                result = Err(self.inner.unavailable(format!(
+                    "{}: the write batch's connection was lost",
+                    self.inner.path.display()
+                )));
+            }
             if let Some(c) = pin.conn {
+                if !c.db.is_autocommit() {
+                    let end = if result.is_ok() {
+                        c.db.execute_batch("COMMIT")
+                    } else {
+                        c.db.execute_batch("ROLLBACK")
+                    };
+                    if let Err(e) = end {
+                        let _ = c.db.execute_batch("ROLLBACK");
+                        result = Err(self.inner.error("write", e));
+                    }
+                }
                 self.inner.pool().push(c);
             }
             if pin.writes > 0 && vci_core::metrics::on() {
@@ -813,7 +925,7 @@ impl BatchEnd for SqliteBatch {
                 );
             }
         }
-        Ok(())
+        result
     }
 }
 

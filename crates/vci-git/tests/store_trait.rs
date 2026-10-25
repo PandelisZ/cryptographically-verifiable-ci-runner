@@ -663,46 +663,129 @@ fn orphan_manifests_matches_today() {
     }
 }
 
-/// Plan test 8: git-meta's batch shares a session; every write is visible and durable
-/// before `finish`, which never fails.
+/// Plan test 8 (2.8): git-meta's batch is one transaction: its writes are
+/// visible to other readers, and durable, once it finishes, and it ends in
+/// the state its calls reach one by one (the same inputs written twice keep
+/// one key, a put then removed is gone).
 #[test]
-fn batch_is_immediate() {
+fn batch_is_one_transaction() {
     let (_t, root) = init_repo();
     let r = repo(&root);
     let gs = GitMetaStore::new(r.clone());
+    let before = gs
+        .put_for_test(C, S1, &hex64(3), None, &env("c", &hex64(0xe0)))
+        .unwrap();
     let batch = gs.batch().unwrap();
-    assert!(!batch.defers_writes());
+    assert!(batch.defers_writes());
     let m = hex64(0xe1);
     assert!(gs.put_manifest(&m, &manifest("one")).unwrap());
-    let h = hint(1, None);
+    assert!(
+        !gs.put_manifest(&m, &manifest("one")).unwrap(),
+        "the batch's own write"
+    );
     let put = gs
         .put(&NewAttestation::for_test(
             A,
             S1,
             &hex64(1),
-            Some(&h),
+            Some(&hint(1, None)),
             &env("a", &m),
         ))
         .unwrap();
-    gs.put_for_test(B, S1, &hex64(2), None, &env("b", &m))
+    // The same inputs again under a newer hint: replaces the batch's own.
+    let newer = gs
+        .put(&NewAttestation::for_test(
+            A,
+            S1,
+            &hex64(1),
+            Some(&hint(2, None)),
+            &env("a2", &m),
+        ))
         .unwrap();
-    // Visible through this handle and to a reader of its own.
-    assert_eq!(gs.list_units(&[A]).unwrap()[0][0].key, put.key);
-    assert_eq!(gs.read_units(&[B]).unwrap()[0][0].bytes, env("b", &m));
-    assert_eq!(AttestStore::new(&r).list(Some(A)).unwrap()[0].key, put.key);
-    assert_eq!(gs.manifest(&m).unwrap().unwrap().bytes, manifest("one"));
-    assert_eq!(gs.count().unwrap(), 2);
-    // A removal too.
-    assert_eq!(gs.remove(vec![put.clone()]).unwrap(), vec![put]);
-    assert!(gs.list_units(&[A]).unwrap()[0].is_empty());
+    assert_ne!(newer.key, put.key);
+    let b = gs
+        .put_for_test(B, S1, &hex64(2), None, &env("b", &m))
+        .unwrap();
+    assert_eq!(gs.remove(vec![b.clone()]).unwrap(), vec![b]);
+    assert_eq!(gs.remove(vec![before.clone()]).unwrap(), vec![before]);
+    // Another reader sees none of it yet.
+    assert!(AttestStore::new(&r).list(Some(A)).unwrap().is_empty());
+    assert_eq!(AttestStore::new(&r).list(Some(C)).unwrap().len(), 1);
     batch.finish().unwrap();
+    let a = AttestStore::new(&r).list(Some(A)).unwrap();
+    assert_eq!(a.len(), 1, "{a:?}");
+    assert_eq!(a[0].key, newer.key);
+    assert_eq!(a[0].bytes, env("a2", &m));
+    assert!(gs.list_units(&[B]).unwrap()[0].is_empty());
+    assert!(gs.list_units(&[C]).unwrap()[0].is_empty());
+    assert_eq!(gs.manifest(&m).unwrap().unwrap().bytes, manifest("one"));
     assert_eq!(gs.count().unwrap(), 1);
-    // A second batch on the same thread works as the first.
+    // A second batch on the same thread works as the first, and one inside
+    // it joins it.
     let again = gs.batch().unwrap();
+    let inner = gs.batch().unwrap();
     gs.put_for_test(C, S1, &hex64(3), None, &env("c", &m))
         .unwrap();
-    assert_eq!(gs.count().unwrap(), 2);
+    inner.finish().unwrap();
+    assert_eq!(
+        AttestStore::new(&r).count().unwrap(),
+        1,
+        "the outer batch is open"
+    );
     again.finish().unwrap();
+    assert_eq!(gs.count().unwrap(), 2);
+}
+
+/// What a batch stores is what the same calls store one by one: the same
+/// rows, the same log operations and deletion records, so `vci push`
+/// publishes the same.
+#[test]
+fn a_batch_stores_what_the_calls_store_one_by_one() {
+    let rows = |batched: bool| {
+        let (t, root) = init_repo();
+        let r = repo(&root);
+        let gs = GitMetaStore::new(r.clone());
+        let m = hex64(0xe1);
+        let old = gs
+            .put_for_test(B, S1, &hex64(9), Some(&hint(1, None)), &env("old", &m))
+            .unwrap();
+        let batch = batched.then(|| gs.batch().unwrap());
+        gs.put_manifest(&m, &manifest("one")).unwrap();
+        gs.put_manifest(&m, &manifest("one")).unwrap();
+        gs.put_for_test(A, S1, &hex64(1), Some(&hint(1, None)), &env("a", &m))
+            .unwrap();
+        gs.put_for_test(B, S1, &hex64(9), Some(&hint(2, None)), &env("new", &m))
+            .unwrap();
+        gs.remove(vec![old]).unwrap();
+        gs.put_for_test(C, S1, &hex64(3), None, &env("c", &m))
+            .unwrap();
+        gs.remove_manifests(&[m.as_str()]).unwrap();
+        if let Some(b) = batch {
+            b.finish().unwrap();
+        }
+        let db = rusqlite::Connection::open(root.join(".git/git-meta.sqlite")).unwrap();
+        let q = |sql: &str| -> Vec<String> {
+            let mut st = db.prepare(sql).unwrap();
+            st.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let out = (
+            q(
+                "SELECT target_type || ' ' || target_value || ' ' || key || ' ' || value || ' ' || value_type || ' ' || is_git_ref FROM metadata ORDER BY 1",
+            ),
+            q(
+                "SELECT target_type || ' ' || target_value || ' ' || key || ' ' || operation || ' ' || value FROM metadata_log ORDER BY rowid",
+            ),
+            q(
+                "SELECT tombstone_type || ' ' || target_type || ' ' || target_value || ' ' || key FROM tombstones ORDER BY 1",
+            ),
+        );
+        drop(t);
+        out
+    };
+    assert_eq!(rows(true), rows(false));
 }
 
 /// Plan test 9: The timing report is the line vci has always printed.

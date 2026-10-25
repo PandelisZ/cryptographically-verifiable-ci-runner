@@ -1,7 +1,9 @@
 //! in-toto Statement v1 + DSSE envelopes signed with SSH keys (SSHSIG).
 //!
-//! * Signing shells out to `ssh-keygen -Y sign` so that ssh-agent and
-//!   hardware-backed keys work.
+//! * Signing ([`SshSigner`]) is in process for an unencrypted ed25519 or
+//!   ECDSA key file, through ssh-agent for a `.pub` the agent holds, and
+//!   otherwise shells out to `ssh-keygen -Y sign`, so that encrypted,
+//!   RSA and hardware-backed keys work as before.
 //! * Verification is pure Rust (`ssh-key`), checks the SSHSIG over the DSSE
 //!   PAE of the *exact stored payload bytes* (never re-serialised), and
 //!   authorises the signer against an OpenSSH `allowed_signers` file.
@@ -14,6 +16,8 @@
 //! Everything here is fail-closed with respect to trust: any doubt produces an
 //! error, which callers turn into "run the test".
 
+#[cfg(unix)]
+mod agent;
 mod allowed_signers;
 pub mod keyless;
 mod sign;
@@ -25,7 +29,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 pub use allowed_signers::{AllowedSigner, AllowedSigners, AllowedSignersError};
-pub use sign::{SignError, sign_payload, sign_statement};
+pub use sign::{SignError, SshSigner, sign_payload, sign_statement};
 pub use verify::{Verified, VerifyError, verify_envelope};
 
 /// DSSE payload type for in-toto statements.

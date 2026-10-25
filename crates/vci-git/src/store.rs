@@ -327,10 +327,11 @@ impl AttestationStore for GitMetaStore {
             .collect())
     }
 
-    /// Writes share one git-meta session and one store connection until
-    /// the batch finishes; each is durable when its call returns.
+    /// Writes share one git-meta session and one store connection, and are
+    /// one transaction on it (2.8): durable, and visible to other readers,
+    /// once the batch finishes.
     fn batch(&self) -> Result<WriteBatch, StoreError> {
-        Ok(WriteBatch::immediate(Box::new(GitBatch(
+        Ok(WriteBatch::deferred(Box::new(GitBatch(
             self.attest_store().batch()?,
         ))))
     }
@@ -434,15 +435,15 @@ impl Exchange for GitMetaStore {
 }
 
 /// An open git-meta write batch ([`AttestStore::batch`]): while it lives,
-/// this thread's writes share one session and one store connection.
+/// this thread's writes share one session and one store connection, in one
+/// transaction.
 struct GitBatch(BatchGuard);
 
 impl BatchEnd for GitBatch {
-    /// Closes the shared session and connection. Every write was durable
-    /// already, so this never fails.
+    /// Commits the batch's transaction and stamps its writes, then closes
+    /// the shared session and connection.
     fn finish(self: Box<Self>) -> Result<(), StoreError> {
-        drop(self);
-        Ok(())
+        Ok(self.0.finish()?)
     }
 }
 

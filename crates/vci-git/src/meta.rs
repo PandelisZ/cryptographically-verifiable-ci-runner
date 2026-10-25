@@ -209,10 +209,24 @@ pub struct AttestStore<'a> {
 /// The session and store connection a batch of writes on this thread
 /// shares ([`AttestStore::batch`], 2.7.15), for the repository whose root
 /// is the first field.
+///
+/// 2.8: the batch's writes are one transaction on `db`, opened by the
+/// first write and committed when the batch finishes (storing 1,200 units
+/// was 4,800 commits on two connections, 0.7 s, before).
 struct BatchConns {
     root: Utf8PathBuf,
     session: std::rc::Rc<Session>,
     db: Option<(Utf8PathBuf, rusqlite::Connection)>,
+    /// Batches opened on this thread and not finished (an inner one joins
+    /// the outer).
+    depth: usize,
+    /// Whether the transaction is open on `db`.
+    open: bool,
+    /// The keys written, stamped once the transaction has committed (see
+    /// [`AttestStore::stamp_written`]).
+    stamps: Vec<(Target, String)>,
+    /// Why the batch cannot commit: SQLite rolled its transaction back.
+    broken: Option<String>,
 }
 
 thread_local! {
@@ -220,15 +234,303 @@ thread_local! {
 }
 
 /// While alive, [`AttestStore`]'s writes on this thread share one git-meta
-/// session and one store connection; dropping it closes them.
+/// session and one store connection, in one transaction:
+/// [`BatchGuard::finish`] commits it. Dropping it commits too, ignoring a
+/// failure.
 pub struct BatchGuard {
+    /// The root of the repository whose batch this is; `None` when another
+    /// repository's batch was open on this thread (this one's writes then
+    /// commit one by one).
+    root: Option<Utf8PathBuf>,
     _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl BatchGuard {
+    /// End the batch: commit its writes (the outermost batch only), then
+    /// stamp them. After an `Err`, none of its writes is stored, except
+    /// when only the stamping failed.
+    pub fn finish(mut self) -> Result<(), GitError> {
+        self.end()
+    }
+
+    fn end(&mut self) -> Result<(), GitError> {
+        let Some(root) = self.root.take() else {
+            return Ok(());
+        };
+        let conns = BATCH.with(|b| {
+            let mut b = b.borrow_mut();
+            match b.as_mut() {
+                Some(c) if c.root == root && c.depth > 1 => {
+                    c.depth -= 1;
+                    None
+                }
+                Some(c) if c.root == root => b.take(),
+                _ => None,
+            }
+        });
+        let Some(BatchConns {
+            db: Some((path, mut db)),
+            open,
+            stamps,
+            broken,
+            ..
+        }) = conns
+        else {
+            return Ok(());
+        };
+        if let Some(why) = broken {
+            return Err(GitError::Store(why));
+        }
+        if !open {
+            return Ok(());
+        }
+        if let Err(e) = db.execute_batch("COMMIT") {
+            let _ = db.execute_batch("ROLLBACK");
+            return Err(sql_err(&path, e));
+        }
+        let written: Vec<(&Target, &str)> = stamps.iter().map(|(t, k)| (t, k.as_str())).collect();
+        AttestStore::stamp_on(&path, &mut db, &written)
+    }
 }
 
 impl Drop for BatchGuard {
     fn drop(&mut self) {
-        BATCH.with(|b| b.borrow_mut().take());
+        let _ = self.end();
     }
+}
+
+// ---- a batch's writes (2.8) ---------------------------------------------------
+//
+// Inside a batch, vci writes git-meta's tables itself, on the batch's
+// connection and in its one transaction, with the statements git-meta's
+// `Store::set_with_git_ref` (a string value) and `Store::remove` run
+// (git-meta-lib is pinned exactly), as `apply_tombstones_batch` does.
+
+/// Whether `key` on `target` holds exactly the string `text`, as
+/// git-meta's `get_value` decodes it. A value kept as a blob or not
+/// fetched yet is read through git-meta (it was committed before the
+/// batch).
+fn current_is(
+    path: &Utf8Path,
+    db: &rusqlite::Connection,
+    session: &Session,
+    target: &Target,
+    key: &str,
+    text: &str,
+) -> Result<bool, GitError> {
+    use rusqlite::OptionalExtension as _;
+    let row: Option<(String, String, bool, bool)> = db
+        .prepare_cached(
+            "SELECT value, value_type, is_git_ref, is_promised FROM metadata
+             WHERE target_type = ?1 AND target_value = ?2 AND key = ?3",
+        )
+        .and_then(|mut st| {
+            st.query_row(
+                rusqlite::params![
+                    target.target_type().as_str(),
+                    target.value().unwrap_or(""),
+                    key
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+        })
+        .map_err(|e| sql_err(path, e))?;
+    Ok(match row {
+        None => false,
+        Some((_, vt, _, _)) if vt != "string" => false,
+        Some((_, _, true, _)) | Some((_, _, _, true)) => {
+            session.target(target).get_value(key).ok().flatten()
+                == Some(MetaValue::String(text.to_owned()))
+        }
+        Some((value, _, false, false)) => {
+            serde_json::from_str::<String>(&value).unwrap_or(value) == text
+        }
+    })
+}
+
+/// git-meta's `set` of the string `text` under `key` on `target`.
+fn set_string_sql(
+    db: &rusqlite::Connection,
+    target: &Target,
+    key: &str,
+    text: &str,
+    email: &str,
+    timestamp: i64,
+) -> rusqlite::Result<()> {
+    let ty = target.target_type().as_str();
+    let value = target.value().unwrap_or("");
+    let json = serde_json::to_string(text)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    db.prepare_cached(
+        "INSERT INTO metadata (target_type, target_value, key, value, value_type, last_timestamp, is_git_ref)
+         VALUES (?1, ?2, ?3, ?4, 'string', ?5, ?6)
+         ON CONFLICT(target_type, target_value, key) DO UPDATE
+         SET value = excluded.value, value_type = 'string', last_timestamp = excluded.last_timestamp, is_git_ref = excluded.is_git_ref, is_promised = 0, source_ref = NULL",
+    )?
+    .execute(rusqlite::params![ty, value, key, json, timestamp, 0i64])?;
+    let id: i64 = db
+        .prepare_cached(
+            "SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3",
+        )?
+        .query_row(rusqlite::params![ty, value, key], |r| r.get(0))?;
+    db.prepare_cached("DELETE FROM list_values WHERE metadata_id = ?1")?
+        .execute([id])?;
+    db.prepare_cached("DELETE FROM set_values WHERE metadata_id = ?1")?
+        .execute([id])?;
+    db.prepare_cached(
+        "DELETE FROM tombstones WHERE tombstone_type = 'set_member' AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+    )?
+    .execute(rusqlite::params![ty, value, key])?;
+    db.prepare_cached(
+        "INSERT INTO metadata_log (target_type, target_value, key, value, value_type, operation, email, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'set', ?6, ?7)",
+    )?
+    .execute(rusqlite::params![ty, value, key, json, "string", email, timestamp])?;
+    db.prepare_cached(
+        "DELETE FROM tombstones WHERE tombstone_type = 'metadata' AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+    )?
+    .execute(rusqlite::params![ty, value, key])?;
+    Ok(())
+}
+
+/// git-meta's `remove` of `key` on `target`: whether it existed.
+fn remove_key_sql(
+    db: &rusqlite::Connection,
+    target: &Target,
+    key: &str,
+    email: &str,
+    timestamp: i64,
+) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension as _;
+    let ty = target.target_type().as_str();
+    let value = target.value().unwrap_or("");
+    let id: Option<i64> = db
+        .prepare_cached(
+            "SELECT rowid FROM metadata WHERE target_type = ?1 AND target_value = ?2 AND key = ?3",
+        )?
+        .query_row(rusqlite::params![ty, value, key], |r| r.get(0))
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(false);
+    };
+    db.prepare_cached("DELETE FROM list_values WHERE metadata_id = ?1")?
+        .execute([id])?;
+    db.prepare_cached("DELETE FROM set_values WHERE metadata_id = ?1")?
+        .execute([id])?;
+    if db
+        .prepare_cached("DELETE FROM metadata WHERE rowid = ?1")?
+        .execute([id])?
+        == 0
+    {
+        return Ok(false);
+    }
+    db.prepare_cached(
+        "INSERT INTO tombstones (tombstone_type, target_type, target_value, key, entry_id, value, timestamp, email)
+         VALUES ('metadata', ?1, ?2, ?3, '', '', ?4, ?5)
+         ON CONFLICT(tombstone_type, target_type, target_value, key, entry_id) DO UPDATE
+         SET timestamp = excluded.timestamp, email = excluded.email",
+    )?
+    .execute(rusqlite::params![ty, value, key, timestamp, email])?;
+    db.prepare_cached(
+        "DELETE FROM tombstones
+         WHERE tombstone_type = 'list_entry' AND target_type = ?1 AND target_value = ?2 AND key = ?3",
+    )?
+    .execute(rusqlite::params![ty, value, key])?;
+    db.prepare_cached(
+        "INSERT INTO metadata_log (target_type, target_value, key, value, value_type, operation, email, timestamp)
+         VALUES (?1, ?2, ?3, '', '', 'rm', ?4, ?5)",
+    )?
+    .execute(rusqlite::params![ty, value, key, email, timestamp])?;
+    Ok(true)
+}
+
+/// [`set_string_sql`] of a key git-meta accepts (its `validate_key`).
+fn set_string(
+    path: &Utf8Path,
+    db: &rusqlite::Connection,
+    target: &Target,
+    key: &str,
+    text: &str,
+    email: &str,
+    timestamp: i64,
+) -> Result<(), GitError> {
+    git_meta_lib::types::validate_key(key).map_err(meta_err)?;
+    set_string_sql(db, target, key, text, email, timestamp).map_err(|e| sql_err(path, e))
+}
+
+/// [`remove_key_sql`] of a key git-meta accepts (its `validate_key`).
+fn remove_key(
+    path: &Utf8Path,
+    db: &rusqlite::Connection,
+    target: &Target,
+    key: &str,
+    email: &str,
+    timestamp: i64,
+) -> Result<bool, GitError> {
+    git_meta_lib::types::validate_key(key).map_err(meta_err)?;
+    remove_key_sql(db, target, key, email, timestamp).map_err(|e| sql_err(path, e))
+}
+
+/// [`AttestStore::put_keyed`] inside a batch: the same inputs' keys found
+/// on the batch's connection (so the batch's own earlier writes count),
+/// the key chosen as outside one, the same inputs under another key
+/// removed, and the value written unless it is already there.
+#[allow(clippy::too_many_arguments)]
+fn batch_put(
+    path: &Utf8Path,
+    db: &rusqlite::Connection,
+    session: &Session,
+    (target, test_key, signer, storage_key): (&Target, &str, &str, &str),
+    hint: Option<&KeyHint>,
+    text: &str,
+    written: &mut Vec<(Target, String)>,
+) -> Result<String, GitError> {
+    let prefix = format!("{KEY_PREFIX}:{test_key}:");
+    let mut same_inputs: Vec<String> = db
+        .prepare_cached(
+            "SELECT key FROM metadata
+             WHERE target_type = ?1 AND target_value = ?2 AND substr(key, 1, ?3) = ?4
+               AND value_type = 'string'",
+        )
+        .and_then(|mut st| {
+            st.query_map(
+                rusqlite::params![
+                    target.target_type().as_str(),
+                    target.value().unwrap_or(""),
+                    prefix.len() as i64,
+                    prefix
+                ],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<String>>>()
+        })
+        .map_err(|e| sql_err(path, e))?
+        .into_iter()
+        .filter(|k| {
+            parse_key(k)
+                .is_some_and(|(tk, s, sk)| tk == test_key && s == signer && sk == storage_key)
+        })
+        .collect();
+    same_inputs.sort();
+    let key = match hint {
+        Some(h) => attestation_key_hinted(test_key, signer, storage_key, h),
+        None => same_inputs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| attestation_key(test_key, signer, storage_key)),
+    };
+    let now = now_ms();
+    for other in same_inputs.iter().filter(|k| **k != key) {
+        if remove_key(path, db, target, other, session.email(), now)? {
+            written.push((target.clone(), other.clone()));
+        }
+    }
+    if !current_is(path, db, session, target, &key, text)? {
+        set_string(path, db, target, &key, text, session.email(), now)?;
+        written.push((target.clone(), key.clone()));
+    }
+    Ok(key)
 }
 
 /// The git-meta target for a test id.
@@ -1072,12 +1374,119 @@ impl<'a> AttestStore<'a> {
     /// units opened three sessions and three connections each, and read
     /// every earlier attestation of the unit, 33 s in all).
     pub fn batch(&self) -> Result<BatchGuard, GitError> {
+        let root = self.repo.root().to_owned();
+        let open = BATCH.with(|b| {
+            b.borrow_mut().as_mut().map(|c| {
+                if c.root == root {
+                    c.depth += 1;
+                    true
+                } else {
+                    false
+                }
+            })
+        });
+        match open {
+            Some(true) => {
+                return Ok(BatchGuard {
+                    root: Some(root),
+                    _not_send: std::marker::PhantomData,
+                });
+            }
+            Some(false) => {
+                return Ok(BatchGuard {
+                    root: None,
+                    _not_send: std::marker::PhantomData,
+                });
+            }
+            None => {}
+        }
         let session = std::rc::Rc::new(self.session()?);
         let db = self.db_rw()?;
-        let root = self.repo.root().to_owned();
-        BATCH.with(|b| *b.borrow_mut() = Some(BatchConns { root, session, db }));
+        BATCH.with(|b| {
+            *b.borrow_mut() = Some(BatchConns {
+                root: root.clone(),
+                session,
+                db,
+                depth: 1,
+                open: false,
+                stamps: Vec::new(),
+                broken: None,
+            })
+        });
         Ok(BatchGuard {
+            root: Some(root),
             _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Run `f` inside this thread's batch of this repository: on the
+    /// batch's connection, in its transaction (opened by the first write),
+    /// in a savepoint of its own that a failure rolls back. `f` adds the
+    /// keys it wrote to the stamps. `None` when no such batch is open, or
+    /// it has no connection: the caller writes through git-meta.
+    fn in_batch<T>(
+        &self,
+        f: impl FnOnce(
+            &Utf8Path,
+            &rusqlite::Connection,
+            &Session,
+            &mut Vec<(Target, String)>,
+        ) -> Result<T, GitError>,
+    ) -> Option<Result<T, GitError>> {
+        BATCH.with(|b| {
+            let mut b = b.borrow_mut();
+            let c = b.as_mut().filter(|c| c.root == self.repo.root())?;
+            let BatchConns {
+                session,
+                db,
+                open,
+                stamps,
+                broken,
+                ..
+            } = c;
+            let (path, db) = db.as_mut()?;
+            if let Some(why) = broken {
+                return Some(Err(GitError::Store(why.clone())));
+            }
+            let begin = if *open {
+                "SAVEPOINT vci_write"
+            } else {
+                "BEGIN IMMEDIATE; SAVEPOINT vci_write"
+            };
+            if let Err(e) = db.execute_batch(begin) {
+                if !db.is_autocommit() {
+                    let _ = db.execute_batch("ROLLBACK");
+                }
+                *open = false;
+                return Some(Err(sql_err(path, e)));
+            }
+            *open = true;
+            let mut written = Vec::new();
+            let mut out = f(path, db, session, &mut written);
+            let end = match &out {
+                Ok(_) => db.execute_batch("RELEASE vci_write"),
+                Err(_) => db.execute_batch("ROLLBACK TO vci_write; RELEASE vci_write"),
+            };
+            if let (Err(e), Ok(_)) = (end, &out) {
+                out = Err(sql_err(path, e));
+            }
+            if db.is_autocommit() {
+                // SQLite ended the transaction itself (an I/O error, a full
+                // disk): the batch's earlier writes are gone with it.
+                *open = false;
+                *broken = Some(format!(
+                    "{path}: the write batch's transaction was rolled back{}",
+                    match &out {
+                        Err(e) => format!(" ({e})"),
+                        Ok(_) => String::new(),
+                    }
+                ));
+                return Some(Err(GitError::Store(broken.clone().unwrap_or_default())));
+            }
+            if out.is_ok() {
+                stamps.extend(written);
+            }
+            Some(out)
         })
     }
 
@@ -1272,6 +1681,19 @@ impl<'a> AttestStore<'a> {
             reason: "must be UTF-8",
         })?;
         validate::hex_id("test_key", test_key)?;
+        if let Some(r) = self.in_batch(|path, db, session, written| {
+            batch_put(
+                path,
+                db,
+                session,
+                (target, test_key, signer, storage_key),
+                hint,
+                text,
+                written,
+            )
+        }) {
+            return r;
+        }
         // Keys alone (2.7.15: their values, read through a new `git
         // cat-file`, were never used).
         let same_inputs: Vec<StoredEnvelope> = self
@@ -1449,6 +1871,22 @@ impl<'a> AttestStore<'a> {
         if doomed.is_empty() {
             return Ok(doomed);
         }
+        let mut doomed = Some(doomed);
+        let batched = self.in_batch(|path, db, session, written| {
+            let mut removed = Vec::new();
+            for e in doomed.take().unwrap_or_default() {
+                let target = Target::parse(&e.target).map_err(meta_err)?;
+                if remove_key(path, db, &target, &e.key, session.email(), now_ms())? {
+                    written.push((target, e.key.clone()));
+                    removed.push(e);
+                }
+            }
+            Ok(removed)
+        });
+        if let Some(r) = batched {
+            return r;
+        }
+        let doomed = doomed.unwrap_or_default();
         let session = self.write_session()?;
         let mut removed = Vec::new();
         let mut targets = Vec::new();
@@ -1488,6 +1926,24 @@ impl<'a> AttestStore<'a> {
             reason: "must be UTF-8",
         })?;
         let key = manifest_key(root);
+        let batched = self.in_batch(|path, db, session, written| {
+            clock(0, t);
+            let t = std::time::Instant::now();
+            let project = Target::project();
+            let same = current_is(path, db, session, &project, &key, text)?;
+            clock(1, t);
+            if same {
+                return Ok(false);
+            }
+            let t = std::time::Instant::now();
+            set_string(path, db, &project, &key, text, session.email(), now_ms())?;
+            written.push((project, key.clone()));
+            clock(2, t);
+            Ok(true)
+        });
+        if let Some(r) = batched {
+            return r;
+        }
         let session = self.write_session()?;
         let handle = session.target(&Target::project());
         clock(0, t);
@@ -1546,6 +2002,16 @@ impl<'a> AttestStore<'a> {
     pub fn remove_manifest(&self, root: &str) -> Result<bool, GitError> {
         validate::hex_id("input root", root)?;
         let key = manifest_key(root);
+        if let Some(r) = self.in_batch(|path, db, session, written| {
+            let project = Target::project();
+            let removed = remove_key(path, db, &project, &key, session.email(), now_ms())?;
+            if removed {
+                written.push((project, key.clone()));
+            }
+            Ok(removed)
+        }) {
+            return r;
+        }
         let removed = self
             .session()?
             .target(&Target::project())
@@ -1571,6 +2037,21 @@ impl<'a> AttestStore<'a> {
         }
         if keys.is_empty() {
             return Ok(0);
+        }
+        let batched = self.in_batch(|path, db, session, written| {
+            let project = Target::project();
+            let now = now_ms();
+            let mut n = 0;
+            for key in &keys {
+                if remove_key(path, db, &project, key, session.email(), now)? {
+                    written.push((project.clone(), key.clone()));
+                    n += 1;
+                }
+            }
+            Ok(n)
+        });
+        if let Some(r) = batched {
+            return r;
         }
         let session = self.write_session()?;
         let project = Target::project();
@@ -2515,10 +2996,16 @@ impl<'a> AttestStore<'a> {
             return Ok(());
         }
         let written: Vec<(&Target, &str)> = written.collect();
-        // The batch's connection when there is one (2.7.15).
+        // The batch's connection when there is one (2.7.15); while its
+        // transaction is open, once it has committed (2.8).
         let shared = BATCH.with(|b| {
             let mut b = b.borrow_mut();
             match b.as_mut() {
+                Some(c) if c.root == self.repo.root() && c.open => {
+                    c.stamps
+                        .extend(written.iter().map(|(t, k)| ((*t).clone(), (*k).to_owned())));
+                    Some(Ok(()))
+                }
                 Some(c) if c.root == self.repo.root() => {
                     c.db.as_mut()
                         .map(|(path, db)| Self::stamp_on(path, db, &written))

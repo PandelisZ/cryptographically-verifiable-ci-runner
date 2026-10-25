@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use vci_adapter::Observed;
 use vci_attest::keyless::KeylessSigner;
-use vci_attest::{Statement, Subject, sign_statement};
+use vci_attest::{Statement, Subject};
 use vci_core::{
     External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain,
 };
@@ -176,16 +176,18 @@ fn store_unusable(e: &StoreError) -> bool {
     )
 }
 
-/// One signed unit for [`StoreLoop::attest`].
-struct ToStore<'a> {
+/// One signed unit for [`StoreLoop::attest`], ready to store: made on the
+/// check pool, stored on the writer thread.
+struct ToStore {
     /// The unit as its lines name it.
-    label: &'a str,
-    test_id: &'a str,
-    input_root: &'a str,
-    /// Its input manifest, stored before the attestation.
-    manifest: &'a InputManifest,
-    /// The shared manifest its own is stored on top of (vci 2.1.8).
-    base: Option<&'a InputManifest>,
+    label: String,
+    test_id: String,
+    input_root: String,
+    /// How many entries its input manifest has.
+    entries: usize,
+    /// Its input manifest, encoded (on the shared manifest when there is
+    /// one, vci 2.1.8), stored before the attestation.
+    manifest: String,
     storage_key: String,
     hint: Option<KeyHint>,
     envelope: Vec<u8>,
@@ -193,7 +195,31 @@ struct ToStore<'a> {
     /// supersedes ([`superseded_by`]).
     doomed: Vec<StoredEnvelope>,
     /// The taints a policy waived.
-    waived: &'a [String],
+    waived: Vec<String>,
+}
+
+/// What [`run_units`]' writer thread does for one unit, in unit order.
+enum Job {
+    /// Not attested.
+    Refused {
+        label: String,
+        reason: String,
+        reasons: Vec<String>,
+        taints: Vec<String>,
+    },
+    /// Attestable, with its warnings (whole lines, said first): stored, or
+    /// it could not be signed.
+    Attestable {
+        warnings: Vec<String>,
+        unit: Result<ToStore, (String, anyhow::Error)>,
+    },
+}
+
+/// A line of a deferred batch's report, held until the batch finishes.
+enum Held {
+    Line(String),
+    /// The line of the unit in this slot.
+    Unit(usize),
 }
 
 /// One unit's place in [`StoreLoop`]'s report, in unit order.
@@ -237,10 +263,11 @@ struct Stored {
 /// One project's store loop in [`run_units`]: each unit in order, refused
 /// or signed and stored, inside one write batch, and reported.
 ///
-/// With an immediate batch (git-meta), each unit is reported as it is
-/// stored, as before. With a deferred one, a stored unit's "attested" line
-/// and outcome wait for the batch to finish: if it fails, nothing of the
-/// batch was stored and every unit it held is refused instead
+/// With an immediate batch, each unit is reported as it is stored. With a
+/// deferred one (every backend's since 2.8: one transaction per project),
+/// the report waits for the batch to finish, and then says every line in
+/// unit order, as an immediate batch would have: if the batch fails,
+/// nothing of it was stored and every unit it held is refused instead
 /// (docs/STORE-BACKENDS.md section 6), so no output claims a unit that was
 /// not stored.
 struct StoreLoop<'s> {
@@ -250,6 +277,8 @@ struct StoreLoop<'s> {
     owner: Owner,
     batch: Option<WriteBatch>,
     slots: Vec<Slot>,
+    /// A deferred batch's report, in order.
+    held: Vec<Held>,
     done: Stored,
     /// Where the lines go (stderr; a test collects them).
     say: &'s mut dyn FnMut(&str),
@@ -277,6 +306,7 @@ impl<'s> StoreLoop<'s> {
             owner,
             batch,
             slots: Vec::new(),
+            held: Vec::new(),
             done: Stored::default(),
             say,
         }
@@ -286,10 +316,41 @@ impl<'s> StoreLoop<'s> {
         self.batch.as_ref().is_some_and(WriteBatch::defers_writes)
     }
 
+    /// Say `line` (a warning, a refusal): at once, or with a deferred
+    /// batch in its place in the report.
+    fn note(&mut self, line: String) {
+        if self.deferred() {
+            self.held.push(Held::Line(line));
+        } else {
+            (self.say)(&line);
+        }
+    }
+
+    /// One unit's [`Job`].
+    fn apply(&mut self, job: Job) {
+        match job {
+            Job::Refused {
+                label,
+                reason,
+                reasons,
+                taints,
+            } => self.refuse(&label, reason, reasons, taints),
+            Job::Attestable { warnings, unit } => {
+                for w in warnings {
+                    self.note(w);
+                }
+                match unit {
+                    Ok(u) => self.attest(u),
+                    Err((label, e)) => self.failed(&label, &e),
+                }
+            }
+        }
+    }
+
     /// A unit not attested; `reason` is its line's text.
     fn refuse(&mut self, label: &str, reason: String, reasons: Vec<String>, taints: Vec<String>) {
         self.done.refused += 1;
-        (self.say)(&format!("vci: not attesting {label}: {reason}"));
+        self.note(format!("vci: not attesting {label}: {reason}"));
         let mut out = UnitOutcome::refused_by(label, &self.owner, reason, reasons);
         out.taints = taints;
         self.slots.push(Slot::Done(out));
@@ -301,12 +362,12 @@ impl<'s> StoreLoop<'s> {
     fn failed(&mut self, label: &str, e: &anyhow::Error) {
         let msg = format!("{label}: {e:#}");
         if e.downcast_ref::<StoreError>().is_some_and(store_unusable) {
-            (self.say)(&format!(
+            self.note(format!(
                 "vci: not attesting {label}: signing or storing failed: {e:#}"
             ));
             self.done.store_failures.push(msg);
         } else {
-            (self.say)(&format!("vci: error: not attesting {msg}"));
+            self.note(format!("vci: error: not attesting {msg}"));
             self.done.errors.push(msg);
         }
         self.done.refused += 1;
@@ -321,9 +382,9 @@ impl<'s> StoreLoop<'s> {
     /// A signed unit: store its manifest, then it, then remove what it
     /// supersedes, and report it (with a deferred batch: once the batch
     /// finishes). Signing only, it is counted and reported as not stored.
-    fn attest(&mut self, u: ToStore<'_>) {
+    fn attest(&mut self, u: ToStore) {
         let outcome = UnitOutcome {
-            test_id: u.label.to_owned(),
+            test_id: u.label.clone(),
             project: self.owner.project.clone(),
             adapter: self.owner.adapter,
             attested: true,
@@ -331,7 +392,7 @@ impl<'s> StoreLoop<'s> {
             reasons: vec![],
             detail: None,
             taints: vec![],
-            waived: u.waived.to_vec(),
+            waived: u.waived.clone(),
         };
         if self.mode == StoreMode::SignOnly {
             self.done.attested += 1;
@@ -339,21 +400,22 @@ impl<'s> StoreLoop<'s> {
             self.slots.push(Slot::Done(outcome));
             return;
         }
-        let (label, entries, root, waived) = (
-            u.label,
-            u.manifest.entries.len(),
-            &u.input_root[..16.min(u.input_root.len())],
-            u.waived,
-        );
-        let (stored, superseded, dropped) = match self.write(u) {
+        let label = u.label.clone();
+        let entries = u.entries;
+        let root = u.input_root[..16.min(u.input_root.len())].to_owned();
+        let waived = u.waived.clone();
+        let (stored, superseded, dropped, warnings) = match self.write(u) {
             Ok(x) => x,
-            Err(e) => return self.failed(label, &e),
+            Err(e) => return self.failed(&label, &e),
         };
+        for w in warnings {
+            self.note(w);
+        }
         self.done.attested += 1;
         let waived = if waived.is_empty() {
             String::new()
         } else {
-            format!(" (waived: {})", waived_note(waived))
+            format!(" (waived: {})", waived_note(&waived))
         };
         let line = format!(
             "vci: attested {label}{waived} ({entries} inputs, root {root}) as {} {} {}",
@@ -362,6 +424,7 @@ impl<'s> StoreLoop<'s> {
             stored.key
         );
         if self.deferred() {
+            self.held.push(Held::Unit(self.slots.len()));
             self.slots.push(Slot::Pending {
                 outcome,
                 line,
@@ -378,20 +441,20 @@ impl<'s> StoreLoop<'s> {
 
     /// Store `u` (the manifest first: an attestation is never stored
     /// without the manifest it references) and remove what it supersedes:
-    /// the entry stored, how many were removed and the roots they
-    /// referenced.
-    fn write(&mut self, u: ToStore<'_>) -> Result<(StoredEnvelope, usize, BTreeSet<String>)> {
+    /// the entry stored, how many were removed, the roots they referenced,
+    /// and the warnings about removals that failed.
+    #[allow(clippy::type_complexity)]
+    fn write(
+        &mut self,
+        u: ToStore,
+    ) -> Result<(StoredEnvelope, usize, BTreeSet<String>, Vec<String>)> {
         let t = std::time::Instant::now();
-        let compact = match u.base {
-            Some(b) => u.manifest.to_compact_on(b),
-            None => u.manifest.to_compact(),
-        };
         self.store
-            .put_manifest(u.input_root, compact.as_bytes())
+            .put_manifest(&u.input_root, u.manifest.as_bytes())
             .context("storing the input manifest")?;
         self.done.manifest_secs += t.elapsed().as_secs_f64();
         let stored = self.store.put_for_test(
-            u.test_id,
+            &u.test_id,
             self.signer,
             &u.storage_key,
             u.hint.as_ref(),
@@ -406,10 +469,12 @@ impl<'s> StoreLoop<'s> {
             .collect();
         let t_remove = std::time::Instant::now();
         let mut dropped = BTreeSet::new();
-        let superseded = remove_superseded(self.store, u.test_id, doomed, &mut dropped);
+        let mut warnings = Vec::new();
+        let superseded =
+            remove_superseded(self.store, &u.test_id, doomed, &mut dropped, &mut warnings);
         self.done.remove_secs += t_remove.elapsed().as_secs_f64();
         self.done.store_secs += t.elapsed().as_secs_f64();
-        Ok((stored, superseded, dropped))
+        Ok((stored, superseded, dropped, warnings))
     }
 
     /// End the batch, then report every unit in order. A deferred batch
@@ -421,6 +486,7 @@ impl<'s> StoreLoop<'s> {
             store,
             batch,
             slots,
+            held,
             mut done,
             say,
             owner,
@@ -439,9 +505,14 @@ impl<'s> StoreLoop<'s> {
             }
             _ => None,
         };
+        // Each pending unit's line, by slot.
+        let mut lines: Vec<Option<String>> = Vec::with_capacity(slots.len());
         for slot in slots {
             match slot {
-                Slot::Done(o) => done.outcomes.push(o),
+                Slot::Done(o) => {
+                    done.outcomes.push(o);
+                    lines.push(None);
+                }
                 Slot::Pending {
                     outcome,
                     line,
@@ -449,7 +520,7 @@ impl<'s> StoreLoop<'s> {
                     dropped,
                 } => match &failed {
                     None => {
-                        say(&line);
+                        lines.push(Some(line));
                         done.superseded += superseded;
                         done.dropped_roots.extend(dropped);
                         done.outcomes.push(outcome);
@@ -458,12 +529,12 @@ impl<'s> StoreLoop<'s> {
                         let label = outcome.test_id;
                         let msg = format!("{label}: storing the batch: {e}");
                         if store_unusable(e) {
-                            say(&format!(
+                            lines.push(Some(format!(
                                 "vci: not attesting {label}: signing or storing failed: storing the batch: {e}"
-                            ));
+                            )));
                             done.store_failures.push(msg);
                         } else {
-                            say(&format!("vci: error: not attesting {msg}"));
+                            lines.push(Some(format!("vci: error: not attesting {msg}")));
                             done.errors.push(msg);
                         }
                         done.attested -= 1;
@@ -476,6 +547,16 @@ impl<'s> StoreLoop<'s> {
                         ));
                     }
                 },
+            }
+        }
+        for h in held {
+            match h {
+                Held::Line(l) => say(&l),
+                Held::Unit(i) => {
+                    if let Some(l) = lines.get_mut(i).and_then(Option::take) {
+                        say(&l);
+                    }
+                }
             }
         }
         done
@@ -1114,17 +1195,14 @@ enum Verdict {
         a: Box<Attestable>,
         warnings: Vec<String>,
         signed: Result<Vec<u8>>,
-        /// The same signer's stored attestations of the unit it supersedes
-        /// (found in parallel; removed, one unit at a time, once it is
-        /// stored).
-        doomed: Vec<StoredEnvelope>,
     },
 }
 
 /// How many units [`run_units`] checks and signs at once after their tests
-/// ran: `$VCI_JOBS`, else the number of CPUs. Each mostly hashes inputs and
-/// waits for `ssh-keygen` or the Sigstore services; the store is written one
-/// unit at a time.
+/// ran: `$VCI_JOBS`, else the number of CPUs. Each mostly hashes inputs; a
+/// key file signs in process (2.8), and only a key ssh-keygen must handle,
+/// or keyless signing, waits for another process or service. One writer
+/// thread stores the units, in order.
 fn check_jobs() -> usize {
     std::env::var("VCI_JOBS")
         .ok()
@@ -2125,7 +2203,8 @@ pub enum Signing<'a> {
 
 /// A resolved signer.
 enum Signer<'a> {
-    Ssh(keys::SigningKey),
+    /// The key, and it read once for every signature of the run.
+    Ssh(keys::SigningKey, vci_attest::SshSigner),
     Keyless(&'a KeylessSigner),
 }
 
@@ -2133,7 +2212,7 @@ impl Signer<'_> {
     /// The signer id in store keys.
     fn signer_id(&self) -> String {
         match self {
-            Signer::Ssh(k) => k.signer_id(),
+            Signer::Ssh(k, _) => k.signer_id(),
             Signer::Keyless(k) => k.signer_id(),
         }
     }
@@ -2142,7 +2221,8 @@ impl Signer<'_> {
     /// Sigstore bundle's material for a keyless signature).
     fn sign(&self, stmt: &Statement) -> Result<Vec<u8>> {
         match self {
-            Signer::Ssh(key) => sign_statement(stmt, &key.path)
+            Signer::Ssh(key, signer) => signer
+                .sign_statement(stmt)
                 .map(|env| env.to_json())
                 .with_context(|| format!("signing with {}", key.path)),
             Signer::Keyless(k) => k
@@ -2265,7 +2345,11 @@ pub fn run_units(
     let ttl = parse_duration(ttl_arg).context("--ttl")?;
     let ctx = Ctx::new(repo, root.clone(), config)?;
     let key = match signing {
-        Signing::Key(k) => Signer::Ssh(keys::discover(k, &root)?),
+        Signing::Key(k) => {
+            let key = keys::discover(k, &root)?;
+            let signer = vci_attest::SshSigner::load(&key.path);
+            Signer::Ssh(key, signer)
+        }
         Signing::Oidc(k) => Signer::Keyless(k),
     };
     let signer = key.signer_id();
@@ -2715,34 +2799,21 @@ pub fn run_units(
                     let t = std::time::Instant::now();
                     let signed = sign_predicate(&key, &a.predicate);
                     add(&tm_sign, t);
-                    let t = std::time::Instant::now();
-                    // Signing only, nothing is superseded.
-                    let doomed = if signed.is_ok() && mode == StoreMode::Write {
-                        superseded_by(
-                            store,
-                            &ctx.repo,
-                            &a.predicate,
-                            &a.manifest,
-                            &signer,
-                            &moved_on,
-                            &live_trees,
-                        )
-                    } else {
-                        Vec::new()
-                    };
-                    add(&tm_supersede, t);
+                    // What it supersedes is found when it is made ready to
+                    // store, while the writer stores the units before it.
                     Verdict::Attestable {
                         warnings,
                         signed,
                         a: Box::new(a),
-                        doomed,
                     }
                 }
             }
         };
-        // Every unit's verdict first, in parallel; then the manifest base
-        // (the entries all attestable units share, stored once: vci
-        // 2.1.8), then each unit stored and reported in order.
+        // Every unit's verdict first (checked and signed), in parallel; then
+        // the manifest base (the entries all signed units share, stored
+        // once: vci 2.1.8), which the units' manifests are encoded on, so
+        // nothing is stored before every unit is signed; then each unit
+        // stored and reported in order.
         let mut verdicts: Vec<Option<Verdict>> = (0..units.len()).map(|_| None).collect();
         in_order(&units, jobs, verdict, |i, v| verdicts[i] = Some(v));
         let t = std::time::Instant::now();
@@ -2769,36 +2840,69 @@ pub fn run_units(
                 t,
             );
         }
-        // Each unit stored and reported in order, inside one write batch.
-        let mut say = |l: &str| eprintln!("{l}");
-        let mut stores = StoreLoop::new(store, mode, &signer, Owner::of(project), &mut say);
-        for (i, v) in verdicts.into_iter().enumerate() {
-            let Some(v) = v else { continue };
-            let label = &units[i].2;
-            match v {
+        // Each unit made ready to store on the pool (what it supersedes
+        // found, its manifest encoded on its group's shared one) and handed
+        // in unit order to one writer
+        // thread, which stores it in the project's write batch (one
+        // transaction) as soon as it and every unit before it are ready,
+        // and reports it.
+        let verdicts: Vec<std::sync::Mutex<Option<Verdict>>> =
+            verdicts.into_iter().map(std::sync::Mutex::new).collect();
+        let indices: Vec<usize> = (0..units.len()).collect();
+        let prepare = |&i: &usize| -> Option<Job> {
+            let v = verdicts[i].lock().ok()?.take()?;
+            let label = units[i].2.clone();
+            Some(match v {
                 Verdict::Refused {
                     reason,
                     reasons,
                     taints,
-                } => stores.refuse(label, reason, reasons, taints),
+                } => Job::Refused {
+                    label,
+                    reason,
+                    reasons,
+                    taints,
+                },
                 Verdict::Attestable {
                     a,
                     warnings,
                     signed,
-                    doomed,
                 } => {
-                    for w in &warnings {
-                        eprintln!("{w}");
-                    }
+                    let t = std::time::Instant::now();
+                    // The same signer's stored attestations of the unit it
+                    // supersedes, removed once it is stored; signing only,
+                    // nothing is superseded, nothing is superseded.
+                    let doomed = if signed.is_ok() && mode == StoreMode::Write {
+                        superseded_by(
+                            store,
+                            &ctx.repo,
+                            &a.predicate,
+                            &a.manifest,
+                            &signer,
+                            &moved_on,
+                            &live_trees,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    add(&tm_supersede, t);
                     let p = &a.predicate;
-                    match signed {
-                        Err(e) => stores.failed(label, &e),
-                        Ok(envelope) => stores.attest(ToStore {
+                    let unit = match signed {
+                        Err(e) => Err((label, e)),
+                        Ok(envelope) => Ok(ToStore {
+                            manifest: match mode {
+                                StoreMode::SignOnly => String::new(),
+                                StoreMode::Write => {
+                                    match manifest_bases.get(&group_key(units[i].0)) {
+                                        Some(b) => a.manifest.to_compact_on(b),
+                                        None => a.manifest.to_compact(),
+                                    }
+                                }
+                            },
+                            entries: a.manifest.entries.len(),
                             label,
-                            test_id: &p.core.test_id,
-                            input_root: &p.core.input_root,
-                            manifest: &a.manifest,
-                            base: manifest_bases.get(&group_key(units[i].0)),
+                            test_id: p.core.test_id.clone(),
+                            input_root: p.core.input_root.clone(),
                             storage_key: storage_key(p),
                             hint: crate::util::parse_rfc3339(&p.core.issued_at).ok().map(
                                 |issued| KeyHint {
@@ -2812,13 +2916,34 @@ pub fn run_units(
                             ),
                             envelope,
                             doomed,
-                            waived: &p.waived,
+                            waived: p.waived.clone(),
                         }),
-                    }
+                    };
+                    Job::Attestable { warnings, unit }
                 }
-            }
-        }
-        let done = stores.finish();
+            })
+        };
+        let (signer_id, owner) = (signer.as_str(), Owner::of(project));
+        let done = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let writer = scope.spawn(move || {
+                let mut say = |l: &str| eprintln!("{l}");
+                let mut stores = StoreLoop::new(store, mode, signer_id, owner, &mut say);
+                for job in rx {
+                    stores.apply(job);
+                }
+                stores.finish()
+            });
+            in_order(&indices, jobs, prepare, |_, job| {
+                if let Some(job) = job {
+                    let _ = tx.send(job);
+                }
+            });
+            drop(tx);
+            writer
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+        });
         attested += done.attested;
         refused += done.refused;
         superseded += done.superseded;
@@ -2840,7 +2965,7 @@ pub fn run_units(
                 f.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
             };
             vci_core::timing_line!(
-                "{}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}, find superseded {:.1}; store and remove superseded (one at a time) {:.1} (manifests {:.1}, removals {:.1})",
+                "{}: thread-seconds: check (capture inputs, tree, taints) {:.1}, warnings {:.1}, sign {:.1}, find superseded {:.1}; store and remove superseded (one writer thread, one batch) {:.1} (manifests {:.1}, removals {:.1})",
                 project.label(),
                 g(&tm_check),
                 g(&tm_warn),
@@ -3099,14 +3224,15 @@ fn superseded_by(
 }
 
 /// Delete what [`superseded_by`] found, once the new attestation is stored.
-/// Failing to delete is only a warning: a kept attestation is verified like
-/// any other. Returns how many were deleted, and adds the input roots they
-/// referenced to `dropped_roots`.
+/// Failing to delete is only a warning (added to `warnings`): a kept
+/// attestation is verified like any other. Returns how many were deleted,
+/// and adds the input roots they referenced to `dropped_roots`.
 fn remove_superseded(
     store: &dyn AttestationStore,
     test_id: &str,
     doomed: Vec<StoredEnvelope>,
     dropped_roots: &mut BTreeSet<String>,
+    warnings: &mut Vec<String>,
 ) -> usize {
     if doomed.is_empty() {
         return 0;
@@ -3121,7 +3247,9 @@ fn remove_superseded(
             removed.len()
         }
         Err(e) => {
-            eprintln!("vci: warning: {test_id}: cannot remove superseded attestations: {e}");
+            warnings.push(format!(
+                "vci: warning: {test_id}: cannot remove superseded attestations: {e}"
+            ));
             0
         }
     }
@@ -4037,13 +4165,13 @@ mod tests {
         c.to_string().repeat(64)
     }
 
-    fn unit<'a>(label: &'a str, manifest: &'a InputManifest, root: &'a str) -> ToStore<'a> {
+    fn unit(label: &str, manifest: &InputManifest, root: &str) -> ToStore {
         ToStore {
-            label,
-            test_id: label,
-            input_root: root,
-            manifest,
-            base: None,
+            label: label.to_owned(),
+            test_id: label.to_owned(),
+            input_root: root.to_owned(),
+            entries: manifest.entries.len(),
+            manifest: manifest.to_compact(),
             storage_key: "abcd".to_owned(),
             hint: Some(KeyHint {
                 issued: 7,
@@ -4051,7 +4179,7 @@ mod tests {
             }),
             envelope: format!("{{\"unit\":\"{label}\"}}").into_bytes(),
             doomed: vec![],
-            waived: &[],
+            waived: vec![],
         }
     }
 
@@ -4072,7 +4200,8 @@ mod tests {
     }
 
     /// With a deferred batch, nothing is reported before the batch
-    /// finishes; then every stored unit is, in order, with what it
+    /// finishes; then every unit is, in unit order (warnings, refusals and
+    /// stored units alike, as an immediate batch says them), with what it
     /// superseded, and the refusals keep their place in the outcomes.
     #[test]
     fn a_deferred_batch_reports_in_order_once_it_finishes() {
@@ -4092,27 +4221,29 @@ mod tests {
             vec!["result failed".into()],
             vec![],
         );
-        sl.attest(unit("src/c.test.ts", &m, &rc));
-        // Not stored yet, so not reported yet; the refusal is.
+        sl.apply(Job::Attestable {
+            warnings: vec!["vci: warning: src/c.test.ts: w".into()],
+            unit: Ok(unit("src/c.test.ts", &m, &rc)),
+        });
+        // Not stored yet, so nothing is reported yet.
         assert_eq!(s.keys(), std::slice::from_ref(&old.key));
-        assert_eq!(
-            said.lines(),
-            ["vci: not attesting src/b.test.ts: result failed"]
-        );
+        assert!(said.lines().is_empty(), "{:?}", said.lines());
         let done = sl.finish();
         assert_eq!((done.attested, done.refused, done.superseded), (2, 1, 1));
         assert!(done.errors.is_empty());
         let lines = said.lines();
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[1], "vci: not attesting src/b.test.ts: result failed");
+        assert_eq!(lines[2], "vci: warning: src/c.test.ts: w");
         assert!(
-            lines[1].starts_with(&format!(
+            lines[0].starts_with(&format!(
                 "vci: attested src/a.test.ts (0 inputs, root {}) as memory path:src/a.test.ts vci:attestation:",
                 &ra[..16]
             )),
             "{lines:?}"
         );
         assert!(
-            lines[2].starts_with("vci: attested src/c.test.ts "),
+            lines[3].starts_with("vci: attested src/c.test.ts "),
             "{lines:?}"
         );
         let ids: Vec<(&str, bool)> = done
