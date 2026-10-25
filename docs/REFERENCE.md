@@ -1477,8 +1477,27 @@ manifest, and one it prunes makes every unit whose attestation references it run
 `attestation` list is not used either: vci attestations are content-addressed by unit and inputs, not tied to a
 commit, so they survive rebases and apply on every branch.
 
-**Exchange.** Metadata lives locally in git-meta's SQLite store (`.git/git-meta.sqlite`, written by `vci run`; your
-index, `HEAD` and work tree are never touched) and is exchanged on the remote's `refs/meta/main`:
+**One store per repository.** Since 2.7.33 the store is `<common git dir>/git-meta.sqlite`: in the main worktree (and
+any clone without linked worktrees) `.git/git-meta.sqlite`, the path it always was, and a linked worktree (`git
+worktree add`) uses that same file instead of one of its own in `.git/worktrees/<name>/`, as it already shared the
+`refs/meta/*` refs. (vci opens git-meta's session on the common git directory, so git-meta's own files, such as its
+history-index checkpoint, are the shared ones too; the stock `git meta` CLI run in a linked worktree still uses that
+worktree's own file.) What `vci run` stores in one worktree is read by `vci plan` in every other at once, with nothing
+pushed or fetched (the attestations are signed and every plan re-hashes its inputs, so this is as safe as reading a
+fetched one), one `vci fetch` serves them all, and `vci push` from any of them publishes everything stored. The lock
+taken while git-meta opens the store (`git-meta.sqlite.vci-lock`) sits next to it, and fetches and pushes take the
+repository's exchange lock (`git-meta.vci-exchange.lock`) as before. A linked worktree's own store left by an earlier
+vci (`.git/worktrees/<name>/git-meta.sqlite`) is handled by the first vci command run there: when the repository has
+no shared store yet, it becomes the shared one (moved, under the exchange lock, when no process has it open; vci then
+prints `vci: note: moved this worktree's git-meta store ...`); when it is in use, or a shared store exists already,
+it is left where it is, unused and never deleted, and vci prints once `vci: note: <path> is no longer used: every
+worktree of this repository now shares the git-meta store <path>; the old file (with its -wal and -shm files) can be
+deleted`. Attestations only that old file held (made in that worktree and never pushed) are not read any more; `vci
+run` makes them again. A shared store made anew gets what `refs/meta/local/main` holds the way any new store does
+(see "A store that does not match the shared metadata ref" below).
+
+**Exchange.** Metadata lives locally in git-meta's SQLite store (`.git/git-meta.sqlite`, one per repository, written
+by `vci run`; your index, `HEAD` and work tree are never touched) and is exchanged on the remote's `refs/meta/main`:
 
 - `vci fetch` fetches `refs/meta/main` into `refs/meta/remotes/main`, serializes local values and materializes the
   remote's (git-meta's merge) into the store, like `git meta pull`. Since 2.0 it downloads keys, not values: `git
@@ -1544,8 +1563,8 @@ concurrent runs in one clone wait for each other instead of failing on ref locks
 
 - **A store that does not match the shared metadata ref.** git-meta serializes its SQLite store as a commit on top of
   `refs/meta/local/main`, and that commit is what gets pushed. A store that lacks values the ref holds (a new, deleted
-  or emptied `.git/git-meta.sqlite`; a **linked worktree**, which has its own store while the refs are shared; a ref
-  fetched by hand) would publish their deletion. vci first copies into the store every value of the ref it has no row
+  or emptied `.git/git-meta.sqlite`; before 2.7.33 a **linked worktree**, which had its own store while the refs are
+  shared; a ref fetched by hand) would publish their deletion. vci first copies into the store every value of the ref it has no row
   and no deletion record for (and the ref's deletion records that are newer than the store's row), printing
   `note: restored N entries`. `vci run`, `vci fetch` and `vci push` work in any worktree;
 - **a serialization or push that would drop someone's values.** If serializing would drop a value without a deletion
@@ -2999,11 +3018,11 @@ word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
   the signature; a manifest repeats each external crate's full source string. Attestations already published keep
   their inline manifest until the unit is re-attested (or `vci prune --superseded` and `vci push --rewrite-history`
   shed them).
-- git-meta keeps its store per git directory: in a linked worktree (`git worktree add`), `vci run` writes the
-  worktree's own `.git/worktrees/<name>/git-meta.sqlite`, while the `refs/meta/*` refs are shared by all worktrees.
-  `vci fetch`/`vci push` copy what the shared ref holds into the worktree's store first (see "What `vci fetch` and
-  `vci push` guard against"), so pushing from any worktree publishes the union. Attestations made in one worktree
-  are visible in another only after a `vci fetch` (or `vci push`) there.
+- git-meta keeps its store per git directory; before 2.7.33 a linked worktree (`git worktree add`) therefore had its
+  own `.git/worktrees/<name>/git-meta.sqlite`, each a full copy of the metadata paying its own fetch and merge (one
+  laptop had 145 of them). Since 2.7.33 vci opens it on the common git directory, so all worktrees share one store
+  (see "One store per repository"); the stock `git meta` CLI run in a linked worktree still uses that worktree's own
+  file, which vci does not read.
 - git-meta's auto-prune and filter rules are shared settings any metadata writer can change (see above): vci warns,
   but cannot stop another client's `git meta push` from pruning attestations (their units then run until re-attested).
   A manual `git meta prune` rewrites only the serialized tree; while the store still holds the values, the next `vci

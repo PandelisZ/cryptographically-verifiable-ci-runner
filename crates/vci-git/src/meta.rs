@@ -47,10 +47,15 @@
 //! commit on the remote tip, retrying when the remote moved. A plain
 //! `git meta pull` / `git meta push` works on the same refs and store.
 //!
+//! The store is one per repository (2.7.33): `<common git dir>/git-meta.sqlite`,
+//! shared by the main worktree and every linked one, as the refs are; a
+//! linked worktree's session is opened on the common git directory (see
+//! [`AttestStore::store_path`]).
+//!
 //! git-meta serializes the local SQLite store as a commit on top of
 //! `refs/<ns>/local/main`, so a store that lacks keys that ref holds (a new
-//! or emptied `.git/git-meta.sqlite`, a linked worktree, whose store is its
-//! own while the refs are shared) would publish their deletion. vci therefore
+//! or emptied `.git/git-meta.sqlite`, or before 2.7.33 a linked worktree's
+//! own store) would publish their deletion. vci therefore
 //! first copies into the store whatever that ref holds and the store has no
 //! row or deletion record for, refuses any serialization or push that would
 //! drop a key without a deletion record, ignores tree entries git-meta cannot
@@ -177,6 +182,40 @@ fn fetch_jobs() -> usize {
 /// itself). `skipFetchAll`/`skipDefaultUpdate` keep `git fetch --all` and
 /// `git remote update` away from it.
 pub const NO_LAZY_FETCH_REMOTE: &str = "vci-no-lazy-fetch";
+/// git-meta's store, in the common git directory (see
+/// [`AttestStore::store_path`]).
+const STORE_FILE: &str = "git-meta.sqlite";
+/// The lock vci holds while it opens a git-meta session (next to the store).
+const SESSION_LOCK: &str = "git-meta.sqlite.vci-lock";
+/// The lock serializing a repository's fetches and pushes.
+const EXCHANGE_LOCK: &str = "git-meta.vci-exchange.lock";
+/// The files recording the tip each tracking ref last materialized.
+const MATERIALIZED_PREFIX: &str = "vci-materialized-";
+/// git-meta's history-index checkpoint (its `index_state`), in the git
+/// directory of the repository a session opens.
+const INDEX_STATE_FILE: &str = "git-meta-index.json";
+
+/// Print a note about where the store lives (once per process), and keep
+/// it for [`store_notes`].
+fn store_note(note: String) {
+    let Ok(mut notes) = STORE_NOTES.lock() else {
+        return;
+    };
+    if !notes.contains(&note) {
+        eprintln!("vci: note: {note}");
+        notes.push(note);
+    }
+}
+
+static STORE_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The notes this process printed about a linked worktree's store left by
+/// a vci before 2.7.33 (for tests).
+#[doc(hidden)]
+pub fn store_notes() -> Vec<String> {
+    STORE_NOTES.lock().map(|n| n.clone()).unwrap_or_default()
+}
+
 /// How a value not fetched yet reads (a promised row).
 const NOT_FETCHED: &str = "value not fetched: run `vci fetch` online (a git-meta promised entry; its blob is not in this clone yet)";
 
@@ -1295,7 +1334,168 @@ impl<'a> AttestStore<'a> {
     }
 
     fn db_path(&self) -> Result<Utf8PathBuf, GitError> {
-        Ok(self.repo.git_dir()?.join("git-meta.sqlite"))
+        self.store_path()
+    }
+
+    /// The repository's git-meta store, `<common git dir>/git-meta.sqlite`
+    /// (2.7.33): one per repository, shared by the main worktree and every
+    /// linked one (`git worktree add`), as the metadata refs are. In the
+    /// main worktree (or a clone without linked worktrees) that is
+    /// `.git/git-meta.sqlite`, the path it always was. A linked worktree's
+    /// own store left by an earlier vci (`.git/worktrees/<name>/
+    /// git-meta.sqlite`) becomes the shared one when there is none yet and
+    /// no process has it open, else it is left alone, unused, and a note
+    /// says so once.
+    pub fn store_path(&self) -> Result<Utf8PathBuf, GitError> {
+        Ok(self.store_dir()?.join(STORE_FILE))
+    }
+
+    /// The directory of the store and of vci's files beside it (its lock
+    /// files and materialization markers): the common git directory.
+    fn store_dir(&self) -> Result<Utf8PathBuf, GitError> {
+        let Some(common) = self.repo.linked_common() else {
+            return self.repo.git_dir();
+        };
+        self.leave_worktree_store(&common);
+        Ok(common)
+    }
+
+    /// In a linked worktree, what to do with its own store left by a vci
+    /// before 2.7.33 (see [`AttestStore::store_path`]). Never fails: the
+    /// shared store is used whatever happens here.
+    fn leave_worktree_store(&self, common: &Utf8Path) {
+        let Ok(own) = self.repo.git_dir() else {
+            return;
+        };
+        let old = own.join(STORE_FILE);
+        // The usual case: no store of its own (any more).
+        if !std::fs::metadata(&old).is_ok_and(|m| m.len() > 0) {
+            return;
+        }
+        let new = common.join(STORE_FILE);
+        // One attempt per process and worktree to take it over: a
+        // process holding the exchange lock never waits on it again.
+        static TRIED: std::sync::Mutex<BTreeSet<Utf8PathBuf>> =
+            std::sync::Mutex::new(BTreeSet::new());
+        let first = TRIED
+            .lock()
+            .map(|mut t| t.insert(own.clone()))
+            .unwrap_or(false);
+        if first && !new.exists() {
+            match self.adopt_worktree_store(&own, common) {
+                Ok(true) => {
+                    store_note(format!(
+                        "moved this worktree's git-meta store {old} to {new}: every worktree of this repository now shares that one"
+                    ));
+                    return;
+                }
+                // In use (a vci before 2.7.33 in this worktree), or it
+                // could not be moved: the shared store is made anew,
+                // and the restore from refs/meta/local/main fills it.
+                Ok(false) | Err(_) => return,
+            }
+        }
+        if !new.exists() {
+            return;
+        }
+        let marker = own.join(format!("{STORE_FILE}.vci-unused"));
+        if marker.exists() {
+            return;
+        }
+        let note = format!(
+            "{old} is no longer used: every worktree of this repository now shares the git-meta store {new}; the old file (with its -wal and -shm files) can be deleted"
+        );
+        let _ = std::fs::write(&marker, format!("{note}\n"));
+        store_note(note);
+    }
+
+    /// Move a linked worktree's own store (`own/git-meta.sqlite`) to the
+    /// common git directory, under the exchange lock and both stores'
+    /// session locks, when no shared store exists and no connection has the
+    /// old one open. `Ok(false)` when it was left where it is.
+    fn adopt_worktree_store(&self, own: &Utf8Path, common: &Utf8Path) -> Result<bool, GitError> {
+        let old = own.join(STORE_FILE);
+        let new = common.join(STORE_FILE);
+        let _exchange = self.lock_file(common.join(EXCHANGE_LOCK))?;
+        let _shared = self.lock_file(common.join(SESSION_LOCK))?;
+        let _own = self.lock_file(own.join(SESSION_LOCK))?;
+        if new.exists() {
+            return Ok(false);
+        }
+        {
+            // Exclusive locking from the first access: SQLite takes an
+            // exclusive lock on the file, which it cannot while any other
+            // connection has it open (a WAL connection holds a shared lock
+            // from open to close); then everything in the -wal file is
+            // written back, so the database file alone is the store.
+            use rusqlite::OpenFlags;
+            let db = rusqlite::Connection::open_with_flags(
+                &old,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|e| sql_err(&old, e))?;
+            db.busy_timeout(Duration::ZERO)
+                .map_err(|e| sql_err(&old, e))?;
+            let held = db
+                .query_row("PRAGMA locking_mode = EXCLUSIVE", [], |_| Ok(()))
+                .and_then(|()| db.execute_batch("BEGIN EXCLUSIVE; COMMIT;"))
+                .and_then(|()| {
+                    db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                });
+            if !matches!(held, Ok(0)) {
+                return Ok(false);
+            }
+        }
+        let wal = own.join(format!("{STORE_FILE}-wal"));
+        if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+            return Ok(false);
+        }
+        // Never over a store that appeared after all (a `git meta` command
+        // takes no vci lock): a hard link fails when the name exists.
+        match std::fs::hard_link(&old, &new) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&old);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(_) => {
+                if new.exists() {
+                    return Ok(false);
+                }
+                std::fs::rename(&old, &new)
+                    .map_err(|e| GitError::Store(format!("cannot move {old} to {new}: {e}")))?;
+            }
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(own.join(format!("{STORE_FILE}{suffix}")));
+        }
+        // What describes the moved store moves with it: the tips it
+        // materialized (any marker of another store is stale now), and
+        // git-meta's history-index checkpoint.
+        let markers = |dir: &Utf8Path| -> Vec<Utf8PathBuf> {
+            dir.read_dir_utf8()
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .filter(|e| e.file_name().starts_with(MATERIALIZED_PREFIX))
+                        .map(|e| e.path().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for m in markers(common) {
+            let _ = std::fs::remove_file(m);
+        }
+        for m in markers(own) {
+            if let Some(name) = m.file_name() {
+                let _ = std::fs::rename(&m, common.join(name));
+            }
+        }
+        let index = own.join(INDEX_STATE_FILE);
+        if index.exists() && std::fs::hard_link(&index, common.join(INDEX_STATE_FILE)).is_ok() {
+            let _ = std::fs::remove_file(&index);
+        }
+        Ok(true)
     }
 
     fn lock_file(&self, path: Utf8PathBuf) -> Result<std::fs::File, GitError> {
@@ -1374,10 +1574,19 @@ impl<'a> AttestStore<'a> {
     /// ("duplicate column name"). vci processes take a lock file around the
     /// open, and retry in case another git-meta client migrated concurrently.
     fn session(&self) -> Result<Session, GitError> {
-        let _lock = self.lock_file(self.repo.git_dir()?.join("git-meta.sqlite.vci-lock"))?;
+        let dir = self.store_dir()?;
+        let _lock = self.lock_file(dir.join(SESSION_LOCK))?;
+        // git-meta keeps its store in the git directory of the repository
+        // it opens: a linked worktree's session is opened on the common one
+        // (2.7.33), so its store and git-meta's own files are the shared
+        // ones. The objects and refs it reads and writes are shared anyway.
+        let at = match self.repo.linked_common() {
+            Some(common) => common,
+            None => self.repo.root().to_owned(),
+        };
         let mut last = None;
         for attempt in 0..5u64 {
-            match Session::open(self.repo.root().as_std_path()) {
+            match Session::open(at.as_std_path()) {
                 Ok(s) => return Ok(s),
                 Err(e) => {
                     last = Some(e);
@@ -1392,12 +1601,9 @@ impl<'a> AttestStore<'a> {
     /// the metadata refs are shared), so two of them never race on
     /// `refs/<ns>/local/main` or the tracking ref.
     fn exchange_lock(&self) -> Result<std::fs::File, GitError> {
-        let common = self
-            .repo
-            .git()
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .run_str()?;
-        self.lock_file(Utf8PathBuf::from(common).join("git-meta.vci-exchange.lock"))
+        // The store directory is the common one; asked first, so that a
+        // worktree's old store is taken over before this lock is held.
+        self.lock_file(self.store_dir()?.join(EXCHANGE_LOCK))
     }
 
     /// A reader over the local store. When the repository has no git-meta
@@ -1407,7 +1613,7 @@ impl<'a> AttestStore<'a> {
     }
 
     /// Store `bytes` for `test_id` under the signer's key in the local
-    /// git-meta store (`.git/git-meta.sqlite`). Nothing is serialized or
+    /// git-meta store ([`AttestStore::store_path`]). Nothing is serialized or
     /// pushed; the user's index, HEAD and working tree are never touched.
     /// Storing identical bytes again is a no-op; different bytes under the
     /// same key replace the old envelope.
@@ -3598,16 +3804,15 @@ impl<'a> AttestStore<'a> {
 
     /// The local tracking ref of a metadata remote.
     /// The file recording the tip of `tracking` last materialized into this
-    /// repository's store (in the git directory, next to git-meta's store).
+    /// repository's store (in the common git directory, next to the store).
     fn materialized_marker(&self, tracking: &str) -> Result<Utf8PathBuf, GitError> {
         let name: String = tracking
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         Ok(self
-            .repo
-            .git_dir()?
-            .join(format!("vci-materialized-{name}")))
+            .store_dir()?
+            .join(format!("{MATERIALIZED_PREFIX}{name}")))
     }
 
     fn tracking_ref(&self, name: &str, ns: &str) -> Result<String, GitError> {
@@ -4004,8 +4209,7 @@ impl<'a> AttestStore<'a> {
 
     /// Make the store cover `refs/<ns>/local/main`: copy in every value of
     /// that ref the store has neither a row nor a deletion record for (a new,
-    /// emptied or replaced `.git/git-meta.sqlite`, or a linked worktree,
-    /// whose store is its own while the ref is shared), and apply the ref's
+    /// emptied or replaced `.git/git-meta.sqlite`), and apply the ref's
     /// deletion records that are newer than the store's row. Without this,
     /// git-meta's serialization (a commit on top of that ref, built from the
     /// store alone) would delete those values for everyone on the next push.
@@ -4999,7 +5203,7 @@ impl<'a> AttestStore<'a> {
         step("cover the local ref", t);
         if restored > 0 {
             report.note(format!(
-                "restored {restored} entr{} of {local_ref} into this repository's git-meta store, which did not hold them (a new or replaced .git/git-meta.sqlite, or a linked worktree)",
+                "restored {restored} entr{} of {local_ref} into this repository's git-meta store, which did not hold them (a new or replaced .git/git-meta.sqlite)",
                 if restored == 1 { "y" } else { "ies" }
             ));
         }
@@ -7365,7 +7569,7 @@ impl<'a> AttestStore<'a> {
             // being written; none at all means the object was never here.
             let loose = self
                 .repo
-                .git_dir()
+                .common_git_dir()
                 .map(|d| d.join("objects").join(&o[..2]).join(&o[2..]))
                 .ok()
                 .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()));
