@@ -43,12 +43,9 @@ pub(crate) fn hex_id(what: &'static str, s: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-pub(crate) fn is_signer_id(s: &str) -> bool {
-    signer_id(s).is_ok()
-}
-
+/// [`hex_id`] as a predicate (vci-store's, which every backend shares).
 pub(crate) fn is_hex_id(s: &str) -> bool {
-    hex_id("id", s).is_ok()
+    vci_store::key::is_hex_id(s)
 }
 
 /// A revision expression we are willing to hand to git: non-empty, not

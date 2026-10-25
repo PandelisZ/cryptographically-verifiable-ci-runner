@@ -22,6 +22,15 @@ vci-adapter = { version = "2.0.0", path = "../vci-adapter" }
 vci-attest = { version = "2.0.0", path = "../vci-attest" }
 vci-core = { version = "2.0.0", path = "../vci-core" }
 vci-git = { version = "2.0.0", path = "../vci-git" }
+vci-store = { version = "2.0.0", path = "../vci-store" }
+vci-store-postgres = { version = "2.0.0", path = "../vci-store-postgres", optional = true }
+vci-store-sqlite = { version = "2.0.0", path = "../vci-store-sqlite", optional = true }
+
+[features]
+default = ["sqlite", "postgres"]
+# The attestation store backends this vci is built with (git-meta always).
+sqlite = ["dep:vci-store-sqlite"]
+postgres = ["dep:vci-store-postgres"]
 
 [[bin]]
 name = "vci"
@@ -32,3 +41,6 @@ assert_cmd = "2.2.2"
 git-meta-lib = { version = "=0.1.13", features = ["internal"] }
 predicates = "3.1.4"
 tempfile = "3.27.0"
+# Step D's CLI tests start PostgreSQL through its testkit, also in a build
+# without the `postgres` feature.
+vci-store-postgres = { version = "2.0.0", path = "../vci-store-postgres" }

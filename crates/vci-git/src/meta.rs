@@ -106,11 +106,15 @@ use crate::cmd::{IDENTITY, command_error};
 use crate::repo::{Repo, is_oid, parse_oid};
 use crate::validate;
 
-/// Key namespace of every vci attestation.
-pub const KEY_PREFIX: &str = "vci:attestation";
-/// Key namespace of the stored input manifests (`vci:manifest:<root>`, on
-/// the `project` target).
-pub const MANIFEST_PREFIX: &str = "vci:manifest";
+// The key format, the records and the exchange outcomes live in vci-store
+// (every backend shares them); re-exported here so every import path still
+// compiles.
+pub use vci_store::{
+    FetchOutcome, Hydration, KEY_PREFIX, KeyHint, MANIFEST_PREFIX, NOT_FETCHED, PushOutcome,
+    PushStatus, StoredEnvelope, StoredManifest, attestation_key, attestation_key_hinted,
+    manifest_key, parse_key, parse_key_hint, parse_manifest_key,
+};
+
 /// The project-local file naming the recommended metadata remote
 /// (`url: <url>`), as read by `git meta setup`.
 pub const SETUP_FILE: &str = ".git-meta";
@@ -177,104 +181,11 @@ fn fetch_jobs() -> usize {
 /// itself). `skipFetchAll`/`skipDefaultUpdate` keep `git fetch --all` and
 /// `git remote update` away from it.
 pub const NO_LAZY_FETCH_REMOTE: &str = "vci-no-lazy-fetch";
-/// How a value not fetched yet reads (a promised row).
-const NOT_FETCHED: &str = "value not fetched: run `vci fetch` online (a git-meta promised entry; its blob is not in this clone yet)";
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// What [`AttestStore::hydrate_units`] and its siblings did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Hydration {
-    /// Values that had not been fetched and now are readable.
-    pub resolved: usize,
-    /// Values asked for that are still not fetched (the fetch failed, or the
-    /// local metadata commit does not hold them).
-    pub unresolved: usize,
-    /// Blobs downloaded.
-    pub fetched: usize,
-    /// Why some values could not be fetched.
-    pub error: Option<String>,
-}
-
-impl Hydration {
-    /// This hydration and `o` together (the first error kept).
-    pub fn add(&mut self, o: Hydration) {
-        self.resolved += o.resolved;
-        self.unresolved += o.unresolved;
-        self.fetched += o.fetched;
-        if self.error.is_none() {
-            self.error = o.error;
-        }
-    }
-}
-
-/// An envelope read back from storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredEnvelope {
-    /// git-meta target, as `git meta get` takes it: `path:<p>` or `project`.
-    pub target: String,
-    /// Full git-meta key.
-    pub key: String,
-    /// BLAKE3 of the test id.
-    pub test_key: String,
-    /// 16 hex characters naming the signing key (a hint; unverified).
-    pub signer: String,
-    /// Storage key (see the module docs).
-    pub storage_key: String,
-    /// When the key says the attestation was issued (seconds since the
-    /// epoch; vci 2.2 keys), read without the value.
-    pub issued: Option<i64>,
-    /// The first 16 hex digits of the tree the key says it was made on.
-    pub tree: Option<String>,
-    /// The stored bytes, exactly as passed to `put` (empty when `error` is
-    /// set).
-    pub bytes: Vec<u8>,
-    /// Why the value could not be read (a blob missing from the object
-    /// database, a value not fetched yet). Such an entry is never valid; it
-    /// is listed so that only its own unit loses it.
-    pub error: Option<String>,
-}
-
-impl StoredEnvelope {
-    /// Mark the value as not read (a plan reads only the candidates it
-    /// checks first, and fetches the rest for the units it could not skip).
-    pub fn mark_not_fetched(&mut self) {
-        self.bytes = Vec::new();
-        self.error = Some(NOT_FETCHED.to_owned());
-    }
-
-    /// Whether the value is unread only because it has not been fetched
-    /// yet (a git-meta promised entry, see the module docs).
-    pub fn not_fetched(&self) -> bool {
-        self.error.as_deref() == Some(NOT_FETCHED)
-    }
-}
-
-/// An input manifest read back from storage (see the module docs).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredManifest {
-    /// The input root it is stored under (a hint until the manifest's own
-    /// root is recomputed).
-    pub root: String,
-    /// Full git-meta key (`vci:manifest:<root>`, target `project`).
-    pub key: String,
-    /// The stored bytes (empty when `error` is set).
-    pub bytes: Vec<u8>,
-    /// Why the value could not be read.
-    pub error: Option<String>,
-}
-
-impl StoredManifest {
-    /// Whether the value is unread only because it has not been fetched
-    /// yet ([`StoredEnvelope::not_fetched`]).
-    pub fn not_fetched(&self) -> bool {
-        self.error.as_deref() == Some(NOT_FETCHED)
-    }
 }
 
 /// What the hydrations of one exchange share (see
@@ -287,45 +198,6 @@ struct HydrateCtx {
     /// The local metadata tree's keys and blobs, listed by the first round
     /// that fetches anything.
     snap: Option<KeySnapshot>,
-}
-
-/// What [`AttestStore::fetch`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FetchOutcome {
-    /// The metadata remote used.
-    pub remote: String,
-    /// False when the remote has no `refs/<ns>/main` yet.
-    pub found: bool,
-    /// Problems worth a warning (values dropped by the remote without a
-    /// deletion record, shared auto-prune or filter settings, entries
-    /// ignored because git-meta cannot read them).
-    pub warnings: Vec<String>,
-    /// What vci repaired on the way (values restored into a store that did
-    /// not match the local metadata ref).
-    pub notes: Vec<String>,
-}
-
-/// How [`AttestStore::push`] ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PushStatus {
-    /// The remote's `refs/<ns>/main` now holds the local metadata commit.
-    Pushed,
-    /// The remote already held everything stored locally; nothing was sent.
-    UpToDate,
-    /// Nothing is stored locally; nothing was sent.
-    NothingStored,
-}
-
-/// What [`AttestStore::push`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushOutcome {
-    /// The metadata remote used.
-    pub remote: String,
-    pub status: PushStatus,
-    /// As for [`FetchOutcome::warnings`].
-    pub warnings: Vec<String>,
-    /// As for [`FetchOutcome::notes`].
-    pub notes: Vec<String>,
 }
 
 /// Attestation store backed by git-meta in a repository.
@@ -380,110 +252,26 @@ pub fn target_label(t: &Target) -> String {
     t.to_string()
 }
 
-/// The key an attestation is stored under (without a hint, as before 2.2).
-pub fn attestation_key(test_key: &str, signer: &str, storage_key: &str) -> String {
-    format!("{KEY_PREFIX}:{test_key}:{signer}:{storage_key}")
-}
-
-/// What a key says about its attestation without the value (vci 2.2): when
-/// it was issued and, when known, the git tree it was made on. A plan
-/// chooses which candidates to download from this; before, it downloaded
-/// every candidate of every unit to find the newest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyHint {
-    /// `issuedAt`, seconds since the epoch.
-    pub issued: i64,
-    /// The first 16 hex digits of the tree the attestation records.
-    pub tree: Option<String>,
-}
-
-/// The key an attestation is stored under, with its hint:
-/// `vci:attestation:<test key>:<signer>:<storage key>:<issued hex>.<tree16 | ->`.
-pub fn attestation_key_hinted(
-    test_key: &str,
-    signer: &str,
-    storage_key: &str,
-    hint: &KeyHint,
-) -> String {
-    let tree = hint
-        .tree
-        .as_deref()
-        .map(|t| t.chars().take(16).collect::<String>())
-        .filter(|t| t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit()))
-        .unwrap_or_else(|| "-".to_owned());
-    format!(
-        "{KEY_PREFIX}:{test_key}:{signer}:{storage_key}:{:x}.{tree}",
-        hint.issued.max(0)
-    )
-}
-
-fn parse_hint(part: &str) -> Option<KeyHint> {
-    let (issued, tree) = part.split_once('.')?;
-    if issued.is_empty() || issued.len() > 16 || !issued.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let issued = i64::from_str_radix(issued, 16).ok()?;
-    let tree = match tree {
-        "-" => None,
-        t if t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit()) => Some(t.to_owned()),
-        _ => return None,
-    };
-    Some(KeyHint { issued, tree })
-}
-
-/// The hint a key carries, if any (keys written before 2.2 carry none).
-pub fn parse_key_hint(key: &str) -> Option<KeyHint> {
-    let rest = key.strip_prefix(KEY_PREFIX)?.strip_prefix(':')?;
-    let parts: Vec<&str> = rest.split(':').collect();
-    if parts.len() == 4 {
-        parse_hint(parts[3])
-    } else {
-        None
-    }
-}
-
-/// The key the input manifest with this root is stored under (target
-/// `project`).
-pub fn manifest_key(root: &str) -> String {
-    format!("{MANIFEST_PREFIX}:{root}")
-}
-
-/// The input root a manifest key names, if it has vci's shape.
-pub fn parse_manifest_key(key: &str) -> Option<&str> {
-    let root = key.strip_prefix(MANIFEST_PREFIX)?.strip_prefix(':')?;
-    validate::is_hex_id(root).then_some(root)
-}
-
 /// Decode a stored input manifest's bytes, reading the base manifest it
 /// lists its entries on top of (vci 2.1.8) from the store through
 /// `reader`. The bytes carry no trust: the caller compares the result's
 /// root with the signed input root.
 pub fn decode_manifest(reader: &Reader, bytes: &[u8]) -> Result<vci_core::InputManifest, String> {
-    vci_core::InputManifest::from_compact_with(bytes, |base| match reader.manifest(base) {
-        Ok(Some(b)) if b.error.is_none() => Ok(b.bytes),
-        Ok(Some(b)) => Err(vci_core::ManifestError::Compact(format!(
-            "base manifest {base} unreadable: {}",
-            b.error.unwrap_or_default()
-        ))),
-        Ok(None) => Err(vci_core::ManifestError::MissingBase(base.to_owned())),
-        Err(e) => Err(vci_core::ManifestError::Compact(format!(
-            "base manifest {base}: {e}"
-        ))),
+    vci_store::decode_manifest(bytes, |base| {
+        reader
+            .manifest(base)
+            .map_err(vci_store::StoreError::backend)
     })
-    .map_err(|e| e.to_string())
 }
 
 /// The `manifestRef` of a stored DSSE envelope's vci predicate (unverified:
-/// only which stored manifest it names), if it has one.
+/// only which stored manifest it names), if it has one
+/// ([`vci_store::key::envelope_manifest_ref`]'s `Root`).
 fn envelope_manifest_ref(bytes: &[u8]) -> Option<String> {
-    use base64::Engine as _;
-    let env: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(env["payload"].as_str()?)
-        .ok()?;
-    let st: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    let r = st["predicate"]["manifestRef"].as_str()?;
-    validate::is_hex_id(r).then(|| r.to_owned())
+    match vci_store::key::envelope_manifest_ref(bytes) {
+        vci_store::ManifestRef::Root(r) => Some(r),
+        _ => None,
+    }
 }
 
 /// The id of the blob git-meta writes for deletion record `t`, in the hash
@@ -497,23 +285,6 @@ fn tombstone_blob_id(t: &Tombstone, like: &str) -> Option<String> {
     gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &bytes)
         .ok()
         .map(|id| id.to_string())
-}
-
-/// Split a key into (test key, signer, storage key) if it has vci's shape,
-/// with or without a hint (vci 2.2).
-pub fn parse_key(key: &str) -> Option<(&str, &str, &str)> {
-    let rest = key.strip_prefix(KEY_PREFIX)?.strip_prefix(':')?;
-    let mut parts = rest.split(':');
-    let (Some(tk), Some(signer), Some(sk)) = (parts.next(), parts.next(), parts.next()) else {
-        return None;
-    };
-    match (parts.next(), parts.next()) {
-        (None, _) => {}
-        (Some(h), None) if parse_hint(h).is_some() => {}
-        _ => return None,
-    }
-    (validate::is_hex_id(tk) && validate::is_signer_id(signer) && validate::is_hex_id(sk))
-        .then_some((tk, signer, sk))
 }
 
 fn meta_err(e: git_meta_lib::Error) -> GitError {
@@ -7951,55 +7722,6 @@ mod tests {
     }
 
     #[test]
-    fn hinted_keys_parse_and_plain_ones_still_do() {
-        let (tk, signer, sk) = ("ab".repeat(32), "0123456789abcdef", "cd".repeat(32));
-        let plain = attestation_key(&tk, signer, &sk);
-        assert_eq!(parse_key(&plain), Some((tk.as_str(), signer, sk.as_str())));
-        assert_eq!(parse_key_hint(&plain), None);
-        let hint = KeyHint {
-            issued: 1_792_430_181,
-            tree: Some("0123456789abcdef".to_owned()),
-        };
-        let k = attestation_key_hinted(&tk, signer, &sk, &hint);
-        assert!(k.ends_with(":6ad65065.0123456789abcdef"), "{k}");
-        assert_eq!(parse_key(&k), Some((tk.as_str(), signer, sk.as_str())));
-        assert_eq!(parse_key_hint(&k), Some(hint.clone()));
-        let no_tree = attestation_key_hinted(
-            &tk,
-            signer,
-            &sk,
-            &KeyHint {
-                issued: 7,
-                tree: None,
-            },
-        );
-        assert!(no_tree.ends_with(":7.-"), "{no_tree}");
-        assert_eq!(parse_key_hint(&no_tree).unwrap().tree, None);
-        // A 40-digit tree is cut to 16; a bad one reads as none.
-        let long = attestation_key_hinted(
-            &tk,
-            signer,
-            &sk,
-            &KeyHint {
-                issued: 1,
-                tree: Some("f".repeat(40)),
-            },
-        );
-        assert_eq!(
-            parse_key_hint(&long).unwrap().tree.as_deref(),
-            Some("ffffffffffffffff")
-        );
-        for bad in [
-            format!("{plain}:zz.-"),
-            format!("{plain}:1.abc"),
-            format!("{plain}:1.-:more"),
-            format!("{plain}:"),
-        ] {
-            assert_eq!(parse_key(&bad), None, "{bad}");
-        }
-    }
-
-    #[test]
     fn tombstone_blob_ids_are_git_metas() {
         let t = Tombstone {
             timestamp: 1792185565887,
@@ -8011,48 +7733,54 @@ mod tests {
         assert_eq!(tombstone_blob_id(&t, &"ab".repeat(32)), None);
     }
 
+    /// vci-store's `target_label` (every backend's `by.target`) is
+    /// git-meta's `Target` label for every unit.
     #[test]
-    fn manifest_refs_of_envelopes() {
-        use base64::Engine as _;
-        let b64 = |v: serde_json::Value| {
-            serde_json::json!({
-                "payloadType": "application/vnd.in-toto+json",
-                "payload": base64::engine::general_purpose::STANDARD.encode(v.to_string()),
-                "signatures": [],
-            })
-            .to_string()
-        };
-        let root = "ab".repeat(32);
-        let env = b64(serde_json::json!({"predicate": {"manifestRef": root}}));
-        assert_eq!(envelope_manifest_ref(env.as_bytes()), Some(root));
-        for bad in [
-            b64(serde_json::json!({"predicate": {"manifest": {}}})),
-            b64(serde_json::json!({"predicate": {"manifestRef": "../x"}})),
-            "not json".to_owned(),
+    fn target_label_parity() {
+        for id in [
+            ".",
+            "a",
+            "ab",
+            "abc",
+            "rs#lib",
+            "src/a.test.ts",
+            "/abs",
+            "a//b",
+            "a/./b",
+            "../x",
+            "a/../b",
+            "rust/core#test:it",
+            "x\0y",
         ] {
-            assert_eq!(envelope_manifest_ref(bad.as_bytes()), None, "{bad}");
+            assert_eq!(
+                vci_store::key::target_label(id),
+                target_label(&target_for(id)),
+                "{id:?}"
+            );
         }
     }
 
+    /// vci-store's argument checks word their errors as vci-git's do.
     #[test]
-    fn key_round_trip() {
-        let (tk, sk) = ("ab".repeat(32), "cd".repeat(32));
-        let k = attestation_key(&tk, "0123456789abcdef", &sk);
-        assert_eq!(k, format!("vci:attestation:{tk}:0123456789abcdef:{sk}"));
-        assert_eq!(
-            parse_key(&k),
-            Some((tk.as_str(), "0123456789abcdef", sk.as_str()))
-        );
-        for bad in [
-            "vci:attestation",
-            "vci:attestation:ab:0123456789abcdef",
-            "vci:attestation:ab:0123456789abcdef:cd:x",
-            "vci:attestation:AB:0123456789abcdef:cd",
-            "vci:attestation:ab:0123:cd",
-            "other:attestation:ab:0123456789abcdef:cd",
-        ] {
-            assert_eq!(parse_key(bad), None, "{bad}");
+    fn invalid_wording_parity() {
+        for s in ["XYZ", "0123456789ABCDEF", "0123456789abcdeg", ""] {
+            assert_eq!(
+                vci_store::key::check_signer(s).unwrap_err().to_string(),
+                validate::signer_id(s).unwrap_err().to_string(),
+                "{s:?}"
+            );
         }
+        for s in ["XYZ", "a", "AB", "a/b", &"a".repeat(129)] {
+            assert_eq!(
+                vci_store::key::check_hex("storage_key", s)
+                    .unwrap_err()
+                    .to_string(),
+                validate::hex_id("storage_key", s).unwrap_err().to_string(),
+                "{s:?}"
+            );
+        }
+        assert!(vci_store::key::check_signer("0123456789abcdef").is_ok());
+        assert!(vci_store::key::check_hex("input root", "ab").is_ok());
     }
 
     #[test]

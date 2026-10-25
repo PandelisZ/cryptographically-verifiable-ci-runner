@@ -1,0 +1,22 @@
+[package]
+name = "vci-store-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Exact pins, each published at least two weeks before 25 Oct 2026 (step A1
+# of the store plan). rustls builds with the `ring` provider only, so static
+# musl builds need nothing beyond musl-gcc (`cargo tree -i aws-lc-rs` is
+# empty).
+postgres = "=0.19.14"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1.0.151"
+tokio-postgres-rustls = "=0.13.0"
+vci-core = { version = "2.0.0", path = "../vci-core" }
+vci-store = { version = "2.0.0", path = "../vci-store" }
+webpki-roots = "=1.0.9"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+vci-store = { version = "2.0.0", path = "../vci-store", features = ["conformance"] }

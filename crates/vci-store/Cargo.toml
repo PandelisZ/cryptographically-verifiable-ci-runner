@@ -1,0 +1,20 @@
+[package]
+name = "vci-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+vci-core = { version = "2.0.0", path = "../vci-core" }
+
+[dev-dependencies]
+toml = "1.1.6"
+
+[features]
+# The backend-neutral conformance suite (src/conformance/scenarios.rs,
+# written in step D of PLAN.md). Backends enable it under
+# [dev-dependencies] only: vci-store = { path = "../vci-store", features = ["conformance"] }
+conformance = []

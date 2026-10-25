@@ -1358,6 +1358,9 @@ pub fn push(remote: Option<&str>, rewrite_history: bool) -> Result<i32> {
         vci_git::PushStatus::NothingStored => eprintln!(
             "vci: nothing to push: no attestations are stored locally (run `vci run` first)"
         ),
+        // The status is vci-store's, non-exhaustive: git-meta's push never
+        // ends otherwise.
+        _ => eprintln!("vci: push to {} finished", out.remote),
     }
     Ok(0)
 }
