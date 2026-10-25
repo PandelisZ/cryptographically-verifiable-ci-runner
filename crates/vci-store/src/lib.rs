@@ -21,8 +21,10 @@
 //! | `sqlite`   | `vci-store-sqlite`   | one SQLite file, default `<git common dir>/vci-store.sqlite`  | no (local)   |
 //! | `postgres` | `vci-store-postgres` | tables in one PostgreSQL schema, one namespace per repository | no (shared)  |
 //!
-//! `docs/STORE-BACKENDS.md` is the implementer guide. This page is the
-//! contract.
+//! The command line registers a factory for each backend in every default
+//! build (cargo features `sqlite` and `postgres` of vci-cli); git-meta is
+//! the default. `docs/STORE-BACKENDS.md` is the implementer guide, and says
+//! how far each backend is implemented. This page is the contract.
 //!
 //! ## Trust: the store is never trusted
 //!
@@ -45,10 +47,19 @@
 //! The command line treats every store error as "run the test". A lookup
 //! that fails makes every test of every project run. A value that cannot be
 //! read fails only its own candidate. A put that fails refuses only its own
-//! unit. Hints that fail do nothing. Only `vci fetch`, `vci push`,
-//! `vci prune` and `vci store` report store errors as failures (exit 2). A
-//! store that cannot be selected or opened becomes a [`FailedStore`], whose
-//! every call fails, so the same error paths apply.
+//! unit (the test result stands). Hints that fail do nothing. `vci fetch`,
+//! `vci push`, `vci prune` and `vci store info` report store errors as
+//! failures (exit 2). `vci run` keeps the tests' exit code when a unit
+//! cannot be stored because the store cannot be used ([`StoreError::Config`],
+//! [`StoreError::Unavailable`], [`StoreError::Timeout`],
+//! [`StoreError::NotInitialized`], [`StoreError::Incompatible`],
+//! [`StoreError::Denied`], [`StoreError::Unsupported`]); any other error
+//! (a backend's own, [`StoreError::Invalid`], [`StoreError::Other`]) is a
+//! problem of the run, after which `vci run` exits 2, as git-meta's errors
+//! always made it. A backend therefore reports "this store cannot be used
+//! here" with those variants, never as [`StoreError::Backend`]. A store
+//! that cannot be selected or opened becomes a [`FailedStore`], whose every
+//! call fails, so the same error paths apply.
 //!
 //! ## Implementing a backend
 //!
@@ -71,8 +82,10 @@
 //! | hints: [`passing_on`], [`flag`] (keep nothing)  | the backend can keep two small tables                           |
 //! | [`exchange`] (`None`)                           | writes reach other machines only through a push and a fetch     |
 //!
-//! Then add a [`BackendFactory`] so the command line can open the backend by
-//! name, and run the conformance suite (feature `conformance`, macro
+//! Then add a [`BackendFactory`] and register it in vci-cli's
+//! `store::factories` (one line, or a [`MissingBackend`] when its cargo
+//! feature is off), so the command line can open the backend by name, and
+//! run the conformance suite (feature `conformance`, macro
 //! `vci_store::conformance_suite!`) from the backend's own tests.
 //!
 //! ## Rules every backend keeps (the conformance suite checks them)
@@ -385,9 +398,9 @@ impl StoredManifest {
 /// One attestation to store ([`AttestationStore::put`]).
 ///
 /// It carries the unit's target label and test key rather than its test id,
-/// so that `vci store copy` can re-put a record it knows only by key, with
-/// its key and target unchanged. [`NewAttestation::for_test`] builds the
-/// usual case.
+/// so that a copy between stores ([`NewAttestation::copy_of`]) can re-put a
+/// record it knows only by key, with its key and target unchanged.
+/// [`NewAttestation::for_test`] builds the usual case.
 #[derive(Debug, Clone)]
 pub struct NewAttestation<'a> {
     /// [`key::target_label`] of the unit's test id.
@@ -604,11 +617,12 @@ pub struct Caps {
     /// Writes and removals are visible to other machines as soon as the call
     /// returns (a shared database), instead of after a push. `vci ci`
     /// without `--push` then neither stores nor supersedes (the publication
-    /// gate; see the design notes).
+    /// gate, `docs/STORE-BACKENDS.md` section 7), and `vci fetch` and
+    /// `vci push` call the store "shared" rather than "local".
     pub shared_writes: bool,
     /// Listings can name values the store does not hold here
     /// ([`NOT_FETCHED`]); [`AttestationStore::prefetch`] makes them
-    /// readable. The plan suggests `vci fetch` only then.
+    /// readable. The plan and `vci prune` suggest `vci fetch` only then.
     pub lazy_values: bool,
     /// The hint methods ([`AttestationStore::passing_on`],
     /// [`AttestationStore::flag`]) keep what they are given.
@@ -788,9 +802,15 @@ impl fmt::Debug for WriteBatch {
 /// Errors from a store.
 ///
 /// Callers fail open on every variant except in `vci fetch`, `vci push`,
-/// `vci prune` and `vci store`. The variants exist for messages, exit codes
-/// and tests, never to decide whether a unit runs. Every message is safe to
-/// print: no variant carries a password.
+/// `vci prune` and `vci store info`, which exit 2. The variants exist for
+/// messages, exit codes and tests, never to decide whether a unit runs.
+/// One exit code depends on them: when a unit cannot be stored, `vci run`
+/// keeps the tests' exit code for the variants that say the store cannot
+/// be used (`Config`, `Unavailable`, `Timeout`, `NotInitialized`,
+/// `Incompatible`, `Denied`, `Unsupported`), and exits 2 after the run for
+/// the others (`Invalid`, `Backend`, `Other`), as it always did for
+/// git-meta's errors. Every message is safe to print: no variant carries a
+/// password.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum StoreError {
@@ -1000,12 +1020,16 @@ pub trait AttestationStore: Send + Sync {
     /// `<key>`", "candidate 1: git-meta ..."), so git-meta's output does not
     /// change.
     ///
-    /// Used by: plan.rs (warnings, check failures, explain), run.rs (the
-    /// attested line), cmds.rs (fetch, push, verify, prune messages).
+    /// Used by: plan.rs (warnings, check failures, `vci explain`), run.rs
+    /// (the attested line), cmds.rs (`vci fetch`, `vci push`, `vci ci`,
+    /// `vci verify` and `vci store info` messages), the metrics log.
     fn kind(&self) -> &'static str;
 
     /// Where the store is, for messages and `vci store info`. It never
     /// carries a password. Default: [`AttestationStore::kind`].
+    ///
+    /// Used by: `vci fetch` on a store without an [`Exchange`],
+    /// `vci store info`.
     fn location(&self) -> String {
         self.kind().to_owned()
     }
@@ -1014,7 +1038,9 @@ pub trait AttestationStore: Send + Sync {
     /// [`Caps::LOCAL`].
     ///
     /// Used by: `vci ci` (the publication gate for shared stores), the
-    /// plan's wording (`run vci fetch` only for lazy stores).
+    /// wording of plan.rs and `vci prune` (`run vci fetch` only for lazy
+    /// stores) and of `vci fetch` and `vci push` ("local" or "shared"),
+    /// `vci store info`.
     fn caps(&self) -> Caps {
         Caps::LOCAL
     }
@@ -1025,8 +1051,10 @@ pub trait AttestationStore: Send + Sync {
     /// cannot be reached, or its schema is newer than this vci
     /// ([`StoreError::Incompatible`]). Default: `Ready` with no version.
     ///
-    /// Used by: plan.rs ("no attestations are available" warning),
-    /// `vci store info`.
+    /// Used by: plan.rs (the "no attestations are available" warning; an
+    /// `Err` runs every test), `vci store info`, and `vci prune` and (on a
+    /// store without an [`Exchange`]) `vci fetch` and `vci push`, which exit
+    /// 2 on an `Err` before doing anything else.
     fn status(&self) -> Result<StoreStatus, StoreError> {
         Ok(StoreStatus::Ready {
             schema_version: None,
@@ -1057,7 +1085,9 @@ pub trait AttestationStore: Send + Sync {
     fn list_all(&self) -> Result<Vec<StoredEnvelope>, StoreError>;
 
     /// Read the values of these listed entries in one batch, in place,
-    /// matching them by key. Each entry gets either `bytes`
+    /// matching them by key (pass entries as they were listed: git-meta,
+    /// which files records by target, also matches their `target`). Each
+    /// entry gets either `bytes`
     /// ([`StoredEnvelope::set_value`]) or an error
     /// ([`StoredEnvelope::set_error`]): [`GONE`] when the key is no longer
     /// stored, [`NOT_FETCHED`] when a lazy store does not hold the value
@@ -1112,7 +1142,8 @@ pub trait AttestationStore: Send + Sync {
     ///
     /// Returns the stored entry ([`NewAttestation::stored`]).
     ///
-    /// Used by: run.rs (each attested unit), `vci store copy`.
+    /// Used by: run.rs, through [`AttestationStore::put_for_test`] (each
+    /// attested unit); a copy between stores ([`NewAttestation::copy_of`]).
     fn put(&self, att: &NewAttestation<'_>) -> Result<StoredEnvelope, StoreError>;
 
     /// Store an input manifest's compact bytes under `root`, unless exactly
@@ -1186,15 +1217,18 @@ pub trait AttestationStore: Send + Sync {
     /// How many attestations are stored (values not read; values not
     /// fetched yet count).
     ///
-    /// Used by: `vci fetch` ("N attestations stored locally"), `vci store
-    /// info`.
+    /// Used by: `vci fetch` ("N attestations stored locally", or "N
+    /// attestations stored" on a store without an [`Exchange`]),
+    /// `vci store info`.
     fn count(&self) -> Result<usize, StoreError> {
         Ok(self.list_all()?.len())
     }
 
     /// [`AttestationStore::manifest`] for several roots, answered in order.
     ///
-    /// Used by: `vci verify`, `vci store copy`; network backends' prefetch.
+    /// Used by: no vci-cli command yet (`vci verify` and `vci prune` read
+    /// one root at a time). It is the batch form for a reader of many roots,
+    /// such as a copy between stores, and a network backend's own prefetch.
     fn manifests(&self, roots: &[&str]) -> Result<Vec<Option<StoredManifest>>, StoreError> {
         roots.iter().map(|r| self.manifest(r)).collect()
     }
@@ -1203,7 +1237,9 @@ pub trait AttestationStore: Send + Sync {
     /// from this store. `None` when it is not stored; `Some(Err(why))` when
     /// it cannot be read or decoded. The caller still checks the root.
     ///
-    /// Used by: run.rs supersession; the e2e helper `store_common`.
+    /// Used by: run.rs supersession. The nested shape is that of vci-git's
+    /// `AttestStore::manifest_decoded`, which the e2e helper `store_common`
+    /// calls.
     fn manifest_decoded(
         &self,
         root: &str,
@@ -1281,7 +1317,11 @@ pub trait AttestationStore: Send + Sync {
     /// default groups nothing. Callers ignore an `Err` from `batch` itself
     /// (they write without one) but never an `Err` from `finish`.
     ///
-    /// Used by: run.rs (every unit of a project is stored inside one batch).
+    /// Used by: run.rs. Every unit of a project is stored inside one batch,
+    /// finished right after that project's units. A deferred batch's units
+    /// are reported as attested only once it finishes `Ok`; if it fails,
+    /// each of them is refused. An immediate batch's units are reported as
+    /// each is stored, and a failure to finish it is a warning.
     fn batch(&self) -> Result<WriteBatch, StoreError> {
         Ok(WriteBatch::none())
     }
@@ -1380,8 +1420,9 @@ pub trait AttestationStore: Send + Sync {
     /// `vci push` then say so and exit 0, `vci plan --fetch` fetches nothing,
     /// and `vci ci --push` succeeds without sending anything.
     ///
-    /// Used by: cmds.rs (`vci fetch`, `vci push`, `vci ci --push`, the
-    /// default-remote message), plan.rs (`--fetch`).
+    /// Used by: cmds.rs (`vci fetch`, `vci push`, `vci ci --push` and
+    /// `vci ci`'s "N unit(s) attested" line, the default-remote message,
+    /// `vci store info`), plan.rs (`--fetch`).
     fn exchange(&self) -> Option<&dyn Exchange> {
         None
     }
@@ -1395,9 +1436,9 @@ pub trait Exchange: Send + Sync {
     fn exchange_point(&self) -> &str;
 
     /// The location of `remote` (a remote name as [`FetchOutcome::remote`]
-    /// gives it) with any credentials removed, printed as "git-meta remote
-    /// `<name>` is `<location>`" when the user named no remote. Default:
-    /// unknown.
+    /// gives it) with any credentials removed ([`select::redact`]), printed
+    /// by `vci fetch` and `vci push` as "vci: `<kind>` remote `<name>` is
+    /// `<location>`" when the user named no remote. Default: unknown.
     fn remote_location(&self, remote: &str) -> Option<String> {
         let _ = remote;
         None
@@ -1442,10 +1483,13 @@ pub fn decode_manifest(
 // ---- a store that failed -------------------------------------------------------
 
 /// A store that could not be selected or opened. Every read and write
-/// returns [`StoreError::Unavailable`] and every hint does nothing, so
-/// callers fail open through their usual error paths: `vci plan` warns and
-/// runs everything, `vci run` refuses to store (the tests still run), and
-/// `vci fetch`, `vci push` and `vci prune` exit 2.
+/// (and [`AttestationStore::status`], [`AttestationStore::batch`] and
+/// [`AttestationStore::prefetch`]) returns [`StoreError::Unavailable`] and
+/// every hint does nothing, so callers fail open through their usual error
+/// paths: `vci plan` warns and runs everything, `vci run` refuses to store
+/// each unit, saying why (the tests still run, and the exit code stays
+/// theirs), and `vci fetch`, `vci push`, `vci prune` and `vci store info`
+/// exit 2.
 #[derive(Debug, Clone)]
 pub struct FailedStore {
     kind: &'static str,
@@ -1543,14 +1587,15 @@ pub struct OpenContext {
     /// It is the default namespace of a shared server: attestations made in
     /// another repository can never verify here.
     pub repo_id: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
-    /// How many threads will use the store at once (`VCI_JOBS`), for pool
-    /// sizes.
+    /// How many threads will use the store at once (`VCI_JOBS`, else one
+    /// per CPU), for pool sizes.
     pub jobs: usize,
-    /// The vci command (`plan`, `run`, ...), shown by PostgreSQL in
-    /// `application_name`.
+    /// The vci command (`plan`, `run`, ...; `vci` when unknown), shown by
+    /// PostgreSQL in `application_name`.
     pub command: String,
-    /// The command reads or writes the whole store (`vci prune`, `vci store
-    /// copy`): statement timeouts are lifted to ten minutes.
+    /// The command reads or writes the whole store (`vci prune`; a copy
+    /// between stores would too): statement timeouts are lifted to ten
+    /// minutes.
     pub long_running: bool,
 }
 
@@ -1575,7 +1620,8 @@ pub trait BackendFactory: Send + Sync {
     /// [`AttestationStore::kind`] of what it opens.
     fn kind(&self) -> &'static str;
 
-    /// One line for `vci store info` and error messages.
+    /// One line saying what the backend is and where it keeps records, for
+    /// a listing of the backends a vci has (vci-cli prints it nowhere yet).
     fn summary(&self) -> &'static str;
 
     /// Open the store `sel` describes.
@@ -2329,8 +2375,9 @@ pub mod select {
         pub postgres: PostgresSelection,
         /// `[store.options]`, for other backends.
         pub options: BTreeMap<String, String>,
-        /// Settings that were overridden or ignored, for `vci: warning:`
-        /// lines.
+        /// Settings that were overridden or ignored. The command line
+        /// prints each once per process as a `vci: warning:` line and adds
+        /// them to the plan's warnings.
         pub warnings: Vec<String>,
     }
 
@@ -2347,7 +2394,8 @@ pub mod select {
 
     impl Selection {
         /// A selection of `kind` with every default and nothing from the
-        /// environment, for tests and `vci store copy`.
+        /// environment, for tests and for tools that open a backend they
+        /// name themselves (such as a copy between stores).
         pub fn for_backend(kind: &str) -> Self {
             Selection {
                 kind: Sourced::default_value(kind.to_owned()),
@@ -2561,12 +2609,14 @@ pub mod select {
     /// Empty variables count as unset. Errors ([`StoreError::Config`]):
     /// connection settings in `vci.toml`; a URL in `VCI_STORE`; a malformed
     /// backend name; `VCI_STORE` disagreeing with the scheme of
-    /// `VCI_STORE_URL`; postgres without `VCI_STORE_URL`; a timeout outside
-    /// (0, 1 h]; a schema that is not a lowercase identifier; a malformed
-    /// namespace; a pool outside 1 to 64; a grace over 30 days; a SQLite path
-    /// in `vci.toml` that is absolute or climbs out with `..`. Overridden and
-    /// ignored settings become [`Selection::warnings`]. A well-formed but
-    /// unknown backend name is reported by [`crate::open`].
+    /// `VCI_STORE_URL`; postgres without `VCI_STORE_URL`; a `sqlite:`
+    /// `VCI_STORE_URL` without a path, or whose path holds `://` (another
+    /// scheme's URL, never printed); a timeout outside (0, 1 h]; a schema
+    /// that is not a lowercase identifier; a malformed namespace; a pool
+    /// outside 1 to 64; a grace over 30 days; a SQLite path in `vci.toml`
+    /// that is absolute or climbs out with `..`. Overridden and ignored
+    /// settings become [`Selection::warnings`]. A well-formed but unknown
+    /// backend name is reported by [`crate::open`].
     pub fn resolve(
         env: &dyn Fn(&str) -> Option<String>,
         file: Option<&StoreSettings>,
@@ -2924,8 +2974,8 @@ pub mod conformance {
         pub const TREE_HEAD: &str = "0123456789abcdef";
     }
 
-    /// The scenario bodies (`src/conformance/scenarios.rs`, written in step
-    /// D of the plan; listed in `docs/STORE-BACKENDS.md`). Each is a `pub fn
+    /// The scenario bodies (`src/conformance/scenarios.rs`), one per row of
+    /// the table in `docs/STORE-BACKENDS.md` section 14. Each is a `pub fn
     /// cNN_...(f: &dyn StoreFactory)` that builds its own world.
     pub mod scenarios;
 }
