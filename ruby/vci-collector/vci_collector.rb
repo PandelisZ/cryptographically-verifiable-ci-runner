@@ -181,7 +181,7 @@ module VciCollector
           now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
           $stdout.puts "vci-profile id=#{id} proc_ms=#{ms.call(now - started)} req_ms=#{ms.call(req_ns)} nreq=#{nreq} " \
                        "routes_ms=#{ms.call(routes_ns)} gc_ms=#{((::GC.stat(:time) rescue 0) - gc_ms0)} " \
-                       "gc_n=#{::GC.stat(:count) - gc_n0}"
+                       "gc_n=#{::GC.stat(:count) - gc_n0} iseq_hit=#{IseqCache.hits.to_i} iseq_miss=#{IseqCache.misses.to_i}"
           $stdout.flush
         end
       end
@@ -195,6 +195,94 @@ module VciCollector
         super
       ensure
         Profile.routes_ns += Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - t
+      end
+    end
+  end
+
+  # A compile cache for the processes of a batch (VCI_RAILS_EXPERIMENT
+  # "iseq"): the instruction sequence Ruby compiles a source file to is kept
+  # under vci's output directory of this run, keyed by the file's path, size
+  # and modification time, so that a file every process requires (an app
+  # file Zeitwerk autoloads, a gem file required lazily) is parsed and
+  # compiled once per batch instead of once per process. Only this run's
+  # processes see the directory, which is made empty for each run, and the
+  # checkout must not change during a run (vci refuses a unit whose input
+  # changed), so an entry can only be the compilation of the very bytes vci
+  # hashed. What is recorded is unchanged: a require is recorded by the
+  # require hook, not by how its bytes were read. Bootsnap's compile cache
+  # stays refused (Checks): it lives across runs, and its YAML and JSON
+  # caches read files in C.
+  module IseqCache
+    DIR = OUT && !OUT.empty? ? File.join(OUT, "iseq") : nil
+
+    module Hook
+      def load_iseq(path)
+        IseqCache.load(path) { |p| compile_file(p) }
+      end
+    end
+
+    class << self
+      attr_accessor :hits, :misses
+
+      def install!
+        return false if DIR.nil?
+        return false unless defined?(::RubyVM::InstructionSequence) &&
+                            ::RubyVM::InstructionSequence.respond_to?(:load_from_binary)
+        VciCollector.quiet { Dir.mkdir(DIR) unless Real.directory?(DIR) }
+        self.hits = 0
+        self.misses = 0
+        ::RubyVM::InstructionSequence.singleton_class.prepend(Hook)
+        true
+      rescue StandardError
+        false
+      end
+
+      # Whether the load_iseq Ruby sees is this cache's.
+      def own?
+        ::RubyVM::InstructionSequence.respond_to?(:load_iseq) &&
+          ::RubyVM::InstructionSequence.method(:load_iseq).owner == Hook
+      rescue StandardError
+        false
+      end
+
+      # FNV-1a (64 bits) of `s`: a stable name for a path (String#hash is
+      # seeded per process).
+      def fnv(s)
+        h = 0xcbf29ce484222325
+        s.each_byte { |b| h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff }
+        h.to_s(16)
+      end
+
+      def load(path)
+        st = VciCollector.quiet { Real.stat(path) }
+        file = File.join(DIR, "#{fnv(path)}-#{st.size}-#{st.mtime.to_i}#{st.mtime.nsec}.bin")
+        bin = VciCollector.quiet { Real.exist?(file) ? Real.binread(file) : nil }
+        if bin
+          iseq = begin
+            ::RubyVM::InstructionSequence.load_from_binary(bin)
+          rescue StandardError
+            nil
+          end
+          if iseq
+            self.hits += 1
+            return iseq
+          end
+        end
+        self.misses += 1
+        iseq = yield(path)
+        begin
+          bin = iseq.to_binary
+          VciCollector.quiet do
+            tmp = "#{file}.#{Process.pid}"
+            File.binwrite(tmp, bin)
+            File.rename(tmp, file)
+          end
+        rescue StandardError
+          nil
+        end
+        iseq
+      rescue StandardError
+        nil
       end
     end
   end
@@ -3068,6 +3156,7 @@ if VciCollector.collect?
   VciCollector.hook(ENV.singleton_class, VciCollector::EnvHooks)
   VciCollector.hook(RubyVM::InstructionSequence.singleton_class, VciCollector::ISeqHooks)
   VciCollector.hook(ARGF.singleton_class, VciCollector::ArgfHooks)
+  VciCollector::IseqCache.install! if VciCollector::BATCH && VciCollector::EXPERIMENT.include?("iseq")
 
   # Every Ruby source compiled from a file (require, require_relative, load,
   # autoload, Zeitwerk) is a module input.
@@ -6100,7 +6189,7 @@ module VciCollector
 
     def run
       out = []
-      if RubyVM::InstructionSequence.respond_to?(:load_iseq)
+      if RubyVM::InstructionSequence.respond_to?(:load_iseq) && !IseqCache.own?
         out << "ruby:iseq-cache (RubyVM::InstructionSequence.load_iseq is defined, e.g. by Bootsnap's compile cache: code may not be compiled from the hashed source; set DISABLE_BOOTSNAP=1)"
       end
       if defined?(::Bootsnap::LoadPathCache) && ::Bootsnap::LoadPathCache.respond_to?(:enabled?) && ::Bootsnap::LoadPathCache.enabled?
