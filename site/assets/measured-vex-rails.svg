@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 420" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="14">
+<style>.t{fill:#1b1d1a}.m{fill:#5d635b}.plain{fill:#15803d}.ovh{fill:#b45309}.attest{fill:#2563eb}.v{fill:#1b1d1a;font-weight:650}.g{stroke:#e1e2dc}@media (prefers-color-scheme:dark){.t{fill:#e6e9e4}.m{fill:#9aa298}.plain{fill:#4ade80}.ovh{fill:#fbbf63}.attest{fill:#60a5fa}.v{fill:#e6e9e4}.g{stroke:#262b29}}</style>
+<text class="t" x="0" y="20" font-size="17" font-weight="650">Measured on a real suite: vex's Rails tests, 2,078 files (vci 2.7.18 to 2.7.32, 23 to 25 October 2026)</text>
+<text class="m" x="0" y="42">Minutes per CI job, container start to job end, medians read from the GitHub Actions logs. Two jobs per pull request.</text>
+<text class="t" x="0" y="82" font-weight="600">without vci: bin/rails test as CI ran it</text><text class="m" x="0" y="100" font-size="12">13 to 19 October, 769 jobs; the week before vci took over</text>
+<rect class="plain" x="360" y="68" width="210" height="20" rx="3"/>
+<text class="v" x="578" y="83">3.5 min</text>
+<text class="t" x="0" y="140" font-weight="600">with vci, little changed (90%+ skipped)</text><text class="m" x="0" y="158" font-size="12">plan 10 to 15 s, then the files that changed, then sign and push; 6 jobs on 2.7.27 to 2.7.30</text>
+<rect class="ovh" x="360" y="126" width="15" height="20" rx="3"/><rect class="plain" x="375" y="126" width="159" height="20" rx="3"/>
+<text class="v" x="542" y="141">2.9 min</text>
+<text class="t" x="0" y="198" font-weight="600">with vci, a shared file changed</text><text class="m" x="0" y="216" font-size="12">137 to 543 files ran; 4 jobs on 2.7.27 to 2.7.30</text>
+<rect class="ovh" x="360" y="184" width="15" height="20" rx="3"/><rect class="plain" x="375" y="184" width="219" height="20" rx="3"/>
+<text class="v" x="602" y="199">3.9 min</text>
+<text class="t" x="0" y="256" font-weight="600">with vci, everything re-ran and attested</text><text class="m" x="0" y="274" font-size="12">2,078 files, one process each, about 1,000 attestations signed and pushed per job; 2 jobs on 2.7.30</text>
+<rect class="ovh" x="360" y="242" width="15" height="20" rx="3"/><rect class="plain" x="375" y="242" width="308" height="20" rx="3"/><rect class="attest" x="683" y="242" width="25" height="20" rx="3"/>
+<text class="v" x="716" y="257">5.8 min</text>
+<text class="t" x="0" y="314" font-weight="600">the same on vci 2.7.18, two days earlier</text><text class="m" x="0" y="332" font-size="12">plan 67 s; 16 jobs on 23 October, before the fifteen releases that followed</text>
+<rect class="ovh" x="360" y="300" width="67" height="20" rx="3"/><rect class="plain" x="427" y="300" width="461" height="20" rx="3"/><rect class="attest" x="888" y="300" width="30" height="20" rx="3"/>
+<text class="v" x="926" y="315">9.3 min</text>
+<line class="g" x1="0" x2="1000" y1="352" y2="352"/>
+<rect class="plain" x="0" y="384" width="14" height="14" rx="3"/><text class="m" x="20" y="396">setup (about a minute) and tests running</text>
+<rect class="ovh" x="300" y="384" width="14" height="14" rx="3"/><text class="m" x="320" y="396">vci plan: fetch, verify, decide</text>
+<rect class="attest" x="560" y="384" width="14" height="14" rx="3"/><text class="m" x="580" y="396">sign, store and push the attestations</text>
+</svg>

@@ -150,11 +150,52 @@ The action downloads a prebuilt binary, fetches the attestations, prints the pla
 rest. The repository is its own demo: the open demo PRs show units attested on a Mac being skipped by the Linux
 runner, and re-running when an input changes.
 
+## What it measures to, on a real suite
+
+The numbers vci is judged by are from production, not a benchmark: every Rails job of [ComposalAI/vex][7]'s pull
+requests and master runs from 23 to 25 October 2026, read from the GitHub Actions logs. The suite is 2,078 Rails
+test files, split over two CI jobs per pull request, with a seeded MySQL database and 16 test slots per job. The
+week before vci took over, a plain `bin/rails test` job took 3.5 minutes (median of 769 jobs).
+
+| A pull request's Rails job | Minutes | What runs |
+|---|---|---|
+| without vci | 3.5 | everything, as CI always did |
+| with vci, little changed (90% or more skipped) | 2.9 | the plan (10 to 15 s), then the files that changed, then sign and push |
+| with vci, a shared file changed (137 to 543 files ran) | 3.9 | the same, with more to run |
+| with vci, everything re-ran and was attested | 5.8 | 2,078 files one process each, about a thousand attestations signed and pushed |
+| the same on vci 2.7.18, two days earlier | 9.3 | plan 67 s, and every cost since removed |
+
+So on this suite the trade is plain: **cheaper when the suite was run before, dearer when it was not.** A job where
+everything re-runs pays for recording inputs at file granularity (one process per file) and for signing and pushing
+the result. Across October, before the speed work, the average vex Rails job with vci took about 30% longer than
+without, because most pull requests touched something every Rails test loads (a new autoload constant, a migration,
+`routes.rb`, an initializer) and re-ran everything at the old plan cost. Those re-runs are correct, not a defect;
+they are what observed inputs cost in a framework that loads most of itself for every test, and the reason the
+savings come from suites that were actually run before CI saw them.
+
+The plan step itself, the fixed cost of every job, went from a median of 67 seconds on 23 October to 15 seconds
+from the evening of the 24th (29 pull request plans; the slowest tenth 27 s), and 4 seconds on the quietest jobs,
+through fifteen releases in two days, each removing one measured cost: the store remembers what each blob names,
+Rails boots beside the fetch, candidates are read in one batch, the metadata commit is written by one `fast-import`,
+the plan remembers which attestation passed per unit per tree. Of the 15 seconds that remain, 7.4 are fetching and
+merging the attestations master pushed since the job's cache was saved; master attests every file it runs, and a
+busy evening pushes 300 to 1,800 new attestations per run. That structural part is the next piece of work: the
+attestation store is becoming a trait, git-meta its first implementation, with SQLite and PostgreSQL backends so a
+shared server answers a plan in a few round trips instead of a merge.
+
+Two things the same logs showed that were not vci: GitHub's cache restores crawling at 140 seconds each for part of
+an evening (toolchain, gems and the attestation store alike), and a merge that broke ten tests and made every
+branch red for three hours, with every retry failing again. One thing that was: a hung single-file retry has nothing
+to stop it before the job's 30 minute timeout. It is getting a deadline.
+
+The full tables, with counts and percentiles per release, are on the [examples page][8].
+
 ## Status and what it costs
 
-v1.0.0, MIT. Six runners. Each has an end-to-end suite that drives the real CLI against a bare git remote. The
-verification step on a GitHub runner takes about ten seconds; what you save beyond that is the tests you had
-already run.
+v2.7.32, MIT. Six runners. Each has an end-to-end suite that drives the real CLI against a bare git remote. The
+verification step on a GitHub runner takes 4 to 15 seconds on a 2,000-file suite; what you save beyond that is the
+tests you had already run, and what you pay beyond that, when nothing was run before, is one process per test file
+plus signing and pushing.
 
 There is no company behind this. It is a tool for a problem that the people with the most agents hit first and that
 the rest of us are about to.
@@ -169,3 +210,5 @@ the rest of us are about to.
 [4]: https://linear.app/now/ci-bottleneck-reworked "AI coding has made CI a bottleneck, so we reworked ours to keep up (Linear, 21 Sep 2026)"
 [5]: https://engineering.atspotify.com/2026/6/code-with-claude-coding-is-no-longer-the-constraint "Coding Is No Longer the Constraint (Spotify Engineering, Jun 2026)"
 [6]: https://www.oreilly.com/radar/coding-was-never-a-bottleneck/ "Coding Was Never a Bottleneck (O'Reilly Radar, Jul 2026), citing CircleCI's 2026 State of Software Delivery report"
+[7]: https://github.com/ComposalAI/vex "ComposalAI/vex, the Rails application the numbers come from"
+[8]: https://pandelisz.github.io/cryptographically-verifiable-ci-runner/examples.html#measured-vex-rails "Measured on vex's Rails tests"
