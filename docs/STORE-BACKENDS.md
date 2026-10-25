@@ -20,6 +20,8 @@ Built and in use:
   batches are reported only once they finish (section 6), `vci ci` has the publication gate for shared stores
   (section 7), `vci store info` exists, and `VCI_STORE_URL` never reaches a child process.
 - **The plan reads the candidates it set aside** even when a round fetched nothing (section 5).
+- **The conformance suite** (section 14): its 34 scenarios, run against git-meta, SQLite and PostgreSQL from each
+  backend's `tests/conformance.rs`.
 
 Not built yet:
 
@@ -28,9 +30,6 @@ Not built yet:
   `StoreError::Config("the sqlite store is not implemented yet")` (and likewise for postgres). Selecting either today
   therefore gives a `FailedStore` (section 10): the plan runs everything, and `vci run` refuses to store each unit
   while keeping the tests' exit code. Their dependencies are already pinned in `Cargo.lock`.
-- **The conformance scenarios** (section 14). The feature, the macro, `StoreFactory`, `World` and the fixtures exist.
-  Each of the 34 scenario functions prints `cNN_<name> (<backend>): not written yet (step D)` and passes, and no
-  backend's test binary runs the suite yet.
 - **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`): `available()` always returns `false`.
 - **Later commands**: `vci store init`, `vci store copy`, `vci init --store`, and the action inputs `store` and
   `store-url` (section 9).
@@ -1026,17 +1025,50 @@ The suite lives in vci-store behind feature `conformance`: `src/conformance/scen
 // crates/vci-store-sqlite/tests/conformance.rs
 vci_store::conformance_suite!(Some(Box::new(SqliteWorlds) as Box<dyn vci_store::conformance::StoreFactory>));
 // crates/vci-store-postgres/tests/conformance.rs
-vci_store::conformance_suite!(vci_store_postgres::testkit::available().then(|| Box::new(PgWorlds) as _));
+vci_store::conformance_suite!(testkit::available().then(|| Box::new(PgWorlds) as Box<dyn StoreFactory>));
 // crates/vci-git/tests/conformance.rs
-vci_store::conformance_suite!(Some(Box::new(GitMetaWorlds) as _));
+vci_store::conformance_suite!(Some(Box::new(GitMetaWorlds) as Box<dyn StoreFactory>));
+```
+
+Run it with:
+
+```sh
+cargo test --locked -p vci-git --test conformance
+cargo test --locked -p vci-store-sqlite --test conformance
+VCI_TEST_POSTGRES=require cargo test --locked -p vci-store-postgres --test conformance   # a server from the testkit
 ```
 
 The macro expands to one `#[test]` per scenario, so failures are named and run in parallel, each in its own world. A
 factory of `None` makes every test say `skipping <name>: this backend is not available here` and pass.
 
-**Today** the 34 scenario functions are declared with their documentation and each prints `cNN_<name> (<backend>):
-not written yet (step D)` and passes; none of the three test files above exists yet. The table below is what each
-scenario must check.
+The table below is what each scenario checks. The three worlds:
+
+| | git-meta (`GitMetaWorlds`) | SQLite (`SqliteWorlds`) | PostgreSQL (`PgWorlds`) |
+|---|---|---|---|
+| world | a bare remote serving partial clones | a temporary directory with one store file | a schema of its own, namespace `test` |
+| peers | `--no-local` clones with a metadata remote for `origin` | separate handles on the file | separate `PgStore`s (own pools and caches) |
+| `sync` | push from one peer, fetch into the others | nothing | nothing |
+| `backing_exists` | `.git/git-meta.sqlite` exists | the file exists | the schema exists |
+| `unreachable` + `secret` | a clone whose metadata remote is `https://vci-user:<secret>@127.0.0.1:1/meta.git` | a file that is not a database (no secret) | a closed port with a password, connect timeout 1 s |
+| `read_only` | `chmod -R a-w .git` (undone on drop) | `chmod 0444` the file, a new handle | a role with USAGE, SELECT, and INSERT and UPDATE on memo and flags |
+| `inject_raw` | a `git_meta_lib::Session` | a raw INSERT | a raw INSERT |
+| `make_unreadable` | the row points at a blob the object database does not hold | `encoding = 99` | `encoding = 99` |
+| `failing_batches` | none (immediate batches) | none (immediate batches) | a role without INSERT on attestations (INSERT on manifests) |
+
+What the scenarios can and cannot check through the trait:
+
+- **c24** checks `location`, every error and outcome, fetch and push output and `remote_location`, but not `Debug`:
+  `dyn AttestationStore` has no `Debug`, so each backend's own tests check that (PostgreSQL test 1).
+- **c17** requires `Denied` or `Unavailable` from a store without an exchange. git-meta reports its own errors as
+  `StoreError::Backend` (section 10), so for a store with an exchange any error passes. A removal through a
+  read-only handle may also succeed having removed nothing.
+- **c08** removes an unreferenced root only on a store that is not shared; a shared store keeps a root put within its
+  grace period, which **c29** checks. With the default grace of an hour, c29 cannot tell a root kept because it is
+  referenced or a base from one kept because it is recent; PostgreSQL's own test 11 checks those with grace 0.
+- **c16** bounds the first failure at 4 s (worlds configure a connect timeout of at most 3 s) and 40 more calls at 2 s.
+  With an exchange the first failing call is `fetch`, since reads of the local store still work.
+- **c29** and **c30** are skipped by every backend but PostgreSQL (not shared; immediate batches), and **c14** by
+  every backend but git-meta (no exchange). A skipped part says so on stderr.
 
 - **Branching.** Scenarios branch only on `Caps` and on `exchange().is_some()`.
 - **Optional hooks.** `World` hooks that return `None` or `false` skip that part of a scenario and say so on stderr:
