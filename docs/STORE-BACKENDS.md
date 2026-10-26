@@ -527,12 +527,16 @@ been measured on one yet.
   either way. The written keys' log entries are stamped once the commit is done (`stamp_written`). A batch opened
   inside the batch joins it. Writes on the batch's thread read the batch's own writes (the slot's keys, whether a
   value is already there); other readers see none of them before `finish`, which the trait allows. Storing 1,200
-  units was 4,800 commits on two connections (0.7 s) before.
+  units was 4,800 commits on two connections (0.7 s) before. The batch's connection keeps its savepoints' journal in
+  memory (`temp_store = MEMORY`) and a 64 MiB page cache: with a temporary file per savepoint and the default cache
+  spilling into the WAL, 1,200 units' writes took 0.5 s of the batch; with them, 0.05 s.
 - **SQLite** (2.8): the batch pins one pooled connection to the thread; the first write begins `BEGIN IMMEDIATE` on
   it, each write is a savepoint, and `finish` commits (a dropped batch commits too). Reads on that thread use the
   pinned connection inside the transaction, so they see the batch's writes; other connections see them after
-  `finish`, and another writer waits for it (at most the busy timeout). When SQLite ends the transaction itself (an
-  I/O error, a full disk) or the connection is lost, the batch is broken: later writes and `finish` fail.
+  `finish`, and another writer waits for it (at most the busy timeout). As git-meta's, the connections keep
+  savepoint journals in memory, and the batch raises the pinned connection's page cache to 64 MiB until `finish`.
+  When SQLite ends the transaction itself (an I/O error, a full disk) or the connection is lost, the batch is broken:
+  later writes and `finish` fail.
 - **PostgreSQL**:
   - `put`, `put_manifest` and `remove` are queued so that `finish` reaches the state the same calls made one by one
     would: per slot the last put (it replaces every stored key of its slot), whether a later removal took that put's

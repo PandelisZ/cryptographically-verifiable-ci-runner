@@ -1202,7 +1202,10 @@ enum Verdict {
 /// ran: `$VCI_JOBS`, else the number of CPUs. Each mostly hashes inputs; a
 /// key file signs in process (2.8), and only a key ssh-keygen must handle,
 /// or keyless signing, waits for another process or service. One writer
-/// thread stores the units, in order.
+/// thread stores the units, in order. Twice as many threads as CPUs were
+/// not faster (1,200 Go packages on 14 cores: the check's thread-seconds
+/// grew by half and the step's wall time did not fall), so the default
+/// stays one per CPU.
 fn check_jobs() -> usize {
     std::env::var("VCI_JOBS")
         .ok()

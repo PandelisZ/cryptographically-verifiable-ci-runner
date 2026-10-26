@@ -85,10 +85,9 @@ impl Agent {
             return None;
         }
         let (blob, _) = take_string(rest)?;
-        let (alg, rest) = take_string(blob)?;
-        let (sig, _) = take_string(rest)?;
-        let alg = Algorithm::new(std::str::from_utf8(alg).ok()?).ok()?;
-        let signature = Signature::new(alg, sig.to_vec()).ok()?;
+        // The algorithm and the signature, and for a security key the flags
+        // and counter after them, which ssh-key's decoding keeps.
+        let signature = Signature::try_from(blob).ok()?;
         let sshsig = SshSig::new(
             self.key.key_data().clone(),
             NAMESPACE,

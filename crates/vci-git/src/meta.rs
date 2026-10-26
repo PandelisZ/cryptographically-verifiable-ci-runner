@@ -1451,7 +1451,11 @@ impl<'a> AttestStore<'a> {
             let begin = if *open {
                 "SAVEPOINT vci_write"
             } else {
-                "BEGIN IMMEDIATE; SAVEPOINT vci_write"
+                // The savepoints' journal in memory, and a page cache that
+                // holds the whole batch: each write's savepoint otherwise
+                // copied its pages to a temporary file, and the cache
+                // spilled into the WAL, most of the time a batch took.
+                "PRAGMA temp_store = MEMORY; PRAGMA cache_size = -65536; BEGIN IMMEDIATE; SAVEPOINT vci_write"
             };
             if let Err(e) = db.execute_batch(begin) {
                 if !db.is_autocommit() {

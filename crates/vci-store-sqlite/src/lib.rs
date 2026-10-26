@@ -560,7 +560,9 @@ impl Inner {
         let begin = if open {
             "SAVEPOINT vci_write"
         } else {
-            "BEGIN IMMEDIATE; SAVEPOINT vci_write"
+            // A page cache that holds the whole batch (its default spills
+            // into the WAL as the transaction grows; reset in `finish`).
+            "PRAGMA cache_size = -65536; BEGIN IMMEDIATE; SAVEPOINT vci_write"
         };
         if let Err(e) = db.execute_batch(begin) {
             if !open && !db.is_autocommit() {
@@ -819,6 +821,9 @@ impl Inner {
             if self.opts.sync_off { "OFF" } else { "NORMAL" },
         )?;
         db.pragma_update(None, "foreign_keys", false)?;
+        // A batch's savepoint journals its pages in memory, not in a
+        // temporary file (2.8).
+        db.pragma_update(None, "temp_store", "MEMORY")?;
         db.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
         Ok(db)
     }
@@ -915,6 +920,9 @@ impl BatchEnd for SqliteBatch {
                         result = Err(self.inner.error("write", e));
                     }
                 }
+                // SQLite's default page cache again (the batch's first
+                // write raised it).
+                let _ = c.db.execute_batch("PRAGMA cache_size = -2000");
                 self.inner.pool().push(c);
             }
             if pin.writes > 0 && vci_core::metrics::on() {
