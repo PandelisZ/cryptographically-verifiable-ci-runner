@@ -13,6 +13,11 @@
 //! replica syncs from, in one transaction. A queue of [`FLUSH_WRITES`]
 //! attestations and removals, or of [`FLUSH_BYTES`], is written early in a
 //! transaction of its own; a failed early write fails `finish`.
+//!
+//! A record a server would refuse as too big ([`MAX_RECORD`] bytes or
+//! more: `sqld` keeps rows under 5,000,000 bytes) is refused before it is
+//! queued or sent, as [`StoreError::Unsupported`]: that unit is not
+//! attested, and the rest of the batch is stored.
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
@@ -27,7 +32,8 @@ use vci_store::{
 };
 
 use crate::conn::{
-    Fail, KIND, READ, WRITE, blob, col_int, col_text, json_list, opt_int, opt_text, text,
+    Fail, KIND, MAX_RECORD, READ, TOO_BIG, WRITE, blob, col_int, col_text, json_list, opt_int,
+    opt_text, text,
 };
 use crate::remote::{LOG_KEEP_SECS, Remote, Tables, now};
 
@@ -209,14 +215,36 @@ fn manifest_base(bytes: &[u8]) -> Option<String> {
         .filter(|b| key::is_hex_id(b))
 }
 
-/// Check a manifest write's arguments, as every backend does.
+/// Check a manifest write's arguments, as every backend does, and that the
+/// server would take its row.
 pub(crate) fn check_manifest(root: &str, bytes: &[u8]) -> Result<(), StoreError> {
     key::check_hex("input root", root)?;
     if bytes.is_empty() {
         return Err(StoreError::invalid("manifest", "", "must not be empty"));
     }
     key::check_utf8("manifest", bytes)?;
+    // The row: the root, its base, the value, the integers and the
+    // record's header.
+    check_size(bytes.len() + 2 * 64 + 64)
+}
+
+/// Refuse a record of [`MAX_RECORD`] bytes or more.
+fn check_size(record: usize) -> Result<(), StoreError> {
+    if record >= MAX_RECORD {
+        return Err(StoreError::Unsupported {
+            backend: KIND,
+            operation: TOO_BIG,
+        });
+    }
     Ok(())
+}
+
+/// Check that the server would take `att`'s row: its value, its key (at
+/// most the slot's parts and a hint), the slot's columns, the target, the
+/// manifest reference, the tree, the integers and the record's header.
+fn check_attestation_size(att: &NewAttestation<'_>) -> Result<(), StoreError> {
+    let slot = att.test_key.len() + att.signer.len() + att.storage_key.len();
+    check_size(att.envelope.len() + att.target.len() + 2 * slot + 64 + 64 + 16 + 128)
 }
 
 /// The key a slot is stored under on the server (one request), if any.
@@ -225,7 +253,7 @@ fn slot_key(
     t: &Tables,
     att: &NewAttestation<'_>,
 ) -> Result<Option<String>, StoreError> {
-    let r = remote.conn.query(
+    let r = remote.query(
         READ,
         &t.shared.slot_key,
         vec![
@@ -263,6 +291,7 @@ fn slot_of(att: &NewAttestation<'_>) -> Slot {
 /// Queue `att`; the entry it will be stored as.
 pub(crate) fn put(remote: &Remote, att: &NewAttestation<'_>) -> Result<StoredEnvelope, StoreError> {
     att.validate()?;
+    check_attestation_size(att)?;
     let t = remote.ready()?;
     let slot = slot_of(att);
     let key = match att.hinted_key() {
@@ -377,6 +406,7 @@ pub(crate) fn put_now(
     after: Option<&After>,
 ) -> Result<StoredEnvelope, StoreError> {
     att.validate()?;
+    check_attestation_size(att)?;
     let t = remote.ready()?;
     let key = match att.hinted_key() {
         Some(k) => k,
@@ -402,7 +432,7 @@ pub(crate) fn put_manifest_now(
 ) -> Result<bool, StoreError> {
     check_manifest(root, bytes)?;
     let t = remote.ready()?;
-    let r = remote.conn.query(
+    let r = remote.query(
         READ,
         &t.shared.manifest_same,
         vec![V::Text(root.to_owned()), V::Blob(bytes.to_vec())],
@@ -422,7 +452,8 @@ pub(crate) fn put_manifest_now(
 }
 
 /// Remove these entries now; the ones that existed (one request to find
-/// them, one to remove them).
+/// them, one to remove them). Every key asked for leaves this handle's
+/// cache and a replica's file, also one the server no longer held.
 pub(crate) fn remove_now(
     remote: &Remote,
     doomed: Vec<StoredEnvelope>,
@@ -433,7 +464,7 @@ pub(crate) fn remove_now(
     }
     let t = remote.ready()?;
     let keys: BTreeSet<&str> = doomed.iter().map(|e| e.key.as_str()).collect();
-    let r = remote.conn.query(
+    let r = remote.query(
         READ,
         &t.existing_keys,
         vec![json_list(keys.iter().copied())],
@@ -442,15 +473,23 @@ pub(crate) fn remove_now(
         .iter()
         .filter_map(|row| row.first().and_then(col_text))
         .collect();
-    if existing.is_empty() {
-        return Ok(Vec::new());
+    if !existing.is_empty() {
+        send(
+            remote,
+            &Pending {
+                removals: existing.clone(),
+                ..Pending::default()
+            },
+        )?;
     }
-    let mut p = Pending {
-        after: after.cloned(),
-        ..Pending::default()
-    };
-    p.removals = existing.clone();
-    write(remote, &p)?;
+    settle(
+        remote,
+        &Pending {
+            removals: keys.iter().map(|k| (*k).to_owned()).collect(),
+            after: after.cloned(),
+            ..Pending::default()
+        },
+    );
     let mut seen = BTreeSet::new();
     Ok(doomed
         .into_iter()
@@ -477,7 +516,7 @@ pub(crate) fn remove_manifests_now(
     }
     let cut = now().saturating_sub(i64::try_from(remote.grace.as_secs()).unwrap_or(i64::MAX));
     let wanted: BTreeSet<&str> = roots.iter().copied().collect();
-    let r = remote.conn.query(
+    let r = remote.query(
         READ,
         &t.removable,
         vec![json_list(wanted.iter().copied()), V::Integer(cut)],
@@ -507,7 +546,7 @@ pub(crate) fn remove_manifests_now(
                 .join(", ")
         ),
     ];
-    match remote.conn.batch(WRITE, &stmts) {
+    match remote.write(WRITE, &stmts) {
         Ok(()) | Err(Fail::Absent) => {}
         Err(Fail::Store(e)) => return Err(e),
     }
@@ -542,6 +581,16 @@ fn log_rows(log: &str, slots: &[&Slot], roots: &[&str], at: i64) -> Option<Strin
 /// Write `p` in one transaction (one request), then bring the cache up to
 /// date and run the queue's hook.
 pub(crate) fn write(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
+    if p.is_empty() {
+        return Ok(());
+    }
+    send(remote, p)?;
+    settle(remote, p);
+    Ok(())
+}
+
+/// Write `p` to the server in one transaction (one request).
+fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
     if p.is_empty() {
         return Ok(());
     }
@@ -639,7 +688,7 @@ pub(crate) fn write(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
         ));
         stmts.push(format!("DELETE FROM {log} WHERE at < {cut}"));
     }
-    match remote.conn.batch(WRITE, &stmts) {
+    match remote.write(WRITE, &stmts) {
         Ok(()) => {}
         // Only removals, and no tables: nothing to remove.
         Err(Fail::Absent) if only_removals => return Ok(()),
@@ -658,6 +707,12 @@ pub(crate) fn write(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
         p.removals.len() + p.emptied.len(),
         remote.conn.requests() - n0
     ));
+    Ok(())
+}
+
+/// What a write changes besides the server: this handle's cache (it reads
+/// its own writes and removals), then the queue's hook (a replica's file).
+fn settle(remote: &Remote, p: &Pending) {
     {
         let mut c = remote.cache();
         for (root, (_, bytes)) in &p.manifests {
@@ -679,5 +734,4 @@ pub(crate) fn write(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
     if let Some(after) = &p.after {
         after(p);
     }
-    Ok(())
 }

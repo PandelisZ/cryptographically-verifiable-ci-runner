@@ -169,9 +169,11 @@ fn a_plan_costs_a_handful_of_requests() {
             }
             roots.push(m.root());
         }
-        let before = s.requests();
+        let before = s.requests() - s.retries();
         b.finish().unwrap();
-        let used = s.requests() - before;
+        // Requests sent again while another test's writer held the
+        // database are not the batch's own.
+        let used = s.requests() - s.retries() - before;
         assert!(used <= 6, "a batch of {n} units took {used} requests");
     }
     let p = open(&testkit::selection(
@@ -194,7 +196,7 @@ fn a_plan_costs_a_handful_of_requests() {
         choose: Some(&newest),
     })
     .unwrap();
-    let after_prefetch = p.requests();
+    let after_prefetch = p.requests() - p.retries();
     let mut listed = p.list_units(&ids).unwrap();
     assert!(listed.iter().all(|l| l.len() == 2));
     let mut chosen: Vec<&mut StoredEnvelope> = listed
@@ -219,7 +221,7 @@ fn a_plan_costs_a_handful_of_requests() {
         }
     });
     assert_eq!(
-        p.requests(),
+        p.requests() - p.retries(),
         after_prefetch,
         "the listings, the values and the manifests came from the cache"
     );
@@ -394,41 +396,181 @@ fn a_closed_port_fails_fast_and_shows_no_secret() {
     assert!(!s.flag("x"));
 }
 
-/// A server that accepts the connection and never answers is given up on
-/// after the request timeout, and the breaker latches.
-#[test]
-fn a_server_that_never_answers_is_given_up_on() {
+/// A port where something accepts connections and never answers.
+fn silent_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
-    let held = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut kept = Vec::new();
-        for c in l.incoming().take(4).flatten() {
+        for c in l.incoming().flatten() {
             kept.push(c);
         }
-        std::thread::sleep(Duration::from_secs(5));
     });
-    let mut sel = testkit::selection(
-        LibsqlMode::Remote,
-        Some(&format!("http://127.0.0.1:{port}")),
-        None,
-        Some("ns"),
-        None,
-    );
-    sel.timeout = Sourced {
-        value: Duration::from_secs(1),
-        source: Source::File,
-    };
-    let s = open(&sel);
-    let t = Instant::now();
-    match s.status() {
-        Err(StoreError::Timeout { operation, .. }) => assert_eq!(operation, "a request"),
-        other => panic!("expected a Timeout, got {other:?}"),
+    port
+}
+
+/// A port where a server answers every request with `response` (an HTTP
+/// response, whole), then closes the connection.
+fn canned_port(response: Vec<u8>) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let response = response.clone();
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                let mut buf = [0u8; 4096];
+                // The headers, then as much body as they announce.
+                while let Ok(n) = c.read(&mut buf) {
+                    if n == 0 {
+                        return;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got).to_ascii_lowercase();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if got.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let _ = c.write_all(&response);
+            });
+        }
+    });
+    port
+}
+
+/// A server that accepts the connection and never answers costs the
+/// connect timeout, not the request timeout (30 s; ten minutes for `vci
+/// prune`): until the server has answered once, a request is bounded by
+/// the connect timeout. The breaker latches; a replica reads what it has,
+/// or (for `vci store`, fetch, push and prune) fails.
+#[test]
+fn a_server_that_never_answers_costs_the_connect_timeout() {
+    let port = silent_port();
+    let url = format!("http://127.0.0.1:{port}");
+    for long_running in [false, true] {
+        let mut sel = testkit::selection(LibsqlMode::Remote, Some(&url), None, Some("ns"), None);
+        sel.connect_timeout = Sourced {
+            value: Duration::from_secs(1),
+            source: Source::File,
+        };
+        let s = LibsqlStore::open(
+            &sel,
+            &testkit::cx_in(Path::new("/nonexistent/.git"), long_running),
+        )
+        .unwrap();
+        let t = Instant::now();
+        match s.status() {
+            Err(StoreError::Timeout {
+                operation, after, ..
+            }) => {
+                assert_eq!(operation, "the server's first answer");
+                assert_eq!(after, Duration::from_secs(1));
+            }
+            other => panic!("expected a Timeout, got {other:?}"),
+        }
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let t = Instant::now();
+        assert!(s.list_all().is_err());
+        assert!(
+            s.put_for_test("src/a.test.ts", S1, "00", None, b"{}")
+                .is_err()
+        );
+        assert!(t.elapsed() < Duration::from_millis(200));
     }
-    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
-    let t = Instant::now();
-    assert!(s.list_all().is_err());
-    assert!(t.elapsed() < Duration::from_millis(200));
-    drop(held);
+    // A replica: the first read reads the (empty) file with a warning
+    // within the connect timeout; for the store commands it fails.
+    let dir = tempfile::tempdir().unwrap();
+    for (command, stale_ok) in [
+        ("plan", true),
+        ("run", true),
+        ("store", false),
+        ("prune", false),
+    ] {
+        let mut sel = testkit::selection(
+            LibsqlMode::Replica,
+            Some(&url),
+            None,
+            Some("ns"),
+            Some(&dir.path().join(format!("{command}.libsql"))),
+        );
+        sel.connect_timeout = Sourced {
+            value: Duration::from_secs(1),
+            source: Source::File,
+        };
+        let mut cx = testkit::cx();
+        cx.command = command.to_owned();
+        cx.long_running = command == "prune";
+        let r = LibsqlStore::open(&sel, &cx).unwrap();
+        let t = Instant::now();
+        let status = r.status();
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "{command}: {:?}",
+            t.elapsed()
+        );
+        if stale_ok {
+            assert!(
+                matches!(status, Ok(StoreStatus::Absent { .. })),
+                "{command}: {status:?}"
+            );
+            assert!(r.list_units(&["src/a.test.ts"]).unwrap()[0].is_empty());
+        } else {
+            match status {
+                Err(StoreError::Unavailable { detail, .. }) => {
+                    assert!(
+                        detail.contains("cannot sync the replica"),
+                        "{command}: {detail}"
+                    )
+                }
+                other => panic!("{command}: expected Unavailable, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// A server or proxy whose error page is not UTF-8 text (a Latin-1 502)
+/// makes libsql 0.10.0 panic: the store fails instead (a latched
+/// `Unavailable`), for every call and on the warming thread.
+#[test]
+fn an_error_page_the_client_cannot_read_fails_without_a_panic() {
+    let body: &[u8] = b"<html>Mauvaise passerelle \xe9t\xe9</html>";
+    let mut response = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html; charset=iso-8859-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    let mut binary =
+        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\n"
+            .to_vec();
+    binary.extend_from_slice(&[0xff, 0xfe, 0x00, 0x80]);
+    for response in [response, binary] {
+        let port = canned_port(response);
+        let sel = testkit::selection(
+            LibsqlMode::Remote,
+            Some(&format!("libsql://127.0.0.1:{port}?tls=0")),
+            Some("s3cretTok"),
+            Some("ns"),
+            None,
+        );
+        let s = open(&sel);
+        s.warm();
+        let e = s.status().unwrap_err();
+        assert!(matches!(e, StoreError::Unavailable { .. }), "{e:?}");
+        assert!(e.to_string().contains("cannot read"), "{e}");
+        let e = s.list_units(&["src/a.test.ts"]).unwrap_err();
+        assert!(e.to_string().contains("not retried"), "{e}");
+        assert!(!format!("{e} {e:?}").contains("s3cretTok"));
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// URLs vci refuses never quote what they hold.
@@ -809,4 +951,530 @@ fn the_prefix_names_the_namespace() {
     assert_eq!(table_prefix("acme"), table_prefix("acme"));
     assert_ne!(table_prefix("acme"), table_prefix("acme2"));
     assert!(table_prefix("acme").starts_with("vci_"));
+}
+
+// ---- contracts the conformance suite cannot reach --------------------------------------
+
+fn keys_of(s: &LibsqlStore, unit: &str) -> Vec<String> {
+    s.list_units(&[unit])
+        .unwrap()
+        .remove(0)
+        .into_iter()
+        .map(|e| e.key)
+        .collect()
+}
+
+/// What `read_values` makes of one entry: `read` or the error.
+fn read_state(s: &LibsqlStore, e: &StoredEnvelope) -> String {
+    let mut e = StoredEnvelope::from_key(e.target.clone(), &e.key).unwrap();
+    s.read_values(&mut [&mut e]).unwrap();
+    match e.state() {
+        ValueState::Read(_) => "read".to_owned(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// A removal outside a batch is read by this handle afterwards, also when
+/// another writer removed or replaced the key first (the server then
+/// holds nothing to remove): its prefetched cache and a replica's file
+/// forget the key all the same.
+#[test]
+fn a_handle_reads_its_own_removals_after_others_wrote() {
+    let Some((a, ns)) = remote() else { return };
+    let b = testkit::open_remote(&ns).unwrap();
+    let unit = "src/rm.test.ts";
+    // Removed by the other writer first.
+    let k = a
+        .put_for_test(unit, S1, &hex64(1), Some(&hint(1)), &envelope(None, "one"))
+        .unwrap();
+    a.prefetch(Prefetch::Units {
+        test_ids: &[unit],
+        choose: None,
+    })
+    .unwrap();
+    assert_eq!(b.remove(vec![k.clone()]).unwrap().len(), 1);
+    assert!(
+        a.remove(vec![k.clone()]).unwrap().is_empty(),
+        "the server held nothing"
+    );
+    assert!(
+        keys_of(&a, unit).is_empty(),
+        "this handle still lists what it removed"
+    );
+    assert!(
+        read_state(&a, &k).contains("no longer"),
+        "{}",
+        read_state(&a, &k)
+    );
+    // Replaced by the other writer first.
+    let k1 = a
+        .put_for_test(unit, S1, &hex64(2), Some(&hint(1)), &envelope(None, "two"))
+        .unwrap();
+    a.prefetch(Prefetch::Units {
+        test_ids: &[unit],
+        choose: None,
+    })
+    .unwrap();
+    let k2 = b
+        .put_for_test(
+            unit,
+            S1,
+            &hex64(2),
+            Some(&hint(2)),
+            &envelope(None, "three"),
+        )
+        .unwrap();
+    a.remove(vec![k1.clone()]).unwrap();
+    assert!(!keys_of(&a, unit).contains(&k1.key));
+    assert_eq!(
+        keys_of(&testkit::open_remote(&ns).unwrap(), unit),
+        vec![k2.key]
+    );
+    // A replica: removed on the server by another writer, then by the
+    // replica's handle.
+    let dir = tempfile::tempdir().unwrap();
+    let k3 = a
+        .put_for_test(
+            "src/rm2.test.ts",
+            S1,
+            &hex64(3),
+            Some(&hint(1)),
+            &envelope(None, "four"),
+        )
+        .unwrap();
+    let r = testkit::open_replica(&ns, &dir.path().join("r.libsql")).unwrap();
+    assert_eq!(keys_of(&r, "src/rm2.test.ts"), vec![k3.key.clone()]);
+    b.remove(vec![k3.clone()]).unwrap();
+    assert!(r.remove(vec![k3.clone()]).unwrap().is_empty());
+    assert!(
+        keys_of(&r, "src/rm2.test.ts").is_empty(),
+        "the replica still lists what it removed"
+    );
+}
+
+/// A replica picks up other writers' changes at its next prefetch (`vci
+/// run`'s before supersession, the plan's later rounds), as the remote mode
+/// does; a key another writer removed then reads as gone.
+#[test]
+fn a_replica_picks_up_other_writers_at_the_next_prefetch() {
+    let Some((w, ns)) = remote() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let (u1, u2) = ("src/p1.test.ts", "src/p2.test.ts");
+    let k1 = w
+        .put_for_test(u1, S1, &hex64(1), Some(&hint(1)), &envelope(None, "one"))
+        .unwrap();
+    let r = testkit::open_replica(&ns, &dir.path().join("r.libsql")).unwrap();
+    r.prefetch(Prefetch::Units {
+        test_ids: &[u1, u2],
+        choose: None,
+    })
+    .unwrap();
+    let listed = r.list_units(&[u1]).unwrap().remove(0);
+    assert_eq!(listed.len(), 1);
+    let k2 = w
+        .put_for_test(u1, S1, &hex64(2), Some(&hint(2)), &envelope(None, "two"))
+        .unwrap();
+    let k3 = w
+        .put_for_test(u2, S1, &hex64(3), Some(&hint(3)), &envelope(None, "three"))
+        .unwrap();
+    w.remove(vec![k1.clone()]).unwrap();
+    let before = r.requests();
+    r.prefetch(Prefetch::Units {
+        test_ids: &[u1, u2],
+        choose: None,
+    })
+    .unwrap();
+    assert!(
+        r.requests() - before <= 2,
+        "a sync of changes took {} requests",
+        r.requests() - before
+    );
+    let units = r.read_units(&[u1, u2]).unwrap();
+    let seen: Vec<Vec<String>> = units
+        .iter()
+        .map(|u| u.iter().map(|e| e.key.clone()).collect())
+        .collect();
+    assert_eq!(seen, vec![vec![k2.key.clone()], vec![k3.key.clone()]]);
+    assert!(
+        read_state(&r, &listed[0]).contains("no longer"),
+        "{}",
+        read_state(&r, &listed[0])
+    );
+}
+
+/// A replica whose write cannot be written through to its file (another
+/// process holds the file) reads its own write from the server for the
+/// rest of the process; the next handle's sync brings it to the file.
+#[test]
+fn a_replica_whose_write_through_fails_reads_its_own_write() {
+    let Some((w, ns)) = remote() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.libsql");
+    w.put_for_test(
+        "src/a.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "a"),
+    )
+    .unwrap();
+    let server = testkit::server().unwrap();
+    let mut sel = testkit::selection(
+        LibsqlMode::Replica,
+        Some(&server.url),
+        server.token.as_deref(),
+        Some(&ns),
+        Some(&path),
+    );
+    sel.timeout = Sourced {
+        value: Duration::from_secs(1),
+        source: Source::File,
+    };
+    let r = open(&sel);
+    assert_eq!(keys_of(&r, "src/a.test.ts").len(), 1);
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let k = r
+        .put_for_test(
+            "src/b.test.ts",
+            S1,
+            &hex64(2),
+            Some(&hint(2)),
+            &envelope(None, "b"),
+        )
+        .unwrap();
+    lock.execute_batch("COMMIT").unwrap();
+    drop(lock);
+    assert_eq!(keys_of(&r, "src/b.test.ts"), vec![k.key.clone()]);
+    assert_eq!(read_state(&r, &k), "read");
+    assert_eq!(
+        keys_of(&r, "src/a.test.ts").len(),
+        1,
+        "the rest is read too"
+    );
+    drop(r);
+    let r2 = testkit::open_replica(&ns, &path).unwrap();
+    assert_eq!(keys_of(&r2, "src/b.test.ts"), vec![k.key]);
+}
+
+/// A replica of a namespace that was dropped and made again (a restore, a
+/// new database at the same URL) syncs everything: it ends as the server
+/// is, without the old records.
+#[test]
+fn a_replica_of_a_namespace_made_again_syncs_everything() {
+    let Some((s, ns)) = remote() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.libsql");
+    for i in 0..12u8 {
+        s.put_for_test(
+            &format!("src/old{i}.test.ts"),
+            S1,
+            &hex64(i + 1),
+            Some(&hint(1)),
+            &envelope(None, "old"),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        testkit::open_replica(&ns, &path).unwrap().count().unwrap(),
+        12
+    );
+    let p = table_prefix(&ns);
+    s.__execute_for_test(&[
+        format!("DROP TABLE {p}attestations"),
+        format!("DROP TABLE {p}manifests"),
+        format!("DROP TABLE {p}memo"),
+        format!("DROP TABLE {p}flags"),
+        format!("DROP TABLE {p}log"),
+        format!("DELETE FROM vci_schema WHERE ns = '{ns}'"),
+    ])
+    .unwrap();
+    // Nothing on the server: nothing in the replica.
+    assert_eq!(
+        testkit::open_replica(&ns, &path).unwrap().count().unwrap(),
+        0
+    );
+    // Made again, with fewer log entries than the replica had synced, then
+    // with more.
+    let w = testkit::open_remote(&ns).unwrap();
+    let fresh = w
+        .put_for_test(
+            "src/new.test.ts",
+            S1,
+            &hex64(0x40),
+            Some(&hint(2)),
+            &envelope(None, "new"),
+        )
+        .unwrap();
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    assert_eq!(
+        r.read_all()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect::<Vec<_>>(),
+        vec![fresh.key.clone()]
+    );
+    drop(r);
+    // Synced to entry N; the namespace is made again and passes N.
+    let path2 = dir.path().join("r2.libsql");
+    assert_eq!(
+        testkit::open_replica(&ns, &path2).unwrap().count().unwrap(),
+        1
+    );
+    let p = table_prefix(&ns);
+    w.__execute_for_test(&[
+        format!("DROP TABLE {p}attestations"),
+        format!("DROP TABLE {p}manifests"),
+        format!("DROP TABLE {p}memo"),
+        format!("DROP TABLE {p}flags"),
+        format!("DROP TABLE {p}log"),
+        format!("DELETE FROM vci_schema WHERE ns = '{ns}'"),
+    ])
+    .unwrap();
+    let w = testkit::open_remote(&ns).unwrap();
+    let mut keys = Vec::new();
+    for i in 0..3u8 {
+        keys.push(
+            w.put_for_test(
+                &format!("src/again{i}.test.ts"),
+                S1,
+                &hex64(0x50 + i),
+                Some(&hint(3)),
+                &envelope(None, "again"),
+            )
+            .unwrap()
+            .key,
+        );
+    }
+    let got: Vec<String> = testkit::open_replica(&ns, &path2)
+        .unwrap()
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.key)
+        .collect();
+    keys.sort();
+    let mut got_sorted = got.clone();
+    got_sorted.sort();
+    assert_eq!(got_sorted, keys, "the replica does not match its server");
+}
+
+/// A replica's `orphan_manifests` is its server's: a root referenced by a
+/// value this vci cannot read (left out of the file) is still referenced.
+#[test]
+fn a_replica_answers_orphans_as_its_server() {
+    let Some((s, ns)) = remote() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let m = manifest(&["src/ref.rs"]);
+    let root = m.root();
+    s.put_manifest(&root, m.to_compact().as_bytes()).unwrap();
+    let k = s
+        .put_for_test(
+            "src/a.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(1)),
+            &envelope(Some(&root), "refs"),
+        )
+        .unwrap();
+    let p = table_prefix(&ns);
+    s.__execute_for_test(&[format!(
+        "UPDATE {p}attestations SET encoding = 99 WHERE key = '{}'",
+        k.key
+    )])
+    .unwrap();
+    let r = testkit::open_replica(&ns, &dir.path().join("r.libsql")).unwrap();
+    assert!(
+        testkit::open_remote(&ns)
+            .unwrap()
+            .orphan_manifests(&[&root])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(r.orphan_manifests(&[&root]).unwrap().is_empty());
+}
+
+/// A statement the server refuses (here a trigger's `RAISE`) fails its
+/// batch as `Backend`, writes nothing, and latches nothing: the handle's
+/// later reads and writes go on, remote and replica.
+#[test]
+fn a_statement_the_server_refuses_latches_nothing() {
+    let Some((s, ns)) = remote() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    s.put_for_test(
+        "src/a.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "kept"),
+    )
+    .unwrap();
+    let p = table_prefix(&ns);
+    let bad = hex64(0xbb);
+    s.__execute_for_test(&[format!(
+        "CREATE TRIGGER {p}boom BEFORE INSERT ON {p}attestations WHEN NEW.storage_key = '{bad}' \
+         BEGIN SELECT RAISE(ABORT, 'boom'); END"
+    )])
+    .unwrap();
+    for (i, replica) in [false, true].into_iter().enumerate() {
+        let h = if replica {
+            testkit::open_replica(&ns, &dir.path().join("r.libsql")).unwrap()
+        } else {
+            testkit::open_remote(&ns).unwrap()
+        };
+        h.prefetch(Prefetch::Units {
+            test_ids: &["src/a.test.ts"],
+            choose: None,
+        })
+        .unwrap();
+        let m = manifest(&[&format!("src/failing{i}.rs")]);
+        let b = h.batch().unwrap();
+        h.put_manifest(&m.root(), m.to_compact().as_bytes())
+            .unwrap();
+        h.put_for_test(
+            "src/b.test.ts",
+            S1,
+            &hex64(2),
+            Some(&hint(5)),
+            &envelope(Some(&m.root()), "good"),
+        )
+        .unwrap();
+        h.put_for_test(
+            "src/a.test.ts",
+            S1,
+            &bad,
+            Some(&hint(5)),
+            &envelope(None, "bad"),
+        )
+        .unwrap();
+        match b.finish() {
+            Err(e @ StoreError::Backend(_)) => assert!(e.to_string().contains("boom"), "{e}"),
+            other => panic!("replica {replica}: expected Backend, got {other:?}"),
+        }
+        let srv = testkit::open_remote(&ns).unwrap();
+        assert!(
+            srv.manifest(&m.root()).unwrap().is_none(),
+            "the failed batch's manifest"
+        );
+        assert!(
+            keys_of(&srv, "src/b.test.ts").is_empty(),
+            "the failed batch's attestation"
+        );
+        // The handle goes on.
+        assert!(h.manifest(&m.root()).unwrap().is_none());
+        h.put_for_test(
+            "src/c.test.ts",
+            S1,
+            &hex64(3 + i as u8),
+            Some(&hint(7)),
+            &envelope(None, "after"),
+        )
+        .unwrap();
+        assert!(matches!(h.status().unwrap(), StoreStatus::Ready { .. }));
+    }
+}
+
+/// A record the server would refuse as too big (`sqld` keeps rows under
+/// 5,000,000 bytes) is refused alone, as `Unsupported` (which keeps `vci
+/// run`'s exit code), before anything is sent: the rest of its batch is
+/// stored and the handle goes on. A value just under the limit is stored.
+#[test]
+fn a_record_too_large_for_the_server_is_refused_alone() {
+    let Some((s, _)) = remote() else { return };
+    let pad = |n: usize| {
+        format!(
+            "{{\"v\":2,\"entries\":[],\"pad\":\"{}\"}}",
+            "y".repeat(n - 30)
+        )
+    };
+    let big = pad(5_000_000);
+    let root_big = hex64(0x61);
+    match s.put_manifest(&root_big, big.as_bytes()) {
+        Err(e @ StoreError::Unsupported { .. }) => {
+            assert!(e.to_string().contains("5,000,000"), "{e}")
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    let near = pad(4_990_000);
+    let root_near = hex64(0x62);
+    assert!(s.put_manifest(&root_near, near.as_bytes()).unwrap());
+    assert_eq!(
+        s.manifest(&root_near).unwrap().unwrap().bytes.len(),
+        near.len()
+    );
+    let b = s.batch().unwrap();
+    let small = manifest(&["src/small.rs"]);
+    s.put_manifest(&small.root(), small.to_compact().as_bytes())
+        .unwrap();
+    assert!(matches!(
+        s.put_manifest(&hex64(0x63), big.as_bytes()),
+        Err(StoreError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        s.put_for_test(
+            "src/big.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(1)),
+            &envelope(None, &"e".repeat(5_000_000))
+        ),
+        Err(StoreError::Unsupported { .. })
+    ));
+    let ok = s
+        .put_for_test(
+            "src/ok.test.ts",
+            S1,
+            &hex64(2),
+            Some(&hint(1)),
+            &envelope(Some(&small.root()), "ok"),
+        )
+        .unwrap();
+    b.finish().unwrap();
+    assert_eq!(keys_of(&s, "src/ok.test.ts"), vec![ok.key]);
+    assert!(keys_of(&s, "src/big.test.ts").is_empty());
+    assert!(s.manifest(&small.root()).unwrap().is_some());
+    assert!(matches!(s.status().unwrap(), StoreStatus::Ready { .. }));
+}
+
+/// A replica file that is not a database, or one in a directory vci may
+/// not write, refuses writes (`Unavailable`) instead of storing on the
+/// server behind it.
+#[test]
+fn a_replica_that_cannot_be_used_refuses_writes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some((_, ns)) = remote() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let garbage = dir.path().join("garbage.libsql");
+    std::fs::write(&garbage, "not a database\n".repeat(100)).unwrap();
+    std::fs::write(
+        dir.path().join("garbage.libsql.sync"),
+        "{\"v\":1,\"source\":\"x\",\"seq\":0}",
+    )
+    .unwrap();
+    let ro = dir.path().join("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    for path in [garbage.clone(), ro.join("r.libsql")] {
+        let r = testkit::open_replica(&ns, &path).unwrap();
+        let put = r.put_for_test("src/w.test.ts", S1, &hex64(1), Some(&hint(1)), b"{}");
+        assert!(
+            matches!(put, Err(StoreError::Unavailable { .. })),
+            "{}: {put:?}",
+            path.display()
+        );
+        assert!(
+            matches!(r.batch(), Err(StoreError::Unavailable { .. })),
+            "{}",
+            path.display()
+        );
+    }
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        testkit::open_remote(&ns)
+            .unwrap()
+            .list_units(&["src/w.test.ts"])
+            .unwrap()[0]
+            .is_empty()
+    );
 }

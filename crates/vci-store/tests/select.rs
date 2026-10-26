@@ -105,8 +105,9 @@ fn the_environment_wins_over_the_url_scheme_over_vci_toml_over_the_default() {
     .unwrap();
     assert_eq!(k(&s), ("git-meta".into(), Source::Env(ENV_STORE)));
     assert_eq!(s.warnings.len(), 1);
+    // (An https:// URL is a libSQL server's: its path is not shown.)
     assert!(
-        s.warnings[0].contains("https://***@host/x"),
+        s.warnings[0].contains("https://***@host/<path>"),
         "{:?}",
         s.warnings
     );
@@ -1111,4 +1112,124 @@ fn libsql_tokens_stay_out_of_vci_toml_and_every_message() {
             .iter()
             .any(|l| l.name == "path" && l.value == "<git common dir>/vci-store.libsql")
     );
+}
+
+/// A libSQL server's URL as `vci store info` and every warning show it:
+/// only `tls` of its query, an `authToken` masked, and anything else (a
+/// token under another key, a bare token, a token in the path) masked with
+/// its name; the URL's other secrets are scrubbed from messages too.
+#[test]
+fn libsql_urls_show_no_token_under_any_key() {
+    for (input, want) in [
+        (
+            "libsql://127.0.0.1:57836?tls=0&token=eyJhbGci.s3cret.sig",
+            "libsql://127.0.0.1:57836?tls=0&***",
+        ),
+        (
+            "libsql://db.turso.io?jwt=s3cret",
+            "libsql://db.turso.io?***",
+        ),
+        (
+            "libsql://db.turso.io?access_token=s3cret&Auth-Token=s3cret",
+            "libsql://db.turso.io?***&***",
+        ),
+        ("libsql://db.turso.io?s3cret", "libsql://db.turso.io?***"),
+        (
+            "libsql://db.turso.io?authToken%3Ds3cret",
+            "libsql://db.turso.io?***",
+        ),
+        (
+            "libsql://db.turso.io?AUTHTOKEN=s3cret",
+            "libsql://db.turso.io?AUTHTOKEN=***",
+        ),
+        (
+            "libsql://db.turso.io/s3cret-in-path",
+            "libsql://db.turso.io/<path>",
+        ),
+        ("https://u:s3cret@db.example/", "https://***@db.example/"),
+        (
+            "http://db.example:8080#s3cret",
+            "http://db.example:8080#***",
+        ),
+        (
+            "libsql://db.turso.io?tls=s3cret",
+            "libsql://db.turso.io?***",
+        ),
+    ] {
+        assert_eq!(redact(input), want, "{input}");
+    }
+    let s = sel(
+        &[(
+            ENV_STORE_URL,
+            "libsql://127.0.0.1:1?tls=0&token=eyJhbGci.s3cret.sig",
+        )],
+        None,
+    )
+    .unwrap();
+    let all = format!("{:?} {s:?}", s.describe());
+    assert!(!all.contains("s3cret"), "{all}");
+    assert!(all.contains("libsql://127.0.0.1:1?tls=0&***"), "{all}");
+    // A message quoting the token under another key, or the path.
+    let u = Secret::new("libsql://db.turso.io/pathTok3n99?token=s3cretTok");
+    assert_eq!(
+        u.scrub("refused s3cretTok at /pathTok3n99"),
+        "refused *** at /***"
+    );
+}
+
+/// A server or proxy that echoes the token JSON-escaped or base64-encoded
+/// (an `Authorization` header in an error body) shows none of it: no run of
+/// 8 characters of the encoding that the token's bytes alone determine.
+#[test]
+fn echoed_tokens_are_scrubbed_in_every_form() {
+    use base64::Engine as _;
+    let token = "envTok/S3cr3t+Foxtrot==";
+    let t = Secret::opaque(token);
+    for prefix in [
+        "Bearer ",
+        "Bearer  x",
+        "",
+        "ab",
+        "{\"authorization\":\"Bearer ",
+    ] {
+        let plain = format!("{prefix}{token}");
+        let std = base64::engine::general_purpose::STANDARD.encode(&plain);
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&plain);
+        let echoed = format!(
+            "{{\"esc\": \"{}\", \"b64\": \"{std}\", \"url\": \"{url}\"}}",
+            plain.replace('/', "\\/"),
+        );
+        let got = t.scrub(&echoed);
+        assert!(!got.contains("S3cr3t"), "{prefix:?}: {got}");
+        // The groups of three bytes that lie inside the token.
+        let first = prefix.len().div_ceil(3) * 4;
+        let last = (prefix.len() + token.len()) / 3 * 4;
+        for e in [&std, &url] {
+            for i in first..last.saturating_sub(8) + 1 {
+                let w = &e[i..i + 8];
+                assert!(!got.contains(w), "{prefix:?}: {w} in {got}");
+            }
+        }
+    }
+    // A short secret is left to its plain forms.
+    assert_eq!(Secret::opaque("abc").scrub("YWJj abc"), "YWJj ***");
+}
+
+/// `[store.libsql] path` (or `[store.sqlite] path`) holding a URL is
+/// refused without being printed, never taken as a file name.
+#[test]
+fn a_url_as_a_path_in_vci_toml_is_refused_unprinted() {
+    for (backend, table) in [("libsql", "libsql"), ("sqlite", "sqlite")] {
+        for path in [
+            "libsql://db.turso.io?authToken=s3cret",
+            "https://db.example/x",
+            "x?authToken=s3cret",
+        ] {
+            let toml =
+                format!("[store]\nbackend = \"{backend}\"\n[store.{table}]\npath = \"{path}\"\n");
+            let m = config_err(&[], Some(&toml));
+            assert!(!m.contains("s3cret") && !m.contains(path), "{m}");
+            assert!(m.contains("holds a URL"), "{m}");
+        }
+    }
 }

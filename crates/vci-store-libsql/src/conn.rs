@@ -6,30 +6,45 @@
 //!   HTTP with `?tls=0`), `https://` or `http://`, a host, an optional port
 //!   and path, and an optional `authToken` query parameter. A user or
 //!   password in it, a fragment, or another query parameter is refused,
-//!   without printing it. The token is `VCI_STORE_TOKEN`, else `authToken`.
+//!   without printing it or the parameter's name. The token is
+//!   `VCI_STORE_TOKEN`, else `authToken`. Messages show the scheme, host
+//!   and port only: a path is shown as `/<path>` (a token could be written
+//!   there).
 //! * **TLS** is rustls with the `ring` provider and the webpki roots, on the
 //!   workspace's one rustls (libsql's own `tls` feature would bring a second).
 //! * **Bounded time.** Each connection (TCP and TLS) is given up after the
-//!   connect timeout, each request after the request timeout. The first
-//!   failure to reach the server, and the first deadline that runs out,
-//!   latch the circuit breaker: every later call of the handle fails at
-//!   once.
+//!   connect timeout. A handle's first request is always the description
+//!   of a statement (a small request, see [`Conn::query`]): until the
+//!   server has answered one, it is given up after the connect timeout
+//!   too, so a server that accepts and never answers (or answers too
+//!   slowly to be used) costs the connect timeout, not the request
+//!   timeout. Every other request is given up after the request timeout.
+//!   The first failure to reach the server, and the first deadline that
+//!   runs out, latch the circuit breaker: every later call of the handle
+//!   fails at once.
 //! * **Requests.** A read is one prepared statement (the server describes a
 //!   statement once per pooled connection; the description is kept) whose
 //!   rows come back in one request. A write is one transactional batch: its
 //!   statements, values written as literals, travel in one request and
-//!   apply atomically.
+//!   apply atomically. A statement the server refuses is
+//!   [`StoreError::Backend`] (or `Unsupported` for a record larger than the
+//!   server takes) and latches nothing.
+//! * **Panics.** libsql 0.10.0 panics on an HTTP error whose body is not
+//!   UTF-8 text; every call into it is guarded (see [`guarded`]): such a
+//!   panic is a latched `Unavailable`, and prints nothing.
 //! * **Secrets.** Every message passes through [`Conn::scrub`], which
 //!   removes the URL's token and `VCI_STORE_TOKEN`; the location never
 //!   holds either.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::error::Error as _;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -45,6 +60,19 @@ pub(crate) const KIND: &str = "libsql";
 
 /// The request timeout of a long-running command (`vci prune`).
 pub(crate) const LONG_RUNNING_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The largest record vci sends a server: `sqld` refuses a row (and any
+/// one value) of 5,000,000 bytes or more ("string or blob too big", its
+/// `SQLITE_LIMIT_LENGTH`).
+pub(crate) const MAX_RECORD: usize = 5_000_000;
+
+/// What a record of [`MAX_RECORD`] bytes or more is refused as
+/// ([`StoreError::Unsupported`]).
+pub(crate) const TOO_BIG: &str = "storing a record of 5,000,000 bytes or more on a server (a libsql server's limit: a unit whose attestation or input manifest is that large is not attested)";
+
+/// What a record the server refused as too big is.
+const TOO_BIG_REFUSED: &str =
+    "storing a record this large on this server (it refused it as too big)";
 
 /// The most connections one handle opens.
 const MAX_POOL: usize = 4;
@@ -85,7 +113,8 @@ pub(crate) struct Target {
     /// port, the path; no query.
     pub(crate) url: String,
     /// For messages and `vci store info`: the scheme as written, the host
-    /// and port, the path; never a query or a credential.
+    /// and port, and `/<path>` for a path; never the path itself (a token
+    /// could be written there), a query or a credential.
     pub(crate) display: String,
 }
 
@@ -182,18 +211,11 @@ impl Target {
                     })
                 }
                 _ => {
-                    let printable = !k.is_empty()
-                        && k.len() <= 32
-                        && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-                    return Err(config(if printable {
-                        format!(
-                            "$VCI_STORE_URL has a query parameter {k:?} vci does not know (a libsql URL takes authToken and tls)"
-                        )
-                    } else {
-                        format!(
-                            "$VCI_STORE_URL has a query parameter vci does not know (a libsql URL takes authToken and tls) {not_printed}"
-                        )
-                    }));
+                    // Neither the parameter nor its name is printed: a
+                    // token may be either (`?<token>`, `?token=<token>`).
+                    return Err(config(format!(
+                        "$VCI_STORE_URL has a query parameter vci does not know (a libsql URL takes authToken and tls; the token belongs in $VCI_STORE_TOKEN) {not_printed}"
+                    )));
                 }
             }
         }
@@ -222,10 +244,11 @@ impl Target {
             .cloned()
             .or(query_token)
             .filter(|t| !t.expose().is_empty());
+        let shown_path = if path.is_empty() { "" } else { "/<path>" };
         Ok((
             Target {
                 url: format!("{connect_scheme}://{authority}{path}"),
-                display: format!("{scheme}://{authority}{path}"),
+                display: format!("{scheme}://{authority}{shown_path}"),
             },
             token,
         ))
@@ -433,6 +456,42 @@ impl Class {
 /// starts a new one (servers expire idle streams after about ten seconds).
 const STREAM_IDLE: Duration = Duration::from_secs(4);
 
+// ---- panics in the client ---------------------------------------------------------
+
+thread_local! {
+    /// How many guarded calls into libsql this thread is in.
+    static QUIET: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `f`, a call into libsql, catching a panic in it. libsql 0.10.0
+/// panics on an HTTP error whose body is not UTF-8 text (`String::from_utf8
+/// (..).unwrap()` in its `hrana/hyper.rs`), as a proxy's Latin-1 error page
+/// is; its message would print the body. The panic hook installed here
+/// (once, wrapping the one it replaces) prints nothing for a panic on a
+/// thread inside such a call, and hands every other panic on.
+fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if QUIET.try_with(Cell::get).unwrap_or(0) == 0 {
+                previous(info);
+            }
+        }));
+    });
+    QUIET.with(|q| q.set(q.get() + 1));
+    let r = std::panic::catch_unwind(AssertUnwindSafe(f));
+    QUIET.with(|q| q.set(q.get().saturating_sub(1)));
+    r.map_err(drop)
+}
+
+/// The marker of a first request the server did not answer within the
+/// connect timeout (see [`Conn::query`]).
+const NO_FIRST_ANSWER: &str = "vci: no first answer within the connect timeout";
+
+/// What a panic in the client means.
+const CLIENT_PANICKED: &str = "the libsql client failed on the server's answer (an error response it cannot read: a body that is not UTF-8 text)";
+
 // ---- the pool and the breaker ----------------------------------------------------
 
 /// One connection of the pool, with the statements it prepared (the
@@ -464,6 +523,12 @@ pub(crate) struct Conn {
     max: usize,
     broken: OnceLock<String>,
     requests: AtomicU64,
+    /// Requests sent again (the server was busy, or had dropped the
+    /// stream), counted in `requests` too.
+    retries: AtomicU64,
+    /// The server has answered a request of this handle: later requests
+    /// get the request timeout, not the connect timeout.
+    answered: AtomicBool,
 }
 
 impl Conn {
@@ -491,6 +556,8 @@ impl Conn {
             max: jobs.clamp(1, MAX_POOL),
             broken: OnceLock::new(),
             requests: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
+            answered: AtomicBool::new(false),
         }
     }
 
@@ -502,6 +569,17 @@ impl Conn {
     /// connection included).
     pub(crate) fn requests(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
+    }
+
+    /// Of [`Conn::requests`], those sent again because the server was busy
+    /// (another writer held the database) or had dropped the stream.
+    pub(crate) fn retries(&self) -> u64 {
+        self.retries.load(Ordering::Relaxed)
+    }
+
+    /// Whether the server has answered a request of this handle.
+    pub(crate) fn answered(&self) -> bool {
+        self.answered.load(Ordering::Relaxed)
     }
 
     /// `text` without the URL's token or `VCI_STORE_TOKEN`.
@@ -569,11 +647,14 @@ impl Conn {
                 .map(|t| t.expose().to_owned())
                 .unwrap_or_default();
             let rt = self.runtime().map_err(|e| e.to_string())?;
-            rt.block_on(
-                libsql::Builder::new_remote(self.target.url.clone(), token)
-                    .connector(connector)
-                    .build(),
-            )
+            guarded(|| {
+                rt.block_on(
+                    libsql::Builder::new_remote(self.target.url.clone(), token)
+                        .connector(connector)
+                        .build(),
+                )
+            })
+            .map_err(|()| CLIENT_PANICKED.to_owned())?
             .map_err(|e| self.scrub(&e.to_string()))
         });
         r.as_ref().map_err(|e| {
@@ -595,7 +676,10 @@ impl Conn {
             if p.open < self.max {
                 p.open += 1;
                 drop(p);
-                return match db.connect() {
+                let connected = guarded(|| db.connect()).unwrap_or_else(|()| {
+                    Err(libsql::Error::ConnectionFailed(CLIENT_PANICKED.to_owned()))
+                });
+                return match connected {
                     Ok(conn) => Ok(Pooled {
                         conn,
                         stmts: HashMap::new(),
@@ -662,14 +746,31 @@ impl Conn {
             )
         };
         let at = &self.target.display;
+        if text.contains(NO_FIRST_ANSWER) {
+            return Class::fail(
+                Fail::Store(StoreError::Timeout {
+                    backend: KIND,
+                    operation: "the server's first answer",
+                    after: self.first_answer_timeout(),
+                }),
+                true,
+                true,
+            );
+        }
         if lower.contains("no such table") {
             return Class::fail(Fail::Absent, false, false);
         }
+        // A busy server: another writer holds the database, no connection
+        // is free, it gave up a transaction that waited too long, or it
+        // interrupted a statement to let a writer in (`sqld` rolls the
+        // transaction back: the whole batch is sent again).
         if lower.contains("database is locked")
             || lower.contains("sqlite_busy")
             || lower.contains("status=429")
             || lower.contains("timed out while opening database connection")
+            || lower.contains("transaction timed out")
             || lower.contains("sqlite_interrupt")
+            || lower.contains("error: interrupted")
         {
             return Class {
                 busy: true,
@@ -694,6 +795,20 @@ impl Conn {
                 stale: true,
                 ..unavailable(format!("{at}: {text}"), false, true)
             };
+        }
+        // A record (a row, or one value) larger than the server takes:
+        // `sqld` keeps rows under 5,000,000 bytes (SQLITE_LIMIT_LENGTH).
+        // `batch` refuses such a record before sending it; this is a server
+        // whose limit is lower. The server works: nothing is latched.
+        if lower.contains("string or blob too big") {
+            return Class::fail(
+                Fail::Store(StoreError::Unsupported {
+                    backend: KIND,
+                    operation: TOO_BIG_REFUSED,
+                }),
+                false,
+                true,
+            );
         }
         if lower.contains("http error") || matches!(e, libsql::Error::ConnectionFailed(_)) {
             return unavailable(format!("cannot reach {at}: {text}"), true, true);
@@ -745,8 +860,22 @@ impl Conn {
                 false,
             );
         }
-        if lower.contains("api error") {
+        if lower.contains("api error") && lower.contains("status=") {
+            // Another HTTP error status (a 5xx, a proxy's page).
             return unavailable(format!("{at}: {text}"), true, false);
+        }
+        if lower.contains("api error") || lower.contains("error at step") {
+            // A statement the server refused (a batch step's error comes as
+            // an API error, a cursor step's as `error at step`): the server
+            // works, so nothing is latched, and the transaction it was in
+            // was rolled back. The stream is given up, to be safe.
+            return Class::fail(
+                Fail::Store(StoreError::backend(LibsqlError {
+                    message: format!("{at}: the server refused a statement: {text}"),
+                })),
+                false,
+                true,
+            );
         }
         if lower.contains("stream closed")
             || lower.contains("unexpected response")
@@ -762,52 +891,98 @@ impl Conn {
         )
     }
 
+    /// The longest wait for the server's first answer.
+    fn first_answer_timeout(&self) -> Duration {
+        self.timeout.min(self.connect_timeout)
+    }
+
     /// Run `f` on a pooled connection on the runtime, within the request
-    /// timeout. A connection whose server stream sat idle starts a new one
-    /// (servers expire idle streams). While another writer holds the
-    /// database (or the server has no connection free), `f` is tried again
-    /// with growing pauses until the deadline; a stream the server no longer
-    /// knows is replaced once.
-    fn run<T, F>(&self, op: Op, mut f: F) -> Result<T, Fail>
+    /// timeout; with `bounded_first`, within the connect timeout until the
+    /// server has answered once (a request whose first part is not
+    /// bounded on its own). A connection whose server stream sat idle
+    /// starts a new one (servers expire idle streams). While another writer
+    /// holds the database (or the server has no connection free), `f` is
+    /// tried again with growing pauses until the deadline; a stream the
+    /// server no longer knows is replaced once. A panic in the client is a
+    /// latched `Unavailable`.
+    fn run<T, F>(&self, op: Op, bounded_first: bool, mut f: F) -> Result<T, Fail>
     where
         F: for<'a> FnMut(
             &'a mut Pooled,
             &'a AtomicU64,
+            &'a AtomicBool,
         ) -> Pin<Box<dyn Future<Output = libsql::Result<T>> + 'a>>,
     {
         let rt = self.runtime()?;
         let mut c = self.checkout()?;
-        let timeout = self.timeout;
+        // A server that accepts and never answers (a frozen server, a
+        // stuck proxy) costs the connect timeout, not the request timeout.
+        let (timeout, operation) = if bounded_first && !self.answered() {
+            (self.first_answer_timeout(), "the server's first answer")
+        } else {
+            (self.timeout, "a request")
+        };
         let deadline = Instant::now() + timeout;
-        let requests = &self.requests;
         let mut pause = Duration::from_millis(10);
         let mut renewed = false;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let fresh = c.used.elapsed() > STREAM_IDLE;
-            let r = rt.block_on(async {
-                if fresh {
-                    c.conn.reset().await;
-                }
-                tokio::time::timeout(left, f(&mut c, requests)).await
+            // This attempt's requests (other threads send theirs at once).
+            let sent = AtomicU64::new(0);
+            let r = guarded(|| {
+                rt.block_on(async {
+                    if fresh {
+                        c.conn.reset().await;
+                    }
+                    tokio::time::timeout(left, f(&mut c, &sent, &self.answered)).await
+                })
             });
+            let sent = sent.load(Ordering::Relaxed);
+            self.requests.fetch_add(sent, Ordering::Relaxed);
             c.used = Instant::now();
+            let Ok(r) = r else {
+                drop(c);
+                self.give_back(None);
+                return Err(Fail::Store(self.latch(StoreError::unavailable(
+                    KIND,
+                    format!("{}: {CLIENT_PANICKED}", self.target.display),
+                ))));
+            };
             match r {
                 Ok(Ok(v)) => {
+                    self.answered.store(true, Ordering::Relaxed);
                     self.give_back(Some(c));
                     return Ok(v);
                 }
                 Ok(Err(e)) => {
                     let class = self.classify(&e, op);
+                    if !class.latch {
+                        self.answered.store(true, Ordering::Relaxed);
+                    }
                     if class.busy && Instant::now() + pause < deadline {
+                        self.retries.fetch_add(sent, Ordering::Relaxed);
                         std::thread::sleep(pause);
                         pause = (pause * 2).min(Duration::from_millis(500));
-                        rt.block_on(c.conn.reset());
+                        if guarded(|| rt.block_on(c.conn.reset())).is_err() {
+                            self.give_back(None);
+                            return Err(Fail::Store(self.latch(StoreError::unavailable(
+                                KIND,
+                                CLIENT_PANICKED.to_owned(),
+                            ))));
+                        }
                         continue;
                     }
                     if class.stale && !renewed {
+                        self.retries.fetch_add(sent, Ordering::Relaxed);
                         renewed = true;
-                        rt.block_on(c.conn.reset());
+                        if guarded(|| rt.block_on(c.conn.reset())).is_err() {
+                            self.give_back(None);
+                            return Err(Fail::Store(self.latch(StoreError::unavailable(
+                                KIND,
+                                CLIENT_PANICKED.to_owned(),
+                            ))));
+                        }
                         continue;
                     }
                     self.give_back((!class.lost).then_some(c));
@@ -820,7 +995,7 @@ impl Conn {
                     self.give_back(None);
                     return Err(Fail::Store(self.latch(StoreError::Timeout {
                         backend: KIND,
-                        operation: "a request",
+                        operation,
                         after: timeout,
                     })));
                 }
@@ -829,6 +1004,12 @@ impl Conn {
     }
 
     /// The rows of one statement with parameters (`?1`, `?2`, ...).
+    ///
+    /// A statement not prepared on the connection yet is described first
+    /// (a small request): a handle's first request is always such a
+    /// description, and until the server has answered one it is given up
+    /// after the connect timeout. The statement itself then has the request
+    /// timeout (a replica's first sync may be large).
     pub(crate) fn query(
         &self,
         op: Op,
@@ -836,12 +1017,25 @@ impl Conn {
         params: Vec<libsql::Value>,
     ) -> Result<Vec<Vec<libsql::Value>>, Fail> {
         let sql = sql.to_owned();
-        self.run(op, move |c, n| {
+        let first = self.first_answer_timeout();
+        self.run(op, false, move |c, n, answered| {
             let (sql, params) = (sql.clone(), params.clone());
             Box::pin(async move {
                 if !c.stmts.contains_key(&sql) {
                     n.fetch_add(1, Ordering::Relaxed);
-                    let st = c.conn.prepare(&sql).await?;
+                    let st = if answered.load(Ordering::Relaxed) {
+                        c.conn.prepare(&sql).await?
+                    } else {
+                        match tokio::time::timeout(first, c.conn.prepare(&sql)).await {
+                            Ok(st) => st?,
+                            Err(_) => {
+                                return Err(libsql::Error::ConnectionFailed(
+                                    NO_FIRST_ANSWER.to_owned(),
+                                ));
+                            }
+                        }
+                    };
+                    answered.store(true, Ordering::Relaxed);
                     c.stmts.insert(sql.clone(), st);
                 }
                 let st = &c.stmts[&sql];
@@ -868,7 +1062,7 @@ impl Conn {
             return Ok(());
         }
         let sql = statements.join(";\n");
-        self.run(op, move |c, n| {
+        self.run(op, true, move |c, n, _| {
             let sql = sql.clone();
             Box::pin(async move {
                 n.fetch_add(1, Ordering::Relaxed);
@@ -892,12 +1086,14 @@ impl Drop for Conn {
             return;
         };
         let handle = rt.handle().clone();
-        rt.block_on(async move {
-            drop(idle);
-            let until = Instant::now() + Duration::from_millis(250);
-            while handle.metrics().num_alive_tasks() > 0 && Instant::now() < until {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+        let _ = guarded(|| {
+            rt.block_on(async move {
+                drop(idle);
+                let until = Instant::now() + Duration::from_millis(250);
+                while handle.metrics().num_alive_tasks() > 0 && Instant::now() < until {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
         });
     }
 }
@@ -1009,7 +1205,12 @@ mod tests {
         assert_eq!(k.as_deref(), Some("env-tok"));
         let (t, k) = parse("HTTPS://db.example:443/base/", None).unwrap();
         assert_eq!(t.url, "https://db.example:443/base");
+        assert_eq!(t.display, "https://db.example:443/<path>");
         assert_eq!(k, None);
+        // A token written into the path is used, never shown.
+        let (t, _) = parse("libsql://db.turso.io/eyJhbGciOiJFZERTQSJ9.s3cret", None).unwrap();
+        assert_eq!(t.url, "https://db.turso.io/eyJhbGciOiJFZERTQSJ9.s3cret");
+        assert_eq!(t.display, "libsql://db.turso.io/<path>");
         assert_eq!(
             parse("http://[::1]:9/", None).unwrap().0.url,
             "http://[::1]:9"
@@ -1022,16 +1223,23 @@ mod tests {
             "libsql://",
             "https://db.turso.io?tls=0",
             "libsql://db.turso.io/a b",
+            // A token under any other key, as a bare key, or with its `=`
+            // percent-encoded: neither the value nor the key is quoted.
+            "libsql://db.turso.io?tls=0&token=s3cret",
+            "libsql://db.turso.io?jwt=s3cret",
+            "libsql://db.turso.io?access_token=s3cret",
+            "libsql://db.turso.io?Auth-Token=s3cret",
+            "libsql://db.turso.io?s3cret",
+            "libsql://db.turso.io?s3cret=",
+            "libsql://db.turso.io?authToken%3Ds3cret",
         ] {
             let e = parse(bad, None).unwrap_err();
             assert!(!e.contains("s3cret"), "{bad}: {e}");
             assert!(e.starts_with("attestation store: "), "{bad}: {e}");
         }
-        assert!(
-            parse("libsql://db?Mode=x", None)
-                .unwrap_err()
-                .contains("\"Mode\"")
-        );
+        let e = parse("libsql://db?Mode=x", None).unwrap_err();
+        assert!(!e.contains("Mode"), "{e}");
+        assert!(e.contains("authToken and tls"), "{e}");
     }
 
     #[test]

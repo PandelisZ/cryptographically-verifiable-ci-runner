@@ -19,16 +19,18 @@
 //!   their own. Writes are shared at once (the publication gate applies).
 //! * **Replica** (a remote URL plus `VCI_STORE_SYNC=replica`,
 //!   `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true`): reads
-//!   come from a local file synced once from the server when the store is
-//!   first used (one request for everything that changed since the last
-//!   sync); writes go to the server, then through to the file. A sync that
-//!   fails leaves the file as it was, with a warning.
+//!   come from a local file synced from the server when the store is first
+//!   used and at each later prefetch (one request for everything that
+//!   changed since the last sync); writes go to the server, then through to
+//!   the file. A sync that fails leaves the file as it was: the plan and the
+//!   run read it with a warning, `vci store`, fetch, push and prune fail.
 //!
-//! Every wait is bounded (the connect timeout for a connection, the request
-//! timeout for a request), the first failure to reach the server latches a
-//! circuit breaker, every error is a [`StoreError`] whose message carries
-//! neither the URL's token nor `VCI_STORE_TOKEN`, and no error is
-//! [`StoreError::Backend`] when the store cannot be used.
+//! Every wait is bounded (the connect timeout for a connection and for the
+//! server's first answer, the request timeout for a request), the first
+//! failure to reach the server latches a circuit breaker, every error is a
+//! [`StoreError`] whose message carries neither the URL's token nor
+//! `VCI_STORE_TOKEN`, and no error is [`StoreError::Backend`] when the
+//! store cannot be used (a statement the server refuses is).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -179,7 +181,9 @@ impl LibsqlStore {
         ));
         Ok(LibsqlStore {
             inner: match mode {
-                LibsqlMode::Replica => Inner::Replica(Arc::new(Replica::new(remote, path, opts))),
+                LibsqlMode::Replica => {
+                    Inner::Replica(Arc::new(Replica::new(remote, path, opts, &cx.command)))
+                }
                 _ => Inner::Remote(remote),
             },
         })
@@ -206,6 +210,13 @@ impl LibsqlStore {
     /// local mode), for tests of the request budget.
     pub fn requests(&self) -> u64 {
         self.remote().map_or(0, |r| r.conn.requests())
+    }
+
+    /// Of [`LibsqlStore::requests`], those sent again because the server
+    /// was busy (another writer held the database) or had dropped the
+    /// stream: what a request budget does not count.
+    pub fn retries(&self) -> u64 {
+        self.remote().map_or(0, |r| r.conn.retries())
     }
 
     /// The local file (local mode) or the replica (replica mode).
@@ -274,6 +285,16 @@ impl LibsqlStore {
             Inner::Remote(_) => unreachable!("a remote store has no local file"),
         }
     }
+
+    /// Where reads go: the server (the remote mode, and a replica whose
+    /// file missed a write of this handle), else the file.
+    fn reads_from_server(&self) -> Option<&Remote> {
+        match &self.inner {
+            Inner::Remote(r) => Some(r),
+            Inner::Replica(p) if p.degraded() => Some(&p.remote),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Debug for LibsqlStore {
@@ -292,12 +313,12 @@ impl fmt::Debug for LibsqlStore {
 }
 
 /// Run `$local` on the local file (local and replica modes) or `$remote`
-/// on the server.
+/// on the server (the remote mode, and a replica reading from the server).
 macro_rules! by_mode {
     ($self:ident, $s:ident => $local:expr, $r:ident => $remote:expr) => {
-        match &$self.inner {
-            Inner::Remote($r) => $remote,
-            _ => {
+        match $self.reads_from_server() {
+            Some($r) => $remote,
+            None => {
                 let $s = $self.local()?;
                 $local
             }
@@ -335,6 +356,7 @@ impl AttestationStore for LibsqlStore {
         match &self.inner {
             Inner::Local(s) => s.status(),
             Inner::Remote(r) => r.status(),
+            Inner::Replica(r) if r.degraded() => r.remote.status(),
             Inner::Replica(r) => {
                 r.remote.ns()?;
                 match r.local()?.status()? {
@@ -370,13 +392,18 @@ impl AttestationStore for LibsqlStore {
         by_mode!(self, s => s.manifest_roots(), r => r.manifest_roots())
     }
 
+    /// A replica's writes need a usable replica: a file that is one, in a
+    /// directory vci can write (a batch checked it when it opened).
     fn put(&self, att: &NewAttestation<'_>) -> Result<StoredEnvelope, StoreError> {
         match &self.inner {
             Inner::Local(s) => s.put(att),
             Inner::Remote(r) if batch::is_open(r) => batch::put(r, att),
             Inner::Remote(r) => batch::put_now(r, att, None),
             Inner::Replica(p) if batch::is_open(&p.remote) => batch::put(&p.remote, att),
-            Inner::Replica(p) => batch::put_now(&p.remote, att, Some(&p.after())),
+            Inner::Replica(p) => {
+                p.writable()?;
+                batch::put_now(&p.remote, att, Some(&p.after()))
+            }
         }
     }
 
@@ -388,7 +415,10 @@ impl AttestationStore for LibsqlStore {
             Inner::Replica(p) if batch::is_open(&p.remote) => {
                 batch::put_manifest(&p.remote, root, bytes)
             }
-            Inner::Replica(p) => batch::put_manifest_now(&p.remote, root, bytes, Some(&p.after())),
+            Inner::Replica(p) => {
+                p.writable()?;
+                batch::put_manifest_now(&p.remote, root, bytes, Some(&p.after()))
+            }
         }
     }
 
@@ -398,7 +428,10 @@ impl AttestationStore for LibsqlStore {
             Inner::Remote(r) if batch::is_open(r) => batch::remove(r, doomed),
             Inner::Remote(r) => batch::remove_now(r, doomed, None),
             Inner::Replica(p) if batch::is_open(&p.remote) => batch::remove(&p.remote, doomed),
-            Inner::Replica(p) => batch::remove_now(&p.remote, doomed, Some(&p.after())),
+            Inner::Replica(p) => {
+                p.writable()?;
+                batch::remove_now(&p.remote, doomed, Some(&p.after()))
+            }
         }
     }
 
@@ -427,6 +460,7 @@ impl AttestationStore for LibsqlStore {
         let removed = batch::remove_manifests_now(remote, &rest)?;
         if let Inner::Replica(p) = &self.inner
             && !removed.is_empty()
+            && !p.degraded()
             && let Ok(local) = p.local()
         {
             let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
@@ -451,8 +485,15 @@ impl AttestationStore for LibsqlStore {
         by_mode!(self, s => s.manifests(roots), r => r.manifests(roots))
     }
 
+    /// A replica asks the server: its file leaves out values this vci
+    /// cannot read, which still count as the references they were stored
+    /// with (and only the server removes manifests).
     fn orphan_manifests(&self, roots: &[&str]) -> Result<Vec<String>, StoreError> {
-        by_mode!(self, s => s.orphan_manifests(roots), r => r.orphan_manifests(roots))
+        match &self.inner {
+            Inner::Local(s) => s.orphan_manifests(roots),
+            Inner::Remote(r) => r.orphan_manifests(roots),
+            Inner::Replica(p) => p.remote.orphan_manifests(roots),
+        }
     }
 
     /// Local: the file's (one transaction). Remote and replica: deferred,
@@ -461,7 +502,10 @@ impl AttestationStore for LibsqlStore {
         match &self.inner {
             Inner::Local(s) => s.batch(),
             Inner::Remote(r) => batch::open(r, None),
-            Inner::Replica(p) => batch::open(&p.remote, Some(p.after())),
+            Inner::Replica(p) => {
+                p.writable()?;
+                batch::open(&p.remote, Some(p.after()))
+            }
         }
     }
 
@@ -469,8 +513,10 @@ impl AttestationStore for LibsqlStore {
         match &self.inner {
             Inner::Local(s) => s.prefetch(what),
             Inner::Remote(r) => r.prefetch(what),
+            Inner::Replica(p) if p.degraded() => p.remote.prefetch(what),
+            // The first use syncs; a later prefetch syncs what changed.
             Inner::Replica(p) => {
-                p.local()?;
+                p.prefetch()?;
                 Ok(Hydration::default())
             }
         }

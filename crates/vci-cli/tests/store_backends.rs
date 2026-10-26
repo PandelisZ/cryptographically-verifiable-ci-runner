@@ -1250,9 +1250,10 @@ fn a_postgres_server_that_never_answers_fails_open_in_time() {
 /// in `VCI_STORE_TOKEN`, used remotely and through a replica: the plan
 /// exits 0 within seconds and runs everything; `vci run` runs the tests
 /// (exit 0) and stores nothing; neither token, nor the URL, reaches any
-/// output, the audit log, the metrics log or a test's environment. The
-/// remote store's `vci store info`, `fetch` and `push` exit 2; the replica
-/// reads what it holds (nothing here) with a warning, and is not created.
+/// output, the audit log, the metrics log or a test's environment. `vci
+/// store info`, `fetch`, `push` and `prune` exit 2, remote and replica (a
+/// replica the plan reads as it is, with a warning, is not read for them);
+/// the replica is not created.
 #[test]
 fn unreachable_libsql_fails_open_and_keeps_its_tokens() {
     const IN_URL: &str = "s3cretUrlTok";
@@ -1324,20 +1325,20 @@ fn unreachable_libsql_fails_open_and_keeps_its_tokens() {
             &["store", "info", "--format", "json"],
             &["fetch"],
             &["push"],
+            &["prune"],
+            &["prune", "--dry-run"],
         ] {
             let t = Instant::now();
             let out = w.vci(args, &env);
             assert!(t.elapsed() < Duration::from_secs(10), "{args:?}");
             if args[0] != "env" {
+                assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
                 if replica {
-                    assert_eq!(out.status.code(), Some(0), "{args:?}: {}", text(&out));
                     assert!(
-                        stderr(&out).contains("vci: warning: cannot sync the libsql replica "),
+                        text(&out).contains("cannot sync the replica "),
                         "{args:?}: {}",
                         text(&out)
                     );
-                } else {
-                    assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
                 }
             }
             outs.push(out);
@@ -1352,6 +1353,234 @@ fn unreachable_libsql_fails_open_and_keeps_its_tokens() {
     assert!(!log.contains("s3cret"), "{log}");
     assert!(log.contains("\"store\":\"libsql\""), "{log}");
     assert!(!w.remote_has_meta());
+}
+
+/// A libSQL server that accepts and never answers (a frozen server, a
+/// stuck proxy) over plain HTTP, used remotely and through a replica: with
+/// the default timeouts the plan exits 0 within the connect timeout (5 s)
+/// and runs everything, `vci run` runs the tests and refuses to store, and
+/// store info, fetch, push and prune (whose requests may take ten
+/// minutes) exit 2 within the connect timeout; no output shows a token.
+#[test]
+fn a_libsql_server_that_never_answers_fails_open_in_time() {
+    const TOKEN: &str = "s3cretSilentTok";
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let url = format!("libsql://127.0.0.1:{}?tls=0", silent_port());
+    let key = w.key.to_str().unwrap().to_owned();
+    for replica in [false, true] {
+        let mut env = vec![
+            ("VCI_STORE_URL", url.as_str()),
+            ("VCI_STORE_TOKEN", TOKEN),
+            ("VCI_STORE_NAMESPACE", "ns"),
+        ];
+        if replica {
+            env.push(("VCI_STORE_SYNC", "replica"));
+        }
+        let mut outs = Vec::new();
+        let t = Instant::now();
+        let (plan, out) = w.plan(&env);
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        assert_eq!(plan.run, set(UNITS), "{plan:?}");
+        assert!(stderr(&out).contains("libsql"), "{}", text(&out));
+        outs.push(out);
+        let t = Instant::now();
+        let out = w.vci(&["run", "--key", &key], &env);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        for u in UNITS {
+            assert!(
+                stderr(&out).contains(&format!(
+                    "vci: not attesting {u}: signing or storing failed: "
+                )),
+                "{u}: {}",
+                text(&out)
+            );
+        }
+        assert!(t.elapsed() < Duration::from_secs(60), "{:?}", t.elapsed());
+        outs.push(out);
+        for args in [
+            &["store", "info"][..],
+            &["store", "info", "--format", "json"],
+            &["fetch"],
+            &["push"],
+            &["prune"],
+            &["prune", "--dry-run"],
+        ] {
+            let t = Instant::now();
+            let out = w.vci(args, &env);
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "{args:?}: {:?}",
+                t.elapsed()
+            );
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
+            outs.push(out);
+        }
+        for out in &outs {
+            assert!(!text(out).contains(TOKEN), "{}", text(out));
+        }
+    }
+}
+
+/// A port where a server answers every request with `response` (a whole
+/// HTTP response), then closes the connection.
+fn canned_port(response: Vec<u8>) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let response = response.clone();
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = c.read(&mut buf) {
+                    if n == 0 {
+                        return;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got).to_ascii_lowercase();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if got.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let _ = c.write_all(&response);
+            });
+        }
+    });
+    port
+}
+
+/// A proxy whose error page is not UTF-8 text (a Latin-1 502), on which
+/// libsql 0.10.0 panics: the plan exits 0 and runs everything, `vci run`
+/// runs the tests (exit 0) and refuses to store, store info and prune exit
+/// 2; nothing panics, remote and replica.
+#[test]
+fn a_libsql_error_page_the_client_cannot_read_fails_open() {
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let body: &[u8] = b"<html>Mauvaise passerelle \xe9t\xe9</html>";
+    let mut response = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html; charset=iso-8859-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    let url = format!("libsql://127.0.0.1:{}?tls=0", canned_port(response));
+    let key = w.key.to_str().unwrap().to_owned();
+    for replica in [false, true] {
+        let mut env = vec![
+            ("VCI_STORE_URL", url.as_str()),
+            ("VCI_STORE_TOKEN", "tok"),
+            ("VCI_STORE_NAMESPACE", "ns"),
+        ];
+        if replica {
+            env.push(("VCI_STORE_SYNC", "replica"));
+        }
+        let (plan, out) = w.plan(&env);
+        assert_eq!(plan.run, set(UNITS), "{plan:?}");
+        let mut outs = vec![out];
+        let out = w.vci(&["run", "--key", &key], &env);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        for u in UNITS {
+            assert!(
+                stderr(&out).contains(&format!(
+                    "vci: not attesting {u}: signing or storing failed: "
+                )),
+                "{u}: {}",
+                text(&out)
+            );
+        }
+        outs.push(out);
+        for args in [&["store", "info"][..], &["prune"]] {
+            let out = w.vci(args, &env);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
+            outs.push(out);
+        }
+        for out in &outs {
+            assert!(!text(out).contains("panicked"), "{}", text(out));
+        }
+    }
+}
+
+/// A token in `VCI_STORE_URL` under any query key, as a bare key, or in
+/// the path, and one under a misspelled key of `vci.toml`'s `[store]`, is
+/// in no output of `vci store info` (text and JSON), `vci env`, `vci run`
+/// or `vci plan`. No server is needed: every URL is refused, or
+/// unreachable.
+#[test]
+fn a_libsql_token_anywhere_in_the_settings_is_never_printed() {
+    const TOKEN: &str = "eyJhbGciOiJFZERTQSJ9.s3cretTokBody.s1gnature";
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let port = closed_port();
+    let urls = [
+        format!("libsql://127.0.0.1:{port}?tls=0&token={TOKEN}"),
+        format!("libsql://127.0.0.1:{port}?tls=0&jwt={TOKEN}"),
+        format!("libsql://127.0.0.1:{port}?tls=0&Auth-Token={TOKEN}"),
+        format!("libsql://127.0.0.1:{port}?{TOKEN}"),
+        format!("libsql://127.0.0.1:{port}?authToken%3D{TOKEN}"),
+        format!("libsql://127.0.0.1:{port}/{TOKEN}?tls=0"),
+    ];
+    let key = w.key.to_str().unwrap().to_owned();
+    let mut outs = Vec::new();
+    for url in &urls {
+        let env = [
+            ("VCI_STORE_URL", url.as_str()),
+            ("VCI_STORE_NAMESPACE", "s7"),
+        ];
+        for args in [
+            &["store", "info"][..],
+            &["store", "info", "--format", "json"],
+            &["env"],
+        ] {
+            outs.push(w.vci(args, &env));
+        }
+        let (plan, out) = w.plan(&env);
+        assert_eq!(plan.run, set(UNITS), "{plan:?}");
+        outs.push(out);
+    }
+    // The run, once (the rest is the same selection).
+    let env = [
+        ("VCI_STORE_URL", urls[0].as_str()),
+        ("VCI_STORE_NAMESPACE", "s7"),
+    ];
+    outs.push(w.vci(&["run", "--key", &key], &env));
+    // A token under a key `[store.libsql]` does not have.
+    let toml = w.read("vci.toml");
+    w.put(
+        "vci.toml",
+        &format!(
+            "{toml}
+[store.libsql]
+authtoken = \"{TOKEN}\"\n"
+        ),
+    );
+    w.commit("a misspelled token key");
+    for env in [
+        &[("VCI_STORE", "libsql")][..],
+        &[("VCI_STORE_URL", urls[0].as_str())],
+        &[],
+    ] {
+        for args in [&["run", "--key", &key][..], &["env"], &["store", "info"]] {
+            let out = w.vci(args, env);
+            assert_ne!(out.status.code(), Some(0), "{args:?}: {}", text(&out));
+            outs.push(out);
+        }
+    }
+    for out in &outs {
+        assert!(!text(out).contains("s3cretTokBody"), "{}", text(out));
+    }
 }
 
 /// A connection string put in `VCI_STORE` by mistake is refused, never

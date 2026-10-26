@@ -1766,12 +1766,14 @@ Then run `vci ci` as before (`--push` where it should store). The store has thre
 | mode | selected by | reads | writes |
 |---|---|---|---|
 | remote | a `libsql://` `VCI_STORE_URL` (an `https://` or `http://` one with `VCI_STORE=libsql`) | from the server, a plan in about a dozen requests | to the server, a project's units in one request |
-| replica | the same plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<file>` or `[store.libsql] replica = true` | from a local file, `<git common dir>/vci-store.libsql`, synced from the server once per command | to the server, then to the file |
+| replica | the same plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<file>` or `[store.libsql] replica = true` | from a local file, `<git common dir>/vci-store.libsql`, synced from the server when a command first reads it (and at its later prefetches) | to the server, then to the file |
 | local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` | from `<git common dir>/vci-store.libsql` | to the file |
 
 - **The token is a secret**, like PostgreSQL's password: `VCI_STORE_TOKEN`, else the URL's `authToken` parameter.
   vci removes both variables from its own environment as it starts, so no test, probe or hook sees them, and never
-  prints a token: `vci store info` says `token: (set)`, and the location is the URL without its query. A read-only
+  prints a token: `vci store info` says `token: (set)`, and shows the URL with its host and port only (a path as
+  `/<path>`; of the query only `tls`, `authToken=***` and `***` for anything else). A URL with another query
+  parameter (a `token=` or `jwt=` by mistake) is refused without printing it or its name. A read-only
   token reads, and stores nothing (`libsql store refused to write: …`, keeping the tests' exit code); a missing or
   refused token (`the server asks for a token: set $VCI_STORE_TOKEN`) makes the store unavailable, and every unit runs.
 - **Shared at once** (remote and replica), as PostgreSQL: `vci ci` without `--push` signs but stores nothing (the
@@ -1784,15 +1786,24 @@ Then run `vci ci` as before (`--push` where it should store). The store has thre
   empty store.
 - **TLS.** `libsql://` and `https://` are HTTPS, verified against the webpki roots; `libsql://…?tls=0` and `http://` are
   plain HTTP (a local `sqld`, `turso dev`).
-- **Bounded time.** Connecting waits at most 5 s (`VCI_STORE_CONNECT_TIMEOUT_SECS`), a request at most 30 s
-  (`VCI_STORE_TIMEOUT_SECS`; ten minutes for `vci prune`). After the first failure every later call of the command
-  fails at once, so a server that is down costs one timeout, and the plan runs everything.
+- **Bounded time.** Connecting, and waiting for the server's first answer, takes at most 5 s
+  (`VCI_STORE_CONNECT_TIMEOUT_SECS`): a server or proxy that accepts and never answers costs that. A later request
+  waits at most 30 s (`VCI_STORE_TIMEOUT_SECS`; ten minutes for `vci prune`). After the first failure every later call
+  of the command fails at once, so a server that is down costs one timeout, and the plan runs everything. A statement
+  the server refuses (a trigger, say) stops nothing else: `vci run` reports it and exits 2 after the run.
+- **A record of 5,000,000 bytes or more is not stored on a server.** `sqld` refuses such a row, so vci refuses a unit
+  whose attestation or input manifest is that large, alone (`signing or storing failed: the libsql store does not
+  support storing a record of 5,000,000 bytes or more …`, keeping the tests' exit code), and stores the rest of the
+  project. That unit runs every time on a libSQL server; the other stores have no such limit.
 - **The replica** suits machines that keep their clone (a laptop, a self-hosted runner): each command syncs only what
-  changed since the last, in one request, then reads locally. A sync that fails warns `vci: warning: cannot sync the
-  libsql replica …; reading the replica as it is`, and the command reads the file as it was (a stale replica only makes
-  units run; writes then fail and units are not stored). An ephemeral runner syncs everything once, about what a
-  remote plan reads anyway. `vci-store.libsql.sync` beside the file records which server and namespace it copies; a
-  file without it, such as a local-mode store, is never used as a replica.
+  changed since the last, in one request, then reads locally, and syncs the changes again where it reads the store
+  again (`vci run` before it supersedes, the plan's later rounds). A sync that fails warns `vci: warning: cannot sync
+  the libsql replica …; reading the replica as it is`, and `vci plan`, `vci run` and `vci ci` read the file as it was
+  (a stale replica only makes units run; writes then fail and units are not stored), while `vci store info`, `vci
+  fetch`, `vci push` and `vci prune` exit 2. An ephemeral runner syncs everything once, about what a remote plan reads
+  anyway. `vci-store.libsql.sync` beside the file records which server and namespace it copies, and up to where; a
+  namespace dropped and created again, or restored, is synced again in full. A file without it, such as a local-mode
+  store, or one that is not a database, is never used as a replica, and stores nothing.
 - **The local mode** is the SQLite store under another name: the same file format, writes and limits (see
   [SQLite](#sqlite)); a `vci-store.sqlite` can be copied to `vci-store.libsql` and back.
 - **Cost.** A plan reads a server in about a dozen requests whatever the number of units, and `vci run` writes a
@@ -2118,7 +2129,7 @@ extra = ["testdata/**"]
 
 # [store.libsql]         # never an address or a token (VCI_STORE_URL and VCI_STORE_TOKEN carry them)
 # path = "vci-store.libsql"   # the local file or the replica, relative to the git common directory, no `..`
-# replica = true         # read a local replica of the VCI_STORE_URL server, synced once per command
+# replica = true         # read a local replica of the VCI_STORE_URL server, synced as each command reads it
 # namespace = "acme-web" # default: the repository id; VCI_STORE_NAMESPACE wins
 ```
 

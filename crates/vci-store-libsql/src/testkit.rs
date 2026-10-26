@@ -416,7 +416,8 @@ pub fn cx_in(dir: &Path, long_running: bool) -> OpenContext {
 
 /// A selection of the libsql store in `mode`: at `url` with `token` and
 /// namespace `ns` (remote and replica modes), with the file `path` (local
-/// and replica modes; absolute or relative to the git common directory).
+/// and replica modes; absolute or relative to the git common directory),
+/// and a connect timeout of 30 s.
 pub fn selection(
     mode: LibsqlMode,
     url: Option<&str>,
@@ -446,6 +447,13 @@ pub fn selection(
         value: p.display().to_string(),
         source: env("VCI_STORE_REPLICA"),
     });
+    // The connect timeout also bounds the server's first answer: a test
+    // server shared by a hundred concurrent tests on a loaded machine can
+    // take longer than the default 5 s. Tests of the bound set their own.
+    s.connect_timeout = Sourced {
+        value: Duration::from_secs(30),
+        source: env("VCI_STORE_CONNECT_TIMEOUT_SECS"),
+    };
     s
 }
 

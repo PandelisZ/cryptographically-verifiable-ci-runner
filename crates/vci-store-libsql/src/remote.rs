@@ -118,6 +118,16 @@ impl Tables {
         );
         let touched_roots =
             format!("SELECT DISTINCT root FROM {log} WHERE seq > ?1 AND root IS NOT NULL");
+        // A log entry's fingerprint: when it was written and what it names.
+        let mark = |seq: &str| {
+            format!(
+                "(SELECT at || ':' || coalesce(test_key, '') || ':' || coalesce(signer, '') \
+                 || ':' || coalesce(storage_key, '') || ':' || coalesce(root, '') \
+                 FROM {log} WHERE seq = {seq})"
+            )
+        };
+        let mark_then = mark("?1");
+        let mark_now = mark(&format!("(SELECT max(seq) FROM {log})"));
         Tables {
             list_units: format!(
                 "SELECT test_key, key, target FROM {a} WHERE test_key IN ({set}) ORDER BY test_key, key"
@@ -156,12 +166,18 @@ impl Tables {
                  AND NOT EXISTS (SELECT 1 FROM {m} AS b WHERE b.base = r.root)"
             ),
             // What changed since seq ?1 (everything when ?2 is 1), in one
-            // snapshot: the log's high-water mark and the oldest seq it
-            // still has (0), the attestations of the slots touched (1),
-            // those slots (2), the manifests touched (3) and their roots
-            // (4). ?3 is the namespace.
+            // snapshot: the fingerprints of entry ?1 and of the last entry,
+            // when the namespace was created, its schema version (NULL: the
+            // namespace has no tables), the log's high-water mark and
+            // the floor below which it dropped entries (0), the
+            // attestations of the slots touched (1), those slots (2), the
+            // manifests touched (3) and their roots (4). ?3 is the
+            // namespace.
             sync: format!(
-                "SELECT 0, NULL, NULL, NULL, NULL, (SELECT coalesce(max(seq), 0) FROM {log}), \
+                "SELECT 0, {mark_then}, {mark_now}, \
+                   (SELECT created_at FROM vci_schema WHERE ns = ?3), \
+                   (SELECT version FROM vci_schema WHERE ns = ?3), \
+                   (SELECT coalesce(max(seq), 0) FROM {log}), \
                    (SELECT log_floor FROM vci_schema WHERE ns = ?3) \
                  UNION ALL \
                  SELECT 1, a.key, a.target, a.value, a.encoding, NULL, NULL FROM {a} AS a \
@@ -331,6 +347,24 @@ impl Remote {
         format!("{} namespace {ns}", self.conn.display())
     }
 
+    // ---- requests ------------------------------------------------------------------
+
+    /// The rows of one statement ([`Conn::query`]: the first request of a
+    /// handle is bounded by the connect timeout).
+    pub(crate) fn query(
+        &self,
+        op: crate::conn::Op,
+        sql: &str,
+        params: Vec<V>,
+    ) -> Result<Vec<Vec<V>>, Fail> {
+        self.conn.query(op, sql, params)
+    }
+
+    /// Statements in one transaction, one request ([`Conn::batch`]).
+    pub(crate) fn write(&self, op: crate::conn::Op, statements: &[String]) -> Result<(), Fail> {
+        self.conn.batch(op, statements)
+    }
+
     // ---- the schema ---------------------------------------------------------------
 
     /// The namespace's schema version (one request, then remembered once
@@ -344,7 +378,7 @@ impl Remote {
             };
         }
         let ns = self.ns()?.to_owned();
-        let r = self.conn.query(READ, STATUS, vec![V::Text(ns)]);
+        let r = self.query(READ, STATUS, vec![V::Text(ns)]);
         match Fail::or_absent(r, Vec::new)?.first() {
             Some(row) => {
                 let v = row
@@ -357,6 +391,15 @@ impl Remote {
             }
             None => Ok(None),
         }
+    }
+
+    /// Remember the schema version a replica's sync read (`v`), as
+    /// [`Remote::version`] would: later calls send nothing for it, and a
+    /// newer one is refused.
+    pub(crate) fn found_version(&self, v: i64) -> Result<(), StoreError> {
+        let v = u32::try_from(v.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX);
+        let _ = self.version.set(v);
+        self.version().map(drop)
     }
 
     /// Make sure the namespace's tables exist before a write: create them
@@ -382,7 +425,7 @@ impl Remote {
             advice: "the first vci run with a token allowed to create tables creates them"
                 .to_owned(),
         };
-        match self.conn.batch(WRITE, &stmts) {
+        match self.write(WRITE, &stmts) {
             Ok(()) => {}
             Err(Fail::Store(StoreError::Denied { .. })) => return Err(not_initialized()),
             Err(Fail::Absent) => return Err(not_initialized()),
@@ -477,7 +520,7 @@ impl Remote {
 
     pub(crate) fn list_all(&self) -> Result<Vec<StoredEnvelope>, StoreError> {
         let t = self.ready()?;
-        let r = self.conn.query(READ, &t.shared.list_all, Vec::new());
+        let r = self.query(READ, &t.shared.list_all, Vec::new());
         Ok(Fail::or_absent(r, Vec::new)?
             .into_iter()
             .filter_map(|row| {
@@ -490,7 +533,7 @@ impl Remote {
 
     pub(crate) fn count(&self) -> Result<usize, StoreError> {
         let t = self.ready()?;
-        let r = self.conn.query(READ, &t.shared.keys, Vec::new());
+        let r = self.query(READ, &t.shared.keys, Vec::new());
         Ok(Fail::or_absent(r, Vec::new)?
             .iter()
             .filter(|row| {
@@ -514,7 +557,7 @@ impl Remote {
     ) -> Result<HashMap<String, (Value, Option<String>)>, StoreError> {
         let mut out = HashMap::new();
         for chunk in keys.chunks(CHUNK) {
-            let r = self.conn.query(
+            let r = self.query(
                 READ,
                 &t.values,
                 vec![
@@ -678,7 +721,7 @@ impl Remote {
 
     pub(crate) fn read_all(&self) -> Result<Vec<StoredEnvelope>, StoreError> {
         let t = self.ready()?;
-        let r = self.conn.query(READ, &t.read_all, Vec::new());
+        let r = self.query(READ, &t.read_all, Vec::new());
         let mut out = Vec::new();
         for row in Fail::or_absent(r, Vec::new)? {
             if row.len() < 4 {
@@ -738,7 +781,7 @@ impl Remote {
             let t = self.ready()?;
             let missing: Vec<&str> = missing.into_iter().collect();
             for chunk in missing.chunks(CHUNK) {
-                let r = self.conn.query(
+                let r = self.query(
                     READ,
                     &t.manifests_of,
                     vec![json_list(chunk.iter().copied())],
@@ -761,7 +804,7 @@ impl Remote {
     /// the ones not stored are cached as absent.
     fn fetch_manifests(&self, t: &Tables, roots: &[String]) -> Result<(), StoreError> {
         for chunk in roots.chunks(CHUNK) {
-            let r = self.conn.query(
+            let r = self.query(
                 READ,
                 &t.manifests_and_bases,
                 vec![json_list(chunk.iter().map(String::as_str))],
@@ -802,7 +845,7 @@ impl Remote {
 
     pub(crate) fn manifest_roots(&self) -> Result<Vec<String>, StoreError> {
         let t = self.ready()?;
-        let r = self.conn.query(READ, &t.shared.manifest_roots, Vec::new());
+        let r = self.query(READ, &t.shared.manifest_roots, Vec::new());
         Ok(Fail::or_absent(r, Vec::new)?
             .iter()
             .filter_map(|row| row.first().and_then(col_text))
@@ -980,7 +1023,7 @@ impl Remote {
         if flags.is_none() {
             let mut set = BTreeSet::new();
             if let Ok(t) = self.ready()
-                && let Ok(rows) = self.conn.query(READ, &t.flags_all, Vec::new())
+                && let Ok(rows) = self.query(READ, &t.flags_all, Vec::new())
             {
                 set.extend(rows.iter().filter_map(|row| row.first().and_then(col_text)));
             }
@@ -1013,7 +1056,7 @@ impl Remote {
                 &[(at - vci_store_sqlite::sql::MEMO_KEEP_SECS).to_string()],
             ));
         }
-        if self.conn.batch(WRITE, &stmts).is_ok() {
+        if self.write(WRITE, &stmts).is_ok() {
             let mut m = self.memo_cache();
             let e = m.entry(tree16.to_owned()).or_default();
             for (tk, k) in items {
@@ -1031,7 +1074,7 @@ impl Remote {
             return;
         }
         let sql = inline(&t.shared.flag_put, &[text(name), now().to_string()]);
-        if self.conn.batch(WRITE, &[sql]).is_ok()
+        if self.write(WRITE, &[sql]).is_ok()
             && let Some(f) = self.flags().as_mut()
         {
             f.insert(name.to_owned());

@@ -183,7 +183,7 @@ schema = "vci"
 namespace = "acme-web"      <span class="c"># default: the repository id</span>
 
 [store.libsql]              <span class="c"># the server is VCI_STORE_URL, its token VCI_STORE_TOKEN</span>
-replica = true              <span class="c"># read a local replica, synced once per command</span>
+replica = true              <span class="c"># read a local replica, synced as each command reads it</span>
 path = "vci-store.libsql"   <span class="c"># the local file or the replica (the default)</span></code></pre>
 <ul>
 <li><strong>Never an address or a credential.</strong> <code>url</code>, <code>host</code>, <code>user</code>, <code>password</code>, <code>dbname</code>, <code>token</code> and <code>authToken</code> are refused: every checkout, a pull request's included, carries <code>vci.toml</code>. The PostgreSQL or libSQL URL goes in <code>VCI_STORE_URL</code> and a libSQL token in <code>VCI_STORE_TOKEN</code>, CI secrets that no test process ever sees.</li>

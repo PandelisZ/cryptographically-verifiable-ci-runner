@@ -2171,7 +2171,8 @@ pub mod select {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub path: Option<String>,
         /// Read a local replica of the remote database named by
-        /// `VCI_STORE_URL` (synced when the store is opened) instead of
+        /// `VCI_STORE_URL` (synced when it is first read, and at each later
+        /// prefetch) instead of
         /// asking the server for every read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub replica: Option<bool>,
@@ -2311,7 +2312,9 @@ pub mod select {
 
         /// `text` with this secret replaced: the whole string by its
         /// redacted form, then its password (as written and
-        /// percent-decoded, when at least 3 bytes) by `***`. Backends pass
+        /// percent-decoded, when at least 3 bytes) by `***`, and the forms
+        /// a server or proxy may echo it in (JSON-escaped; base64, standard
+        /// and URL-safe, inside a longer encoded text too). Backends pass
         /// every message from their libraries through this.
         ///
         /// A URL password holding an unencoded `@` is read differently by
@@ -2320,23 +2323,22 @@ pub mod select {
         /// reading is removed: the password up to each `@`, each of its
         /// `@`-separated pieces, and the host such a client would see.
         pub fn scrub(&self, text: &str) -> String {
-            if self.1 {
+            let (mut out, mut found) = if self.1 {
                 // An opaque secret: itself, and its percent-decoded and
                 // percent-encoded forms (a token in a URL's query).
-                let mut out = text.to_owned();
-                for p in [
-                    self.0.clone(),
-                    percent_decode(&self.0),
-                    percent_encode(&self.0),
-                ] {
-                    if p.len() >= 3 {
-                        out = out.replace(&p, "***");
-                    }
-                }
-                return out;
-            }
-            let mut out = text.replace(&self.0, &self.redacted());
-            let mut found = self.passwords();
+                (
+                    text.to_owned(),
+                    vec![
+                        self.0.clone(),
+                        percent_decode(&self.0),
+                        percent_encode(&self.0),
+                    ],
+                )
+            } else {
+                (text.replace(&self.0, &self.redacted()), self.passwords())
+            };
+            let echoed: Vec<String> = found.iter().flat_map(|p| echoed_forms(p)).collect();
+            found.extend(echoed);
             found.sort_by_key(|p| std::cmp::Reverse(p.len()));
             for p in found {
                 if p.len() >= 3 {
@@ -2399,8 +2401,78 @@ pub mod select {
             for (from, to) in secret_values(s, split_url(s).is_some()) {
                 add(&s[from..to]);
             }
+            // A libSQL server's URL: every query value but `tls`'s, a bare
+            // query key, and the path, may be a token (none of them is
+            // printed by `redact` either).
+            if is_libsql_server(s)
+                && let Some((_, rest)) = split_url(s)
+            {
+                let rest = rest.split('#').next().unwrap_or_default();
+                let (before_query, query) = rest.split_once('?').unwrap_or((rest, ""));
+                for pair in query.split('&') {
+                    match pair.split_once('=') {
+                        Some((k, _)) if percent_decode(k).eq_ignore_ascii_case("tls") => {}
+                        Some((_, v)) => add(v),
+                        None => add(pair),
+                    }
+                }
+                if let Some(i) = before_query.find('/') {
+                    let path = before_query[i..].trim_matches('/');
+                    if path.len() >= 8 {
+                        add(path);
+                        for seg in path.split('/').filter(|seg| seg.len() >= 8) {
+                            add(seg);
+                        }
+                    }
+                }
+            }
             found
         }
+    }
+
+    /// The forms in which a server, a proxy or a library may echo the
+    /// secret `p` back: JSON-escaped (`/` as `\/`, quotes and backslashes
+    /// escaped), and base64, standard and URL-safe. A secret inside a
+    /// longer base64 text (`Authorization: Bearer <token>`, encoded) shows
+    /// as the encoding of its bytes from one of three offsets, whole groups
+    /// only: each of those is a form. None for a secret under 6 bytes.
+    fn echoed_forms(p: &str) -> Vec<String> {
+        use base64::Engine as _;
+        let mut out = Vec::new();
+        let json: String = p
+            .chars()
+            .flat_map(|c| match c {
+                '"' => vec!['\\', '"'],
+                '\\' => vec!['\\', '\\'],
+                c => vec![c],
+            })
+            .collect();
+        for form in [json.clone(), json.replace('/', "\\/")] {
+            if form != p && !out.contains(&form) {
+                out.push(form);
+            }
+        }
+        let b = p.as_bytes();
+        if b.len() < 6 {
+            return out;
+        }
+        for skip in 0..3 {
+            let rest = &b[skip..];
+            let whole = rest.len() / 3 * 3;
+            if whole < 6 {
+                continue;
+            }
+            for engine in [
+                &base64::engine::general_purpose::STANDARD,
+                &base64::engine::general_purpose::URL_SAFE,
+            ] {
+                let form = engine.encode(&rest[..whole]);
+                if !out.contains(&form) {
+                    out.push(form);
+                }
+            }
+        }
+        out
     }
 
     fn percent_encode(s: &str) -> String {
@@ -2630,6 +2702,9 @@ pub mod select {
         let Some((scheme, rest)) = split_url(s) else {
             return mask_spans(s, &secret_values(s, false));
         };
+        if is_libsql_server(s) {
+            return redact_server_url(scheme, rest);
+        }
         let at = userinfo_end(rest);
         let mut spans = secret_values(rest, true);
         if let Some(at) = at {
@@ -2637,6 +2712,65 @@ pub mod select {
         }
         spans.extend(query_secret_values(rest));
         format!("{scheme}://{}", mask_spans(rest, &merge_spans(spans)))
+    }
+
+    /// A libSQL server's URL (`libsql://`, `https://`, `http://`; `rest`
+    /// follows `scheme://`) as [`redact`] shows it: a user or password
+    /// becomes `***@`, a path `/<path>` (a token could be written there),
+    /// and of the query only `tls` is shown as written; an `authToken` (or
+    /// another secret key) shows as `authToken=***`, any other parameter as
+    /// `***`, its name too (a token may be either), and a fragment as
+    /// `#***`.
+    fn redact_server_url(scheme: &str, rest: &str) -> String {
+        let (user, rest) = match userinfo_end(rest) {
+            Some(at) => ("***@", &rest[at + 1..]),
+            None => ("", rest),
+        };
+        let (rest, fragment) = match rest.find('#') {
+            Some(i) => (&rest[..i], "#***"),
+            None => (rest, ""),
+        };
+        let (before_query, query) = match rest.find('?') {
+            Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+            None => (rest, None),
+        };
+        let (host, path) =
+            before_query.split_at(before_query.find('/').unwrap_or(before_query.len()));
+        let path = if path.trim_matches('/').is_empty() {
+            path
+        } else {
+            "/<path>"
+        };
+        let mut out = format!("{scheme}://{user}{host}{path}");
+        if let Some(q) = query {
+            let shown: Vec<String> = q
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    _ if pair.is_empty() => String::new(),
+                    Some((k, v))
+                        if percent_decode(k).eq_ignore_ascii_case("tls")
+                            && matches!(v, "0" | "1" | "true" | "false") =>
+                    {
+                        format!("tls={v}")
+                    }
+                    Some((k, _)) if is_secret_key(&percent_decode(k)) => {
+                        let k = percent_decode(k);
+                        if k.eq_ignore_ascii_case("authtoken")
+                            || k.eq_ignore_ascii_case("auth_token")
+                        {
+                            format!("{k}=***")
+                        } else {
+                            "***".to_owned()
+                        }
+                    }
+                    _ => "***".to_owned(),
+                })
+                .collect();
+            out.push('?');
+            out.push_str(&shown.join("&"));
+        }
+        out.push_str(fragment);
+        out
     }
 
     /// `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"`, or a bare number of
@@ -2675,8 +2809,8 @@ pub mod select {
         /// A server (`libsql://`, `https://` or `http://`): every read and
         /// write goes to it.
         Remote,
-        /// A server, read through a local replica synced when the store is
-        /// opened; writes go to the server.
+        /// A server, read through a local replica synced when it is first
+        /// read and at each later prefetch; writes go to the server.
         Replica,
     }
 
@@ -3036,6 +3170,13 @@ pub mod select {
 
     fn relative_path_of(p: &str, table: &str, url: &str) -> Result<String, StoreError> {
         use std::path::{Component, Path};
+        if p.contains("://") || p.contains('?') {
+            // A server's URL put here by mistake (it may hold a token) is
+            // neither taken as a file name nor printed.
+            return Err(StoreError::Config(format!(
+                "vci.toml [store.{table}] path holds a URL, not a file (it was not printed): a server's URL is read only from ${ENV_STORE_URL}, and its token from ${ENV_TOKEN}"
+            )));
+        }
         let ok = !p.is_empty()
             && !p.contains('\0')
             && Path::new(p)

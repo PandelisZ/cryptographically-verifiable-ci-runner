@@ -785,7 +785,7 @@ impl EnvOverride {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
-        let mut c: Config = toml::from_str(text).context("parsing vci.toml")?;
+        let mut c: Config = toml::from_str(text).map_err(|e| parse_error(text, e))?;
         c.normalize_env()?;
         c.validate()?;
         Ok(c)
@@ -1453,6 +1453,64 @@ pub fn template_for(adapter: &str) -> &'static str {
     }
 }
 
+/// Why `vci.toml` cannot be parsed. toml's message quotes the source line,
+/// so an error inside `[store]` (or a `store.` key) would print a token put
+/// under a misspelled key there (`[store.libsql] authtoken = "..."`), a
+/// duplicated one, or one on a line with an unterminated string: such an
+/// error names the line, and the key of an unknown one, never the values,
+/// as [`working_tree_store`] does. Any other error keeps toml's message.
+fn parse_error(text: &str, e: toml::de::Error) -> anyhow::Error {
+    let Some(span) = e.span() else {
+        return anyhow::Error::new(e).context("parsing vci.toml");
+    };
+    let start = span.start.min(text.len());
+    let line = text[..start].matches('\n').count();
+    if !in_store_table(text, line) {
+        return anyhow::Error::new(e).context("parsing vci.toml");
+    }
+    let what = if e.message().starts_with("unknown field") {
+        format!(": {}", e.message())
+    } else {
+        String::new()
+    };
+    anyhow::anyhow!(
+        "parsing vci.toml (line {}): [store] cannot be read{what} (its values are not printed)",
+        line + 1
+    )
+}
+
+/// Whether line `n` (from 0) of a `vci.toml` belongs to `[store]`: a key of
+/// the `[store]` table or one below it (`[store.libsql]`), or a `store.` key
+/// or `store` inline table outside them.
+fn in_store_table(text: &str, n: usize) -> bool {
+    let is_store = |name: &str| {
+        let name: String = name
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect();
+        name == "store" || name.starts_with("store.")
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    if let Some(l) = lines.get(n) {
+        let key = l.trim_start();
+        let key = key.split('=').next().unwrap_or(key);
+        if !key.trim_start().starts_with('[') && is_store(key) {
+            return true;
+        }
+    }
+    lines
+        .iter()
+        .take(n + 1)
+        .rev()
+        .map(|l| l.trim_start())
+        .find(|l| l.starts_with('['))
+        .is_some_and(|header| {
+            let name = header.trim_start_matches('[');
+            let name = name.split(']').next().unwrap_or(name);
+            is_store(name)
+        })
+}
+
 /// `[store]` of the working tree's `vci.toml` in `root`, for choosing the
 /// attestation store; `None` when there is no file or no `[store]`. Only
 /// `[store]` is read (leniently: no other key is checked), so a broken
@@ -1497,6 +1555,37 @@ mod tests {
     use super::*;
 
     const STORE_TOML: &str = "adapter = \"go\"\n\n[store]\nbackend = \"sqlite\"\ntimeout = \"10s\"\n\n[store.sqlite]\npath = \"vci.sqlite\"\n\n[store.postgres]\nschema = \"ci\"\n";
+
+    /// A token under a key of `[store]` vci does not know (misspelled,
+    /// duplicated, or on a line toml cannot read) is refused by line and
+    /// key, never echoed with its line; other errors keep toml's message.
+    #[test]
+    fn store_parse_errors_never_echo_values() {
+        const TOKEN: &str = "tomlS3cr3tEcho99";
+        for toml in [
+            format!("adapter = \"go\"\n\n[store.libsql]\nauthtoken = \"{TOKEN}\"\n"),
+            format!("[store.libsql]\nauth-token = \"{TOKEN}\"\n"),
+            format!("[store.libsql]\njwt = \"{TOKEN}\"\n"),
+            format!("[store]\nbackend = \"libsql\"\ntoken = \"{TOKEN}\"\n"),
+            format!("[store.libsql]\nnamespace = \"a\"\nnamespace = \"{TOKEN}\"\n"),
+            format!("[store.libsql]\ntoken = \"{TOKEN}\n"),
+            format!("[ store . \"libsql\" ]\ntokn = \"{TOKEN}\"\n"),
+            format!("adapter = \"go\"\nstore.libsql.authtoken = \"{TOKEN}\"\n"),
+            format!("adapter = \"go\"\nstore = {{ backend = \"libsql\", tok = \"{TOKEN}\" }}\n"),
+        ] {
+            let e = format!("{:#}", Config::parse(&toml).unwrap_err());
+            assert!(!e.contains(TOKEN), "{toml}: {e}");
+            assert!(e.contains("vci.toml (line "), "{toml}: {e}");
+        }
+        let e = format!(
+            "{:#}",
+            Config::parse("[store.libsql]\nauthtoken = \"x\"\n").unwrap_err()
+        );
+        assert!(e.contains("unknown field `authtoken`"), "{e}");
+        // Outside [store], toml's message (with its line) is kept.
+        let e = format!("{:#}", Config::parse("adapter = [\n").unwrap_err());
+        assert!(e.contains("TOML parse error"), "{e}");
+    }
 
     /// A base commit's `vci.toml` with `[store]` parses (for its policy).
     #[test]
