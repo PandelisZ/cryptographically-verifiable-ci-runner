@@ -627,12 +627,12 @@ struct Recorder {
 }
 
 impl BatchEnd for Recorder {
-    fn finish(self: Box<Self>) -> Result<(), StoreError> {
+    fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError> {
         self.finished.set(self.finished.get() + 1);
         if self.fail {
             Err(StoreError::other("flush failed"))
         } else {
-            Ok(())
+            Ok(Vec::new())
         }
     }
 }

@@ -247,15 +247,16 @@ pub struct BatchGuard {
 
 impl BatchGuard {
     /// End the batch: commit its writes (the outermost batch only), then
-    /// stamp them. After an `Err`, none of its writes is stored, except
-    /// when only the stamping failed.
-    pub fn finish(mut self) -> Result<(), GitError> {
+    /// stamp them. After an `Err`, none of its writes is stored. Stamping
+    /// comes after the commit and loses no write when it fails: that is a
+    /// warning in `Ok`.
+    pub fn finish(mut self) -> Result<Vec<String>, GitError> {
         self.end()
     }
 
-    fn end(&mut self) -> Result<(), GitError> {
+    fn end(&mut self) -> Result<Vec<String>, GitError> {
         let Some(root) = self.root.take() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let conns = BATCH.with(|b| {
             let mut b = b.borrow_mut();
@@ -276,20 +277,26 @@ impl BatchGuard {
             ..
         }) = conns
         else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         if let Some(why) = broken {
             return Err(GitError::Store(why));
         }
         if !open {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if let Err(e) = db.execute_batch("COMMIT") {
             let _ = db.execute_batch("ROLLBACK");
-            return Err(sql_err(&path, e));
+            return Err(write_err(e));
         }
         let written: Vec<(&Target, &str)> = stamps.iter().map(|(t, k)| (t, k.as_str())).collect();
-        AttestStore::stamp_on(&path, &mut db, &written)
+        Ok(match AttestStore::stamp_on(&path, &mut db, &written) {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!(
+                "stamping the {} write(s) of the batch after its commit: {e}; they are stored, but a push that ran during the batch may have left them out",
+                written.len()
+            )],
+        })
     }
 }
 
@@ -311,7 +318,6 @@ impl Drop for BatchGuard {
 /// fetched yet is read through git-meta (it was committed before the
 /// batch).
 fn current_is(
-    path: &Utf8Path,
     db: &rusqlite::Connection,
     session: &Session,
     target: &Target,
@@ -335,7 +341,7 @@ fn current_is(
             )
             .optional()
         })
-        .map_err(|e| sql_err(path, e))?;
+        .map_err(write_err)?;
     Ok(match row {
         None => false,
         Some((_, vt, _, _)) if vt != "string" => false,
@@ -447,7 +453,6 @@ fn remove_key_sql(
 
 /// [`set_string_sql`] of a key git-meta accepts (its `validate_key`).
 fn set_string(
-    path: &Utf8Path,
     db: &rusqlite::Connection,
     target: &Target,
     key: &str,
@@ -456,12 +461,11 @@ fn set_string(
     timestamp: i64,
 ) -> Result<(), GitError> {
     git_meta_lib::types::validate_key(key).map_err(meta_err)?;
-    set_string_sql(db, target, key, text, email, timestamp).map_err(|e| sql_err(path, e))
+    set_string_sql(db, target, key, text, email, timestamp).map_err(write_err)
 }
 
 /// [`remove_key_sql`] of a key git-meta accepts (its `validate_key`).
 fn remove_key(
-    path: &Utf8Path,
     db: &rusqlite::Connection,
     target: &Target,
     key: &str,
@@ -469,7 +473,7 @@ fn remove_key(
     timestamp: i64,
 ) -> Result<bool, GitError> {
     git_meta_lib::types::validate_key(key).map_err(meta_err)?;
-    remove_key_sql(db, target, key, email, timestamp).map_err(|e| sql_err(path, e))
+    remove_key_sql(db, target, key, email, timestamp).map_err(write_err)
 }
 
 /// [`AttestStore::put_keyed`] inside a batch: the same inputs' keys found
@@ -478,7 +482,6 @@ fn remove_key(
 /// removed, and the value written unless it is already there.
 #[allow(clippy::too_many_arguments)]
 fn batch_put(
-    path: &Utf8Path,
     db: &rusqlite::Connection,
     session: &Session,
     (target, test_key, signer, storage_key): (&Target, &str, &str, &str),
@@ -505,7 +508,7 @@ fn batch_put(
             )?
             .collect::<rusqlite::Result<Vec<String>>>()
         })
-        .map_err(|e| sql_err(path, e))?
+        .map_err(write_err)?
         .into_iter()
         .filter(|k| {
             parse_key(k)
@@ -522,12 +525,12 @@ fn batch_put(
     };
     let now = now_ms();
     for other in same_inputs.iter().filter(|k| **k != key) {
-        if remove_key(path, db, target, other, session.email(), now)? {
+        if remove_key(db, target, other, session.email(), now)? {
             written.push((target.clone(), other.clone()));
         }
     }
-    if !current_is(path, db, session, target, &key, text)? {
-        set_string(path, db, target, &key, text, session.email(), now)?;
+    if !current_is(db, session, target, &key, text)? {
+        set_string(db, target, &key, text, session.email(), now)?;
         written.push((target.clone(), key.clone()));
     }
     Ok(key)
@@ -595,6 +598,13 @@ fn meta_err(e: git_meta_lib::Error) -> GitError {
 
 fn sql_err(path: &Utf8Path, e: rusqlite::Error) -> GitError {
     GitError::Store(format!("{path}: {e}"))
+}
+
+/// A SQLite error of a batch's write (2.8), as git-meta reports one of its
+/// own writes (`git-meta: database is locked`, vci 2.7's text): the batch
+/// writes git-meta's tables in its stead.
+fn write_err(e: rusqlite::Error) -> GitError {
+    GitError::Meta(e.to_string())
 }
 
 /// Whether git-meta can serialize a target: its value is long enough for
@@ -1427,7 +1437,6 @@ impl<'a> AttestStore<'a> {
     fn in_batch<T>(
         &self,
         f: impl FnOnce(
-            &Utf8Path,
             &rusqlite::Connection,
             &Session,
             &mut Vec<(Target, String)>,
@@ -1462,17 +1471,17 @@ impl<'a> AttestStore<'a> {
                     let _ = db.execute_batch("ROLLBACK");
                 }
                 *open = false;
-                return Some(Err(sql_err(path, e)));
+                return Some(Err(write_err(e)));
             }
             *open = true;
             let mut written = Vec::new();
-            let mut out = f(path, db, session, &mut written);
+            let mut out = f(db, session, &mut written);
             let end = match &out {
                 Ok(_) => db.execute_batch("RELEASE vci_write"),
                 Err(_) => db.execute_batch("ROLLBACK TO vci_write; RELEASE vci_write"),
             };
             if let (Err(e), Ok(_)) = (end, &out) {
-                out = Err(sql_err(path, e));
+                out = Err(write_err(e));
             }
             if db.is_autocommit() {
                 // SQLite ended the transaction itself (an I/O error, a full
@@ -1685,9 +1694,8 @@ impl<'a> AttestStore<'a> {
             reason: "must be UTF-8",
         })?;
         validate::hex_id("test_key", test_key)?;
-        if let Some(r) = self.in_batch(|path, db, session, written| {
+        if let Some(r) = self.in_batch(|db, session, written| {
             batch_put(
-                path,
                 db,
                 session,
                 (target, test_key, signer, storage_key),
@@ -1876,11 +1884,11 @@ impl<'a> AttestStore<'a> {
             return Ok(doomed);
         }
         let mut doomed = Some(doomed);
-        let batched = self.in_batch(|path, db, session, written| {
+        let batched = self.in_batch(|db, session, written| {
             let mut removed = Vec::new();
             for e in doomed.take().unwrap_or_default() {
                 let target = Target::parse(&e.target).map_err(meta_err)?;
-                if remove_key(path, db, &target, &e.key, session.email(), now_ms())? {
+                if remove_key(db, &target, &e.key, session.email(), now_ms())? {
                     written.push((target, e.key.clone()));
                     removed.push(e);
                 }
@@ -1930,17 +1938,17 @@ impl<'a> AttestStore<'a> {
             reason: "must be UTF-8",
         })?;
         let key = manifest_key(root);
-        let batched = self.in_batch(|path, db, session, written| {
+        let batched = self.in_batch(|db, session, written| {
             clock(0, t);
             let t = std::time::Instant::now();
             let project = Target::project();
-            let same = current_is(path, db, session, &project, &key, text)?;
+            let same = current_is(db, session, &project, &key, text)?;
             clock(1, t);
             if same {
                 return Ok(false);
             }
             let t = std::time::Instant::now();
-            set_string(path, db, &project, &key, text, session.email(), now_ms())?;
+            set_string(db, &project, &key, text, session.email(), now_ms())?;
             written.push((project, key.clone()));
             clock(2, t);
             Ok(true)
@@ -2006,9 +2014,9 @@ impl<'a> AttestStore<'a> {
     pub fn remove_manifest(&self, root: &str) -> Result<bool, GitError> {
         validate::hex_id("input root", root)?;
         let key = manifest_key(root);
-        if let Some(r) = self.in_batch(|path, db, session, written| {
+        if let Some(r) = self.in_batch(|db, session, written| {
             let project = Target::project();
-            let removed = remove_key(path, db, &project, &key, session.email(), now_ms())?;
+            let removed = remove_key(db, &project, &key, session.email(), now_ms())?;
             if removed {
                 written.push((project, key.clone()));
             }
@@ -2042,12 +2050,12 @@ impl<'a> AttestStore<'a> {
         if keys.is_empty() {
             return Ok(0);
         }
-        let batched = self.in_batch(|path, db, session, written| {
+        let batched = self.in_batch(|db, session, written| {
             let project = Target::project();
             let now = now_ms();
             let mut n = 0;
             for key in &keys {
-                if remove_key(path, db, &project, key, session.email(), now)? {
+                if remove_key(db, &project, key, session.email(), now)? {
                     written.push((project.clone(), key.clone()));
                     n += 1;
                 }

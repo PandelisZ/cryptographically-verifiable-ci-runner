@@ -441,8 +441,9 @@ struct GitBatch(BatchGuard);
 
 impl BatchEnd for GitBatch {
     /// Commits the batch's transaction and stamps its writes, then closes
-    /// the shared session and connection.
-    fn finish(self: Box<Self>) -> Result<(), StoreError> {
+    /// the shared session and connection. Stamping fails only after the
+    /// commit: a warning.
+    fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError> {
         Ok(self.0.finish()?)
     }
 }

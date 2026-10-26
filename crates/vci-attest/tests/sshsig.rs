@@ -708,3 +708,105 @@ fn keys_only_ssh_keygen_can_judge_are_not_signed_in_process() {
     let r = signer.sign_statement(&statement(1));
     assert!(matches!(r, Err(SignError::SshKeygen { .. })), "{r:?}");
 }
+
+/// The public key blob of `key`'s `.pub` line.
+fn blob(key: &Key) -> Vec<u8> {
+    b64()
+        .decode(key.pub_line.split_whitespace().nth(1).unwrap())
+        .unwrap()
+}
+
+/// A private key signs only as the public key it is named by. One whose
+/// `.pub` is another key's is not signed in process: ssh-keygen refuses it,
+/// as it did before keys signed in process (vci stored such signatures
+/// under the `.pub`'s signer id, and removed that key's attestations as
+/// superseded). Named as another key by the caller, it is not signed in
+/// process either, and the signature ssh-keygen makes with it is refused.
+#[test]
+fn a_key_signs_only_as_the_public_key_it_is_named_by() {
+    let (_t, dir) = tempdir();
+    let alice = keygen(&dir, "alice");
+    let bob = keygen_kind(&dir, "bob", &["-t", "ecdsa", "-b", "256"], "");
+
+    let stale = dir.join("stale");
+    std::fs::copy(&alice.private, &stale).unwrap();
+    std::fs::copy(&bob.public, format!("{stale}.pub")).unwrap();
+    for signer in [
+        SshSigner::load(&stale),
+        SshSigner::load_for(&stale, &blob(&bob)),
+    ] {
+        assert!(!signer.in_process(), "{signer:?}");
+        let r = signer.sign_statement(&statement(1));
+        assert!(
+            matches!(&r, Err(SignError::SshKeygen { stderr, .. }) if stderr.contains("match")),
+            "{r:?}"
+        );
+    }
+
+    let named_bob = SshSigner::load_for(&alice.private, &blob(&bob));
+    assert!(!named_bob.in_process());
+    let r = named_bob.sign_statement(&statement(1));
+    match &r {
+        Err(e @ SignError::WrongKey { signed_by, named }) => {
+            assert_eq!(signed_by, &alice.fingerprint);
+            assert_eq!(named, &bob.fingerprint);
+            assert!(e.to_string().contains(&bob.fingerprint), "{e}");
+        }
+        other => panic!("expected WrongKey, got {other:?}"),
+    }
+
+    let named_alice = SshSigner::load_for(&alice.private, &blob(&alice));
+    assert!(named_alice.in_process());
+    let env = named_alice.sign_statement(&statement(1)).unwrap();
+    assert_eq!(env.signatures[0].keyid, alice.fingerprint);
+
+    // Named by its own public key, every kind signs as before: in process,
+    // or with ssh-keygen for RSA.
+    let kinds: [(&str, &[&str], bool); 3] = [
+        ("p384", &["-t", "ecdsa", "-b", "384"], true),
+        ("p521", &["-t", "ecdsa", "-b", "521"], true),
+        ("rsa", &["-t", "rsa", "-b", "2048"], false),
+    ];
+    for (name, kind, in_process) in kinds {
+        let key = keygen_kind(&dir, name, kind, "");
+        let signer = SshSigner::load_for(&key.private, &blob(&key));
+        assert_eq!(signer.in_process(), in_process, "{name}");
+        let env = signer.sign_statement(&statement(1)).unwrap();
+        assert_eq!(env.signatures[0].keyid, key.fingerprint, "{name}");
+        let other = SshSigner::load_for(&key.private, &blob(&bob));
+        assert!(!other.in_process(), "{name}");
+        let r = other.sign_statement(&statement(1));
+        assert!(
+            matches!(r, Err(SignError::WrongKey { .. })),
+            "{name}: {r:?}"
+        );
+    }
+}
+
+/// A key file with CRLF line ends is left to ssh-keygen, whose parser finds
+/// no key in it (ssh-key's would): vci signs with the key files ssh-keygen
+/// signs with, and with no others.
+#[test]
+fn a_crlf_key_file_is_left_to_ssh_keygen() {
+    let (_t, dir) = tempdir();
+    let key = keygen(&dir, "crlf");
+    let text = std::fs::read_to_string(&key.private).unwrap();
+    std::fs::write(&key.private, text.replace('\n', "\r\n")).unwrap();
+    let signer = SshSigner::load(&key.private);
+    assert!(!signer.in_process());
+    let ours = signer.sign_statement(&statement(1));
+    let mut child = std::process::Command::new("ssh-keygen")
+        .args(["-Y", "sign", "-n", NAMESPACE, "-f", key.private.as_str()])
+        .env_remove("SSH_AUTH_SOCK")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+    }
+    let theirs = child.wait_with_output().unwrap();
+    assert_eq!(ours.is_ok(), theirs.status.success(), "{ours:?}");
+}

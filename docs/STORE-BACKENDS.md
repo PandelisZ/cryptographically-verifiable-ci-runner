@@ -518,14 +518,19 @@ been measured on one yet.
   writes shared. No backend uses it since 2.8 (git-meta and SQLite did, each write committing on its own).
 - **`WriteBatch::deferred(end)`**: writes become durable only when `finish` returns `Ok`. Every backend uses this kind
   since 2.8.
+- `finish` returns `Ok(warnings)`: what failed once the writes were durable and lost none of them (2.8). Only git-meta
+  has any: the re-stamp of its log after the commit (below). `vci run` prints each as `vci: warning: …` after the
+  project's lines and reports every unit as stored.
 - **git-meta** (2.8): the batch shares one git-meta session and one connection to git-meta's SQLite store, and its
   writes are one `BEGIN IMMEDIATE` transaction on that connection, begun by the first write and committed by
   `finish`; each write is a savepoint in it, so a write that fails leaves the others. Inside the batch vci writes
   git-meta's tables itself, with the statements git-meta-lib 0.1.13 (pinned exactly) runs for `set` of a string and
   for `remove`, keys checked with its `validate_key`; outside one, writes go through git-meta as before.
   `a_batch_stores_what_the_calls_store_one_by_one` (vci-git) compares the rows, log entries and deletion records
-  either way. The written keys' log entries are stamped once the commit is done (`stamp_written`). A batch opened
-  inside the batch joins it. Writes on the batch's thread read the batch's own writes (the slot's keys, whether a
+  either way. The written keys' log entries are stamped once the commit is done (`stamp_written`); stamping is a
+  transaction of its own, so when it fails the writes are stored and `finish` returns a warning, not an error. A
+  SQLite error of a write inside the batch, or of its commit, reads as the same write through git-meta reads
+  (`git-meta: database is locked`, 2.7's text). A batch opened inside the batch joins it. Writes on the batch's thread read the batch's own writes (the slot's keys, whether a
   value is already there); other readers see none of them before `finish`, which the trait allows. Storing 1,200
   units was 4,800 commits on two connections (0.7 s) before. The batch's connection keeps its savepoints' journal in
   memory (`temp_store = MEMORY`) and a 64 MiB page cache: with a temporary file per savepoint and the default cache
@@ -581,9 +586,10 @@ been measured on one yet.
 - Orphan-manifest collection runs once, after every project's batch has finished, and only when something was
   superseded.
 
-The in-memory `MemStore` in vci-cli's tests (`store::mem`) has deferred and failing batches; the unit tests
-`a_deferred_batch_reports_in_order_once_it_finishes`, `a_failed_deferred_batch_refuses_every_unit_it_held` and
-`an_immediate_batch_reports_each_unit_as_it_is_stored` (run.rs) hold the rule.
+The in-memory `MemStore` in vci-cli's tests (`store::mem`) has deferred, failing and warning batches; the unit tests
+`a_deferred_batch_reports_in_order_once_it_finishes`, `a_failed_deferred_batch_refuses_every_unit_it_held`,
+`a_failure_after_the_batch_stored_its_writes_is_a_warning` and `an_immediate_batch_reports_each_unit_as_it_is_stored`
+(run.rs) hold the rule.
 
 ---
 
@@ -1352,11 +1358,12 @@ from `vci_git`), so every import path still compiles: `KEY_PREFIX`, `MANIFEST_PR
 
 `AttestStore::remove_for_signer` has no caller. Delete it in a follow-up.
 
-**Tests.** `crates/vci-git/tests/store_trait.rs` (11 tests) checks the implementation against `AttestStore` on lazy
+**Tests.** `crates/vci-git/tests/store_trait.rs` (15 tests) checks the implementation against `AttestStore` on lazy
 worlds with hinted, unhinted, promised and missing-blob entries: listings match, `read_values` matches, `read_units` is
 targeted and equal to the default, error mapping, the pool seeing a store created later and being refreshed after a
-prefetch, `orphan_manifests` against a re-implementation of 2.7's logic, the batch (one transaction since 2.8), the timing line, `put`
-keeping `put_hinted`'s keys, and the factory.
+prefetch, `orphan_manifests` against a re-implementation of 2.7's logic, the batch (one transaction since 2.8, the
+same rows as its calls one by one, a failed stamp after its commit a warning, a refused write in git-meta's text),
+the timing line, `put` keeping `put_hinted`'s keys, and the factory.
 
 ---
 

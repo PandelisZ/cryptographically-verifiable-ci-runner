@@ -1322,7 +1322,9 @@ private key file that only its owner can read is read once per run and signs in 
 `ssh-keygen -Y sign` makes (sha512; byte for byte for ed25519); a `.pub` signs through `ssh-agent` (`SSH_AUTH_SOCK`)
 over connections vci keeps open. RSA keys (the Rust `rsa` crate's private-key operation is not constant-time,
 RUSTSEC-2023-0071), encrypted, PEM-format and security keys, and any signature the agent does not make, sign with
-`ssh-keygen -Y sign` as before. Every signature is checked before it is stored. The signer id (a segment of the git-meta key) is the first 16 hex chars of SHA-256 over the
+`ssh-keygen -Y sign` as before, and so do the key files `ssh-keygen` refuses: one whose `.pub` holds another key,
+and one with CRLF line ends. Every signature is checked before it is stored, and refused when a key other than the
+one the signer id names made it. The signer id (a segment of the git-meta key) is the first 16 hex chars of SHA-256 over the
 public key blob. Keyless (since 2.0): `--oidc` instead of a key, in a GitHub Actions job with `permissions: id-token:
 write`; the signer id is then the first 16 hex chars of SHA-256 over the job's identity claims (see [Keyless signing
 (OIDC)](#keyless-signing-oidc)).

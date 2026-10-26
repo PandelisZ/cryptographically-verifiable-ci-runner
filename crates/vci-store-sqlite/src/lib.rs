@@ -887,7 +887,7 @@ impl BatchEnd for SqliteBatch {
     /// The outermost batch commits the transaction, then gives the shared
     /// connection back to the pool. It fails when the commit does, or when
     /// the transaction was lost; nothing of the batch is stored then.
-    fn finish(self: Box<Self>) -> Result<(), StoreError> {
+    fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError> {
         let id = self.inner.id;
         let ended = PINNED
             .try_with(|p| {
@@ -933,7 +933,7 @@ impl BatchEnd for SqliteBatch {
                 );
             }
         }
-        result
+        result.map(|()| Vec::new())
     }
 }
 
