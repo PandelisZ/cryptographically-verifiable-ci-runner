@@ -29,6 +29,7 @@
 <tr><td><a href="#env"><code>vci env</code></a></td><td class="wrap">Show which environment variables vci sets, hashes, ignores and removes</td></tr>
 <tr><td><a href="#prune"><code>vci prune</code></a></td><td class="wrap">Delete expired attestations</td></tr>
 <tr><td><a href="#verify"><code>vci verify</code></a></td><td class="wrap">Verify one attestation envelope and print its claims</td></tr>
+<tr><td><a href="#store-info"><code>vci store info</code></a></td><td class="wrap">Show which attestation store the repository uses and how it is set up</td></tr>
 <tr><td><a href="#update"><code>vci update</code></a></td><td class="wrap">Install the latest release the way vci was installed</td></tr>
 </table>
 
@@ -128,7 +129,7 @@ vci ci --base-ref "$GITHUB_SHA" --key "$RUNNER_TEMP/vci-key" --push --remote ori
 
 <h3 id="prune">vci prune</h3>
 <pre data-nocopy><code>vci prune [--dry-run]</code></pre>
-<p>Deletes expired attestations from the local store. <code>vci push</code> publishes the deletions. <code>--dry-run</code> only lists them. It reads every attestation, so since 2.0 it first fetches the ones a fetch left out.</p>
+<p>Deletes expired attestations from the attestation store: with git-meta from the local store, and <code>vci push</code> publishes the deletions; SQLite, PostgreSQL and libSQL delete at once. <code>--dry-run</code> only lists them. It reads every attestation, so since 2.0 it first fetches the ones a fetch left out.</p>
 <pre><code>vci prune --dry-run
 vci prune &amp;&amp; vci push</code></pre>
 
@@ -140,6 +141,15 @@ vci prune &amp;&amp; vci push</code></pre>
 <li><code>--identities F</code>, <code>--trusted-root F</code>: the trust for a keyless (<code>--oidc</code>) envelope. Default: <code>.vci/identities.toml</code> and <code>.vci/sigstore-trusted-root.json</code> at <code>--base-ref</code>, or at HEAD.</li>
 <li>Trust given on the command line is the only trust: once any of these is given, an envelope whose kind needs a file that was not given is INVALID.</li>
 </ul>
+
+<h3 id="store-info">vci store info</h3>
+<pre data-nocopy><code>vci store info [--format text|json]</code></pre>
+<p>Since 2.8.0. Says which <a href="configuration.html#store">attestation store</a> the repository uses (git-meta, SQLite, PostgreSQL or libSQL) and how it was chosen: its location, every setting with where it came from (<code>$VCI_STORE</code>, <code>$VCI_STORE_URL</code>, <code>vci.toml</code>, the default), what it can do, whether it exists and how many attestations it holds. It never prints a password or a token. In a linked worktree, git-meta's location is the common git directory's store, which every worktree of the repository shares.</p>
+<ul>
+<li>Exit 0 when the store can be read, also before anything is stored; otherwise it prints what it knows, then the error, and exits 2. Run it first when a plan says it cannot read the store.</li>
+<li><code>--format json</code>: the same, for scripts.</li>
+</ul>
+<pre><code>VCI_STORE=sqlite vci store info</code></pre>
 
 <h3 id="update">vci update</h3>
 <pre data-nocopy><code>vci update [--check] [--version X.Y.Z] [--keep-old]</code></pre>
