@@ -66,12 +66,63 @@ the run's two jobs stamp differently), git merges by content and needs the tip's
 fetched. The rest of a push is the fetch and merge round (git fetch 2 to 7 s, serializing the run's attestations
 through fast-import 3 to 5 s), the pre-push checks 2 s, the pack's missing objects 4 s, `git push` 4 to 7 s.
 
-## What was changed
+## The same suite, plain and with vci, on the same day
 
-1. **The merge of a fetched tip** (vci-git, 2.7.34): the deletion records both sides wrote differently take ours
-   *before* git merges, written into the tip's tree, so no path differs on both sides and `git merge-tree` merges
-   trees alone, with `-X no-renames` so it never looks for where a deleted path went (that reads blobs too). A
-   push whose other job deleted the same superseded attestations no longer pays a failed merge-tree and
-   git-meta's merge. Measured: see "After".
+The plain step of 18 October is not today's suite. A manual workflow on a vex branch
+(`pz/vci-rails-cost-experiment`, `.github/workflows/vci-rails-cost.yml`) ran the `application` group (1,072 files,
+6,463 tests) on the runners on 26 October, one variant per job, with a vci built from this branch, no store, no
+push, no shards (a store with no recorded durations shards nothing):
 
-(to be continued)
+| variant | runner | what it measures | result |
+|---|---|---|---|
+| plain, eager-loaded (`CI=true`, 16 workers, as CI runs it) | fast | `bin/rails test` of the 1,072 files | `Finished in 344 s`, step 350 s |
+| plain, lazily loaded (`CI` unset) | slow | the same, loaded as vci loads | `Finished in 638 s`, step 643 s |
+| `vci run`, 16 slots (lazy, as shipped) | slow | the Ruby batch | 696 s; slot setup 18 s; a process 6.5 s on average (requires 0.33 s of it, routes 0.17 s, GC 0.46 s, 69 requires) |
+| the same with the application eager-loaded and routes drawn before the slots fork (`VCI_RAILS_EXPERIMENT=eager`) | slow | what lazy loading costs a process | 798 s; a process 7.9 s (requires 0.05 s): slower, not faster |
+| the same with a run-private compile cache (`iseq`) | slow | what parsing and compiling cost | 676 s; a process 6.0 s (requires 0.31 s; 1,294 cache hits and 1,831 misses a process) |
+| the same with `Process.warmup` in each slot (`warmup`) | fast | copy-on-write after the fork | 360 s; a process 3.0 s |
+| the same with the routes drawn before the fork (`routes`) | fast | the routes' first draw | 404 s; a process 3.5 s |
+
+What this says:
+
+- **On the same runner, vci's batch costs about what the plain run costs.** On the fast kind, the plain run's 344 s
+  against 360 and 404 s for two vci variants that differ from the shipped one by nothing that moved a process
+  (and without shards: the slowest file ran 284 and 319 s in one process and ended both batches). The 2.2 s a
+  file-worker read from the 18 October step was the October 18 suite; the same group takes 344 s plain today
+  because the suite gained the long `persistent_agents` tests, which the plain run spreads over 16 workers test by
+  test and vci can only shard.
+- **Lazy loading is not the cost.** A process spends 0.3 s of its 5.5 to 6.5 s in requires (autoloads included)
+  and 0.17 s drawing routes; eager-loading everything before the fork made processes slower (bigger heap to copy
+  on write and to collect), and the compile cache moved requires from 0.33 to 0.31 s.
+- **The slow runner kind is the slow runner kind**: plain lazy 638 s there against 344 s eager on the fast kind is
+  mostly the host, not the loading.
+- `Process.warmup` hung a batch for four hours on macOS (a slot's process never ended; the file watchdog did not
+  stop it) and changed nothing measurable on Linux: not shipped, left as a switch.
+
+**Slot setup** (the per-slot database, schema and seeds; 45 s on the fast kind, 13 s on the slow kind, paid by vci's
+slots and by plain's workers alike) is bound by fsync: on this Mac, `bin/rails db:test:prepare` against the same
+`mysql:8.0.46` container took 25 to 45 s with the data directory on disk and 5.5 to 10.5 s on a tmpfs
+(`--tmpfs /var/lib/mysql`). That is vex's `services.mysql.options` to change, for the plain and the vci jobs
+alike; not done here.
+
+## What was changed (2.7.34)
+
+1. **The merge of a fetched tip** (vci-git): the deletion records both sides wrote differently take ours *before*
+   git merges, written into the tip's tree, so no path differs on both sides and `git merge-tree` merges trees
+   alone, with `-X no-renames` so it never looks for where a deleted path went (that reads blobs too). A push
+   whose other job deleted the same superseded attestations no longer pays a failed merge-tree (8 to 55 s) and
+   git-meta's merge (10 to 67 s). Tests: `two_blobless_clones_deleting_the_same_value_both_push` asserts the merge
+   went through git.
+2. **One slot per piece of work** (the collector): a batch that runs few files, some as shards, opens one slot per
+   file or shard instead of one per file (a job that ran 8 files, four of them as 3 to 5 shards, ran its 20 pieces
+   on 8 of 16 slots).
+3. **Measurement switches**, off: `VCI_RAILS_PROFILE=1` prints one `vci-profile` line per process (requires,
+   routes, GC, process time); `VCI_RAILS_EXPERIMENT` takes `eager`, `routes`, `warmup`, `iseq` (above).
+
+Measured and not changed: lazy loading, the compile cache and `Process.warmup` (above); the plan's three
+dependent blob fetches (envelopes, manifests, base manifests: about 4 s a plan, a round trip each, each needing
+the previous one's answer unless remembered from an earlier plan).
+
+## After
+
+(filled in once 2.7.34 has run on vex's pull requests)
