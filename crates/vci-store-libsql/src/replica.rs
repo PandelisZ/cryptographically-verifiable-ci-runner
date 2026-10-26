@@ -602,7 +602,8 @@ impl Replica {
             for r in p.attestations.values() {
                 put_copy(store, &r.key, &r.target, &r.value)?;
             }
-            b.finish()
+            // SQLite's batch warns of nothing after its commit.
+            b.finish().map(drop)
         })();
         if let Err(e) = r {
             self.degraded.store(true, Ordering::Relaxed);
@@ -705,5 +706,5 @@ fn apply_changes(store: &SqliteStore, c: &Changes, full: bool) -> Result<(), Sto
         let left: BTreeSet<String> = store.manifest_roots()?.into_iter().collect();
         gone.retain(|r| left.contains(r));
     }
-    b.finish()
+    b.finish().map(drop)
 }

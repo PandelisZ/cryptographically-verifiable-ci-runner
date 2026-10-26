@@ -480,7 +480,8 @@ impl<'s> StoreLoop<'s> {
     /// End the batch, then report every unit in order. A deferred batch
     /// that fails stored nothing: each unit it held is refused ("signing
     /// or storing failed") and counted as an error, and what it would have
-    /// superseded stays.
+    /// superseded stays. What failed after the batch's writes were durable
+    /// (git-meta's log re-stamp) is a warning after them.
     fn finish(self) -> Stored {
         let StoreLoop {
             store,
@@ -493,6 +494,7 @@ impl<'s> StoreLoop<'s> {
             ..
         } = self;
         let deferred = batch.as_ref().is_some_and(WriteBatch::defers_writes);
+        let mut after = Vec::new();
         let failed = match batch.map(WriteBatch::finish) {
             Some(Err(e)) if deferred => Some(e),
             Some(Err(e)) => {
@@ -503,7 +505,11 @@ impl<'s> StoreLoop<'s> {
                 ));
                 None
             }
-            _ => None,
+            Some(Ok(warnings)) => {
+                after = warnings;
+                None
+            }
+            None => None,
         };
         // Each pending unit's line, by slot.
         let mut lines: Vec<Option<String>> = Vec::with_capacity(slots.len());
@@ -558,6 +564,9 @@ impl<'s> StoreLoop<'s> {
                     }
                 }
             }
+        }
+        for w in after {
+            say(&format!("vci: warning: {w}"));
         }
         done
     }
@@ -1202,7 +1211,10 @@ enum Verdict {
 /// ran: `$VCI_JOBS`, else the number of CPUs. Each mostly hashes inputs; a
 /// key file signs in process (2.8), and only a key ssh-keygen must handle,
 /// or keyless signing, waits for another process or service. One writer
-/// thread stores the units, in order.
+/// thread stores the units, in order. Twice as many threads as CPUs were
+/// not faster (1,200 Go packages on 14 cores: the check's thread-seconds
+/// grew by half and the step's wall time did not fall), so the default
+/// stays one per CPU.
 fn check_jobs() -> usize {
     std::env::var("VCI_JOBS")
         .ok()
@@ -2347,7 +2359,11 @@ pub fn run_units(
     let key = match signing {
         Signing::Key(k) => {
             let key = keys::discover(k, &root)?;
-            let signer = vci_attest::SshSigner::load(&key.path);
+            // Signatures by the key the signer id names, and no other: a
+            // private key whose .pub is another key's goes to ssh-keygen,
+            // which refuses it, instead of being stored under that other
+            // key's signer id.
+            let signer = vci_attest::SshSigner::load_for(&key.path, &key.blob);
             Signer::Ssh(key, signer)
         }
         Signing::Oidc(k) => Signer::Keyless(k),
@@ -4274,6 +4290,46 @@ mod tests {
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(!keys.contains(&old.key));
         assert_eq!(s.roots(), [ra, rc]);
+    }
+
+    /// A batch whose writes were stored and whose end then failed (git-meta
+    /// re-stamping its log after the commit) refuses nothing: every unit is
+    /// attested and reported, and the failure is a warning after them, not
+    /// an error of the run.
+    #[test]
+    fn a_failure_after_the_batch_stored_its_writes_is_a_warning() {
+        let s = crate::store::mem::MemStore::new()
+            .deferred(true)
+            .warning(Some(
+                "stamping the 2 write(s) of the batch after its commit: refused",
+            ));
+        let m = InputManifest::default();
+        let (ra, rc) = (root('a'), root('c'));
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        sl.attest(unit("src/a.test.ts", &m, &ra));
+        sl.attest(unit("src/c.test.ts", &m, &rc));
+        let done = sl.finish();
+        assert_eq!((done.attested, done.refused), (2, 0));
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert!(done.store_failures.is_empty(), "{:?}", done.store_failures);
+        assert!(done.outcomes.iter().all(|o| o.attested && o.stored));
+        let lines = said.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("vci: attested src/a.test.ts "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("vci: attested src/c.test.ts "),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[2],
+            "vci: warning: stamping the 2 write(s) of the batch after its commit: refused"
+        );
+        assert_eq!(s.keys().len(), 2);
     }
 
     /// A deferred batch that fails stored nothing: every unit it held is

@@ -716,7 +716,9 @@ impl fmt::Debug for Prefetch<'_> {
 pub trait BatchEnd {
     /// Make every write of the batch durable and visible (commit, flush), or
     /// say why not. After an `Err`, treat every write of the batch as lost.
-    fn finish(self: Box<Self>) -> Result<(), StoreError>;
+    /// `Ok` carries warnings: what failed once the writes were durable, and
+    /// lost none of them (git-meta's re-stamp of its log after the commit).
+    fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError>;
 }
 
 /// An open write batch ([`AttestationStore::batch`]).
@@ -771,11 +773,13 @@ impl WriteBatch {
     }
 
     /// End the batch: every write made in it is durable, or the error says
-    /// why not.
-    pub fn finish(mut self) -> Result<(), StoreError> {
+    /// why not. `Ok` carries warnings about what failed after the writes
+    /// were durable ([`BatchEnd::finish`]); callers print them and still
+    /// report every write as stored.
+    pub fn finish(mut self) -> Result<Vec<String>, StoreError> {
         match self.end.take() {
             Some(e) => e.finish(),
-            None => Ok(()),
+            None => Ok(Vec::new()),
         }
     }
 }

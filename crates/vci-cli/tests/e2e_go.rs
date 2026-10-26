@@ -729,6 +729,52 @@ fn go_run_refuses_unattestable_packages() {
     }
 }
 
+/// A private key file whose `.pub` is another key's signs nothing: ssh-keygen
+/// refuses it, as it did before key files signed in process, so the unit
+/// is not attested, nothing is stored under the `.pub`'s signer id, and
+/// that key's own attestation is not removed as superseded (the in-process
+/// signer signed with the private key, stored under the other key's id and
+/// removed its attestation).
+#[test]
+fn go_a_key_whose_pub_is_another_keys_signs_nothing() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    w.run(&work, B, &w.untrusted);
+    let repo = store_for(&work);
+    let keys = |r: &Repo| -> Vec<String> {
+        AttestStore::new(r)
+            .list(Some(B))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect()
+    };
+    let before = keys(&repo);
+    assert_eq!(before.len(), 1, "{before:?}");
+    let stale = w.base.join("keys/stale");
+    std::fs::copy(&w.trusted, &stale).unwrap();
+    std::fs::copy(
+        w.untrusted.with_extension("pub"),
+        stale.with_extension("pub"),
+    )
+    .unwrap();
+    let src = w.read("b/b.go");
+    w.put("b/b.go", &format!("{src}\n// edited\n"));
+    let out = w.vci(&work, &["run", B, "--key", stale.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.starts_with("vci: error: not attesting b: ")
+                && l.contains("ssh-keygen -Y sign failed")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("vci: attested"), "{stderr}");
+    assert!(!stderr.contains("superseded"), "{stderr}");
+    assert_eq!(keys(&repo), before);
+}
+
 /// `policy.go_allow_net` waives the `net` refusal; the attestation records
 /// the waiver and is only accepted while the base commit's policy has it.
 /// `policy.ignore_taints = ["go:net"]` is the same waiver.

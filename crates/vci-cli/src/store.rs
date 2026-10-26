@@ -319,6 +319,8 @@ pub mod mem {
         shared: AtomicBool,
         deferred: AtomicBool,
         fail: Mutex<Option<String>>,
+        /// A warning every batch's `finish` gives after applying its writes.
+        warn: Mutex<Option<String>>,
         writes: AtomicUsize,
         batches: AtomicUsize,
     }
@@ -381,6 +383,14 @@ pub mod mem {
             self
         }
 
+        /// Make every batch's `finish` store its writes and then warn
+        /// `what` (a failure after the commit, such as git-meta's log
+        /// re-stamp), or not warn again with `None`.
+        pub fn warning(self, what: Option<&str>) -> Self {
+            *self.state.warn.lock().unwrap() = what.map(str::to_owned);
+            self
+        }
+
         /// How many write methods were called (`put`, `put_manifest`,
         /// `remove`, `remove_manifests`), and batches opened.
         pub fn writes(&self) -> usize {
@@ -408,9 +418,10 @@ pub mod mem {
     struct MemBatch(Arc<State>);
 
     impl BatchEnd for MemBatch {
-        fn finish(self: Box<Self>) -> Result<(), StoreError> {
+        fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError> {
+            let warnings: Vec<String> = self.0.warn.lock().unwrap().iter().cloned().collect();
             let Some(ops) = self.0.pending.lock().unwrap().take() else {
-                return Ok(());
+                return Ok(warnings);
             };
             if let Some(why) = self.0.fail.lock().unwrap().clone() {
                 return Err(StoreError::unavailable("memory", why));
@@ -428,7 +439,7 @@ pub mod mem {
             for op in manifests.into_iter().chain(puts).chain(removals) {
                 self.0.apply(op);
             }
-            Ok(())
+            Ok(warnings)
         }
     }
 

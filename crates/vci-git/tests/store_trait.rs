@@ -788,6 +788,72 @@ fn a_batch_stores_what_the_calls_store_one_by_one() {
     assert_eq!(rows(true), rows(false));
 }
 
+/// A batch whose commit went through stored its writes, even when
+/// stamping their log entries afterwards fails: `finish` is `Ok` with a
+/// warning (it used to fail, and vci run refused every unit it had
+/// stored).
+#[test]
+fn a_stamp_that_fails_after_the_commit_is_a_warning() {
+    let (_t, root) = init_repo();
+    let gs = GitMetaStore::new(repo(&root));
+    gs.put_for_test(C, S1, &hex64(3), None, &env("c", &hex64(0xe0)))
+        .unwrap();
+    let db = rusqlite::Connection::open(root.join(".git/git-meta.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_stamp BEFORE UPDATE OF timestamp ON metadata_log
+         BEGIN SELECT RAISE(ABORT, 'stamp refused by test trigger'); END;",
+    )
+    .unwrap();
+    let batch = gs.batch().unwrap();
+    let m = hex64(0xe1);
+    gs.put_manifest(&m, &manifest("one")).unwrap();
+    let a = gs
+        .put_for_test(A, S1, &hex64(1), None, &env("a", &m))
+        .unwrap();
+    // A later millisecond than the writes', so the stamp is an update.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let warnings = batch.finish().unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("stamping the 2 write(s) of the batch after its commit: ")
+            && warnings[0].contains("stamp refused by test trigger"),
+        "{warnings:?}"
+    );
+    let r = repo(&root);
+    assert_eq!(AttestStore::new(&r).list(Some(A)).unwrap()[0].key, a.key);
+    assert!(gs.manifest(&m).unwrap().is_some());
+}
+
+/// A batch's write that SQLite refuses fails with the text git-meta gives
+/// the same write one by one (`git-meta: <SQLite's message>`, as vci 2.7
+/// printed it), not a path-prefixed store error.
+#[test]
+fn a_refused_write_reads_the_same_in_a_batch() {
+    let refused = |batched: bool| {
+        let (_t, root) = init_repo();
+        let gs = GitMetaStore::new(repo(&root));
+        gs.put_for_test(C, S1, &hex64(3), None, &env("c", &hex64(0xe0)))
+            .unwrap();
+        let db = rusqlite::Connection::open(root.join(".git/git-meta.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER no_insert BEFORE INSERT ON metadata
+             BEGIN SELECT RAISE(ABORT, 'refused by test trigger'); END;",
+        )
+        .unwrap();
+        let batch = batched.then(|| gs.batch().unwrap());
+        let e = gs
+            .put_manifest(&hex64(0xe1), &manifest("one"))
+            .unwrap_err()
+            .to_string();
+        if let Some(b) = batch {
+            b.finish().unwrap();
+        }
+        e
+    };
+    assert_eq!(refused(false), "git-meta: refused by test trigger");
+    assert_eq!(refused(true), refused(false));
+}
+
 /// Plan test 9: The timing report is the line vci has always printed.
 #[test]
 fn timing_report_line() {

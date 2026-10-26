@@ -20,6 +20,8 @@ pub enum SignError {
     SshKeygen { status: String, stderr: String },
     #[error("ssh-keygen produced an unusable signature: {0}")]
     BadOutput(String),
+    #[error("the signature is by {signed_by}, not by {named}, the key the signer is named by")]
+    WrongKey { signed_by: String, named: String },
 }
 
 /// The SSHSIG hash `ssh-keygen -Y sign` uses for every kind of key
@@ -36,11 +38,17 @@ pub(crate) const HASH: HashAlg = HashAlg::Sha512;
 /// thread. Everything else, and any signature the agent does not make,
 /// goes to `ssh-keygen -Y sign` as before: encrypted keys, RSA keys (the
 /// `rsa` crate's private-key operation is not constant-time,
-/// RUSTSEC-2023-0071), PEM-format keys, security keys, and key files
-/// readable by others (ssh-keygen decides about those).
+/// RUSTSEC-2023-0071), PEM-format keys, security keys, key files readable
+/// by others, key files ssh-keygen's parser would not read (CRLF line
+/// ends), and a key whose public half is not the one its `.pub` (or the
+/// caller, [`SshSigner::load_for`]) names: ssh-keygen decides about those,
+/// and reports what is wrong.
 pub struct SshSigner {
     path: Utf8PathBuf,
     how: How,
+    /// The public key blob every signature must be made by
+    /// ([`SshSigner::load_for`]).
+    public: Option<Vec<u8>>,
 }
 
 enum How {
@@ -71,16 +79,31 @@ impl SshSigner {
     /// process or through the agent signs with ssh-keygen, which reports
     /// what is wrong with it.
     pub fn load(key_path: &Utf8Path) -> SshSigner {
+        Self::load_inner(key_path, None)
+    }
+
+    /// [`SshSigner::load`] for signatures that must be made by the public
+    /// key `public` (its SSH wire-format blob, the one the caller names the
+    /// signer by). A key file or agent key whose public half is another
+    /// signs with ssh-keygen, which refuses a private key that does not
+    /// match its `.pub`; no signature is made in process or by the agent
+    /// with a key other than `public`.
+    pub fn load_for(key_path: &Utf8Path, public: &[u8]) -> SshSigner {
+        Self::load_inner(key_path, Some(public))
+    }
+
+    fn load_inner(key_path: &Utf8Path, public: Option<&[u8]>) -> SshSigner {
         let how = match std::fs::read(key_path.as_std_path()) {
-            Ok(bytes) if bytes.starts_with(b"-----BEGIN") => {
-                in_process_key(key_path, &bytes).map_or(How::SshKeygen, |k| How::Key(Box::new(k)))
-            }
-            Ok(bytes) => agent_for(&bytes).unwrap_or(How::SshKeygen),
+            Ok(bytes) if bytes.starts_with(b"-----BEGIN") => in_process_key(key_path, &bytes)
+                .filter(|k| signs_as(k.public_key(), key_path, public))
+                .map_or(How::SshKeygen, |k| How::Key(Box::new(k))),
+            Ok(bytes) => agent_for(&bytes, public).unwrap_or(How::SshKeygen),
             Err(_) => How::SshKeygen,
         };
         SshSigner {
             path: key_path.to_owned(),
             how,
+            public: public.map(<[u8]>::to_vec),
         }
     }
 
@@ -106,7 +129,8 @@ impl SshSigner {
     }
 
     /// Sign arbitrary in-toto payload bytes (payload type [`PAYLOAD_TYPE`]).
-    /// The signature is re-checked in Rust before it is returned.
+    /// The signature is re-checked in Rust before it is returned, and with
+    /// [`SshSigner::load_for`] refused when another key made it.
     pub fn sign_payload(&self, payload: &[u8]) -> Result<Envelope, SignError> {
         let message = pae(PAYLOAD_TYPE, payload);
         let pem = match &self.how {
@@ -124,14 +148,16 @@ impl SshSigner {
             },
             How::SshKeygen => ssh_keygen_sign(&message, &self.path)?,
         };
-        envelope(payload, &message, pem)
+        envelope(payload, &message, pem, self.public.as_deref())
     }
 }
 
 /// The private key in `bytes` when it can sign in process: an unencrypted
 /// OpenSSH key of a kind ssh-key signs with, in a file only its owner can
 /// read (ssh-keygen refuses or warns about others), whose trial signature
-/// verifies.
+/// verifies. A file with a carriage return is left to ssh-keygen: its
+/// parser wants the armor's first line to end in a bare newline, and finds
+/// no key in a CRLF file, which ssh-key would read.
 fn in_process_key(path: &Utf8Path, bytes: &[u8]) -> Option<PrivateKey> {
     #[cfg(unix)]
     {
@@ -146,7 +172,7 @@ fn in_process_key(path: &Utf8Path, bytes: &[u8]) -> Option<PrivateKey> {
     }
     #[cfg(not(unix))]
     let _ = path;
-    if !bytes.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----") {
+    if !bytes.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----\n") || bytes.contains(&b'\r') {
         return None;
     }
     let key = PrivateKey::from_openssh(bytes).ok()?;
@@ -163,20 +189,51 @@ fn in_process_key(path: &Utf8Path, bytes: &[u8]) -> Option<PrivateKey> {
     Some(key)
 }
 
-/// ssh-agent for the public key in `bytes`, when there is an agent.
-fn agent_for(bytes: &[u8]) -> Option<How> {
+/// Whether the private key whose public half is `key` (read from
+/// `path`) signs as ssh-keygen would sign with `path`: `path.pub`, when
+/// there is one, holds the same key (ssh-keygen reads the public key from
+/// it, and refuses a private key that does not match), and so does
+/// `public` when the caller names one. Anything else is left to
+/// ssh-keygen.
+fn signs_as(key: &PublicKey, path: &Utf8Path, public: Option<&[u8]>) -> bool {
+    let Ok(blob) = key.to_bytes() else {
+        return false;
+    };
+    if public.is_some_and(|p| p != blob.as_slice()) {
+        return false;
+    }
+    match std::fs::read(format!("{path}.pub")) {
+        Ok(bytes) => public_key_in(&bytes).is_some_and(|k| k.key_data() == key.key_data()),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The public key on the first line of `bytes` that is neither blank nor a
+/// comment (an OpenSSH public key file).
+fn public_key_in(bytes: &[u8]) -> Option<PublicKey> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))?;
+    PublicKey::from_openssh(line.trim()).ok()
+}
+
+/// ssh-agent for the public key in `bytes` (when it is `public`, if the
+/// caller names one), when there is an agent.
+fn agent_for(bytes: &[u8], public: Option<&[u8]>) -> Option<How> {
     #[cfg(unix)]
     {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let line = text
-            .lines()
-            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))?;
-        let key = PublicKey::from_openssh(line.trim()).ok()?;
+        let key = public_key_in(bytes)?;
+        if let Some(p) = public
+            && key.to_bytes().ok()?.as_slice() != p
+        {
+            return None;
+        }
         crate::agent::Agent::new(key).map(|a| How::Agent(Box::new(a)))
     }
     #[cfg(not(unix))]
     {
-        let _ = bytes;
+        let _ = (bytes, public);
         None
     }
 }
@@ -256,9 +313,15 @@ fn ssh_keygen_sign(message: &[u8], key_path: &Utf8Path) -> Result<String, SignEr
     String::from_utf8(stdout).map_err(|_| SignError::BadOutput("signature is not UTF-8".into()))
 }
 
-/// Check the SSHSIG `pem` over `message` (its namespace, and the signature
-/// against the key it names), then wrap it with `payload` as an envelope.
-fn envelope(payload: &[u8], message: &[u8], pem: String) -> Result<Envelope, SignError> {
+/// Check the SSHSIG `pem` over `message` (its namespace, the signature
+/// against the key it names, and that key against `named` when given),
+/// then wrap it with `payload` as an envelope.
+fn envelope(
+    payload: &[u8],
+    message: &[u8],
+    pem: String,
+    named: Option<&[u8]>,
+) -> Result<Envelope, SignError> {
     let sshsig = SshSig::from_pem(pem.as_bytes())
         .map_err(|e| SignError::BadOutput(format!("parse SSHSIG: {e}")))?;
     if sshsig.namespace() != NAMESPACE {
@@ -271,6 +334,17 @@ fn envelope(payload: &[u8], message: &[u8], pem: String) -> Result<Envelope, Sig
     public
         .verify(NAMESPACE, message, &sshsig)
         .map_err(|e| SignError::BadOutput(format!("self-check failed: {e}")))?;
+    if let Some(named) = named
+        && public.to_bytes().ok().as_deref() != Some(named)
+    {
+        return Err(SignError::WrongKey {
+            signed_by: public.fingerprint(HashAlg::Sha256).to_string(),
+            named: PublicKey::from_bytes(named).map_or_else(
+                |_| "an unreadable public key".to_owned(),
+                |k| k.fingerprint(HashAlg::Sha256).to_string(),
+            ),
+        });
+    }
 
     Ok(Envelope {
         payload_type: PAYLOAD_TYPE.to_string(),

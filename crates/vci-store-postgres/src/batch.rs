@@ -196,7 +196,7 @@ struct End {
 }
 
 impl BatchEnd for End {
-    fn finish(self: Box<Self>) -> Result<(), StoreError> {
+    fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError> {
         let p = OPEN
             .try_with(|o| o.borrow_mut().remove(&self.inner.id))
             .ok()
@@ -205,7 +205,7 @@ impl BatchEnd for End {
         if let Some(e) = p.failed {
             return Err(e);
         }
-        write(&self.inner, p)
+        write(&self.inner, p).map(|()| Vec::new())
     }
 }
 
