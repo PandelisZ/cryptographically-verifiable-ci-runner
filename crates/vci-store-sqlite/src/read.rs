@@ -14,6 +14,7 @@ use rusqlite::{Connection, OptionalExtension};
 use vci_store::{GONE, StoredEnvelope, StoredManifest, key};
 
 use crate::schema::REF_UNKNOWN;
+use crate::sql::plain as sql;
 
 /// Text of a column, `None` when it is not UTF-8 text.
 fn text(v: ValueRef<'_>) -> Option<String> {
@@ -41,8 +42,7 @@ pub(crate) fn list_units(
     test_ids: &[&str],
 ) -> rusqlite::Result<Vec<Vec<StoredEnvelope>>> {
     let _snapshot = snapshot(conn)?;
-    let mut stmt =
-        conn.prepare("SELECT key, target FROM attestations WHERE test_key = ?1 ORDER BY key")?;
+    let mut stmt = conn.prepare(&sql().list_unit)?;
     let mut by_key: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<Vec<StoredEnvelope>> = Vec::with_capacity(test_ids.len());
     for id in test_ids {
@@ -70,7 +70,7 @@ pub(crate) fn list_units(
 
 /// Every record, keys only, sorted by (target, key).
 pub(crate) fn list_all(conn: &Connection) -> rusqlite::Result<Vec<StoredEnvelope>> {
-    let mut stmt = conn.prepare("SELECT key, target FROM attestations ORDER BY target, key")?;
+    let mut stmt = conn.prepare(&sql().list_all)?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -94,7 +94,7 @@ pub(crate) fn read_values(
         return Ok(());
     }
     let _snapshot = snapshot(conn)?;
-    let mut stmt = conn.prepare("SELECT value, encoding FROM attestations WHERE key = ?1")?;
+    let mut stmt = conn.prepare(&sql().value)?;
     for e in envs.iter_mut() {
         let got = stmt
             .query_row([&e.key], |r| Ok(value(r.get_ref(0)?, r.get_ref(1)?)))
@@ -113,7 +113,7 @@ pub(crate) fn manifest(conn: &Connection, root: &str) -> rusqlite::Result<Option
     if !key::is_hex_id(root) {
         return Ok(None);
     }
-    let mut stmt = conn.prepare("SELECT value, encoding FROM manifests WHERE root = ?1")?;
+    let mut stmt = conn.prepare(&sql().manifest)?;
     manifest_with(&mut stmt, root)
 }
 
@@ -123,7 +123,7 @@ pub(crate) fn manifests(
     roots: &[&str],
 ) -> rusqlite::Result<Vec<Option<StoredManifest>>> {
     let _snapshot = snapshot(conn)?;
-    let mut stmt = conn.prepare("SELECT value, encoding FROM manifests WHERE root = ?1")?;
+    let mut stmt = conn.prepare(&sql().manifest)?;
     roots
         .iter()
         .map(|root| {
@@ -153,7 +153,7 @@ fn manifest_with(
 /// Every stored manifest's root, sorted (the primary key keeps them
 /// distinct).
 pub(crate) fn manifest_roots(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT root FROM manifests ORDER BY root")?;
+    let mut stmt = conn.prepare(&sql().manifest_roots)?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -168,7 +168,7 @@ pub(crate) fn manifest_roots(conn: &Connection) -> rusqlite::Result<Vec<String>>
 
 /// How many records have a key of vci's shape (values not read).
 pub(crate) fn count(conn: &Connection) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare("SELECT key FROM attestations")?;
+    let mut stmt = conn.prepare(&sql().keys)?;
     let mut rows = stmt.query([])?;
     let mut n = 0;
     while let Some(row) = rows.next()? {
@@ -191,16 +191,11 @@ pub(crate) fn orphan_manifests(conn: &Connection, roots: &[&str]) -> rusqlite::R
         return Ok(Vec::new());
     }
     let _snapshot = snapshot(conn)?;
-    let unknown: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM attestations WHERE ref_state = ?1)",
-        [REF_UNKNOWN],
-        |r| r.get(0),
-    )?;
+    let unknown: bool = conn.query_row(&sql().ref_unknown, [REF_UNKNOWN], |r| r.get(0))?;
     if unknown {
         return Ok(Vec::new());
     }
-    let mut stmt =
-        conn.prepare("SELECT EXISTS (SELECT 1 FROM attestations WHERE manifest_ref = ?1)")?;
+    let mut stmt = conn.prepare(&sql().ref_exists)?;
     let wanted: BTreeSet<&str> = roots.iter().copied().collect();
     let mut out = Vec::new();
     for r in wanted {
@@ -217,7 +212,7 @@ pub(crate) fn passing_on(
     conn: &Connection,
     tree16: &str,
 ) -> rusqlite::Result<BTreeMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT test_key, key FROM memo WHERE tree16 = ?1")?;
+    let mut stmt = conn.prepare(&sql().memo)?;
     let mut rows = stmt.query([tree16])?;
     let mut out = BTreeMap::new();
     while let Some(row) = rows.next()? {
@@ -230,11 +225,7 @@ pub(crate) fn passing_on(
 
 /// Whether `name` is flagged.
 pub(crate) fn flag(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM flags WHERE name = ?1)",
-        [name],
-        |r| r.get(0),
-    )
+    conn.query_row(&sql().flag, [name], |r| r.get(0))
 }
 
 /// One read transaction on `conn`, so that several statements see one

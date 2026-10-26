@@ -7,9 +7,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use vci_store::{ManifestRef, NewAttestation, StoredEnvelope, key};
 
 use crate::schema::{REF_INLINE, REF_ROOT, REF_UNKNOWN};
+use crate::sql::plain as sql;
 
-/// How long the memo keeps what a plan remembered: a week of trees.
-pub(crate) const MEMO_KEEP_SECS: i64 = 7 * 24 * 60 * 60;
+use crate::sql::MEMO_KEEP_SECS;
 
 /// Store one attestation under the hinted key, or (without a hint) under
 /// the key its slot already has, else the plain key. The slot's UNIQUE
@@ -30,21 +30,7 @@ pub(crate) fn put(
     match att.hinted_key() {
         Some(k) => {
             let hint = key::parse_key_hint(&k);
-            let mut stmt = conn.prepare(
-                "INSERT INTO attestations
-                   (key, test_key, signer, storage_key, target, issued, tree16, manifest_ref,
-                    ref_state, stored_at, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT (test_key, signer, storage_key) DO UPDATE SET
-                   key = excluded.key, target = excluded.target, issued = excluded.issued,
-                   tree16 = excluded.tree16, manifest_ref = excluded.manifest_ref,
-                   ref_state = excluded.ref_state, stored_at = excluded.stored_at,
-                   encoding = 0, value = excluded.value
-                 WHERE attestations.key IS NOT excluded.key
-                    OR attestations.value IS NOT excluded.value
-                    OR attestations.encoding <> 0
-                 RETURNING key",
-            )?;
+            let mut stmt = conn.prepare(&sql().put_hinted)?;
             stmt.query_row(
                 params![
                     k,
@@ -65,19 +51,7 @@ pub(crate) fn put(
             Ok(k)
         }
         None => {
-            let mut stmt = conn.prepare(
-                "INSERT INTO attestations
-                   (key, test_key, signer, storage_key, target, issued, tree16, manifest_ref,
-                    ref_state, stored_at, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8, ?9)
-                 ON CONFLICT (test_key, signer, storage_key) DO UPDATE SET
-                   target = excluded.target, manifest_ref = excluded.manifest_ref,
-                   ref_state = excluded.ref_state, stored_at = excluded.stored_at,
-                   encoding = 0, value = excluded.value
-                 WHERE attestations.value IS NOT excluded.value
-                    OR attestations.encoding <> 0
-                 RETURNING key",
-            )?;
+            let mut stmt = conn.prepare(&sql().put_plain)?;
             let written: Option<String> = stmt
                 .query_row(
                     params![
@@ -99,8 +73,7 @@ pub(crate) fn put(
                 // Nothing changed: the slot holds these bytes already, under
                 // the key it keeps.
                 None => conn.query_row(
-                    "SELECT key FROM attestations
-                     WHERE test_key = ?1 AND signer = ?2 AND storage_key = ?3",
+                    &sql().slot_key,
                     params![att.test_key, att.signer, att.storage_key],
                     |r| r.get(0),
                 ),
@@ -119,29 +92,17 @@ pub(crate) fn put_manifest(
     now: i64,
 ) -> rusqlite::Result<bool> {
     let same: Option<bool> = conn
-        .query_row(
-            "SELECT value = ?2 AND encoding = 0 FROM manifests WHERE root = ?1",
-            params![root, bytes],
-            |r| r.get(0),
-        )
+        .query_row(&sql().manifest_same, params![root, bytes], |r| r.get(0))
         .optional()?;
     if same == Some(true) {
-        conn.execute(
-            "UPDATE manifests SET put_at = ?2 WHERE root = ?1",
-            params![root, now],
-        )?;
+        conn.execute(&sql().manifest_touch, params![root, now])?;
         return Ok(false);
     }
     let base = vci_core::InputManifest::compact_base(bytes)
         .ok()
         .flatten()
         .filter(|b| key::is_hex_id(b));
-    conn.execute(
-        "INSERT INTO manifests (root, base, put_at, encoding, value) VALUES (?1, ?2, ?3, 0, ?4)
-         ON CONFLICT (root) DO UPDATE SET
-           base = excluded.base, put_at = excluded.put_at, encoding = 0, value = excluded.value",
-        params![root, base, now, bytes],
-    )?;
+    conn.execute(&sql().manifest_upsert, params![root, base, now, bytes])?;
     Ok(true)
 }
 
@@ -151,7 +112,7 @@ pub(crate) fn remove(
     conn: &Connection,
     doomed: Vec<StoredEnvelope>,
 ) -> rusqlite::Result<Vec<StoredEnvelope>> {
-    let mut stmt = conn.prepare("DELETE FROM attestations WHERE key = ?1")?;
+    let mut stmt = conn.prepare(&sql().remove)?;
     let mut removed = Vec::new();
     for e in doomed {
         if stmt.execute([&e.key])? > 0 {
@@ -167,11 +128,7 @@ pub(crate) fn remove(
 /// write transaction, and SQLite has one writer, so no grace period is
 /// needed.
 pub(crate) fn remove_manifests(conn: &Connection, roots: &[&str]) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare(
-        "DELETE FROM manifests WHERE root = ?1
-           AND NOT EXISTS (SELECT 1 FROM attestations WHERE manifest_ref = ?1)
-           AND NOT EXISTS (SELECT 1 FROM manifests WHERE base = ?1)",
-    )?;
+    let mut stmt = conn.prepare(&sql().remove_manifest)?;
     let mut n = 0;
     let unique: std::collections::BTreeSet<&str> = roots.iter().copied().collect();
     for r in unique {
@@ -188,25 +145,16 @@ pub(crate) fn remember_passing(
     items: &[(String, String)],
     now: i64,
 ) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare(
-        "INSERT INTO memo (tree16, test_key, key, at) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (tree16, test_key) DO UPDATE SET key = excluded.key, at = excluded.at",
-    )?;
+    let mut stmt = conn.prepare(&sql().memo_put)?;
     for (tk, k) in items {
         stmt.execute(params![tree16, tk, k, now])?;
     }
-    conn.execute(
-        "DELETE FROM memo WHERE at < ?1",
-        [now.saturating_sub(MEMO_KEEP_SECS)],
-    )?;
+    conn.execute(&sql().memo_prune, [now.saturating_sub(MEMO_KEEP_SECS)])?;
     Ok(())
 }
 
 /// Flag `name`.
 pub(crate) fn set_flag(conn: &Connection, name: &str, now: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO flags (name, at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING",
-        params![name, now],
-    )?;
+    conn.execute(&sql().flag_put, params![name, now])?;
     Ok(())
 }

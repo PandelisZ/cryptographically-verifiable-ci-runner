@@ -1419,7 +1419,7 @@ deprecation warning. Attestations made before vci 1.6.0 re-run once: the env con
 ## Where attestations live
 
 An attestation (the signed DSSE envelope) and the input manifest it references are kept in the repository's
-**attestation store**. Since 2.8.0 there are three; git-meta stays the default, and a repository that configures
+**attestation store**. Since 2.8.0 there are four; git-meta stays the default, and a repository that configures
 nothing behaves exactly as before:
 
 | store | where | shared how | selected by |
@@ -1427,6 +1427,7 @@ nothing behaves exactly as before:
 | [git-meta](#git-meta) (the default) | `.git/git-meta.sqlite`, exchanged on `refs/meta/main` of a git remote | `vci push` and `vci fetch` (`vci ci --push`, `--fetch`) | nothing, or `VCI_STORE=git-meta` |
 | [SQLite](#sqlite) | one file, `<git common dir>/vci-store.sqlite` | not shared: the clone and its worktrees (a CI cache can carry the file) | `VCI_STORE=sqlite` |
 | [PostgreSQL](#postgresql) | tables in schema `vci` of a server, one namespace per repository | at once: every write is seen by every reader | `VCI_STORE_URL=postgres://…` |
+| [libSQL](#libsql-turso) (Turso) | a libSQL database (Turso, or a `sqld` of your own), tables per repository; or a local replica of one; or a local file | at once on a server; the file is not shared | `VCI_STORE_URL=libsql://…` and `VCI_STORE_TOKEN`; `VCI_STORE=libsql` for the file |
 
 [Choosing a store](#choosing-a-store) says how one is selected and configured, and `vci store info` which one a
 repository uses. [docs/STORE-BACKENDS.md](STORE-BACKENDS.md) is the design: the store contract every backend
@@ -1437,7 +1438,8 @@ What every store has in common:
 - **The store is never trusted.** `vci plan` verifies every envelope against the base commit's allowed signers and
   identities and recomputes every manifest's root, so a record that is forged, altered, replayed, missing or
   deleted can only make a unit run, never skip. Write access to a store (push rights on `refs/meta/main`, a
-  PostgreSQL role with INSERT and DELETE, a writable SQLite file) is an availability privilege, not an integrity one.
+  PostgreSQL role with INSERT and DELETE, a libSQL token that may write, a writable SQLite file) is an availability
+  privilege, not an integrity one.
 - **The same keys everywhere.** An attestation is stored under `vci:attestation:<test key>:<signer id>:<storage
   key>[:<hint>]` on its unit's target and a manifest under `vci:manifest:<input root>` (described under
   [git-meta](#git-meta)), whatever the store, so `by.metaKey` and `by.target` in `vci plan --format json` read the same
@@ -1739,25 +1741,89 @@ GRANT INSERT, UPDATE ON vci.memo, vci.flags TO vci_reader;  -- optional: the pla
 A reader's `vci run` refuses each unit (`postgres store refused to write: permission denied for table manifests`)
 and keeps the tests' exit code. Back up with `pg_dump -n vci`; `vci prune` keeps the tables small.
 
+### libSQL (Turso)
+
+`VCI_STORE_URL=libsql://<database>-<organization>.turso.io` with `VCI_STORE_TOKEN=<a database token>` (since 2.8.0)
+keeps the attestations in a [libSQL](https://github.com/tursodatabase/libsql) database, on Turso or on a `sqld` of
+your own, which every machine reads and writes at once, with nothing to cache, fetch or push. Getting started:
+
+```sh
+turso db create vci                       # once
+turso db show vci --url                   # libsql://vci-<organization>.turso.io: VCI_STORE_URL
+turso db tokens create vci                # VCI_STORE_TOKEN for the jobs that store (vci ci --push on main)
+turso db tokens create vci --read-only    # VCI_STORE_TOKEN for pull requests and developers
+```
+
+```yaml
+# a GitHub Actions job, with both values in secrets
+env:
+  VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
+  VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}
+```
+
+Then run `vci ci` as before (`--push` where it should store). The store has three modes:
+
+| mode | selected by | reads | writes |
+|---|---|---|---|
+| remote | a `libsql://` `VCI_STORE_URL` (an `https://` or `http://` one with `VCI_STORE=libsql`) | from the server, a plan in about a dozen requests | to the server, a project's units in one request |
+| replica | the same plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<file>` or `[store.libsql] replica = true` | from a local file, `<git common dir>/vci-store.libsql`, synced from the server once per command | to the server, then to the file |
+| local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` | from `<git common dir>/vci-store.libsql` | to the file |
+
+- **The token is a secret**, like PostgreSQL's password: `VCI_STORE_TOKEN`, else the URL's `authToken` parameter.
+  vci removes both variables from its own environment as it starts, so no test, probe or hook sees them, and never
+  prints a token: `vci store info` says `token: (set)`, and the location is the URL without its query. A read-only
+  token reads, and stores nothing (`libsql store refused to write: …`, keeping the tests' exit code); a missing or
+  refused token (`the server asks for a token: set $VCI_STORE_TOKEN`) makes the store unavailable, and every unit runs.
+- **Shared at once** (remote and replica), as PostgreSQL: `vci ci` without `--push` signs but stores nothing (the
+  publication gate), the plan's memo and flags are shared on the server, a manifest nothing references is kept for an
+  hour after it was last stored (`vci prune` removes it at once), and `vci fetch` and `vci push` say the store is
+  shared.
+- **Namespaces.** One database can hold many repositories, each in tables of its own (`vci_<hash>_attestations`, …)
+  named after its namespace: the repository id, or `VCI_STORE_NAMESPACE` or `[store.libsql] namespace` (a shallow
+  clone needs one). The first `vci run` with a token allowed to create tables creates them; until then reads find an
+  empty store.
+- **TLS.** `libsql://` and `https://` are HTTPS, verified against the webpki roots; `libsql://…?tls=0` and `http://` are
+  plain HTTP (a local `sqld`, `turso dev`).
+- **Bounded time.** Connecting waits at most 5 s (`VCI_STORE_CONNECT_TIMEOUT_SECS`), a request at most 30 s
+  (`VCI_STORE_TIMEOUT_SECS`; ten minutes for `vci prune`). After the first failure every later call of the command
+  fails at once, so a server that is down costs one timeout, and the plan runs everything.
+- **The replica** suits machines that keep their clone (a laptop, a self-hosted runner): each command syncs only what
+  changed since the last, in one request, then reads locally. A sync that fails warns `vci: warning: cannot sync the
+  libsql replica …; reading the replica as it is`, and the command reads the file as it was (a stale replica only makes
+  units run; writes then fail and units are not stored). An ephemeral runner syncs everything once, about what a
+  remote plan reads anyway. `vci-store.libsql.sync` beside the file records which server and namespace it copies; a
+  file without it, such as a local-mode store, is never used as a replica.
+- **The local mode** is the SQLite store under another name: the same file format, writes and limits (see
+  [SQLite](#sqlite)); a `vci-store.sqlite` can be copied to `vci-store.libsql` and back.
+- **Cost.** A plan reads a server in about a dozen requests whatever the number of units, and `vci run` writes a
+  project's units in one (a new request every 2,000 records or 8 MiB). On a synthetic store of 1,200 Go units attested
+  three times (3,600 attestations of about 3 KB) on a local `sqld`, the store's part of a plan that skipped every unit
+  took 0.5-0.6 s remote against 0.01 s from a SQLite file, a replica's first sync of everything 0.6-9 s on a heavily
+  loaded laptop and a sync with nothing new 0.04 s, and `vci run` wrote 1,200 attestations and manifests in one
+  request of 0.14-0.25 s. Over the internet to Turso each request adds a round trip (not measured here).
+
 ### Choosing a store
 
 The store is chosen once per command, from the first of:
 
-1. **`VCI_STORE`**: `git-meta`, `sqlite` or `postgres` (also `gitmeta`, `sqlite3`, `postgresql`, `pg`). Never a URL:
-   a value with `://` is refused and not printed.
-2. **The scheme of `VCI_STORE_URL`**: `postgres://` or `postgresql://` is PostgreSQL, `sqlite:` is SQLite.
+1. **`VCI_STORE`**: `git-meta`, `sqlite`, `postgres` or `libsql` (also `gitmeta`, `sqlite3`, `postgresql`, `pg`,
+   `turso`). Never a URL: a value with `://` is refused and not printed.
+2. **The scheme of `VCI_STORE_URL`**: `postgres://` or `postgresql://` is PostgreSQL, `sqlite:` is SQLite, `libsql://`
+   is libSQL. An `https://` or `http://` URL selects nothing on its own (it could be any service's): give
+   `VCI_STORE=libsql` with it.
 3. **`[store] backend`** in the working tree's `vci.toml` (see [`vci.toml`](#vcitoml)).
 4. **git-meta.**
 
 Empty variables count as unset. `VCI_STORE` that disagrees with the scheme of `VCI_STORE_URL`, PostgreSQL without
-`VCI_STORE_URL`, an unknown backend or one this vci was built without, and a value out of range are errors: the store
-is then unusable and every command fails open as above. A `[store] backend` the environment overrides, and settings
+`VCI_STORE_URL`, a `VCI_STORE_URL` libSQL cannot use, an unknown backend or one this vci was built without, and a
+value out of range are errors: the store is then unusable and every command fails open as above. A `[store] backend` the environment overrides, and settings
 for a backend that is not selected, are warnings (on stderr, and in the plan's `warnings`). The environment variables
 are listed in [docs/ENV.md](ENV.md#store-selection).
 
 - **Secrets only in the environment.** `vci.toml` is in every checkout, a pull request's included, so it may name a
-  kind and tune it but never say where: `url`, `host`, `user`, `password` and `dbname` are refused there (the error
-  names the keys, never their values). A pull request can pick a store kind for its own jobs, never an address or a
+  kind and tune it but never say where: `url`, `host`, `user`, `password`, `dbname`, `token` and `authToken` are
+  refused there (the error names the keys, never their values). `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE`
+  never reach a test, a probe or a hook. A pull request can pick a store kind for its own jobs, never an address or a
   credential; since no store is trusted, the most it can do is make its own units run.
 - **`[store]` is never an input**: switching store invalidates no attestation. A new store starts empty, though, so
   its units run (and are attested) once; there is no command that copies a store yet.
@@ -1768,10 +1834,10 @@ are listed in [docs/ENV.md](ENV.md#store-selection).
 - **Rolling out.** A vci before 2.8.0 rejects a `vci.toml` with `[store]` (an unknown key), so at a base commit with it
   that vci runs every test. Introduce a store with `VCI_STORE` and `VCI_STORE_URL` in the CI jobs and developers'
   environments first, and add `[store]` only once every runner and developer has 2.8.0 or later.
-- **CI.** git-meta jobs keep `vci ci --fetch origin ... --push --remote origin`. On SQLite and PostgreSQL `--fetch`'s
-  remote and `--push`'s `--remote` are ignored with a warning, so the same command works; on PostgreSQL `--push` is
-  what stores (the publication gate above), and the job needs `VCI_STORE_URL` from a secret and, with a shallow
-  checkout, `VCI_STORE_NAMESPACE`.
+- **CI.** git-meta jobs keep `vci ci --fetch origin ... --push --remote origin`. On SQLite, PostgreSQL and libSQL
+  `--fetch`'s remote and `--push`'s `--remote` are ignored with a warning, so the same command works; on PostgreSQL and
+  a libSQL server `--push` is what stores (the publication gate above), and the job needs `VCI_STORE_URL` (and for
+  libSQL `VCI_STORE_TOKEN`) from a secret and, with a shallow checkout, `VCI_STORE_NAMESPACE`.
 
 `vci store info [--format json]` prints the store, its location (password hidden), every setting with where it came
 from, what the store can do, whether it exists and how many attestations it holds:
@@ -2037,7 +2103,7 @@ match = ["crates/b#test:*"]
 extra = ["testdata/**"]
 
 # [store]                # since 2.8.0; read from the working tree, never an input (see "Choosing a store")
-# backend = "sqlite"     # "git-meta" (default) | "sqlite" | "postgres"; VCI_STORE and VCI_STORE_URL win
+# backend = "sqlite"     # "git-meta" (default) | "sqlite" | "postgres" | "libsql"; VCI_STORE and VCI_STORE_URL win
 # connect_timeout = "5s" # a network store's connect bound (VCI_STORE_CONNECT_TIMEOUT_SECS wins)
 # timeout = "30s"        # one statement or wait (VCI_STORE_TIMEOUT_SECS wins)
 
@@ -2049,13 +2115,18 @@ extra = ["testdata/**"]
 # namespace = "acme-web" # default: the repository id; VCI_STORE_NAMESPACE wins
 # pool = 8               # connections per vci process, 1 to 64
 # manifest_grace = "1h"  # keep an unreferenced manifest stored this recently (at most 30 days; vci prune: none)
+
+# [store.libsql]         # never an address or a token (VCI_STORE_URL and VCI_STORE_TOKEN carry them)
+# path = "vci-store.libsql"   # the local file or the replica, relative to the git common directory, no `..`
+# replica = true         # read a local replica of the VCI_STORE_URL server, synced once per command
+# namespace = "acme-web" # default: the repository id; VCI_STORE_NAMESPACE wins
 ```
 
 **`[store]`** (since 2.8.0) chooses the attestation store, after `VCI_STORE` and `VCI_STORE_URL`: see [Choosing a
 store](#choosing-a-store). Unlike the rest of the file it is read from the **working tree**, not the base commit, and
 it is never an input. Durations are `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"` or a number of seconds. `url` (in
-`[store]` or `[store.postgres]`) and `host`, `user`, `password` and `dbname` are refused, naming the keys and never
-their values. **A vci before 2.8.0 rejects a `vci.toml` with `[store]`** and so runs every test against such a base
+`[store]`, `[store.postgres]` or `[store.libsql]`), `host`, `user`, `password` and `dbname`, and `token` and
+`authToken` are refused, naming the keys and never their values. **A vci before 2.8.0 rejects a `vci.toml` with `[store]`** and so runs every test against such a base
 commit: select the store with `VCI_STORE` or `VCI_STORE_URL` until every runner and developer has 2.8.0.
 
 **`policy.allow_superuser_mismatch`** (default `false`). Every toolchain records whether the tests ran as root
@@ -2984,6 +3055,9 @@ crates/vci-git        the git-meta store (git-meta-lib): blobless fetch, values 
 crates/vci-store-sqlite    the SQLite store (one file in the git common directory)
 crates/vci-store-postgres  the PostgreSQL store (rustls with the ring provider), and testkit: a throwaway
                       PostgreSQL cluster for tests
+crates/vci-store-libsql    the libSQL store (Turso, sqld): a server over Hrana (libsql's HTTP client, rustls with the
+                      ring provider), a local replica of one, or a local file in the SQLite store's format; and
+                      testkit: a throwaway sqld for tests
 crates/vci-adapter    Adapter trait + Vitest, node:test, pytest, Go, Cargo and Rails adapters (list, run, JSONL / go test log
                       parsing; src/golang/vci_testlog.go is the logger overlaid into Go's internal/testlog; src/cargo/
                       reads cargo's JSON messages, rustc dep-info and build script output, and scans sources;
@@ -3036,11 +3110,13 @@ cargo test --locked -p vci-cli --test store_select --test store_backends   # the
 **The attestation stores** (since 2.8.0). `crates/vci-store` holds the contract and a conformance suite of 34
 scenarios (feature `conformance`; docs/STORE-BACKENDS.md section 14), which each backend runs from its own
 `tests/conformance.rs`: git-meta (a bare remote and blobless clones synced by push and fetch), SQLite (handles on one
-file) and PostgreSQL (handles on a schema of their own). Each backend keeps its own tests as well
-(`crates/vci-git/tests/store*.rs`, `crates/vci-store-sqlite/tests/sqlite.rs`,
-`crates/vci-store-postgres/tests/pg.rs`). `crates/vci-cli/tests/store_select.rs` checks the store's selection and that
-`VCI_STORE_URL` reaches no test and no output, and `store_backends.rs` runs `run`, `plan`, `explain`, supersession,
-`prune`, `fetch`, `push` and `ci` on SQLite and PostgreSQL against a copy of `fixtures/go-abcd`.
+file), PostgreSQL (handles on a schema of their own) and libSQL (its local file; a server, in a namespace of its own;
+replicas of it). Each backend keeps its own tests as well (`crates/vci-git/tests/store*.rs`,
+`crates/vci-store-sqlite/tests/sqlite.rs`, `crates/vci-store-postgres/tests/pg.rs`,
+`crates/vci-store-libsql/tests/libsql.rs`). `crates/vci-cli/tests/store_select.rs` checks the store's selection and
+that `VCI_STORE_URL` reaches no test and no output, and `store_backends.rs` runs `run`, `plan`, `explain`,
+supersession, `prune`, `fetch`, `push` and `ci` on SQLite, PostgreSQL and libSQL (local, remote and replica) against a
+copy of `fixtures/go-abcd`, and checks that an unreachable libSQL server fails open without showing its tokens.
 
 The PostgreSQL tests take their server from `vci_store_postgres::testkit`: `VCI_TEST_POSTGRES_URL` when it is set (a
 role that may create schemas, roles and databases; `sslmode=prefer` is added when the URL names none), otherwise one
@@ -3052,6 +3128,13 @@ of its own, dropped with its roles and databases. Without a server, or as root (
 store crates against a `postgres:16` service container with stock Ubuntu's git (`store-stock-git`), the store crates'
 rustdoc (`store-docs`), the two CLI suites with Go and a service container (`store-cli`), and the testkit and the
 PostgreSQL conformance suite on a cluster `initdb` starts (`store-pg-initdb`).
+
+The libSQL tests take their server from `vci_store_libsql::testkit`: `VCI_TEST_LIBSQL_URL` (and
+`VCI_TEST_LIBSQL_TOKEN`) when set, otherwise one throwaway `sqld` per test process (from `PATH`, as Homebrew's `libsql`
+formula installs it), else `turso dev`, else the Docker image `ghcr.io/tursodatabase/libsql-server:v0.24.32`, on a free
+port of 127.0.0.1 and stopped by a watcher process when the test process exits. Tests keep apart by namespace. Without
+a server they say `skipping` and pass; `VCI_TEST_LIBSQL=require` makes them fail. CI runs them against that image as a
+service container (`store-stock-git`, `store-cli`).
 
 Every runner's end-to-end suite (`e2e.rs` for Vitest, `e2e_node_test.rs`, `e2e_pytest.rs`, `e2e_go.rs`,
 `e2e_cargo.rs`, `e2e_rails.rs`, `e2e_rspec.rs`) has one environment policy test built on

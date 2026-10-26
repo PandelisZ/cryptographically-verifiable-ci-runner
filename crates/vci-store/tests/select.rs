@@ -854,3 +854,261 @@ fn open_finds_the_factory_or_says_what_this_vci_has() {
         "this vci was built without the postgres store (cargo feature `postgres`)"
     );
 }
+
+const TURSO: &str = "libsql://ci-acme.turso.io";
+
+#[test]
+fn libsql_modes_come_from_the_url_and_the_replica_settings() {
+    use vci_store::select::{ENV_REPLICA, ENV_SYNC, ENV_TOKEN, LibsqlMode};
+    let k = |s: &Selection| (s.kind.value.clone(), s.kind.source);
+    let mode = |s: &Selection| (s.libsql.mode.value, s.libsql.mode.source);
+    let path = |s: &Selection| s.libsql.path.as_ref().map(|p| (p.value.clone(), p.source));
+    // VCI_STORE=libsql (or turso) alone: the local file, at its default.
+    for name in ["libsql", "Turso"] {
+        let s = sel(&[(ENV_STORE, name)], None).unwrap();
+        assert_eq!(k(&s), ("libsql".into(), Source::Env(ENV_STORE)));
+        assert_eq!(mode(&s), (LibsqlMode::Local, Source::Default));
+        assert_eq!(path(&s), None);
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    }
+    // A libsql:// URL selects the store, remote.
+    let s = sel(&[(ENV_STORE_URL, TURSO), (ENV_TOKEN, "t0ken")], None).unwrap();
+    assert_eq!(k(&s), ("libsql".into(), Source::Env(ENV_STORE_URL)));
+    assert_eq!(mode(&s), (LibsqlMode::Remote, Source::Env(ENV_STORE_URL)));
+    assert_eq!(s.token.as_ref().unwrap().value.expose(), "t0ken");
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    // An https:// URL alone selects nothing (it may be any service's).
+    let s = sel(
+        &[(ENV_STORE_URL, "https://ci-acme.turso.io?authToken=s3cret")],
+        None,
+    )
+    .unwrap();
+    assert_eq!(k(&s), ("git-meta".into(), Source::Default));
+    assert!(!format!("{:?}", s.warnings).contains("s3cret"));
+    // ... VCI_STORE=libsql (or vci.toml) says it is a libSQL server.
+    let s = sel(
+        &[
+            (ENV_STORE, "libsql"),
+            (ENV_STORE_URL, "https://ci-acme.turso.io"),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(mode(&s).0, LibsqlMode::Remote);
+    let s = sel(
+        &[(ENV_STORE_URL, "http://127.0.0.1:8080")],
+        Some("[store]\nbackend = \"libsql\""),
+    )
+    .unwrap();
+    assert_eq!(k(&s), ("libsql".into(), Source::File));
+    assert_eq!(mode(&s).0, LibsqlMode::Remote);
+    // The replica, asked for three ways; its file from the environment,
+    // else vci.toml, else the default.
+    let s = sel(&[(ENV_STORE_URL, TURSO), (ENV_SYNC, "replica")], None).unwrap();
+    assert_eq!(mode(&s), (LibsqlMode::Replica, Source::Env(ENV_SYNC)));
+    assert_eq!(path(&s), None);
+    let s = sel(
+        &[(ENV_STORE_URL, TURSO), (ENV_REPLICA, "/cache/r.libsql")],
+        Some("[store.libsql]\npath = \"other.libsql\""),
+    )
+    .unwrap();
+    assert_eq!(mode(&s), (LibsqlMode::Replica, Source::Env(ENV_REPLICA)));
+    assert_eq!(
+        path(&s),
+        Some(("/cache/r.libsql".into(), Source::Env(ENV_REPLICA)))
+    );
+    let s = sel(
+        &[(ENV_STORE_URL, TURSO)],
+        Some("[store.libsql]\nreplica = true\npath = \"r.libsql\""),
+    )
+    .unwrap();
+    assert_eq!(mode(&s), (LibsqlMode::Replica, Source::File));
+    assert_eq!(path(&s), Some(("r.libsql".into(), Source::File)));
+    // A replica without a server is the local file, with a warning.
+    let s = sel(&[(ENV_STORE, "libsql"), (ENV_SYNC, "replica")], None).unwrap();
+    assert_eq!(mode(&s).0, LibsqlMode::Local);
+    assert_eq!(
+        s.warnings,
+        [
+            "the libsql replica (from $VCI_STORE_SYNC) is ignored: $VCI_STORE_URL names no libsql server (libsql://, https:// or http://), so the store is a local file"
+        ]
+    );
+    // file:<path> is the local file there.
+    let s = sel(
+        &[(ENV_STORE, "libsql"), (ENV_STORE_URL, "file:/abs/v.libsql")],
+        None,
+    )
+    .unwrap();
+    assert_eq!(mode(&s).0, LibsqlMode::Local);
+    assert_eq!(
+        path(&s),
+        Some(("/abs/v.libsql".into(), Source::Env(ENV_STORE_URL)))
+    );
+    // A token the store does not use is a warning.
+    let s = sel(&[(ENV_STORE, "libsql"), (ENV_TOKEN, "t0ken")], None).unwrap();
+    assert_eq!(
+        s.warnings,
+        ["$VCI_STORE_TOKEN is ignored: the store is libsql in local mode (from $VCI_STORE)"]
+    );
+    let s = sel(&[(ENV_STORE, "sqlite"), (ENV_TOKEN, "t0ken")], None).unwrap();
+    assert_eq!(
+        s.warnings,
+        ["$VCI_STORE_TOKEN is ignored: the store is sqlite (from $VCI_STORE)"]
+    );
+    // The namespace: the environment, else [store.libsql], else none.
+    let s = sel(
+        &[(ENV_STORE_URL, TURSO)],
+        Some("[store.libsql]\nnamespace = \"acme\""),
+    )
+    .unwrap();
+    assert_eq!(s.namespace.as_ref().unwrap().value, "acme");
+    let s = sel(
+        &[(ENV_STORE_URL, TURSO), (ENV_NAMESPACE, "env-ns")],
+        Some("[store.libsql]\nnamespace = \"acme\""),
+    )
+    .unwrap();
+    assert_eq!(
+        s.namespace.as_ref().map(|n| (n.value.as_str(), n.source)),
+        Some(("env-ns", Source::Env(ENV_NAMESPACE)))
+    );
+    // [store.libsql] under another backend is ignored with a warning.
+    let s = sel(&[], Some("[store.libsql]\nreplica = true")).unwrap();
+    assert_eq!(
+        s.warnings,
+        ["vci.toml [store.libsql] is ignored: the store is git-meta (from the default)"]
+    );
+    assert_eq!(mode(&s).0, LibsqlMode::Local);
+}
+
+#[test]
+fn libsql_locations_that_are_not_its_own_are_refused_unprinted() {
+    // Another backend's URL, or a scheme that is no libsql location.
+    assert_eq!(
+        config_err(&[(ENV_STORE, "libsql"), (ENV_STORE_URL, PG_URL)], None),
+        "$VCI_STORE_URL is a postgres location but the backend is libsql (from $VCI_STORE)"
+    );
+    assert_eq!(
+        config_err(&[(ENV_STORE, "postgres"), (ENV_STORE_URL, TURSO)], None),
+        "$VCI_STORE_URL is a libsql location but the backend is postgres (from $VCI_STORE)"
+    );
+    for url in [
+        "ws://u:s3cret@db.example",
+        "wss://db.example?authToken=s3cret",
+        "mysql://u:s3cret@db/x",
+    ] {
+        let m = config_err(&[(ENV_STORE, "libsql"), (ENV_STORE_URL, url)], None);
+        assert!(m.contains("is not a libsql location"), "{url}: {m}");
+        assert!(!m.contains("s3cret"), "{url}: {m}");
+    }
+    assert!(
+        config_err(&[(ENV_STORE, "libsql"), (ENV_STORE_URL, "file:")], None)
+            .contains("needs a path")
+    );
+    // A path in vci.toml stays in the git directory.
+    for p in ["/etc/x.libsql", "../x.libsql", ""] {
+        let m = config_err(
+            &[(ENV_STORE, "libsql")],
+            Some(&format!("[store.libsql]\npath = {p:?}")),
+        );
+        assert!(
+            m.contains("[store.libsql] path") && m.contains("VCI_STORE_REPLICA"),
+            "{p}: {m}"
+        );
+    }
+}
+
+#[test]
+fn libsql_tokens_stay_out_of_vci_toml_and_every_message() {
+    use vci_store::select::{ENV_TOKEN, NEVER_TO_CHILDREN};
+    // vci.toml never holds a server or a token.
+    let toml = "[store]\nbackend = \"libsql\"\n[store.libsql]\nurl = \"libsql://planted1.turso.io\"\ntoken = \"planted2\"\nauthToken = \"planted3\"\n";
+    let settings = file(toml);
+    assert!(!format!("{settings:?}").contains("planted"));
+    let m = config_err(&[], Some(toml));
+    assert!(
+        m.starts_with(
+            "vci.toml sets store.libsql.url, store.libsql.token, store.libsql.auth_token:"
+        ),
+        "{m}"
+    );
+    assert!(m.contains("$VCI_STORE_TOKEN"), "{m}");
+    assert!(!m.contains("planted"), "{m}");
+    assert!(toml::from_str::<OnlyStore>("[store.libsql]\nhost = \"x\"").is_err());
+    // The token never reaches a child, and is printed as `***`.
+    assert!(NEVER_TO_CHILDREN.contains(&ENV_TOKEN));
+    assert!(select::ENV_VARS.contains(&ENV_TOKEN));
+    let t = Secret::opaque("eyJhbGciOi.s3cret+tok/en=");
+    assert_eq!(t.redacted(), "***");
+    assert_eq!(format!("{t:?} {t}"), "Secret(***) ***");
+    assert_eq!(
+        t.scrub("token eyJhbGciOi.s3cret+tok/en= or eyJhbGciOi.s3cret%2Btok%2Fen%3D"),
+        "token *** or ***"
+    );
+    // In a URL: the authToken parameter.
+    assert_eq!(
+        redact("libsql://ci-acme.turso.io?authToken=s3cret.tok"),
+        "libsql://ci-acme.turso.io?authToken=***"
+    );
+    let u = Secret::new("https://ci-acme.turso.io/?tls=1&authToken=s3cret.tok");
+    assert_eq!(
+        u.scrub("401 for s3cret.tok at https://ci-acme.turso.io/?tls=1&authToken=s3cret.tok"),
+        "401 for *** at https://ci-acme.turso.io/?tls=1&authToken=***"
+    );
+    // describe() says whether a token is set, never what it is.
+    let s = sel(
+        &[
+            (
+                ENV_STORE_URL,
+                "libsql://ci-acme.turso.io?authToken=s3cret-u",
+            ),
+            (ENV_TOKEN, "s3cret-e"),
+        ],
+        None,
+    )
+    .unwrap();
+    let lines: Vec<(&str, String, String)> = s
+        .describe()
+        .into_iter()
+        .map(|l| (l.name, l.value, l.source.to_string()))
+        .collect();
+    let get = |n: &str| lines.iter().find(|l| l.0 == n).cloned().unwrap();
+    assert_eq!(
+        get("url").1,
+        "libsql://ci-acme.turso.io?authToken=***",
+        "{lines:?}"
+    );
+    assert_eq!(
+        get("mode"),
+        ("mode", "remote".into(), "$VCI_STORE_URL".into())
+    );
+    assert_eq!(
+        get("token"),
+        ("token", "(set)".into(), "$VCI_STORE_TOKEN".into())
+    );
+    assert_eq!(get("namespace").1, "(the repository id)");
+    assert!(!format!("{lines:?} {s:?}").contains("s3cret"), "{lines:?}");
+    // A token only in the URL is said to be there.
+    let s = sel(
+        &[(
+            ENV_STORE_URL,
+            "libsql://ci-acme.turso.io?authToken=s3cret-u",
+        )],
+        None,
+    )
+    .unwrap();
+    let token = s
+        .describe()
+        .into_iter()
+        .find(|l| l.name == "token")
+        .unwrap();
+    assert_eq!(
+        (token.value.as_str(), token.source),
+        ("(the URL's authToken)", Source::Env(ENV_STORE_URL))
+    );
+    let s = sel(&[(ENV_STORE, "libsql")], None).unwrap();
+    assert!(
+        s.describe()
+            .iter()
+            .any(|l| l.name == "path" && l.value == "<git common dir>/vci-store.libsql")
+    );
+}

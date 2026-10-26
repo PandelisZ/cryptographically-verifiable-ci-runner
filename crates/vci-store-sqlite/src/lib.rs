@@ -47,6 +47,7 @@
 
 mod read;
 mod schema;
+pub mod sql;
 mod write;
 
 use std::cell::RefCell;
@@ -122,7 +123,7 @@ impl BackendFactory for SqliteFactory {
         let opts = SqliteOptions {
             busy_timeout: sel.timeout.value,
             sync_off: std::env::var_os(ENV_SYNC).is_some_and(|v| v == "off"),
-            read_only: false,
+            ..SqliteOptions::default()
         };
         Ok(Arc::new(SqliteStore::open_path(
             SqliteFactory::path(sel, cx),
@@ -148,6 +149,10 @@ pub struct SqliteOptions {
     /// file), every write is [`StoreError::Denied`], and hints keep nothing.
     /// Default false.
     pub read_only: bool,
+    /// The name the store goes by ([`AttestationStore::kind`], errors and
+    /// timing lines). Default `sqlite`; the libSQL store's local mode keeps
+    /// its file in this format under its own name.
+    pub kind: &'static str,
 }
 
 impl Default for SqliteOptions {
@@ -156,6 +161,7 @@ impl Default for SqliteOptions {
             busy_timeout: DEFAULT_TIMEOUT,
             sync_off: false,
             read_only: false,
+            kind: KIND,
         }
     }
 }
@@ -208,7 +214,7 @@ impl SqliteStore {
 
 impl AttestationStore for SqliteStore {
     fn kind(&self) -> &'static str {
-        KIND
+        self.inner.opts.kind
     }
 
     /// The file's path.
@@ -237,7 +243,7 @@ impl AttestationStore for SqliteStore {
     /// One index-only seek per unit, on one connection in one read
     /// transaction.
     fn list_units(&self, test_ids: &[&str]) -> Result<Vec<Vec<StoredEnvelope>>, StoreError> {
-        let step = timing::Step::start(KIND);
+        let step = timing::Step::start(self.inner.opts.kind);
         let out = self
             .inner
             .read(|c| read::list_units(c, test_ids))?
@@ -254,7 +260,7 @@ impl AttestationStore for SqliteStore {
     /// longer stored reads as [`GONE`], a value of an unknown `encoding` as
     /// unreadable.
     fn read_values(&self, envs: &mut [&mut StoredEnvelope]) -> Result<(), StoreError> {
-        let step = timing::Step::start(KIND);
+        let step = timing::Step::start(self.inner.opts.kind);
         let n = envs.len();
         if self
             .inner
@@ -430,7 +436,10 @@ impl AttestationStore for SqliteStore {
             return Vec::new();
         }
         let secs = self.inner.write_nanos.load(Ordering::Relaxed) as f64 / 1e9;
-        vec![format!("store: {KIND}: {n} write(s): {secs:.2}s")]
+        vec![format!(
+            "store: {}: {n} write(s): {secs:.2}s",
+            self.inner.opts.kind
+        )]
     }
 }
 
@@ -518,7 +527,7 @@ impl Inner {
     ) -> Result<T, StoreError> {
         if self.opts.read_only {
             return Err(StoreError::Denied {
-                backend: KIND,
+                backend: self.opts.kind,
                 operation,
                 detail: format!("{}: the store was opened read-only", self.path.display()),
             });
@@ -667,7 +676,7 @@ impl Inner {
                 }
                 State::Newer(found) => {
                     return Err(StoreError::Incompatible {
-                        backend: KIND,
+                        backend: self.opts.kind,
                         found,
                         supported: SCHEMA_VERSION,
                     });
@@ -783,13 +792,13 @@ impl Inner {
             );
             return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
                 StoreError::Denied {
-                    backend: KIND,
+                    backend: self.opts.kind,
                     operation: "create the store",
                     detail,
                 }
             } else {
                 StoreError::Unavailable {
-                    backend: KIND,
+                    backend: self.opts.kind,
                     detail,
                 }
             });
@@ -799,7 +808,7 @@ impl Inner {
             Ok(db) => Ok(Conn { db, ready: false }),
             Err(e) if e.sqlite_error_code() == Some(ErrorCode::CannotOpen) => {
                 Err(StoreError::Denied {
-                    backend: KIND,
+                    backend: self.opts.kind,
                     operation: "create the store",
                     detail: format!("{}: {e}", self.path.display()),
                 })
@@ -830,7 +839,7 @@ impl Inner {
     fn error(&self, operation: &'static str, e: rusqlite::Error) -> StoreError {
         match e.sqlite_error_code() {
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => StoreError::Timeout {
-                backend: KIND,
+                backend: self.opts.kind,
                 operation: "waiting for another writer",
                 after: self.opts.busy_timeout,
             },
@@ -839,7 +848,7 @@ impl Inner {
                 | ErrorCode::PermissionDenied
                 | ErrorCode::AuthorizationForStatementDenied,
             ) => StoreError::Denied {
-                backend: KIND,
+                backend: self.opts.kind,
                 operation,
                 detail: format!("{}: {e}", self.path.display()),
             },
@@ -849,7 +858,7 @@ impl Inner {
 
     fn unavailable(&self, why: String) -> StoreError {
         StoreError::Unavailable {
-            backend: KIND,
+            backend: self.opts.kind,
             detail: format!("{}: {why}", self.path.display()),
         }
     }
@@ -919,7 +928,8 @@ impl BatchEnd for SqliteBatch {
             }
             if pin.writes > 0 && vci_core::metrics::on() {
                 vci_core::timing_line!(
-                    "store: {KIND}: write {} record(s): {:.2}s",
+                    "store: {}: write {} record(s): {:.2}s",
+                    self.inner.opts.kind,
                     pin.writes,
                     pin.nanos as f64 / 1e9
                 );

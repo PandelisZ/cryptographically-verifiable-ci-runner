@@ -1977,18 +1977,20 @@ pub mod select {
     //!    `sqlite`, `postgres`, or another registered backend). Never a URL:
     //!    a value with `://` is refused, without being printed.
     //! 2. The scheme of `VCI_STORE_URL`: `postgres://` or `postgresql://`
-    //!    selects postgres, `sqlite:` selects sqlite.
+    //!    selects postgres, `sqlite:` selects sqlite, `libsql://` selects
+    //!    libsql (an `https://` URL selects nothing: name the backend).
     //! 3. `[store] backend` in the working tree's `vci.toml`.
     //! 4. `git-meta`.
     //!
     //! Every other setting: the environment, then `vci.toml`, then the
     //! default. A server's address and credentials come only from
-    //! `VCI_STORE_URL`, never from `vci.toml`, which every checkout carries
-    //! (a pull request's too): a URL, host, user, password or database name
-    //! there is refused, naming the key and never its value. The command
-    //! line reads `VCI_STORE_URL` and `VCI_STORE` once at start-up and
-    //! removes them from its own environment, so no test process, adapter
-    //! or hook ever sees them ([`NEVER_TO_CHILDREN`]).
+    //! `VCI_STORE_URL` and `VCI_STORE_TOKEN`, never from `vci.toml`, which
+    //! every checkout carries (a pull request's too): a URL, host, user,
+    //! password, token or database name there is refused, naming the key and
+    //! never its value. The command line reads `VCI_STORE_URL`,
+    //! `VCI_STORE_TOKEN` and `VCI_STORE` once at start-up and removes them
+    //! from its own environment, so no test process, adapter or hook ever
+    //! sees them ([`NEVER_TO_CHILDREN`]).
     //!
     //! This module only parses and validates. The command line turns a
     //! [`Selection`] into a store through the registered
@@ -2005,9 +2007,21 @@ pub mod select {
     /// Selects the backend by name.
     pub const ENV_STORE: &str = "VCI_STORE";
     /// The store's location: a `postgres://` URL (which may carry a
-    /// password), or `sqlite:<path>`. The only place a connection string is
-    /// read from.
+    /// password), `sqlite:<path>`, or a libSQL server (`libsql://`,
+    /// `https://`, `http://`; it may carry an `authToken`) or file
+    /// (`file:<path>`). The only place a connection string is read from.
     pub const ENV_STORE_URL: &str = "VCI_STORE_URL";
+    /// A libSQL server's auth token (a Turso database token). A secret,
+    /// like `VCI_STORE_URL`.
+    pub const ENV_TOKEN: &str = "VCI_STORE_TOKEN";
+    /// The libSQL store's local replica of a remote database: a path
+    /// (absolute, or relative to the git common directory). Setting it asks
+    /// for the replica mode.
+    pub const ENV_REPLICA: &str = "VCI_STORE_REPLICA";
+    /// `off`: no `fsync` in the SQLite files vci keeps (git-meta's, the
+    /// SQLite store's, the libSQL store's local file); `replica`: the libSQL
+    /// store reads a local replica of its remote database.
+    pub const ENV_SYNC: &str = "VCI_STORE_SYNC";
     /// The namespace of this repository's rows on a shared server (default:
     /// the repository id).
     pub const ENV_NAMESPACE: &str = "VCI_STORE_NAMESPACE";
@@ -2022,6 +2036,9 @@ pub mod select {
         ENV_NAMESPACE,
         ENV_CONNECT_TIMEOUT,
         ENV_TIMEOUT,
+        ENV_TOKEN,
+        ENV_REPLICA,
+        ENV_SYNC,
     ];
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
@@ -2029,11 +2046,14 @@ pub mod select {
     /// `VCI_*` variables pass through as built-in ignore). `VCI_STORE` is
     /// one of them because a connection string put there by mistake would
     /// otherwise reach every test.
-    pub const NEVER_TO_CHILDREN: &[&str] = &[ENV_STORE, ENV_STORE_URL];
+    pub const NEVER_TO_CHILDREN: &[&str] = &[ENV_STORE, ENV_STORE_URL, ENV_TOKEN];
     /// The backend when nothing chooses one.
     pub const DEFAULT_BACKEND: &str = "git-meta";
     /// The SQLite store's file name in the git common directory.
     pub const DEFAULT_SQLITE_FILE: &str = "vci-store.sqlite";
+    /// The libSQL store's file (its local mode) or replica (its replica
+    /// mode) in the git common directory.
+    pub const DEFAULT_LIBSQL_FILE: &str = "vci-store.libsql";
     /// The PostgreSQL schema holding vci's tables.
     pub const DEFAULT_SCHEMA: &str = "vci";
     /// The default bound on connecting.
@@ -2080,6 +2100,9 @@ pub mod select {
         /// `[store.postgres]` (tuning only, never an address).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub postgres: Option<PostgresSettings>,
+        /// `[store.libsql]` (never an address or a token).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub libsql: Option<LibsqlSettings>,
         /// `[store.options]`: non-secret string settings for backends this
         /// crate does not describe (an HTTP or gRPC service). The backend's
         /// factory reads them and refuses the ones it does not know.
@@ -2137,6 +2160,36 @@ pub mod select {
         pub dbname: Option<Refused>,
     }
 
+    /// `[store.libsql]`: everything except where the server is and how to
+    /// sign in.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct LibsqlSettings {
+        /// The local file (local mode) or the replica (replica mode),
+        /// relative to the git common directory, without `..`. Default:
+        /// `vci-store.libsql`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub path: Option<String>,
+        /// Read a local replica of the remote database named by
+        /// `VCI_STORE_URL` (synced when the store is opened) instead of
+        /// asking the server for every read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub replica: Option<bool>,
+        /// The namespace of this repository's records on a shared database
+        /// (default: the repository id). `VCI_STORE_NAMESPACE` overrides it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub namespace: Option<String>,
+        /// Refused.
+        #[serde(default, skip_serializing)]
+        pub url: Option<Refused>,
+        /// Refused.
+        #[serde(default, skip_serializing)]
+        pub token: Option<Refused>,
+        /// Refused.
+        #[serde(default, skip_serializing, alias = "authToken")]
+        pub auth_token: Option<Refused>,
+    }
+
     impl StoreSettings {
         /// Refuse connection settings in `vci.toml`. A password there would
         /// be public, and a host there would let a pull request send CI's
@@ -2160,11 +2213,22 @@ pub mod select {
                     }
                 }
             }
+            if let Some(l) = &self.libsql {
+                for (name, present) in [
+                    ("store.libsql.url", l.url.is_some()),
+                    ("store.libsql.token", l.token.is_some()),
+                    ("store.libsql.auth_token", l.auth_token.is_some()),
+                ] {
+                    if present {
+                        found.push(name);
+                    }
+                }
+            }
             if found.is_empty() {
                 return Ok(());
             }
             Err(StoreError::Config(format!(
-                "vci.toml sets {}: connection settings are read only from ${ENV_STORE_URL} (vci.toml is in every checkout, a pull request's too); remove them and pass ${ENV_STORE_URL} as a secret",
+                "vci.toml sets {}: connection settings are read only from ${ENV_STORE_URL} and ${ENV_TOKEN} (vci.toml is in every checkout, a pull request's too); remove them and pass ${ENV_STORE_URL} (and ${ENV_TOKEN}) as secrets",
                 found.join(", ")
             )))
         }
@@ -2210,15 +2274,24 @@ pub mod select {
         }
     }
 
-    /// A string that may carry credentials (`VCI_STORE_URL`). `Debug` and
-    /// `Display` print it redacted; only [`Secret::expose`] gives it whole.
+    /// A string that may carry credentials (`VCI_STORE_URL`), or that is a
+    /// credential as a whole (`VCI_STORE_TOKEN`, [`Secret::opaque`]).
+    /// `Debug` and `Display` print it redacted; only [`Secret::expose`]
+    /// gives it whole.
     #[derive(Clone, PartialEq, Eq)]
-    pub struct Secret(String);
+    pub struct Secret(String, bool);
 
     impl Secret {
-        /// Wrap a secret.
+        /// Wrap a secret that may carry credentials (a URL, a libpq string):
+        /// its redacted form keeps what is not a credential.
         pub fn new(s: impl Into<String>) -> Self {
-            Secret(s.into())
+            Secret(s.into(), false)
+        }
+
+        /// Wrap a secret that is a credential as a whole (a token): its
+        /// redacted form is `***`.
+        pub fn opaque(s: impl Into<String>) -> Self {
+            Secret(s.into(), true)
         }
 
         /// The secret itself, for the one place that needs it (the
@@ -2227,8 +2300,12 @@ pub mod select {
             &self.0
         }
 
-        /// The secret with its credentials replaced by `***` ([`redact`]).
+        /// The secret with its credentials replaced by `***` ([`redact`]);
+        /// `***` for an opaque one.
         pub fn redacted(&self) -> String {
+            if self.1 {
+                return "***".to_owned();
+            }
             redact(&self.0)
         }
 
@@ -2243,6 +2320,21 @@ pub mod select {
         /// reading is removed: the password up to each `@`, each of its
         /// `@`-separated pieces, and the host such a client would see.
         pub fn scrub(&self, text: &str) -> String {
+            if self.1 {
+                // An opaque secret: itself, and its percent-decoded and
+                // percent-encoded forms (a token in a URL's query).
+                let mut out = text.to_owned();
+                for p in [
+                    self.0.clone(),
+                    percent_decode(&self.0),
+                    percent_encode(&self.0),
+                ] {
+                    if p.len() >= 3 {
+                        out = out.replace(&p, "***");
+                    }
+                }
+                return out;
+            }
             let mut out = text.replace(&self.0, &self.redacted());
             let mut found = self.passwords();
             found.sort_by_key(|p| std::cmp::Reverse(p.len()));
@@ -2311,6 +2403,18 @@ pub mod select {
         }
     }
 
+    fn percent_encode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
     fn percent_decode(s: &str) -> String {
         let b = s.as_bytes();
         let mut out = Vec::with_capacity(b.len());
@@ -2349,6 +2453,8 @@ pub mod select {
         k.eq_ignore_ascii_case("password")
             || k.eq_ignore_ascii_case("sslpassword")
             || k.eq_ignore_ascii_case("sslkey")
+            || k.eq_ignore_ascii_case("authtoken")
+            || k.eq_ignore_ascii_case("auth_token")
     }
 
     /// `s` as `(scheme, rest)` when it is a URL: a scheme (a letter, then
@@ -2443,7 +2549,15 @@ pub mod select {
         let mut out = Vec::new();
         let mut i = 0;
         while i < b.len() {
-            let Some(k) = ["password", "sslpassword", "sslkey"].into_iter().find(|k| {
+            let Some(k) = [
+                "password",
+                "sslpassword",
+                "sslkey",
+                "authtoken",
+                "auth_token",
+            ]
+            .into_iter()
+            .find(|k| {
                 b.len() - i >= k.len() && b[i..i + k.len()].eq_ignore_ascii_case(k.as_bytes())
             }) else {
                 i += 1;
@@ -2508,7 +2622,7 @@ pub mod select {
     /// and the last `@`, becomes `***` (`postgres://***@host/db`, as `vci
     /// fetch` already prints git remotes, even when the password holds an
     /// unencoded `/`, `?` or `@`), and so do the values of `password`,
-    /// `sslpassword` and `sslkey`, in a query string (keys
+    /// `sslpassword`, `sslkey` and `authToken`, in a query string (keys
     /// percent-decoded) or in a libpq `key=value` string (spaces around `=`
     /// and quoted values included). A secret value that runs past the last
     /// `@` (`?password=a@b`) is masked whole, its `@` with it.
@@ -2553,6 +2667,63 @@ pub mod select {
         pub path: Option<Sourced<String>>,
     }
 
+    /// How the libSQL store reaches its records.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LibsqlMode {
+        /// A local file (no `VCI_STORE_URL`, or `file:<path>`).
+        Local,
+        /// A server (`libsql://`, `https://` or `http://`): every read and
+        /// write goes to it.
+        Remote,
+        /// A server, read through a local replica synced when the store is
+        /// opened; writes go to the server.
+        Replica,
+    }
+
+    impl LibsqlMode {
+        /// `local`, `remote` or `replica`.
+        pub fn name(self) -> &'static str {
+            match self {
+                LibsqlMode::Local => "local",
+                LibsqlMode::Remote => "remote",
+                LibsqlMode::Replica => "replica",
+            }
+        }
+    }
+
+    /// The libSQL settings as resolved (the server is [`Selection::url`],
+    /// its token [`Selection::token`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct LibsqlSelection {
+        /// Local file, remote server, or replica of a remote server.
+        pub mode: Sourced<LibsqlMode>,
+        /// The local file (local mode) or the replica (replica mode):
+        /// absolute (only from the environment) or relative to the git
+        /// common directory. `None`: `vci-store.libsql` there.
+        pub path: Option<Sourced<String>>,
+    }
+
+    /// Whether `url`'s query has an `authToken` (or `auth_token`)
+    /// parameter.
+    fn url_has_token(url: &str) -> bool {
+        url.split_once('?').is_some_and(|(_, q)| {
+            q.split('&').any(|kv| {
+                let k = kv.split_once('=').map_or(kv, |(k, _)| k);
+                let k = percent_decode(k);
+                k.eq_ignore_ascii_case("authtoken") || k.eq_ignore_ascii_case("auth_token")
+            })
+        })
+    }
+
+    /// Whether `url` names a libSQL server: `libsql://`, `https://` or
+    /// `http://`.
+    pub fn is_libsql_server(url: &str) -> bool {
+        let lower = url.trim_start().to_ascii_lowercase();
+        ["libsql://", "https://", "http://"]
+            .iter()
+            .any(|p| lower.starts_with(p))
+    }
+
     /// The PostgreSQL settings as resolved (the URL is
     /// [`Selection::url`]).
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2573,6 +2744,8 @@ pub mod select {
         pub kind: Sourced<String>,
         /// `VCI_STORE_URL`, when set.
         pub url: Option<Sourced<Secret>>,
+        /// `VCI_STORE_TOKEN`, when set (an [`Secret::opaque`] secret).
+        pub token: Option<Sourced<Secret>>,
         /// The namespace on a shared server; `None`: the repository id.
         pub namespace: Option<Sourced<String>>,
         /// The longest wait to connect.
@@ -2583,6 +2756,8 @@ pub mod select {
         pub sqlite: SqliteSelection,
         /// `[store.postgres]` as resolved.
         pub postgres: PostgresSelection,
+        /// `[store.libsql]` and the libSQL variables as resolved.
+        pub libsql: LibsqlSelection,
         /// `[store.options]`, for other backends.
         pub options: BTreeMap<String, String>,
         /// Settings that were overridden or ignored. The command line
@@ -2610,6 +2785,7 @@ pub mod select {
             Selection {
                 kind: Sourced::default_value(kind.to_owned()),
                 url: None,
+                token: None,
                 namespace: None,
                 connect_timeout: Sourced::default_value(DEFAULT_CONNECT_TIMEOUT),
                 timeout: Sourced::default_value(DEFAULT_TIMEOUT),
@@ -2618,6 +2794,10 @@ pub mod select {
                     schema: Sourced::default_value(DEFAULT_SCHEMA.to_owned()),
                     pool: Sourced::default_value(DEFAULT_POOL),
                     manifest_grace: Sourced::default_value(DEFAULT_MANIFEST_GRACE),
+                },
+                libsql: LibsqlSelection {
+                    mode: Sourced::default_value(LibsqlMode::Local),
+                    path: None,
                 },
                 options: BTreeMap::new(),
                 warnings: Vec::new(),
@@ -2663,6 +2843,46 @@ pub mod select {
                         pg.manifest_grace.source,
                     ));
                 }
+                "libsql" => {
+                    let l = &self.libsql;
+                    v.push(line("mode", l.mode.value.name().to_owned(), l.mode.source));
+                    if l.mode.value != LibsqlMode::Remote {
+                        let name = if l.mode.value == LibsqlMode::Replica {
+                            "replica"
+                        } else {
+                            "path"
+                        };
+                        v.push(match &l.path {
+                            Some(p) => line(name, p.value.clone(), p.source),
+                            None => line(
+                                name,
+                                format!("<git common dir>/{DEFAULT_LIBSQL_FILE}"),
+                                Source::Default,
+                            ),
+                        });
+                    }
+                    if l.mode.value != LibsqlMode::Local {
+                        let in_url = self
+                            .url
+                            .as_ref()
+                            .filter(|u| url_has_token(u.value.expose()));
+                        v.push(match (&self.token, in_url) {
+                            (Some(t), _) => line("token", "(set)".to_owned(), t.source),
+                            (None, Some(u)) => {
+                                line("token", "(the URL's authToken)".to_owned(), u.source)
+                            }
+                            (None, None) => line("token", "(none)".to_owned(), Source::Default),
+                        });
+                        v.push(match &self.namespace {
+                            Some(n) => line("namespace", n.value.clone(), n.source),
+                            None => line(
+                                "namespace",
+                                "(the repository id)".to_owned(),
+                                Source::Default,
+                            ),
+                        });
+                    }
+                }
                 _ => {}
             }
             v.push(line(
@@ -2680,13 +2900,17 @@ pub mod select {
     }
 
     /// The backend a URL's scheme names: `postgres://` or `postgresql://`
-    /// for postgres, `sqlite:` for sqlite; anything else names none.
+    /// for postgres, `sqlite:` for sqlite, `libsql://` for libsql; anything
+    /// else names none (an `https://` URL may be a libSQL server, or not:
+    /// `VCI_STORE=libsql` says so).
     pub fn backend_of_url(url: &str) -> Option<&'static str> {
         let lower = url.trim_start().to_ascii_lowercase();
         if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
             Some("postgres")
         } else if lower.starts_with("sqlite:") {
             Some("sqlite")
+        } else if lower.starts_with("libsql://") {
+            Some("libsql")
         } else {
             None
         }
@@ -2702,6 +2926,7 @@ pub mod select {
         let n = match n.as_str() {
             "postgresql" | "pg" => "postgres".to_owned(),
             "sqlite3" => "sqlite".to_owned(),
+            "turso" => "libsql".to_owned(),
             "gitmeta" | "git_meta" => "git-meta".to_owned(),
             _ => n,
         };
@@ -2806,6 +3031,10 @@ pub mod select {
     }
 
     fn relative_path(p: &str) -> Result<String, StoreError> {
+        relative_path_of(p, "sqlite", &format!("{ENV_STORE_URL}=sqlite:<path>"))
+    }
+
+    fn relative_path_of(p: &str, table: &str, url: &str) -> Result<String, StoreError> {
         use std::path::{Component, Path};
         let ok = !p.is_empty()
             && !p.contains('\0')
@@ -2816,9 +3045,126 @@ pub mod select {
             Ok(p.to_owned())
         } else {
             Err(StoreError::Config(format!(
-                "vci.toml [store.sqlite] path {p:?} must be relative to the git common directory, without `..` (an absolute path can be given with {ENV_STORE_URL}=sqlite:<path>)"
+                "vci.toml [store.{table}] path {p:?} must be relative to the git common directory, without `..` (an absolute path can be given with {url})"
             )))
         }
+    }
+
+    /// The libSQL store's mode and file, for backend `k` (the defaults for
+    /// any other backend).
+    ///
+    /// * A `libsql://`, `https://` or `http://` `VCI_STORE_URL` is a server:
+    ///   the replica mode when `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA`
+    ///   or `[store.libsql] replica = true` asks for it, else the remote
+    ///   mode. The replica is `VCI_STORE_REPLICA`, else `[store.libsql]
+    ///   path`.
+    /// * `file:<path>`, or no URL, is the local mode, in that file, else
+    ///   `[store.libsql] path`. A replica asked for without a server is a
+    ///   warning.
+    /// * Any other URL is refused, without being printed.
+    fn libsql_selection(
+        k: &str,
+        url: Option<&Sourced<Secret>>,
+        file: Option<&LibsqlSettings>,
+        var: &dyn Fn(&'static str) -> Option<String>,
+        warnings: &mut Vec<String>,
+    ) -> Result<LibsqlSelection, StoreError> {
+        let local = LibsqlSelection {
+            mode: Sourced::default_value(LibsqlMode::Local),
+            path: None,
+        };
+        if k != "libsql" {
+            return Ok(local);
+        }
+        let file_path = match file.and_then(|f| f.path.as_deref()) {
+            Some(p) => Some(Sourced {
+                value: relative_path_of(
+                    p,
+                    "libsql",
+                    &format!("{ENV_STORE_URL}=file:<path> or {ENV_REPLICA}"),
+                )?,
+                source: Source::File,
+            }),
+            None => None,
+        };
+        let env_replica = var(ENV_REPLICA);
+        let asked = if var(ENV_SYNC).is_some_and(|v| v.eq_ignore_ascii_case("replica")) {
+            Some(Source::Env(ENV_SYNC))
+        } else if env_replica.is_some() {
+            Some(Source::Env(ENV_REPLICA))
+        } else if file.and_then(|f| f.replica) == Some(true) {
+            Some(Source::File)
+        } else {
+            None
+        };
+        let server = url.filter(|u| is_libsql_server(u.value.expose()));
+        if let Some(u) = server {
+            let path = match env_replica {
+                Some(p) if p.contains('\0') => {
+                    return Err(StoreError::Config(format!("${ENV_REPLICA} is not a path")));
+                }
+                Some(p) => Some(Sourced {
+                    value: p,
+                    source: Source::Env(ENV_REPLICA),
+                }),
+                None => file_path,
+            };
+            return Ok(match asked {
+                Some(source) => LibsqlSelection {
+                    mode: Sourced {
+                        value: LibsqlMode::Replica,
+                        source,
+                    },
+                    path,
+                },
+                None => LibsqlSelection {
+                    mode: Sourced {
+                        value: LibsqlMode::Remote,
+                        source: u.source,
+                    },
+                    path: None,
+                },
+            });
+        }
+        if let Some(source) = asked {
+            warnings.push(format!(
+                "the libsql replica (from {source}) is ignored: ${ENV_STORE_URL} names no libsql server (libsql://, https:// or http://), so the store is a local file"
+            ));
+        }
+        let Some(u) = url else {
+            return Ok(LibsqlSelection {
+                path: file_path,
+                ..local
+            });
+        };
+        let s = u.value.expose();
+        let lower = s.to_ascii_lowercase();
+        let p = if lower.starts_with("file://") {
+            &s[7..]
+        } else if lower.starts_with("file:") {
+            &s[5..]
+        } else {
+            // Another scheme's URL (which may carry a password) is not
+            // printed.
+            return Err(StoreError::Config(format!(
+                "${ENV_STORE_URL} is not a libsql location: expected libsql://<database>, https://<host>, http://<host> or file:<path> (it was not printed)"
+            )));
+        };
+        if p.is_empty() || p.contains('\0') || p.contains("://") {
+            return Err(StoreError::Config(format!(
+                "${ENV_STORE_URL}=file:<path> needs a path"
+            )));
+        }
+        Ok(LibsqlSelection {
+            mode: Sourced {
+                value: LibsqlMode::Local,
+                source: u.source,
+            },
+            path: Some(Sourced {
+                value: p.to_owned(),
+                source: u.source,
+            }),
+        })
     }
 
     /// Resolve the store from the environment (`env` reads a variable; the
@@ -2893,6 +3239,11 @@ pub mod select {
         let k = kind.value.as_str();
         let f_sqlite = file.and_then(|f| f.sqlite.as_ref());
         let f_pg = file.and_then(|f| f.postgres.as_ref());
+        let f_libsql = file.and_then(|f| f.libsql.as_ref());
+        let token = var(ENV_TOKEN).map(|t| Sourced {
+            value: Secret::opaque(t),
+            source: Source::Env(ENV_TOKEN),
+        });
         if k != "sqlite" && f_sqlite.is_some() {
             warnings.push(format!(
                 "vci.toml [store.sqlite] is ignored: the store is {k} (from {})",
@@ -2902,6 +3253,12 @@ pub mod select {
         if k != "postgres" && f_pg.is_some() {
             warnings.push(format!(
                 "vci.toml [store.postgres] is ignored: the store is {k} (from {})",
+                kind.source
+            ));
+        }
+        if k != "libsql" && f_libsql.is_some() {
+            warnings.push(format!(
+                "vci.toml [store.libsql] is ignored: the store is {k} (from {})",
                 kind.source
             ));
         }
@@ -2917,6 +3274,14 @@ pub mod select {
             return Err(StoreError::Config(format!(
                 "the postgres store needs ${ENV_STORE_URL} (postgres://<user>@<host>/<database>?sslmode=require); it is never read from vci.toml, and GitHub does not pass secrets to pull requests from forks"
             )));
+        }
+        let libsql = libsql_selection(k, url.as_ref(), f_libsql, &var, &mut warnings)?;
+        if token.is_some() && !(k == "libsql" && libsql.mode.value != LibsqlMode::Local) {
+            warnings.push(format!(
+                "${ENV_TOKEN} is ignored: the store is {k}{} (from {})",
+                if k == "libsql" { " in local mode" } else { "" },
+                kind.source
+            ));
         }
         let sqlite = SqliteSelection {
             path: if k != "sqlite" {
@@ -2980,12 +3345,17 @@ pub mod select {
                 schema.value, schema.source
             )));
         }
+        let file_namespace = if k == "libsql" {
+            f_libsql.and_then(|l| l.namespace.clone())
+        } else {
+            f_pg.and_then(|p| p.namespace.clone())
+        };
         let namespace = match var(ENV_NAMESPACE) {
             Some(n) => Some(Sourced {
                 value: n,
                 source: Source::Env(ENV_NAMESPACE),
             }),
-            None => f_pg.and_then(|p| p.namespace.clone()).map(|n| Sourced {
+            None => file_namespace.map(|n| Sourced {
                 value: n,
                 source: Source::File,
             }),
@@ -3026,6 +3396,7 @@ pub mod select {
         Ok(Selection {
             kind,
             url,
+            token,
             namespace,
             connect_timeout,
             timeout,
@@ -3035,6 +3406,7 @@ pub mod select {
                 pool,
                 manifest_grace,
             },
+            libsql,
             options: file.map(|f| f.options.clone()).unwrap_or_default(),
             warnings,
         })

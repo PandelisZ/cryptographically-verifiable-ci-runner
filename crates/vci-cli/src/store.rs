@@ -41,7 +41,8 @@ struct Opened {
     selection: Option<Selection>,
 }
 
-/// Take every [`select::NEVER_TO_CHILDREN`] variable (`VCI_STORE`, `VCI_STORE_URL`) out
+/// Take every [`select::NEVER_TO_CHILDREN`] variable (`VCI_STORE`,
+/// `VCI_STORE_URL`, `VCI_STORE_TOKEN`) out
 /// of this process's environment, keeping its value in memory, so that no
 /// test, adapter probe, hook or git command vci starts can see it. Later
 /// calls do nothing.
@@ -58,7 +59,15 @@ pub unsafe fn take_secrets() {
                 // SAFETY: the caller guarantees that this process has no
                 // other thread yet (this function's contract).
                 unsafe { std::env::remove_var(name) };
-                kept.insert(name, Secret::new(v.to_string_lossy()));
+                let v = v.to_string_lossy();
+                kept.insert(
+                    name,
+                    if name == select::ENV_TOKEN {
+                        Secret::opaque(v)
+                    } else {
+                        Secret::new(v)
+                    },
+                );
             }
         }
         kept
@@ -102,6 +111,13 @@ pub fn factories(repo: &Repo) -> Vec<Box<dyn BackendFactory>> {
         Box::new(vci_store::MissingBackend {
             kind: "postgres",
             feature: "postgres",
+        }),
+        #[cfg(feature = "libsql")]
+        Box::new(vci_store_libsql::LibsqlFactory),
+        #[cfg(not(feature = "libsql"))]
+        Box::new(vci_store::MissingBackend {
+            kind: "libsql",
+            feature: "libsql",
         }),
     ]
 }
@@ -584,7 +600,7 @@ mod tests {
     fn every_backend_is_registered() {
         let (_t, repo) = git_repo();
         let kinds: Vec<&str> = factories(&repo).iter().map(|f| f.kind()).collect();
-        assert_eq!(kinds, ["git-meta", "sqlite", "postgres"]);
+        assert_eq!(kinds, ["git-meta", "sqlite", "postgres", "libsql"]);
     }
 
     #[test]
@@ -644,8 +660,31 @@ mod tests {
         assert_eq!(o.store.kind(), "unknown");
         let e = o.store.status().unwrap_err().to_string();
         assert!(
-            e.contains("\"nope\"") && e.contains("git-meta, sqlite, postgres"),
+            e.contains("\"nope\"") && e.contains("git-meta, sqlite, postgres, libsql"),
             "{e}"
+        );
+
+        // A libsql:// URL selects libsql; neither its token nor
+        // VCI_STORE_TOKEN reaches a message.
+        let o = open(
+            &repo,
+            &env_of(&[
+                (
+                    "VCI_STORE_URL",
+                    "libsql://db-org.turso.io?authToken=s3cret-q",
+                ),
+                ("VCI_STORE_TOKEN", "s3cret-env"),
+            ]),
+        );
+        assert_eq!(o.store.kind(), "libsql");
+        let sel = o.selection.unwrap();
+        let all = format!("{} {sel:?} {:?}", o.store.location(), sel.describe());
+        assert!(!all.contains("s3cret"), "{all}");
+        assert!(
+            o.store
+                .location()
+                .starts_with("libsql://db-org.turso.io namespace "),
+            "{all}"
         );
 
         let o = open(&repo, &env_of(&[("VCI_STORE", "postgres")]));

@@ -170,9 +170,9 @@ extra = ["testdata/**", "shared/config.json"]</code></pre>
 </ul>
 
 <h2 id="store">[store]: where attestations live</h2>
-<p>Since 2.8.0. Attestations live in git-meta (the default: <code>refs/meta/main</code> of a git remote), a local SQLite file, or a shared PostgreSQL server. The environment chooses first: <code>VCI_STORE</code> (<code>git-meta</code>, <code>sqlite</code>, <code>postgres</code>), else the scheme of <code>VCI_STORE_URL</code>, else <code>[store]</code> in the working tree's <code>vci.toml</code>, else git-meta. <code>vci store info</code> says which one a repository uses and where each setting came from.</p>
+<p>Since 2.8.0. Attestations live in git-meta (the default: <code>refs/meta/main</code> of a git remote), a local SQLite file, a shared PostgreSQL server, or a libSQL database (Turso; read directly or through a local replica). The environment chooses first: <code>VCI_STORE</code> (<code>git-meta</code>, <code>sqlite</code>, <code>postgres</code>, <code>libsql</code>), else the scheme of <code>VCI_STORE_URL</code>, else <code>[store]</code> in the working tree's <code>vci.toml</code>, else git-meta. <code>vci store info</code> says which one a repository uses and where each setting came from.</p>
 <pre><code>[store]
-backend = "sqlite"          <span class="c"># "git-meta" (default) | "sqlite" | "postgres"</span>
+backend = "sqlite"          <span class="c"># "git-meta" (default) | "sqlite" | "postgres" | "libsql"</span>
 timeout = "30s"             <span class="c"># one statement or wait; connect_timeout = "5s" too</span>
 
 [store.sqlite]
@@ -180,12 +180,16 @@ path = "vci-store.sqlite"   <span class="c"># relative to the git common directo
 
 [store.postgres]            <span class="c"># tuning only</span>
 schema = "vci"
-namespace = "acme-web"      <span class="c"># default: the repository id</span></code></pre>
+namespace = "acme-web"      <span class="c"># default: the repository id</span>
+
+[store.libsql]              <span class="c"># the server is VCI_STORE_URL, its token VCI_STORE_TOKEN</span>
+replica = true              <span class="c"># read a local replica, synced once per command</span>
+path = "vci-store.libsql"   <span class="c"># the local file or the replica (the default)</span></code></pre>
 <ul>
-<li><strong>Never an address or a credential.</strong> <code>url</code>, <code>host</code>, <code>user</code>, <code>password</code> and <code>dbname</code> are refused: every checkout, a pull request's included, carries <code>vci.toml</code>. The PostgreSQL URL goes in <code>VCI_STORE_URL</code>, a CI secret that no test process ever sees.</li>
+<li><strong>Never an address or a credential.</strong> <code>url</code>, <code>host</code>, <code>user</code>, <code>password</code>, <code>dbname</code>, <code>token</code> and <code>authToken</code> are refused: every checkout, a pull request's included, carries <code>vci.toml</code>. The PostgreSQL or libSQL URL goes in <code>VCI_STORE_URL</code> and a libSQL token in <code>VCI_STORE_TOKEN</code>, CI secrets that no test process ever sees.</li>
 <li><strong>Never an input.</strong> Switching store invalidates no attestation; the new store starts empty, so its units run once.</li>
 <li><strong>Roll out through the environment first.</strong> A vci before 2.8.0 rejects a <code>vci.toml</code> with <code>[store]</code> and runs every test, so add it only once every runner and developer has 2.8.0.</li>
-<li>On PostgreSQL, <code>vci ci</code> stores only with <code>--push</code>. Details: <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md#where-attestations-live">where attestations live</a>.</li>
+<li>On PostgreSQL and a libSQL server, <code>vci ci</code> stores only with <code>--push</code>. Details: <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md#where-attestations-live">where attestations live</a>.</li>
 </ul>
 
 <h2 id="projects">Several projects in one repository</h2>

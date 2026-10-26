@@ -1,9 +1,11 @@
 //! The command line on each attestation store backend, end to end
-//! (docs/STORE-BACKENDS.md sections 7, 9, 10, 16 and 17): `vci run`, `vci
-//! plan`, `vci explain`, supersession, `vci prune`, `vci fetch`, `vci push`
-//! and `vci ci` on SQLite (`VCI_STORE=sqlite`) and PostgreSQL
-//! (`VCI_STORE_URL`), the publication gate of a shared store, failing open
-//! when a store cannot be used, and git-meta when nothing is configured.
+//! (docs/STORE-BACKENDS.md sections 7, 9, 10, 16, 17 and 18): `vci run`,
+//! `vci plan`, `vci explain`, supersession, `vci prune`, `vci fetch`, `vci
+//! push` and `vci ci` on SQLite (`VCI_STORE=sqlite`), PostgreSQL
+//! (`VCI_STORE_URL`) and libSQL (`VCI_STORE=libsql`: its local file, a
+//! server, and a replica of one), the publication gate of a shared store,
+//! failing open when a store cannot be used, and git-meta when nothing is
+//! configured.
 //!
 //! A copy of `fixtures/go-abcd` in a throwaway git repository. Needs `go`,
 //! `git` and `ssh-keygen` on PATH; every test prints `SKIPPED:` and returns
@@ -13,6 +15,10 @@
 //! throwaway cluster started with `initdb`), each in a schema of its own
 //! named in the world's `vci.toml`, with `VCI_STORE_NAMESPACE=test`. They
 //! skip without a server, and fail under `VCI_TEST_POSTGRES=require`.
+//! The libSQL server tests take theirs from
+//! [`vci_store_libsql::testkit::server`] (`VCI_TEST_LIBSQL_URL`, else a
+//! throwaway `sqld`), each in a namespace of its own; they skip without one,
+//! and fail under `VCI_TEST_LIBSQL=require`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -21,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::Value;
+use vci_store_libsql::testkit as libsql_kit;
 use vci_store_postgres::testkit::{self, PgDb};
 
 fn workspace_root() -> PathBuf {
@@ -124,6 +131,15 @@ fn slot_and_tree(key: &str) -> (String, String) {
 /// The store a world's `vci` commands use.
 struct Backend {
     kind: &'static str,
+    /// Whether every write is shared at once (`Caps::shared_writes`): the
+    /// publication gate applies, and unreferenced manifests are kept for an
+    /// hour.
+    shared: bool,
+    /// The libSQL store's mode (`local`, `remote`, `replica`); empty for
+    /// the others.
+    mode: &'static str,
+    /// The libSQL server's URL and the namespace (remote and replica).
+    server: Option<(String, String)>,
     /// Added to the environment of every `vci` command of the world.
     env: Vec<(String, String)>,
     /// Added to the base commit's `vci.toml`.
@@ -137,6 +153,9 @@ impl Backend {
     fn git_meta() -> Self {
         Backend {
             kind: "git-meta",
+            shared: false,
+            mode: "",
+            server: None,
             env: Vec::new(),
             toml: String::new(),
             db: None,
@@ -147,6 +166,9 @@ impl Backend {
     fn sqlite() -> Self {
         Backend {
             kind: "sqlite",
+            shared: false,
+            mode: "",
+            server: None,
             env: vec![("VCI_STORE".into(), "sqlite".into())],
             toml: String::new(),
             db: None,
@@ -159,12 +181,59 @@ impl Backend {
         let db = testkit::pg()?;
         Some(Backend {
             kind: "postgres",
+            shared: true,
+            mode: "",
+            server: None,
             env: vec![
                 ("VCI_STORE_URL".into(), db.url.clone()),
                 ("VCI_STORE_NAMESPACE".into(), "test".into()),
             ],
             toml: format!("\n[store.postgres]\nschema = \"{}\"\n", db.schema),
             db: Some(db),
+        })
+    }
+
+    /// libSQL's local file at its default path, `.git/vci-store.libsql`.
+    fn libsql() -> Self {
+        Backend {
+            kind: "libsql",
+            shared: false,
+            mode: "local",
+            server: None,
+            env: vec![("VCI_STORE".into(), "libsql".into())],
+            toml: String::new(),
+            db: None,
+        }
+    }
+
+    /// libSQL on the testkit's server, in a namespace of its own: every
+    /// read and write on the server, or (`replica`) reads from a replica
+    /// at `.git/vci-store.libsql`. `None` (test skipped) without a server.
+    fn libsql_server(replica: bool) -> Option<Self> {
+        if !libsql_kit::available() {
+            return None;
+        }
+        let server = libsql_kit::server().ok()?;
+        let ns = libsql_kit::namespace();
+        let mut env: Vec<(String, String)> = vec![
+            ("VCI_STORE".into(), "libsql".into()),
+            ("VCI_STORE_URL".into(), server.url.clone()),
+            ("VCI_STORE_NAMESPACE".into(), ns.clone()),
+        ];
+        if let Some(t) = &server.token {
+            env.push(("VCI_STORE_TOKEN".into(), t.clone()));
+        }
+        if replica {
+            env.push(("VCI_STORE_SYNC".into(), "replica".into()));
+        }
+        Some(Backend {
+            kind: "libsql",
+            shared: true,
+            mode: if replica { "replica" } else { "remote" },
+            server: Some((server.url.clone(), ns)),
+            env,
+            toml: String::new(),
+            db: None,
         })
     }
 }
@@ -599,6 +668,27 @@ fn postgres_runs_plans_and_explains() {
     run_plan_explain(b);
 }
 
+#[test]
+fn libsql_runs_plans_and_explains() {
+    run_plan_explain(Backend::libsql());
+}
+
+#[test]
+fn libsql_remote_runs_plans_and_explains() {
+    let Some(b) = Backend::libsql_server(false) else {
+        return;
+    };
+    run_plan_explain(b);
+}
+
+#[test]
+fn libsql_replica_runs_plans_and_explains() {
+    let Some(b) = Backend::libsql_server(true) else {
+        return;
+    };
+    run_plan_explain(b);
+}
+
 // ---------------------------------------------------------------------------
 // 2. An edit, supersession, orphan manifests and prune.
 
@@ -614,12 +704,14 @@ fn prune_dry_run(w: &World) -> (Vec<String>, String) {
 
 /// Edit a file: the plan runs that unit only. Its second attestation on
 /// this branch supersedes the first, and the first one's manifest, which
-/// nothing references any more, is removed: by the run itself on SQLite;
-/// on PostgreSQL, which keeps an unreferenced manifest put less than an
-/// hour ago (`manifest_grace`), by `vci prune`. `vci prune --dry-run` lists
-/// nothing else.
+/// nothing references any more, is removed: by the run itself on SQLite
+/// and libSQL's local file; on a shared store (PostgreSQL, a libSQL
+/// server), which keeps an unreferenced manifest put less than an hour ago
+/// (`manifest_grace`), by `vci prune`. `vci prune --dry-run` lists nothing
+/// else.
 fn edit_supersede_prune(backend: Backend) {
     let kind = backend.kind;
+    let shared = backend.shared;
     let Some(w) = World::new(backend) else { return };
     attest_all(&w);
 
@@ -674,7 +766,7 @@ fn edit_supersede_prune(backend: Backend) {
         )),
         "{summary}"
     );
-    if kind == "postgres" {
+    if shared {
         // Within the grace period, the run kept the orphan; prune (no
         // grace) removes it, and only it.
         assert_eq!(listed.len(), 1, "{listed:?}");
@@ -711,6 +803,27 @@ fn sqlite_supersedes_and_prunes() {
 #[test]
 fn postgres_supersedes_and_prunes() {
     let Some(b) = Backend::postgres() else { return };
+    edit_supersede_prune(b);
+}
+
+#[test]
+fn libsql_supersedes_and_prunes() {
+    edit_supersede_prune(Backend::libsql());
+}
+
+#[test]
+fn libsql_remote_supersedes_and_prunes() {
+    let Some(b) = Backend::libsql_server(false) else {
+        return;
+    };
+    edit_supersede_prune(b);
+}
+
+#[test]
+fn libsql_replica_supersedes_and_prunes() {
+    let Some(b) = Backend::libsql_server(true) else {
+        return;
+    };
     edit_supersede_prune(b);
 }
 
@@ -788,11 +901,7 @@ fn fetch_and_push(backend: Backend) {
     let kind = backend.kind;
     let Some(w) = World::new(backend) else { return };
     attest_all(&w);
-    let reach = if kind == "postgres" {
-        "shared"
-    } else {
-        "local"
-    };
+    let reach = if w.backend.shared { "shared" } else { "local" };
     let location = w.info()["location"].as_str().unwrap().to_owned();
 
     let out = w.vci(&["fetch"], &[]);
@@ -827,17 +936,31 @@ fn fetch_and_push(backend: Backend) {
     }
     assert!(!w.remote_has_meta(), "nothing was pushed to git");
     assert_eq!(w.info()["count"], UNITS.len());
-    if kind == "postgres" {
-        let db = w.backend.db.as_ref().unwrap();
-        assert!(
-            location.contains(&format!(" schema {} namespace test", db.schema)),
-            "{location}"
-        );
-    } else {
-        assert_eq!(
-            Path::new(&location),
-            w.work.join(".git/vci-store.sqlite").as_path()
-        );
+    let file = |name: &str| w.work.join(".git").join(name).display().to_string();
+    match (kind, w.backend.mode, &w.backend.server) {
+        ("postgres", _, _) => {
+            let db = w.backend.db.as_ref().unwrap();
+            assert!(
+                location.contains(&format!(" schema {} namespace test", db.schema)),
+                "{location}"
+            );
+        }
+        ("libsql", "local", _) => {
+            assert_eq!(location, format!("{} (local)", file("vci-store.libsql")));
+        }
+        ("libsql", "remote", Some((url, ns))) => {
+            assert_eq!(location, format!("{url} namespace {ns} (remote)"));
+        }
+        ("libsql", "replica", Some((url, ns))) => {
+            assert_eq!(
+                location,
+                format!(
+                    "{} (replica of {url} namespace {ns})",
+                    file("vci-store.libsql")
+                )
+            );
+        }
+        _ => assert_eq!(location, file("vci-store.sqlite")),
     }
 }
 
@@ -852,14 +975,34 @@ fn postgres_has_nothing_to_fetch_or_push() {
     fetch_and_push(b);
 }
 
+#[test]
+fn libsql_has_nothing_to_fetch_or_push() {
+    fetch_and_push(Backend::libsql());
+}
+
+#[test]
+fn libsql_remote_has_nothing_to_fetch_or_push() {
+    let Some(b) = Backend::libsql_server(false) else {
+        return;
+    };
+    fetch_and_push(b);
+}
+
+#[test]
+fn libsql_replica_has_nothing_to_fetch_or_push() {
+    let Some(b) = Backend::libsql_server(true) else {
+        return;
+    };
+    fetch_and_push(b);
+}
+
 // ---------------------------------------------------------------------------
 // 5. The publication gate of a shared store.
 
-/// `vci ci` without `--push` on PostgreSQL signs but stores nothing, and
-/// says so; with `--push` it stores.
-#[test]
-fn postgres_ci_stores_only_with_push() {
-    let Some(b) = Backend::postgres() else { return };
+/// `vci ci` without `--push` on a shared store signs but stores nothing,
+/// and says so; with `--push` it stores.
+fn ci_stores_only_with_push(b: Backend) {
+    let kind = b.kind;
     let Some(w) = World::new(b) else { return };
     let before = w.info();
     assert_eq!(before["status"], "absent", "{before}");
@@ -870,14 +1013,14 @@ fn postgres_ci_stores_only_with_push() {
     let err = stderr(&out);
     assert!(
         err.contains(&format!(
-            "vci: not storing {} attestation(s): the postgres store is shared and vci ci was not given --push\n",
+            "vci: not storing {} attestation(s): the {kind} store is shared and vci ci was not given --push\n",
             UNITS.len()
         )),
         "{err}"
     );
     assert!(
         err.contains(&format!(
-            "vci ci: {} unit(s) attested (not stored: the postgres store is shared and --push was not given)\n",
+            "vci ci: {} unit(s) attested (not stored: the {kind} store is shared and --push was not given)\n",
             UNITS.len()
         )),
         "{err}"
@@ -898,7 +1041,7 @@ fn postgres_ci_stores_only_with_push() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let err = stderr(&out);
     assert!(!err.contains("not storing"), "{err}");
-    assert_eq!(attested_keys(&out, "postgres").len(), UNITS.len(), "{err}");
+    assert_eq!(attested_keys(&out, kind).len(), UNITS.len(), "{err}");
     assert!(
         err.contains(&format!("vci ci: {} unit(s) attested\n", UNITS.len())),
         "{err}"
@@ -915,6 +1058,28 @@ fn postgres_ci_stores_only_with_push() {
     assert_eq!(after["status"], "ready", "{after}");
     let (plan, _) = w.plan(&[]);
     assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+}
+
+#[test]
+fn postgres_ci_stores_only_with_push() {
+    let Some(b) = Backend::postgres() else { return };
+    ci_stores_only_with_push(b);
+}
+
+#[test]
+fn libsql_remote_ci_stores_only_with_push() {
+    let Some(b) = Backend::libsql_server(false) else {
+        return;
+    };
+    ci_stores_only_with_push(b);
+}
+
+#[test]
+fn libsql_replica_ci_stores_only_with_push() {
+    let Some(b) = Backend::libsql_server(true) else {
+        return;
+    };
+    ci_stores_only_with_push(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,6 +1244,114 @@ fn a_postgres_server_that_never_answers_fails_open_in_time() {
     for out in &outs {
         assert!(!text(out).contains(SECRET), "{}", text(out));
     }
+}
+
+/// A libSQL server on a closed port, with a token in the URL and another
+/// in `VCI_STORE_TOKEN`, used remotely and through a replica: the plan
+/// exits 0 within seconds and runs everything; `vci run` runs the tests
+/// (exit 0) and stores nothing; neither token, nor the URL, reaches any
+/// output, the audit log, the metrics log or a test's environment. The
+/// remote store's `vci store info`, `fetch` and `push` exit 2; the replica
+/// reads what it holds (nothing here) with a warning, and is not created.
+#[test]
+fn unreachable_libsql_fails_open_and_keeps_its_tokens() {
+    const IN_URL: &str = "s3cretUrlTok";
+    const IN_ENV: &str = "s3cretEnvTok";
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let dump = w.base.join("env-dump.txt");
+    w.put("envdump/envdump_test.go", &envdump_test(&dump));
+    w.commit("envdump");
+    let all = set(&["a", "b", "c", "d", "envdump"]);
+    let url = format!(
+        "libsql://127.0.0.1:{}/?tls=0&authToken={IN_URL}",
+        closed_port()
+    );
+    let key = w.key.to_str().unwrap().to_owned();
+    for (i, replica) in [false, true].into_iter().enumerate() {
+        let mut env = vec![
+            ("VCI_STORE_URL", url.as_str()),
+            ("VCI_STORE_TOKEN", IN_ENV),
+            ("VCI_STORE_NAMESPACE", "ns"),
+        ];
+        if replica {
+            env.push(("VCI_STORE_SYNC", "replica"));
+        }
+        let mut outs = Vec::new();
+        let t = Instant::now();
+        let (plan, out) = w.plan(&env);
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        assert_eq!(plan.run, all, "{plan:?}");
+        assert!(stderr(&out).contains("libsql"), "{}", text(&out));
+        outs.push(out);
+
+        let _ = std::fs::remove_file(&dump);
+        let out = w.vci(&["run", "--key", &key], &env);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "the tests' exit code: {}",
+            text(&out)
+        );
+        for u in UNITS {
+            assert!(
+                stderr(&out).contains(&format!(
+                    "vci: not attesting {u}: signing or storing failed: "
+                )),
+                "{u}: {}",
+                text(&out)
+            );
+        }
+        assert!(!stderr(&out).contains("vci: attested "), "{}", text(&out));
+        outs.push(out);
+        let dumped = std::fs::read_to_string(&dump).expect("the envdump test ran");
+        assert!(dumped.starts_with("getenv:\n"), "{dumped}");
+        for name in ["VCI_STORE_URL=", "VCI_STORE_TOKEN=", "VCI_STORE="] {
+            assert!(!dumped.lines().any(|l| l.starts_with(name)), "{dumped}");
+        }
+        assert!(!dumped.contains("s3cret"), "{dumped}");
+
+        let (out, audit) = w.ci(&[], &env, &format!("audit-libsql-{i}.json"));
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        assert_eq!(audit["exitCode"], 0);
+        let audit_text = serde_json::to_string(&audit).unwrap();
+        assert!(!audit_text.contains("s3cret"), "{audit_text}");
+        outs.push(out);
+        for args in [
+            &["env"][..],
+            &["store", "info"],
+            &["store", "info", "--format", "json"],
+            &["fetch"],
+            &["push"],
+        ] {
+            let t = Instant::now();
+            let out = w.vci(args, &env);
+            assert!(t.elapsed() < Duration::from_secs(10), "{args:?}");
+            if args[0] != "env" {
+                if replica {
+                    assert_eq!(out.status.code(), Some(0), "{args:?}: {}", text(&out));
+                    assert!(
+                        stderr(&out).contains("vci: warning: cannot sync the libsql replica "),
+                        "{args:?}: {}",
+                        text(&out)
+                    );
+                } else {
+                    assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
+                }
+            }
+            outs.push(out);
+        }
+        for out in &outs {
+            assert!(!text(out).contains("s3cret"), "{}", text(out));
+        }
+        assert!(!w.work.join(".git/vci-store.libsql").exists());
+        assert!(!w.work.join(".git/vci-store.libsql.sync").exists());
+    }
+    let log = std::fs::read_to_string(&w.metrics).unwrap();
+    assert!(!log.contains("s3cret"), "{log}");
+    assert!(log.contains("\"store\":\"libsql\""), "{log}");
+    assert!(!w.remote_has_meta());
 }
 
 /// A connection string put in `VCI_STORE` by mistake is refused, never
@@ -1305,6 +1578,7 @@ fn nothing_configured_is_git_meta_and_pushes() {
     assert_eq!(info["count"], UNITS.len());
     assert!(w.work.join(".git/git-meta.sqlite").exists());
     assert!(!w.work.join(".git/vci-store.sqlite").exists());
+    assert!(!w.work.join(".git/vci-store.libsql").exists());
     let log = std::fs::read_to_string(&w.metrics).unwrap();
     let last: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     assert_eq!(last["store"], "git-meta");

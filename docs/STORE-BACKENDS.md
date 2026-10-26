@@ -18,19 +18,26 @@ Built and in use (vci 2.8.0):
 - **The SQLite backend** (`vci-store-sqlite`, section 16): one file in the git common directory, selected with
   `VCI_STORE=sqlite`.
 - **The PostgreSQL backend** (`vci-store-postgres`, section 17): a shared server, selected with a `postgres://`
-  `VCI_STORE_URL`. Both are in vci-cli's default features, so the release binaries carry them (section 17, "Crate").
+  `VCI_STORE_URL`.
+- **The libSQL backend** (`vci-store-libsql`, section 18): a local file (`VCI_STORE=libsql`), a libSQL server such as
+  Turso (a `libsql://` `VCI_STORE_URL`, its token in `VCI_STORE_TOKEN`), or a local replica of one
+  (`VCI_STORE_SYNC=replica`). The three backends are in vci-cli's default features, so the release binaries carry
+  them (section 17, "Crate"; section 18, "Crate").
 - **The command line on the trait** (section 13): every command reaches the store through one
   `Arc<dyn AttestationStore>` per repository, selected from the environment and `[store]` (section 9). Deferred write
   batches are reported only once they finish (section 6), `vci ci` has the publication gate for shared stores
-  (section 7), `vci store info` exists, and neither `VCI_STORE_URL` nor `VCI_STORE` reaches a child process.
+  (section 7), `vci store info` exists, and none of `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` reaches a
+  child process.
 - **The plan reads the candidates it set aside** even when a round fetched nothing (section 5).
-- **The conformance suite** (section 14): its 34 scenarios, run against git-meta, SQLite and PostgreSQL from each
-  backend's `tests/conformance.rs`.
-- **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14) and the CI jobs that run all of
-  the above (`store-stock-git`, `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`).
+- **The conformance suite** (section 14): its 34 scenarios, run against git-meta, SQLite, PostgreSQL and libSQL (in
+  each of its three modes) from each backend's `tests/conformance.rs`.
+- **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14), the temporary libSQL server
+  (`vci_store_libsql::testkit`, section 18) and the CI jobs that run all of the above (`store-stock-git`,
+  `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`; the libSQL server is the
+  `libsql-server` image as a service container).
 
 Not built yet: `vci store init`, `vci store copy`, `vci init --store`, and the action inputs `store` and `store-url`
-(section 9). The questions still open are in section 20.
+(section 9). The questions still open are in section 21.
 
 Contents
 
@@ -51,9 +58,10 @@ Contents
 15. Backend: git-meta
 16. Backend: SQLite
 17. Backend: PostgreSQL
-18. Notes for an HTTP or gRPC backend
-19. Decisions and why
-20. Decided questions, and what is still open
+18. Backend: libSQL (Turso)
+19. Notes for an HTTP or gRPC backend
+20. Decisions and why
+21. Decided questions, and what is still open
 
 ---
 
@@ -65,7 +73,8 @@ the ones it chooses, and skips a unit when one of them proves the inputs unchang
 kinds of records live. git-meta is the default store: `.git/git-meta.sqlite`, mirrored into `refs/meta/main` trees
 and exchanged with `vci fetch` and `vci push`. It is one implementation of the trait
 `vci_store::AttestationStore`. SQLite (a local file) and PostgreSQL (a shared server) are the other two (sections 16
-and 17), and an HTTP or gRPC service can follow (section 18).
+and 17), libSQL (a local file, a Turso or `sqld` server, or a local replica of one; section 18) is a fourth, and an
+HTTP or gRPC service can follow (section 19).
 
 ### The store is never trusted
 
@@ -238,12 +247,13 @@ In every contract below:
 
 ### `kind`, `location`, `caps`, `status`
 
-- `kind()` is a static short name: `git-meta`, `sqlite`, `postgres`. Messages print it ("attested … as `<kind>`
+- `kind()` is a static short name: `git-meta`, `sqlite`, `postgres`, `libsql`. Messages print it ("attested … as `<kind>`
   `<target>` `<key>`", "candidate 1: `<kind>` …"), so git-meta's output stays byte-identical. A `FailedStore` reports
   the kind that was asked for, or `unknown` (section 10).
 - `location()` is human text and never carries a password. Examples: `.git/git-meta.sqlite (exchanged on
   refs/meta/main)` (git-meta's, whatever `meta.namespace` is set to), `/repo/.git/vci-store.sqlite`,
-  `postgres://***@db.internal:5432/ci schema vci namespace <repo id>`. A `FailedStore`'s is
+  `postgres://***@db.internal:5432/ci schema vci namespace <repo id>`, `libsql://ci-acme.turso.io namespace <repo
+  id> (remote)`. A `FailedStore`'s is
   `<kind> (unavailable: <why>)`.
 - `caps()` is cheap and does no I/O.
 - `status()` returns `Absent{advice}` when nothing exists yet (no file, no schema) and creates nothing to find out.
@@ -272,6 +282,7 @@ In every contract below:
   - git-meta: one pooled reader, one indexed SQLite query per unit (vci 2.7's loop).
   - SQLite: one indexed seek per unit on one connection inside one read transaction.
   - PostgreSQL: `test_key = ANY($2)`.
+  - libSQL on a server: `test_key IN (SELECT value FROM json_each(?1))`, one request.
 
 ### `list_all() -> Vec<StoredEnvelope>`
 
@@ -382,7 +393,7 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
 - **Fail open**: orphan collection after supersession warns (`vci: warning: cannot remove the unreferenced input
   manifests: …`). Prune exits 2.
 - `vci prune` passes one root per call and prints `removed project vci:manifest:<root> (unreferenced manifest)` for
-  each root it asked to remove, whatever the count returned. That is exact for git-meta; see section 20 for stores
+  each root it asked to remove, whatever the count returned. That is exact for git-meta; see section 21 for stores
   that keep roots.
 
 ### Provided reads
@@ -588,8 +599,8 @@ The in-memory `MemStore` in vci-cli's tests (`store::mem`) has deferred and fail
 | kind | example | `exchange()` | `vci fetch` | `vci push` | `vci plan --fetch` | `vci ci --push` |
 |---|---|---|---|---|---|---|
 | replicated | git-meta | `Some` | merge the remote's metadata into the local store (blobless: keys and trees, no values) | publish local writes and deletion records | fetch on a background thread while projects are probed | push; a failure becomes a GitHub warning |
-| local file | SQLite | `None` | says the store is local, prints the count, exits 0 | says there is nothing to push, exits 0 | nothing (`warm` only) | succeeds; `pushed: true` means "stored" |
-| shared server | PostgreSQL | `None` | says the store is shared, prints the count, exits 0 | says writes were stored when `vci run` made them, exits 0 | nothing | succeeds; see the publication gate |
+| local file | SQLite, libSQL's local file | `None` | says the store is local, prints the count, exits 0 | says there is nothing to push, exits 0 | nothing (`warm` only) | succeeds; `pushed: true` means "stored" |
+| shared server | PostgreSQL, libSQL on a server (remote or replica) | `None` | says the store is shared, prints the count, exits 0 | says writes were stored when `vci run` made them, exits 0 | nothing | succeeds; see the publication gate |
 | remote service | HTTP/gRPC | `None` (writes are global) | as shared | as shared | nothing | as shared |
 
 The messages for a store without an exchange, as printed:
@@ -664,6 +675,8 @@ Per backend:
 - SQLite uses `memo` and `flags` tables in its file; hint writes do nothing while the file does not exist.
 - PostgreSQL uses server-side tables per namespace, and never creates the schema for a hint. A pull-request plan then reads master's memo with no
   cache, and flags become shared facts about the repository (a global `plan:natives:<project>` flag is acceptable).
+- libSQL keeps them as SQLite does in its local mode, and as PostgreSQL does on a server (tables of the namespace,
+  never created for a hint) in its remote and replica modes.
 - A backend that keeps no hints leaves the defaults: plans still work, just without the memo's head start.
 - A `FailedStore` keeps no hints.
 
@@ -675,12 +688,13 @@ Per backend:
 
 The backend, highest precedence first:
 
-1. **`VCI_STORE`**: a backend name: `git-meta`, `sqlite`, `postgres`, or another registered backend. It is trimmed
-   and lowercased, and `postgresql` and `pg` mean postgres, `sqlite3` means sqlite, `gitmeta` and `git_meta` mean
-   git-meta. A name is a lowercase letter followed by letters, digits and `-`, at most 32 bytes. **Never a URL.** A
+1. **`VCI_STORE`**: a backend name: `git-meta`, `sqlite`, `postgres`, `libsql`, or another registered backend. It is
+   trimmed and lowercased, and `postgresql` and `pg` mean postgres, `sqlite3` means sqlite, `turso` means libsql,
+   `gitmeta` and `git_meta` mean git-meta. A name is a lowercase letter followed by letters, digits and `-`, at most 32 bytes. **Never a URL.** A
    value containing `://` is refused with "put the URL in $VCI_STORE_URL", and the value is not printed.
-2. **The scheme of `VCI_STORE_URL`**: `postgres://` and `postgresql://` mean postgres; `sqlite:` means sqlite. Any
-   other scheme selects nothing.
+2. **The scheme of `VCI_STORE_URL`**: `postgres://` and `postgresql://` mean postgres; `sqlite:` means sqlite;
+   `libsql://` means libsql. Any other scheme selects nothing: an `https://` or `http://` URL may be a libSQL server
+   or anything else, so it needs `VCI_STORE=libsql` (or `[store] backend = "libsql"`), and `file:` too.
 3. **`[store] backend`** in the **working tree's** `vci.toml`.
 4. **`git-meta`**. With nothing configured, behaviour is exactly as in 2.7.
 
@@ -699,34 +713,38 @@ share one handle, one pool and one circuit breaker. On any error, selecting or o
 | variable | meaning | default |
 |---|---|---|
 | `VCI_STORE` | backend name | (see precedence) |
-| `VCI_STORE_URL` | location: `postgres://user[:password]@host[:port]/db[?sslmode=…&sslrootcert=…]`, or `sqlite:<path>` (absolute, or relative to the git common directory). **A secret.** | none |
-| `VCI_STORE_NAMESPACE` | a shared server's namespace | the repository id (smallest root commit) |
+| `VCI_STORE_URL` | location: `postgres://user[:password]@host[:port]/db[?sslmode=…&sslrootcert=…]`, `sqlite:<path>` (absolute, or relative to the git common directory), a libSQL server (`libsql://host[:port][/path][?authToken=…&tls=0]`, `https://…`, `http://…`) or file (`file:<path>`). **A secret.** | none |
+| `VCI_STORE_TOKEN` | a libSQL server's auth token (a Turso database token); wins over the URL's `authToken`. **A secret**, redacted whole | none |
+| `VCI_STORE_REPLICA` | the libSQL store's replica file (absolute, or relative to the git common directory); setting it asks for the replica mode | `[store.libsql] path`, else `vci-store.libsql` |
+| `VCI_STORE_NAMESPACE` | a shared server's namespace (PostgreSQL, libSQL) | `[store.postgres]` or `[store.libsql] namespace`, else the repository id (smallest root commit) |
 | `VCI_STORE_CONNECT_TIMEOUT_SECS` | bound on connecting, in seconds (a number, more than 0 and at most 3600) | 5 |
 | `VCI_STORE_TIMEOUT_SECS` | bound on one statement or request, same form | 30 (a network backend lifts it to 10 min for `vci prune`, `OpenContext::long_running`) |
-| `VCI_STORE_SYNC` | `off` disables SQLite `synchronous`, in git-meta's store (which also turns it off when `CI` is set) and in the SQLite backend (which does not look at `CI`) | unchanged |
+| `VCI_STORE_SYNC` | `off` disables SQLite `synchronous`, in git-meta's store (which also turns it off when `CI` is set) and in the SQLite backend and libSQL's files (which do not look at `CI`); `replica` asks the libSQL store for its replica mode | unchanged |
 | unchanged, git-meta only | `VCI_FETCH_JOBS`, `VCI_LOCK_TIMEOUT_SECS`, `VCI_DELETION_RECORDS_DROP_AT`, `VCI_DELETION_RECORDS_KEEP_SECS` | |
-| tests only | `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require`, `VCI_TEST_PG_BINDIR` (section 14) | |
+| tests only | `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require`, `VCI_TEST_PG_BINDIR` (section 14); `VCI_TEST_LIBSQL_URL`, `VCI_TEST_LIBSQL_TOKEN`, `VCI_TEST_LIBSQL=require` (section 18) | |
 
-`vci_store::select::ENV_VARS` lists the five `VCI_STORE*` variables `resolve` reads (not `VCI_STORE_SYNC`). Every e2e
+`vci_store::select::ENV_VARS` lists the eight `VCI_STORE*` variables `resolve` reads (`VCI_STORE_SYNC` since the
+libSQL replica). Every e2e
 harness removes them from the environment of the commands it starts, so a developer's exported store never reaches
 the git-specific assertions.
 
 **Secrets model.**
 
-- **Only `VCI_STORE_URL` carries a connection string.**
+- **Only `VCI_STORE_URL` carries a connection string, and only `VCI_STORE_TOKEN` a token apart from it.**
 - `VCI_*` variables are built-in *ignore*: they reach every test process (`COMMON_IGNORE` in vci-adapter/src/lib.rs).
   Pull-request code runs in those tests, so vci-cli's `main` handles the URL specially. Its first statement is
-  `unsafe { store::take_secrets() }`: it reads every name in `select::NEVER_TO_CHILDREN` (`VCI_STORE_URL`, and
-  `VCI_STORE`, where a connection string may be put by mistake),
+  `unsafe { store::take_secrets() }`: it reads every name in `select::NEVER_TO_CHILDREN` (`VCI_STORE_URL`,
+  `VCI_STORE_TOKEN`, and `VCI_STORE`, where a connection string may be put by mistake),
   keeps the values in a process-wide map of `Secret`s (a value that is not UTF-8 is kept lossily), and removes them
   from its own environment (`std::env::remove_var`, sound while the process has one thread). No test, adapter probe,
   hook or git command it starts can see the URL.
 - `envpolicy::build_child_env` also drops those names, in loose mode too and even when `[env] set` names them, as
   defence in depth.
-- The env closure passed to `resolve` (`store::env_lookup`) answers `VCI_STORE_URL` and `VCI_STORE` from the kept
-  copies.
+- The env closure passed to `resolve` (`store::env_lookup`) answers `VCI_STORE_URL`, `VCI_STORE_TOKEN` and
+  `VCI_STORE` from the kept copies.
 - `Secret`'s `Debug` and `Display` print it redacted, and `Secret::scrub` removes the URL and its password (raw and
-  percent-decoded) from every library error.
+  percent-decoded) from every library error. A token is a `Secret::opaque`: redacted whole (`***`), and scrubbed raw,
+  percent-encoded and percent-decoded. `authToken` (and `auth_token`) is a secret query key, like `password`.
 - `select::redact` masks a URL's userinfo as everything between `//` and the **last** `@`, so a password holding an
   unencoded `@`, `/` or `?`, in any order, is masked whole; where a path or query holds an `@` instead, more is
   masked than needed, never less. A secret query value that runs past that `@` (`?password=a@b`) is masked with it.
@@ -745,7 +763,7 @@ the git-specific assertions.
 
 ```toml
 [store]
-backend = "postgres"          # "git-meta" (default) | "sqlite" | "postgres" | another registered backend
+backend = "postgres"          # "git-meta" (default) | "sqlite" | "postgres" | "libsql" | another registered backend
 connect_timeout = "5s"        # overridden by VCI_STORE_CONNECT_TIMEOUT_SECS
 timeout = "30s"               # one statement or request; overridden by VCI_STORE_TIMEOUT_SECS
 
@@ -758,14 +776,19 @@ namespace = "acme-monorepo"   # VCI_STORE_NAMESPACE overrides; default: the repo
 pool = 8                      # connections per vci process, 1..=64
 manifest_grace = "1h"         # an unreferenced manifest put more recently is kept; at most 30 days
 
+[store.libsql]                # never an address or a token
+path = "vci-store.libsql"     # the local file or the replica, relative to the git common directory, no `..`
+replica = true                # read a local replica of the VCI_STORE_URL server (VCI_STORE_SYNC=replica too)
+namespace = "acme-monorepo"   # VCI_STORE_NAMESPACE overrides; default: the repository id
+
 [store.options]               # non-secret strings for backends vci-store does not describe (HTTP, gRPC)
 # region = "eu"
 ```
 
 - Durations in `vci.toml` are `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"` or a bare number of seconds. The environment
   variables take a number of seconds only.
-- `url` (in `[store]` or `[store.postgres]`) and `host`, `user`, `password` and `dbname` (in `[store.postgres]`) are
-  **refused**. Every checkout, a pull request's included, carries `vci.toml`, so a password there would be public, and
+- `url` (in `[store]`, `[store.postgres]` or `[store.libsql]`), `host`, `user`, `password` and `dbname` (in
+  `[store.postgres]`) and `token` and `authToken` (in `[store.libsql]`) are **refused**. Every checkout, a pull request's included, carries `vci.toml`, so a password there would be public, and
   a host there would let a pull request send CI's credentials to a server it controls. The error names the keys and
   never their values: the refused keys deserialize into a value-less marker (`select::Refused`).
 - `[store]` is **never an input**. It is not part of `Project::config_hash`, so switching backend invalidates no
@@ -799,22 +822,26 @@ manifest_grace = "1h"         # an unreferenced manifest put more recently is ke
 
 Errors (each displayed as `attestation store: <message>`):
 
-- connection keys in `vci.toml` (`store.url`, `store.postgres.url`, `.host`, `.user`, `.password`, `.dbname`);
+- connection keys in `vci.toml` (`store.url`, `store.postgres.url`, `.host`, `.user`, `.password`, `.dbname`,
+  `store.libsql.url`, `.token`, `.auth_token`);
 - a URL in `VCI_STORE`;
 - a malformed backend name;
-- an unknown backend (`unknown store backend "x" (from $VCI_STORE); this vci has: git-meta, sqlite, postgres`, from
-  `vci_store::open`);
+- an unknown backend (`unknown store backend "x" (from $VCI_STORE); this vci has: git-meta, sqlite, postgres,
+  libsql`, from `vci_store::open`);
 - a backend built out (`this vci was built without the postgres store (cargo feature `postgres`)`, from
   `MissingBackend`);
 - `VCI_STORE` disagreeing with the scheme of `VCI_STORE_URL`;
 - postgres without `VCI_STORE_URL` (the message adds that GitHub does not pass secrets to pull requests from forks);
 - a `sqlite:` `VCI_STORE_URL` without a path, or whose path holds `://` (another scheme's URL, which may carry a
   password, is never printed as a path);
+- for libsql, a `VCI_STORE_URL` that is neither a server (`libsql://`, `https://`, `http://`) nor `file:<path>` (not
+  printed), and, when the store opens, a server URL with a user or password, a fragment or a query parameter other
+  than `authToken` and `tls` (not printed), or the remote modes without a URL;
 - a timeout outside (0, 1 h];
 - a bad schema name or namespace (a namespace is 1 to 128 of `A-Z a-z 0-9 . _ : / @ -`);
 - a pool outside 1..=64;
 - a grace over 30 days;
-- a SQLite path in `vci.toml` that is absolute or contains `..`;
+- a SQLite or libSQL path in `vci.toml` that is absolute or contains `..`;
 - a working-tree `[store]` that cannot be read (above).
 
 Warnings, printed once per process as `vci: warning:` lines when the store is opened, and added to the plan JSON's
@@ -822,8 +849,12 @@ warnings:
 
 - `[store] backend` overridden by the environment (`vci.toml [store] backend = "sqlite" is overridden: using git-meta
   (from $VCI_STORE)`);
-- `[store.sqlite]` or `[store.postgres]` ignored because another backend is selected;
-- `VCI_STORE_URL` set (with a scheme that selects no backend) while the backend is git-meta.
+- `[store.sqlite]`, `[store.postgres]` or `[store.libsql]` ignored because another backend is selected;
+- `VCI_STORE_URL` set (with a scheme that selects no backend) while the backend is git-meta;
+- `VCI_STORE_TOKEN` set while no libSQL server is used (`$VCI_STORE_TOKEN is ignored: the store is sqlite (from
+  $VCI_STORE)`, or `… libsql in local mode …`);
+- a libSQL replica asked for while `VCI_STORE_URL` names no server (`the libsql replica (from $VCI_STORE_SYNC) is
+  ignored: … so the store is a local file`).
 
 ### Command-line surface
 
@@ -843,7 +874,8 @@ warnings:
     attestations: 12
     ```
 
-    The settings are `Selection::describe()` (secrets redacted; the backend-specific ones for sqlite and postgres),
+    The settings are `Selection::describe()` (secrets redacted; the backend-specific ones for sqlite, postgres and
+    libsql: its `mode`, `path` or `replica`, whether a `token` is set and where, and its `namespace`),
     or `settings: not resolved (see the error)`. The status is `ready`, `ready (schema version N)`, `absent: nothing
     is stored yet (<advice>)` or `unavailable`.
   - JSON: `kind`, `location`, `settings` (`[{name, value, source}]`), `caps` (`sharedWrites`, `lazyValues`,
@@ -855,7 +887,7 @@ warnings:
 - `vci init` sets up `.git-meta` and the meta remote only when the selected kind is `git-meta`. It calls vci-git
   directly (`AttestStore::new(repo)`).
 - Later: `vci store init` (create or migrate a SQL schema with an owner role), `vci store copy --from <backend>`
-  (section 19), `vci init --store <backend>`, and the action inputs `store` and `store-url` (the latter masked with
+  (section 20), `vci init --store <backend>`, and the action inputs `store` and `store-url` (the latter masked with
   `::add-mask::`).
 
 ---
@@ -905,7 +937,9 @@ What each command does on a store error:
 - A backend must therefore report "this store cannot be used here" (an unreachable server, a file that is not a
   database, a read-only role or file, a missing schema) with those variants, never as `Backend`: SQLite's garbage file
   is `Unavailable`, an unwritable directory `Denied` or `Unavailable`; PostgreSQL's unreachable server `Unavailable` or
-  `Timeout`, a read-only role `Denied`, no schema `NotInitialized`.
+  `Timeout`, a read-only role `Denied`, no schema `NotInitialized`; libSQL's unreachable server, refused token or
+  missing database `Unavailable` or `Timeout`, a read-only token `Denied`, a token that may not create the tables
+  `NotInitialized`.
 
 **`FailedStore`.** When selection or opening fails, `for_repo` returns `FailedStore::for_request(factories, wanted,
 &err)`. Its kind is the requested backend's when a registered factory has that name, else `unknown`. When the
@@ -921,7 +955,10 @@ bounds every wait:
   tried in turn within its share), statement (30 s; 600 s
   for `vci prune`), lock (10 s), idle-in-transaction (60 s), TCP
   keepalives and `tcp_user_timeout` (30 s), and a pool checkout bounded by the connect timeout.
-- SQLite: `busy_timeout`, the store timeout (30 s).
+- SQLite (and libSQL's local and replica files): `busy_timeout`, the store timeout (30 s).
+- libSQL on a server: connect (5 s, TCP and TLS), each request (30 s; 600 s for `vci prune`), retries of a busy
+  server within the request's deadline, a pool checkout bounded by the connect timeout; a replica's sync is one
+  request under the same bounds, and a failed one falls back to the replica as it is (section 18).
 - git-meta: `VCI_LOCK_TIMEOUT_SECS`.
 
 **Circuit breaker** (network backends). After the first `Unavailable` or `Timeout` of reaching the server, a network
@@ -932,7 +969,7 @@ failure takes at most the connect timeout plus 1 s and the next 40 calls take un
 
 **git-meta's documented exception.** Its prefetch takes the per-repository exchange lock and may wait up to
 `VCI_LOCK_TIMEOUT_SECS` (default 600 s) behind another vci's fetch or push in the same repository, as in 2.7. A
-shorter deadline for plan-time prefetch is out of scope here (section 20).
+shorter deadline for plan-time prefetch is out of scope here (section 21).
 
 ---
 
@@ -948,7 +985,8 @@ The store is called concurrently by:
 Hence `AttestationStore: Send + Sync`.
 
 - **Non-`Sync` resources are pooled inside the backend.** git-meta pools `Reader`s (section 15). SQLite pools
-  `rusqlite::Connection`s (`Send`, not `Sync`), and PostgreSQL `postgres::Client`s (`Send`, not `Sync`; each runs
+  `rusqlite::Connection`s (`Send`, not `Sync`), libSQL its Hrana connections (on one current-thread tokio runtime per
+  handle, driven by `block_on` from the calling thread), and PostgreSQL `postgres::Client`s (`Send`, not `Sync`; each runs
   a private current-thread tokio runtime that is invisible to vci). The pool hands one resource to each concurrent
   caller and takes it back afterwards, so concurrency matches the per-thread readers of 2.7.
 - **`WriteBatch` is `!Send`.** It ends on the thread that opened it, and only that thread's writes join it.
@@ -965,7 +1003,7 @@ Hence `AttestationStore: Send + Sync`.
   or `.done(label)`. This emits `store: <kind>: <step>: <secs>s` through `vci_core::timing_line!`, so the line is
   recorded in the metrics log (`vci metrics` groups steps with numbers replaced by `#`) and printed under
   `VCI_TIMING`. Labels carry counts, never paths, test ids, hosts or URLs, and stay stable because metric history is
-  keyed by them. SQLite and PostgreSQL use `Step`; git-meta keeps its own lines.
+  keyed by them. SQLite, PostgreSQL and libSQL use `Step`; git-meta keeps its own lines.
 - **git-meta** keeps every line it printed in 2.7 (`fetch: …`, `hydrate: …`, `read values: …`, `push: …`).
 - **`put_manifest` seconds.** The static `AttestStore::put_manifest_seconds()` call in run.rs became
   `timing_report()`. git-meta returns `"put_manifest seconds: session …, read current …, set …, stamp …"`, and run.rs
@@ -981,6 +1019,11 @@ Hence `AttestationStore: Send + Sync`.
   `prefetch N manifest(s), K statement(s)`, `write batch: N manifest(s), M attestation(s), K removal(s), S
   statement(s)`, `list N unit(s)`, `read N value(s)`). It also exposes an inherent `PgStore::statements()` counter for tests, and sets
   `application_name` to `vci <version> <command>` so `pg_stat_activity` shows which command each connection serves.
+- **libSQL** prints its local and replica files' SQLite lines under `store: libsql: …`, and on a server labels with
+  request counts (`store: libsql: prefetch N unit(s), M value(s), K request(s)`, `prefetch N manifest(s), K
+  request(s)`, `write batch: N manifest(s), M attestation(s), K removal(s), R request(s)`, `list N unit(s)`, `read N
+  value(s)`, `sync replica: N attestation(s), M manifest(s), everything|changes`). `LibsqlStore::requests()` counts
+  requests for tests.
 - **The metrics log** has `"store": "<kind>"` (the first store the command opened), or `null`.
 
 ---
@@ -994,7 +1037,8 @@ Hence `AttestationStore: Send + Sync`.
 - `set_command(&'static str)`: `main` names the running command (`Cmd::name()`) for `OpenContext::command`;
 - `factories(&Repo) -> Vec<Box<dyn BackendFactory>>`: `GitMetaFactory::new(repo.clone())`, then `SqliteFactory` or
   `MissingBackend{kind: "sqlite", feature: "sqlite"}`, then `PostgresFactory` or `MissingBackend{kind: "postgres",
-  feature: "postgres"}`, by cargo feature (both on by default);
+  feature: "postgres"}`, then `LibsqlFactory` or `MissingBackend{kind: "libsql", feature: "libsql"}`, by cargo
+  feature (all on by default);
 - `open_context(&Repo, command) -> OpenContext`:
   - `git_dir` is `repo.git_dir()` (`<root>/.git` if that fails);
   - `git_common_dir` is the directory `<git_dir>/commondir` names, git's own rule for linked worktrees, else
@@ -1072,6 +1116,8 @@ vci_store::conformance_suite!(Some(Box::new(SqliteWorlds) as Box<dyn vci_store::
 vci_store::conformance_suite!(testkit::available().then(|| Box::new(PgWorlds) as Box<dyn StoreFactory>));
 // crates/vci-git/tests/conformance.rs
 vci_store::conformance_suite!(Some(Box::new(GitMetaWorlds) as Box<dyn StoreFactory>));
+// crates/vci-store-libsql/tests/conformance.rs: once per mode, in modules local, remote and replica
+vci_store::conformance_suite!(testkit::available().then(|| Box::new(Worlds) as Box<dyn StoreFactory>));
 ```
 
 Run it with:
@@ -1080,12 +1126,13 @@ Run it with:
 cargo test --locked -p vci-git --test conformance
 cargo test --locked -p vci-store-sqlite --test conformance
 VCI_TEST_POSTGRES=require cargo test --locked -p vci-store-postgres --test conformance   # a server from the testkit
+VCI_TEST_LIBSQL=require cargo test --locked -p vci-store-libsql --test conformance       # sqld, turso dev or Docker
 ```
 
 The macro expands to one `#[test]` per scenario, so failures are named and run in parallel, each in its own world. A
 factory of `None` makes every test say `skipping <name>: this backend is not available here` and pass.
 
-The table below is what each scenario checks. The three worlds:
+The table below is what each scenario checks. Three of the worlds (libSQL's are in section 18):
 
 | | git-meta (`GitMetaWorlds`) | SQLite (`SqliteWorlds`) | PostgreSQL (`PgWorlds`) |
 |---|---|---|---|
@@ -1111,8 +1158,9 @@ What the scenarios can and cannot check through the trait:
   referenced or a base from one kept because it is recent; PostgreSQL's own test 11 checks those with grace 0.
 - **c16** bounds the first failure at 4 s (worlds configure a connect timeout of at most 3 s) and 40 more calls at 2 s.
   With an exchange the first failing call is `fetch`, since reads of the local store still work.
-- **c29** and **c30** are skipped by every backend but PostgreSQL (not shared; no failing batch hook), and **c14** by
-  every backend but git-meta (no exchange). A skipped part says so on stderr.
+- **c29** is skipped by every store that is not shared (git-meta, SQLite, libSQL's local file), **c30** by every one
+  without a failing batch hook (all but PostgreSQL and libSQL's remote mode), and **c14** by every backend but git-meta
+  (no exchange). A skipped part says so on stderr.
 
 - **Branching.** Scenarios branch only on `Caps` and on `exchange().is_some()`.
 - **Optional hooks.** `World` hooks that return `None` or `false` skip that part of a scenario and say so on stderr:
@@ -1168,9 +1216,11 @@ Backends keep their own tests for what is theirs:
 - SQLite adds its own tests for the WAL checkpoint, the read-only fallback, `application_id` and `user_version`.
 - PostgreSQL adds its own tests for advisory-lock migrations, the statement timeout, the role and RLS recipes,
   namespace isolation, batch deduplication and the round-trip budget.
+- libSQL adds its own for the local file's format, the request budget, tokens, deadlines and the replica's sync
+  (section 18).
 - vci-store's own `tests/keys.rs` (the key format and its edge cases, `ManifestRef`, `StoredEnvelope::from_key` and
   `state()`, `NOT_FETCHED` byte for byte, `StoreError` display, `FailedStore`) and `tests/select.rs` (the precedence
-  matrix, refused keys, timeouts and bounds, `redact` and `Secret::scrub`).
+  matrix, refused keys, timeouts and bounds, `redact` and `Secret::scrub`, libSQL's modes and tokens).
 
 ### The temporary-PostgreSQL test helper
 
@@ -1584,7 +1634,7 @@ absolute sizes may differ there.)
   units with set-aside candidates, then `read_values` of those candidates, then `Manifests` for the roots found not
   fetched; the per-handle cache and the statement budget below must cover that.
 - `OpenContext::long_running` is true for `vci prune`, and means a statement timeout of at least 600 s and a manifest
-  grace of 0 (no trait change; this settled section 20's question).
+  grace of 0 (no trait change; this settled section 21's question).
 
 ### Connection handling
 
@@ -1808,7 +1858,7 @@ manifests of about 490 bytes), one connection, debug build, two runs with identi
 The unchanged plan reads the 1,800 listing rows, 1,200 values (the 600 `choose` picked, then the second-newest 600)
 and 1,202 manifests. When every unit runs, 3,000 value rows are sent for 1,800 distinct values: round 2's
 `prefetch(Units{choose: None})` fetches all 1,800 again because `read_values` moved the first 1,200 out of the cache
-(about 3.8 MB, a third of the bytes; section 20). The synthetic manifests are tiny; on a real repository input
+(about 3.8 MB, a third of the bytes; section 21). The synthetic manifests are tiny; on a real repository input
 manifests, often megabytes, dominate. Not measured on vex.
 
 ### Writes
@@ -1915,7 +1965,287 @@ instead of about 3,000 round trips. Inside a deferred batch:
 
 ---
 
-## 18. Notes for an HTTP or gRPC backend
+## 18. Backend: libSQL (Turso)
+
+`vci-store-libsql` holds `LibsqlFactory` (kind `libsql`, registered under vci-cli's cargo feature `libsql`, on by
+default), `LibsqlStore` (`open(&Selection, &OpenContext)`, which does no I/O; `mode()`, `path()`, `namespace()`,
+`requests()`, every HTTP request sent; doc-hidden `__execute_for_test` and `__query_for_test`), `LibsqlError` (the
+payload of `StoreError::Backend` for unexpected errors), `table_prefix(namespace)` and the testkit (below). The
+modules are `conn` (the URL and the token, the TLS connector, the runtime, the pool, the circuit breaker, deadlines,
+error classification and scrubbing, SQL literals), `remote` (the tables of a namespace, reads, prefetch, hints),
+`cache`, `batch` and `replica`. One store, three modes, chosen from the selection (section 9):
+
+| mode | selected by | reads | writes | `caps` |
+|---|---|---|---|---|
+| local | `VCI_STORE=libsql` with no `VCI_STORE_URL`, or `VCI_STORE_URL=file:<path>` | a file, `<git common dir>/vci-store.libsql` by default | the file | `LOCAL.with_hints(true)` |
+| remote | a `libsql://` `VCI_STORE_URL` (or `https://`/`http://` with `VCI_STORE=libsql`) | the server, through a per-handle cache | the server, one request per batch | `with_shared_writes(true).with_hints(true)` |
+| replica | remote, plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true` | a local file synced from the server once per process | the server, then written through to the file | as remote |
+
+**Crate.** `vci-store-libsql` depends on `vci-store`, `vci-core`, `vci-store-sqlite` (the schema SQL and the file
+format), `serde_json`, `libsql = { version = "=0.10.0", default-features = false, features = ["remote"] }` (the Hrana
+client: HTTP, in Rust), and, for the connector it hands libsql, `hyper` 0.14 (`client`, `http1`, `tcp`; the version
+libsql's connector trait is written against), `http` 0.2, `tower-service` 0.3, `tokio` (`rt`, `time`, `net`),
+`tokio-rustls` 0.26 and the PostgreSQL store's pins `rustls = "=0.23.45"` (`ring`, `std`, `tls12`) and
+`webpki-roots = "=1.0.9"`. One `rustls` resolves and `cargo tree -i aws-lc-rs` is empty. libsql 0.10.0 was published
+on 13 October 2026, twelve days before it was pinned, not the two weeks decision 13 asks for; it is the version the
+work was specified against. Two of libsql's features are left off on purpose:
+
+- **`core`** (libsql's local engine, which its `replication` and `sync` features, the embedded replicas, build on)
+  compiles libSQL's SQLite fork with the ordinary `sqlite3_*` symbols, which rusqlite's bundled SQLite (git-meta-lib's
+  and the SQLite store's) exports too. Checked with a binary holding both: one copy wins at link time for every caller
+  (rusqlite reported SQLite 3.47.0, libSQL's version, not its own), and libsql's first `Database` then panics on its
+  start-up assertion (`sqlite3_config` returns 21, `SQLITE_MISUSE`, because the library was initialized already). So
+  vci links no libSQL engine: the local mode keeps the SQLite store's file through `vci-store-sqlite`, and the replica
+  is vci's own, synced over Hrana (below).
+- **`tls`** brings `hyper-rustls` 0.25 and a second `rustls` (0.22). vci gives libsql a connector of its own instead:
+  TCP (`TCP_NODELAY`), then rustls with the `ring` provider and the webpki roots, ALPN `http/1.1`.
+
+Each handle owns a current-thread tokio runtime, started on first use, on which every request runs (`block_on` from
+the calling thread); the trait stays synchronous. The store costs the release binary about 4.3 MiB: on macOS arm64
+(Rust 1.99.1, dynamic), 25,339,616 bytes with the default features against 20,811,120 with `--no-default-features
+--features sqlite,postgres` (stripped: 19,912,984 against 16,472,296). Most of it is what libsql's `remote` feature
+pulls in: hyper 0.14 with its HTTP/2 stack (`h2`, from libsql's `hyper` features), `tower`, `libsql-hrana`, and
+libSQL's SQL parser (`libsql-sqlite3-parser`, with which `execute_transactional_batch` splits statements). Not
+measured on the static musl build of section 17.
+
+**What the command line relies on**:
+
+- `status()`: local as SQLite's (``Absent{advice: "the first `vci run` creates it"}``); remote ``Absent{advice: "the
+  first `vci run` creates it"}`` until the namespace's tables exist, `Ready{schema_version: Some(1)}` after; replica
+  ``Absent{advice: "nothing was synced from <url> yet; the first `vci run` stores records there"}`` while its file
+  holds nothing.
+- `exchange()` is `None`: `vci fetch` says `vci: the libsql store at <location> is local|shared: nothing to fetch (N
+  attestations stored)` (local for the local mode, shared for the others) and `vci push` that there is nothing to
+  push.
+- `location()`: `<file> (local)`, `libsql://<host> namespace <ns> (remote)`, `<file> (replica of libsql://<host>
+  namespace <ns>)`. The URL is printed as written but without its query, so never with a token. `vci store info`
+  prints it, and its settings say `mode`, `path` or `replica`, `token` (`(set)`, `(the URL's authToken)` or
+  `(none)`, never the value) and `namespace`.
+- Conditions that mean the store cannot be used are `Unavailable`, `Timeout`, `Denied`, `NotInitialized`,
+  `Incompatible` or `Config` (section 10); `Backend(LibsqlError)` only for a statement the server refused for a reason
+  vci does not know.
+- The publication gate (section 7) applies to the remote and replica modes, not to the local one.
+
+### The local mode
+
+`LibsqlStore` wraps a `vci_store_sqlite::SqliteStore` opened with `SqliteOptions { kind: "libsql", .. }`: the same
+file format (`application_id` 'vci1', `user_version` 1, schema v1 of section 16), the same statements, batches, WAL
+checkpoint, read-only fallbacks and errors, under the name `libsql` (in `kind()`, errors and timing lines). The file is
+`<git common dir>/vci-store.libsql`, `[store.libsql] path` (relative to the git common directory, no `..`) or
+`VCI_STORE_URL=file:<path>` (absolute or relative). A SQLite store's file can be copied to it and back unchanged.
+
+### The schema on a server
+
+The SQL of schema v1 lives once, in `vci_store_sqlite::sql` (`Names`, `Sql`, `sql::plain()`): the SQLite store
+creates its tables from it, and the libSQL store creates the same tables, indexes and statements under a name prefix
+per namespace (`Names::prefixed`). A libSQL database is one SQLite database, so namespaces are table sets:
+
+```sql
+CREATE TABLE IF NOT EXISTS vci_schema (
+  ns TEXT NOT NULL PRIMARY KEY, prefix TEXT NOT NULL, version INTEGER NOT NULL,
+  vci_version TEXT NOT NULL, created_at INTEGER NOT NULL, log_floor INTEGER NOT NULL DEFAULT 0);
+-- per namespace, prefix vci_<the first 16 hex digits of BLAKE3(namespace)>_:
+--   <prefix>attestations, <prefix>manifests, <prefix>memo, <prefix>flags   (schema v1, section 16)
+CREATE TABLE IF NOT EXISTS <prefix>log (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  test_key TEXT, signer TEXT, storage_key TEXT, root TEXT, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
+```
+
+- **Created on the first write**, in one transaction (every `CREATE … IF NOT EXISTS`, then `INSERT INTO vci_schema …
+  ON CONFLICT (ns) DO NOTHING`), so concurrent first writers are safe (c21). Reads never create anything: a missing
+  table (`no such table`) reads as an empty store. Hints never create the tables.
+- **Versioned** per namespace (`vci_schema.version`): a version above 1 is `Incompatible`, and every later call of the
+  handle says so without a request. A token that may not create tables gets `NotInitialized{advice: "the first vci
+  run with a token allowed to create tables creates them"}`.
+- **Bytewise order** comes with SQLite's `BINARY` collation, as in section 16.
+- **The log** names every slot and root a write touched (a put, a removal, a manifest), for replicas. Entries older
+  than 30 days are deleted once per handle by its first write, which records the newest deleted `seq` in
+  `vci_schema.log_floor`: a replica that last synced before it syncs everything.
+
+### Connection handling
+
+- **The URL** comes only from `VCI_STORE_URL`: `libsql://<host>[:<port>][/<path>]` is HTTPS (`?tls=0`: HTTP, as the
+  Turso CLI writes a local server's URL), `https://` and `http://` are themselves. Its query may hold `authToken` and
+  `tls`; any other parameter, a user or password, or a fragment is a `Config` error that does not print the URL
+  (an unknown parameter's name is printed only when it is short and plain).
+- **The token** is `VCI_STORE_TOKEN`, else the URL's `authToken`, sent as `Authorization: Bearer`. Both are secrets
+  (section 9): `VCI_STORE_TOKEN` is in `NEVER_TO_CHILDREN`, kept as a `Secret::opaque` (redacted whole as `***`), and
+  `select::redact` masks `authToken` in a URL. Every message passes through `Conn::scrub` (the URL's secrets, raw,
+  percent-encoded and percent-decoded, then the token); `location()`, `Debug` and `vci store info` never hold either.
+- **TLS** is always verified, against the webpki roots; there is no setting for another CA yet (section 21).
+- **Bounded time.** The connector gives up on a connection (TCP and TLS) after the connect timeout (5 s); a request
+  after the request timeout (`VCI_STORE_TIMEOUT_SECS`, 30 s; ten minutes for `vci prune`, `OpenContext::long_running`);
+  a pool checkout after the connect timeout. While the server answers that the database is locked, that it is out of
+  connections (HTTP 429) or that it interrupted the statement, the request is tried again with growing pauses until
+  its deadline (`Timeout{operation: "waiting for another writer"}` then). A server stream idle for more than 4 s is
+  reset before use (servers expire idle streams after about 10 s), and a stream the server no longer knows is
+  replaced once.
+- **Circuit breaker.** Per handle, as PostgreSQL's (section 17): the first connection failure, HTTP 401, or 403 on a
+  read (`the server asks for a token: set $VCI_STORE_TOKEN`, or `the server refused the token …`), 404 (`no libsql
+  database there`), Hrana API error, or deadline that ran out is latched, and every later call of the handle fails at
+  once with `… (failed earlier in this process; not retried)`. Busy retries, `Denied` and `Backend` are not latched.
+- **Errors.** A write the server refuses (HTTP 403 on a write, as for a read-only token: `Authorization forbidden:
+  … doesn't not have Write permission`; or a refusal worded read-only, unauthorized or forbidden) is
+  `Denied{operation: "write"}`, not latched: the hints a plan writes and the units `vci run` stores are refused, and
+  reads go on, on a new stream (the server closes the refused one; a stream whose baton the server no longer knows is
+  replaced and the request tried once more). Creating the tables refused that way is `NotInitialized`.
+- **Pool.** At most `min(VCI_JOBS, 4)` Hrana connections per handle. Each keeps the statements it prepared: Hrana's
+  `prepare` asks the server to describe the statement (one request), once per connection and statement.
+- **Namespace.** As PostgreSQL's: `VCI_STORE_NAMESPACE`, else `[store.libsql] namespace`, else the repository id; a
+  shallow clone needs an explicit one, and a namespace is 1 to 128 of `A-Z a-z 0-9 . _ : / @ -`.
+
+### Reads (remote mode) and the per-handle cache
+
+The cache is `vci-store-postgres`'s, with the same rules (section 17, "Reads and the per-handle cache"): filled only
+by `prefetch` and `read_values`' manifest read-ahead, kept current by this handle's own writes, values moved out on
+their first read, capped at 256 MiB. Each read is one statement whatever the number of keys, the keys bound as one
+JSON array (`IN (SELECT value FROM json_each(?1))`), 5,000 to a request:
+
+| method | on a cache miss |
+|---|---|
+| `list_units` | `SELECT test_key, key, target FROM <a> WHERE test_key IN (…) ORDER BY test_key, key` |
+| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference and those manifests' bases, which go to the cache |
+| `manifest`, `manifests` | `root = ?1`; `root IN (…)` |
+| `read_units` | fully cached units from the cache (values kept); the rest in one statement with values |
+| `list_all`, `count`, `manifest_roots`, `read_all` | one statement each, never cached |
+| `orphan_manifests` | one statement: empty when a row's `ref_state` is 0, else the roots no row references |
+
+**`prefetch(Units{ids, choose})` is two requests**: the listings of every unit (from the server even when cached, which
+is where other writers' changes are picked up), then the values `choose` picks that are not cached, with their
+manifests and bases. `prefetch(Manifests)` is one request for the roots not cached as stored, with their bases.
+Hrana's batch could carry several statements in one HTTP request; one statement per read already does, so a plan of
+1,200 units is the status, the flags, the memo, two prefetches of two requests and the descriptions of the statements
+on each connection: `a_plan_costs_a_handful_of_requests` checks at most 8 requests for the status and a prefetch of
+300 units, and none for the listings, the batch read and 300 manifest reads from 8 threads after it.
+
+### Writes (remote and replica modes)
+
+`batch()` is deferred, with PostgreSQL's queue (section 17, "Writes"): per slot the last put, the slots a removal
+emptied, the removed keys, per root the last manifest, and `remove_manifests` keeping what the open batch will write
+or reference. `finish` writes the queue as **one request**, `execute_transactional_batch` (Hrana runs the statements
+between `BEGIN` and `COMMIT`, each conditioned on the previous one's success):
+
+1. the manifests, one multi-row upsert (the value replaced only when it differs or is unreadable; `put_at` refreshed);
+2. the removed keys (`DELETE … WHERE key IN (…)`) and the emptied slots;
+3. the attestations, one multi-row upsert on the slot, replacing the key, the value and the columns derived from them
+   when either changed;
+4. the log rows of every slot and root touched, and once per handle the log's prune.
+
+Values travel as SQL literals, since the transactional batch takes SQL text only: UTF-8 bytes without NUL as text cast
+to a blob (`CAST('…' AS BLOB)`, the same bytes), anything else as hex. A queue of 2,000 writes or 8 MiB is written
+early, in a request and transaction of its own (a failed early write fails `finish`). A write outside a batch is a
+batch of one: `put` one request (an unhinted put first reads its slot's key), `put_manifest` two (it compares the
+stored bytes first), `remove` two (it reads which keys exist first). `remove_manifests` reads the removable roots (put
+before the grace period, an hour, none for `vci prune`; not referenced; nobody's base), then deletes them with the same
+conditions and logs them: two requests.
+
+`a_plan_costs_a_handful_of_requests` writes 300 units (600 attestations and 300 manifests) in at most 6 requests; the
+release-build test `many_units_are_listed_and_read_quickly` (1,200 units of 18 KB against a local `sqld`) wrote them
+in 0.64 s and 8 requests (three transactions: the queue flushes at 8 MiB), and listed and read them on a new handle in
+0.10 s and 4 requests.
+
+### The replica mode
+
+The replica is a SQLite store file (the local mode's format), by default `<git common dir>/vci-store.libsql`, else
+`VCI_STORE_REPLICA` (absolute or relative to the git common directory) or `[store.libsql] path`. Beside it,
+`<file>.sync` (JSON: `{"v": 1, "source": "<url> namespace <ns>", "seq": N}`) says which server and namespace it copies
+and up to which log entry.
+
+- **One sync per process**, the first time the store is read (`warm()` starts it on a thread at the start of a plan):
+  one request reads, in one snapshot, the log's high-water mark and floor and every attestation and manifest the log
+  names after `seq` (everything when the file is new, copies another source, or is older than the log floor), and it
+  is applied to the file in one transaction: each slot and root touched ends as the server has it (keys of the slot the
+  server no longer holds removed; after a full sync, every slot and root of the file is reconciled), so a reader of
+  the file never sees half of it. `<file>.sync` is written before the file is first changed (at entry 0, so an
+  interrupted first sync is redone in full) and after the transaction. Timing line: `store: libsql: sync replica: N
+  attestation(s), M manifest(s), everything|changes`.
+- **A failed sync never blocks.** It is bounded by the connect timeout (connecting) and the request timeout (the
+  request), latches the breaker, prints `vci: warning: cannot sync the libsql replica <file> from <url>: <error>;
+  reading the replica as it is`, and the store reads the file as it was: a stale replica only makes units run. Writes
+  then fail at once (the breaker), so `vci run` refuses each unit and keeps the tests' exit code.
+- **Writes** go to the server as in the remote mode; after each request that stored them they are written to the file
+  in one transaction (a failure is a warning; the next sync brings them). A file the sync found nothing for (the
+  server had no tables yet) gets its `<file>.sync`, at entry 0, before the first write reaches it.
+- **Reads** are the SQLite store's on the file (the plan's 4,000 listings, the batch read and the manifests: no
+  request). `prefetch` only makes sure the sync ran. Hints go to the server, as in the remote mode.
+- **A file that is not a replica** (it exists without `<file>.sync`: a local-mode store at the same default path, say)
+  is never written: the store is `Unavailable` ("… is not a replica …: set $VCI_STORE_REPLICA to another file").
+- **Costs.** The release-build test above synced 1,200 units of 18 KB into a new replica in 0.41 s (one statement)
+  and read them all from it in 11 ms.
+
+This is the on-ramp for CI: no cache of the store to restore or save, and a long-lived machine (a developer's clone, a
+self-hosted runner) syncs only what changed since its last command. An ephemeral runner starts without the file and
+syncs everything once, which is what a remote plan reads anyway, then reads locally.
+
+### Measured
+
+On prove-perf's synthetic world (1,200 Go packages, each attested at three commits: 3,600 attestations of about 3 KB
+and 3,601 manifests on a local `sqld` 0.24.32, written there by three `vci run`s in the remote mode), release build,
+macOS arm64, two repetitions, on a laptop that other work kept at a load average of 35 to 315. Plan totals swung from
+14 to 65 s in every mode alike, dominated by rehashing inputs; the store's own timing lines are what compare:
+
+| step | SQLite file (and libSQL local) | libSQL remote | libSQL replica |
+|---|---|---|---|
+| plan, every unit skips: listings and the chosen values | 0.01 s (1,200 listings, 2,400 values) | `prefetch 1200 unit(s), 1200 value(s), 4 request(s)` 0.42-0.57 s (3.5 s at the worst load), then 1,200 more values in one request, 0.04-0.06 s | the sync, then as SQLite |
+| plan, every unit runs (round 2) | 0.01 s | `prefetch 1200 unit(s), 3600 value(s), 2 request(s)` 0.15-0.38 s (1.7 and 3.3 s at the worst load) | as SQLite |
+| the replica's sync | | | everything (3,600 + 3,601 records, 7,201 rows written): 0.6-9.3 s, median 3.4 s; nothing new: 0.01-0.04 s |
+| `vci run`, 1,200 units edited: the store's writes | 2,400 records in one transaction, 0.20-0.76 s | 1,200 manifests and 1,200 attestations in one request, 0.14-0.25 s | that request, then 2,400 records written through, 0.10-0.11 s |
+| `vci run`: "check, sign and store" | 0.47-1.80 s | 0.35-1.11 s (an empty namespace; 1.08-2.37 s into the filled one) | 0.80-1.03 s |
+
+Round 2 reads all 3,600 values again because `read_values` moved the first ones out of the cache, as PostgreSQL does
+(section 21, open item 2). Not measured against Turso's hosted service, where every request crosses the internet:
+a plan is then about a dozen round trips (the status, the flags, the memo, the prefetches, one read, the memo's
+write, and the first description of each statement on each connection) plus the bytes (about 11 MB of values for
+3,600 attestations here).
+
+### fetch, push, hints, operations
+
+- `vci fetch`, `vci push`, `--remote` and `--rewrite-history` behave as on any store without an exchange (section 7).
+- **Hints** (remote and replica): the memo and the flags are the namespace's tables on the server, as PostgreSQL's:
+  every flag read once per handle, `passing_on` memoized per tree, `remember_passing` one request (with the 7-day memo
+  prune, once per handle), every error swallowed, never creating the tables. Local: the file's tables.
+- **Turso.** A database per organization or per repository; a full-access token for the jobs that store (`vci ci
+  --push` on protected branches) and a read-only one for pull requests and developers (`turso db tokens create <db>
+  --read-only`): their writes are `Denied`, their plans read. Backups are Turso's (point-in-time restore); `vci
+  prune` keeps the tables small.
+- **Monitoring.** `LibsqlStore::requests()` counts requests; the timing lines carry them.
+
+### The temporary libSQL server for tests
+
+`vci_store_libsql::testkit` (`#[doc(hidden)]`, always compiled) finds a server once per test process:
+`VCI_TEST_LIBSQL_URL` (and `VCI_TEST_LIBSQL_TOKEN`) when set; else a throwaway `sqld` from `PATH` (Homebrew's
+`libsql` formula, the release binaries) on a free port of 127.0.0.1, else `turso dev`, else the Docker image
+`ghcr.io/tursodatabase/libsql-server:v0.24.32` when Docker is running, each retried on up to five ports. A watcher
+process (`/bin/sh` in its own process group, ignoring INT and HUP, reading a pipe only the test process holds) stops
+the server and deletes its directory when the test process ends, however it ends. Without a server the tests that
+need one say `skipping: no libsql server: …`, or panic under `VCI_TEST_LIBSQL=require`. Tests keep apart by namespace
+(`testkit::namespace()`). `start_sqld(args)` and `start_docker_with_env(env)` start servers of their own (the token
+test starts one that checks JWTs).
+
+**Tests.** `tests/libsql.rs`: the local file is a SQLite store file; a plan's request budget; slots, bytewise order,
+namespaces and a newer schema; orphans and the grace period; a closed port failing fast with neither token shown; a
+server that never answers given up on; bad URLs as `Config` errors without their secrets; tokens (none, wrong, right
+in either place, read-only: its hints and writes `Denied`, its reads going on) against a server that checks them,
+none of them shown; a replica syncing what changed, a replica's first write, a replica of an unreachable server; and, ignored outside release builds, 1,200 units of 18 KB.
+`tests/conformance.rs` runs the 34 scenarios in each mode (102 tests); the remote and replica ones need a server and
+skip without one. Its worlds:
+
+| | local | remote | replica |
+|---|---|---|---|
+| world | a temporary directory with one file | a namespace of its own | a namespace, and a directory of replica files |
+| peers | handles on the file | handles (own pools and caches) | a replica file each: writes through one handle, every read through a new handle (which syncs) |
+| `unreachable` + `secret` | a file that is not a database | a closed port with an `authToken` | none (a replica reads what it has; `tests/libsql.rs` checks it) |
+| `read_only` | `chmod 0444` the file | none | none |
+| `inject_raw`, `make_unreadable` | SQL on the file | SQL on the server (with a log row) | SQL on the server |
+| `failing_batches` | none | a URL with a path the server does not serve (HTTP 404) | none |
+
+The CLI tests (`crates/vci-cli/tests/store_backends.rs`) run run, plan, explain, supersession, prune, fetch, push and
+`vci ci`'s gate in the three modes, and a server on a closed port, remote and replica, failing open with neither token
+reaching any output, log or test.
+
+---
+
+## 19. Notes for an HTTP or gRPC backend
 
 The trait maps one-to-one onto a wire protocol. Every read has a batch form (`list_units`, `read_values`, `manifests`),
 every write is idempotent, and `batch` is a bulk upload.
@@ -1945,7 +2275,7 @@ every write is idempotent, and `batch` is a bulk upload.
 
 ---
 
-## 19. Decisions and why
+## 20. Decisions and why
 
 1. **Consumer-first trait.** Every method exists for a vci-cli call site; the "Used by" lines in the rustdoc name it.
    Ten required methods, sensible defaults, and git-only sync behind an optional `Exchange`, so a server backend never
@@ -1981,10 +2311,18 @@ every write is idempotent, and `batch` is a bulk upload.
     - Attestations whose manifest is missing are copied anyway; they simply never verify.
     - It is idempotent and has `--dry-run`. Its source location comes from `VCI_STORE_FROM_URL`, which joins
       `NEVER_TO_CHILDREN`.
+16. **libSQL without libSQL's engine.** libsql's local engine cannot share a process with rusqlite's bundled SQLite,
+    which git-meta needs (section 18, "Crate"), so vci uses libsql's Hrana client only: the local mode is the SQLite
+    store's file under another name, and the replica is a SQLite store file that vci syncs itself from a change log on
+    the server. The cost is a log table per namespace and a sync written in vci; the gain is one SQLite in the binary,
+    one file format for every local store, and a replica that reads with the SQLite store's code.
+17. **A libSQL namespace is a set of tables.** A libSQL database is one SQLite database; the SQLite store's schema
+    under a prefix per namespace keeps every statement of `vci_store_sqlite::sql` usable unchanged on the server
+    (one copy of the SQL), where a namespace column would have needed a second copy of every statement.
 
 ---
 
-## 20. Decided questions, and what is still open
+## 21. Decided questions, and what is still open
 
 Decided on 25 October 2026, before the work was built:
 
@@ -2033,6 +2371,13 @@ Decided while building it:
     PostgreSQL store never prints a host or database the client library parsed from a URL with userinfo, and
     `Secret::scrub` removes every reading of such a password (section 9). The client library still connects such a
     URL to the wrong host: percent-encode the `@` as `%40`.
+20. **libsql 0.10.0 is pinned twelve days after it was published** (13 October 2026), short of decision 13's two weeks:
+    it is the version the libSQL store was specified against.
+21. **`https://` selects no backend.** A Turso URL is `libsql://`; an `https://` or `http://` `VCI_STORE_URL` (a
+    `sqld` without TLS, a proxy) needs `VCI_STORE=libsql` or `[store] backend = "libsql"`, so a URL meant for some
+    other service never sends its token to a libSQL client by accident.
+22. **A replica whose server is down is read as it is.** The plan, `vci store info`, `vci fetch` and `vci push` read the
+    replica with a warning (exit 0); writes fail at once and `vci run` refuses each unit with the tests' exit code.
 
 Still open:
 
@@ -2062,7 +2407,7 @@ Still open:
 8. **SQLite sharing.** Should SQLite later gain an exchange (merging another SQLite file or URL) so that parallel CI
    jobs that carry it in a cache do not lose each other's writes?
 9. **Out-of-tree backends.** Is a compiled-in registry enough, or should a subprocess or wire protocol let backends
-   live outside vci (section 18)?
+   live outside vci (section 19)?
 10. **The demo-oidc job.** It reads `.git/git-meta.sqlite` from Python. Replace it with a `vci store export <key>`
     subcommand that works on every backend?
 11. **Follow-ups.** `vci store init`, `vci store copy`, `vci init --store`, the action inputs `store` and `store-url`
@@ -2073,3 +2418,15 @@ Still open:
 13. **SQLite details.** Whether the SQLite backend should turn syncing off when `CI` is set, as git-meta's store does
     since 2.7.27; and turning on rusqlite's `cache` feature in `vci-store-sqlite` so it can use `prepare_cached`
     (`hashlink` is already in `Cargo.lock` through git-meta-lib).
+14. **libSQL on Turso's hosted service.** The store was tested against `sqld` 0.24.32 (the libsql-server image Turso
+    publishes, locally and in CI), not against Turso itself: its limits on a request's or a response's size (a
+    vex-scale plan reads about 75 MB; a batch request is capped at 8 MiB of values), how a read-only token's write is
+    refused (`sqld` answers HTTP 403, which vci maps to `Denied`), and HTTP/1.1 over TLS through vci's own connector are unchecked there.
+    `sqld`'s own response limit (`--max-response-size`, 10 MB by default) refuses a large result of a plain execute
+    request (`RESPONSE_TOO_LARGE`), but not the cursor requests vci reads with: a 22 MB read and a 12 MB sync went
+    through.
+15. **A CA for a libSQL server.** TLS is verified against the webpki roots only; a self-hosted `sqld` with a private
+    certificate needs a setting like PostgreSQL's `sslrootcert`.
+16. **The libSQL change log.** Every write logs a row per slot and root it touched, kept 30 days; its size on a busy
+    namespace, and whether a shorter retention (a full sync after it) is better, have not been measured. A replica on
+    an ephemeral runner syncs everything every time; a cache of the replica file would make that a delta.

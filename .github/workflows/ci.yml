@@ -210,7 +210,10 @@ jobs:
           if-no-files-found: ignore
 
   # The attestation stores (docs/STORE-BACKENDS.md): the store crates' own
-  # tests and the conformance suite on git-meta, SQLite and PostgreSQL.
+  # tests and the conformance suite on git-meta, SQLite, PostgreSQL and
+  # libSQL (its local file, and a libSQL server remotely and through a
+  # replica: the server is the libsql-server image, the one Turso runs,
+  # pinned to the sqld release the tests were written against).
   # git-meta runs against the git a stock Ubuntu 24.04 ships (2.43): GitHub's
   # runner images carry a newer git, and 2.0.0's presence check of values not
   # yet downloaded died only on the older one (fixed in 2.0.1). Self-hosted
@@ -233,9 +236,13 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
+      libsql:
+        image: ghcr.io/tursodatabase/libsql-server:v0.24.32
     env:
       VCI_TEST_POSTGRES_URL: postgres://postgres:vci@postgres:5432/postgres?sslmode=disable
       VCI_TEST_POSTGRES: require
+      VCI_TEST_LIBSQL_URL: http://libsql:8080
+      VCI_TEST_LIBSQL: require
     steps:
       - name: Stock git and a Rust toolchain
         run: |
@@ -250,7 +257,8 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --global user.email ci@vci.invalid
           git config --global user.name vci
-          cargo test --locked -p vci-store --features vci-store/conformance -p vci-git -p vci-store-sqlite -p vci-store-postgres
+          for i in $(seq 30); do curl -sf "$VCI_TEST_LIBSQL_URL/health" >/dev/null && break; sleep 1; done
+          cargo test --locked -p vci-store --features vci-store/conformance -p vci-git -p vci-store-sqlite -p vci-store-postgres -p vci-store-libsql
 
   # The store crates' rustdoc: vci-store is the contract a backend implements
   # (its rustdoc is authoritative), and every public item is documented.
@@ -263,15 +271,16 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          cargo doc --no-deps --locked -p vci-store -p vci-store-sqlite -p vci-store-postgres
+          cargo doc --no-deps --locked -p vci-store -p vci-store-sqlite -p vci-store-postgres -p vci-store-libsql
           cargo doc --no-deps --locked -p vci-store --features conformance
 
   # The command line on each store, end to end (crates/vci-cli/tests/
   # store_select.rs and store_backends.rs): selection, secrets that never
   # reach a test, fail open, and run, plan, explain, prune, fetch, push and
-  # ci on SQLite and PostgreSQL against a copy of fixtures/go-abcd. The
-  # PostgreSQL service is reached on localhost, where vci does not require
-  # TLS. Without go the tests would skip, so the module is downloaded first.
+  # ci on SQLite, PostgreSQL and libSQL (local, remote and replica) against
+  # a copy of fixtures/go-abcd. The PostgreSQL service is reached on
+  # localhost, where vci does not require TLS, and so is the libSQL server.
+  # Without go the tests would skip, so the module is downloaded first.
   store-cli:
     runs-on: ubuntu-latest
     services:
@@ -286,9 +295,15 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
+      libsql:
+        image: ghcr.io/tursodatabase/libsql-server:v0.24.32
+        ports:
+          - 8080:8080
     env:
       VCI_TEST_POSTGRES_URL: postgres://postgres:vci@localhost:5432/postgres
       VCI_TEST_POSTGRES: require
+      VCI_TEST_LIBSQL_URL: http://localhost:8080
+      VCI_TEST_LIBSQL: require
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -299,7 +314,13 @@ jobs:
       - name: The fixture's Go modules
         run: cd fixtures/go-abcd && go mod download
       - name: Store selection and the stores end to end
-        run: cargo test --locked -p vci-cli --test store_select --test store_backends
+        run: |
+          for i in $(seq 30); do curl -sf "$VCI_TEST_LIBSQL_URL/health" >/dev/null && break; sleep 1; done
+          cargo test --locked -p vci-cli --test store_select --test store_backends
+      # The store job above runs in a container without Docker; here the
+      # test starts the libsql-server image itself, with a JWT key.
+      - name: libSQL tokens against a server that checks them
+        run: cargo test --locked -p vci-store-libsql --test libsql tokens_are_sent_and_never_shown -- --nocapture
 
   # The temporary-PostgreSQL helper's own path: no server is given, so
   # vci_store_postgres::testkit starts a throwaway cluster with the runner's

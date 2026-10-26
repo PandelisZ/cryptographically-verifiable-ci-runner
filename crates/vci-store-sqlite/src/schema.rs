@@ -19,50 +19,7 @@ pub(crate) const APPLICATION_ID: i64 = 0x7663_6931;
 /// The schema version this vci writes and reads (`PRAGMA user_version`).
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
-/// Schema version 1. Every text column compares with SQLite's default
-/// `BINARY` collation, which is bytewise, as the store's order requires.
-/// `value` is each table's last column, so reads of the other columns
-/// never touch the value's overflow pages.
-const DDL_V1: &str = "
-CREATE TABLE attestations (
-  key          TEXT    NOT NULL PRIMARY KEY,
-  test_key     TEXT    NOT NULL,
-  signer       TEXT    NOT NULL,
-  storage_key  TEXT    NOT NULL,
-  target       TEXT    NOT NULL,
-  issued       INTEGER,
-  tree16       TEXT,
-  manifest_ref TEXT,
-  ref_state    INTEGER NOT NULL,
-  stored_at    INTEGER NOT NULL,
-  encoding     INTEGER NOT NULL DEFAULT 0,
-  value        BLOB    NOT NULL,
-  UNIQUE (test_key, signer, storage_key)
-);
-CREATE INDEX attestations_unit ON attestations (test_key, key, target);
-CREATE INDEX attestations_all  ON attestations (target, key);
-CREATE INDEX attestations_ref  ON attestations (manifest_ref) WHERE manifest_ref IS NOT NULL;
-CREATE INDEX attestations_unknown_ref ON attestations (ref_state) WHERE ref_state = 0;
-CREATE TABLE manifests (
-  root     TEXT    NOT NULL PRIMARY KEY,
-  base     TEXT,
-  put_at   INTEGER NOT NULL,
-  encoding INTEGER NOT NULL DEFAULT 0,
-  value    BLOB    NOT NULL
-);
-CREATE INDEX manifests_base ON manifests (base) WHERE base IS NOT NULL;
-CREATE TABLE memo  (tree16 TEXT NOT NULL, test_key TEXT NOT NULL, key TEXT NOT NULL, at INTEGER NOT NULL,
-                    PRIMARY KEY (tree16, test_key)) WITHOUT ROWID;
-CREATE TABLE flags (name TEXT NOT NULL PRIMARY KEY, at INTEGER NOT NULL) WITHOUT ROWID;
-";
-
-/// `ref_state` of a row whose value's `manifestRef` is unknown (the value
-/// does not parse as a vci envelope).
-pub(crate) const REF_UNKNOWN: i64 = 0;
-/// `ref_state` of a row whose value names a stored manifest (`manifest_ref`).
-pub(crate) const REF_ROOT: i64 = 1;
-/// `ref_state` of a row whose value carries its manifest inline.
-pub(crate) const REF_INLINE: i64 = 2;
+pub(crate) use crate::sql::{REF_INLINE, REF_ROOT, REF_UNKNOWN};
 
 /// What a database file holds, as far as vci is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +99,7 @@ pub(crate) fn migrate(conn: &mut Connection, deadline: Duration) -> rusqlite::Re
     if found != State::Empty {
         return Ok(found);
     }
-    tx.execute_batch(DDL_V1)?;
+    tx.execute_batch(&crate::sql::plain().ddl)?;
     tx.pragma_update(None, "application_id", APPLICATION_ID)?;
     tx.pragma_update(None, "user_version", i64::from(SCHEMA_VERSION))?;
     tx.commit()?;
