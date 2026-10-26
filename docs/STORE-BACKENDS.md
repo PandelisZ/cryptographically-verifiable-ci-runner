@@ -842,12 +842,13 @@ Errors (each displayed as `attestation store: <message>`):
 - `VCI_STORE` disagreeing with the scheme of `VCI_STORE_URL`;
 - postgres without `VCI_STORE_URL` (the message adds that GitHub does not pass secrets to pull requests from forks);
 - a `sqlite:` `VCI_STORE_URL` without a path, or whose path holds `://` (another scheme's URL, which may carry a
-  password, is never printed as a path) or a query (`sqlite:x.db?authToken=…`: it would be taken whole as the file's
-  name and printed as one; not printed);
+  password, is never printed as a path), a query or a fragment (`sqlite:x.db?authToken=…`,
+  `sqlite:x.db#authToken=…`, with `VCI_STORE` unset or `sqlite`: it would be taken whole as the file's name and
+  printed as one; not printed);
 - for libsql, a `VCI_STORE_URL` that is neither a server (`libsql://`, `https://`, `http://`) nor `file:<path>` (not
-  printed), a `file:` URL with a query (as for `sqlite:`, not printed), and, when the store opens, a server URL with a
-  user or password, a fragment or a query parameter other than `authToken` and `tls` (not printed, nor the
-  parameter's name: a token may be either), or the remote modes without a URL;
+  printed), a `file:` URL with a query or a fragment (as for `sqlite:`, not printed), and, when the store opens, a
+  server URL with a user or password, a fragment or a query parameter other than `authToken` and `tls` (not printed,
+  nor the parameter's name: a token may be either), or the remote modes without a URL;
 - a timeout outside (0, 1 h];
 - a bad schema name or namespace (a namespace is 1 to 128 of `A-Z a-z 0-9 . _ : / @ -`);
 - a pool outside 1..=64;
@@ -2022,7 +2023,7 @@ the calling thread); the trait stays synchronous. The store costs the release bi
 (Rust 1.99.1, dynamic), 25,339,616 bytes with the default features against 20,811,120 with `--no-default-features
 --features sqlite,postgres` (stripped: 19,912,984 against 16,472,296). Most of it is what libsql's `remote` feature
 pulls in: hyper 0.14 with its HTTP/2 stack (`h2`, from libsql's `hyper` features), `tower`, `libsql-hrana`, and
-libSQL's SQL parser (`libsql-sqlite3-parser`, with which `execute_transactional_batch` splits statements). Not
+libSQL's SQL parser (`libsql-sqlite3-parser`, with which `execute_batch` splits statements). Not
 measured on the static musl build of section 17.
 
 **What the command line relies on**:
@@ -2118,10 +2119,10 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   retried)`. Busy retries, `Denied`, `Unsupported` and `Backend` are not latched.
 - **Statements the server refuses.** `sqld` reports a statement's error (a batch step's as a Hrana API error, a
   cursor step's as `error at step N`) with HTTP 200: the server works, so it is `Backend(LibsqlError)` (`<url>: the
-  server refused a statement: …`), not latched; the transactional batch it was in was rolled back, and the stream is
-  given up. A busy server (`database is locked`, HTTP 429, a connection it could not open in time, `Transaction timed
-  out` when it gave up a transaction that waited for the lock, `interrupted` when it stopped a statement to let a
-  writer in) is tried again within the request's deadline.
+  server refused a statement: …`), not latched; the transaction it was in was rolled back (its stream closes with
+  the batch), and the stream is given up. A busy server (`database is locked`, HTTP 429, a connection it could not
+  open in time, `Transaction timed out` when it gave up a transaction that waited for the lock, `interrupted` when it
+  stopped a statement to let a writer in) is tried again within the request's deadline.
 - **Panics in the client.** libsql 0.10.0 panics on an HTTP error whose body is not UTF-8 text
   (`String::from_utf8(…).unwrap()` in its `hrana/hyper.rs`), as a proxy's Latin-1 error page is. Every call into it
   (building the database, connecting, each request, closing streams) runs under `catch_unwind`; such a panic is a
@@ -2184,8 +2185,16 @@ on each connection: `a_plan_costs_a_handful_of_requests` checks at most 8 reques
 
 `batch()` is deferred, with PostgreSQL's queue (section 17, "Writes"): per slot the last put, the slots a removal
 emptied, the removed keys, per root the last manifest, and `remove_manifests` keeping what the open batch will write
-or reference. `finish` writes the queue as **one request**, `execute_transactional_batch` (Hrana runs the statements
-between `BEGIN` and `COMMIT`, each conditioned on the previous one's success):
+or reference. `finish` writes the queue as **one request**: a Hrana batch of `BEGIN IMMEDIATE`, the statements below
+and `COMMIT`, each step run only when the one before it succeeded (libsql's `execute_batch`), with the stream's closing
+in the same request, so that a batch that stopped part way is rolled back as the server closes the stream's connection
+(a connection libsql still believes in a transaction after such a batch is replaced first, so every batch closes its
+stream). Every write vci sends is such a batch, a namespace's first `CREATE TABLE`s included, so each takes the write
+lock before its first statement. Under libsql's transactional batch (a deferred `BEGIN`), a namespace's first batch
+began by creating `vci_schema`, which exists once any namespace does and so only reads: it held a read snapshot it then
+had to promote to the write lock, a promotion that fails at once under concurrent writers (`SQLITE_BUSY_SNAPSHOT`, sent
+back as `database is locked`, and vci sent the batch again) and can abort `sqld` 0.24 (section 21, item 17). A
+namespace whose `vci_schema` row exists sends no DDL at all (one read per handle). The statements:
 
 1. the manifests, one multi-row upsert (the value replaced only when it differs or is unreadable; `put_at` refreshed);
 2. the removed keys (`DELETE … WHERE key IN (…)`) and the emptied slots;
@@ -2193,7 +2202,7 @@ between `BEGIN` and `COMMIT`, each conditioned on the previous one's success):
    when either changed;
 4. the log rows of every slot and root touched, and once per handle the log's prune.
 
-Values travel as SQL literals, since the transactional batch takes SQL text only: UTF-8 bytes without NUL as text cast
+Values travel as SQL literals, since the batch takes SQL text only: UTF-8 bytes without NUL as text cast
 to a blob (`CAST('…' AS BLOB)`, the same bytes), anything else as hex. A queue of 2,000 writes or 8 MiB is written
 early, in a request and transaction of its own (a failed early write fails `finish`). A write outside a batch is a
 batch of one: `put` one request (an unhinted put first reads its slot's key), `put_manifest` two (it compares the
@@ -2522,6 +2531,11 @@ Decided while building it:
 27. **A libSQL replica's file is a snapshot taken at its sync.** Before its caller's first prefetch, `read_values`
     syncs first, so a key removed since it was listed reads as gone; the other reads before a prefetch use the
     opening sync's snapshot, which may only make a unit run (section 18, "Reads before a prefetch").
+28. **Every libSQL write takes the write lock first.** A batch is `BEGIN IMMEDIATE`, its statements and `COMMIT`
+    (section 18, "Writes"), so no batch promotes a read to the write lock, which fails under concurrent writers and
+    can abort `sqld` 0.24 (item 17 below); before, a namespace's first batch began by creating `vci_schema`, which
+    only reads once it exists. It does not prevent `sqld`'s stalled write lock (item 17), which a stress test brought
+    on whatever the transaction began with.
 
 Still open:
 
@@ -2585,12 +2599,54 @@ Still open:
     macOS's 16,384 ports (`Can't assign requested address`), after which most scenarios failed: three runs back to
     back on 26 October, at a load average of 12 to 34, reached 16,344 sockets in `TIME_WAIT`, and the second failed 30
     of its 102 tests. The connector now closes its sockets with a reset (section 18, "Pool"): the same three runs
-    passed, at most ten sockets in `TIME_WAIT`, in 10 to 11 s each. Still open: a `sqld` 0.24.32 whose writes stall
-    while reads go on. At a load average of 60 to 300 (14 CPUs), about one run in four had every write wait out its
-    30 s request timeout (the store's first commit too), and after one port-exhausted run a reviewer's `sqld` kept
-    answering reads while every write hung for 37 minutes; whether `sqld` stalls on the concurrent `CREATE TABLE`s of
-    a hundred namespaces, on the load, or on what a run that ran out of ports left behind, is not known. Four runs in a
-    row against one external `sqld` since left it writing. The suite still opens a connection per read (libsql's), and
-    on a server that keeps its namespaces (an external one) its scenarios slow as the tables of earlier runs accumulate
-    (those four runs took 10, 28, 42 and 50 s; 15 to 18 s for the remote ones at 7,500 schema objects, against 2.5 to
-    4.8 s at a few hundred, in an earlier measurement).
+    passed, at most ten sockets in `TIME_WAIT`, in 10 to 11 s each. Still open, and in `sqld`, not in vci: **`sqld`
+    0.24.32's write lock stalls for good under concurrent writers.** Every write then waits out its request timeout
+    while reads go on, until the server restarts. Against a fresh `sqld` per run (26 October, `RUST_LOG=info`, load
+    average 14 to 78 on 14 CPUs), the suite passed 10 of 15 runs; each failed run was this stall (a write sent after
+    the run hung for its 20 s), its `sqld` alive. The suspected trigger, a batch that reads before it writes (libsql's
+    transactional batch begins with a deferred `BEGIN`, and a namespace's first batch began by creating `vci_schema`,
+    which only reads once it exists), is not it: with every batch taking the write lock first (decision 28) the suite
+    passed 11 of 15, and with every batch writing first under the deferred `BEGIN` (tried, not kept) 6 of 15, the
+    other runs stalling the same way. Run with `--use-custom-wal libsql-wal` (its newer WAL), `sqld` stalled in 3 runs
+    of 3. On one `sqld`, its scenarios with the most concurrency each ran 25 times without a stall (c12, 14 writer
+    threads on four handles; c32, 16 readers and a writer; c21, six first writes at once), and the replica half of the
+    suite 15 times; the remote half stalled it at its eighth run (with the batches before decision 28 as with it), and
+    the whole suite with four test threads at its ninth.
+    A stress test of `sqld` alone (Python; one fresh server per case; writers sending vci-shaped batches of 50 rows of
+    2 KB, `BEGIN IMMEDIATE` first, each request closing its stream; 40 s a case) stalled it in all 8 runs with four
+    writers (after 1,016 to 12,425 commits), with eight and with 32, and with three when four readers held snapshots
+    (after 5,618); never with one writer (21,612 commits) or two (three runs, up to 18,920 commits); with eight
+    writers and four readers after 39 and 40 commits (the readers went on: 32,574 reads in one of those runs); with
+    one 10-byte row a transaction, not with four writers or eight with readers (28,872 and 29,529 commits) but with
+    32 (twice).
+    Holding the lock for 2 s, or past `sqld`'s 5 s transaction timeout, while three or eight writers waited did not
+    stall it, nor did its log compactions (96 with two writers; with them turned off, four writers still stalled).
+    The transaction's first statement only moves the stall: with a deferred `BEGIN` and a write first (vci's batches
+    before decision 28) in 1 of 4 runs with four writers, and in each run with eight (with readers) and 32; with a read
+    first, whose waiting writers fail their promotion at once (about 50,000 `database is locked` a run) instead of
+    queueing, in none of 4 runs with four writers, and in each with eight (with readers) and 32. With its newer WAL
+    the same server took 21,183 commits from 32 writers and four readers without stalling, yet the suite stalled it,
+    so what stalls that WAL is not known. What the source of `sqld` 0.24.32's default WAL path shows
+    (`libsql-server/src/connection/connection_manager.rs`), which fits the measurements: writers take turns through
+    one slot and a queue; `acquire()` queues the connection once per call, with a parker made for that call; it
+    returns `SQLITE_BUSY` at the top of its loop when a WAL checkpoint holds the slot, and `SQLITE_BUSY_SNAPSHOT` when
+    a `RESTART` or `TRUNCATE` checkpoint changed its sync token, without taking its entry off the queue; for a
+    transaction that has not read yet, the busy handler (100 ms on `sqld`'s connections) calls `acquire()` again,
+    which queues the connection again; `schedule_next()` hands the slot ("Notified") to the next entry without
+    checking that its connection still waits; and a slot Notified to another connection is never taken back (its
+    waiters park until its deadline and loop). An entry left behind by a request that has ended (vci's stream closes
+    with the batch) thus holds the slot for good. A reviewer's debug log of a stalled server shows that state
+    (`Slot { id: 536, …, state: Notified }`, every writer looping on `unparked after before_deadline?: false`); it was
+    not traced event by event, since that module's debug log writes about 1.5 GB a minute once the server stalls. The
+    same file can also abort `sqld` (`assertion left == right failed` in `release()`, a panic where it cannot unwind):
+    `close()` checks that its connection holds the slot, then `release()` takes it, and in between a writer that waited
+    15 ms on a slot in `Failure` handed it to the next one. A reviewer's run hit it after 216 failed promotions
+    (`Cannot promote read transaction to write transaction`) of namespaces' first batches, each leaving the slot in
+    `Failure` until its stream closed; with decision 28 a write whose snapshot went stale while it waited is retried
+    inside the server within milliseconds instead. vci cannot prevent the stall from the client; meanwhile it fails
+    open (each write is given up at the request timeout, which latches the store, and `vci run` keeps the tests' exit
+    code). A `sqld` whose writes stop needs a restart; Turso's hosted service runs its own server, not measured. The
+    suite still opens a connection per read (libsql's), and on a server that keeps its namespaces (an external one)
+    its scenarios slow as the tables of earlier runs accumulate (four runs in a row took 10, 28, 42 and 50 s; 15 to
+    18 s for the remote ones at 7,500 schema objects, against 2.5 to 4.8 s at a few hundred, in an earlier
+    measurement).

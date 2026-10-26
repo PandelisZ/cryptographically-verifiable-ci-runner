@@ -1375,6 +1375,109 @@ fn a_statement_the_server_refuses_latches_nothing() {
     }
 }
 
+/// Every write batch takes the write lock before its first statement
+/// (`BEGIN IMMEDIATE`). A namespace's first batch begins by creating
+/// `vci_schema`, which exists once any namespace does, so it only reads: under
+/// libsql's deferred `BEGIN` it held a read snapshot it must later promote to
+/// the write lock, and when another writer committed while it waited for that
+/// lock, the promotion failed (`SQLITE_BUSY_SNAPSHOT`) and vci sent the batch
+/// again, a failure that can abort `sqld` 0.24 (docs/STORE-BACKENDS.md section
+/// 21, item 17). Taking the lock first, the server retries with a fresh
+/// snapshot: here, where another connection holds the write lock and commits
+/// a write while the first write waits, that write is stored without being
+/// sent again. And a batch that stopped part way holds nothing afterwards:
+/// two such batches on one connection leave the write lock free for another
+/// handle at once. On a `sqld` of the test's own.
+#[test]
+fn a_write_batch_takes_the_write_lock_before_it_reads() {
+    let server = match testkit::start_sqld(&[]) {
+        Ok(s) => s,
+        Err(why) => {
+            eprintln!("skipping: no sqld to hold the write lock on: {why}");
+            return;
+        }
+    };
+    let (url, port) = (server.url(), server.port());
+    let handle = |ns: &str, timeout: u64| {
+        let mut sel = testkit::selection(LibsqlMode::Remote, Some(&url), None, Some(ns), None);
+        sel.timeout = Sourced {
+            value: Duration::from_secs(timeout),
+            source: Source::File,
+        };
+        open(&sel)
+    };
+    // Another namespace makes vci_schema exist.
+    let first = handle(&testkit::namespace(), 30);
+    first
+        .put_for_test(
+            "src/a.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(1)),
+            &envelope(None, "first"),
+        )
+        .unwrap();
+    first
+        .__execute_for_test(&["CREATE TABLE lock_probe (x)".to_owned()])
+        .unwrap();
+
+    // Another connection holds the write lock while a new namespace's first
+    // write waits for it, then commits a write of its own.
+    let baton = testkit::pipeline(port, None, &["BEGIN IMMEDIATE"], false)
+        .unwrap()
+        .expect("the holder's stream stays open");
+    let ns = testkit::namespace();
+    let s = handle(&ns, 30);
+    assert!(matches!(s.status().unwrap(), StoreStatus::Absent { .. }));
+    let waiting = std::thread::spawn(move || {
+        let r = s.put_for_test(
+            "src/b.test.ts",
+            S1,
+            &hex64(2),
+            Some(&hint(2)),
+            &envelope(None, "second"),
+        );
+        (r, s.retries())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    testkit::pipeline(
+        port,
+        Some(&baton),
+        &["INSERT INTO lock_probe VALUES (1)", "COMMIT"],
+        true,
+    )
+    .unwrap();
+    let (stored, retries) = waiting.join().unwrap();
+    stored.unwrap();
+    assert_eq!(
+        retries, 0,
+        "the first write was sent again: it read before it took the write lock"
+    );
+    assert_eq!(keys_of(&handle(&ns, 30), "src/b.test.ts").len(), 1);
+
+    // Two batches on one connection, each stopping part way (a table that
+    // does not exist): neither keeps the write lock.
+    let failing = handle(&ns, 30);
+    for (i, missing) in ["absent_a", "absent_b"].into_iter().enumerate() {
+        let r = failing.__execute_for_test(&[
+            format!("INSERT INTO lock_probe VALUES ({})", 10 + i),
+            format!("INSERT INTO {missing} VALUES (1)"),
+        ]);
+        assert!(r.is_err(), "{missing}: {r:?}");
+    }
+    handle(&ns, 1)
+        .__execute_for_test(&["INSERT INTO lock_probe VALUES (7)".to_owned()])
+        .unwrap();
+    let rows = first
+        .__query_for_test("SELECT group_concat(x) FROM lock_probe")
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec!["1,7".to_owned()]],
+        "the failed batches wrote nothing"
+    );
+}
+
 /// A record the server would refuse as too big (`sqld` keeps rows under
 /// 5,000,000 bytes) is refused alone, as `Unsupported` (which keeps `vci
 /// run`'s exit code), before anything is sent: the rest of its batch is

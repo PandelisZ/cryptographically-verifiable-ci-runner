@@ -547,32 +547,40 @@ fn the_environment_overrides_vci_toml_with_a_warning() {
     );
 }
 
-/// 9. A local file's URL (`file:` for libsql, `sqlite:`) holding a query,
-///    which may carry a token (`?authToken=…`), is refused: the plan fails
-///    open, the commands that manage the store exit 2, no output shows the
-///    token, and no file is made under that name.
+/// 9. A local file's URL (`file:` for libsql, `sqlite:`) holding a query or
+///    a fragment, either of which may carry a token (`?authToken=…`,
+///    `#authToken=…`), is refused: the plan fails open, the commands that
+///    manage the store exit 2, no output shows the token, and no file is
+///    made under that name.
 #[test]
 fn a_local_file_url_with_a_query_is_refused_and_never_printed() {
     const TOKEN: &str = "fileTokS3cr3tZulu";
     let Some(w) = attested_world() else { return };
     for (backend, url) in [
-        ("libsql", format!("file:local.db?authToken={TOKEN}")),
-        ("sqlite", format!("sqlite:local.db?authToken={TOKEN}")),
+        (Some("libsql"), format!("file:local.db?authToken={TOKEN}")),
+        (Some("sqlite"), format!("sqlite:local.db?authToken={TOKEN}")),
+        (Some("libsql"), format!("file:local.db#authToken={TOKEN}")),
+        (Some("sqlite"), format!("file:local.db#authToken={TOKEN}")),
+        (Some("sqlite"), format!("sqlite:local.db#authToken={TOKEN}")),
+        (None, format!("sqlite:local.db#authToken={TOKEN}")),
     ] {
-        let env = [("VCI_STORE", backend), ("VCI_STORE_URL", url.as_str())];
+        let mut env = vec![("VCI_STORE_URL", url.as_str())];
+        env.extend(backend.map(|b| ("VCI_STORE", b)));
         let mut outs = fails_open(&w, &env, "query");
         let out = w.run(&env);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
         outs.push(out);
         for out in &outs {
-            assert!(!text(out).contains(TOKEN), "{backend}: {}", text(out));
+            assert!(!text(out).contains(TOKEN), "{url}: {}", text(out));
         }
-        let made: Vec<String> = std::fs::read_dir(w.work.join(".git"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains("local.db"))
-            .collect();
-        assert!(made.is_empty(), "{made:?}");
+        for dir in [w.work.join(".git"), w.work.clone()] {
+            let made: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("local.db"))
+                .collect();
+            assert!(made.is_empty(), "{url}: {made:?} in {}", dir.display());
+        }
     }
     let log = std::fs::read_to_string(&w.metrics).unwrap();
     assert!(!log.contains(TOKEN), "{log}");

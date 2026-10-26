@@ -338,7 +338,7 @@ pub fn start_sqld_with_admin() -> Result<(Process, u16), String> {
 fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), String> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("cannot connect to the admin API: {e}"))?;
+        .map_err(|e| format!("cannot connect to 127.0.0.1:{port}: {e}"))?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
     let body = body.unwrap_or("");
     let req = format!(
@@ -346,10 +346,10 @@ fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(u16,
         body.len()
     );
     s.write_all(req.as_bytes())
-        .map_err(|e| format!("cannot send to the admin API: {e}"))?;
+        .map_err(|e| format!("cannot send to 127.0.0.1:{port}: {e}"))?;
     let mut raw = Vec::new();
     s.read_to_end(&mut raw)
-        .map_err(|e| format!("cannot read the admin API's answer: {e}"))?;
+        .map_err(|e| format!("cannot read the answer of 127.0.0.1:{port}: {e}"))?;
     let raw = String::from_utf8_lossy(&raw).into_owned();
     let (head, rest) = raw
         .split_once("\r\n\r\n")
@@ -377,6 +377,39 @@ fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(u16,
         out.push_str(rest);
     }
     Ok((status, out))
+}
+
+/// One Hrana pipeline request to the `sqld` on 127.0.0.1:`port` (no
+/// token), on the stream `baton` names (a new one when `None`): the
+/// statements in order, then closing the stream when `close`. The baton
+/// that continues the stream (`None` once closed), or the first error. A
+/// test holds the write lock this way: `BEGIN IMMEDIATE` on a stream left
+/// open.
+pub fn pipeline(
+    port: u16,
+    baton: Option<&str>,
+    statements: &[&str],
+    close: bool,
+) -> Result<Option<String>, String> {
+    let mut requests: Vec<serde_json::Value> = statements
+        .iter()
+        .map(|s| serde_json::json!({"type": "execute", "stmt": {"sql": s}}))
+        .collect();
+    if close {
+        requests.push(serde_json::json!({"type": "close"}));
+    }
+    let body = serde_json::json!({"baton": baton, "requests": requests}).to_string();
+    let (status, answer) = http(port, "POST", "/v2/pipeline", Some(&body))?;
+    if status != 200 {
+        return Err(format!("POST /v2/pipeline: {status} {answer}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&answer).map_err(|e| format!("/v2/pipeline: {e}: {answer}"))?;
+    let results = v["results"].as_array().cloned().unwrap_or_default();
+    if let Some(e) = results.iter().find(|r| r["type"] != "ok") {
+        return Err(format!("/v2/pipeline: {e}"));
+    }
+    Ok(v["baton"].as_str().map(str::to_owned))
 }
 
 /// Change the configuration of the server's database (`sqld`'s namespace

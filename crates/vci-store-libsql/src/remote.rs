@@ -402,13 +402,20 @@ impl Remote {
         self.version().map(drop)
     }
 
-    /// Make sure the namespace's tables exist before a write: create them
-    /// when missing, in one transaction. A token that may not create them
-    /// gets [`StoreError::NotInitialized`]; a server that takes no more
-    /// writes, [`StoreError::Denied`] as for any write.
+    /// Make sure the namespace's tables exist before a write. When the
+    /// namespace's row in `vci_schema` says they do (one read, then
+    /// remembered by the handle), nothing is sent: no DDL and no write
+    /// transaction. Otherwise they are created in one transaction, which,
+    /// as every write, takes the write lock before its first statement
+    /// ([`Conn::batch`]). A token that may not create them gets
+    /// [`StoreError::NotInitialized`]; a server that takes no more writes,
+    /// [`StoreError::Denied`] as for any write.
+    ///
+    /// [`Conn::batch`]: crate::conn::Conn::batch
     pub(crate) fn ensure(&self) -> Result<&Tables, StoreError> {
         let t = self.ready()?;
         if self.version()?.is_some() {
+            // The tables are there (a newer schema is refused by version()).
             return Ok(t);
         }
         let ns = self.ns()?;

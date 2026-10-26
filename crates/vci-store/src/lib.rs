@@ -3231,13 +3231,19 @@ pub mod select {
                 .all(|b| b.is_ascii_alphanumeric() || b"._:/@-".contains(&b))
     }
 
-    /// Why a `file:` or `sqlite:` `VCI_STORE_URL` holding a query is
-    /// refused: it would be taken whole as a file name, and printed as one,
-    /// while a query may hold a token (`?authToken=…`).
+    /// Why a `file:` or `sqlite:` `VCI_STORE_URL` holding a query or a
+    /// fragment is refused: it would be taken whole as a file name, and
+    /// printed as one, while either may hold a token (`?authToken=…`,
+    /// `#authToken=…`).
     fn file_url_query(scheme: &str) -> String {
         format!(
-            "${ENV_STORE_URL}={scheme}:<path> names a file and takes no query (?…), which may hold a token (it was not printed)"
+            "${ENV_STORE_URL}={scheme}:<path> names a file and takes no query (?…) or fragment (#…), which may hold a token (it was not printed)"
         )
+    }
+
+    /// Whether a `file:` or `sqlite:` path holds a query or a fragment.
+    fn has_query_or_fragment(p: &str) -> bool {
+        p.contains('?') || p.contains('#')
     }
 
     fn relative_path(p: &str) -> Result<String, StoreError> {
@@ -3277,7 +3283,8 @@ pub mod select {
     ///   path`.
     /// * `file:<path>`, or no URL, is the local mode, in that file, else
     ///   `[store.libsql] path`. A replica asked for without a server is a
-    ///   warning. A `file:` URL with a query (`?`) is refused, unprinted.
+    ///   warning. A `file:` URL with a query (`?`) or a fragment (`#`) is
+    ///   refused, unprinted.
     /// * Any other URL is refused, without being printed.
     fn libsql_selection(
         k: &str,
@@ -3372,7 +3379,7 @@ pub mod select {
                 "${ENV_STORE_URL}=file:<path> needs a path"
             )));
         }
-        if p.contains('?') {
+        if has_query_or_fragment(p) {
             return Err(StoreError::Config(file_url_query("file")));
         }
         Ok(LibsqlSelection {
@@ -3396,10 +3403,10 @@ pub mod select {
     /// backend name; `VCI_STORE` disagreeing with the scheme of
     /// `VCI_STORE_URL`; postgres without `VCI_STORE_URL`; a `sqlite:` or
     /// `file:` `VCI_STORE_URL` without a path, or whose path holds `://`
-    /// (another scheme's URL) or a query (`?`, which may hold a token),
-    /// never printed; a timeout outside (0, 1 h]; a schema
-    /// that is not a lowercase identifier; a malformed namespace; a pool
-    /// outside 1 to 64; a grace over 30 days; a SQLite path in `vci.toml`
+    /// (another scheme's URL), a query (`?`) or a fragment (`#`), either of
+    /// which may hold a token, never printed; a timeout outside (0, 1 h]; a
+    /// schema that is not a lowercase identifier; a malformed namespace; a
+    /// pool outside 1 to 64; a grace over 30 days; a SQLite path in `vci.toml`
     /// that is absolute or climbs out with `..`. Overridden and ignored
     /// settings become [`Selection::warnings`]. A well-formed but unknown
     /// backend name is reported by [`crate::open`].
@@ -3525,7 +3532,7 @@ pub mod select {
                         "${ENV_STORE_URL} is not a sqlite:<path> location (it was not printed)"
                     )));
                 }
-                if p.contains('?') {
+                if has_query_or_fragment(p) {
                     return Err(StoreError::Config(file_url_query("sqlite")));
                 }
                 Some(Sourced {

@@ -24,9 +24,10 @@
 //!   fails at once.
 //! * **Requests.** A read is one prepared statement (the server describes a
 //!   statement once per pooled connection; the description is kept) whose
-//!   rows come back in one request. A write is one transactional batch: its
-//!   statements, values written as literals, travel in one request and
-//!   apply atomically. A statement the server refuses is
+//!   rows come back in one request. A write is one transaction that takes
+//!   the write lock before its first statement (`BEGIN IMMEDIATE`, see
+//!   [`Conn::batch`]): its statements, values written as literals, travel
+//!   in one request and apply atomically. A statement the server refuses is
 //!   [`StoreError::Backend`] (or `Unsupported` for a record larger than the
 //!   server takes, `Denied` for a write to a server that takes no more
 //!   writes: blocked over a quota, or full) and latches nothing.
@@ -1117,17 +1118,46 @@ impl Conn {
     }
 
     /// Apply `statements` (literals only, no parameters) in one
-    /// transaction, sent as one request.
+    /// transaction that takes the write lock before its first statement,
+    /// sent as one request.
+    ///
+    /// The request is a Hrana batch of `BEGIN IMMEDIATE`, the statements and
+    /// `COMMIT`, each step run only when the one before it succeeded, and it
+    /// closes the stream, so a batch that stopped part way is rolled back as
+    /// the server closes the stream's connection. libsql's transactional
+    /// batch is not used: its deferred `BEGIN` lets a batch whose first
+    /// statements only read (a namespace's first `CREATE TABLE IF NOT
+    /// EXISTS` on `vci_schema`, which exists once any namespace does) hold a
+    /// read snapshot that it must later promote to the write lock. Under
+    /// concurrent writers that promotion fails at once
+    /// (`SQLITE_BUSY_SNAPSHOT`, which no busy handler retries; it came back
+    /// as `database is locked` and the batch was sent again), and on `sqld`
+    /// 0.24 it leaves the write slot failed until the stream closes, a close
+    /// that can race another writer taking the slot and abort the server
+    /// (docs/STORE-BACKENDS.md section 21, item 17). `BEGIN IMMEDIATE` asks
+    /// for the write lock outside any transaction, which the server retries
+    /// with a fresh snapshot.
     pub(crate) fn batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
         if statements.is_empty() {
             return Ok(());
         }
-        let sql = statements.join(";\n");
+        let sql = format!("BEGIN IMMEDIATE;\n{};\nCOMMIT", statements.join(";\n"));
+        let db = self.database()?;
         self.run(op, true, move |c, n, _| {
             let sql = sql.clone();
+            // libsql closes the stream with the batch only while it believes
+            // the stream is outside a transaction, and a batch that stopped
+            // part way leaves it believing otherwise: such a connection is
+            // replaced first (a local step, no request), so that every batch
+            // closes its stream and no failed one keeps the write lock.
+            let renewed = (!c.conn.is_autocommit()).then(|| db.connect());
             Box::pin(async move {
+                if let Some(conn) = renewed {
+                    c.conn = conn?;
+                    c.stmts.clear();
+                }
                 n.fetch_add(1, Ordering::Relaxed);
-                c.conn.execute_transactional_batch(&sql).await?;
+                c.conn.execute_batch(&sql).await?;
                 Ok(())
             })
         })

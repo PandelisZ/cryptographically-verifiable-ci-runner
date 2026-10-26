@@ -1767,7 +1767,7 @@ Then run `vci ci` as before (`--push` where it should store). The store has thre
 |---|---|---|---|
 | remote | a `libsql://` `VCI_STORE_URL` (an `https://` or `http://` one with `VCI_STORE=libsql`) | from the server, a plan in about a dozen requests | to the server, a project's units in one request |
 | replica | the same plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<file>` or `[store.libsql] replica = true` | from a local file, `<git common dir>/vci-store.libsql`, synced from the server when a command first reads it (and at its later prefetches) | to the server, then to the file |
-| local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` (no `?query`) | from `<git common dir>/vci-store.libsql` | to the file |
+| local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` (no `?query` or `#fragment`) | from `<git common dir>/vci-store.libsql` | to the file |
 
 - **The token is a secret**, like PostgreSQL's password: `VCI_STORE_TOKEN`, else the URL's `authToken` parameter.
   vci removes both variables from its own environment as it starts, so no test, probe or hook sees them, and never

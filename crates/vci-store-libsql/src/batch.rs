@@ -1,6 +1,7 @@
 //! Writes to the server (`docs/STORE-BACKENDS.md` sections 6 and 18).
 //!
-//! Every write is a transactional batch sent in one request: a write
+//! Every write is a transaction sent in one request, which takes the write
+//! lock before its first statement ([`crate::conn::Conn::batch`]): a write
 //! outside a batch is a batch of one. While a batch of a store is open on a
 //! thread, that thread's `put`, `put_manifest` and `remove` through the
 //! store are queued and written when the batch finishes, ending in the

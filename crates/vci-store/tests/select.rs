@@ -1272,24 +1272,46 @@ fn tokens_escaped_again_and_again_are_scrubbed() {
     assert_eq!(t.scrub("a\\/b envTok"), "a\\/b envTok");
 }
 
-/// A `file:` (libsql) or `sqlite:` `$VCI_STORE_URL` holding a query is
-/// refused, unprinted, never taken whole as a file name: the query could
-/// hold a token (`?authToken=…`).
+/// A `file:` (libsql) or `sqlite:` `$VCI_STORE_URL` holding a query or a
+/// fragment is refused, unprinted, never taken whole as a file name: either
+/// could hold a token (`?authToken=…`, `#authToken=…`).
 #[test]
 fn a_local_file_url_with_a_query_is_refused_unprinted() {
     for (backend, url) in [
-        ("libsql", "file:local.db?authToken=fileTokS3cr3tZulu"),
-        ("libsql", "file:///tmp/local.db?authToken=fileTokS3cr3tZulu"),
-        ("libsql", "file:local.db?fileTokS3cr3tZulu"),
-        ("sqlite", "sqlite:local.db?authToken=fileTokS3cr3tZulu"),
-        ("sqlite", "sqlite:///tmp/local.db?token=fileTokS3cr3tZulu"),
+        (Some("libsql"), "file:local.db?authToken=fileTokS3cr3tZulu"),
+        (
+            Some("libsql"),
+            "file:///tmp/local.db?authToken=fileTokS3cr3tZulu",
+        ),
+        (Some("libsql"), "file:local.db?fileTokS3cr3tZulu"),
+        (
+            Some("sqlite"),
+            "sqlite:local.db?authToken=fileTokS3cr3tZulu",
+        ),
+        (
+            Some("sqlite"),
+            "sqlite:///tmp/local.db?token=fileTokS3cr3tZulu",
+        ),
+        // A fragment, with the backend named or (for sqlite:) taken from
+        // the scheme.
+        (Some("libsql"), "file:local.db#authToken=fileTokS3cr3tZulu"),
+        (Some("libsql"), "file:///tmp/local.db#fileTokS3cr3tZulu"),
+        (Some("sqlite"), "file:local.db#authToken=fileTokS3cr3tZulu"),
+        (
+            Some("sqlite"),
+            "sqlite:local.db#authToken=fileTokS3cr3tZulu",
+        ),
+        (None, "sqlite:local.db#authToken=fileTokS3cr3tZulu"),
+        (None, "sqlite:///tmp/local.db#fileTokS3cr3tZulu"),
     ] {
-        let m = config_err(&[(ENV_STORE, backend), (ENV_STORE_URL, url)], None);
+        let mut vars = vec![(ENV_STORE_URL, url)];
+        vars.extend(backend.map(|b| (ENV_STORE, b)));
+        let m = config_err(&vars, None);
         assert!(
             !m.contains("S3cr3t") && !m.contains("local.db"),
             "{url}: {m}"
         );
-        assert!(m.contains("query"), "{url}: {m}");
+        assert!(m.contains("query") && m.contains("fragment"), "{url}: {m}");
     }
     // A plain path is still taken.
     let s = sel(
