@@ -409,14 +409,15 @@ impl Exchange for GitMetaStore {
         EXCHANGE_POINT
     }
 
-    /// The remote's URL without credentials ([`vci_store::select::redact`]).
+    /// The remote's URL without credentials
+    /// ([`vci_store::select::redact_credentials`]): a git remote's URL, not
+    /// a store's, so its path is shown, where
+    /// [`vci_store::select::redact`] hides a libSQL server's.
     fn remote_location(&self, remote: &str) -> Option<String> {
         self.attest_store()
             .remote_url(remote)
             .ok()
             .flatten()
-            // A git remote's URL, not a store's: its path is shown (a
-            // libSQL server's would be hidden).
             .map(|u| vci_store::select::redact_credentials(&u))
     }
 

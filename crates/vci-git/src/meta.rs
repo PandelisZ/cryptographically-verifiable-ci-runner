@@ -329,13 +329,22 @@ impl BatchGuard {
             return Err(write_err(e));
         }
         let written: Vec<(&Target, &str)> = stamps.iter().map(|(t, k)| (t, k.as_str())).collect();
-        Ok(match AttestStore::stamp_on(&path, &mut db, &written) {
+        let warnings = match AttestStore::stamp_on(&path, &mut db, &written) {
             Ok(()) => Vec::new(),
             Err(e) => vec![format!(
                 "stamping the {} write(s) of the batch after its commit: {e}; they are stored, but a push that ran during the batch may have left them out",
                 written.len()
             )],
-        })
+        };
+        // Empty the write-ahead log (best effort, waiting briefly for
+        // readers), as the SQLite store does when it closes: the one
+        // transaction wrote every page it changed there (20 MB for 1,200
+        // units), and a read-only connection still open (the trait store's
+        // pooled reader) cannot checkpoint when it closes last, so the log
+        // stayed, and the next vci to open the store read all of it first.
+        let _ = db.busy_timeout(Duration::from_millis(100));
+        let _ = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        Ok(warnings)
     }
 }
 

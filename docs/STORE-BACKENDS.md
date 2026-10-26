@@ -557,7 +557,16 @@ been measured on one yet.
   spilling into the WAL, 1,200 units' writes took 0.5 s of the batch; with them, 0.05 s. The session and the
   connection are the repository's one store (`AttestStore::store_path`, `<git common dir>/git-meta.sqlite` since
   2.7.33; section 15), so a batch in a linked worktree writes the file every worktree reads, and the batches of two
-  worktrees take turns on its write lock (at most the 5 s busy timeout), as two runs in one worktree do.
+  worktrees take turns on its write lock (at most the 5 s busy timeout), as two runs in one worktree do. After the
+  stamp, `finish` empties the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`, best effort, 100 ms busy wait, as the SQLite
+  store does when it closes): the one transaction writes every page it changes to the WAL (20 MB for 1,200 units),
+  and the trait store's pooled reader is a read-only connection, which cannot checkpoint when it closes last, so the
+  file stayed and the next command to open the store read all of it first (a plan's "fetch the stored values" 0.04
+  to 0.10 s instead of 0.02 to 0.03). On 1,200 Go units (release build) a run left a WAL of 22 to 31 MB before and
+  none after (5 runs each), the next plan's line took 0.03 to 0.07 s before and 0.02 to 0.03 s after, and the
+  checkpoint itself took 5 to 7 ms (the commit's own checkpoint has already written the pages back).
+  `a_finished_batch_leaves_no_write_ahead_log` (vci-git) holds a pooled reader across a batch of 200 units and finds
+  no WAL left.
 - **SQLite** (2.8): the batch pins one pooled connection to the thread; the first write begins `BEGIN IMMEDIATE` on
   it, each write is a savepoint, and `finish` commits (a dropped batch commits too). Reads on that thread use the
   pinned connection inside the transaction, so they see the batch's writes; other connections see them after

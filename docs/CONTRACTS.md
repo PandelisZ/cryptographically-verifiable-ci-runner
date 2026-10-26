@@ -100,7 +100,8 @@ pub struct Envelope { pub payload_type: String, pub payload: String /* base64 */
 pub fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8>;
 /// The signature `ssh-keygen -Y sign -n vci-attest -f <key>` makes (sha512); key may be a private key path or a .pub path whose private half is in ssh-agent.
 pub fn sign_statement(statement: &Statement, key_path: &Utf8Path) -> Result<Envelope, SignError>;
-/// 2.8: the key read once for many signatures. An unencrypted ed25519 or ECDSA key file (owner-only) signs in process,
+/// 2.8: the key read once for many signatures. An unencrypted ed25519 or ECDSA key file (owner-only; an ECDSA scalar
+/// ssh-keygen wrote short, as for about half of P-521 keys, is read at full width) signs in process,
 /// a .pub through ssh-agent over kept connections, anything else (RSA, encrypted, PEM, security keys, a key whose .pub
 /// holds another key, a CRLF key file) with ssh-keygen; a failed in-process or agent signature falls back to
 /// ssh-keygen. Every signature is re-checked in Rust. `load_for` names the public key (its blob) every signature must

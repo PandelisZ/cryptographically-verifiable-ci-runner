@@ -783,6 +783,48 @@ fn a_key_signs_only_as_the_public_key_it_is_named_by() {
     }
 }
 
+/// An ECDSA key whose private scalar ssh-keygen writes without its leading
+/// zero byte (about half of all P-521 keys; ssh-key 0.6 reads only the full
+/// width) signs in process too, as the key ssh-keygen signs with: OpenSSH
+/// and vci accept the signature, and named as another key it is refused.
+#[test]
+fn a_p521_key_with_a_short_scalar_signs_in_process() {
+    let (_t, dir) = tempdir();
+    let key = (0..64)
+        .map(|i| {
+            keygen_kind(
+                &dir,
+                &format!("p521-{i}"),
+                &["-t", "ecdsa", "-b", "521"],
+                "",
+            )
+        })
+        .find(|k| ssh_key::PrivateKey::from_openssh(std::fs::read(&k.private).unwrap()).is_err())
+        .expect("one P-521 key in 64 with a short scalar");
+    let signer = SshSigner::load_for(&key.private, &blob(&key));
+    assert!(signer.in_process(), "{signer:?}");
+    assert!(SshSigner::load(&key.private).in_process());
+    let env = signer.sign_statement(&statement(1)).unwrap();
+    assert_eq!(env.signatures[0].keyid, key.fingerprint);
+    let allowed_text = format!("p521@example.com {}\n", key.pub_line);
+    let v = verify_envelope(&env, &allowed(&allowed_text), now()).unwrap();
+    assert_eq!(v.statement, statement(1));
+    let message = pae(PAYLOAD_TYPE, &b64().decode(&env.payload).unwrap());
+    assert!(openssh_verify(
+        &dir,
+        &allowed_text,
+        "p521@example.com",
+        NAMESPACE,
+        &sig_pem(&env, 0),
+        &message
+    ));
+    let bob = keygen_kind(&dir, "bob", &["-t", "ecdsa", "-b", "256"], "");
+    let other = SshSigner::load_for(&key.private, &blob(&bob));
+    assert!(!other.in_process());
+    let r = other.sign_statement(&statement(1));
+    assert!(matches!(r, Err(SignError::WrongKey { .. })), "{r:?}");
+}
+
 /// A key file with CRLF line ends is left to ssh-keygen, whose parser finds
 /// no key in it (ssh-key's would): vci signs with the key files ssh-keygen
 /// signs with, and with no others.

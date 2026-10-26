@@ -125,7 +125,7 @@ enum Cmd {
         /// Attestation lifetime (with --key or --oidc).
         #[arg(long, default_value = "14d", requires = "signing")]
         ttl: String,
-        /// Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code). On a shared store (PostgreSQL) this is what stores them: without --push they are signed but not stored.
+        /// Afterwards publish the attestations as `vci push` does (best effort: a failure is a warning, never the exit code). On a shared store (PostgreSQL, or a libSQL server or its replica) this is what stores them: without --push they are signed but not stored.
         #[arg(long, requires = "signing")]
         push: bool,
         /// git-meta remote, or a git remote / URL, to push to (as `vci push --remote`; a store without a remote ignores it with a warning).
@@ -159,7 +159,7 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         manifest: Option<Utf8PathBuf>,
     },
-    /// Publish local attestations from the attestation store (git-meta by default: push refs/meta/main with merge and retry; a SQLite or PostgreSQL store has nothing to push).
+    /// Publish local attestations from the attestation store (git-meta by default: push refs/meta/main with merge and retry; a SQLite, PostgreSQL or libSQL store has nothing to push).
     Push {
         /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin). git-meta only: a store without a remote exits 2.
         #[arg(long)]
@@ -168,7 +168,7 @@ enum Cmd {
         #[arg(long)]
         rewrite_history: bool,
     },
-    /// Fetch attestations into the attestation store (git-meta by default: pull refs/meta/main and materialize it locally; a SQLite or PostgreSQL store has nothing to fetch).
+    /// Fetch attestations into the attestation store (git-meta by default: pull refs/meta/main and materialize it locally; a SQLite, PostgreSQL or libSQL store has nothing to fetch).
     Fetch {
         /// git-meta remote, or a git remote / URL to exchange metadata with (default: the configured git-meta remote, else .git-meta's url, else origin). git-meta only: a store without a remote exits 2.
         #[arg(long)]
@@ -607,5 +607,36 @@ mod tests {
             assert_eq!(e.exit_code(), 2);
         }
         assert!(Cli::try_parse_from(["vci", "plan", "--partition", "1/2"]).is_err());
+    }
+
+    /// The help of `vci push`, `vci fetch` and `vci ci --push` names every
+    /// store without an exchange, libSQL (2.8.0) included: on it, as on
+    /// PostgreSQL, `vci ci` stores only with `--push`, and push and fetch
+    /// have nothing to do.
+    #[test]
+    fn help_names_libsql_beside_the_other_stores_without_an_exchange() {
+        use clap::CommandFactory as _;
+        let mut cli = Cli::command();
+        // One line, however the help is wrapped.
+        let mut help = |sub: &str| -> String {
+            let text = cli
+                .find_subcommand_mut(sub)
+                .unwrap_or_else(|| panic!("no vci {sub}"))
+                .render_long_help()
+                .to_string();
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        for sub in ["push", "fetch"] {
+            let text = help(sub);
+            assert!(
+                text.contains("a SQLite, PostgreSQL or libSQL store has nothing to"),
+                "vci {sub}: {text}"
+            );
+        }
+        let ci = help("ci");
+        assert!(
+            ci.contains("On a shared store (PostgreSQL, or a libSQL server or its replica)"),
+            "{ci}"
+        );
     }
 }

@@ -1376,8 +1376,9 @@ Signing key: `--key`, else `$VCI_SIGNING_KEY`, else `git config user.signingkey`
 signing key is never used). Errors name the source the key came from. A `.pub` path works when the private
 half is in `ssh-agent` (hardware keys included). Since 2.8 an unencrypted ed25519 or ECDSA (P-256, P-384, P-521)
 private key file that only its owner can read is read once per run and signs in process, making the signature
-`ssh-keygen -Y sign` makes (sha512; byte for byte for ed25519); a `.pub` signs through `ssh-agent` (`SSH_AUTH_SOCK`)
-over connections vci keeps open. RSA keys (the Rust `rsa` crate's private-key operation is not constant-time,
+`ssh-keygen -Y sign` makes (sha512; byte for byte for ed25519), every P-521 key included (`ssh-keygen` writes about
+half of their private scalars a byte short, which vci reads at full width); a `.pub` signs through `ssh-agent`
+(`SSH_AUTH_SOCK`) over connections vci keeps open. RSA keys (the Rust `rsa` crate's private-key operation is not constant-time,
 RUSTSEC-2023-0071), encrypted, PEM-format and security keys, and any signature the agent does not make, sign with
 `ssh-keygen -Y sign` as before, and so do the key files `ssh-keygen` refuses: one whose `.pub` holds another key,
 and one with CRLF line ends. Every signature is checked before it is stored, and refused when a key other than the
@@ -2940,7 +2941,8 @@ one passed ran. A round now ends only when it fetched nothing and its read made 
 remembered attestation failed on its inputs is still not read again (2.7.30). `VCI_TIMING=1` prints `round N: read K
 candidate value(s) of U unit(s) again` and `round N: read K candidate(s) set aside for U unit(s) not skipped, check
 them again (R still not)`. On a synthetic, fully fetched store of 600 Go units with three attestations each, the
-added read took 0.02 to 0.03 s and the whole round, which checks the units not skipped again, 0.16 to 0.21 s.
+added read took 0.02 to 0.03 s and the whole round, which checks the units not skipped again, 0.16 to 0.21 s; on
+1,200 units that all ran (release build) 0.03 s and 0.10 to 0.15 s on git-meta, with plan totals within noise.
 
 ## Threat model (v1)
 

@@ -736,6 +736,38 @@ fn batch_is_one_transaction() {
     assert_eq!(gs.count().unwrap(), 2);
 }
 
+/// A finished batch leaves no write-ahead log behind, even while a pooled
+/// reader (a read-only connection, which cannot checkpoint when it closes)
+/// keeps the store open, as vci run's does: the batch's one transaction
+/// wrote every page it changed to the log (20 MB for 1,200 units), and the
+/// next process to open the store read all of it first (a plan's first
+/// read 2-4 times main's).
+#[test]
+fn a_finished_batch_leaves_no_write_ahead_log() {
+    let (_t, root) = init_repo();
+    let gs = GitMetaStore::new(repo(&root));
+    gs.put_for_test(C, S1, &hex64(3), None, &env("c", &hex64(0xe0)))
+        .unwrap();
+    assert_eq!(gs.list_units(&[A]).unwrap()[0].len(), 0);
+    assert_eq!(gs.pooled_readers(), 1);
+    let wal = root.join(".git/git-meta.sqlite-wal");
+    let batch = gs.batch().unwrap();
+    for i in 0..200u64 {
+        let unit = format!("src/u{i:03}.test.ts");
+        let m = format!("{:064x}", 0xe000 + i);
+        gs.put_manifest(&m, &manifest(&unit)).unwrap();
+        gs.put_for_test(&unit, S1, &format!("{i:064x}"), None, &env(&unit, &m))
+            .unwrap();
+    }
+    assert!(batch.finish().unwrap().is_empty());
+    assert_eq!(gs.pooled_readers(), 1);
+    let left = std::fs::metadata(&wal).map_or(0, |m| m.len());
+    assert_eq!(left, 0, "the batch left a {left}-byte log");
+    assert_eq!(gs.count().unwrap(), 201);
+    drop(gs);
+    assert_eq!(std::fs::metadata(&wal).map_or(0, |m| m.len()), 0);
+}
+
 /// What a batch stores is what the same calls store one by one: the same
 /// rows, the same log operations and deletion records, so `vci push`
 /// publishes the same.

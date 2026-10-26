@@ -175,7 +175,10 @@ fn in_process_key(path: &Utf8Path, bytes: &[u8]) -> Option<PrivateKey> {
     if !bytes.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----\n") || bytes.contains(&b'\r') {
         return None;
     }
-    let key = PrivateKey::from_openssh(bytes).ok()?;
+    let key = match PrivateKey::from_openssh(bytes) {
+        Ok(key) => key,
+        Err(_) => PrivateKey::from_openssh(widened_ecdsa_scalar(bytes)?).ok()?,
+    };
     if key.is_encrypted()
         || !matches!(
             key.algorithm(),
@@ -187,6 +190,94 @@ fn in_process_key(path: &Utf8Path, bytes: &[u8]) -> Option<PrivateKey> {
     let trial = key.sign(NAMESPACE, HASH, b"vci").ok()?;
     key.public_key().verify(NAMESPACE, b"vci", &trial).ok()?;
     Some(key)
+}
+
+/// The unencrypted OpenSSH private key file `bytes` again with its ECDSA
+/// private scalar written at the curve's full width, for ssh-key to read.
+/// OpenSSH writes the scalar as an mpint, which has no leading zero bytes,
+/// and ssh-key 0.6 reads only the full width (or one zero byte more): a
+/// P-521 scalar's first byte is zero about half the time, so about half of
+/// ssh-keygen's P-521 keys, and one P-256 or P-384 key in 256, signed with
+/// ssh-keygen, not in process. `None` for any other file, or one already
+/// at full width.
+fn widened_ecdsa_scalar(bytes: &[u8]) -> Option<String> {
+    const BEGIN: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    const END: &str = "-----END OPENSSH PRIVATE KEY-----";
+    let text = std::str::from_utf8(bytes).ok()?;
+    let body = text.trim().strip_prefix(BEGIN)?.strip_suffix(END)?;
+    let blob = crate::b64_decode(&body.split_whitespace().collect::<String>()).ok()?;
+
+    let rest = blob.strip_prefix(b"openssh-key-v1\0")?;
+    let (cipher, rest) = take_string(rest)?;
+    let (kdf, rest) = take_string(rest)?;
+    let (kdf_options, rest) = take_string(rest)?;
+    let (count, rest) = rest.split_first_chunk::<4>()?;
+    let (public, rest) = take_string(rest)?;
+    let (private, rest) = take_string(rest)?;
+    if cipher != b"none" || kdf != b"none" || u32::from_be_bytes(*count) != 1 || !rest.is_empty() {
+        return None;
+    }
+
+    let (checks, p) = private.split_first_chunk::<8>()?;
+    let (kind, p) = take_string(p)?;
+    let width = match kind {
+        b"ecdsa-sha2-nistp256" => 32,
+        b"ecdsa-sha2-nistp384" => 48,
+        b"ecdsa-sha2-nistp521" => 66,
+        _ => return None,
+    };
+    let (curve, p) = take_string(p)?;
+    let (point, p) = take_string(p)?;
+    let (scalar, p) = take_string(p)?;
+    let (comment, _padding) = take_string(p)?;
+    let first = scalar.iter().position(|b| *b != 0)?;
+    let digits = &scalar[first..];
+    if digits.len() >= width {
+        return None;
+    }
+    let mut wide = vec![0u8; width - digits.len()];
+    wide.extend_from_slice(digits);
+
+    let mut inner = checks.to_vec();
+    for field in [kind, curve, point, wide.as_slice(), comment] {
+        put_string(&mut inner, field);
+    }
+    // The private section's padding (1, 2, 3, ...) to the cipher's block,
+    // 8 bytes for "none".
+    let mut pad = 1u8;
+    while inner.len() % 8 != 0 {
+        inner.push(pad);
+        pad += 1;
+    }
+    let mut out = b"openssh-key-v1\0".to_vec();
+    for field in [cipher, kdf, kdf_options] {
+        put_string(&mut out, field);
+    }
+    out.extend_from_slice(count);
+    put_string(&mut out, public);
+    put_string(&mut out, &inner);
+
+    let encoded = crate::b64_encode(&out);
+    let mut pem = format!("{BEGIN}\n");
+    for line in encoded.as_bytes().chunks(70) {
+        pem.push_str(std::str::from_utf8(line).ok()?);
+        pem.push('\n');
+    }
+    pem.push_str(END);
+    pem.push('\n');
+    Some(pem)
+}
+
+/// An SSH `string` at the start of `b`, and what follows it.
+fn take_string(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (len, rest) = b.split_first_chunk::<4>()?;
+    let len = usize::try_from(u32::from_be_bytes(*len)).ok()?;
+    (rest.len() >= len).then(|| rest.split_at(len))
+}
+
+fn put_string(out: &mut Vec<u8>, s: &[u8]) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(s);
 }
 
 /// Whether the private key whose public half is `key` (read from
