@@ -1,6 +1,6 @@
 # vex's Rails jobs: where the minutes go, what was changed, what it measured to
 
-Date: 25 October 2026 (measurements), vci 2.7.32 measured, 2.7.34 released from this work. Status: in progress;
+Date: 25 to 26 October 2026 (measurements), vci 2.7.32 measured, 2.7.34 and 2.7.35 released from this work. Status: in progress;
 the "After" section is filled in once the release has run on vex's pull requests.
 
 Everything below is read from GitHub Actions on `ComposalAI/vex`, `rails-tests.yml`: the jobs API for each step's
@@ -77,7 +77,8 @@ push, no shards (a store with no recorded durations shards nothing):
 |---|---|---|---|
 | plain, eager-loaded (`CI=true`, 16 workers, as CI runs it) | fast | `bin/rails test` of the 1,072 files | `Finished in` 340, 341, 344, 346 s (four jobs); step 347 to 351 s |
 | plain, lazily loaded (`CI` unset) | slow | the same, loaded as vci loads | `Finished in 638 s`, step 643 s |
-| `vci run`, 16 slots (lazy, as shipped) | slow | the Ruby batch | 696 s; slot setup 18 s; a process 6.5 s on average (requires 0.33 s of it, routes 0.17 s, GC 0.46 s, 69 requires) |
+| `vci run`, 16 slots (lazy, as shipped) | fast | the Ruby batch | 372 and 384 s (two jobs); slot setup 48 s; a process 3.1 to 3.2 s on average, 295 to 308 s at most (unsharded; a slot's files add up to 335 s at most and 194 s at least, so the slowest file ends the batch) |
+| the same | slow | | 674 and 696 s; slot setup 14 to 18 s; a process 6.5 s on average (requires 0.33 s of it, routes 0.17 s, GC 0.46 s, 69 requires) |
 | the same with the application eager-loaded and routes drawn before the slots fork (`VCI_RAILS_EXPERIMENT=eager`) | slow | what lazy loading costs a process | 798 s; a process 7.9 s (requires 0.05 s): slower, not faster |
 | the same with a run-private compile cache (`iseq`) | slow | what parsing and compiling cost | 676 s; a process 6.0 s (requires 0.31 s; 1,294 cache hits and 1,831 misses a process) |
 | the same with `Process.warmup` in each slot (`warmup`) | fast | copy-on-write after the fork | 360 s; a process 3.0 s |
@@ -85,9 +86,10 @@ push, no shards (a store with no recorded durations shards nothing):
 
 What this says:
 
-- **On the same runner, vci's batch costs about what the plain run costs.** On the fast kind, the plain run's 344 s
-  against 360 and 404 s for two vci variants that differ from the shipped one by nothing that moved a process
-  (and without shards: the slowest file ran 284 and 319 s in one process and ended both batches). The 2.2 s a
+- **On the same runner, vci's batch costs about what the plain run costs.** On the fast kind, the plain run's 340
+  to 346 s against 372 and 384 s for the shipped vci (and 360 and 404 s for two variants that moved nothing), all
+  without shards: the slowest file ran 284 to 319 s in one process and ended every vci batch, where the plain run
+  spreads its tests over the workers. The 2.2 s a
   file-worker read from the 18 October step was the October 18 suite; the same group takes 344 s plain today
   because the suite gained the long `persistent_agents` tests, which the plain run spreads over 16 workers test by
   test and vci can only shard.
@@ -107,12 +109,18 @@ alike; not done here.
 
 ## What was changed (2.7.34)
 
-1. **The merge of a fetched tip** (vci-git): the deletion records both sides wrote differently take ours *before*
-   git merges, written into the tip's tree, so no path differs on both sides and `git merge-tree` merges trees
-   alone, with `-X no-renames` so it never looks for where a deleted path went (that reads blobs too). A push
-   whose other job deleted the same superseded attestations no longer pays a failed merge-tree (8 to 55 s) and
-   git-meta's merge (10 to 67 s). Tests: `two_blobless_clones_deleting_the_same_value_both_push` asserts the merge
-   went through git.
+1. **The merge of a fetched tip** (vci-git; 2.7.34, finished in 2.7.35): every path both sides changed is put
+   back to the base's state in the tip's tree before git merges, so each is a change on ours' side only and
+   `git merge-tree` merges trees alone, reading no blob, with `-X no-renames` besides. The result is what
+   git-meta's merge gives (ours wins a deletion record both wrote differently; a value both deleted stays deleted;
+   a record both added once). A push whose other job deleted the same superseded attestations no longer pays a
+   failed merge-tree (8 to 55 s) and git-meta's merge (10 to 67 s). 2.7.34 edited only the records that differed,
+   through a gix tree editor, and passed trees to merge-tree: on git 2.43 (Ubuntu 24.04's, the runners') that
+   git takes commits only and reads the base's blob of a path both sides deleted whenever both also added a path,
+   so every merge there still took the slow path (found by running the store's tests in an Ubuntu 24.04
+   container; they run there now). 2.7.35 edits through git's index (`read-tree`, `update-index --index-info`,
+   `write-tree --missing-ok`, which take an object id the clone lacks) and commits the edited tree. Tests:
+   `two_blobless_clones_deleting_the_same_value_both_push` asserts the merge went through git.
 2. **One slot per piece of work** (the collector): a batch that runs few files, some as shards, opens one slot per
    file or shard instead of one per file (a job that ran 8 files, four of them as 3 to 5 shards, ran its 20 pieces
    on 8 of 16 slots).
