@@ -907,9 +907,15 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   and a relative program path holding a `/` (`["scripts/vci-token"]`) is the checkout's. stdin is `/dev/null`. The
   environment is vci's own, which `take_secrets` already emptied of `NEVER_TO_CHILDREN`; the command removes them again
   (`env_remove`), so `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` never reach it. stdout is captured, at most
-  64 KiB (more is read and dropped, and refused); stderr is captured for the message. Once the command exits, what it
-  wrote is read within a second, even when a process it started (a secrets tool's daemon) keeps the pipes open.
-  After 60 s (or the connect timeout, when longer) the command is killed through its handle and waited for.
+  64 KiB (more is read and dropped, and refused); stderr is captured for the message (its last 64 KiB). Once the
+  command exits, what it wrote is read within a second, even when a process it started (a secrets tool's daemon)
+  keeps the pipes open. On unix the command leads a process group of its own (`process_group(0)`): after 60 s (or the
+  connect timeout, when longer, `Credential::timeout`) the whole group is killed (`kill -KILL -<pgid>`, as the Rails
+  adapter stops a test file, since the crate has no unsafe code to call `kill(2)`), so a wrapper script's program or
+  each stage of a `sh -c` pipeline is stopped with it, and the command is waited for. Two consequences: outside the
+  terminal's foreground group the command cannot prompt there (the system stops a process that reads the terminal,
+  until the timeout), so sign in beforehand (`com login`, `op signin`, `ssh-add`); and a Ctrl-C that stops vci does
+  not reach it, so a command still running then ends on its own (its output goes nowhere).
 - **What it prints.** UTF-8, surrounding whitespace trimmed, not empty, one line, no control character: the token,
   kept as a `Secret::opaque` (redacted everywhere, scrubbed from every message the backend passes through
   `Conn::scrub` once it is known).
@@ -918,7 +924,12 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   (it was stopped)`, `… printed nothing on standard output`, `… printed more than one line on standard output (not
   printed): it must print the credential alone`, `… printed something that is not UTF-8 text …`, `… printed more than
   64 KiB …`, `… was killed by signal 9`. The stderr shown is its last 400 characters on one line, with everything
-  stdout held removed first (whole, by line, and each word of six bytes or more). As for a store that cannot be
+  stdout held removed first (`credential::printed_pieces`: whole, by line, and each piece of six bytes or more
+  between whitespace, control characters or a byte that is not UTF-8, quotes, brackets and `,:;=`, each run of the
+  characters a token is made of, a value after its `key=` or `key:`, the same again with terminal escape sequences
+  taken out, so a token framed in JSON, coloured, or beside a stray byte is removed). No stderr is shown when stdout
+  went past 64 KiB (what it held is not all known) or held more than 256 such pieces, and when stderr went past
+  64 KiB its first word, which may be part of one cut in two, is dropped. As for a store that cannot be
   reached: `vci plan` runs everything with the warning, `vci run` keeps the tests' exit code and attests nothing, and
   `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. A token the server refuses says `the server
   refused the token from [store] token_command (<command>)`.

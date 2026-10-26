@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vci_store::select::{
-    self, ENV_CONNECT_TIMEOUT, ENV_NAMESPACE, ENV_STORE, ENV_STORE_URL, ENV_TIMEOUT, ENV_TOKEN,
-    LibsqlMode, Secret, Selection, Source, StoreSettings, TokenCommand, redact, resolve,
+    self, ENV_CONNECT_TIMEOUT, ENV_NAMESPACE, ENV_REPLICA, ENV_STORE, ENV_STORE_URL, ENV_SYNC,
+    ENV_TIMEOUT, ENV_TOKEN, LibsqlMode, Secret, Selection, Source, StoreSettings, TokenCommand,
+    redact, resolve,
 };
 use vci_store::{
     AttestationStore, BackendFactory, FailedStore, MissingBackend, OpenContext, StoreError,
@@ -1607,25 +1608,42 @@ fn store_url_selects_by_scheme_and_the_environment_wins() {
 
 /// A credential from the environment is only ever sent to a URL from the
 /// environment: `VCI_STORE_TOKEN` with the URL from `vci.toml` is refused,
-/// saying to set `VCI_STORE_URL` too, and printing neither.
+/// saying to set `VCI_STORE_URL` too, and printing neither; so it is when
+/// the environment also chooses the backend or the libSQL mode (CI setting
+/// `VCI_STORE` beside the token, the URL left in `vci.toml`).
 #[test]
 fn an_environment_token_never_goes_to_a_url_from_vci_toml() {
     const TOKEN: &str = "envT0kenS3cret";
-    for toml in [
+    let libsql = [
         TURSO_TOML,
         "[store]\nurl = \"libsql://db.turso.io\"\n",
         "[store]\nbackend = \"libsql\"\nurl = \"https://db.example\"\n[store.libsql]\nreplica = true\n",
-        "[store]\nurl = \"postgres://vci@db.example/ci\"\n",
-    ] {
-        let m = config_err(&[(ENV_TOKEN, TOKEN)], Some(toml));
-        assert!(
-            m.starts_with(
-                "$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url: a credential from the environment is sent only to a URL from the environment"
-            ),
-            "{toml}: {m}"
-        );
-        assert!(m.contains("set $VCI_STORE_URL as well"), "{m}");
-        assert!(!m.contains(TOKEN) && !m.contains("db."), "{m}");
+    ];
+    let postgres = ["[store]\nurl = \"postgres://vci@db.example/ci\"\n"];
+    let token = (ENV_TOKEN, TOKEN);
+    // An environment, and the vci.toml files to try with it.
+    type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
+    let cases: [Case; 7] = [
+        (&[token], &libsql),
+        (&[token], &postgres),
+        (&[(ENV_STORE, "libsql"), token], &libsql),
+        (&[(ENV_STORE, "turso"), token], &libsql),
+        (&[(ENV_SYNC, "replica"), token], &libsql),
+        (&[(ENV_REPLICA, "r.libsql"), token], &libsql),
+        (&[(ENV_STORE, "postgres"), token], &postgres),
+    ];
+    for (vars, tomls) in cases {
+        for toml in tomls {
+            let m = config_err(vars, Some(toml));
+            assert!(
+                m.starts_with(
+                    "$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url: a credential from the environment is sent only to a URL from the environment"
+                ),
+                "{vars:?} {toml}: {m}"
+            );
+            assert!(m.contains("set $VCI_STORE_URL as well"), "{m}");
+            assert!(!m.contains(TOKEN) && !m.contains("db."), "{m}");
+        }
     }
     // With VCI_STORE_URL as well, both come from the environment: the
     // token is used and the command is not.
@@ -1686,12 +1704,33 @@ fn token_command_applies_to_stores_that_take_a_credential() {
     assert_eq!(s.token_command, Some(com.clone()));
     // A token in VCI_STORE_URL comes first: describe says so; the backend
     // does not run the command (it sees the URL's token first).
-    let s = sel(
-        &[(ENV_STORE_URL, "libsql://ci.turso.io?authToken=s3cret-u")],
-        Some(TURSO_TOML),
-    )
-    .unwrap();
-    assert_eq!(line(&s, "token").0, "(the URL's authToken)");
+    for url in [
+        "libsql://ci.turso.io?authToken=s3cret-u",
+        "libsql://ci.turso.io?tls=1&AUTH_TOKEN=s3cret-u",
+        "libsql://ci.turso.io?auth%54oken=s3cret-u",
+        "libsql://ci.turso.io?authToken=&authToken=s3cret-u",
+    ] {
+        let s = sel(&[(ENV_STORE_URL, url)], Some(TURSO_TOML)).unwrap();
+        assert_eq!(line(&s, "token").0, "(the URL's authToken)", "{url}");
+    }
+    // An empty one is no token (the backend skips it, as it skips an empty
+    // VCI_STORE_TOKEN): the command supplies it, and describe says so.
+    for url in [
+        "libsql://ci.turso.io?authToken=",
+        "libsql://ci.turso.io?authToken",
+        "libsql://ci.turso.io?auth_token=&tls=1",
+        "libsql://ci.turso.io?authToken=s3cret-u&authToken=",
+    ] {
+        let s = sel(&[(ENV_STORE_URL, url)], Some(TURSO_TOML)).unwrap();
+        assert_eq!(
+            line(&s, "token"),
+            (
+                "(from token_command: com secrets get vci-store-token --org vex)".into(),
+                "vci.toml [store]".into()
+            ),
+            "{url}"
+        );
+    }
     // A server from VCI_STORE_URL with no token: the command supplies it.
     let s = sel(&[(ENV_STORE_URL, "libsql://ci.turso.io")], Some(TURSO_TOML)).unwrap();
     assert_eq!(s.token_command, Some(com.clone()));

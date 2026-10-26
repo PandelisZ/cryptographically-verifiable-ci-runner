@@ -3051,16 +3051,22 @@ pub mod select {
         pub path: Option<Sourced<String>>,
     }
 
-    /// Whether `url`'s query has an `authToken` (or `auth_token`)
-    /// parameter.
+    /// Whether `url`'s query gives a token: its last `authToken` (or
+    /// `auth_token`, any case, percent-encoded or not) is not empty once
+    /// percent-decoded, as the libSQL backend reads it (an empty one is no
+    /// token, and `[store] token_command` supplies it).
     fn url_has_token(url: &str) -> bool {
-        url.split_once('?').is_some_and(|(_, q)| {
-            q.split('&').any(|kv| {
-                let k = kv.split_once('=').map_or(kv, |(k, _)| k);
+        let Some((_, q)) = url.split_once('?') else {
+            return false;
+        };
+        q.rsplit('&')
+            .find_map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
                 let k = percent_decode(k);
-                k.eq_ignore_ascii_case("authtoken") || k.eq_ignore_ascii_case("auth_token")
+                (k.eq_ignore_ascii_case("authtoken") || k.eq_ignore_ascii_case("auth_token"))
+                    .then(|| percent_decode(v))
             })
-        })
+            .is_some_and(|v| !v.is_empty())
     }
 
     /// Whether a PostgreSQL connection string seems to carry a password: a

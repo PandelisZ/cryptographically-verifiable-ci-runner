@@ -2010,11 +2010,15 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
 - **The environment comes first.** `VCI_STORE_TOKEN`, then the URL's own credential (`authToken` in
   `VCI_STORE_URL`, a password in a PostgreSQL connection string), then the command; when the environment gives a
   token the command is never run. CI, which sets `VCI_STORE_URL` and `VCI_STORE_TOKEN` from secrets, never runs it.
-- **Bounded.** After 60 s (or the connect timeout, when longer) it is stopped. A command that is not found, exits
-  non-zero, is stopped, or prints nothing or more than one line makes the store unavailable, as an unreachable server
-  does: `vci plan` runs everything with a warning saying why (`the token_command (com secrets get vci-store-token
-  --org vex) exited 1: <the end of its stderr>`), `vci run` keeps the tests' exit code and attests nothing, and `vci
-  fetch`, `vci push`, `vci prune` and `vci store info` exit 2. Nothing it printed on standard output is ever shown.
+- **Bounded.** After 60 s (or the connect timeout, when longer) it is stopped with every process it started: it runs
+  in a process group of its own, which is killed. So it cannot prompt on the terminal (the system stops it until the
+  timeout; sign in first: `com login`, `op signin`, `ssh-add`), and a Ctrl-C that stops vci does not reach it. A
+  command that is not found, exits non-zero, is stopped, or prints nothing or more than one line makes the store
+  unavailable, as an unreachable server does: `vci plan` runs everything with a warning saying why (`the
+  token_command (com secrets get vci-store-token --org vex) exited 1: <the end of its stderr>`), `vci run` keeps the
+  tests' exit code and attests nothing, and `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. Nothing
+  it printed on standard output is ever shown: the end of its stderr is shown without it (however it was framed, in
+  JSON or coloured), and not at all when standard output went past 64 KiB.
 - **`vci store info`** names it, never the token: `token: (from token_command: com secrets get vci-store-token --org
   vex) (vci.toml [store])` (`password:` for PostgreSQL), so its output stays safe to paste into an issue.
 - **Trust.** The command comes from the checkout's `vci.toml` and runs with your own privileges: the same trust as

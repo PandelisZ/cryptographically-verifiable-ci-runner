@@ -563,25 +563,42 @@ fn the_token_command_supplies_the_token_and_nothing_else_sees_it() {
 
 /// 2. The trust rule: a token from the environment (CI's secret) with the
 ///    URL from `vci.toml` (which a pull request can change) is refused,
-///    saying to set `VCI_STORE_URL` too: the store fails open, the helper
-///    never runs, and the token is printed nowhere. With `VCI_STORE_URL`
-///    as well, as CI sets both, the token is used and the helper still
-///    never runs.
+///    saying to set `VCI_STORE_URL` too, also when the environment chooses
+///    the backend (`VCI_STORE`, as CI may set it beside the token): the
+///    store fails open, the helper never runs, nothing reaches the server
+///    (the store holds nothing afterwards), and the token is printed
+///    nowhere. With `VCI_STORE_URL` as well, as CI sets both, the token is
+///    used and the helper still never runs.
 #[test]
 fn an_environment_token_is_never_sent_to_a_url_from_vci_toml() {
     let Some(w) = World::new() else { return };
     let com = w.helper("com", &format!("printf '%s\\n' '{TOKEN}'"));
     w.use_store(&com);
-    let env = [("VCI_STORE_TOKEN", TOKEN)];
-    let mut outs = fails_open(&w, &env, "set $VCI_STORE_URL as well");
-    let out = w.run(&env);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    assert!(!text(&out).contains("vci: attested"), "{}", text(&out));
-    outs.push(out);
-    assert_eq!(w.helper_runs(), 0, "the token command never runs");
+    let mut outs = Vec::new();
+    for env in [
+        &[("VCI_STORE_TOKEN", TOKEN)][..],
+        &[("VCI_STORE", "libsql"), ("VCI_STORE_TOKEN", TOKEN)],
+    ] {
+        outs.extend(fails_open(&w, env, "set $VCI_STORE_URL as well"));
+        let out = w.run(env);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        assert!(!text(&out).contains("vci: attested"), "{}", text(&out));
+        outs.push(out);
+        assert_eq!(w.helper_runs(), 0, "the token command never runs");
+    }
 
     let url = w.url();
     let env = [("VCI_STORE_TOKEN", TOKEN), ("VCI_STORE_URL", url.as_str())];
+    // Nothing was stored by the runs refused above: the namespace is still
+    // empty.
+    let (plan, plan_out) = w.plan(&env);
+    assert!(plan.skip.is_empty(), "{plan:?}");
+    assert_eq!(
+        plan.warnings,
+        ["no attestations are available in the libsql store (the first `vci run` creates it)"],
+        "{plan:?}"
+    );
+    outs.push(plan_out);
     let out = w.run(&env);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(text(&out).contains("vci: attested a "), "{}", text(&out));
@@ -643,6 +660,17 @@ fn a_token_command_that_fails_fails_open() {
             "printed more than one line on standard output (not printed)".to_owned(),
         ),
         (
+            // JSON (a secrets CLI without its raw flag), the token echoed on
+            // standard error (debug logging).
+            w.helper(
+                "com-json",
+                &format!(
+                    "printf '{{\\n  \"value\": \"%s\"\\n}}\\n' '{TOKEN}'\necho \"debug: decrypted {TOKEN}\" >&2"
+                ),
+            ),
+            "printed more than one line on standard output (not printed): it must print the credential alone: debug: decrypted ***".to_owned(),
+        ),
+        (
             w.base
                 .join("helpers/com-missing")
                 .to_str()
@@ -672,12 +700,20 @@ fn a_token_command_that_fails_fails_open() {
     w.assert_no_token(&outs);
 }
 
-/// 4. A helper that hangs is stopped after a minute (killed through its
-///    handle), and the store fails open.
+/// 4. A helper that hangs is stopped after a minute, with what it started
+///    (its process group is killed: here a program it runs without
+///    `exec`), and the store fails open.
 #[test]
 fn a_token_command_that_hangs_is_stopped_and_fails_open() {
     let Some(w) = World::new() else { return };
-    let com = w.helper("com-hangs", &format!("echo '{TOKEN}'\nexec sleep 600"));
+    let pid_file = w.base.join("hung.pid");
+    let com = w.helper(
+        "com-hangs",
+        &format!(
+            "echo '{TOKEN}'\nsh -c 'echo $$ > {:?}; exec sleep 600'",
+            pid_file.to_str().unwrap()
+        ),
+    );
     w.use_store(&com);
     let started = Instant::now();
     let (plan, out) = w.plan(&[]);
@@ -696,5 +732,26 @@ fn a_token_command_that_hangs_is_stopped_and_fails_open() {
         "{took:?}"
     );
     assert_eq!(w.helper_runs(), 1);
+    // The program the helper ran is gone too.
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let pid = pid.trim();
+    let until = Instant::now() + Duration::from_secs(10);
+    let alive = loop {
+        let alive = Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive || Instant::now() >= until {
+            break alive;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if alive {
+        // Not left behind by this test either: by its own pid.
+        let _ = Command::new("kill").args(["-KILL", pid]).status();
+    }
+    assert!(!alive, "the helper's sleep ({pid}) outlived it");
     w.assert_no_token(&[out]);
 }

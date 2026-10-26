@@ -243,8 +243,69 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
     );
 }
 
-/// A command that does not finish in time is killed through its handle
-/// and waited for; so is one that leaves a process holding its output.
+/// A command whose standard output is refused and whose standard error
+/// echoes the credential (debug logging, `set -x`): the excerpt of standard
+/// error never shows it, however standard output framed it (pretty JSON, an
+/// ANSI escape or a byte that is not UTF-8 beside it), and is not shown at
+/// all when standard output went past its limit.
+#[test]
+fn standard_error_never_shows_the_credential_standard_output_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let t = Duration::from_secs(30);
+    let echo = format!("echo \"debug: decrypted value {TOKEN} (17 bytes)\" >&2");
+    let shown = "debug: decrypted value *** (17 bytes)";
+    let cases = [
+        (
+            "json-pretty",
+            format!("printf '{{\\n  \"value\": \"{TOKEN}\"\\n}}\\n'\n{echo}"),
+            "printed more than one line on standard output (not printed)",
+            Some(shown),
+        ),
+        (
+            "json-failed",
+            format!("printf '{{\"value\":\"{TOKEN}\"}}\\n'\n{echo}\nexit 4"),
+            "exited 4",
+            Some(shown),
+        ),
+        (
+            "ansi-after",
+            format!("printf '{TOKEN}\\033[0m\\n'\n{echo}"),
+            "printed a control character on standard output (not printed)",
+            Some(shown),
+        ),
+        (
+            "ansi-before",
+            format!("printf '\\033[1m{TOKEN}\\033[0m\\n'\n{echo}"),
+            "printed a control character on standard output (not printed)",
+            Some(shown),
+        ),
+        (
+            "not-utf8",
+            format!("printf '{TOKEN}\\377\\n'\n{echo}"),
+            "not UTF-8 text on standard output (not printed)",
+            Some(shown),
+        ),
+        (
+            "overflow",
+            format!("head -c 70000 /dev/zero | tr '\\0' 'a'\necho\necho {TOKEN}\n{echo}"),
+            "printed more than 64 KiB on standard output (not printed)",
+            None,
+        ),
+    ];
+    for (name, body, says, excerpt) in cases {
+        let cmd = argv(&[&script(d, name, &body)]);
+        let m = fetch(cmd, d, t).unwrap_err().to_string();
+        assert!(m.contains(says), "{name}: {m}");
+        assert!(!m.contains(TOKEN), "{name}: {m}");
+        match excerpt {
+            Some(e) => assert!(m.ends_with(&format!(": {e}")), "{name}: {m}"),
+            None => assert!(!m.contains("debug"), "{name}: {m}"),
+        }
+    }
+}
+
+/// A command that does not finish in time is killed and waited for.
 #[test]
 fn a_command_that_hangs_is_stopped_after_its_time() {
     let dir = tempfile::tempdir().unwrap();
@@ -278,6 +339,76 @@ fn a_command_that_hangs_is_stopped_after_its_time() {
     assert!(!alive, "pid {} still runs", pid.trim());
 }
 
+/// Whether the process `pid` ends within `within` (killed, it is reaped by
+/// whoever adopted it).
+fn ends_within(pid: &str, within: Duration) -> bool {
+    let until = Instant::now() + within;
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A command that does not finish in time is stopped with every process it
+/// started: a wrapper script that runs its program without `exec`, and
+/// each stage of a pipeline run with `sh -c`, leave nothing running.
+#[test]
+fn a_command_that_hangs_is_stopped_with_what_it_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let pid = |name: &str| d.join(name).to_str().unwrap().to_owned();
+    let wrapper = script(
+        d,
+        "wrapper",
+        &format!(
+            "echo {TOKEN}\nsh -c 'echo $$ > {:?}; exec sleep 300'\necho done",
+            pid("wrapped.pid")
+        ),
+    );
+    let pipeline = TokenCommand::Shell(format!(
+        "sh -c 'echo $$ > {:?}; exec sleep 301' | sh -c 'echo $$ > {:?}; exec head -n 1'",
+        pid("left.pid"),
+        pid("right.pid")
+    ));
+    for (cmd, files) in [
+        (argv(&[&wrapper]), &["wrapped.pid"][..]),
+        (pipeline, &["left.pid", "right.pid"]),
+    ] {
+        let m = fetch(cmd.clone(), d, Duration::from_secs(2))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            m.contains("did not finish within 2 s (it was stopped)"),
+            "{m}"
+        );
+        let mut left = Vec::new();
+        for f in files {
+            let p = std::fs::read_to_string(d.join(f)).unwrap();
+            let p = p.trim().to_owned();
+            if !ends_within(&p, Duration::from_secs(10)) {
+                // Not left behind by this test either: the process it
+                // started, by its own pid.
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &p])
+                    .status();
+                left.push(format!("{f} ({p})"));
+            }
+        }
+        assert!(left.is_empty(), "{cmd:?} left {left:?} running");
+    }
+}
+
 /// A command that leaves a process behind holding its output (a secrets
 /// tool's daemon) is read as soon as it exits, not at its deadline.
 #[test]
@@ -305,8 +436,8 @@ fn a_command_that_leaves_a_daemon_behind_is_read_when_it_exits() {
     assert!(took < Duration::from_secs(10), "{took:?}");
 }
 
-/// The time a backend gives it is a minute, or the connect timeout when
-/// longer; its directory is the repository's top level.
+/// A selection's command runs in the repository's top level, when first
+/// asked for (its time: [`the_command_gets_a_minute_or_the_connect_timeout`]).
 #[test]
 fn a_selection_gives_the_command_the_repository_and_a_minute() {
     let dir = tempfile::tempdir().unwrap();
@@ -347,5 +478,93 @@ fn a_selection_gives_the_command_the_repository_and_a_minute() {
         Selection::for_backend("libsql")
             .token_credential(&cx)
             .is_none()
+    );
+}
+
+/// Set, to a directory, in the copy of this test binary that
+/// [`the_command_never_reads_vcis_stdin`] starts.
+const STDIN_INNER: &str = "VCI_CREDENTIAL_TEST_STDIN_DIR";
+
+/// The command's stdin is `/dev/null`, whatever vci's own is: in a copy of
+/// this test binary whose stdin is a pipe holding a line and kept open, a
+/// helper that reads its stdin gets nothing (with vci's stdin, it would
+/// read the line, and fail).
+#[test]
+fn the_command_never_reads_vcis_stdin() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    if let Some(dir) = std::env::var_os(STDIN_INNER) {
+        let dir = Path::new(&dir);
+        let helper = script(
+            dir,
+            "reads-stdin",
+            &format!(
+                "if IFS= read -r line; then echo \"read from stdin: $line\" >&2; exit 9; fi\necho {TOKEN}"
+            ),
+        );
+        let t = fetch(argv(&[&helper]), dir, Duration::from_secs(20)).unwrap();
+        assert_eq!(t.expose(), TOKEN);
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "the_command_never_reads_vcis_stdin",
+            "--nocapture",
+        ])
+        .env(STDIN_INNER, dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"a line on vci's stdin\n").unwrap();
+    stdin.flush().unwrap();
+    // Kept open until the copy has finished.
+    let out = child.wait_with_output().unwrap();
+    drop(stdin);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+}
+
+/// The time the command gets: [`vci_store::credential::TIMEOUT`] (a
+/// minute), or the store's connect timeout when that is longer.
+#[test]
+fn the_command_gets_a_minute_or_the_connect_timeout() {
+    #[derive(serde::Deserialize)]
+    struct OnlyStore {
+        store: vci_store::select::StoreSettings,
+    }
+    let f = toml::from_str::<OnlyStore>(
+        "[store]\nurl = \"libsql://db.turso.io\"\ntoken_command = [\"com\"]\n",
+    )
+    .unwrap()
+    .store;
+    let mut s = resolve(&|_: &str| None, Some(&f)).unwrap();
+    let cx = OpenContext {
+        repo_root: "/repo".into(),
+        git_dir: "/repo/.git".into(),
+        git_common_dir: "/repo/.git".into(),
+        repo_id: std::sync::Arc::new(|| Ok("r".into())),
+        jobs: 1,
+        command: "plan".into(),
+        long_running: false,
+    };
+    assert_eq!(vci_store::credential::TIMEOUT, Duration::from_secs(60));
+    for (connect, given) in [(5, 60), (60, 60), (90, 90)] {
+        s.connect_timeout.value = Duration::from_secs(connect);
+        let c = s.token_credential(&cx).unwrap();
+        assert_eq!(c.timeout(), Some(Duration::from_secs(given)), "{connect}");
+    }
+    assert_eq!(
+        Credential::given(Secret::opaque(TOKEN), "$VCI_STORE_TOKEN").timeout(),
+        None
     );
 }
