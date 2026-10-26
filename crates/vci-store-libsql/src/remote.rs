@@ -404,7 +404,8 @@ impl Remote {
 
     /// Make sure the namespace's tables exist before a write: create them
     /// when missing, in one transaction. A token that may not create them
-    /// gets [`StoreError::NotInitialized`].
+    /// gets [`StoreError::NotInitialized`]; a server that takes no more
+    /// writes, [`StoreError::Denied`] as for any write.
     pub(crate) fn ensure(&self) -> Result<&Tables, StoreError> {
         let t = self.ready()?;
         if self.version()?.is_some() {
@@ -427,6 +428,9 @@ impl Remote {
         };
         match self.write(WRITE, &stmts) {
             Ok(()) => {}
+            // A server that takes no more writes (blocked, full) refuses
+            // this one as it would any other: the token is not the reason.
+            Err(Fail::Store(e)) if crate::conn::is_no_writes(&e) => return Err(e),
             Err(Fail::Store(StoreError::Denied { .. })) => return Err(not_initialized()),
             Err(Fail::Absent) => return Err(not_initialized()),
             Err(Fail::Store(e)) => return Err(e),

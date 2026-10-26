@@ -1812,3 +1812,121 @@ fn nothing_configured_is_git_meta_and_pushes() {
     let last: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     assert_eq!(last["store"], "git-meta");
 }
+
+// ---------------------------------------------------------------------------
+// A store that refuses some writes.
+
+/// A libSQL server that takes no more writes (`sqld`'s write block, what a
+/// Turso database over its quota gets): `vci run`, remote and through a
+/// replica, runs the tests, refuses to store each unit saying why, and
+/// exits as the tests did, not 2; the plan still reads the store. On a
+/// `sqld` of the test's own (the block holds for the whole server).
+#[test]
+fn a_libsql_server_that_blocks_writes_keeps_the_tests_exit_code() {
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    let (server, admin) = match libsql_kit::start_sqld_with_admin() {
+        Ok(s) => s,
+        Err(why) => {
+            eprintln!("SKIPPED: no sqld to block writes on: {why}");
+            return;
+        }
+    };
+    let url = server.url();
+    let key = w.key.to_str().unwrap().to_owned();
+    let env = [
+        ("VCI_STORE", "libsql"),
+        ("VCI_STORE_URL", url.as_str()),
+        ("VCI_STORE_NAMESPACE", "quota"),
+    ];
+    let out = w.vci(&["run", "--key", &key], &env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        attested_keys(&out, "libsql").len(),
+        UNITS.len(),
+        "{}",
+        text(&out)
+    );
+    libsql_kit::set_config(
+        admin,
+        &serde_json::json!({"block_writes": true, "block_reason": "storage quota exceeded"}),
+    )
+    .unwrap();
+    for (i, replica) in [false, true].into_iter().enumerate() {
+        w.touch("a/a.go", &format!("blocked {i}"));
+        w.touch("b/b.go", &format!("blocked {i}"));
+        w.commit(&format!("blocked {i}"));
+        let mut env = env.to_vec();
+        if replica {
+            env.push(("VCI_STORE_SYNC", "replica"));
+        }
+        let out = w.vci(&["run", "--key", &key], &env);
+        let all = text(&out);
+        assert_eq!(out.status.code(), Some(0), "the tests' exit code: {all}");
+        for u in UNITS {
+            assert!(
+                stderr(&out).contains(&format!(
+                    "vci: not attesting {u}: signing or storing failed: "
+                )),
+                "{u}: {all}"
+            );
+        }
+        assert!(all.contains("storage quota exceeded"), "{all}");
+        assert!(!all.contains("problem(s)"), "{all}");
+        assert!(!stderr(&out).contains("vci: attested "), "{all}");
+        // Reads go on: the units left alone still skip.
+        let (plan, _) = w.plan(&env);
+        assert_eq!(plan.skip, set(&["c", "d"]), "{plan:?}");
+        assert_eq!(plan.run, set(&["a", "b"]), "{plan:?}");
+    }
+    drop(server);
+}
+
+/// A shared input manifest the store refuses (here a trigger refuses every
+/// manifest that lists no test file, which only the units' shared base
+/// does; on a libSQL server a base of 5,000,000 bytes or more is refused
+/// the same way) is not relied on: each unit's manifest is stored whole
+/// instead, so every unit `vci run` reports attested verifies, and the
+/// next plan skips it.
+#[test]
+fn a_shared_input_manifest_the_store_refuses_is_not_relied_on() {
+    use vci_store::AttestationStore as _;
+    let Some(b) = Backend::libsql_server(false) else {
+        return;
+    };
+    let ns = b.server.as_ref().unwrap().1.clone();
+    let Some(w) = World::new(b) else { return };
+    // The namespace's tables, then the trigger on its manifests.
+    let s = libsql_kit::open_remote(&ns).unwrap();
+    let e = s
+        .put_for_test("src/setup.test.ts", "1111111111111111", "00", None, b"{}")
+        .unwrap();
+    s.remove(vec![e]).unwrap();
+    let p = vci_store_libsql::table_prefix(&ns);
+    s.__execute_for_test(&[format!(
+        "CREATE TRIGGER {p}no_bases BEFORE INSERT ON {p}manifests \
+         WHEN instr(CAST(NEW.value AS TEXT), '_test.go') = 0 \
+         BEGIN SELECT RAISE(ABORT, 'no shared manifests here'); END"
+    )])
+    .unwrap();
+    let key = w.key.to_str().unwrap().to_owned();
+    let out = w.vci(&["run", "--key", &key], &[]);
+    let all = text(&out);
+    assert!(
+        all.contains("vci: warning: storing the units' shared input manifest: ")
+            && all.contains("no shared manifests here"),
+        "the base was refused: {all}"
+    );
+    let attested = attested_keys(&out, "libsql");
+    assert_eq!(attested.len(), UNITS.len(), "{all}");
+    assert_eq!(out.status.code(), Some(0), "{all}");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(
+        plan.skip,
+        set(UNITS),
+        "every unit attested verifies: {plan:?}"
+    );
+    let ex = w.explain("a");
+    assert!(ex.contains("a: SKIP"), "{ex}");
+}

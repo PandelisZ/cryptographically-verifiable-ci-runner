@@ -321,6 +321,88 @@ pub fn start_sqld(extra: &[String]) -> Result<Process, String> {
     )
 }
 
+/// A throwaway `sqld` from `PATH` with its admin API on a port of its own
+/// (returned with it), for tests that change the server's configuration
+/// ([`set_config`]: blocked writes, a size limit). It serves only the test
+/// that started it.
+pub fn start_sqld_with_admin() -> Result<(Process, u16), String> {
+    let admin = free_port()?;
+    let p = start_sqld(&[
+        "--admin-listen-addr".to_owned(),
+        format!("127.0.0.1:{admin}"),
+    ])?;
+    Ok((p, admin))
+}
+
+/// One HTTP/1.1 request to 127.0.0.1:`port`: the status and the body.
+fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("cannot connect to the admin API: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+    let body = body.unwrap_or("");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes())
+        .map_err(|e| format!("cannot send to the admin API: {e}"))?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)
+        .map_err(|e| format!("cannot read the admin API's answer: {e}"))?;
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let (head, rest) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("not an HTTP answer: {raw}"))?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| format!("no status in {head}"))?;
+    let chunked = head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked");
+    let mut out = String::new();
+    if chunked {
+        let mut rest = rest;
+        while let Some((size, after)) = rest.split_once("\r\n") {
+            let n = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+            if n == 0 || after.len() < n {
+                break;
+            }
+            out.push_str(&after[..n]);
+            rest = after[n..].trim_start_matches("\r\n");
+        }
+    } else {
+        out.push_str(rest);
+    }
+    Ok((status, out))
+}
+
+/// Change the configuration of the server's database (`sqld`'s namespace
+/// `default`, which holds every vci namespace) through its admin API at
+/// `admin`: `patch`'s fields (`block_writes`, `block_reason`,
+/// `max_db_size`, ...) over the current ones.
+pub fn set_config(admin: u16, patch: &serde_json::Value) -> Result<(), String> {
+    const PATH: &str = "/v1/namespaces/default/config";
+    let (status, body) = http(admin, "GET", PATH, None)?;
+    if status != 200 {
+        return Err(format!("GET {PATH}: {status} {body}"));
+    }
+    let mut config: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("GET {PATH}: {e}: {body}"))?;
+    if let (Some(c), Some(p)) = (config.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            c.insert(k.clone(), v.clone());
+        }
+    }
+    let (status, body) = http(admin, "POST", PATH, Some(&config.to_string()))?;
+    if status != 200 {
+        return Err(format!("POST {PATH}: {status} {body}"));
+    }
+    Ok(())
+}
+
 /// A throwaway `turso dev` from `PATH` (`extra` is ignored).
 fn start_turso_dev(_extra: &[String]) -> Result<Process, String> {
     let bin = on_path("turso").ok_or("no turso on PATH")?;

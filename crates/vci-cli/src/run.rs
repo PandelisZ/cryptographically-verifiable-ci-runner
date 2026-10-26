@@ -2817,17 +2817,27 @@ pub fn run_units(
         let mut verdicts: Vec<Option<Verdict>> = (0..units.len()).map(|_| None).collect();
         in_order(&units, jobs, verdict, |i, v| verdicts[i] = Some(v));
         let t = std::time::Instant::now();
-        let manifest_bases = shared_manifest_bases(&verdicts, &units);
+        let mut manifest_bases = shared_manifest_bases(&verdicts, &units);
         if !manifest_bases.is_empty() && mode == StoreMode::Write {
+            // A base the store refused is not relied on: its units' manifests
+            // are encoded whole instead (each then stored, or refused with
+            // its unit, on its own), so no unit is attested on a manifest
+            // that cannot be read back.
             let mut stored_roots = BTreeSet::new();
+            let mut refused = BTreeSet::new();
             for b in manifest_bases.values() {
-                if !stored_roots.insert(b.root()) {
+                let root = b.root();
+                if !stored_roots.insert(root.clone()) {
                     continue;
                 }
-                if let Err(e) = store.put_manifest(&b.root(), b.to_compact().as_bytes()) {
-                    eprintln!("vci: warning: storing the units' shared input manifest: {e}");
+                if let Err(e) = store.put_manifest(&root, b.to_compact().as_bytes()) {
+                    eprintln!(
+                        "vci: warning: storing the units' shared input manifest: {e}; storing each unit's input manifest whole instead"
+                    );
+                    refused.insert(root);
                 }
             }
+            manifest_bases.retain(|_, b| !refused.contains(&b.root()));
             let sizes: Vec<usize> = manifest_bases.values().map(|b| b.entries.len()).collect();
             crate::plan::timing(
                 &format!(

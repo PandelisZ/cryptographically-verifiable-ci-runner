@@ -365,7 +365,10 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
 - The caller guarantees the bytes decode to a manifest with this root. Readers recompute the root anyway.
 - **Fail open**: a unit's own manifest that cannot be stored refuses the unit ("signing or storing failed: storing
   the input manifest: …"). A shared base manifest that cannot be stored is a warning (`vci: warning: storing the
-  units' shared input manifest: …`); the units whose manifests are stored on top of it then never verify, and run.
+  units' shared input manifest: …; storing each unit's input manifest whole instead`), and it is not relied on: the
+  units of its group encode their manifests whole, without the base, and each is stored, or refused with its unit,
+  on its own. No unit is reported attested on a base that is not stored (encoded on it, they would never verify, and
+  would run every time).
 
 ### `remove(doomed) -> removed`
 
@@ -560,7 +563,8 @@ been measured on one yet.
 
 1. Every unit's verdict is decided first, in parallel: checked and signed. The shared base manifests (vci 2.1.8) are
    the entries every signed unit of a group shares, so they are known only once every unit is signed.
-2. The shared base manifests are stored with `put_manifest`, outside the batch. A failure is a warning.
+2. The shared base manifests are stored with `put_manifest`, outside the batch. A failure is a warning, and that
+   base is dropped: its group's units encode their manifests whole (section 4, `put_manifest`).
 3. (2.8) On the check pool, each unit is made ready to store: the supersession reads (`read_units`) of what it
    supersedes, and its manifest encoded on its base. Each is handed in unit order to one writer thread, which opens
    the batch (`store.batch().ok()`: an `Err` from `batch()` is ignored, and the writes go unbatched) and, as soon as
@@ -713,7 +717,7 @@ share one handle, one pool and one circuit breaker. On any error, selecting or o
 | variable | meaning | default |
 |---|---|---|
 | `VCI_STORE` | backend name | (see precedence) |
-| `VCI_STORE_URL` | location: `postgres://user[:password]@host[:port]/db[?sslmode=…&sslrootcert=…]`, `sqlite:<path>` (absolute, or relative to the git common directory), a libSQL server (`libsql://host[:port][/path][?authToken=…&tls=0]`, `https://…`, `http://…`) or file (`file:<path>`). **A secret.** | none |
+| `VCI_STORE_URL` | location: `postgres://user[:password]@host[:port]/db[?sslmode=…&sslrootcert=…]`, `sqlite:<path>` (absolute, or relative to the git common directory; no query), a libSQL server (`libsql://host[:port][/path][?authToken=…&tls=0]`, `https://…`, `http://…`) or file (`file:<path>`, no query). **A secret.** | none |
 | `VCI_STORE_TOKEN` | a libSQL server's auth token (a Turso database token); wins over the URL's `authToken`. **A secret**, redacted whole | none |
 | `VCI_STORE_REPLICA` | the libSQL store's replica file (absolute, or relative to the git common directory); setting it asks for the replica mode | `[store.libsql] path`, else `vci-store.libsql` |
 | `VCI_STORE_NAMESPACE` | a shared server's namespace (PostgreSQL, libSQL) | `[store.postgres]` or `[store.libsql] namespace`, else the repository id (smallest root commit) |
@@ -838,11 +842,12 @@ Errors (each displayed as `attestation store: <message>`):
 - `VCI_STORE` disagreeing with the scheme of `VCI_STORE_URL`;
 - postgres without `VCI_STORE_URL` (the message adds that GitHub does not pass secrets to pull requests from forks);
 - a `sqlite:` `VCI_STORE_URL` without a path, or whose path holds `://` (another scheme's URL, which may carry a
-  password, is never printed as a path);
+  password, is never printed as a path) or a query (`sqlite:x.db?authToken=…`: it would be taken whole as the file's
+  name and printed as one; not printed);
 - for libsql, a `VCI_STORE_URL` that is neither a server (`libsql://`, `https://`, `http://`) nor `file:<path>` (not
-  printed), and, when the store opens, a server URL with a user or password, a fragment or a query parameter other
-  than `authToken` and `tls` (not printed, nor the parameter's name: a token may be either), or the remote modes
-  without a URL;
+  printed), a `file:` URL with a query (as for `sqlite:`, not printed), and, when the store opens, a server URL with a
+  user or password, a fragment or a query parameter other than `authToken` and `tls` (not printed, nor the
+  parameter's name: a token may be either), or the remote modes without a URL;
 - a timeout outside (0, 1 h];
 - a bad schema name or namespace (a namespace is 1 to 128 of `A-Z a-z 0-9 . _ : / @ -`);
 - a pool outside 1..=64;
@@ -945,8 +950,9 @@ What each command does on a store error:
   database, a read-only role or file, a missing schema) with those variants, never as `Backend`: SQLite's garbage file
   is `Unavailable`, an unwritable directory `Denied` or `Unavailable`; PostgreSQL's unreachable server `Unavailable` or
   `Timeout`, a read-only role `Denied`, no schema `NotInitialized`; libSQL's unreachable server, refused token or
-  missing database `Unavailable` or `Timeout`, a read-only token `Denied`, a token that may not create the tables
-  `NotInitialized`.
+  missing database `Unavailable` or `Timeout`, a read-only token or a server that takes no more writes (a database
+  over its quota, at its size limit) `Denied`, a token that may not create the tables `NotInitialized`, a record
+  larger than the server takes `Unsupported` (for its unit alone).
 
 **`FailedStore`.** When selection or opening fails, `for_repo` returns `FailedStore::for_request(factories, wanted,
 &err)`. Its kind is the requested backend's when a registered factory has that name, else `unknown`. When the
@@ -2034,8 +2040,9 @@ measured on the static musl build of section 17.
   libSQL server's URL the same way, and of its query only `tls`, `authToken=***`, and `***` for any other parameter,
   its name included, since a token may be either), `mode`, `path` or `replica`, `token` (`(set)`, `(the URL's
   authToken)` or `(none)`, never the value) and `namespace`.
-- Conditions that mean the store cannot be used are `Unavailable`, `Timeout`, `Denied`, `NotInitialized`,
-  `Incompatible`, `Unsupported` (a record larger than a server takes, below) or `Config` (section 10);
+- Conditions that mean the store cannot be used are `Unavailable`, `Timeout`, `Denied` (a read-only token; a server
+  that takes no more writes, below), `NotInitialized`, `Incompatible`, `Unsupported` (a record larger than a server
+  takes, below) or `Config` (section 10);
   `Backend(LibsqlError)` only for a statement the server refused for a reason vci does not know (a trigger, a
   constraint), which latches nothing: `vci run` then exits 2 after the run, and the handle goes on.
 - The publication gate (section 7) applies to the remote and replica modes, not to the local one.
@@ -2046,7 +2053,9 @@ measured on the static musl build of section 17.
 file format (`application_id` 'vci1', `user_version` 1, schema v1 of section 16), the same statements, batches, WAL
 checkpoint, read-only fallbacks and errors, under the name `libsql` (in `kind()`, errors and timing lines). The file is
 `<git common dir>/vci-store.libsql`, `[store.libsql] path` (relative to the git common directory, no `..`) or
-`VCI_STORE_URL=file:<path>` (absolute or relative). A SQLite store's file can be copied to it and back unchanged.
+`VCI_STORE_URL=file:<path>` (absolute or relative; a `file:` URL with a query, which could hold a token, is refused
+without being printed, never taken whole as a file's name). A SQLite store's file can be copied to it and back
+unchanged.
 
 ### The schema on a server
 
@@ -2086,9 +2095,10 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   (section 9): `VCI_STORE_TOKEN` is in `NEVER_TO_CHILDREN`, kept as a `Secret::opaque` (redacted whole as `***`), and
   `select::redact` masks a libSQL URL's query and path (above). Every message passes through `Conn::scrub`: the URL's
   secrets (every query value but `tls`'s, a bare query key, a path) and the token, each raw, percent-encoded and
-  percent-decoded, JSON-escaped (`\/`) and base64-encoded (standard and URL-safe, at the three offsets it can have
-  inside a longer encoded text, such as an echoed `Authorization` header); `location()`, `Debug` and `vci store info`
-  never hold either.
+  percent-decoded, JSON-escaped at any depth (any run of backslashes before any of its characters: `\/`, then
+  `\\/` when the echoed body is quoted again, and so on) and base64-encoded (standard and URL-safe, at the three
+  offsets it can have inside a longer encoded text, such as an echoed `Authorization` header); `location()`, `Debug`
+  and `vci store info` never hold either.
 - **TLS** is always verified, against the webpki roots; there is no setting for another CA yet (section 21).
 - **Bounded time.** The connector gives up on a connection (TCP and TLS) after the connect timeout (5 s). A handle's
   first request is always the description of a statement (Hrana's `describe`, which `prepare` sends once per
@@ -2124,8 +2134,25 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   `Denied{operation: "write"}`, not latched: the hints a plan writes and the units `vci run` stores are refused, and
   reads go on, on a new stream (the server closes the refused one; a stream whose baton the server no longer knows is
   replaced and the request tried once more). Creating the tables refused that way is `NotInitialized`.
+- **A server that takes no more writes.** `sqld` blocks a database's writes (`Operation was blocked: <reason>`, code
+  `BLOCKED`: what a Turso database over its quota gets, and an operator's block) and refuses a write past its size
+  limit (`database or disk is full`, `SQLITE_FULL`), both with HTTP 200 while reads go on. Such a refusal is
+  `Denied{operation: "write", detail: "<url>: the server takes no more writes (blocked, as a database over its quota
+  is, or full): …"}`, not latched: `vci run` refuses each unit it would store (`signing or storing failed: …`) and
+  exits as the tests did, the plan reads on, and a namespace whose tables do not exist yet is refused the same way
+  (not `NotInitialized`: the token is not the reason). A server that blocks reads too answers a read the same way:
+  that is a latched `Unavailable` (the plan fails open). Checked against `sqld`'s own write block and size limit
+  (its admin API); Turso's hosted quota answers were not observed (section 21).
 - **Pool.** At most `min(VCI_JOBS, 4)` Hrana connections per handle. Each keeps the statements it prepared: Hrana's
-  `prepare` asks the server to describe the statement (one request), once per connection and statement.
+  `prepare` asks the server to describe the statement (one request), once per connection and statement. Its HTTP
+  connections are hyper's (libsql's client), kept alive between requests, except after a read: libsql 0.10.0 drops
+  a read's answer (a cursor) at the end of its statement, before the end of the HTTP body, so hyper closes that
+  connection and the next request opens another (TCP, and TLS on `https://`). vci's connector closes its sockets
+  with a reset (`SO_LINGER` 0, `TcpStream::set_zero_linger`), so a closed connection leaves no `TIME_WAIT` behind:
+  with an ordinary close each read held an ephemeral port for twice the maximum segment lifetime (30 s on macOS, 60 s
+  on Linux), and the conformance suite's 5,900 connections a run ran macOS out of its 16,384 when two runs came close
+  together or the machine was loaded (`Can't assign requested address`, section 21). Only connections whose answer
+  was read, or that were given up, are closed.
 - **Namespace.** As PostgreSQL's: `VCI_STORE_NAMESPACE`, else `[store.libsql] namespace`, else the repository id; a
   shallow clone needs an explicit one, and a namespace is 1 to 128 of `A-Z a-z 0-9 . _ : / @ -`.
 
@@ -2181,7 +2208,9 @@ in one row are not), while a statement may be much larger (24 MB of literals in 
 rest of the row from above: its key, slot, target and reference, a few hundred bytes) before anything is queued or
 sent, as `Unsupported{operation: "storing a record of 5,000,000 bytes or more on a server …"}`: `vci run` refuses that
 unit (`signing or storing failed: …`, keeping the tests' exit code) and stores the rest of the batch, and the handle
-goes on. A shared base manifest that large is a warning, and the units encoded on it then run every time (section 4).
+goes on. A shared base manifest that large is refused too (a warning); its units' manifests are then encoded whole,
+without it (section 4, `put_manifest`), and each unit whose own manifest is that large is refused alone, so no unit
+is reported attested on a base that was not stored.
 A server with a lower limit refuses the batch as `Unsupported` too, not latched. vex's largest manifest is 1.98 MB.
 The SQLite and PostgreSQL stores and git-meta have no such limit, and the local mode, a SQLite file, has none either.
 
@@ -2218,8 +2247,12 @@ was written and what it names) and when the namespace was created.
   it is`, and the store reads the file as it was (a stale replica only makes units run); writes then fail at once
   (the breaker), so `vci run` refuses each unit and keeps the tests' exit code. `vci store info`, `vci fetch`, `vci
   push` and `vci prune` are about the store itself, so for them (`OpenContext::command`) a failed sync is
-  `Unavailable` (`cannot sync the replica <file> from <url>: …`) and they exit 2 (section 10). A sync again at a
-  later prefetch that fails is a warning, once.
+  `Unavailable` (`cannot sync the replica <file> from <url>: …`) and they exit 2 (section 10). So is, for them, a
+  replica they cannot keep (`the replica <file> cannot be kept: …`): a directory vci cannot write (probed first, with a
+  file made there and removed at once, or in the nearest directory above it when it does not exist yet: nothing else
+  is made), whether or not the server holds anything for the namespace yet, or a sync whose changes cannot be written
+  to the file; for the plan and the run that is a warning, and the run's writes are refused (below). A sync again at
+  a later prefetch that fails is a warning, once.
 - **Writes** go to the server as in the remote mode; after each request that stored them they are written to the file
   in one transaction. A write needs a usable replica: a file that is one (below) in a directory vci can write (checked
   once with a probe file, creating nothing); otherwise it is refused as `Unavailable` and nothing reaches the server
@@ -2231,6 +2264,14 @@ was written and what it names) and when the namespace was created.
   request). A value this vci cannot read (an unknown `encoding`) is left out of the file, so its unit runs;
   `orphan_manifests` is asked of the server, where that value still counts as the reference it was stored with.
   Hints go to the server, as in the remote mode.
+- **Reads before a prefetch.** The file is a snapshot taken at its sync, which section 4 allows after a prefetch.
+  Before its caller's first prefetch, `read_values` therefore syncs what changed first (one request when nothing
+  did), so a key another writer removed since it was listed reads as `GONE`, as a remote handle's read does; after a
+  prefetch it reads the file as that prefetch synced it, with no request, until the next one. The plan (the one
+  caller of `read_values`) prefetches before it reads, so this costs it nothing. The other reads before a prefetch
+  (`list_units`, `manifest`, `read_units`, ...) read the file as the opening sync left it, at the store's first use
+  in the process: they may miss what another writer stored or removed since, which only makes a unit run (a value
+  read is verified like any other), and is not worth a request each.
 - **A file that is not a replica** (it exists without `<file>.sync`: a local-mode store at the same default path, say),
   or that is not a database, is never read or written: the store is `Unavailable` ("… is not a replica …", "the
   replica … cannot be read …: remove it, or set $VCI_STORE_REPLICA to another file").
@@ -2286,7 +2327,8 @@ one say `skipping: no libsql server: …`, or panic under `VCI_TEST_LIBSQL=requi
 (`testkit::namespace()`). `testkit::selection` sets a connect timeout of 30 s, since it also bounds the server's first
 answer and one test server serves a hundred concurrent tests (the tests of that bound set their own).
 `start_sqld(args)` and `start_docker_with_env(env)` start servers of their own (the token test starts one that checks
-JWTs).
+JWTs), and `start_sqld_with_admin()` one with its admin API, whose database `set_config(admin, patch)` changes (the
+tests of a server that takes no more writes block its writes and set its size limit there).
 
 **Tests.** `tests/libsql.rs`: the local file is a SQLite store file; a plan's request budget (requests sent again
 while another test's writer held the database, `LibsqlStore::retries()`, not counted); slots, bytewise order,
@@ -2299,8 +2341,12 @@ first write, a replica of an unreachable server; a handle reading its own remova
 (remote and replica); a replica picking up other writers at its next prefetch; a replica whose write-through fails
 reading its own write; a replica of a namespace dropped and made again; a replica's orphans answered as its
 server's; a statement the server refuses latching nothing (remote and replica); a record too large for the server
-refused alone; a replica that cannot be used refusing writes; and, ignored outside release builds, 1,200 units of 18
-KB.
+refused alone; a replica that cannot be used refusing writes; a server that takes no more writes (blocked, full)
+refusing them as `Denied`, an empty namespace's included, with reads going on (remote and replica); a replica's
+`read_values` before a prefetch reading a key removed since it was listed as gone, and after one sending nothing; the
+store commands failing on a replica they cannot keep (an unwritable directory, an empty namespace or not); and,
+ignored outside release builds, 1,200 units of 18 KB. `src/conn.rs` checks that the connector's sockets close
+without lingering and which errors mean a server takes no more writes.
 `tests/conformance.rs` runs the 34 scenarios in each mode (102 tests); the remote and replica ones need a server and
 skip without one. Its worlds:
 
@@ -2316,8 +2362,12 @@ skip without one. Its worlds:
 The CLI tests (`crates/vci-cli/tests/store_backends.rs`) run run, plan, explain, supersession, prune, fetch, push and
 `vci ci`'s gate in the three modes; a server on a closed port, remote and replica, failing open with neither token
 reaching any output, log or test, and store info, fetch, push and prune exiting 2; a server that never answers,
-remote and replica, within the connect timeout with the default timeouts; an error page the client cannot read; and
-a token under any query key, as a bare key, in the path, or under a misspelled `[store.libsql]` key, in no output.
+remote and replica, within the connect timeout with the default timeouts; an error page the client cannot read; a
+token under any query key, as a bare key, in the path, or under a misspelled `[store.libsql]` key, in no output; a
+server that blocks writes (a `sqld` of the test's own, through its admin API), remote and replica, keeping the tests'
+exit code while the plan reads on; and a shared input manifest the server refuses (a trigger) not relied on, every
+unit reported attested skipping on the next plan. `crates/vci-cli/tests/store_select.rs` refuses a `file:` or
+`sqlite:` URL holding a token in its query, printing it nowhere and making no file.
 
 ---
 
@@ -2461,6 +2511,17 @@ Decided while building it:
     (section 18). A unit whose input manifest is that large is never attested on a libSQL server.
 24. **A libSQL server's statement refusals are `Backend`, its HTTP errors `Unavailable`.** Only failures to reach or
     use the server latch the breaker (section 18).
+25. **A server that takes no more writes is `Denied`, not `Backend`.** A database over its quota (`sqld`'s write block,
+    `Operation was blocked`) or at its size limit (`database or disk is full`) still reads; its refused write keeps
+    `vci run`'s exit code the tests' (each unit refused with the reason), latches nothing, and the plan reads on
+    (section 18).
+26. **A shared base manifest the store refuses is not relied on.** `vci run` encodes that group's units' manifests
+    whole instead, so each is stored, or refused with its unit, on its own; no unit is reported attested on a base that
+    was not stored (section 4, `put_manifest`). Its cost is the base's bytes once per unit in that run, only when the
+    base could not be stored.
+27. **A libSQL replica's file is a snapshot taken at its sync.** Before its caller's first prefetch, `read_values`
+    syncs first, so a key removed since it was listed reads as gone; the other reads before a prefetch use the
+    opening sync's snapshot, which may only make a unit run (section 18, "Reads before a prefetch").
 
 Still open:
 
@@ -2505,6 +2566,9 @@ Still open:
     publishes, locally and in CI), not against Turso itself: its limits on a request's or a response's size (a
     vex-scale plan reads about 75 MB; a batch request is capped at 8 MiB of values), how a read-only token's write is
     refused (`sqld` answers HTTP 403, which vci maps to `Denied`), and HTTP/1.1 over TLS through vci's own connector are unchecked there.
+    How Turso refuses a write over a quota was not observed either: vci recognizes `sqld`'s write block (`Operation
+    was blocked`) and size limit (`database or disk is full`), which its hosted service runs on (decision 25); a
+    refusal worded otherwise, with HTTP 200, would be `Backend` and make `vci run` exit 2.
     `sqld`'s own response limit (`--max-response-size`, 10 MB by default) refuses a large result of a plain execute
     request (`RESPONSE_TOO_LARGE`), but not the cursor requests vci reads with: a 22 MB read and a 12 MB sync went
     through. Its row limit (5,000,000 bytes, decision 23) is assumed for Turso too; a lower one is refused as
@@ -2514,7 +2578,19 @@ Still open:
 16. **The libSQL change log.** Every write logs a row per slot and root it touched, kept 30 days; its size on a busy
     namespace, and whether a shorter retention (a full sync after it) is better, have not been measured. A replica on
     an ephemeral runner syncs everything every time; a cache of the replica file would make that a delta.
-17. **The libSQL conformance suite on a loaded machine.** With one throwaway `sqld` serving its 102 tests at once, on a
-    laptop at a load average of 60 to 300 (14 CPUs), about one run in four has every write wait out its 30 s request
-    timeout (reads go on), so most scenarios fail; the commit that added the store does the same. Whether `sqld`
-    stalls on the concurrent `CREATE TABLE`s of a hundred namespaces or on the load alone is not known.
+17. **The libSQL conformance suite on a loaded machine.** Its intermittent failures had a cause in the client: libsql
+    0.10.0 drops each read's answer before the end of its HTTP body, so every read closed its connection, and each
+    close held an ephemeral port in `TIME_WAIT` (30 s on macOS); a run opened about 5,900 connections (2,000 in the
+    three seconds of one scenario, c32), and two runs close together, or a slow one on a loaded machine, ran out of
+    macOS's 16,384 ports (`Can't assign requested address`), after which most scenarios failed: three runs back to
+    back on 26 October, at a load average of 12 to 34, reached 16,344 sockets in `TIME_WAIT`, and the second failed 30
+    of its 102 tests. The connector now closes its sockets with a reset (section 18, "Pool"): the same three runs
+    passed, at most ten sockets in `TIME_WAIT`, in 10 to 11 s each. Still open: a `sqld` 0.24.32 whose writes stall
+    while reads go on. At a load average of 60 to 300 (14 CPUs), about one run in four had every write wait out its
+    30 s request timeout (the store's first commit too), and after one port-exhausted run a reviewer's `sqld` kept
+    answering reads while every write hung for 37 minutes; whether `sqld` stalls on the concurrent `CREATE TABLE`s of
+    a hundred namespaces, on the load, or on what a run that ran out of ports left behind, is not known. Four runs in a
+    row against one external `sqld` since left it writing. The suite still opens a connection per read (libsql's), and
+    on a server that keeps its namespaces (an external one) its scenarios slow as the tables of earlier runs accumulate
+    (those four runs took 10, 28, 42 and 50 s; 15 to 18 s for the remote ones at 7,500 schema objects, against 2.5 to
+    4.8 s at a few hundred, in an earlier measurement).

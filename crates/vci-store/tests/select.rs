@@ -1233,3 +1233,77 @@ fn a_url_as_a_path_in_vci_toml_is_refused_unprinted() {
         }
     }
 }
+
+/// A token a server echoes JSON-escaped, then escaped again by whatever
+/// carries the text on (a JSON body quoted inside another, a message
+/// printed as JSON), is scrubbed at every depth: `\/`, `\\/`, `\\\/`,
+/// `\\\\/`, and quotes and backslashes in the token escaped as often.
+#[test]
+fn tokens_escaped_again_and_again_are_scrubbed() {
+    let token = "envTok/S3cr3t+Foxtrot==";
+    let t = Secret::opaque(token);
+    // The echo401 server's body: json.dumps of the token with `/` as `\/`.
+    let body = format!(
+        "{{\"error\": \"bad token Bearer {token}\", \"esc\": \"Bearer {}\"}}",
+        token.replace('/', "\\\\/")
+    );
+    let printed = serde_json::to_string(&body).unwrap();
+    let twice = serde_json::to_string(&printed).unwrap();
+    for text in [body.as_str(), printed.as_str(), twice.as_str()] {
+        let got = t.scrub(text);
+        assert!(!got.contains("S3cr3t"), "{got}");
+    }
+    for slashes in 1..6 {
+        let echoed = format!(
+            "x {} y",
+            token.replace('/', &format!("{}/", "\\".repeat(slashes)))
+        );
+        let got = t.scrub(&echoed);
+        assert_eq!(got, "x *** y", "{echoed}");
+    }
+    let odd = Secret::opaque("tok\"en\\S3cr3t/x");
+    for text in [
+        "tok\\\"en\\\\S3cr3t\\/x",
+        "tok\\\\\\\"en\\\\\\\\S3cr3t\\\\/x",
+    ] {
+        assert_eq!(odd.scrub(text), "***", "{text}");
+    }
+    // Ordinary text around a backslash is left alone.
+    assert_eq!(t.scrub("a\\/b envTok"), "a\\/b envTok");
+}
+
+/// A `file:` (libsql) or `sqlite:` `$VCI_STORE_URL` holding a query is
+/// refused, unprinted, never taken whole as a file name: the query could
+/// hold a token (`?authToken=…`).
+#[test]
+fn a_local_file_url_with_a_query_is_refused_unprinted() {
+    for (backend, url) in [
+        ("libsql", "file:local.db?authToken=fileTokS3cr3tZulu"),
+        ("libsql", "file:///tmp/local.db?authToken=fileTokS3cr3tZulu"),
+        ("libsql", "file:local.db?fileTokS3cr3tZulu"),
+        ("sqlite", "sqlite:local.db?authToken=fileTokS3cr3tZulu"),
+        ("sqlite", "sqlite:///tmp/local.db?token=fileTokS3cr3tZulu"),
+    ] {
+        let m = config_err(&[(ENV_STORE, backend), (ENV_STORE_URL, url)], None);
+        assert!(
+            !m.contains("S3cr3t") && !m.contains("local.db"),
+            "{url}: {m}"
+        );
+        assert!(m.contains("query"), "{url}: {m}");
+    }
+    // A plain path is still taken.
+    let s = sel(
+        &[(ENV_STORE, "libsql"), (ENV_STORE_URL, "file:local.db")],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        s.libsql.path.as_ref().map(|p| p.value.as_str()),
+        Some("local.db")
+    );
+    let s = sel(&[(ENV_STORE_URL, "sqlite:local.db")], None).unwrap();
+    assert_eq!(
+        s.sqlite.path.as_ref().map(|p| p.value.as_str()),
+        Some("local.db")
+    );
+}

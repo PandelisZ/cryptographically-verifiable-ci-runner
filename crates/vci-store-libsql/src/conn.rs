@@ -28,7 +28,13 @@
 //!   statements, values written as literals, travel in one request and
 //!   apply atomically. A statement the server refuses is
 //!   [`StoreError::Backend`] (or `Unsupported` for a record larger than the
-//!   server takes) and latches nothing.
+//!   server takes, `Denied` for a write to a server that takes no more
+//!   writes: blocked over a quota, or full) and latches nothing.
+//! * **Connections** are hyper's, kept alive, except after a read: libsql
+//!   drops a read's answer before the end of its HTTP body, so hyper closes
+//!   that connection. The connector's sockets close with a reset, leaving
+//!   no `TIME_WAIT` behind (one per read would exhaust the machine's
+//!   ephemeral ports).
 //! * **Panics.** libsql 0.10.0 panics on an HTTP error whose body is not
 //!   UTF-8 text; every call into it is guarded (see [`guarded`]): such a
 //!   panic is a latched `Unavailable`, and prints nothing.
@@ -73,6 +79,29 @@ pub(crate) const TOO_BIG: &str = "storing a record of 5,000,000 bytes or more on
 /// What a record the server refused as too big is.
 const TOO_BIG_REFUSED: &str =
     "storing a record this large on this server (it refused it as too big)";
+
+/// What a [`StoreError::Denied`] write says when the server takes no more
+/// writes for now: blocked (a database over its quota, an operator's
+/// block) or full (its size limit, its disk).
+pub(crate) const TAKES_NO_WRITES: &str =
+    "the server takes no more writes (blocked, as a database over its quota is, or full)";
+
+/// Whether `lower` (an error's text, in lowercase) says that the server
+/// takes no more writes: `sqld`'s write block (`Operation was blocked[:
+/// <reason>]`, code `BLOCKED`, what a Turso database over its quota gets)
+/// or its size limit (`database or disk is full`, `SQLITE_FULL`).
+fn takes_no_writes(lower: &str) -> bool {
+    lower.contains("operation was blocked")
+        || lower.contains("code: \"blocked\"")
+        || lower.contains("database or disk is full")
+        || lower.contains("sqlite_full")
+}
+
+/// Whether `e` is a write refused because the server takes no more writes
+/// (see [`TAKES_NO_WRITES`]), not because of the token.
+pub(crate) fn is_no_writes(e: &StoreError) -> bool {
+    matches!(e, StoreError::Denied { detail, .. } if detail.contains(TAKES_NO_WRITES))
+}
 
 /// The most connections one handle opens.
 const MAX_POOL: usize = 4;
@@ -371,6 +400,16 @@ impl tower_service::Service<http::Uri> for Connector {
                     .trim_end_matches(']')
                     .to_owned();
                 let tcp = tower_service::Service::call(&mut http, uri).await?;
+                // Closed with a reset, leaving no TIME_WAIT behind: libsql
+                // 0.10.0 drops a read's answer at the end of its statement,
+                // before the end of the HTTP body, so hyper cannot reuse
+                // the connection and closes it, one per read. With an
+                // ordinary close each read would hold an ephemeral port for
+                // twice the maximum segment lifetime (30 s on macOS, 60 s
+                // on Linux), and thousands of reads (a conformance run's
+                // 5,900) run the machine out of ports. Only a connection
+                // whose answer was read, or that is given up, is closed.
+                let _ = tcp.set_zero_linger();
                 if !https {
                     return Ok::<Socket, BoxError>(Socket::Plain(tcp));
                 }
@@ -864,6 +903,28 @@ impl Conn {
             // Another HTTP error status (a 5xx, a proxy's page).
             return unavailable(format!("{at}: {text}"), true, false);
         }
+        if takes_no_writes(&lower) {
+            // The server works but takes no more writes (a database over its
+            // quota, at its size limit): a write is refused, which keeps
+            // `vci run`'s exit code the tests', and reads go on (nothing is
+            // latched). A server that blocks reads as well cannot be used.
+            if op.verb == WRITE.verb {
+                return Class::fail(
+                    Fail::Store(StoreError::Denied {
+                        backend: KIND,
+                        operation: op.verb,
+                        detail: format!("{at}: {TAKES_NO_WRITES}: {text}"),
+                    }),
+                    false,
+                    true,
+                );
+            }
+            return unavailable(
+                format!("{at}: the server refused to read: {text}"),
+                true,
+                true,
+            );
+        }
         if lower.contains("api error") || lower.contains("error at step") {
             // A statement the server refused (a batch step's error comes as
             // an API error, a cursor step's as `error at step`): the server
@@ -1250,6 +1311,51 @@ mod tests {
         assert_eq!(blob(&[0xff, 0]), "X'FF00'");
         assert_eq!(opt_int(None), "NULL");
         assert_eq!(opt_text(Some("x")), "'x'");
+    }
+
+    /// The connector's sockets close with a reset and leave no TIME_WAIT
+    /// behind: libsql 0.10.0 drops a read's answer at the end of its
+    /// statement, before the end of the HTTP body, so hyper closes that
+    /// connection, one per read, and thousands of reads (the conformance
+    /// suite's) would hold every ephemeral port of the machine.
+    #[test]
+    fn connections_close_without_lingering() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut c = Connector::new(None, Duration::from_secs(5));
+        let uri: http::Uri = format!("http://127.0.0.1:{port}/").parse().unwrap();
+        let s = rt
+            .block_on(tower_service::Service::call(&mut c, uri))
+            .unwrap();
+        match s {
+            Socket::Plain(t) => assert_eq!(t.linger().unwrap(), Some(Duration::ZERO)),
+            Socket::Tls(_) => panic!("a plain connection"),
+        }
+    }
+
+    /// A server that takes no more writes: `sqld`'s write block (a
+    /// database over its quota) and its size limit, as a batch step's
+    /// error, a statement's and a cursor step's.
+    #[test]
+    fn blocked_and_full_servers_are_recognized() {
+        for text in [
+            "Hrana: `api error: `Operation was blocked: storage quota exceeded``",
+            "Hrana: `stream error: `Error { message: \"Operation was blocked\", code: \"BLOCKED\" }``",
+            "Hrana: `api error: `SQLite error: database or disk is full``",
+            "Hrana: `cursor error: `error at step 1: (error code: SQLITE_FULL) `SQLite error: database or disk is full```",
+        ] {
+            assert!(takes_no_writes(&text.to_ascii_lowercase()), "{text}");
+        }
+        for text in [
+            "Hrana: `api error: `SQLite error: UNIQUE constraint failed: t.a``",
+            "Hrana: `api error: `boom``",
+        ] {
+            assert!(!takes_no_writes(&text.to_ascii_lowercase()), "{text}");
+        }
     }
 
     #[test]

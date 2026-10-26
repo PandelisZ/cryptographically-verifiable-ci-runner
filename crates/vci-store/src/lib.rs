@@ -2313,9 +2313,11 @@ pub mod select {
         /// `text` with this secret replaced: the whole string by its
         /// redacted form, then its password (as written and
         /// percent-decoded, when at least 3 bytes) by `***`, and the forms
-        /// a server or proxy may echo it in (JSON-escaped; base64, standard
-        /// and URL-safe, inside a longer encoded text too). Backends pass
-        /// every message from their libraries through this.
+        /// a server or proxy may echo it in (JSON-escaped, once or again and
+        /// again: any run of backslashes before any of its characters;
+        /// base64, standard and URL-safe, inside a longer encoded text
+        /// too). Backends pass every message from their libraries through
+        /// this.
         ///
         /// A URL password holding an unencoded `@` is read differently by
         /// different parsers (the PostgreSQL client ends it at the first
@@ -2340,9 +2342,19 @@ pub mod select {
             let echoed: Vec<String> = found.iter().flat_map(|p| echoed_forms(p)).collect();
             found.extend(echoed);
             found.sort_by_key(|p| std::cmp::Reverse(p.len()));
-            for p in found {
+            for p in &found {
                 if p.len() >= 3 {
-                    out = out.replace(&p, "***");
+                    out = out.replace(p, "***");
+                }
+            }
+            // Escaped again by whatever carried the text on (a JSON body
+            // quoted in another, a message printed as JSON): any run of
+            // backslashes before any of the secret's characters.
+            if out.contains('\\') {
+                for p in &found {
+                    if p.len() >= 3 {
+                        out = replace_escaped(&out, p);
+                    }
                 }
             }
             out
@@ -2473,6 +2485,61 @@ pub mod select {
             }
         }
         out
+    }
+
+    /// `text` with each occurrence of `secret` replaced by `***`, also where
+    /// backslashes were put before any of its characters after the first
+    /// (it was escaped once or more, as JSON escapes `/`, `"` and `\`): a
+    /// backslash of the secret's own matches a run of backslashes.
+    fn replace_escaped(text: &str, secret: &str) -> String {
+        let t = text.as_bytes();
+        let s = secret.as_bytes();
+        let Some(&first) = s.first() else {
+            return text.to_owned();
+        };
+        // Where an escaped occurrence starting at `i` ends, if one does.
+        let ends = |i: usize| -> Option<usize> {
+            let mut at = i;
+            for (k, &c) in s.iter().enumerate() {
+                if c == b'\\' {
+                    let from = at;
+                    while t.get(at) == Some(&b'\\') {
+                        at += 1;
+                    }
+                    if at == from {
+                        return None;
+                    }
+                    continue;
+                }
+                if k > 0 {
+                    while t.get(at) == Some(&b'\\') {
+                        at += 1;
+                    }
+                }
+                if t.get(at) != Some(&c) {
+                    return None;
+                }
+                at += 1;
+            }
+            Some(at)
+        };
+        let mut out = Vec::with_capacity(t.len());
+        let mut i = 0;
+        while i < t.len() {
+            if t[i] == first
+                && let Some(end) = ends(i)
+            {
+                out.extend_from_slice(b"***");
+                i = end;
+            } else {
+                out.push(t[i]);
+                i += 1;
+            }
+        }
+        // A match starts and ends with whole characters of the secret (only
+        // ASCII backslashes are skipped), so the text stays UTF-8.
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
     }
 
     fn percent_encode(s: &str) -> String {
@@ -3164,6 +3231,15 @@ pub mod select {
                 .all(|b| b.is_ascii_alphanumeric() || b"._:/@-".contains(&b))
     }
 
+    /// Why a `file:` or `sqlite:` `VCI_STORE_URL` holding a query is
+    /// refused: it would be taken whole as a file name, and printed as one,
+    /// while a query may hold a token (`?authToken=…`).
+    fn file_url_query(scheme: &str) -> String {
+        format!(
+            "${ENV_STORE_URL}={scheme}:<path> names a file and takes no query (?…), which may hold a token (it was not printed)"
+        )
+    }
+
     fn relative_path(p: &str) -> Result<String, StoreError> {
         relative_path_of(p, "sqlite", &format!("{ENV_STORE_URL}=sqlite:<path>"))
     }
@@ -3201,7 +3277,7 @@ pub mod select {
     ///   path`.
     /// * `file:<path>`, or no URL, is the local mode, in that file, else
     ///   `[store.libsql] path`. A replica asked for without a server is a
-    ///   warning.
+    ///   warning. A `file:` URL with a query (`?`) is refused, unprinted.
     /// * Any other URL is refused, without being printed.
     fn libsql_selection(
         k: &str,
@@ -3296,6 +3372,9 @@ pub mod select {
                 "${ENV_STORE_URL}=file:<path> needs a path"
             )));
         }
+        if p.contains('?') {
+            return Err(StoreError::Config(file_url_query("file")));
+        }
         Ok(LibsqlSelection {
             mode: Sourced {
                 value: LibsqlMode::Local,
@@ -3315,9 +3394,10 @@ pub mod select {
     /// Empty variables count as unset. Errors ([`StoreError::Config`]):
     /// connection settings in `vci.toml`; a URL in `VCI_STORE`; a malformed
     /// backend name; `VCI_STORE` disagreeing with the scheme of
-    /// `VCI_STORE_URL`; postgres without `VCI_STORE_URL`; a `sqlite:`
-    /// `VCI_STORE_URL` without a path, or whose path holds `://` (another
-    /// scheme's URL, never printed); a timeout outside (0, 1 h]; a schema
+    /// `VCI_STORE_URL`; postgres without `VCI_STORE_URL`; a `sqlite:` or
+    /// `file:` `VCI_STORE_URL` without a path, or whose path holds `://`
+    /// (another scheme's URL) or a query (`?`, which may hold a token),
+    /// never printed; a timeout outside (0, 1 h]; a schema
     /// that is not a lowercase identifier; a malformed namespace; a pool
     /// outside 1 to 64; a grace over 30 days; a SQLite path in `vci.toml`
     /// that is absolute or climbs out with `..`. Overridden and ignored
@@ -3444,6 +3524,9 @@ pub mod select {
                     return Err(StoreError::Config(format!(
                         "${ENV_STORE_URL} is not a sqlite:<path> location (it was not printed)"
                     )));
+                }
+                if p.contains('?') {
+                    return Err(StoreError::Config(file_url_query("sqlite")));
                 }
                 Some(Sourced {
                     value: p.to_owned(),

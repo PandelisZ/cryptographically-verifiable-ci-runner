@@ -1478,3 +1478,220 @@ fn a_replica_that_cannot_be_used_refuses_writes() {
             .is_empty()
     );
 }
+
+// ---- a server that takes no more writes ------------------------------------------------------
+
+/// A server that takes no more writes refuses them as `Denied`, which
+/// keeps `vci run`'s exit code the tests' (`docs/STORE-BACKENDS.md`
+/// section 10), latches nothing, and lets reads go on: `sqld`'s write
+/// block (what a database over its quota gets: `Operation was blocked:
+/// <reason>`), and its size limit (`database or disk is full`). In an
+/// empty namespace the first write is refused the same way, not as a
+/// store that is "not set up". Remote and replica, on a `sqld` of the
+/// test's own (the block holds for every namespace of the server).
+#[test]
+fn a_server_that_blocks_writes_refuses_them_and_reads_go_on() {
+    let (server, admin) = match testkit::start_sqld_with_admin() {
+        Ok(s) => s,
+        Err(why) => {
+            eprintln!("skipping: no sqld to block writes on: {why}");
+            return;
+        }
+    };
+    let url = server.url();
+    let dir = tempfile::tempdir().unwrap();
+    let ns = testkit::namespace();
+    let empty = testkit::namespace();
+    let handle = |mode: LibsqlMode, ns: &str, file: &str| {
+        open(&testkit::selection(
+            mode,
+            Some(&url),
+            None,
+            Some(ns),
+            (mode == LibsqlMode::Replica)
+                .then(|| dir.path().join(file))
+                .as_deref(),
+        ))
+    };
+    let w = handle(LibsqlMode::Remote, &ns, "");
+    let kept = w
+        .put_for_test(
+            "src/kept.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(1)),
+            &envelope(None, "kept"),
+        )
+        .unwrap();
+    let blocks = [
+        (
+            serde_json::json!({"block_writes": true, "block_reason": "storage quota exceeded"}),
+            "blocked",
+        ),
+        (
+            serde_json::json!({"block_writes": false, "block_reason": null, "max_db_size": "40KB"}),
+            "full",
+        ),
+    ];
+    for (i, (block, says)) in blocks.iter().enumerate() {
+        testkit::set_config(admin, block).unwrap();
+        for (j, mode) in [LibsqlMode::Remote, LibsqlMode::Replica]
+            .into_iter()
+            .enumerate()
+        {
+            let tag = format!("{says} {}", mode.name());
+            let s = handle(mode, &ns, &format!("r{i}.libsql"));
+            let big = envelope(None, &"z".repeat(200_000));
+            let n = u8::try_from(2 + i * 4 + j * 2).unwrap();
+            let put = s.put_for_test("src/new.test.ts", S1, &hex64(n), Some(&hint(2)), &big);
+            match &put {
+                Err(e @ StoreError::Denied { operation, .. }) => {
+                    assert_eq!(*operation, "write", "{tag}: {e}");
+                    assert!(e.to_string().contains(says), "{tag}: {e}");
+                }
+                other => panic!("{tag}: expected Denied, got {other:?}"),
+            }
+            // A batch is refused when it finishes, the same way.
+            let b = s.batch().unwrap();
+            let m = manifest(&[&format!("src/m{n}.rs")]);
+            s.put_manifest(&m.root(), m.to_compact().as_bytes())
+                .unwrap();
+            s.put_for_test("src/new.test.ts", S1, &hex64(n + 1), Some(&hint(3)), &big)
+                .unwrap();
+            match b.finish() {
+                Err(StoreError::Denied { .. }) => {}
+                other => panic!("{tag}: the batch: expected Denied, got {other:?}"),
+            }
+            // Nothing is latched: reads go on.
+            assert_eq!(
+                keys_of(&s, "src/kept.test.ts"),
+                vec![kept.key.clone()],
+                "{tag}"
+            );
+            assert!(keys_of(&s, "src/new.test.ts").is_empty(), "{tag}");
+            assert!(
+                matches!(s.status(), Ok(StoreStatus::Ready { .. })),
+                "{tag}: {:?}",
+                s.status()
+            );
+            // A namespace with no tables yet: its first write creates them,
+            // and that is refused the same way.
+            let e = handle(mode, &empty, &format!("e{i}{j}.libsql"));
+            match e.put_for_test("src/e.test.ts", S1, &hex64(n), None, &big) {
+                Err(StoreError::Denied { .. }) => {}
+                other => panic!("{tag}: an empty namespace: expected Denied, got {other:?}"),
+            }
+        }
+    }
+    testkit::set_config(
+        admin,
+        &serde_json::json!({"block_writes": false, "max_db_size": "1000PB"}),
+    )
+    .unwrap();
+    w.put_for_test(
+        "src/after.test.ts",
+        S1,
+        &hex64(99),
+        Some(&hint(9)),
+        &envelope(None, "after"),
+    )
+    .unwrap();
+    drop(server);
+}
+
+// ---- a replica's reads before a prefetch ------------------------------------------------------
+
+/// Before its caller's first prefetch, a replica answers `read_values` as
+/// the server holds the keys now, as a remote handle does: a key another
+/// writer removed since it was listed reads as gone (section 4). After a
+/// prefetch, reads come from the file as that prefetch synced it, with no
+/// request, until the next prefetch (the snapshot section 4 allows).
+#[test]
+fn a_replica_reads_a_key_removed_since_it_was_listed_as_gone() {
+    let Some((w, ns)) = remote() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let u = "src/gone.test.ts";
+    let k = w
+        .put_for_test(u, S1, &hex64(1), Some(&hint(1)), &envelope(None, "one"))
+        .unwrap();
+    let r = testkit::open_replica(&ns, &dir.path().join("r.libsql")).unwrap();
+    let listed = r.list_units(&[u]).unwrap().remove(0);
+    assert_eq!(listed.len(), 1);
+    w.remove(vec![k.clone()]).unwrap();
+    let state = read_state(&r, &listed[0]);
+    assert!(state.contains("no longer"), "{state}");
+
+    // After a prefetch: the file as the prefetch synced it, no request.
+    let k2 = w
+        .put_for_test(u, S1, &hex64(2), Some(&hint(2)), &envelope(None, "two"))
+        .unwrap();
+    let r2 = testkit::open_replica(&ns, &dir.path().join("r2.libsql")).unwrap();
+    r2.prefetch(Prefetch::Units {
+        test_ids: &[u],
+        choose: None,
+    })
+    .unwrap();
+    let listed = r2.list_units(&[u]).unwrap().remove(0);
+    assert_eq!(listed[0].key, k2.key);
+    let before = r2.requests();
+    assert_eq!(read_state(&r2, &listed[0]), "read");
+    assert_eq!(r2.requests(), before, "reads after a prefetch send nothing");
+}
+
+// ---- a replica the store commands cannot keep ---------------------------------------------------
+
+/// `vci store info`, fetch, push and prune (the commands about the store
+/// itself) fail on a replica that cannot be kept, as they do when its
+/// server cannot be reached: one in a directory vci cannot write, whether
+/// or not the namespace holds anything yet. The plan and the run read it
+/// as it is (and the run refuses each write).
+#[test]
+fn the_store_commands_fail_on_a_replica_that_cannot_be_kept() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some((w, filled)) = remote() else { return };
+    w.put_for_test(
+        "src/f.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "f"),
+    )
+    .unwrap();
+    let empty = testkit::namespace();
+    let dir = tempfile::tempdir().unwrap();
+    let ro = dir.path().join("ro");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let server = testkit::server().unwrap();
+    let replica = |ns: &str, command: &str| {
+        let sel = testkit::selection(
+            LibsqlMode::Replica,
+            Some(&server.url),
+            server.token.as_deref(),
+            Some(ns),
+            Some(&ro.join("r.libsql")),
+        );
+        let cx = vci_store::OpenContext {
+            command: command.to_owned(),
+            ..testkit::cx()
+        };
+        LibsqlStore::open(&sel, &cx).unwrap()
+    };
+    for ns in [&empty, &filled] {
+        for command in ["store", "fetch", "push", "prune"] {
+            match replica(ns, command).status() {
+                Err(e @ StoreError::Unavailable { .. }) => {
+                    assert!(e.to_string().contains("cannot"), "{command} {ns}: {e}")
+                }
+                other => panic!("{command} {ns}: expected Unavailable, got {other:?}"),
+            }
+        }
+        let plan = replica(ns, "plan");
+        assert!(plan.status().is_ok(), "plan {ns}: {:?}", plan.status());
+        assert!(matches!(
+            plan.put_for_test("src/w.test.ts", S1, &hex64(2), None, b"{}"),
+            Err(StoreError::Unavailable { .. })
+        ));
+    }
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

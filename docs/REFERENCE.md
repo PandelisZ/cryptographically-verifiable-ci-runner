@@ -1767,7 +1767,7 @@ Then run `vci ci` as before (`--push` where it should store). The store has thre
 |---|---|---|---|
 | remote | a `libsql://` `VCI_STORE_URL` (an `https://` or `http://` one with `VCI_STORE=libsql`) | from the server, a plan in about a dozen requests | to the server, a project's units in one request |
 | replica | the same plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<file>` or `[store.libsql] replica = true` | from a local file, `<git common dir>/vci-store.libsql`, synced from the server when a command first reads it (and at its later prefetches) | to the server, then to the file |
-| local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` | from `<git common dir>/vci-store.libsql` | to the file |
+| local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` (no `?query`) | from `<git common dir>/vci-store.libsql` | to the file |
 
 - **The token is a secret**, like PostgreSQL's password: `VCI_STORE_TOKEN`, else the URL's `authToken` parameter.
   vci removes both variables from its own environment as it starts, so no test, probe or hook sees them, and never
@@ -1776,6 +1776,9 @@ Then run `vci ci` as before (`--push` where it should store). The store has thre
   parameter (a `token=` or `jwt=` by mistake) is refused without printing it or its name. A read-only
   token reads, and stores nothing (`libsql store refused to write: …`, keeping the tests' exit code); a missing or
   refused token (`the server asks for a token: set $VCI_STORE_TOKEN`) makes the store unavailable, and every unit runs.
+- **A database that takes no more writes** (over its quota: `Operation was blocked: …`; at its size limit: `database
+  or disk is full`) is treated as a read-only token is: the plan reads it, and `vci run` stores nothing (`libsql
+  store refused to write: … the server takes no more writes …`), keeping the tests' exit code.
 - **Shared at once** (remote and replica), as PostgreSQL: `vci ci` without `--push` signs but stores nothing (the
   publication gate), the plan's memo and flags are shared on the server, a manifest nothing references is kept for an
   hour after it was last stored (`vci prune` removes it at once), and `vci fetch` and `vci push` say the store is
@@ -1794,7 +1797,8 @@ Then run `vci ci` as before (`--push` where it should store). The store has thre
 - **A record of 5,000,000 bytes or more is not stored on a server.** `sqld` refuses such a row, so vci refuses a unit
   whose attestation or input manifest is that large, alone (`signing or storing failed: the libsql store does not
   support storing a record of 5,000,000 bytes or more …`, keeping the tests' exit code), and stores the rest of the
-  project. That unit runs every time on a libSQL server; the other stores have no such limit.
+  project. That unit runs every time on a libSQL server; the other stores have no such limit. When the units' shared
+  input manifest is that large, it is not stored (a warning), and each unit's manifest is stored whole instead.
 - **The replica** suits machines that keep their clone (a laptop, a self-hosted runner): each command syncs only what
   changed since the last, in one request, then reads locally, and syncs the changes again where it reads the store
   again (`vci run` before it supersedes, the plan's later rounds). A sync that fails warns `vci: warning: cannot sync

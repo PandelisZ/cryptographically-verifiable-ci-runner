@@ -25,7 +25,13 @@
 //!   `vci run`, `vci ci`, `vci explain` and `vci verify` read it as it is
 //!   with a warning (a stale replica only makes units run), while `vci
 //!   store`, `vci fetch`, `vci push` and `vci prune`, which are about the
-//!   store itself, fail.
+//!   store itself, fail; they also fail on a replica they cannot keep (a
+//!   directory vci cannot write, a sync that cannot be written to the
+//!   file), whether or not the server holds anything yet.
+//! * **Reads** come from the file, a snapshot taken at its sync. Before
+//!   the caller's first prefetch, `read_values` syncs what changed first,
+//!   so a key removed since it was listed reads as gone (section 4); after
+//!   a prefetch, the file as that prefetch synced it.
 //! * **Writes** are the remote mode's, then the same writes to the file.
 //!   They need a usable replica (a file vci can keep beside its server). A
 //!   write that cannot be written through leaves this handle reading from
@@ -68,6 +74,9 @@ pub(crate) struct Replica {
     marked: AtomicBool,
     /// The file's directory was found writable.
     writable_dir: OnceLock<()>,
+    /// The caller has prefetched: reads may come from the file as that
+    /// prefetch synced it (section 4's snapshot), until the next one.
+    prefetched: AtomicBool,
     /// A write could not be written through: reads go to the server.
     degraded: AtomicBool,
     write_through_warned: AtomicBool,
@@ -141,6 +150,7 @@ impl Replica {
             syncing: Mutex::new(()),
             marked: AtomicBool::new(false),
             writable_dir: OnceLock::new(),
+            prefetched: AtomicBool::new(false),
             degraded: AtomicBool::new(false),
             write_through_warned: AtomicBool::new(false),
             resync_warned: AtomicBool::new(false),
@@ -171,34 +181,54 @@ impl Replica {
         if self.marked.load(Ordering::Relaxed) || self.writable_dir.get().is_some() {
             return Ok(());
         }
+        self.probe(true)
+            .map_err(|e| StoreError::unavailable(KIND, e))
+    }
+
+    /// Whether vci can write in the file's directory: a probe file, made
+    /// there and removed at once. With `create`, the directory is made
+    /// first when missing (a write is about to make the file there);
+    /// without, nothing else is made, and a missing directory is judged by
+    /// the nearest one above it, where it would be made.
+    fn probe(&self, create: bool) -> Result<(), String> {
         let side = sidecar(&self.path);
         let dir = side
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
+        let cannot = |at: &Path, e: std::io::Error| {
+            format!(
+                "the replica {} cannot be kept: cannot write in {}: {e}",
+                self.path.display(),
+                at.display()
+            )
+        };
+        let at = if create {
+            std::fs::create_dir_all(dir).map_err(|e| cannot(dir, e))?;
+            dir
+        } else {
+            dir.ancestors()
+                .find(|d| d.as_os_str().is_empty() || d.is_dir())
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+        };
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let probe = side.with_extension(format!(
-            "sync.{}.{}.probe",
+        let name = side.file_name().map_or_else(
+            || "vci-replica".into(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let probe = at.join(format!(
+            "{name}.{}.{}.probe",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let r = std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(&probe, b""))
-            .and_then(|()| std::fs::remove_file(&probe));
-        match r {
-            Ok(()) => {
-                let _ = self.writable_dir.set(());
-                Ok(())
-            }
-            Err(e) => Err(StoreError::unavailable(
-                KIND,
-                format!(
-                    "the replica {} cannot be kept: cannot write in {}: {e}",
-                    self.path.display(),
-                    dir.display()
-                ),
-            )),
+        std::fs::write(&probe, b"")
+            .and_then(|()| std::fs::remove_file(&probe))
+            .map_err(|e| cannot(at, e))?;
+        if at == dir {
+            let _ = self.writable_dir.set(());
         }
+        Ok(())
     }
 
     /// A prefetch: the first use syncs (that is the opening sync); every
@@ -206,14 +236,42 @@ impl Replica {
     /// picks up other writers' changes (`docs/STORE-BACKENDS.md` section
     /// 4). A failed sync again is a warning, once.
     pub(crate) fn prefetch(&self) -> Result<(), StoreError> {
+        self.prefetched.store(true, Ordering::Relaxed);
         let first = self.local.get().is_none();
         let store = self.local()?;
         if first || self.degraded() {
             return Ok(());
         }
+        self.resync(store)
+    }
+
+    /// The file for a read that must see what the server holds now, as a
+    /// remote handle's read without a prefetch does: before the caller's
+    /// first prefetch, the changes since the last sync are synced first
+    /// (one request when there are none), so a key another writer removed
+    /// since it was listed reads as gone (section 4, `read_values`). After
+    /// a prefetch, the file as that prefetch synced it.
+    pub(crate) fn current(&self) -> Result<&SqliteStore, StoreError> {
+        let first = self.local.get().is_none();
+        let store = self.local()?;
+        if !first && !self.degraded() && !self.prefetched.load(Ordering::Relaxed) {
+            self.resync(store)?;
+        }
+        Ok(store)
+    }
+
+    /// Sync `store` again: a failure is a warning, once, and the file is
+    /// read as it is; for the commands about the store itself, an error.
+    fn resync(&self, store: &SqliteStore) -> Result<(), StoreError> {
         match self.sync(store) {
             Ok(()) => {}
             Err(SyncFail::Server(e)) if !self.stale_ok => return Err(e),
+            Err(SyncFail::File(e)) if !self.stale_ok => {
+                return Err(StoreError::unavailable(
+                    KIND,
+                    format!("the replica {} cannot be kept: {e}", self.path.display()),
+                ));
+            }
             Err(SyncFail::Server(e)) => self.warn_resync(&e.to_string()),
             Err(SyncFail::File(e)) => self.warn_resync(&e),
         }
@@ -297,6 +355,12 @@ impl Replica {
         }
         let source = self.source().map_err(|e| e.to_string())?;
         let same = found.as_ref().is_some_and(|s| s.source == source);
+        if !self.stale_ok {
+            // The commands about the store say whether this replica can
+            // be kept, before the sync finds anything to write (an empty
+            // namespace writes nothing).
+            self.probe(false)?;
+        }
         match self.sync(&store) {
             Ok(()) => Ok(store),
             Err(SyncFail::Server(e)) if exists && !same => Err(format!(
@@ -316,6 +380,10 @@ impl Replica {
                 );
                 Ok(store)
             }
+            Err(SyncFail::File(e)) if !self.stale_ok => Err(format!(
+                "the replica {} cannot be kept: {e}",
+                self.path.display()
+            )),
             Err(SyncFail::File(e)) => {
                 eprintln!(
                     "vci: warning: cannot apply the sync of the libsql replica {}: {e}; reading the replica as it is",

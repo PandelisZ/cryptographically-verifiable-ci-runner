@@ -380,8 +380,14 @@ impl AttestationStore for LibsqlStore {
         by_mode!(self, s => s.list_all(), r => r.list_all())
     }
 
+    /// A replica's, before its caller's first prefetch, syncs what changed
+    /// first: a key removed since it was listed reads as gone, as on the
+    /// server.
     fn read_values(&self, envs: &mut [&mut StoredEnvelope]) -> Result<(), StoreError> {
-        by_mode!(self, s => s.read_values(envs), r => r.read_values(envs))
+        match &self.inner {
+            Inner::Replica(p) if !p.degraded() => p.current()?.read_values(envs),
+            _ => by_mode!(self, s => s.read_values(envs), r => r.read_values(envs)),
+        }
     }
 
     fn manifest(&self, root: &str) -> Result<Option<StoredManifest>, StoreError> {
