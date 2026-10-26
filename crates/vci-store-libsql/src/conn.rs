@@ -2,14 +2,16 @@
 //! and its token, the TLS connector, the runtime, the pool of connections,
 //! the circuit breaker, deadlines, and what an error means.
 //!
-//! * **The URL** comes only from `VCI_STORE_URL`: `libsql://` (HTTPS, or
-//!   HTTP with `?tls=0`), `https://` or `http://`, a host, an optional port
-//!   and path, and an optional `authToken` query parameter. A user or
-//!   password in it, a fragment, or another query parameter is refused,
-//!   without printing it or the parameter's name. The token is
-//!   `VCI_STORE_TOKEN`, else `authToken`. Messages show the scheme, host
-//!   and port only: a path is shown as `/<path>` (a token could be written
-//!   there).
+//! * **The URL** comes from `VCI_STORE_URL`, else `[store] url`:
+//!   `libsql://` (HTTPS, or HTTP with `?tls=0`), `https://` or `http://`, a
+//!   host, an optional port and path, and an optional `authToken` query
+//!   parameter (never in `[store] url`). A user or password in it, a
+//!   fragment, or another query parameter is refused, without printing it
+//!   or the parameter's name. The token is `VCI_STORE_TOKEN`, else
+//!   `authToken`, else what `[store] token_command` prints, run when the
+//!   first connection is made ([`vci_store::credential`]). Messages show
+//!   the scheme, host and port only: a path is shown as `/<path>` (a token
+//!   could be written there).
 //! * **TLS** is rustls with the `ring` provider and the webpki roots, on the
 //!   workspace's one rustls (libsql's own `tls` feature would bring a second).
 //! * **Bounded time.** Each connection (TCP and TLS) is given up after the
@@ -40,8 +42,8 @@
 //!   UTF-8 text; every call into it is guarded (see [`guarded`]): such a
 //!   panic is a latched `Unavailable`, and prints nothing.
 //! * **Secrets.** Every message passes through [`Conn::scrub`], which
-//!   removes the URL's token and `VCI_STORE_TOKEN`; the location never
-//!   holds either.
+//!   removes the URL's token, `VCI_STORE_TOKEN` and the token command's;
+//!   the location never holds any.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -60,7 +62,7 @@ use hyper::client::connect::{Connected, Connection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use vci_store::StoreError;
-use vci_store::select::Secret;
+use vci_store::select::{Credential, Secret};
 
 /// The backend's name ([`vci_store::AttestationStore::kind`]).
 pub(crate) const KIND: &str = "libsql";
@@ -551,9 +553,15 @@ struct Pool {
 /// The connections of one store handle.
 pub(crate) struct Conn {
     target: Target,
-    /// `VCI_STORE_URL`, for scrubbing (its `authToken` included).
+    /// `VCI_STORE_URL` (or `[store] url`), for scrubbing (its `authToken`
+    /// included).
     url: Secret,
-    token: Option<Secret>,
+    /// How messages name the URL: `$VCI_STORE_URL` or `vci.toml [store]
+    /// url`.
+    url_name: &'static str,
+    /// The token: given, or printed by `[store] token_command` when the
+    /// first connection is made ([`Conn::database`]).
+    token: Option<Credential>,
     connect_timeout: Duration,
     timeout: Duration,
     runtime: OnceLock<Result<tokio::runtime::Runtime, String>>,
@@ -575,7 +583,8 @@ impl Conn {
     pub(crate) fn new(
         target: Target,
         url: Secret,
-        token: Option<Secret>,
+        url_name: &'static str,
+        token: Option<Credential>,
         connect_timeout: Duration,
         timeout: Duration,
         jobs: usize,
@@ -583,6 +592,7 @@ impl Conn {
         Conn {
             target,
             url,
+            url_name,
             token,
             connect_timeout,
             timeout,
@@ -622,7 +632,8 @@ impl Conn {
         self.answered.load(Ordering::Relaxed)
     }
 
-    /// `text` without the URL's token or `VCI_STORE_TOKEN`.
+    /// `text` without the URL's token, `VCI_STORE_TOKEN`, or the token
+    /// command's.
     pub(crate) fn scrub(&self, text: &str) -> String {
         let mut out = self.url.scrub(text);
         if let Some(t) = &self.token {
@@ -674,6 +685,14 @@ impl Conn {
     }
 
     fn database(&self) -> Result<&libsql::Database, StoreError> {
+        if self.db.get().is_none()
+            && let Some(t) = &self.token
+        {
+            // The token command runs here, when the first connection is
+            // made, at most once per process; a failure is the store's
+            // (unavailable), every later call too.
+            t.get(KIND)?;
+        }
         let r = self.db.get_or_init(|| {
             let tls = if self.target.url.starts_with("https://") {
                 Some(tls_config()?)
@@ -681,11 +700,10 @@ impl Conn {
                 None
             };
             let connector = Connector::new(tls, self.connect_timeout);
-            let token = self
-                .token
-                .as_ref()
-                .map(|t| t.expose().to_owned())
-                .unwrap_or_default();
+            let token = match &self.token {
+                Some(t) => t.get(KIND).map_err(|e| e.to_string())?.expose().to_owned(),
+                None => String::new(),
+            };
             let rt = self.runtime().map_err(|e| e.to_string())?;
             guarded(|| {
                 rt.block_on(
@@ -698,7 +716,7 @@ impl Conn {
             .map_err(|e| self.scrub(&e.to_string()))
         });
         r.as_ref().map_err(|e| {
-            StoreError::Config(format!("$VCI_STORE_URL ({}): {e}", self.target.display))
+            StoreError::Config(format!("{} ({}): {e}", self.url_name, self.target.display))
         })
     }
 
@@ -868,10 +886,18 @@ impl Conn {
             );
         }
         if lower.contains("status=401") || lower.contains("status=403") {
-            let why = if self.token.is_some() {
-                "the server refused the token in $VCI_STORE_TOKEN or the URL's authToken"
-            } else {
-                "the server asks for a token: set $VCI_STORE_TOKEN"
+            let why = match &self.token {
+                Some(t) if t.from_command() => {
+                    format!("the server refused the token from {}", t.origin())
+                }
+                Some(_) => {
+                    "the server refused the token in $VCI_STORE_TOKEN or the URL's authToken"
+                        .to_owned()
+                }
+                None => {
+                    "the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)"
+                        .to_owned()
+                }
             };
             return unavailable(format!("{at}: {why} ({text})"), true, false);
         }

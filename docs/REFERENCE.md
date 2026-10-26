@@ -1749,10 +1749,12 @@ git-meta's store since 2.7.33. `[store.sqlite] path` (relative to the git common
 libpq `key=value` string) keeps the attestations on a PostgreSQL server that every machine reads and writes at once:
 no push, no fetch, no cache.
 
-- **The URL is a secret** and comes only from `VCI_STORE_URL`. vci removes it from its own environment as it
-  starts, so no test, probe or hook it runs ever sees it (`VCI_*` variables otherwise reach every test process), and
-  never prints it: `vci store info`, errors and `vci fetch` show `postgres://***@db.example.com:5432/ci`, and the
-  metrics log records only the store's kind. In GitHub Actions, put it in a secret of an environment; pull requests
+- **The URL is a secret** when it holds the password, and comes from `VCI_STORE_URL`, else from `[store] url` in
+  `vci.toml` without a password (`postgres://vci@db.example.com/ci`), the password then printed by `[store]
+  token_command` (see [The credential from a command](#the-credential-from-a-command)). vci removes `VCI_STORE_URL`
+  from its own environment as it starts, so no test, probe or hook it runs ever sees it (`VCI_*` variables otherwise
+  reach every test process), and never prints it: `vci store info`, errors and `vci fetch` show
+  `postgres://***@db.example.com:5432/ci`, and the metrics log records only the store's kind. In GitHub Actions, put it in a secret of an environment; pull requests
   from forks get no secrets, so their jobs cannot read the store and run every test.
 - **TLS.** Without `sslmode`, TLS is required, except for `localhost`, `127.0.0.1`, `::1` and Unix sockets, where it is
   preferred. Certificates are always verified, against the webpki roots plus the CA file of
@@ -1840,21 +1842,34 @@ env:
   VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}
 ```
 
-Then run `vci ci` as before (`--push` where it should store). The store has three modes:
+Then run `vci ci` as before (`--push` where it should store). On developers' and agents' machines, nothing needs
+exporting: `vci.toml` can name the database and how to fetch a token (since 2.8.0; see [The credential from a
+command](#the-credential-from-a-command)), and CI's two secrets still win there:
+
+```toml
+[store]
+backend = "libsql"
+url = "libsql://vci-vex-composal.aws-eu-west-1.turso.io"
+token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
+```
+
+The store has three modes:
 
 | mode | selected by | reads | writes |
 |---|---|---|---|
-| remote | a `libsql://` `VCI_STORE_URL` (an `https://` or `http://` one with `VCI_STORE=libsql`) | from the server, a plan in about a dozen requests | to the server, a project's units in one request |
+| remote | a `libsql://` `VCI_STORE_URL` or `[store] url` (an `https://` or `http://` one with `VCI_STORE=libsql` or `[store] backend = "libsql"`) | from the server, a plan in about a dozen requests | to the server, a project's units in one request |
 | replica | the same plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<file>` or `[store.libsql] replica = true` | from a local file, `<git common dir>/vci-store.libsql`, synced from the server when a command first reads it (and at its later prefetches) | to the server, then to the file |
 | local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` (no `?query` or `#fragment`) | from `<git common dir>/vci-store.libsql` | to the file |
 
-- **The token is a secret**, like PostgreSQL's password: `VCI_STORE_TOKEN`, else the URL's `authToken` parameter.
-  vci removes both variables from its own environment as it starts, so no test, probe or hook sees them, and never
-  prints a token: `vci store info` says `token: (set)`, and shows the URL with its host and port only (a path as
+- **The token is a secret**, like PostgreSQL's password: `VCI_STORE_TOKEN`, else the URL's `authToken` parameter,
+  else what `[store] token_command` prints. vci removes both variables from its own environment as it starts, so no
+  test, probe, hook or token command sees them, and never prints a token: `vci store info` says `token: (set)` (or
+  `token: (from token_command: <command>)`), and shows the URL with its host and port only (a path as
   `/<path>`; of the query only `tls`, `authToken=***` and `***` for anything else). A URL with another query
   parameter (a `token=` or `jwt=` by mistake) is refused without printing it or its name. A read-only
   token reads, and stores nothing (`libsql store refused to write: …`, keeping the tests' exit code); a missing or
-  refused token (`the server asks for a token: set $VCI_STORE_TOKEN`) makes the store unavailable, and every unit runs.
+  refused token (`the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)`) makes the store
+  unavailable, and every unit runs.
 - **A database that takes no more writes** (over its quota: `Operation was blocked: …`; at its size limit: `database
   or disk is full`) is treated as a read-only token is: the plan reads it, and `vci run` stores nothing (`libsql
   store refused to write: … the server takes no more writes …`), keeping the tests' exit code.
@@ -1906,7 +1921,8 @@ The store is chosen once per command, from the first of:
    is libSQL. An `https://` or `http://` URL selects nothing on its own (it could be any service's): give
    `VCI_STORE=libsql` with it.
 3. **`[store] backend`** in the working tree's `vci.toml` (see [`vci.toml`](#vcitoml)).
-4. **git-meta.**
+4. **The scheme of `[store] url`**, as for `VCI_STORE_URL`, when `VCI_STORE_URL` is unset.
+5. **git-meta.**
 
 Empty variables count as unset. `VCI_STORE` that disagrees with the scheme of `VCI_STORE_URL`, PostgreSQL without
 `VCI_STORE_URL`, a `VCI_STORE_URL` libSQL cannot use, an unknown backend or one this vci was built without, and a
@@ -1914,11 +1930,18 @@ value out of range are errors: the store is then unusable and every command fail
 for a backend that is not selected, are warnings (on stderr, and in the plan's `warnings`). The environment variables
 are listed in [docs/ENV.md](ENV.md#store-selection).
 
-- **Secrets only in the environment.** `vci.toml` is in every checkout, a pull request's included, so it may name a
-  kind and tune it but never say where: `url`, `host`, `user`, `password`, `dbname`, `token` and `authToken` are
-  refused there (the error names the keys, never their values). `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE`
-  never reach a test, a probe or a hook. A pull request can pick a store kind for its own jobs, never an address or a
-  credential; since no store is trusted, the most it can do is make its own units run.
+- **Credentials never in `vci.toml`.** `vci.toml` is in every checkout, a pull request's included, so it may name a
+  kind, tune it, say where the server is (`[store] url`) and how to fetch its credential (`[store] token_command`),
+  but never hold a credential: a `[store] url` with a password, a user (a libSQL server's), an `authToken` or another
+  query parameter that may hold one, or a `#fragment`, is refused, and so are `url`, `host`, `user`, `password`,
+  `dbname`, `token` and `authToken` under `[store.postgres]` and `[store.libsql]` (the errors name the key, never the
+  value). `VCI_STORE_URL` wins over `[store] url`. `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` never reach a
+  test, a probe, a hook or a token command.
+- **A credential from the environment goes only to a URL from the environment.** `VCI_STORE_TOKEN` with the URL from
+  `[store] url` is refused (`$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url: … set
+  $VCI_STORE_URL as well`), and the store fails open: otherwise a pull request could point CI's secret at a server it
+  controls. In CI set both as secrets; on a developer's machine set neither. Since no store is trusted, the most a
+  pull request can do with `[store]` is make its own units run.
 - **`[store]` is never an input**: switching store invalidates no attestation. A new store starts empty, though, so
   its units run (and are attested) once; there is no command that copies a store yet.
 - **The working tree's `vci.toml`.** The store is chosen from the checkout, not from the base commit, so that `vci
@@ -1928,7 +1951,10 @@ are listed in [docs/ENV.md](ENV.md#store-selection).
 - **Rolling out.** A vci before 2.8.0 rejects a `vci.toml` with `[store]` (an unknown key), so at a base commit with it
   that vci runs every test. Introduce a store with `VCI_STORE` and `VCI_STORE_URL` in the CI jobs and developers'
   environments first, and add `[store]` only once every runner and developer has 2.8.0 or later.
-- **CI.** git-meta jobs keep `vci ci --fetch origin ... --push --remote origin`. On SQLite, PostgreSQL and libSQL
+- **CI.** In a job that has the store's secrets, `VCI_STORE_URL` and `VCI_STORE_TOKEN` win over `[store] url` and
+  `[store] token_command`, and the command never runs (a fork's pull request has no secrets: the command runs, fails
+  where its program is not installed or signed in, and the plan runs everything). git-meta jobs keep `vci ci --fetch
+  origin ... --push --remote origin`. On SQLite, PostgreSQL and libSQL
   `--fetch`'s remote and `--push`'s `--remote` are ignored with a warning, so the same command works; on PostgreSQL and
   a libSQL server `--push` is what stores (the publication gate above), and the job needs `VCI_STORE_URL` (and for
   libSQL `VCI_STORE_TOKEN`) from a secret and, with a shallow checkout, `VCI_STORE_NAMESPACE`.
@@ -1958,6 +1984,58 @@ It exits 0 when the store can be read (also before anything is stored) and 2 oth
 and the error: run it first when a plan says `reading attestations from postgres: …`. The JSON form has `kind`,
 `location`, `settings` (`name`, `value`, `source`), `caps`, `exchange`, `status` (`ready`, `absent` or
 `unavailable`), `advice`, `schemaVersion`, `count`, `error` (`code`, `transient`, `message`) and `warnings`.
+
+### The credential from a command
+
+Since 2.8.0, `[store] token_command` in `vci.toml` fetches the store's credential (a libSQL server's token, or a
+PostgreSQL password the URL does not carry) when nothing in the environment gives one, so developers and agents need
+not export a secret:
+
+```toml
+[store]
+backend = "libsql"
+url = "libsql://vci-vex-composal.aws-eu-west-1.turso.io"
+token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
+```
+
+- **The command** is an array, the program and its arguments, run directly (preferred), or a string, run with `sh -c`
+  for a pipeline. It runs in the repository's top level (a relative program path such as `scripts/vci-token` is the
+  checkout's), with stdin from `/dev/null` and vci's environment without `VCI_STORE_URL`, `VCI_STORE_TOKEN` and
+  `VCI_STORE`. It must print the credential alone on standard output: one line of UTF-8 text (surrounding whitespace
+  is trimmed), at most 64 KiB.
+- **Only when needed, once.** It runs when a command first connects to the store (`vci plan`, `vci run`, `vci ci`, `vci
+  store info`, ...), never for one that does not reach it (`vci --version`, `vci init`, `vci update`, `vci env`), at
+  most once per vci process, and its output is kept in memory only. A store that takes no credential (git-meta,
+  SQLite, libSQL's local file) ignores it with a warning and never runs it.
+- **The environment comes first.** `VCI_STORE_TOKEN`, then the URL's own credential (`authToken` in
+  `VCI_STORE_URL`, a password in a PostgreSQL connection string), then the command; when the environment gives a
+  token the command is never run. CI, which sets `VCI_STORE_URL` and `VCI_STORE_TOKEN` from secrets, never runs it.
+- **Bounded.** After 60 s (or the connect timeout, when longer) it is stopped. A command that is not found, exits
+  non-zero, is stopped, or prints nothing or more than one line makes the store unavailable, as an unreachable server
+  does: `vci plan` runs everything with a warning saying why (`the token_command (com secrets get vci-store-token
+  --org vex) exited 1: <the end of its stderr>`), `vci run` keeps the tests' exit code and attests nothing, and `vci
+  fetch`, `vci push`, `vci prune` and `vci store info` exit 2. Nothing it printed on standard output is ever shown.
+- **`vci store info`** names it, never the token: `token: (from token_command: com secrets get vci-store-token --org
+  vex) (vci.toml [store])` (`password:` for PostgreSQL), so its output stays safe to paste into an issue.
+- **Trust.** The command comes from the checkout's `vci.toml` and runs with your own privileges: the same trust as
+  running the checkout's tests, which a pull request can change too. Review a change to it as you would a change to
+  a test helper.
+
+Examples:
+
+```toml
+# Composal: an admin's read of an organization secret, each read audited
+token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
+
+# 1Password
+token_command = ["op", "read", "op://Engineering/vci-store/credential"]
+
+# a file (weaker: the token sits on disk, readable by anything you run, never audited)
+token_command = ["cat", "/Users/me/.config/vci/store-token"]
+
+# a pipeline, through sh -c
+token_command = "pass show vci/store | head -n 1"
+```
 
 ## CI attests its own runs
 
@@ -2201,19 +2279,21 @@ extra = ["testdata/**"]
 
 # [store]                # since 2.8.0; read from the working tree, never an input (see "Choosing a store")
 # backend = "sqlite"     # "git-meta" (default) | "sqlite" | "postgres" | "libsql"; VCI_STORE and VCI_STORE_URL win
+# url = "libsql://vci-acme.turso.io"  # a server, never a credential; selects by its scheme; VCI_STORE_URL wins
+# token_command = ["com", "secrets", "get", "vci-store-token", "--org", "acme"]  # prints the credential; VCI_STORE_TOKEN wins
 # connect_timeout = "5s" # a network store's connect bound (VCI_STORE_CONNECT_TIMEOUT_SECS wins)
 # timeout = "30s"        # one statement or wait (VCI_STORE_TIMEOUT_SECS wins)
 
 # [store.sqlite]
 # path = "vci-store.sqlite"   # relative to the git common directory, no `..` (absolute: VCI_STORE_URL=sqlite:<path>)
 
-# [store.postgres]       # tuning only: an address or a credential here is an error (VCI_STORE_URL carries them)
+# [store.postgres]       # tuning only: an address or a credential here is an error ([store] url, VCI_STORE_URL)
 # schema = "vci"
 # namespace = "acme-web" # default: the repository id; VCI_STORE_NAMESPACE wins
 # pool = 8               # connections per vci process, 1 to 64
 # manifest_grace = "1h"  # keep an unreferenced manifest stored this recently (at most 30 days; vci prune: none)
 
-# [store.libsql]         # never an address or a token (VCI_STORE_URL and VCI_STORE_TOKEN carry them)
+# [store.libsql]         # never an address or a token ([store] url and token_command, or the environment)
 # path = "vci-store.libsql"   # the local file or the replica, relative to the git common directory, no `..`
 # replica = true         # read a local replica of the VCI_STORE_URL server, synced as each command reads it
 # namespace = "acme-web" # default: the repository id; VCI_STORE_NAMESPACE wins
@@ -2221,9 +2301,11 @@ extra = ["testdata/**"]
 
 **`[store]`** (since 2.8.0) chooses the attestation store, after `VCI_STORE` and `VCI_STORE_URL`: see [Choosing a
 store](#choosing-a-store). Unlike the rest of the file it is read from the **working tree**, not the base commit, and
-it is never an input. Durations are `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"` or a number of seconds. `url` (in
-`[store]`, `[store.postgres]` or `[store.libsql]`), `host`, `user`, `password` and `dbname`, and `token` and
-`authToken` are refused, naming the keys and never their values. **A vci before 2.8.0 rejects a `vci.toml` with `[store]`** and so runs every test against such a base
+it is never an input. Durations are `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"` or a number of seconds. `[store] url`
+names the server without a credential, and `[store] token_command` how to fetch the credential (see [The credential
+from a command](#the-credential-from-a-command)); a credential in `[store] url`, and `url`, `host`, `user`,
+`password` and `dbname` (in `[store.postgres]`) and `url`, `token` and `authToken` (in `[store.libsql]`), are
+refused, naming the keys and never their values. **A vci before 2.8.0 rejects a `vci.toml` with `[store]`** and so runs every test against such a base
 commit: select the store with `VCI_STORE` or `VCI_STORE_URL` until every runner and developer has 2.8.0.
 
 **`policy.allow_superuser_mismatch`** (default `false`). Every toolchain records whether the tests ran as root

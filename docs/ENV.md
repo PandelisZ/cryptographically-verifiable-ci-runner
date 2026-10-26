@@ -381,7 +381,8 @@ A hash of a low-entropy value can be brute-forced by anyone who can read the att
 `refs/meta/main`, or the store's file or database). Put secrets in `ignore`, never in `hash`: `vci run` warns when a `hash` name matches `*TOKEN*`,
 `*SECRET*`, `*PASSWORD*`, `*KEY*`. `set` values are in `vci.toml` in plain text: never put a secret there.
 `VCI_STORE_URL` and `VCI_STORE_TOKEN` are the secrets vci itself reads, and they never reach a test, nor does
-`VCI_STORE` ([Store selection](#store-selection)).
+`VCI_STORE` ([Store selection](#store-selection)). A token `[store] token_command` prints is kept in vci's memory
+only: it is never put in any environment, a test's or the command's own.
 
 ## Store selection
 
@@ -390,9 +391,9 @@ store"). The environment wins over `[store]` in the working tree's `vci.toml`; a
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `VCI_STORE` | the store: `git-meta`, `sqlite`, `postgres` or `libsql` (also `gitmeta`, `sqlite3`, `postgresql`, `pg`, `turso`). Never a URL: a value with `://`, or one not shaped like a name, is refused and not printed. Like `VCI_STORE_URL` it never reaches a test (since 2.8.0) | the scheme of `VCI_STORE_URL`, else `[store] backend`, else `git-meta` |
-| `VCI_STORE_URL` | where the store is: `postgres://user:password@host:port/database[?sslmode=...&sslrootcert=...]` (or `postgresql://`, or a libpq `key=value` string), `sqlite:<path>` (absolute, or relative to the git common directory; no `?query` or `#fragment`), a libSQL server, `libsql://<database>-<organization>.turso.io` (HTTPS; `?tls=0` for HTTP; it may carry `?authToken=...`) or, with `VCI_STORE=libsql`, `https://...` or `http://...`, or a libSQL file, `file:<path>` (with `VCI_STORE=libsql`; no `?query` or `#fragment`). `postgres://`, `sqlite:` and `libsql://` select their store when `VCI_STORE` is unset. **A secret**: vci removes it from its own environment as it starts, so no test, probe or hook sees it, and never prints it (passwords and tokens show as `***`) | none (PostgreSQL and a libSQL server require it) |
-| `VCI_STORE_TOKEN` | libSQL: the server's auth token (a Turso database token: `turso db tokens create <db>`, `--read-only` for jobs that should not store); wins over the URL's `authToken`. **A secret**, like `VCI_STORE_URL`: removed from vci's environment at start-up, never printed (`vci store info` says `token: (set)`) | none |
+| `VCI_STORE` | the store: `git-meta`, `sqlite`, `postgres` or `libsql` (also `gitmeta`, `sqlite3`, `postgresql`, `pg`, `turso`). Never a URL: a value with `://`, or one not shaped like a name, is refused and not printed. Like `VCI_STORE_URL` it never reaches a test (since 2.8.0) | the scheme of `VCI_STORE_URL`, else `[store] backend`, else the scheme of `[store] url`, else `git-meta` |
+| `VCI_STORE_URL` | where the store is: `postgres://user:password@host:port/database[?sslmode=...&sslrootcert=...]` (or `postgresql://`, or a libpq `key=value` string), `sqlite:<path>` (absolute, or relative to the git common directory; no `?query` or `#fragment`), a libSQL server, `libsql://<database>-<organization>.turso.io` (HTTPS; `?tls=0` for HTTP; it may carry `?authToken=...`) or, with `VCI_STORE=libsql`, `https://...` or `http://...`, or a libSQL file, `file:<path>` (with `VCI_STORE=libsql`; no `?query` or `#fragment`). `postgres://`, `sqlite:` and `libsql://` select their store when `VCI_STORE` is unset. Wins over `[store] url`. **A secret**: vci removes it from its own environment as it starts, so no test, probe, hook or token command sees it, and never prints it (passwords and tokens show as `***`) | `[store] url` (PostgreSQL and a libSQL server need one of them) |
+| `VCI_STORE_TOKEN` | libSQL: the server's auth token (a Turso database token: `turso db tokens create <db>`, `--read-only` for jobs that should not store); wins over the URL's `authToken` and over `[store] token_command`, which then never runs. Sent only to a URL from the environment: with the URL from `[store] url` it is refused (set `VCI_STORE_URL` too). **A secret**, like `VCI_STORE_URL`: removed from vci's environment at start-up, never printed (`vci store info` says `token: (set)`) | the URL's `authToken`, else what `[store] token_command` prints |
 | `VCI_STORE_REPLICA` | libSQL: read a local replica of the `VCI_STORE_URL` server kept in this file (absolute, or relative to the git common directory), synced when a command first reads it and at its later prefetches | `[store.libsql] path`, else `vci-store.libsql` in the git common directory, when the replica is asked for |
 | `VCI_STORE_NAMESPACE` | PostgreSQL and a libSQL server: the namespace of this repository's records. Required in a shallow clone, with the same value wherever the store is shared | `[store.postgres]` or `[store.libsql] namespace`, else the repository id (its first commit) |
 | `VCI_STORE_CONNECT_TIMEOUT_SECS` | seconds a connection may take (more than 0, at most 3600) | `[store] connect_timeout`, else 5 |
@@ -402,8 +403,11 @@ store"). The environment wins over `[store]` in the working tree's `vci.toml`; a
 `VCI_STORE_NAMESPACE` and the timeouts are ordinary `VCI_*` variables: they reach the test processes (built-in
 ignore) and are never hashed. `VCI_STORE` is removed like `VCI_STORE_URL`, so a connection string put there by mistake
 reaches no test either. Put `VCI_STORE_URL` (and `VCI_STORE_TOKEN`) in a CI secret; a job without the secret (a pull
-request from a fork) cannot reach the store and runs every test. `VCI_STORE_REPLICA` and `VCI_STORE_SYNC` are ordinary
-`VCI_*` variables too. `vci store info` prints the store and every setting with where it came from. The test suites
+request from a fork) cannot reach the store and runs every test. On a developer's machine export nothing: `[store]
+url` and `[store] token_command` in `vci.toml` say where the server is and which command prints its token (`com
+secrets get …`, `op read …`), run once per vci command that reads the store, in the repository's top level, without
+the three variables above (docs/REFERENCE.md, "The credential from a command"). `VCI_STORE_REPLICA` and
+`VCI_STORE_SYNC` are ordinary `VCI_*` variables too. `vci store info` prints the store and every setting with where it came from. The test suites
 read `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require` and `VCI_TEST_PG_BINDIR`, and `VCI_TEST_LIBSQL_URL`,
 `VCI_TEST_LIBSQL_TOKEN` and `VCI_TEST_LIBSQL=require` (docs/REFERENCE.md, "Development").
 

@@ -6,9 +6,12 @@
 //! Which one a repository uses is resolved once per process
 //! ([`vci_store::select::resolve`]): `VCI_STORE`, else the scheme of
 //! `VCI_STORE_URL`, else `[store] backend` in the working tree's
-//! `vci.toml`, else git-meta. A store that cannot be selected or opened is
-//! a [`FailedStore`], whose every call fails, so commands fail open
-//! through their usual error paths.
+//! `vci.toml`, else the scheme of its `[store] url`, else git-meta. A store
+//! that cannot be selected or opened is a [`FailedStore`], whose every call
+//! fails, so commands fail open through their usual error paths. Opening
+//! does no I/O: a `[store] token_command` runs only when the store first
+//! connects ([`vci_store::credential`]), so a command that never reads the
+//! store never runs it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -144,7 +144,7 @@ vci prune &amp;&amp; vci push</code></pre>
 
 <h3 id="store-info">vci store info</h3>
 <pre data-nocopy><code>vci store info [--format text|json]</code></pre>
-<p>Since 2.8.0. Says which <a href="configuration.html#store">attestation store</a> the repository uses (git-meta, SQLite, PostgreSQL or libSQL) and how it was chosen: its location, every setting with where it came from (<code>$VCI_STORE</code>, <code>$VCI_STORE_URL</code>, <code>vci.toml</code>, the default), what it can do, whether it exists and how many attestations it holds. It never prints a password or a token. In a linked worktree, git-meta's location is the common git directory's store, which every worktree of the repository shares.</p>
+<p>Since 2.8.0. Says which <a href="configuration.html#store">attestation store</a> the repository uses (git-meta, SQLite, PostgreSQL or libSQL) and how it was chosen: its location, every setting with where it came from (<code>$VCI_STORE</code>, <code>$VCI_STORE_URL</code>, <code>vci.toml</code>, the default), what it can do, whether it exists and how many attestations it holds. It never prints a password or a token: a token that <code>[store] token_command</code> prints shows as <code>token: (from token_command: &lt;the command&gt;)</code>. In a linked worktree, git-meta's location is the common git directory's store, which every worktree of the repository shares.</p>
 <ul>
 <li>Exit 0 when the store can be read, also before anything is stored; otherwise it prints what it knows, then the error, and exits 2. Run it first when a plan says it cannot read the store.</li>
 <li><code>--format json</code>: the same, for scripts.</li>
