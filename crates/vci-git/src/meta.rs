@@ -1171,6 +1171,10 @@ static PUT_NS: [std::sync::atomic::AtomicU64; 4] = [
 /// A tree entry's mode, kind and object id, owned.
 type OwnedTreeEntry = (Vec<u8>, Vec<u8>, Vec<u8>);
 
+/// A path's change between two trees: the mode it had, and the blob ids it
+/// had before and after (all zeros: absent).
+type PathChange = (String, String, String);
+
 /// How many commits the kept tree listing may be behind the tree to list
 /// for its difference to be taken instead of listing anew (see
 /// [`AttestStore::cached_tree_listing`]).
@@ -6170,49 +6174,47 @@ impl<'a> AttestStore<'a> {
     ) -> Result<Option<String>, GitError> {
         // path -> the blob id it had before the change and has after it
         // (all zeros: absent).
-        let changed =
-            |to: &str| -> Result<Option<BTreeMap<Vec<u8>, (String, String, String)>>, GitError> {
-                let (_, out) = self
-                    .repo
-                    .git()
-                    .args([
-                        "diff-tree",
-                        "-r",
-                        "-z",
-                        "--no-renames",
-                        "--no-commit-id",
-                        base,
-                        to,
-                    ])
-                    .env("GIT_NO_LAZY_FETCH", "1")
-                    .output_described()?;
-                if !out.status.success() {
+        let changed = |to: &str| -> Result<Option<BTreeMap<Vec<u8>, PathChange>>, GitError> {
+            let (_, out) = self
+                .repo
+                .git()
+                .args([
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-renames",
+                    "--no-commit-id",
+                    base,
+                    to,
+                ])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .output_described()?;
+            if !out.status.success() {
+                return Ok(None);
+            }
+            // `:<mode> <mode> <old> <new> <status>\0<path>\0` per entry.
+            let mut m = BTreeMap::new();
+            let mut it = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty());
+            while let Some(meta) = it.next() {
+                let Some(path) = it.next() else {
                     return Ok(None);
-                }
-                // `:<mode> <mode> <old> <new> <status>\0<path>\0` per entry.
-                let mut m = BTreeMap::new();
-                let mut it = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty());
-                while let Some(meta) = it.next() {
-                    let Some(path) = it.next() else {
-                        return Ok(None);
-                    };
-                    let meta = String::from_utf8_lossy(meta);
-                    let mut f = meta.split_whitespace();
-                    let (Some(old_mode), Some(old), Some(new)) = (f.next(), f.nth(1), f.next())
-                    else {
-                        return Ok(None);
-                    };
-                    m.insert(
-                        path.to_vec(),
-                        (
-                            old_mode.trim_start_matches(':').to_owned(),
-                            old.to_owned(),
-                            new.to_owned(),
-                        ),
-                    );
-                }
-                Ok(Some(m))
-            };
+                };
+                let meta = String::from_utf8_lossy(meta);
+                let mut f = meta.split_whitespace();
+                let (Some(old_mode), Some(old), Some(new)) = (f.next(), f.nth(1), f.next()) else {
+                    return Ok(None);
+                };
+                m.insert(
+                    path.to_vec(),
+                    (
+                        old_mode.trim_start_matches(':').to_owned(),
+                        old.to_owned(),
+                        new.to_owned(),
+                    ),
+                );
+            }
+            Ok(Some(m))
+        };
         let (Some(ours), Some(theirs)) = (changed(local)?, changed(tip)?) else {
             return Ok(None);
         };
@@ -6222,7 +6224,7 @@ impl<'a> AttestStore<'a> {
         // time; 2.7.28: 2,054 such paths sent every push of a vex run to
         // git-meta's merge of three listed trees, 6 s), as git-meta's merge
         // does; any other takes git-meta's merge.
-        let both: Vec<(&Vec<u8>, &(String, String, String))> = ours
+        let both: Vec<(&Vec<u8>, &PathChange)> = ours
             .iter()
             .filter(|(p, _)| theirs.contains_key(*p))
             .collect();
