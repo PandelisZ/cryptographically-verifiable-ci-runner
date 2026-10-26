@@ -415,7 +415,9 @@ impl Exchange for GitMetaStore {
             .remote_url(remote)
             .ok()
             .flatten()
-            .map(|u| vci_store::select::redact(&u))
+            // A git remote's URL, not a store's: its path is shown (a
+            // libSQL server's would be hidden).
+            .map(|u| vci_store::select::redact_credentials(&u))
     }
 
     /// [`AttestStore::fetch`]; then the reader pool is emptied.

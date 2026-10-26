@@ -1413,11 +1413,12 @@ how it differs from 2.7 for malformed envelopes).
 **Exchange**:
 
 - `exchange_point` is `"refs/meta/main"`.
-- `remote_location(name)` is `remote_url(name)` passed through `select::redact`. On ordinary remote URLs that is the
-  text 2.7's `redact_userinfo` gave. They differ when the authority ends at `?` rather than `/`, and when the path or
-  query holds an `@` (`redact` masks up to the last `@`), and `redact` also masks `password=`, `sslpassword=` and
-  `sslkey=` values in a query. `redact_userinfo` is still used for remotes the
-  user typed, in warnings.
+- `remote_location(name)` is `remote_url(name)` passed through `select::redact_credentials`, the part of
+  `select::redact` for a URL that names no store (`redact` shows a libSQL server's `https://` URL as its host alone,
+  which would hide a git remote's path: `https://***@github.com/<path>`). On ordinary remote URLs that is the text
+  2.7's `redact_userinfo` gave. They differ when the authority ends at `?` rather than `/`, and when the path or
+  query holds an `@` (it masks up to the last `@`), and it also masks `password=`, `sslpassword=`, `sslkey=` and
+  `authToken=` values in a query. `redact_userinfo` is still used for remotes the user typed, in warnings.
 - `fetch` is `AttestStore::fetch`.
 - `push(Merge)` is `push`, and `push(RewriteHistory)` is `push_rewriting_history`. A future `PushMode` is
   `Unsupported{git-meta, "this kind of push"}`.

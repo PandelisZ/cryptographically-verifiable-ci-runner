@@ -2770,14 +2770,25 @@ pub mod select {
     /// `sslpassword`, `sslkey` and `authToken`, in a query string (keys
     /// percent-decoded) or in a libpq `key=value` string (spaces around `=`
     /// and quoted values included). A secret value that runs past the last
-    /// `@` (`?password=a@b`) is masked whole, its `@` with it.
+    /// `@` (`?password=a@b`) is masked whole, its `@` with it. A libSQL
+    /// server's URL (`libsql://`, `https://`, `http://`) shows its host and
+    /// port only, its path as `/<path>`; [`redact_credentials`] keeps the
+    /// path of a URL that names no store.
     pub fn redact(s: &str) -> String {
+        match split_url(s) {
+            Some((scheme, rest)) if is_libsql_server(s) => redact_server_url(scheme, rest),
+            _ => redact_credentials(s),
+        }
+    }
+
+    /// [`redact`] of a URL that does not name a store (a git remote's):
+    /// its userinfo and secret values masked, its host and path kept, as
+    /// `vci fetch` and `vci push` print a git-meta remote
+    /// (`https://***@github.com/o/r.git`).
+    pub fn redact_credentials(s: &str) -> String {
         let Some((scheme, rest)) = split_url(s) else {
             return mask_spans(s, &secret_values(s, false));
         };
-        if is_libsql_server(s) {
-            return redact_server_url(scheme, rest);
-        }
         let at = userinfo_end(rest);
         let mut spans = secret_values(rest, true);
         if let Some(at) = at {
