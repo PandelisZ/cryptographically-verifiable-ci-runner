@@ -6170,43 +6170,49 @@ impl<'a> AttestStore<'a> {
     ) -> Result<Option<String>, GitError> {
         // path -> the blob id it had before the change and has after it
         // (all zeros: absent).
-        let changed = |to: &str| -> Result<Option<BTreeMap<Vec<u8>, (String, String, String)>>, GitError> {
-            let (_, out) = self
-                .repo
-                .git()
-                .args([
-                    "diff-tree",
-                    "-r",
-                    "-z",
-                    "--no-renames",
-                    "--no-commit-id",
-                    base,
-                    to,
-                ])
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .output_described()?;
-            if !out.status.success() {
-                return Ok(None);
-            }
-            // `:<mode> <mode> <old> <new> <status>\0<path>\0` per entry.
-            let mut m = BTreeMap::new();
-            let mut it = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty());
-            while let Some(meta) = it.next() {
-                let Some(path) = it.next() else {
+        let changed =
+            |to: &str| -> Result<Option<BTreeMap<Vec<u8>, (String, String, String)>>, GitError> {
+                let (_, out) = self
+                    .repo
+                    .git()
+                    .args([
+                        "diff-tree",
+                        "-r",
+                        "-z",
+                        "--no-renames",
+                        "--no-commit-id",
+                        base,
+                        to,
+                    ])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .output_described()?;
+                if !out.status.success() {
                     return Ok(None);
-                };
-                let meta = String::from_utf8_lossy(meta);
-                let mut f = meta.split_whitespace();
-                let (Some(old_mode), Some(old), Some(new)) = (f.next(), f.nth(1), f.next()) else {
-                    return Ok(None);
-                };
-                m.insert(
-                    path.to_vec(),
-                    (old_mode.trim_start_matches(':').to_owned(), old.to_owned(), new.to_owned()),
-                );
-            }
-            Ok(Some(m))
-        };
+                }
+                // `:<mode> <mode> <old> <new> <status>\0<path>\0` per entry.
+                let mut m = BTreeMap::new();
+                let mut it = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty());
+                while let Some(meta) = it.next() {
+                    let Some(path) = it.next() else {
+                        return Ok(None);
+                    };
+                    let meta = String::from_utf8_lossy(meta);
+                    let mut f = meta.split_whitespace();
+                    let (Some(old_mode), Some(old), Some(new)) = (f.next(), f.nth(1), f.next())
+                    else {
+                        return Ok(None);
+                    };
+                    m.insert(
+                        path.to_vec(),
+                        (
+                            old_mode.trim_start_matches(':').to_owned(),
+                            old.to_owned(),
+                            new.to_owned(),
+                        ),
+                    );
+                }
+                Ok(Some(m))
+            };
         let (Some(ours), Some(theirs)) = (changed(local)?, changed(tip)?) else {
             return Ok(None);
         };
@@ -6216,8 +6222,10 @@ impl<'a> AttestStore<'a> {
         // time; 2.7.28: 2,054 such paths sent every push of a vex run to
         // git-meta's merge of three listed trees, 6 s), as git-meta's merge
         // does; any other takes git-meta's merge.
-        let both: Vec<(&Vec<u8>, &(String, String, String))> =
-            ours.iter().filter(|(p, _)| theirs.contains_key(*p)).collect();
+        let both: Vec<(&Vec<u8>, &(String, String, String))> = ours
+            .iter()
+            .filter(|(p, _)| theirs.contains_key(*p))
+            .collect();
         let is_record =
             |p: &[u8]| p.ends_with(b"/__deleted") && p.windows(14).any(|w| w == b"/__tombstones/");
         let differing = both
