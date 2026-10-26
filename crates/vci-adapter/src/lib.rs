@@ -43,9 +43,9 @@ pub use pytest::{
     PytestAdapter, UV_ENV, UV_RUN_ARGS, find_py_plugin, pytest_jobs,
 };
 pub use rails::{
-    RAILS_GLOBAL_FILES, RAILS_HASH, RAILS_IGNORE, RAILS_LOOSE_HASH, RAILS_RUN_VARS,
-    RAILS_SCRATCH_DIRS, RAILS_SEED, RSPEC_GLOBAL_FILES, RUBY_BIN_ENV, RUBY_COLLECTOR_ENV,
-    RailsAdapter, RailsRunner, find_ruby_collector,
+    AUTOLOAD_INPUTS, RAILS_GLOBAL_FILES, RAILS_HASH, RAILS_IGNORE, RAILS_LOOSE_HASH,
+    RAILS_LOOSE_IGNORED_INPUTS, RAILS_RUN_VARS, RAILS_SCRATCH_DIRS, RAILS_SEED, RSPEC_GLOBAL_FILES,
+    RUBY_BIN_ENV, RUBY_COLLECTOR_ENV, RailsAdapter, RailsRunner, find_ruby_collector,
 };
 pub use vitest::{JS_PLUGIN_ENV, VITEST_HASH, VITEST_IGNORE, VitestAdapter, find_js_plugin};
 

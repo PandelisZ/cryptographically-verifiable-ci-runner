@@ -101,6 +101,10 @@ pub struct CandidateInfo {
     /// library versions not compared), for `explain`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub accepted_by_policy: Vec<String>,
+    /// Rails: the `rails_inputs` the attestation records (empty: made
+    /// before 2.7.36, every input recorded), for `explain`.
+    #[serde(skip)]
+    pub rails_inputs: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +130,10 @@ pub struct FileVerdict {
     /// The base policy's `libraries` for this file (omitted when "exact").
     #[serde(skip_serializing_if = "is_exact")]
     pub libraries: Libraries,
+    /// Rails: the base vci.toml's `rails_inputs` and the globs it leaves
+    /// out of manifests, for `explain`.
+    #[serde(skip)]
+    pub rails_inputs: Option<(crate::config::RailsInputs, Vec<String>)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<CandidateInfo>,
     #[serde(skip)]
@@ -967,10 +975,16 @@ impl Verifier<'_> {
 
     /// The current global manifest of `f` (`run::global_manifest`), captured
     /// through the plan's checkout cache once per set of global observations.
-    fn global_now(&self, f: &TestFile) -> Result<Arc<InputManifest>, String> {
-        let obs =
+    /// `ignored`: leave out what the project's `rails_inputs`/`ignore_inputs`
+    /// leave out (as `vci run` does since 2.7.36); without, every global
+    /// input (as `vci run` recorded them before).
+    fn global_now(&self, f: &TestFile, ignored: bool) -> Result<Arc<InputManifest>, String> {
+        let mut obs =
             crate::global::observations(&self.ctx.root, self.project.adapter.as_ref(), &f.abs)
                 .map_err(|e| format!("{e:#}"))?;
+        if ignored {
+            obs.retain(|(p, _)| self.project.ignored_input(p.as_str()).is_none());
+        }
         if let Some(g) = self
             .globals
             .lock()
@@ -1090,6 +1104,7 @@ fn verdict_run(f: &TestFile, reason: &str) -> FileVerdict {
         skip: false,
         reason: reason.to_owned(),
         libraries: Libraries::Exact,
+        rails_inputs: None,
         by: None,
         candidates: vec![],
         project_idx: f.project,
@@ -2078,10 +2093,22 @@ fn fallback_listing(
     Ok(())
 }
 
+/// The current global manifest of a file, with every global input (what an
+/// attestation made before 2.7.36 recorded) and without what the project's
+/// `rails_inputs`/`ignore_inputs` leave out (the same when nothing is).
+struct GlobalsNow {
+    all: Result<Arc<InputManifest>, String>,
+    ignored: Result<Arc<InputManifest>, String>,
+}
+
 impl Verifier<'_> {
     fn verdict(&self, f: &TestFile, cands: &[StoredEnvelope]) -> FileVerdict {
         let mut out = verdict_run(f, "");
         out.libraries = self.project.policy.libraries_for(&f.project_rel);
+        out.rails_inputs = self
+            .project
+            .rails_inputs
+            .map(|m| (m, self.project.ignored_inputs.clone()));
         if f.ambiguous {
             out.reason =
                 "listed under more than one runner project (or by more than one vci project)"
@@ -2096,9 +2123,19 @@ impl Verifier<'_> {
             out.reason = "no attestation".into();
             return out;
         }
-        // Current global inputs are the same for every candidate.
+        // Current global inputs are the same for every candidate: all of
+        // them for an attestation made before 2.7.36, and without what the
+        // project leaves out for one that records `rails_inputs`.
         let t = std::time::Instant::now();
-        let global_now = self.global_now(f);
+        let all = self.global_now(f, false);
+        let global_now = GlobalsNow {
+            ignored: if self.project.ignored_inputs.is_empty() {
+                all.clone()
+            } else {
+                self.global_now(f, true)
+            },
+            all,
+        };
         Timers::add(&self.timers.globals, t);
         // Newest first (by the issuedAt each says, unread ones last; ties
         // in store order): the first that passes is used, and a newer
@@ -2211,7 +2248,7 @@ impl Verifier<'_> {
         &self,
         f: &TestFile,
         s: &StoredEnvelope,
-        global_now: &Result<Arc<InputManifest>, String>,
+        globals_now: &GlobalsNow,
         info: &mut CandidateInfo,
     ) -> Result<(), Failure> {
         // A value the store could not read (e.g. a blob missing from the
@@ -2312,6 +2349,12 @@ impl Verifier<'_> {
         })?;
         info.issued_at = Some(p.core.issued_at.clone());
         info.expires_at = Some(p.core.expires_at.clone());
+        info.rails_inputs = p.rails_inputs.clone();
+        let global_now = if p.rails_inputs.is_empty() {
+            &globals_now.all
+        } else {
+            &globals_now.ignored
+        };
         // The input manifest: inline (before vci 1.9.0) or by reference to
         // the signed input root, exactly one of them.
         match (&p.core.manifest, &p.core.manifest_ref) {
@@ -3230,6 +3273,9 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
     if f.libraries == Libraries::Any {
         println!("{LIBRARIES_ANY_POLICY_LINE}");
     }
+    if let Some((mode, ignored)) = &f.rails_inputs {
+        println!("{}", rails_inputs_line(*mode, ignored));
+    }
     for (i, c) in f.candidates.iter().enumerate() {
         println!(
             "candidate {}: git-meta {} {}",
@@ -3248,6 +3294,15 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
         }
         for a in &c.info.accepted_by_policy {
             println!("  accepted by policy.libraries = \"any\": {a}");
+        }
+        if f.rails_inputs.is_some() && c.info.issued_at.is_some() {
+            if c.info.rails_inputs.is_empty() {
+                println!(
+                    "  recorded before rails_inputs (vci < 2.7.36): every file Rails read at boot is an input"
+                );
+            } else {
+                println!("  recorded with rails_inputs = {:?}", c.info.rails_inputs);
+            }
         }
         match &c.failure {
             None => println!("  all checks passed"),
@@ -3312,6 +3367,24 @@ fn not_waived(
         });
     }
     out
+}
+
+/// The `vci explain` line for a Rails test file: the base vci.toml's
+/// `rails_inputs` and what it leaves out of manifests.
+pub fn rails_inputs_line(mode: crate::config::RailsInputs, ignored: &[String]) -> String {
+    let list = if ignored.is_empty() {
+        "nothing".to_owned()
+    } else {
+        ignored.join(", ")
+    };
+    match mode {
+        crate::config::RailsInputs::Loose => format!(
+            "inputs: rails_inputs = \"loose\" (base vci.toml; the default): not inputs: {list} (a change to them runs no test again here; a run that skips nothing runs them)"
+        ),
+        crate::config::RailsInputs::Strict => format!(
+            "inputs: rails_inputs = \"strict\" (base vci.toml): every file the test's process read is an input; not inputs (ignore_inputs): {list}"
+        ),
+    }
 }
 
 /// The `vci explain` line for a test file whose base policy sets

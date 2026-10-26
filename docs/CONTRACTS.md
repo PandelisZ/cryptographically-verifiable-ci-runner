@@ -637,7 +637,13 @@ base commit's policy still waives every entry; an older vci, which knows only th
 `policy.rails_allow_db`, is still deserialised and never accepted), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
 host's cfg set), and for every adapter `declaredInputs` (the `[[inputs]] extra` globs of the test id, which must equal
 the base config's) and `envSet` (since vci 1.6.0: the names of the variables vci set from `[env] set`, whose manifest
-env entries hash the declared value; informational, older vci ignores it); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
+env entries hash the declared value; informational, older vci ignores it), and for Rails (since vci 2.7.36)
+`railsInputs` (`"loose"` or `"strict"`: the project's `rails_inputs` when the unit was recorded) and `ignoredInputs`
+(the globs, relative to the project dir, whose paths were left out of both manifests: loose mode's
+`RAILS_LOOSE_IGNORED_INPUTS`, `.vci-autoload` naming the autoload lookup records, then `ignore_inputs`); `vci plan`
+leaves the base config's list out of the current global inputs only for a predicate with `railsInputs`, so one
+without it (older vci) is checked against every global input, and an older vci refuses a loose predicate (its
+global input set differs); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
 Since vci 1.9.0 `vci run` writes `manifestRef` (= `inputRoot`) and omits `manifest` (see "Manifests by reference"
 below); `globalManifest` is always inline.
 `input_root` is the per-file manifest root; `global_input_root` is the per-file global manifest root (lockfiles,
@@ -648,7 +654,7 @@ directory up to the project dir; for Go: `vci.toml`, `go.mod`/`go.sum`/`go.work`
 up to the repo root and `vendor/modules.txt` in the project dir; for Cargo: `vci.toml`, `Cargo.toml` from the package dir
 up to the repo root, `Cargo.lock`/`rust-toolchain(.toml)`/`.cargo/config(.toml)` from the project dir up to the repo
 root; for Rails: `vci.toml`, `RAILS_GLOBAL_FILES` in the project dir (RSpec files: without `test/test_helper.rb`,
-with `.rspec`), and `.ruby-version`/`.tool-versions`/`mise.toml` variants from the project dir up to the repo root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
+with `.rspec`; without what `ignoredInputs` names), and `.ruby-version`/`.tool-versions`/`mise.toml` variants from the project dir up to the repo root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
 test id, input root, global input root, env config digest, toolchain and argv (plus the pytest toolchain fields, the
 project name, the Go, Rust and Rails toolchain fields, `platformSpecific`, `archSpecific`, `waived`, `cfgPredicates`, `declaredInputs` and a
 non-Vitest adapter name when set), so re-running with identical inputs replaces (renews) the

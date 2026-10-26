@@ -563,33 +563,28 @@ fn rails_end_to_end_verification_steps() {
     assert_eq!(w.plan(&work, "main").run, set(&[C]), "step 5: alpha.txt");
     w.git(&work, &["checkout", "--", "test/fixtures/files"]);
 
-    // Step 6: config/routes.rb -> D (which draws the routes) runs.
+    // Step 6: config/routes.rb is read while Rails boots (D draws the
+    // routes): with `rails_inputs = "loose"`, the default since 2.7.36, it
+    // is not an input, and nothing runs (`rails_inputs_loose_skips_boot_
+    // file_changes_and_strict_does_not` covers strict mode, where D runs).
     let routes = w.read("config/routes.rb");
     w.put("config/routes.rb", &format!("{routes}# edited\n"));
     let p = w.plan(&work, "main");
-    assert!(p.run.contains(D), "step 6: {p:?}");
-    assert!(
-        w.explain(&work, D, "main")
-            .contains("entry:config/routes.rb")
-    );
+    assert_eq!(p.skip, set(ALL), "step 6: {p:?}");
     w.put("config/routes.rb", &routes);
-    assert_eq!(w.plan(&work, "main").skip, set(ALL), "step 6: restored");
 
-    // Step 7: a new file in an autoload directory that changes what a
-    // constant resolves to (app/models comes before lib, so this Calc wins)
-    // -> A runs. Zeitwerk's listing of app/models is an input.
+    // Step 7: a new file in an autoload directory, even one that changes
+    // what a constant resolves to (app/models comes before lib, so this
+    // Calc wins): loose mode records autoload lookups instead of Zeitwerk's
+    // listings and leaves them out, so nothing runs (the trade-off the
+    // default branch's full run covers).
     w.put(
         "app/models/calc.rb",
         "module Calc\n  def self.add(a, b) = a - b\nend\n",
     );
     let p = w.plan(&work, "main");
-    assert!(p.run.contains(A), "step 7: {p:?}");
-    assert!(
-        w.explain(&work, A, "main").contains("entry:app/models"),
-        "step 7: the listing"
-    );
+    assert_eq!(p.skip, set(ALL), "step 7: {p:?}");
     std::fs::remove_file(work.join("app/models/calc.rb")).unwrap();
-    assert_eq!(w.plan(&work, "main").skip, set(ALL), "step 7: restored");
 
     // Step 8: db/schema.rb -> every test that uses the database runs (all of
     // them: test_helper loads every fixture, and Rails checks the schema).
@@ -3501,10 +3496,17 @@ fn rails_slots_give_what_one_process_per_file_gives() {
 /// the policy in the base commit, such attestations are not accepted.
 #[test]
 fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
-    let toml = VCI_TOML.replace(
-        "platform = \"any\"",
-        "platform = \"any\"\nrails_autoload_lookups = true",
-    );
+    // Strict inputs: loose mode (the default since 2.7.36) leaves the
+    // lookup records out of the manifest.
+    let toml = VCI_TOML
+        .replace(
+            "platform = \"any\"",
+            "platform = \"any\"\nrails_autoload_lookups = true",
+        )
+        .replace(
+            "adapter = \"rails\"\n",
+            "adapter = \"rails\"\nrails_inputs = \"strict\"\n",
+        );
     let Some(w) = World::build(&toml, copy_rails_fixture) else {
         return;
     };
@@ -3648,4 +3650,166 @@ fn rails_file_past_the_timeout_is_stopped() {
     let got = outcomes(&stderr);
     assert_eq!(got.get(files[1]), Some(&None), "{stderr}");
     assert_ne!(got.get(hung), Some(&None), "{stderr}");
+}
+
+/// `rails_inputs` (2.7.36). Loose (the default): what Rails reads while it
+/// boots (routes, the boot files, initializers, migrations, the autoload
+/// records) is not an input, so a change to `config/routes.rb` and
+/// `config/application.rb` plus a new constant file under app/models skips
+/// the model test and the one that draws the routes; the predicate records
+/// the mode and the list. Strict: the same change runs both. A change to a
+/// model the test reads runs it in both modes. A base that switches to
+/// strict does not accept the loose attestation.
+#[test]
+fn rails_inputs_loose_skips_boot_file_changes_and_strict_does_not() {
+    const B: &str = "test/models/b_test.rb";
+    const D: &str = "test/controllers/d_test.rb";
+    for strict in [false, true] {
+        let toml = if strict {
+            VCI_TOML.replace(
+                "adapter = \"rails\"\n",
+                "adapter = \"rails\"\nrails_inputs = \"strict\"\n",
+            )
+        } else {
+            VCI_TOML.to_owned()
+        };
+        let Some(w) = World::build(&toml, copy_rails_fixture) else {
+            return;
+        };
+        let work = w.work.clone();
+        let mode = if strict { "strict" } else { "loose" };
+        let stderr = strip_ansi(&w.run(&work, &[B, D], &w.trusted));
+        let got = outcomes(&stderr);
+        for f in [B, D] {
+            assert_eq!(got.get(f), Some(&None), "{mode}: {f}:\n{stderr}");
+        }
+        assert_eq!(
+            stderr.contains("vci: rails inputs are loose: "),
+            !strict,
+            "{mode}:\n{stderr}"
+        );
+        if !strict {
+            assert!(
+                stderr.contains("set rails_inputs = \"strict\" to record them"),
+                "{stderr}"
+            );
+            assert_eq!(
+                stderr.matches("rails inputs are loose").count(),
+                1,
+                "once per project:\n{stderr}"
+            );
+        }
+        let pred = stored_predicate(&work, B);
+        assert_eq!(pred["railsInputs"], mode, "{pred}");
+        let ignored: Vec<&str> = pred["ignoredInputs"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if strict {
+            assert!(ignored.is_empty(), "{ignored:?}");
+        } else {
+            assert_eq!(ignored, vci_adapter::RAILS_LOOSE_IGNORED_INPUTS, "{pred}");
+        }
+        let entries = manifest_entries(&pred);
+        let has = |p: &str| entries.iter().any(|(e, _)| e == p);
+        assert!(has("app/models/widget.rb"), "{entries:?}");
+        assert!(has("test/fixtures/widgets.yml"), "{entries:?}");
+        assert!(has("db/schema.rb"), "{entries:?}");
+        assert!(has("Gemfile.lock"), "{entries:?}");
+        assert!(has("test/test_helper.rb"), "{entries:?}");
+        assert_eq!(has("config/application.rb"), strict, "{entries:?}");
+        assert_eq!(has("config/environments/test.rb"), strict, "{entries:?}");
+        assert_eq!(
+            entries
+                .iter()
+                .any(|(e, k)| e == "app/models" && k == "dirListing"),
+            strict,
+            "the listing: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(e, _)| e.contains(".vci-autoload")),
+            "{entries:?}"
+        );
+        let d = manifest_entries(&stored_predicate(&work, D));
+        assert_eq!(
+            d.iter().any(|(e, _)| e == "config/routes.rb"),
+            strict,
+            "{d:?}"
+        );
+        assert_eq!(w.plan(&work, "main").skip, set(&[B, D]), "{mode}");
+        let ex = w.explain(&work, B, "main");
+        assert!(
+            ex.contains(&format!("inputs: rails_inputs = \"{mode}\"")),
+            "{ex}"
+        );
+        assert!(
+            ex.contains(&format!("recorded with rails_inputs = \"{mode}\"")),
+            "{ex}"
+        );
+
+        // Boot files and a new constant: skipped when loose, run when strict.
+        let routes = w.read("config/routes.rb");
+        let app = w.read("config/application.rb");
+        w.put(
+            "config/routes.rb",
+            &routes.replace(
+                "end\n",
+                "  get \"ping\" => \"codes#show\", defaults: { id: 1 }\nend\n",
+            ),
+        );
+        w.put("config/application.rb", &format!("{app}# edited\n"));
+        w.put(
+            "app/models/sprocket.rb",
+            "class Sprocket < ApplicationRecord\n  self.table_name = \"widgets\"\nend\n",
+        );
+        let p = w.plan(&work, "main");
+        if strict {
+            assert!(p.skip.is_empty(), "{mode}: {p:?}");
+            let ex = w.explain(&work, D, "main");
+            assert!(ex.contains("config/application.rb"), "{ex}");
+        } else {
+            assert_eq!(p.skip, set(&[B, D]), "{mode}: {p:?}");
+        }
+        w.put("config/routes.rb", &routes);
+        w.put("config/application.rb", &app);
+        std::fs::remove_file(work.join("app/models/sprocket.rb")).unwrap();
+        assert_eq!(w.plan(&work, "main").skip, set(&[B, D]), "{mode}: restored");
+
+        // A model the test reads (the fixtures every test loads read it
+        // too): runs in both modes.
+        let widget = w.read("app/models/widget.rb");
+        w.put("app/models/widget.rb", &format!("{widget}# edited\n"));
+        let p = w.plan(&work, "main");
+        assert!(p.skip.is_empty(), "{mode}: {p:?}");
+        assert!(
+            w.explain(&work, B, "main")
+                .contains("entry:app/models/widget.rb")
+        );
+        w.put("app/models/widget.rb", &widget);
+
+        if !strict {
+            // The base switches to strict: the loose attestations are not
+            // accepted (the global inputs strict mode records are missing
+            // from them, and the mode is part of the `vci:config` external).
+            w.git(&work, &["checkout", "-q", "main"]);
+            w.put(
+                "vci.toml",
+                &VCI_TOML.replace(
+                    "adapter = \"rails\"\n",
+                    "adapter = \"rails\"\nrails_inputs = \"strict\"\n",
+                ),
+            );
+            w.git(&work, &["commit", "-q", "-am", "strict inputs"]);
+            w.git(&work, &["checkout", "-q", "feature"]);
+            let p = w.plan(&work, "main");
+            assert!(p.skip.is_empty(), "base strict: {p:?}");
+            let ex = w.explain(&work, B, "main");
+            assert!(ex.contains("inputs: rails_inputs = \"strict\""), "{ex}");
+            assert!(
+                ex.contains("recorded with rails_inputs = \"loose\""),
+                "{ex}"
+            );
+            assert!(ex.contains("failed check: global-inputs"), "{ex}");
+        }
+    }
 }

@@ -661,7 +661,7 @@ a number applies to any project (`1`: one file at a time, as in vci 2.0); withou
 batch runs one file at a time. RSpec has no parallel workers: slots there share the test database (set
 `VCI_RAILS_JOBS` only if your specs can share it). Details: [`docs/spike-rails.md`](spike-rails.md) ("Slots").
 
-Autoload lookups (since 2.6, opt-in): with `rails_autoload_lookups = true` in `[policy]` (or a project's), a directory Zeitwerk lists only to set up autoloads (never to eager load) is not an input as a listing. vci records instead the constant names the test's process looked up without loading them: a miss (`const_missing`, which a plain reference, `const_get`, `constantize` and `safe_constantize` reach), and `const_defined?` answering false, or true for an autoload not loaded yet. A unit then runs again only when one of its autoload directories gains, loses or renames a child whose name matches one of those names (`html_parser.rb` matches `HTMLParser`; names compare without underscores or case, and in any autoload directory, whatever namespace asked). A file added to an autoload directory (by the change, or on the base branch since the attestation) otherwise runs every test that booted the application again. A namespace whose constants are enumerated (`Module#constants`) keeps its directories' listings. Ruby answers `defined?(Constant)` without a method vci can hook, so (since 2.6.1) the constant paths after `defined?` in every repository Ruby file the test loaded are names it looked up too. What remains unseen is a gem's own code asking `defined?` about one of the application's constants: a test may then pass without having seen a constant a new file defines. The base commit's policy must set it for `vci plan` to accept such an attestation; the collector records lookups when the policy `vci run` or `vci ci` reads sets it.
+Autoload lookups (since 2.6, opt-in): with `rails_autoload_lookups = true` in `[policy]` (or a project's), a directory Zeitwerk lists only to set up autoloads (never to eager load) is not an input as a listing. vci records instead the constant names the test's process looked up without loading them: a miss (`const_missing`, which a plain reference, `const_get`, `constantize` and `safe_constantize` reach), and `const_defined?` answering false, or true for an autoload not loaded yet. A unit then runs again only when one of its autoload directories gains, loses or renames a child whose name matches one of those names (`html_parser.rb` matches `HTMLParser`; names compare without underscores or case, and in any autoload directory, whatever namespace asked). A file added to an autoload directory (by the change, or on the base branch since the attestation) otherwise runs every test that booted the application again. A namespace whose constants are enumerated (`Module#constants`) keeps its directories' listings. Ruby answers `defined?(Constant)` without a method vci can hook, so (since 2.6.1) the constant paths after `defined?` in every repository Ruby file the test loaded are names it looked up too. What remains unseen is a gem's own code asking `defined?` about one of the application's constants: a test may then pass without having seen a constant a new file defines. The base commit's policy must set it for `vci plan` to accept such an attestation; the collector records lookups when the policy `vci run` or `vci ci` reads sets it. Since 2.7.36 `rails_inputs = "loose"` (the default) records lookups too and leaves the records out of the manifest, so the lookups no longer decide anything there: with loose inputs, a new file in an autoload directory runs nothing again (see [Boot-time files are not inputs](#boot-time-files-are-not-inputs-rails_inputs-since-2734)); this policy matters with `rails_inputs = "strict"`.
 
 Long files run as shards (since 2.3): when slots run a Minitest file whose last attested run took at least twice
 `VCI_RAILS_SHARD_SECONDS` (default 30; `0` turns it off), the file runs as `ceil(duration / that)` processes, at most
@@ -732,7 +732,9 @@ it loads (`require "net/http"` does that), is not an input; any other read of it
   (an optional dependency, `Bundler.require` of a gem with no file of its name) records every candidate as absent;
 - **Zeitwerk**: the listing of every autoload directory it scans (`app/models`, `lib`, ... and namespaces as they
   load). A new file in `app/models` therefore runs every test that boots Rails: whether a new constant changes
-  resolution is decided by Zeitwerk at run time, and vci does not model it;
+  resolution is decided by Zeitwerk at run time, and vci does not model it. With `rails_inputs = "loose"` (the
+  default since 2.7.36, below) the collector records autoload lookups instead and leaves them out: a new file there
+  runs nothing again;
 - **files**: every read, existence or type check (absent paths as probes), glob (the listing of every directory the
   pattern reads, and every literal path it checks) and directory listing: `config/database.yml`, initializers, locale
   files, view templates (read when rendered), `test/fixtures` (`fixtures :all` lists the directory and loads every
@@ -754,7 +756,59 @@ Global inputs of every file: the project's settings in `vci.toml` (the `vci:conf
 `config/application.rb`, `config/boot.rb`, `config/environment.rb`, `config/environments/test.rb`, `config.ru`,
 `bin/rails`, `test/test_helper.rb` and `Rakefile`; and `.ruby-version`, `.tool-versions`, `mise.toml` (and its
 variants) from the project dir up to the repository root. Missing ones are recorded as absent. **Any `Gemfile.lock`
-change runs everything.**
+change runs everything.** With `rails_inputs = "loose"` (the default since 2.7.36) the boot files among them
+(`config/application.rb`, `config/boot.rb`, `config/environment.rb`, `config/environments/test.rb`, `config.ru`) are
+not global inputs.
+
+### Boot-time files are not inputs (`rails_inputs`, since 2.7.36)
+
+Rails reads its routes, initializers, environment files, migrations and translations while it boots, and Zeitwerk
+lists every autoload directory. Recorded, each of them is an input of every test file of the project, so a pull
+request that adds a route, an initializer or a model file ran the whole suite again. Since 2.7.36 a Rails project
+(Minitest and RSpec alike) leaves them out of its manifests by default:
+
+```toml
+adapter = "rails"
+rails_inputs = "loose"                        # the default; "strict": every file a test's process read is an input
+ignore_inputs = ["config/credentials/**"]     # more globs, relative to the project dir (in either mode)
+```
+
+In `[[projects]]` both go in the project's own table, next to `adapter` and `runner`. In loose mode these are never
+inputs (globs relative to the Rails root; `dir/**` covers the directory's listing too):
+
+| Glob | What |
+| --- | --- |
+| `config/application.rb`, `config/boot.rb`, `config/environment.rb` | the boot files |
+| `config/environments/**` | per-environment settings (`test.rb`) |
+| `config/initializers/**` | initializers |
+| `config/routes.rb`, `config/routes/**` | routes (and `draw`n route files) |
+| `config/locales/**` | translations |
+| `config/puma.rb`, `config/spring.rb`, `config.ru` | server and preloader configuration |
+| `db/migrate/**` | migrations (the schema they produce, `db/schema.rb`/`db/structure.sql`, stays an input) |
+| `.vci-autoload` | the autoload lookup records (`<dir>/.vci-autoload`, `.vci-autoload/<name>`): in loose mode the collector records lookups instead of autoload directory listings, as `policy.rails_autoload_lookups` does, and leaves them out, so a file added to `app/models` (or any autoload directory) runs nothing again |
+
+What stays an input: `Gemfile`, `Gemfile.lock` and the gems (a gem change runs everything), `db/schema.rb` and
+`db/structure.sql`, `config/database.yml`, `test/test_helper.rb`, `test/support/**`, `spec/*_helper.rb`,
+`spec/support/**`, the Ruby version files, and every file the test's process read that is not in the list: models,
+services, controllers, views, fixtures, the test file itself. `ignore_inputs` adds to the list (in strict mode it is
+the whole list); `.vci-autoload` in it leaves out the lookup records in strict mode too.
+
+**The trade-off, plainly:** a change to a boot file no longer runs any test again on a pull request. A test whose
+outcome depends on a route, an initializer, a migration, a translation or which constants exist can pass on the pull
+request's branch with a skip it should not have had. A run that skips nothing catches it: the default branch's
+(`policy.no_skip_refs` covers it in the `vci init` template), whose full run then attests every unit again. Set
+`rails_inputs = "strict"` where that is not acceptable.
+
+The filter is applied when a unit is recorded: a loose attestation's manifests simply do not contain those paths, and
+its predicate says so (`railsInputs`, `"loose"` or `"strict"`, and `ignoredInputs`, the globs left out). `vci plan`
+re-checks what an attestation records, as always, and leaves the base vci.toml's list out of the current global inputs
+only for an attestation that records `railsInputs`. An attestation made before 2.7.36 records every input: it stays
+usable (loose mode's default settings do not change the `vci:config` external) and keeps running again on a change
+to a boot file until the unit is attested in loose mode, which the default branch's first full run after the upgrade
+does. `rails_inputs = "strict"` or any `ignore_inputs` is part of `vci:config`, so an attestation made in the other mode
+or with another list is not accepted. `vci run` says once per project what it left out (`vci: rails inputs are loose:
+N boot-time files are not inputs (config/routes.rb, ...); set rails_inputs = "strict" to record them`), and
+`vci explain` prints the base vci.toml's mode and list, and the mode each candidate was recorded with.
 
 Toolchain: Ruby's version and patchlevel (`3.4.9p82`) and engine, Rails (`Rails::VERSION`, or the bundle's `railties`
 for a test file that never loads Rails, such as a Minitest file under `test/lib` that requires only `minitest` and
@@ -1797,6 +1851,9 @@ they ran, with 1.9.2's trade-off. `vci ci --oidc` refuses to attest when the job
 project = "."          # project dir (Vitest root / pytest rootdir / Go module root / Cargo workspace root / Rails app root), relative to the repo root
 adapter = "vitest"     # or "pytest", "go", "cargo", "rails", "node-test"
 # runner = "rspec"     # rails only: "minitest" or "rspec" (unset: detected, see Quick start (RSpec)); in [[projects]] per project
+# rails_inputs = "strict"  # rails only: "loose" (default since 2.7.36: routes, initializers, boot files, migrations, locales,
+                           # autoload records are not inputs) or "strict"; in [[projects]] per project
+# ignore_inputs = ["config/credentials/**"]  # rails only: more globs (relative to the project dir) that are never inputs
 # test_script = "test" # node-test only: the package.json script that runs `node --test` (default "test"); or instead:
 # test_globs = ["src/**/*.test.ts"]                  # node-test only: test file globs (node:test's glob syntax)
 # node_args = ["--import", "./test/hooks.mjs"]       # node-test only, with test_globs: node options
@@ -2147,7 +2204,9 @@ file compiled from disk with the shadowing candidates of each `require`, Zeitwer
 checked, globbed or listed (fixtures, templates, configuration, the schema files of every test database), the loaded
 gems by version (their installed files checked against their archives when attested), `ENV` reads, and global inputs
 (`Gemfile`, `Gemfile.lock`, the boot files, `test/test_helper.rb` for Minitest files and `.rspec` for RSpec files, the
-Ruby version files). The test database is the engine's and its contents are not an input. RSpec files also record
+Ruby version files). Except with `rails_inputs = "strict"`, what Rails reads while it boots (routes, initializers,
+environments, the boot files, migrations, locales, the autoload records) is left out: see
+[Boot-time files are not inputs](#boot-time-files-are-not-inputs-rails_inputs-since-2734). The test database is the engine's and its contents are not an input. RSpec files also record
 `spec_helper`/`rails_helper`, the `spec/support` glob's listings, FactoryBot's definition directories and everything
 else under [Quick start (RSpec)](#quick-start-rspec).
 
@@ -2446,7 +2505,9 @@ decision.
 
 Since 2.7.0 a unit's attestation records its project's settings as one external, `vci:config`: a hash of the
 project's directory, adapter and adapter settings (`runner`, the node:test command), its effective `[env]` and its
-`[[inputs]]`. Nothing else of the file is an input: not `[policy]` (read from the base commit when planning), not
+`[[inputs]]`, and (since 2.7.36) Rails' `rails_inputs` and `ignore_inputs` when they are not the default (`"strict"`,
+or any `ignore_inputs`; the default leaves the hash as 2.7.33 computed it, so earlier attestations, which record every
+input, stay usable). Nothing else of the file is an input: not `[policy]` (read from the base commit when planning), not
 comments or formatting, not other projects. Before 2.7.0 the whole file was a global input of every unit, so any
 edit to it ran every unit of every project again. A project whose directory the checkout does not have is left out
 with a warning (2.7.0; it has no units), instead of every project running.

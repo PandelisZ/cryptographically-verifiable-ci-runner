@@ -139,7 +139,10 @@ fn global_manifest_in(
     child: &ChildEnvMap,
     test_abs: &Utf8Path,
 ) -> Result<InputManifest> {
-    let obs = global::observations(checkout.root, project.adapter.as_ref(), test_abs)?;
+    let mut obs = global::observations(checkout.root, project.adapter.as_ref(), test_abs)?;
+    // Rails' `rails_inputs`/`ignore_inputs` (2.7.36): `config/application.rb`
+    // and the other boot files are not global inputs either.
+    obs.retain(|(p, _)| project.ignored_input(p.as_str()).is_none());
     let m = checkout.capture(
         &obs,
         vec![],
@@ -1090,6 +1093,29 @@ fn check_one(
         &pruned
     };
     let mut obs = observations_in(checkout, o, adapter.name(), adapter.tsconfig_is_input())?;
+    // Rails' `rails_inputs`/`ignore_inputs` (2.7.36): what Rails reads while
+    // it boots is left out (declared `[[inputs]]` are not).
+    if !project.ignored_inputs.is_empty() {
+        let mut matched: BTreeSet<&str> = BTreeSet::new();
+        let mut files = BTreeSet::new();
+        obs.retain(|(p, _)| match project.ignored_input(p.as_str()) {
+            Some(g) => {
+                matched.insert(g);
+                if g != vci_adapter::AUTOLOAD_INPUTS {
+                    files.insert(p.as_str().to_owned());
+                }
+                false
+            }
+            None => true,
+        });
+        if !matched.is_empty()
+            && !project
+                .ignored_noted
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("vci: {}", ignored_note(project, files.len(), &matched));
+        }
+    }
     obs.extend(expand_extra_inputs(
         &ctx.root,
         &project.dir,
@@ -1200,9 +1226,42 @@ fn check_one(
             cfg_predicates: o.cfg_predicates.iter().cloned().collect(),
             declared_inputs: declared,
             env_set: fenv.set.keys().cloned().collect(),
+            rails_inputs: project
+                .rails_inputs
+                .map(|m| m.as_str().to_owned())
+                .unwrap_or_default(),
+            ignored_inputs: project.ignored_inputs.clone(),
         },
         manifest,
     })
+}
+
+/// `vci run`'s line (once per project) saying which inputs it leaves out:
+/// `files` paths (the autoload lookup records aside) matched the globs of
+/// [`Project::ignored_inputs`] in `matched`.
+fn ignored_note(project: &Project, files: usize, matched: &BTreeSet<&str>) -> String {
+    // In the list's order.
+    let names: Vec<&str> = project
+        .ignored_inputs
+        .iter()
+        .map(String::as_str)
+        .filter(|g| matched.contains(g))
+        .collect();
+    let label = if project.name.is_empty() {
+        String::new()
+    } else {
+        format!("{}: ", project.name)
+    };
+    match project.rails_inputs {
+        Some(crate::config::RailsInputs::Loose) => format!(
+            "{label}rails inputs are loose: {files} boot-time files are not inputs ({}); set rails_inputs = \"strict\" to record them",
+            names.join(", ")
+        ),
+        _ => format!(
+            "{label}ignore_inputs: {files} files are not inputs ({})",
+            names.join(", ")
+        ),
+    }
 }
 
 /// Directory names never walked for declared inputs (the tree snapshot does
@@ -2171,7 +2230,7 @@ pub fn run_units(
                 &child.to_child_env(),
                 &vci_adapter::RunHints {
                     last_ms: last_ms.clone(),
-                    rails_autoload_lookups: project.policy.rails_autoload_lookups,
+                    rails_autoload_lookups: project.autoload_lookups(),
                 },
             )?;
             Ok((go_tree, out))

@@ -255,6 +255,9 @@ vci push</code></pre>
 <li>every variable read through <code>ENV</code>.</li>
 </ul>
 <p>Any change to <code>Gemfile.lock</code> runs everything.</p>
+<h3 id="rails-inputs">What Rails reads at boot is not an input</h3>
+<p>Since 2.7.36, by default (<code>rails_inputs = "loose"</code>), the files Rails reads while it boots are left out of every test file's inputs: <code>config/routes.rb</code> and <code>config/routes/**</code>, <code>config/initializers/**</code>, <code>config/environments/**</code>, <code>config/application.rb</code>, <code>config/boot.rb</code>, <code>config/environment.rb</code>, <code>config/puma.rb</code>, <code>config/spring.rb</code>, <code>config.ru</code>, <code>db/migrate/**</code>, <code>config/locales/**</code>, and the autoload records, so a new file in <code>app/models</code> runs nothing again. <code>Gemfile.lock</code>, <code>db/schema.rb</code>, <code>config/database.yml</code>, <code>test_helper.rb</code>, <code>test/support</code> and every file a test reads after boot (models, services, fixtures, templates) stay inputs.</p>
+<p>The trade-off: a change to a boot file no longer runs any test again on a pull request. The default branch's full run (<code>no_skip_refs</code>) runs every test against it. <code>rails_inputs = "strict"</code> records everything, as before; <code>ignore_inputs = ["config/credentials/**"]</code> adds globs to leave out. Both go next to <code>adapter</code>, or in a project's table. <code>vci run</code> says once what it left out, and <code>vci explain</code> shows the mode. See <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/REFERENCE.md#boot-time-files-are-not-inputs-rails_inputs-since-2734">the reference</a>.</p>
 <h3>What is refused</h3>
 <ul>
 <li>child processes and forks (except the <code>bin/rails db:test:prepare</code> that Active Record's own schema maintenance starts);</li>
