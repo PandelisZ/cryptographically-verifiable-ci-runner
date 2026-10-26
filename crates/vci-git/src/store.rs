@@ -74,8 +74,10 @@ struct Pool {
 }
 
 /// The attestation store of one repository, kept by git-meta in
-/// `.git/git-meta.sqlite` and exchanged on `refs/meta/main` (see
-/// [`crate::meta`]). One value serves every thread of a process.
+/// `<common git dir>/git-meta.sqlite` (`.git/git-meta.sqlite`, shared by
+/// every linked worktree since 2.7.33: [`AttestStore::store_path`]) and
+/// exchanged on `refs/meta/main` (see [`crate::meta`]). One value serves
+/// every thread of a process.
 pub struct GitMetaStore {
     repo: Repo,
     readers: Mutex<Pool>,
@@ -172,8 +174,15 @@ impl AttestationStore for GitMetaStore {
         KIND
     }
 
+    /// `.git/git-meta.sqlite` in the main worktree; in a linked one, the
+    /// common git directory's store it shares (2.7.33), by its path.
     fn location(&self) -> String {
-        format!(".git/git-meta.sqlite (exchanged on {EXCHANGE_POINT})")
+        match self.repo.linked_common() {
+            Some(common) => format!(
+                "{common}/git-meta.sqlite, shared by every worktree of the repository (exchanged on {EXCHANGE_POINT})"
+            ),
+            None => format!(".git/git-meta.sqlite (exchanged on {EXCHANGE_POINT})"),
+        }
     }
 
     fn caps(&self) -> Caps {
@@ -358,7 +367,8 @@ impl AttestationStore for GitMetaStore {
         Ok(out?)
     }
 
-    /// Reads `.git/git-meta.sqlite` through once on a thread.
+    /// Reads the store file ([`AttestStore::store_path`]) through once on a
+    /// thread.
     fn warm(&self) {
         self.attest_store().warm_in_background();
     }
@@ -468,7 +478,7 @@ impl BackendFactory for GitMetaFactory {
     }
 
     fn summary(&self) -> &'static str {
-        "git-meta in .git/git-meta.sqlite, exchanged on refs/meta/main by vci fetch and vci push (the default)"
+        "git-meta in .git/git-meta.sqlite (shared by the repository's worktrees), exchanged on refs/meta/main by vci fetch and vci push (the default)"
     }
 
     /// The store of the factory's repository. git-meta has no settings of

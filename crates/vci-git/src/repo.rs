@@ -26,6 +26,9 @@ pub struct Repo {
     /// attestation asked about eight times, a `git rev-parse` each, most of
     /// the 20 ms each unit took to store on vex's runners).
     git_dir: std::sync::OnceLock<Utf8PathBuf>,
+    /// The common git directory of a linked worktree, `None` elsewhere,
+    /// asked of git once ([`Repo::common_git_dir`]).
+    linked_common: std::sync::OnceLock<Option<Utf8PathBuf>>,
 }
 
 /// How many of `oids` the object database at `root` holds, asked without
@@ -96,6 +99,7 @@ impl Repo {
         Ok(Repo {
             root: Utf8PathBuf::from(root),
             git_dir: std::sync::OnceLock::new(),
+            linked_common: std::sync::OnceLock::new(),
         })
     }
 
@@ -118,6 +122,25 @@ impl Repo {
             .args(["rev-parse", "--absolute-git-dir"])
             .run_str()?;
         Ok(self.git_dir.get_or_init(|| Utf8PathBuf::from(dir)).clone())
+    }
+
+    /// The git directory every worktree of the repository shares: for a
+    /// linked worktree (`git worktree add`) the common git directory (the
+    /// main checkout's `.git`, or the bare repository), elsewhere
+    /// [`Repo::git_dir`], spelled as that returns it. vci's git-meta store
+    /// lives here (2.7.33: one per repository, not one per worktree).
+    pub fn common_git_dir(&self) -> Result<Utf8PathBuf, GitError> {
+        match self.linked_common() {
+            Some(common) => Ok(common),
+            None => self.git_dir(),
+        }
+    }
+
+    /// [`Repo::linked_worktree_common_dir`], asked of git once.
+    pub(crate) fn linked_common(&self) -> Option<Utf8PathBuf> {
+        self.linked_common
+            .get_or_init(|| self.linked_worktree_common_dir())
+            .clone()
     }
 
     /// For a linked worktree (`git worktree add`), the repository's common

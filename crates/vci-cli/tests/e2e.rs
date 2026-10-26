@@ -1831,6 +1831,80 @@ fn worktrees_and_lost_stores_keep_published_attestations() {
     assert_eq!(w.plan(&work, "main").skip, set(&[A, B, C, D]));
 }
 
+/// Since 2.7.33 every worktree of a repository shares one git-meta store:
+/// a unit attested in one linked worktree is skipped by a plan in another
+/// with nothing pushed or fetched, a push from that other worktree publishes
+/// it, and the main worktree's plan skips it after a fetch. A worktree's own
+/// store left by an earlier vci is left alone, and said so once.
+#[test]
+fn linked_worktrees_share_one_store() {
+    let w = World::new();
+    let work = w.work.clone();
+    let add = |name: &str| {
+        let wt = w.base.join(name);
+        w.git(
+            &work,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("{name}-branch"),
+                wt.to_str().unwrap(),
+            ],
+        );
+        w.install_node_modules(&wt);
+        wt
+    };
+    let (wt1, wt2) = (add("wt1"), add("wt2"));
+    w.run(&wt1, A, &w.trusted);
+    assert!(w.plan(&wt2, "main").skip.contains(A), "no push, no fetch");
+    // The commands reach git-meta through the store trait (2.8.0): `vci
+    // store info` in a linked worktree names the shared store, and counts
+    // what the other worktree stored.
+    let info = w.vci_ok(&wt2, &["store", "info"]);
+    let common = work.join(".git").canonicalize().unwrap();
+    assert!(
+        info.contains(&format!(
+            "location: {}/git-meta.sqlite, shared by every worktree of the repository (exchanged on refs/meta/main)",
+            common.display()
+        )),
+        "{info}"
+    );
+    assert!(info.contains("attestations: 1"), "{info}");
+    let err = w.stderr_of(&wt2, &["push", "--remote", "origin"]);
+    assert!(err.contains("vci: pushed"), "{err}");
+    w.vci_ok(&work, &["fetch"]);
+    assert!(w.plan(&work, "main").skip.contains(A));
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    let fresh = w.fresh_clone("fresh");
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    assert!(w.plan(&fresh, "main").skip.contains(A), "it was pushed");
+    let worktrees = work.join(".git/worktrees");
+    for e in std::fs::read_dir(&worktrees).unwrap() {
+        let store = e.unwrap().path().join("git-meta.sqlite");
+        assert!(!store.exists(), "{}", store.display());
+    }
+
+    // A store an earlier vci made in a worktree (here, a copy of an old
+    // one): unused, noted by the first command only.
+    let wt3 = add("wt3");
+    let old = worktrees.join("wt3/git-meta.sqlite");
+    std::fs::copy(work.join(".git/git-meta.sqlite"), &old).unwrap();
+    let first = w.stderr_of(&wt3, &["plan", "--base-ref", "main"]);
+    assert!(
+        first.contains(&format!(
+            "vci: note: {} is no longer used: every worktree of this repository now shares the git-meta store",
+            old.display()
+        )),
+        "{first}"
+    );
+    let second = w.stderr_of(&wt3, &["plan", "--base-ref", "main"]);
+    assert!(!second.contains("is no longer used"), "{second}");
+    assert!(old.exists());
+    assert!(w.plan(&wt3, "main").skip.contains(A));
+}
+
 /// One value whose blob is missing makes only its own unit run, and `vci
 /// plan` reads the store from a read-only `.git`.
 #[test]

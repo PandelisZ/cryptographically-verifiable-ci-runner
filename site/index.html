@@ -21,7 +21,7 @@
     <ul class="proof">
       <li><strong>up to 90%</strong><span>less CI time when the suite was run locally first</span></li>
       <li><strong>0</strong><span>known false skips after adversarial testing of every adapter</span></li>
-      <li><strong>~10 s</strong><span>to verify and plan a pull request on a GitHub runner</span></li>
+      <li><strong>4 to 15 s</strong><span>to verify and plan a 2,078-file Rails suite on a GitHub runner, measured over 266 CI jobs</span></li>
       <li><strong>6</strong><span>test runners: Vitest, pytest, Go, Cargo, Rails, RSpec</span></li>
     </ul>
     <div class="cta">
@@ -40,9 +40,9 @@
 
 <section>
   <h2 id="what-it-saves">What it saves</h2>
-  <p class="sub">Only attested tests that still match are skipped; everything else runs as before, plus about ten seconds of verification.</p>
+  <p class="sub">Only attested tests that still match are skipped; everything else runs as before, plus the plan step: 15 seconds median on a 2,078-file Rails suite, 4 seconds on a quiet job.</p>
   <img src="assets/savings.svg" alt="CI time for one pull request, full suite versus vci, in five cases" width="1000" height="538" style="width:100%;height:auto;display:block;margin:16px 0 4px">
-  <p class="sub">The chart above is a model. For a measured benchmark of this repository's own demo projects, where a commit with nothing to run costs vci about two seconds, see <a href="examples.html#measured">Measured on this repository</a>; for a real 253-file suite that goes from 17 seconds to 8, see <a href="examples.html#measured-vex">Measured on vex-web</a>.</p>
+  <p class="sub">The chart above is a model. The measured numbers: on vex's 2,078-file Rails suite, a job where little changed takes 2.9 minutes against 3.5 without vci, and a job where everything re-ran and was attested takes 5.8 minutes (9.3 two days earlier), from 266 CI jobs over 23 to 25 October 2026; see <a href="examples.html#measured-vex-rails">Measured on vex's Rails tests</a>. For this repository's own demo projects, where a commit with nothing to run costs vci about two seconds, see <a href="examples.html#measured">Measured on this repository</a>; for a 253-file node:test suite that goes from 17 seconds to 8, see <a href="examples.html#measured-vex">Measured on vex-web</a>.</p>
 </section>
 
 <section>

@@ -752,15 +752,18 @@ fn rspec_end_to_end_verification_steps() {
     assert_eq!(w.plan(&work, "main").run, set(&[C]), "step 8: alpha.txt");
     w.git(&work, &["checkout", "--", "spec/fixtures/files"]);
 
-    // Step 9: config/routes.rb -> D (which draws the routes) runs; A (no
-    // Rails) stays skipped.
+    // Step 9: config/routes.rb is read while Rails boots (D draws the
+    // routes): with `rails_inputs = "loose"`, the default since 2.7.36, it
+    // is not an input of any spec, and nothing runs (e2e_rails'
+    // `rails_inputs_loose_skips_boot_file_changes_and_strict_does_not`
+    // covers strict mode, where D runs).
     let routes = w.read("config/routes.rb");
     w.put("config/routes.rb", &format!("{routes}# edited\n"));
     let p = w.plan(&work, "main");
-    assert!(p.run.contains(D) && p.skip.contains(A), "step 9: {p:?}");
+    assert_eq!(p.skip, set(ALL), "step 9: {p:?}");
     assert!(
         w.explain(&work, D, "main")
-            .contains("entry:config/routes.rb")
+            .contains("inputs: rails_inputs = \"loose\"")
     );
     w.put("config/routes.rb", &routes);
 

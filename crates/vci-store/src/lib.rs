@@ -17,13 +17,14 @@
 //!
 //! | backend    | crate                | where the records are                                         | [`Exchange`] |
 //! |------------|----------------------|---------------------------------------------------------------|--------------|
-//! | `git-meta` | `vci-git`            | `.git/git-meta.sqlite`, published on `refs/meta/main`         | yes: `vci fetch` / `vci push` |
+//! | `git-meta` | `vci-git`            | `<git common dir>/git-meta.sqlite` (`.git/git-meta.sqlite`, shared by every worktree), published on `refs/meta/main` | yes: `vci fetch` / `vci push` |
 //! | `sqlite`   | `vci-store-sqlite`   | one SQLite file, default `<git common dir>/vci-store.sqlite`  | no (local)   |
 //! | `postgres` | `vci-store-postgres` | tables in one PostgreSQL schema, one namespace per repository | no (shared)  |
+//! | `libsql`   | `vci-store-libsql`   | tables in a libSQL database (Turso, or a `sqld`), one namespace per repository; or a local file | no (shared)  |
 //!
 //! The command line registers a factory for each backend in every default
-//! build (cargo features `sqlite` and `postgres` of vci-cli); git-meta is
-//! the default. `docs/STORE-BACKENDS.md` is the implementer guide, and says
+//! build (cargo features `sqlite`, `postgres` and `libsql` of vci-cli);
+//! git-meta is the default. `docs/STORE-BACKENDS.md` is the implementer guide, and says
 //! how far each backend is implemented. This page is the contract.
 //!
 //! ## Trust: the store is never trusted
@@ -1602,10 +1603,11 @@ impl AttestationStore for FailedStore {
 pub struct OpenContext {
     /// The work tree root.
     pub repo_root: PathBuf,
-    /// This worktree's git directory (git-meta keeps `git-meta.sqlite` here).
+    /// This worktree's git directory.
     pub git_dir: PathBuf,
-    /// The git directory shared by every linked worktree (the SQLite
-    /// backend's default home, and the base of relative SQLite paths).
+    /// The git directory shared by every linked worktree (git-meta keeps
+    /// `git-meta.sqlite` here since 2.7.33, the SQLite backend's default
+    /// home, and the base of relative SQLite paths).
     pub git_common_dir: PathBuf,
     /// The repository id (its smallest root commit), computed on first call.
     /// It is the default namespace of a shared server: attestations made in

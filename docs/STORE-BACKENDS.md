@@ -14,7 +14,10 @@ Built and in use (vci 2.8.0):
   and the conformance suite (feature `conformance`).
 - **git-meta as an implementation of the trait**: `vci_git::GitMetaStore` and `vci_git::GitMetaFactory` (section 15).
   git-meta is the default store. Its output is byte-identical to vci 2.7.32 on an output-diff harness (run, plan,
-  explain and push in one clone; fetch, plan, prune and verify in a second) and on every end-to-end suite.
+  explain and push in one clone; fetch, plan, prune and verify in a second) and on every end-to-end suite. 2.8.0 also
+  carries what 2.7.33 to 2.7.36 changed in git-meta: one store per repository, shared by its linked worktrees, which
+  `GitMetaStore` opens like every other git-meta command (section 15), and the merge of a fetched tip through `git
+  merge-tree`.
 - **The SQLite backend** (`vci-store-sqlite`, section 16): one file in the git common directory, selected with
   `VCI_STORE=sqlite`.
 - **The PostgreSQL backend** (`vci-store-postgres`, section 17): a shared server, selected with a `postgres://`
@@ -70,8 +73,9 @@ Contents
 `vci run` signs one attestation per unit that passed (a DSSE envelope) and stores it, together with the input
 manifest the attestation's `manifestRef` names. `vci plan` lists the stored attestations of every unit, verifies
 the ones it chooses, and skips a unit when one of them proves the inputs unchanged. The **store** is where those two
-kinds of records live. git-meta is the default store: `.git/git-meta.sqlite`, mirrored into `refs/meta/main` trees
-and exchanged with `vci fetch` and `vci push`. It is one implementation of the trait
+kinds of records live. git-meta is the default store: `<git common dir>/git-meta.sqlite` (`.git/git-meta.sqlite`, one
+per repository and shared by its linked worktrees since 2.7.33), mirrored into `refs/meta/main` trees and exchanged
+with `vci fetch` and `vci push`. It is one implementation of the trait
 `vci_store::AttestationStore`. SQLite (a local file) and PostgreSQL (a shared server) are the other two (sections 16
 and 17), libSQL (a local file, a Turso or `sqld` server, or a local replica of one; section 18) is a fourth, and an
 HTTP or gRPC service can follow (section 19).
@@ -251,7 +255,9 @@ In every contract below:
   `<target>` `<key>`", "candidate 1: `<kind>` …"), so git-meta's output stays byte-identical. A `FailedStore` reports
   the kind that was asked for, or `unknown` (section 10).
 - `location()` is human text and never carries a password. Examples: `.git/git-meta.sqlite (exchanged on
-  refs/meta/main)` (git-meta's, whatever `meta.namespace` is set to), `/repo/.git/vci-store.sqlite`,
+  refs/meta/main)` (git-meta's, whatever `meta.namespace` is set to; in a linked worktree, `<common git
+  dir>/git-meta.sqlite, shared by every worktree of the repository (exchanged on refs/meta/main)`),
+  `/repo/.git/vci-store.sqlite`,
   `postgres://***@db.internal:5432/ci schema vci namespace <repo id>`, `libsql://ci-acme.turso.io namespace <repo
   id> (remote)`. A `FailedStore`'s is
   `<kind> (unavailable: <why>)`.
@@ -461,7 +467,7 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
 
 ### `warm()`
 
-Starts background work that makes the first reads fast: git-meta reads `.git/git-meta.sqlite` through once on a
+Starts background work that makes the first reads fast: git-meta reads its store file through once on a
 thread (`warm_in_background`); SQLite reads its file through once on a thread, into the page cache; PostgreSQL opens
 its first connection and TLS session on a thread. It never blocks and never fails. The plan calls it first.
 
@@ -548,7 +554,10 @@ been measured on one yet.
   value is already there); other readers see none of them before `finish`, which the trait allows. Storing 1,200
   units was 4,800 commits on two connections (0.7 s) before. The batch's connection keeps its savepoints' journal in
   memory (`temp_store = MEMORY`) and a 64 MiB page cache: with a temporary file per savepoint and the default cache
-  spilling into the WAL, 1,200 units' writes took 0.5 s of the batch; with them, 0.05 s.
+  spilling into the WAL, 1,200 units' writes took 0.5 s of the batch; with them, 0.05 s. The session and the
+  connection are the repository's one store (`AttestStore::store_path`, `<git common dir>/git-meta.sqlite` since
+  2.7.33; section 15), so a batch in a linked worktree writes the file every worktree reads, and the batches of two
+  worktrees take turns on its write lock (at most the 5 s busy timeout), as two runs in one worktree do.
 - **SQLite** (2.8): the batch pins one pooled connection to the thread; the first write begins `BEGIN IMMEDIATE` on
   it, each write is a savepoint, and `finish` commits (a dropped batch commits too). Reads on that thread use the
   pinned connection inside the transaction, so they see the batch's writes; other connections see them after
@@ -685,7 +694,8 @@ So on a store with `Caps::shared_writes` (`cmds::store_mode(shared_writes, push)
 
 Per backend:
 
-- git-meta uses `vci_memo` and `vci_flags` in `.git/git-meta.sqlite`. A CI cache carries them, as in 2.7.
+- git-meta uses `vci_memo` and `vci_flags` in its store (`.git/git-meta.sqlite`, shared by the worktrees). A CI
+  cache carries them, as in 2.7.
 - SQLite uses `memo` and `flags` tables in its file; hint writes do nothing while the file does not exist.
 - PostgreSQL uses server-side tables per namespace, and never creates the schema for a hint. A pull-request plan then reads master's memo with no
   cache, and flags become shared facts about the repository (a global `plan:natives:<project>` flag is acceptable).
@@ -1238,8 +1248,9 @@ whose base64 payload carries `predicate.manifestRef`.
 
 Backends keep their own tests for what is theirs:
 
-- git-meta keeps its 62 store tests (`store`, `store_deletion_records`, `store_lazy`, `store_robustness`), unchanged,
-  plus `store_trait.rs` for the trait implementation (section 15).
+- git-meta keeps its 62 store tests (`store`, `store_deletion_records`, `store_lazy`, `store_robustness`), unchanged
+  by the trait work (2.7.33 and 2.7.34 added assertions of their own), plus `store_worktrees.rs` for the store its
+  worktrees share and `store_trait.rs` for the trait implementation (section 15).
 - SQLite adds its own tests for the WAL checkpoint, the read-only fallback, `application_id` and `user_version`.
 - PostgreSQL adds its own tests for advisory-lock migrations, the statement timeout, the role and RLS recipes,
   namespace isolation, batch deduplication and the round-trip budget.
@@ -1311,11 +1322,30 @@ impl From<GitError> for StoreError { … }
 **Identity**:
 
 - `kind` is `"git-meta"`.
-- `location` is `".git/git-meta.sqlite (exchanged on refs/meta/main)"`, whatever `meta.namespace` is set to.
+- `location` is `".git/git-meta.sqlite (exchanged on refs/meta/main)"`, whatever `meta.namespace` is set to; in a
+  linked worktree, `"<common git dir>/git-meta.sqlite, shared by every worktree of the repository (exchanged on
+  refs/meta/main)"`, by the absolute path git gives (`Repo::common_git_dir`).
 - `caps` is `LOCAL.with_lazy_values(true).with_hints(true)`.
 - `status` is `Reader::has_store` on a pooled reader, mapped to ``Absent{advice: "run `vci fetch`"}`` or
   `Ready{None}`.
 - `count` is `Reader::count`.
+
+**Where the store is** (2.7.33). `AttestStore::store_path()` is `<common git dir>/git-meta.sqlite`, one store per
+repository: `.git/git-meta.sqlite` in the main worktree (or a clone without linked worktrees), the path it always
+was, and the same file for every linked worktree (`git worktree add`), which before 2.7.33 had its own
+`.git/worktrees/<name>/git-meta.sqlite` while the `refs/meta/*` refs were shared. git-meta keeps its store in the git
+directory of the repository it opens, so in a linked worktree `AttestStore::session()` opens git-meta on the common
+git directory, under the session lock `git-meta.sqlite.vci-lock` beside the store; the exchange lock
+(`git-meta.vci-exchange.lock`), the materialization markers (`vci-materialized-*`) and git-meta's history-index
+checkpoint (`git-meta-index.json`) live there too. Every reader (`Reader::open`) and the batch's connection
+(`db_rw`) open `store_path()`, so everything `GitMetaStore` does (reads, writes, a batch's in-process statements,
+hints, fetch and push) uses the shared file, and what `vci run` stores in one worktree `vci plan` reads in every
+other with nothing pushed or fetched. A linked worktree's own store left by an earlier vci is taken over by the first
+command run there when the repository has no shared store yet and no connection has the old one open (under the
+exchange lock and both session locks: an exclusive lock on the old file and a WAL checkpoint, then a hard link, or a
+rename; `vci: note: moved this worktree's git-meta store …`); otherwise it is left as it is, unused, and a note says once that it
+can be deleted (a `git-meta.sqlite.vci-unused` marker beside it). The stock `git meta` CLI run in a linked worktree
+still uses that worktree's own file. `crates/vci-git/tests/store_worktrees.rs` covers it, through the trait too.
 
 **Reads**:
 
@@ -1425,7 +1455,10 @@ from `vci_git`), so every import path still compiles: `KEY_PREFIX`, `MANIFEST_PR
 
 `AttestStore::remove_for_signer` has no caller. Delete it in a follow-up.
 
-**Tests.** `crates/vci-git/tests/store_trait.rs` (15 tests) checks the implementation against `AttestStore` on lazy
+**Tests.** `crates/vci-git/tests/store_worktrees.rs` (8 tests) checks the shared store: its path with and without
+linked worktrees, a put (and a trait batch) in one worktree read in another and in the main one, a fetch in one serving
+a plan in another, concurrent writers in two worktrees, and an old worktree store taken over, left in use, or left
+unused. `crates/vci-git/tests/store_trait.rs` (15 tests) checks the implementation against `AttestStore` on lazy
 worlds with hinted, unhinted, promised and missing-blob entries: listings match, `read_values` matches, `read_units` is
 targeted and equal to the default, error mapping, the pool seeing a store created later and being refreshed after a
 prefetch, `orphan_manifests` against a re-implementation of 2.7's logic, the batch (one transaction since 2.8, the

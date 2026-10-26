@@ -52,7 +52,7 @@
 <h2>Install</h2>
 <p>With Homebrew (macOS and Linux). This installs a prebuilt binary with the collectors included, so there is nothing else to set up:</p>
 <pre><code>brew install pandelisz/tap/vci</code></pre>
-<p>Upgrade later with <code>brew upgrade vci</code>.</p>
+<p>Upgrade later with <code>vci update</code> (it runs <code>brew update</code> and <code>brew upgrade pandelisz/tap/vci</code>), or <code>brew upgrade vci</code>.</p>
 
 <h3>Without Homebrew</h3>
 <p>The install script clones the repository to <code>~/.local/share/vci</code> and builds it with cargo, so it needs a Rust toolchain:</p>
@@ -71,6 +71,11 @@ export VCI_RUBY_COLLECTOR="$HOME/.local/share/vci/ruby/vci-collector"</code></pr
 
 <h3>Check the install</h3>
 <pre><code>vci --version</code></pre>
+
+<h3>Keep it current</h3>
+<pre><code>vci update           <span class="c"># install the latest release the way vci was installed</span>
+vci update --check   <span class="c"># only compare: exit 0 when current, 1 when there is an update</span></code></pre>
+<p><code>vci update</code> uses Homebrew for a Homebrew install and re-runs the install script at the release's tag for the script's install. A release binary downloaded by hand is replaced in place after its SHA-256 is checked; collectors installed beside it are not updated.</p>
 
 <h2>Set up a repository</h2>
 <p>Do this once, in the repository you want to speed up. Pick your test runner in the first step; the other tabs on these pages follow your choice.</p>

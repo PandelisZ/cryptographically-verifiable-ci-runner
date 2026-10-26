@@ -90,8 +90,8 @@ fn a_linked_worktree_sees_and_keeps_published_attestations() {
     sa.put(B, S2, &hex64(7), &big("second signer")).unwrap();
     sa.push(Some("origin")).unwrap();
 
-    // A linked worktree has its own (empty) git-meta store but shares
-    // refs/meta/local/main with the main worktree.
+    // A linked worktree shares the main worktree's git-meta store (2.7.33;
+    // before, it had its own, empty) and refs/meta/local/main.
     let wt = main.parent().unwrap().join("wt2");
     git(
         main,

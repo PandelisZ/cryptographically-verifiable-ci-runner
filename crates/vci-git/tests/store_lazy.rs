@@ -404,6 +404,14 @@ fn two_blobless_clones_deleting_the_same_value_both_push() {
             matches!(&out, Ok(o) if o.status == PushStatus::Pushed),
             "later_first={later_first}: {out:?}"
         );
+        // The two records of one key differ only in their stamp: the merge
+        // takes ours before git merges the trees, without reading the
+        // other's blob (which this blobless clone never fetched).
+        assert_eq!(
+            vci_git::meta::last_merge_kind(),
+            Some("git"),
+            "later_first={later_first}"
+        );
     }
 }
 
@@ -720,8 +728,10 @@ fn diverged_clones_merge_from_paths_and_push_the_union() {
 
     let out = sf.fetch(None).unwrap();
     assert!(!out.notes.iter().any(|n| n.contains("in full")), "{out:?}");
-    // The other side's new value was not fetched to merge it.
+    // The other side's new value was not fetched to merge it (both sides
+    // wrote A/S1 differently, so git-meta's merge decided, from the keys).
     assert!(!has_object(&f, &value_blob(&w, D, S2, &hex64(8))));
+    assert_eq!(vci_git::meta::last_merge_kind(), Some("git-meta"));
     assert_eq!(sf.push(None).unwrap().status, PushStatus::Pushed);
     // Linear history on the remote, as before.
     assert_eq!(

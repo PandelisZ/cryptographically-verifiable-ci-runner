@@ -40,6 +40,8 @@ ignore = []                    <span class="c"># visible, never hashed: secrets 
 <tr><td><code>project</code></td><td><code>"."</code></td><td class="wrap">The project directory (where the test runner runs), relative to the repository root.</td></tr>
 <tr><td><code>adapter</code></td><td><code>"vitest"</code></td><td class="wrap">The test runner: <code>"vitest"</code>, <code>"pytest"</code>, <code>"go"</code>, <code>"cargo"</code> or <code>"rails"</code>.</td></tr>
 <tr><td><code>runner</code></td><td>detected</td><td class="wrap">Rails only: <code>"minitest"</code> or <code>"rspec"</code>. See <a href="adapters.html#rspec">RSpec</a>.</td></tr>
+<tr><td><code>rails_inputs</code></td><td><code>"loose"</code></td><td class="wrap">Rails only, since 2.7.36: <code>"loose"</code> leaves what Rails reads at boot out of every test's inputs (routes, initializers, environments, the boot files, <code>config.ru</code>, migrations, locales and the autoload records), so a change there runs no test again on a pull request; the default branch's full run catches it. <code>"strict"</code> records everything. See <a href="adapters.html#rails-inputs">Rails</a>.</td></tr>
+<tr><td><code>ignore_inputs</code></td><td><code>[]</code></td><td class="wrap">Rails only, since 2.7.36: more globs, relative to the project directory, that are never inputs (in strict mode, the only ones).</td></tr>
 </table>
 <p>The rest of the file is four tables, explained in order below: <code>[policy]</code>, <code>[env]</code>, <code>[[inputs]]</code> and, for a repository with several projects, <code>[[projects]]</code>.</p>
 
@@ -217,7 +219,7 @@ hash = ["APP_*"]</code></pre>
 <li>Test ids stay repo-relative paths, so they are unambiguous across projects.</li>
 <li><code>vci run</code>, <code>plan</code>, <code>ci</code> and <code>explain</code> work across all projects.</li>
 <li><code>vci run FILE</code> only needs the toolchain of the project that file belongs to.</li>
-<li>A project can also set its own <code>runner</code>, and its own <code>inputs = [...]</code>, which replaces the top-level <code>[[inputs]]</code> list.</li>
+<li>A project can also set its own <code>runner</code>, <code>rails_inputs</code> and <code>ignore_inputs</code>, and its own <code>inputs = [...]</code>, which replaces the top-level <code>[[inputs]]</code> list.</li>
 </ul>
 
 <h2 id="allowed-signers">.vci/allowed_signers</h2>

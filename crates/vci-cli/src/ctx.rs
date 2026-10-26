@@ -65,6 +65,21 @@ pub struct VciPredicate {
     /// declared values); empty and omitted when there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_set: Vec<String>,
+    /// Rails (2.7.36): the project's `rails_inputs` when the unit was
+    /// recorded, `"loose"` or `"strict"`. Empty and omitted for the other
+    /// adapters, and in attestations made before 2.7.36 (every path the
+    /// test's process read is in their manifests).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rails_inputs: String,
+    /// Rails (2.7.36): the globs (relative to the project dir) whose paths
+    /// were left out of the unit's manifests: the loose mode's list
+    /// (`vci_adapter::RAILS_LOOSE_IGNORED_INPUTS`, `.vci-autoload` naming
+    /// the autoload lookup records) and the project's `ignore_inputs`.
+    /// Informational: `vci plan` leaves the base vci.toml's list out of the
+    /// current global inputs of an attestation that records a mode, and the
+    /// `vci:config` external ties the mode and list to the base vci.toml.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_inputs: Vec<String>,
 }
 
 /// Storage key for an attestation: everything that must match for two
@@ -220,6 +235,13 @@ pub struct Project {
     pub adapter_options: vci_adapter::AdapterOptions,
     /// [`Project::config_hash`], computed once.
     pub config_hash: String,
+    /// Rails: the `rails_inputs` setting (`None` for the other adapters).
+    pub rails_inputs: Option<crate::config::RailsInputs>,
+    /// The globs (relative to the project dir) whose paths are left out of
+    /// this project's manifests ([`crate::config::ignored_inputs`]).
+    pub ignored_inputs: Vec<String>,
+    /// Whether `vci run` said which inputs it leaves out (once per project).
+    pub ignored_noted: std::sync::atomic::AtomicBool,
 }
 
 /// The external a unit's attestation records its project's configuration
@@ -233,18 +255,36 @@ impl Project {
     /// time), not comments or formatting, not other projects. Before 2.7.0
     /// the whole file was an input of every test, so any edit to it ran
     /// every test of every project again.
+    ///
+    /// Rails' `rails_inputs` and `ignore_inputs` (2.7.36) join it when they
+    /// are not the default (`"strict"`, or any `ignore_inputs`): a unit
+    /// recorded in another mode, or with another list, is not accepted. The
+    /// default leaves the hash as 2.7.33 computed it, so an attestation
+    /// made before 2.7.36 (whose manifests keep every input, a superset of
+    /// what loose mode records) stays usable until it is attested again.
     pub fn config_hash_of(
         rel: &str,
         adapter: &str,
         options: &vci_adapter::AdapterOptions,
         env: &EnvConfig,
         inputs: &[InputsConfig],
+        rails_inputs: Option<crate::config::RailsInputs>,
+        ignore_inputs: &[String],
     ) -> String {
-        let text = format!(
+        let mut text = format!(
             "vci-config-v1\n{rel}\n{adapter}\n{options:?}\n{}\n{}",
             serde_json::to_string(env).unwrap_or_default(),
             serde_json::to_string(inputs).unwrap_or_default()
         );
+        if let Some(mode) = rails_inputs
+            && (mode != crate::config::RailsInputs::Loose || !ignore_inputs.is_empty())
+        {
+            text.push_str(&format!(
+                "\nrails_inputs={}\nignore_inputs={}",
+                mode.as_str(),
+                serde_json::to_string(ignore_inputs).unwrap_or_default()
+            ));
+        }
         vci_core::blake3_hex(text.as_bytes())
     }
 }
@@ -310,6 +350,25 @@ impl Project {
     /// `[[env.files]]` entry applies): what decides the child environment.
     pub fn project_env(&self) -> FileEnv {
         self.with_builtins(FileEnv::for_project(&self.effective_env()))
+    }
+
+    /// The item of [`Project::ignored_inputs`] that leaves the repository
+    /// path `path` out of this project's manifests, if any.
+    pub fn ignored_input(&self, path: &str) -> Option<&str> {
+        crate::config::ignored_input(&self.ignored_inputs, &self.rel, path)
+    }
+
+    /// Whether the collector should record autoload lookups instead of
+    /// directory listings: `policy.rails_autoload_lookups`, or the lookup
+    /// records are left out anyway (`rails_inputs = "loose"`, or
+    /// `.vci-autoload` in `ignore_inputs`), when the listings would be the
+    /// only trace of the autoload directories left.
+    pub fn autoload_lookups(&self) -> bool {
+        self.policy.rails_autoload_lookups
+            || self
+                .ignored_inputs
+                .iter()
+                .any(|g| g == vci_adapter::AUTOLOAD_INPUTS)
     }
 
     /// `[[inputs]] extra` globs declared for a project-relative test id.
@@ -437,9 +496,15 @@ impl Ctx {
                 &options,
                 &spec.env,
                 &spec.inputs,
+                spec.rails_inputs,
+                &spec.ignore_inputs,
             );
+            let ignored_inputs = spec.ignored_inputs();
             projects.push(Project {
                 config_hash,
+                rails_inputs: spec.rails_inputs,
+                ignored_inputs,
+                ignored_noted: Default::default(),
                 adapter_options: options,
                 name: spec.name,
                 rel: spec.rel,
@@ -455,5 +520,48 @@ impl Ctx {
             root,
             projects,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RailsInputs;
+
+    /// `rails_inputs` and `ignore_inputs` join the config hash only when not
+    /// the default, so loose mode without a list hashes as 2.7.33 did (its
+    /// strict attestations stay usable), and the other settings do not mix.
+    #[test]
+    fn rails_inputs_join_the_config_hash_unless_default() {
+        let opts = vci_adapter::AdapterOptions::default();
+        let env = EnvConfig::default();
+        let h = |mode: Option<RailsInputs>, list: &[String]| {
+            Project::config_hash_of(".", "rails", &opts, &env, &[], mode, list)
+        };
+        let before = {
+            let text = format!(
+                "vci-config-v1\n.\nrails\n{opts:?}\n{}\n{}",
+                serde_json::to_string(&env).unwrap(),
+                serde_json::to_string::<Vec<InputsConfig>>(&vec![]).unwrap()
+            );
+            vci_core::blake3_hex(text.as_bytes())
+        };
+        assert_eq!(h(Some(RailsInputs::Loose), &[]), before);
+        assert_eq!(h(None, &[]), before);
+        let strict = h(Some(RailsInputs::Strict), &[]);
+        let listed = h(
+            Some(RailsInputs::Loose),
+            &["config/credentials/**".to_owned()],
+        );
+        let strict_listed = h(
+            Some(RailsInputs::Strict),
+            &["config/credentials/**".to_owned()],
+        );
+        let all = [before, strict, listed, strict_listed];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 }

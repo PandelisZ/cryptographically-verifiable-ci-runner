@@ -126,6 +126,167 @@ module VciCollector
   # AutoloadLookups.
   AUTOLOAD_LOOKUPS = ENV["VCI_RAILS_AUTOLOAD_LOOKUPS"] == "1"
 
+  # Batch mode: experiments (VCI_RAILS_EXPERIMENT, a comma-separated list,
+  # read here before any hook is installed): "eager" eager-loads the
+  # application and draws its routes in the group's process before the
+  # slots fork (every file then records them as inputs: a measurement, not
+  # a mode to attest with); "routes" draws the routes only; "warmup" calls
+  # Process.warmup in each slot once it is set up, before its first file's
+  # process forks.
+  EXPERIMENT = ENV["VCI_RAILS_EXPERIMENT"].to_s.split(",").map(&:strip).reject(&:empty?).freeze
+
+  # A profile of each file's process (VCI_RAILS_PROFILE=1): how long its
+  # top-level requires took (autoloads included), the routes' first draw,
+  # the garbage collector, and the process from the fork to its exit, one
+  # `vci-profile` line on stdout per process.
+  module Profile
+    ON = ENV["VCI_RAILS_PROFILE"] == "1"
+    @req_ns = 0
+    @nreq = 0
+    @depth = 0
+    @routes_ns = 0
+    class << self
+      attr_accessor :req_ns, :nreq, :depth, :routes_ns, :started, :gc_ms0, :gc_n0
+
+      # Time `yield` as a require (nested requires count in the outermost).
+      def require
+        return yield unless ON
+        self.depth += 1
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        yield
+      ensure
+        if ON
+          self.depth -= 1
+          if depth.zero?
+            self.req_ns += Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - t
+            self.nreq += 1
+          end
+        end
+      end
+
+      # In a file's process: start counting from here, print at exit.
+      def start!(id)
+        return unless ON
+        self.req_ns = 0
+        self.nreq = 0
+        self.routes_ns = 0
+        self.started = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        self.gc_ms0 = (::GC.stat(:time) rescue 0)
+        self.gc_n0 = ::GC.stat(:count)
+        if defined?(::Rails::Application::RoutesReloader) && !::Rails::Application::RoutesReloader.ancestors.include?(Routes)
+          ::Rails::Application::RoutesReloader.prepend(Routes)
+        end
+        ::Kernel.at_exit do
+          ms = ->(ns) { (ns / 1_000_000.0).round(1) }
+          now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+          $stdout.puts "vci-profile id=#{id} proc_ms=#{ms.call(now - started)} req_ms=#{ms.call(req_ns)} nreq=#{nreq} " \
+                       "routes_ms=#{ms.call(routes_ns)} gc_ms=#{((::GC.stat(:time) rescue 0) - gc_ms0)} " \
+                       "gc_n=#{::GC.stat(:count) - gc_n0} iseq_hit=#{IseqCache.hits.to_i} iseq_miss=#{IseqCache.misses.to_i}"
+          $stdout.flush
+        end
+      end
+    end
+
+    # Times the routes' draw (Rails loads them lazily, on first use, when
+    # it does not eager-load).
+    module Routes
+      def execute(*args, **kw, &blk)
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+        super
+      ensure
+        Profile.routes_ns += Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - t
+      end
+    end
+  end
+
+  # A compile cache for the processes of a batch (VCI_RAILS_EXPERIMENT
+  # "iseq"): the instruction sequence Ruby compiles a source file to is kept
+  # under vci's output directory of this run, keyed by the file's path, size
+  # and modification time, so that a file every process requires (an app
+  # file Zeitwerk autoloads, a gem file required lazily) is parsed and
+  # compiled once per batch instead of once per process. Only this run's
+  # processes see the directory, which is made empty for each run, and the
+  # checkout must not change during a run (vci refuses a unit whose input
+  # changed), so an entry can only be the compilation of the very bytes vci
+  # hashed. What is recorded is unchanged: a require is recorded by the
+  # require hook, not by how its bytes were read. Bootsnap's compile cache
+  # stays refused (Checks): it lives across runs, and its YAML and JSON
+  # caches read files in C.
+  module IseqCache
+    DIR = OUT && !OUT.empty? ? File.join(OUT, "iseq") : nil
+
+    module Hook
+      def load_iseq(path)
+        IseqCache.load(path) { |p| compile_file(p) }
+      end
+    end
+
+    class << self
+      attr_accessor :hits, :misses
+
+      def install!
+        return false if DIR.nil?
+        return false unless defined?(::RubyVM::InstructionSequence) &&
+                            ::RubyVM::InstructionSequence.respond_to?(:load_from_binary)
+        VciCollector.quiet { Dir.mkdir(DIR) unless Real.directory?(DIR) }
+        self.hits = 0
+        self.misses = 0
+        ::RubyVM::InstructionSequence.singleton_class.prepend(Hook)
+        true
+      rescue StandardError
+        false
+      end
+
+      # Whether the load_iseq Ruby sees is this cache's.
+      def own?
+        ::RubyVM::InstructionSequence.respond_to?(:load_iseq) &&
+          ::RubyVM::InstructionSequence.method(:load_iseq).owner == Hook
+      rescue StandardError
+        false
+      end
+
+      # FNV-1a (64 bits) of `s`: a stable name for a path (String#hash is
+      # seeded per process).
+      def fnv(s)
+        h = 0xcbf29ce484222325
+        s.each_byte { |b| h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff }
+        h.to_s(16)
+      end
+
+      def load(path)
+        st = VciCollector.quiet { Real.stat(path) }
+        file = File.join(DIR, "#{fnv(path)}-#{st.size}-#{st.mtime.to_i}#{st.mtime.nsec}.bin")
+        bin = VciCollector.quiet { Real.exist?(file) ? Real.binread(file) : nil }
+        if bin
+          iseq = begin
+            ::RubyVM::InstructionSequence.load_from_binary(bin)
+          rescue StandardError
+            nil
+          end
+          if iseq
+            self.hits += 1
+            return iseq
+          end
+        end
+        self.misses += 1
+        iseq = yield(path)
+        begin
+          bin = iseq.to_binary
+          VciCollector.quiet do
+            tmp = "#{file}.#{Process.pid}"
+            File.binwrite(tmp, bin)
+            File.rename(tmp, file)
+          end
+        rescue StandardError
+          nil
+        end
+        iseq
+      rescue StandardError
+        nil
+      end
+    end
+  end
+
   # Batch mode (2.7.2): seconds a file's process may run in a slot before
   # it is stopped (VCI_RAILS_FILE_TIMEOUT, default 600; 0: no limit). A file
   # past it is reported as timed out (not attested, not run again); a file
@@ -1169,7 +1330,8 @@ module VciCollector
       # --- slots --------------------------------------------------------------
 
       # How many slots run the group's `files` (1: one file at a time, as
-      # above): SLOTS, at most one per file, when the project runs its tests
+      # above): SLOTS, at most one per piece of work (a file, or a shard of
+      # one; slots_for), when the project runs its tests
       # in Rails' parallel worker processes (at most as many as its
       # `parallelize(workers:)` asks for, unless vci's PARALLEL_WORKERS says
       # how many: `workers: 1` is a project whose tests must not run at
@@ -1178,8 +1340,12 @@ module VciCollector
       # after-fork hook gives a slot its database (the files' own
       # `require "test_helper"` registers Rails' only after the fork), and
       # its files would run at once on one database.
+      # At most one slot per piece of work: a file, or each shard of a file
+      # vci asked to shard (2.7.34: a job that ran 8 files, four of them as
+      # 3 to 5 shards each, ran its 20 pieces on 8 slots).
       def slots_for(files, boot)
-        w = [SLOTS, files.size].min
+        work = files.sum { |f| RUNNER == "rspec" ? 1 : [SHARDS[f].to_i, 1].max }
+        w = [SLOTS, work].min
         return 1 if w < 2 || boot.nil?
         return w if SLOTS_ASKED
         return 1 unless rails_parallel?
@@ -1276,6 +1442,7 @@ module VciCollector
           @tmp_mark = File.join(OUT.to_s, "batch", "tmp-shared-#{Process.pid}")
           @shared_dirs = VciCollector.quiet { Output.both(TMP) }
         end
+        experiment_preload!
         begin
           rails_hooks(:before_fork_hooks).each(&:call)
         rescue Exception => e # rubocop:disable Lint/RescueException
@@ -1361,6 +1528,11 @@ module VciCollector
           @slot_setup = false
           status(slot: i, setup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round,
                  at: batch_at)
+          if EXPERIMENT.include?("warmup") && Process.respond_to?(:warmup)
+            t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            Process.warmup
+            status(slot: i, warmup_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round)
+          end
         rescue Exception => e # rubocop:disable Lint/RescueException
           status(slot: i, why: "slot #{i}'s setup (Rails' after-fork hooks: its database, parallelize_setup) " \
                                "failed: #{e.class}: #{e.message.to_s.lines.first.to_s.strip}")
@@ -1650,7 +1822,27 @@ module VciCollector
         # Minitest's at_exit (registered by the driver) sets the exit status
         # only in the process that registered it, unless forks may.
         ::Minitest.allow_fork = true if defined?(::Minitest) && ::Minitest.respond_to?(:allow_fork=)
+        Profile.start!(id)
         id
+      end
+
+      # VCI_RAILS_EXPERIMENT "eager" or "routes" (see EXPERIMENT): load in
+      # the group's process what every file's process would otherwise load
+      # on its own. What is loaded here is recorded as read by the boot.
+      def experiment_preload!
+        return unless defined?(::Rails) && ::Rails.respond_to?(:application) && ::Rails.application
+        t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        if EXPERIMENT.include?("eager")
+          ::Rails.application.eager_load!
+        end
+        if (EXPERIMENT.include?("eager") || EXPERIMENT.include?("routes")) &&
+           ::Rails.application.respond_to?(:routes_reloader)
+          rr = ::Rails.application.routes_reloader
+          rr.respond_to?(:execute_unless_loaded) ? rr.execute_unless_loaded : rr.execute
+        end
+        status(experiment: EXPERIMENT.join(","), preload_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        $stderr.puts "vci_collector: experiment preload: #{e.class}: #{e.message}"
       end
 
       # Close the boot's database connections before a file's process forks,
@@ -1949,7 +2141,7 @@ module VciCollector
       f = pathify(path)
       lp = f && relative_feature?(f) ? expanded_load_path : nil
       n = $LOADED_FEATURES.size
-      r = yield
+      r = Profile.require { yield }
       if r && lp
         hit = $LOADED_FEATURES.size > n ? $LOADED_FEATURES.last : nil
         lookup(f, hit, lp)
@@ -2969,6 +3161,7 @@ if VciCollector.collect?
   VciCollector.hook(ENV.singleton_class, VciCollector::EnvHooks)
   VciCollector.hook(RubyVM::InstructionSequence.singleton_class, VciCollector::ISeqHooks)
   VciCollector.hook(ARGF.singleton_class, VciCollector::ArgfHooks)
+  VciCollector::IseqCache.install! if VciCollector::BATCH && VciCollector::EXPERIMENT.include?("iseq")
 
   # Every Ruby source compiled from a file (require, require_relative, load,
   # autoload, Zeitwerk) is a module input.
@@ -6001,7 +6194,7 @@ module VciCollector
 
     def run
       out = []
-      if RubyVM::InstructionSequence.respond_to?(:load_iseq)
+      if RubyVM::InstructionSequence.respond_to?(:load_iseq) && !IseqCache.own?
         out << "ruby:iseq-cache (RubyVM::InstructionSequence.load_iseq is defined, e.g. by Bootsnap's compile cache: code may not be compiled from the hashed source; set DISABLE_BOOTSNAP=1)"
       end
       if defined?(::Bootsnap::LoadPathCache) && ::Bootsnap::LoadPathCache.respond_to?(:enabled?) && ::Bootsnap::LoadPathCache.enabled?

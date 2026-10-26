@@ -195,9 +195,17 @@ pub struct PushOutcome { pub remote: String, pub status: PushStatus, pub warning
 pub struct AttestStore<'a> { /* &Repo */ }
 impl<'a> AttestStore<'a> {
     pub fn new(repo: &'a Repo) -> Self;
-    /// Sets the git-meta string value in the local store (.git/git-meta.sqlite); no serialize, no push,
+    /// `<common git dir>/git-meta.sqlite` (2.7.33): one store per repository, shared by its linked worktrees
+    /// (`.git/git-meta.sqlite` in the main worktree, as before).
+    pub fn store_path(&self) -> Result<Utf8PathBuf, GitError>;
+    /// Sets the git-meta string value in the local store (`store_path`); no serialize, no push,
     /// never touches the index or working tree. Identical bytes: no write.
     pub fn put(&self, test_id: &str, signer: &str, storage_key: &str, bytes: &[u8]) -> Result<StoredEnvelope, GitError>;
+    /// 2.8: this thread's writes until `BatchGuard::finish` share one git-meta session and one connection to the store
+    /// `store_path` names (the worktrees' shared one), in one `BEGIN IMMEDIATE` transaction begun by the first write
+    /// (a savepoint per write; vci writes git-meta's rows with the statements git-meta-lib's `set` and `remove` run).
+    /// `finish` commits, then stamps the log: `Ok(warnings)` when only the stamping failed. A batch inside it joins it.
+    pub fn batch(&self) -> Result<BatchGuard, GitError>;
     pub fn list(&self, test_id: Option<&str>) -> Result<Vec<StoredEnvelope>, GitError>;
     pub fn reader(&self) -> Result<Reader, GitError>;      // many per-unit lookups; read-only SQLite, no lock, creates nothing
     pub fn remove(&self, e: &StoredEnvelope) -> Result<bool, GitError>;   // git-meta tombstone
@@ -236,8 +244,9 @@ another git process wins a ref lock):
 
 - Before serializing, the store is made to cover `refs/<ns>/local/main`: values of that ref the store has no row and
   no deletion record for are copied in, and its deletion records newer than the store's row are applied. (git-meta
-  serializes the store alone as a commit on top of that ref; a new, emptied or replaced `.git/git-meta.sqlite`, or a
-  linked worktree, whose store is its own while the refs are shared, would otherwise publish deletions.)
+  serializes the store alone as a commit on top of that ref; a new, emptied or replaced `.git/git-meta.sqlite` would
+  otherwise publish deletions. Since 2.7.33 the store is one per repository, in the common git directory, shared by
+  its linked worktrees.)
 - A serialization that drops a value the previous local commit held, without a deletion record in the store, is
   undone and is an error (a `meta:filter` rule excluding or routing the key). A push that drops a value of the remote
   tip that this store did not delete is refused.
@@ -640,7 +649,13 @@ base commit's policy still waives every entry; an older vci, which knows only th
 `policy.rails_allow_db`, is still deserialised and never accepted), for Cargo `cfgPredicates` (checked against `toolchain.rustCfg` and the verifying
 host's cfg set), and for every adapter `declaredInputs` (the `[[inputs]] extra` globs of the test id, which must equal
 the base config's) and `envSet` (since vci 1.6.0: the names of the variables vci set from `[env] set`, whose manifest
-env entries hash the declared value; informational, older vci ignores it); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
+env entries hash the declared value; informational, older vci ignores it), and for Rails (since vci 2.7.36)
+`railsInputs` (`"loose"` or `"strict"`: the project's `rails_inputs` when the unit was recorded) and `ignoredInputs`
+(the globs, relative to the project dir, whose paths were left out of both manifests: loose mode's
+`RAILS_LOOSE_IGNORED_INPUTS`, `.vci-autoload` naming the autoload lookup records, then `ignore_inputs`); `vci plan`
+leaves the base config's list out of the current global inputs only for a predicate with `railsInputs`, so one
+without it (older vci) is checked against every global input, and an older vci refuses a loose predicate (its
+global input set differs); all omitted when empty. Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`.
 Since vci 1.9.0 `vci run` writes `manifestRef` (= `inputRoot`) and omits `manifest` (see "Manifests by reference"
 below); `globalManifest` is always inline.
 `input_root` is the per-file manifest root; `global_input_root` is the per-file global manifest root (lockfiles,
@@ -651,7 +666,7 @@ directory up to the project dir; for Go: `vci.toml`, `go.mod`/`go.sum`/`go.work`
 up to the repo root and `vendor/modules.txt` in the project dir; for Cargo: `vci.toml`, `Cargo.toml` from the package dir
 up to the repo root, `Cargo.lock`/`rust-toolchain(.toml)`/`.cargo/config(.toml)` from the project dir up to the repo
 root; for Rails: `vci.toml`, `RAILS_GLOBAL_FILES` in the project dir (RSpec files: without `test/test_helper.rb`,
-with `.rspec`), and `.ruby-version`/`.tool-versions`/`mise.toml` variants from the project dir up to the repo root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
+with `.rspec`; without what `ignoredInputs` names), and `.ruby-version`/`.tool-versions`/`mise.toml` variants from the project dir up to the repo root). The store key passed to `AttestStore::put` as `input_root` is BLAKE3 over repo id,
 test id, input root, global input root, env config digest, toolchain and argv (plus the pytest toolchain fields, the
 project name, the Go, Rust and Rails toolchain fields, `platformSpecific`, `archSpecific`, `waived`, `cfgPredicates`, `declaredInputs` and a
 non-Vitest adapter name when set), so re-running with identical inputs replaces (renews) the

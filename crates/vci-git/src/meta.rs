@@ -47,10 +47,15 @@
 //! commit on the remote tip, retrying when the remote moved. A plain
 //! `git meta pull` / `git meta push` works on the same refs and store.
 //!
+//! The store is one per repository (2.7.33): `<common git dir>/git-meta.sqlite`,
+//! shared by the main worktree and every linked one, as the refs are; a
+//! linked worktree's session is opened on the common git directory (see
+//! [`AttestStore::store_path`]).
+//!
 //! git-meta serializes the local SQLite store as a commit on top of
 //! `refs/<ns>/local/main`, so a store that lacks keys that ref holds (a new
-//! or emptied `.git/git-meta.sqlite`, a linked worktree, whose store is its
-//! own while the refs are shared) would publish their deletion. vci therefore
+//! or emptied `.git/git-meta.sqlite`, or before 2.7.33 a linked worktree's
+//! own store) would publish their deletion. vci therefore
 //! first copies into the store whatever that ref holds and the store has no
 //! row or deletion record for, refuses any serialization or push that would
 //! drop a key without a deletion record, ignores tree entries git-meta cannot
@@ -181,6 +186,40 @@ fn fetch_jobs() -> usize {
 /// itself). `skipFetchAll`/`skipDefaultUpdate` keep `git fetch --all` and
 /// `git remote update` away from it.
 pub const NO_LAZY_FETCH_REMOTE: &str = "vci-no-lazy-fetch";
+/// git-meta's store, in the common git directory (see
+/// [`AttestStore::store_path`]).
+const STORE_FILE: &str = "git-meta.sqlite";
+/// The lock vci holds while it opens a git-meta session (next to the store).
+const SESSION_LOCK: &str = "git-meta.sqlite.vci-lock";
+/// The lock serializing a repository's fetches and pushes.
+const EXCHANGE_LOCK: &str = "git-meta.vci-exchange.lock";
+/// The files recording the tip each tracking ref last materialized.
+const MATERIALIZED_PREFIX: &str = "vci-materialized-";
+/// git-meta's history-index checkpoint (its `index_state`), in the git
+/// directory of the repository a session opens.
+const INDEX_STATE_FILE: &str = "git-meta-index.json";
+
+/// Print a note about where the store lives (once per process), and keep
+/// it for [`store_notes`].
+fn store_note(note: String) {
+    let Ok(mut notes) = STORE_NOTES.lock() else {
+        return;
+    };
+    if !notes.contains(&note) {
+        eprintln!("vci: note: {note}");
+        notes.push(note);
+    }
+}
+
+static STORE_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The notes this process printed about a linked worktree's store left by
+/// a vci before 2.7.33 (for tests).
+#[doc(hidden)]
+pub fn store_notes() -> Vec<String> {
+    STORE_NOTES.lock().map(|n| n.clone()).unwrap_or_default()
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -534,6 +573,22 @@ fn batch_put(
         written.push((target.clone(), key.clone()));
     }
     Ok(key)
+}
+
+thread_local! {
+    /// How the last merge of the local metadata with a fetched tip on this
+    /// thread was made: "git" (`git merge-tree` of the changed subtrees)
+    /// or "git-meta" (every key of three trees listed and merged).
+    static LAST_MERGE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// How the last merge of the local metadata with a fetched tip on this
+/// thread was made (tests): `Some("git")` for `git merge-tree` of the
+/// changed subtrees, `Some("git-meta")` for git-meta's merge of every key
+/// of three listed trees, `None` when no merge ran yet.
+#[doc(hidden)]
+pub fn last_merge_kind() -> Option<&'static str> {
+    LAST_MERGE.with(|m| m.get())
 }
 
 /// The git-meta target for a test id.
@@ -1230,6 +1285,10 @@ static PUT_NS: [std::sync::atomic::AtomicU64; 4] = [
 /// A tree entry's mode, kind and object id, owned.
 type OwnedTreeEntry = (Vec<u8>, Vec<u8>, Vec<u8>);
 
+/// A path's change between two trees: the mode it had, and the blob ids it
+/// had before and after (all zeros: absent).
+type PathChange = (String, String, String);
+
 /// How many commits the kept tree listing may be behind the tree to list
 /// for its difference to be taken instead of listing anew (see
 /// [`AttestStore::cached_tree_listing`]).
@@ -1519,7 +1578,168 @@ impl<'a> AttestStore<'a> {
     }
 
     fn db_path(&self) -> Result<Utf8PathBuf, GitError> {
-        Ok(self.repo.git_dir()?.join("git-meta.sqlite"))
+        self.store_path()
+    }
+
+    /// The repository's git-meta store, `<common git dir>/git-meta.sqlite`
+    /// (2.7.33): one per repository, shared by the main worktree and every
+    /// linked one (`git worktree add`), as the metadata refs are. In the
+    /// main worktree (or a clone without linked worktrees) that is
+    /// `.git/git-meta.sqlite`, the path it always was. A linked worktree's
+    /// own store left by an earlier vci (`.git/worktrees/<name>/
+    /// git-meta.sqlite`) becomes the shared one when there is none yet and
+    /// no process has it open, else it is left alone, unused, and a note
+    /// says so once.
+    pub fn store_path(&self) -> Result<Utf8PathBuf, GitError> {
+        Ok(self.store_dir()?.join(STORE_FILE))
+    }
+
+    /// The directory of the store and of vci's files beside it (its lock
+    /// files and materialization markers): the common git directory.
+    fn store_dir(&self) -> Result<Utf8PathBuf, GitError> {
+        let Some(common) = self.repo.linked_common() else {
+            return self.repo.git_dir();
+        };
+        self.leave_worktree_store(&common);
+        Ok(common)
+    }
+
+    /// In a linked worktree, what to do with its own store left by a vci
+    /// before 2.7.33 (see [`AttestStore::store_path`]). Never fails: the
+    /// shared store is used whatever happens here.
+    fn leave_worktree_store(&self, common: &Utf8Path) {
+        let Ok(own) = self.repo.git_dir() else {
+            return;
+        };
+        let old = own.join(STORE_FILE);
+        // The usual case: no store of its own (any more).
+        if !std::fs::metadata(&old).is_ok_and(|m| m.len() > 0) {
+            return;
+        }
+        let new = common.join(STORE_FILE);
+        // One attempt per process and worktree to take it over: a
+        // process holding the exchange lock never waits on it again.
+        static TRIED: std::sync::Mutex<BTreeSet<Utf8PathBuf>> =
+            std::sync::Mutex::new(BTreeSet::new());
+        let first = TRIED
+            .lock()
+            .map(|mut t| t.insert(own.clone()))
+            .unwrap_or(false);
+        if first && !new.exists() {
+            match self.adopt_worktree_store(&own, common) {
+                Ok(true) => {
+                    store_note(format!(
+                        "moved this worktree's git-meta store {old} to {new}: every worktree of this repository now shares that one"
+                    ));
+                    return;
+                }
+                // In use (a vci before 2.7.33 in this worktree), or it
+                // could not be moved: the shared store is made anew,
+                // and the restore from refs/meta/local/main fills it.
+                Ok(false) | Err(_) => return,
+            }
+        }
+        if !new.exists() {
+            return;
+        }
+        let marker = own.join(format!("{STORE_FILE}.vci-unused"));
+        if marker.exists() {
+            return;
+        }
+        let note = format!(
+            "{old} is no longer used: every worktree of this repository now shares the git-meta store {new}; the old file (with its -wal and -shm files) can be deleted"
+        );
+        let _ = std::fs::write(&marker, format!("{note}\n"));
+        store_note(note);
+    }
+
+    /// Move a linked worktree's own store (`own/git-meta.sqlite`) to the
+    /// common git directory, under the exchange lock and both stores'
+    /// session locks, when no shared store exists and no connection has the
+    /// old one open. `Ok(false)` when it was left where it is.
+    fn adopt_worktree_store(&self, own: &Utf8Path, common: &Utf8Path) -> Result<bool, GitError> {
+        let old = own.join(STORE_FILE);
+        let new = common.join(STORE_FILE);
+        let _exchange = self.lock_file(common.join(EXCHANGE_LOCK))?;
+        let _shared = self.lock_file(common.join(SESSION_LOCK))?;
+        let _own = self.lock_file(own.join(SESSION_LOCK))?;
+        if new.exists() {
+            return Ok(false);
+        }
+        {
+            // Exclusive locking from the first access: SQLite takes an
+            // exclusive lock on the file, which it cannot while any other
+            // connection has it open (a WAL connection holds a shared lock
+            // from open to close); then everything in the -wal file is
+            // written back, so the database file alone is the store.
+            use rusqlite::OpenFlags;
+            let db = rusqlite::Connection::open_with_flags(
+                &old,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|e| sql_err(&old, e))?;
+            db.busy_timeout(Duration::ZERO)
+                .map_err(|e| sql_err(&old, e))?;
+            let held = db
+                .query_row("PRAGMA locking_mode = EXCLUSIVE", [], |_| Ok(()))
+                .and_then(|()| db.execute_batch("BEGIN EXCLUSIVE; COMMIT;"))
+                .and_then(|()| {
+                    db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                });
+            if !matches!(held, Ok(0)) {
+                return Ok(false);
+            }
+        }
+        let wal = own.join(format!("{STORE_FILE}-wal"));
+        if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+            return Ok(false);
+        }
+        // Never over a store that appeared after all (a `git meta` command
+        // takes no vci lock): a hard link fails when the name exists.
+        match std::fs::hard_link(&old, &new) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&old);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(_) => {
+                if new.exists() {
+                    return Ok(false);
+                }
+                std::fs::rename(&old, &new)
+                    .map_err(|e| GitError::Store(format!("cannot move {old} to {new}: {e}")))?;
+            }
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(own.join(format!("{STORE_FILE}{suffix}")));
+        }
+        // What describes the moved store moves with it: the tips it
+        // materialized (any marker of another store is stale now), and
+        // git-meta's history-index checkpoint.
+        let markers = |dir: &Utf8Path| -> Vec<Utf8PathBuf> {
+            dir.read_dir_utf8()
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .filter(|e| e.file_name().starts_with(MATERIALIZED_PREFIX))
+                        .map(|e| e.path().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for m in markers(common) {
+            let _ = std::fs::remove_file(m);
+        }
+        for m in markers(own) {
+            if let Some(name) = m.file_name() {
+                let _ = std::fs::rename(&m, common.join(name));
+            }
+        }
+        let index = own.join(INDEX_STATE_FILE);
+        if index.exists() && std::fs::hard_link(&index, common.join(INDEX_STATE_FILE)).is_ok() {
+            let _ = std::fs::remove_file(&index);
+        }
+        Ok(true)
     }
 
     fn lock_file(&self, path: Utf8PathBuf) -> Result<std::fs::File, GitError> {
@@ -1598,10 +1818,19 @@ impl<'a> AttestStore<'a> {
     /// ("duplicate column name"). vci processes take a lock file around the
     /// open, and retry in case another git-meta client migrated concurrently.
     fn session(&self) -> Result<Session, GitError> {
-        let _lock = self.lock_file(self.repo.git_dir()?.join("git-meta.sqlite.vci-lock"))?;
+        let dir = self.store_dir()?;
+        let _lock = self.lock_file(dir.join(SESSION_LOCK))?;
+        // git-meta keeps its store in the git directory of the repository
+        // it opens: a linked worktree's session is opened on the common one
+        // (2.7.33), so its store and git-meta's own files are the shared
+        // ones. The objects and refs it reads and writes are shared anyway.
+        let at = match self.repo.linked_common() {
+            Some(common) => common,
+            None => self.repo.root().to_owned(),
+        };
         let mut last = None;
         for attempt in 0..5u64 {
-            match Session::open(self.repo.root().as_std_path()) {
+            match Session::open(at.as_std_path()) {
                 Ok(s) => return Ok(s),
                 Err(e) => {
                     last = Some(e);
@@ -1616,12 +1845,9 @@ impl<'a> AttestStore<'a> {
     /// the metadata refs are shared), so two of them never race on
     /// `refs/<ns>/local/main` or the tracking ref.
     fn exchange_lock(&self) -> Result<std::fs::File, GitError> {
-        let common = self
-            .repo
-            .git()
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .run_str()?;
-        self.lock_file(Utf8PathBuf::from(common).join("git-meta.vci-exchange.lock"))
+        // The store directory is the common one; asked first, so that a
+        // worktree's old store is taken over before this lock is held.
+        self.lock_file(self.store_dir()?.join(EXCHANGE_LOCK))
     }
 
     /// A reader over the local store. When the repository has no git-meta
@@ -1631,7 +1857,7 @@ impl<'a> AttestStore<'a> {
     }
 
     /// Store `bytes` for `test_id` under the signer's key in the local
-    /// git-meta store (`.git/git-meta.sqlite`). Nothing is serialized or
+    /// git-meta store ([`AttestStore::store_path`]). Nothing is serialized or
     /// pushed; the user's index, HEAD and working tree are never touched.
     /// Storing identical bytes again is a no-op; different bytes under the
     /// same key replace the old envelope.
@@ -3916,16 +4142,15 @@ impl<'a> AttestStore<'a> {
 
     /// The local tracking ref of a metadata remote.
     /// The file recording the tip of `tracking` last materialized into this
-    /// repository's store (in the git directory, next to git-meta's store).
+    /// repository's store (in the common git directory, next to the store).
     fn materialized_marker(&self, tracking: &str) -> Result<Utf8PathBuf, GitError> {
         let name: String = tracking
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         Ok(self
-            .repo
-            .git_dir()?
-            .join(format!("vci-materialized-{name}")))
+            .store_dir()?
+            .join(format!("{MATERIALIZED_PREFIX}{name}")))
     }
 
     fn tracking_ref(&self, name: &str, ns: &str) -> Result<String, GitError> {
@@ -4322,8 +4547,7 @@ impl<'a> AttestStore<'a> {
 
     /// Make the store cover `refs/<ns>/local/main`: copy in every value of
     /// that ref the store has neither a row nor a deletion record for (a new,
-    /// emptied or replaced `.git/git-meta.sqlite`, or a linked worktree,
-    /// whose store is its own while the ref is shared), and apply the ref's
+    /// emptied or replaced `.git/git-meta.sqlite`), and apply the ref's
     /// deletion records that are newer than the store's row. Without this,
     /// git-meta's serialization (a commit on top of that ref, built from the
     /// store alone) would delete those values for everyone on the next push.
@@ -5317,7 +5541,7 @@ impl<'a> AttestStore<'a> {
         step("cover the local ref", t);
         if restored > 0 {
             report.note(format!(
-                "restored {restored} entr{} of {local_ref} into this repository's git-meta store, which did not hold them (a new or replaced .git/git-meta.sqlite, or a linked worktree)",
+                "restored {restored} entr{} of {local_ref} into this repository's git-meta store, which did not hold them (a new or replaced .git/git-meta.sqlite)",
                 if restored == 1 { "y" } else { "ies" }
             ));
         }
@@ -5852,9 +6076,15 @@ impl<'a> AttestStore<'a> {
             Some(l) if self.is_ancestor(l, tip)? => {
                 (format!("{l}^{{tree}}"), tip.to_owned(), false)
             }
-            Some(l) => match self.merge_from_paths(remote, l, tip, tip_snap)? {
-                Err(why) => return fallback(why),
-                Ok(m) => (format!("{l}^{{tree}}"), m, true),
+            Some(l) => match self.merge_from_paths(remote, l, tip, tip_snap) {
+                Err(e) => {
+                    if timed {
+                        vci_core::timing_line!("materialize: merging from paths failed: {e}");
+                    }
+                    return Err(e);
+                }
+                Ok(Err(why)) => return fallback(why),
+                Ok(Ok(m)) => (format!("{l}^{{tree}}"), m, true),
             },
         };
         part(if merged { "merge commit" } else { "base" });
@@ -6118,6 +6348,7 @@ impl<'a> AttestStore<'a> {
         {
             return Ok(Ok(commit));
         }
+        LAST_MERGE.with(|m| m.set(Some("git-meta")));
         let ours = self.snapshot_keys(local)?;
         let base_snap = match &base {
             Some(b) => {
@@ -6259,8 +6490,9 @@ impl<'a> AttestStore<'a> {
         local: &str,
         tip: &str,
     ) -> Result<Option<String>, GitError> {
-        // path -> the blob id it has after the change (all zeros: deleted).
-        let changed = |to: &str| -> Result<Option<BTreeMap<Vec<u8>, String>>, GitError> {
+        // path -> the blob id it had before the change and has after it
+        // (all zeros: absent).
+        let changed = |to: &str| -> Result<Option<BTreeMap<Vec<u8>, PathChange>>, GitError> {
             let (_, out) = self
                 .repo
                 .git()
@@ -6286,40 +6518,126 @@ impl<'a> AttestStore<'a> {
                     return Ok(None);
                 };
                 let meta = String::from_utf8_lossy(meta);
-                let Some(new) = meta.split_whitespace().nth(3) else {
+                let mut f = meta.split_whitespace();
+                let (Some(old_mode), Some(old), Some(new)) = (f.next(), f.nth(1), f.next()) else {
                     return Ok(None);
                 };
-                m.insert(path.to_vec(), new.to_owned());
+                m.insert(
+                    path.to_vec(),
+                    (
+                        old_mode.trim_start_matches(':').to_owned(),
+                        old.to_owned(),
+                        new.to_owned(),
+                    ),
+                );
             }
             Ok(Some(m))
         };
         let (Some(ours), Some(theirs)) = (changed(local)?, changed(tip)?) else {
             return Ok(None);
         };
-        // A path both sides changed the same way (2.7.11: both of a run's
-        // jobs write the same deletion records) merges cleanly; one they
-        // left different takes git-meta's merge.
-        let conflicts: Vec<(&Vec<u8>, &String)> = ours
+        // The paths both sides changed. One they left different takes ours
+        // when it is a deletion record (both of a run's jobs delete the same
+        // superseded attestations, each stamping the record with its own
+        // time; 2.7.28: 2,054 such paths sent every push of a vex run to
+        // git-meta's merge of three listed trees, 6 s), as git-meta's merge
+        // does; any other takes git-meta's merge.
+        let both: Vec<(&Vec<u8>, &PathChange)> = ours
             .iter()
-            .filter(|(p, o)| theirs.get(*p).is_some_and(|t| t != *o))
+            .filter(|(p, _)| theirs.contains_key(*p))
             .collect();
-        // Both of a run's jobs delete the same superseded attestations, each
-        // stamping the record with its own time: deletion records of one
-        // key that differ take ours, as git-meta's merge does (2.7.28:
-        // 2,054 such paths sent every push of a vex run to git-meta's merge
-        // of three listed trees, 6 s). Any other path both sides changed
-        // differently takes git-meta's merge.
         let is_record =
             |p: &[u8]| p.ends_with(b"/__deleted") && p.windows(14).any(|w| w == b"/__tombstones/");
-        if conflicts.iter().any(|(p, _)| !is_record(p)) {
+        let differing = both
+            .iter()
+            .filter(|(p, o)| theirs.get(*p).is_some_and(|t| t.2 != o.2))
+            .count();
+        if both
+            .iter()
+            .any(|(p, o)| theirs.get(*p).is_some_and(|t| t.2 != o.2) && !is_record(p))
+        {
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
-                    "materialize: {} path(s) changed differently on both sides; git-meta merges",
-                    conflicts.len()
+                    "materialize: {differing} path(s) changed differently on both sides; git-meta merges"
                 );
             }
             return Ok(None);
         }
+        // Every path both sides changed is put back to the base's state in
+        // the tip's tree before git merges, so that each path changed on one
+        // side only: ours. git then merges trees alone, without reading a
+        // blob, which a blobless clone may not have (2.7.34 wrote ours into
+        // the tip for the records that differed, and left a path both sides
+        // changed the same way to git: git 2.43, Ubuntu 24.04's and vex's
+        // runners', reads the base's blob for a path both sides deleted when
+        // both sides also added a path, whatever `-X no-renames` says, and
+        // every such merge on vex failed on a missing blob, 8 to 55 s, then
+        // took git-meta's merge, 10 to 67 s). The edited tree is given a
+        // commit (git 2.43 merges commits only), never pushed. `no-renames`
+        // besides: a metadata tree has no renames, and looking for them
+        // reads blobs too.
+        let theirs_commit = if both.is_empty() {
+            tip.to_owned()
+        } else {
+            // Through git's index, not a gix tree editor: the base's blob at
+            // a path both sides deleted (a superseded attestation's value)
+            // was never fetched by this clone, and the editor refuses to
+            // name an object it cannot find; `update-index --index-info`
+            // and `write-tree --missing-ok` take any id.
+            let dir = tempfile::tempdir()?;
+            let index = dir.path().join("index");
+            self.repo
+                .git()
+                .args(["read-tree", &format!("{tip}^{{tree}}")])
+                .env("GIT_INDEX_FILE", &index)
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run()?;
+            let mut info: Vec<u8> = Vec::new();
+            for (p, (old_mode, old, _)) in &both {
+                if old.chars().all(|c| c == '0') {
+                    info.extend_from_slice(b"0 0000000000000000000000000000000000000000\t");
+                } else {
+                    info.extend_from_slice(old_mode.as_bytes());
+                    info.push(b' ');
+                    info.extend_from_slice(old.as_bytes());
+                    info.push(b'\t');
+                }
+                info.extend_from_slice(p);
+                info.push(0);
+            }
+            self.repo
+                .git()
+                .args(["update-index", "-z", "--index-info"])
+                .env("GIT_INDEX_FILE", &index)
+                .run_with_stdin(&info)?;
+            if vci_core::metrics::on() {
+                vci_core::timing_line!(
+                    "materialize: {} path(s) both sides changed take ours ({differing} deletion record(s) they wrote differently)",
+                    both.len()
+                );
+            }
+            let edited = parse_oid(
+                &self
+                    .repo
+                    .git()
+                    .args(["write-tree", "--missing-ok"])
+                    .env("GIT_INDEX_FILE", &index)
+                    .run()?,
+            )?;
+            let mut git = self.repo.git().args([
+                "commit-tree",
+                "--no-gpg-sign",
+                &edited,
+                "-p",
+                tip,
+                "-m",
+                "the tip as the base at the paths both sides changed",
+            ]);
+            for (k, v) in IDENTITY {
+                git = git.env(k, v);
+            }
+            parse_oid(&git.run()?)?
+        };
         let (_, out) = self
             .repo
             .git()
@@ -6327,30 +6645,29 @@ impl<'a> AttestStore<'a> {
                 "merge-tree",
                 "--write-tree",
                 "--no-messages",
+                "-X",
+                "no-renames",
                 "--merge-base",
                 base,
                 local,
-                tip,
+                &theirs_commit,
             ])
             .env("GIT_NO_LAZY_FETCH", "1")
             .output_described()?;
-        // Exit status 1: conflicts, the tree written with markers at those
-        // paths; only the deletion records found above may conflict, and
-        // they are replaced below.
-        let conflicted = out.status.code() == Some(1) && !conflicts.is_empty();
-        if !out.status.success() && !conflicted {
+        if !out.status.success() {
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
                     "materialize: git merge-tree did not merge ({}); git-meta merges",
                     String::from_utf8_lossy(&out.stderr)
                         .lines()
-                        .next()
-                        .unwrap_or("no message")
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
                 );
             }
             return Ok(None);
         }
-        let Some(mut tree) = String::from_utf8_lossy(&out.stdout)
+        let Some(tree) = String::from_utf8_lossy(&out.stdout)
             .lines()
             .next()
             .map(str::trim)
@@ -6359,33 +6676,7 @@ impl<'a> AttestStore<'a> {
         else {
             return Ok(None);
         };
-        if !conflicts.is_empty() {
-            let session = self.session()?;
-            let repo = session.repo();
-            let gerr = |e: &dyn std::fmt::Display| {
-                GitError::Meta(format!("resolving deletion records in the merge: {e}"))
-            };
-            let id = gix::ObjectId::from_hex(tree.as_bytes()).map_err(|e| gerr(&e))?;
-            let mut editor = repo.edit_tree(id).map_err(|e| gerr(&e))?;
-            for (p, o) in &conflicts {
-                let path = String::from_utf8_lossy(p).into_owned();
-                if o.chars().all(|c| c == '0') {
-                    let _ = editor.remove(path.as_str());
-                } else {
-                    let blob = gix::ObjectId::from_hex(o.as_bytes()).map_err(|e| gerr(&e))?;
-                    editor
-                        .upsert(path.as_str(), gix::objs::tree::EntryKind::Blob, blob)
-                        .map_err(|e| gerr(&e))?;
-                }
-            }
-            tree = editor.write().map_err(|e| gerr(&e))?.detach().to_string();
-            if vci_core::metrics::on() {
-                vci_core::timing_line!(
-                    "materialize: {} deletion record(s) both sides wrote differently take ours",
-                    conflicts.len()
-                );
-            }
-        }
+        LAST_MERGE.with(|m| m.set(Some("git")));
         let mut git = self.repo.git().args([
             "commit-tree",
             "--no-gpg-sign",
@@ -7683,7 +7974,7 @@ impl<'a> AttestStore<'a> {
             // being written; none at all means the object was never here.
             let loose = self
                 .repo
-                .git_dir()
+                .common_git_dir()
                 .map(|d| d.join("objects").join(&o[..2]).join(&o[2..]))
                 .ok()
                 .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()));

@@ -439,6 +439,42 @@ pub const RAILS_GLOBAL_FILES: &[&str] = &[
     "Rakefile",
 ];
 
+/// `rails_inputs = "loose"` (the default since 2.7.36): what a unit's
+/// manifest leaves out, as globs relative to the Rails root (`dir/**` also
+/// matches `dir` itself, so its listing goes too). Rails reads these while
+/// it boots, so recorded they were inputs of every test file of the
+/// project, and a change to one (a route, an initializer, a migration, a
+/// translation) ran every test again. Left out, a pull request that only
+/// changes one of them skips what it would skip without it; a run where
+/// nothing is skipped (the default branch's, `policy.no_skip_refs`) runs
+/// the tests against it. `.vci-autoload` is the autoload lookup records
+/// (`<dir>/.vci-autoload` and `.vci-autoload/<name>`, wherever they are):
+/// a file added to an autoload directory runs nothing again. What stays an
+/// input: `Gemfile.lock` and the rest of the bundle, `db/schema.rb` and
+/// `db/structure.sql`, `config/database.yml`, `test/test_helper.rb`,
+/// `test/support/**`, `spec/*_helper.rb`, and every file read after boot
+/// (models, services, fixtures, templates, the test file itself).
+pub const RAILS_LOOSE_IGNORED_INPUTS: &[&str] = &[
+    "config/application.rb",
+    "config/boot.rb",
+    "config/environment.rb",
+    "config/environments/**",
+    "config/initializers/**",
+    "config/routes.rb",
+    "config/routes/**",
+    "config/locales/**",
+    "config/puma.rb",
+    "config/spring.rb",
+    "config.ru",
+    "db/migrate/**",
+    AUTOLOAD_INPUTS,
+];
+
+/// The item of [`RAILS_LOOSE_IGNORED_INPUTS`] (and of `ignore_inputs`)
+/// that names the autoload lookup records: any path with a `.vci-autoload`
+/// component.
+pub const AUTOLOAD_INPUTS: &str = ".vci-autoload";
+
 /// What a probe process reports: the toolchain (`vci plan` and `vci run`
 /// read it without booting the application, see [`RailsAdapter::light_probe`])
 /// and, from a booted application, the native libraries it opened.
@@ -1077,6 +1113,13 @@ impl RailsAdapter {
         }
         if let Ok(v) = std::env::var(RAILS_SHARED_OUTPUT_ENV) {
             cmd.env(RAILS_SHARED_OUTPUT_ENV, v);
+        }
+        // Measurement switches of the collector (see its EXPERIMENT and
+        // Profile): passed on as set in vci's environment.
+        for k in ["VCI_RAILS_EXPERIMENT", "VCI_RAILS_PROFILE"] {
+            if let Ok(v) = std::env::var(k) {
+                cmd.env(k, v);
+            }
         }
         if !shards.is_empty() {
             let lines: Vec<String> = shards.iter().map(|(f, k)| format!("{k}\t{f}")).collect();

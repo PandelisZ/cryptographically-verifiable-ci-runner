@@ -22,6 +22,7 @@ mod plan;
 mod run;
 mod store;
 mod treestat;
+mod update;
 mod util;
 
 use anyhow::Result;
@@ -218,6 +219,19 @@ enum Cmd {
         #[arg(long, value_enum, default_value = "text")]
         format: EnvFormat,
     },
+    /// Install the latest release the way this vci was installed: brew upgrade for Homebrew, the install script at the release's tag for a cargo install from its clone, else download the release binary, check its SHA-256 and replace this one. VCI_UPDATE_REPO or VCI_UPDATE_BASE_URL point elsewhere.
+    #[command(visible_alias = "upgrade")]
+    Update {
+        /// Only compare this version with the latest release: exit 0 when it is current, 1 when there is an update; changes nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install this release (X.Y.Z) instead of the latest: a release binary, or the install script at its tag; Homebrew installs only the tap's version.
+        #[arg(long, value_name = "X.Y.Z", conflicts_with = "check")]
+        version: Option<String>,
+        /// Keep the replaced release binary beside the new one, as vci.old.
+        #[arg(long, conflicts_with = "check")]
+        keep_old: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -245,6 +259,7 @@ impl Cmd {
             Cmd::Explain { .. } => "explain",
             Cmd::Store { .. } => "store",
             Cmd::Metrics { .. } => "metrics",
+            Cmd::Update { .. } => "update",
         }
     }
 }
@@ -435,6 +450,15 @@ fn main() {
             command,
             format,
         } => metrics::report(last, command.as_deref(), matches!(format, EnvFormat::Json)),
+        Cmd::Update {
+            check,
+            version,
+            keep_old,
+        } => update::update(update::UpdateArgs {
+            check,
+            version,
+            keep_old,
+        }),
     };
     let exit = match &r {
         Ok(code) => *code,
@@ -526,6 +550,39 @@ mod tests {
         assert!(matches!(format, EnvFormat::Json));
         assert!(Cli::try_parse_from(["vci", "store", "info"]).is_ok());
         assert!(Cli::try_parse_from(["vci", "store"]).is_err());
+    }
+
+    /// `vci update` (and its alias `vci upgrade`) sits beside `vci store
+    /// info`, and names itself `update` either way.
+    #[test]
+    fn update_parses_beside_store_info() {
+        for typed in ["update", "upgrade"] {
+            let cli = Cli::try_parse_from(["vci", typed, "--check"]).unwrap();
+            assert_eq!(cli.cmd.name(), "update", "{typed}");
+            let Cmd::Update {
+                check,
+                version,
+                keep_old,
+            } = cli.cmd
+            else {
+                panic!("{typed}: not update")
+            };
+            assert!(check && version.is_none() && !keep_old, "{typed}");
+        }
+        let cli =
+            Cli::try_parse_from(["vci", "update", "--version", "2.8.0", "--keep-old"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Update { check: false, version: Some(ref v), keep_old: true } if v == "2.8.0"
+        ));
+        assert!(Cli::try_parse_from(["vci", "update", "--check", "--keep-old"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["vci", "store", "info"])
+                .unwrap()
+                .cmd
+                .name(),
+            "store"
+        );
     }
 
     /// `--partition I/N` (1 <= I <= N); anything else is a usage error.

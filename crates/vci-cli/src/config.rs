@@ -48,6 +48,15 @@ pub struct Config {
     /// node-test adapter: node options with `test_globs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_args: Option<Vec<String>>,
+    /// Rails adapter (single-project form): which of the files Rails reads
+    /// while it boots are inputs, `"loose"` (default) or `"strict"`; see
+    /// [`RailsInputs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rails_inputs: Option<RailsInputs>,
+    /// Rails adapter (single-project form): more globs (relative to the
+    /// project dir) whose files are never inputs; see [`RailsInputs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_inputs: Option<Vec<String>>,
     #[serde(default)]
     pub policy: Policy,
     #[serde(default)]
@@ -121,6 +130,13 @@ pub struct ProjectConfig {
     pub test_globs: Option<Vec<String>>,
     #[serde(default)]
     pub node_args: Option<Vec<String>>,
+    /// Rails adapter: `"loose"` (default) or `"strict"`; see [`RailsInputs`].
+    #[serde(default)]
+    pub rails_inputs: Option<RailsInputs>,
+    /// Rails adapter: more globs (relative to the project dir) whose files
+    /// are never inputs.
+    #[serde(default)]
+    pub ignore_inputs: Option<Vec<String>>,
     #[serde(default)]
     pub policy: Option<PolicyOverride>,
     #[serde(default)]
@@ -183,12 +199,93 @@ pub struct ProjectSpec {
     pub runner: Option<String>,
     /// node-test: the test command settings.
     pub node_test: vci_adapter::NodeTestOptions,
+    /// Rails: the `rails_inputs` setting (default loose); `None` for the
+    /// other adapters.
+    pub rails_inputs: Option<RailsInputs>,
+    /// Rails: the `ignore_inputs` setting.
+    pub ignore_inputs: Vec<String>,
     pub policy: Policy,
     pub env: EnvConfig,
     pub inputs: Vec<InputsConfig>,
 }
 
+/// `rails_inputs` (2.7.36): which of the files Rails reads while it boots
+/// are inputs of a Rails project's units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RailsInputs {
+    /// The default: [`vci_adapter::RAILS_LOOSE_IGNORED_INPUTS`] (routes,
+    /// initializers, environments, the boot files, migrations, locales and
+    /// the autoload lookup records) and `ignore_inputs` are left out of
+    /// every manifest. A change to one of them runs no test again on a pull
+    /// request; a run that skips nothing (the default branch's, through
+    /// `policy.no_skip_refs`) runs the tests against it.
+    #[default]
+    Loose,
+    /// Everything the test's process read is an input (vci before 2.7.36),
+    /// except what `ignore_inputs` names.
+    Strict,
+}
+
+impl RailsInputs {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loose => "loose",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+/// The globs (relative to the project dir) whose paths a Rails project
+/// leaves out of its manifests: [`vci_adapter::RAILS_LOOSE_IGNORED_INPUTS`]
+/// in loose mode, then `ignore_inputs`, once each. Empty without a mode
+/// (the other adapters).
+pub fn ignored_inputs(mode: Option<RailsInputs>, ignore_inputs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if mode == Some(RailsInputs::Loose) {
+        out.extend(
+            vci_adapter::RAILS_LOOSE_IGNORED_INPUTS
+                .iter()
+                .map(|g| (*g).to_owned()),
+        );
+    }
+    if mode.is_some() {
+        for g in ignore_inputs {
+            if !out.contains(g) {
+                out.push(g.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The item of `ignored` (globs relative to the project dir, see
+/// [`ignored_inputs`]) that leaves the repository path `path` out of a
+/// manifest, if any. `project` is the project dir relative to the
+/// repository root (`.` for the root). `dir/**` also matches `dir` (its
+/// listing); [`vci_adapter::AUTOLOAD_INPUTS`] matches any path with a
+/// `.vci-autoload` component, wherever it is.
+pub fn ignored_input<'a>(ignored: &'a [String], project: &str, path: &str) -> Option<&'a str> {
+    let rel = if project == "." {
+        Some(path)
+    } else {
+        path.strip_prefix(project).and_then(|r| r.strip_prefix('/'))
+    };
+    ignored.iter().map(String::as_str).find(|g| {
+        if *g == vci_adapter::AUTOLOAD_INPUTS {
+            return path.split('/').any(|c| c == vci_adapter::AUTOLOAD_INPUTS);
+        }
+        let Some(rel) = rel else { return false };
+        glob_match(g, rel) || g.strip_suffix("/**").is_some_and(|d| d == rel)
+    })
+}
+
 impl ProjectSpec {
+    /// The globs this project's manifests leave out ([`ignored_inputs`]).
+    pub fn ignored_inputs(&self) -> Vec<String> {
+        ignored_inputs(self.rails_inputs, &self.ignore_inputs)
+    }
+
     /// The adapter options this project's settings give.
     pub fn adapter_options(&self) -> vci_adapter::AdapterOptions {
         vci_adapter::AdapterOptions {
@@ -261,6 +358,36 @@ fn check_runner(what: &str, adapter: &str, runner: Option<&str>) -> Result<()> {
     }
     if vci_adapter::RailsRunner::parse(r).is_none() {
         bail!("{what}: runner must be \"minitest\" or \"rspec\", got {r:?}");
+    }
+    Ok(())
+}
+
+/// `rails_inputs` and `ignore_inputs` are settings of the rails adapter;
+/// each glob is relative to the project dir, without `..`.
+fn check_rails_inputs(
+    what: &str,
+    adapter: &str,
+    mode: Option<RailsInputs>,
+    globs: Option<&[String]>,
+) -> Result<()> {
+    if mode.is_none() && globs.is_none() {
+        return Ok(());
+    }
+    if adapter != "rails" {
+        bail!(
+            "{what}: `rails_inputs` and `ignore_inputs` are settings of the rails adapter, not {adapter:?}"
+        );
+    }
+    for g in globs.unwrap_or_default() {
+        if g.trim().is_empty()
+            || g.starts_with('/')
+            || g.contains('\\')
+            || g.split('/').any(|c| c == "..")
+        {
+            bail!(
+                "{what}: ignore_inputs glob {g:?} must be relative to the project dir, without '..'"
+            );
+        }
     }
     Ok(())
 }
@@ -848,6 +975,12 @@ impl Config {
             check_adapter(adapter)?;
             check_runner("vci.toml", adapter, self.runner.as_deref())?;
             check_node_test("vci.toml", adapter, &self.node_test_options())?;
+            check_rails_inputs(
+                "vci.toml",
+                adapter,
+                self.rails_inputs,
+                self.ignore_inputs.as_deref(),
+            )?;
             check_rel("project", self.project.as_deref().unwrap_or("."))?;
             return Ok(());
         }
@@ -855,9 +988,11 @@ impl Config {
             || self.adapter.is_some()
             || self.runner.is_some()
             || self.node_test_options() != vci_adapter::NodeTestOptions::default()
+            || self.rails_inputs.is_some()
+            || self.ignore_inputs.is_some()
         {
             bail!(
-                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args` cannot be combined with [[projects]]; give each project its own"
+                "top-level `project`/`adapter`/`runner`/`test_script`/`test_globs`/`node_args`/`rails_inputs`/`ignore_inputs` cannot be combined with [[projects]]; give each project its own"
             );
         }
         let mut names = std::collections::BTreeSet::new();
@@ -892,6 +1027,12 @@ impl Config {
                     test_globs: p.test_globs.clone(),
                     node_args: p.node_args.clone(),
                 },
+            )?;
+            check_rails_inputs(
+                &format!("project {:?}", p.name),
+                &p.adapter,
+                p.rails_inputs,
+                p.ignore_inputs.as_deref(),
             )?;
             if !dirs.insert((normalise_rel(&p.path), p.adapter.clone())) {
                 bail!(
@@ -995,6 +1136,11 @@ impl Config {
                 adapter: self.adapter.clone().unwrap_or_else(default_adapter),
                 runner: self.runner.clone(),
                 node_test: self.node_test_options(),
+                rails_inputs: rails_mode(
+                    self.adapter.as_deref().unwrap_or("vitest"),
+                    self.rails_inputs,
+                ),
+                ignore_inputs: self.ignore_inputs.clone().unwrap_or_default(),
                 policy: Policy {
                     removed_rails_allow_db: None,
                     ..self.policy.clone()
@@ -1082,6 +1228,8 @@ impl Config {
                         test_globs: p.test_globs.clone(),
                         node_args: p.node_args.clone(),
                     },
+                    rails_inputs: rails_mode(&p.adapter, p.rails_inputs),
+                    ignore_inputs: p.ignore_inputs.clone().unwrap_or_default(),
                     policy,
                     env,
                     inputs: p.inputs.clone().unwrap_or_else(|| self.inputs.clone()),
@@ -1089,6 +1237,12 @@ impl Config {
             })
             .collect()
     }
+}
+
+/// A Rails project's effective `rails_inputs` (the default when unset);
+/// `None` for the other adapters.
+fn rails_mode(adapter: &str, set: Option<RailsInputs>) -> Option<RailsInputs> {
+    (adapter == "rails").then(|| set.unwrap_or_default())
 }
 
 /// Does a `policy.ignore_taints` pattern match a taint's reason key
@@ -1329,6 +1483,17 @@ adapter = "rails"
 # rspec-core and there is a spec/ directory but no Minitest file, both when
 # both are present, Minitest otherwise.
 # runner = "rspec"
+# Which of the files Rails reads while it boots are inputs. "loose" (the
+# default): config/routes.rb, config/routes/**, config/initializers/**,
+# config/environments/**, config/application.rb, config/boot.rb,
+# config/environment.rb, config/puma.rb, config/spring.rb, config.ru,
+# db/migrate/**, config/locales/** and the autoload lookup records are not:
+# a change to one of them runs no test again on a pull request (a run that
+# skips nothing, such as the default branch's, runs every test against it).
+# "strict": every file a test's process read is an input.
+# rails_inputs = "strict"
+# More globs (relative to this directory) that are never inputs.
+# ignore_inputs = ["config/credentials/**"]
 
 [policy]
 # "any" | "same-os" | "exact": which OS/arch may satisfy CI. Ruby (version and
@@ -1623,6 +1788,8 @@ mod tests {
                         &s.adapter_options(),
                         &s.env,
                         &s.inputs,
+                        s.rails_inputs,
+                        &s.ignore_inputs,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1975,6 +2142,152 @@ mod tests {
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    /// `rails_inputs` (2.7.36): loose by default for Rails projects, none
+    /// for the others; `ignore_inputs` adds to the loose list, and is the
+    /// whole list in strict mode. Only the rails adapter takes them.
+    #[test]
+    fn rails_inputs_setting() {
+        let loose: Vec<String> = vci_adapter::RAILS_LOOSE_IGNORED_INPUTS
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        let c = Config::parse(RAILS_TEMPLATE).unwrap();
+        let s = &c.project_specs()[0];
+        assert_eq!(s.rails_inputs, Some(RailsInputs::Loose));
+        assert_eq!(s.ignored_inputs(), loose);
+        let c = Config::parse(
+            "adapter = \"rails\"\nignore_inputs = [\"config/credentials/**\", \"config/routes.rb\"]\n",
+        )
+        .unwrap();
+        let mut want = loose.clone();
+        want.push("config/credentials/**".into());
+        assert_eq!(c.project_specs()[0].ignored_inputs(), want);
+        let c = Config::parse(
+            "adapter = \"rails\"\nrails_inputs = \"strict\"\nignore_inputs = [\"config/credentials/**\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.project_specs()[0].ignored_inputs(),
+            vec!["config/credentials/**".to_owned()]
+        );
+        let c = Config::parse("adapter = \"rails\"\nrails_inputs = \"strict\"\n").unwrap();
+        assert!(c.project_specs()[0].ignored_inputs().is_empty());
+        let c = Config::parse(
+            "[[projects]]\nname = \"api\"\npath = \"api\"\nadapter = \"rails\"\nrails_inputs = \"strict\"\n\n[[projects]]\nname = \"web\"\npath = \"web\"\nadapter = \"vitest\"\n",
+        )
+        .unwrap();
+        let s = c.project_specs();
+        assert_eq!(s[0].rails_inputs, Some(RailsInputs::Strict));
+        assert_eq!(s[1].rails_inputs, None);
+        assert!(s[1].ignored_inputs().is_empty());
+        for bad in [
+            "adapter = \"rails\"\nrails_inputs = \"lax\"\n",
+            "adapter = \"pytest\"\nrails_inputs = \"loose\"\n",
+            "adapter = \"vitest\"\nignore_inputs = [\"x\"]\n",
+            "adapter = \"rails\"\nignore_inputs = [\"../x\"]\n",
+            "adapter = \"rails\"\nignore_inputs = [\"/abs\"]\n",
+            "adapter = \"rails\"\nignore_inputs = [\"\"]\n",
+            "rails_inputs = \"strict\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n",
+            "[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"go\"\nignore_inputs = [\"x\"]\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The loose list and the filter: boot files, migrations and the
+    /// autoload lookup records are left out; models, fixtures, the schema,
+    /// the lockfile and the test helper are not; a user glob is honoured;
+    /// strict mode keeps everything.
+    #[test]
+    fn ignored_inputs_filter() {
+        let loose = ignored_inputs(Some(RailsInputs::Loose), &[]);
+        let dropped = |project: &str, path: &str| ignored_input(&loose, project, path);
+        for (path, glob) in [
+            ("config/routes.rb", "config/routes.rb"),
+            ("config/routes/admin.rb", "config/routes/**"),
+            ("config/routes", "config/routes/**"),
+            ("config/initializers/cors.rb", "config/initializers/**"),
+            ("config/initializers", "config/initializers/**"),
+            ("config/initializers/deep/x.rb", "config/initializers/**"),
+            ("config/environments/test.rb", "config/environments/**"),
+            ("config/application.rb", "config/application.rb"),
+            ("config/boot.rb", "config/boot.rb"),
+            ("config/environment.rb", "config/environment.rb"),
+            ("config/puma.rb", "config/puma.rb"),
+            ("config.ru", "config.ru"),
+            (
+                "db/migrate/20260101000000_create_widgets.rb",
+                "db/migrate/**",
+            ),
+            ("db/migrate", "db/migrate/**"),
+            ("config/locales/en.yml", "config/locales/**"),
+            (".vci-autoload/sprocket", ".vci-autoload"),
+            ("app/models/.vci-autoload", ".vci-autoload"),
+        ] {
+            assert_eq!(dropped(".", path), Some(glob), "{path}");
+        }
+        for kept in [
+            "app/models/widget.rb",
+            "app/services/billing/charge.rb",
+            "app/views/reports/show.text.erb",
+            "test/fixtures/widgets.yml",
+            "test/models/widget_test.rb",
+            "test/test_helper.rb",
+            "test/support/login.rb",
+            "db/schema.rb",
+            "db/structure.sql",
+            "Gemfile.lock",
+            "Gemfile",
+            "config/database.yml",
+            "config",
+            "db",
+            "config/routes_helper.rb",
+            "lib/config/routes.rb",
+        ] {
+            assert_eq!(dropped(".", kept), None, "{kept}");
+        }
+        // Relative to the project dir; autoload records wherever they are.
+        assert_eq!(
+            dropped("api", "api/config/routes.rb"),
+            Some("config/routes.rb")
+        );
+        assert_eq!(dropped("api", "config/routes.rb"), None);
+        assert_eq!(dropped("api", "apix/config/routes.rb"), None);
+        assert_eq!(dropped("api", "api/app/models/widget.rb"), None);
+        assert_eq!(
+            dropped("api", ".vci-autoload/sprocket"),
+            Some(".vci-autoload")
+        );
+        // A user glob, in either mode.
+        let user = vec![
+            "config/credentials/**".to_owned(),
+            "lib/tasks/*.rake".to_owned(),
+        ];
+        for mode in [RailsInputs::Loose, RailsInputs::Strict] {
+            let list = ignored_inputs(Some(mode), &user);
+            assert_eq!(
+                ignored_input(&list, ".", "config/credentials/test.yml.enc"),
+                Some("config/credentials/**")
+            );
+            assert_eq!(
+                ignored_input(&list, ".", "lib/tasks/seed.rake"),
+                Some("lib/tasks/*.rake")
+            );
+            assert_eq!(ignored_input(&list, ".", "app/models/widget.rb"), None);
+            assert_eq!(
+                ignored_input(&list, ".", "config/routes.rb").is_some(),
+                mode == RailsInputs::Loose
+            );
+        }
+        // Strict without a list keeps everything.
+        let strict = ignored_inputs(Some(RailsInputs::Strict), &[]);
+        for p in ["config/routes.rb", ".vci-autoload/x", "db/migrate/1_a.rb"] {
+            assert_eq!(ignored_input(&strict, ".", p), None, "{p}");
+        }
+        // The other adapters leave nothing out.
+        assert!(ignored_inputs(None, &user).is_empty());
     }
 
     /// node-test settings: top level in the single-project form, per
