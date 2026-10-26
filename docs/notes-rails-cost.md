@@ -144,31 +144,51 @@ describe no longer runs on pull requests, so the three cases cannot be re-measur
 job on 2.7.35, by the same cases, and the parts of a job the fixes touch (the plan, the push) are comparable
 across shapes.
 
-## After: the new job on 2.7.35, and the push
+## After: the new job on 2.7.35 and 2.7.36, and the push
 
-Pull requests that ran on 2.7.35 between its publication (04:46 UTC) and 2.7.36's (about 05:25 UTC), six jobs of
-four pull requests, SQLite lane, 4 slots on a 4-core runner (the jobs API for the steps, the logs for vci's lines):
+Every pull-request Rails job completed between 2.7.35's publication (04:46 UTC) and 17:45 UTC on 26 October:
+32 jobs, 8 on 2.7.35 and 24 on 2.7.36 (the other session's release of the same morning, Rails inputs loose by
+default). SQLite lane, 4 or 8 slots on a 4-core runner. The jobs API gives the steps; the logs give vci's lines.
+"Files ran" is the count after `vci-skip.py` dropped the attested ones; the cases are the same as above.
 
-| case (files this job ran) | jobs | job wall | plan step | `vci run` step | publish step |
-|---|---|---|---|---|---|
-| little (3 to 21 files) | 4 | 96, 137, 178, 225 s | 9 to 17 s (one 61 s) | 17 to 103 s | 15 to 54 s |
-| a shared file (46 ran) | 1 | 584 s | 18 s | 475 s (batch 449 s: the files that ran took 23 s a process, 63 s at most) | 17 s |
-| everything (816 ran) | 1 | 786 s | 19 s | 683 s (batch 604 s: 2.8 s a process on 4 slots; check, sign and store 16 s) | 26 s |
+| version | case (files ran) | jobs | job wall, median (range) | `vci run` step | Ruby batch | plan step | publish step |
+|---|---|---|---|---|---|---|---|
+| 2.7.35 | little (3 to 25) | 6 | 202 s (96 to 907) | 66 s | 50 s | 18 s | 22 s |
+| 2.7.35 | a shared file (276) | 1 | 1,742 s | 1,237 s | 1,179 s (the files that ran took 15 s a process, 149 s at most) | 44 s | 67 s |
+| 2.7.35 | everything (816) | 1 | 786 s | 683 s | 604 s (2.8 s a process on 4 slots) | 19 s | 26 s |
+| 2.7.36 | little (5 to 24) | 8 | 598 s (451 to 644) | 182 s | 20 s | 22 s | 24 s |
+| 2.7.36 | a shared file (195 to 197) | 2 | 635 s (510 to 760) | 218 s | 77 s | 22 s | 38 s |
+| 2.7.36 | everything (808 to 832) | 14 | 742 s (334 to 1,173) | 406 s | 317 s (2.8 s a process; 8 slots in 12 of the 14) | 22 s | 27 s |
 
-The first two 2.7.36 jobs (808 files each, nothing attested after the change to loose inputs) took 334 and 371 s
-with batches of 200 and 233 s on 8 slots.
+Three things in these numbers are not vci's doing, and they dominate the medians:
+
+- **GitHub's cache restores crawled again** from about noon UTC: `jdx/mise-action`, the gems restore and the
+  attestation-store restore took about 140 s each (they take 3 to 5 s when the cache is well). The part of a job
+  outside vci's three steps was a median of 72 s on the 2.7.35 jobs (55 to 394) and **358 s** on the 2.7.36
+  jobs (53 to 416; above 300 s in 14 of 24). That is the whole of the "little" row's rise from 202 to 598 s.
+- **Pull requests with failing tests.** A file whose process fails in a slot runs again on its own, to tell a slot
+  effect from a real failure, one process at a time (about 10 s each on this runner). Two 2.7.36 pull requests had
+  13 and 16 files failing for real under SQLite; their jobs ran 20 s of batch and then 130 to 160 s of such
+  re-runs, which is most of the "little" row's 182 s `vci run` step. A cheaper rule for a file whose own tests
+  failed (as opposed to its process dying) is a candidate change, not made here.
+- **Most 2.7.36 jobs re-ran everything** (14 of 24) because master had not been attested in loose mode yet when
+  they ran, and because the SQLite lane's attestations were new (the first jobs on the lane attested it from
+  nothing). Those full re-runs are the honest cost of a suite nobody had run yet: 317 s of batch for about 820
+  files on 8 slots, 406 s of `vci run` step with the check, sign and store, against the lane's own cold plain
+  run of 12 min 28 s and 12 min 42 s a shard on 4 workers (vex #2128's measurement).
 
 **The push fix, measured.** On 25 October 57 of 143 jobs pushed through a `git merge-tree` that failed after 8 to
-55 s and git-meta's merge of 10 to 67 s. In the six 2.7.35 jobs no merge-tree failed; the job whose other job had
-pushed first (the full re-run, 809 attestations) merged "220 path(s) both sides changed take ours (110 deletion
-record(s) they wrote differently)" in a 2.4 s merge commit, its push round's fetch and merge taking 14.6 s in all
-and `git push` 6.1 s; the other five merged in 0.5 s and pushed in 4 to 16 s. A push's fetch-and-merge round was
-6.6 to 14.6 s against 7 to 51 s the day before (the 50.7 s round of the long job in "Where the push's 49 s go"
-was 25.5 s of failing merge-tree and 31.2 s of git-meta's merge). Rails jobs are not the only ones that push:
-every vex job that attests pays this merge when the other job of its run pushed first.
+55 s and git-meta's merge of 10 to 67 s. In the 32 jobs since, **no merge-tree failed**; the seven jobs whose
+other job had pushed first merged "N path(s) both sides changed take ours" in 0.5 to 2.4 s (the largest: 220
+paths, 110 deletion records written differently). A push's fetch-and-merge round was a median of 11.8 s on 2.7.35
+and 14.2 s on 2.7.36, against 7 to 51 s the day before (the 50.7 s round of the long job in "Where the push's
+49 s go" was 25.5 s of failing merge-tree and 31.2 s of git-meta's merge). The publish step as a whole, which
+also serializes the run's attestations and pushes, took a median of 22 to 27 s. Every vex job that attests pays
+this merge whenever the other job of its run pushed first, so the saving is not the Rails jobs' alone.
 
-What the new numbers do not show: the three cases against the plain job of the same shape (the pull request that
-made it measured its cold run at 12 min 28 s and 12 min 42 s a shard on four cores against 10 to 11 min with vci
-here, nothing attested); and medians, with six jobs. The script that reads these from the logs is in the session's
-scratchpad (`measure_new.sh`, `parse_logs.py`); more pull requests on 2.7.36 and later will refine them, by case
-and by version, and 2.7.36's loose inputs are expected to move most pull requests into the "little" row.
+**The plan** on the new job: the action's plan step 18 to 22 s median (vci's own `plan total` 4.6 to 4.8 s; the
+rest is installing vci and the store's warm-up), then `vci-skip.py`'s second plan of about 5 s.
+
+What the new numbers do not show: the three cases against a plain job of the same shape on the same day (vex
+#2128's cold run is the only plain measurement of the SQLite lane). The scripts that read these from the logs are
+`measure_new.sh` and `parse_logs.py` in the session's scratchpad; the per-job table is `new/parsed.tsv` there.
