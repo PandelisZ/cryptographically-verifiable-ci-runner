@@ -406,7 +406,9 @@ reaches no test either. Put `VCI_STORE_URL` (and `VCI_STORE_TOKEN`) in a CI secr
 request from a fork) cannot reach the store and runs every test. On a developer's machine export nothing: `[store]
 url` and `[store] token_command` in `vci.toml` say where the server is and which command prints its token (`com
 secrets get …`, `op read …`), run once per vci command that reads the store, in the repository's top level, without
-the three variables above (docs/REFERENCE.md, "The credential from a command"). `VCI_STORE_REPLICA` and
+the three variables above (docs/REFERENCE.md, "The credential from a command"). Both come from the checkout, and the
+token goes to its url: review a change to either, and set `VCI_STORE=git-meta` in a checkout you have not reviewed,
+which makes vci ignore them. `VCI_STORE_REPLICA` and
 `VCI_STORE_SYNC` are ordinary `VCI_*` variables too. `vci store info` prints the store and every setting with where it came from. The test suites
 read `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require` and `VCI_TEST_PG_BINDIR`, and `VCI_TEST_LIBSQL_URL`,
 `VCI_TEST_LIBSQL_TOKEN` and `VCI_TEST_LIBSQL=require` (docs/REFERENCE.md, "Development").

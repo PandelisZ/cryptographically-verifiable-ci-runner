@@ -726,8 +726,9 @@ fn a_url_from_vci_toml_is_named_so() {
 /// `[store] token_command` supplies the token when neither
 /// `VCI_STORE_TOKEN` nor the URL does: the server gets it (a `sqld` that
 /// checks tokens accepts it), the command runs when the store first
-/// connects, never when it opens, and not at all when another token is
-/// there; a token the server refuses, or a command that fails, makes the
+/// connects, never when it opens or warms up, and not at all when another
+/// token is there (`VCI_STORE_TOKEN`, or an `authToken` in the URL, which
+/// the server then gets); a token the server refuses, or a command that fails, makes the
 /// store unavailable saying so, and no message shows the token.
 #[test]
 fn a_token_command_supplies_the_token() {
@@ -803,10 +804,38 @@ fn a_token_command_supplies_the_token() {
     assert_eq!(runs(), 1, "run once, when the store first connected");
     assert!(!format!("{s:?} {}", s.location()).contains(&good));
 
+    // warm() runs nothing while the command has not run (its thread is
+    // never joined, and the plan may never read the store): the first
+    // read does.
+    let s = with(helper("warm", &format!("echo {good}")), None);
+    s.warm();
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(runs(), 1, "warm() ran the token command");
+    s.status().unwrap();
+    assert_eq!(runs(), 2);
+    s.warm();
+
     // VCI_STORE_TOKEN wins: the command is never run.
     let s = with(helper("unused", "echo unused"), Some(&good));
     s.status().unwrap();
-    assert_eq!(runs(), 1);
+    assert_eq!(runs(), 2);
+
+    // So does an authToken in VCI_STORE_URL (a CI job may set only the
+    // URL): the server gets the URL's token, and the command, whose token
+    // it would refuse, never runs.
+    let mut sel = testkit::selection(
+        LibsqlMode::Remote,
+        Some(&format!("{}?authToken={good}", server.url())),
+        None,
+        Some(&testkit::namespace()),
+        None,
+    );
+    sel.token_command = Some(helper("loses", &format!("echo {wrong}")));
+    let s = LibsqlStore::open(&sel, &cx).expect("open");
+    s.put_for_test("src/a.test.ts", S1, &hex64(2), None, b"{}")
+        .unwrap();
+    assert_eq!(s.list_units(&["src/a.test.ts"]).unwrap()[0].len(), 1);
+    assert_eq!(runs(), 2, "the URL's authToken wins over the command");
 
     // A token the server refuses: unavailable, naming the command.
     let s = with(helper("wrong", &format!("echo {wrong}")), None);

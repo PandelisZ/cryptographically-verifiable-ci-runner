@@ -1941,7 +1941,13 @@ are listed in [docs/ENV.md](ENV.md#store-selection).
   `[store] url` is refused (`$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url: … set
   $VCI_STORE_URL as well`), and the store fails open: otherwise a pull request could point CI's secret at a server it
   controls. In CI set both as secrets; on a developer's machine set neither. Since no store is trusted, the most a
-  pull request can do with `[store]` is make its own units run.
+  pull request can do with `[store]` in CI is make its own units run.
+- **On your own machine, `[store] url` is as sensitive as `[store] token_command`.** The token the command prints is
+  sent to whatever `[store] url` names, and both come from the checkout. A pull request that changes only the url,
+  leaving the command alone, therefore has your token sent to its server by any vci command that reads the store in
+  that checkout (`vci plan`, `vci run`, `vci ci`, `vci store info`, `vci fetch`, `vci push`), before any test runs. Review
+  a change to either, and in a checkout you have not reviewed run vci with `VCI_STORE=git-meta` ([The credential from a
+  command](#the-credential-from-a-command), "Trust").
 - **`[store]` is never an input**: switching store invalidates no attestation. A new store starts empty, though, so
   its units run (and are attested) once; there is no command that copies a store yet.
 - **The working tree's `vci.toml`.** The store is chosen from the checkout, not from the base commit, so that `vci
@@ -2004,8 +2010,9 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   `VCI_STORE`. It must print the credential alone on standard output: one line of UTF-8 text (surrounding whitespace
   is trimmed), at most 64 KiB.
 - **Only when needed, once.** It runs when a command first connects to the store (`vci plan`, `vci run`, `vci ci`, `vci
-  store info`, ...), never for one that does not reach it (`vci --version`, `vci init`, `vci update`, `vci env`), at
-  most once per vci process, and its output is kept in memory only. A store that takes no credential (git-meta,
+  store info`, ...), never for one that does not reach it (`vci --version`, `vci init`, `vci update`, `vci env`) nor
+  for a plan that never reads the store (no base ref: everything runs), at most once per vci process, and its output
+  is kept in memory only. A store that takes no credential (git-meta,
   SQLite, libSQL's local file) ignores it with a warning and never runs it.
 - **The environment comes first.** `VCI_STORE_TOKEN`, then the URL's own credential (`authToken` in
   `VCI_STORE_URL`, a password in a PostgreSQL connection string), then the command; when the environment gives a
@@ -2021,9 +2028,14 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   JSON or coloured), and not at all when standard output went past 64 KiB.
 - **`vci store info`** names it, never the token: `token: (from token_command: com secrets get vci-store-token --org
   vex) (vci.toml [store])` (`password:` for PostgreSQL), so its output stays safe to paste into an issue.
-- **Trust.** The command comes from the checkout's `vci.toml` and runs with your own privileges: the same trust as
-  running the checkout's tests, which a pull request can change too. Review a change to it as you would a change to
-  a test helper.
+- **Trust.** The command, and the URL what it prints is sent to, both come from the checkout's `vci.toml`. Any vci
+  command that reads the store runs the command with your own privileges, `vci plan` included (which for some
+  adapters runs nothing else of the checkout's: Go's plan only runs `go list`), and sends its token to the checkout's
+  `[store] url`. So running vci in a checkout takes the trust of running its tests, and a pull request that changes
+  only `[store] url` has your token sent to its server. Review a change to `[store] url` or to `token_command` as you
+  would a change to a test helper. In a checkout you have not reviewed (someone else's pull request, an agent's
+  sandbox), run vci with `VCI_STORE=git-meta`: the url and the command are then ignored with a warning, and the
+  command never runs. In CI the environment's secrets win, and the command never runs.
 
 Examples:
 

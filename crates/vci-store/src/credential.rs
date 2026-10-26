@@ -13,18 +13,26 @@
 //!
 //! * **When.** Only when a store that needs a server's credential first
 //!   connects (a libSQL server's token, a PostgreSQL password the URL does
-//!   not carry), never when the store is selected or opened, so a command
-//!   that does not reach the store never runs it. At most once per process
-//!   for a command and working directory: the result, a failure too, is
-//!   kept in memory ([`Credential::command`]), never on disk.
+//!   not carry), never when the store is selected or opened, nor by a
+//!   backend's `warm` ([`Credential::pending`]): a command that does not
+//!   read the store never runs it, and it always runs on a thread that
+//!   waits for it to end. At most once per process for a command and
+//!   working directory: the result, a failure too, is kept in memory
+//!   ([`Credential::command`]), never on disk.
+//! * **Whose.** The checkout's. The command and the URL its output is
+//!   sent to both come from the working tree's `vci.toml`, so any vci
+//!   command that reads the store (`vci plan` included) runs that
+//!   checkout's command, with the user's privileges, and sends what it
+//!   prints to that checkout's `[store] url`: a change to either needs the
+//!   same review, and in a checkout not yet reviewed `VCI_STORE=git-meta`
+//!   keeps both from being used.
 //! * **How.** An array is the program and its arguments, run directly; a
 //!   string is run with `sh -c` (a pipeline). The working directory is the
 //!   repository's top level (a program path holding a `/` is relative to
 //!   it), stdin is `/dev/null`, and the environment is vci's own without
 //!   [`crate::select::NEVER_TO_CHILDREN`] (`VCI_STORE_URL`,
 //!   `VCI_STORE_TOKEN`, `VCI_STORE`): a credential from the environment is
-//!   never handed to the command. It runs with the user's privileges, the
-//!   trust of running the checkout's tests.
+//!   never handed to the command.
 //! * **What it prints.** Standard output, at most [`MAX_OUTPUT`] bytes:
 //!   UTF-8, one line once surrounding whitespace is trimmed, not empty.
 //!   It becomes a [`Secret::opaque`], redacted wherever it could be
@@ -292,6 +300,19 @@ impl Credential {
         matches!(self.0, Inner::Command { .. })
     }
 
+    /// Whether asking for it now would run the command: it comes from
+    /// `[store] token_command` and no run of it in this process has ended.
+    /// A backend's `warm` does nothing then, so that the command runs only
+    /// on a thread that waits for it (a warm-up thread is never joined: a
+    /// command it started would outlive vci and its timeout), and only for
+    /// a command that reads the store.
+    pub fn pending(&self) -> bool {
+        match &self.0 {
+            Inner::Given { .. } => false,
+            Inner::Command { cell, .. } => cell.get().is_none(),
+        }
+    }
+
     /// How long the command may run before it is stopped; `None` for a
     /// credential given.
     pub fn timeout(&self) -> Option<Duration> {
@@ -407,13 +428,16 @@ const PIECES: usize = 256;
 /// Every piece of what the command printed on standard output that could
 /// be (or hold) the credential, longest first: the whole and each line
 /// (trimmed, of three bytes or more); each piece of six bytes or more
-/// between separators of four kinds, each finer than the last (whitespace,
+/// between separators of five kinds, each finer than the last (whitespace,
 /// control characters and the replacement of a byte that is not UTF-8, as
 /// in `<token>\x1b[0m`; those, quotes and brackets, as in
 /// `{"value":"<token>"}`; those and `,:;=`, as in `token=<token>`; any
-/// character a token is not made of, `[A-Za-z0-9._~+/=-]`); and what
-/// follows the first `=` or `:` of a piece between quotes
-/// (`token=<base64 token>==`, `"t":"<a:b>"`). The same again once terminal
+/// character a token is not made of, `[A-Za-z0-9._~+/=-]`; those and `/`
+/// and `.`, as in `https://vault/v1/<token>/`); and what follows the first
+/// `=` or `:` of a piece between quotes (`token=<base64 token>==`,
+/// `"t":"<a:b>"`). Each piece is kept as it is and also without the
+/// characters a token may hold but rarely ends with (`._~+/-`) at its ends,
+/// as in `Fetched <token>.` or `--<token>--`. The same again once terminal
 /// escape sequences are taken out (`\x1b[1m<token>`). `None` when there
 /// are more than [`PIECES`] of them.
 fn printed_pieces(out: &str) -> Option<Vec<String>> {
@@ -421,18 +445,27 @@ fn printed_pieces(out: &str) -> Option<Vec<String>> {
     let quote = |c: char| space(c) || "\"'`{}[]()<>".contains(c);
     let punct = |c: char| quote(c) || ",:;=".contains(c);
     let other = |c: char| !(c.is_ascii_alphanumeric() || "._~+/=-".contains(c));
+    let path = |c: char| other(c) || "/.".contains(c);
     let mut pieces = std::collections::BTreeSet::new();
     let mut add = |p: &str, min: usize| {
         let p = p.trim();
-        if p.len() >= min {
-            pieces.insert(p.to_owned());
+        for p in [p, p.trim_matches(|c: char| "._~+/-".contains(c))] {
+            if p.len() >= min {
+                pieces.insert(p.to_owned());
+            }
         }
     };
     let plain = strip_escapes(out);
     for text in [out, plain.as_str()] {
         add(text, 3);
         text.lines().for_each(|l| add(l, 3));
-        for sep in [&space as &dyn Fn(char) -> bool, &quote, &punct, &other] {
+        for sep in [
+            &space as &dyn Fn(char) -> bool,
+            &quote,
+            &punct,
+            &other,
+            &path,
+        ] {
             text.split(sep).for_each(|p| add(p, 6));
         }
         // A value after its key (`token=<token>==`, `token:<a:b>`).
@@ -764,6 +797,10 @@ mod tests {
             format!("({T})"),
             format!("'{T}'"),
             format!("`{T}`"),
+            format!("Your token: {T}.\nIt expires in 1h.\n"),
+            format!("--{T}--"),
+            format!("+{T}+\n"),
+            format!("~{T}~"),
         ] {
             let e = excerpt(&cap(err.as_bytes()), &cap(out.as_bytes()));
             assert!(!e.contains("S3cret"), "{out:?}: {e}");
@@ -786,6 +823,27 @@ mod tests {
             &cap(b"{\"t\":\"abc:defghi:jklmno\"}"),
         );
         assert_eq!(e, "bad: ***");
+    }
+
+    /// The credential is found when standard output put a character a token
+    /// may hold right beside it: a sentence's period, dashes, a path's
+    /// slashes.
+    #[test]
+    fn the_excerpt_finds_the_credential_beside_token_punctuation() {
+        const T: &str = "tok3nS3cretVal";
+        let err = cap(format!("debug: fetched {T} from vault\n").as_bytes());
+        for out in [
+            format!("Your token: {T}.\nIt expires in 1h.\n"),
+            format!("Fetched {T}.\n"),
+            format!("--{T}--\n"),
+            format!("https://v/x/{T}/\n"),
+            format!("https://vault.example/v1/{T}/\n"),
+            format!("_{T}_ ~{T}~ +{T}+\n"),
+            format!("{T}.{T}\n"),
+        ] {
+            let e = excerpt(&err, &cap(out.as_bytes()));
+            assert_eq!(e, "debug: fetched *** from vault", "{out:?}");
+        }
     }
 
     /// Standard output past its limit is not all known: standard error is

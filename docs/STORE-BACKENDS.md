@@ -469,7 +469,11 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
 
 Starts background work that makes the first reads fast: git-meta reads its store file through once on a
 thread (`warm_in_background`); SQLite reads its file through once on a thread, into the page cache; PostgreSQL opens
-its first connection and TLS session on a thread. It never blocks and never fails. The plan calls it first.
+its first connection and TLS session on a thread; libSQL reads its local file through, or on a thread asks a server
+for its schema version (opening the connection and TLS session), or syncs its replica. It never blocks and never
+fails. The plan calls it first, and never joins those threads, so a network backend whose credential is a `[store]
+token_command` that has not run yet (`Credential::pending`) does nothing: the command runs at the first real read,
+on a thread that waits for it (section 9).
 
 ---
 
@@ -841,9 +845,13 @@ namespace = "acme-monorepo"   # VCI_STORE_NAMESPACE overrides; default: the repo
   never the value (`vci.toml [store] url carries a password (it was not printed): …`); the value is kept as a `Secret`
   until it is checked, so no `Debug` of the settings prints it, and it is never serialized back. A refused per-backend
   key deserializes into a value-less marker (`select::Refused`).
-- A pull request that changes `[store] url` can point its own jobs at a server it controls, but never CI's
-  credential (the rule above): the most it can do is read records it wrote itself, which are verified like any
-  other, or make its units run.
+- A pull request that changes `[store] url` can point its own CI jobs at a server it controls, but never CI's
+  credential (the rule above): the most it can do there is read records it wrote itself, which are verified like any
+  other, or make its units run. **On a developer's or agent's machine it is different**: the credential there comes
+  from `[store] token_command`, and is sent to whatever `[store] url` names, so the same change, with the command left
+  alone, has that user's token sent to the pull request's server by any vci command that reads the store in its
+  checkout, `vci plan` included, before any test runs. A change to `[store] url` needs the review a change to
+  `token_command` gets (its **Trust**, below).
 - `[store]` is **never an input**. It is not part of `Project::config_hash`, so switching backend invalidates no
   attestation.
 - The base-commit `Config` (deny_unknown_fields) has `pub store: Option<vci_store::select::StoreSettings>`, so a base
@@ -865,8 +873,9 @@ namespace = "acme-monorepo"   # VCI_STORE_NAMESPACE overrides; default: the repo
 **Why the working tree, not the base commit.**
 
 - The store is untrusted (section 1), so a pull request that switches backend can only make its own units run.
-- It cannot redirect CI's credentials: one from the environment goes only to a URL from the environment, and a
-  `token_command` runs with the privileges of whoever runs the checkout's tests anyway.
+- It cannot redirect CI's credentials: one from the environment goes only to a URL from the environment. It can
+  redirect the token a developer's `token_command` prints (the url and the command are both the checkout's), as it
+  can change the command itself: running vci in a checkout takes the trust of running its tests (**Trust**, below).
 - The working tree is available before base-ref resolution, which is when `--fetch` starts.
 - Plan and run inside `vci ci` then agree on one store.
 
@@ -898,8 +907,11 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   environment names.)
 - **When.** `resolve` only records the command (`Selection::token_command`); `Selection::token_credential(cx)` makes a
   lazy `credential::Credential` that the backend asks for when it **first connects** (libSQL's `Conn::database`,
-  PostgreSQL's `Conn::connect`), never at selection or at `open`. A command that does not reach the store (`vci
-  --version`, `vci init`, `vci update`, `vci env`) never runs it. It runs **at most once
+  PostgreSQL's `Conn::connect`), never at selection or at `open`, and never from `warm()` (section 4): while the
+  credential is a command not yet run (`Credential::pending`), a backend's `warm` does nothing, since its thread is
+  never joined and a command it started could outlive vci and its timeout; the command then runs on the thread of the
+  first real read, which waits for it. A command that does not reach the store (`vci --version`, `vci init`, `vci
+  update`, `vci env`), or a plan that never reads it (no base ref resolved: everything runs), never runs it. It runs **at most once
   per vci process** for a command and directory: the result, a failure too, is kept in memory
   (`credential::FETCHED`, one `OnceLock` per command and directory; other threads wait for the run), never on disk.
 - **How.** An array is the program and its arguments, run directly, with no shell; a string is run with `sh -c`, for
@@ -926,8 +938,10 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   64 KiB …`, `… was killed by signal 9`. The stderr shown is its last 400 characters on one line, with everything
   stdout held removed first (`credential::printed_pieces`: whole, by line, and each piece of six bytes or more
   between whitespace, control characters or a byte that is not UTF-8, quotes, brackets and `,:;=`, each run of the
-  characters a token is made of, a value after its `key=` or `key:`, the same again with terminal escape sequences
-  taken out, so a token framed in JSON, coloured, or beside a stray byte is removed). No stderr is shown when stdout
+  characters a token is made of, and of those but `/` and `.`, a value after its `key=` or `key:`, each also
+  without `._~+/-` at its ends, the same again with terminal escape sequences taken out, so a token framed in
+  JSON, coloured, beside a stray byte, ending a sentence (`Fetched <token>.`), between dashes or in a URL's path is
+  removed). No stderr is shown when stdout
   went past 64 KiB (what it held is not all known) or held more than 256 such pieces, and when stderr went past
   64 KiB its first word, which may be part of one cut in two, is dropped. As for a store that cannot be
   reached: `vci plan` runs everything with the warning, `vci run` keeps the tests' exit code and attests nothing, and
@@ -936,9 +950,15 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
 - **`vci store info`** names the command and never the token: `token: (from token_command: com secrets get
   vci-store-token --org vex) (vci.toml [store])` for libSQL, `password: (from token_command: …)` for PostgreSQL. It
   runs the command only because it reads the store (its status and count), as it always connected.
-- **Trust.** The command comes from the checkout's `vci.toml` and runs with the user's own privileges: the trust of
-  running the checkout's tests, which a pull request can change as well. It is never given a credential from the
-  environment, and a credential from the environment is never sent to a URL from `vci.toml`.
+- **Trust.** The command, and the URL what it prints is sent to, both come from the checkout's `vci.toml`. Any vci
+  command that reads the store runs the command with the user's own privileges, `vci plan` included (for Go, a plan
+  otherwise runs only `go list`), and sends its token to the checkout's `[store] url`: running vci in a checkout takes
+  the trust of running its tests, and a pull request that changes only the url, leaving the command alone, has the
+  user's token sent to its server. A change to `[store] url` or `token_command` needs the review a change to a test
+  helper gets. In a checkout not yet reviewed (someone else's pull request, an agent's sandbox), `VCI_STORE=git-meta`
+  makes vci ignore both, with a warning, and never run the command. The command is never given a credential from the
+  environment, and a credential from the environment is never sent to a URL from `vci.toml`, so in CI, where the
+  environment's secrets win, none of this applies.
 - **Examples.**
   - The Composal CLI (each read audited, admins only): `token_command = ["com", "secrets", "get", "vci-store-token",
     "--org", "vex"]`.

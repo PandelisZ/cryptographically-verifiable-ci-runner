@@ -1092,6 +1092,12 @@ impl Conn {
         }
     }
 
+    /// Whether connecting now would run `[store] token_command`
+    /// ([`Credential::pending`]).
+    pub(crate) fn password_pending(&self) -> bool {
+        self.password.as_ref().is_some_and(Credential::pending)
+    }
+
     /// Open a connection in the background, so the first call finds one
     /// (its TLS session too). Never blocks, never fails.
     pub(crate) fn warm(&self) {

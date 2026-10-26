@@ -465,7 +465,9 @@ fn fails_open(w: &World, env: &[(&str, &str)], says: &str) -> Vec<Output> {
 /// 1. vex's set-up on a developer's machine: nothing exported, the server
 ///    and the token command in `vci.toml`. The token reaches the server
 ///    (`vci run` stores, the plan then skips), the helper runs once per vci
-///    process and only in a command that reaches the store, `vci store
+///    process and only in a command that reads the store (not in a plan
+///    that never reads it, whose warm-up would leave it unwaited, nor
+///    under `VCI_STORE=git-meta`), `vci store
 ///    info` names the command and never the token, and neither any output
 ///    nor any test sees the token. With `VCI_STORE_URL` and `VCI_STORE`
 ///    exported, the helper still runs (no token in the environment), and
@@ -530,13 +532,35 @@ fn the_token_command_supplies_the_token_and_nothing_else_sees_it() {
                 && s["source"] == "vci.toml [store]")
     );
 
-    // Commands that do not reach the store never run it.
+    // Commands that do not reach the store never run it, nor does a plan
+    // that never reads it (no base ref: everything runs), whose warm-up
+    // must not start the command on a thread nobody waits for.
     let mut outs = vec![run, out, info, json];
-    for args in [&["--version"][..], &["env"]] {
+    for args in [
+        &["--version"][..],
+        &["env"],
+        &["plan", "--base-ref", "doesnotexist", "--format", "json"],
+    ] {
         let out = w.vci(args, &[]);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
         outs.push(out);
     }
+    // In a checkout not yet reviewed, VCI_STORE=git-meta ignores the url
+    // and the command, saying so, and never runs it.
+    let (plan, out) = w.plan(&[("VCI_STORE", "git-meta")]);
+    for says in [
+        "vci.toml [store] url (",
+        "vci.toml [store] token_command is ignored (not run)",
+    ] {
+        assert!(
+            plan.warnings.iter().any(|w| w.starts_with(says)),
+            "{says}: {plan:?}"
+        );
+    }
+    outs.push(out);
+    // A command a warm-up thread started would record its run after vci
+    // exits.
+    std::thread::sleep(Duration::from_secs(2));
     assert_eq!(w.helper_runs(), 4);
 
     // With the server exported (and VCI_STORE), but no token: the command
@@ -568,7 +592,8 @@ fn the_token_command_supplies_the_token_and_nothing_else_sees_it() {
 ///    store fails open, the helper never runs, nothing reaches the server
 ///    (the store holds nothing afterwards), and the token is printed
 ///    nowhere. With `VCI_STORE_URL` as well, as CI sets both, the token is
-///    used and the helper still never runs.
+///    used and the helper still never runs, nor with an `authToken` in
+///    `VCI_STORE_URL` alone.
 #[test]
 fn an_environment_token_is_never_sent_to_a_url_from_vci_toml() {
     let Some(w) = World::new() else { return };
@@ -613,6 +638,23 @@ fn an_environment_token_is_never_sent_to_a_url_from_vci_toml() {
     );
     assert_eq!(w.helper_runs(), 0, "the environment's token wins");
     outs.extend([out, plan_out, info]);
+
+    // So does an authToken in VCI_STORE_URL, without VCI_STORE_TOKEN (a CI
+    // job may keep the whole URL in one secret).
+    let with_token = format!("{url}&authToken={TOKEN}");
+    let env = [("VCI_STORE_URL", with_token.as_str())];
+    let (plan, plan_out) = w.plan(&env);
+    assert!(plan.skip.is_superset(&set(ATTESTABLE)), "{plan:?}");
+    let info = w.vci(&["store", "info"], &env);
+    assert_eq!(info.status.code(), Some(0), "{}", text(&info));
+    assert!(
+        String::from_utf8_lossy(&info.stdout)
+            .contains("  token: (the URL's authToken) ($VCI_STORE_URL)\n"),
+        "{}",
+        text(&info)
+    );
+    assert_eq!(w.helper_runs(), 0, "the URL's token wins");
+    outs.extend([plan_out, info]);
 
     // vci.toml may name the server, never hold its token: refused, and
     // printed nowhere.
@@ -669,6 +711,17 @@ fn a_token_command_that_fails_fails_open() {
                 ),
             ),
             "printed more than one line on standard output (not printed): it must print the credential alone: debug: decrypted ***".to_owned(),
+        ),
+        (
+            // A sentence that ends right after the token, which standard
+            // error echoes.
+            w.helper(
+                "com-sentence",
+                &format!(
+                    "printf 'Your token: %s.\\n' '{TOKEN}'\necho \"debug: fetched {TOKEN} from vault\" >&2\nexit 1"
+                ),
+            ),
+            "exited 1: debug: fetched *** from vault".to_owned(),
         ),
         (
             w.base

@@ -122,6 +122,12 @@ fn the_token_command_is_the_password_when_the_url_has_none() {
     let url = format!("postgres://vci@127.0.0.1:{port}/ci?sslmode=disable");
     let s = store(&dir, &url, Source::File, &counter);
     assert_eq!(runs(&counter), 0, "opening runs nothing");
+    // Nor does warming up (its thread is never joined, and the plan may
+    // never read the store): the first read runs it.
+    s.warm();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    assert_eq!(runs(&counter), 0, "warm() ran the token command");
+    assert!(got.lock().unwrap().is_empty(), "warm() connected");
     let e = s.status().unwrap_err();
     let all = format!("{e} {e:?} {s:?} {}", s.location());
     assert!(matches!(e, StoreError::Unavailable { .. }), "{all}");

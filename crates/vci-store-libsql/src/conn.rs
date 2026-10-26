@@ -632,6 +632,12 @@ impl Conn {
         self.answered.load(Ordering::Relaxed)
     }
 
+    /// Whether connecting now would run `[store] token_command`
+    /// ([`Credential::pending`]): the store's `warm` then does nothing.
+    pub(crate) fn token_pending(&self) -> bool {
+        self.token.as_ref().is_some_and(Credential::pending)
+    }
+
     /// `text` without the URL's token, `VCI_STORE_TOKEN`, or the token
     /// command's.
     pub(crate) fn scrub(&self, text: &str) -> String {

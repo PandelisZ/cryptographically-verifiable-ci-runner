@@ -550,10 +550,16 @@ impl AttestationStore for LibsqlStore {
 
     /// Local: the file read through once. Remote: the schema version and
     /// the flags asked for on a thread (which opens the connection and its
-    /// TLS session). Replica: the sync, on a thread.
+    /// TLS session). Replica: the sync, on a thread. Neither while the
+    /// token is `[store] token_command`'s and the command has not run: a
+    /// warm-up thread is never joined, so the command would run for a
+    /// command that may never read the store and could outlive vci; it
+    /// runs at the first read instead.
     fn warm(&self) {
         match &self.inner {
             Inner::Local(s) => s.warm(),
+            Inner::Remote(r) if r.conn.token_pending() => {}
+            Inner::Replica(p) if p.remote.conn.token_pending() => {}
             Inner::Remote(r) => {
                 let r = Arc::clone(r);
                 let _ = std::thread::Builder::new()

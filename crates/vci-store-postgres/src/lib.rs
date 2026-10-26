@@ -515,8 +515,13 @@ impl AttestationStore for PgStore {
     }
 
     /// Opens the first connection (and its TLS session) on a thread of its
-    /// own.
+    /// own; not while the password is `[store] token_command`'s and the
+    /// command has not run (that thread is never joined: the command runs
+    /// at the first read instead).
     fn warm(&self) {
+        if self.inner.conn.password_pending() {
+            return;
+        }
         let inner = Arc::clone(&self.inner);
         let _ = std::thread::Builder::new()
             .name("vci-postgres-warm".into())
