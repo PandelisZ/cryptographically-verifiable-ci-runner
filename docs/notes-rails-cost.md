@@ -144,7 +144,31 @@ describe no longer runs on pull requests, so the three cases cannot be re-measur
 job on 2.7.35, by the same cases, and the parts of a job the fixes touch (the plan, the push) are comparable
 across shapes.
 
-## After: the new job on 2.7.35
+## After: the new job on 2.7.35, and the push
 
-(filled in as pull requests run on 2.7.35; from 2.7.36, which another session releases on 26 October, Rails
-projects default to loose inputs, which changes how many files a pull request re-runs for reasons of its own)
+Pull requests that ran on 2.7.35 between its publication (04:46 UTC) and 2.7.36's (about 05:25 UTC), six jobs of
+four pull requests, SQLite lane, 4 slots on a 4-core runner (the jobs API for the steps, the logs for vci's lines):
+
+| case (files this job ran) | jobs | job wall | plan step | `vci run` step | publish step |
+|---|---|---|---|---|---|
+| little (3 to 21 files) | 4 | 96, 137, 178, 225 s | 9 to 17 s (one 61 s) | 17 to 103 s | 15 to 54 s |
+| a shared file (46 ran) | 1 | 584 s | 18 s | 475 s (batch 449 s: the files that ran took 23 s a process, 63 s at most) | 17 s |
+| everything (816 ran) | 1 | 786 s | 19 s | 683 s (batch 604 s: 2.8 s a process on 4 slots; check, sign and store 16 s) | 26 s |
+
+The first two 2.7.36 jobs (808 files each, nothing attested after the change to loose inputs) took 334 and 371 s
+with batches of 200 and 233 s on 8 slots.
+
+**The push fix, measured.** On 25 October 57 of 143 jobs pushed through a `git merge-tree` that failed after 8 to
+55 s and git-meta's merge of 10 to 67 s. In the six 2.7.35 jobs no merge-tree failed; the job whose other job had
+pushed first (the full re-run, 809 attestations) merged "220 path(s) both sides changed take ours (110 deletion
+record(s) they wrote differently)" in a 2.4 s merge commit, its push round's fetch and merge taking 14.6 s in all
+and `git push` 6.1 s; the other five merged in 0.5 s and pushed in 4 to 16 s. A push's fetch-and-merge round was
+6.6 to 14.6 s against 7 to 51 s the day before (the 50.7 s round of the long job in "Where the push's 49 s go"
+was 25.5 s of failing merge-tree and 31.2 s of git-meta's merge). Rails jobs are not the only ones that push:
+every vex job that attests pays this merge when the other job of its run pushed first.
+
+What the new numbers do not show: the three cases against the plain job of the same shape (the pull request that
+made it measured its cold run at 12 min 28 s and 12 min 42 s a shard on four cores against 10 to 11 min with vci
+here, nothing attested); and medians, with six jobs. The script that reads these from the logs is in the session's
+scratchpad (`measure_new.sh`, `parse_logs.py`); more pull requests on 2.7.36 and later will refine them, by case
+and by version, and 2.7.36's loose inputs are expected to move most pull requests into the "little" row.
