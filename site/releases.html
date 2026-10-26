@@ -17,6 +17,7 @@
 
 <table>
 <tr><th>Version</th><th>Date</th><th>In one line</th></tr>
+<tr><td><a href="#v2-7-35">2.7.35</a></td><td>26 Oct 2026</td><td>The merge of a fetched tip merges on git 2.43 too (Ubuntu 24.04's, vex's runners): the tip's tree is put back to the base at every path both sides changed, through git's index, and given a commit, so git merges one-sided changes only and reads no blob</td></tr>
 <tr><td><a href="#v2-7-34">2.7.34</a></td><td>26 Oct 2026</td><td>A push whose other job deleted the same superseded attestations merges through <code>git merge-tree</code> again (ours written into the tip's tree first, no rename search): no failed merge-tree and no git-meta merge, 20 to 120 s on vex's busy evenings; a Rails batch opens one slot per shard, not per file; a per-process profile and measurement switches for the Rails collector</td></tr>
 <tr><td><a href="#v2-7-33">2.7.33</a></td><td>25 Oct 2026</td><td>One git-meta store per repository, shared by all its worktrees: what one worktree stores another plans with at once, and one fetch serves them all; new <code>vci update</code>: installs the latest release the way vci was installed (Homebrew, the install script, or a release binary replaced in place after its SHA-256 is checked); <code>--check</code> for scripts</td></tr>
 <tr><td><a href="#v2-7-32">2.7.32</a></td><td>25 Oct 2026</td><td>A vci waiting for another's fetch or push in the same repository says so, names it, and gives up after VCI_LOCK_TIMEOUT_SECS (600); the kept tree listing is one blob, brought up to date only from a nearby commit; a push marks the commit it writes as complete</td></tr>
@@ -131,6 +132,10 @@
 <tr><td><a href="#v0-2-0">0.2.0</a></td><td>1 Oct 2026</td><td>Attestations move to git-meta; Rails (Minitest) adapter</td></tr>
 <tr><td><a href="#v0-1-x">0.1.x</a></td><td>28 Sep 2026</td><td>Vitest, pytest, Go and Cargo adapters; the action with prebuilt binaries</td></tr>
 </table>
+
+<h2 id="v2-7-35">2.7.35</h2>
+
+<p>2.7.34's merge did not merge on git 2.43, the stock git of Ubuntu 24.04 and of vex's self-hosted runners, so every merge of a fetched tip there still took git-meta's merge of three listed trees. Two reasons, both found by running the store's tests in an Ubuntu 24.04 container: that git's <code>merge-tree</code> takes commits only ("expected commit type"), and it reads the base's blob of a path both sides deleted whenever both sides also added a path, whatever <code>-X no-renames</code> says, and a blobless clone has not fetched it. <strong>The tip's tree is now put back to the base's state at every path both sides changed</strong>, so each of them is a change on ours' side only (the result is what git-meta's merge gives: ours), <strong>through git's index</strong> (<code>read-tree</code>, <code>update-index --index-info</code>, <code>write-tree --missing-ok</code>, which take any object id; the gix tree editor refuses an object the clone lacks), and <strong>committed</strong> on the tip, never pushed, before <code>git merge-tree</code> runs. The store's tests run under git 2.43 as well as the current git.</p>
 
 <h2 id="v2-7-34">2.7.34</h2>
 

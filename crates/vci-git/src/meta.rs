@@ -5754,9 +5754,15 @@ impl<'a> AttestStore<'a> {
             Some(l) if self.is_ancestor(l, tip)? => {
                 (format!("{l}^{{tree}}"), tip.to_owned(), false)
             }
-            Some(l) => match self.merge_from_paths(remote, l, tip, tip_snap)? {
-                Err(why) => return fallback(why),
-                Ok(m) => (format!("{l}^{{tree}}"), m, true),
+            Some(l) => match self.merge_from_paths(remote, l, tip, tip_snap) {
+                Err(e) => {
+                    if timed {
+                        vci_core::timing_line!("materialize: merging from paths failed: {e}");
+                    }
+                    return Err(e);
+                }
+                Ok(Err(why)) => return fallback(why),
+                Ok(Ok(m)) => (format!("{l}^{{tree}}"), m, true),
             },
         };
         part(if merged { "merge commit" } else { "base" });
@@ -6162,8 +6168,9 @@ impl<'a> AttestStore<'a> {
         local: &str,
         tip: &str,
     ) -> Result<Option<String>, GitError> {
-        // path -> the blob id it has after the change (all zeros: deleted).
-        let changed = |to: &str| -> Result<Option<BTreeMap<Vec<u8>, String>>, GitError> {
+        // path -> the blob id it had before the change and has after it
+        // (all zeros: absent).
+        let changed = |to: &str| -> Result<Option<BTreeMap<Vec<u8>, (String, String, String)>>, GitError> {
             let (_, out) = self
                 .repo
                 .git()
@@ -6189,86 +6196,119 @@ impl<'a> AttestStore<'a> {
                     return Ok(None);
                 };
                 let meta = String::from_utf8_lossy(meta);
-                let Some(new) = meta.split_whitespace().nth(3) else {
+                let mut f = meta.split_whitespace();
+                let (Some(old_mode), Some(old), Some(new)) = (f.next(), f.nth(1), f.next()) else {
                     return Ok(None);
                 };
-                m.insert(path.to_vec(), new.to_owned());
+                m.insert(
+                    path.to_vec(),
+                    (old_mode.trim_start_matches(':').to_owned(), old.to_owned(), new.to_owned()),
+                );
             }
             Ok(Some(m))
         };
         let (Some(ours), Some(theirs)) = (changed(local)?, changed(tip)?) else {
             return Ok(None);
         };
-        // A path both sides changed the same way (2.7.11: both of a run's
-        // jobs write the same deletion records) merges cleanly; one they
-        // left different takes git-meta's merge.
-        let conflicts: Vec<(&Vec<u8>, &String)> = ours
-            .iter()
-            .filter(|(p, o)| theirs.get(*p).is_some_and(|t| t != *o))
-            .collect();
-        // Both of a run's jobs delete the same superseded attestations, each
-        // stamping the record with its own time: deletion records of one
-        // key that differ take ours, as git-meta's merge does (2.7.28:
-        // 2,054 such paths sent every push of a vex run to git-meta's merge
-        // of three listed trees, 6 s). Any other path both sides changed
-        // differently takes git-meta's merge.
+        // The paths both sides changed. One they left different takes ours
+        // when it is a deletion record (both of a run's jobs delete the same
+        // superseded attestations, each stamping the record with its own
+        // time; 2.7.28: 2,054 such paths sent every push of a vex run to
+        // git-meta's merge of three listed trees, 6 s), as git-meta's merge
+        // does; any other takes git-meta's merge.
+        let both: Vec<(&Vec<u8>, &(String, String, String))> =
+            ours.iter().filter(|(p, _)| theirs.contains_key(*p)).collect();
         let is_record =
             |p: &[u8]| p.ends_with(b"/__deleted") && p.windows(14).any(|w| w == b"/__tombstones/");
-        if conflicts.iter().any(|(p, _)| !is_record(p)) {
+        let differing = both
+            .iter()
+            .filter(|(p, o)| theirs.get(*p).is_some_and(|t| t.2 != o.2))
+            .count();
+        if both
+            .iter()
+            .any(|(p, o)| theirs.get(*p).is_some_and(|t| t.2 != o.2) && !is_record(p))
+        {
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
-                    "materialize: {} path(s) changed differently on both sides; git-meta merges",
-                    conflicts.len()
+                    "materialize: {differing} path(s) changed differently on both sides; git-meta merges"
                 );
             }
             return Ok(None);
         }
-        // The deletion records both sides wrote differently take ours, as
-        // git-meta's merge does, by giving the tip's tree ours' state at
-        // those paths before git merges: then no path differs on both
-        // sides, and git merges trees alone. Left to git, a path changed on
-        // both sides is merged by content, which reads both blobs, and a
-        // blobless clone has not fetched the tip's (2.7.34: on vex, every
-        // push whose other job had deleted the same superseded attestations
-        // spent 8 to 55 s in a merge-tree that then failed with "lazy
-        // fetching disabled", and 10 to 67 s more in git-meta's merge of
-        // three listed trees). `no-renames` for the same reason: finding
-        // where a deleted path went reads blobs too, and a metadata tree
-        // has no renames.
-        let theirs = if conflicts.is_empty() {
-            format!("{tip}^{{tree}}")
+        // Every path both sides changed is put back to the base's state in
+        // the tip's tree before git merges, so that each path changed on one
+        // side only: ours. git then merges trees alone, without reading a
+        // blob, which a blobless clone may not have (2.7.34 wrote ours into
+        // the tip for the records that differed, and left a path both sides
+        // changed the same way to git: git 2.43, Ubuntu 24.04's and vex's
+        // runners', reads the base's blob for a path both sides deleted when
+        // both sides also added a path, whatever `-X no-renames` says, and
+        // every such merge on vex failed on a missing blob, 8 to 55 s, then
+        // took git-meta's merge, 10 to 67 s). The edited tree is given a
+        // commit (git 2.43 merges commits only), never pushed. `no-renames`
+        // besides: a metadata tree has no renames, and looking for them
+        // reads blobs too.
+        let theirs_commit = if both.is_empty() {
+            tip.to_owned()
         } else {
-            let session = self.session()?;
-            let repo = session.repo();
-            let gerr = |e: &dyn std::fmt::Display| {
-                GitError::Meta(format!("resolving deletion records in the merge: {e}"))
-            };
-            let tip_tree = self
-                .repo
+            // Through git's index, not a gix tree editor: the base's blob at
+            // a path both sides deleted (a superseded attestation's value)
+            // was never fetched by this clone, and the editor refuses to
+            // name an object it cannot find; `update-index --index-info`
+            // and `write-tree --missing-ok` take any id.
+            let dir = tempfile::tempdir()?;
+            let index = dir.path().join("index");
+            self.repo
                 .git()
-                .args(["rev-parse", &format!("{tip}^{{tree}}")])
+                .args(["read-tree", &format!("{tip}^{{tree}}")])
+                .env("GIT_INDEX_FILE", &index)
                 .env("GIT_NO_LAZY_FETCH", "1")
-                .run_str()?;
-            let id = gix::ObjectId::from_hex(tip_tree.trim().as_bytes()).map_err(|e| gerr(&e))?;
-            let mut editor = repo.edit_tree(id).map_err(|e| gerr(&e))?;
-            for (p, o) in &conflicts {
-                let path = String::from_utf8_lossy(p).into_owned();
-                if o.chars().all(|c| c == '0') {
-                    let _ = editor.remove(path.as_str());
+                .run()?;
+            let mut info: Vec<u8> = Vec::new();
+            for (p, (old_mode, old, _)) in &both {
+                if old.chars().all(|c| c == '0') {
+                    info.extend_from_slice(b"0 0000000000000000000000000000000000000000\t");
                 } else {
-                    let blob = gix::ObjectId::from_hex(o.as_bytes()).map_err(|e| gerr(&e))?;
-                    editor
-                        .upsert(path.as_str(), gix::objs::tree::EntryKind::Blob, blob)
-                        .map_err(|e| gerr(&e))?;
+                    info.extend_from_slice(old_mode.as_bytes());
+                    info.push(b' ');
+                    info.extend_from_slice(old.as_bytes());
+                    info.push(b'\t');
                 }
+                info.extend_from_slice(p);
+                info.push(0);
             }
+            self.repo
+                .git()
+                .args(["update-index", "-z", "--index-info"])
+                .env("GIT_INDEX_FILE", &index)
+                .run_with_stdin(&info)?;
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
-                    "materialize: {} deletion record(s) both sides wrote differently take ours",
-                    conflicts.len()
+                    "materialize: {} path(s) both sides changed take ours ({differing} deletion record(s) they wrote differently)",
+                    both.len()
                 );
             }
-            editor.write().map_err(|e| gerr(&e))?.detach().to_string()
+            let edited = parse_oid(
+                &self
+                    .repo
+                    .git()
+                    .args(["write-tree", "--missing-ok"])
+                    .env("GIT_INDEX_FILE", &index)
+                    .run()?,
+            )?;
+            let mut git = self.repo.git().args([
+                "commit-tree",
+                "--no-gpg-sign",
+                &edited,
+                "-p",
+                tip,
+                "-m",
+                "the tip as the base at the paths both sides changed",
+            ]);
+            for (k, v) in IDENTITY {
+                git = git.env(k, v);
+            }
+            parse_oid(&git.run()?)?
         };
         let (_, out) = self
             .repo
@@ -6282,7 +6322,7 @@ impl<'a> AttestStore<'a> {
                 "--merge-base",
                 base,
                 local,
-                &theirs,
+                &theirs_commit,
             ])
             .env("GIT_NO_LAZY_FETCH", "1")
             .output_described()?;
@@ -6292,8 +6332,9 @@ impl<'a> AttestStore<'a> {
                     "materialize: git merge-tree did not merge ({}); git-meta merges",
                     String::from_utf8_lossy(&out.stderr)
                         .lines()
-                        .next()
-                        .unwrap_or("no message")
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
                 );
             }
             return Ok(None);

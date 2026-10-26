@@ -75,7 +75,7 @@ push, no shards (a store with no recorded durations shards nothing):
 
 | variant | runner | what it measures | result |
 |---|---|---|---|
-| plain, eager-loaded (`CI=true`, 16 workers, as CI runs it) | fast | `bin/rails test` of the 1,072 files | `Finished in 344 s`, step 350 s |
+| plain, eager-loaded (`CI=true`, 16 workers, as CI runs it) | fast | `bin/rails test` of the 1,072 files | `Finished in` 340, 341, 344, 346 s (four jobs); step 347 to 351 s |
 | plain, lazily loaded (`CI` unset) | slow | the same, loaded as vci loads | `Finished in 638 s`, step 643 s |
 | `vci run`, 16 slots (lazy, as shipped) | slow | the Ruby batch | 696 s; slot setup 18 s; a process 6.5 s on average (requires 0.33 s of it, routes 0.17 s, GC 0.46 s, 69 requires) |
 | the same with the application eager-loaded and routes drawn before the slots fork (`VCI_RAILS_EXPERIMENT=eager`) | slow | what lazy loading costs a process | 798 s; a process 7.9 s (requires 0.05 s): slower, not faster |
