@@ -131,6 +131,20 @@ Measured and not changed: lazy loading, the compile cache and `Process.warmup` (
 dependent blob fetches (envelopes, manifests, base manifests: about 4 s a plan, a round trip each, each needing
 the previous one's answer unless remembered from an earlier plan).
 
-## After
+## The job changed under this work
 
-(filled in once 2.7.34 has run on vex's pull requests)
+At 00:30 UTC on 26 October vex merged #2128, "Use SQLite for fast Rails tests and reduce CI resources": a pull
+request's Rails jobs now run on `composal-x64-4x` (4 cores), with file-backed SQLite instead of the seeded MySQL
+service, 4 slots, and only the files the SQLite lane runs (809 per shard, 1,618 of 2,232; the 613 MySQL-dependent
+files are an optional local task), through `scripts/ci/rails-db-tests.sh`: the action's `plan` step, then
+`vci-skip.py` drops the attested files and `vci run` runs the rest, then a separate "Publish Rails attestations"
+step pushes (best effort, two minutes at most). The pull request's own numbers for a cold run of that lane: the test
+step took 12 min 28 s and 12 min 42 s per shard on four cores. The 16-slot MySQL job the measurements above
+describe no longer runs on pull requests, so the three cases cannot be re-measured on it; what follows is the new
+job on 2.7.35, by the same cases, and the parts of a job the fixes touch (the plan, the push) are comparable
+across shapes.
+
+## After: the new job on 2.7.35
+
+(filled in as pull requests run on 2.7.35; from 2.7.36, which another session releases on 26 October, Rails
+projects default to loose inputs, which changes how many files a pull request re-runs for reasons of its own)
