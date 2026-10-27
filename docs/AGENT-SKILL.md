@@ -180,7 +180,9 @@ the site's `stores.html`). `SKILL.md` has a section, "Attestation stores", that 
   user what failed and the command, for them to run in their own terminal with standard output discarded
   (`com secrets get vci-store-token --org vex > /dev/null`, as vci's message says since 2.8.1; with 2.8.0, whose
   message leaves `&`, `;`, `|`, `#`, globs and other shell characters unquoted, the agent gives the command from
-  `vci.toml` with every argument in single quotes);
+  `vci.toml` with every argument in single quotes, and a string `token_command` as `sh -c '<the string>'`);
+- never to sign a sandbox or other machine of its own in to `com` or 1Password, or ask the user to, and to read the
+  store there only with `VCI_STORE_URL` and a token of its own set in its environment;
 - to run `turso db tokens create`, with the user's go-ahead, only piped straight into `gh secret set` or
   `com secrets set --from-stdin`, and never to read a token back;
 - to check, as a command of its own before any vci command that reads the store in a session (every one but
@@ -195,13 +197,18 @@ the site's `stores.html`). `SKILL.md` has a section, "Attestation stores", that 
 - and, when asked to set up Turso, to pipe tokens from `turso db tokens create` into `gh secret set` on standard input,
   never as an argument, asking before each command that creates a database, token, environment or secret.
 
-On a repository whose `vci.toml` has `[store] url` and `token_command`, the agent needs no store variable in its
-environment: sign its machine in to the tool the command uses (`com login`, `op signin`), as an account allowed to
-read the secret (`com secrets get` reads an organization's secret for its admins only). That gives the agent the same
-token as every developer. If it should plan but not store, give it a read-only token instead: set `VCI_STORE_URL` and
-a read-only `VCI_STORE_TOKEN` in the environment the agent starts with, which win over `[store]` (both are needed: a
-token from the environment is never sent to `vci.toml`'s url). Every process the agent starts can read them, its tests
-included, which is acceptable for a token that can only read. Its `vci run` then runs the tests and stores nothing.
+On a repository whose `vci.toml` has `[store] url` and `token_command`, the command is for a person's own machine,
+signed in to its tool as that person (`com secrets get` reads an organization's secret for its admins only); an agent
+working in that person's own session there reads the store the same way. Never sign an agent's sandbox, or any machine
+that runs code nobody has reviewed, in to `com` or a person's 1Password account: every secret the account can read,
+the token that can write included, would be open to the code the agent runs, and `VCI_STORE=git-meta` keeps vci from
+running `token_command` while `vci run` still runs the checkout's tests. Give the sandbox a credential for the store
+alone: `VCI_STORE_URL` and a Turso token made for that database (`--read-only` unless its `vci run` should store), set
+in the environment the agent starts with by the person or the sandbox's secret settings, or read there from a
+1Password service account allowed only a vault that holds nothing but that token. Both are needed (a token from the
+environment is never sent to `vci.toml`'s url), and they win over `[store]`. Every process the agent starts can read
+them, its tests included, which is acceptable for a token that can only read; with one, its `vci run` runs the tests
+and stores nothing.
 
 The helper script can be run by hand too:
 

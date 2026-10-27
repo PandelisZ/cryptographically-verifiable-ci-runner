@@ -205,9 +205,17 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
   yourself with its standard output discarded (> /dev/null) to see why` and quotes the command for a shell. vci
   2.8.0's ends `run the command yourself to see why` and leaves arguments holding `&`, `;`, `|`, `#`, `<`, `(`, glob
   characters and others unquoted, so with 2.8.0 give the user the command from `vci.toml`'s `token_command` with
-  every argument in single quotes: `'com' 'secrets' 'get' 'vci-store-token' '--org' 'vex' > /dev/null`. Usual
-  causes: the user is not signed in (`com login`, `op signin`: ask them), the command tried to prompt, or the user is
-  not allowed to read the secret (`com secrets get` reads an organization's secret for its admins only).
+  every argument in single quotes: `'com' 'secrets' 'get' 'vci-store-token' '--org' 'vex' > /dev/null`. A string
+  `token_command` runs with `sh -c`, so give it as `sh -c '<the string>' > /dev/null` (each `'` in it written `'\''`):
+  bare, `a || b > /dev/null` discards only what `b` prints. Usual causes: the user is not signed in on their own
+  machine (`com login`, `op signin`: ask them), the command tried to prompt, or the user is not allowed to read the
+  secret (`com secrets get` reads an organization's secret for its admins only).
+- **In a sandbox, a token of its own.** `token_command` is for a person's own machine, signed in as that person. Never
+  sign a sandbox or any other machine of your own in to `com` or 1Password (`com login`, `op signin`), and never ask
+  the user to: every command you run there, the checkout's tests included, could then read every secret the account
+  can, the token that can write included. If the sandbox should read the store, ask the user to set `VCI_STORE_URL`
+  and a token made for that database alone (`--read-only` unless your `vci run` should store) in the sandbox's secret
+  settings. Until then a plan there that needs the token fails open and runs everything.
 - **Failing open is safe.** When the store cannot be used (no token, a refused token, a server down, a failing token
   command), `vci plan` warns and prints `running everything: reading attestations from <kind>: …`: every test runs and
   nothing is skipped by mistake. `vci run` still runs the tests, refuses each unit with `signing or storing failed: …`
@@ -226,7 +234,9 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
 - **Someone else's checkout**: `VCI_STORE=git-meta` in front of every vci command (see "Whose `[store]`?" under "Before
   you start"). Never change `[store]` without the user.
 - **Setting up Turso, when the user asks.** Follow the steps at
-  https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#turso. Tokens go straight from
+  https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#turso, with one database per
+  repository, or per group of repositories with the same readers: a token reads and writes every repository in its
+  database. Tokens go straight from
   `turso db tokens create` into `gh secret set` on standard input, never as `--body` or any other argument, and never
   on screen: `turso db tokens create <db> --read-only | gh secret set VCI_STORE_TOKEN` for pull-request jobs,
   `turso db tokens create <db> | gh secret set VCI_STORE_TOKEN --env vci-attest` for the main-branch job,

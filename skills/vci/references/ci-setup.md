@@ -228,13 +228,16 @@ the user anything else that handles a token, such as the site's 1Password pipeli
 1. Turso: `turso db create <db>` (an ordinary database: not `--tursodb`, whose `turso://` URL vci does not accept).
    PostgreSQL: a database and the roles `vci_owner`, `vci_writer`, `vci_reader`, created and granted as
    https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#postgresql says (the grants in
-   database `ci`, once `vci_owner`'s first `vci run` created schema `vci`).
-2. Secrets, read from standard input so no token is ever on screen or on a command line:
+   database `ci`, once `vci_owner`'s first `vci run` created schema `vci`). A token or role reads, and if it can
+   write deletes, every repository in its database (or schema), so use one per repository, or per group of
+   repositories with the same readers.
+2. Secrets, read from standard input so no token is ever on screen or on a command line, the read-only token for
+   pull-request jobs and the other for the main-branch job:
 
    ```sh
    turso db show <db> --url | gh secret set VCI_STORE_URL
-   turso db tokens create <db> --read-only | gh secret set VCI_STORE_TOKEN            # pull-request jobs
-   turso db tokens create <db> | gh secret set VCI_STORE_TOKEN --env vci-attest       # the main-branch job
+   turso db tokens create <db> --read-only | gh secret set VCI_STORE_TOKEN
+   turso db tokens create <db> | gh secret set VCI_STORE_TOKEN --env vci-attest
    ```
 
    The environment's secret wins over the repository's in jobs that use the environment. `vci-attest` is the
@@ -259,15 +262,18 @@ the user anything else that handles a token, such as the site's 1Password pipeli
 4. Only the main-branch job stores: on a shared store `vci ci` stores only with `--push`, which the action passes with
    `signing-key` or `oidc` (and `push: true`, the default). It writes to the database, not to git, so it needs no
    `contents: write`. Pull-request jobs read and store nothing.
-5. Laptops and agents: `[store]` in `vci.toml` with `url` (never a credential) and `token_command` (a command that
-   prints the token, e.g. `["com", "secrets", "get", "vci-store-token", "--org", "acme"]` or `["op", "read", "op://..."]`).
+5. Laptops: `[store]` in `vci.toml` with `url` (never a credential) and `token_command` (a command that prints the
+   token, e.g. `["com", "secrets", "get", "vci-store-token", "--org", "acme"]` or `["op", "read", "op://..."]`).
    First store a token that can write where the command reads it, from standard input:
    `turso db tokens create <db> | com secrets set vci-store-token --org <org> --from-stdin --env-key VCI_STORE_TOKEN`
    (never `--value`; without `--ci`, which would expose it to CI runners). `com secrets get` reads an organization's
    secret for its admins only: for developers who are not admins, use a source they can read (a shared 1Password
-   vault). A machine that should only plan gets `VCI_STORE_URL` and a read-only `VCI_STORE_TOKEN` in its own
-   environment instead, which win over `[store]`. Commit `[store]` only once every runner and developer has vci 2.8.0:
-   an older vci rejects it and runs every test.
+   vault). A machine that should only plan, an agent's sandbox, or any machine that runs code nobody has reviewed gets
+   `VCI_STORE_URL` and a token made for that database alone (read-only unless it should store) in its own environment
+   instead, from the person or the sandbox's secret settings, or from a 1Password service account limited to a vault
+   holding only that token; they win over `[store]`. Never sign such a machine in to `com` or a person's 1Password
+   account: every secret the account can read, the token that can write included, would be open to the code it runs.
+   Commit `[store]` only once every runner and developer has vci 2.8.0: an older vci rejects it and runs every test.
 6. Check with `vci store info` (an uncommitted `[store]` in the working tree is enough). The store starts empty: every
    unit runs until the main-branch job's next full run (or a developer's `vci run`) stores attestations. Nothing is
    copied from `refs/meta/main`.

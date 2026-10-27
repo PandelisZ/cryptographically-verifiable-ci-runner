@@ -2500,7 +2500,8 @@ was written and what it names) and when the namespace was created.
 
 This is the on-ramp for CI: no cache of the store to restore or save, and a long-lived machine (a developer's clone, a
 self-hosted runner) syncs only what changed since its last command. An ephemeral runner starts without the file and
-syncs everything once, which is what a remote plan reads anyway, then reads locally.
+syncs the whole namespace before it reads locally, more than a remote plan reads (only what it checks), so the vex
+pilot found it no faster there ("Measured", below).
 
 ### Measured
 

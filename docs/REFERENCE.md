@@ -1809,7 +1809,9 @@ no push, no fetch, no cache.
   `--remote` and `--rewrite-history` exit 2.
 
 Roles (one schema per deployment; there is no row-level security per namespace in this version, so any role that can
-write the schema can write or delete any repository's rows on it, which only ever makes units run):
+read the schema reads every repository's test ids, paths and content hashes on it, and any role that can write it can
+write or delete any repository's rows, which only ever makes units run; set this up once per group of repositories
+with the same readers, in a database, or a schema (`[store.postgres] schema`), of their own):
 
 ```sql
 -- in psql, as an administrator
@@ -1818,6 +1820,8 @@ CREATE ROLE vci_owner  LOGIN;   -- creates the schema: its first `vci run` does
 CREATE ROLE vci_writer LOGIN;   -- trusted CI only: the default branch (vci ci --push)
 CREATE ROLE vci_reader LOGIN;   -- pull-request jobs, and anyone who only plans
 GRANT CREATE ON DATABASE ci TO vci_owner;
+\c ci
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 \password vci_owner
 \password vci_writer
 \password vci_reader
@@ -1830,11 +1834,14 @@ GRANT SELECT ON ALL TABLES IN SCHEMA vci TO vci_reader;
 GRANT INSERT, UPDATE ON vci.memo, vci.flags TO vci_reader;  -- optional: the plan's hints
 ```
 
-`\password` asks for the password without showing it and sends it to the server already encrypted, so it lands in
-neither psql's history nor the server's log, as `PASSWORD '…'` in the SQL would. Never put a password in SQL text or
-on a command line. Build each URL into its secret without showing it: paste one of these lines, press Enter, and
-paste that role's password at the prompt (`read -s` shows nothing; `printf` is built into the shell, so the password
-is never a program's argument). First `vci_reader`'s, for the repository secret:
+PostgreSQL 14 and earlier, and clusters upgraded from them, let every role create objects in schema `public`, where
+`vci_reader` could create a function that vci, run later as `vci_writer` or any other role, calls in place of a
+built-in one, with that role's rights; the `REVOKE` takes that away, and changes nothing on a cluster made by
+PostgreSQL 15 or later. `\password` asks for the password without showing it and sends it to the server already
+encrypted, so it lands in neither psql's history nor the server's log, as `PASSWORD '…'` in the SQL would. Never put a
+password in SQL text or on a command line. Build each URL into its secret without showing it: paste one of these
+lines, press Enter, and paste that role's password at the prompt (`read -s` shows nothing; `printf` is built into the
+shell, so the password is never a program's argument). First `vci_reader`'s, for the repository secret:
 
 ```sh
 printf 'vci_reader password: '; read -rs pw; echo; printf 'postgres://vci_reader:%s@db.example.com:5432/ci' "$pw" | gh secret set VCI_STORE_URL; unset pw
@@ -1848,7 +1855,9 @@ printf 'vci_writer password: '; read -rs pw; echo; printf 'postgres://vci_writer
 
 One line at a time: pasted together, the first `read` takes the second line as its password, and the password typed
 after it runs as a command and lands in the shell's history. Do not add a comment to them: zsh at its prompt reads
-`#` as a word unless `interactivecomments` is set, and an apostrophe in such a comment opens a quote.
+`#` as a word unless `interactivecomments` is set, and an apostrophe in such a comment opens a quote. They are for
+bash and zsh: fish and dash reject `read -rs`, and ksh's `-s` saves what you paste to its history, so in those shells
+run `bash` first.
 
 The password goes in the URL percent-encoded where it holds `@`, `/`, `?` or `:`, so make it of letters and digits
 only. A reader's `vci run` refuses each unit (`postgres store refused to write: permission denied for table
@@ -1860,13 +1869,16 @@ page has every step.
 
 `VCI_STORE_URL=libsql://<database>-<organization>.turso.io` with `VCI_STORE_TOKEN=<a database token>` (since 2.8.0)
 keeps the attestations in a [libSQL](https://github.com/tursodatabase/libsql) database, on Turso or on a `sqld` of
-your own, which every machine reads and writes at once, with nothing to cache, fetch or push. Getting started:
+your own, which every machine reads and writes at once, with nothing to cache, fetch or push. Getting started, with
+an ordinary database (not `--tursodb`: vci refuses `turso://` URLs), its URL
+(`libsql://vci-<organization>.<region>.turso.io`, not a secret), a read-only token for pull-request jobs, which read
+and store nothing, and one that can write for the default branch's job, which stores:
 
 ```sh
-turso db create vci                                    # once; an ordinary database, not --tursodb (turso:// URLs are refused)
-turso db show vci --url | gh secret set VCI_STORE_URL  # libsql://vci-<organization>.<region>.turso.io, not a secret
-turso db tokens create vci --read-only | gh secret set VCI_STORE_TOKEN        # pull-request jobs: read, store nothing
-turso db tokens create vci | gh secret set VCI_STORE_TOKEN --env vci-attest  # the default branch's job, which stores
+turso db create vci
+turso db show vci --url | gh secret set VCI_STORE_URL
+turso db tokens create vci --read-only | gh secret set VCI_STORE_TOKEN
+turso db tokens create vci | gh secret set VCI_STORE_TOKEN --env vci-attest
 ```
 
 Each token goes from standard input into its secret, never on screen or on a command line. `vci-attest` is an
@@ -1883,9 +1895,11 @@ runs vci, not to the job, so that the setup steps before it never see the token:
 
 The main-branch job (`environment: vci-attest`) stores what it attests with the action's `signing-key` or `oidc`,
 which pass `--push`. Without the action, run `vci ci` as before, with `--push` in that job only, and drop a `vci fetch
---remote origin` step, which exits 2 on any store but git-meta. Developers and agents whose `vci run` should store
-get a token that can write through `[store] token_command` (below), so that nothing needs exporting; a machine that
-should only plan gets `VCI_STORE_URL` and a read-only `VCI_STORE_TOKEN` in its environment instead. The site's
+--remote origin` step, which exits 2 on any store but git-meta. Developers whose `vci run` should store get a token
+that can write through `[store] token_command` (below), signed in to its tool on their own machines, so that nothing
+needs exporting. A machine that should only plan, or an agent's sandbox, gets `VCI_STORE_URL` and a token of its own
+(read-only unless it should store) in its environment instead, never a person's `com` or 1Password session, which
+would open every secret the account can read to the code it runs. The site's
 [Choosing a store](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#turso) page has
 every step. `vci.toml` can name the database and how to fetch a token (since 2.8.0; see [The credential from a
 command](#the-credential-from-a-command)), and CI's two secrets still win there:
@@ -1925,7 +1939,9 @@ The store has three modes:
   shared.
 - **Namespaces.** One database can hold many repositories, each in tables of its own (`vci_<hash>_attestations`, …)
   named after its namespace: the repository id, or `VCI_STORE_NAMESPACE` or `[store.libsql] namespace` (a shallow
-  clone needs one). The first `vci run` with a token allowed to create tables creates them; until then reads find an
+  clone needs one). A token covers the whole database: it reads every repository's test ids, paths and content hashes
+  there, and one that can write can delete them, so use a database per repository, or per group of repositories with
+  the same readers. The first `vci run` with a token allowed to create tables creates them; until then reads find an
   empty store.
 - **TLS.** `libsql://` and `https://` are HTTPS, verified against the webpki roots; `libsql://…?tls=0` and `http://` are
   plain HTTP (a local `sqld`, `turso dev`).
@@ -1944,10 +1960,11 @@ The store has three modes:
   again (`vci run` before it supersedes, the plan's later rounds). A sync that fails warns `vci: warning: cannot sync
   the libsql replica …; reading the replica as it is`, and `vci plan`, `vci run` and `vci ci` read the file as it was
   (a stale replica only makes units run; writes then fail and units are not stored), while `vci store info`, `vci
-  fetch`, `vci push` and `vci prune` exit 2. An ephemeral runner syncs everything once, about what a remote plan reads
-  anyway. `vci-store.libsql.sync` beside the file records which server and namespace it copies, and up to where; a
-  namespace dropped and created again, or restored, is synced again in full. A file without it, such as a local-mode
-  store, or one that is not a database, is never used as a replica, and stores nothing.
+  fetch`, `vci push` and `vci prune` exit 2. An ephemeral runner's first sync reads the whole namespace, which grows
+  over time, while a remote plan reads only the attestations it checks, so there the replica is no faster than remote
+  (Cost, below). `vci-store.libsql.sync` beside the file records which server and namespace it copies, and up to
+  where; a namespace dropped and created again, or restored, is synced again in full. A file without it, such as a
+  local-mode store, or one that is not a database, is never used as a replica, and stores nothing.
 - **The local mode** is the SQLite store under another name: the same file format, writes and limits (see
   [SQLite](#sqlite)); a `vci-store.sqlite` can be copied to `vci-store.libsql` and back.
 - **Cost.** A plan reads a server in about a dozen requests whatever the number of units, and `vci run` writes a
@@ -3734,8 +3751,10 @@ word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
   test](#what-vci-cannot-hide-from-a-test)): a job that runs untrusted code holds a read-only credential, or none.
   The default namespace is the repository's first commit, which
   forks and mirrors share (they then share attestations, as they do through git-meta) and a shallow clone cannot
-  give (set `VCI_STORE_NAMESPACE`). There is no row-level security per namespace: a role that can write the schema can
-  write or delete every repository's rows on it, which can only make units run; use one schema per trust domain.
+  give (set `VCI_STORE_NAMESPACE`). There is no row-level security per namespace: a role that can read the schema reads
+  every repository's rows on it (test ids, paths, content hashes), and one that can write it can write or delete them,
+  which can only make units run; use one database or schema per group of repositories with the same readers. A libSQL
+  token likewise covers its whole database.
 - SQLite is not shared between machines: parallel CI jobs that each restore and save the file in a cache lose each
   other's writes, and a store that switches kind starts empty (there is no command to copy one store into another
   yet). `vci prune` on SQLite or PostgreSQL still ends by suggesting `vci push` to publish the deletions, which has
