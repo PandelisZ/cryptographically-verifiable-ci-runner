@@ -1150,9 +1150,10 @@ bounds every wait:
   ten minutes), each later request (30 s; 600 s for `vci prune`), retries of a busy server within the request's
   deadline, a request whose connection was lost under it (a keep-alive connection the server or a proxy closed while
   it sat idle, a reset) sent again on a new connection at once, then after 100 ms and 500 ms, within the same
-  deadline, a pool checkout bounded by the connect timeout; a replica's sync is one request under the same bounds,
-  and a failed one falls back to the replica as it is for the plan and the run, and fails `vci store info`, fetch,
-  push and prune (section 18).
+  deadline, once the server has answered the handle (before that, such a loss latches at once, within the first
+  answer's bound), a pool checkout bounded by the connect timeout; a replica's sync is one request under the same
+  bounds, and a failed one falls back to the replica as it is for the plan and the run, and fails `vci store info`,
+  fetch, push and prune (section 18).
 - git-meta: `VCI_LOCK_TIMEOUT_SECS`.
 
 **Circuit breaker** (network backends). After the first `Unavailable` or `Timeout` of reaching the server, a network
@@ -1160,10 +1161,12 @@ backend latches it, and every later call of that handle returns `Unavailable` at
 CLI's one per repository, so in practice per process). A store that is down costs one timeout per
 command, not one per call (4,000 listings would otherwise each wait). Conformance scenario c16 checks that the first
 failure takes at most the connect timeout plus 1 s and the next 40 calls take under 2 s. A connection lost under a
-request is not yet such a failure: libSQL sends the request again on a new connection first (section 18, "Lost
-connections"), since a keep-alive connection a server closed while it sat idle is found out only that way, and a
-store that latched on it refused every later write of the job. Only when the request sent again fails too, or a new
-connection cannot be made (refused at once when the server went away), is the breaker latched.
+request, once the server has answered the handle, is not yet such a failure: libSQL sends the request again on a new
+connection first (section 18, "Lost connections"), since a keep-alive connection a server closed while it sat idle is
+found out only that way, and a store that latched on it refused every later write of the job. Only when the request
+sent again fails too, or a new connection cannot be made (refused at once when the server went away), is the breaker
+latched. Before the server has answered the handle, no connection was kept alive to be lost: a server that accepts
+and closes without answering latches the breaker at once, within the first answer's bound, as an unreachable one.
 
 **git-meta's documented exception.** Its prefetch takes the per-repository exchange lock and may wait up to
 `VCI_LOCK_TIMEOUT_SECS` (default 600 s) behind another vci's fetch or push in the same repository, as in 2.7. A
@@ -2327,28 +2330,38 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   tried again with growing pauses until its deadline (`Timeout{operation: "waiting for another writer"}` then). A
   server stream idle for more than 4 s is reset before use (servers expire idle streams after about 10 s), and a
   stream the server no longer knows is replaced once.
-- **Lost connections.** hyper keeps a connection alive between requests, and the handle's runtime runs only inside
-  a call, so a keep-alive connection that the server, or a proxy in front of it, closed while it sat idle is found out
+- **Lost connections.** hyper keeps a connection alive between requests, and the handle's runtime runs only inside a
+  call, so a keep-alive connection that the server, or a proxy in front of it, closed while it sat idle is found out
   only when the next request has gone out on it: `connection closed before message completed` (hyper's
   `IncompleteMessage`, what vex's CI got from Turso after a Go job's tests ran for minutes), or a reset, a broken
   pipe, an aborted connection, an end of file before the answer's end, or a TLS connection closed without its
-  `close_notify`. Such a request is sent again, each time on a new libsql connection, whose new HTTP client opens a
-  new TCP (and TLS) connection (hyper drops the failed connection from its pool, but the client may hold others that
-  sat idle as long, and hands out the one used last first): at once, then after 100 ms and 500 ms, each only while the
-  request's deadline allows, counted in `retries()`. Only when those fail too, or no time is left, is it a latched
-  `Unavailable` (`cannot reach <url>: …`). A connection that cannot be made (`error trying to connect`: nothing
-  listening, DNS, TLS, the connect timeout) latches at once, as before, so a server that went away costs one more
-  connection attempt, refused at once, and an unreachable one no more than before; an HTTP status (401, 403, 404, a
-  5xx) is the server's answer and is never sent again. Sending a request again is safe: a read changes nothing, and a
-  write batch converges when applied twice ("Writes", below). 2.8.0 latched the first lost connection, and every
-  later read and write of the process failed with `… (failed earlier in this process; not retried)`.
-- **Circuit breaker.** Per handle, as PostgreSQL's (section 17): the first connection that cannot be made, or that
-  is lost under a request every time the request is sent (above), HTTP 401, or 403 on a
-  read (`the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)`, or `the server refused the
-  token …`, `… from [store] token_command (<command>)` for the command's), 404 (`no libsql
-  database there`), other HTTP error status (a 5xx, a proxy's page), answer the client cannot read, or deadline that
-  ran out is latched, and every later call of the handle fails at once with `… (failed earlier in this process; not
-  retried)`. Busy retries, `Denied`, `Unsupported` and `Backend` are not latched.
+  `close_notify`, each a transport failure in libsql's words (`Hrana: `http error: …``). Such a request is sent again,
+  each time on a new libsql connection, whose new HTTP client opens a new TCP (and TLS) connection (hyper drops the
+  failed connection from its pool, but the client may hold others that sat idle as long, and hands out the one used
+  last first): at once, then after 100 ms and 500 ms, each only while the request's deadline allows, counted in
+  `retries()`. Only when those fail too, or no time is left, is it a latched `Unavailable` (`cannot reach <url>: …`).
+  It is sent again only once the server has answered the handle: before that no connection was kept alive to be lost,
+  so a server or proxy that accepts and closes without answering (at once, with a reset, or after a wait; a
+  `docker-proxy` with nothing behind it) latches at once, within the first answer's bound, as before, and a server
+  that accepts and never answers still costs the connect timeout. A connection that cannot be made (`error trying to
+  connect`: nothing listening, DNS, TLS, the connect timeout) latches at once, as before, so a server that went away
+  costs one more connection attempt, refused at once, and an unreachable one no more than before. An HTTP status (401,
+  403, 404, a 5xx) is the server's answer and is never sent again, whatever its body says (a proxy's page that quotes
+  an upstream's `http error: connection reset by peer` included), nor is a statement's or a stream's error. A read's
+  rows cut off after the server began sending them (`cursor error: …`, reading the answer's body) are not a lost
+  connection either, since the connection was alive when the request went out: that read fails and nothing is latched,
+  as in 2.8.0, so a server or middlebox that cuts some answer every time fails that read only. Sending a request again
+  is safe: a read changes nothing, and a write batch applied twice leaves the rows as applied once but for the change
+  log's, though it can undo a write of another handle that followed its first commit ("A batch sent again", below).
+  2.8.0 latched the first lost connection, and every later read and write of the process failed with `… (failed
+  earlier in this process; not retried)`.
+- **Circuit breaker.** Per handle, as PostgreSQL's (section 17): the first connection that cannot be made, or that is
+  lost under a request every time the request is sent (or once, before the server has answered the handle; above),
+  HTTP 401, or 403 on a read (`the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)`, or `the
+  server refused the token …`, `… from [store] token_command (<command>)` for the command's), 404 (`no libsql database
+  there`), other HTTP error status (a 5xx, a proxy's page), answer the client cannot read, or deadline that ran out is
+  latched, and every later call of the handle fails at once with `… (failed earlier in this process; not retried)`.
+  Busy retries, `Denied`, `Unsupported`, `Backend` and a read whose rows were cut off are not latched.
 - **Statements the server refuses.** `sqld` reports a statement's error (a batch step's as a Hrana API error, a
   cursor step's as `error at step N`) with HTTP 200: the server works, so it is `Backend(LibsqlError)` (`<url>: the
   server refused a statement: …`), not latched; the transaction it was in was rolled back (its stream closes with
@@ -2435,19 +2448,30 @@ namespace whose `vci_schema` row exists sends no DDL at all (one read per handle
 4. the log rows of every slot and root touched, and once per handle the log's prune.
 
 **A batch sent again.** A batch whose connection was lost under it is sent again (above, "Lost connections"), and the
-server may have committed it and lost only the answer, so every batch converges when applied twice. It is one
-transaction ending in `COMMIT`, applied whole or not at all, and its values are literals fixed when it was built (the
-manifests' `put_at`, the attestations' `stored_at` and the log's `at` included), so the same text goes again: the
-upserts of manifests, attestations and the memo write the same rows (the second time changes nothing), a removal
-deletes what is already gone, `remove_manifests` deletes only roots still unreferenced, nobody's base and put before
-the grace period, the DDL is `IF NOT EXISTS`, the `vci_schema` row and the flags are `ON CONFLICT DO NOTHING`, and the
-prunes move `log_floor` up to the same value and delete the same rows. Only the log's rows are inserted again, under
-new `seq`s, which a replica tolerates: a sync reads the server's current rows of the slots and roots the log names
-after its last entry (`DISTINCT`), so a slot named twice is read once, and one named again after a replica synced is
-read again as it now is. When another writer wrote the same slot, or stored a removed key again, in between, the batch
-sent again wins, as it would have had its request arrived later (the call had not returned, so neither write came
-first). Should the server keep the transaction of a request that was cut off open, it holds the write lock until the
-server expires its stream, and the batch sent again waits for it as for any other writer, within its deadline.
+server may have committed it and lost only the answer. It is one transaction ending in `COMMIT`, applied whole or not
+at all, and its values are literals fixed when it was built (the manifests' `put_at`, the attestations' `stored_at`
+and the log's `at` included), so the same text goes again, and applied twice in a row it leaves the rows as applied
+once, but for the log's: the upserts of manifests, attestations and the memo write the same rows (the second time
+changes nothing), a removal deletes what is already gone, `remove_manifests` deletes only roots still unreferenced,
+nobody's base and put before the grace period, the DDL is `IF NOT EXISTS`, the `vci_schema` row and the flags are `ON
+CONFLICT DO NOTHING`, and the prunes move `log_floor` up to the same value and delete the same rows. The log's rows
+are inserted again, under new `seq`s (a unit put once whose answer was lost has two), which a replica tolerates: a
+sync reads the server's current rows of the slots and roots the log names after its last entry (`DISTINCT`), so a
+slot named twice is read once, and one named again after a replica synced is read again as it now is.
+
+The batch sent again is applied after whatever the server applied since its first commit, and wins as the last writer
+in the order the server applies them: a write of another handle that followed the first commit, and returned, is
+undone where the two overlap. Its upserts replace that writer's newer row of the same slot, memo entry or manifest's
+`put_at`, and its removals delete a key that writer stored again, or, for a slot the batch emptied (a `DELETE` by test
+key, signer and storage key), whatever that writer stored in the slot. A reader can see the batch's rows, then the
+other writer's, then the batch's again (a key removed, stored again, then gone), which no order of single applications
+gives. The window is from the first commit to the batch sent again (a few round trips, and at most 0.6 s
+of pauses), vci's removals are of keys superseded and slots emptied, and the store is untrusted (section 1: every
+attestation is verified when read), so the worst is a miss, a test that runs again and stores its attestation again,
+never a wrong verification (removals conditioned on the row they meant to remove would order them strictly; for a
+miss this rare they are not made). Should the server keep the transaction of a request that was cut off open, it
+holds the write lock until the server expires its stream, and the batch sent again waits for it as for any other
+writer, within its deadline.
 
 Values travel as SQL literals, since the batch takes SQL text only: UTF-8 bytes without NUL as text cast
 to a blob (`CAST('…' AS BLOB)`, the same bytes), anything else as hex. A queue of 2,000 writes or 8 MiB is written
@@ -2593,7 +2617,10 @@ namespaces and a newer schema; orphans and the grace period; a closed port faili
 keep-alive connection a proxy dropped while it sat idle (closed after the next request was read, or reset) sent
 again on a new connection, a write and a read after the idle wait succeeding with `retries()` counting them (2.8.0
 latched `connection closed before message completed`); a server gone while the connection sat idle latching at once
-(the request sent again is refused) and every later call failing at once; a
+(the request sent again is refused) and every later call failing at once; a server that accepts and closes without
+ever answering (at once, with a reset, or after a wait) latching at once on its one connection, not sent again; a
+read whose rows a proxy cut off failing alone, not sent again, with the next write and read succeeding; an HTTP
+status (a 502, a 401) whose body quotes a transport error answered once and latched as that status; a
 server that never answers costing the connect timeout (remote, `vci prune`'s handle, and replicas for the plan and
 for the store commands); an error page the client cannot read failing without a panic; bad URLs as `Config` errors
 without their secrets; tokens (none, wrong, right in either place, read-only: its hints and writes `Denied`, its
@@ -2608,7 +2635,8 @@ refusing them as `Denied`, an empty namespace's included, with reads going on (r
 store commands failing on a replica they cannot keep (an unwritable directory, an empty namespace or not); and,
 ignored outside release builds, 1,200 units of 18 KB. `src/conn.rs` checks that the connector's sockets close
 without lingering, which errors mean a server takes no more writes, and which mean a connection lost under a request
-(sent again) rather than one that could not be made or an answer of the server (not sent again).
+(sent again) rather than one that could not be made, a read's rows cut off (not latched) or an answer of the server
+whatever its body says (not sent again).
 `tests/conformance.rs` runs the 34 scenarios in each mode (102 tests); the remote and replica ones need a server and
 skip without one. Its worlds:
 

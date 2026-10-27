@@ -29,11 +29,19 @@
 //!   idle, found out only when the next request went out on it; a reset)
 //!   is sent again on a new connection, at once and then after short
 //!   pauses, within its deadline ([`RESEND`]); only when those fail too is
-//!   the breaker latched. A connection that cannot be made (nothing
-//!   listening, DNS, TLS, the connect timeout) latches it at once, as
-//!   before. Sending a request again is safe: reads change nothing, and
-//!   a write is one transaction whose statements converge when applied
-//!   twice (see [`Conn::batch`]).
+//!   the breaker latched. That is done only once the server has answered
+//!   the handle: before that no connection was kept alive, and a server
+//!   that accepts and closes without answering latches it at once, within
+//!   the first answer's bound, as before. A connection that cannot be
+//!   made (nothing listening, DNS, TLS, the connect timeout) latches it at
+//!   once, as before; an answer of the server (an HTTP status, whatever
+//!   its body says) is never sent again; an answer cut off after the
+//!   server began it (a read's rows) fails that call and latches nothing,
+//!   as before. Sending a request again is safe: reads change nothing,
+//!   and a write is one transaction whose statements, applied twice,
+//!   leave the rows as applied once but for the change log's, though it
+//!   can undo a write of another handle that followed its first commit
+//!   (see [`Conn::batch`]).
 //! * **Requests.** A read is one prepared statement (the server describes a
 //!   statement once per pooled connection; the description is kept) whose
 //!   rows come back in one request. A write is one transaction that takes
@@ -544,15 +552,33 @@ const DROPPED: &[&str] = &[
     "close_notify",
 ];
 
+/// How libsql's text for a request that failed in transport begins, in
+/// lowercase: its `HranaError::Http` (hyper's error) as
+/// `libsql::Error::Hrana` shows it. Every other text is not a transport
+/// failure, whatever words it holds: an answer of the server (`api error`:
+/// an HTTP status and its body, or a statement's error; a `stream error`),
+/// or a `cursor error`, which comes after the server answered (a read's
+/// rows cut off, or an error the server sent among them).
+const HTTP_ERROR: &str = "hrana: `http error: ";
+
+/// Whether `lower` (an error's text, in lowercase) is libsql's text for a
+/// transport failure of the request ([`HTTP_ERROR`]).
+fn transport(lower: &str) -> bool {
+    lower.starts_with(HTTP_ERROR)
+}
+
 /// Whether `lower` (an error's text, in lowercase) says that an HTTP
-/// connection was lost under the request ([`DROPPED`]), in libsql's
-/// words for a transport failure (`http error`, or a `cursor error` from
-/// reading an answer's body): not a refusal the server sent, and not a
+/// connection was lost under the request ([`DROPPED`]), as a transport
+/// failure ([`transport`]): not an answer the server sent (a refused
+/// token, an error page, whatever its body says), not an answer cut off
+/// after the server began it (a `cursor error`: the connection was alive
+/// when the request went out, so it is not a keep-alive connection closed
+/// while idle; that call fails, latching nothing, as in 2.8.0), and not a
 /// connection that could not be made (`error trying to connect`: nothing
 /// listening, DNS, TLS, the connect timeout), which is a server out of
 /// reach.
 fn dropped(lower: &str) -> bool {
-    (lower.contains("http error") || lower.contains("cursor error"))
+    transport(lower)
         && !lower.contains("error trying to connect")
         && DROPPED.iter().any(|m| lower.contains(m))
 }
@@ -947,14 +973,15 @@ impl Conn {
         }
         // The connection was lost under the request (a keep-alive
         // connection closed while it sat idle, a reset): sent again on a
-        // new connection; when that fails too, the server is out of reach.
+        // new connection once the server has answered the handle; when
+        // that fails too, or before any answer, the server is out of reach.
         if dropped(&lower) {
             return Class {
                 dropped: true,
                 ..unavailable(format!("cannot reach {at}: {text}"), true, true)
             };
         }
-        if lower.contains("http error") || matches!(e, libsql::Error::ConnectionFailed(_)) {
+        if transport(&lower) || matches!(e, libsql::Error::ConnectionFailed(_)) {
             return unavailable(format!("cannot reach {at}: {text}"), true, true);
         }
         if lower.contains("status=403") && op.verb == WRITE.verb {
@@ -1078,10 +1105,11 @@ impl Conn {
     /// holds the database (or the server has no connection free), `f` is
     /// tried again with growing pauses until the deadline; a stream the
     /// server no longer knows is replaced once; a request whose connection
-    /// was lost under it is sent again on a new connection ([`RESEND`],
-    /// [`Conn::renew`]), and latches the breaker only when that fails too
-    /// or the deadline leaves no time for it. A panic in the client is a
-    /// latched `Unavailable`.
+    /// was lost under it, once the server has answered the handle, is sent
+    /// again on a new connection ([`RESEND`], [`Conn::renew`]), and latches
+    /// the breaker only when that fails too or the deadline leaves no time
+    /// for it (before any answer, it latches the breaker at once). A panic
+    /// in the client is a latched `Unavailable`.
     fn run<T, F>(&self, op: Op, bounded_first: bool, mut f: F) -> Result<T, Fail>
     where
         F: for<'a> FnMut(
@@ -1164,7 +1192,14 @@ impl Conn {
                         }
                         continue;
                     }
+                    // Only once the server has answered this handle: before
+                    // that, no connection was kept alive to be lost, and a
+                    // server that accepts and closes without answering is
+                    // out of reach, latched at once and within the first
+                    // answer's bound (each request sent again would get a
+                    // bound of its own).
                     if class.dropped
+                        && self.answered()
                         && let Some(&wait) = RESEND.get(resent)
                         && Instant::now() + wait < deadline
                     {
@@ -1301,23 +1336,38 @@ impl Conn {
     /// **Sending a batch again is safe**, which [`Conn::run`] does when the
     /// connection was lost under it: the server may have committed it and
     /// lost only the answer. It is one transaction ending in `COMMIT`, so
-    /// the server applied all of it or none, and every write vci sends
-    /// converges when applied twice. Its values are literals fixed when
-    /// the batch was built (`put_at`, `stored_at` and the log's `at`
-    /// included), so the same text goes again: the manifests, the
-    /// attestations and the memo are upserts of the same rows (a no-op the
-    /// second time), a removal deletes what is already gone (and
-    /// `remove_manifests` only what is still unreferenced and old), the
-    /// schema's DDL is `IF NOT EXISTS` and its `vci_schema` row and the
-    /// flags `ON CONFLICT DO NOTHING`, and the prunes move `log_floor` up
-    /// to the same value and delete the same rows. Only the change log's
-    /// rows are inserted again, under new `seq`s: a replica reads, for the
-    /// slots and roots the log names after its last sync (`DISTINCT`), the
-    /// server's current rows, so a slot named twice is read once, and one
-    /// named again after a replica synced is read again as it now is; it
-    /// converges. When another writer wrote the same slot in between, the
-    /// batch sent again wins, as it would have had it arrived later
-    /// (concurrent writers of a slot are last-writer-wins anyway). Should
+    /// the server applied all of it or none. Its values are literals fixed
+    /// when the batch was built (`put_at`, `stored_at` and the log's `at`
+    /// included), so the same text goes again, and applied twice in a row
+    /// it leaves the rows as applied once, but for the change log's: the
+    /// manifests, the attestations and the memo are upserts of the same
+    /// rows (a no-op the second time), a removal deletes what is already
+    /// gone (and `remove_manifests` only what is still unreferenced and
+    /// old), the schema's DDL is `IF NOT EXISTS` and its `vci_schema` row
+    /// and the flags `ON CONFLICT DO NOTHING`, and the prunes move
+    /// `log_floor` up to the same value and delete the same rows. The
+    /// change log's rows are inserted again, under new `seq`s, which
+    /// replicas tolerate: a replica reads, for the slots and roots the log
+    /// names after its last sync (`DISTINCT`), the server's current rows,
+    /// so a slot named twice is read once, and one named again after a
+    /// replica synced is read again as it now is; it converges.
+    ///
+    /// The batch sent again is applied after whatever the server applied
+    /// since its first commit, and wins as the last writer in the server's
+    /// order: a write of another handle that followed the first commit,
+    /// and returned, is undone where the two overlap. Its upserts replace
+    /// that writer's newer row of the same slot, memo entry or manifest's
+    /// `put_at`, and its removals delete a key that writer stored again,
+    /// or, for a slot the batch emptied (`DELETE` by test key, signer and
+    /// storage key), whatever that writer stored in the slot. A reader can
+    /// see the batch's rows, then the other writer's, then the batch's
+    /// again (a key removed, stored again, then gone): no order of single
+    /// applications gives that. The window is from the first commit to
+    /// the batch sent again (a few round trips, and at most 0.6 s of
+    /// pauses); vci's removals are of keys superseded and slots emptied,
+    /// and the store is not trusted (every attestation is verified when
+    /// read), so the worst is a miss: a test runs again and its
+    /// attestation is stored again, never a wrong verification. Should
     /// the server keep the transaction of a request that was cut off open,
     /// it holds the write lock until the server expires its stream, and the
     /// batch sent again waits for it as for any other writer, within its
@@ -1575,8 +1625,9 @@ mod tests {
 
     /// A connection lost under a request (libsql's words for hyper's and
     /// the system's errors, on macOS and Linux) is sent again; a
-    /// connection that could not be made, and every answer the server
-    /// sent (a refused token included), is not.
+    /// connection that could not be made, an answer cut off after the
+    /// server began it, and every answer the server sent (a refused token
+    /// included, whatever its body says), is not.
     #[test]
     fn lost_connections_are_told_from_unreachable_servers() {
         let url = Secret::new("http://127.0.0.1:9");
@@ -1603,7 +1654,6 @@ mod tests {
             "http error: `error reading a body from connection: end of file before message length reached`",
             "http error: `operation was canceled: connection closed`",
             "http error: `channel closed`",
-            "cursor error: `error reading a body from connection: Connection reset by peer (os error 54)`",
         ] {
             let c = class(text);
             assert!(c.dropped, "{text}");
@@ -1630,14 +1680,59 @@ mod tests {
             assert!(!c.dropped, "{text}");
             assert!(c.latch, "{text}: an unreachable server latches at once");
         }
+        // An answer the server began (a read's rows) and that was cut off:
+        // that read fails, and nothing is latched, as in 2.8.0.
+        for text in [
+            "cursor error: `error reading a body from connection: Connection reset by peer (os error 54)`",
+            "cursor error: `error reading a body from connection: end of file before message length reached`",
+            "cursor error: `cursor stream ended prematurely`",
+        ] {
+            let c = class(text);
+            assert!(!c.dropped, "{text}");
+            assert!(!c.latch, "{text}: latched");
+            match &c.fail {
+                Fail::Store(e) => {
+                    assert!(!e.to_string().contains("cannot reach"), "{text}: {e}")
+                }
+                Fail::Absent => panic!("{text}: absent"),
+            }
+        }
+        // Answers of the server, whatever words their bodies hold.
+        let says = |text: &str| match class(text) {
+            c if c.dropped => panic!("{text}: sent again"),
+            Class {
+                fail: Fail::Store(e),
+                ..
+            } => e.to_string(),
+            Class { .. } => panic!("{text}: absent"),
+        };
         for text in [
             "api error: `status=401 Unauthorized, body={\"error\":\"Unauthorized: `The JWT is invalid`\"}`",
             "api error: `status=502 Bad Gateway, body=upstream connection reset`",
             "api error: `SQLite error: broken pipe`",
+            "api error: `SQLite error: http error: connection reset by peer`",
             "stream error: `Error { message: \"SQLite error: database is locked\", code: \"SQLITE_BUSY\" }`",
-            "cursor error: `cursor stream ended prematurely`",
+            "stream error: `Error { message: \"http error: `connection closed before message completed`\", code: \"X\" }`",
         ] {
-            assert!(!class(text).dropped, "{text}");
+            says(text);
+        }
+        for (text, said) in [
+            (
+                "api error: `status=502 Bad Gateway, body=upstream: http error: `connection reset by peer``",
+                "status=502",
+            ),
+            (
+                "api error: `status=503 Service Unavailable, body=http error: `connection closed before message completed``",
+                "status=503",
+            ),
+            (
+                "api error: `status=401 Unauthorized, body=http error: `connection reset by peer``",
+                "the server asks for a token",
+            ),
+        ] {
+            let e = says(text);
+            assert!(e.contains(said), "{text}: {e}");
+            assert!(!e.contains("cannot reach"), "{text}: {e}");
         }
     }
 
