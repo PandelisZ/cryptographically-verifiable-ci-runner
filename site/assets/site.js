@@ -7,7 +7,9 @@
     ["get-started.html", "Get started"],
     ["adapters.html", "Test runners"],
     ["examples.html", "Examples"],
+    ["benchmarks.html", "Benchmarks"],
     ["configuration.html", "Configuration"],
+    ["stores.html", "Stores"],
     ["github-actions.html", "GitHub Actions"],
     ["cli.html", "CLI"],
     ["security.html", "How it works"],
@@ -135,7 +137,7 @@
       if (/^\[\[?[\w.-]+\]\]?\s*$/m.test(t) || /^\w[\w.-]* = /m.test(t)) return "toml";
       if (/RSpec\.|\bexpect\(|^\s*(it|describe|require|end)\b|\bdo\s*$/m.test(t)) return "ruby";
       if (/^\s*(def|import|from|assert)\b|pytest\./m.test(t)) return "python";
-      if (/^(\$ |vci |brew |curl |git |cd |export |npm |npx |uv |go |cargo |bundle |mise |ssh-keygen |ln |cat |echo )/m.test(t)) return "bash";
+      if (/^(\$ |vci |brew |curl |git |cd |export |npm |npx |uv |go |cargo |bundle |mise |ssh-keygen |ln |cat |echo |turso |gh )/m.test(t)) return "bash";
       return null;
     };
     var todo = [];

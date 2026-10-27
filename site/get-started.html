@@ -98,6 +98,7 @@ vci init --adapter rails --key ~/.ssh/id_ed25519.pub</code></pre></div>
   <tr><td><code>.vci/allowed_signers</code></td><td class="wrap">Who may sign attestations. Your key is the first entry.</td></tr>
   <tr><td><code>.git-meta</code></td><td class="wrap">Where attestations are exchanged: your <code>origin</code> remote, or the URL you pass with <code>--meta-url</code>. Without either, it is not written.</td></tr>
   </table>
+  <p>By default attestations travel through git, on <code>refs/meta/main</code>, and need no server. To keep them in a SQLite file, PostgreSQL or Turso instead, see <a href="stores.html">choosing a store</a> once this setup works.</p>
   <p>Add <code>--project DIR</code> when the project is not at the repository root, and <code>--principal you@example.com</code> to name the key's owner. For Vitest, <code>--no-install</code> stops <code>vci init</code> from running <code>npm install</code> for the <code>@vci/vitest</code> collector.</p>
 </li>
 <li>
@@ -179,6 +180,7 @@ candidate 1: git-meta path:src/b.test.ts vci:attestation:3b9f…:b6c35e2a042def4
   <a class="card" href="adapters.html"><h3>Your test runner</h3><p>What each adapter records, refuses and needs pinned.</p></a>
   <a class="card" href="examples.html"><h3>Worked examples</h3><p>A full round trip with real output, and a setup for each runner.</p></a>
   <a class="card" href="configuration.html"><h3>Configure vci.toml</h3><p>Policy, environment variables, several projects.</p></a>
+  <a class="card" href="stores.html"><h3>Choose a store</h3><p>git-meta, SQLite, PostgreSQL or Turso, and how to set each up.</p></a>
 </div>
 </main>
 </div>

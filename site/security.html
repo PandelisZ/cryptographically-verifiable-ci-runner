@@ -44,7 +44,7 @@
 <p>Each adapter has its own list; see <a href="adapters.html">test runners</a>.</p>
 
 <h2 id="storage">Where attestations live</h2>
-<p>vci has no database, server or storage format of its own. Attestations are git metadata, pushed and fetched like any other ref:</p>
+<p>vci has no storage format of its own. By default attestations are git metadata, pushed and fetched like any other ref. Since 2.8.0 they can live in a SQLite file, on PostgreSQL or in a Turso database instead (<a href="stores.html">choosing a store</a>); the checks below are the same whichever store holds them, since no store is trusted.</p>
 <img src="assets/diagrams/storage.svg" alt="Your git remote holds ordinary branches plus refs/meta/main, managed by git-meta. Inside refs/meta/main each unit's path, such as path:spec/models/order_spec.rb, holds keys of the form vci:attestation:unit:signer:inputs whose value is the signed envelope. One value per unit, signer and inputs. Metadata is not trusted on its own: a value causes a skip only if its signature verifies and every input matches, and deleting one only makes a test run." width="756" height="354" loading="lazy" style="width:100%;height:auto">
 <p>Each attestation is one <a href="https://git-meta.com/">git-meta</a> value attached to the unit's path:</p>
 <pre><code>git meta get path:src/b.test.ts</code></pre>

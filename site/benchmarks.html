@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks · vci</title>
+<meta name="description" content="What vci costs and saves, measured: vex's Rails suite in production, the plan step release by release, signing and storing a run, and the attestation stores side by side.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="toc"><h2>On this page</h2></aside>
+<main>
+<h1>Benchmarks</h1>
+<p class="lede">What vci costs and what it saves, as measured. Every number says where and when it was taken, and links to the notes it comes from.</p>
+
+<p>The chart on the <a href="index.html#what-it-saves">overview</a> is a model. This page has measurements only: production CI jobs of one large Rails suite, the plan step across fifteen releases, and synthetic stores on a laptop. Where two readings of the same thing disagree, both are here.</p>
+
+<h2 id="vex-rails">vex's Rails suite in production</h2>
+<p><a href="https://github.com/ComposalAI/vex">ComposalAI/vex</a> is a Rails application with 2,078 test files on 23 October 2026 (2,230 by the 25th), split over two CI jobs per pull request, with a seeded MySQL database and 16 test slots per job. Everything below is read from its GitHub Actions runs: the job logs, with vci's <code>VCI_TIMING</code> lines, and the jobs API for each step's start and end.</p>
+
+<h3 id="vex-rails-jobs">23 to 25 October: minutes per job</h3>
+<figure class="barchart">
+<figcaption>Median minutes per Rails job, container start to job end. vci 2.7.18 to 2.7.32.</figcaption>
+<div class="bar-row"><span class="bar-label">without vci, as first reported<small>13 to 19 October, 769 jobs</small></span><span class="bar-track" aria-hidden="true"><span class="bar plain" style="width:37.6%"></span></span><span class="bar-value">3.5 min</span></div>
+<div class="bar-row"><span class="bar-label">without vci, read again from the jobs API<small>16 and 17 October, 341 jobs</small></span><span class="bar-track" aria-hidden="true"><span class="bar plain" style="width:48.4%"></span></span><span class="bar-value">4.5 min</span></div>
+<div class="bar-row"><span class="bar-label">with vci, little changed<small>90% or more skipped; 6 jobs on 2.7.27 to 2.7.30</small></span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:31.2%"></span></span><span class="bar-value">2.9 min</span></div>
+<div class="bar-row"><span class="bar-label">with vci, a shared file changed<small>137 to 543 files ran; 4 jobs</small></span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:41.9%"></span></span><span class="bar-value">3.9 min</span></div>
+<div class="bar-row"><span class="bar-label">with vci, everything re-ran and was attested<small>2,078 files; 2 jobs on 2.7.30</small></span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:62.4%"></span></span><span class="bar-value">5.8 min</span></div>
+<div class="bar-row"><span class="bar-label">the same on vci 2.7.18<small>23 October, 16 jobs</small></span><span class="bar-track" aria-hidden="true"><span class="bar before" style="width:100%"></span></span><span class="bar-value">9.3 min</span></div>
+<div class="legend"><span class="plain">without vci</span><span>with vci</span><span class="before">before fifteen releases of speed work</span></div>
+</figure>
+<p>The first plain row and the rows with vci are from <a href="examples.html#measured-vex-rails">Measured on vex's Rails tests</a> and <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/CI-IS-THE-BOTTLENECK.md">CI is the bottleneck</a>, read from the logs of 23 to 25 October. A job where little changed was shorter than the plain job; a job where everything re-ran was longer, because each file runs in its own process so its inputs can be recorded, and about a thousand attestations are then signed, stored and pushed.</p>
+<p>The plain figure did not hold up. Read again from the jobs API on 25 October (<a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/notes-rails-cost.md">notes-rails-cost.md</a>), the plain jobs of 16 and 17 October took a median of 272 s (application 261 s, services 284 s), and those of 18 October 304 and 318 s: 4.5 to 5.3 minutes, not 3.5. The 3.5 could not be reproduced. Since then the MySQL service image is pulled on every job, which takes container setup from 20 s to 48 s, plain or not.</p>
+
+<h3 id="vex-rails-25-october">25 October, vci 2.7.32: 143 jobs by runner kind</h3>
+<p>vex's runner pool hands out two kinds of host. The kind with 94,750 MiB of memory runs a test file's process in 4 to 5 s; the kind with 257,583 MiB takes 9 to 12 s, so every median here is per kind.</p>
+<table>
+<tr><th>Files this job ran</th><th>Fast runners: job, vci step</th><th>Slow runners: job, vci step</th></tr>
+<tr><td>60 or fewer</td><td>437 s, 297 s (10 jobs)</td><td>686 s, 348 s (10 jobs)</td></tr>
+<tr><td>61 to 900 (a shared file)</td><td>472 s, 261 s (31 jobs)</td><td>1,133 s, 686 s (9 jobs)</td></tr>
+<tr><td>more than 900 (everything)</td><td>682 s, 534 s (57 jobs)</td><td>1,423 s, 999 s (25 jobs)</td></tr>
+</table>
+<p>Against the plain 272 to 318 s, every case was longer on that day. The files that still ran after a small change were mostly long <code>persistent_agents</code> tests (90 to 280 s each, run as shards), so even the "little" case spent 186 s in its Ruby batch. A full re-run's 534 s on a fast runner was, in medians: the plan 23 s, the Ruby batch 406 s, checking, signing and storing 13 s, and the push 49 s. 57 of the 143 pushes went through a <code>git merge-tree</code> that failed after 8 to 55 s and then git-meta's own merge of 10 to 67 s; 2.7.34 and 2.7.35 fixed that (below).</p>
+
+<h3 id="vex-rails-same-runner">26 October: the same files, plain and with vci, on the same runner</h3>
+<p>A manual workflow ran the <code>application</code> group (1,072 files, 6,463 tests) once per variant per job, with no store, no push and no shards:</p>
+<table>
+<tr><th>Variant</th><th>Runner</th><th>Result</th></tr>
+<tr><td class="wrap">plain <code>bin/rails test</code>, eager-loaded, 16 workers, as CI runs it</td><td>fast</td><td class="wrap"><code>Finished in</code> 340 to 346 s (four jobs)</td></tr>
+<tr><td class="wrap"><code>vci run</code>, 16 slots, as shipped</td><td>fast</td><td class="wrap">372 and 384 s (two jobs); a process 3.1 to 3.2 s on average</td></tr>
+<tr><td class="wrap">plain, lazily loaded, as vci loads</td><td>slow</td><td>638 s</td></tr>
+<tr><td class="wrap"><code>vci run</code>, 16 slots</td><td>slow</td><td class="wrap">674 and 696 s; a process 6.5 s on average</td></tr>
+</table>
+<p>On the same runner, vci's batch cost about what the plain run cost. The slowest file, unsharded, ran 284 to 319 s in one process and ended every vci batch, where the plain run spreads its tests over the workers. Loading the application before the slots fork made each process slower on the slow kind (7.9 s against 6.5 s); a compile cache and <code>Process.warmup</code> changed nothing measurable.</p>
+
+<h3 id="vex-rails-new-job">26 October: the new job, vci 2.7.35 and 2.7.36</h3>
+<p>At 00:30 UTC on 26 October vex moved its pull-request Rails jobs to 4-core runners with file-backed SQLite and 4 or 8 slots, running 1,618 of the 2,232 files. So the three cases above cannot be measured again on the old job. These are the 32 pull-request jobs that finished between 04:46 and 17:45 UTC that day:</p>
+<table>
+<tr><th>vci</th><th>Files ran</th><th>Jobs</th><th>Job, median (range)</th><th><code>vci run</code> step</th><th>Plan step</th><th>Publish step</th></tr>
+<tr><td>2.7.35</td><td>3 to 25</td><td>6</td><td>202 s (96 to 907)</td><td>66 s</td><td>18 s</td><td>22 s</td></tr>
+<tr><td>2.7.35</td><td>276</td><td>1</td><td>1,742 s</td><td>1,237 s</td><td>44 s</td><td>67 s</td></tr>
+<tr><td>2.7.35</td><td>816</td><td>1</td><td>786 s</td><td>683 s</td><td>19 s</td><td>26 s</td></tr>
+<tr><td>2.7.36</td><td>5 to 24</td><td>8</td><td>598 s (451 to 644)</td><td>182 s</td><td>22 s</td><td>24 s</td></tr>
+<tr><td>2.7.36</td><td>195 to 197</td><td>2</td><td>635 s (510 to 760)</td><td>218 s</td><td>22 s</td><td>38 s</td></tr>
+<tr><td>2.7.36</td><td>808 to 832</td><td>14</td><td>742 s (334 to 1,173)</td><td>406 s</td><td>22 s</td><td>27 s</td></tr>
+</table>
+<p>Three things outside vci dominate these medians. GitHub's cache restores took about 140 s each from about noon UTC, so the part of a job outside vci's steps was a median of 358 s on the 2.7.36 jobs against 72 s on the 2.7.35 ones. Two pull requests had 13 and 16 files failing for real, and each failing file runs again alone to tell a slot effect from a real failure. And 14 of the 24 jobs on 2.7.36 re-ran everything, because master had not yet been attested in that release's mode and the SQLite lane's attestations were new. For comparison, vex's own cold plain run of that lane took 12 min 28 s and 12 min 42 s per shard on 4 workers.</p>
+<p>The push fix held: in those 32 jobs no <code>git merge-tree</code> failed, the seven jobs whose other job had pushed first merged in 0.5 to 2.4 s, and the publish step took a median of 22 to 27 s.</p>
+
+<h2 id="plan-step">The plan step, release by release</h2>
+<p>The plan is what every job pays, whatever it runs. These are vex's Rails plans from 23 to 25 October 2026, 266 in all, read from the GitHub Actions logs.</p>
+<figure class="barchart">
+<figcaption>Median seconds for <code>vci plan</code> on vex's Rails jobs.</figcaption>
+<div class="bar-row"><span class="bar-label">2.7.18<small>23 October, 35 plans; p90 77 s</small></span><span class="bar-track" aria-hidden="true"><span class="bar before" style="width:100%"></span></span><span class="bar-value">67 s</span></div>
+<div class="bar-row"><span class="bar-label">2.7.19<small>pull requests</small></span><span class="bar-track" aria-hidden="true"><span class="bar before" style="width:47.8%"></span></span><span class="bar-value">32 s</span></div>
+<div class="bar-row"><span class="bar-label">2.7.27 to 2.7.32<small>24 October evening on, 29 pull-request plans; p90 27 s</small></span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:22.4%"></span></span><span class="bar-value">15 s</span></div>
+<div class="bar-row"><span class="bar-label">2.7.27 to 2.7.32, quietest jobs</span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:6.6%"></span></span><span class="bar-value">4.0 to 4.4 s</span></div>
+</figure>
+<table>
+<tr><th>vci</th><th>Plan, median</th><th>What changed</th></tr>
+<tr><td>2.7.18 (23 Oct)</td><td>67 s (35 plans; p90 77 s)</td><td class="wrap">the version measured first</td></tr>
+<tr><td>2.7.19</td><td class="wrap">32 s pull requests, 21 s master</td><td class="wrap">the store remembers what each blob names and which trees are complete</td></tr>
+<tr><td>2.7.22 to 2.7.26 (24 Oct, morning)</td><td class="wrap">master 10.5 s (9 of 20 plans under 10 s; best 6.5 s)</td><td class="wrap">Rails boots beside the fetch; candidates read in one batch; only the newest few read first; store warmed in the background</td></tr>
+<tr><td>2.7.27 to 2.7.32 (24 Oct evening on)</td><td class="wrap">15 s pull requests (29 plans; p90 27 s), 15 s master; 4.0 to 4.4 s on the quietest jobs</td><td class="wrap">completeness walks only new objects; the metadata commit is one fast-import; the plan remembers which attestation passed per unit per tree; no second round after an inputs failure; the tip listing kept as one blob</td></tr>
+</table>
+<p>Of the 15 seconds, over the last twelve pull-request plans of that period: 7.4 s fetching and merging the attestations master pushed since the job's cache was saved, 2.1 s downloading the attestation files the verdicts need, 1.6 s re-hashing inputs, 1.1 s for a second look at units that did not pass, and 0.7 s reading candidates. The fetch is git-meta's structural cost; a shared store answers a plan in a few requests instead (<a href="#stores">below</a>).</p>
+<p>Two later readings, from <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/notes-rails-cost.md">notes-rails-cost.md</a>: on 25 October, 2.7.32's plans took a median of 25 s (p90 46 s), 11.7 s of it fetching and merging; on 26 October, on the new 4-core job, the action's plan step took a median of 18 to 22 s, of which vci's own <code>plan total</code> was 4.6 to 4.8 s and the rest installing vci and warming the store.</p>
+
+<h2 id="check-sign-store">Checking, signing and storing a run</h2>
+<p>After its tests, <code>vci run</code> checks each unit, signs its attestation and stores it. 2.8.0 signs in process (ed25519 and ECDSA key files, and through <code>ssh-agent</code>) instead of starting <code>ssh-keygen</code> per unit, and writes a project's units in one transaction instead of a commit per write. Measured on a synthetic module of 1,200 Go packages, on a 14-core Mac busy with other work, medians of three runs, on 25 October 2026 (<a href="releases.html#v2-8-0">2.8.0 release notes</a>):</p>
+<figure class="barchart">
+<figcaption>Seconds for <code>vci run</code>'s check, sign and store step, 1,200 units.</figcaption>
+<div class="bar-row"><span class="bar-label">git-meta, before</span><span class="bar-track" aria-hidden="true"><span class="bar before" style="width:100%"></span></span><span class="bar-value">1.57 s</span></div>
+<div class="bar-row"><span class="bar-label">git-meta, 2.8.0</span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:22.3%"></span></span><span class="bar-value">0.35 s</span></div>
+<div class="bar-row"><span class="bar-label">SQLite, before</span><span class="bar-track" aria-hidden="true"><span class="bar before" style="width:91.7%"></span></span><span class="bar-value">1.44 s</span></div>
+<div class="bar-row"><span class="bar-label">SQLite, 2.8.0</span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:20.4%"></span></span><span class="bar-value">0.32 s</span></div>
+<div class="bar-row"><span class="bar-label">PostgreSQL, before</span><span class="bar-track" aria-hidden="true"><span class="bar before" style="width:62.4%"></span></span><span class="bar-value">0.98 s</span></div>
+<div class="bar-row"><span class="bar-label">PostgreSQL, 2.8.0</span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:17.2%"></span></span><span class="bar-value">0.27 s</span></div>
+<div class="legend"><span class="before">before the change (ssh-keygen per unit, a commit per write)</span><span>2.8.0</span></div>
+</figure>
+<p>The units are still checked one per CPU at a time: twice as many threads as cores grew the check's thread-seconds by half and did not shorten the step. On a heavily loaded machine, SQLite wrote a 1,200-unit run's 2,400 records in 4.8 s with a commit each, and in 0.9 s as one transaction.</p>
+
+<h2 id="stores">The attestation stores side by side</h2>
+<div class="note warn">
+<p><strong>Read these as relative numbers.</strong> They were measured for 2.8.0 on 24 and 25 October 2026 on a laptop, against a PostgreSQL server and a <code>sqld</code> 0.24.32 on the same machine, so no request crossed a network. During the first table other work kept the laptop at a load average of 35 to 315, and whole plans swung from 14 to 65 s in every store alike, mostly rehashing inputs: only the store's own timing lines compare.</p>
+</div>
+<p>The synthetic world: 1,200 Go packages, each attested at three commits, so 3,600 attestations of about 3 KB and 3,601 input manifests, written by three <code>vci run</code>s; macOS arm64, release build, two repetitions (<a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/STORE-BACKENDS.md">STORE-BACKENDS.md</a>, section 18, "Measured").</p>
+<table>
+<tr><th>Step</th><th>SQLite file (and libSQL's local file)</th><th>libSQL server, remote</th><th>libSQL, replica</th></tr>
+<tr><td class="wrap">plan, every unit skips: listings and chosen values</td><td class="wrap">0.01 s (1,200 listings, 2,400 values)</td><td class="wrap">0.42 to 0.57 s for 1,200 units and values in 4 requests (3.5 s at the worst load), then 1,200 more values in one request, 0.04 to 0.06 s</td><td class="wrap">the sync, then as SQLite</td></tr>
+<tr><td class="wrap">plan, every unit runs (its second round)</td><td>0.01 s</td><td class="wrap">0.15 to 0.38 s for 3,600 values in 2 requests (1.7 and 3.3 s at the worst load)</td><td>as SQLite</td></tr>
+<tr><td class="wrap">the replica's sync</td><td></td><td></td><td class="wrap">everything (7,201 records): 0.6 to 9.3 s, median 3.4 s; nothing new: 0.01 to 0.04 s</td></tr>
+<tr><td class="wrap"><code>vci run</code>, 1,200 units edited: the store's writes</td><td class="wrap">2,400 records in one transaction, 0.20 to 0.76 s</td><td class="wrap">1,200 manifests and 1,200 attestations in one request, 0.14 to 0.25 s</td><td class="wrap">that request, then 2,400 records written to the file, 0.10 to 0.11 s</td></tr>
+<tr><td class="wrap"><code>vci run</code>: check, sign and store</td><td>0.47 to 1.80 s</td><td class="wrap">0.35 to 1.11 s into an empty namespace; 1.08 to 2.37 s into the filled one</td><td>0.80 to 1.03 s</td></tr>
+</table>
+<p>PostgreSQL, on a synthetic world of 600 Go units attested at three commits (1,800 attestations of about 3,100 bytes, 1,801 manifests of about 490 bytes), one connection, debug build, measured with a byte-counting proxy and <code>pg_stat_statements</code> (STORE-BACKENDS.md, section 17):</p>
+<table>
+<tr><th>Plan</th><th>Client to server</th><th>Server to client</th><th>Statements</th></tr>
+<tr><td>unchanged: all 600 skip</td><td>510,857 B</td><td class="wrap">5,380,920 B (5.13 MiB, about 9.0 KB a unit)</td><td>9</td></tr>
+<tr><td>every unit edited: all run</td><td>741,399 B</td><td class="wrap">11,916,040 B (11.36 MiB, about 19.9 KB a unit)</td><td>10</td></tr>
+<tr><td class="wrap">reverted to the oldest: all skip in the second round</td><td>897,879 B</td><td>11,916,148 B</td><td>12</td></tr>
+</table>
+<p>These manifests are tiny. On a real repository input manifests, often megabytes, dominate the bytes; none of this was measured on vex.</p>
+<p>Request and statement counts, from the stores' tests:</p>
+<ul>
+<li>PostgreSQL: a plan of 1,200 units in 14 statements (the test allows 15), and 0 more for 1,200 manifest reads from 8 threads; a 1,000-unit batch written in 5 statements, <code>BEGIN</code> and <code>COMMIT</code> included.</li>
+<li>libSQL, release build against a local <code>sqld</code>: 1,200 units of 18 KB written in 0.64 s and 8 requests, then listed and read on a new handle in 0.10 s and 4 requests; synced into a new replica in 0.41 s and read from it in 11 ms. A plan's status and a prefetch of 300 units take at most 8 requests.</li>
+<li>SQLite: 1,200 units of 18 KB listed and read in about 8 ms, release build.</li>
+</ul>
+
+<h2 id="turso-hosted">Turso's hosted service from a GitHub runner</h2>
+<div class="note">
+<p><strong>Being measured on vex. No numbers yet.</strong> Every number above was taken against a server on the same machine. Against Turso's hosted service, each request crosses the internet from the runner.</p>
+</div>
+<p>What is known without measuring: a plan reads a libSQL server in about a dozen round trips whatever the number of units (the status, the flags, the memo, the prefetches, one read, the memo's write, and the first description of each statement on each connection), plus the bytes of the values it reads, about 11 MB for the 3,600 attestations of the synthetic store above. A replica with nothing new to sync costs one request. This section will give, for vex's Rails jobs on GitHub-hosted runners: the plan's store time and request count in remote and replica mode, the replica's first sync on a fresh runner, and the time to store a full run's attestations.</p>
+
+<h2 id="elsewhere">Other measurements</h2>
+<ul>
+<li><a href="examples.html#measured">Measured on this repository</a>: the demo projects, 21 units, with vci 1.5.0. A job with nothing changed costs about two seconds; attesting costs about 1.5 s per test file or package on top of its tests.</li>
+<li><a href="examples.html#measured-vex">Measured on vex-web</a>: 253 <code>node --test</code> files, 17 s plain against 8 s with nothing changed, with vci 1.5.0.</li>
+</ul>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

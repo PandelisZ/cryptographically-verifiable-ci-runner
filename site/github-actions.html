@@ -122,7 +122,7 @@ jobs:
 <h2>What the action does</h2>
 <ol>
 <li>Installs <code>vci</code> in about a second: the release binary recorded in the pinned action's <code>release/manifest.txt</code>, its checksum verified against that file. The action never compiles <code>vci</code> in your CI. When no published binary fits (the action is pinned to a commit that is not a release, or the download fails) it fails at once with an error that says what to do (see <a href="#prebuilt-binaries">prebuilt binaries</a>).</li>
-<li>Runs <code>vci fetch --remote origin</code>. This fetches <code>refs/meta/main</code>, the git ref where attestations live. A <code>contents: read</code> token is enough. Since vci 2.0 it downloads the keys, not the values (about 2 MB for a store of thousands of attestations, whatever its history), and the plan then fetches, in one batch, the attestations it verifies and the input manifests they reference. If the fetch fails, it warns and every test runs; a value that cannot be fetched makes its unit run.</li>
+<li>Runs <code>vci fetch --remote origin</code>. This fetches <code>refs/meta/main</code>, the git ref where attestations live by default (on a <a href="#shared-store">shared store</a> there is nothing to fetch, and the remote is ignored with a warning). A <code>contents: read</code> token is enough. Since vci 2.0 it downloads the keys, not the values (about 2 MB for a store of thousands of attestations, whatever its history), and the plan then fetches, in one batch, the attestations it verifies and the input manifests they reference. If the fetch fails, it warns and every test runs; a value that cannot be fetched makes its unit run.</li>
 <li>Runs <code>vci plan</code> and writes the plan to the job summary.</li>
 <li>Runs <code>vci ci</code>: it runs every unit that was not skipped and writes an audit log. The job fails if any test fails.</li>
 <li>With <code>signing-key</code> (or keylessly, with <code>oidc</code>): it attests every unit that ran and passed, and pushes the attestations to <code>refs/meta/main</code>, so the next commit skips each unit whose inputs did not change. See <a href="#attesting-in-ci">attesting in CI</a>.</li>
@@ -302,6 +302,18 @@ environment = "vci-attest"</code></pre>
 </li>
 </ol>
 <p>A stolen certificate is worthless ten minutes later and its key never leaves the job's memory. What stays the same: any step of the attesting job can ask for a token while the job runs, so the identity main skips on must only match runs on main (pin <code>ref</code>, <code>event</code> and, best, an environment restricted to the default branch). <code>vci ci --oidc</code> refuses to attest, like <code>--key</code>, when the job's identity signs as a principal of <code>no_skip_refs_except</code> on a ref <code>no_skip_refs</code> does not match. Verification is offline: the certificate must chain to the committed trust root, a trusted timestamp must place the signature inside the certificate's ten minutes, its repository and workflow URIs must be on the issuer's host (<code>github.com</code> for GitHub's issuer), and the certificate's identity must match an <code>[[identity]]</code>. Pull request runs and main runs of one workflow file are separate signers in the store, so a pull request's attestation never replaces main's. Anything else makes the unit run, and <code>vci explain</code> names the check. Details: <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/blob/main/docs/GITHUB_ACTIONS.md#keyless-attestation-oidc">docs/GITHUB_ACTIONS.md</a>.</p>
+
+<h2 id="shared-store">With a shared store</h2>
+<p>When attestations live on PostgreSQL or in a Turso database instead of <code>refs/meta/main</code>, each job gets the store's address and credential from secrets, and nothing else in the workflow changes:</p>
+<pre><code>    env:
+      VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
+      VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}   <span class="c"># Turso; PostgreSQL's password is in the URL</span></code></pre>
+<ul>
+<li>Give pull-request jobs a read-only token (or a PostgreSQL role that can only read), and the main-branch job, in the <code>vci-attest</code> environment, one that can write. Every step of a job can read its environment, and so can the tests.</li>
+<li>On a shared store <code>vci ci</code> stores only with <code>--push</code>, which the action passes with <code>signing-key</code> or <code>oidc</code>. The push writes to the store, not to git, so the job needs no <code>contents: write</code> for it.</li>
+<li>Keep <code>fetch-depth: 0</code>: the store names each repository's records after its first commit, which a shallow clone does not have.</li>
+</ul>
+<p>Step by step, with the <code>turso</code> and <code>gh secret set</code> commands: <a href="stores.html#turso">set up Turso</a>.</p>
 
 <h2 id="splitting-a-suite-over-jobs">Splitting a suite over jobs</h2>
 <p>A suite too slow for one runner runs as a matrix of <code>N</code> jobs with <code>partition: I/N</code> (<code>vci ci --partition I/N</code>, since 2.0). Each job plans the same way, then runs only its share of what the plan runs: a unit belongs to the partition its test id hashes to, so the split is the same in every job and on every machine, and every unit runs in exactly one job. What the plan skips is skipped in every job. With <code>signing-key</code> or <code>oidc</code>, each job attests and pushes its own share, and the next commit's plan skips all of it.</p>

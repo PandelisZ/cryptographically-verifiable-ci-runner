@@ -42,7 +42,7 @@ vci turns "I ran the tests" into something CI can check.
 
 1. **Record.** `vci run` executes the tests with a collector attached to the test runner. The collector observes every file the test read, every file it looked for and did not find, every directory it listed, every package it loaded and every environment variable it consulted. vci hashes all of it.
 2. **Sign.** The result (what ran, against which hashes, with which toolchain, by whom) is signed with the developer's or agent's SSH key as an [in-toto](https://in-toto.io/) attestation.
-3. **Share.** The attestation is stored as [git-meta](https://git-meta.com/) metadata on the test's path and pushed with `vci push`. It travels through git; there is no server and no database.
+3. **Share.** The attestation is stored as [git-meta](https://git-meta.com/) metadata on the test's path and pushed with `vci push`. It travels through git; there is no server and no database. Since 2.8.0 it can live in a SQLite file, on PostgreSQL or in a Turso database instead ([choosing a store](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html)).
 4. **Verify.** In CI, `vci ci` reads the trusted keys and policy from the *base* branch, checks each signature, re-hashes every recorded input from CI's own checkout, and skips a test only when everything matches. Then it runs the rest.
 
 ## Why it is safe
@@ -188,6 +188,8 @@ Or per tool:
 | [Get started](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/get-started.html) | Requirements, install, repository setup, agents |
 | [Examples](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/examples.html) | A full round trip with real output; setup per runner; what refusals look like |
 | [Test runners](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/adapters.html) | What each adapter records, refuses and needs pinned |
+| [Choosing a store](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html) | git-meta, SQLite, PostgreSQL or Turso: which to pick, setup step by step, keeping the credentials safe |
+| [Benchmarks](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/benchmarks.html) | Every measurement, with its source and date |
 | [How it works](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/security.html) | Attestations, verification, threat model |
 | [Reference](docs/REFERENCE.md) | Everything, in one long document |
 | [Design notes](docs/PLAN.md) | The original plan and the research behind it |
