@@ -130,7 +130,10 @@
 //!    backend understands is [`StoreError::Incompatible`].
 //! 9. **Secrets stay secret.** No error, `Debug` output, location or timing
 //!    line carries a password. Backends pass their libraries' messages
-//!    through [`select::Secret::scrub`].
+//!    through [`select::Secret::scrub`]. A credential `[store]
+//!    token_command` prints ([`credential`]) is fetched when the backend
+//!    first connects ([`select::Selection::token_credential`]), never when
+//!    it opens, and scrubbed the same way ([`credential::Credential::scrub`]).
 //!
 //! ## Timing
 //!
@@ -172,6 +175,8 @@ pub use key::{
     envelope_manifest_ref, manifest_key, parse_key, parse_key_hint, parse_manifest_key,
     target_label, test_key,
 };
+
+pub mod credential;
 
 // ---- value states ------------------------------------------------------------
 
@@ -1986,21 +1991,38 @@ pub mod select {
     //!    selects postgres, `sqlite:` selects sqlite, `libsql://` selects
     //!    libsql (an `https://` URL selects nothing: name the backend).
     //! 3. `[store] backend` in the working tree's `vci.toml`.
-    //! 4. `git-meta`.
+    //! 4. The scheme of `[store] url` (as for `VCI_STORE_URL`), when
+    //!    `VCI_STORE_URL` is unset.
+    //! 5. `git-meta`.
     //!
     //! Every other setting: the environment, then `vci.toml`, then the
-    //! default. A server's address and credentials come only from
-    //! `VCI_STORE_URL` and `VCI_STORE_TOKEN`, never from `vci.toml`, which
-    //! every checkout carries (a pull request's too): a URL, host, user,
-    //! password, token or database name there is refused, naming the key and
-    //! never its value. The command line reads `VCI_STORE_URL`,
-    //! `VCI_STORE_TOKEN` and `VCI_STORE` once at start-up and removes them
-    //! from its own environment, so no test process, adapter or hook ever
-    //! sees them ([`NEVER_TO_CHILDREN`]).
+    //! default. `vci.toml`, which every checkout carries (a pull request's
+    //! too), may say where a server is (`[store] url`, without a credential)
+    //! and how to fetch its credential (`[store] token_command`,
+    //! [`crate::credential`]), never the credential itself: a URL holding a
+    //! password, a token or a fragment, and the per-backend `url`, `host`,
+    //! `user`, `password`, `dbname`, `token` and `authToken`, are refused,
+    //! naming the key and never its value. `VCI_STORE_URL` wins over `[store]
+    //! url`, and the credential is `VCI_STORE_TOKEN`, else the URL's own
+    //! (`authToken`, a PostgreSQL password), else what `token_command`
+    //! prints.
+    //!
+    //! **A credential from the environment is only ever sent to a URL from
+    //! the environment**: `VCI_STORE_TOKEN` with the URL from `vci.toml` is
+    //! refused (set `VCI_STORE_URL` too), since a pull request could
+    //! otherwise point CI's secret at a server of its own. The command line
+    //! reads `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` once at
+    //! start-up and removes them from its own environment, so no test
+    //! process, adapter, hook or token command inherits them
+    //! ([`NEVER_TO_CHILDREN`]). A process that reads another's environment
+    //! (`/proc/<pid>/environ`, `ps eww`) still finds them in the one vci,
+    //! or the shell that set them, started with: a CI job that runs
+    //! untrusted code should hold a read-only credential, or none.
     //!
     //! This module only parses and validates. The command line turns a
     //! [`Selection`] into a store through the registered
-    //! [`crate::BackendFactory`]s.
+    //! [`crate::BackendFactory`]s; a backend runs the token command, if it
+    //! needs one, when it first connects ([`Selection::token_credential`]).
 
     use std::collections::BTreeMap;
     use std::fmt;
@@ -2008,7 +2030,8 @@ pub mod select {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::StoreError;
+    pub use crate::credential::{Credential, TokenCommand};
+    use crate::{OpenContext, StoreError};
 
     /// Selects the backend by name.
     pub const ENV_STORE: &str = "VCI_STORE";
@@ -2048,8 +2071,9 @@ pub mod select {
     ];
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
-    /// again, so that they never reach a test, an adapter or a hook (other
-    /// `VCI_*` variables pass through as built-in ignore). `VCI_STORE` is
+    /// again, so that no test, adapter or hook inherits them (other `VCI_*`
+    /// variables pass through as built-in ignore). The environment vci
+    /// started with still holds them, for a process that reads it. `VCI_STORE` is
     /// one of them because a connection string put there by mistake would
     /// otherwise reach every test.
     pub const NEVER_TO_CHILDREN: &[&str] = &[ENV_STORE, ENV_STORE_URL, ENV_TOKEN];
@@ -2103,10 +2127,11 @@ pub mod select {
         /// `[store.sqlite]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sqlite: Option<SqliteSettings>,
-        /// `[store.postgres]` (tuning only, never an address).
+        /// `[store.postgres]` (tuning only: the address is `[store] url`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub postgres: Option<PostgresSettings>,
-        /// `[store.libsql]` (never an address or a token).
+        /// `[store.libsql]` (never an address or a token: `[store] url` and
+        /// `[store] token_command`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub libsql: Option<LibsqlSettings>,
         /// `[store.options]`: non-secret string settings for backends this
@@ -2114,9 +2139,23 @@ pub mod select {
         /// factory reads them and refuses the ones it does not know.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub options: BTreeMap<String, String>,
-        /// Refused ([`StoreSettings::check`]).
-        #[serde(default, skip_serializing)]
-        pub url: Option<Refused>,
+        /// The server: a `libsql://`, `https://`, `http://`, `postgres://` or
+        /// `postgresql://` URL without a credential ([`StoreSettings::check`]
+        /// refuses a password, a token, any userinfo but a PostgreSQL user,
+        /// and a fragment). `VCI_STORE_URL` wins over it. Kept as a
+        /// [`Secret`] (until checked it may hold one) and never written back.
+        #[serde(default, skip_serializing, deserialize_with = "file_url")]
+        pub url: Option<Secret>,
+        /// How to fetch the server's credential when the environment gives
+        /// none: a command that prints it ([`crate::credential`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub token_command: Option<TokenCommand>,
+    }
+
+    /// `[store] url`, as a [`Secret`] so that no `Debug` of the settings
+    /// prints a credential put there by mistake.
+    fn file_url<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Secret>, D::Error> {
+        String::deserialize(d).map(|s| Some(Secret::new(s)))
     }
 
     /// `[store.sqlite]`.
@@ -2130,7 +2169,9 @@ pub mod select {
         pub path: Option<String>,
     }
 
-    /// `[store.postgres]`: everything except how to connect.
+    /// `[store.postgres]`: everything except how to connect (the server is
+    /// `[store] url`, its password from the environment or `[store]
+    /// token_command`).
     #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     pub struct PostgresSettings {
@@ -2167,7 +2208,7 @@ pub mod select {
     }
 
     /// `[store.libsql]`: everything except where the server is and how to
-    /// sign in.
+    /// sign in (`[store] url` and `[store] token_command`).
     #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     pub struct LibsqlSettings {
@@ -2177,9 +2218,9 @@ pub mod select {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub path: Option<String>,
         /// Read a local replica of the remote database named by
-        /// `VCI_STORE_URL` (synced when it is first read, and at each later
-        /// prefetch) instead of
-        /// asking the server for every read.
+        /// `VCI_STORE_URL` or `[store] url` (synced when it is first read,
+        /// and at each later prefetch) instead of asking the server for
+        /// every read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub replica: Option<bool>,
         /// The namespace of this repository's records on a shared database
@@ -2198,15 +2239,15 @@ pub mod select {
     }
 
     impl StoreSettings {
-        /// Refuse connection settings in `vci.toml`. A password there would
-        /// be public, and a host there would let a pull request send CI's
-        /// credentials to a server it controls. The error names the keys,
-        /// never their values.
+        /// Refuse credentials in `vci.toml`, which every checkout carries (a
+        /// pull request's too): a password or a token there would be
+        /// public. The server's address has one place, `[store] url`,
+        /// checked by `check_file_url`; the per-backend address and
+        /// credential keys are refused, and a malformed `token_command`.
+        /// Errors name the keys, never their values. (Where a credential
+        /// from the environment may be sent is [`resolve`]'s rule.)
         pub fn check(&self) -> Result<(), StoreError> {
             let mut found = Vec::new();
-            if self.url.is_some() {
-                found.push("store.url");
-            }
             if let Some(p) = &self.postgres {
                 for (name, present) in [
                     ("store.postgres.url", p.url.is_some()),
@@ -2231,14 +2272,87 @@ pub mod select {
                     }
                 }
             }
-            if found.is_empty() {
-                return Ok(());
+            if !found.is_empty() {
+                return Err(StoreError::Config(format!(
+                    "vci.toml sets {}: a server's address goes in [store] url (or ${ENV_STORE_URL}), and its credential in ${ENV_TOKEN} or ${ENV_STORE_URL} (CI secrets) or comes from [store] token_command, never in vci.toml, which is in every checkout, a pull request's too",
+                    found.join(", ")
+                )));
             }
-            Err(StoreError::Config(format!(
-                "vci.toml sets {}: connection settings are read only from ${ENV_STORE_URL} and ${ENV_TOKEN} (vci.toml is in every checkout, a pull request's too); remove them and pass ${ENV_STORE_URL} (and ${ENV_TOKEN}) as secrets",
-                found.join(", ")
-            )))
+            if let Some(u) = &self.url {
+                check_file_url(u.expose())?;
+            }
+            if let Some(c) = &self.token_command {
+                c.check()?;
+            }
+            Ok(())
         }
+    }
+
+    /// Whether `k` (a query key, percent-decoded) may name a credential: a
+    /// [`is_secret_key`] key, or one that says token, pass, secret, key,
+    /// jwt, pwd or auth, in any case.
+    fn is_credential_key(k: &str) -> bool {
+        let k = k.trim().to_ascii_lowercase();
+        is_secret_key(&k)
+            || ["token", "pass", "secret", "key", "jwt", "pwd", "auth"]
+                .iter()
+                .any(|w| k.contains(w))
+    }
+
+    /// Refuse a `[store] url` that is not a server's URL, or that carries a
+    /// credential: a userinfo (a user alone is allowed for PostgreSQL, which
+    /// needs one), a query key that may hold one (`authToken`, `password`,
+    /// any case, percent-encoded or not; for a libSQL server any key but
+    /// `tls`), or a fragment. The error names the key, never the value.
+    fn check_file_url(s: &str) -> Result<(), StoreError> {
+        let refuse = |why: &str| {
+            Err(StoreError::Config(format!(
+                "vci.toml [store] url {why} (it was not printed): vci.toml is in every checkout, a pull request's too, so it may name the server but never a credential; the credential comes from ${ENV_TOKEN} or ${ENV_STORE_URL} (CI secrets), or from [store] token_command"
+            )))
+        };
+        if s.trim().is_empty() || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return refuse("is empty or holds a space or a control character");
+        }
+        let scheme = split_url(s).map(|(scheme, _)| scheme.to_ascii_lowercase());
+        let server = matches!(scheme.as_deref(), Some("libsql" | "https" | "http"));
+        let postgres = matches!(scheme.as_deref(), Some("postgres" | "postgresql"));
+        let Some((_, rest)) = split_url(s).filter(|_| server || postgres) else {
+            return refuse(
+                "is not a server's URL: expected libsql://, https://, http://, postgres:// or postgresql:// (a local file is [store.sqlite] path or [store.libsql] path)",
+            );
+        };
+        if rest.contains('#') {
+            return refuse("has a #fragment, which may hold a token");
+        }
+        if let Some(at) = userinfo_end(rest) {
+            let userinfo = &rest[..at];
+            if server {
+                return refuse("carries a user or a password");
+            }
+            if userinfo.contains(':')
+                || percent_decode(userinfo).contains(':')
+                || rest.matches('@').count() > 1
+            {
+                return refuse("carries a password");
+            }
+        }
+        if !query_secret_values(rest).is_empty() || !secret_values(rest, true).is_empty() {
+            return refuse("carries a credential in its query (authToken, password, ...)");
+        }
+        if let Some((_, query)) = rest.split_once('?') {
+            for pair in query.split(['&', '?']).filter(|p| !p.is_empty()) {
+                let k = percent_decode(pair.split_once('=').map_or(pair, |(k, _)| k));
+                if server && !k.eq_ignore_ascii_case("tls") {
+                    return refuse(
+                        "has a query parameter other than tls (a libsql URL takes authToken and tls, and a token belongs in neither vci.toml nor its URL)",
+                    );
+                }
+                if is_credential_key(&k) {
+                    return refuse("has a query parameter that may hold a credential");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Where a setting came from, for `vci store info` and messages.
@@ -2278,6 +2392,26 @@ pub mod select {
                 value,
                 source: Source::Default,
             }
+        }
+    }
+
+    /// How messages name the store's URL from `source`: `$VCI_STORE_URL`,
+    /// or `vci.toml [store] url`.
+    pub fn url_name(source: Source) -> &'static str {
+        match source {
+            Source::File => "vci.toml [store] url",
+            _ => "$VCI_STORE_URL",
+        }
+    }
+
+    /// `e` naming the URL where it came from: a backend's messages about
+    /// the URL say `$VCI_STORE_URL`, which a URL from `vci.toml` is not.
+    pub fn name_url_source(e: StoreError, source: Source) -> StoreError {
+        match e {
+            StoreError::Config(m) if source == Source::File => {
+                StoreError::Config(m.replace(&format!("${ENV_STORE_URL}"), url_name(source)))
+            }
+            e => e,
         }
     }
 
@@ -2921,16 +3055,46 @@ pub mod select {
         pub path: Option<Sourced<String>>,
     }
 
-    /// Whether `url`'s query has an `authToken` (or `auth_token`)
-    /// parameter.
+    /// Whether `url`'s query gives a token: its last `authToken` (or
+    /// `auth_token`, any case, percent-encoded or not) is not empty once
+    /// percent-decoded, as the libSQL backend reads it (an empty one is no
+    /// token, and `[store] token_command` supplies it).
     fn url_has_token(url: &str) -> bool {
-        url.split_once('?').is_some_and(|(_, q)| {
-            q.split('&').any(|kv| {
-                let k = kv.split_once('=').map_or(kv, |(k, _)| k);
+        let Some((_, q)) = url.split_once('?') else {
+            return false;
+        };
+        q.rsplit('&')
+            .find_map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
                 let k = percent_decode(k);
-                k.eq_ignore_ascii_case("authtoken") || k.eq_ignore_ascii_case("auth_token")
+                (k.eq_ignore_ascii_case("authtoken") || k.eq_ignore_ascii_case("auth_token"))
+                    .then(|| percent_decode(v))
             })
-        })
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Whether a PostgreSQL connection string seems to carry a password: a
+    /// URL's userinfo with a `:`, or a `password` value in its query or in a
+    /// libpq `key=value` string. For `vci store info` only: the backend asks
+    /// the parsed connection settings.
+    fn url_has_password(s: &str) -> bool {
+        let Some((_, rest)) = split_url(s) else {
+            // A libpq string: a value given to `password` (not
+            // `sslpassword`).
+            return secret_values(s, false).iter().any(|&(from, _)| {
+                let key = s[..from]
+                    .trim_end()
+                    .trim_end_matches('=')
+                    .trim_end()
+                    .to_ascii_lowercase();
+                key.ends_with("password") && !key.ends_with("sslpassword")
+            });
+        };
+        userinfo_end(rest).is_some_and(|at| rest[..at].contains(':'))
+            || rest.split(['?', '&']).skip(1).any(|kv| {
+                let k = kv.split_once('=').map_or(kv, |(k, _)| k);
+                percent_decode(k).trim().eq_ignore_ascii_case("password")
+            })
     }
 
     /// Whether `url` names a libSQL server: `libsql://`, `https://` or
@@ -2960,10 +3124,17 @@ pub mod select {
     pub struct Selection {
         /// The backend's name.
         pub kind: Sourced<String>,
-        /// `VCI_STORE_URL`, when set.
+        /// The server or file: `VCI_STORE_URL`, else `[store] url` (for a
+        /// store that takes a server).
         pub url: Option<Sourced<Secret>>,
         /// `VCI_STORE_TOKEN`, when set (an [`Secret::opaque`] secret).
         pub token: Option<Sourced<Secret>>,
+        /// `[store] token_command`, for a store that takes a credential
+        /// (a libSQL server, PostgreSQL) when `VCI_STORE_TOKEN` is unset. The
+        /// backend runs it, when it first connects, only if the URL carries
+        /// no credential either (an `authToken`, a password): see
+        /// [`Selection::token_credential`].
+        pub token_command: Option<TokenCommand>,
         /// The namespace on a shared server; `None`: the repository id.
         pub namespace: Option<Sourced<String>>,
         /// The longest wait to connect.
@@ -3004,6 +3175,7 @@ pub mod select {
                 kind: Sourced::default_value(kind.to_owned()),
                 url: None,
                 token: None,
+                token_command: None,
                 namespace: None,
                 connect_timeout: Sourced::default_value(DEFAULT_CONNECT_TIMEOUT),
                 timeout: Sourced::default_value(DEFAULT_TIMEOUT),
@@ -3022,8 +3194,25 @@ pub mod select {
             }
         }
 
+        /// The credential [`Selection::token_command`] prints, run in the
+        /// repository's top level (`cx.repo_root`) when first asked for, for
+        /// at most [`crate::credential::TIMEOUT`] or the connect timeout if
+        /// longer; `None` without a command. A backend asks for it only when
+        /// it connects and neither `VCI_STORE_TOKEN` nor the URL gives a
+        /// credential.
+        pub fn token_credential(&self, cx: &OpenContext) -> Option<Credential> {
+            self.token_command.as_ref().map(|c| {
+                Credential::command(
+                    c.clone(),
+                    cx.repo_root.clone(),
+                    self.connect_timeout.value.max(crate::credential::TIMEOUT),
+                )
+            })
+        }
+
         /// Every setting that applies to this backend, with its source, with
-        /// secrets redacted.
+        /// secrets redacted. Where a credential comes from is said, never
+        /// the credential: a token command is named, not run.
         pub fn describe(&self) -> Vec<SettingLine> {
             let line = |name, value: String, source| SettingLine {
                 name,
@@ -3045,6 +3234,19 @@ pub mod select {
                 }),
                 "postgres" => {
                     let pg = &self.postgres;
+                    let in_url = self
+                        .url
+                        .as_ref()
+                        .filter(|u| url_has_password(u.value.expose()));
+                    v.push(match (in_url, &self.token_command) {
+                        (Some(u), _) => line("password", "(in the URL)".to_owned(), u.source),
+                        (None, Some(c)) => line(
+                            "password",
+                            format!("(from token_command: {})", c.display()),
+                            Source::File,
+                        ),
+                        (None, None) => line("password", "(none)".to_owned(), Source::Default),
+                    });
                     v.push(line("schema", pg.schema.value.clone(), pg.schema.source));
                     v.push(match &self.namespace {
                         Some(n) => line("namespace", n.value.clone(), n.source),
@@ -3084,12 +3286,19 @@ pub mod select {
                             .url
                             .as_ref()
                             .filter(|u| url_has_token(u.value.expose()));
-                        v.push(match (&self.token, in_url) {
-                            (Some(t), _) => line("token", "(set)".to_owned(), t.source),
-                            (None, Some(u)) => {
+                        v.push(match (&self.token, in_url, &self.token_command) {
+                            (Some(t), _, _) => line("token", "(set)".to_owned(), t.source),
+                            (None, Some(u), _) => {
                                 line("token", "(the URL's authToken)".to_owned(), u.source)
                             }
-                            (None, None) => line("token", "(none)".to_owned(), Source::Default),
+                            (None, None, Some(c)) => line(
+                                "token",
+                                format!("(from token_command: {})", c.display()),
+                                Source::File,
+                            ),
+                            (None, None, None) => {
+                                line("token", "(none)".to_owned(), Source::Default)
+                            }
                         });
                         v.push(match &self.namespace {
                             Some(n) => line("namespace", n.value.clone(), n.source),
@@ -3185,12 +3394,18 @@ pub mod select {
         if let Some(v) = var(ENV_STORE) {
             return canonical_kind(&v, Source::Env(ENV_STORE)).unwrap_or_else(|_| "unknown".into());
         }
-        if let Some(k) = var(ENV_STORE_URL).as_deref().and_then(backend_of_url) {
+        let env_url = var(ENV_STORE_URL);
+        if let Some(k) = env_url.as_deref().and_then(backend_of_url) {
             return k.to_owned();
         }
-        match file.and_then(|f| f.backend.as_deref()) {
-            Some(b) => canonical_kind(b, Source::File).unwrap_or_else(|_| "unknown".into()),
-            None => DEFAULT_BACKEND.to_owned(),
+        if let Some(b) = file.and_then(|f| f.backend.as_deref()) {
+            return canonical_kind(b, Source::File).unwrap_or_else(|_| "unknown".into());
+        }
+        match file.and_then(|f| f.url.as_ref()) {
+            Some(u) if env_url.is_none() => backend_of_url(u.expose())
+                .unwrap_or(DEFAULT_BACKEND)
+                .to_owned(),
+            _ => DEFAULT_BACKEND.to_owned(),
         }
     }
 
@@ -3440,29 +3655,46 @@ pub mod select {
             f.check()?;
         }
         let mut warnings = Vec::new();
-        let url = var(ENV_STORE_URL).map(|u| Sourced {
+        let env_url = var(ENV_STORE_URL).map(|u| Sourced {
             value: Secret::new(u),
             source: Source::Env(ENV_STORE_URL),
         });
-        let url_kind = url.as_ref().and_then(|u| backend_of_url(u.value.expose()));
+        // `[store] url`, unless `VCI_STORE_URL` wins over it.
+        let file_url = match file.and_then(|f| f.url.as_ref()) {
+            Some(u) if env_url.is_none() => Some(Sourced {
+                value: Secret::new(u.expose().trim()),
+                source: Source::File,
+            }),
+            _ => None,
+        };
+        let url_kind = env_url
+            .as_ref()
+            .and_then(|u| backend_of_url(u.value.expose()));
+        let file_url_kind = file_url
+            .as_ref()
+            .and_then(|u| backend_of_url(u.value.expose()));
         let file_kind = match file.and_then(|f| f.backend.as_deref()) {
             Some(b) => Some(canonical_kind(b, Source::File)?),
             None => None,
         };
-        let kind = match (var(ENV_STORE), url_kind, &file_kind) {
-            (Some(v), _, _) => Sourced {
+        let kind = match (var(ENV_STORE), url_kind, &file_kind, file_url_kind) {
+            (Some(v), ..) => Sourced {
                 value: canonical_kind(&v, Source::Env(ENV_STORE))?,
                 source: Source::Env(ENV_STORE),
             },
-            (None, Some(k), _) => Sourced {
+            (None, Some(k), ..) => Sourced {
                 value: k.to_owned(),
                 source: Source::Env(ENV_STORE_URL),
             },
-            (None, None, Some(k)) => Sourced {
+            (None, None, Some(k), _) => Sourced {
                 value: k.clone(),
                 source: Source::File,
             },
-            (None, None, None) => Sourced::default_value(DEFAULT_BACKEND.to_owned()),
+            (None, None, None, Some(k)) => Sourced {
+                value: k.to_owned(),
+                source: Source::File,
+            },
+            (None, None, None, None) => Sourced::default_value(DEFAULT_BACKEND.to_owned()),
         };
         if let Some(k) = url_kind
             && k != kind.value
@@ -3482,6 +3714,42 @@ pub mod select {
             ));
         }
         let k = kind.value.as_str();
+        // The server: `VCI_STORE_URL`, else `[store] url` when the store
+        // takes one and the file agrees with itself.
+        let url = match (env_url, file_url) {
+            (Some(u), _) => Some(u),
+            (None, Some(u)) => match file_url_kind {
+                Some(uk) if uk != k && kind.source == Source::File => {
+                    return Err(StoreError::Config(format!(
+                        "vci.toml [store] url is a {uk} location but [store] backend is {k}"
+                    )));
+                }
+                Some(uk) if uk != k => {
+                    warnings.push(format!(
+                        "vci.toml [store] url ({}) is ignored: it is a {uk} location and the store is {k} (from {})",
+                        u.value.redacted(),
+                        kind.source
+                    ));
+                    None
+                }
+                _ if matches!(k, "git-meta" | "sqlite") => {
+                    warnings.push(format!(
+                        "vci.toml [store] url ({}) is ignored: the {k} store (from {}) takes no server",
+                        u.value.redacted(),
+                        kind.source
+                    ));
+                    None
+                }
+                None if k == "postgres" => {
+                    return Err(StoreError::Config(
+                        "vci.toml [store] url is not a postgres:// or postgresql:// URL, which the postgres store needs (it was not printed)"
+                            .to_owned(),
+                    ));
+                }
+                _ => Some(u),
+            },
+            (None, None) => None,
+        };
         let f_sqlite = file.and_then(|f| f.sqlite.as_ref());
         let f_pg = file.and_then(|f| f.postgres.as_ref());
         let f_libsql = file.and_then(|f| f.libsql.as_ref());
@@ -3489,6 +3757,19 @@ pub mod select {
             value: Secret::opaque(t),
             source: Source::Env(ENV_TOKEN),
         });
+        // A credential from the environment goes only to a URL from the
+        // environment: vci.toml is in every pull request, and could point
+        // CI's secret at a server of its own. (A URL in `VCI_STORE_URL`
+        // always wins over `[store] url`, so an `authToken` in it never
+        // meets a URL from the file.)
+        if token.is_some()
+            && let Some(u) = &url
+            && u.source == Source::File
+        {
+            return Err(StoreError::Config(format!(
+                "${ENV_TOKEN} is set but the store's URL comes from vci.toml [store] url: a credential from the environment is sent only to a URL from the environment, because vci.toml is in every checkout, a pull request's too, and could name another server; set ${ENV_STORE_URL} as well (in CI, both as secrets), or unset ${ENV_TOKEN} to use [store] token_command"
+            )));
+        }
         if k != "sqlite" && f_sqlite.is_some() {
             warnings.push(format!(
                 "vci.toml [store.sqlite] is ignored: the store is {k} (from {})",
@@ -3517,17 +3798,32 @@ pub mod select {
         }
         if k == "postgres" && url.is_none() {
             return Err(StoreError::Config(format!(
-                "the postgres store needs ${ENV_STORE_URL} (postgres://<user>@<host>/<database>?sslmode=require); it is never read from vci.toml, and GitHub does not pass secrets to pull requests from forks"
+                "the postgres store needs ${ENV_STORE_URL} or [store] url (postgres://<user>@<host>/<database>?sslmode=require; a password only in ${ENV_STORE_URL}, else from [store] token_command), and GitHub does not pass secrets to pull requests from forks"
             )));
         }
         let libsql = libsql_selection(k, url.as_ref(), f_libsql, &var, &mut warnings)?;
+        let local = if k == "libsql" { " in local mode" } else { "" };
+        let takes_credential =
+            k == "postgres" || (k == "libsql" && libsql.mode.value != LibsqlMode::Local);
         if token.is_some() && !(k == "libsql" && libsql.mode.value != LibsqlMode::Local) {
             warnings.push(format!(
-                "${ENV_TOKEN} is ignored: the store is {k}{} (from {})",
-                if k == "libsql" { " in local mode" } else { "" },
+                "${ENV_TOKEN} is ignored: the store is {k}{local} (from {})",
                 kind.source
             ));
         }
+        // The command runs only where the store may need it, and never
+        // when the environment gives the credential.
+        let token_command = match file.and_then(|f| f.token_command.clone()) {
+            Some(_) if !takes_credential => {
+                warnings.push(format!(
+                    "vci.toml [store] token_command is ignored (not run): the store is {k}{local} (from {}), which takes no credential",
+                    kind.source
+                ));
+                None
+            }
+            Some(_) if token.is_some() => None,
+            c => c,
+        };
         let sqlite = SqliteSelection {
             path: if k != "sqlite" {
                 None
@@ -3645,6 +3941,7 @@ pub mod select {
             kind,
             url,
             token,
+            token_command,
             namespace,
             connect_timeout,
             timeout,

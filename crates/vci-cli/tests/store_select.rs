@@ -443,8 +443,8 @@ fn a_url_in_vci_store_is_refused_and_never_printed() {
     assert!(!log.contains(SECRET));
 }
 
-/// 5. `VCI_STORE_URL` never reaches a test process (vci takes it out of
-///    its own environment at start-up), nor any output. The store cannot
+/// 5. `VCI_STORE_URL` is in no environment vci builds for a test (vci
+///    takes it out of its own at start-up), nor in any output. The store cannot
 ///    be used here, so the run refuses to store, saying why, and its exit
 ///    code stays the tests'.
 #[test]

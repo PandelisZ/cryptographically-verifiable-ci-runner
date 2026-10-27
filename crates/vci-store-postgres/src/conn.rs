@@ -14,7 +14,7 @@ use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, Row, Transaction};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use vci_store::StoreError;
-use vci_store::select::Secret;
+use vci_store::select::{Credential, Secret};
 
 /// The backend's name in errors and timing lines.
 pub(crate) const KIND: &str = "postgres";
@@ -82,6 +82,9 @@ pub(crate) struct ConnSpec {
     ssl_mode: SslMode,
     root_cert: Option<PathBuf>,
     display: String,
+    /// What messages call the URL: `$VCI_STORE_URL`, or `vci.toml [store]
+    /// url` when it came from there ([`vci_store::select::url_name`]).
+    pub(crate) url_name: &'static str,
     pub(crate) connect_timeout: Duration,
     pub(crate) statement_timeout: Duration,
     options: String,
@@ -441,6 +444,7 @@ impl ConnSpec {
             .copied()
             .unwrap_or(connect_timeout);
         Ok(ConnSpec {
+            url_name: "$VCI_STORE_URL",
             display: display(&s.text, &config),
             attempts: attempts(&config),
             config,
@@ -464,6 +468,12 @@ impl ConnSpec {
             .max(1);
         self.connect_timeout
             .saturating_mul(u32::try_from(hosts).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the connection string carries a password (else `[store]
+    /// token_command` may supply one).
+    pub(crate) fn has_password(&self) -> bool {
+        self.config.get_password().is_some()
     }
 
     /// Where the server is, without credentials.
@@ -691,6 +701,9 @@ struct Pool {
 pub(crate) struct Conn {
     spec: ConnSpec,
     secret: Secret,
+    /// The password `[store] token_command` prints, when the connection
+    /// string has none: fetched before the first connection.
+    password: Option<Credential>,
     tls: OnceLock<Result<MakeRustlsConnect, String>>,
     pool: Mutex<Pool>,
     freed: Condvar,
@@ -733,10 +746,16 @@ impl Drop for Guard<'_> {
 }
 
 impl Conn {
-    pub(crate) fn new(spec: ConnSpec, secret: Secret, max: usize) -> Conn {
+    pub(crate) fn new(
+        spec: ConnSpec,
+        secret: Secret,
+        password: Option<Credential>,
+        max: usize,
+    ) -> Conn {
         Conn {
             spec,
             secret,
+            password,
             tls: OnceLock::new(),
             pool: Mutex::new(Pool {
                 idle: Vec::new(),
@@ -753,8 +772,14 @@ impl Conn {
         &self.spec
     }
 
-    pub(crate) fn secret(&self) -> &Secret {
-        &self.secret
+    /// The text of `e`, without the connection string's password or the
+    /// one `[store] token_command` printed.
+    pub(crate) fn error_text(&self, e: &postgres::Error) -> String {
+        let text = error_text(&self.secret, e);
+        match &self.password {
+            Some(p) => p.scrub(&text),
+            None => text,
+        }
     }
 
     /// Statements sent so far (`BEGIN` and `COMMIT` included).
@@ -799,7 +824,7 @@ impl Conn {
             .get_or_init(|| build_tls(self.spec.root_cert.as_ref()))
         {
             Ok(t) => Ok(t.clone()),
-            Err(e) => Err(StoreError::Config(format!("$VCI_STORE_URL: {e}"))),
+            Err(e) => Err(StoreError::Config(format!("{}: {e}", self.spec.url_name))),
         }
     }
 
@@ -820,6 +845,12 @@ impl Conn {
             SslMode::Disable => None,
             _ => Some(self.tls()?),
         };
+        // The token command runs before the first connection, at most once
+        // per process, and outside the connect deadline.
+        let password = match &self.password {
+            Some(p) => Some(p.get(KIND).map_err(|e| self.latch(e))?),
+            None => None,
+        };
         let deadline = Instant::now() + self.spec.connect_deadline();
         let floor = self.spec.connect_timeout.min(Duration::from_secs(1));
         let n = self.spec.attempts.len();
@@ -827,7 +858,11 @@ impl Conn {
         for (i, config) in self.spec.attempts.iter().enumerate() {
             let left = u32::try_from(n - i).unwrap_or(u32::MAX);
             let share = deadline.saturating_duration_since(Instant::now()) / left;
-            match self.attempt(config.clone(), tls.clone(), share.max(floor)) {
+            let mut config = config.clone();
+            if let Some(p) = &password {
+                config.password(p.expose());
+            }
+            match self.attempt(config, tls.clone(), share.max(floor)) {
                 Ok(c) => return Ok(c),
                 Err(e) => last = Some(e),
             }
@@ -880,7 +915,7 @@ impl Conn {
             }
         };
         r.map_err(|e| {
-            let text = error_text(&self.secret, &e);
+            let text = self.error_text(&e);
             if io_cause(&e) == Some(std::io::ErrorKind::TimedOut) {
                 StoreError::Timeout {
                     backend: KIND,
@@ -946,7 +981,7 @@ impl Conn {
     }
 
     fn classify(&self, e: &postgres::Error, op: Op, attempt: u32) -> Class {
-        let text = error_text(&self.secret, e);
+        let text = self.error_text(e);
         let backend = |code: Option<&str>| {
             StoreError::backend(PgError {
                 message: text.clone(),
@@ -1059,6 +1094,12 @@ impl Conn {
                 },
             }
         }
+    }
+
+    /// Whether connecting now would run `[store] token_command`
+    /// ([`Credential::pending`]).
+    pub(crate) fn password_pending(&self) -> bool {
+        self.password.as_ref().is_some_and(Credential::pending)
     }
 
     /// Open a connection in the background, so the first call finds one

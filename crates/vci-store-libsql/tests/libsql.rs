@@ -697,6 +697,180 @@ fn tokens_are_sent_and_never_shown() {
     );
 }
 
+/// A URL from `vci.toml` the store cannot use is named so, not as
+/// `$VCI_STORE_URL`.
+#[test]
+fn a_url_from_vci_toml_is_named_so() {
+    let mut s = testkit::selection(
+        LibsqlMode::Remote,
+        Some("libsql://h%41st.turso.io"),
+        None,
+        None,
+        None,
+    );
+    s.url.as_mut().unwrap().source = Source::File;
+    let e = LibsqlStore::open(&s, &testkit::cx())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("vci.toml [store] url needs a host name") && !e.contains("$VCI_STORE_URL"),
+        "{e}"
+    );
+    s.url.as_mut().unwrap().source = Source::Env("VCI_STORE_URL");
+    let e = LibsqlStore::open(&s, &testkit::cx())
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("$VCI_STORE_URL needs a host name"), "{e}");
+}
+
+/// `[store] token_command` supplies the token when neither
+/// `VCI_STORE_TOKEN` nor the URL does: the server gets it (a `sqld` that
+/// checks tokens accepts it), the command runs when the store first
+/// connects, never when it opens or warms up, and not at all when another
+/// token is there (`VCI_STORE_TOKEN`, or an `authToken` in the URL, which
+/// the server then gets); a token the server refuses, or a command that fails, makes the
+/// store unavailable saying so, and no message shows the token.
+#[test]
+fn a_token_command_supplies_the_token() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use vci_store::select::TokenCommand;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("jwt.key");
+    std::fs::write(
+        &key_file,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+    )
+    .unwrap();
+    let public =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes());
+    let server = match testkit::start_sqld(&[
+        "--auth-jwt-key-file".to_owned(),
+        key_file.display().to_string(),
+    ])
+    .or_else(|e| {
+        testkit::start_docker_with_env(&[("SQLD_AUTH_JWT_KEY", &public)])
+            .map_err(|d| format!("{e}; docker: {d}"))
+    }) {
+        Ok(s) => s,
+        Err(why) => {
+            eprintln!("skipping: no sqld or Docker to check tokens with: {why}");
+            return;
+        }
+    };
+    let good = jwt(&key, &serde_json::json!({}));
+    let wrong = jwt(
+        &ed25519_dalek::SigningKey::from_bytes(&[10; 32]),
+        &serde_json::json!({}),
+    );
+    let mut cx = testkit::cx();
+    cx.repo_root = dir.path().to_owned();
+    let counter = dir.path().join("runs");
+    // A helper per token, each counting its runs.
+    let helper = |name: &str, body: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho run >> {:?}\n{body}\n",
+                counter.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        TokenCommand::Argv(vec![p.to_str().unwrap().to_owned()])
+    };
+    let runs = || {
+        std::fs::read_to_string(&counter)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    let with = |cmd: TokenCommand, token: Option<&str>| {
+        let mut s = testkit::selection(
+            LibsqlMode::Remote,
+            Some(&server.url()),
+            token,
+            Some(&testkit::namespace()),
+            None,
+        );
+        s.token_command = Some(cmd);
+        LibsqlStore::open(&s, &cx).expect("open")
+    };
+    let s = with(helper("good", &format!("echo {good}")), None);
+    assert_eq!(runs(), 0, "opening runs nothing");
+    s.put_for_test("src/a.test.ts", S1, &hex64(1), None, b"{}")
+        .unwrap();
+    assert_eq!(s.list_units(&["src/a.test.ts"]).unwrap()[0].len(), 1);
+    assert_eq!(runs(), 1, "run once, when the store first connected");
+    assert!(!format!("{s:?} {}", s.location()).contains(&good));
+
+    // warm() runs nothing while the command has not run (its thread is
+    // never joined, and the plan may never read the store): the first
+    // read does.
+    let s = with(helper("warm", &format!("echo {good}")), None);
+    s.warm();
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(runs(), 1, "warm() ran the token command");
+    s.status().unwrap();
+    assert_eq!(runs(), 2);
+    s.warm();
+
+    // VCI_STORE_TOKEN wins: the command is never run.
+    let s = with(helper("unused", "echo unused"), Some(&good));
+    s.status().unwrap();
+    assert_eq!(runs(), 2);
+
+    // So does an authToken in VCI_STORE_URL (a CI job may set only the
+    // URL): the server gets the URL's token, and the command, whose token
+    // it would refuse, never runs.
+    let mut sel = testkit::selection(
+        LibsqlMode::Remote,
+        Some(&format!("{}?authToken={good}", server.url())),
+        None,
+        Some(&testkit::namespace()),
+        None,
+    );
+    sel.token_command = Some(helper("loses", &format!("echo {wrong}")));
+    let s = LibsqlStore::open(&sel, &cx).expect("open");
+    s.put_for_test("src/a.test.ts", S1, &hex64(2), None, b"{}")
+        .unwrap();
+    assert_eq!(s.list_units(&["src/a.test.ts"]).unwrap()[0].len(), 1);
+    assert_eq!(runs(), 2, "the URL's authToken wins over the command");
+
+    // A token the server refuses: unavailable, naming the command.
+    let s = with(helper("wrong", &format!("echo {wrong}")), None);
+    let e = s.status().unwrap_err();
+    let all = format!("{e} {e:?} {s:?}");
+    assert!(matches!(e, StoreError::Unavailable { .. }), "{all}");
+    assert!(
+        all.contains("the server refused the token from [store] token_command ("),
+        "{all}"
+    );
+    assert!(!all.contains(&wrong), "{all}");
+
+    // A command that fails: unavailable, saying how (never what it wrote
+    // on standard error), and never retried.
+    let s = with(
+        helper(
+            "fails",
+            &format!("echo {good}\necho denied {good} >&2\nexit 4"),
+        ),
+        None,
+    );
+    let before = runs();
+    for _ in 0..3 {
+        let e = s.status().unwrap_err();
+        let all = format!("{e} {e:?}");
+        assert!(matches!(e, StoreError::Unavailable { .. }), "{all}");
+        assert!(
+            all.contains(&format!("exited 4; {}", vci_store::credential::HINT)),
+            "{all}"
+        );
+        assert!(!all.contains(&good) && !all.contains("denied"), "{all}");
+    }
+    assert_eq!(runs(), before + 1);
+}
+
 // ---- the replica ------------------------------------------------------------------------
 
 /// A replica reads what it synced: a new handle syncs what changed (puts,

@@ -10,8 +10,10 @@
 //!   in: its bundled SQLite and rusqlite's (git-meta's) export the same C
 //!   symbols, and one process cannot hold both.
 //! * **Remote** (`VCI_STORE_URL=libsql://<db>-<org>.turso.io`, `https://` or
-//!   `http://`, the token in `VCI_STORE_TOKEN` or an `authToken` query
-//!   parameter): every read and write goes to the server over Hrana (HTTP),
+//!   `http://`, or `[store] url`; the token in `VCI_STORE_TOKEN` or an
+//!   `authToken` query parameter, else printed by `[store] token_command`
+//!   when the store first connects): every read and write goes to the
+//!   server over Hrana (HTTP),
 //!   through the `libsql` crate. Reads are served from a per-handle cache
 //!   that a prefetch fills in two requests; writes are batched into one
 //!   transactional request. Each repository's records live under a
@@ -50,7 +52,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use vci_store::select::{DEFAULT_LIBSQL_FILE, DEFAULT_MANIFEST_GRACE, LibsqlMode, Selection};
+use vci_store::select::{
+    self, Credential, DEFAULT_LIBSQL_FILE, DEFAULT_MANIFEST_GRACE, LibsqlMode, Selection,
+};
 use vci_store::{
     AttestationStore, BackendFactory, Caps, Hydration, NewAttestation, OpenContext, Prefetch,
     StoreError, StoreStatus, StoredEnvelope, StoredManifest, WriteBatch, key,
@@ -139,11 +143,26 @@ impl LibsqlStore {
         }
         let Some(url) = &sel.url else {
             return Err(StoreError::Config(
-                "the libsql store's remote and replica modes need $VCI_STORE_URL (libsql://<database>-<organization>.turso.io)"
+                "the libsql store's remote and replica modes need $VCI_STORE_URL or [store] url (libsql://<database>-<organization>.turso.io)"
                     .into(),
             ));
         };
-        let (target, token) = Target::parse(&url.value, sel.token.as_ref().map(|t| &t.value))?;
+        let (target, token) = Target::parse(&url.value, sel.token.as_ref().map(|t| &t.value))
+            .map_err(|e| select::name_url_source(e, url.source))?;
+        // The token: `VCI_STORE_TOKEN`, else the URL's `authToken`, else
+        // what `[store] token_command` prints when the store first
+        // connects (never run when either of the others is there).
+        let token = match token {
+            Some(t) => Some(Credential::given(
+                t,
+                if sel.token.is_some() {
+                    "$VCI_STORE_TOKEN"
+                } else {
+                    "the URL's authToken"
+                },
+            )),
+            None => sel.token_credential(cx),
+        };
         let explicit_namespace = match &sel.namespace {
             Some(n) if !remote::is_namespace(&n.value) => {
                 return Err(StoreError::Config(format!(
@@ -167,6 +186,7 @@ impl LibsqlStore {
         let conn = Conn::new(
             target,
             url.value.clone(),
+            select::url_name(url.source),
             token,
             sel.connect_timeout.value,
             timeout,
@@ -530,10 +550,16 @@ impl AttestationStore for LibsqlStore {
 
     /// Local: the file read through once. Remote: the schema version and
     /// the flags asked for on a thread (which opens the connection and its
-    /// TLS session). Replica: the sync, on a thread.
+    /// TLS session). Replica: the sync, on a thread. Neither while the
+    /// token is `[store] token_command`'s and the command has not run: a
+    /// warm-up thread is never joined, so the command would run for a
+    /// command that may never read the store and could outlive vci; it
+    /// runs at the first read instead.
     fn warm(&self) {
         match &self.inner {
             Inner::Local(s) => s.warm(),
+            Inner::Remote(r) if r.conn.token_pending() => {}
+            Inner::Replica(p) if p.remote.conn.token_pending() => {}
             Inner::Remote(r) => {
                 let r = Arc::clone(r);
                 let _ = std::thread::Builder::new()

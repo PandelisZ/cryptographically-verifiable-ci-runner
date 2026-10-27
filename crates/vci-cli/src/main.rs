@@ -236,7 +236,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum StoreCmd {
-    /// Which attestation store this repository uses ($VCI_STORE, else the scheme of $VCI_STORE_URL, else `[store] backend` in the working tree's vci.toml, else git-meta), every setting and where it came from (secrets redacted), what the store can do, whether it exists and how many attestations it holds. Exits 0 when the store can be read (also before anything is stored), 2 otherwise.
+    /// Which attestation store this repository uses ($VCI_STORE, else the scheme of $VCI_STORE_URL, else `[store] backend` in the working tree's vci.toml, else the scheme of its `[store] url`, else git-meta), every setting and where it came from (secrets redacted), what the store can do, whether it exists and how many attestations it holds. Exits 0 when the store can be read (also before anything is stored), 2 otherwise.
     Info {
         #[arg(long, value_enum, default_value = "text")]
         format: EnvFormat,
@@ -550,6 +550,16 @@ mod tests {
         assert!(matches!(format, EnvFormat::Json));
         assert!(Cli::try_parse_from(["vci", "store", "info"]).is_ok());
         assert!(Cli::try_parse_from(["vci", "store"]).is_err());
+        // Its help gives the whole precedence, `[store] url` included.
+        let help = Cli::try_parse_from(["vci", "store", "info", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            help.contains("else `[store] backend` in the working tree's vci.toml, else the scheme of its `[store] url`, else git-meta"),
+            "{help}"
+        );
     }
 
     /// `vci update` (and its alias `vci upgrade`) sits beside `vci store

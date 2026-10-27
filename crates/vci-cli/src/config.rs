@@ -1795,6 +1795,19 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(hash(&plain), hash(&with));
+        // Nor where the server is, or how its token is fetched.
+        let server = Config::parse(
+            "adapter = \"go\"\n\n[store]\nbackend = \"libsql\"\nurl = \"libsql://vci-vex-composal.aws-eu-west-1.turso.io\"\ntoken_command = [\"com\", \"secrets\", \"get\", \"vci-store-token\", \"--org\", \"vex\"]\n",
+        )
+        .unwrap();
+        let s = server.store.as_ref().unwrap();
+        assert!(s.url.is_some() && s.token_command.is_some());
+        assert_eq!(hash(&plain), hash(&server));
+        let piped = Config::parse(
+            "adapter = \"go\"\n\n[store]\nurl = \"libsql://other.turso.io\"\ntoken_command = \"op read op://ci/vci/token\"\n",
+        )
+        .unwrap();
+        assert_eq!(hash(&plain), hash(&piped));
         // Nor does a config without [store] serialize differently.
         assert!(!serde_json::to_string(&plain).unwrap().contains("store"));
     }

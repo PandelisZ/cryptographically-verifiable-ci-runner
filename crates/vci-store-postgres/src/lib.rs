@@ -6,10 +6,13 @@
 //! `--push` stores nothing (the publication gate). `docs/STORE-BACKENDS.md`
 //! (section 17) is its design.
 //!
-//! * **Where.** The connection string comes only from `VCI_STORE_URL`
-//!   ([`Selection::url`]), a `postgres://` URL or a libpq `key=value`
-//!   string. vci reads `sslrootcert` itself; without an `sslmode`, TLS is
-//!   required, except for `localhost`, `127.0.0.1`, `::1` and Unix sockets
+//! * **Where.** The connection string comes from `VCI_STORE_URL`, a
+//!   `postgres://` URL or a libpq `key=value` string, else `[store] url`, a
+//!   `postgres://` URL without a password ([`Selection::url`]). When it has
+//!   no password, `[store] token_command` prints one, run before the first
+//!   connection ([`Selection::token_credential`]). vci reads `sslrootcert`
+//!   itself; without an `sslmode`, TLS is required, except for
+//!   `localhost`, `127.0.0.1`, `::1` and Unix sockets
 //!   (`prefer`). With TLS, certificates are always verified (the webpki
 //!   roots, plus `sslrootcert`). Every row carries a namespace:
 //!   `VCI_STORE_NAMESPACE`, else `[store.postgres] namespace`, else the
@@ -51,7 +54,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use postgres::types::Type;
-use vci_store::select::Selection;
+use vci_store::select::{self, Selection};
 use vci_store::{
     AttestationStore, BackendFactory, Caps, Hydration, KeyHint, NewAttestation, OpenContext,
     Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, WriteBatch, key,
@@ -207,7 +210,7 @@ impl Inner {
 
     /// A row that does not decode as this vci wrote it.
     pub(crate) fn decode_error(&self, e: &postgres::Error) -> StoreError {
-        StoreError::backend(PgError::from_text(conn::error_text(self.conn.secret(), e)))
+        StoreError::backend(PgError::from_text(self.conn.error_text(e)))
     }
 
     fn location(&self, compute_namespace: bool) -> String {
@@ -245,7 +248,7 @@ impl PgStore {
     pub fn open(sel: &Selection, cx: &OpenContext) -> Result<PgStore, StoreError> {
         let Some(url) = &sel.url else {
             return Err(StoreError::Config(
-                "the postgres store needs $VCI_STORE_URL (postgres://<user>@<host>/<database>?sslmode=require)"
+                "the postgres store needs $VCI_STORE_URL or [store] url (postgres://<user>@<host>/<database>?sslmode=require)"
                     .into(),
             ));
         };
@@ -271,12 +274,21 @@ impl PgStore {
         } else {
             sel.timeout.value
         };
-        let spec = ConnSpec::parse(
+        let mut spec = ConnSpec::parse(
             &url.value,
             sel.connect_timeout.value,
             statement_timeout,
             &cx.command,
-        )?;
+        )
+        .map_err(|e| select::name_url_source(e, url.source))?;
+        spec.url_name = select::url_name(url.source);
+        // The password: the connection string's, else what `[store]
+        // token_command` prints before the first connection.
+        let password = if spec.has_password() {
+            None
+        } else {
+            sel.token_credential(cx)
+        };
         let pool = sel.postgres.pool.value.clamp(1, 64) as usize;
         let grace = if cx.long_running {
             Duration::ZERO
@@ -286,7 +298,7 @@ impl PgStore {
         Ok(PgStore {
             inner: Arc::new(Inner {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                conn: Conn::new(spec, url.value.clone(), pool),
+                conn: Conn::new(spec, url.value.clone(), password, pool),
                 schema_sql: schema::SchemaSql::new(&schema),
                 read_sql: read::Sql::new(&schema),
                 write_sql: write::Sql::new(&schema),
@@ -504,8 +516,13 @@ impl AttestationStore for PgStore {
     }
 
     /// Opens the first connection (and its TLS session) on a thread of its
-    /// own.
+    /// own; not while the password is `[store] token_command`'s and the
+    /// command has not run (that thread is never joined: the command runs
+    /// at the first read instead).
     fn warm(&self) {
+        if self.inner.conn.password_pending() {
+            return;
+        }
         let inner = Arc::clone(&self.inner);
         let _ = std::thread::Builder::new()
             .name("vci-postgres-warm".into())

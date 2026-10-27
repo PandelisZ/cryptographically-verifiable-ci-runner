@@ -6,9 +6,12 @@
 //! Which one a repository uses is resolved once per process
 //! ([`vci_store::select::resolve`]): `VCI_STORE`, else the scheme of
 //! `VCI_STORE_URL`, else `[store] backend` in the working tree's
-//! `vci.toml`, else git-meta. A store that cannot be selected or opened is
-//! a [`FailedStore`], whose every call fails, so commands fail open
-//! through their usual error paths.
+//! `vci.toml`, else the scheme of its `[store] url`, else git-meta. A store
+//! that cannot be selected or opened is a [`FailedStore`], whose every call
+//! fails, so commands fail open through their usual error paths. Opening
+//! does no I/O: a `[store] token_command` runs only when the store first
+//! connects ([`vci_store::credential`]), so a command that never reads the
+//! store never runs it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,8 +47,11 @@ struct Opened {
 /// Take every [`select::NEVER_TO_CHILDREN`] variable (`VCI_STORE`,
 /// `VCI_STORE_URL`, `VCI_STORE_TOKEN`) out
 /// of this process's environment, keeping its value in memory, so that no
-/// test, adapter probe, hook or git command vci starts can see it. Later
-/// calls do nothing.
+/// test, adapter probe, hook, git command or token command vci starts
+/// inherits it. Later calls do nothing. The environment the process started
+/// with keeps it, readable by any process of the same user
+/// (`/proc/<pid>/environ`, `ps eww`): this cannot hide it from a test that
+/// goes looking (docs/REFERENCE.md, "What vci cannot hide from a test").
 ///
 /// # Safety
 ///

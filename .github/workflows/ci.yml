@@ -275,10 +275,11 @@ jobs:
           cargo doc --no-deps --locked -p vci-store --features conformance
 
   # The command line on each store, end to end (crates/vci-cli/tests/
-  # store_select.rs and store_backends.rs): selection, secrets that never
-  # reach a test, fail open, and run, plan, explain, prune, fetch, push and
-  # ci on SQLite, PostgreSQL and libSQL (local, remote and replica) against
-  # a copy of fixtures/go-abcd. The PostgreSQL service is reached on
+  # store_select.rs, store_backends.rs and store_credential.rs): selection,
+  # secrets kept out of every test's environment, fail open, run, plan,
+  # explain, prune, fetch, push and ci on SQLite, PostgreSQL and libSQL
+  # (local, remote and replica), and [store] token_command, against a copy of
+  # fixtures/go-abcd. The PostgreSQL service is reached on
   # localhost, where vci does not require TLS, and so is the libSQL server.
   # Without go the tests would skip, so the module is downloaded first.
   store-cli:
@@ -318,9 +319,11 @@ jobs:
           for i in $(seq 30); do curl -sf "$VCI_TEST_LIBSQL_URL/health" >/dev/null && break; sleep 1; done
           cargo test --locked -p vci-cli --test store_select --test store_backends
       # The store job above runs in a container without Docker; here the
-      # test starts the libsql-server image itself, with a JWT key.
+      # tests start the libsql-server image themselves, with a JWT key.
       - name: libSQL tokens against a server that checks them
-        run: cargo test --locked -p vci-store-libsql --test libsql tokens_are_sent_and_never_shown -- --nocapture
+        run: |
+          cargo test --locked -p vci-store-libsql --test libsql -- tokens_are_sent_and_never_shown a_token_command_supplies_the_token --nocapture
+          cargo test --locked -p vci-cli --test store_credential
 
   # The temporary-PostgreSQL helper's own path: no server is given, so
   # vci_store_postgres::testkit starts a throwaway cluster with the runner's

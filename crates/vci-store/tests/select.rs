@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vci_store::select::{
-    self, ENV_CONNECT_TIMEOUT, ENV_NAMESPACE, ENV_STORE, ENV_STORE_URL, ENV_TIMEOUT, Secret,
-    Selection, Source, StoreSettings, redact, resolve,
+    self, ENV_CONNECT_TIMEOUT, ENV_NAMESPACE, ENV_REPLICA, ENV_STORE, ENV_STORE_URL, ENV_SYNC,
+    ENV_TIMEOUT, ENV_TOKEN, LibsqlMode, Secret, Selection, Source, StoreSettings, TokenCommand,
+    redact, resolve,
 };
 use vci_store::{
     AttestationStore, BackendFactory, FailedStore, MissingBackend, OpenContext, StoreError,
@@ -234,12 +235,25 @@ url = ["planted6"]
     let m = config_err(&[(ENV_STORE_URL, PG_URL)], Some(toml));
     assert!(
         m.starts_with(
-            "vci.toml sets store.url, store.postgres.url, store.postgres.host, store.postgres.user, store.postgres.password, store.postgres.dbname:"
+            "vci.toml sets store.postgres.url, store.postgres.host, store.postgres.user, store.postgres.password, store.postgres.dbname:"
         ),
+        "{m}"
+    );
+    assert!(
+        m.contains("[store] url") && m.contains("token_command"),
         "{m}"
     );
     assert!(!m.contains("planted") && !m.contains("evil"), "{m}");
     assert!(settings.check().is_err());
+    // Without them, [store] url's password is refused in turn (even when
+    // VCI_STORE_URL wins over it), by key and never by value.
+    let toml = "[store]\nbackend = \"postgres\"\nurl = \"postgres://u:planted1@evil.example/db\"\n";
+    let m = config_err(&[(ENV_STORE_URL, PG_URL)], Some(toml));
+    assert!(
+        m.starts_with("vci.toml [store] url carries a password (it was not printed)"),
+        "{m}"
+    );
+    assert!(!m.contains("planted") && !m.contains("evil"), "{m}");
     // Serializing never writes them back.
     let back = serde_json::to_string(&settings).unwrap();
     assert!(
@@ -1328,4 +1342,458 @@ fn a_local_file_url_with_a_query_is_refused_unprinted() {
         s.sqlite.path.as_ref().map(|p| p.value.as_str()),
         Some("local.db")
     );
+}
+
+// ---- [store] url and [store] token_command ----------------------------------------
+
+/// vex's configuration: the server in `vci.toml`, its token fetched by a
+/// command.
+const TURSO_TOML: &str = r#"
+[store]
+backend = "libsql"
+url = "libsql://vci-vex-composal.aws-eu-west-1.turso.io"
+token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
+"#;
+
+fn argv(a: &[&str]) -> TokenCommand {
+    TokenCommand::Argv(a.iter().map(|s| (*s).to_owned()).collect())
+}
+
+fn describe(s: &Selection) -> Vec<(&'static str, String, String)> {
+    s.describe()
+        .into_iter()
+        .map(|l| (l.name, l.value, l.source.to_string()))
+        .collect()
+}
+
+fn line(s: &Selection, name: &str) -> (String, String) {
+    let l = describe(s).into_iter().find(|l| l.0 == name).unwrap();
+    (l.1, l.2)
+}
+
+#[test]
+fn token_command_is_an_array_or_a_shell_string() {
+    let f = file(TURSO_TOML);
+    assert_eq!(
+        f.token_command,
+        Some(argv(&[
+            "com",
+            "secrets",
+            "get",
+            "vci-store-token",
+            "--org",
+            "vex"
+        ]))
+    );
+    assert_eq!(
+        f.url.as_ref().map(Secret::expose),
+        Some("libsql://vci-vex-composal.aws-eu-west-1.turso.io")
+    );
+    f.check().unwrap();
+    let f = file("[store]\ntoken_command = \"op read op://ci/vci/token | tr -d '\\\\n'\"\n");
+    assert_eq!(
+        f.token_command,
+        Some(TokenCommand::Shell(
+            "op read op://ci/vci/token | tr -d '\\n'".into()
+        ))
+    );
+    f.check().unwrap();
+    // Neither empty, nor a NUL, nor another type.
+    for bad in [
+        "token_command = []",
+        "token_command = [\"\"]",
+        "token_command = \"  \"",
+        "token_command = [\"a\\u0000b\"]",
+    ] {
+        let m = file(&format!("[store]\n{bad}\n"))
+            .check()
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("[store] token_command"), "{bad}: {m}");
+    }
+    for bad in [
+        "token_command = 5",
+        "token_command = [1, 2]",
+        "token_command = { a = 1 }",
+    ] {
+        assert!(
+            toml::from_str::<OnlyStore>(&format!("[store]\n{bad}\n")).is_err(),
+            "{bad}"
+        );
+    }
+    // It is not a store input either: serialized back as given, the url
+    // never (it may have held a credential before it was checked).
+    let back = serde_json::to_string(&file(TURSO_TOML)).unwrap();
+    assert!(back.contains("\"token_command\":[\"com\""), "{back}");
+    assert!(!back.contains("turso.io"), "{back}");
+}
+
+/// `[store] url` may name a server, never carry a credential: a password,
+/// any userinfo of a libSQL server, a token or password in its query (in
+/// any case, percent-encoded or not; for libSQL any parameter but `tls`),
+/// or a fragment. The error names the key, never the value.
+#[test]
+fn a_credential_in_store_url_is_refused_unprinted() {
+    for url in [
+        "postgres://ci:pl4nted@db.example/ci",
+        "postgresql://ci:@db.example/ci",
+        "postgres://ci%3Apl4nted@db.example/ci",
+        "postgres://ci:a@pl4nted@db.example/ci",
+        "postgres://db.example/ci?password=pl4nted",
+        "postgres://db.example/ci?PassWord=pl4nted",
+        "postgres://db.example/ci?pass%77ord=pl4nted",
+        "postgres://db.example/ci?sslpassword=pl4nted",
+        "postgres://db.example/ci?sslmode=require&api_token=pl4nted",
+        "postgres://db.example/ci#pl4nted",
+        "libsql://vci-pl4nted.turso.io?authToken=pl4nted",
+        "libsql://vci.turso.io?AUTHTOKEN=pl4nted",
+        "libsql://vci.turso.io?auth%54oken=pl4nted",
+        "libsql://vci.turso.io?auth_token=pl4nted",
+        "libsql://vci.turso.io?tls=1&jwt=pl4nted",
+        "libsql://vci.turso.io?pl4nted",
+        "libsql://vci.turso.io#authToken=pl4nted",
+        "libsql://pl4nted@vci.turso.io",
+        "https://u:pl4nted@vci.turso.io",
+        "https://vci.turso.io/?token=pl4nted",
+        "file:pl4nted.db",
+        "sqlite:/tmp/pl4nted.db",
+        "host=db.example password=pl4nted",
+        "pl4nted",
+        "libsql://vci.turso.io pl4nted",
+        "",
+    ] {
+        let toml = format!("[store]\nbackend = \"libsql\"\nurl = {url:?}\n");
+        for env in [&[][..], &[(ENV_STORE_URL, "libsql://other.turso.io")][..]] {
+            let m = config_err(env, Some(&toml));
+            assert!(m.starts_with("vci.toml [store] url "), "{url}: {m}");
+            assert!(m.contains("(it was not printed)"), "{url}: {m}");
+            assert!(!m.contains("pl4nted"), "{url}: {m}");
+        }
+    }
+    // A user alone is allowed for PostgreSQL (it needs one), and the query
+    // parameters that carry no credential.
+    for url in [
+        "postgres://vci@db.example:5432/ci?sslmode=verify-full&sslrootcert=/etc/ca.pem",
+        "postgresql://db.example/ci?user=vci&application_name=vci",
+        "libsql://vci-vex-composal.aws-eu-west-1.turso.io",
+        "libsql://127.0.0.1:8080?tls=0",
+        "https://vci.turso.io",
+        "http://127.0.0.1:8080/",
+    ] {
+        file(&format!("[store]\nurl = {url:?}\n"))
+            .check()
+            .unwrap_or_else(|e| panic!("{url}: {e}"));
+    }
+}
+
+/// The backend: `VCI_STORE`, the scheme of `VCI_STORE_URL`, `[store]
+/// backend`, the scheme of `[store] url`, git-meta. `VCI_STORE_URL` wins
+/// over `[store] url`; a file that contradicts itself is an error, an
+/// environment that overrides it a warning.
+#[test]
+fn store_url_selects_by_scheme_and_the_environment_wins() {
+    let k = |s: &Selection| (s.kind.value.clone(), s.kind.source);
+    let url = |s: &Selection| {
+        s.url
+            .as_ref()
+            .map(|u| (u.value.expose().to_owned(), u.source))
+    };
+    // vex's file: libsql, remote, the server from vci.toml.
+    let s = sel(&[], Some(TURSO_TOML)).unwrap();
+    assert_eq!(k(&s), ("libsql".into(), Source::File));
+    assert_eq!(s.libsql.mode.value, LibsqlMode::Remote);
+    assert_eq!(s.libsql.mode.source, Source::File);
+    assert_eq!(
+        url(&s),
+        Some((
+            "libsql://vci-vex-composal.aws-eu-west-1.turso.io".into(),
+            Source::File
+        ))
+    );
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    assert_eq!(
+        line(&s, "url"),
+        (
+            "libsql://vci-vex-composal.aws-eu-west-1.turso.io".into(),
+            "vci.toml [store]".into()
+        )
+    );
+    // The scheme alone selects, as VCI_STORE_URL's does.
+    let s = sel(&[], Some("[store]\nurl = \"libsql://db.turso.io\"\n")).unwrap();
+    assert_eq!(k(&s), ("libsql".into(), Source::File));
+    let s = sel(
+        &[],
+        Some("[store]\nurl = \"postgres://vci@db.example/ci\"\n"),
+    )
+    .unwrap();
+    assert_eq!(k(&s), ("postgres".into(), Source::File));
+    assert_eq!(
+        url(&s),
+        Some(("postgres://vci@db.example/ci".into(), Source::File))
+    );
+    // [store] backend over the url's scheme: an https:// server needs it.
+    let s = sel(
+        &[],
+        Some("[store]\nbackend = \"libsql\"\nurl = \"https://db.example\"\n"),
+    )
+    .unwrap();
+    assert_eq!(s.libsql.mode.value, LibsqlMode::Remote);
+    // ... and a file that contradicts itself is refused.
+    let m = config_err(
+        &[],
+        Some("[store]\nbackend = \"postgres\"\nurl = \"libsql://db.turso.io\"\n"),
+    );
+    assert_eq!(
+        m,
+        "vci.toml [store] url is a libsql location but [store] backend is postgres"
+    );
+    let m = config_err(
+        &[],
+        Some("[store]\nbackend = \"postgres\"\nurl = \"https://db.example\"\n"),
+    );
+    assert!(m.contains("not a postgres:// or postgresql:// URL"), "{m}");
+    // An https:// url without a backend is git-meta's, which takes none.
+    let s = sel(&[], Some("[store]\nurl = \"https://db.example\"\n")).unwrap();
+    assert_eq!(k(&s), ("git-meta".into(), Source::Default));
+    assert_eq!(url(&s), None);
+    assert_eq!(
+        s.warnings,
+        [
+            "vci.toml [store] url (https://db.example) is ignored: the git-meta store (from the default) takes no server"
+        ]
+    );
+    // VCI_STORE_URL wins over [store] url (and selects by its scheme).
+    let env_url = "libsql://ci.turso.io?authToken=s3cret-u";
+    let s = sel(&[(ENV_STORE_URL, env_url)], Some(TURSO_TOML)).unwrap();
+    assert_eq!(url(&s), Some((env_url.into(), Source::Env(ENV_STORE_URL))));
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    let s = sel(
+        &[(ENV_STORE_URL, PG_URL)],
+        Some("[store]\nurl = \"libsql://db.turso.io\"\n"),
+    )
+    .unwrap();
+    assert_eq!(k(&s), ("postgres".into(), Source::Env(ENV_STORE_URL)));
+    assert_eq!(url(&s).unwrap().1, Source::Env(ENV_STORE_URL));
+    // VCI_STORE elsewhere: the url is ignored, with a warning, and so is
+    // the command (never run).
+    for (store, warning) in [
+        (
+            "git-meta",
+            "vci.toml [store] url (libsql://vci-vex-composal.aws-eu-west-1.turso.io) is ignored: it is a libsql location and the store is git-meta (from $VCI_STORE)",
+        ),
+        (
+            "sqlite",
+            "vci.toml [store] url (libsql://vci-vex-composal.aws-eu-west-1.turso.io) is ignored: it is a libsql location and the store is sqlite (from $VCI_STORE)",
+        ),
+    ] {
+        let s = sel(&[(ENV_STORE, store)], Some(TURSO_TOML)).unwrap();
+        assert_eq!(url(&s), None);
+        assert_eq!(s.token_command, None);
+        assert!(s.warnings.iter().any(|w| w == warning), "{:?}", s.warnings);
+        assert!(
+            s.warnings.iter().any(|w| w
+                == &format!("vci.toml [store] token_command is ignored (not run): the store is {store} (from $VCI_STORE), which takes no credential")),
+            "{:?}",
+            s.warnings
+        );
+    }
+    // The kind a failed store is named after follows the same order.
+    let f = file("[store]\nurl = \"libsql://db.turso.io\"\n");
+    assert_eq!(select::requested_kind(&env(&[]), Some(&f)), "libsql");
+    assert_eq!(
+        select::requested_kind(&env(&[(ENV_STORE_URL, "https://x")]), Some(&f)),
+        "git-meta"
+    );
+}
+
+/// A credential from the environment is only ever sent to a URL from the
+/// environment: `VCI_STORE_TOKEN` with the URL from `vci.toml` is refused,
+/// saying to set `VCI_STORE_URL` too, and printing neither; so it is when
+/// the environment also chooses the backend or the libSQL mode (CI setting
+/// `VCI_STORE` beside the token, the URL left in `vci.toml`).
+#[test]
+fn an_environment_token_never_goes_to_a_url_from_vci_toml() {
+    const TOKEN: &str = "envT0kenS3cret";
+    let libsql = [
+        TURSO_TOML,
+        "[store]\nurl = \"libsql://db.turso.io\"\n",
+        "[store]\nbackend = \"libsql\"\nurl = \"https://db.example\"\n[store.libsql]\nreplica = true\n",
+    ];
+    let postgres = ["[store]\nurl = \"postgres://vci@db.example/ci\"\n"];
+    let token = (ENV_TOKEN, TOKEN);
+    // An environment, and the vci.toml files to try with it.
+    type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
+    let cases: [Case; 7] = [
+        (&[token], &libsql),
+        (&[token], &postgres),
+        (&[(ENV_STORE, "libsql"), token], &libsql),
+        (&[(ENV_STORE, "turso"), token], &libsql),
+        (&[(ENV_SYNC, "replica"), token], &libsql),
+        (&[(ENV_REPLICA, "r.libsql"), token], &libsql),
+        (&[(ENV_STORE, "postgres"), token], &postgres),
+    ];
+    for (vars, tomls) in cases {
+        for toml in tomls {
+            let m = config_err(vars, Some(toml));
+            assert!(
+                m.starts_with(
+                    "$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url: a credential from the environment is sent only to a URL from the environment"
+                ),
+                "{vars:?} {toml}: {m}"
+            );
+            assert!(m.contains("set $VCI_STORE_URL as well"), "{m}");
+            assert!(!m.contains(TOKEN) && !m.contains("db."), "{m}");
+        }
+    }
+    // With VCI_STORE_URL as well, both come from the environment: the
+    // token is used and the command is not.
+    let s = sel(
+        &[
+            (ENV_TOKEN, TOKEN),
+            (
+                ENV_STORE_URL,
+                "libsql://vci-vex-composal.aws-eu-west-1.turso.io",
+            ),
+        ],
+        Some(TURSO_TOML),
+    )
+    .unwrap();
+    assert_eq!(s.token.as_ref().unwrap().value.expose(), TOKEN);
+    assert_eq!(s.token_command, None);
+    assert_eq!(
+        line(&s, "token"),
+        ("(set)".into(), "$VCI_STORE_TOKEN".into())
+    );
+    assert!(!format!("{s:?} {:?}", describe(&s)).contains(TOKEN));
+    // A store that takes no URL from vci.toml is not refused: the token is
+    // only ignored, as before.
+    let s = sel(
+        &[(ENV_TOKEN, TOKEN), (ENV_STORE, "git-meta")],
+        Some(TURSO_TOML),
+    )
+    .unwrap();
+    assert!(s.url.is_none());
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.starts_with("$VCI_STORE_TOKEN is ignored")),
+        "{:?}",
+        s.warnings
+    );
+}
+
+/// The command is the credential's last source: it is kept only for a
+/// store that takes a credential (a libSQL server, PostgreSQL) and only
+/// when `VCI_STORE_TOKEN` is unset; elsewhere it is ignored with a
+/// warning. `vci store info` names it and never runs it.
+#[test]
+fn token_command_applies_to_stores_that_take_a_credential() {
+    let com = argv(&["com", "secrets", "get", "vci-store-token", "--org", "vex"]);
+    let s = sel(&[], Some(TURSO_TOML)).unwrap();
+    assert_eq!(s.token_command, Some(com.clone()));
+    assert_eq!(
+        line(&s, "token"),
+        (
+            "(from token_command: com secrets get vci-store-token --org vex)".into(),
+            "vci.toml [store]".into()
+        )
+    );
+    // The replica mode too.
+    let s = sel(&[("VCI_STORE_SYNC", "replica")], Some(TURSO_TOML)).unwrap();
+    assert_eq!(s.libsql.mode.value, LibsqlMode::Replica);
+    assert_eq!(s.token_command, Some(com.clone()));
+    // A token in VCI_STORE_URL comes first: describe says so; the backend
+    // does not run the command (it sees the URL's token first).
+    for url in [
+        "libsql://ci.turso.io?authToken=s3cret-u",
+        "libsql://ci.turso.io?tls=1&AUTH_TOKEN=s3cret-u",
+        "libsql://ci.turso.io?auth%54oken=s3cret-u",
+        "libsql://ci.turso.io?authToken=&authToken=s3cret-u",
+    ] {
+        let s = sel(&[(ENV_STORE_URL, url)], Some(TURSO_TOML)).unwrap();
+        assert_eq!(line(&s, "token").0, "(the URL's authToken)", "{url}");
+    }
+    // An empty one is no token (the backend skips it, as it skips an empty
+    // VCI_STORE_TOKEN): the command supplies it, and describe says so.
+    for url in [
+        "libsql://ci.turso.io?authToken=",
+        "libsql://ci.turso.io?authToken",
+        "libsql://ci.turso.io?auth_token=&tls=1",
+        "libsql://ci.turso.io?authToken=s3cret-u&authToken=",
+    ] {
+        let s = sel(&[(ENV_STORE_URL, url)], Some(TURSO_TOML)).unwrap();
+        assert_eq!(
+            line(&s, "token"),
+            (
+                "(from token_command: com secrets get vci-store-token --org vex)".into(),
+                "vci.toml [store]".into()
+            ),
+            "{url}"
+        );
+    }
+    // A server from VCI_STORE_URL with no token: the command supplies it.
+    let s = sel(&[(ENV_STORE_URL, "libsql://ci.turso.io")], Some(TURSO_TOML)).unwrap();
+    assert_eq!(s.token_command, Some(com.clone()));
+    // PostgreSQL: its password, when the URL has none.
+    let pg = "[store]\nurl = \"postgres://vci@db.example/ci\"\ntoken_command = [\"pw\"]\n";
+    let s = sel(&[], Some(pg)).unwrap();
+    assert_eq!(s.token_command, Some(argv(&["pw"])));
+    assert_eq!(
+        line(&s, "password"),
+        ("(from token_command: pw)".into(), "vci.toml [store]".into())
+    );
+    let s = sel(&[(ENV_STORE_URL, PG_URL)], Some(pg)).unwrap();
+    assert_eq!(
+        line(&s, "password"),
+        ("(in the URL)".into(), "$VCI_STORE_URL".into())
+    );
+    for url in [
+        "host=db password='a b' dbname=x",
+        "postgres://db.example/ci?password=x",
+    ] {
+        let s = sel(&[(ENV_STORE, "postgres"), (ENV_STORE_URL, url)], None).unwrap();
+        assert_eq!(line(&s, "password").0, "(in the URL)", "{url}");
+    }
+    for url in [
+        "host=db sslpassword=x dbname=x",
+        "postgres://vci@db.example/ci",
+    ] {
+        let s = sel(&[(ENV_STORE, "postgres"), (ENV_STORE_URL, url)], None).unwrap();
+        assert_eq!(line(&s, "password").0, "(none)", "{url}");
+    }
+    // Stores that take no credential: ignored, never run, with a warning.
+    for (vars, toml, store) in [
+        (
+            &[][..],
+            "[store]\ntoken_command = [\"pw\"]\n",
+            "git-meta (from the default)",
+        ),
+        (
+            &[][..],
+            "[store]\nbackend = \"sqlite\"\ntoken_command = [\"pw\"]\n",
+            "sqlite (from vci.toml [store])",
+        ),
+        (
+            &[][..],
+            "[store]\nbackend = \"libsql\"\ntoken_command = [\"pw\"]\n",
+            "libsql in local mode (from vci.toml [store])",
+        ),
+        (
+            &[(ENV_STORE_URL, "file:local.libsql")][..],
+            TURSO_TOML,
+            "libsql in local mode (from vci.toml [store])",
+        ),
+    ] {
+        let s = sel(vars, Some(toml)).unwrap();
+        assert_eq!(s.token_command, None, "{toml}");
+        assert_eq!(
+            s.warnings,
+            [format!(
+                "vci.toml [store] token_command is ignored (not run): the store is {store}, which takes no credential"
+            )],
+            "{toml}"
+        );
+    }
+    // A selection made without one has none.
+    assert_eq!(Selection::for_backend("libsql").token_command, None);
 }
