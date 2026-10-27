@@ -2031,12 +2031,14 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   nothing, more than one line, something that is not UTF-8 or more than 64 KiB), the store is unavailable, as when a
   server cannot be reached: `vci plan` runs everything with a warning saying what happened and naming the command as
   `vci.toml` gives it (`the token_command (com secrets get vci-store-token --org vex) exited 1; vci shows none of its
-  output, which may hold the credential: run the command yourself to see why`), `vci run` keeps the tests' exit code
+  output, which may hold the credential: run the command yourself with its standard output discarded (> /dev/null)
+  to see why`), `vci run` keeps the tests' exit code
   and stores nothing, and `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. **Nothing the command
   printed is ever shown, on standard output or standard error**: a command that fails may print the credential on
   either, framed in ways no scrubbing finds (a pipeline stage that echoes its input, as `jq` does when it cannot parse
   it; a wrapper that logs the token; a passphrase with spaces), so its standard error is read and dropped. Run the
-  command yourself, in the repository's top level, to see its error.
+  command yourself, in the repository's top level, with its standard output discarded, to see its error without
+  printing the credential: `com secrets get vci-store-token --org vex > /dev/null`.
 - **`vci store info`** names it, never the token: `token: (from token_command: com secrets get vci-store-token --org
   vex) (vci.toml [store])` (`password:` for PostgreSQL). No message vci prints about the command holds anything it
   printed.

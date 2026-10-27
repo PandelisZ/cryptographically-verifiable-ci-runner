@@ -246,6 +246,46 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
     );
 }
 
+/// The hint says to run the command with its standard output discarded,
+/// not plainly: a command that works prints the credential on standard
+/// output, which would put it in a terminal's scrollback or an agent's
+/// transcript. Run that way, a helper that prints a token and fails shows
+/// its error and not the token.
+#[test]
+fn the_hint_says_to_discard_standard_output() {
+    assert!(
+        HINT.ends_with(
+            "run the command yourself with its standard output discarded (> /dev/null) to see why"
+        ),
+        "{HINT}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let helper = script(
+        d,
+        "half-signed-in",
+        &format!("echo {TOKEN}\necho 'session expired: sign in again' >&2\nexit 3"),
+    );
+    let m = fetch(argv(&[&helper]), d, Duration::from_secs(30))
+        .unwrap_err()
+        .to_string();
+    assert!(m.ends_with(&format!("exited 3; {HINT}")), "{m}");
+    // What the hint says to do, as a person or an agent would type it.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{helper}' > /dev/null"))
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(3), "{shown}");
+    assert!(shown.contains("session expired: sign in again"), "{shown}");
+    assert!(!shown.contains(TOKEN), "{shown}");
+}
+
 /// What a command that fails wrote on standard error is never shown,
 /// whatever it held: the credential in any frame, which no scrubbing of
 /// standard output could find. Each helper puts a canary on standard error

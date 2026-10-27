@@ -54,7 +54,8 @@
 //!   fetch`, `vci push`, `vci prune` and `vci store info` exit 2. The
 //!   message says what happened and names the command as `vci.toml` gives
 //!   it (not a secret), with [`HINT`]: nothing the command printed, on
-//!   standard output or standard error, is ever shown.
+//!   standard output or standard error, is ever shown, and the way to see
+//!   why is to run the command with its standard output discarded.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -79,8 +80,11 @@ pub const MAX_OUTPUT: usize = 64 * 1024;
 /// What a failure of the command ends with, after what happened (`the
 /// token_command (<command>) exited 1; <HINT>`): vci shows nothing the
 /// command printed, since its standard error, like its standard output,
-/// may hold the credential, so the way to see why is to run it.
-pub const HINT: &str = "vci shows none of its output, which may hold the credential: run the command yourself to see why";
+/// may hold the credential, so the way to see why is to run it, with its
+/// standard output discarded: a command that works prints the credential
+/// there, and a person's terminal or an agent's transcript is no place for
+/// it, while the error it explains itself with goes to standard error.
+pub const HINT: &str = "vci shows none of its output, which may hold the credential: run the command yourself with its standard output discarded (> /dev/null) to see why";
 
 /// The longest command a message shows, in characters.
 const SHOWN: usize = 200;

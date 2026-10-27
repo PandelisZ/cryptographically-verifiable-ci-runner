@@ -711,9 +711,10 @@ const CANARY: &str = "stderrC4naryE2e";
 
 /// 3. A helper that cannot give a token (it fails, prints nothing, prints
 ///    two lines, or is not there): the plan runs everything with a warning
-///    saying what happened, naming the command and saying to run it to see
-///    why, in every format (text, JSON, GitHub's), the commands that manage
-///    the store exit 2 saying it, `vci run` and `vci ci` keep the tests'
+///    saying what happened, naming the command and saying to run it with
+///    its standard output discarded to see why, in every format (text,
+///    JSON, GitHub's), the commands that manage the store exit 2 saying
+///    it, `vci run` and `vci ci` keep the tests'
 ///    exit code and store nothing, and the audit log's warnings say it.
 ///    Nothing the helper printed, on standard output or standard error, is
 ///    shown anywhere: each helper puts a canary on standard error beside the
