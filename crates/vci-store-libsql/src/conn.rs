@@ -35,7 +35,9 @@
 //!   the first answer's bound, as before. A connection that cannot be
 //!   made (nothing listening, DNS, TLS, the connect timeout) latches it at
 //!   once, as before; an answer of the server (an HTTP status, whatever
-//!   its body says) is never sent again; an answer cut off after the
+//!   its body says) is never sent again, unless its body was cut off
+//!   before it arrived whole, which looks like a lost connection and is
+//!   sent again as one; an answer cut off after the
 //!   server began it (a read's rows) fails that call and latches nothing,
 //!   as before. Sending a request again is safe: reads change nothing,
 //!   and a write is one transaction whose statements, applied twice,
@@ -586,8 +588,10 @@ fn dropped(lower: &str) -> bool {
 /// The pauses before a request whose connection was lost ([`dropped`]) is
 /// sent again, each time on a new connection: at once, then after 100 ms
 /// and 500 ms, each only while the request's deadline allows. A server
-/// that drops every connection costs about 0.6 s before the breaker
-/// latches; one that went away is refused at the first new connection.
+/// that drops every connection costs those 0.6 s of pauses plus four
+/// tries, each as long as the server takes to drop it, all within the
+/// request's deadline, before the breaker latches; one that went away is
+/// refused at the first new connection.
 const RESEND: [Duration; 3] = [
     Duration::ZERO,
     Duration::from_millis(100),
@@ -1363,8 +1367,8 @@ impl Conn {
     /// see the batch's rows, then the other writer's, then the batch's
     /// again (a key removed, stored again, then gone): no order of single
     /// applications gives that. The window is from the first commit to
-    /// the batch sent again (a few round trips, and at most 0.6 s of
-    /// pauses); vci's removals are of keys superseded and slots emptied,
+    /// the batch sent again (usually a few round trips and well under a
+    /// second, at most the request's deadline); vci's removals are of keys superseded and slots emptied,
     /// and the store is not trusted (every attestation is verified when
     /// read), so the worst is a miss: a test runs again and its
     /// attestation is stored again, never a wrong verification. Should

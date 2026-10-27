@@ -2347,7 +2347,9 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   connect`: nothing listening, DNS, TLS, the connect timeout) latches at once, as before, so a server that went away
   costs one more connection attempt, refused at once, and an unreachable one no more than before. An HTTP status (401,
   403, 404, a 5xx) is the server's answer and is never sent again, whatever its body says (a proxy's page that quotes
-  an upstream's `http error: connection reset by peer` included), nor is a statement's or a stream's error. A read's
+  an upstream's `http error: connection reset by peer` included), nor is a statement's or a stream's error; the
+  exception is a status whose body was cut off before it arrived whole, which looks like a lost connection and is sent
+  again as one. A read's
   rows cut off after the server began sending them (`cursor error: …`, reading the answer's body) are not a lost
   connection either, since the connection was alive when the request went out: that read fails and nothing is latched,
   as in 2.8.0, so a server or middlebox that cuts some answer every time fails that read only. Sending a request again
@@ -2465,8 +2467,8 @@ undone where the two overlap. Its upserts replace that writer's newer row of the
 `put_at`, and its removals delete a key that writer stored again, or, for a slot the batch emptied (a `DELETE` by test
 key, signer and storage key), whatever that writer stored in the slot. A reader can see the batch's rows, then the
 other writer's, then the batch's again (a key removed, stored again, then gone), which no order of single applications
-gives. The window is from the first commit to the batch sent again (a few round trips, and at most 0.6 s
-of pauses), vci's removals are of keys superseded and slots emptied, and the store is untrusted (section 1: every
+gives. The window is from the first commit to the batch sent again (usually a few round trips and well
+under a second, at most the request's deadline), vci's removals are of keys superseded and slots emptied, and the store is untrusted (section 1: every
 attestation is verified when read), so the worst is a miss, a test that runs again and stores its attestation again,
 never a wrong verification (removals conditioned on the row they meant to remove would order them strictly; for a
 miss this rare they are not made). Should the server keep the transaction of a request that was cut off open, it
