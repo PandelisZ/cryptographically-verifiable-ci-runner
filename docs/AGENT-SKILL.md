@@ -175,8 +175,13 @@ the site's `stores.html`). `SKILL.md` has a section, "Attestation stores", that 
   show;
 - never to print, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN` or what a `[store] token_command` prints, and
   never to put a credential in `vci.toml`;
-- to see why a token command failed by running it with its standard output discarded
-  (`com secrets get vci-store-token --org vex > /dev/null`), which is what vci's message says since 2.8.1;
+- not to run a failing token command itself, since its standard error can hold the token even with standard output
+  discarded, but to ask the user to run it in their own terminal as vci's message says since 2.8.1
+  (`com secrets get vci-store-token --org vex > /dev/null`) and report the cause;
+- to check, before its first vci command in a session, whether the checkout changes `[store] url` or `token_command`
+  (`git diff origin/main -- vci.toml`), since reading the store runs that command and sends its output to that url,
+  and to run vci with `VCI_STORE=git-meta` in a checkout the user has not reviewed;
+- that attestations in SQLite, or libSQL's local file, stay on that machine, so a local skip says nothing about CI;
 - that `vci push` publishes on git-meta only, that `vci run` stores at once on the other stores, and that `vci ci
   --push` is for trusted CI jobs;
 - that a plan which says `running everything: reading attestations from <kind>: …` failed open, which is safe;
@@ -184,8 +189,12 @@ the site's `stores.html`). `SKILL.md` has a section, "Attestation stores", that 
   never as an argument, asking before each command that creates a database, token, environment or secret.
 
 On a repository whose `vci.toml` has `[store] url` and `token_command`, the agent needs no store variable in its
-environment: sign its machine in to the tool the command uses (`com login`, `op signin`). Give it a read-only token
-if it should plan but not store; its `vci run` then runs the tests and stores nothing.
+environment: sign its machine in to the tool the command uses (`com login`, `op signin`), as an account allowed to
+read the secret (`com secrets get` reads an organization's secret for its admins only). That gives the agent the same
+token as every developer. If it should plan but not store, give it a read-only token instead: set `VCI_STORE_URL` and
+a read-only `VCI_STORE_TOKEN` in the environment the agent starts with, which win over `[store]` (both are needed: a
+token from the environment is never sent to `vci.toml`'s url). Every process the agent starts can read them, its tests
+included, which is acceptable for a token that can only read. Its `vci run` then runs the tests and stores nothing.
 
 The helper script can be run by hand too:
 

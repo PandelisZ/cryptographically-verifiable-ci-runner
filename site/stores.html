@@ -34,7 +34,7 @@
 <ul>
 <li><strong>git-meta</strong> writes to a local store. <code>vci push</code> publishes it on <code>refs/meta/main</code>, and <code>vci fetch</code> (or <code>vci ci --fetch</code>, as the action runs it) brings in what others pushed. On a busy repository that fetch and merge is the largest part of a plan: a median of 7.4 of 15 seconds on vex's Rails pull requests on 24 and 25 October 2026 (<a href="benchmarks.html#plan-step">benchmarks</a>).</li>
 <li><strong>SQLite</strong> has nothing to exchange. <code>vci fetch</code> says <code>the sqlite store at … is local: nothing to fetch (N attestations stored)</code>, <code>vci push</code> says there is nothing to push, and both exit 0, so a workflow written for git-meta keeps working.</li>
-<li><strong>PostgreSQL and a libSQL server are shared.</strong> <code>vci run</code> writes to the server at once, and every reader sees it with no fetch. <code>vci fetch</code> and <code>vci push</code> say the store is shared and exit 0; the action's <code>--fetch origin</code> and <code>--remote origin</code> are ignored with a warning. <code>vci fetch --remote</code> and <code>vci push --remote</code> exit 2 on any store but git-meta.</li>
+<li><strong>PostgreSQL and a libSQL server are shared.</strong> <code>vci run</code> writes to the server at once, and every reader sees it with no fetch. <code>vci fetch</code> and <code>vci push</code> say the store is shared and exit 0; the action's <code>--fetch origin</code> and <code>--remote origin</code> are ignored with a warning. <code>vci fetch --remote</code> and <code>vci push --remote</code> exit 2 on any store but git-meta, so a workflow without the action drops its <code>vci fetch --remote origin</code> step (<a href="#turso">step 5</a> below).</li>
 </ul>
 <p>On a shared store, <strong><code>vci ci</code> stores nothing without <code>--push</code></strong>. With git-meta nothing a CI job attests leaves it unless the job pushes, and the shared stores keep that rule. Without <code>--push</code> it signs, then prints:</p>
 <pre data-nocopy><code>vci: not storing 2 attestation(s): the libsql store is shared and vci ci was not given --push
@@ -77,11 +77,11 @@ attestations: 4</code></pre>
 <p>A shared store has a credential: a Turso token, or a PostgreSQL password. vci handles it like this, and asks the same of you.</p>
 <ul>
 <li><strong>Never a credential in <code>vci.toml</code>.</strong> Every checkout carries it, a pull request's included. vci refuses a <code>[store] url</code> holding a password, a token, an <code>authToken</code> or a <code>#fragment</code>, without printing it. <code>vci.toml</code> may say where the server is (<code>[store] url</code>) and which command prints the credential (<code>[store] token_command</code>).</li>
-<li><strong>A token from the environment goes only to a URL from the environment.</strong> <code>VCI_STORE_TOKEN</code> with the URL from <code>vci.toml</code> is refused, because a pull request could change that URL to a server of its own and collect CI's token. CI sets both <code>VCI_STORE_URL</code> and <code>VCI_STORE_TOKEN</code>; a laptop sets neither.</li>
+<li><strong>A token from the environment goes only to a URL from the environment.</strong> <code>VCI_STORE_TOKEN</code> with the URL from <code>vci.toml</code> is refused, because a pull request could change that URL to a server of its own and collect CI's token. CI sets both <code>VCI_STORE_URL</code> and <code>VCI_STORE_TOKEN</code>, and so does a machine given a read-only token of its own (step 6); a laptop that reads the token through <code>token_command</code> sets neither.</li>
 <li><strong>Tests can still find the token.</strong> vci removes <code>VCI_STORE_URL</code>, <code>VCI_STORE_TOKEN</code> and <code>VCI_STORE</code> from its own environment as it starts and from every environment it builds for a test, probe, hook or token command. The environment a process started with stays readable to every process of the same user, though (<code>/proc/&lt;pid&gt;/environ</code> on Linux, <code>ps eww</code> on macOS), and so does the CI step's shell, which set the variables. vci cannot hide them there.</li>
 <li><strong>So a job that runs untrusted code gets a read-only token, or none.</strong> Only trusted jobs hold a token that can write: the default branch's, or pull requests from the same repository, whose authors could change the workflow and read its secrets anyway.</li>
 <li><strong>On your own machine, <code>[store] url</code> is as sensitive as <code>token_command</code>.</strong> The token the command prints goes to whatever <code>[store] url</code> names, and both come from the checkout. Review a change to either as you would a change to a test helper. In a checkout you have not reviewed, run vci with <code>VCI_STORE=git-meta</code>: it then ignores both and never runs the command.</li>
-<li><strong>Never print a token.</strong> Pipe it from <code>turso db tokens create</code> straight into <code>gh secret set</code> or your secrets manager, and never pass it as a command-line argument, where it lands in shell history and process listings. To see why a token command fails, run it with its standard output discarded (below).</li>
+<li><strong>Never print a token.</strong> Pipe it from <code>turso db tokens create</code> straight into <code>gh secret set</code> or your secrets manager, and never pass it as a command-line argument, where it lands in shell history and process listings. To see why a token command fails, run it yourself, in your own terminal, with its standard output discarded (<a href="#turso-troubleshooting">below</a>). That discards the token a command that works prints on standard output. Its standard error still shows, and a wrapper or a pipeline stage can log the token there, so never have an agent run it.</li>
 </ul>
 </div>
 
@@ -115,11 +115,11 @@ turso db show vci --url   <span class="c"># libsql://vci-&lt;organization&gt;.&l
 <pre><code>turso db show vci --url | gh secret set VCI_STORE_URL
 turso db tokens create vci --read-only | gh secret set VCI_STORE_TOKEN
 turso db tokens create vci | gh secret set VCI_STORE_TOKEN --env vci-attest</code></pre>
-  <p><code>gh secret set</code> reads the value from standard input when it has no <code>--body</code>, so the token never appears on screen or on a command line. A secret of an environment wins over a repository secret of the same name in the jobs that use that environment: pull-request jobs get the read-only token, and the main-branch job, which runs in <code>vci-attest</code>, gets the one that can write. Pull requests from forks get no secrets at all; their jobs cannot read the store and run every test.</p>
+  <p><code>gh secret set</code> reads the value from standard input when it has no <code>--body</code>, so the token never appears on screen or on a command line. A secret of an environment wins over a repository secret of the same name in the jobs that use that environment: pull-request jobs get the read-only token, and the main-branch job, which runs in <code>vci-attest</code>, gets the one that can write. Pull requests from forks get no secrets at all, and vci treats an empty variable as unset, so their jobs fall back to <code>vci.toml</code>. Before <code>[store]</code> is committed (step 6) that is git-meta: the action fetches <code>refs/meta/main</code>, and the attestations already there, verified as always, can still skip units. Once it is committed, vci runs its <code>token_command</code>, which is neither installed nor signed in on GitHub's runners, so the plan says <code>running everything: … the token_command (…) was not found</code> and every test runs.</p>
 </li>
 <li>
-  <h3>Give both jobs the two variables</h3>
-  <p>The same two lines in each job. The main-branch job also attests (<code>signing-key</code>, or <code>oidc: true</code>), and the action then runs <code>vci ci --key … --push</code>, which stores what it attested. On a shared store <code>--push</code> writes to the database, not to git, so that job needs no <code>contents: write</code>.</p>
+  <h3>Give both jobs' vci step the two variables</h3>
+  <p>The same two lines in each job, on the vci step. The main-branch job also attests (<code>signing-key</code>, or <code>oidc: true</code>), and the action then runs <code>vci ci --key … --push</code>, which stores what it attested. On a shared store <code>--push</code> writes to the database, not to git, so that job needs no <code>contents: write</code>.</p>
 <pre><code>name: test
 
 on:
@@ -135,57 +135,70 @@ jobs:
   test:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    env:
-      VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
-      VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}   <span class="c"># the repository secret: read-only</span>
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0      <span class="c"># the base commit, and the repository id the store's tables are named after</span>
       <span class="c"># ...your toolchain steps...</span>
       - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+        env:
+          VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
+          VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}   <span class="c"># the repository secret: read-only</span>
 
   <span class="c"># Pushes to main: run what is not attested, attest it, store it.</span>
   test-main:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main'
     environment: vci-attest
-    env:
-      VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
-      VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}   <span class="c"># vci-attest's secret: can write</span>
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       <span class="c"># ...your toolchain steps...</span>
       - uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+        env:
+          VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
+          VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}   <span class="c"># vci-attest's secret: can write</span>
         with:
           signing-key: ${{ secrets.VCI_SIGNING_KEY }}   <span class="c"># or oidc: true (with permissions: id-token: write)</span></code></pre>
-  <p>Every step of a job can read its <code>env</code>, the install steps and the tests included, which is why the pull-request job's token is read-only. Without the action, run <code>vci ci --base-ref "$BASE" --key "$KEY" --push</code> in the main-branch job and leave out <code>--push</code> everywhere else.</p>
+  <p>Every step of a job can read the job's <code>env</code>. On the vci step, the variables reach vci (the action is a composite action, whose steps inherit them) and no earlier step, so the toolchain and setup actions never see the token that can write. The tests run inside the vci step, though, and can read what it was given (see the box above), which is why the pull-request job's token is read-only.</p>
+  <p>Without the action, give the two variables to the step that runs <code>vci ci</code>, run <code>vci ci --base-ref "$BASE" --key "$KEY" --push</code> in the main-branch job, and leave out <code>--push</code> everywhere else. Remove a <code>vci fetch --remote origin</code> step if the workflow has one, as the workflow <code>vci init</code> prints and this repository's examples do: on any store but git-meta it stops the job with <code>vci: error: the libsql store does not support a remote</code> (exit 2) before any test runs. <code>vci ci --fetch origin</code> only warns, so it can stay.</p>
 </li>
 <li>
   <h3>Point laptops and agents at it</h3>
-  <p>Commit a <code>[store]</code> table that names the database and the command that prints a token, so that nobody exports anything:</p>
+  <p>Developers and agents read a token through a command named in <code>vci.toml</code>, so that nobody exports anything. First put a token that can write where that command will read it, from standard input as before:</p>
+<pre><code><span class="c"># Composal: --from-stdin, never --value. Leave out --ci, which would hand the</span>
+<span class="c"># secret to CI runners as an environment variable.</span>
+turso db tokens create vci | com secrets set vci-store-token --org acme --from-stdin --env-key VCI_STORE_TOKEN
+
+<span class="c"># 1Password: given -, op item create reads the item's JSON on standard input</span>
+turso db tokens create vci \
+  | jq -R '{title: "vci-store", category: "API_CREDENTIAL", fields: [{id: "credential", label: "credential", type: "CONCEALED", value: .}]}' \
+  | op item create --vault Engineering -</code></pre>
+  <p>Then commit a <code>[store]</code> table that names the database and that command:</p>
 <pre><code>[store]
 backend = "libsql"
 url = "libsql://vci-acme.aws-eu-west-1.turso.io"   <span class="c"># never a credential</span>
 token_command = ["com", "secrets", "get", "vci-store-token", "--org", "acme"]</code></pre>
   <p><code>token_command</code> is an array run directly, without a shell, or a string run with <code>sh -c</code>. It runs only when a command first reads the store, at most once per vci process, in the repository's top level, and must print the token alone on one line within 60 seconds. It cannot prompt, so sign in to the tool first. Some choices:</p>
-<pre><code><span class="c"># Composal: each read of the organization's secret is audited</span>
+<pre><code><span class="c"># Composal: each read of the organization's secret is audited; admins only</span>
 token_command = ["com", "secrets", "get", "vci-store-token", "--org", "acme"]
 
-<span class="c"># 1Password</span>
+<span class="c"># 1Password: anyone who can read the vault</span>
 token_command = ["op", "read", "op://Engineering/vci-store/credential"]
 
 <span class="c"># a file: weaker (below). A string runs with sh -c, so ~ is expanded</span>
 token_command = "cat ~/.config/vci/store-token"</code></pre>
+  <p><code>com secrets get</code> reads an organization's secret for its admins only (its help says "admin only, audited"). A developer who is not an admin gets a failing command, and their plans run everything. If such developers should store attestations too, keep the token where they can all read it, such as a shared 1Password vault.</p>
   <p>A file is the weakest choice: the token sits on disk, readable by anything you run, never audited, and signing out does not revoke it. If you use one anyway, write it without showing it: <code>mkdir -p ~/.config/vci &amp;&amp; (umask 077; turso db tokens create vci &gt; ~/.config/vci/store-token)</code>. In an array, <code>~</code> is not expanded: give the full path.</p>
-  <p>In CI, <code>VCI_STORE_URL</code> and <code>VCI_STORE_TOKEN</code> win over <code>[store]</code>, and the command never runs. A vci before 2.8.0 rejects a <code>vci.toml</code> with <code>[store]</code> and runs every test, so commit the table only once every runner and developer has 2.8.0 or later; until then, select the store through the environment.</p>
+  <p>One committed <code>token_command</code> gives every machine the same token. A machine that should only plan, such as an agent's sandbox or one that runs code nobody has reviewed, gets a read-only token through its environment instead. Keep a second token, made with <code>--read-only</code>, as a secret of its own, and set both variables where that machine's session starts, for example <code>export VCI_STORE_URL=libsql://vci-acme.aws-eu-west-1.turso.io</code> and <code>export VCI_STORE_TOKEN="$(op read op://Engineering/vci-store-read-only/credential)"</code>. Both are needed (a token from the environment is never sent to <code>vci.toml</code>'s URL), and they win over <code>[store]</code>. Every process of that user can read them, its tests included, which a token that can only read allows for.</p>
+  <p>In CI the two variables win over <code>[store]</code>, and the command does not run while <code>VCI_STORE_TOKEN</code> is set and not empty. GitHub gives a secret that does not exist (a fork's pull request, a secret never set) as an empty string, which vci treats as unset: the command then runs in CI, and fails where its tool is not installed or not signed in (<a href="#turso-troubleshooting">troubleshooting</a>). Do not sign a CI runner in to that tool, or such a job would get the token that can write.</p>
+  <p>A vci before 2.8.0 rejects a <code>vci.toml</code> with <code>[store]</code> and runs every test, so commit the table only once every runner and developer has 2.8.0 or later; until then, select the store through the environment.</p>
 </li>
 <li>
   <h3>Check it</h3>
 <pre><code>vci store info</code></pre>
-  <p>Before anything is stored it says:</p>
+  <p>An uncommitted <code>[store]</code> in the working tree is enough for this check, since vci reads the working tree's <code>vci.toml</code>. Before anything is stored it says:</p>
 <pre data-nocopy><code>store: libsql
 location: libsql://vci-acme.aws-eu-west-1.turso.io namespace &lt;repository id&gt; (remote)
 settings:
@@ -205,7 +218,12 @@ attestations: 0</code></pre>
 <li>
   <h3>Expect the first runs to run everything</h3>
   <p>The store starts empty. Until something is stored, a plan warns <code>no attestations are available in the libsql store (the first `vci run` creates it)</code> and every unit runs. The default branch's next full run fills it: <code>no_skip_refs</code> makes that run run everything, and with CI's key it attests every unit that passes and stores it. Developers' and agents' <code>vci run</code> add theirs. The first write with a token that can write creates the repository's tables; a read-only token cannot (<code>libsql store is not set up: the first vci run with a token allowed to create tables creates them</code>).</p>
-  <p>Switching store copies nothing and invalidates nothing. The attestations on <code>refs/meta/main</code> stay there, unused, and each unit runs once more before the new store has it. There is no command that copies a store yet.</p>
+  <p>Switching store copies nothing and invalidates nothing. The attestations on <code>refs/meta/main</code> stay there, read only by a job that falls back to git-meta (a fork's pull request before <code>[store]</code> is committed), and each unit runs once more before the new store has it. There is no command that copies a store yet.</p>
+</li>
+<li>
+  <h3>Check CI</h3>
+  <p>After the first push to main, the main-branch job's log has a line per stored unit (<code>vci: attested … as libsql …</code>) and <code>vci ci: N unit(s) attested</code>. If that line ends <code>(not stored: the libsql store is shared and --push was not given)</code>, the job did not get <code>signing-key</code> or <code>oidc</code>. The plan of the next pull request shows <code>SKIP</code> lines for what main attested, and no <code>running everything: reading attestations from libsql</code>.</p>
+  <p>Nothing in CI shows that the repository secret is read-only, since pull-request jobs never write. If you are not sure it came from <code>--read-only</code>, make every token of the database invalid with <code>turso db tokens invalidate vci</code>, then set the secrets of steps 4 and 6 again.</p>
 </li>
 </ol>
 
@@ -224,12 +242,13 @@ replica = true   <span class="c"># or VCI_STORE_SYNC=replica in the environment<
 <p>A store that cannot be used fails open. <code>vci plan</code> prints a warning and <code>running everything: reading attestations from libsql: …</code>, every test runs, and nothing is skipped by mistake. <code>vci run</code> and <code>vci ci</code> run the tests, refuse to store each unit with the reason, and keep the tests' exit code. <code>vci store info</code>, <code>vci fetch</code>, <code>vci push</code> and <code>vci prune</code> exit 2 with the error.</p>
 <table>
 <tr><th>Message (shortened)</th><th>What it means</th></tr>
-<tr><td class="wrap"><code>the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)</code> (HTTP 401)</td><td class="wrap">No token reached vci. In CI: the secret is missing, not mapped in <code>env:</code>, or the job is a fork's pull request. Locally: no <code>token_command</code>.</td></tr>
+<tr><td class="wrap"><code>the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)</code> (HTTP 401)</td><td class="wrap">No token reached vci, and <code>vci.toml</code> has no <code>token_command</code>. In CI: <code>VCI_STORE_URL</code> is set but <code>VCI_STORE_TOKEN</code> is empty (the secret was never set, or is not in the vci step's <code>env:</code>). Locally: <code>VCI_STORE_URL</code> is exported without a token.</td></tr>
 <tr><td class="wrap"><code>the server refused the token in $VCI_STORE_TOKEN or the URL's authToken</code>, or <code>… from [store] token_command (…)</code></td><td class="wrap">A token for another database, revoked or expired. Make a new one (step 3).</td></tr>
 <tr><td class="wrap"><code>libsql store refused to write: … the token may not write</code></td><td class="wrap">A read-only token where vci stores. Expected in pull-request jobs; elsewhere use a token that can write.</td></tr>
 <tr><td class="wrap"><code>$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url</code></td><td class="wrap">The trust rule above. In CI set <code>VCI_STORE_URL</code> too; on a laptop unset <code>VCI_STORE_TOKEN</code> so the command supplies the token.</td></tr>
 <tr><td class="wrap"><code>vci.toml [store] url carries a credential in its query (authToken, password, ...) (it was not printed)</code></td><td class="wrap">Take the token out of <code>vci.toml</code>, and make a new one: it was in a file every checkout carries.</td></tr>
-<tr><td class="wrap"><code>the token_command (…) exited 1; vci shows none of its output, which may hold the credential: run the command yourself with its standard output discarded (&gt; /dev/null) to see why</code></td><td class="wrap">The command failed. Run it as the message says, from the repository's top level: <code>com secrets get vci-store-token --org acme &gt; /dev/null</code>. Its error goes to standard error and the token, if it printed one, goes nowhere. Usual causes: not signed in (<code>com login</code>, <code>op signin</code>), a command that wanted to prompt, or one stopped after 60 s. vci 2.8.0 says only "run the command yourself to see why"; discard standard output all the same.</td></tr>
+<tr><td class="wrap"><code>the token_command (…) was not found</code> in CI</td><td class="wrap">The job's <code>VCI_STORE_TOKEN</code> is empty, so vci ran <code>[store] token_command</code>, whose tool CI's runners do not have. A fork's pull request gets no secrets, so it runs everything by design. Otherwise the secret was never set (the repository's, for pull-request jobs) or is not in the vci step's <code>env:</code>: set it (step 4). Running the command on a laptop tells you nothing here.</td></tr>
+<tr><td class="wrap"><code>the token_command (…) exited 1; vci shows none of its output, which may hold the credential: run the command yourself with its standard output discarded (&gt; /dev/null) to see why</code></td><td class="wrap">The command failed on your machine. Run it yourself, in your own terminal, as the message says, from the repository's top level: <code>com secrets get vci-store-token --org acme &gt; /dev/null</code>. Only standard output is discarded: the error shows on standard error, and so would the token if a wrapper or a pipeline stage logged it there, so do not run it where others can see the screen, and do not have an agent run it. Usual causes: not signed in (<code>com login</code>, <code>op signin</code>), not allowed to read the secret (<code>com secrets get</code> is for the organization's admins), a command that wanted to prompt, or one stopped after 60 s. vci 2.8.0 says only "run the command yourself to see why"; discard standard output all the same.</td></tr>
 <tr><td class="wrap"><code>cannot reach libsql://…</code>, <code>libsql store: the server's first answer timed out after 5s</code></td><td class="wrap">The server is down or unreachable. Connecting and the first answer take at most 5 s (<code>VCI_STORE_CONNECT_TIMEOUT_SECS</code>), later requests 30 s (<code>VCI_STORE_TIMEOUT_SECS</code>), and after the first failure every later call of the command fails at once, so it costs one timeout per command.</td></tr>
 <tr><td class="wrap"><code>no libsql database there (HTTP 404)</code></td><td class="wrap">The URL names no database: check <code>turso db show vci --url</code>.</td></tr>
 <tr><td class="wrap"><code>the server takes no more writes (blocked, as a database over its quota is, or full)</code></td><td class="wrap">The database is over its plan's quota or at its size limit. Plans still read it; nothing is stored. <code>vci prune</code> keeps the tables small.</td></tr>
@@ -241,16 +260,24 @@ replica = true   <span class="c"># or VCI_STORE_SYNC=replica in the environment<
 <ol class="steps">
 <li>
   <h3>Create the database and the roles</h3>
-<pre><code><span class="c">-- as an administrator</span>
+<pre><code><span class="c">-- in psql, as an administrator</span>
 CREATE DATABASE ci;
-CREATE ROLE vci_owner  LOGIN PASSWORD '...';   <span class="c">-- creates the schema</span>
-CREATE ROLE vci_writer LOGIN PASSWORD '...';   <span class="c">-- trusted CI: the default branch</span>
-CREATE ROLE vci_reader LOGIN PASSWORD '...';   <span class="c">-- pull-request jobs, and anyone who only plans</span>
-GRANT CREATE ON DATABASE ci TO vci_owner;</code></pre>
+CREATE ROLE vci_owner  LOGIN;   <span class="c">-- creates the schema</span>
+CREATE ROLE vci_writer LOGIN;   <span class="c">-- trusted CI: the default branch</span>
+CREATE ROLE vci_reader LOGIN;   <span class="c">-- pull-request jobs, and anyone who only plans</span>
+GRANT CREATE ON DATABASE ci TO vci_owner;
+\password vci_owner
+\password vci_writer
+\password vci_reader</code></pre>
+  <p><code>\password</code> asks for the new password without showing it and sends it to the server already encrypted, so it lands in neither psql's history nor the server's log, as <code>PASSWORD '…'</code> in the SQL would. Make each password in your password manager from letters and digits only, so the URLs below need no percent-encoding, and paste it at the prompts.</p>
 </li>
 <li>
   <h3>Let the owner's first run create the schema</h3>
-  <p>The first write by a role allowed to create schema <code>vci</code> creates it. Until then reads find an empty store, and other roles get <code>postgres store is not set up: the first vci run with a role allowed to create schema vci creates it</code>. Run one <code>vci run</code> as <code>vci_owner</code>, then grant the others:</p>
+  <p>The first write by a role allowed to create schema <code>vci</code> creates it. Until then reads find an empty store, and other roles get <code>postgres store is not set up: the first vci run with a role allowed to create schema vci creates it</code>. Run one <code>vci run</code> as <code>vci_owner</code>, with the URL in that command's environment only, then grant the others:</p>
+<pre><code>read -rs pw   <span class="c"># paste vci_owner's password: nothing is shown</span>
+VCI_STORE_URL="postgres://vci_owner:$pw@db.example.com/ci" vci run &lt;one unit&gt;
+unset pw</code></pre>
+  <p>The shell's history keeps <code>$pw</code>, not the password. Then:</p>
 <pre><code>GRANT USAGE ON SCHEMA vci TO vci_writer, vci_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vci TO vci_writer;
 GRANT SELECT ON ALL TABLES IN SCHEMA vci TO vci_reader;
@@ -259,7 +286,13 @@ GRANT INSERT, UPDATE ON vci.memo, vci.flags TO vci_reader;   <span class="c">-- 
 </li>
 <li>
   <h3>Give CI the URL</h3>
-  <p>For PostgreSQL the password goes in the URL: <code>postgres://vci_writer:&lt;password&gt;@db.example.com:5432/ci</code>, percent-encoded where it holds <code>@</code>, <code>/</code>, <code>?</code> or <code>:</code>. Store it the same way as Turso's token: a <code>vci_reader</code> URL as the repository secret <code>VCI_STORE_URL</code>, a <code>vci_writer</code> URL as the <code>vci-attest</code> environment's, and <code>VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}</code> in each job's <code>env</code>. <code>VCI_STORE_TOKEN</code> is not used.</p>
+  <p>For PostgreSQL the password goes in the URL, percent-encoded where it holds <code>@</code>, <code>/</code>, <code>?</code> or <code>:</code> (letters and digits need nothing). Build each URL without showing it: a <code>vci_reader</code> URL as the repository secret <code>VCI_STORE_URL</code>, a <code>vci_writer</code> URL as the <code>vci-attest</code> environment's.</p>
+<pre><code>read -rs pw   <span class="c"># vci_reader's password</span>
+printf 'postgres://vci_reader:%s@db.example.com:5432/ci' "$pw" | gh secret set VCI_STORE_URL
+read -rs pw   <span class="c"># vci_writer's password</span>
+printf 'postgres://vci_writer:%s@db.example.com:5432/ci' "$pw" | gh secret set VCI_STORE_URL --env vci-attest
+unset pw</code></pre>
+  <p><code>printf</code> is built into the shell, so the password is never a program's argument. Then put <code>VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}</code> in each job's vci step <code>env</code>, as for Turso. <code>VCI_STORE_TOKEN</code> is not used.</p>
 </li>
 <li>
   <h3>Point laptops at it</h3>
@@ -281,7 +314,7 @@ backend = "sqlite"</code></pre>
 <p>The file lives in the git common directory, so a clone's worktrees share it. Keep it off network file systems: SQLite's write-ahead log needs shared memory. To carry it between CI jobs, cache <code>.git/vci-store.sqlite</code>; each command checkpoints the log as it closes the store, so the one file holds everything. Jobs that run in parallel each save their own copy, and the last one saved wins.</p>
 
 <h2 id="agents">For agents</h2>
-<p>The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/skills/vci">vci agent skill</a> carries these rules for coding agents. In short: run <code>vci store info</code> to see which store a repository uses (its output is safe to paste); never print <code>VCI_STORE_URL</code>, <code>VCI_STORE_TOKEN</code> or what a <code>token_command</code> prints; never write a credential into <code>vci.toml</code>; debug a failing <code>token_command</code> with its standard output discarded; <code>vci push</code> on git-meta, and on a shared store let <code>vci run</code> store and leave <code>vci ci --push</code> to trusted CI jobs; and set secrets with <code>gh secret set</code> reading standard input.</p>
+<p>The <a href="https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/tree/main/skills/vci">vci agent skill</a> carries these rules for coding agents. In short: before the first vci command in a checkout, check that it does not change <code>[store] url</code> or <code>token_command</code> (<code>git diff origin/main -- vci.toml</code>), and in a checkout the user has not reviewed use <code>VCI_STORE=git-meta</code>; run <code>vci store info</code> to see which store a repository uses (its output is safe to paste); never print <code>VCI_STORE_URL</code>, <code>VCI_STORE_TOKEN</code> or what a <code>token_command</code> prints; never write a credential into <code>vci.toml</code>; never run a failing <code>token_command</code>, but ask the user to run it in their own terminal; <code>vci push</code> on git-meta, and on a shared store let <code>vci run</code> store and leave <code>vci ci --push</code> to trusted CI jobs; and set secrets with <code>gh secret set</code> reading standard input.</p>
 </main>
 </div>
 <script src="assets/site.js"></script>

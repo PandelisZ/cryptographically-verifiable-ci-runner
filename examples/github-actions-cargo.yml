@@ -57,6 +57,8 @@ jobs:
 
       # git-meta pull of refs/meta/main (attestations pushed with `vci push`
       # or `git meta push`) into .git/git-meta.sqlite; read access is enough.
+      # On any other store (SQLite, PostgreSQL, libSQL) remove this step:
+      # there is nothing to fetch, and `vci fetch --remote` exits 2 there.
       - name: Fetch attestations
         run: vci fetch --remote origin
 

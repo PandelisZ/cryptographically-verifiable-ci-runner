@@ -248,9 +248,10 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
 
 /// The hint says to run the command with its standard output discarded,
 /// not plainly: a command that works prints the credential on standard
-/// output, which would put it in a terminal's scrollback or an agent's
-/// transcript. Run that way, a helper that prints a token and fails shows
-/// its error and not the token.
+/// output, which would put it in a terminal's scrollback. Run that way, a
+/// helper that prints a token and fails shows its error and not the
+/// token. (Standard error is not discarded: a helper that logs the token
+/// there still shows it, which is why the docs tell agents not to run it.)
 #[test]
 fn the_hint_says_to_discard_standard_output() {
     assert!(
@@ -284,6 +285,83 @@ fn the_hint_says_to_discard_standard_output() {
     assert_eq!(out.status.code(), Some(3), "{shown}");
     assert!(shown.contains("session expired: sign in again"), "{shown}");
     assert!(!shown.contains(TOKEN), "{shown}");
+}
+
+/// The command the message names can be pasted with the hint's
+/// `> /dev/null` after it: every argument a shell would split, expand or
+/// end the command at (`&`, `;`, `|`, a glob, `~`, `$`, a backquote, a
+/// quote) is quoted, so the shell runs the command as vci did, with each
+/// argument intact, and its standard output goes nowhere. Unquoted, a URL
+/// such as `https://…?a=1&b=2` ends the command at its `&`: the shell runs
+/// it in the background with its standard output on the terminal, and the
+/// redirection applies to `b=2` alone.
+#[test]
+fn the_command_named_runs_as_given_with_the_hint_appended() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let helper = script(
+        d,
+        "tok",
+        &format!("echo {TOKEN}\nprintf '%s\\n' \"$@\" >&2\nexit 3"),
+    );
+    let args = [
+        "https://v.example.test/t?n=vci&raw=1",
+        "a;b",
+        "x|y",
+        "(z)",
+        "*",
+        "~",
+        "$HOME",
+        "`id`",
+        "it's",
+        "=x",
+        "two words",
+    ];
+    let mut cmd = vec![helper.as_str()];
+    cmd.extend(args);
+    let cmd = argv(&cmd);
+    let shown = cmd.display();
+    assert!(!shown.ends_with('…'), "{shown}");
+    let m = fetch(cmd, d, Duration::from_secs(30))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        m.contains(&format!("the token_command ({shown}) exited 3; {HINT}")),
+        "{m}"
+    );
+    // zsh without its startup files (-f), which could print.
+    let mut shells = vec![("sh", vec!["-c"])];
+    for (s, flags) in [("bash", vec!["-c"]), ("zsh", vec!["-f", "-c"])] {
+        if std::process::Command::new(s)
+            .args(&flags)
+            .arg("exit 0")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            shells.push((s, flags));
+        }
+    }
+    // Each argument alone, then all of them in one command.
+    let mut cases: Vec<Vec<&str>> = args.iter().map(|a| vec![*a]).collect();
+    cases.push(args.to_vec());
+    for case in &cases {
+        let mut c = vec![helper.as_str()];
+        c.extend(case);
+        let shown = argv(&c).display();
+        for (sh, flags) in &shells {
+            let out = std::process::Command::new(sh)
+                .args(flags)
+                .arg(format!("{shown} > /dev/null"))
+                .current_dir(d)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(stdout, "", "{sh}: {shown}");
+            assert_eq!(out.status.code(), Some(3), "{sh}: {shown}: {stderr}");
+            assert_eq!(stderr.lines().collect::<Vec<_>>(), *case, "{sh}: {shown}");
+        }
+    }
 }
 
 /// What a command that fails wrote on standard error is never shown,

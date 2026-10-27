@@ -84,7 +84,7 @@ vci fetch [--remote R]</code></pre>
 <p>Exchange attestations on <code>refs/meta/main</code>, like <code>git meta push</code> and <code>git meta pull</code>. Push your branch with <code>git push</code> as usual. Since 2.0 a fetch downloads the keys, not the values; <code>plan</code>, <code>explain</code>, <code>verify</code>, <code>run</code> and <code>prune</code> fetch the values they read, and a value that cannot be fetched (offline) makes its unit run.</p>
 <ul>
 <li><code>--remote R</code>: a git-meta remote, or a git remote or URL to use as one. Default: the configured git-meta remote, else the <code>url:</code> in <code>.git-meta</code>, else origin.</li>
-<li>In CI, always pass <code>--remote</code>, so the checkout never chooses where attestations come from.</li>
+<li>In CI, always pass <code>--remote</code> on git-meta, so the checkout never chooses where attestations come from. On any other store there is nothing to exchange, and <code>--remote</code> exits 2 (<a href="stores.html#fetch-and-push">what fetch and push mean</a>).</li>
 </ul>
 <pre><code>vci push &amp;&amp; git push              <span class="c"># on your laptop</span>
 vci fetch --remote origin         <span class="c"># in CI (the action does this)</span></code></pre>

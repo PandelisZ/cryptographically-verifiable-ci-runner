@@ -274,8 +274,9 @@ Options:
   knows, then `vci: error: <error>`, and exits 2.
 - It never prints a secret: a password or user as `***`, a token as `token: (set) ($VCI_STORE_TOKEN)` or `token: (from
   token_command: <command>) (vci.toml [store])`, PostgreSQL's as `password: (...)`. Its output is safe to show.
-- It reads the store (status and count), so on a store whose credential comes from `[store] token_command` it runs
-  that command once.
+- It reads the store (status and count), so on a store whose credential comes from `[store] token_command` it runs that
+  command once and sends what it prints to the store's URL, which `[store] url` in the checkout may name: in a checkout
+  the user has not reviewed, read `[store]` in `vci.toml` instead, and run vci with `VCI_STORE=git-meta`.
 - Stores without an exchange (SQLite, PostgreSQL, libSQL): `vci fetch` prints `vci: the <kind> store at <location> is
   local|shared: nothing to fetch (N attestations stored)`, `vci push` prints `vci: nothing to push: the <kind> store is
   local|shared; attestations were stored when vci run made them`, both exit 0; `--remote` and `--rewrite-history` exit

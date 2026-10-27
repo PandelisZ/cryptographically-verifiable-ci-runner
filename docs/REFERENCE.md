@@ -1965,12 +1965,13 @@ are listed in [docs/ENV.md](ENV.md#store-selection).
   that vci runs every test. Introduce a store with `VCI_STORE` and `VCI_STORE_URL` in the CI jobs and developers'
   environments first, and add `[store]` only once every runner and developer has 2.8.0 or later.
 - **CI.** In a job that has the store's secrets, `VCI_STORE_URL` and `VCI_STORE_TOKEN` win over `[store] url` and
-  `[store] token_command`, and the command never runs (a fork's pull request has no secrets: the command runs, fails
-  where its program is not installed or signed in, and the plan runs everything). git-meta jobs keep `vci ci --fetch
-  origin ... --push --remote origin`. On SQLite, PostgreSQL and libSQL
-  `--fetch`'s remote and `--push`'s `--remote` are ignored with a warning, so the same command works; on PostgreSQL and
-  a libSQL server `--push` is what stores (the publication gate above), and the job needs `VCI_STORE_URL` (and for
-  libSQL `VCI_STORE_TOKEN`) from a secret and, with a shallow checkout, `VCI_STORE_NAMESPACE`.
+  `[store] token_command`, and the command does not run while `VCI_STORE_TOKEN` is set and not empty (GitHub gives a
+  secret that does not exist as an empty string, which vci treats as unset; a fork's pull request has no secrets: the
+  command runs, fails where its program is not installed or signed in, and the plan runs everything). git-meta jobs keep
+  `vci ci --fetch origin ... --push --remote origin`. On SQLite, PostgreSQL and libSQL `--fetch`'s remote and `--push`'s
+  `--remote` are ignored with a warning, so the same command works; on PostgreSQL and a libSQL server `--push` is what
+  stores (the publication gate above), and the job needs `VCI_STORE_URL` (and for libSQL `VCI_STORE_TOKEN`) from a
+  secret and, with a shallow checkout, `VCI_STORE_NAMESPACE`.
 
 `vci store info [--format json]` prints the store, its location (password hidden), every setting with where it came
 from, what the store can do, whether it exists and how many attestations it holds:
@@ -2021,35 +2022,39 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   for a plan that never reads the store (no base ref: everything runs), at most once per vci process, and its output
   is kept in memory only. A store that takes no credential (git-meta,
   SQLite, libSQL's local file) ignores it with a warning and never runs it.
-- **The environment comes first.** `VCI_STORE_TOKEN`, then the URL's own credential (`authToken` in
-  `VCI_STORE_URL`, a password in a PostgreSQL connection string), then the command; when the environment gives a
-  token the command is never run. CI, which sets `VCI_STORE_URL` and `VCI_STORE_TOKEN` from secrets, never runs it.
+- **The environment comes first.** `VCI_STORE_TOKEN`, then the URL's own credential (`authToken` in `VCI_STORE_URL`, a
+  password in a PostgreSQL connection string), then the command; when the environment gives a token the command is never
+  run. CI, which sets `VCI_STORE_URL` and `VCI_STORE_TOKEN` from secrets, never runs it, as long as `VCI_STORE_TOKEN` is
+  not empty: an empty variable counts as unset.
 - **Bounded.** After 60 s (or the connect timeout, when longer) it is stopped with every process it started: it runs
   in a process group of its own, which is killed. So it cannot prompt on the terminal (the system stops it until the
   timeout; sign in first: `com login`, `op signin`, `ssh-add`), and a Ctrl-C that stops vci does not reach it.
 - **When it fails** (it is not found, exits non-zero, is killed by a signal or stopped after its time, or prints
   nothing, more than one line, something that is not UTF-8 or more than 64 KiB), the store is unavailable, as when a
   server cannot be reached: `vci plan` runs everything with a warning saying what happened and naming the command as
-  `vci.toml` gives it (`the token_command (com secrets get vci-store-token --org vex) exited 1; vci shows none of its
-  output, which may hold the credential: run the command yourself with its standard output discarded (> /dev/null)
-  to see why`), `vci run` keeps the tests' exit code
-  and stores nothing, and `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. **Nothing the command
-  printed is ever shown, on standard output or standard error**: a command that fails may print the credential on
-  either, framed in ways no scrubbing finds (a pipeline stage that echoes its input, as `jq` does when it cannot parse
-  it; a wrapper that logs the token; a passphrase with spaces), so its standard error is read and dropped. Run the
-  command yourself, in the repository's top level, with its standard output discarded, to see its error without
-  printing the credential: `com secrets get vci-store-token --org vex > /dev/null`.
+  `vci.toml` gives it, quoted for a shell so that it can be pasted (`the token_command (com secrets get vci-store-token
+  --org vex) exited 1; vci shows none of its output, which may hold the credential: run the command yourself with its
+  standard output discarded (> /dev/null) to see why`), `vci run` keeps the tests' exit code and stores nothing, and
+  `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. **Nothing the command printed is ever shown, on
+  standard output or standard error**: a command that fails may print the credential on either, framed in ways no
+  scrubbing finds (a pipeline stage that echoes its input, as `jq` does when it cannot parse it; a wrapper that logs the
+  token; a passphrase with spaces), so its standard error is read and dropped. Run the command yourself, in your own
+  terminal and the repository's top level, with its standard output discarded, to see its error: `com secrets get
+  vci-store-token --org vex > /dev/null`. That discards the credential a command that works prints on standard
+  output. Standard error still shows, and for the reasons above it can hold the credential too, so never have an agent run the command:
+  ask the person to.
 - **`vci store info`** names it, never the token: `token: (from token_command: com secrets get vci-store-token --org
   vex) (vci.toml [store])` (`password:` for PostgreSQL). No message vci prints about the command holds anything it
   printed.
 - **Trust.** The command, and the URL what it prints is sent to, both come from the checkout's `vci.toml`. Any vci
-  command that reads the store runs the command with your own privileges, `vci plan` included (which for some
-  adapters runs nothing else of the checkout's: Go's plan only runs `go list`), and sends its token to the checkout's
-  `[store] url`. So running vci in a checkout takes the trust of running its tests, and a pull request that changes
-  only `[store] url` has your token sent to its server. Review a change to `[store] url` or to `token_command` as you
-  would a change to a test helper. In a checkout you have not reviewed (someone else's pull request, an agent's
-  sandbox), run vci with `VCI_STORE=git-meta`: the url and the command are then ignored with a warning, and the
-  command never runs. In CI the environment's secrets win, and the command never runs.
+  command that reads the store runs the command with your own privileges, `vci plan` included (which for some adapters
+  runs nothing else of the checkout's: Go's plan only runs `go list`), and sends its token to the checkout's `[store]
+  url`. So running vci in a checkout takes the trust of running its tests, and a pull request that changes only `[store]
+  url` has your token sent to its server. Review a change to `[store] url` or to `token_command` as you would a change
+  to a test helper. In a checkout you have not reviewed (someone else's pull request, an agent's sandbox), run vci with
+  `VCI_STORE=git-meta`: the url and the command are then ignored with a warning, and the command never runs. In CI the
+  environment's secrets win, and the command does not run while `VCI_STORE_TOKEN` is set and not empty. Do not sign a CI
+  runner in to the command's tool: a job whose secret is empty would get its token.
 
 Examples:
 

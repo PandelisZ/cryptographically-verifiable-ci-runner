@@ -956,11 +956,12 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   kept as a `Secret::opaque` (redacted everywhere, scrubbed from every message the backend passes through
   `Conn::scrub` once it is known).
 - **Failure** is `StoreError::Unavailable` for the backend, saying what happened and naming the command as `vci.toml`
-  gives it (`TokenCommand::display`; not a secret), then `credential::HINT`, and never anything the command printed,
+  gives it (`TokenCommand::display`, quoted for sh, bash and zsh since 2.8.1, so that the command can be pasted with
+  `> /dev/null` after it; not a secret), then `credential::HINT`, and never anything the command printed,
   on stdout or stderr: `the token_command (<command>) exited 3; vci shows none of its output, which may hold the
   credential: run the command yourself with its standard output discarded (> /dev/null) to see why` (since 2.8.1;
-  2.8.0 said to run it, which prints the credential of a command that works into a terminal or an agent's
-  transcript), and in place of `exited 3`: `was not found (…)`, `could not be started (…)`, `was killed by signal 9`, `did not finish within 60 s (it was stopped)`, `printed nothing on standard
+  2.8.0 said to run it, which prints the credential of a command that works into the terminal; standard error still
+  shows, and can hold it too, so the agent skill tells agents never to run the command), and in place of `exited 3`: `was not found (…)`, `could not be started (…)`, `was killed by signal 9`, `did not finish within 60 s (it was stopped)`, `printed nothing on standard
   output`, `printed more than one line on standard output: it must print the credential alone`, `printed something
   that is not UTF-8 text on standard output`, `printed a control character on standard output`, `printed more than
   64 KiB on standard output`. A first version, never released, showed the end of stderr scrubbed of every piece of
@@ -2683,8 +2684,12 @@ every write is idempotent, and `batch` is a bulk upload.
     echoing its input, a wrapper's log line, a passphrase cut at its spaces): three reviews of the scrubbed excerpt
     each found one more. A failure says what happened and names the command, which `vci.toml` gives and is not
     secret, and says to run it with its standard output discarded (`> /dev/null`) to see why, so the credential of
-    a command that works is not printed into a terminal or an agent's transcript; standard error is still read, and
-    dropped, so the command never blocks on a full pipe.
+    a command that works is not printed into the terminal. Only standard output is discarded: a wrapper or a
+    pipeline stage can still log the credential on standard error, so the docs say to run it in one's own terminal
+    and the agent skill tells agents never to run it. Since 2.8.1 the command is shown quoted for a shell: 2.8.0
+    left `&`, `;`, `|` and globs bare, so a URL argument with `&` pasted with `> /dev/null` ran in the background with
+    its standard output on the terminal. Standard error is still read, and dropped, so the command never blocks on a
+    full pipe.
 20. **The store's secrets stay out of every environment vci builds, and vci says it cannot do more.** The environment
     a process started with stays readable to its user's other processes, vci's and the CI step shell's alike, and a
     clean re-exec of vci would leave the shell's. The defence is the credential's scope: a job that runs untrusted

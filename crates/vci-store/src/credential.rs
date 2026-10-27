@@ -82,8 +82,10 @@ pub const MAX_OUTPUT: usize = 64 * 1024;
 /// command printed, since its standard error, like its standard output,
 /// may hold the credential, so the way to see why is to run it, with its
 /// standard output discarded: a command that works prints the credential
-/// there, and a person's terminal or an agent's transcript is no place for
-/// it, while the error it explains itself with goes to standard error.
+/// there. Only standard output is discarded: the error it explains itself
+/// with goes to standard error, and so does whatever a wrapper or a
+/// pipeline stage logs, the token included, so the docs say to run it in
+/// one's own terminal and tell agents not to run it at all.
 pub const HINT: &str = "vci shows none of its output, which may hold the credential: run the command yourself with its standard output discarded (> /dev/null) to see why";
 
 /// The longest command a message shows, in characters.
@@ -152,27 +154,38 @@ impl TokenCommand {
         Ok(())
     }
 
-    /// The command as messages and `vci store info` show it: the program
-    /// and its arguments joined by spaces (one holding a space or a quote
-    /// is quoted), or `sh -c '<script>'`; at most 200 characters. It comes
-    /// from `vci.toml`, which every checkout carries: it is not a secret.
+    /// The command as messages and `vci store info` show it, quoted so that
+    /// a shell (sh, bash or zsh) runs the same command when it is pasted
+    /// with `> /dev/null` after it, as [`HINT`] says to: the program and its
+    /// arguments joined by spaces, each in single quotes unless it is made
+    /// of ASCII letters, digits and `@%+=:,./-_` alone (the program also
+    /// when it holds a `=`, which a shell reads as an assignment, and any
+    /// word starting with `=`, which zsh expands), or `sh -c '<script>'`; at
+    /// most 200 characters. An unquoted `&`, `;` or `|` would end the
+    /// command before the redirection, and a command that works would then
+    /// print the credential. It comes from `vci.toml`, which every checkout
+    /// carries: it is not a secret.
     pub fn display(&self) -> String {
-        let quoted = |a: &str| {
-            if !a.is_empty()
-                && !a
-                    .chars()
-                    .any(|c| c.is_whitespace() || c.is_control() || "'\"\\$`".contains(c))
-            {
+        let quoted = |a: &str, program: bool| {
+            let plain = !a.is_empty()
+                && !a.starts_with('=')
+                && !(program && a.contains('='))
+                && a.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./-_".contains(&b));
+            if plain {
                 a.to_owned()
             } else {
                 format!("'{}'", a.replace('\'', r"'\''"))
             }
         };
         let s = match self {
-            TokenCommand::Argv(argv) => {
-                argv.iter().map(|a| quoted(a)).collect::<Vec<_>>().join(" ")
-            }
-            TokenCommand::Shell(s) => format!("sh -c {}", quoted(s)),
+            TokenCommand::Argv(argv) => argv
+                .iter()
+                .enumerate()
+                .map(|(i, a)| quoted(a, i == 0))
+                .collect::<Vec<_>>()
+                .join(" "),
+            TokenCommand::Shell(s) => format!("sh -c {}", quoted(s, false)),
         };
         let s: String = s
             .chars()
@@ -615,6 +628,29 @@ mod tests {
             TokenCommand::Shell("pass show vci | head -1".into()).display(),
             "sh -c 'pass show vci | head -1'"
         );
+        // Anything a shell would read as more than a word is quoted.
+        assert_eq!(
+            argv(&[
+                "bin/tok",
+                "https://vault.example.test/v1/token?name=vci&raw=1"
+            ])
+            .display(),
+            "bin/tok 'https://vault.example.test/v1/token?name=vci&raw=1'"
+        );
+        assert_eq!(
+            argv(&["tok", "a;b", "x|y", "(z)", "*", "~", "it's", ""]).display(),
+            r"tok 'a;b' 'x|y' '(z)' '*' '~' 'it'\''s' ''"
+        );
+        assert_eq!(
+            argv(&["tok", "--org=vex", "=x", "café"]).display(),
+            "tok --org=vex '=x' 'café'"
+        );
+        assert_eq!(argv(&["X=1", "Y=2"]).display(), "'X=1' Y=2");
+        assert_eq!(
+            TokenCommand::Shell("tok&x".into()).display(),
+            "sh -c 'tok&x'"
+        );
+        assert_eq!(TokenCommand::Shell("tok".into()).display(), "sh -c tok");
         let long = TokenCommand::Shell("x".repeat(500)).display();
         assert_eq!(long.chars().count(), SHOWN);
         assert!(long.ends_with('…'));
