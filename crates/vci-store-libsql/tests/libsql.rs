@@ -7,6 +7,7 @@
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -570,6 +571,342 @@ fn an_error_page_the_client_cannot_read_fails_without_a_panic() {
         assert!(e.to_string().contains("not retried"), "{e}");
         assert!(!format!("{e} {e:?}").contains("s3cretTok"));
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+// ---- connections dropped while idle ---------------------------------------------------
+
+/// How a [`Proxy`] closes the client's side of a connection it forgot,
+/// when the client sends its next request on it.
+#[derive(Clone, Copy, Debug)]
+enum Close {
+    /// The whole request is read, then the connection closed (FIN), with
+    /// no answer: hyper's `connection closed before message completed`,
+    /// what vex's CI got from Turso.
+    Fin,
+    /// The connection is closed with the request unread, which resets it
+    /// (RST): `connection reset by peer` or `broken pipe`.
+    Reset,
+}
+
+/// A TCP proxy in front of a server that forgets a connection once it has
+/// sat idle for `idle` with no request outstanding, as a load balancer or
+/// a NAT does, without telling the client: its connection to the server
+/// is closed at once, the client's side only when the client sends its
+/// next request on it ([`Close`]), so the client cannot see it coming.
+/// [`Proxy::go_away`] makes it stop listening (a new connection is
+/// refused) and forget every connection.
+struct Proxy {
+    port: u16,
+    gone: Arc<AtomicBool>,
+    forgotten: Arc<AtomicUsize>,
+    listener: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The test server's `host:port` and token, when it speaks plain HTTP (a
+/// throwaway `sqld`, `turso dev`, the CI's service container), for a
+/// [`Proxy`] to stand in front of; `None` (the test skipped) otherwise.
+fn proxied_server() -> Option<(String, Option<String>)> {
+    if !testkit::available() {
+        return None;
+    }
+    let s = testkit::server().ok()?;
+    let hostport = s
+        .url
+        .strip_prefix("http://")
+        .map(|r| r.trim_end_matches('/'));
+    match hostport {
+        Some(h) if !h.contains('/') && !h.contains('?') => Some((h.to_owned(), s.token.clone())),
+        _ => {
+            eprintln!(
+                "skipping: the test server is not plain http://<host>:<port>, which the proxy needs"
+            );
+            None
+        }
+    }
+}
+
+impl Proxy {
+    fn start(upstream: &str, idle: Duration, close: Close) -> Proxy {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let upstream = upstream.to_owned();
+        let gone = Arc::new(AtomicBool::new(false));
+        let forgotten = Arc::new(AtomicUsize::new(0));
+        let (g, f) = (gone.clone(), forgotten.clone());
+        let listener = std::thread::spawn(move || {
+            while !g.load(Ordering::SeqCst) {
+                match l.accept() {
+                    Ok((client, _)) => {
+                        let (g, f, upstream) = (g.clone(), f.clone(), upstream.clone());
+                        std::thread::spawn(move || relay(client, &upstream, idle, close, &g, &f));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+            // The listener closes here: a new connection is refused.
+        });
+        Proxy {
+            port,
+            gone,
+            forgotten,
+            listener: Some(listener),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// How many connections it forgot.
+    fn forgotten(&self) -> usize {
+        self.forgotten.load(Ordering::SeqCst)
+    }
+
+    /// Stop listening, and forget every connection.
+    fn go_away(&mut self) {
+        self.gone.store(true, Ordering::SeqCst);
+        if let Some(l) = self.listener.take() {
+            l.join().unwrap();
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.go_away();
+    }
+}
+
+/// Write all of `b` to a non-blocking socket.
+fn send_all(mut to: &std::net::TcpStream, mut b: &[u8]) -> bool {
+    use std::io::{ErrorKind, Write as _};
+    while !b.is_empty() {
+        match to.write(b) {
+            Ok(0) => return false,
+            Ok(n) => b = &b[n..],
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Read what `from` has (non-blocking): `Some(0)` when it closed, `None`
+/// when nothing is there yet.
+fn take(mut from: &std::net::TcpStream, buf: &mut [u8]) -> Option<usize> {
+    use std::io::{ErrorKind, Read as _};
+    match from.read(buf) {
+        Ok(n) => Some(n),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => None,
+        Err(_) => Some(0),
+    }
+}
+
+/// One client connection of a [`Proxy`].
+fn relay(
+    client: std::net::TcpStream,
+    upstream: &str,
+    idle: Duration,
+    close: Close,
+    gone: &AtomicBool,
+    forgotten: &AtomicUsize,
+) {
+    let Ok(server) = std::net::TcpStream::connect(upstream) else {
+        return;
+    };
+    for s in [&client, &server] {
+        s.set_nonblocking(true).unwrap();
+        s.set_nodelay(true).unwrap();
+    }
+    let mut server = Some(server);
+    let mut last = Instant::now();
+    // A request was sent and its answer has not started: not idle.
+    let mut waiting = false;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if server.is_some() && (gone.load(Ordering::SeqCst) || (!waiting && last.elapsed() > idle))
+        {
+            // Forgotten: the server's side closes now, the client is not
+            // told.
+            server = None;
+            forgotten.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut moved = false;
+        let Some(s) = &server else {
+            // The client's next request on a forgotten connection: one
+            // byte of it is read, then the connection is closed.
+            match take(&client, &mut buf[..1]) {
+                None => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Some(0) => return,
+                Some(_) => {}
+            }
+            if let Close::Fin = close {
+                // The rest of the request, then a FIN, then whatever the
+                // client still does until it closes.
+                let mut quiet = Instant::now();
+                while quiet.elapsed() < Duration::from_millis(50) {
+                    match take(&client, &mut buf) {
+                        Some(0) => return,
+                        Some(_) => quiet = Instant::now(),
+                        None => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                }
+                let _ = client.shutdown(std::net::Shutdown::Write);
+                let until = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < until && take(&client, &mut buf) != Some(0) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            // Close::Reset: dropped with the rest of the request unread,
+            // which resets the connection.
+            return;
+        };
+        match take(&client, &mut buf) {
+            Some(0) => return,
+            Some(n) => {
+                if !send_all(s, &buf[..n]) {
+                    return;
+                }
+                (moved, waiting, last) = (true, true, Instant::now());
+            }
+            None => {}
+        }
+        match take(s, &mut buf) {
+            Some(0) => {
+                // The server closed: the client is told.
+                let _ = client.shutdown(std::net::Shutdown::Write);
+                return;
+            }
+            Some(n) => {
+                if !send_all(&client, &buf[..n]) {
+                    return;
+                }
+                (moved, waiting, last) = (true, false, Instant::now());
+            }
+            None => {}
+        }
+        if !moved {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// A keep-alive connection that a server, or a proxy in front of it,
+/// closed while it sat idle (vex's CI met it on Turso) is found out only
+/// when the next request goes out on it: hyper's `connection closed before
+/// message completed`, or a reset. The request is sent again on a new
+/// connection, so the write, and every call after it, succeed and nothing
+/// is latched (2.8.0 latched `cannot reach` and refused every later write
+/// of the process). Reads are sent again the same way.
+#[test]
+fn a_connection_the_server_dropped_while_idle_is_replaced() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    for close in [Close::Fin, Close::Reset] {
+        let proxy = Proxy::start(&server, Duration::from_millis(300), close);
+        let s = open(&testkit::selection(
+            LibsqlMode::Remote,
+            Some(&proxy.url()),
+            token.as_deref(),
+            Some(&testkit::namespace()),
+            None,
+        ));
+        let put = |n: u8, unit: &str| {
+            s.put_for_test(unit, S1, &hex64(n), Some(&hint(1)), &envelope(None, unit))
+        };
+        put(1, "src/a.test.ts").unwrap_or_else(|e| panic!("{close:?}: the first write: {e}"));
+        let before = s.retries();
+        // Longer than the proxy keeps an idle connection.
+        std::thread::sleep(Duration::from_millis(800));
+        put(2, "src/b.test.ts")
+            .unwrap_or_else(|e| panic!("{close:?}: the write after an idle wait: {e}"));
+        assert!(proxy.forgotten() >= 1, "{close:?}");
+        let after_write = s.retries();
+        assert!(after_write > before, "{close:?}: no request was sent again");
+        std::thread::sleep(Duration::from_millis(800));
+        let targets: Vec<String> = s
+            .list_all()
+            .unwrap_or_else(|e| panic!("{close:?}: the read after an idle wait: {e}"))
+            .into_iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            ["path:src/a.test.ts", "path:src/b.test.ts"],
+            "{close:?}"
+        );
+        assert!(
+            s.retries() > after_write,
+            "{close:?}: the read was not sent again"
+        );
+        // Nothing was latched.
+        put(3, "src/c.test.ts").unwrap_or_else(|e| panic!("{close:?}: a later write: {e}"));
+        s.status().unwrap();
+    }
+}
+
+/// A server that went away while the handle's connection sat idle: the
+/// request sent again finds nothing listening, which latches the breaker
+/// at once, as an unreachable server always has; every later call fails
+/// at once.
+#[test]
+fn a_server_gone_while_idle_stays_latched_and_fast() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    for close in [Close::Fin, Close::Reset] {
+        let mut proxy = Proxy::start(&server, Duration::from_secs(60), close);
+        let s = open(&testkit::selection(
+            LibsqlMode::Remote,
+            Some(&proxy.url()),
+            token.as_deref(),
+            Some(&testkit::namespace()),
+            None,
+        ));
+        let put = |n: u8, unit: &str| {
+            s.put_for_test(unit, S1, &hex64(n), Some(&hint(1)), &envelope(None, unit))
+        };
+        put(1, "src/a.test.ts").unwrap();
+        // Another test's writer may have kept this one waiting.
+        let before = s.retries();
+        proxy.go_away();
+        let t = Instant::now();
+        let e = put(2, "src/b.test.ts").unwrap_err();
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "{close:?}: {:?}",
+            t.elapsed()
+        );
+        assert!(
+            matches!(e, StoreError::Unavailable { .. }),
+            "{close:?}: {e:?}"
+        );
+        // Sent again at once, on a new connection, which nothing accepted.
+        assert!(e.to_string().contains("cannot reach"), "{close:?}: {e}");
+        assert!(
+            e.to_string().contains("error trying to connect"),
+            "{close:?}: {e}"
+        );
+        assert_eq!(s.retries() - before, 1, "{close:?}");
+        let t = Instant::now();
+        for i in 0..40 {
+            let e = put(3, &format!("src/c{i}.test.ts")).unwrap_err();
+            assert!(e.to_string().contains("not retried"), "{close:?}: {e}");
+            assert!(s.list_all().is_err());
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "{close:?}: {:?}",
+            t.elapsed()
+        );
     }
 }
 

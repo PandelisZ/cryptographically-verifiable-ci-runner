@@ -233,8 +233,10 @@ impl LibsqlStore {
     }
 
     /// Of [`LibsqlStore::requests`], those sent again because the server
-    /// was busy (another writer held the database) or had dropped the
-    /// stream: what a request budget does not count.
+    /// was busy (another writer held the database), had dropped the
+    /// stream, or the connection was lost under them (a keep-alive
+    /// connection closed while it sat idle): what a request budget does
+    /// not count.
     pub fn retries(&self) -> u64 {
         self.remote().map_or(0, |r| r.conn.retries())
     }
