@@ -247,14 +247,14 @@ Options:
       --base-ref <BASE_REF>
           
       --manifest <FILE>
-          The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the local git-meta store when run inside the repository
+          The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the repository's attestation store (git-meta by default) when run inside the repository
   -h, --help
           Print help
 ```
 
 - Verifies one DSSE envelope (a file, or `-` for stdin) and prints signer, test id, repo id, commit, input root. Mostly for debugging; `vci explain` is the usual tool.
 - An SSH-signed envelope is checked against `.vci/allowed_signers`, a keyless one (since 2.0, a `sigstore` member) against `.vci/identities.toml` and `.vci/sigstore-trusted-root.json`, at `--base-ref` or HEAD. Once any of `--allowed-signers`, `--identities`, `--trusted-root` is given, only the given files are used: an envelope whose kind needs one that was not given is INVALID.
-- Since 1.9.0 an attestation references its input manifest instead of embedding it: `vci verify` reads it from `--manifest FILE` (as `git meta get project vci:manifest:<root>` prints it) or else from the repository's git-meta store, checks that its root is the signed input root, and exits 1 when it is missing, corrupt or another manifest.
+- Since 1.9.0 an attestation references its input manifest instead of embedding it: `vci verify` reads it from `--manifest FILE` (as `git meta get project vci:manifest:<root>` prints it) or else from the repository's attestation store, whichever it is (since 2.8.0), checks that its root is the signed input root, and exits 1 when it is missing, corrupt or another manifest. Reading the store runs `[store] token_command` and sends what it prints to `[store] url`, as every command that reads the store does, so in a checkout you have not reviewed run it with `VCI_STORE=git-meta` (SKILL.md, "Before you start"). A `--manifest FILE` in the compact encoding, built on a base manifest, reads that base from the store too.
 
 ## vci store info
 

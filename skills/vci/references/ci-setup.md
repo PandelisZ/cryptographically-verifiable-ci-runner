@@ -221,7 +221,9 @@ the trust root, the user refreshes `.vci/sigstore-trusted-root.json` on the defa
 Optional, since vci 2.8.0, and only when the user asks: attestations live in a database every machine reads at once,
 instead of on `refs/meta/main`. Full guide with every command:
 https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html. Ask before each command that creates a
-database, a token, an environment or a secret.
+database, a token, an environment or a secret. Run `turso db tokens create` only piped straight into `gh secret set` or
+`com secrets set ... --from-stdin`, as below, and never a command that reads a secret back (SKILL.md, rule 9); give
+the user anything else that handles a token, such as the site's 1Password pipeline or the PostgreSQL password lines.
 
 1. Turso: `turso db create <db>` (an ordinary database: not `--tursodb`, whose `turso://` URL vci does not accept).
    PostgreSQL: a database and the roles `vci_owner`, `vci_writer`, `vci_reader`, created and granted as

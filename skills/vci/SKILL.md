@@ -54,10 +54,11 @@ echo "${VCI_SIGNING_KEY:-unset}"                # signing key, or pass --key
 This skill writes `origin/main`; use the default branch the command above printed. None of these commands reads the
 attestation store. Before any that does, check whose `[store]` this is:
 
-- **Whose `[store]`?** Every vci command that reads the attestation store (`vci store info`, `vci plan`, `vci run`,
-  `vci ci`, `vci explain`, `vci fetch`, `vci push`, `vci prune`) runs `[store] token_command` and sends what it
-  prints, the user's credential, to `[store] url`. Both come from this checkout's `vci.toml`, the top-level one
-  whatever the current directory. So first run this as a command of its own and read its output:
+- **Whose `[store]`?** Every vci command but `vci --version`, `vci init`, `vci env`, `vci metrics` and `vci update`
+  reads the attestation store (`vci store info`, `plan`, `run`, `ci`, `explain`, `verify`, `fetch`, `push`, `prune`),
+  and reading it runs `[store] token_command` and sends what it prints, the user's credential, to `[store] url`. Both
+  come from this checkout's `vci.toml`, the top-level one whatever the current directory. So first run this as a
+  command of its own and read its output:
 
   ```sh
   git diff origin/main -- :/vci.toml    # the default branch; :/ is the top level from any directory
@@ -194,18 +195,19 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
   (`libsql://vci-acme.aws-eu-west-1.turso.io`, `postgres://vci_writer@db.example.com/ci`), and the credential comes
   from the environment (CI) or `[store] token_command` (laptops). vci refuses a `[store] url` with a password, token or
   `authToken`, and refuses `VCI_STORE_TOKEN` paired with a URL from `vci.toml`.
-- **A failing `token_command`: never run it yourself**, nor any other secret tool (`op`, `com secrets get`, `gh auth
-  token`, `security`), not even with its output discarded: its standard error can hold the token too (a wrapper
-  script run with `sh -x` prints each line it runs, the token's included, and `jq` quotes the value it could not
-  parse). Tell the user what failed, as vci's message says it (`exited 1`, `was not found`, `printed nothing on
-  standard output`, ...), and the command it names, and ask them to run that command in their own terminal, from the
-  repository root, with its standard output discarded (`com secrets get vci-store-token --org vex > /dev/null`).
-  Since vci 2.8.1 the message ends `run the command yourself with its standard output discarded (> /dev/null) to see
-  why` and quotes the command for a shell. vci 2.8.0's ends `run the command yourself to see why` and leaves an
-  argument holding `&`, `;`, `|` or a glob character unquoted, so with 2.8.0 give the user the command from
-  `vci.toml`'s `token_command` with each such argument in single quotes. Usual causes: the user is not signed in
-  (`com login`, `op signin`: ask them), the command tried to prompt, or the user is not allowed to read the secret
-  (`com secrets get` reads an organization's secret for its admins only).
+- **A failing `token_command`: never run it yourself**, nor any other command that reads a secret (`op read`,
+  `com secrets get`, `gh auth token`, `security find-generic-password`), not even with its output discarded: its
+  standard error can hold the token too (a wrapper script run with `sh -x` prints each line it runs, the token's
+  included, and `jq` quotes the value it could not parse). Tell the user what failed, as vci's message says it
+  (`exited 1`, `was not found`, `printed nothing on standard output`, ...), and the command it names, and ask them to
+  run that command in their own terminal, from the repository root, with its standard output discarded
+  (`com secrets get vci-store-token --org vex > /dev/null`). Since vci 2.8.1 the message ends `run the command
+  yourself with its standard output discarded (> /dev/null) to see why` and quotes the command for a shell. vci
+  2.8.0's ends `run the command yourself to see why` and leaves arguments holding `&`, `;`, `|`, `#`, `<`, `(`, glob
+  characters and others unquoted, so with 2.8.0 give the user the command from `vci.toml`'s `token_command` with
+  every argument in single quotes: `'com' 'secrets' 'get' 'vci-store-token' '--org' 'vex' > /dev/null`. Usual
+  causes: the user is not signed in (`com login`, `op signin`: ask them), the command tried to prompt, or the user is
+  not allowed to read the secret (`com secrets get` reads an organization's secret for its admins only).
 - **Failing open is safe.** When the store cannot be used (no token, a refused token, a server down, a failing token
   command), `vci plan` warns and prints `running everything: reading attestations from <kind>: …`: every test runs and
   nothing is skipped by mistake. `vci run` still runs the tests, refuses each unit with `signing or storing failed: …`
@@ -225,16 +227,20 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
   you start"). Never change `[store]` without the user.
 - **Setting up Turso, when the user asks.** Follow the steps at
   https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#turso. Tokens go straight from
-  `turso db tokens create` into `gh secret set` on standard input, never as `--body` or any other argument, and never on
-  screen: `turso db tokens create <db> --read-only | gh secret set VCI_STORE_TOKEN` for pull-request jobs,
+  `turso db tokens create` into `gh secret set` on standard input, never as `--body` or any other argument, and never
+  on screen: `turso db tokens create <db> --read-only | gh secret set VCI_STORE_TOKEN` for pull-request jobs,
   `turso db tokens create <db> | gh secret set VCI_STORE_TOKEN --env vci-attest` for the main-branch job,
   `turso db show <db> --url | gh secret set VCI_STORE_URL`. The token laptops and agents read through
   `[store] token_command` goes into that tool the same way, from standard input
-  (`turso db tokens create <db> | com secrets set vci-store-token --org <org> --from-stdin --env-key
-  VCI_STORE_TOKEN`; never `--value`). Run each command that creates a database, a token, an environment or a secret
-  only with the user's go-ahead. Propose the workflow `env:` lines and the `[store]` table as a diff, and add `[store]`
-  to `vci.toml` only once every runner and developer has vci 2.8.0 or later. Steps for CI:
-  [references/ci-setup.md](references/ci-setup.md) ("Use a shared store").
+  (`turso db tokens create <db> | com secrets set vci-store-token --org <org> --from-stdin --env-key VCI_STORE_TOKEN`;
+  never `--value`). Run each command that creates a database, a token, an environment or a secret only with the user's
+  go-ahead. `turso db tokens create` prints a new token, so run it only with its standard output piped straight into
+  `gh secret set` or `com secrets set ... --from-stdin`: never on its own, into a file or a variable, or through
+  anything that prints it. That is the only command handling a token you run; never read one back to check it
+  (`com secrets get`, `op read`), since `vci store info` and the next plan show whether it works. Give anything else,
+  such as the site's 1Password pipeline, to the user to run. Propose the workflow `env:` lines and the `[store]` table
+  as a diff, and add `[store]` to `vci.toml` only once every runner and developer has vci 2.8.0 or later. Steps for
+  CI: [references/ci-setup.md](references/ci-setup.md) ("Use a shared store").
 
 ## Set up a repository
 
@@ -358,9 +364,11 @@ Short version (details in [references/runners.md](references/runners.md)):
 8. **Report honestly**: list refused units and failed checks; never claim CI will skip something `vci plan` shows as
    `RUN`.
 9. **Never expose a store credential**: never print, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN` or a
-   `token_command`'s output, never put a credential in `vci.toml`, never run a token command or any other secret tool
-   yourself, not even with its output discarded (tell the user what failed and the command), and never let a
-   checkout you have not reviewed choose the store (see "Before you start" and "Attestation stores").
+   `token_command`'s output, never put a credential in `vci.toml`, never run a token command or any other command
+   that reads a secret yourself, not even with its output discarded (tell the user what failed and the command),
+   create a token only piped straight into `gh secret set` or `com secrets set --from-stdin` and with the user's
+   go-ahead, and never let a checkout you have not reviewed choose the store (see "Before you start" and "Attestation
+   stores").
 
 ## Reference files
 

@@ -56,7 +56,7 @@
 <p>On the same runner, vci's batch cost about what the plain run cost. The slowest file, unsharded, ran 284 to 319 s in one process and ended every vci batch, where the plain run spreads its tests over the workers. Loading the application before the slots fork made each process slower on the slow kind (7.9 s against 6.5 s); a compile cache and <code>Process.warmup</code> changed nothing measurable.</p>
 
 <h3 id="vex-rails-new-job">26 October: the new job, vci 2.7.35 and 2.7.36</h3>
-<p>At 00:30 UTC on 26 October vex moved its pull-request Rails jobs to 4-core runners with file-backed SQLite and 4 or 8 slots, running 1,618 of the 2,232 files. So the three cases above cannot be measured again on the old job. These are the 32 pull-request jobs that finished between 04:46 and 17:45 UTC that day:</p>
+<p>At 00:30 UTC on 26 October vex moved its pull-request Rails jobs to file-backed SQLite, running 1,618 of the 2,232 files, on <code>composal-x64-4x</code> runners with 4 CPUs (vex #2128). At 05:46 UTC it moved them to <code>composal-x64-8x</code>, with 8 CPUs (#2139), the label of the Turso pilot below. So the three cases above cannot be measured again on the old job. These are the 32 pull-request jobs that finished between 04:46 and 17:45 UTC that day, with 4 or 8 slots. Most of those that finished before 06:00 ran on the 4-CPU label, and every later one on the 8-CPU label:</p>
 <table>
 <tr><th>vci</th><th>Files ran</th><th>Jobs</th><th>Job, median (range)</th><th><code>vci run</code> step</th><th>Plan step</th><th>Publish step</th></tr>
 <tr><td>2.7.35</td><td>3 to 25</td><td>6</td><td>202 s (96 to 907)</td><td>66 s</td><td>18 s</td><td>22 s</td></tr>
@@ -133,20 +133,22 @@
 <h2 id="turso-hosted">Turso's hosted service from a GitHub runner</h2>
 <p>On 27 October 2026 a pilot ran vci 2.8.0 against Turso's hosted service in aws-eu-west-1, about 25 ms of TCP round trip from vex's runners. It took three workflow runs (<a href="https://github.com/ComposalAI/vex/actions/runs/40435874219">1</a>, <a href="https://github.com/ComposalAI/vex/actions/runs/40436708247">2</a>, <a href="https://github.com/ComposalAI/vex/actions/runs/40437939673">3</a>), each on one <code>composal-x64-8x</code> runner, the label vex's Rails jobs use, with a fresh namespace per run. The project was vex-api's 2,291 Rails units. The git-meta side is vex's production path, from the 38 pull-request jobs of <code>rails-tests.yml</code> that ran between 00:12 and 01:50 UTC that day, mostly on vci 2.7.36.</p>
 <figure class="barchart">
-<figcaption>Seconds to get the attestations and plan, before any test runs. In the Turso plans 1,638 units skip and 653 run.</figcaption>
-<div class="bar-row"><span class="bar-label">git-meta, as vex's jobs run it<small>median of 37 jobs: restore the actions cache 9.5 s, put it in place 4 s, plan 25 s</small></span><span class="bar-track" aria-hidden="true"><span class="bar plain" style="width:100%"></span></span><span class="bar-value">44 s</span></div>
+<figcaption>Seconds to get the attestations and plan, before any test runs. In the Turso plans 1,638 units skip and 653 run; vex's jobs skipped 15 to 1,636.</figcaption>
+<div class="bar-row"><span class="bar-label">git-meta, as vex's jobs run it<small>the three steps together, median of 37 jobs; alone, restore the actions cache 9 s, put it in place 4 s, plan 25 s</small></span><span class="bar-track" aria-hidden="true"><span class="bar plain" style="width:100%"></span></span><span class="bar-value">44 s</span></div>
 <div class="bar-row"><span class="bar-label">Turso, remote<small>median of four plans, 4.8 to 10.1 s</small></span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:15.2%"></span></span><span class="bar-value">6.7 s</span></div>
 <div class="bar-row"><span class="bar-label">Turso, empty namespace<small>nothing stored yet, so every unit runs</small></span><span class="bar-track" aria-hidden="true"><span class="bar" style="width:2.7%"></span></span><span class="bar-value">1.2 s</span></div>
 <div class="legend"><span class="plain">git-meta</span><span>Turso</span></div>
 </figure>
 <table>
 <tr><th>Checking, signing and storing about 810 Rails units</th><th>Seconds</th></tr>
-<tr><td class="wrap">Turso, into a new namespace (four requests of up to 8 MiB, 3 to 11 s each)</td><td>21.6 to 30.4</td></tr>
-<tr><td class="wrap">Turso, into a namespace already holding 1,600 to 2,500 attestations</td><td>39.8 to 41.6</td></tr>
-<tr><td class="wrap">git-meta's local store, in vex's jobs on the same host class</td><td class="wrap">9.3 to 18, then <code>vci push</code>: a median of 22 (up to 94)</td></tr>
+<tr><td class="wrap">Turso, 819 units into an empty namespace (three runs)</td><td>21.6 to 30.4</td></tr>
+<tr><td class="wrap">Turso, 819 units into a namespace holding 819 (two runs)</td><td>29.5 and 30.1</td></tr>
+<tr><td class="wrap">Turso, 819 units into a namespace holding 1,638, then 2,457</td><td>41.6, then 39.8</td></tr>
+<tr><td class="wrap">git-meta's local store, in vex's jobs on the same host class (seven parts of 804 to 811 units)</td><td class="wrap">9.3 to 18, then <code>vci push</code>: 32 to 63, a median of 39</td></tr>
 </table>
-<p>Turso gains the most in the plan: no cache to restore, nothing to fetch, and only the attestations a plan checks cross the network. Without the cache, on the pilot's own runners, git-meta's fetch and plan took 86 to 94 s. Storing is slower, by about what the push it replaces costs, so the write side comes out roughly even. A replica gained nothing on a fresh runner: synced from nothing, its plans took 4.1 to 5.1 s, and its first sync reads the whole namespace, about a millisecond a record, where a remote plan reads only what it checks. It suits a machine that keeps its clone. The pilot wrote 4,914 attestations with none refused.</p>
-<p>After the pilot, vex moved its Rails CI to Turso, in a pull request that is still under review.</p>
+<p>Each Turso run wrote its units in four requests of 3 to 12 s: three of 8 MiB of values or more, and a smaller last one.</p>
+<p>Turso gains the most in the plan: no cache to restore, nothing to fetch, and only the attestations a plan checks cross the network. Without the cache, on the pilot's own runners, git-meta's fetch and plan took 86 to 94 s. Storing into Turso takes longer than into git-meta's local store, but nothing is pushed after it: on the pilot's host class git-meta's store and push together took 43 to 81 s a job, against Turso's 22 to 42 s. On vex's smaller hosts (94,750 MiB) the same parts took 19 to 29 s on git-meta (3.9 to 6.6 s to store, 15 to 22 s to push); Turso was not measured there. A replica gained nothing on a fresh runner: synced from nothing, its plans took 4.1 to 5.1 s, and its first sync reads the whole namespace, about a millisecond a record, where a remote plan reads only what it checks. It suits a machine that keeps its clone. The pilot wrote 5,733 attestations, seven runs of 819, with none refused.</p>
+<p>A vex pull request (#2214) proposes moving its Rails CI to Turso. It is under review.</p>
 <div class="note warn">
 <p><strong>Three runs and a small namespace.</strong> The largest pilot namespace held 3,276 attestations. vex's git-meta holds about 24,000, and its plans check 3,700 to 26,000 candidates; a remote plan's cost grows with the values it reads, so Turso at that size is not measured. Turso's latency varied up to 3x: the same read of 1,638 values took 2.5 to 7.8 s. The git-meta figures are whole CI steps of other jobs, from the jobs API, and the Turso ones <code>vci plan</code>'s wall time in the pilot. On the pilot's host class (257,583 MiB of memory) the git-meta median was 51.5 s.</p>
 </div>

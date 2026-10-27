@@ -146,9 +146,11 @@ across shapes.
 
 ## After: the new job on 2.7.35 and 2.7.36, and the push
 
-Every pull-request Rails job completed between 2.7.35's publication (04:46 UTC) and 17:45 UTC on 26 October:
-32 jobs, 8 on 2.7.35 and 24 on 2.7.36 (the other session's release of the same morning, Rails inputs loose by
-default). SQLite lane, 4 or 8 slots on a 4-core runner. The jobs API gives the steps; the logs give vci's lines.
+Every pull-request Rails job completed between 2.7.35's publication (04:46 UTC) and 17:45 UTC on 26 October: 32
+jobs, 8 on 2.7.35 and 24 on 2.7.36 (the other session's release of the same morning, Rails inputs loose by
+default). SQLite lane, 4 or 8 slots. At 05:46 UTC vex #2139 moved the jobs from `composal-x64-4x` to
+`composal-x64-8x` (8 CPUs), so most jobs that finished before 06:00 ran on 4 cores and every later one on 8. The
+jobs API gives the steps; the logs give vci's lines.
 "Files ran" is the count after `vci-skip.py` dropped the attested ones; the cases are the same as above.
 
 | version | case (files ran) | jobs | job wall, median (range) | `vci run` step | Ruby batch | plan step | publish step |

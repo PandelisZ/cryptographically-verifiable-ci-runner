@@ -2531,19 +2531,22 @@ run in a fresh namespace:
 
 | step | Turso | git-meta, on the same runner label |
 |---|---|---|
-| plan, 1,638 units skip and 653 run | remote 4.8-10.1 s (`prefetch 2291 unit(s), 1638 value(s), 4 request(s)` 2.5-7.8 s) | production's path, 38 pull-request jobs of 27 October 00:12-01:50 UTC: restore the actions cache, put it in place and plan, 44 s median (51.5 s on the pilot's host class); a cold fetch and plan without the cache, 86-94 s |
+| plan, 1,638 units skip and 653 run | remote 4.8-10.1 s (`prefetch 2291 unit(s), 1638 value(s), 4 request(s)` 2.5-7.8 s) | a cold fetch and plan without the cache, on the pilot's runners, 86-94 s |
+| plan, as vex's pull-request jobs run it (15 to 1,636 units skipped) | | production's path, the 38 pull-request jobs of 27 October 00:12-01:50 UTC: restore the actions cache, put it in place and plan, 44 s median over the 37 with all three steps (51.5 s over the 20 on the pilot's host class) |
 | plan, empty namespace | 1.2 s | |
 | plan, nothing matches (3,276 attestations read) | remote 4.3-5.2 s | 24.4 s over 26,347 candidates, store up to date |
 | replica on a fresh runner | cold sync and plan 4.1-5.1 s (sync 1.4-3.9 s for 1.6k-3.3k records), warm 4.0-4.4 s | |
-| `vci run`, 819 units: check, sign and store | 21.6-30.4 s into a new namespace, 39.8-41.6 s once it held 1.6k-2.5k (4 or 8 requests of up to 8 MiB, 3-12 s each) | 9.3-18 s locally, then `vci push`, a median of 22 s (up to 94 s) |
+| `vci run`, about 810 units: check, sign and store | 819 units: 21.6-30.4 s into an empty namespace (three runs), 29.5 and 30.1 s into one holding 819, 41.6 s into one holding 1,638 and 39.8 s into one holding 2,457; each run four requests of 3-12 s, three of 8 MiB of values or more and a smaller last one | 804-811 units on the pilot's host class (seven parts): 9.3-18 s locally, then `vci push` 32-63 s (median 39 s), 43-81 s together; on the 94,750 MiB hosts 3.9-6.6 s, then 15-22 s (19-29 s together) |
 
-The plan gains the most: there is no cache to restore and nothing to fetch. Storing is slower, by about what the push it
-replaces cost. The same 1,638-value prefetch took 2.5 to 7.8 s across four plans, so Turso's latency varied up to 3x. A
-replica gained nothing on an ephemeral runner, and its first sync reads the whole namespace (about 0.6-1.2 ms a record),
-where a remote plan reads only what it picks. 4,914 attestations were written with none refused. Not measured: a
-namespace of git-meta's size (vex's held about 24,000 attestations, and its plans check 3,700 to 26,000 candidates; the
-largest pilot namespace held 3,276), a read-only token's refusal, and Turso's quotas. vex moved its Rails jobs to Turso
-after the pilot, in a pull request still under review.
+The plan gains the most: there is no cache to restore and nothing to fetch. Storing takes longer than into git-meta's
+local store but needs no push after it, so on the pilot's host class the write side took about half as long (22-42 s
+against 43-81 s); on the 94,750 MiB hosts git-meta's took 19-29 s, and Turso was not measured there. The same
+1,638-value prefetch took 2.5 to 7.8 s across four plans, so Turso's latency varied up to 3x. A replica gained nothing
+on an ephemeral runner, and its first sync reads the whole namespace (about 0.6-1.2 ms a record), where a remote plan
+reads only what it picks. 5,733 attestations (seven runs of 819) were written with none refused. Not measured: a
+namespace of git-meta's size (vex's held about 24,000 attestations, and its plans check 3,700 to 26,000 candidates;
+the largest pilot namespace held 3,276), a read-only token's refusal, and Turso's quotas. A vex pull request (#2214)
+proposes moving its Rails jobs to Turso; it is under review.
 
 ### fetch, push, hints, operations
 
@@ -2842,8 +2845,9 @@ Still open:
     (`hashlink` is already in `Cargo.lock` through git-meta-lib).
 14. **libSQL on Turso's hosted service.** The store was tested against `sqld` 0.24.32 (the libsql-server image Turso
     publishes, locally and in CI), not against Turso itself: its limits on a request's or a response's size (a
-    vex-scale plan reads about 75 MB; a batch request is capped at 8 MiB of values), how a read-only token's write is
-    refused (`sqld` answers HTTP 403, which vci maps to `Denied`), and HTTP/1.1 over TLS through vci's own connector are unchecked there.
+    vex-scale plan reads about 75 MB; a batch request is sent once it holds 2,000 writes or 8 MiB of values, so at
+    most 8 MiB plus one record), how a read-only token's write is refused (`sqld` answers HTTP 403, which vci maps to
+    `Denied`), and HTTP/1.1 over TLS through vci's own connector are unchecked there.
     How Turso refuses a write over a quota was not observed either: vci recognizes `sqld`'s write block (`Operation
     was blocked`) and size limit (`database or disk is full`), which its hosted service runs on (decision 25); a
     refusal worded otherwise, with HTTP 200, would be `Backend` and make `vci run` exit 2.
@@ -2851,9 +2855,9 @@ Still open:
     request (`RESPONSE_TOO_LARGE`), but not the cursor requests vci reads with: a 22 MB read and a 12 MB sync went
     through. Its row limit (5,000,000 bytes, decision 23) is assumed for Turso too; a lower one is refused as
     `Unsupported` per batch. The vex pilot of 27 October 2026 (section 18, "Measured") ran against Turso itself:
-    4,914 attestations went in through write requests of up to 8 MiB with none refused, and plans and replica syncs
-    of up to 6,546 records read back, over vci's own connector. The read-only refusal and the quota answers stay
-    unchecked there.
+    5,733 attestations went in through write requests of 8 MiB of values or more (a smaller last one per run) with
+    none refused, and plans and replica syncs of up to 6,546 records read back, over vci's own connector. The
+    read-only refusal and the quota answers stay unchecked there.
 15. **A CA for a libSQL server.** TLS is verified against the webpki roots only; a self-hosted `sqld` with a private
     certificate needs a setting like PostgreSQL's `sslrootcert`.
 16. **The libSQL change log.** Every write logs a row per slot and root it touched, kept 30 days; its size on a busy
