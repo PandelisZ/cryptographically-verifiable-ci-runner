@@ -175,12 +175,15 @@ the site's `stores.html`). `SKILL.md` has a section, "Attestation stores", that 
   show;
 - never to print, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN` or what a `[store] token_command` prints, and
   never to put a credential in `vci.toml`;
-- not to run a failing token command itself, since its standard error can hold the token even with standard output
-  discarded, but to ask the user to run it in their own terminal as vci's message says since 2.8.1
-  (`com secrets get vci-store-token --org vex > /dev/null`) and report the cause;
-- to check, before its first vci command in a session, whether the checkout changes `[store] url` or `token_command`
-  (`git diff origin/main -- vci.toml`), since reading the store runs that command and sends its output to that url,
-  and to run vci with `VCI_STORE=git-meta` in a checkout the user has not reviewed;
+- never to run a token command or any other secret tool itself, not even with its output discarded, since its
+  standard error can hold the token, but to tell the user what failed and the command, for them to run in their own
+  terminal with standard output discarded (`com secrets get vci-store-token --org vex > /dev/null`, as vci's message
+  says since 2.8.1; with 2.8.0, whose message leaves `&`, `;`, `|` and globs unquoted, the agent gives the command from
+  `vci.toml` with such arguments quoted);
+- to check, as a command of its own before any vci command that reads the store in a session, whether the checkout
+  changes `[store] url` or `token_command` (`git diff origin/main -- :/vci.toml`, with the default branch in place of
+  `main`), since reading the store runs that command and sends its output to that url, and to run every vci command
+  with `VCI_STORE=git-meta` in a checkout the user has not reviewed, or when that check fails;
 - that attestations in SQLite, or libSQL's local file, stay on that machine, so a local skip says nothing about CI;
 - that `vci push` publishes on git-meta only, that `vci run` stores at once on the other stores, and that `vci ci
   --push` is for trusted CI jobs;

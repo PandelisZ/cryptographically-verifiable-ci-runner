@@ -224,7 +224,9 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html. 
 database, a token, an environment or a secret.
 
 1. Turso: `turso db create <db>` (an ordinary database: not `--tursodb`, whose `turso://` URL vci does not accept).
-   PostgreSQL: a database and the roles `vci_owner`, `vci_writer`, `vci_reader` (docs/REFERENCE.md, "PostgreSQL").
+   PostgreSQL: a database and the roles `vci_owner`, `vci_writer`, `vci_reader`, created and granted as
+   https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#postgresql says (the grants in
+   database `ci`, once `vci_owner`'s first `vci run` created schema `vci`).
 2. Secrets, read from standard input so no token is ever on screen or on a command line:
 
    ```sh
@@ -310,10 +312,10 @@ none: its tests can read the token from the environment the job's shell or vci s
 | `::warning title=vci::not attesting: the key signs as ...` | CI's key reached a non-main run (a pull request): pass it only from the main-only job with the environment |
 | A Go package or cargo target never skips on the runner | Platform-specific code (`_linux.go`, `cfg(target_os)`, `runtime.GOOS`, float maths): accepted only on the same OS/arch |
 | A test reads `HOME` or `TMPDIR`, or a variable in `[env] hash` such as `CI` | Values differ on a runner; that unit always runs there (`CI` is removed unless listed) |
-| `running everything: reading attestations from libsql: ...` (or `postgres`) | The store cannot be used: a missing secret (fork pull requests get none and fall back to `vci.toml`; check the vci step's `env:`), a refused or expired token, a server that does not answer. Every test ran; `vci store info` run with the same variables says why |
+| `running everything: reading attestations from libsql: ...` (or `postgres`) | The store cannot be used: a missing secret (fork pull requests get none, and Dependabot's only Dependabot secrets, so both fall back to `vci.toml`; check the vci step's `env:`), a refused or expired token, a server that does not answer. Every test ran; `vci store info` run with the same variables says why |
 | `$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url` | The job sets the token but not `VCI_STORE_URL`: set both from secrets |
-| `the token_command (...) was not found` in a CI job | The job's `VCI_STORE_TOKEN` is empty, so vci ran `vci.toml`'s `token_command`: a fork's pull request (no secrets: everything runs, by design), a repository secret never set, or the variables not on the vci step. Not a laptop problem: do not run the command |
+| `the token_command (...) was not found` in a CI job | The job's `VCI_STORE_TOKEN` is empty, so vci ran `vci.toml`'s `token_command`: a fork's pull request (no secrets: everything runs, by design), a Dependabot pull request (it gets only Dependabot secrets: set the two there too, the token read-only, with `gh secret set ... --app dependabot`, if its jobs should skip), a repository secret never set, or the variables not on the vci step. Not a laptop problem: do not run the command |
 | `vci: error: the libsql store does not support a remote` (or `sqlite`, `postgres`), exit 2 | A `vci fetch --remote origin` step on a store other than git-meta: remove it |
 | `libsql store refused to write: ... the token may not write` in the main-branch job | It got the read-only token: the `vci-attest` environment lacks its own `VCI_STORE_TOKEN`, or the job does not name the environment |
-| `vci: not storing N attestation(s): the <kind> store is shared and vci ci was not given --push` | Expected in pull-request jobs. In the main-branch job: `push: false`, or neither `signing-key` nor `oidc` |
+| `vci: not storing N attestation(s): the <kind> store is shared and vci ci was not given --push`, or `vci ci: N unit(s) attested (not stored: ...)` | The job attested (it has `signing-key` or `oidc`) but stored nothing: the action's `push: false`, or, without the action, `vci ci` without `--push`. A job without a key or OIDC attests nothing and prints neither line |
 | No Rails file ever skips | `config/environments/test.rb` reads `ENV["CI"]` and `CI` is in `[env] hash` (leave it out of `[env]`); Ruby patchlevel, Bundler, SQLite or tz data differ; `Gemfile.lock` lacks `x86_64-linux`; the app loads libvips (Active Storage), whose Homebrew file never matches the runner's (`policy.libraries = "any"` matches it by name, with libvips installed on the runner; also stops comparing the SQLite, libyaml and tz data versions) |

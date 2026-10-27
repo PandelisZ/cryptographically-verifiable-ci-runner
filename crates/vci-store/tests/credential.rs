@@ -271,7 +271,7 @@ fn the_hint_says_to_discard_standard_output() {
         .unwrap_err()
         .to_string();
     assert!(m.ends_with(&format!("exited 3; {HINT}")), "{m}");
-    // What the hint says to do, as a person or an agent would type it.
+    // What the hint says to do, as a person would type it in their own terminal.
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("'{helper}' > /dev/null"))

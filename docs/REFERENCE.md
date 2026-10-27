@@ -1812,20 +1812,42 @@ Roles (one schema per deployment; there is no row-level security per namespace i
 write the schema can write or delete any repository's rows on it, which only ever makes units run):
 
 ```sql
--- as an administrator
-CREATE ROLE vci_owner  LOGIN PASSWORD '...';   -- creates the schema: its first `vci run` does
-CREATE ROLE vci_writer LOGIN PASSWORD '...';   -- trusted CI only: the default branch (vci ci --push)
-CREATE ROLE vci_reader LOGIN PASSWORD '...';   -- pull request jobs and developers: plan, explain
+-- in psql, as an administrator
+CREATE DATABASE ci;
+CREATE ROLE vci_owner  LOGIN;   -- creates the schema: its first `vci run` does
+CREATE ROLE vci_writer LOGIN;   -- trusted CI only: the default branch (vci ci --push)
+CREATE ROLE vci_reader LOGIN;   -- pull-request jobs, and anyone who only plans
 GRANT CREATE ON DATABASE ci TO vci_owner;
--- once vci_owner's first `vci run` created schema vci
+\password vci_owner
+\password vci_writer
+\password vci_reader
+-- once vci_owner's first `vci run` created schema vci, in database ci, where it is
+-- (as the administrator, or as vci_owner, which owns it)
+\c ci
 GRANT USAGE ON SCHEMA vci TO vci_writer, vci_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vci TO vci_writer;
 GRANT SELECT ON ALL TABLES IN SCHEMA vci TO vci_reader;
 GRANT INSERT, UPDATE ON vci.memo, vci.flags TO vci_reader;  -- optional: the plan's hints
 ```
 
-A reader's `vci run` refuses each unit (`postgres store refused to write: permission denied for table manifests`)
-and keeps the tests' exit code. Back up with `pg_dump -n vci`; `vci prune` keeps the tables small.
+`\password` asks for the password without showing it and sends it to the server already encrypted, so it lands in
+neither psql's history nor the server's log, as `PASSWORD '…'` in the SQL would. Never put a password in SQL text or
+on a command line. Build each URL into its secret without showing it (`printf` is built into the shell, so the
+password is never a program's argument):
+
+```sh
+read -rs pw   # vci_reader's password: nothing is shown
+printf 'postgres://vci_reader:%s@db.example.com:5432/ci' "$pw" | gh secret set VCI_STORE_URL
+read -rs pw   # vci_writer's password
+printf 'postgres://vci_writer:%s@db.example.com:5432/ci' "$pw" | gh secret set VCI_STORE_URL --env vci-attest
+unset pw
+```
+
+The password goes in the URL percent-encoded where it holds `@`, `/`, `?` or `:`, so make it of letters and digits
+only. A reader's `vci run` refuses each unit (`postgres store refused to write: permission denied for table
+manifests`) and keeps the tests' exit code. Back up with `pg_dump -n vci`; `vci prune` keeps the tables small. The
+site's [Choosing a store](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#postgresql)
+page has every step.
 
 ### libSQL (Turso)
 
@@ -1834,21 +1856,31 @@ keeps the attestations in a [libSQL](https://github.com/tursodatabase/libsql) da
 your own, which every machine reads and writes at once, with nothing to cache, fetch or push. Getting started:
 
 ```sh
-turso db create vci                       # once
-turso db show vci --url                   # libsql://vci-<organization>.turso.io: VCI_STORE_URL
-turso db tokens create vci                # VCI_STORE_TOKEN for trusted jobs that store (vci ci --push on main)
-turso db tokens create vci --read-only    # VCI_STORE_TOKEN for pull requests and developers
+turso db create vci                                    # once; an ordinary database, not --tursodb (turso:// URLs are refused)
+turso db show vci --url | gh secret set VCI_STORE_URL  # libsql://vci-<organization>.<region>.turso.io, not a secret
+turso db tokens create vci --read-only | gh secret set VCI_STORE_TOKEN        # pull-request jobs: read, store nothing
+turso db tokens create vci | gh secret set VCI_STORE_TOKEN --env vci-attest  # the default branch's job, which stores
 ```
+
+Each token goes from standard input into its secret, never on screen or on a command line. `vci-attest` is an
+environment limited to the default branch, whose secret wins over the repository's in the job that names it: that
+job gets the token that can write, and pull-request jobs the read-only one. Give the two variables to the step that
+runs vci, not to the job, so that the setup steps before it never see the token:
 
 ```yaml
-# a GitHub Actions job, with both values in secrets
-env:
-  VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
-  VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}
+- uses: PandelisZ/cryptographically-verifiable-ci-runner@v2
+  env:
+    VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
+    VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}
 ```
 
-Then run `vci ci` as before (`--push` where it should store). On developers' and agents' machines, nothing needs
-exporting: `vci.toml` can name the database and how to fetch a token (since 2.8.0; see [The credential from a
+The main-branch job (`environment: vci-attest`) stores what it attests with the action's `signing-key` or `oidc`,
+which pass `--push`. Without the action, run `vci ci` as before, with `--push` in that job only, and drop a `vci fetch
+--remote origin` step, which exits 2 on any store but git-meta. Developers and agents whose `vci run` should store
+get a token that can write through `[store] token_command` (below), so that nothing needs exporting; a machine that
+should only plan gets `VCI_STORE_URL` and a read-only `VCI_STORE_TOKEN` in its environment instead. The site's
+[Choosing a store](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#turso) page has
+every step. `vci.toml` can name the database and how to fetch a token (since 2.8.0; see [The credential from a
 command](#the-credential-from-a-command)), and CI's two secrets still win there:
 
 ```toml
@@ -1916,7 +1948,11 @@ The store has three modes:
   three times (3,600 attestations of about 3 KB) on a local `sqld`, the store's part of a plan that skipped every unit
   took 0.5-0.6 s remote against 0.01 s from a SQLite file, a replica's first sync of everything 0.6-9 s on a heavily
   loaded laptop and a sync with nothing new 0.04 s, and `vci run` wrote 1,200 attestations and manifests in one
-  request of 0.14-0.25 s. Over the internet to Turso each request adds a round trip (not measured here).
+  request of 0.14-0.25 s. Over the internet each request adds a round trip: from vex's GitHub runners to Turso's
+  hosted service (aws-eu-west-1, 27 October 2026, 2.8.0), a plan of 2,291 Rails units that read 1,638 attestations
+  took 4.8-10.1 s, one on an empty namespace 1.2 s, and storing 819 attestations 22-42 s, in a namespace of at most
+  3,276 attestations ([benchmarks](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/benchmarks.html#turso-hosted)).
+  A replica on an ephemeral runner was no faster than remote there.
 
 ### Choosing a store
 
@@ -2032,17 +2068,24 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
 - **When it fails** (it is not found, exits non-zero, is killed by a signal or stopped after its time, or prints
   nothing, more than one line, something that is not UTF-8 or more than 64 KiB), the store is unavailable, as when a
   server cannot be reached: `vci plan` runs everything with a warning saying what happened and naming the command as
-  `vci.toml` gives it, quoted for a shell so that it can be pasted (`the token_command (com secrets get vci-store-token
-  --org vex) exited 1; vci shows none of its output, which may hold the credential: run the command yourself with its
-  standard output discarded (> /dev/null) to see why`), `vci run` keeps the tests' exit code and stores nothing, and
-  `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. **Nothing the command printed is ever shown, on
-  standard output or standard error**: a command that fails may print the credential on either, framed in ways no
-  scrubbing finds (a pipeline stage that echoes its input, as `jq` does when it cannot parse it; a wrapper that logs the
-  token; a passphrase with spaces), so its standard error is read and dropped. Run the command yourself, in your own
-  terminal and the repository's top level, with its standard output discarded, to see its error: `com secrets get
-  vci-store-token --org vex > /dev/null`. That discards the credential a command that works prints on standard
-  output. Standard error still shows, and for the reasons above it can hold the credential too, so never have an agent run the command:
-  ask the person to.
+  `vci.toml` gives it (`the token_command (com secrets get vci-store-token --org vex) exited 1; vci shows none of its
+  output, which may hold the credential: run the command yourself with its standard output discarded (> /dev/null) to
+  see why`), `vci run` keeps the tests' exit code and stores nothing, and `vci fetch`, `vci push`, `vci prune` and `vci
+  store info` exit 2. **Nothing the command printed is ever shown, on standard output or standard error**: a command
+  that fails may print the credential on either, framed in ways no scrubbing finds (a pipeline stage that echoes its
+  input, as `jq` does when it cannot parse it; a wrapper that logs the token; a passphrase with spaces), so its
+  standard error is read and dropped. Run the command yourself, in your own terminal and the repository's top level,
+  with its standard output discarded, to see its error: `com secrets get vci-store-token --org vex > /dev/null`. That
+  discards the credential a command that works prints on standard output. Standard error still shows, and for the
+  reasons above it can hold the credential too, so never have an agent run the command, or any other secret tool: the
+  agent tells the person what failed and the command, and the person runs it.
+- **Since 2.8.1** the message ends as above and names the command quoted for a shell (sh, bash, zsh), so that it can
+  be pasted with `> /dev/null` after it: every argument holding anything but ASCII letters, digits and `@%+=:,./-_` is
+  in single quotes. 2.8.0's message ends `run the command yourself to see why`, and it quotes only an argument holding
+  whitespace, a quote, a backslash, `$` or a backquote. An argument with `&`, `;`, `|` or a glob character is then
+  shown bare, and pasted as it is, the shell can end the command before the redirect (`&` runs it in the background
+  with its standard output on the terminal) or expand the glob. With 2.8.0, discard standard output all the same, and
+  copy the command from `vci.toml` with each such argument in single quotes rather than from the message.
 - **`vci store info`** names it, never the token: `token: (from token_command: com secrets get vci-store-token --org
   vex) (vci.toml [store])` (`password:` for PostgreSQL). No message vci prints about the command holds anything it
   printed.

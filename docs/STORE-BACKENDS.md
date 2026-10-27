@@ -2518,10 +2518,32 @@ macOS arm64, two repetitions, on a laptop that other work kept at a load average
 | `vci run`: "check, sign and store" | 0.47-1.80 s | 0.35-1.11 s (an empty namespace; 1.08-2.37 s into the filled one) | 0.80-1.03 s |
 
 Round 2 reads all 3,600 values again because `read_values` moved the first ones out of the cache, as PostgreSQL does
-(section 21, open item 2). Not measured against Turso's hosted service, where every request crosses the internet:
-a plan is then about a dozen round trips (the status, the flags, the memo, the prefetches, one read, the memo's
-write, and the first description of each statement on each connection) plus the bytes (about 11 MB of values for
-3,600 attestations here).
+(section 21, open item 2). Against a server across the internet, a plan pays about a dozen round trips (the status,
+the flags, the memo, the prefetches, one read, the memo's write, and the first description of each statement on each
+connection) plus the bytes (about 11 MB of values for 3,600 attestations here).
+
+**Turso's hosted service, from vex's runners** (27 October 2026, vci 2.8.0, three workflow runs on
+`composal-x64-8x` runners, one runner each, Turso in aws-eu-west-1 about 25 ms of TCP round trip away; runs
+[40435874219](https://github.com/ComposalAI/vex/actions/runs/40435874219),
+[40436708247](https://github.com/ComposalAI/vex/actions/runs/40436708247) and
+[40437939673](https://github.com/ComposalAI/vex/actions/runs/40437939673)). Project vex-api, 2,291 Rails units, each
+run in a fresh namespace:
+
+| step | Turso | git-meta, on the same runner label |
+|---|---|---|
+| plan, 1,638 units skip and 653 run | remote 4.8-10.1 s (`prefetch 2291 unit(s), 1638 value(s), 4 request(s)` 2.5-7.8 s) | production's path, 38 pull-request jobs of 27 October 00:12-01:50 UTC: restore the actions cache, put it in place and plan, 44 s median (51.5 s on the pilot's host class); a cold fetch and plan without the cache, 86-94 s |
+| plan, empty namespace | 1.2 s | |
+| plan, nothing matches (3,276 attestations read) | remote 4.3-5.2 s | 24.4 s over 26,347 candidates, store up to date |
+| replica on a fresh runner | cold sync and plan 4.1-5.1 s (sync 1.4-3.9 s for 1.6k-3.3k records), warm 4.0-4.4 s | |
+| `vci run`, 819 units: check, sign and store | 21.6-30.4 s into a new namespace, 39.8-41.6 s once it held 1.6k-2.5k (4 or 8 requests of up to 8 MiB, 3-12 s each) | 9.3-18 s locally, then `vci push`, a median of 22 s (up to 94 s) |
+
+The plan gains the most: there is no cache to restore and nothing to fetch. Storing is slower, by about what the push it
+replaces cost. The same 1,638-value prefetch took 2.5 to 7.8 s across four plans, so Turso's latency varied up to 3x. A
+replica gained nothing on an ephemeral runner, and its first sync reads the whole namespace (about 0.6-1.2 ms a record),
+where a remote plan reads only what it picks. 4,914 attestations were written with none refused. Not measured: a
+namespace of git-meta's size (vex's held about 24,000 attestations, and its plans check 3,700 to 26,000 candidates; the
+largest pilot namespace held 3,276), a read-only token's refusal, and Turso's quotas. vex moved its Rails jobs to Turso
+after the pilot, in a pull request still under review.
 
 ### fetch, push, hints, operations
 
@@ -2530,8 +2552,9 @@ write, and the first description of each statement on each connection) plus the 
   every flag read once per handle, `passing_on` memoized per tree, `remember_passing` one request (with the 7-day memo
   prune, once per handle), every error swallowed, never creating the tables. Local: the file's tables.
 - **Turso.** A database per organization or per repository; a full-access token for the trusted jobs that store
-  (`vci ci --push` on protected branches) and a read-only one for pull requests and developers (`turso db tokens
-  create <db> --read-only`): their writes are `Denied`, their plans read. A job that runs untrusted code gets the
+  (`vci ci --push` on protected branches, and developers whose `vci run` should store, through `[store]
+  token_command`) and a read-only one for pull-request jobs and machines that only plan (`turso db tokens create <db>
+  --read-only`): their writes are `Denied`, their plans read. A job that runs untrusted code gets the
   read-only one or none, since its tests can read the token (section 9, "What this cannot hide"). Backups are
   Turso's (point-in-time restore); `vci prune` keeps the tables small.
 - **Monitoring.** `LibsqlStore::requests()` counts requests; the timing lines carry them.
@@ -2680,16 +2703,16 @@ every write is idempotent, and `batch` is a bulk upload.
     setting of its own: a helper waiting for a human (1Password's unlock) gets time, a stuck one cannot hold a plan
     for long.
 19. **Nothing the token command printed is shown, its standard error included.** A scrubber removes only what it can
-    recognise, and standard error can hold the credential in a frame standard output never showed (a `jq` stage
-    echoing its input, a wrapper's log line, a passphrase cut at its spaces): three reviews of the scrubbed excerpt
-    each found one more. A failure says what happened and names the command, which `vci.toml` gives and is not
-    secret, and says to run it with its standard output discarded (`> /dev/null`) to see why, so the credential of
-    a command that works is not printed into the terminal. Only standard output is discarded: a wrapper or a
-    pipeline stage can still log the credential on standard error, so the docs say to run it in one's own terminal
-    and the agent skill tells agents never to run it. Since 2.8.1 the command is shown quoted for a shell: 2.8.0
-    left `&`, `;`, `|` and globs bare, so a URL argument with `&` pasted with `> /dev/null` ran in the background with
-    its standard output on the terminal. Standard error is still read, and dropped, so the command never blocks on a
-    full pipe.
+    recognise, and standard error can hold the credential in a frame standard output never showed (a `jq` stage echoing
+    its input, a wrapper's log line, a passphrase cut at its spaces): three reviews of the scrubbed excerpt each found
+    one more. A failure says what happened and names the command, which `vci.toml` gives and is not secret, and since
+    2.8.1 says to run it with its standard output discarded (`> /dev/null`) to see why, so the credential of a command
+    that works is not printed into the terminal (2.8.0 said only to run it). Only standard output is discarded: a
+    wrapper or a pipeline stage can still log the credential on standard error, so the docs say to run it in one's own
+    terminal and the agent skill tells agents never to run it. Since 2.8.1 the command is shown quoted for a shell:
+    2.8.0 left `&`, `;`, `|` and globs bare, so a URL argument with `&` pasted with `> /dev/null` ran in the background
+    with its standard output on the terminal. Standard error is still read, and dropped, so the command never blocks on
+    a full pipe.
 20. **The store's secrets stay out of every environment vci builds, and vci says it cannot do more.** The environment
     a process started with stays readable to its user's other processes, vci's and the CI step shell's alike, and a
     clean re-exec of vci would leave the shell's. The defence is the credential's scope: a job that runs untrusted
@@ -2827,7 +2850,10 @@ Still open:
     `sqld`'s own response limit (`--max-response-size`, 10 MB by default) refuses a large result of a plain execute
     request (`RESPONSE_TOO_LARGE`), but not the cursor requests vci reads with: a 22 MB read and a 12 MB sync went
     through. Its row limit (5,000,000 bytes, decision 23) is assumed for Turso too; a lower one is refused as
-    `Unsupported` per batch.
+    `Unsupported` per batch. The vex pilot of 27 October 2026 (section 18, "Measured") ran against Turso itself:
+    4,914 attestations went in through write requests of up to 8 MiB with none refused, and plans and replica syncs
+    of up to 6,546 records read back, over vci's own connector. The read-only refusal and the quota answers stay
+    unchecked there.
 15. **A CA for a libSQL server.** TLS is verified against the webpki roots only; a self-hosted `sqld` with a private
     certificate needs a setting like PostgreSQL's `sslrootcert`.
 16. **The libSQL change log.** Every write logs a row per slot and root it touched, kept 30 days; its size on a busy

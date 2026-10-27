@@ -47,20 +47,29 @@ git rev-parse --show-toplevel                   # run vci from the repository ro
 test -f vci.toml && sed -n '1,40p' vci.toml     # set up? which adapter(s) and project dirs, [env] set/hash/ignore
 git branch --show-current                       # must not be the default branch (see below)
 git fetch origin                                # so origin/main is the real base
+git symbolic-ref --short refs/remotes/origin/HEAD   # the default branch (origin/main, origin/master); if it fails, ask
 echo "${VCI_SIGNING_KEY:-unset}"                # signing key, or pass --key
-git diff origin/main -- vci.toml                # does this checkout change [store]? (see "Whose [store]")
-vci store info                                  # which store; only after "Whose [store]?" below: it runs
-                                                # token_command and sends its output to [store] url
 ```
 
+This skill writes `origin/main`; use the default branch the command above printed. None of these commands reads the
+attestation store. Before any that does, check whose `[store]` this is:
+
 - **Whose `[store]`?** Every vci command that reads the attestation store (`vci store info`, `vci plan`, `vci run`,
-  `vci ci`) runs `[store] token_command` and sends what it prints, the user's credential, to `[store] url`. Both come
-  from this checkout's `vci.toml`. So before the first of them, check that the checkout is the user's own work and that
-  the `git diff` above changes neither `url` nor `token_command` (nor, for a `token_command` that is a path in the
-  repository such as `scripts/vci-token`, that file), unless the user made that change. Otherwise (someone else's pull
-  request, a clone the user has not reviewed, a branch that changes either) run every vci command with
-  `VCI_STORE=git-meta` in front, which ignores both and never runs the command, and tell the user why. What
-  `vci store info` prints never holds a secret, so it is safe to show.
+  `vci ci`, `vci explain`, `vci fetch`, `vci push`, `vci prune`) runs `[store] token_command` and sends what it
+  prints, the user's credential, to `[store] url`. Both come from this checkout's `vci.toml`, the top-level one
+  whatever the current directory. So first run this as a command of its own and read its output:
+
+  ```sh
+  git diff origin/main -- :/vci.toml    # the default branch; :/ is the top level from any directory
+  ```
+
+  Check that the checkout is the user's own work and that the diff changes neither `url` nor `token_command` (nor,
+  for a `token_command` that is a path in the repository such as `scripts/vci-token`, that file), unless the user
+  made that change. Otherwise (someone else's pull request, a clone the user has not reviewed, a branch that changes
+  either), or if the diff fails (no such branch, no `origin`), run every vci command with `VCI_STORE=git-meta` in
+  front, which ignores both and never runs the command, and tell the user why.
+- **Which store**: then, as a step of its own, `vci store info` (`VCI_STORE=git-meta vci store info` in a checkout
+  the user has not reviewed). What it prints never holds a secret, so it is safe to show.
 - **Signing key**: `--key <path>`, else `$VCI_SIGNING_KEY`, else `git config user.signingkey` when
   `gpg.format = ssh`. Use the key the user gave you. Never generate a key and start using it silently.
 - **Is the key trusted?** Compare its public key with the base branch's trust file:
@@ -174,10 +183,10 @@ PostgreSQL, or libSQL (Turso, or a `sqld`; remote, through a local replica, or a
 the plan verifies every record against the base branch, so a store can only make a unit run, never skip. Full guide:
 https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
 
-- **Which store**: run `vci store info` (`--format json` for scripts). It names the store, where each setting came
-  from, its status and its count, and never prints a secret (`token: (set)`, `postgres://***@…`), so its output is
-  safe to show the user. Chosen from `VCI_STORE`, else the scheme of `VCI_STORE_URL`, else `[store]` in the working
-  tree's `vci.toml`, else git-meta.
+- **Which store**: run `vci store info` (`--format json` for scripts), after the check in "Whose `[store]`?". It names
+  the store, where each setting came from, its status and its count, and never prints a secret (`token: (set)`,
+  `postgres://***@…`), so its output is safe to show the user. Chosen from `VCI_STORE`, else the scheme of
+  `VCI_STORE_URL`, else `[store]` in the working tree's `vci.toml`, else git-meta.
 - **Never print a store credential.** Do not echo, log, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN`, or
   anything a `[store] token_command` prints. No `env`, `printenv` or `set` dumps in a shell that has them. To check
   whether one is set without showing it: `echo "${VCI_STORE_TOKEN:+set}"`.
@@ -185,16 +194,18 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
   (`libsql://vci-acme.aws-eu-west-1.turso.io`, `postgres://vci_writer@db.example.com/ci`), and the credential comes
   from the environment (CI) or `[store] token_command` (laptops). vci refuses a `[store] url` with a password, token or
   `authToken`, and refuses `VCI_STORE_TOKEN` paired with a URL from `vci.toml`.
-- **A failing `token_command`: do not run it yourself.** vci's message ends with
-  `vci shows none of its output, which may hold the credential: run the command yourself with its standard output discarded (> /dev/null) to see why`.
-  That advice is for the user, in their own terminal. Discarding standard output is not enough for a transcript: the
-  command's standard error can hold the token too (a wrapper script run with `sh -x` prints each line it runs, the
-  token's included, and `jq` quotes the value it could not parse). Ask the user to run the command the message names,
-  from the repository root, with `> /dev/null` after it (`com secrets get vci-store-token --org vex > /dev/null`), and
-  to tell you only the cause. If you must check something yourself, keep the exit status alone:
-  `<command> > /dev/null 2>&1; echo "exit=$?"`. Never capture, pipe or show either stream. Usual causes: the user is not
-  signed in (`com login`, `op signin`: ask them), the command tried to prompt, or the user is not allowed to read the
-  secret (`com secrets get` reads an organization's secret for its admins only).
+- **A failing `token_command`: never run it yourself**, nor any other secret tool (`op`, `com secrets get`, `gh auth
+  token`, `security`), not even with its output discarded: its standard error can hold the token too (a wrapper
+  script run with `sh -x` prints each line it runs, the token's included, and `jq` quotes the value it could not
+  parse). Tell the user what failed, as vci's message says it (`exited 1`, `was not found`, `printed nothing on
+  standard output`, ...), and the command it names, and ask them to run that command in their own terminal, from the
+  repository root, with its standard output discarded (`com secrets get vci-store-token --org vex > /dev/null`).
+  Since vci 2.8.1 the message ends `run the command yourself with its standard output discarded (> /dev/null) to see
+  why` and quotes the command for a shell. vci 2.8.0's ends `run the command yourself to see why` and leaves an
+  argument holding `&`, `;`, `|` or a glob character unquoted, so with 2.8.0 give the user the command from
+  `vci.toml`'s `token_command` with each such argument in single quotes. Usual causes: the user is not signed in
+  (`com login`, `op signin`: ask them), the command tried to prompt, or the user is not allowed to read the secret
+  (`com secrets get` reads an organization's secret for its admins only).
 - **Failing open is safe.** When the store cannot be used (no token, a refused token, a server down, a failing token
   command), `vci plan` warns and prints `running everything: reading attestations from <kind>: …`: every test runs and
   nothing is skipped by mistake. `vci run` still runs the tests, refuses each unit with `signing or storing failed: …`
@@ -219,11 +230,11 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
   `turso db tokens create <db> | gh secret set VCI_STORE_TOKEN --env vci-attest` for the main-branch job,
   `turso db show <db> --url | gh secret set VCI_STORE_URL`. The token laptops and agents read through
   `[store] token_command` goes into that tool the same way, from standard input
-  (`turso db tokens create <db> | com secrets set vci-store-token --org <org> --from-stdin --env-key <NAME>`; never
-  `--value`). Run each command that creates a database, a token, an environment or a secret only with the user's
-  go-ahead. Propose the workflow `env:` lines and the `[store]` table as a diff, and add `[store]` to `vci.toml` only
-  once every runner and developer has vci 2.8.0 or later. Steps for CI: [references/ci-setup.md](references/ci-setup.md)
-  ("Use a shared store").
+  (`turso db tokens create <db> | com secrets set vci-store-token --org <org> --from-stdin --env-key
+  VCI_STORE_TOKEN`; never `--value`). Run each command that creates a database, a token, an environment or a secret
+  only with the user's go-ahead. Propose the workflow `env:` lines and the `[store]` table as a diff, and add `[store]`
+  to `vci.toml` only once every runner and developer has vci 2.8.0 or later. Steps for CI:
+  [references/ci-setup.md](references/ci-setup.md) ("Use a shared store").
 
 ## Set up a repository
 
@@ -347,9 +358,9 @@ Short version (details in [references/runners.md](references/runners.md)):
 8. **Report honestly**: list refused units and failed checks; never claim CI will skip something `vci plan` shows as
    `RUN`.
 9. **Never expose a store credential**: never print, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN` or a
-   `token_command`'s output, never put a credential in `vci.toml`, never run a failing token command where its output
-   reaches you (ask the user to run it), and never let a checkout you have not reviewed choose the store (see "Before
-   you start" and "Attestation stores").
+   `token_command`'s output, never put a credential in `vci.toml`, never run a token command or any other secret tool
+   yourself, not even with its output discarded (tell the user what failed and the command), and never let a
+   checkout you have not reviewed choose the store (see "Before you start" and "Attestation stores").
 
 ## Reference files
 
