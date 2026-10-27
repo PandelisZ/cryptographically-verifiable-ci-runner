@@ -24,6 +24,26 @@
 //!   The first failure to reach the server, and the first deadline that
 //!   runs out, latch the circuit breaker: every later call of the handle
 //!   fails at once.
+//! * **Lost connections.** A request whose connection was lost under it
+//!   (a keep-alive connection the server, or a proxy, closed while it sat
+//!   idle, found out only when the next request went out on it; a reset)
+//!   is sent again on a new connection, at once and then after short
+//!   pauses, within its deadline ([`RESEND`]); only when those fail too is
+//!   the breaker latched. That is done only once the server has answered
+//!   the handle: before that no connection was kept alive, and a server
+//!   that accepts and closes without answering latches it at once, within
+//!   the first answer's bound, as before. A connection that cannot be
+//!   made (nothing listening, DNS, TLS, the connect timeout) latches it at
+//!   once, as before; an answer of the server (an HTTP status, whatever
+//!   its body says) is never sent again, unless its body was cut off
+//!   before it arrived whole, which looks like a lost connection and is
+//!   sent again as one; an answer cut off after the
+//!   server began it (a read's rows) fails that call and latches nothing,
+//!   as before. Sending a request again is safe: reads change nothing,
+//!   and a write is one transaction whose statements, applied twice,
+//!   leave the rows as applied once but for the change log's, though it
+//!   can undo a write of another handle that followed its first commit
+//!   (see [`Conn::batch`]).
 //! * **Requests.** A read is one prepared statement (the server describes a
 //!   statement once per pooled connection; the description is kept) whose
 //!   rows come back in one request. A write is one transaction that takes
@@ -480,6 +500,9 @@ struct Class {
     /// The server no longer knows the connection's stream (it expired):
     /// tried again once on a new stream.
     stale: bool,
+    /// The HTTP connection was lost under the request ([`dropped`]): sent
+    /// again on a new connection, as [`RESEND`] says.
+    dropped: bool,
 }
 
 impl Class {
@@ -490,6 +513,7 @@ impl Class {
             lost,
             busy: false,
             stale: false,
+            dropped: false,
         }
     }
 }
@@ -497,6 +521,82 @@ impl Class {
 /// How long a connection's server stream may sit idle before the next call
 /// starts a new one (servers expire idle streams after about ten seconds).
 const STREAM_IDLE: Duration = Duration::from_secs(4);
+
+/// What hyper 0.14 and the system say (in lowercase) when an HTTP
+/// connection that was made is lost under a request:
+///
+/// * hyper's `IncompleteMessage`, the connection closed before the whole
+///   answer came: a keep-alive connection that the server, or a proxy in
+///   front of it, closed while it sat idle (vex's CI met it on Turso) is
+///   found out only when the next request has gone out on it, since the
+///   client's runtime runs only inside a call;
+/// * hyper's errors reading or writing a body on the connection, a
+///   request canceled because its connection closed before it was
+///   written (one on a reused connection hyper sends again itself), and a
+///   closed connection's channel;
+/// * a reset (`ECONNRESET`, `Connection reset by peer`), a broken pipe
+///   (`EPIPE`), an aborted connection (`ECONNABORTED`, `Software caused
+///   connection abort`), the end of the stream before the answer's
+///   (`std::io::ErrorKind::UnexpectedEof`, hyper's `end of file before
+///   message length reached`), and a TLS connection closed without its
+///   `close_notify` (rustls).
+const DROPPED: &[&str] = &[
+    "connection closed before message completed",
+    "error reading a body from connection",
+    "error writing a body to connection",
+    "operation was canceled: connection closed",
+    "channel closed",
+    "connection reset",
+    "broken pipe",
+    "connection abort",
+    "unexpected end of file",
+    "end of file before message length reached",
+    "close_notify",
+];
+
+/// How libsql's text for a request that failed in transport begins, in
+/// lowercase: its `HranaError::Http` (hyper's error) as
+/// `libsql::Error::Hrana` shows it. Every other text is not a transport
+/// failure, whatever words it holds: an answer of the server (`api error`:
+/// an HTTP status and its body, or a statement's error; a `stream error`),
+/// or a `cursor error`, which comes after the server answered (a read's
+/// rows cut off, or an error the server sent among them).
+const HTTP_ERROR: &str = "hrana: `http error: ";
+
+/// Whether `lower` (an error's text, in lowercase) is libsql's text for a
+/// transport failure of the request ([`HTTP_ERROR`]).
+fn transport(lower: &str) -> bool {
+    lower.starts_with(HTTP_ERROR)
+}
+
+/// Whether `lower` (an error's text, in lowercase) says that an HTTP
+/// connection was lost under the request ([`DROPPED`]), as a transport
+/// failure ([`transport`]): not an answer the server sent (a refused
+/// token, an error page, whatever its body says), not an answer cut off
+/// after the server began it (a `cursor error`: the connection was alive
+/// when the request went out, so it is not a keep-alive connection closed
+/// while idle; that call fails, latching nothing, as in 2.8.0), and not a
+/// connection that could not be made (`error trying to connect`: nothing
+/// listening, DNS, TLS, the connect timeout), which is a server out of
+/// reach.
+fn dropped(lower: &str) -> bool {
+    transport(lower)
+        && !lower.contains("error trying to connect")
+        && DROPPED.iter().any(|m| lower.contains(m))
+}
+
+/// The pauses before a request whose connection was lost ([`dropped`]) is
+/// sent again, each time on a new connection: at once, then after 100 ms
+/// and 500 ms, each only while the request's deadline allows. A server
+/// that drops every connection costs those 0.6 s of pauses plus four
+/// tries, each as long as the server takes to drop it, all within the
+/// request's deadline, before the breaker latches; one that went away is
+/// refused at the first new connection.
+const RESEND: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+];
 
 // ---- panics in the client ---------------------------------------------------------
 
@@ -571,8 +671,8 @@ pub(crate) struct Conn {
     max: usize,
     broken: OnceLock<String>,
     requests: AtomicU64,
-    /// Requests sent again (the server was busy, or had dropped the
-    /// stream), counted in `requests` too.
+    /// Requests sent again (the server was busy, had dropped the stream,
+    /// or the connection was lost under them), counted in `requests` too.
     retries: AtomicU64,
     /// The server has answered a request of this handle: later requests
     /// get the request timeout, not the connect timeout.
@@ -622,7 +722,8 @@ impl Conn {
     }
 
     /// Of [`Conn::requests`], those sent again because the server was busy
-    /// (another writer held the database) or had dropped the stream.
+    /// (another writer held the database), had dropped the stream, or the
+    /// connection was lost under them.
     pub(crate) fn retries(&self) -> u64 {
         self.retries.load(Ordering::Relaxed)
     }
@@ -874,7 +975,17 @@ impl Conn {
                 true,
             );
         }
-        if lower.contains("http error") || matches!(e, libsql::Error::ConnectionFailed(_)) {
+        // The connection was lost under the request (a keep-alive
+        // connection closed while it sat idle, a reset): sent again on a
+        // new connection once the server has answered the handle; when
+        // that fails too, or before any answer, the server is out of reach.
+        if dropped(&lower) {
+            return Class {
+                dropped: true,
+                ..unavailable(format!("cannot reach {at}: {text}"), true, true)
+            };
+        }
+        if transport(&lower) || matches!(e, libsql::Error::ConnectionFailed(_)) {
             return unavailable(format!("cannot reach {at}: {text}"), true, true);
         }
         if lower.contains("status=403") && op.verb == WRITE.verb {
@@ -997,8 +1108,12 @@ impl Conn {
     /// starts a new one (servers expire idle streams). While another writer
     /// holds the database (or the server has no connection free), `f` is
     /// tried again with growing pauses until the deadline; a stream the
-    /// server no longer knows is replaced once. A panic in the client is a
-    /// latched `Unavailable`.
+    /// server no longer knows is replaced once; a request whose connection
+    /// was lost under it, once the server has answered the handle, is sent
+    /// again on a new connection ([`RESEND`], [`Conn::renew`]), and latches
+    /// the breaker only when that fails too or the deadline leaves no time
+    /// for it (before any answer, it latches the breaker at once). A panic
+    /// in the client is a latched `Unavailable`.
     fn run<T, F>(&self, op: Op, bounded_first: bool, mut f: F) -> Result<T, Fail>
     where
         F: for<'a> FnMut(
@@ -1019,6 +1134,8 @@ impl Conn {
         let deadline = Instant::now() + timeout;
         let mut pause = Duration::from_millis(10);
         let mut renewed = false;
+        // Times sent again on a new connection.
+        let mut resent = 0;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let fresh = c.used.elapsed() > STREAM_IDLE;
@@ -1079,6 +1196,26 @@ impl Conn {
                         }
                         continue;
                     }
+                    // Only once the server has answered this handle: before
+                    // that, no connection was kept alive to be lost, and a
+                    // server that accepts and closes without answering is
+                    // out of reach, latched at once and within the first
+                    // answer's bound (each request sent again would get a
+                    // bound of its own).
+                    if class.dropped
+                        && self.answered()
+                        && let Some(&wait) = RESEND.get(resent)
+                        && Instant::now() + wait < deadline
+                    {
+                        self.retries.fetch_add(sent, Ordering::Relaxed);
+                        resent += 1;
+                        std::thread::sleep(wait);
+                        if let Err(e) = self.renew(rt, &mut c) {
+                            self.give_back(None);
+                            return Err(Fail::Store(self.latch(e)));
+                        }
+                        continue;
+                    }
                     self.give_back((!class.lost).then_some(c));
                     return Err(match class.fail {
                         Fail::Store(e) if class.latch => Fail::Store(self.latch(e)),
@@ -1095,6 +1232,36 @@ impl Conn {
                 }
             }
         }
+    }
+
+    /// Give `c` a new libsql connection, after its HTTP connection was lost
+    /// under a request: a new HTTP client, so that the request sent again
+    /// opens a new TCP (and TLS) connection. hyper takes a connection that
+    /// failed out of its pool, but the client may hold others that sat
+    /// idle as long, and it hands out the one used last first; a new
+    /// client holds none. The old connection's server stream is given up
+    /// without a request (whether the server still has it is not known;
+    /// it expires it), and the statements prepared on it go with it.
+    fn renew(&self, rt: &tokio::runtime::Runtime, c: &mut Pooled) -> Result<(), StoreError> {
+        let db = self.database()?;
+        let conn = guarded(|| {
+            rt.block_on(c.conn.reset());
+            db.connect()
+        })
+        .unwrap_or_else(|()| Err(libsql::Error::ConnectionFailed(CLIENT_PANICKED.to_owned())))
+        .map_err(|e| {
+            StoreError::unavailable(
+                KIND,
+                format!(
+                    "cannot connect to {}: {}",
+                    self.target.display,
+                    self.scrub(&e.to_string())
+                ),
+            )
+        })?;
+        c.conn = conn;
+        c.stmts.clear();
+        Ok(())
     }
 
     /// The rows of one statement with parameters (`?1`, `?2`, ...).
@@ -1169,6 +1336,46 @@ impl Conn {
     /// (docs/STORE-BACKENDS.md section 21, item 17). `BEGIN IMMEDIATE` asks
     /// for the write lock outside any transaction, which the server retries
     /// with a fresh snapshot.
+    ///
+    /// **Sending a batch again is safe**, which [`Conn::run`] does when the
+    /// connection was lost under it: the server may have committed it and
+    /// lost only the answer. It is one transaction ending in `COMMIT`, so
+    /// the server applied all of it or none. Its values are literals fixed
+    /// when the batch was built (`put_at`, `stored_at` and the log's `at`
+    /// included), so the same text goes again, and applied twice in a row
+    /// it leaves the rows as applied once, but for the change log's: the
+    /// manifests, the attestations and the memo are upserts of the same
+    /// rows (a no-op the second time), a removal deletes what is already
+    /// gone (and `remove_manifests` only what is still unreferenced and
+    /// old), the schema's DDL is `IF NOT EXISTS` and its `vci_schema` row
+    /// and the flags `ON CONFLICT DO NOTHING`, and the prunes move
+    /// `log_floor` up to the same value and delete the same rows. The
+    /// change log's rows are inserted again, under new `seq`s, which
+    /// replicas tolerate: a replica reads, for the slots and roots the log
+    /// names after its last sync (`DISTINCT`), the server's current rows,
+    /// so a slot named twice is read once, and one named again after a
+    /// replica synced is read again as it now is; it converges.
+    ///
+    /// The batch sent again is applied after whatever the server applied
+    /// since its first commit, and wins as the last writer in the server's
+    /// order: a write of another handle that followed the first commit,
+    /// and returned, is undone where the two overlap. Its upserts replace
+    /// that writer's newer row of the same slot, memo entry or manifest's
+    /// `put_at`, and its removals delete a key that writer stored again,
+    /// or, for a slot the batch emptied (`DELETE` by test key, signer and
+    /// storage key), whatever that writer stored in the slot. A reader can
+    /// see the batch's rows, then the other writer's, then the batch's
+    /// again (a key removed, stored again, then gone): no order of single
+    /// applications gives that. The window is from the first commit to
+    /// the batch sent again (usually a few round trips and well under a
+    /// second, at most the request's deadline); vci's removals are of keys superseded and slots emptied,
+    /// and the store is not trusted (every attestation is verified when
+    /// read), so the worst is a miss: a test runs again and its
+    /// attestation is stored again, never a wrong verification. Should
+    /// the server keep the transaction of a request that was cut off open,
+    /// it holds the write lock until the server expires its stream, and the
+    /// batch sent again waits for it as for any other writer, within its
+    /// deadline.
     pub(crate) fn batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
         if statements.is_empty() {
             return Ok(());
@@ -1417,6 +1624,119 @@ mod tests {
             "Hrana: `api error: `boom``",
         ] {
             assert!(!takes_no_writes(&text.to_ascii_lowercase()), "{text}");
+        }
+    }
+
+    /// A connection lost under a request (libsql's words for hyper's and
+    /// the system's errors, on macOS and Linux) is sent again; a
+    /// connection that could not be made, an answer cut off after the
+    /// server began it, and every answer the server sent (a refused token
+    /// included, whatever its body says), is not.
+    #[test]
+    fn lost_connections_are_told_from_unreachable_servers() {
+        let url = Secret::new("http://127.0.0.1:9");
+        let (target, _) = Target::parse(&url, None).unwrap();
+        let conn = Conn::new(
+            target,
+            url,
+            "$VCI_STORE_URL",
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            1,
+        );
+        let class = |text: &str| conn.classify(&libsql::Error::Hrana(text.into()), WRITE);
+        for text in [
+            // What vex's CI got from Turso, and what a reset gives.
+            "http error: `connection closed before message completed`",
+            "http error: `connection error: Connection reset by peer (os error 54)`",
+            "http error: `connection error: Connection reset by peer (os error 104)`",
+            "http error: `error writing a body to connection: Broken pipe (os error 32)`",
+            "http error: `connection error: Software caused connection abort (os error 53)`",
+            "http error: `connection error: unexpected end of file`",
+            "http error: `connection error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof`",
+            "http error: `error reading a body from connection: end of file before message length reached`",
+            "http error: `operation was canceled: connection closed`",
+            "http error: `channel closed`",
+        ] {
+            let c = class(text);
+            assert!(c.dropped, "{text}");
+            assert!(
+                c.latch && c.lost,
+                "{text}: latched when sending it again fails"
+            );
+            match &c.fail {
+                Fail::Store(e) => {
+                    assert!(e.to_string().contains("cannot reach"), "{text}: {e}")
+                }
+                Fail::Absent => panic!("{text}: absent"),
+            }
+        }
+        for text in [
+            "http error: `error trying to connect: tcp connect error: Connection refused (os error 61)`",
+            "http error: `error trying to connect: tcp connect error: Connection reset by peer (os error 54)`",
+            "http error: `error trying to connect: dns error: failed to lookup address information: nodename nor servname provided, or not known`",
+            "http error: `error trying to connect: connecting timed out after 5s`",
+            "http error: `error trying to connect: peer closed connection without sending TLS close_notify`",
+            "http error: `error trying to connect: invalid peer certificate: UnknownIssuer`",
+        ] {
+            let c = class(text);
+            assert!(!c.dropped, "{text}");
+            assert!(c.latch, "{text}: an unreachable server latches at once");
+        }
+        // An answer the server began (a read's rows) and that was cut off:
+        // that read fails, and nothing is latched, as in 2.8.0.
+        for text in [
+            "cursor error: `error reading a body from connection: Connection reset by peer (os error 54)`",
+            "cursor error: `error reading a body from connection: end of file before message length reached`",
+            "cursor error: `cursor stream ended prematurely`",
+        ] {
+            let c = class(text);
+            assert!(!c.dropped, "{text}");
+            assert!(!c.latch, "{text}: latched");
+            match &c.fail {
+                Fail::Store(e) => {
+                    assert!(!e.to_string().contains("cannot reach"), "{text}: {e}")
+                }
+                Fail::Absent => panic!("{text}: absent"),
+            }
+        }
+        // Answers of the server, whatever words their bodies hold.
+        let says = |text: &str| match class(text) {
+            c if c.dropped => panic!("{text}: sent again"),
+            Class {
+                fail: Fail::Store(e),
+                ..
+            } => e.to_string(),
+            Class { .. } => panic!("{text}: absent"),
+        };
+        for text in [
+            "api error: `status=401 Unauthorized, body={\"error\":\"Unauthorized: `The JWT is invalid`\"}`",
+            "api error: `status=502 Bad Gateway, body=upstream connection reset`",
+            "api error: `SQLite error: broken pipe`",
+            "api error: `SQLite error: http error: connection reset by peer`",
+            "stream error: `Error { message: \"SQLite error: database is locked\", code: \"SQLITE_BUSY\" }`",
+            "stream error: `Error { message: \"http error: `connection closed before message completed`\", code: \"X\" }`",
+        ] {
+            says(text);
+        }
+        for (text, said) in [
+            (
+                "api error: `status=502 Bad Gateway, body=upstream: http error: `connection reset by peer``",
+                "status=502",
+            ),
+            (
+                "api error: `status=503 Service Unavailable, body=http error: `connection closed before message completed``",
+                "status=503",
+            ),
+            (
+                "api error: `status=401 Unauthorized, body=http error: `connection reset by peer``",
+                "the server asks for a token",
+            ),
+        ] {
+            let e = says(text);
+            assert!(e.contains(said), "{text}: {e}");
+            assert!(!e.contains("cannot reach"), "{text}: {e}");
         }
     }
 
