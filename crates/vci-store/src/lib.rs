@@ -2013,8 +2013,11 @@ pub mod select {
     //! otherwise point CI's secret at a server of its own. The command line
     //! reads `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` once at
     //! start-up and removes them from its own environment, so no test
-    //! process, adapter, hook or token command ever sees them
-    //! ([`NEVER_TO_CHILDREN`]).
+    //! process, adapter, hook or token command inherits them
+    //! ([`NEVER_TO_CHILDREN`]). A process that reads another's environment
+    //! (`/proc/<pid>/environ`, `ps eww`) still finds them in the one vci,
+    //! or the shell that set them, started with: a CI job that runs
+    //! untrusted code should hold a read-only credential, or none.
     //!
     //! This module only parses and validates. The command line turns a
     //! [`Selection`] into a store through the registered
@@ -2068,8 +2071,9 @@ pub mod select {
     ];
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
-    /// again, so that they never reach a test, an adapter or a hook (other
-    /// `VCI_*` variables pass through as built-in ignore). `VCI_STORE` is
+    /// again, so that no test, adapter or hook inherits them (other `VCI_*`
+    /// variables pass through as built-in ignore). The environment vci
+    /// started with still holds them, for a process that reads it. `VCI_STORE` is
     /// one of them because a connection string put there by mistake would
     /// otherwise reach every test.
     pub const NEVER_TO_CHILDREN: &[&str] = &[ENV_STORE, ENV_STORE_URL, ENV_TOKEN];

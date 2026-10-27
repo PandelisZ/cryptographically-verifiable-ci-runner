@@ -678,7 +678,9 @@ So on a store with `Caps::shared_writes` (`cmds::store_mode(shared_writes, push)
 - **`vci ci --push`** stores directly, and the audit log's `pushed: true` means "stored in the shared store".
 - **Plain `vci run`** always stores (`StoreMode::Write`): a developer publishing directly.
 - Operators who do not want developers or pull-request jobs to publish give them a read-only role (section 17).
-  The memo and flags then fail silently; they are hints.
+  The memo and flags then fail silently; they are hints. A job that runs untrusted pull-request code must hold a
+  read-only credential (or none) whatever it runs: its tests can read the credential from the environment vci or
+  the step's shell started with (section 9, "What this cannot hide"), and the gate does not stop them using it.
 - A later option, if the gate proves too coarse, is a **Staged** wrapper: a local SQLite outbox over a shared
   backend, read as an overlay and published by `vci push`. The trait allows it, but it is not in v1.
 
@@ -781,7 +783,17 @@ the git-specific assertions.
   `VCI_STORE_TOKEN`, and `VCI_STORE`, where a connection string may be put by mistake),
   keeps the values in a process-wide map of `Secret`s (a value that is not UTF-8 is kept lossily), and removes them
   from its own environment (`std::env::remove_var`, sound while the process has one thread). No test, adapter probe,
-  hook or git command it starts can see the URL.
+  hook, git command or token command it starts inherits them.
+- **What this cannot hide.** `remove_var` changes the environment vci's own code and its children see, not the one
+  the process started with: that stays readable to every process of the same user (`/proc/<pid>/environ` on Linux,
+  `ps eww` and `KERN_PROCARGS2` on macOS), as does the CI step's shell, which set the variables. A test that goes
+  looking reads the URL and the token there. Starting vci again with a clean environment would not help while the
+  shell holds them, so vci does not try; the defence is the credential's scope, and the user docs say so
+  (REFERENCE.md, "What vci cannot hide from a test"): a CI job that runs untrusted pull-request code holds no store
+  credential or a read-only one (`turso db tokens create <db> --read-only`; a PostgreSQL role with `SELECT` only),
+  and only trusted jobs (the default branch, or same-repository pull requests, whose authors could change the
+  workflow anyway) hold one that can write. A token `[store] token_command` printed is in vci's memory only, never in
+  an environment.
 - `envpolicy::build_child_env` also drops those names, in loose mode too and even when `[env] set` names them, as
   defence in depth.
 - The env closure passed to `resolve` (`store::env_lookup`) answers `VCI_STORE_URL`, `VCI_STORE_TOKEN` and
@@ -802,7 +814,9 @@ the git-specific assertions.
 - The CLI test `store_select::the_store_url_reaches_no_test_and_no_output` runs a Go test that writes
   `os.Getenv("VCI_STORE_URL")` and `os.Environ()` to a file outside the repository, and checks that neither the
   variable nor its password reaches it, nor any output or the metrics log. vci 2.7.32 passes the URL through.
-  `store_credential` does the same for a token a `token_command` printed.
+  `store_credential` does the same for a token a `token_command` printed, and checks that nothing a failing command
+  printed (a canary on its standard error, beside the token, in each frame below) reaches any output, a plan's JSON
+  or GitHub output, its warnings, `vci ci`'s audit log or the metrics log.
 
 ### `vci.toml`
 
@@ -914,39 +928,39 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   update`, `vci env`), or a plan that never reads it (no base ref resolved: everything runs), never runs it. It runs **at most once
   per vci process** for a command and directory: the result, a failure too, is kept in memory
   (`credential::FETCHED`, one `OnceLock` per command and directory; other threads wait for the run), never on disk.
-- **How.** An array is the program and its arguments, run directly, with no shell; a string is run with `sh -c`, for
-  a pipeline (the array is preferred). The working directory is the repository's top level (`OpenContext::repo_root`),
-  and a relative program path holding a `/` (`["scripts/vci-token"]`) is the checkout's. stdin is `/dev/null`. The
+- **How.** An array is the program and its arguments, run directly, with no shell; a string is run with `sh -c`, for a
+  pipeline (the array is preferred). The working directory is the repository's top level (`OpenContext::repo_root`), and
+  a relative program path holding a `/` (`["scripts/vci-token"]`) is the checkout's. stdin is `/dev/null`. The
   environment is vci's own, which `take_secrets` already emptied of `NEVER_TO_CHILDREN`; the command removes them again
-  (`env_remove`), so `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` never reach it. stdout is captured, at most
-  64 KiB (more is read and dropped, and refused); stderr is captured for the message (its last 64 KiB). Once the
-  command exits, what it wrote is read within a second, even when a process it started (a secrets tool's daemon)
-  keeps the pipes open. On unix the command leads a process group of its own (`process_group(0)`): after 60 s (or the
-  connect timeout, when longer, `Credential::timeout`) the whole group is killed (`kill -KILL -<pgid>`, as the Rails
-  adapter stops a test file, since the crate has no unsafe code to call `kill(2)`), so a wrapper script's program or
-  each stage of a `sh -c` pipeline is stopped with it, and the command is waited for. Two consequences: outside the
-  terminal's foreground group the command cannot prompt there (the system stops a process that reads the terminal,
-  until the timeout), so sign in beforehand (`com login`, `op signin`, `ssh-add`); and a Ctrl-C that stops vci does
-  not reach it, so a command still running then ends on its own (its output goes nowhere).
+  (`env_remove`), so `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` are not in its environment. stdout is captured,
+  at most 64 KiB (more is read and dropped, and refused); stderr is a pipe read on a thread of its own and dropped
+  (`credential::discard`), so the command never blocks on it and nothing it wrote there is kept. Once the command exits,
+  what it wrote on stdout is read within a second, even when a process it started (a secrets tool's daemon) keeps the
+  pipe open. On unix the command leads a process group of its own (`process_group(0)`): after 60 s (or the connect
+  timeout, when longer, `Credential::timeout`) the whole group is killed (`kill -KILL -<pgid>`, as the Rails adapter
+  stops a test file, since the crate has no unsafe code to call `kill(2)`), so a wrapper script's program or each stage
+  of a `sh -c` pipeline is stopped with it, and the command is waited for. Two consequences: outside the terminal's
+  foreground group the command cannot prompt there (the system stops a process that reads the terminal, until the
+  timeout), so sign in beforehand (`com login`, `op signin`, `ssh-add`); and a Ctrl-C that stops vci does not reach it,
+  so a command still running then ends on its own (its output goes nowhere).
 - **What it prints.** UTF-8, surrounding whitespace trimmed, not empty, one line, no control character: the token,
   kept as a `Secret::opaque` (redacted everywhere, scrubbed from every message the backend passes through
   `Conn::scrub` once it is known).
-- **Failure** is `StoreError::Unavailable` for the backend, with what went wrong and never what the command printed on
-  stdout: `the token_command (<command>) exited 3: <stderr>`, `… was not found (…)`, `… did not finish within 60 s
-  (it was stopped)`, `… printed nothing on standard output`, `… printed more than one line on standard output (not
-  printed): it must print the credential alone`, `… printed something that is not UTF-8 text …`, `… printed more than
-  64 KiB …`, `… was killed by signal 9`. The stderr shown is its last 400 characters on one line, with everything
-  stdout held removed first (`credential::printed_pieces`: whole, by line, and each piece of six bytes or more
-  between whitespace, control characters or a byte that is not UTF-8, quotes, brackets and `,:;=`, each run of the
-  characters a token is made of, and of those but `/` and `.`, a value after its `key=` or `key:`, each also
-  without `._~+/-` at its ends, the same again with terminal escape sequences taken out, so a token framed in
-  JSON, coloured, beside a stray byte, ending a sentence (`Fetched <token>.`), between dashes or in a URL's path is
-  removed). No stderr is shown when stdout
-  went past 64 KiB (what it held is not all known) or held more than 256 such pieces, and when stderr went past
-  64 KiB its first word, which may be part of one cut in two, is dropped. As for a store that cannot be
-  reached: `vci plan` runs everything with the warning, `vci run` keeps the tests' exit code and attests nothing, and
-  `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. A token the server refuses says `the server
-  refused the token from [store] token_command (<command>)`.
+- **Failure** is `StoreError::Unavailable` for the backend, saying what happened and naming the command as `vci.toml`
+  gives it (`TokenCommand::display`; not a secret), then `credential::HINT`, and never anything the command printed,
+  on stdout or stderr: `the token_command (<command>) exited 3; vci shows none of its output, which may hold the
+  credential: run the command yourself to see why`, and in place of `exited 3`: `was not found (…)`, `could not be
+  started (…)`, `was killed by signal 9`, `did not finish within 60 s (it was stopped)`, `printed nothing on standard
+  output`, `printed more than one line on standard output: it must print the credential alone`, `printed something
+  that is not UTF-8 text on standard output`, `printed a control character on standard output`, `printed more than
+  64 KiB on standard output`. A first version, never released, showed the end of stderr scrubbed of every piece of
+  what stdout held; three reviews each found a frame the scrubbing missed, since stderr may hold the credential in a
+  form stdout never showed: a pipeline whose last stage echoes its input when it cannot parse it and prints nothing
+  (`jq: error … (while parsing '<token>')`), a wrapper that logs the token, stdout framed as `key=<token>&…` or
+  `k=<token>!`, a passphrase with spaces. Hence no stderr at all (decision 19 in section 20). As for a store that
+  cannot be reached: `vci plan` runs everything with the warning, `vci run` keeps the tests' exit code and stores
+  nothing, and `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. A token the server refuses says `the
+  server refused the token from [store] token_command (<command>)`.
 - **`vci store info`** names the command and never the token: `token: (from token_command: com secrets get
   vci-store-token --org vex) (vci.toml [store])` for libSQL, `password: (from token_command: …)` for PostgreSQL. It
   runs the command only because it reads the store (its status and count), as it always connected.
@@ -1268,8 +1282,8 @@ Hence `AttestationStore: Send + Sync`.
 - **`tests/store_select.rs`** (a copy of `fixtures/go-abcd`, skipped without `go`) checks selection end to end:
   nothing configured is git-meta and pushes `refs/meta/main`; an unknown store, postgres without a URL, a URL in
   `VCI_STORE` and a password in `vci.toml` all fail open (plan exits 0 and runs everything; fetch, push, prune and
-  store info exit 2) without printing the secret; `VCI_STORE_URL` reaches no test; the environment overrides
-  `vci.toml` with a warning.
+  store info exit 2) without printing the secret; `VCI_STORE_URL` is in no test's environment; the environment
+  overrides `vci.toml` with a warning.
 
 ---
 
@@ -2504,10 +2518,11 @@ write, and the first description of each statement on each connection) plus the 
 - **Hints** (remote and replica): the memo and the flags are the namespace's tables on the server, as PostgreSQL's:
   every flag read once per handle, `passing_on` memoized per tree, `remember_passing` one request (with the 7-day memo
   prune, once per handle), every error swallowed, never creating the tables. Local: the file's tables.
-- **Turso.** A database per organization or per repository; a full-access token for the jobs that store (`vci ci
-  --push` on protected branches) and a read-only one for pull requests and developers (`turso db tokens create <db>
-  --read-only`): their writes are `Denied`, their plans read. Backups are Turso's (point-in-time restore); `vci
-  prune` keeps the tables small.
+- **Turso.** A database per organization or per repository; a full-access token for the trusted jobs that store
+  (`vci ci --push` on protected branches) and a read-only one for pull requests and developers (`turso db tokens
+  create <db> --read-only`): their writes are `Denied`, their plans read. A job that runs untrusted code gets the
+  read-only one or none, since its tests can read the token (section 9, "What this cannot hide"). Backups are
+  Turso's (point-in-time restore); `vci prune` keeps the tables small.
 - **Monitoring.** `LibsqlStore::requests()` counts requests; the timing lines carry them.
 
 ### The temporary libSQL server for tests
@@ -2653,6 +2668,16 @@ every write is idempotent, and `batch` is a bulk upload.
     pull request's `[store] url` from receiving them. One timeout, 60 s or the connect timeout when longer, with no
     setting of its own: a helper waiting for a human (1Password's unlock) gets time, a stuck one cannot hold a plan
     for long.
+19. **Nothing the token command printed is shown, its standard error included.** A scrubber removes only what it can
+    recognise, and standard error can hold the credential in a frame standard output never showed (a `jq` stage
+    echoing its input, a wrapper's log line, a passphrase cut at its spaces): three reviews of the scrubbed excerpt
+    each found one more. A failure says what happened and names the command, which `vci.toml` gives and is not
+    secret, and says to run it to see why; standard error is still read, and dropped, so the command never blocks on
+    a full pipe.
+20. **The store's secrets stay out of every environment vci builds, and vci says it cannot do more.** The environment
+    a process started with stays readable to its user's other processes, vci's and the CI step shell's alike, and a
+    clean re-exec of vci would leave the shell's. The defence is the credential's scope: a job that runs untrusted
+    code holds a read-only credential or none (section 9, "What this cannot hide").
 
 ---
 
@@ -2693,8 +2718,9 @@ Decided while building it:
     17.5 MiB static x86_64 musl binary.
 16. **The default namespace in a shallow clone** is refused by the PostgreSQL backend itself (section 17), because
     `Repo::repo_id()` returns the shallow boundary there instead of failing.
-17. **`VCI_STORE` never reaches a test either.** It is in `NEVER_TO_CHILDREN` with `VCI_STORE_URL`, so a connection
-    string put there by mistake reaches no child process; and a value that is not shaped like a backend name is
+17. **`VCI_STORE` is in no test's environment either.** It is in `NEVER_TO_CHILDREN` with `VCI_STORE_URL`, so a
+    connection string put there by mistake is in no environment vci builds for a child (section 9 says what a test
+    that goes looking can still read); and a value that is not shaped like a backend name is
     refused without being quoted back.
 18. **A PostgreSQL connection is bounded as a whole.** The client library bounds only the TCP connect; a peer that
     accepts and never answers (a frozen or failing-over server, a stuck proxy, another service on the port) would hold

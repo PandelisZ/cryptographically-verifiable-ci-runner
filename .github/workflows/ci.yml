@@ -276,9 +276,10 @@ jobs:
 
   # The command line on each store, end to end (crates/vci-cli/tests/
   # store_select.rs, store_backends.rs and store_credential.rs): selection,
-  # secrets that never reach a test, fail open, run, plan, explain, prune,
-  # fetch, push and ci on SQLite, PostgreSQL and libSQL (local, remote and
-  # replica), and [store] token_command, against a copy of fixtures/go-abcd. The PostgreSQL service is reached on
+  # secrets kept out of every test's environment, fail open, run, plan,
+  # explain, prune, fetch, push and ci on SQLite, PostgreSQL and libSQL
+  # (local, remote and replica), and [store] token_command, against a copy of
+  # fixtures/go-abcd. The PostgreSQL service is reached on
   # localhost, where vci does not require TLS, and so is the libSQL server.
   # Without go the tests would skip, so the module is downloaded first.
   store-cli:

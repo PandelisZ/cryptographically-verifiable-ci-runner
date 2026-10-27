@@ -1752,10 +1752,13 @@ no push, no fetch, no cache.
 - **The URL is a secret** when it holds the password, and comes from `VCI_STORE_URL`, else from `[store] url` in
   `vci.toml` without a password (`postgres://vci@db.example.com/ci`), the password then printed by `[store]
   token_command` (see [The credential from a command](#the-credential-from-a-command)). vci removes `VCI_STORE_URL`
-  from its own environment as it starts, so no test, probe or hook it runs ever sees it (`VCI_*` variables otherwise
-  reach every test process), and never prints it: `vci store info`, errors and `vci fetch` show
-  `postgres://***@db.example.com:5432/ci`, and the metrics log records only the store's kind. In GitHub Actions, put it in a secret of an environment; pull requests
-  from forks get no secrets, so their jobs cannot read the store and run every test.
+  from its own environment as it starts, so it is in no environment vci builds for a test, probe or hook (`VCI_*`
+  variables otherwise reach every test process), and never prints it: `vci store info`, errors and `vci fetch` show
+  `postgres://***@db.example.com:5432/ci`, and the metrics log records only the store's kind. A test that goes
+  looking can still read it from the environment vci, or the CI step's shell, started with (see [what vci cannot hide
+  from a test](#what-vci-cannot-hide-from-a-test)), so a job that runs untrusted pull-request code gets a role with
+  `SELECT` only, or no URL. In GitHub Actions, put it in a secret of an environment; pull requests from forks get no
+  secrets, so their jobs cannot read the store and run every test.
 - **TLS.** Without `sslmode`, TLS is required, except for `localhost`, `127.0.0.1`, `::1` and Unix sockets, where it is
   preferred. Certificates are always verified, against the webpki roots plus the CA file of
   `?sslrootcert=/path/to/ca.pem`, which vci reads itself; `verify-ca` and `verify-full` mean `require`, `allow` means
@@ -1783,7 +1786,8 @@ no push, no fetch, no cache.
   `attested` line adds `(not stored: the postgres store is shared and --push was not given)`, and the audit log's
   `attested` entries carry `"stored": false` and `pushed` is `false`. `vci ci --push` stores (`pushed: true` means
   stored), as does a plain `vci run`: a developer publishing directly. Give pull request jobs and developers who should
-  not publish a role that cannot write (below).
+  not publish a role that cannot write (below); a job that runs untrusted pull-request code must hold no password
+  that can write, whatever it runs (see [what vci cannot hide from a test](#what-vci-cannot-hide-from-a-test)).
 - **Batches.** A project's attestations are written in one transaction once its units are signed (in a few for more
   than 2,000 writes), and each `vci: attested …` line is printed only once that transaction committed. A transaction
   that fails refuses every unit it held (`signing or storing failed: storing the batch: …`), and nothing claims an
@@ -1809,7 +1813,7 @@ write the schema can write or delete any repository's rows on it, which only eve
 ```sql
 -- as an administrator
 CREATE ROLE vci_owner  LOGIN PASSWORD '...';   -- creates the schema: its first `vci run` does
-CREATE ROLE vci_writer LOGIN PASSWORD '...';   -- protected-branch CI (vci ci --push)
+CREATE ROLE vci_writer LOGIN PASSWORD '...';   -- trusted CI only: the default branch (vci ci --push)
 CREATE ROLE vci_reader LOGIN PASSWORD '...';   -- pull request jobs and developers: plan, explain
 GRANT CREATE ON DATABASE ci TO vci_owner;
 -- once vci_owner's first `vci run` created schema vci
@@ -1831,7 +1835,7 @@ your own, which every machine reads and writes at once, with nothing to cache, f
 ```sh
 turso db create vci                       # once
 turso db show vci --url                   # libsql://vci-<organization>.turso.io: VCI_STORE_URL
-turso db tokens create vci                # VCI_STORE_TOKEN for the jobs that store (vci ci --push on main)
+turso db tokens create vci                # VCI_STORE_TOKEN for trusted jobs that store (vci ci --push on main)
 turso db tokens create vci --read-only    # VCI_STORE_TOKEN for pull requests and developers
 ```
 
@@ -1862,8 +1866,10 @@ The store has three modes:
 | local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` (no `?query` or `#fragment`) | from `<git common dir>/vci-store.libsql` | to the file |
 
 - **The token is a secret**, like PostgreSQL's password: `VCI_STORE_TOKEN`, else the URL's `authToken` parameter,
-  else what `[store] token_command` prints. vci removes both variables from its own environment as it starts, so no
-  test, probe, hook or token command sees them, and never prints a token: `vci store info` says `token: (set)` (or
+  else what `[store] token_command` prints. vci removes both variables from its own environment as it starts, so they
+  are in no environment it builds for a test, probe, hook or token command (a test that goes looking can still read
+  them: [what vci cannot hide from a test](#what-vci-cannot-hide-from-a-test); give a job that runs untrusted
+  pull-request code a read-only token, or none), and never prints a token: `vci store info` says `token: (set)` (or
   `token: (from token_command: <command>)`), and shows the URL with its host and port only (a path as
   `/<path>`; of the query only `tls`, `authToken=***` and `***` for anything else). A URL with another query
   parameter (a `token=` or `jwt=` by mistake) is refused without printing it or its name. A read-only
@@ -1935,8 +1941,8 @@ are listed in [docs/ENV.md](ENV.md#store-selection).
   but never hold a credential: a `[store] url` with a password, a user (a libSQL server's), an `authToken` or another
   query parameter that may hold one, or a `#fragment`, is refused, and so are `url`, `host`, `user`, `password`,
   `dbname`, `token` and `authToken` under `[store.postgres]` and `[store.libsql]` (the errors name the key, never the
-  value). `VCI_STORE_URL` wins over `[store] url`. `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` never reach a
-  test, a probe, a hook or a token command.
+  value). `VCI_STORE_URL` wins over `[store] url`. `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` are in no
+  environment vci builds for a test, a probe, a hook or a token command; a test can still read them elsewhere (below).
 - **A credential from the environment goes only to a URL from the environment.** `VCI_STORE_TOKEN` with the URL from
   `[store] url` is refused (`$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url: … set
   $VCI_STORE_URL as well`), and the store fails open: otherwise a pull request could point CI's secret at a server it
@@ -2019,15 +2025,20 @@ token_command = ["com", "secrets", "get", "vci-store-token", "--org", "vex"]
   token the command is never run. CI, which sets `VCI_STORE_URL` and `VCI_STORE_TOKEN` from secrets, never runs it.
 - **Bounded.** After 60 s (or the connect timeout, when longer) it is stopped with every process it started: it runs
   in a process group of its own, which is killed. So it cannot prompt on the terminal (the system stops it until the
-  timeout; sign in first: `com login`, `op signin`, `ssh-add`), and a Ctrl-C that stops vci does not reach it. A
-  command that is not found, exits non-zero, is stopped, or prints nothing or more than one line makes the store
-  unavailable, as an unreachable server does: `vci plan` runs everything with a warning saying why (`the
-  token_command (com secrets get vci-store-token --org vex) exited 1: <the end of its stderr>`), `vci run` keeps the
-  tests' exit code and attests nothing, and `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. Nothing
-  it printed on standard output is ever shown: the end of its stderr is shown without it (however it was framed, in
-  JSON or coloured), and not at all when standard output went past 64 KiB.
+  timeout; sign in first: `com login`, `op signin`, `ssh-add`), and a Ctrl-C that stops vci does not reach it.
+- **When it fails** (it is not found, exits non-zero, is killed by a signal or stopped after its time, or prints
+  nothing, more than one line, something that is not UTF-8 or more than 64 KiB), the store is unavailable, as when a
+  server cannot be reached: `vci plan` runs everything with a warning saying what happened and naming the command as
+  `vci.toml` gives it (`the token_command (com secrets get vci-store-token --org vex) exited 1; vci shows none of its
+  output, which may hold the credential: run the command yourself to see why`), `vci run` keeps the tests' exit code
+  and stores nothing, and `vci fetch`, `vci push`, `vci prune` and `vci store info` exit 2. **Nothing the command
+  printed is ever shown, on standard output or standard error**: a command that fails may print the credential on
+  either, framed in ways no scrubbing finds (a pipeline stage that echoes its input, as `jq` does when it cannot parse
+  it; a wrapper that logs the token; a passphrase with spaces), so its standard error is read and dropped. Run the
+  command yourself, in the repository's top level, to see its error.
 - **`vci store info`** names it, never the token: `token: (from token_command: com secrets get vci-store-token --org
-  vex) (vci.toml [store])` (`password:` for PostgreSQL), so its output stays safe to paste into an issue.
+  vex) (vci.toml [store])` (`password:` for PostgreSQL). No message vci prints about the command holds anything it
+  printed.
 - **Trust.** The command, and the URL what it prints is sent to, both come from the checkout's `vci.toml`. Any vci
   command that reads the store runs the command with your own privileges, `vci plan` included (which for some
   adapters runs nothing else of the checkout's: Go's plan only runs `go list`), and sends its token to the checkout's
@@ -2052,6 +2063,28 @@ token_command = ["cat", "/Users/me/.config/vci/store-token"]
 # a pipeline, through sh -c
 token_command = "pass show vci/store | head -n 1"
 ```
+
+### What vci cannot hide from a test
+
+vci reads `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` as it starts, removes them from its own environment and
+leaves them out of every environment it builds for another process: no test, probe, hook, git command or token
+command inherits them, and the token a `[store] token_command` prints is never put in any environment. That keeps
+them from code that reads its own environment, not from code that goes looking. The environment a process started
+with stays readable to every other process of the same user (`/proc/<pid>/environ` on Linux, `ps eww <pid>` on
+macOS): vci's own, whatever it removed since, and that of the CI step's shell, which set them. A test the job runs can
+read the store's credential that way, and vci cannot prevent it (starting itself again with a clean environment would
+not help, since the step's shell still holds them). The token a `[store] token_command` prints is in vci's memory
+only, out of reach of that read (a process the system lets debug vci could read its memory); on a developer's machine
+a test can run the command itself anyway (see "Trust" above).
+
+So a CI job's store credential is only as safe as the least trusted code the job runs:
+
+- **A job that runs untrusted pull-request code** (a fork's, through `pull_request_target`, or on a runner that gives
+  such jobs secrets) holds no store credential, or one that can only read: a read-only libSQL token (`turso db tokens
+  create <db> --read-only`), or a PostgreSQL role with `SELECT` only (`vci_reader` in [PostgreSQL](#postgresql),
+  without its optional grant on the hints). Its plans read the store, and anything it tries to write is refused.
+- **Only trusted jobs hold a credential that can write**: the default branch's, or pull requests from the same
+  repository, whose authors could change the workflow, and read its secrets, anyway.
 
 ## CI attests its own runs
 
@@ -3313,7 +3346,9 @@ file), PostgreSQL (handles on a schema of their own) and libSQL (its local file;
 replicas of it). Each backend keeps its own tests as well (`crates/vci-git/tests/store*.rs`,
 `crates/vci-store-sqlite/tests/sqlite.rs`, `crates/vci-store-postgres/tests/pg.rs`,
 `crates/vci-store-libsql/tests/libsql.rs`). `crates/vci-cli/tests/store_select.rs` checks the store's selection and
-that `VCI_STORE_URL` reaches no test and no output, and `store_backends.rs` runs `run`, `plan`, `explain`,
+that `VCI_STORE_URL` is in no test's environment and no output (`store_credential.rs` does the same for a token
+`[store] token_command` prints, and checks that nothing a failing command printed, on standard output or standard
+error, reaches any output, warning or audit log), and `store_backends.rs` runs `run`, `plan`, `explain`,
 supersession, `prune`, `fetch`, `push` and `ci` on SQLite, PostgreSQL and libSQL (local, remote and replica) against a
 copy of `fixtures/go-abcd`, and checks that an unreachable libSQL server fails open without showing its tokens.
 
@@ -3632,7 +3667,10 @@ word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
   collector directory only when the real path is there, but a symlink in that directory created and removed by a test
   can no longer be resolved after the run (the Rails collector resolves paths when they are used).
 - Shared stores (PostgreSQL, since 2.8.0): GitHub does not pass secrets to workflows of pull requests from forks, so
-  their jobs cannot read the store and run every test. The default namespace is the repository's first commit, which
+  their jobs cannot read the store and run every test. A test can read the store's credential from the environment
+  vci, or the CI step's shell, started with, which vci cannot hide ([What vci cannot hide from a
+  test](#what-vci-cannot-hide-from-a-test)): a job that runs untrusted code holds a read-only credential, or none.
+  The default namespace is the repository's first commit, which
   forks and mirrors share (they then share attestations, as they do through git-meta) and a shallow clone cannot
   give (set `VCI_STORE_NAMESPACE`). There is no row-level security per namespace: a role that can write the schema can
   write or delete every repository's rows on it, which can only make units run; use one schema per trust domain.

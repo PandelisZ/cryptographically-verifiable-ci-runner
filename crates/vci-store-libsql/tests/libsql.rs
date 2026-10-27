@@ -848,9 +848,13 @@ fn a_token_command_supplies_the_token() {
     );
     assert!(!all.contains(&wrong), "{all}");
 
-    // A command that fails: unavailable, saying how, and never retried.
+    // A command that fails: unavailable, saying how (never what it wrote
+    // on standard error), and never retried.
     let s = with(
-        helper("fails", &format!("echo {good}\necho denied >&2\nexit 4")),
+        helper(
+            "fails",
+            &format!("echo {good}\necho denied {good} >&2\nexit 4"),
+        ),
         None,
     );
     let before = runs();
@@ -858,8 +862,11 @@ fn a_token_command_supplies_the_token() {
         let e = s.status().unwrap_err();
         let all = format!("{e} {e:?}");
         assert!(matches!(e, StoreError::Unavailable { .. }), "{all}");
-        assert!(all.contains("exited 4: denied"), "{all}");
-        assert!(!all.contains(&good), "{all}");
+        assert!(
+            all.contains(&format!("exited 4; {}", vci_store::credential::HINT)),
+            "{all}"
+        );
+        assert!(!all.contains(&good) && !all.contains("denied"), "{all}");
     }
     assert_eq!(runs(), before + 1);
 }

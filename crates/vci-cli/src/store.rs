@@ -47,8 +47,11 @@ struct Opened {
 /// Take every [`select::NEVER_TO_CHILDREN`] variable (`VCI_STORE`,
 /// `VCI_STORE_URL`, `VCI_STORE_TOKEN`) out
 /// of this process's environment, keeping its value in memory, so that no
-/// test, adapter probe, hook or git command vci starts can see it. Later
-/// calls do nothing.
+/// test, adapter probe, hook, git command or token command vci starts
+/// inherits it. Later calls do nothing. The environment the process started
+/// with keeps it, readable by any process of the same user
+/// (`/proc/<pid>/environ`, `ps eww`): this cannot hide it from a test that
+/// goes looking (docs/REFERENCE.md, "What vci cannot hide from a test").
 ///
 /// # Safety
 ///

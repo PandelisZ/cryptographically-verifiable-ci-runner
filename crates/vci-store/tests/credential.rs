@@ -1,13 +1,14 @@
 //! `[store] token_command`: the command runs where and when it should, at
 //! most once per process, within its time, and its credential (or anything
-//! it printed on standard output) never reaches a message.
+//! it printed, on standard output or standard error) never reaches a
+//! message.
 
 #![cfg(unix)]
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use vci_store::credential::{Credential, MAX_OUTPUT, TokenCommand};
+use vci_store::credential::{Credential, HINT, MAX_OUTPUT, TokenCommand};
 use vci_store::select::{Secret, Selection, resolve};
 use vci_store::{OpenContext, StoreError};
 
@@ -146,8 +147,9 @@ fn a_string_runs_in_a_shell_and_a_relative_program_in_the_directory() {
 }
 
 /// A command that cannot give a credential is the store's failure
-/// (unavailable), saying what went wrong, never what it printed on
-/// standard output; standard error is shown, scrubbed of it.
+/// (unavailable), saying what went wrong, naming the command and ending
+/// with the hint to run it, never showing anything it printed, on standard
+/// output or standard error.
 #[test]
 fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
     let dir = tempfile::tempdir().unwrap();
@@ -160,11 +162,11 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
                 "exit3",
                 &format!("echo {TOKEN}\necho \"not allowed: {TOKEN} is a member's\" >&2\nexit 3"),
             )]),
-            "exited 3: not allowed: *** is a member's",
+            "exited 3",
         ),
         (
             argv(&[d.join("no-such-helper").to_str().unwrap()]),
-            "was not found",
+            "was not found (",
         ),
         (
             TokenCommand::Shell("no-such-helper-anywhere --org vex".into()),
@@ -180,15 +182,15 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
                 "lines",
                 &format!("echo {TOKEN}\necho second-{TOKEN}"),
             )]),
-            "printed more than one line on standard output (not printed)",
+            "printed more than one line on standard output: it must print the credential alone",
         ),
         (
             argv(&[&script(d, "binary", "printf 'tok\\377en'")]),
-            "not UTF-8 text on standard output (not printed)",
+            "printed something that is not UTF-8 text on standard output",
         ),
         (
             argv(&[&script(d, "control", &format!("printf '{TOKEN}\\033[0m'"))]),
-            "printed a control character on standard output (not printed)",
+            "printed a control character on standard output",
         ),
         (
             argv(&[&script(
@@ -198,7 +200,7 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
                     "i=0; while [ $i -lt 20 ]; do head -c 4096 /dev/zero | tr '\\0' 'a'; i=$((i+1)); done; echo {TOKEN}"
                 ),
             )]),
-            "printed more than 64 KiB on standard output (not printed)",
+            "printed more than 64 KiB on standard output",
         ),
         (
             argv(&[&script(d, "killed", &format!("echo {TOKEN}\nkill -9 $$"))]),
@@ -219,15 +221,16 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
             ),
             "{m}"
         );
-        assert!(
-            m.starts_with(&format!(
-                "libsql store unavailable: the token_command ({})",
-                cmd.display()
-            )),
-            "{m}"
+        let head = format!(
+            "libsql store unavailable: the token_command ({}) {says}",
+            cmd.display()
         );
-        assert!(m.contains(says), "{cmd:?}: {m}");
-        assert!(!m.contains(TOKEN), "{cmd:?}: {m}");
+        assert!(m.starts_with(&head), "{cmd:?}: {m}");
+        assert!(m.ends_with(&format!("; {HINT}")), "{cmd:?}: {m}");
+        if !says.ends_with('(') {
+            assert_eq!(m, format!("{head}; {HINT}"));
+        }
+        assert!(!m.contains(TOKEN) && !m.contains("allowed"), "{cmd:?}: {m}");
         // The failure is kept: asked again, nothing runs again.
         assert_eq!(fetch(cmd, d, t).unwrap_err().to_string(), m);
     }
@@ -243,66 +246,106 @@ fn a_command_that_fails_says_why_and_shows_nothing_it_printed() {
     );
 }
 
-/// A command whose standard output is refused and whose standard error
-/// echoes the credential (debug logging, `set -x`): the excerpt of standard
-/// error never shows it, however standard output framed it (pretty JSON, an
-/// ANSI escape or a byte that is not UTF-8 beside it), and is not shown at
-/// all when standard output went past its limit.
+/// What a command that fails wrote on standard error is never shown,
+/// whatever it held: the credential in any frame, which no scrubbing of
+/// standard output could find. Each helper puts a canary on standard error
+/// beside the credential, as a real tool would: a pipeline whose last stage
+/// echoes its input on failure, printing nothing (`jq: error … (while
+/// parsing '<token>')`), a wrapper that logs the token there and prints
+/// nothing, standard output framed as `key=<token>&…` or `k=<token>!`, and
+/// a passphrase with spaces. The message is exactly what happened, the
+/// command, and the hint.
 #[test]
-fn standard_error_never_shows_the_credential_standard_output_held() {
+fn standard_error_is_never_shown() {
+    const CANARY: &str = "stderrC4nary";
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let t = Duration::from_secs(30);
-    let echo = format!("echo \"debug: decrypted value {TOKEN} (17 bytes)\" >&2");
-    let shown = "debug: decrypted value *** (17 bytes)";
+    let phrase = "quill zephyr mango tundra";
+    let print = script(d, "print-token", &format!("printf '%s\\n' '{TOKEN}'"));
+    let jq = script(
+        d,
+        "jq-like",
+        &format!(
+            "IFS= read -r line\necho \"jq: error (at <stdin>:1): Cannot index string with string \\\"value\\\" (while parsing '$line') {CANARY}\" >&2\nexit 5"
+        ),
+    );
     let cases = [
         (
-            "json-pretty",
-            format!("printf '{{\\n  \"value\": \"{TOKEN}\"\\n}}\\n'\n{echo}"),
-            "printed more than one line on standard output (not printed)",
-            Some(shown),
+            TokenCommand::Shell(format!("{print} | {jq} .value")),
+            "exited 5",
         ),
         (
-            "json-failed",
-            format!("printf '{{\"value\":\"{TOKEN}\"}}\\n'\n{echo}\nexit 4"),
-            "exited 4",
-            Some(shown),
+            argv(&[&script(
+                d,
+                "wrapper-logs",
+                &format!("echo \"wrapper: fetched {TOKEN} for vex {CANARY}\" >&2"),
+            )]),
+            "printed nothing on standard output",
         ),
         (
-            "ansi-after",
-            format!("printf '{TOKEN}\\033[0m\\n'\n{echo}"),
-            "printed a control character on standard output (not printed)",
-            Some(shown),
+            argv(&[&script(
+                d,
+                "key-value",
+                &format!(
+                    "printf 'token={TOKEN}&expires_in=3600\\n'\necho \"debug: response token={TOKEN}&expires_in=3600 {CANARY}\" >&2\nexit 2"
+                ),
+            )]),
+            "exited 2",
         ),
         (
-            "ansi-before",
-            format!("printf '\\033[1m{TOKEN}\\033[0m\\n'\n{echo}"),
-            "printed a control character on standard output (not printed)",
-            Some(shown),
+            argv(&[&script(
+                d,
+                "bang",
+                &format!(
+                    "printf 'k={TOKEN}!\\nexpires: 1h\\n'\necho \"k={TOKEN}! {CANARY}\" >&2\necho \"{TOKEN}\" >&2"
+                ),
+            )]),
+            "printed more than one line on standard output: it must print the credential alone",
         ),
         (
-            "not-utf8",
-            format!("printf '{TOKEN}\\377\\n'\n{echo}"),
-            "not UTF-8 text on standard output (not printed)",
-            Some(shown),
-        ),
-        (
-            "overflow",
-            format!("head -c 70000 /dev/zero | tr '\\0' 'a'\necho\necho {TOKEN}\n{echo}"),
-            "printed more than 64 KiB on standard output (not printed)",
-            None,
+            argv(&[&script(
+                d,
+                "passphrase",
+                &format!(
+                    "printf '{phrase}\\n'\necho \"unlocking with  quill  zephyr\nmango tundra {CANARY}\" >&2\nexit 1"
+                ),
+            )]),
+            "exited 1",
         ),
     ];
-    for (name, body, says, excerpt) in cases {
-        let cmd = argv(&[&script(d, name, &body)]);
-        let m = fetch(cmd, d, t).unwrap_err().to_string();
-        assert!(m.contains(says), "{name}: {m}");
-        assert!(!m.contains(TOKEN), "{name}: {m}");
-        match excerpt {
-            Some(e) => assert!(m.ends_with(&format!(": {e}")), "{name}: {m}"),
-            None => assert!(!m.contains("debug"), "{name}: {m}"),
+    for (cmd, says) in cases {
+        let m = fetch(cmd.clone(), d, t).unwrap_err().to_string();
+        assert_eq!(
+            m,
+            format!(
+                "libsql store unavailable: the token_command ({}) {says}; {HINT}",
+                cmd.display()
+            ),
+            "{cmd:?}"
+        );
+        for leaked in [
+            CANARY, TOKEN, "quill", "zephyr", "tundra", "jq:", "wrapper:", "debug",
+        ] {
+            assert!(!m.contains(leaked), "{leaked} in {m}");
         }
     }
+}
+
+/// Standard error is read as the command writes it, so a command that
+/// writes more there than a pipe holds never blocks on it.
+#[test]
+fn a_command_that_writes_much_on_standard_error_does_not_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = script(
+        dir.path(),
+        "noisy",
+        &format!("head -c 1048576 /dev/zero | tr '\\0' 'e' >&2\necho {TOKEN}"),
+    );
+    let started = Instant::now();
+    let t = fetch(argv(&[&helper]), dir.path(), Duration::from_secs(20)).unwrap();
+    assert_eq!(t.expose(), TOKEN);
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 /// A command that does not finish in time is killed and waited for.
@@ -323,7 +366,9 @@ fn a_command_that_hangs_is_stopped_after_its_time() {
     let took = started.elapsed();
     let m = e.to_string();
     assert!(
-        m.contains("did not finish within 0.7 s (it was stopped)"),
+        m.contains(&format!(
+            "did not finish within 0.7 s (it was stopped); {HINT}"
+        )),
         "{m}"
     );
     assert!(!m.contains(TOKEN), "{m}");

@@ -36,11 +36,10 @@
 //! * **What it prints.** Standard output, at most [`MAX_OUTPUT`] bytes:
 //!   UTF-8, one line once surrounding whitespace is trimmed, not empty.
 //!   It becomes a [`Secret::opaque`], redacted wherever it could be
-//!   printed. Standard error is captured (its last [`MAX_OUTPUT`] bytes),
-//!   shown only when the command fails: an excerpt, scrubbed of whatever
-//!   standard output held however it was framed (quoted, beside an escape
-//!   sequence or a byte that is not UTF-8), and not shown at all when
-//!   standard output went past its limit, since what it held is not known.
+//!   printed. Standard error is read and dropped, never kept or shown: a
+//!   command that fails may print the credential there in any framing (a
+//!   pipeline's stage that echoes its input, a wrapper's log line, a
+//!   passphrase cut at its spaces), which no scrubbing can be sure to find.
 //! * **Bounded.** On unix the command leads a process group of its own.
 //!   After [`TIMEOUT`] (or the store's connect timeout, when longer) the
 //!   whole group is killed, so a pipeline or a wrapper script leaves
@@ -48,12 +47,14 @@
 //!   terminal's foreground group, it cannot prompt there (the system stops
 //!   a process that reads the terminal, until the timeout), and a Ctrl-C
 //!   that stops vci does not reach it: it is left to end on its own.
-//! * **Failure** (not found, a non-zero exit, a timeout, nothing printed, more
-//!   than one line) is [`StoreError::Unavailable`] for the backend: the
-//!   store cannot be used, so `vci plan` runs everything with a warning
-//!   saying why, and `vci fetch`, `vci push`, `vci prune` and `vci store
-//!   info` exit 2. Nothing the command printed on standard output is ever
-//!   shown.
+//! * **Failure** (not found, a non-zero exit, a signal, a timeout, nothing
+//!   printed, more than one line, not UTF-8, too long) is
+//!   [`StoreError::Unavailable`] for the backend: the store cannot be used,
+//!   so `vci plan` runs everything with a warning saying why, and `vci
+//!   fetch`, `vci push`, `vci prune` and `vci store info` exit 2. The
+//!   message says what happened and names the command as `vci.toml` gives
+//!   it (not a secret), with [`HINT`]: nothing the command printed, on
+//!   standard output or standard error, is ever shown.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -72,12 +73,14 @@ use crate::select::{NEVER_TO_CHILDREN, Secret};
 /// timeout raises it).
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The most a token command may print on standard output (or keep of its
-/// standard error).
+/// The most a token command may print on standard output.
 pub const MAX_OUTPUT: usize = 64 * 1024;
 
-/// The longest excerpt of standard error a failure shows, in characters.
-const EXCERPT: usize = 400;
+/// What a failure of the command ends with, after what happened (`the
+/// token_command (<command>) exited 1; <HINT>`): vci shows nothing the
+/// command printed, since its standard error, like its standard output,
+/// may hold the credential, so the way to see why is to run it.
+pub const HINT: &str = "vci shows none of its output, which may hold the credential: run the command yourself to see why";
 
 /// The longest command a message shows, in characters.
 const SHOWN: usize = 200;
@@ -180,7 +183,8 @@ impl TokenCommand {
     }
 
     /// The process to start, in `cwd`: no shell for an array, `sh -c` for
-    /// a string; stdin `/dev/null`, stdout and stderr captured; vci's
+    /// a string; stdin `/dev/null`, stdout captured, stderr a pipe that
+    /// [`run`] reads and drops; vci's
     /// environment without [`NEVER_TO_CHILDREN`]; on unix, the leader of a
     /// process group of its own, which a timeout kills whole ([`stop`]).
     pub(crate) fn command(&self, cwd: &Path) -> Command {
@@ -352,15 +356,15 @@ impl fmt::Debug for Credential {
     }
 }
 
-/// What one pipe of the command carried: at most [`MAX_OUTPUT`] bytes (the
-/// first, or the last: [`drain`]), and whether there was more.
+/// What the command printed on standard output: at most its first
+/// [`MAX_OUTPUT`] bytes, and whether there was more.
 #[derive(Default)]
 struct Captured {
     bytes: Vec<u8>,
     overflow: bool,
 }
 
-/// A pipe of the command, read on a thread of its own.
+/// Standard output, read on a thread of its own.
 struct Drained {
     /// What it carried so far.
     so_far: Arc<Mutex<Captured>>,
@@ -368,10 +372,10 @@ struct Drained {
     end: mpsc::Receiver<()>,
 }
 
-/// Read `pipe` to its end on a thread of its own, keeping [`MAX_OUTPUT`]
-/// bytes (its first, or with `tail` its last) and discarding the rest, so
-/// the command never blocks on a full pipe.
-fn drain(pipe: Option<impl Read + Send + 'static>, tail: bool) -> Drained {
+/// Read `pipe` to its end on a thread of its own, keeping its first
+/// [`MAX_OUTPUT`] bytes and discarding the rest, so the command never
+/// blocks on a full pipe.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> Drained {
     let (tx, end) = mpsc::channel();
     let so_far = Arc::new(Mutex::new(Captured::default()));
     let c = Arc::clone(&so_far);
@@ -386,18 +390,9 @@ fn drain(pipe: Option<impl Read + Send + 'static>, tail: bool) -> Drained {
                         Ok(0) => break,
                         Ok(n) => {
                             let mut c = c.lock().unwrap_or_else(PoisonError::into_inner);
-                            if tail {
-                                c.bytes.extend_from_slice(&buf[..n]);
-                                let over = c.bytes.len().saturating_sub(MAX_OUTPUT);
-                                if over > 0 {
-                                    c.bytes.drain(..over);
-                                    c.overflow = true;
-                                }
-                            } else {
-                                let room = MAX_OUTPUT.saturating_sub(c.bytes.len());
-                                c.overflow |= n > room;
-                                c.bytes.extend_from_slice(&buf[..n.min(room)]);
-                            }
+                            let room = MAX_OUTPUT.saturating_sub(c.bytes.len());
+                            c.overflow |= n > room;
+                            c.bytes.extend_from_slice(&buf[..n.min(room)]);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
@@ -407,6 +402,22 @@ fn drain(pipe: Option<impl Read + Send + 'static>, tail: bool) -> Drained {
             });
     }
     Drained { so_far, end }
+}
+
+/// Read `pipe` (standard error) to its end on a thread of its own and drop
+/// every byte, so the command never blocks on a full pipe and nothing it
+/// wrote there is kept: no message shows it ([`HINT`]). Nobody waits for
+/// the thread: a process the command left running may hold the pipe open.
+fn discard(pipe: Option<impl Read + Send + 'static>) {
+    if let Some(mut pipe) = pipe {
+        // A thread that cannot start drops the pipe: a command that then
+        // writes to standard error fails, and says nothing either way.
+        let _ = std::thread::Builder::new()
+            .name("vci-token-command-stderr".into())
+            .spawn(move || {
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+            });
+    }
 }
 
 impl Drained {
@@ -419,145 +430,6 @@ impl Drained {
             .recv_timeout(until.saturating_duration_since(Instant::now()));
         std::mem::take(&mut *self.so_far.lock().unwrap_or_else(PoisonError::into_inner))
     }
-}
-
-/// The most pieces of standard output [`excerpt`] scrubs standard error
-/// of; with more, standard error is not shown.
-const PIECES: usize = 256;
-
-/// Every piece of what the command printed on standard output that could
-/// be (or hold) the credential, longest first: the whole and each line
-/// (trimmed, of three bytes or more); each piece of six bytes or more
-/// between separators of five kinds, each finer than the last (whitespace,
-/// control characters and the replacement of a byte that is not UTF-8, as
-/// in `<token>\x1b[0m`; those, quotes and brackets, as in
-/// `{"value":"<token>"}`; those and `,:;=`, as in `token=<token>`; any
-/// character a token is not made of, `[A-Za-z0-9._~+/=-]`; those and `/`
-/// and `.`, as in `https://vault/v1/<token>/`); and what follows the first
-/// `=` or `:` of a piece between quotes (`token=<base64 token>==`,
-/// `"t":"<a:b>"`). Each piece is kept as it is and also without the
-/// characters a token may hold but rarely ends with (`._~+/-`) at its ends,
-/// as in `Fetched <token>.` or `--<token>--`. The same again once terminal
-/// escape sequences are taken out (`\x1b[1m<token>`). `None` when there
-/// are more than [`PIECES`] of them.
-fn printed_pieces(out: &str) -> Option<Vec<String>> {
-    let space = |c: char| c.is_whitespace() || c.is_control() || c == char::REPLACEMENT_CHARACTER;
-    let quote = |c: char| space(c) || "\"'`{}[]()<>".contains(c);
-    let punct = |c: char| quote(c) || ",:;=".contains(c);
-    let other = |c: char| !(c.is_ascii_alphanumeric() || "._~+/=-".contains(c));
-    let path = |c: char| other(c) || "/.".contains(c);
-    let mut pieces = std::collections::BTreeSet::new();
-    let mut add = |p: &str, min: usize| {
-        let p = p.trim();
-        for p in [p, p.trim_matches(|c: char| "._~+/-".contains(c))] {
-            if p.len() >= min {
-                pieces.insert(p.to_owned());
-            }
-        }
-    };
-    let plain = strip_escapes(out);
-    for text in [out, plain.as_str()] {
-        add(text, 3);
-        text.lines().for_each(|l| add(l, 3));
-        for sep in [
-            &space as &dyn Fn(char) -> bool,
-            &quote,
-            &punct,
-            &other,
-            &path,
-        ] {
-            text.split(sep).for_each(|p| add(p, 6));
-        }
-        // A value after its key (`token=<token>==`, `token:<a:b>`).
-        for p in text.split(quote) {
-            if let Some((_, v)) = p.split_once(['=', ':']) {
-                add(v, 6);
-            }
-        }
-    }
-    if pieces.len() > PIECES {
-        return None;
-    }
-    let mut pieces: Vec<String> = pieces.into_iter().collect();
-    pieces.sort_by_key(|p| std::cmp::Reverse(p.len()));
-    Some(pieces)
-}
-
-/// `s` with each terminal escape sequence (`ESC [ ... <final>`, `ESC ] ...
-/// BEL` or `ESC ] ... ESC \`, `ESC <one character>`) replaced by a space.
-fn strip_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            // Parameters and intermediates, then one final byte.
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\x07' {
-                        break;
-                    }
-                    if c == '\x1b' {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-        out.push(' ');
-    }
-    out
-}
-
-/// The end of `stderr` as one line of at most [`EXCERPT`] characters, with
-/// whatever `stdout` printed removed first ([`printed_pieces`]: a command
-/// that failed may have printed a credential, and echoed it on standard
-/// error). Empty when standard output went past [`MAX_OUTPUT`] (what it
-/// held is not all known) or held too many pieces to scrub. When standard
-/// error went past it, its first word, which may be the end of one cut in
-/// two, is dropped.
-fn excerpt(stderr: &Captured, stdout: &Captured) -> String {
-    if stdout.overflow {
-        return String::new();
-    }
-    let out = String::from_utf8_lossy(&stdout.bytes);
-    let Some(printed) = printed_pieces(&out) else {
-        return String::new();
-    };
-    let mut text = String::from_utf8_lossy(&stderr.bytes).into_owned();
-    if stderr.overflow {
-        text = text
-            .split_once(char::is_whitespace)
-            .map(|(_, rest)| rest.to_owned())
-            .unwrap_or_default();
-    }
-    for p in printed {
-        text = Secret::opaque(p).scrub(&text);
-    }
-    let flat: String = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
-    let n = flat.chars().count();
-    if n <= EXCERPT {
-        return flat;
-    }
-    let tail: String = flat.chars().skip(n - (EXCERPT - 1)).collect();
-    format!("…{tail}")
 }
 
 /// Kill `child` and every process of its group (it leads one:
@@ -599,10 +471,13 @@ fn ended(status: ExitStatus) -> String {
 }
 
 /// Run `cmd` in `cwd`, for at most `timeout`, and take the credential it
-/// printed. The error says what went wrong, never what it printed on
-/// standard output.
+/// printed. The error says what went wrong and names the command, never
+/// anything it printed: standard output, and standard error, which is read
+/// and dropped, may hold the credential. A failure of the command itself
+/// ends with [`HINT`].
 fn run(cmd: &TokenCommand, cwd: &Path, timeout: Duration) -> Fetched {
     let what = format!("the token_command ({})", cmd.display());
+    let failed = |kind: String| format!("{what} {kind}; {HINT}");
     let mut child = cmd.command(cwd).spawn().map_err(|e| {
         if !cwd.is_dir() {
             format!(
@@ -610,24 +485,24 @@ fn run(cmd: &TokenCommand, cwd: &Path, timeout: Duration) -> Fetched {
                 cwd.display()
             )
         } else if e.kind() == std::io::ErrorKind::NotFound {
-            format!("{what} was not found ({e})")
+            failed(format!("was not found ({e})"))
         } else {
-            format!("{what} could not be started ({e})")
+            failed(format!("could not be started ({e})"))
         }
     })?;
-    let out = drain(child.stdout.take(), false);
-    let err = drain(child.stderr.take(), true);
+    let out = drain(child.stdout.take());
+    discard(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let mut pause = Duration::from_millis(1);
     let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break Ok(s),
+            Ok(Some(s)) => break s,
             Ok(None) if Instant::now() >= deadline => {
                 stop(&mut child);
-                break Err(format!(
-                    "{what} did not finish within {} (it was stopped)",
+                return Err(failed(format!(
+                    "did not finish within {} (it was stopped)",
                     seconds(timeout)
-                ));
+                )));
             }
             Ok(None) => {
                 std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
@@ -635,52 +510,42 @@ fn run(cmd: &TokenCommand, cwd: &Path, timeout: Duration) -> Fetched {
             }
             Err(e) => {
                 stop(&mut child);
-                break Err(format!("{what}: cannot wait for it ({e})"));
+                return Err(format!("{what}: cannot wait for it ({e})"));
             }
         }
     };
-    // Its pipes close as it exits, unless a process it started (a daemon
-    // a secrets tool leaves running) keeps them open: what it wrote is
-    // read within a second.
-    let until = Instant::now() + Duration::from_secs(1);
-    let stdout = out.take(until);
-    let stderr = err.take(until);
-    let shown = excerpt(&stderr, &stdout);
-    let with = |msg: String| {
-        if shown.is_empty() {
-            msg
-        } else {
-            format!("{msg}: {shown}")
-        }
-    };
-    let status = status.map_err(with)?;
     if !status.success() {
-        return Err(with(format!("{what} {}", ended(status))));
+        return Err(failed(ended(status)));
     }
+    // Its pipe closes as it exits, unless a process it started (a daemon
+    // a secrets tool leaves running) keeps it open: what it wrote is read
+    // within a second.
+    let stdout = out.take(Instant::now() + Duration::from_secs(1));
     if stdout.overflow {
-        return Err(with(format!(
-            "{what} printed more than {} KiB on standard output (not printed)",
+        return Err(failed(format!(
+            "printed more than {} KiB on standard output",
             MAX_OUTPUT / 1024
         )));
     }
     let Ok(text) = std::str::from_utf8(&stdout.bytes) else {
-        return Err(with(format!(
-            "{what} printed something that is not UTF-8 text on standard output (not printed)"
-        )));
+        return Err(failed(
+            "printed something that is not UTF-8 text on standard output".into(),
+        ));
     };
     let token = text.trim();
     if token.is_empty() {
-        return Err(with(format!("{what} printed nothing on standard output")));
+        return Err(failed("printed nothing on standard output".into()));
     }
     if token.contains(['\n', '\r']) {
-        return Err(with(format!(
-            "{what} printed more than one line on standard output (not printed): it must print the credential alone"
-        )));
+        return Err(failed(
+            "printed more than one line on standard output: it must print the credential alone"
+                .into(),
+        ));
     }
     if token.chars().any(char::is_control) {
-        return Err(with(format!(
-            "{what} printed a control character on standard output (not printed)"
-        )));
+        return Err(failed(
+            "printed a control character on standard output".into(),
+        ));
     }
     Ok(Secret::opaque(token))
 }
@@ -751,128 +616,19 @@ mod tests {
         assert!(long.ends_with('…'));
     }
 
-    fn cap(bytes: &[u8]) -> Captured {
-        Captured {
-            bytes: bytes.to_vec(),
-            overflow: false,
-        }
-    }
-
-    /// Standard error is shown as one bounded line, without anything
-    /// standard output held.
+    /// Standard output keeps its first [`MAX_OUTPUT`] bytes and says
+    /// whether there was more.
     #[test]
-    fn the_excerpt_hides_what_stdout_printed() {
-        let e = excerpt(
-            &cap(b"error: token tok3nS3cretVal is expired\nretry later\n"),
-            &cap(b"  tok3nS3cretVal\n"),
-        );
-        assert_eq!(e, "error: token *** is expired retry later");
-        let e = excerpt(
-            &cap(b"partial: abcdefghij\n"),
-            &cap(b"abcdefghij klm\nsecond line\n"),
-        );
-        assert!(!e.contains("abcdefghij"), "{e}");
-        let long = excerpt(
-            &cap(format!("{}END", "x".repeat(5000)).as_bytes()),
-            &cap(b""),
-        );
-        assert_eq!(long.chars().count(), EXCERPT);
-        assert!(long.starts_with('…') && long.ends_with("END"), "{long}");
-    }
-
-    /// The credential is found in standard output however it was framed,
-    /// and removed from standard error wherever it stands there.
-    #[test]
-    fn the_excerpt_finds_the_credential_in_any_frame() {
-        const T: &str = "tok3n.S3cret_Val-9+/x==";
-        let err = format!("debug: fetched {T} (23 bytes)\nsee also x{T}y and \"{T}\"\n");
-        for out in [
-            format!("{{\n  \"value\": \"{T}\"\n}}\n"),
-            format!("{{\"value\":\"{T}\",\"version\":3}}"),
-            format!("{T}\x1b[0m\n"),
-            format!("\x1b[1m{T}"),
-            format!("token={T}\n"),
-            format!("token: {T};"),
-            format!("<{T}>"),
-            format!("({T})"),
-            format!("'{T}'"),
-            format!("`{T}`"),
-            format!("Your token: {T}.\nIt expires in 1h.\n"),
-            format!("--{T}--"),
-            format!("+{T}+\n"),
-            format!("~{T}~"),
-        ] {
-            let e = excerpt(&cap(err.as_bytes()), &cap(out.as_bytes()));
-            assert!(!e.contains("S3cret"), "{out:?}: {e}");
-            assert!(
-                e.starts_with("debug: fetched *** (23 bytes) see also x***y and "),
-                "{out:?}: {e}"
-            );
-        }
-        // A byte that is not UTF-8 beside it.
-        let mut out = T.as_bytes().to_vec();
-        out.extend_from_slice(b"\xff\n");
-        let e = excerpt(&cap(err.as_bytes()), &cap(&out));
-        assert!(
-            !e.contains(T) && e.starts_with("debug: fetched *** "),
-            "{e}"
-        );
-        // A token holding punctuation, inside JSON.
-        let e = excerpt(
-            &cap(b"bad: abc:defghi:jklmno\n"),
-            &cap(b"{\"t\":\"abc:defghi:jklmno\"}"),
-        );
-        assert_eq!(e, "bad: ***");
-    }
-
-    /// The credential is found when standard output put a character a token
-    /// may hold right beside it: a sentence's period, dashes, a path's
-    /// slashes.
-    #[test]
-    fn the_excerpt_finds_the_credential_beside_token_punctuation() {
-        const T: &str = "tok3nS3cretVal";
-        let err = cap(format!("debug: fetched {T} from vault\n").as_bytes());
-        for out in [
-            format!("Your token: {T}.\nIt expires in 1h.\n"),
-            format!("Fetched {T}.\n"),
-            format!("--{T}--\n"),
-            format!("https://v/x/{T}/\n"),
-            format!("https://vault.example/v1/{T}/\n"),
-            format!("_{T}_ ~{T}~ +{T}+\n"),
-            format!("{T}.{T}\n"),
-        ] {
-            let e = excerpt(&err, &cap(out.as_bytes()));
-            assert_eq!(e, "debug: fetched *** from vault", "{out:?}");
-        }
-    }
-
-    /// Standard output past its limit is not all known: standard error is
-    /// not shown. So it is when standard output holds too many pieces to
-    /// scrub.
-    #[test]
-    fn the_excerpt_is_empty_when_stdout_is_not_all_known() {
-        let err = cap(b"debug: fetched tok3nS3cretVal\n");
-        let mut out = cap(&vec![b'a'; MAX_OUTPUT]);
-        out.overflow = true;
-        assert_eq!(excerpt(&err, &out), "");
-        let words: String = (0..=PIECES).map(|i| format!("word{i:04} ")).collect();
-        assert_eq!(excerpt(&err, &cap(words.as_bytes())), "");
-        assert_eq!(excerpt(&err, &cap(b"tok3nS3cretVal")), "debug: fetched ***");
-    }
-
-    /// Standard error past its limit keeps its end, without its first word,
-    /// which may be what is left of one cut in two.
-    #[test]
-    fn standard_error_keeps_its_end_without_a_cut_word() {
-        let mut err = cap(b"S3cretVal and the end of it\n");
-        err.overflow = true;
-        assert_eq!(excerpt(&err, &cap(b"tok3nS3cretVal")), "and the end of it");
-        let mut big = vec![b'x'; MAX_OUTPUT + 10];
-        big.extend_from_slice(b" END");
-        let c = drain(Some(std::io::Cursor::new(big)), true)
-            .take(Instant::now() + Duration::from_secs(10));
+    fn standard_output_keeps_its_start_and_says_it_overflowed() {
+        let until = || Instant::now() + Duration::from_secs(10);
+        let c = drain(Some(std::io::Cursor::new(b"tok3n\n".to_vec()))).take(until());
+        assert!(!c.overflow);
+        assert_eq!(c.bytes, b"tok3n\n");
+        let mut big = b"START".to_vec();
+        big.extend(vec![b'x'; MAX_OUTPUT + 10]);
+        let c = drain(Some(std::io::Cursor::new(big))).take(until());
         assert!(c.overflow);
         assert_eq!(c.bytes.len(), MAX_OUTPUT);
-        assert!(c.bytes.ends_with(b"x END"));
+        assert!(c.bytes.starts_with(b"START"));
     }
 }

@@ -15,8 +15,9 @@
 //! runs once per process and never when the environment gives a token, an
 //! environment token is never sent to a URL from `vci.toml`, the helper
 //! gets none of `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE`, a
-//! helper that fails makes the store fail open, and the token appears in no
-//! output and reaches no test.
+//! helper that fails makes the store fail open, saying how and never what
+//! it printed (standard error included), and the token appears in no output
+//! and reaches no test.
 //!
 //! A copy of `fixtures/go-abcd` in a throwaway git repository, plus a Go
 //! package whose test writes its environment to a file outside the
@@ -33,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::Value;
+use vci_store::credential::{HINT, TokenCommand};
 use vci_store_libsql::testkit as libsql_kit;
 
 /// The public key `sqld` checks tokens with: Ed25519, from the seed of
@@ -328,8 +330,24 @@ impl World {
     /// Commit a `vci.toml` whose store is the server, its token from
     /// `program secrets get vci-store-token --org vex`.
     fn use_store(&self, program: &str) {
+        self.use_command(&com(program));
+    }
+
+    /// Commit a `vci.toml` whose store is the server, its token from `cmd`.
+    fn use_command(&self, cmd: &TokenCommand) {
+        // A Rust string's debug form is a TOML basic string for these.
+        let cmd = match cmd {
+            TokenCommand::Argv(argv) => format!(
+                "[{}]",
+                argv.iter()
+                    .map(|a| format!("{a:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            TokenCommand::Shell(s) => format!("{s:?}"),
+        };
         let text = format!(
-            "{VCI_TOML}\n[store]\nbackend = \"libsql\"\nurl = \"{url}\"\ntoken_command = [\"{program}\", \"secrets\", \"get\", \"vci-store-token\", \"--org\", \"vex\"]\n\n[store.libsql]\nnamespace = \"{ns}\"\n",
+            "{VCI_TOML}\n[store]\nbackend = \"libsql\"\nurl = \"{url}\"\ntoken_command = {cmd}\n\n[store.libsql]\nnamespace = \"{ns}\"\n",
             url = self.url(),
             ns = self.ns
         );
@@ -419,6 +437,16 @@ struct Plan {
     skip: BTreeSet<String>,
     run: BTreeSet<String>,
     warnings: Vec<String>,
+}
+
+/// `program secrets get vci-store-token --org vex`, as `vci.toml` gives it.
+fn com(program: &str) -> TokenCommand {
+    TokenCommand::Argv(
+        [program, "secrets", "get", "vci-store-token", "--org", "vex"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+    )
 }
 
 fn set(ids: &[&str]) -> BTreeSet<String> {
@@ -677,78 +705,227 @@ fn an_environment_token_is_never_sent_to_a_url_from_vci_toml() {
     w.assert_no_token(&outs);
 }
 
+/// What a token command wrote on standard error, beside the token in each
+/// frame [`a_token_command_that_fails_fails_open`] tries.
+const CANARY: &str = "stderrC4naryE2e";
+
 /// 3. A helper that cannot give a token (it fails, prints nothing, prints
 ///    two lines, or is not there): the plan runs everything with a warning
-///    saying why, the commands that manage the store exit 2 saying it, the
-///    run keeps the tests' exit code and attests nothing, and whatever the
-///    helper printed on standard output is shown nowhere.
+///    saying what happened, naming the command and saying to run it to see
+///    why, in every format (text, JSON, GitHub's), the commands that manage
+///    the store exit 2 saying it, `vci run` and `vci ci` keep the tests'
+///    exit code and store nothing, and the audit log's warnings say it.
+///    Nothing the helper printed, on standard output or standard error, is
+///    shown anywhere: each helper puts a canary on standard error beside the
+///    token, in the frames that slipped past scrubbing standard error of
+///    what standard output held (a pipeline whose last stage echoes its
+///    input, as jq does, and prints nothing; a wrapper that logs the token;
+///    `key=<token>&…`; `k=<token>!`; a passphrase with spaces), and neither
+///    reaches vci's standard output or error, a plan's JSON or GitHub output,
+///    its warnings, the audit log or the metrics log.
 #[test]
 fn a_token_command_that_fails_fails_open() {
     let Some(w) = World::new() else { return };
+    let phrase = "quill zephyr mango tundra";
+    let print = w.helper("com-raw", &format!("printf '%s\\n' '{TOKEN}'"));
+    let jq = w.helper(
+        "jq",
+        &format!(
+            "IFS= read -r line\necho \"jq: error (at <stdin>:1): Cannot index string with string \\\"value\\\" (while parsing '$line') {CANARY}\" >&2\nexit 5"
+        ),
+    );
+    // A helper, how vci.toml runs it, what vci says happened, and how many
+    // helpers each run of it starts.
     let cases = [
         (
-            w.helper(
+            com(&w.helper(
                 "com-denied",
-                &format!("printf '%s\\n' '{TOKEN}'\necho 'com: not an admin of vex' >&2\nexit 3"),
-            ),
-            "exited 3: com: not an admin of vex".to_owned(),
+                &format!(
+                    "printf '%s\\n' '{TOKEN}'\necho 'com: not an admin of vex {CANARY}' >&2\nexit 3"
+                ),
+            )),
+            "exited 3",
+            1,
         ),
         (
-            w.helper("com-empty", "true"),
-            "printed nothing on standard output".to_owned(),
+            com(&w.helper("com-empty", "true")),
+            "printed nothing on standard output",
+            1,
         ),
         (
-            w.helper("com-lines", &format!("echo '{TOKEN}'\necho '{TOKEN}'")),
-            "printed more than one line on standard output (not printed)".to_owned(),
+            com(&w.helper("com-lines", &format!("echo '{TOKEN}'\necho '{TOKEN}'"))),
+            "printed more than one line on standard output: it must print the credential alone",
+            1,
         ),
         (
             // JSON (a secrets CLI without its raw flag), the token echoed on
             // standard error (debug logging).
-            w.helper(
+            com(&w.helper(
                 "com-json",
                 &format!(
-                    "printf '{{\\n  \"value\": \"%s\"\\n}}\\n' '{TOKEN}'\necho \"debug: decrypted {TOKEN}\" >&2"
+                    "printf '{{\\n  \"value\": \"%s\"\\n}}\\n' '{TOKEN}'\necho \"debug: decrypted {TOKEN} {CANARY}\" >&2"
                 ),
-            ),
-            "printed more than one line on standard output (not printed): it must print the credential alone: debug: decrypted ***".to_owned(),
+            )),
+            "printed more than one line on standard output: it must print the credential alone",
+            1,
         ),
         (
-            // A sentence that ends right after the token, which standard
-            // error echoes.
-            w.helper(
-                "com-sentence",
+            // A pipeline whose last stage fails on its input and echoes it
+            // on standard error, printing nothing.
+            TokenCommand::Shell(format!("{print} | {jq} .value")),
+            "exited 5",
+            2,
+        ),
+        (
+            // A wrapper that logs the token on standard error and prints
+            // nothing.
+            com(&w.helper(
+                "com-wrapper",
                 &format!(
-                    "printf 'Your token: %s.\\n' '{TOKEN}'\necho \"debug: fetched {TOKEN} from vault\" >&2\nexit 1"
+                    "{print} > /dev/null\necho \"com-wrapper: fetched {TOKEN} {CANARY}\" >&2"
                 ),
-            ),
-            "exited 1: debug: fetched *** from vault".to_owned(),
+            )),
+            "printed nothing on standard output",
+            2,
         ),
         (
-            w.base
-                .join("helpers/com-missing")
-                .to_str()
-                .unwrap()
-                .to_owned(),
-            "was not found".to_owned(),
+            com(&w.helper(
+                "com-query",
+                &format!(
+                    "printf 'token=%s&expires_in=3600\\n' '{TOKEN}'\necho \"debug: token={TOKEN}&expires_in=3600 {CANARY}\" >&2\nexit 2"
+                ),
+            )),
+            "exited 2",
+            1,
+        ),
+        (
+            com(&w.helper(
+                "com-bang",
+                &format!(
+                    "printf 'k=%s!\\nexpires: 1h\\n' '{TOKEN}'\necho \"k={TOKEN}! {CANARY}\" >&2"
+                ),
+            )),
+            "printed more than one line on standard output: it must print the credential alone",
+            1,
+        ),
+        (
+            com(&w.helper(
+                "com-phrase",
+                &format!(
+                    "printf '%s\\n' '{phrase}'\necho \"unlocking with  quill  zephyr\nmango tundra {CANARY}\" >&2\nexit 1"
+                ),
+            )),
+            "exited 1",
+            1,
+        ),
+        (
+            com(w.base.join("helpers/com-missing").to_str().unwrap()),
+            "was not found (No such file or directory (os error 2))",
+            0,
         ),
     ];
+    let leaks = [
+        TOKEN_SIG,
+        CANARY,
+        "quill",
+        "zephyr",
+        "tundra",
+        "jq: error",
+        "not an admin",
+        "debug:",
+        "com-wrapper:",
+    ];
+    let key = w.key.to_str().unwrap().to_owned();
+    let github_output = w.base.join("github-output.txt");
+    let audit = w.base.join("audit.json");
     let mut outs = Vec::new();
-    for (program, says) in &cases {
-        w.use_store(program);
-        let says =
-            format!("the token_command ({program} secrets get vci-store-token --org vex) {says}");
+    let mut files = String::new();
+    for (cmd, kind, per_run) in &cases {
+        w.use_command(cmd);
+        let says = format!("the token_command ({}) {kind}", cmd.display());
         let before = w.helper_runs();
         outs.extend(fails_open(&w, &[], &says));
+        // The plan's JSON warnings, its text and GitHub forms, and the
+        // GitHub output file.
+        let (plan, _) = w.plan(&[]);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|m| m.contains(&says) && m.contains(HINT)),
+            "{says}: {plan:?}"
+        );
+        let _ = std::fs::remove_file(&github_output);
+        let gh = github_output.to_str().unwrap();
+        for (args, env) in [
+            (&["plan", "--base-ref", "main"][..], &[][..]),
+            (
+                &["plan", "--base-ref", "main", "--format", "github"],
+                &[("GITHUB_OUTPUT", gh)],
+            ),
+        ] {
+            let out = w.vci(args, env);
+            assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(err.contains(&format!("{says}; {HINT}")), "{args:?}: {err}");
+            outs.push(out);
+        }
+        files.push_str(&std::fs::read_to_string(&github_output).unwrap());
+        // vci run and vci ci keep the tests' exit code and store nothing;
+        // vci ci's audit log says why in its warnings.
         let out = w.run(&[]);
         let all = text(&out);
         assert_eq!(out.status.code(), Some(0), "the tests passed: {all}");
         assert!(!all.contains("vci: attested"), "{all}");
-        assert!(all.contains(&says), "{all}");
+        assert!(all.contains(&format!("{says}; {HINT}")), "{all}");
         outs.push(out);
-        if !program.ends_with("com-missing") {
-            // Once per process: the plan, the five commands, the run.
-            assert_eq!(w.helper_runs(), before + 7, "{program}");
+        let out = w.vci(
+            &[
+                "ci",
+                "--base-ref",
+                "main",
+                "--audit-log",
+                audit.to_str().unwrap(),
+                "--key",
+                &key,
+            ],
+            &[],
+        );
+        let all = text(&out);
+        assert_eq!(out.status.code(), Some(0), "the tests passed: {all}");
+        assert!(!all.contains("vci: attested"), "{all}");
+        outs.push(out);
+        let log = std::fs::read_to_string(&audit).unwrap();
+        let v: Value = serde_json::from_str(&log).unwrap();
+        assert!(
+            v["warnings"].as_array().unwrap().iter().any(|m| m
+                .as_str()
+                .is_some_and(|m| m.contains(&says) && m.contains(HINT))),
+            "{log}"
+        );
+        // Signed at most, never stored (the store is shared, and was not
+        // given --push).
+        assert!(
+            v["attested"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["stored"] == false),
+            "{log}"
+        );
+        files.push_str(&log);
+        // Once per process: the plan, the five commands, the three plans,
+        // the run and vci ci.
+        assert_eq!(w.helper_runs(), before + 11 * per_run, "{cmd:?}");
+    }
+    files.push_str(&std::fs::read_to_string(&w.metrics).unwrap_or_default());
+    for out in &outs {
+        let t = text(out);
+        for leak in leaks {
+            assert!(!t.contains(leak), "{leak} in {t}");
         }
+    }
+    for leak in leaks {
+        assert!(!files.contains(leak), "{leak} in {files}");
     }
     w.assert_no_token(&outs);
 }
@@ -776,7 +953,7 @@ fn a_token_command_that_hangs_is_stopped_and_fails_open() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains(&format!(
-            "the token_command ({com} secrets get vci-store-token --org vex) did not finish within 60 s (it was stopped)"
+            "the token_command ({com} secrets get vci-store-token --org vex) did not finish within 60 s (it was stopped); {HINT}"
         )),
         "{err}"
     );

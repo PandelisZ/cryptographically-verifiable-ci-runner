@@ -438,9 +438,9 @@ impl ChildEnvMap {
 /// Strict mode keeps the variables of every class but stripped; loose mode
 /// keeps everything. Then every `set` variable gets its declared value.
 /// The store's secrets ([`vci_store::select::NEVER_TO_CHILDREN`],
-/// `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE`) never reach a test,
-/// in either mode: vci removes them from its own environment at start-up,
-/// and this drops them again.
+/// `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE`) are in no test's
+/// environment, in either mode: vci removes them from its own environment
+/// at start-up, and this drops them again.
 pub fn build_child_env(
     policy: &FileEnv,
     parent: impl IntoIterator<Item = (OsString, OsString)>,
