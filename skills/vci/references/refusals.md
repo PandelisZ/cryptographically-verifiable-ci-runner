@@ -40,6 +40,10 @@ Both fail open: the worst outcome is that CI runs the unit. Never "fix" either b
 | `go.work <path> is outside the repository (...)` | A `go.work` from outside the repo | `GOWORK=off` or move it in |
 | `listed under more than one runner project (or by more than one vci project)` | The file belongs to two projects | Fix the project configuration (user decision) |
 | `not in the runner's test file list` / `the collector produced no output for it` | The runner did not run it as a unit, or crashed | Check the path and the runner output |
+| `signing or storing failed: storing the batch: <kind> store refused to write: ...` (`libsql`: `the token may not write`; `postgres`: `permission denied for table ...`) | vci 2.8+: the store's credential can only read. The tests ran and passed; nothing was stored | Report it; a read-only credential is how pull-request jobs are meant to be set up. Never look for another credential |
+| `signing or storing failed: ... store is not set up: the first vci run with a token allowed to create tables creates them` (or `... a role allowed to create schema vci ...`) | A new shared store, and this credential may not create its tables | The user's first run with a credential that can write creates them |
+| `signing or storing failed: ... store unavailable: ...` | The store cannot be used: no or a refused token, a server down, a failing `[store] token_command` | `vci store info` says why. For `the token_command (...) exited N; ...`, run that command with its standard output discarded (`... > /dev/null`) to see its error, never plainly |
+| `signing or storing failed: the libsql store does not support storing a record of 5,000,000 bytes or more ...` | The unit's attestation or input manifest is too large for a libSQL server's row limit | Nothing to do: that unit runs every time on such a server |
 
 **`policy.ignore_taints` (vci 1.7.0+).** A repository's `vci.toml` can waive taints: `ignore_taints = ["process:*",
 "child_process.*", "go:syscall"]` (globs over the reason key the "why not attested" lines print; `"*"` for all,
@@ -105,5 +109,10 @@ Plan-wide reasons (`running everything: ...`, or `running everything in <project
 - `listing test files failed: ...` or `could not parse ... probe`: the runner could not list tests (collection
   error, missing or wrong toolchain version, e.g. `rbenv: version '3.4.9' is not installed`).
 - Warning `no git-meta store in this repository: no attestations are available (run \`vci fetch\` first)`.
+- `running everything: reading attestations from <kind>: <error>` (vci 2.8+): the attestation store (SQLite,
+  PostgreSQL, libSQL) cannot be used, so every unit runs. That is the safe outcome. `vci store info` prints why, and
+  never a secret; see SKILL.md, "Attestation stores", for a failing `token_command`.
+- Warning `no attestations are available in the <kind> store (the first \`vci run\` creates it)`: a new store that
+  holds nothing yet. Every unit runs until something is stored.
 - Warning that the base commit is HEAD or contains it: trust would come from the commit under test; pass the real
   base (`--base-ref origin/main`).

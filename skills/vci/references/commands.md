@@ -1,6 +1,6 @@
 # vci command reference
 
-The help text below is the verbatim output of `vci <command> --help` for vci 2.0.0 (generated with `cargo run -p vci-cli -- <command> --help`). Notes after each block come from docs/REFERENCE.md.
+The help text below is the verbatim output of `vci <command> --help` for vci 2.0.0 (generated with `cargo run -p vci-cli -- <command> --help`), except `vci store`, which is vci 2.8.0's. Notes after each block come from docs/REFERENCE.md. vci 2.8.0 also has `vci metrics` and `vci update`, and its `push`, `fetch`, `prune` and `ci --push` help mentions the stores (see "vci store info" below).
 
 ## vci --help
 
@@ -256,6 +256,34 @@ Options:
 - An SSH-signed envelope is checked against `.vci/allowed_signers`, a keyless one (since 2.0, a `sigstore` member) against `.vci/identities.toml` and `.vci/sigstore-trusted-root.json`, at `--base-ref` or HEAD. Once any of `--allowed-signers`, `--identities`, `--trusted-root` is given, only the given files are used: an envelope whose kind needs one that was not given is INVALID.
 - Since 1.9.0 an attestation references its input manifest instead of embedding it: `vci verify` reads it from `--manifest FILE` (as `git meta get project vci:manifest:<root>` prints it) or else from the repository's git-meta store, checks that its root is the signed input root, and exits 1 when it is missing, corrupt or another manifest.
 
+## vci store info
+
+```text
+Which attestation store this repository uses ($VCI_STORE, else the scheme of $VCI_STORE_URL, else `[store] backend` in the working tree's vci.toml, else the scheme of its `[store] url`, else git-meta), every setting and where it came from (secrets redacted), what the store can do, whether it exists and how many attestations it holds. Exits 0 when the store can be read (also before anything is stored), 2 otherwise
+
+Usage: vci store info [OPTIONS]
+
+Options:
+      --format <FORMAT>  [default: text] [possible values: text, json]
+  -h, --help             Print help
+```
+
+- Since 2.8.0. Prints `store:` (`git-meta`, `sqlite`, `postgres` or `libsql`), `location:`, `settings:` (each with its
+  source: `($VCI_STORE_URL)`, `(vci.toml [store])`, `(the default)`), `capabilities:`, `exchange:`, `status:`
+  (`ready`, `absent: nothing is stored yet (...)` or `unavailable`) and `attestations:`. On failure it prints what it
+  knows, then `vci: error: <error>`, and exits 2.
+- It never prints a secret: a password or user as `***`, a token as `token: (set) ($VCI_STORE_TOKEN)` or `token: (from
+  token_command: <command>) (vci.toml [store])`, PostgreSQL's as `password: (...)`. Its output is safe to show.
+- It reads the store (status and count), so on a store whose credential comes from `[store] token_command` it runs
+  that command once.
+- Stores without an exchange (SQLite, PostgreSQL, libSQL): `vci fetch` prints `vci: the <kind> store at <location> is
+  local|shared: nothing to fetch (N attestations stored)`, `vci push` prints `vci: nothing to push: the <kind> store is
+  local|shared; attestations were stored when vci run made them`, both exit 0; `--remote` and `--rewrite-history` exit
+  2 there. `vci ci --fetch <remote>` and `vci ci --push --remote <remote>` ignore the remote with a warning.
+- On a shared store (PostgreSQL, a libSQL server or its replica) `vci ci` without `--push` signs but stores nothing:
+  `vci: not storing N attestation(s): the <kind> store is shared and vci ci was not given --push`. Plain `vci run`
+  always stores.
+
 ## Environment variables
 
 | Variable | Meaning |
@@ -266,6 +294,13 @@ Options:
 | `VCI_JOBS` | Parallel test processes in `vci run` (pytest, Go; Rails files run one at a time) |
 | `VCI_PY_PLUGIN`, `VCI_JS_PLUGIN`, `VCI_RUBY_COLLECTOR` | Collector locations (not needed with Homebrew) |
 | `VCI_UV`, `VCI_NODE`, `VCI_GO`, `VCI_CARGO`, `VCI_RUBY` | Toolchain binaries to use |
+| `VCI_STORE` | Since 2.8.0: the attestation store, `git-meta`, `sqlite`, `postgres` or `libsql` (never a URL) |
+| `VCI_STORE_URL` | **Secret.** The store's server: `postgres://user:password@host/db` or `libsql://<db>.turso.io`; wins over `vci.toml`'s `[store] url`. Never print it |
+| `VCI_STORE_TOKEN` | **Secret.** A libSQL server's token; sent only to a URL from `VCI_STORE_URL`, never to `[store] url`. Never print it |
+| `VCI_STORE_NAMESPACE` | A shared store's namespace (default: the repository id; required in a shallow clone) |
+| `VCI_STORE_SYNC` | `replica` reads a libSQL server through a local replica; `off` turns off SQLite syncing |
+| `VCI_STORE_REPLICA` | The libSQL replica's file (asks for the replica mode) |
+| `VCI_STORE_CONNECT_TIMEOUT_SECS`, `VCI_STORE_TIMEOUT_SECS` | A network store's connect bound (5) and request bound (30), in seconds |
 
 The `[env]` policy (docs/ENV.md) is three lists: `set` (vci sets the variable in every test process, on every machine), `hash` (taken from the machine and hashed: another value re-runs) and `ignore` (taken from the machine, never hashed: put secrets there). Each runner adds a short built-in list: built-in hash (`TZ`, and per runner what the runtime reads natively, e.g. `RUSTFLAGS`, `GOFLAGS`, `PYTHONHASHSEED`, Node's `LANG`) and built-in ignore (`PATH`, `HOME`, `TMPDIR`, caches; hashed only when a test reads one). Every other variable, `CI` included, is removed from the test process in `vci run`, `vci ci` and the plan's probes. `vci env` prints the effective lists. The old names `global` and `pass_through` still work, with a warning.
 

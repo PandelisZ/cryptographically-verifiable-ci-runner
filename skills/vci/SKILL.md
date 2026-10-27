@@ -1,6 +1,6 @@
 ---
 name: vci
-description: Run tests locally with vci (cryptographically verifiable CI), sign an attestation of exactly what they depended on, push it through git, and let CI skip those tests. Use when the user or an agent wants to run tests with proof, attest tests, skip already-run tests in CI, speed up CI for a pull request, or set up vci / verifiable CI (vci init, allowed_signers, the PandelisZ/cryptographically-verifiable-ci-runner GitHub Action), and when diagnosing why vci did not skip a test or refused to attest one. Covers Vitest, pytest (uv), Go, Cargo, Rails Minitest and RSpec. Triggers include "vci", "attest", "attestation", "verifiable CI", "skip tests in CI", "vci.toml", "allowed_signers", "identities.toml", "vci --oidc", "refs/meta/main".
+description: Run tests locally with vci (cryptographically verifiable CI), sign an attestation of exactly what they depended on, push it through git, and let CI skip those tests. Use when the user or an agent wants to run tests with proof, attest tests, skip already-run tests in CI, speed up CI for a pull request, or set up vci / verifiable CI (vci init, allowed_signers, the PandelisZ/cryptographically-verifiable-ci-runner GitHub Action), and when diagnosing why vci did not skip a test or refused to attest one, or setting up its attestation store (git-meta, SQLite, PostgreSQL, Turso). Covers Vitest, pytest (uv), Go, Cargo, Rails Minitest and RSpec. Triggers include "vci", "attest", "attestation", "verifiable CI", "skip tests in CI", "vci.toml", "allowed_signers", "identities.toml", "vci --oidc", "refs/meta/main", "vci store", "VCI_STORE_URL", "token_command", "Turso".
 license: MIT
 compatibility: Needs the vci CLI (brew install pandelisz/tap/vci), git, ssh-keygen (OpenSSH 8.1+) and the project's test toolchain, on macOS or Linux.
 metadata:
@@ -11,7 +11,8 @@ metadata:
 # vci: run tests once, prove it, let CI skip them
 
 vci runs a project's tests with a collector attached, records every input each test unit actually used, signs that
-record with an SSH key, and stores it in git (git-meta on `refs/meta/main`). In CI, the vci GitHub Action checks each
+record with an SSH key, and stores it: by default in git (git-meta on `refs/meta/main`), since vci 2.8.0 optionally in
+a SQLite file, on PostgreSQL or in a libSQL database such as Turso (see "Attestation stores"). In CI, the vci GitHub Action checks each
 record against the base branch's trusted keys and policy, re-hashes every input from its own checkout, and skips a
 unit only when everything matches. Everything else runs.
 
@@ -29,7 +30,8 @@ unit only when everything matches. Everything else runs.
    cargo test target (`crates/x#lib`, `crates/x#test:name`).
 2. **`vci run <units>`** runs each unit in its own process, records what it read, and signs an attestation; only
    units whose tests all ran and passed, with nothing unobservable going on, are attested.
-3. **`vci push`** publishes attestations on `refs/meta/main`; there is no server.
+3. **`vci push`** publishes attestations on `refs/meta/main` (git-meta, the default; no server). On a shared store
+   (PostgreSQL, Turso) `vci run` stores them on the server at once and `vci push` has nothing to do.
 4. **Trust and policy come from the base branch** (`.vci/allowed_signers`, `vci.toml` at the PR's base commit, and
    for CI jobs that sign keylessly with their OIDC token `.vci/identities.toml` and `.vci/sigstore-trusted-root.json`),
    never from the pull request.
@@ -46,6 +48,7 @@ test -f vci.toml && sed -n '1,40p' vci.toml     # set up? which adapter(s) and p
 git branch --show-current                       # must not be the default branch (see below)
 git fetch origin                                # so origin/main is the real base
 echo "${VCI_SIGNING_KEY:-unset}"                # signing key, or pass --key
+vci store info                                  # which attestation store; prints no secret, safe to show
 ```
 
 - **Signing key**: `--key <path>`, else `$VCI_SIGNING_KEY`, else `git config user.signingkey` when
@@ -139,6 +142,10 @@ vci push        # publishes attestations (git-meta push of refs/meta/main); "not
 git push        # the branch, as usual
 ```
 
+On SQLite, PostgreSQL or a libSQL server, `vci run` already stored the attestations and `vci push` prints `vci:
+nothing to push: the <kind> store is local|shared; attestations were stored when vci run made them`. Running it is
+harmless.
+
 Push only when the user wants the branch pushed (or it is the agreed workflow). Push the attestations before or
 together with the branch: CI fetches `refs/meta/main` when the job starts. `vci push` needs push access to the
 metadata remote; if it is refused, report it (the user may need to grant the agent access to `refs/meta/main`).
@@ -149,6 +156,52 @@ or fork that is still the upstream repository, so never run it from a throwaway 
 
 Tell the user, briefly: which units were attested, which were refused and why (one line each), the `vci plan`
 summary line (`N to skip, M to run`), and whether attestations and the branch were pushed.
+
+## Attestation stores
+
+Since vci 2.8.0 attestations live in one of four stores: git-meta (the default), SQLite (`.git/vci-store.sqlite`),
+PostgreSQL, or libSQL (Turso, or a `sqld`; remote, through a local replica, or a local file). No store is trusted:
+the plan verifies every record against the base branch, so a store can only make a unit run, never skip. Full guide:
+https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
+
+- **Which store**: run `vci store info` (`--format json` for scripts). It names the store, where each setting came
+  from, its status and its count, and never prints a secret (`token: (set)`, `postgres://***@…`), so its output is
+  safe to show the user. Chosen from `VCI_STORE`, else the scheme of `VCI_STORE_URL`, else `[store]` in the working
+  tree's `vci.toml`, else git-meta.
+- **Never print a store credential.** Do not echo, log, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN`, or
+  anything a `[store] token_command` prints. No `env`, `printenv` or `set` dumps in a shell that has them. To check
+  whether one is set without showing it: `echo "${VCI_STORE_TOKEN:+set}"`.
+- **Never write a credential into `vci.toml`** or any committed file: `[store] url` names the server only
+  (`libsql://vci-acme.aws-eu-west-1.turso.io`, `postgres://vci_writer@db.example.com/ci`), and the credential comes
+  from the environment (CI) or `[store] token_command` (laptops). vci refuses a `[store] url` with a password, token or
+  `authToken`, and refuses `VCI_STORE_TOKEN` paired with a URL from `vci.toml`.
+- **A failing `token_command`** ends with `vci shows none of its output, which may hold the credential: run the command
+  yourself with its standard output discarded (> /dev/null) to see why`. Do exactly that, from the repository root,
+  with the command the message names: `com secrets get vci-store-token --org vex > /dev/null`. Its error is on
+  standard error; never run it without the redirect, and never capture or pipe its standard output. Usual causes: the
+  user is not signed in (`com login`, `op signin`: ask the user to do it), or it tried to prompt.
+- **Failing open is safe.** When the store cannot be used (no token, a refused token, a server down, a failing token
+  command), `vci plan` warns and prints `running everything: reading attestations from <kind>: …`: every test runs and
+  nothing is skipped by mistake. `vci run` still runs the tests, refuses each unit with `signing or storing failed: …`
+  and keeps the tests' exit code. Report the reason; do not work around it by switching stores or finding another
+  credential.
+- **When to push.** git-meta: `vci push` after `vci run`. SQLite, PostgreSQL, libSQL: `vci run` stored them; nothing
+  to push. `vci ci --push` is what stores on a shared store in CI, and only trusted CI jobs (the default branch, with
+  CI's key or OIDC) run it: never run `vci ci --push` yourself.
+- **Read-only tokens.** `libsql store refused to write: … the token may not write` (or `postgres store refused to
+  write`) means the credential can only read: the plan works, nothing is stored. Tell the user; it is how pull-request
+  jobs are meant to be set up.
+- **Someone else's checkout.** `[store] url` and `token_command` come from the checkout, and the command's token is sent
+  to that url. In a checkout the user has not reviewed (another person's pull request, a scratch clone), run vci with
+  `VCI_STORE=git-meta`, which ignores both. Never change `[store]` without the user.
+- **Setting up Turso, when the user asks.** Follow the steps at
+  https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html#turso. Tokens go straight from `turso db tokens create` into `gh secret set` on standard input, never as `--body` or any
+  other argument, and never on screen: `turso db tokens create <db> --read-only | gh secret set VCI_STORE_TOKEN` for
+  pull-request jobs, `turso db tokens create <db> | gh secret set VCI_STORE_TOKEN --env vci-attest` for the main-branch
+  job, `turso db show <db> --url | gh secret set VCI_STORE_URL`. Run each command that creates a database, a token, an
+  environment or a secret only with the user's go-ahead. Propose the workflow `env:` lines and the `[store]` table as a
+  diff, and add `[store]` to `vci.toml` only once every runner and developer has vci 2.8.0 or later. Steps for CI:
+  [references/ci-setup.md](references/ci-setup.md) ("Use a shared store").
 
 ## Set up a repository
 
@@ -209,7 +262,9 @@ run `vci fetch` online``: run again with network access.
 | `env-config` | The base `[env]` lists or vci's built-in lists differ from the attestation's (every attestation from before vci 1.6.0, once) | Re-attest; `vci env --base-ref origin/main` shows the difference |
 
 Plan-wide: `running everything: policy.no_skip_refs matches ...` (you are on main or a tag), `vci.toml is missing at
-the base commit` (setup not merged yet), and the warning `no git-meta store ... run vci fetch first`. Full list:
+the base commit` (setup not merged yet), `running everything: reading attestations from <kind>: ...` (the store cannot
+be used; `vci store info` says why), and the warnings `no git-meta store ... run vci fetch first` or `no attestations
+are available in the <kind> store` (a new store: nothing stored yet). Full list:
 [references/refusals.md](references/refusals.md).
 
 ## Refusals in one paragraph
@@ -269,6 +324,9 @@ Short version (details in [references/runners.md](references/runners.md)):
 7. **Re-attest after editing**: if you change any file the tests read after `vci run`, run it again before pushing.
 8. **Report honestly**: list refused units and failed checks; never claim CI will skip something `vci plan` shows as
    `RUN`.
+9. **Never expose a store credential**: never print, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN` or a
+   `token_command`'s output, never put a credential in `vci.toml`, and run a failing token command only with its
+   standard output discarded (see "Attestation stores").
 
 ## Reference files
 

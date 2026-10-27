@@ -4,8 +4,9 @@
 Cursor, Gemini CLI, GitHub Copilot, OpenCode and others) to use vci: after it changes code, it finds the test units
 that cover the change, runs them with `vci run`, reads what was attested or refused, checks `vci plan`, and pushes
 the attestations so CI skips those tests. It also covers setting up a repository, diagnosing "not skipped" with
-`vci explain`, and the rules an agent must not break (it never edits `.vci/allowed_signers`, never weakens policy,
-never attests tests it did not run or that failed).
+`vci explain`, the attestation stores of vci 2.8 (below), and the rules an agent must not break (it never edits
+`.vci/allowed_signers`, never weakens policy, never attests tests it did not run or that failed, never prints a
+store credential).
 
 The skill does not install vci itself. Install the CLI first (`brew install pandelisz/tap/vci`, see
 [INSTALL.md](INSTALL.md)) and give the agent its own signing key (`VCI_SIGNING_KEY`), listed in
@@ -163,6 +164,28 @@ do not also install the generic one, or rename it (`<repo>-vci`) so the two are 
 Ask the agent to make a change "and attest the tests with vci", or ask "why didn't CI skip tests/test_orders.py?".
 The agent needs, in its environment: the `vci` binary, `VCI_SIGNING_KEY` pointing at its own key, the project's test
 toolchain at the same versions as CI, and push access to `refs/meta/main` if it should share attestations.
+
+### Attestation stores
+
+Since vci 2.8.0 a repository can keep its attestations in a SQLite file, on PostgreSQL or in a libSQL database (Turso)
+instead of git-meta ([REFERENCE.md, "Where attestations live"](REFERENCE.md#where-attestations-live); the setup guide is
+the site's `stores.html`). `SKILL.md` has a section, "Attestation stores", that tells the agent:
+
+- to find out which store a repository uses with `vci store info`, whose output never holds a secret and is safe to
+  show;
+- never to print, paste or commit `VCI_STORE_URL`, `VCI_STORE_TOKEN` or what a `[store] token_command` prints, and
+  never to put a credential in `vci.toml`;
+- to see why a token command failed by running it with its standard output discarded
+  (`com secrets get vci-store-token --org vex > /dev/null`), which is what vci's message says since 2.8.1;
+- that `vci push` publishes on git-meta only, that `vci run` stores at once on the other stores, and that `vci ci
+  --push` is for trusted CI jobs;
+- that a plan which says `running everything: reading attestations from <kind>: …` failed open, which is safe;
+- and, when asked to set up Turso, to pipe tokens from `turso db tokens create` into `gh secret set` on standard input,
+  never as an argument, asking before each command that creates a database, token, environment or secret.
+
+On a repository whose `vci.toml` has `[store] url` and `token_command`, the agent needs no store variable in its
+environment: sign its machine in to the tool the command uses (`com login`, `op signin`). Give it a read-only token
+if it should plan but not store; its `vci run` then runs the tests and stores nothing.
 
 The helper script can be run by hand too:
 

@@ -215,6 +215,47 @@ Never run `vci run --oidc` or `vci ci --oidc` yourself, even inside a CI job: it
 GitHub renews its Sigstore intermediates yearly; when `vci explain` says the certificate's issuer is no authority of
 the trust root, the user refreshes `.vci/sigstore-trusted-root.json` on the default branch.
 
+## Use a shared store (Turso, PostgreSQL)
+
+Optional, since vci 2.8.0, and only when the user asks: attestations live in a database every machine reads at once,
+instead of on `refs/meta/main`. Full guide with every command:
+https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html. Ask before each command that creates a
+database, a token, an environment or a secret.
+
+1. Turso: `turso db create <db>` (an ordinary database: not `--tursodb`, whose `turso://` URL vci does not accept).
+   PostgreSQL: a database and the roles `vci_owner`, `vci_writer`, `vci_reader` (docs/REFERENCE.md, "PostgreSQL").
+2. Secrets, read from standard input so no token is ever on screen or on a command line:
+
+   ```sh
+   turso db show <db> --url | gh secret set VCI_STORE_URL
+   turso db tokens create <db> --read-only | gh secret set VCI_STORE_TOKEN            # pull-request jobs
+   turso db tokens create <db> | gh secret set VCI_STORE_TOKEN --env vci-attest       # the main-branch job
+   ```
+
+   The environment's secret wins over the repository's in jobs that use the environment. `vci-attest` is the
+   environment limited to the default branch (as for CI's signing key). For PostgreSQL the password is in
+   `VCI_STORE_URL` (a `vci_reader` URL for the repository, a `vci_writer` one for the environment); there is no token.
+3. In each job, beside `fetch-depth: 0` (a shallow clone has no repository id and needs `VCI_STORE_NAMESPACE`):
+
+   ```yaml
+       env:
+         VCI_STORE_URL: ${{ secrets.VCI_STORE_URL }}
+         VCI_STORE_TOKEN: ${{ secrets.VCI_STORE_TOKEN }}
+   ```
+
+   Set both: a token from the environment is never sent to `vci.toml`'s `[store] url` (vci refuses the pair).
+4. Only the main-branch job stores: on a shared store `vci ci` stores only with `--push`, which the action passes with
+   `signing-key` or `oidc` (and `push: true`, the default). It writes to the database, not to git, so it needs no
+   `contents: write`. Pull-request jobs read and store nothing.
+5. Laptops and agents: `[store]` in `vci.toml` with `url` (never a credential) and `token_command` (a command that
+   prints the token, e.g. `["com", "secrets", "get", "vci-store-token", "--org", "acme"]` or `["op", "read", "op://..."]`).
+   Commit it only once every runner and developer has vci 2.8.0: an older vci rejects `[store]` and runs every test.
+6. Check with `vci store info`. The store starts empty: every unit runs until the main-branch job's next full run (or a
+   developer's `vci run`) stores attestations. Nothing is copied from `refs/meta/main`.
+
+A job that runs untrusted code (a fork's, or any job you would not hand a write credential) gets a read-only token or
+none: its tests can read the token from the environment the job's shell or vci started with, whatever vci removes.
+
 ## Security rules (do not relax them)
 
 - Pin the action (`@v2`, or the full commit SHA `v2` points to; `@v1` stays on 1.9.2); never a branch, and not
@@ -250,4 +291,8 @@ the trust root, the user refreshes `.vci/sigstore-trusted-root.json` on the defa
 | `::warning title=vci::not attesting: the key signs as ...` | CI's key reached a non-main run (a pull request): pass it only from the main-only job with the environment |
 | A Go package or cargo target never skips on the runner | Platform-specific code (`_linux.go`, `cfg(target_os)`, `runtime.GOOS`, float maths): accepted only on the same OS/arch |
 | A test reads `HOME` or `TMPDIR`, or a variable in `[env] hash` such as `CI` | Values differ on a runner; that unit always runs there (`CI` is removed unless listed) |
+| `running everything: reading attestations from libsql: ...` (or `postgres`) | The store cannot be used: a missing secret (fork pull requests get none; check the job's `env:`), a refused or expired token, a server that does not answer. Every test ran; `vci store info` run with the same variables says why |
+| `$VCI_STORE_TOKEN is set but the store's URL comes from vci.toml [store] url` | The job sets the token but not `VCI_STORE_URL`: set both from secrets |
+| `libsql store refused to write: ... the token may not write` in the main-branch job | It got the read-only token: the `vci-attest` environment lacks its own `VCI_STORE_TOKEN`, or the job does not name the environment |
+| `vci: not storing N attestation(s): the <kind> store is shared and vci ci was not given --push` | Expected in pull-request jobs. In the main-branch job: `push: false`, or neither `signing-key` nor `oidc` |
 | No Rails file ever skips | `config/environments/test.rb` reads `ENV["CI"]` and `CI` is in `[env] hash` (leave it out of `[env]`); Ruby patchlevel, Bundler, SQLite or tz data differ; `Gemfile.lock` lacks `x86_64-linux`; the app loads libvips (Active Storage), whose Homebrew file never matches the runner's (`policy.libraries = "any"` matches it by name, with libvips installed on the runner; also stops comparing the SQLite, libyaml and tz data versions) |
