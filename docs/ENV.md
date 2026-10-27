@@ -78,8 +78,9 @@ unset in CI, so it cannot make two runs differ.
 **Every runner.** Built-in hash: `TZ` (every runtime reads the local time zone natively). Built-in ignore: `PATH`,
 `HOME`, `USER`, `SHELL`, `TMPDIR`, `TEMP`, `TMP`, `TERM`, `VCI_*` (your `VCI_BASE_REF`, ...; vci's own per-run
 `VCI_OUT`, ... are never hashed), except `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE`, which vci removes from
-its own environment at start-up and which no test process ever sees (since 2.8.0; not even when `set` or `hash` names
-them), and on Windows `SYSTEMROOT`, `COMSPEC`, `PATHEXT`, `WINDIR`, `USERPROFILE`,
+its own environment at start-up and keeps out of every environment it builds for a test, probe, hook or token command
+(since 2.8.0; not even when `set` or `hash` names them; a test that goes looking can still read them from the
+environment vci or the CI step's shell started with, see [Secrets](#secrets)), and on Windows `SYSTEMROOT`, `COMSPEC`, `PATHEXT`, `WINDIR`, `USERPROFILE`,
 `APPDATA`, `LOCALAPPDATA`.
 
 ### Vitest

@@ -159,5 +159,17 @@ fn the_token_command_is_the_password_when_the_url_has_none() {
         e.contains("vci.toml [store] url") && !e.contains("$VCI_STORE_URL"),
         "{e}"
     );
+    // So is it in a failure found only when connecting (a missing root
+    // certificate), which the URL's parse did not see.
+    let (port, _) = password_server();
+    let url = format!(
+        "postgres://vci@127.0.0.1:{port}/ci?sslmode=require&sslrootcert=/nonexistent/vci-ca.pem"
+    );
+    let s = store(&dir, &url, Source::File, &counter);
+    let e = s.status().unwrap_err().to_string();
+    assert!(
+        e.contains("vci.toml [store] url: ") && !e.contains("$VCI_STORE_URL"),
+        "{e}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1698,12 +1698,17 @@ fn plan_with(
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
     let mut verdicts = verdicts;
     let t = std::time::Instant::now();
-    let memos = {
+    // A plan that verifies no project reads nothing from the store (its
+    // memos would go unused), so it never connects, nor runs a [store]
+    // token_command.
+    let memos = if verifiers.iter().any(Result::is_ok) {
         let base = res
             .base_commit
             .as_deref()
             .and_then(|b| ctx.repo.tree_of(b).ok());
         passing_memos(store, head_tree.as_deref(), base.as_deref())
+    } else {
+        BTreeMap::new()
     };
     hydrate_more(
         store,

@@ -82,6 +82,9 @@ pub(crate) struct ConnSpec {
     ssl_mode: SslMode,
     root_cert: Option<PathBuf>,
     display: String,
+    /// What messages call the URL: `$VCI_STORE_URL`, or `vci.toml [store]
+    /// url` when it came from there ([`vci_store::select::url_name`]).
+    pub(crate) url_name: &'static str,
     pub(crate) connect_timeout: Duration,
     pub(crate) statement_timeout: Duration,
     options: String,
@@ -441,6 +444,7 @@ impl ConnSpec {
             .copied()
             .unwrap_or(connect_timeout);
         Ok(ConnSpec {
+            url_name: "$VCI_STORE_URL",
             display: display(&s.text, &config),
             attempts: attempts(&config),
             config,
@@ -820,7 +824,7 @@ impl Conn {
             .get_or_init(|| build_tls(self.spec.root_cert.as_ref()))
         {
             Ok(t) => Ok(t.clone()),
-            Err(e) => Err(StoreError::Config(format!("$VCI_STORE_URL: {e}"))),
+            Err(e) => Err(StoreError::Config(format!("{}: {e}", self.spec.url_name))),
         }
     }
 

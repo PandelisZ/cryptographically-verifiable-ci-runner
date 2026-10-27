@@ -985,3 +985,28 @@ fn a_token_command_that_hangs_is_stopped_and_fails_open() {
     assert!(!alive, "the helper's sleep ({pid}) outlived it");
     w.assert_no_token(&[out]);
 }
+
+/// A plan that verifies nothing (its base commit trusts no signer, so
+/// every unit runs) reads nothing from the store, so it never runs the
+/// token command: each run of it is an audited secret read, up to a minute
+/// long, whose failure nobody would be told about.
+#[test]
+fn a_plan_that_runs_everything_never_runs_the_token_command() {
+    let Some(w) = World::new() else { return };
+    w.git(&w.work, &["checkout", "-q", "-b", "untrusted", "main"]);
+    w.git(&w.work, &["rm", "-q", ".vci/allowed_signers"]);
+    w.git(&w.work, &["commit", "-q", "-m", "no signers"]);
+    w.git(&w.work, &["checkout", "-q", "feature"]);
+    w.use_store(&w.helper("com", &format!("printf '%s\\n' '{TOKEN}'")));
+    let out = w.vci(
+        &["plan", "--base-ref", "untrusted", "--format", "json"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "vci plan fails open");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let files = v["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    assert!(files.iter().all(|f| !f["skip"].as_bool().unwrap()), "{v}");
+    assert_eq!(w.helper_runs(), 0, "the token command ran");
+    w.assert_no_token(&[out]);
+}

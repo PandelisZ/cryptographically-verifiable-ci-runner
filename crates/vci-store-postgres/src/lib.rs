@@ -274,13 +274,14 @@ impl PgStore {
         } else {
             sel.timeout.value
         };
-        let spec = ConnSpec::parse(
+        let mut spec = ConnSpec::parse(
             &url.value,
             sel.connect_timeout.value,
             statement_timeout,
             &cx.command,
         )
         .map_err(|e| select::name_url_source(e, url.source))?;
+        spec.url_name = select::url_name(url.source);
         // The password: the connection string's, else what `[store]
         // token_command` prints before the first connection.
         let password = if spec.has_password() {
