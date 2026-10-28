@@ -1960,18 +1960,21 @@ The store has three modes:
   by then running, and once a read ran out of time the plan's later reads of values end when it did, so a slow link
   costs the plan that once, not once per round. `vci run` writes its units in transactions of at most a megabyte, one
   right after the other (since 2.8.2), so that none holds the database's one write lock for long, halving them (down
-  to 128 KiB) while one takes more than a third of the timeout and doubling them again while one takes less than a
-  tenth, and never splits a unit across two transactions; a transaction that runs out of time asks the server
-  (within a quarter of the timeout, at most 5 s) whether it was stored and is sent again as it was after a pause if
-  not (each transaction carries a nonce, so that should the first copy commit late, whichever copy comes second is
-  refused and it is applied once), and only the units whose transaction still fails are not attested (`signing or
-  storing failed: storing the batch: …`); the rest are. A command spends at most two timeouts in all on writes that
-  fail (60 s at the default) before it stops writing, and at most six timeouts on writes in all, those that succeed
-  included (180 s at the default, plus the transaction under way): then the units it has not stored are not attested
-  (`this process's writes … timed out after 180s`) and run again next time, so a slow server costs a job a bounded
-  time. The timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`) sets both. The plan's memo and flags are written only when new, and each such write waits at most 5 s and never
-  stops the command. A statement the server refuses (a trigger, say) costs the unit it writes: `vci run` reports it
-  and exits 2 after the run.
+  to 256 KiB) after one runs out of time and doubling them again while they commit fast, and never splits a unit
+  across two transactions; a transaction that runs out of time asks the server (within a quarter of the timeout, at
+  most 5 s) whether it was stored and is sent again as it was after a pause if not (each transaction carries a nonce,
+  so that should the first copy commit late, whichever copy comes second is refused and it is applied once), and only
+  the units whose transaction still fails are not attested (`signing or storing failed: storing the batch: …`); the
+  rest are. A command spends at most two timeouts in all on writes that fail (60 s at the default) before it stops
+  writing, and on writes in all, those that succeed included, at most six timeouts plus one for each 4 MiB its
+  transactions stored (180 s at the default, and 7.5 s more for each MiB stored): then the units it has not sent are
+  not attested (`this process's writes … timed out after …`) and run again next time, and removing unreferenced input
+  manifests after the run is skipped with a warning, so a server that takes writes slowly costs a job a bounded time
+  while one that keeps storing finishes a large job's writes. A unit reported not attested may still have been
+  stored, when its transaction ran out of time, was given up and committed afterwards; the next plan then finds it.
+  The timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`) sets both. The plan's memo and flags are written
+  only when new, and each such write waits at most 5 s and never stops the command. A statement the server refuses (a
+  trigger, say) costs the unit it writes: `vci run` reports it and exits 2 after the run.
 - **Compressed values** (since 2.8.2). `[store] compress = "zstd"` in `vci.toml`, or `VCI_STORE_COMPRESS=zstd` (which
   wins: `VCI_STORE_COMPRESS=off` turns it off for one command), stores each attestation and input manifest
   compressed (about 3x smaller for vex's; they travel at about two thirds of their size, as hex). On vex's Turso database,
@@ -2006,12 +2009,13 @@ The store has three modes:
   local-mode store, or one that is not a database, is never used as a replica, and stores nothing.
 - **The local mode** is the SQLite store under another name: the same file format, writes and limits (see
   [SQLite](#sqlite)); a `vci-store.sqlite` can be copied to `vci-store.libsql` and back.
-- **Cost.** A plan reads a server in a few dozen requests (vex-api's 1,652 values in 8 or 9), and `vci run` writes
+- **Cost.** A plan reads a server in a few dozen requests (vex-api's 1,652 values in 8 to 11), and `vci run` writes
   a project's units in transactions of at most 1 MiB of values or 64 attestations, one request each (2.8.1: one of
   up to 8 MiB, which held the database's one write lock while it was applied). From a laptop to vex's Turso database
   on 28 October 2026, a read-only plan of vex-api took 7.3 s median (2.8.1: 13.2 s), and 2.8.1 lost every attestation
-  of a 500-unit write in two of three runs, and of three 350-unit writes at once, where 2.8.2 lost none
-  ([STORE-BACKENDS.md](STORE-BACKENDS.md), section 18, "Measured"). On a synthetic store of 1,200 Go units attested
+  of a 500-unit write in two of three runs, and of three 350-unit writes at once, where 2.8.2 lost none; three Rails-sized writers at once (800
+  units, 28 to 31 MB each) took 142 to 152 s each on a quiet database, uncompressed, and compressed wrote 2.5 to 3
+  times faster than uncompressed ([STORE-BACKENDS.md](STORE-BACKENDS.md), section 18, "Measured"). On a synthetic store of 1,200 Go units attested
   three times (3,600 attestations of about 3 KB) on a local `sqld`, the store's part of a plan that skipped every unit
   took 0.5-0.6 s remote against 0.01 s from a SQLite file, a replica's first sync of everything 0.6-9 s on a heavily
   loaded laptop and a sync with nothing new 0.04 s, and `vci run` wrote 1,200 attestations and manifests in one

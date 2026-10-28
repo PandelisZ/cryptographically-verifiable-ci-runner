@@ -357,9 +357,18 @@ pub(crate) struct Remote {
     /// The time spent writing, all writes that ended so far
     /// ([`Remote::writing_out_of_time`]).
     write_time: Mutex<Duration>,
+    /// Bytes of values (as sent) of the write transactions that committed
+    /// ([`Remote::stored_writes`]): each [`crate::batch::WRITE_TIME_BYTES`]
+    /// of them earns the process one more request timeout of writes.
+    write_stored: AtomicU64,
     /// The most bytes of values the next transaction of a write sends
     /// ([`Remote::size_writes_from`]).
     tx_bytes: AtomicUsize,
+    /// The shortest time a write transaction of this handle took to commit
+    /// when first sent, within its deadline: the wait every transaction
+    /// has (the link, the server's answer), which does not shrink with
+    /// its size ([`Remote::size_writes_from`]).
+    write_fastest: Mutex<Option<Duration>>,
     /// Roots a read of values found to be bases: a later read does not
     /// bring them again while they are cached.
     bases: Mutex<BTreeSet<String>>,
@@ -409,7 +418,9 @@ impl Remote {
             values_until: Mutex::new(None),
             write_spent: Mutex::new(Duration::ZERO),
             write_time: Mutex::new(Duration::ZERO),
+            write_stored: AtomicU64::new(0),
             tx_bytes: AtomicUsize::new(crate::batch::TX_BYTES),
+            write_fastest: Mutex::new(None),
             bases: Mutex::new(BTreeSet::new()),
         }
     }
@@ -561,12 +572,17 @@ impl Remote {
         *spent < self.write_retry_time()
     }
 
-    /// The time this process may spend on writes in all
-    /// ([`crate::batch::WRITE_TIME_DEADLINES`] request timeouts).
+    /// The time this process may spend on writes in all: as many request
+    /// timeouts as [`crate::batch::WRITE_TIME_DEADLINES`], and one more for
+    /// each [`crate::batch::WRITE_TIME_BYTES`] of values its transactions
+    /// stored, so that the bound follows the work a slow server still
+    /// does and cuts short only one that stores less than that a timeout.
     fn write_time_budget(&self) -> Duration {
-        self.conn
-            .timeout()
-            .saturating_mul(crate::batch::WRITE_TIME_DEADLINES)
+        let stored = self.write_stored.load(Ordering::Relaxed);
+        let per = u64::try_from(crate::batch::WRITE_TIME_BYTES).unwrap_or(u64::MAX);
+        let t = self.conn.timeout();
+        t.saturating_mul(crate::batch::WRITE_TIME_DEADLINES)
+            .saturating_add(t.mul_f64(stored as f64 / per as f64))
     }
 
     /// Count `d` (a write that ended) against the process's time for
@@ -576,6 +592,13 @@ impl Remote {
             .write_time
             .lock()
             .unwrap_or_else(PoisonError::into_inner) += d;
+    }
+
+    /// Count `bytes` of values (as sent) a transaction stored: they earn
+    /// the process more time for writes ([`Remote::write_time_budget`]).
+    pub(crate) fn stored_writes(&self, bytes: usize) {
+        self.write_stored
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Whether the process has spent its time for writes, with `now` spent
@@ -594,7 +617,7 @@ impl Remote {
         StoreError::Timeout {
             backend: KIND,
             operation: "this process's writes (the server took them too slowly)",
-            after: self.write_time_budget(),
+            after: Duration::from_secs(self.write_time_budget().as_secs()),
         }
     }
 
@@ -603,23 +626,38 @@ impl Remote {
         self.tx_bytes.load(Ordering::Relaxed)
     }
 
-    /// Size the next transactions from the time one took (sent, waited for
-    /// the write lock, committed, or ran out of time): half as large when
-    /// it took more than a third of the request timeout (down to
-    /// [`crate::batch::TX_MIN_BYTES`]), twice as large when it took less
-    /// than a tenth (up to [`crate::batch::TX_BYTES`]). Under other
-    /// writers a transaction of about 1 MB took 23 to 31 s on vex's Turso
-    /// database, at the edge of the 30 s timeout; a smaller one holds the
-    /// write lock for less, so every writer waits less for it.
-    pub(crate) fn size_writes_from(&self, took: Duration) {
+    /// Size the next transactions from the time a transaction first sent
+    /// took (`took`; `out_of_time`: its deadline ran out, whether it then
+    /// turned out committed or not): half as large after one out of time
+    /// (down to [`crate::batch::TX_MIN_BYTES`]), twice as large again (up
+    /// to [`crate::batch::TX_BYTES`]) after one that took less than a
+    /// tenth of the request timeout beyond the handle's fastest. Time
+    /// within the deadline does not shrink them: much of it is a wait a
+    /// smaller transaction pays again (the link, the server's answer,
+    /// another writer's lock), and the review of a draft that halved after
+    /// a third of the timeout found it stored 122 of 600 units within the
+    /// bound behind a proxy holding each answer 1.1 s at a 3 s timeout,
+    /// against 503 without it.
+    pub(crate) fn size_writes_from(&self, took: Duration, out_of_time: bool) {
         let t = self.conn.timeout();
         let cur = self.tx_bytes();
-        let next = if took > t / 3 {
+        let next = if out_of_time {
             (cur / 2).max(crate::batch::TX_MIN_BYTES)
-        } else if took < t / 10 {
-            cur.saturating_mul(2).min(crate::batch::TX_BYTES)
         } else {
-            cur
+            let fastest = {
+                let mut f = self
+                    .write_fastest
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let v = f.map_or(took, |f| f.min(took));
+                *f = Some(v);
+                v
+            };
+            if took.saturating_sub(fastest) < t / 10 {
+                cur.saturating_mul(2).min(crate::batch::TX_BYTES)
+            } else {
+                cur
+            }
         };
         self.tx_bytes.store(next, Ordering::Relaxed);
     }

@@ -4352,7 +4352,8 @@ fn a_write_sends_its_transactions_without_a_pause() {
     assert!(median < Duration::from_millis(60), "paused: {gaps:?}");
 }
 
-/// A process's writes stop once they took six request timeouts in all,
+/// A process's writes stop once they took six request timeouts in all
+/// (and the little more its small transactions earn by what they store),
 /// even when every transaction commits in time: the units still queued are
 /// lost at once (their units run again next time), the ones stored stay,
 /// nothing is latched, and a later write of the process is lost at once
@@ -4401,12 +4402,14 @@ fn a_process_writes_for_a_bounded_time_in_all() {
     assert_eq!(r.list_all().unwrap().len(), 1 + keys.len() - lost);
 }
 
-/// A write's transactions are made smaller when they commit slowly (more
-/// than a third of the request timeout each), down to 128 KiB, and larger
-/// again, up to 1 MiB, when they commit fast (less than a tenth): behind
-/// other writers on vex's Turso database transactions of about 1 MB took
-/// 23 to 31 s, at the edge of the 30 s timeout, where 2.8.2 as first
-/// reviewed kept sending 1 MiB.
+/// A write's transactions keep their size while each commits within its
+/// deadline, however long the wait every answer has; one that ran out of
+/// time makes the next ones half as large (down to 256 KiB), and ones that
+/// commit fast beyond that wait make them larger again (up to 1 MiB). A
+/// draft halved them after any that took more than a third of the timeout:
+/// with each answer held 800 ms at a 2 s timeout they fell to 128 KiB,
+/// each paying the wait again (the review: 122 of 600 units stored within
+/// the bound against 503 at a constant size).
 #[test]
 fn a_write_sizes_its_transactions_from_their_commit_times() {
     let Some((server, token)) = proxied_server() else {
@@ -4418,22 +4421,187 @@ fn a_write_sizes_its_transactions_from_their_commit_times() {
     // The tables made first.
     let (f, _) = small_batch(&s, "seed", 1, 100);
     assert_eq!(f.lost_count(), 0);
-    // Each answer held 0.8 s: more than a third of the 2 s timeout.
+    // Each answer held 0.8 s: more than a third of the 2 s timeout, the
+    // same for any size.
     proxy.delay_answers(800);
     let w0 = proxy.write_sizes().len();
-    // 80 units of about 25 kB as sent: 2 MB, 5 transactions.
-    let (f, _) = small_batch(&s, "big", 80, 20_000);
+    // 80 units of about 25 kB as sent: 2 MB, 2 transactions.
+    let (f, _) = small_batch(&s, "wait", 80, 20_000);
     assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
-    let slow: Vec<usize> = proxy.write_sizes()[w0..].to_vec();
-    assert!(slow.len() >= 4, "{slow:?}");
-    assert!(slow[0] > 900_000, "{slow:?}");
-    assert!(slow[1] < slow[0] * 6 / 10, "halved: {slow:?}");
-    assert!(slow[3] < 250_000, "down to 128 KiB: {slow:?}");
-    // Fast again: they grow back.
+    let waited: Vec<usize> = proxy.write_sizes()[w0..].to_vec();
+    assert!(waited.len() <= 3, "{waited:?}");
+    assert!(waited[0] > 900_000, "{waited:?}");
+    assert!(
+        waited[..waited.len() - 1].iter().all(|&b| b > 900_000),
+        "kept their size: {waited:?}"
+    );
+    // A transaction out of time (committed, its answer never passed on):
+    // the next ones half as large.
     proxy.delay_answers(0);
+    proxy.swallow_writes(1);
     let w1 = proxy.write_sizes().len();
+    let (f, _) = small_batch(&s, "late", 80, 20_000);
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let late: Vec<usize> = proxy.write_sizes()[w1..].to_vec();
+    assert!(late[0] > 900_000, "{late:?}");
+    assert!(
+        late[1] < 600_000 && late[1] > 400_000,
+        "halved once: {late:?}"
+    );
+    // Fast again: they grow back.
+    let w2 = proxy.write_sizes().len();
     let (f, _) = small_batch(&s, "fast", 80, 20_000);
     assert_eq!(f.lost_count(), 0);
-    let fast: Vec<usize> = proxy.write_sizes()[w1..].to_vec();
+    let fast: Vec<usize> = proxy.write_sizes()[w2..].to_vec();
     assert!(fast.iter().any(|&b| b > 900_000), "grown back: {fast:?}");
+}
+
+/// A transaction out of time halves the next ones, and its copy sent again
+/// does not double them back: the copy measures no commit of that size
+/// (its guard refused it at once, the first copy having committed). A
+/// draft sized from the copy's time too, undoing the halving.
+#[test]
+fn a_copy_sent_again_does_not_size_a_write() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s timeout; the question 0.5 s.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // The first transaction commits, its answer is never passed on, and
+    // the question after it goes unanswered: it is sent again, and the
+    // copy's guard refuses it.
+    proxy.swallow_writes(1);
+    let held = proxy.stalled();
+    let w0 = proxy.write_sizes().len();
+    let (f, keys) = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let t = Instant::now();
+            while proxy.stalled() == held && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            proxy.stall_cursors(1);
+        });
+        small_batch(&s, "copy", 80, 20_000)
+    });
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let sizes: Vec<usize> = proxy.write_sizes()[w0..].to_vec();
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert_eq!(sizes[0], sizes[1], "sent again as it was: {sizes:?}");
+    // The next one halved (it then grows again, committing fast).
+    assert!(sizes[2] < 600_000, "still halved after the copy: {sizes:?}");
+    let r = testkit::open_remote(&ns).unwrap();
+    let on_server: Vec<String> = r.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert!(keys.iter().all(|k| on_server.contains(k)));
+}
+
+/// A transaction out of time that is to be sent again goes out even when
+/// the process's time for writes ran out meanwhile, as the transaction
+/// under way: it may have committed late (the question is a read, which
+/// does not wait for the lock), and the copy or its guard's refusal says
+/// that it is stored. A draft lost it unasked: its units were reported not
+/// attested while the server held them (the review: `lost 4 … timed out
+/// after 12s`, 4 of 4 on the server).
+#[test]
+fn a_write_out_of_time_is_sent_again_past_the_time_bound() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s timeout: 12 s of writes, and a little more for what is stored.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // About 10 s of writes that commit, each answer held 1 s.
+    proxy.delay_answers(1_000);
+    let t = Instant::now();
+    let mut i = 0;
+    while t.elapsed() < Duration::from_millis(10_200) {
+        let (f, _) = small_batch(&s, &format!("burn{i}"), 1, 100);
+        assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+        i += 1;
+    }
+    proxy.delay_answers(0);
+    // The next transaction reaches the server 3 s late and commits: its
+    // deadline (2 s) and question (0.5 s) end first, which spends the
+    // process's time for writes, before it is sent again.
+    proxy.late_writes(1, 3_000);
+    let (f, keys) = small_batch(&s, "late", 4, 100);
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let r = testkit::open_remote(&ns).unwrap();
+    let on_server: Vec<String> = r.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert!(keys.iter().all(|k| on_server.contains(k)));
+    // The bound holds for what was not sent yet.
+    let (f, _) = small_batch(&s, "after", 4, 100);
+    assert_eq!(f.lost_count(), 4);
+}
+
+/// The time a process may spend on writes grows with what its
+/// transactions store (a timeout for each 4 MiB): a slow server that keeps
+/// storing finishes a large write past six timeouts. A flat six timeouts
+/// lost 0 to 200 of 800 units per process on a quiet Turso database and up
+/// to 690 while vex's Rails jobs wrote (the fourth write review).
+#[test]
+fn a_process_that_keeps_storing_writes_past_six_timeouts() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s timeout: 12 s of writes, and 2 s more for each 4 MiB stored
+    // (a 1 s timeout left a debug build's 1 MiB transaction too little).
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // Each answer held 800 ms: about 1 MiB a second.
+    proxy.delay_answers(800);
+    let t = Instant::now();
+    // 480 units of about 25 kB: 12 MB, 12 transactions, earning 6 s.
+    let (f, keys) = small_batch(&s, "big", 480, 20_000);
+    let took = t.elapsed();
+    assert_eq!(f.lost_count(), 0, "{took:?}: {:?}", f.into_error());
+    eprintln!("took {took:?}");
+    assert!(
+        took > Duration::from_secs(12),
+        "past six timeouts: {took:?}"
+    );
+    proxy.delay_answers(0);
+    let r = testkit::open_remote(&ns).unwrap();
+    assert_eq!(r.list_all().unwrap().len(), 1 + keys.len());
+}
+
+/// Removing unreferenced manifests is a write within the process's time
+/// for writes: once that is spent it sends nothing and says so. A draft
+/// sent it with the whole request timeout after `vci run`'s writes were
+/// cut short, so a slow server cost a job one more timeout past the bound.
+#[test]
+fn removing_manifests_keeps_to_the_time_for_writes() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 1 s timeout: 6 s of writes in all.
+    let s = proxied(&proxy, token.as_deref(), &ns, 1);
+    let m = manifest(&["src/free.rs"]);
+    s.put_manifest(&m.root(), m.to_compact().as_bytes())
+        .unwrap();
+    proxy.delay_answers(250);
+    let (f, _) = small_batch(&s, "slow", 2_560, 100);
+    assert!(f.lost_count() > 0, "the time for writes spent");
+    proxy.delay_answers(0);
+    let n0 = s.requests();
+    let t = Instant::now();
+    let e = s.remove_manifests(&[&m.root()]).unwrap_err();
+    assert!(e.to_string().contains("this process's writes"), "{e}");
+    assert_eq!(s.requests(), n0, "nothing sent");
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
 }

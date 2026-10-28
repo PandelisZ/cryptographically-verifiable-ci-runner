@@ -24,10 +24,12 @@
 //! sent or [`TX_UNITS`] attestations, one right after the other: each
 //! holds the server's one write lock for one to a few seconds, not the 15
 //! to 37 s an 8 MB transaction held it on Turso (2.8.1). A transaction
-//! that took more than a third of the request timeout (behind other
-//! writers) makes the next ones half as large, down to [`TX_MIN_BYTES`],
-//! and one that took less than a tenth twice as large again
-//! ([`crate::remote::Remote::size_writes_from`]). Another job's write (a
+//! that ran out of time makes the next ones half as large, down to
+//! [`TX_MIN_BYTES`], and one that took less than a tenth of the timeout
+//! beyond the handle's fastest twice as large again
+//! ([`crate::remote::Remote::size_writes_from`]); time within the deadline
+//! does not shrink them, since most of it is a wait (the link, another
+//! writer's lock) that a smaller transaction pays again. Another job's write (a
 //! hint, a shared manifest, its own units) still waits behind every
 //! writer's transaction that is waiting too: beside three processes
 //! writing at once on vex's Turso database a manifest put waited up to
@@ -51,10 +53,19 @@
 //! once per transaction), and every write still queued fails at once. A
 //! server that cannot be reached latches it at once, as before. The time
 //! a process spends on writes in all, those that succeed included, is
-//! bounded by [`WRITE_TIME_DEADLINES`] request timeouts (plus the
-//! transaction under way when it runs out): past that every unit still
-//! queued, and every later write's, is lost at once, latching nothing, so
+//! bounded by [`WRITE_TIME_DEADLINES`] request timeouts and one more for
+//! each [`WRITE_TIME_BYTES`] its transactions stored (plus the transaction
+//! under way when it runs out, and a transaction out of time sent again):
+//! past that every unit still queued, and every later write's (removing
+//! unreferenced manifests included), is lost at once, latching nothing, so
 //! that a server that takes writes slowly costs a job a bounded time.
+//!
+//! A unit reported lost was not always left unstored: a transaction that
+//! ran out of time and was given up (its tries or the retry time spent,
+//! the breaker latched) may commit afterwards, since the question whether
+//! it did is a read that does not wait for the write lock. The store is
+//! not trusted, so this costs a warning and the report of a unit as not
+//! attested, never a wrong verification.
 //!
 //! A record a server would refuse as too big ([`MAX_RECORD`] bytes or
 //! more: `sqld` keeps rows under 5,000,000 bytes) is refused before it is
@@ -105,21 +116,31 @@ pub(crate) const TX_UNITS: usize = 64;
 pub(crate) const WRITE_RETRY_DEADLINES: u32 = 2;
 
 /// The smallest a transaction's bytes are made ([`Remote::tx_bytes`])
-/// when transactions commit slowly.
-pub(crate) const TX_MIN_BYTES: usize = 128 << 10;
+/// after transactions ran out of time: two halvings of [`TX_BYTES`], as
+/// many as the process's retry time ([`WRITE_RETRY_DEADLINES`]) lets
+/// transactions out of time come about before it latches.
+pub(crate) const TX_MIN_BYTES: usize = 256 << 10;
 
 /// The time a process may spend on writes in all (transactions that
 /// committed, failed or were asked about, and the pauses before one was
-/// sent again), in request timeouts: 180 s at the default 30 s timeout.
-/// Past it, every unit still queued is lost at once (vci run runs them
-/// again next time) rather than the job waiting on. 2.8.2 as first
-/// reviewed bounded only the time of writes that failed: on vex's Turso
-/// database three processes writing 150 units each at once took up to
-/// 88 s each, so a Rails job's 800 units could take minutes. Three
-/// writing 800 units each (28 to 31 MB) on a quiet database spent 99 to
-/// 131 s each on writes (28 October 2026), which a bound of four timeouts
-/// would have cut short.
+/// sent again), in request timeouts, before those its transactions earn
+/// ([`WRITE_TIME_BYTES`]): 180 s at the default 30 s timeout. Past it,
+/// every unit still queued is lost at once (vci run runs them again next
+/// time) rather than the job waiting on. 2.8.2 as first reviewed bounded
+/// only the time of writes that failed: on vex's Turso database three
+/// processes writing 150 units each at once took up to 88 s each, so a
+/// Rails job's 800 units could take minutes.
 pub(crate) const WRITE_TIME_DEADLINES: u32 = 6;
+
+/// Bytes of values (as sent) a process's transactions store that earn it
+/// one more request timeout of writes ([`WRITE_TIME_DEADLINES`]): at the
+/// default 30 s timeout, 7.5 s a MiB, so the bound cuts short a server
+/// that stores less than about 140 kB/s over the process's writes. A flat
+/// bound of six timeouts lost 0 to 200 of 800 units per process when
+/// three Rails-sized writers ran on a quiet Turso database (187 to 189 s
+/// of writes each, 28 to 31 MB raw), and 294 to 690 while vex's Rails
+/// jobs wrote (28 October 2026, the fourth write review).
+pub(crate) const WRITE_TIME_BYTES: usize = 4 << 20;
 
 /// The most times one unit's writes are sent (each failure costing part
 /// of the process's retry time).
@@ -746,7 +767,10 @@ pub(crate) fn remove_now(
 
 /// Remove the manifests under these roots that no attestation references,
 /// no manifest uses as its base, and that were put before the grace
-/// period; the roots removed.
+/// period; the roots removed. Its write counts against the process's time
+/// for writes, and once that is spent nothing is sent
+/// ([`Remote::write_time_error`]): `vci run` warns, and the manifests go
+/// in a later run.
 pub(crate) fn remove_manifests_now(
     remote: &Remote,
     roots: &[&str],
@@ -756,6 +780,10 @@ pub(crate) fn remove_manifests_now(
     }
     if roots.is_empty() {
         return Ok(Vec::new());
+    }
+    // Within the process's time for writes, like a batch's.
+    if remote.writing_out_of_time(Duration::ZERO) {
+        return Err(remote.write_time_error());
     }
     let t = remote.ready()?;
     if remote.version()?.is_none() {
@@ -793,7 +821,10 @@ pub(crate) fn remove_manifests_now(
                 .join(", ")
         ),
     ];
-    match remote.write(WRITE, &stmts) {
+    let began = Instant::now();
+    let r = remote.write(WRITE, &stmts);
+    remote.spent_writing(began.elapsed());
+    match r {
         Ok(()) | Err(Fail::Absent) => {}
         Err(Fail::Store(e)) => return Err(e),
     }
@@ -1005,7 +1036,8 @@ fn nonce(remote: &Remote) -> String {
 /// process's retry time ([`Remote::spend_on_writes`]); the units whose
 /// transaction still fails are lost, and the rest is stored. Once the
 /// process has spent its time for writes ([`Remote::writing_out_of_time`])
-/// every unit still queued is lost at once. A manifest `stored` holds with
+/// every unit not yet sent is lost at once; a transaction out of time is
+/// still sent again. A manifest `stored` holds with
 /// the same bytes is not sent again, and those stored are added to it;
 /// `also_keep`: roots that writes still queued reference, which no
 /// transaction removes as superseded.
@@ -1051,7 +1083,12 @@ pub(crate) fn write_all(
                 None => break,
             },
         };
-        if remote.writing_out_of_time(began.elapsed()) {
+        let resend = again.is_some();
+        // A transaction already sent (and out of time) goes out again even
+        // past the bound, as the transaction under way: it may have
+        // committed late, and the copy, or its guard's refusal, says so.
+        // Losing it unasked reported units the server stored as lost.
+        if !resend && remote.writing_out_of_time(began.elapsed()) {
             // Every unit still queued, at once.
             let mut failed = vec![group];
             failed.extend(queue.drain(..).map(|(g, _, _)| g));
@@ -1090,8 +1127,11 @@ pub(crate) fn write_all(
             (Ok(n), Some(tx)) => {
                 txs += 1;
                 bytes += n;
-                if n > 0 {
-                    remote.size_writes_from(took);
+                remote.stored_writes(n);
+                // A copy sent again measures no commit of its size: its
+                // guard may have refused it at once.
+                if n > 0 && !resend {
+                    remote.size_writes_from(took, took >= remote.conn.timeout());
                 }
                 for (root, (_, b)) in &tx.p.manifests {
                     stored.insert(root.clone(), vci_core::blake3_hex(b));
@@ -1118,7 +1158,9 @@ pub(crate) fn write_all(
             give_up(&mut why, &mut failed);
         } else if worth_again(&why) && tries + 1 < MAX_TRIES {
             // Out of time: the transactions after it are made smaller.
-            remote.size_writes_from(took);
+            if !resend {
+                remote.size_writes_from(took, matches!(why, StoreError::Timeout { .. }));
+            }
             // Time spent on a write that failed, and the pause before it is
             // sent again, count against the process's retry time.
             let pause = backoff(tries);

@@ -2619,13 +2619,23 @@ manifest); and an attestation that filled the queue went in one transaction, ref
 it supersedes went in the next and deleted it. Only losses that latch nothing could do this (a refusal, or a
 transaction out of time with retry time left).
 
-A write's transactions go one right after the other. A transaction that took more than a third of the request
-timeout (sent, waited for the lock, committed, or out of time) makes the next ones half as large, down to
-`TX_MIN_BYTES` (128 KiB), and one that took less than a tenth twice as large again, up to `TX_BYTES`
-(`Remote::size_writes_from`, per handle, so the early writes of a batch carry it to the later ones): behind other
-writers on vex's Turso database transactions of about 1 MB took 23 to 31 s, at the edge of the 30 s timeout, and a
-smaller one holds the lock for less, so every writer waits less for it
-(`a_write_sizes_its_transactions_from_their_commit_times`). A draft of 2.8.2 paused between transactions (a quarter
+A write's transactions go one right after the other. A transaction first sent that ran out of time (whether it then
+turned out committed or not) makes the next ones half as large, down to `TX_MIN_BYTES` (256 KiB, two halvings, as many
+as the process's minute of retries lets come about before it latches), and one that took less than a tenth of the
+timeout beyond the handle's fastest transaction twice as large again, up to `TX_BYTES` (`Remote::size_writes_from`,
+per handle, so the early writes of a batch carry it to the later ones): behind other writers on vex's Turso database
+transactions of about 1 MB took 23 to 31 s, at the edge of the 30 s timeout. Time within the deadline does not shrink
+them, and a copy sent again sizes nothing (its guard may refuse it at once, which measures no commit). The third
+review's build halved them after any transaction that took more than a third of the timeout; the fourth review found
+that most of such time is a wait a smaller transaction pays again (the link, the server's answer, another writer's
+lock), so halving only made more transactions: behind a proxy holding each answer 1.1 s at a 3 s timeout, 600 units
+of about 25 kB, it stored 122 within the bound in 17 transactions against 503 in 16 at a constant size, and on Turso
+under vex's Rails jobs (zstd) one 2.8 MB early write went as 3 transactions in 20.5 s, the next as 5 in 41.1 s and the
+next as 11 of about 250 kB in 129.4 s, about 11.8 s each, before the bound lost the rest. Its copy refused by its
+guard then doubled the size back. (`a_write_sizes_its_transactions_from_their_commit_times`: each answer held 0.8 s
+at a 2 s timeout, the transactions keep 1 MiB, one out of time halves the next, fast ones grow back;
+`a_copy_sent_again_does_not_size_a_write`.) Sizing from time per byte would tell a slow commit from a long wait more
+finely, but needs transactions of several sizes to compare; it is not done. A draft of 2.8.2 paused between transactions (a quarter
 of the last one's time, 200 ms to 2 s, randomized) so that another job's small write waiting for the lock could take
 it; that cost a lone writer about 10% (the review: 390 units behind a proxy answering in 0.3 s at 4 MB/s, 11.1 to
 11.5 s with the pause and 10.1 to 10.2 s without, three interleaved runs each) and showed no effect on small writes
@@ -2650,19 +2660,33 @@ held transaction sent again and the batch stored whole; a server that stops taki
 transaction: that transaction's units stored, the rest lost within 9 s at a 2 s timeout, the handle latched). A
 server that cannot be reached latches at once, as before; so do a token that may not write and a server that takes
 no more writes (`Denied`), which lose every unit still queued with that error. **A process's time for writes in all
-is bounded too**: the time of every write (transactions that committed included) counts against
-`WRITE_TIME_DEADLINES` (6) request timeouts, 180 s at the default, for the handle (`Remote::writing_out_of_time`);
-once it is spent, before the next transaction, every unit still queued is lost at once (`libsql store: this
-process's writes (the server took them too slowly) timed out after 180s`) and so is every later write's, latching
-nothing (reads and hints go on), so that a server that takes writes slowly costs a job at most that and one
-transaction more. 2.8.2 as first reviewed bounded only the time of writes that failed: three of its processes
-writing 150 units each at once took 84.5 to 88.3 s each on vex's database (the review, 08:03 UTC), so a Rails job's
-800 units could take minutes; on the other hand three writing 800 units each spent 99 to 156 s each on a quiet
-database or one where vex's CI wrote ("Measured", below), so the bound is six timeouts, not four
-(`a_process_writes_for_a_bounded_time_in_all`: at a 1 s timeout, each answer held 250 ms, 2,560 units stop after
-about 6 s with the units stored kept, nothing latched, and a later batch lost at once). Units lost so run again in
-the next pipeline, which costs test time but never a wrong skip; the timeout (`[store] timeout`,
-`VCI_STORE_TIMEOUT_SECS`) sets the bound. An early write (a queue of 2,000
+is bounded too**: the time of every write (transactions that committed included, and the removal of unreferenced
+manifests after `vci run`'s units) counts against `WRITE_TIME_DEADLINES` (6) request timeouts, plus one more for each
+`WRITE_TIME_BYTES` (4 MiB) of values its transactions stored, for the handle (`Remote::writing_out_of_time`): 180 s
+at the default, and 7.5 s more for each MiB stored, so the bound cuts short a server that stores less than about
+140 kB/s over the process's writes, not a large write on one that keeps storing. Once it is spent, before the next
+transaction not yet sent, every unit still queued is lost at once (`libsql store: this process's writes (the server
+took them too slowly) timed out after …`) and so is every later write's (the removal of unreferenced manifests
+refused at once, which `vci run` warns about), latching nothing (reads and hints go on), so that a server that takes
+writes slowly costs a job at most that and one transaction more. A transaction out of time that is to be sent again
+still goes, as the transaction under way: it may have committed after its question (a read, which does not wait for
+the lock), and its copy, or the copy's refusal by the guard, says it is stored; the third review's build lost it
+unasked, reporting units the server held as not attested (the fourth review behind a proxy at a 2 s timeout:
+`lost 4: … timed out after 12s`, 4 of 4 on the server; `a_write_out_of_time_is_sent_again_past_the_time_bound`).
+2.8.2 as first reviewed bounded only the time of writes that failed: three of its processes writing 150 units each
+at once took 84.5 to 88.3 s each on vex's database (the review, 08:03 UTC), so a Rails job's 800 units could take
+minutes. The third review's build bounded writes at a flat six timeouts, which cut short Rails-sized writes on
+Turso in every raw round of the fourth review, quiet or not (0 to 200 of 800 units lost per process on a quiet
+database at 187 to 189 s of writes, 294 to 690 while vex's Rails jobs wrote; "Measured", below), and removing
+unreferenced manifests afterwards still waited the whole request timeout. (`a_process_writes_for_a_bounded_time_in_all`:
+at a 1 s timeout, each answer held 250 ms, 2,560 small units stop after about 6 s with the units stored kept, nothing
+latched, and a later batch lost at once; `a_process_that_keeps_storing_writes_past_six_timeouts`: 480 units of about
+25 kB, 12 MB, at a 2 s timeout with each answer held 800 ms, all stored in more than 12 s; `removing_manifests_keeps_to_the_time_for_writes`.)
+Units lost so run again in the next pipeline, which costs test time but never a wrong skip; the timeout (`[store]
+timeout`, `VCI_STORE_TIMEOUT_SECS`) sets the bound. A unit reported lost may still have been stored: a transaction out
+of time that is given up (its tries or the minute of retries spent, the breaker latched) can commit afterwards,
+which the question cannot see; the store is not trusted, so this costs a warning and a unit reported as not attested
+that the next plan finds, never a wrong verification. An early write (a queue of 2,000
 writes or 4 MiB, below) loses its units the same way, and `finish` reports them with the rest. The timing line says
 what went: `write batch: M manifest(s), A attestation(s), R removal(s), T transaction(s), N request(s), X MB[
 compressed], longest Ys[, L attestation(s) not stored]`.
@@ -2855,7 +2879,14 @@ vex's Rails checks, so this is the plan's first round, where its reads are. Six 
 | vci | plan, median (range) | prefetch | the candidates' read | read, as stored | requests of values |
 |---|---|---|---|---|---|
 | 2.8.1 | 13.2 s (12.1-16.4) | 7.1-9.4 s | 3.2-5.5 s | about 99 MB | 2 |
-| 2.8.2 | 7.3 s (6.5-10.1) | 4.2-8.1 s | 0.02-0.05 s | 63.5 MB | 8-9 |
+| 2.8.2 | 7.3 s (6.5-10.1) | 4.2-8.1 s | 0.02-0.05 s | 63.5 MB | 8-9 (9-11 later: below) |
+
+The fourth write review ran the same plans again, interleaved, at 09:18 to 09:21 UTC (one warm run of each first)
+with the third review's build (`c26638a`, whose reads are this section's): 9.22, 6.59, 11.55, 7.48 and 7.48 s,
+median 7.48 s, its prefetch of 1,654 values in 9 to 11 requests (64.2 MB) taking 4.5 to 9.3 s and the candidates'
+read 0.02 s; 2.8.1 18.31, 17.14, 15.36, 29.36 and 34.29 s, median 18.31 s, its prefetch in 4 requests 7.3 to 28.1 s
+and the read of 1,384 newest candidates 4.3 to 20.1 s. 2.8.2's plan held its numbers; 2.8.1's was slower under that
+hour's load.
 
 An interleaved set 17 minutes earlier, with a build of 2.8.2 that differed in when the statements were described
 ahead, the pool's spare connection and the requests' size target, gave 12.9 s (12.5-16.4) against 7.8 s (7.1-8.6).
@@ -2944,8 +2975,9 @@ and, against a draft without the pause between transactions (raw both):
 | 07:21-07:24 | 2,027-2,073 | 127.8, 128.4, 132.4 (2 out of time in each, sent again) | 14.5, 13.1, 21.0 | 0.8-46.9 s / 0.7-5.8 s |
 | 07:24-07:26 | 784-847 | 12.4, 16.1, 14.5 | 114.6, 115.0, 113.7 (1 out of time in each) | 0.7-3.5 s / 0.7-44.9 s |
 
-What these show: the time a write takes is the database's load, not the version's encoding or pause; compressed and
-raw trade places from round to round, so compression buys a smaller database, not faster writes. On a quiet database
+What these show: at 100 units a process, the time a write takes is the database's load, not the version's encoding or
+pause; compressed and raw trade places from round to round, so at that size compression buys a smaller database, not
+faster writes (at 800 units it does write faster: the Rails-sized rounds below). On a quiet database
 2.8.2 here wrote slower per process than 2.8.1 (10 to 24 s against 5 to 13 s), and in the review's rounds at 08:03
 to 08:13 UTC (three processes of 150 units, 4.8 to 7.2 MB) raw 2.8.2 (`7a973b5`) took 84.5 to 88.3 s and then 15.6
 to 30.9 s, 2.8.1 23.3 to 35.4 s (one process losing its 150 units): its gain is the units it no longer loses
@@ -2960,25 +2992,61 @@ flag): beside 2.8.2 the manifest 0.5 to 24.7 s and the flag dropped at its deadl
 draft 1.1 to 17.5 s and 1 of 3; beside 2.8.1 4.1 to 30.3 s. The pause between transactions showed no effect this load
 lets one see (it is gone since: above).
 
-*Rails-sized writes* (the third write review, 28 October 2026, 08:27 to 08:42 UTC). Three processes at once, 800 of
+*Rails-sized writes* (the third write review's build, `c26638a`, 28 October 2026, 08:27 to 08:42 UTC; the fourth
+review's rounds below correct what these led to). Three processes at once, 800 of
 vex's units each (28.2 to 30.6 MB as they are, the size of a vex Rails job's), uncompressed, each configuration into
 a fresh scratch namespace, in two rounds in opposite orders. vex's CI committed 1 to 2 attestations a minute until
 08:37 and 659 to 683 after. Seconds each process spent on writes, nothing lost unless said:
 
-| round (UTC) | vex's CI a minute | this 2.8.2 (no pause, sized from commit times, a short question, a bound in all) | 2.8.2 as reviewed (`7a973b5`) | 2.8.1 |
+| round (UTC) | vex's CI a minute | `c26638a` (no pause, sized from commit times, a short question, a flat bound in all) | `7a973b5` | 2.8.1 |
 |---|---|---|---|---|
 | 08:27-08:31 | 1-2 | 99.4, 104.0, 130.5 (longest transaction 5.9 to 13.5 s) | | 3 processes out of time at 30 s; 436 of 2,400 units stored (261, 175, 0) |
 | 08:33-08:42 | 2, then 659-683 | 143.5, 143.7, 155.6 (longest 7.9 to 10.0 s) | 200.4, 217.2 (longest 20.2 and 21.6 s), and 310.5: two transactions out of time at 30.7 s, the minute of retries spent, latched, 449 of 800 stored | |
 
-Small writes beside them: a manifest put 20 s into the writes took 1.7 and 2.4 s beside this 2.8.2, 2.9 s beside
+Small writes beside them: a manifest put 20 s into the writes took 1.7 and 2.4 s beside `c26638a`, 2.9 s beside
 `7a973b5` and 11.3 s beside 2.8.1; the flag after it 2.0 and 1.1 s, 5.3 s (dropped at its deadline) and 13.7 s
 (2.8.1 had no hint deadline); one-row writes every half second a median of 0.9 and 2.0 s (at most 12.4 and 7.8 s)
-beside this 2.8.2, 0.7 s (at most 33.7 s, one failed) beside `7a973b5`, and 10.0 s (at most 14.7 s) beside 2.8.1.
-One round of each order cannot separate the build from the load (`7a973b5` ran while vex's CI was quiet and this
-2.8.2 while it wrote), but this 2.8.2's transactions stayed under a third of the timeout and none ran out of time,
-where `7a973b5`'s reached 30.7 s and lost 351 units. A Rails job's 800 units take two to three minutes of writes
-from a laptop when three jobs write at once, against 2.8.1's median "check, sign and store" of 53 s on vex's
-runners, which gave up on 39% of its units; vex's runners were not measured with 2.8.2.
+beside `c26638a`, 0.7 s (at most 33.7 s, one failed) beside `7a973b5`, and 10.0 s (at most 14.7 s) beside 2.8.1.
+One round of each order cannot separate the build from the load (`7a973b5` ran while vex's CI was quiet and
+`c26638a` while it wrote). These two rounds were the lucky end of what the same build does: the fourth review's
+rounds, next, are not.
+
+*Rails-sized writes, again* (the fourth write review, 28 October 2026, 08:52 to 09:28 UTC). The same tooling, units
+and sizes (28.2 to 30.6 MB a process as they are, about 32% fewer bytes sent compressed), `c26638a` built in release,
+each run into a fresh scratch namespace, a one-row write every 0.5 s and a manifest put and flag 20 s in beside them.
+vex's CI's rate is its production change log's attestations a minute, which understates its load: a 2.8.1
+transaction that fails never reaches the log, so a round that logged 2 a minute (r5 raw) was among the most
+contended. Seconds of writes per process; units lost of 800; longest transaction:
+
+| round (UTC) | vex's CI a minute | raw | zstd | one-row writes, median / most (raw; zstd) |
+|---|---|---|---|---|
+| r1, 08:52-08:57 | 2-14, no Rails job writing | 187.1, 189.4, 188.0; lost 0, 20, 200 to the bound; one transaction out of time (30.7 s) in each; 29-37 transactions | 58.5, 72.9, 63.9; lost 0; longest 6.4-7.5 s; 21-23 transactions | 1.1 / 30.3 s; 0.77 / 3.3 s |
+| r2, 08:58-09:04 | 9-14, Rails jobs running | transactions out of time at 30.7 s, the minute of retries spent, latched: 600 of 2,400 stored | the first transaction in each fresh namespace (creating its tables) took 60.2 s and latched: nothing stored; a manifest put 82 s | 5.2 / 38 s; not recorded |
+| r3, 09:04-09:12 | 9-31 (zstd), 438-928 (raw) | 205.1, 205.0, 204.8; lost 294, 410, 378 to the bound; longest 30.7 s | 190.9, 190.7, 191.4; lost 412, 401, 472 to the bound; longest 27 s | 1.6 / 46.5 s; 6.0 / 35.4 s |
+| r4, 09:12-09:17 | 928-1,607 | every first transaction 60.2 s, latched: 0 of 2,400 stored | 143, 143 and 83 s, then latched: 441 of 2,400 stored | every one failed; 8.2 / 48 s |
+| r5, 09:21-09:28 | 4-621 (zstd), 2 (raw) | 187.6, 187.5, 187.7; lost 678, 660, 690 to the bound | 155.2, 180.4, 161.2; lost 0; longest 30.7 s (one out of time in each) | 12.2 / 50.1 s; 1.08 / 45.3 s |
+
+Raw was lossless in no round, and a flat bound of six timeouts cut it short in every round the server took writes
+at all, a quiet one included; zstd was lossless in r1 and r5 (r5's slowest process at the bound's edge). Once the
+bound was spent every later early write was lost at once (`0 transaction(s) … 130 attestation(s) not stored:
+0.00s`). The manifest put 20 s in took 1.0 s (r1 zstd), 2.3 s (r1 raw), 11.2 and 13.2 s (r3) and 1.1 and 16.0 s (r5,
+the flag 5.3 s beside raw). So at Rails size compression writes faster too: in r1 zstd took 58 to 73 s against raw's
+187 to 189 s, about 2.5 to 3 times sooner, where at 100 units the two traded places; and one-row writes beside
+three Rails-sized writers wait up to 30 to 50 s, not the 12.4 s of the third review's rounds. A transaction of 1 MB
+took 15 to 26 s in raw runs without running out of time, not the 1.8 to 3.7 s measured alone. The 60.2 s first
+transactions of r2 and r4 are the minute of retries spent on a namespace's first write under that load (section 21,
+item 19). This is what changed the bound to grow with what a process stores (above).
+
+With those fixes (the bound growing with what is stored, transactions halved only after one runs out of time, a
+copy sent again sizing nothing), one more uncompressed round on 28 October at 09:39 to 09:42 UTC, the same three
+processes of 800 units into a fresh scratch namespace, vex's CI logging 14 attestations a minute and then none:
+151.5, 147.7 and 142.2 s of writes per process, nothing lost, no transaction out of time (34, 37 and 33
+transactions; longest 9.6, 9.3 and 13.2 s); one-row writes beside them a median of 0.96 s and at most 9.9 s (5 of 70
+over 5 s), the manifest put 3.2 s and the flag 1.9 s; on the server 2,400 attestations, 1,176 manifests and none
+applied twice. Every process stayed under 180 s, so the round shows this build sound at Rails size on a quiet
+database, not the larger bound at work; it was not repeated compressed or under load, to keep within the free
+plan's rows written.
+
 
 *Reads behind a 3 s wait* (the write review's fourth finding). On the local copy behind a proxy holding each answer
 3 s, three interleaved runs each (07:06 to 07:11 UTC): 2.8.2's plan took 24.5, 24.5 and 25.5 s, its prefetch 9.1 to
@@ -3377,8 +3445,11 @@ Still open:
     still sending its first 8 MB, it took 0.2 s; a one-row write every 1.2 s waited at most 16.9 s beside 2.8.2 and
     up to 56 s beside 2.8.1. A draft paused between a write's transactions; in interleaved rounds that morning a
     manifest put beside three such writers still took up to 24.7 s and one-row writes up to 46.9 s, as beside a
-    draft without the pause, while vex's CI's 8 MB requests set the pace, so the pause is gone. 2.8.2 now makes its
-    transactions smaller when they commit slowly; beside three Rails-sized 2.8.2 writers one-row writes took a
-    median of 0.9 to 2.0 s and at most 12.4 s. How small writes fare once
-    every job of a database runs 2.8.2, and whether hints and single manifest puts need a path of their own (or
-    smaller transactions), is not known.
+    draft without the pause, while vex's CI's 8 MB requests set the pace, so the pause is gone. Beside three
+    Rails-sized 2.8.2 writers one-row writes took a median of 0.8 to 12.2 s and at most 30 to 50 s in the fourth
+    write review's rounds (the third's two rounds had shown at most 12.4 s), and a manifest put up to 16 s; under
+    vex's Rails jobs a fresh namespace's first write (which creates its tables) spent the minute of retries at
+    60.2 s and latched, in two rounds of five. Making transactions smaller under contention did not help (it made
+    more of them, each waiting again: section 18, "Writes"). How small writes fare once every job of a database
+    runs 2.8.2, and whether hints, single manifest puts and a namespace's first write need a path of their own, is
+    not known.
