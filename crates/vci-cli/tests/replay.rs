@@ -3,6 +3,12 @@
 //! them) go through the format-3 pipeline exactly as `vci run` will build it
 //! and the plan will read it, and every signed fact comes back.
 //!
+//! The test lives in vci-cli, which depends on vci-core and vci-attest,
+//! rather than in vci-core: a dev-dependency of vci-core on vci-attest would
+//! put vci-attest's sources among the inputs the cargo adapter sees for
+//! `vci attest crates/vci-core#lib`, and `e2e_cargo.rs` checks that unit is
+//! not tainted.
+//!
 //! For every unit: the envelope and the compact manifest are parsed; units
 //! are grouped into runs by (commit, issuedAt, projectName, adapter), the
 //! design's run (one `vci run` of one project; `design/final/measure.py`
