@@ -4,8 +4,9 @@
 //! push` and `vci ci` on SQLite (`VCI_STORE=sqlite`), PostgreSQL
 //! (`VCI_STORE_URL`) and libSQL (`VCI_STORE=libsql`: its local file, a
 //! server, and a replica of one), the publication gate of a shared store,
-//! failing open when a store cannot be used, and git-meta when nothing is
-//! configured.
+//! failing open when a store cannot be used, git-meta when nothing is
+//! configured, and a vci 2.8 binary (`VCI_TEST_VCI_2_8`) on a SQLite file
+//! this vci wrote.
 //!
 //! A copy of `fixtures/go-abcd` in a throwaway git repository. Needs `go`,
 //! `git` and `ssh-keygen` on PATH; every test prints `SKIPPED:` and returns
