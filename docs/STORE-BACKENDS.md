@@ -695,11 +695,15 @@ been measured on one yet.
   When SQLite ends the transaction itself (an I/O error, a full disk) or the connection is lost, the batch is broken:
   later writes and `finish` fail.
 - **PostgreSQL**:
-  - `put`, `put_manifest` and `remove` are queued so that `finish` reaches the state the same calls made one by one
-    would: per slot the last put (it replaces every stored key of its slot), whether a later removal took that put's
-    own key away (the slot then ends empty), and the keys removed otherwise; per root the last manifest.
-  - `finish` flushes them in **one transaction**: manifests (one UNNEST upsert), the removed keys (one `DELETE … =
-    ANY`), the emptied slots (one `DELETE`, only when there are some), then attestations (one UNNEST upsert).
+  - `put`, `put_manifest`, `remove` and (2.9) `put_objects` and `remove_objects` are queued so that `finish` reaches
+    the state the same calls made one by one would: per id each object; per slot the last put (it replaces every
+    stored key of its slot), whether a later removal took that put's own key away (the slot then ends empty), and
+    the keys removed otherwise; per root the last manifest; the object ids to remove under the orphan rule.
+  - `finish` flushes them in **one transaction**, in the format-3 order below: objects (one UNNEST upsert),
+    manifests (one UNNEST upsert), attestations (one UNNEST upsert), the removed keys (one `DELETE … = ANY`, a `gone`
+    row each), the emptied slots (one `DELETE`, only when there are some, `gone` rows too), the queued object removals
+    (one `DELETE` under the orphan rule, `gone` rows), then one statement that numbers every row written from the
+    namespace's `seq` counter (section 17, "Objects, columns, `seq` and `gone`").
   - A large batch flushes early at 2,000 attestations and removals or 32 MiB (manifests count only toward the bytes),
     so 1,000 units with their manifests stay one transaction. Each flush is its own transaction, and a failed flush
     fails `finish`.
@@ -1476,6 +1480,7 @@ The table below is what each scenario checks. Three of the worlds (libSQL's are 
 | `inject_raw` | a `git_meta_lib::Session` | a raw INSERT | a raw INSERT |
 | `make_unreadable` | the row points at a blob the object database does not hold | `encoding = 99` | `encoding = 99` |
 | `failing_batches` | none (no way to make the transaction fail from outside) | none (no way to make the transaction fail from outside) | a role without INSERT on attestations (INSERT on manifests) |
+| `age_objects` (2.9) | `last_timestamp` of the object rows in `.git/git-meta.sqlite` moved back | `UPDATE objects SET put_at = put_at - ?` on the file | `UPDATE objects SET put_at = put_at - make_interval(secs => ?)` in the schema |
 
 What the scenarios can and cannot check through the trait:
 
@@ -2119,17 +2124,30 @@ stores.
 by default), `PgStore` (`open(&Selection, &OpenContext)`, which does no I/O; `Clone`, sharing one handle;
 `statements()`, every statement sent including `BEGIN` and `COMMIT`; `schema()`; `namespace()`; doc-hidden
 `__sleep_for_test` and `__connection_for_test` for its tests), `PgError` (the payload of `StoreError::Backend` for
-unexpected errors, with `message()` and `code()`), and the testkit (section 14). The modules are `conn` (URL, TLS,
-session settings, pool, circuit breaker, error classification and scrubbing), `schema`, `cache`, `read`, `write` and
-`batch`. Its tests are `tests/pg.rs` (an unreachable server failing fast with no secret shown; a server that never
-answers given up on in time; no piece of a password holding `@`, `/` or `?` in `location()`, `Debug` or an error;
-URL handling; a first host that never answers not blocking a working second one; round trips and slot replacement; bytewise order, through an ICU linguistic collation when libc's is
+unexpected errors, with `message()` and `code()`), (2.9) `Finish` (what `PgStore::upgrade_finish` found) and the
+testkit (section 14). The modules are `conn` (URL, TLS, session settings, pool, circuit breaker, error
+classification and scrubbing), `schema`, `cache`, `read`, `write`, `batch` and (2.9) `objects` (the objects, the
+listing columns, the `seq` counter and the `gone` rows). Its tests are `tests/pg.rs` (an unreachable server failing
+fast with no secret shown; a server that never answers given up on in time; no piece of a password holding `@`, `/`
+or `?` in `location()`, `Debug` or an error; URL handling; a first host that never answers not blocking a working
+second one; round trips and slot replacement; bytewise order, through an ICU linguistic collation when libc's is
 bytewise; concurrent first writers creating the schema once; absent, not initialized and incompatible schemas; a
 statement timeout latching the breaker; the plan's statement budget; reads after a prefetch seeing the handle's
 writes; deferred batches; `remove_manifests` keeping referenced, base and recent roots; `orphan_manifests` with an
-unknown reference; namespace isolation; a read-only role; `application_name`), unit tests in the modules and the
-conformance suite. Two mutation checks showed the tests
-catch real faults: dropping `COLLATE "C"` fails test 4, and not caching prefetched values fails test 8.
+unknown reference; namespace isolation; a read-only role; `application_name`; and (2.9) the format-3 side the
+conformance suite cannot see: a schema vci 2.8 made reading as a store without columns or objects until a write of
+this vci adds the additions in a request of its own, a role that cannot alter it told so, and a handle that saw
+the old schema using the additions once there; `seq` handed out in commit order with each batch one block, its
+objects then its attestations then its `gone` rows, two concurrent batches never interleaving, and later writes and
+removals numbering after; a batch writing its objects first and applying its queued object removals last, in the
+same transaction as the record removal that orphans them, `prune_state_objects` applied at once; `upgrade_finish`
+refused with the count of rows that are not format-3 records in any namespace, then dropping `manifests` and
+setting version 2, which the handle and a fresh one read and after which a manifest cannot be stored; an objects
+answer past `MAX_OBJECTS_ANSWER` refused on its first row; `columns` and each object read and put costing one
+statement, objects per namespace; and the columns following the last put in and outside a batch, a value no
+column can hold reading as none), unit tests in the modules and the conformance suite, every objects scenario
+included (42 passed). Two mutation checks showed the tests catch real faults: dropping `COLLATE "C"` fails test 4,
+and not caching prefetched values fails test 8.
 
 **Crate.** `vci-store-postgres` depends on `vci-store`, `vci-core`, `serde_json`, and these exact pins (each published
 at least two weeks before 25 October 2026; one `rustls` and one `tokio-postgres` resolve, and `cargo tree -i
@@ -2150,9 +2168,12 @@ absolute sizes may differ there.)
 
 **What the command line relies on**:
 
-- `caps()` is `LOCAL.with_shared_writes(true).with_hints(true)`, so `vci ci` without `--push` signs only (section 7),
-  and `exchange()` is `None` (`vci fetch`: `vci: the postgres store at <location> is shared: nothing to fetch (N
-  attestations stored)`).
+- `caps()` is `LOCAL.with_shared_writes(true).with_hints(true)` and (2.9) `.with_objects(true).with_columns(true)`,
+  so `vci ci` without `--push` signs only (section 7), `exchange()` is `None` (`vci fetch`: `vci: the postgres store
+  at <location> is shared: nothing to fetch (N attestations stored)`), and the store keeps a run's objects and a
+  record's listing columns.
+- (2.9) `vci store upgrade --begin` is `PgStore::upgrade_begin` and `--finish` is `PgStore::upgrade_finish ->
+  Finish` (below, "Objects, columns, `seq` and `gone`"); they are methods of `PgStore`, not of the trait.
 - `open` does no I/O: a bad setting is `Config` at once, and an unreachable server fails at the first call, bounded
   by the connect timeout, as `Unavailable` or `Timeout`. A read-only role's write is `Denied`, a missing schema on
   write `NotInitialized`, a newer schema `Incompatible`. None of these may be `Backend`, or `vci run` exits 2
@@ -2294,11 +2315,67 @@ CREATE TABLE vci.flags (ns text NOT NULL, name text NOT NULL, at timestamptz NOT
 There are deliberately **no foreign keys**. They would be stricter than git-meta (an attestation whose manifest is
 missing would be refused) and would add a retry path. Ordering, grace and NOT EXISTS checks give the same safety.
 
+**The format-3 additions (2.9, STORE-V2 section 2.1)**, in the same DDL text after the tables above, every statement
+`IF NOT EXISTS`, so that a new schema has them from its first write and a schema vci 2.8 made gets them from this
+vci's first write on it:
+
+```sql
+ALTER TABLE vci.attestations
+  ADD COLUMN IF NOT EXISTS format smallint,          -- NULL or 1: an envelope JSON; 3: a frame
+  ADD COLUMN IF NOT EXISTS commit_id text, ADD COLUMN IF NOT EXISTS platform text,
+  ADD COLUMN IF NOT EXISTS state text, ADD COLUMN IF NOT EXISTS duration_ms bigint,
+  ADD COLUMN IF NOT EXISTS expires bigint,
+  ADD COLUMN IF NOT EXISTS hdr text COLLATE "C", ADD COLUMN IF NOT EXISTS tables_id text COLLATE "C",
+  ADD COLUMN IF NOT EXISTS shape text COLLATE "C", ADD COLUMN IF NOT EXISTS state_obj text COLLATE "C",
+  ADD COLUMN IF NOT EXISTS seq bigint;                -- the namespace's write counter, commit order
+CREATE INDEX attestations_hdr    ON vci.attestations (ns, hdr)       WHERE hdr       IS NOT NULL;
+CREATE INDEX attestations_tables ON vci.attestations (ns, tables_id) WHERE tables_id IS NOT NULL;
+CREATE INDEX attestations_shape  ON vci.attestations (ns, shape)     WHERE shape     IS NOT NULL;
+CREATE INDEX attestations_state  ON vci.attestations (ns, state_obj) WHERE state_obj IS NOT NULL;
+CREATE INDEX attestations_seq    ON vci.attestations (ns, seq);
+CREATE TABLE vci.namespaces (ns text PRIMARY KEY, seq bigint NOT NULL DEFAULT 0);   -- the counter row
+CREATE TABLE vci.gone (ns text NOT NULL, seq bigint, key text COLLATE "C", object text COLLATE "C",
+                       at timestamptz NOT NULL DEFAULT now());                        -- a deletion, for replicas
+CREATE INDEX gone_seq ON vci.gone (ns, seq);
+CREATE TABLE vci.objects (ns text NOT NULL, id text COLLATE "C" NOT NULL, kind smallint NOT NULL,
+                          put_at timestamptz NOT NULL DEFAULT now(), seq bigint, bytes bytea NOT NULL,
+                          PRIMARY KEY (ns, id));
+CREATE INDEX objects_seq      ON vci.objects (ns, seq);
+CREATE INDEX objects_kind_put ON vci.objects (ns, kind, put_at);                       -- the state TTL
+```
+
+Objects are per namespace (`vci prune` and the orphan rule are per namespace, as every row is), so one object two
+repositories share is stored twice. `gone` has no primary key: a deferred batch inserts its rows with `seq` NULL and
+numbers them before `COMMIT` (below). The counter lives in `namespaces` (the design's `vci_schema` row per
+namespace); `schema_version` stays one row for the schema, and whether the additions are there is read with the
+version in one statement, `SELECT version, to_regclass('"<s>".objects') IS NOT NULL FROM "<s>".schema_version`
+(the DDL is one transaction, so the `objects` table stands for all of it). A handle remembers both; one that found
+the additions missing asks again at its next check, since any writer may add them.
+
 **Migrations.**
 
 - The first write creates or upgrades the schema in one transaction, under `SELECT
   pg_advisory_xact_lock(hashtext('vci-store:' || <schema>))`. Concurrent `CREATE … IF NOT EXISTS` otherwise races on
   `pg_type`.
+- (2.9) A schema that lacks the format-3 additions gets them from the first write of this vci (`put`, `remove`, the
+  object writes, a batch's `finish`; not `put_manifest` or `remove_manifests`, which touch nothing new) **in a
+  request of its own before the write**, the same DDL transaction under the same lock, so a batch's transaction never
+  carries DDL (STORE-V2 section 2.1: a 2-4 MB batch already uses a third of its deadline). `PgStore::upgrade_begin`
+  (`vci store upgrade --begin`) runs it ahead of a rollout. Until then the schema reads as a store without columns or
+  objects: `columns` answers none (one statement, the check), `get_objects` and `orphan_objects` answer empty (the
+  table is missing: 42P01 reads as absent). A role that may write the rows but not alter the tables gets
+  `NotInitialized{advice: "schema <s> lacks the format-3 tables (vci 2.9): the first vci run with a role allowed to
+  alter it adds them"}` from every such write, removals included (a removal needs the `gone` table), so nothing is
+  half done. A `GRANT … ON ALL TABLES IN SCHEMA` given before the upgrade does not cover the new tables: the role
+  recipe is run again after it (below, "Roles").
+- (2.9) The version stays **1** while a format-1 row can exist, so a 2.8 vci keeps reading the rows it parses and
+  writing rows with NULL in the new columns. `PgStore::upgrade_finish` (`vci store upgrade --finish`) ends the
+  window: under the advisory lock it counts the rows of the schema, **in every namespace**, whose `format` is not 3,
+  and with any returns `Finish::FormatOneRows(n)` and changes nothing; with none it drops `manifests` and sets
+  `schema_version.version = 2` (`vci_version`, `migrated_at` and `migrated_by` updated), which this vci reads
+  (`SUPPORTED` is 2; a new schema is created at 1) and a 2.8 vci refuses as newer than it. Idempotent. After it a
+  manifest read answers none, `remove_manifests` 0, and `put_manifest` `NotInitialized` (a batch holding one fails
+  the same way): not undone.
 - **Reads never run DDL.** A missing relation (SQLSTATE 42P01 or 3F000) reads as an empty store, `Absent{advice:
   "the first vci run with a role allowed to create schema <s> creates it"}`, so a SELECT-only role works.
 - A `schema_version.version` above the supported one gives `Incompatible`, and the plan fails open.
@@ -2328,6 +2405,8 @@ Each read is served from the cache when it can be, and otherwise:
 | `read_values` | `SELECT key, value, encoding FROM … WHERE ns=$1 AND key = ANY($2)`, in chunks of 5,000 keys; a key not returned gets `GONE` |
 | `manifest` | a single-row query |
 | `manifests` | `root = ANY($2)` |
+| `columns` (2.9) | `SELECT key, format, commit_id, platform, state, duration_ms, expires, hdr, tables_id, shape, state_obj FROM … WHERE ns=$1 AND key = ANY($2)`, in chunks of 5,000 keys, never cached; none for a key not returned, a NULL column, or a value no column can hold (a negative `format` or `duration_ms`) |
+| `get_objects` (2.9) | `SELECT id, kind, bytes, sum(octet_length(bytes)) OVER () FROM vci.objects WHERE ns=$1 AND id = ANY($2)`, distinct ids in chunks of 5,000, the answer put back in the order asked; the window sum rides on every row, so an answer past `MAX_OBJECTS_ANSWER` is refused on its first row with the rest read off the connection and dropped; a `kind` no kind has is a foreign row, left out; never cached (`Prefetch::Objects` does nothing) |
 
 The rest go to the server directly:
 
@@ -2345,6 +2424,10 @@ The rest go to the server directly:
 - `orphan_manifests`: one statement, answering empty if `EXISTS (… ref_state = 0)`, otherwise `SELECT r FROM
   unnest($2::text[]) r WHERE NOT EXISTS (SELECT 1 FROM vci.attestations a WHERE a.ns=$1 AND a.manifest_ref=r) ORDER
   BY r COLLATE "C"`.
+- `orphan_objects` (2.9): one statement, the orphan rule over the table, `SELECT o.id FROM vci.objects o WHERE o.ns=$1
+  AND o.put_at < now() - make_interval(secs => <OBJECT_GRACE>) AND NOT EXISTS (SELECT 1 FROM vci.attestations x WHERE
+  x.ns=$1 AND (x.hdr = o.id OR x.tables_id = o.id OR x.shape = o.id OR x.state_obj = o.id)) ORDER BY o.id` (the four
+  partial indexes, one BitmapOr); no value is read.
 
 **`prefetch(Units{ids, choose})`** takes three round trips:
 
@@ -2400,15 +2483,21 @@ manifests, often megabytes, dominate. Not measured on vex.
 **`put`** is one statement. The slot replacement is atomic, and concurrent writers of one slot leave one row:
 
 ```sql
-WITH up AS (
+WITH s AS (INSERT INTO vci.namespaces AS n (ns, seq) SELECT $1, 1
+           ON CONFLICT (ns) DO UPDATE SET seq = n.seq + EXCLUDED.seq RETURNING seq),       -- (2.9) one number
+up AS (
   INSERT INTO vci.attestations AS a
-    (ns, key, test_key, signer, storage_key, target, issued, tree16, manifest_ref, ref_state, value)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    (ns, key, test_key, signer, storage_key, target, issued, tree16, manifest_ref, ref_state, value,
+     format, commit_id, platform, state, duration_ms, expires, hdr, tables_id, shape, state_obj, seq)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+          $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, (SELECT seq FROM s))
   ON CONFLICT (ns, test_key, signer, storage_key) DO UPDATE SET
     key = EXCLUDED.key, target = EXCLUDED.target, issued = EXCLUDED.issued, tree16 = EXCLUDED.tree16,
     manifest_ref = EXCLUDED.manifest_ref, ref_state = EXCLUDED.ref_state, encoding = 0, value = EXCLUDED.value,
+    format = EXCLUDED.format, …, state_obj = EXCLUDED.state_obj, seq = EXCLUDED.seq,
     stored_at = now(), stored_by = session_user
   WHERE (a.key, a.value, a.encoding) IS DISTINCT FROM (EXCLUDED.key, EXCLUDED.value, EXCLUDED.encoding)
+     OR (a.format, …, a.state_obj) IS DISTINCT FROM (EXCLUDED.format, …, EXCLUDED.state_obj)
   RETURNING a.key)
 SELECT key FROM up
 UNION ALL
@@ -2417,10 +2506,13 @@ WHERE ns = $1 AND test_key = $3 AND signer = $4 AND storage_key = $5 AND NOT EXI
 ```
 
 A conflict on `(ns, key)` implies the same slot. The unhinted variant keeps `key`, `issued` and `tree16` and compares
-`(value, encoding)` only. Both read the kept key back in the same statement, so a put is one round trip (a second
-only in a concurrent race); comparing `encoding` lets identical bytes repair a row this vci cannot read. Concurrent
-first inserts of one key can collide on the primary key `(ns, key)`, which is not the arbiter, so a unique
-violation is retried (up to three times).
+`(value, encoding)` and the columns only. Both read the kept key back in the same statement, so a put is one round
+trip (a second only in a concurrent race); comparing `encoding` lets identical bytes repair a row this vci cannot
+read. (2.9) The ten listing columns (`$12` to `$21`) are the `Columns` given, every one NULL without, and the row
+comparison (`IS DISTINCT FROM` treats two NULLs as equal) makes the same bytes put with other columns, or without
+them, replace them while the bytes stay a no-op; a put takes one `seq` number whether or not it changes the row
+(gaps are nothing to a replica). Concurrent first inserts of one key can collide on the primary key `(ns, key)`,
+which is not the arbiter, so a unique violation is retried (up to three times).
 
 **`put_manifest`** always refreshes `put_at` and reports a change. The CTE reads the snapshot before the upsert:
 
@@ -2433,8 +2525,11 @@ ON CONFLICT (ns, root) DO UPDATE SET
 RETURNING COALESCE((SELECT value FROM old) IS DISTINCT FROM $4 OR (SELECT encoding FROM old) <> 0, true) AS changed;
 ```
 
-**`remove`**: `DELETE FROM vci.attestations WHERE ns=$1 AND key = ANY($2) RETURNING key`. It is immediate and
-global, with no records.
+**`remove`**: `WITH d AS (DELETE FROM vci.attestations WHERE ns=$1 AND key = ANY($2) RETURNING key), s AS (<n
+numbers, n = count(*) FROM d, none when nothing went>), g AS (INSERT INTO vci.gone (ns, seq, key) SELECT $1, <the
+i-th number>, key FROM d) SELECT key FROM d`: immediate and global, a `gone` row per key that existed (2.9). On a
+schema that lacks the `gone` table the removal first adds the format-3 tables (a request of its own); on a missing
+schema it removes nothing and creates nothing.
 
 **`remove_manifests`** validates every root first, then:
 
@@ -2455,15 +2550,31 @@ the grace, and not counted.
 
 **`batch`** is write-behind (`WriteBatch::deferred`), with `finish` flushing as section 6 describes:
 
-- `INSERT … SELECT * FROM unnest($roots, $bases, $values) ON CONFLICT DO UPDATE …`;
-- then `DELETE … = ANY` of the removed keys, and a `DELETE … USING unnest(...)` of the slots a removal emptied (a put
-  whose own key was removed afterwards in the same batch);
+- (2.9) the objects first: `INSERT INTO vci.objects (ns, id, kind, bytes) SELECT … FROM unnest($ids, $kinds, $bytes)
+  ON CONFLICT (ns, id) DO UPDATE SET put_at = now()`, `seq` left NULL (an object stored already keeps its number);
+- `INSERT … SELECT * FROM unnest($roots, $bases, $values) ON CONFLICT DO UPDATE …` for the manifests;
 - then the attestation upsert from unnest arrays, one row per slot, because `ON CONFLICT` cannot touch one row twice
-  in one statement. Removals go first: a put queued after a removal in its slot replaces the slot anyway.
+  in one statement, with the ten column arrays (`$12` to `$21`) and `seq` NULL on every row it inserts or changes;
+- then `DELETE … = ANY` of the removed keys and a `DELETE … USING unnest(...)` of the slots a removal emptied (a put
+  whose own key was removed afterwards in the same batch), each a CTE whose deleted keys become `gone` rows (`seq`
+  NULL). Removals after the upsert, as section 6 orders them: a put queued in a removed key's slot replaced the slot
+  whatever its key, and an emptied slot has no put, so the end state is the same either way;
+- then the queued `remove_objects`, under the orphan rule as outside a batch (so the objects of a record this batch
+  removes go with it, in the same transaction), `gone` rows for what went;
+- then **the stamp**, one statement right before `COMMIT`: it counts the objects and the `gone` rows of the namespace
+  whose `seq` is NULL (only this transaction's are visible so), takes that many numbers plus one per attestation put
+  from the counter, and sets `seq` on the objects (by id), the attestations (by key, so a row the upsert left as it
+  was is numbered again) and the `gone` rows (by `ctid`), in that order. The counter's row lock is therefore held
+  from the stamp to the commit, not for the whole flush.
 
-Measured: a 1,000-unit batch takes 5 statements (gate 6), the schema version check, `BEGIN` and `COMMIT` included,
-instead of about 3,000 round trips. Inside a deferred batch:
+Measured: a 1,000-unit batch takes 6 statements (gate 6), the schema check, `BEGIN`, the stamp and `COMMIT` included,
+instead of about 3,000 round trips; a batch of objects, records, removals and object removals 7 plus `BEGIN` and
+`COMMIT` (gate 8 with an unhinted put's slot read). Inside a deferred batch:
 
+- `put_objects` queues (validated first) and counts the objects the batch did not hold yet; `remove_objects` queues
+  the ids (validated first, those the batch itself puts left out: they are within their grace) and counts nothing,
+  since what goes is known only at `finish`; `get_objects` and `orphan_objects` read the server, where neither is
+  visible yet; `prune_state_objects` is applied at once;
 - `put_manifest` returns `true` unless the batch already holds the same bytes;
 - `remove` returns every entry asked for, deduplicated by key;
 - an unhinted put looks up the slot's key: queued first; the plain key when the batch empties the slot or removes the
@@ -2472,9 +2583,45 @@ instead of about 3,000 round trips. Inside a deferred batch:
   manifests and their bases), whatever the grace, because the server cannot see them yet;
 - dropping the batch without `finish` also flushes it.
 
+### Objects, columns, `seq` and `gone` (2.9)
+
+The `objects` module. Every method validates its arguments first, as section 4 says, and writes nothing on failure.
+
+- **`put_objects`** (outside a batch): one statement, `WITH s AS (<n numbers, n = cardinality($ids)>), up AS (INSERT
+  INTO vci.objects AS o (ns, id, kind, seq, bytes) SELECT $1, u.id, u.kind, <the i-th number>, u.bytes FROM
+  unnest($ids, $kinds, $bytes) WITH ORDINALITY AS u(id, kind, bytes, i) ON CONFLICT (ns, id) DO UPDATE SET put_at =
+  now() RETURNING (xmax = 0) AS inserted) SELECT count(*) FILTER (WHERE inserted) FROM up`: idempotent by id, the
+  grace restarted on a re-put, the count of the rows inserted (`xmax = 0` on a returned row of an upsert means
+  inserted, not updated); an id repeated in one call is put once. The bytes go as `bytea` parameters, binary.
+- **`remove_objects`** (outside a batch): one statement, `WITH d AS (DELETE FROM vci.objects AS o WHERE o.id =
+  ANY($ids) AND o.ns=$1 AND o.put_at < now() - make_interval(secs => <OBJECT_GRACE>) AND NOT EXISTS (<a referrer in
+  hdr, tables_id, shape or state_obj>) RETURNING o.id), s AS (<count(*) FROM d numbers>), g AS (INSERT INTO vci.gone
+  (ns, seq, object) …) SELECT count(*) FROM d`. The grace is always `OBJECT_GRACE` (one hour; the manifest grace of
+  the selection and `long_running`'s zero do not apply, as the trait fixes it).
+- **`prune_state_objects(older_than)`**: the same shape over `kind = 4 AND put_at < now() - make_interval(secs =>
+  $2)`, whatever references them, on the `(ns, kind, put_at)` index; a `gone` row each.
+- **`orphan_objects`**, **`get_objects`** and **`columns`**: above, "Reads and the per-handle cache".
+- **The `seq` counter.** `namespaces.seq` per namespace, the design's `vci_schema` counter. A statement that needs
+  numbers takes them with `INSERT INTO vci.namespaces AS n (ns, seq) SELECT $1, <n> ON CONFLICT (ns) DO UPDATE SET
+  seq = n.seq + EXCLUDED.seq RETURNING seq` as a CTE (the last number taken; the i-th is `seq - n + i`), and the
+  counter row's lock is held to the end of the transaction, so the next transaction of the namespace gets its block
+  only once this one has committed or rolled back: **`seq` is in commit order**, each transaction one block of its
+  own, and the writers of a namespace queue behind each other for the length of that lock (an ordering cost, not a
+  safety one; STORE-V2 section 2.1). Outside a batch that is one autocommit statement. In a deferred batch it is
+  the stamp before `COMMIT`, so a flush of several seconds holds the lock only for the stamp and the commit; a writer
+  that waits longer than `lock_timeout` (10 s) for it fails as `Timeout{operation: "a lock"}`, latched, like any
+  lock wait that runs out. A put that changes nothing, an object stored already and a removal of nothing take
+  numbers nobody uses; gaps are nothing to a replica. Rows a 2.8 vci wrote keep `seq` NULL for good, and an object
+  put inside a batch and found already stored keeps its number. Nothing syncs from PostgreSQL today; `seq` and
+  `gone` are the same data libSQL's replica reads, kept so that `vci store copy` and a future replica see one model.
+- **`gone`.** One row per removal: `key` for an attestation, `object` for an object, `at` the time, `seq` as above.
+  Never read by this backend; purged by nothing yet (STORE-V2 section 2.1's horizon is the libSQL replica's: open).
+- **`upgrade_begin` and `upgrade_finish`**: above, "Migrations".
+
 ### fetch, push, hints, roles
 
-- **`exchange` and `caps`.** `exchange()` is `None`. `caps` is `LOCAL.with_shared_writes(true).with_hints(true)`.
+- **`exchange` and `caps`.** `exchange()` is `None`. `caps` is `LOCAL.with_shared_writes(true).with_hints(true)` and
+  (2.9) `.with_objects(true).with_columns(true)`.
 - **`vci fetch`** prints `vci: the postgres store at <location> is shared: nothing to fetch (N attestations stored)`.
 - **`vci push`** prints `vci: nothing to push: the postgres store is shared; attestations were stored when vci run
   made them`.
@@ -2489,6 +2636,11 @@ instead of about 3,000 round trips. Inside a deferred batch:
   - `vci_writer` has USAGE on the schema and SELECT, INSERT, UPDATE and DELETE on its tables, for protected-branch CI.
   - `vci_reader` has USAGE and SELECT, plus INSERT and UPDATE on memo and flags, for pull-request jobs and
     developers.
+  - (2.9) `vci store upgrade --begin` (or the owner's first write with this vci) adds the `objects`, `gone` and
+    `namespaces` tables; a `GRANT … ON ALL TABLES IN SCHEMA vci` given before it does not cover them, so the two
+    GRANT lines are run again afterwards (or `ALTER DEFAULT PRIVILEGES` set beforehand). Until then `vci_writer`'s
+    writes, removals included, fail as `Denied` on the new tables, and on a schema that still lacks them as
+    `NotInitialized` naming the schema.
   - Optional RLS: `CREATE POLICY own_rows ON vci.attestations FOR ALL TO vci_writer USING (stored_by = session_user)
     WITH CHECK (stored_by = session_user)` plus a read-all SELECT policy, so a role can delete or replace only its own
     rows.
