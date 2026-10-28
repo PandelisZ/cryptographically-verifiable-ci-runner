@@ -2,7 +2,13 @@
 //! round trips, the slot rule, bytewise order, per-entry read errors,
 //! manifests and their removal, an absent file, read-only files, files it
 //! must not use, concurrent first writers, batches, hints, the WAL
-//! checkpoint at the end, and the speed of a plan-sized read.
+//! checkpoint at the end, the speed of a plan-sized read, and (2.9) the
+//! format-3 side the conformance suite cannot see: a version-1 file from
+//! before 2.9 given the additions by the first write, in a transaction of
+//! its own before the write's batch; `upgrade_begin` and `upgrade_finish`;
+//! the objects as BLOBs and the columns on the row; the answer cap;
+//! foreign object rows; each of the four referrer columns; and an object
+//! removal inside a batch.
 //!
 //! These tests never set environment variables: options are passed to
 //! [`SqliteStore::open_path`].
@@ -11,12 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
+use vci_store::conformance::scenarios::Run3;
 use vci_store::{
-    AttestationStore, GONE, KeyHint, ManifestRef, NewAttestation, StoreError, StoreStatus,
-    StoredEnvelope, ValueState, key,
+    AttestationStore, Columns, GONE, KeyHint, ManifestRef, NewAttestation, OBJECT_GRACE,
+    StoreError, StoreStatus, StoredEnvelope, ValueState, key,
 };
-use vci_store_sqlite::{SqliteOptions, SqliteStore};
+use vci_store_sqlite::{Finish, SqliteOptions, SqliteStore};
 
 const S1: &str = "1111111111111111";
 const S2: &str = "2222222222222222";
@@ -764,7 +771,7 @@ fn files_it_cannot_use_fail_every_call() {
         put(&s, A, S1, &hex64(1), None, b"x");
         s.set_flag("f");
     }
-    raw(&path).pragma_update(None, "user_version", 2).unwrap();
+    raw(&path).pragma_update(None, "user_version", 3).unwrap();
     let newer = store(dir.path());
 
     let garbage_path = dir.path().join("garbage.sqlite");
@@ -812,8 +819,8 @@ fn files_it_cannot_use_fail_every_call() {
         matches!(
             e,
             StoreError::Incompatible {
-                found: 2,
-                supported: 1,
+                found: 3,
+                supported: 2,
                 ..
             }
         )
@@ -823,7 +830,7 @@ fn files_it_cannot_use_fail_every_call() {
             .status()
             .unwrap_err()
             .to_string()
-            .contains("sqlite store schema version 2 is newer than this vci reads (up to 1)")
+            .contains("sqlite store schema version 3 is newer than this vci reads (up to 2)")
     );
     check(&not_a_db, &|e| matches!(e, StoreError::Unavailable { .. }));
     assert!(
@@ -858,7 +865,7 @@ fn files_it_cannot_use_fail_every_call() {
         .query_row("SELECT name FROM flags WHERE name = 'g'", [], |r| r.get(0))
         .optional()
         .unwrap();
-    assert_eq!((v, n, g), (2, 1, None));
+    assert_eq!((v, n, g), (3, 1, None));
     let c = raw(&foreign_path);
     let tables: i64 = c
         .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
@@ -914,7 +921,7 @@ fn concurrent_first_writers_create_the_store_once() {
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!((objects, v), (4, 1), "round {round}");
+        assert_eq!((objects, v), (5, 1), "round {round}");
     }
 }
 
@@ -1224,4 +1231,581 @@ fn concurrent_readers_and_a_writer() {
         batch.finish().unwrap();
         done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
+}
+
+// ---- format 3 (vci 2.9) ---------------------------------------------------------
+
+/// A store file as vci 2.8 left it: schema version 1 without the format-3
+/// additions, holding one format-1 record with its manifest.
+fn file_of_2_8(path: &Path) -> (StoredEnvelope, String) {
+    let c = raw(path);
+    c.execute_batch(&vci_store_sqlite::sql::plain().ddl)
+        .unwrap();
+    c.pragma_update(None, "application_id", 0x7663_6931_i64)
+        .unwrap();
+    c.pragma_update(None, "user_version", 1).unwrap();
+    drop(c);
+    assert_eq!(tables(path), ["attestations", "flags", "manifests", "memo"]);
+    // The additions are added by a write; a 2.8 file is written through
+    // the same store, so make the record with a raw insert instead.
+    let root = hex64(0x28);
+    let value = envelope(Some(&root), 10);
+    let k = key::attestation_key_hinted(&key::test_key(A), S1, &hex64(1), &hint(28, Some(TREE1)));
+    let c = raw(path);
+    c.execute(
+        "INSERT INTO manifests (root, base, put_at, encoding, value) VALUES (?1, NULL, 1, 0, ?2)",
+        params![root, b"{\"v\":2}"],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO attestations (key, test_key, signer, storage_key, target, issued, tree16,
+                                   manifest_ref, ref_state, stored_at, value)
+         VALUES (?1, ?2, ?3, ?4, ?5, 28, ?6, ?7, 1, 1, ?8)",
+        params![
+            k,
+            key::test_key(A),
+            S1,
+            hex64(1),
+            "path:src",
+            TREE1,
+            root,
+            value
+        ],
+    )
+    .unwrap();
+    let mut e = StoredEnvelope::from_key("path:src", &k).unwrap();
+    e.set_value(value);
+    (e, root)
+}
+
+/// The file's tables, sorted.
+fn tables(path: &Path) -> Vec<String> {
+    let c = raw(path);
+    let mut stmt = c
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// The attestations table's columns, in order.
+fn attestation_columns(path: &Path) -> Vec<String> {
+    let c = raw(path);
+    let mut stmt = c.prepare("PRAGMA table_info(attestations)").unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn user_version(path: &Path) -> i64 {
+    raw(path)
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Move these objects' `put_at` back by `secs`, behind the store's back.
+fn age(path: &Path, ids: &[&str], secs: i64) {
+    let c = raw(path);
+    for id in ids {
+        assert_eq!(
+            c.execute(
+                "UPDATE objects SET put_at = put_at - ?2 WHERE id = ?1",
+                params![id, secs]
+            )
+            .unwrap(),
+            1,
+            "{id}"
+        );
+    }
+}
+
+fn put3(
+    s: &dyn AttestationStore,
+    unit: &str,
+    sk: &str,
+    rec: &[u8],
+    cols: &Columns,
+) -> StoredEnvelope {
+    s.put(&NewAttestation::for_test(unit, S1, sk, None, rec).with_columns(cols))
+        .unwrap()
+}
+
+/// The ten format-3 columns of a row, as SQL gives them.
+type RawColumns = (
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn ids_of(got: &[vci_store::StoredObject]) -> Vec<String> {
+    got.iter().map(|o| o.id.clone()).collect()
+}
+
+/// 15. A file vci 2.8 wrote reads as it did (no object, no columns,
+///     version 1) and gets the format-3 columns and the `objects` table
+///     from the first write, in a transaction of its own that is committed
+///     before the write's batch: another handle sees the additions while
+///     the batch is still open and its records only after `finish`. The
+///     2.8 record keeps its manifest, reads back and has no columns; the
+///     file stays at version 1, so a 2.8 binary still opens it.
+#[test]
+fn a_file_of_2_8_gets_the_additions_from_the_first_write_before_its_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    let (old, root) = file_of_2_8(&path);
+    let s = store(dir.path());
+    let other = store(dir.path());
+    let run = Run3::build(&["src/t15/a.ts"]);
+    let (rec, cols) = run.record(A, 1, 15);
+
+    assert_eq!(
+        s.status().unwrap(),
+        StoreStatus::Ready {
+            schema_version: Some(1)
+        }
+    );
+    assert_eq!(keys(&listed(&s, A)), std::slice::from_ref(&old.key));
+    assert!(s.get_objects(&run.id_refs()).unwrap().is_empty());
+    assert!(s.orphan_objects().unwrap().is_empty());
+    assert_eq!(s.columns(&[&old]).unwrap(), [Columns::default()]);
+    assert_eq!(tables(&path).len(), 4, "a read adds nothing");
+
+    let batch = s.batch().unwrap();
+    assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
+    let e = put3(&s, A, &hex64(2), &rec, &cols);
+    assert_eq!(s.remove(vec![old.clone()]).unwrap().len(), 1);
+    // The DDL is committed; the batch is not.
+    assert_eq!(
+        tables(&path),
+        ["attestations", "flags", "manifests", "memo", "objects"]
+    );
+    assert!(attestation_columns(&path).ends_with(&[
+        "format".to_owned(),
+        "commit_id".to_owned(),
+        "platform".to_owned(),
+        "state".to_owned(),
+        "duration_ms".to_owned(),
+        "expires".to_owned(),
+        "hdr".to_owned(),
+        "tables_id".to_owned(),
+        "shape".to_owned(),
+        "state_obj".to_owned(),
+    ]));
+    assert_eq!(
+        keys(&listed(&other, A)),
+        std::slice::from_ref(&old.key),
+        "the batch is open"
+    );
+    assert!(other.get_objects(&run.id_refs()).unwrap().is_empty());
+    assert_eq!(
+        keys(&listed(&s, A)),
+        std::slice::from_ref(&e.key),
+        "this thread sees it"
+    );
+    batch.finish().unwrap();
+
+    assert_eq!(keys(&listed(&other, A)), std::slice::from_ref(&e.key));
+    assert_eq!(other.get_objects(&run.id_refs()).unwrap().len(), 4);
+    let l = listed(&other, A);
+    assert_eq!(
+        other.columns(&[&l[0]]).unwrap(),
+        std::slice::from_ref(&cols)
+    );
+    assert_eq!(user_version(&path), 1);
+    assert!(other.manifest(&root).unwrap().is_some());
+    let got = read_unit(&other, A);
+    assert_eq!(got[0].state(), ValueState::Read(&rec));
+    // A format-1 record put now has no columns either.
+    let e1 = put(&s, B, S1, &hex64(1), None, &envelope(Some(&root), 3));
+    assert_eq!(s.columns(&[&e1]).unwrap(), [Columns::default()]);
+    let (format, hdr): (Option<i64>, Option<String>) = raw(&path)
+        .query_row(
+            "SELECT format, hdr FROM attestations WHERE key = ?1",
+            [&e1.key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((format, hdr), (None, None));
+}
+
+/// 16. `upgrade_begin` adds the additions to a 2.8 file once (true the
+///     first time, false after), creates a missing file with them, and is
+///     refused on a read-only handle; `upgrade_finish` refuses with the
+///     count while a format-1 row remains (the file still at version 1
+///     with its manifests), then drops the manifests and sets version 2,
+///     after which a vci before 2.9 would report the schema too new,
+///     manifests read as none, `put_manifest` is unsupported, records and
+///     objects go on, and a second finish says so.
+#[test]
+fn upgrade_begin_and_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    let (old, root) = file_of_2_8(&path);
+    let s = store(dir.path());
+    assert!(s.upgrade_begin().unwrap(), "added now");
+    assert!(!s.upgrade_begin().unwrap(), "there already");
+    assert_eq!(tables(&path).len(), 5);
+    assert_eq!(user_version(&path), 1);
+    let ro = SqliteStore::open_path(
+        &path,
+        SqliteOptions {
+            read_only: true,
+            ..opts()
+        },
+    );
+    assert!(matches!(
+        ro.upgrade_begin().unwrap_err(),
+        StoreError::Denied { .. }
+    ));
+    assert!(matches!(
+        ro.upgrade_finish().unwrap_err(),
+        StoreError::Denied { .. }
+    ));
+
+    // A missing file is created with the additions by `--begin`, and not
+    // by `--finish`.
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = store(fresh_dir.path());
+    assert!(matches!(
+        fresh.upgrade_finish().unwrap_err(),
+        StoreError::Unavailable { .. }
+    ));
+    assert!(!db_path(fresh_dir.path()).exists());
+    assert!(!fresh.upgrade_begin().unwrap());
+    assert_eq!(tables(&db_path(fresh_dir.path())).len(), 5);
+    assert_eq!(fresh.upgrade_finish().unwrap(), Finish::Finished);
+    assert_eq!(
+        fresh.status().unwrap(),
+        StoreStatus::Ready {
+            schema_version: Some(2)
+        }
+    );
+
+    // The 2.8 file: refused while its format-1 record is there.
+    let run = Run3::build(&["src/t16/a.ts"]);
+    let (rec, cols) = run.record(A, 1, 16);
+    s.put_objects(&run.new_objects()).unwrap();
+    let e3 = put3(&s, B, &hex64(2), &rec, &cols);
+    assert_eq!(s.upgrade_finish().unwrap(), Finish::FormatOneRows(1));
+    assert_eq!(user_version(&path), 1);
+    assert!(s.manifest(&root).unwrap().is_some());
+    assert_eq!(s.remove(vec![old]).unwrap().len(), 1);
+    assert_eq!(s.upgrade_finish().unwrap(), Finish::Finished);
+    assert_eq!(user_version(&path), 2);
+    assert_eq!(
+        tables(&path),
+        ["attestations", "flags", "memo", "objects"],
+        "the manifests are dropped"
+    );
+    assert_eq!(s.upgrade_finish().unwrap(), Finish::AlreadyFinished);
+    assert!(!s.upgrade_begin().unwrap());
+
+    // The handle that finished, and a new one.
+    for h in [&s, &store(dir.path())] {
+        assert_eq!(
+            h.status().unwrap(),
+            StoreStatus::Ready {
+                schema_version: Some(2)
+            }
+        );
+        assert!(h.manifest(&root).unwrap().is_none());
+        assert_eq!(h.manifests(&[&root]).unwrap(), [None]);
+        assert!(h.manifest_roots().unwrap().is_empty());
+        assert_eq!(
+            h.orphan_manifests(&[&root]).unwrap(),
+            std::slice::from_ref(&root)
+        );
+        assert_eq!(h.remove_manifests(&[&root]).unwrap(), 0);
+        assert!(matches!(
+            h.put_manifest(&root, b"{}").unwrap_err(),
+            StoreError::Unsupported { .. }
+        ));
+        assert_eq!(keys(&read_unit(h, B)), std::slice::from_ref(&e3.key));
+        assert_eq!(h.get_objects(&run.id_refs()).unwrap().len(), 4);
+        let l = listed(h, B);
+        assert_eq!(h.columns(&[&l[0]]).unwrap(), std::slice::from_ref(&cols));
+    }
+    let (rec2, cols2) = run.record(A, 1, 17);
+    let e4 = put3(&s, A, &hex64(3), &rec2, &cols2);
+    assert_eq!(keys(&listed(&store(dir.path()), A)), [e4.key]);
+    assert_eq!(s.count().unwrap(), 2);
+}
+
+/// 17. Objects are BLOBs filed under their id with their kind and
+///     `put_at`, which an idempotent put refreshes; the columns of a put
+///     are on the record's row, `NULL` where the put had none; an empty
+///     put, a removal and a state prune on a missing file create nothing.
+#[test]
+fn objects_are_blobs_and_columns_are_on_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    let s = store(dir.path());
+    assert_eq!(s.put_objects(&[]).unwrap(), 0);
+    assert_eq!(s.remove_objects(&[&hex64(1)]).unwrap(), 0);
+    assert_eq!(s.prune_state_objects(Duration::ZERO).unwrap(), 0);
+    assert!(s.orphan_objects().unwrap().is_empty());
+    assert!(!path.exists(), "nothing to write, nothing created");
+
+    let run = Run3::build(&["src/t17/b.ts", "src/t17/a.ts"]);
+    let objects = run.new_objects();
+    assert_eq!(
+        s.put_objects(&[objects[0], objects[0], objects[1]])
+            .unwrap(),
+        2
+    );
+    assert_eq!(s.put_objects(&objects).unwrap(), 2);
+    let rows = |id: &str| -> (String, i64, i64, Vec<u8>) {
+        raw(&path)
+            .query_row(
+                "SELECT typeof(bytes), kind, put_at, bytes FROM objects WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    };
+    for (i, (kind, bytes)) in run.objects.iter().enumerate() {
+        let (ty, k, _, b) = rows(run.id_refs()[i]);
+        assert_eq!(
+            (ty.as_str(), k, &b),
+            ("blob", i64::from(*kind as u8), bytes)
+        );
+    }
+    age(&path, &[&run.ids.hdr], 1000);
+    let before = rows(&run.ids.hdr).2;
+    assert_eq!(s.put_objects(&objects[..1]).unwrap(), 0);
+    assert!(rows(&run.ids.hdr).2 >= before + 1000, "put_at refreshed");
+
+    let (rec, cols) = run.record(A, 2, 17);
+    let e = put3(&s, A, &hex64(1), &rec, &cols);
+    let row: RawColumns = raw(&path)
+        .query_row(
+            "SELECT format, commit_id, platform, state, duration_ms, expires, hdr, tables_id,
+                    shape, state_obj FROM attestations WHERE key = ?1",
+            [&e.key],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            Some(3),
+            cols.commit.clone(),
+            cols.platform.clone(),
+            cols.state.clone(),
+            cols.duration_ms.map(|n| n as i64),
+            cols.expires,
+            cols.hdr.clone(),
+            cols.tables.clone(),
+            cols.shape.clone(),
+            cols.state_obj.clone()
+        )
+    );
+    let partial = Columns {
+        format: Some(3),
+        hdr: Some(run.ids.hdr.clone()),
+        ..Columns::default()
+    };
+    put3(&s, A, &hex64(1), &rec, &partial);
+    assert_eq!(s.columns(&[&e]).unwrap(), [partial]);
+    let (state, shape): (Option<String>, Option<String>) = raw(&path)
+        .query_row(
+            "SELECT state, shape FROM attestations WHERE key = ?1",
+            [&e.key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state, shape), (None, None));
+}
+
+/// 18. An answer past `MAX_OBJECTS_ANSWER` is refused before a byte is
+///     read (`Invalid`, what `objects`); each object alone reads. A row
+///     whose id is not an object id is foreign: never answered, listed or
+///     removed. A row under an object id whose kind column names no kind
+///     is not answered (it has no kind), but the orphan rule goes by id
+///     and referrers alone, so it is collected like any other.
+#[test]
+fn the_answer_cap_and_foreign_object_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    let s = store(dir.path());
+    let run = Run3::build(&["src/t18/a.ts"]);
+    s.put_objects(&run.new_objects()).unwrap();
+    let big1 = hex64(0xb1);
+    let big2 = hex64(0xb2);
+    let odd_kind = hex64(0x99);
+    let c = raw(&path);
+    let now = "strftime('%s', 'now')";
+    for id in [&big1, &big2] {
+        c.execute(
+            &format!(
+                "INSERT INTO objects (id, kind, put_at, bytes) VALUES (?1, 4, {now}, zeroblob(40 << 20))"
+            ),
+            [id],
+        )
+        .unwrap();
+    }
+    c.execute(
+        &format!("INSERT INTO objects (id, kind, put_at, bytes) VALUES (?1, 9, {now}, X'766f09')"),
+        [&odd_kind],
+    )
+    .unwrap();
+    c.execute(
+        &format!(
+            "INSERT INTO objects (id, kind, put_at, bytes) VALUES ('not-an-id', 1, {now}, X'766f01')"
+        ),
+        [],
+    )
+    .unwrap();
+    drop(c);
+    match s.get_objects(&[&run.ids.hdr, &big1, &big2]) {
+        Err(StoreError::Invalid {
+            what: "objects", ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    let one = s.get_objects(&[&big1, &odd_kind]).unwrap();
+    assert_eq!(ids_of(&one), std::slice::from_ref(&big1));
+    assert_eq!(one[0].bytes.len(), 40 << 20);
+    assert_eq!(
+        ids_of(&s.get_objects(&[&odd_kind, &run.ids.hdr]).unwrap()),
+        std::slice::from_ref(&run.ids.hdr)
+    );
+    // Aged, the foreign rows are no orphans; the big ones are.
+    assert!(s.orphan_objects().unwrap().is_empty());
+    let grace = OBJECT_GRACE.as_secs() as i64 * 2;
+    age(&path, &[&run.ids.hdr, &odd_kind, &big1, &big2], grace);
+    raw(&path)
+        .execute(
+            "UPDATE objects SET put_at = put_at - ?1 WHERE id = 'not-an-id'",
+            [grace],
+        )
+        .unwrap();
+    let mut want = vec![
+        big1.clone(),
+        big2.clone(),
+        odd_kind.clone(),
+        run.ids.hdr.clone(),
+    ];
+    want.sort();
+    assert_eq!(s.orphan_objects().unwrap(), want);
+    assert_eq!(s.remove_objects(&[&odd_kind, &big1, &big2]).unwrap(), 3);
+    let left: i64 = raw(&path)
+        .query_row("SELECT count(*) FROM objects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 5, "the four of the run and the foreign row");
+    assert_eq!(
+        s.prune_state_objects(Duration::ZERO).unwrap(),
+        1,
+        "the run's state object"
+    );
+}
+
+/// 19. The orphan rule reads each of the four referrer columns: a record
+///     naming an object in its `hdr`, `tables`, `shape` or `state_obj`
+///     column alone keeps it past the grace, and only its removal frees
+///     it; `prune_state_objects` goes by the kind column, not by a referrer.
+#[test]
+fn each_referrer_column_keeps_its_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    let s = store(dir.path());
+    let run = Run3::build(&["src/t19/a.ts"]);
+    s.put_objects(&run.new_objects()).unwrap();
+    let (rec, _) = run.record(A, 1, 19);
+    let by = |c: Columns| c;
+    let referrers = [
+        by(Columns {
+            hdr: Some(run.ids.hdr.clone()),
+            ..Columns::default()
+        }),
+        by(Columns {
+            tables: Some(run.ids.tables.clone()),
+            ..Columns::default()
+        }),
+        by(Columns {
+            shape: Some(run.ids.shape.clone()),
+            ..Columns::default()
+        }),
+        by(Columns {
+            state_obj: Some(run.ids.state.clone()),
+            ..Columns::default()
+        }),
+    ];
+    let records: Vec<StoredEnvelope> = referrers
+        .iter()
+        .enumerate()
+        .map(|(i, c)| put3(&s, A, &hex64(i as u8 + 1), &rec, c))
+        .collect();
+    age(&path, &run.id_refs(), OBJECT_GRACE.as_secs() as i64 * 2);
+    assert!(s.orphan_objects().unwrap().is_empty());
+    assert_eq!(s.remove_objects(&run.id_refs()).unwrap(), 0);
+    for (i, e) in records.iter().enumerate() {
+        s.remove(vec![e.clone()]).unwrap();
+        assert_eq!(s.orphan_objects().unwrap(), [run.id_refs()[i].to_owned()]);
+        assert_eq!(s.remove_objects(&run.id_refs()).unwrap(), 1);
+    }
+    assert!(s.get_objects(&run.id_refs()).unwrap().is_empty());
+}
+
+/// 20. Inside a batch an object removal is applied at once, in the batch's
+///     transaction: this thread no longer reads the object, another handle
+///     still does until `finish`; the batch's own objects, just put (an
+///     idempotent put of an aged one included), are within their grace and
+///     stay.
+#[test]
+fn an_object_removal_in_a_batch_is_applied_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    let s = store(dir.path());
+    let other = store(dir.path());
+    // Two runs share their hdr and tables (the same toolchain and tables)
+    // and differ in shape and state.
+    let old = Run3::build(&["src/t20/old.ts"]);
+    let new = Run3::build(&["src/t20/new.ts"]);
+    assert_eq!(
+        (&old.ids.hdr, &old.ids.tables),
+        (&new.ids.hdr, &new.ids.tables)
+    );
+    assert_ne!(old.ids.shape, new.ids.shape);
+    s.put_objects(&old.new_objects()).unwrap();
+    age(&path, &old.id_refs(), OBJECT_GRACE.as_secs() as i64 * 2);
+
+    let batch = s.batch().unwrap();
+    assert_eq!(
+        s.put_objects(&new.new_objects()).unwrap(),
+        2,
+        "the shape and the state"
+    );
+    let (rec, cols) = new.record(A, 1, 20);
+    put3(&s, A, &hex64(1), &rec, &cols);
+    let mut all: Vec<&str> = old.id_refs();
+    all.extend([new.ids.shape.as_str(), new.ids.state.as_str()]);
+    assert_eq!(
+        s.remove_objects(&all).unwrap(),
+        2,
+        "the old shape and state: aged and unreferenced"
+    );
+    assert_eq!(ids_of(&s.get_objects(&all).unwrap()), new.id_refs());
+    assert_eq!(ids_of(&other.get_objects(&all).unwrap()), old.id_refs());
+    batch.finish().unwrap();
+    assert_eq!(ids_of(&other.get_objects(&all).unwrap()), new.id_refs());
 }

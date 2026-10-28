@@ -1,14 +1,26 @@
-//! The SQL of schema version 1: the tables and the statements this crate
-//! runs, for its own file and for the libSQL store (`vci-store-libsql`),
-//! whose server keeps one set of these tables per namespace under a name
-//! prefix ([`Names::prefixed`]). One copy of the SQL serves both: the
-//! libSQL store adds only what a server needs on top (set-based reads and
-//! writes, a schema version per namespace, a change log for replicas).
+//! The SQL of schema version 1, its format-3 additions (vci 2.9, STORE-V2
+//! section 2.1) and schema version 2: the tables and the statements this
+//! crate runs, for its own file and for the libSQL store
+//! (`vci-store-libsql`), whose server keeps one set of these tables per
+//! namespace under a name prefix ([`Names::prefixed`]). One copy of the SQL
+//! serves both: the libSQL store adds only what a server needs on top
+//! (set-based reads and writes, a schema version per namespace, a change
+//! log for replicas).
 //!
 //! Every text column compares with SQLite's default `BINARY` collation,
 //! which is bytewise, as the store's order requires. `value` is each
-//! table's last column, so reads of the other columns never touch the
-//! value's overflow pages.
+//! table's last column as created, so reads of the other columns never
+//! touch the value's overflow pages; the format-3 columns are added behind
+//! it by `ALTER TABLE` ([`Sql::add_column`]), and a row that carries them
+//! is a frame of about 2 KB, which overflows no page.
+//!
+//! The format-3 additions ([`Sql::ddl_v2`], [`COLUMNS_V2`]) are nullable
+//! columns on the attestations table (`NULL` on a format-1 row), the
+//! `objects` table and its indexes. There is no `gone` table and no `seq`
+//! column in a SQLite file: nothing syncs from it (the design lists them
+//! for the stores with replicas). Schema version 2 is version 1 with the
+//! additions and without the `manifests` table (`vci store upgrade
+//! --finish`, [`Sql::drop_manifests`]).
 
 use std::sync::LazyLock;
 
@@ -23,6 +35,29 @@ pub const REF_INLINE: i64 = 2;
 /// How long the memo keeps what a plan remembered: a week of trees.
 pub const MEMO_KEEP_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// The format-3 columns of the attestations table (STORE-V2 section 2.1),
+/// each `(name, type)`, in the order [`Sql::columns`] selects them and the
+/// upserts take them: the record's format, the commit, the platform, the
+/// result state (text, as [`vci_store::Columns::state`] is), the duration,
+/// the expiry, and the hdr, tables, shape and state object ids (64 hex,
+/// text, so they index as text). All nullable: `NULL` on a format-1 row
+/// and on a record put without columns.
+pub const COLUMNS_V2: [(&str, &str); 10] = [
+    ("format", "INTEGER"),
+    ("commit_id", "TEXT"),
+    ("platform", "TEXT"),
+    ("state", "TEXT"),
+    ("duration_ms", "INTEGER"),
+    ("expires", "INTEGER"),
+    ("hdr", "TEXT"),
+    ("tables_id", "TEXT"),
+    ("shape", "TEXT"),
+    ("state_obj", "TEXT"),
+];
+
+/// The kind column of a state object (`vci_core::ObjectKind::State as u8`).
+pub const KIND_STATE: i64 = 4;
+
 /// The table names of one store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Names {
@@ -34,13 +69,15 @@ pub struct Names {
     pub memo: String,
     /// The flags.
     pub flags: String,
+    /// The format-3 objects, by id (vci 2.9).
+    pub objects: String,
     /// What index names start with.
     prefix: String,
 }
 
 impl Names {
     /// The names of a SQLite store file: `attestations`, `manifests`,
-    /// `memo`, `flags`.
+    /// `memo`, `flags`, `objects`.
     pub fn plain() -> Names {
         Names::prefixed("")
     }
@@ -63,6 +100,7 @@ impl Names {
             manifests: format!("{prefix}manifests"),
             memo: format!("{prefix}memo"),
             flags: format!("{prefix}flags"),
+            objects: format!("{prefix}objects"),
             prefix: prefix.to_owned(),
         }
     }
@@ -97,11 +135,12 @@ pub struct Sql {
     /// The upsert of an attestation under a hinted key (`?1` key, `?2` test
     /// key, `?3` signer, `?4` storage key, `?5` target, `?6` issued, `?7`
     /// tree16, `?8` manifest ref, `?9` ref state, `?10` stored at, `?11`
-    /// value), returning the key when a row changed.
+    /// value, `?12` to `?21` the [`COLUMNS_V2`] in order), returning the
+    /// key when a row changed.
     pub put_hinted: String,
     /// The same without a hint (`?1` plain key, `?2` to `?5` as above, `?6`
-    /// manifest ref, `?7` ref state, `?8` stored at, `?9` value): the slot
-    /// keeps its key.
+    /// manifest ref, `?7` ref state, `?8` stored at, `?9` value, `?10` to
+    /// `?19` the columns): the slot keeps its key.
     pub put_plain: String,
     /// The key a slot is stored under (`?1` test key, `?2` signer, `?3`
     /// storage key).
@@ -126,8 +165,42 @@ pub struct Sql {
     pub memo_prune: String,
     /// Set a flag (`?1` name, `?2` now).
     pub flag_put: String,
+    /// The format-3 additions that are not columns: the `objects` table,
+    /// its index and the partial indexes on the object-id columns, each
+    /// created only when missing. The columns go first, with
+    /// [`Sql::add_column`] for each of [`COLUMNS_V2`] the table lacks
+    /// (`ALTER TABLE ADD COLUMN` is not `IF NOT EXISTS`).
+    pub ddl_v2: String,
+    /// One record's format-3 columns, in [`COLUMNS_V2`] order (`?1`: key).
+    pub columns: String,
+    /// One object's kind and bytes (`?1`: id).
+    pub object: String,
+    /// One object's kind and size, bytes not read (`?1`: id).
+    pub object_size: String,
+    /// Refresh an object's `put_at` (`?1` id, `?2` now): a changed row
+    /// means the object was stored already.
+    pub object_touch: String,
+    /// Store an object that is not stored (`?1` id, `?2` kind, `?3` now,
+    /// `?4` bytes).
+    pub object_insert: String,
+    /// Delete one object under the orphan rule (`?1` id, `?2` the oldest
+    /// `put_at` still within the grace): only when no attestation's `hdr`,
+    /// `tables_id`, `shape` or `state_obj` column names it and it was put
+    /// before `?2`.
+    pub object_remove: String,
+    /// The ids [`Sql::object_remove`] would delete now, sorted (`?1` as
+    /// there).
+    pub orphan_objects: String,
+    /// Delete every state object put before `?1`, referenced or not.
+    pub prune_state_objects: String,
+    /// How many attestations are not format-3 frames (their value does not
+    /// start with `v`): what `vci store upgrade --finish` refuses on.
+    pub format_one_count: String,
+    /// Drop the manifests table (`--finish`).
+    pub drop_manifests: String,
     /// The table names (for statements built from rows,
-    /// [`Sql::upsert_attestations`] and [`Sql::upsert_manifests`]).
+    /// [`Sql::upsert_attestations`] and [`Sql::upsert_manifests`], and
+    /// [`Sql::add_column`]).
     names: Names,
 }
 
@@ -135,6 +208,11 @@ impl Sql {
     /// The statements over `n`.
     pub fn new(n: &Names) -> Sql {
         let (a, m, memo, flags, p) = (&n.attestations, &n.manifests, &n.memo, &n.flags, &n.prefix);
+        let o = &n.objects;
+        let referenced = format!(
+            "EXISTS (SELECT 1 FROM {a} WHERE hdr = {o}.id OR tables_id = {o}.id
+                                       OR shape = {o}.id OR state_obj = {o}.id)"
+        );
         Sql {
             ddl: format!(
                 "
@@ -182,20 +260,29 @@ CREATE TABLE IF NOT EXISTS {flags} (name TEXT NOT NULL PRIMARY KEY, at INTEGER N
             flag: format!("SELECT EXISTS (SELECT 1 FROM {flags} WHERE name = ?1)"),
             put_hinted: format!(
                 "{} RETURNING key",
-                upsert_attestations(a, "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")
+                upsert_attestations(
+                    a,
+                    "(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
+                )
             ),
             put_plain: format!(
                 "INSERT INTO {a}
                    (key, test_key, signer, storage_key, target, issued, tree16, manifest_ref,
-                    ref_state, stored_at, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8, ?9)
+                    ref_state, stored_at, value, {cols})
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8, ?9,
+                         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                  ON CONFLICT (test_key, signer, storage_key) DO UPDATE SET
                    target = excluded.target, manifest_ref = excluded.manifest_ref,
                    ref_state = excluded.ref_state, stored_at = excluded.stored_at,
-                   encoding = 0, value = excluded.value
+                   encoding = 0, value = excluded.value, {set_cols}
                  WHERE {a}.value IS NOT excluded.value
                     OR {a}.encoding <> 0
-                 RETURNING key"
+                    OR {cols_differ}
+                 RETURNING key",
+                cols = column_list(),
+                set_cols = column_sets(),
+                cols_differ = columns_differ(a),
             ),
             slot_key: format!(
                 "SELECT key FROM {a} WHERE test_key = ?1 AND signer = ?2 AND storage_key = ?3"
@@ -220,15 +307,68 @@ CREATE TABLE IF NOT EXISTS {flags} (name TEXT NOT NULL PRIMARY KEY, at INTEGER N
             flag_put: format!(
                 "INSERT INTO {flags} (name, at) VALUES (?1, ?2) ON CONFLICT (name) DO NOTHING"
             ),
+            ddl_v2: format!(
+                "
+CREATE TABLE IF NOT EXISTS {o} (
+  id     TEXT    NOT NULL PRIMARY KEY,
+  kind   INTEGER NOT NULL,
+  put_at INTEGER NOT NULL,
+  bytes  BLOB    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS {p}objects_kind_put ON {o} (kind, put_at);
+CREATE INDEX IF NOT EXISTS {p}attestations_hdr    ON {a} (hdr)       WHERE hdr       IS NOT NULL;
+CREATE INDEX IF NOT EXISTS {p}attestations_tables ON {a} (tables_id) WHERE tables_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS {p}attestations_shape  ON {a} (shape)     WHERE shape     IS NOT NULL;
+CREATE INDEX IF NOT EXISTS {p}attestations_state  ON {a} (state_obj) WHERE state_obj IS NOT NULL;
+"
+            ),
+            columns: format!("SELECT {} FROM {a} WHERE key = ?1", column_list()),
+            object: format!("SELECT kind, bytes FROM {o} WHERE id = ?1"),
+            object_size: format!("SELECT kind, length(bytes) FROM {o} WHERE id = ?1"),
+            object_touch: format!("UPDATE {o} SET put_at = ?2 WHERE id = ?1"),
+            object_insert: format!(
+                "INSERT INTO {o} (id, kind, put_at, bytes) VALUES (?1, ?2, ?3, ?4)"
+            ),
+            object_remove: format!(
+                "DELETE FROM {o} WHERE id = ?1 AND put_at < ?2 AND NOT {referenced}"
+            ),
+            orphan_objects: format!(
+                "SELECT id FROM {o} WHERE put_at < ?1 AND NOT {referenced} ORDER BY id"
+            ),
+            prune_state_objects: format!(
+                "DELETE FROM {o} WHERE kind = {KIND_STATE} AND put_at < ?1"
+            ),
+            format_one_count: format!(
+                "SELECT count(*) FROM {a} WHERE hex(substr(value, 1, 1)) <> '76'"
+            ),
+            drop_manifests: format!("DROP TABLE IF EXISTS {m}"),
             names: n.clone(),
         }
     }
 
+    /// The table names these statements are over.
+    pub fn names(&self) -> &Names {
+        &self.names
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN` for one of [`COLUMNS_V2`] (`(name,
+    /// type)`), which the caller runs only when the attestations table
+    /// lacks the column (`PRAGMA table_info`).
+    pub fn add_column(&self, column: (&str, &str)) -> String {
+        format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            self.names.attestations, column.0, column.1
+        )
+    }
+
     /// The upsert of attestations on their slot, `rows` being one or more
     /// `(key, test_key, signer, storage_key, target, issued, tree16,
-    /// manifest_ref, ref_state, stored_at, value)` tuples (parameters or
-    /// literals): each replaces its slot's row, key included, unless the
-    /// key, the value and a readable encoding are already there.
+    /// manifest_ref, ref_state, stored_at, value, format, commit_id,
+    /// platform, state, duration_ms, expires, hdr, tables_id, shape,
+    /// state_obj)` tuples (parameters or literals): each replaces its
+    /// slot's row, key included, unless the key, the value, a readable
+    /// encoding and the same columns are already there (a put of the same
+    /// bytes with other columns, or without them, replaces the columns).
     /// [`Sql::put_hinted`] is this with parameters.
     pub fn upsert_attestations(&self, rows: &str) -> String {
         upsert_attestations(&self.names.attestations, rows)
@@ -267,17 +407,49 @@ fn upsert_attestations(a: &str, rows: &str) -> String {
     format!(
         "INSERT INTO {a}
            (key, test_key, signer, storage_key, target, issued, tree16, manifest_ref,
-            ref_state, stored_at, value)
+            ref_state, stored_at, value, {cols})
          VALUES {rows}
          ON CONFLICT (test_key, signer, storage_key) DO UPDATE SET
            key = excluded.key, target = excluded.target, issued = excluded.issued,
            tree16 = excluded.tree16, manifest_ref = excluded.manifest_ref,
            ref_state = excluded.ref_state, stored_at = excluded.stored_at,
-           encoding = 0, value = excluded.value
+           encoding = 0, value = excluded.value, {set_cols}
          WHERE {a}.key IS NOT excluded.key
             OR {a}.value IS NOT excluded.value
-            OR {a}.encoding <> 0"
+            OR {a}.encoding <> 0
+            OR {cols_differ}",
+        cols = column_list(),
+        set_cols = column_sets(),
+        cols_differ = columns_differ(a),
     )
+}
+
+/// `format, commit_id, ...`: the [`COLUMNS_V2`] names.
+fn column_list() -> String {
+    COLUMNS_V2
+        .iter()
+        .map(|(c, _)| *c)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `format = excluded.format, ...` for an upsert's `DO UPDATE SET`.
+fn column_sets() -> String {
+    COLUMNS_V2
+        .iter()
+        .map(|(c, _)| format!("{c} = excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `a.format IS NOT excluded.format OR ...`: whether an upsert changes a
+/// column (`IS NOT` so that `NULL` compares).
+fn columns_differ(a: &str) -> String {
+    COLUMNS_V2
+        .iter()
+        .map(|(c, _)| format!("{a}.{c} IS NOT excluded.{c}"))
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 /// The statements of a SQLite store file ([`Names::plain`]).
@@ -296,10 +468,21 @@ mod tests {
         for t in ["attestations", "manifests", "memo", "flags"] {
             assert!(s.ddl.contains(&format!("vci_ab12_{t}")), "{t}");
         }
-        for line in s.ddl.lines().filter(|l| l.starts_with("CREATE")) {
+        assert!(s.ddl_v2.contains("vci_ab12_objects"));
+        for line in s
+            .ddl
+            .lines()
+            .chain(s.ddl_v2.lines())
+            .filter(|l| l.starts_with("CREATE"))
+        {
             let name = line.split_whitespace().nth(5).unwrap_or_default();
             assert!(name.starts_with("vci_ab12_"), "{line}");
         }
+        assert_eq!(
+            s.add_column(COLUMNS_V2[7]),
+            "ALTER TABLE vci_ab12_attestations ADD COLUMN tables_id TEXT"
+        );
+        assert!(s.object_remove.contains("vci_ab12_objects.id"));
         assert_eq!(
             plain().list_unit,
             "SELECT key, target FROM attestations WHERE test_key = ?1 ORDER BY key"

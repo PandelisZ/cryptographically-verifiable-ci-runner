@@ -1844,11 +1844,24 @@ The conformance world's `age_objects` moves `last_timestamp` in `.git/git-meta.s
 
 `vci-store-sqlite` holds `SqliteFactory` (kind `sqlite`, registered under vci-cli's cargo feature `sqlite`, on by
 default; `SqliteFactory::path(sel, cx)` says which file a selection names), `SqliteStore` (`open_path(path,
-SqliteOptions)`, which opens nothing until the first call; `path()`, `options()`) and `SqliteOptions { busy_timeout,
-sync_off, read_only }` (default 30 s, false, false). Its tests are `tests/sqlite.rs` (the design's fourteen cases
-plus a read-only file beside a live WAL, readers racing a writer, a lock held past the busy timeout, an unwritable
-directory and a copy between two files; 1,200 units of 18 KB listed and read in about 8 ms in a release build) and the
-conformance suite.
+SqliteOptions)`, which opens nothing until the first call; `path()`, `options()`; (2.9) `upgrade_begin()` and
+`upgrade_finish() -> Finish` behind `vci store upgrade --begin` and `--finish`, below) and `SqliteOptions {
+busy_timeout, sync_off, read_only, kind }` (default 30 s, false, false, `sqlite`). Its tests are `tests/sqlite.rs`
+(the design's fourteen cases plus a read-only file beside a live WAL, readers racing a writer, a lock held past the
+busy timeout, an unwritable directory and a copy between two files; 1,200 units of 18 KB listed and read in about 8 ms
+in a release build; and (2.9) the format-3 side the conformance suite cannot see: a file vci 2.8 wrote given the
+additions by the first write in a transaction committed before the write's batch, `upgrade_begin` and
+`upgrade_finish` with their refusals, the objects as BLOBs and the columns on the row, the 64 MiB answer cap, foreign
+object rows, each of the four referrer columns keeping its object, and an object removal applied inside a batch) and
+the conformance suite, every objects scenario included (`age_objects` moves `objects.put_at` back with SQL).
+
+**Format 3 (2.9).** `caps` is `LOCAL.with_hints(true).with_objects(true).with_columns(true)`: the store keeps the
+objects in an `objects` table (`bytes BLOB`, filed under the BLAKE3 of them) and a record's listing columns on its
+row, and implements the whole objects section of the trait (section 4). There is no `gone` table and no `seq` column:
+nothing syncs from a SQLite file (STORE-V2 section 2.1 lists them for the stores with replicas), and the state TTL
+and the orphan rule delete outright. A file has no `vci_schema` table either: its version is `PRAGMA user_version`,
+and whether the additions are there is read from `sqlite_master` (the `objects` table, created in the one
+transaction that adds the columns).
 
 **Crate.** `vci-store-sqlite` depends on `vci-store`, `vci-core`, `serde_json` and `rusqlite = { version = "=0.39.0",
 default-features = false, features = ["bundled"] }`.
@@ -1884,10 +1897,34 @@ default-features = false, features = ["bundled"] }`.
 - Pragmas: `journal_mode=WAL`, `busy_timeout = timeout` (default 30 s; writes commit one by one, so waits are
   milliseconds), `synchronous=NORMAL` (`OFF` under `VCI_STORE_SYNC=off`, read once by the factory),
   `foreign_keys=OFF`.
-- `PRAGMA application_id = 0x76636931` ('vci1') and `PRAGMA user_version = 1`.
-- The schema's state (application id, user version, tables) is read in one read transaction: read as three
-  statements, it raced a concurrent creator (c21 and the crate's test 10 caught it).
-- A newer `user_version` with application id 'vci1' gives `Incompatible{found, supported: 1}`.
+- `PRAGMA application_id = 0x76636931` ('vci1') and `PRAGMA user_version = 1`, or `2` past `vci store upgrade
+  --finish` (2.9). A file this vci creates is at version 1 with the format-3 additions, so that a 2.8 binary sharing
+  it (a CI cache) still reads it; `status()` reports the file's version.
+- The schema's state (application id, user version, tables, and since 2.9 whether `objects` is among them) is read
+  in one read transaction: read as three statements, it raced a concurrent creator (c21 and the crate's test 10
+  caught it). Each connection learns it once and passes it to every read and write, so a query touches only the
+  tables and columns the file has: a version-1 file from before 2.9 answers no object and no columns until a write
+  adds them, and a version-2 file is asked for no manifest.
+- A newer `user_version` with application id 'vci1' gives `Incompatible{found, supported: 2}`.
+- **An older file's first write** (2.9): a write on a version-1 file without the additions (one vci 2.8 wrote) first
+  adds the columns the table lacks (`PRAGMA table_info`, then `ALTER TABLE ADD COLUMN` each; the DDL is not `IF NOT
+  EXISTS` for columns) and the `objects` table with its indexes, in one `BEGIN IMMEDIATE` transaction of its own,
+  committed before the write's transaction, or before the batch's, which its first write begins afterwards
+  (STORE-V2 section 2.1: the DDL is never part of a batch request). `SqliteStore::upgrade_begin()` runs the same
+  ahead of a rollout (`vci store upgrade --begin`; it creates a missing file with the additions, returns whether it
+  added them now, and is `Denied` on a read-only handle).
+- **`SqliteStore::upgrade_finish()`** (`vci store upgrade --finish`, STORE-V2 section 5 step 4): in one `BEGIN
+  IMMEDIATE` transaction, make sure the additions are there, count the attestations whose value does not start with
+  `v` (`hex(substr(value, 1, 1)) <> '76'`: format-1 rows, and anything that is not a frame, since a reader of them
+  needs the manifests), and when there are none `DROP TABLE manifests` and set `user_version = 2`
+  (`Finish::Finished`); `Finish::FormatOneRows(n)` leaves the file at version 1 with its manifests (the additions,
+  if made here, are kept); `Finish::AlreadyFinished` at version 2; `Unavailable` when there is no file (nothing is
+  created); `Denied` on a read-only handle. At version 2 a vci before 2.9 reports the schema too new and fails
+  open; this vci reads manifests as none (`manifest`, `manifests`, `manifest_roots` empty, `orphan_manifests` every
+  given root, `remove_manifests` 0) and refuses `put_manifest` with `Unsupported` (``"format-1 manifests after `vci
+  store upgrade --finish`"``), while records of either format, hints, objects and columns go on as before. The CLI
+  (M3) reaches both through `SqliteStore` (opened with `SqliteFactory::path`), since the trait has no upgrade
+  method.
 - **Files it refuses.** A file with tables but `user_version` 0, or another `application_id`, is
   `Unavailable("<path>: not a vci store: …")` and is never written: pointing the store at `.git/git-meta.sqlite` fails
   this way and leaves the file untouched. SQLite's NOTADB or CORRUPT is `Unavailable` at once, without trying the
@@ -1940,6 +1977,32 @@ CREATE TABLE flags (name TEXT NOT NULL PRIMARY KEY, at INTEGER NOT NULL) WITHOUT
 
 The default `BINARY` collation is bytewise, as the contract requires.
 
+**The format-3 additions (2.9, `sql::COLUMNS_V2` and `Sql::ddl_v2`)**, on a version-1 file from before 2.9 added
+behind `value` by `ALTER TABLE` (a row that carries them is a frame of about 2 KB, which overflows no page; a
+format-1 row carries `NULL`s, which cost no read):
+
+```sql
+ALTER TABLE attestations ADD COLUMN format INTEGER;        -- 3 for a frame; NULL on a format-1 row or a put without columns
+ALTER TABLE attestations ADD COLUMN commit_id TEXT;
+ALTER TABLE attestations ADD COLUMN platform TEXT;
+ALTER TABLE attestations ADD COLUMN state TEXT;            -- `passed` / `failed`, as Columns::state is
+ALTER TABLE attestations ADD COLUMN duration_ms INTEGER;
+ALTER TABLE attestations ADD COLUMN expires INTEGER;
+ALTER TABLE attestations ADD COLUMN hdr TEXT;              -- 64-hex object ids, for the orphan queries
+ALTER TABLE attestations ADD COLUMN tables_id TEXT;
+ALTER TABLE attestations ADD COLUMN shape TEXT;
+ALTER TABLE attestations ADD COLUMN state_obj TEXT;
+CREATE TABLE objects (id TEXT NOT NULL PRIMARY KEY, kind INTEGER NOT NULL, put_at INTEGER NOT NULL, bytes BLOB NOT NULL);
+CREATE INDEX objects_kind_put     ON objects (kind, put_at);               -- the state TTL
+CREATE INDEX attestations_hdr     ON attestations (hdr)       WHERE hdr       IS NOT NULL;
+CREATE INDEX attestations_tables  ON attestations (tables_id) WHERE tables_id IS NOT NULL;
+CREATE INDEX attestations_shape   ON attestations (shape)     WHERE shape     IS NOT NULL;
+CREATE INDEX attestations_state   ON attestations (state_obj) WHERE state_obj IS NOT NULL;
+```
+
+Schema version 2 is this without the `manifests` table. The libSQL store shares `Names`, `Sql::ddl_v2`,
+`Sql::add_column` and the object statements for its namespaces as it shares the version-1 SQL.
+
 **Reads.**
 
 - `list_units`: `SELECT key, target FROM attestations WHERE test_key = ?1 ORDER BY key`, once per id, on one
@@ -1956,6 +2019,17 @@ The default `BINARY` collation is bytewise, as the contract requires.
   deduplicated.
 - `orphan_manifests`: empty if any row has `ref_state = 0`; otherwise the given roots with no row where
   `manifest_ref = root`.
+- (2.9) `get_objects`: every id validated, then in one read transaction `SELECT kind, length(bytes) FROM objects
+  WHERE id = ?1` per distinct id (the sizes come from the record header, so no blob is read) summed against
+  `MAX_OBJECTS_ANSWER`, refused as `Invalid{what: "objects"}` past it before a byte is read, then `SELECT kind,
+  bytes` per id, in the order asked; a missing id, a row whose `kind` names no kind, and a row whose `bytes` is not a
+  BLOB are left out. Timing line `store: sqlite: read N object(s)`. Nothing is read on a file without the additions.
+- (2.9) `orphan_objects`: `SELECT id FROM objects WHERE put_at < now - 3600 AND NOT EXISTS (SELECT 1 FROM
+  attestations WHERE hdr = objects.id OR tables_id = objects.id OR shape = objects.id OR state_obj = objects.id)
+  ORDER BY id` (the four partial indexes), ids that are not object ids (a foreign row) left out; no value read.
+- (2.9) `columns`: `SELECT format, commit_id, platform, state, duration_ms, expires, hdr, tables_id, shape,
+  state_obj FROM attestations WHERE key = ?1` per entry in one read transaction; a missing key, and a column that is
+  `NULL` or of another type, gives `None`.
 
 **Writes.** Each write is one `BEGIN IMMEDIATE` transaction.
 
@@ -1979,6 +2053,10 @@ The default `BINARY` collation is bytewise, as the contract requires.
     key is read back.
   - `encoding <> 0` lets a put of identical bytes repair a row this vci cannot read; otherwise identical bytes under
     the same key change nothing, `stored_at` included.
+  - (2.9) The ten format-3 columns are in the row list (`?12` to `?21`; `?10` to `?19` without a hint), from the
+    put's `Columns` or `NULL` each without them, and in the `DO UPDATE SET`; the `WHERE` gains `OR attestations.c IS
+    NOT excluded.c` for each, so the same bytes put with other columns, or without them, replace the columns (and
+    `stored_at`), as c40 requires.
 - `put_manifest`: compares inside SQL (`SELECT value = ?2 AND encoding = 0`), then only refreshes `put_at` when equal
   or upserts the value otherwise, in the same transaction, and returns whether the value changed. `base` comes from
   `compact_base`, kept only when it is a hex id.
@@ -1990,11 +2068,26 @@ The default `BINARY` collation is bytewise, as the contract requires.
 - `remove_manifests`: validate all roots, then in one `BEGIN IMMEDIATE` transaction delete only roots that no
   attestation references and no manifest uses as its base. SQLite has one writer, so this check is atomic and needs
   no grace period.
+- (2.9) `put_objects`: every object validated (`NewObject::validate`, which gives the id), then per object `UPDATE
+  objects SET put_at = ?2 WHERE id = ?1` and, when that changed no row, `INSERT INTO objects (id, kind, put_at,
+  bytes) VALUES (?1, ?2, ?3, ?4)`; the count of inserts is returned (exact, in a batch too). An empty list writes
+  nothing and creates no file.
+- (2.9) `remove_objects`: every id validated, then per distinct id `DELETE FROM objects WHERE id = ?1 AND put_at <
+  now - 3600 AND NOT EXISTS (… the four columns …)`: the orphan rule is inside the statement, and SQLite has one
+  writer, so nothing can come to reference an object between the check and the delete. The sum of the changed-row
+  counts is returned. Inside a batch it is applied at once in the batch's transaction (the batch's own objects were
+  put at `now`, within their grace). A missing file removes nothing and is not created.
+- (2.9) `prune_state_objects(older_than)`: `DELETE FROM objects WHERE kind = 4 AND put_at < now - older_than` on
+  the `(kind, put_at)` index, referenced or not; no `gone` row, since nothing syncs from the file. A missing file
+  removes nothing and is not created.
 
 **Batch.** `WriteBatch::deferred` (2.8; immediate before): it pins one pooled connection to the thread (a
 thread-local keyed by the handle), and its writes are one `BEGIN IMMEDIATE` transaction on it, with a savepoint per
 write, committed by `finish` (section 6). `vci run` of 1,200 Go units on a heavily loaded machine wrote its 2,400
-records in 4.8 s with a commit each, and in 0.9 s as one transaction.
+records in 4.8 s with a commit each, and in 0.9 s as one transaction. (2.9) Object puts and removals are writes of
+the batch like any other, in the order the caller makes them, so the order of section 6 (objects before records)
+is the caller's order inside one transaction, and no other connection sees a record before its objects; the
+additions' DDL on an older file is committed before the batch's transaction begins (its first write).
 
 **Other methods.**
 
@@ -2005,13 +2098,14 @@ records in 4.8 s with a commit each, and in 0.9 s as one transaction.
 - `synchronous` is `OFF` only under `VCI_STORE_SYNC=off`, read once at open. Unlike git-meta's store (2.7.27), it does
   not turn syncing off when `CI` is set.
 - `exchange` is `None`.
-- `caps` is `LOCAL.with_hints(true)`.
+- `caps` is `LOCAL.with_hints(true).with_objects(true).with_columns(true)` (2.9).
 - On drop of the last connection, the store runs `PRAGMA wal_checkpoint(TRUNCATE)` (best effort, 100 ms busy wait),
   so a CI cache of the file captures one consistent file without `-wal` and `-shm`. `store::close_all()` drops the
   store at the end of every command. (macOS's `/usr/bin/sqlite3` keeps the WAL files after reading such a file:
   tests that look for them must not use it.)
-- Timing lines (section 12): `store: sqlite: list N unit(s)`, `store: sqlite: read N value(s)`, `store: sqlite: write
-  N record(s)` per finished batch, and `timing_report()` with the handle's total writes.
+- Timing lines (section 12): `store: sqlite: list N unit(s)`, `store: sqlite: read N value(s)`, `store: sqlite: read
+  N object(s)`, `store: sqlite: write N record(s)` per finished batch, and `timing_report()` with the handle's total
+  writes.
 
 **Uses.** Local development loops, single-runner CI with a cache, the reference implementation for new backends
 (about 1,500 lines with its schema, reads and writes; no special cases), and a possible later outbox for shared
