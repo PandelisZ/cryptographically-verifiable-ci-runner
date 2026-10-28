@@ -891,6 +891,53 @@ fn sqlite_reads_the_candidates_it_set_aside() {
     }
 }
 
+/// On a server (libSQL's remote mode) a plan reads only the candidates it
+/// checks first (2.8.2: not each unit's newest two besides, a second
+/// request of 30 to 45 MB per vex plan). A pull request's second push:
+/// d's attestation remembered passing on main fails on d's edited inputs,
+/// so the plan reads, in its second round, only the candidates issued
+/// after it (the pull request's first push attested d as it is now) and
+/// skips d with that one, never reading the older one from before main's.
+#[test]
+fn libsql_remote_reads_newer_candidates_after_an_inputs_failure() {
+    let Some(b) = Backend::libsql_server(false) else {
+        return;
+    };
+    let Some(w) = World::new(b) else {
+        return;
+    };
+    let src = w.read("d/d.go");
+    let state = |s: &str| format!("{src}\n// {s}\n");
+    w.git(&w.work, &["checkout", "-q", "main"]);
+    let mut keys = Vec::new();
+    for s in ["old", "base"] {
+        w.put("d/d.go", &state(s));
+        w.commit(s);
+        keys.push(attested_keys(&w.run(&["d"]), "libsql")["d"].clone());
+        // A key's hint has whole seconds.
+        std::thread::sleep(Duration::from_millis(1100));
+    }
+    // A plan of main remembers what passed on its tree.
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.by["d"].0, keys[1], "{plan:?}");
+
+    w.git(&w.work, &["checkout", "-q", "-b", "pr"]);
+    w.put("d/d.go", &state("pr"));
+    w.commit("pr: d edited");
+    keys.push(attested_keys(&w.run(&["d"]), "libsql")["d"].clone());
+    w.touch("a/a.go", "unrelated");
+    w.commit("pr: a edited");
+
+    let (plan, out) = w.plan(&[("VCI_TIMING", "1")]);
+    let err = stderr(&out);
+    assert!(plan.skip.contains("d"), "{plan:?}\n{err}");
+    assert_eq!(plan.by["d"].0, keys[2], "the pull request's own: {err}");
+    assert!(
+        err.contains("round 2: read 1 candidate(s) set aside"),
+        "the newer one alone, in the second round: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. Fetch and push on a store without an exchange.
 

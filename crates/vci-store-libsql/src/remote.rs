@@ -8,10 +8,11 @@
 //!   namespace's prefix and version. The first write creates them in one
 //!   transaction; reads never do.
 //! * **Reads** are served from a per-handle cache ([`crate::cache`]) that
-//!   [`AttestationStore::prefetch`] fills in two requests (the listings,
-//!   then the chosen values with their manifests and bases), whatever the
-//!   number of units; a miss is one request for any number of keys (a JSON
-//!   array bound to `json_each`).
+//!   [`AttestationStore::prefetch`] fills: the listings in one request,
+//!   then the chosen values with their manifests, [`VALUES_PER_REQUEST`]
+//!   to a request and up to the pool's size at once, then their bases in
+//!   one more; a request that fails costs only its own keys. A miss is
+//!   read the same way (the keys a JSON array bound to `json_each`).
 //! * **Writes** are queued in a deferred batch ([`crate::batch`]) and sent
 //!   as one transactional request; a write outside a batch is a batch of
 //!   one.
@@ -20,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,13 +33,27 @@ use vci_store::{
 use vci_store_sqlite::sql::{Names, Sql};
 
 use crate::cache::{Cache, Listed, Manifest, Value};
-use crate::conn::{Conn, Fail, KIND, READ, WRITE, col_int, col_text, col_value, json_list, text};
+use crate::conn::{
+    Conn, Fail, HINT, KIND, Op, READ, READ_AGAIN, READ_SHARED, WRITE, col_int, col_text, col_value,
+    json_list, text,
+};
 
 /// The newest schema version this vci reads and writes.
 pub(crate) const SUPPORTED: u32 = 1;
 
 /// Keys, test keys or roots per request.
 const CHUNK: usize = 5_000;
+
+/// Attestation values per request, each with the manifest it references:
+/// a few megabytes (vex's Rails values: about 37 kB each stored as they
+/// are, 13 kB compressed), so that one request is answered within seconds
+/// even while other jobs write, and one that fails costs only its own
+/// units. Up to the pool's connections are read at once.
+pub(crate) const VALUES_PER_REQUEST: usize = 250;
+
+/// The most roots a read of values names as already cached (not sent
+/// again): the bases and shared manifests an earlier request brought.
+const EXCLUDE_CAP: usize = 4_096;
 
 /// How long the change log keeps an entry. A replica that last synced
 /// before the oldest entry kept syncs everything again.
@@ -78,6 +93,9 @@ pub(crate) struct Tables {
     pub(crate) existing_keys: String,
     pub(crate) removable: String,
     pub(crate) sync: String,
+    /// Whether a manifest is stored with these bytes (`?2` as they are,
+    /// `?3` compressed, or NULL).
+    pub(crate) manifest_same: String,
 }
 
 const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS vci_schema (
@@ -92,6 +110,42 @@ const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS vci_schema (
 const STATUS: &str = "SELECT version, log_floor FROM vci_schema WHERE ns = ?1";
 
 impl Tables {
+    /// The upsert of attestations on their slot, `rows` being one or more
+    /// `(key, test_key, signer, storage_key, target, issued, tree16,
+    /// manifest_ref, ref_state, stored_at, encoding, value)` literals: the
+    /// SQLite store's ([`Sql::upsert_attestations`]) with the value's
+    /// encoding (as it is, or compressed) written too.
+    pub(crate) fn upsert_attestations(&self, rows: &str) -> String {
+        let a = &self.names.attestations;
+        format!(
+            "INSERT INTO {a} \
+               (key, test_key, signer, storage_key, target, issued, tree16, manifest_ref, \
+                ref_state, stored_at, encoding, value) \
+             VALUES {rows} \
+             ON CONFLICT (test_key, signer, storage_key) DO UPDATE SET \
+               key = excluded.key, target = excluded.target, issued = excluded.issued, \
+               tree16 = excluded.tree16, manifest_ref = excluded.manifest_ref, \
+               ref_state = excluded.ref_state, stored_at = excluded.stored_at, \
+               encoding = excluded.encoding, value = excluded.value \
+             WHERE {a}.key IS NOT excluded.key \
+                OR {a}.value IS NOT excluded.value \
+                OR {a}.encoding IS NOT excluded.encoding"
+        )
+    }
+
+    /// The upsert of manifests, `rows` being one or more `(root, base,
+    /// put_at, encoding, value)` literals: `put_at` and `base` are
+    /// refreshed, the value and its encoding replaced.
+    pub(crate) fn upsert_manifests(&self, rows: &str) -> String {
+        let m = &self.names.manifests;
+        format!(
+            "INSERT INTO {m} (root, base, put_at, encoding, value) VALUES {rows} \
+             ON CONFLICT (root) DO UPDATE SET \
+               value = excluded.value, encoding = excluded.encoding, \
+               base = excluded.base, put_at = excluded.put_at"
+        )
+    }
+
     fn new(namespace: &str) -> Tables {
         let prefix = table_prefix(namespace);
         let names = Names::prefixed(&prefix);
@@ -133,15 +187,16 @@ impl Tables {
                 "SELECT test_key, key, target FROM {a} WHERE test_key IN ({set}) ORDER BY test_key, key"
             ),
             // The values of these keys (?1), and when ?2 is 1, the
-            // manifests they reference with those manifests' bases: one
-            // request.
+            // manifests they reference but those named in ?3 (cached
+            // already), each with the name of its base: one request. The
+            // bases are read once for all the requests of a read
+            // (`Remote::query_values`).
             values: format!(
                 "SELECT 0, key, value, encoding, manifest_ref FROM {a} WHERE key IN ({set}) \
                  UNION ALL \
-                 SELECT 1, root, value, encoding, base FROM {m} WHERE ?2 = 1 AND (\
-                   root IN (SELECT manifest_ref FROM {a} WHERE key IN ({set})) \
-                   OR root IN (SELECT base FROM {m} WHERE base IS NOT NULL AND \
-                     root IN (SELECT manifest_ref FROM {a} WHERE key IN ({set}))))"
+                 SELECT 1, root, value, encoding, base FROM {m} WHERE ?2 = 1 \
+                   AND root IN (SELECT manifest_ref FROM {a} WHERE key IN ({set})) \
+                   AND root NOT IN (SELECT value FROM json_each(?3))"
             ),
             manifests_and_bases: format!(
                 "SELECT root, value, encoding, base FROM {m} WHERE root IN ({set}) \
@@ -159,6 +214,10 @@ impl Tables {
                  AND NOT EXISTS (SELECT 1 FROM {a} AS x WHERE x.manifest_ref = j.value)"
             ),
             flags_all: format!("SELECT name FROM {f}"),
+            manifest_same: format!(
+                "SELECT (encoding = 0 AND value = ?2) OR (encoding = 1 AND value IS ?3) \
+                 FROM {m} WHERE root = ?1"
+            ),
             existing_keys: format!("SELECT key FROM {a} WHERE key IN ({set})"),
             removable: format!(
                 "SELECT root FROM {m} AS r WHERE r.root IN ({set}) AND r.put_at <= ?2 \
@@ -221,8 +280,12 @@ pub(crate) struct Remote {
     flags: Mutex<Option<BTreeSet<String>>>,
     pub(crate) memo_pruned: AtomicBool,
     pub(crate) log_pruned: AtomicBool,
-    /// `remove_manifests` keeps a root put more recently than this.
+    /// `remove_manifests` keeps a root put more recently than this, and a
+    /// write that supersedes an attestation removes the manifest only it
+    /// referenced when that was put before this.
     pub(crate) grace: Duration,
+    /// Write values compressed (`VCI_STORE_COMPRESS=zstd`).
+    compress: AtomicBool,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -248,6 +311,7 @@ impl Remote {
         repo_id: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
         git_common_dir: PathBuf,
         grace: Duration,
+        compress: bool,
     ) -> Remote {
         Remote {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -264,7 +328,18 @@ impl Remote {
             memo_pruned: AtomicBool::new(false),
             log_pruned: AtomicBool::new(false),
             grace,
+            compress: AtomicBool::new(compress),
         }
+    }
+
+    /// Whether values are written compressed.
+    pub(crate) fn compress(&self) -> bool {
+        self.compress.load(Ordering::Relaxed)
+    }
+
+    /// Write values compressed from now on, or not (tests).
+    pub(crate) fn set_compress(&self, on: bool) {
+        self.compress.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn cache(&self) -> MutexGuard<'_, Cache> {
@@ -559,30 +634,115 @@ impl Remote {
 
     /// The values of these keys (with the manifest each references), and
     /// when `with_manifests`, those manifests and their bases into the
-    /// cache (the ones not stored as absent): one request per [`CHUNK`].
-    fn query_values(
-        &self,
-        t: &Tables,
-        keys: &[&str],
-        with_manifests: bool,
-    ) -> Result<HashMap<String, (Value, Option<String>)>, StoreError> {
-        let mut out = HashMap::new();
-        for chunk in keys.chunks(CHUNK) {
+    /// cache (the ones not stored as absent). The keys go
+    /// [`VALUES_PER_REQUEST`] to a request, up to the pool's connections at
+    /// once, each manifest and base at most once: the manifests with their
+    /// attestations (but those cached already), then the bases not cached
+    /// in one more request. A request that fails (after the deadline's one
+    /// retry, see `Conn::run`) leaves its keys out of [`Values::found`] and
+    /// in [`Values::failed`]: the others are read.
+    fn query_values(&self, t: &Tables, keys: &[&str], with_manifests: bool) -> Values {
+        let mut out = Values::default();
+        if keys.is_empty() {
+            return out;
+        }
+        let chunks: Vec<&[&str]> = keys.chunks(VALUES_PER_REQUEST).collect();
+        let exclude = if with_manifests {
+            let c = self.cache();
+            json_list(c.stored_roots(EXCLUDE_CAP))
+        } else {
+            json_list(std::iter::empty())
+        };
+        let ask = |op: Op, chunk: &[&str]| -> Rows {
             let r = self.query(
-                READ,
+                op,
                 &t.values,
                 vec![
                     json_list(chunk.iter().copied()),
                     V::Integer(i64::from(with_manifests)),
+                    exclude.clone(),
                 ],
             );
-            let rows = Fail::or_absent(r, Vec::new)?;
-            let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
-            let mut bases: BTreeSet<String> = BTreeSet::new();
-            let mut refs: BTreeSet<String> = BTreeSet::new();
+            Fail::or_absent(r, Vec::new)
+        };
+        let mut answers: Vec<Rows> = {
+            let workers = self.conn.max().min(chunks.len());
+            if workers <= 1 {
+                chunks.iter().map(|c| ask(READ, c)).collect()
+            } else {
+                let next = AtomicUsize::new(0);
+                // A request ran out of time: no more are sent at once.
+                let slow = AtomicBool::new(false);
+                let done: Mutex<Vec<Option<Rows>>> =
+                    Mutex::new((0..chunks.len()).map(|_| None).collect());
+                std::thread::scope(|sc| {
+                    for _ in 0..workers {
+                        sc.spawn(|| {
+                            while !slow.load(Ordering::Relaxed) {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(chunk) = chunks.get(i) else {
+                                    break;
+                                };
+                                let r = ask(READ_SHARED, chunk);
+                                if matches!(r, Err(StoreError::Timeout { .. })) {
+                                    slow.store(true, Ordering::Relaxed);
+                                }
+                                done.lock().unwrap_or_else(PoisonError::into_inner)[i] = Some(r);
+                            }
+                        });
+                    }
+                });
+                done.into_inner()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .into_iter()
+                    .map(|r| {
+                        r.unwrap_or(Err(StoreError::Timeout {
+                            backend: KIND,
+                            operation: "a request (not sent: another ran out of time)",
+                            after: Duration::ZERO,
+                        }))
+                    })
+                    .collect()
+            }
+        };
+        // A request sent beside others that ran out of time, and those not
+        // sent after it: their keys again, one request at a time, half as
+        // many to a request; one out of time now latches the breaker (it
+        // was the second try), and the rest then fail at once.
+        for (chunk, answer) in chunks.iter().zip(answers.iter_mut()) {
+            if !matches!(answer, Err(StoreError::Timeout { .. })) {
+                continue;
+            }
+            let mut rows = Vec::new();
+            let mut again = Ok(());
+            for half in chunk.chunks(chunk.len().div_ceil(2).max(1)) {
+                match ask(READ_AGAIN, half) {
+                    Ok(r) => rows.extend(r),
+                    Err(e) => {
+                        again = Err(e);
+                        break;
+                    }
+                }
+            }
+            *answer = again.map(|()| rows);
+        }
+        let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
+        let mut bases: BTreeSet<String> = BTreeSet::new();
+        let mut refs: BTreeSet<String> = BTreeSet::new();
+        for (chunk, answer) in chunks.iter().zip(answers) {
+            let rows = match answer {
+                Ok(rows) => rows,
+                Err(e) => {
+                    out.failed.extend(chunk.iter().map(|k| (*k).to_owned()));
+                    out.error.get_or_insert(e);
+                    continue;
+                }
+            };
             for row in rows {
                 if row.len() < 5 {
-                    return Err(malformed("values"));
+                    out.failed.extend(chunk.iter().map(|k| (*k).to_owned()));
+                    out.error.get_or_insert_with(|| malformed("values"));
+                    break;
                 }
                 let Some(name) = col_text(&row[1]) else {
                     continue;
@@ -596,7 +756,7 @@ impl Remote {
                     if let Some(r) = &extra {
                         refs.insert(r.clone());
                     }
-                    out.insert(name, (v, extra));
+                    out.found.insert(name, (v, extra));
                 } else {
                     if let Some(b) = extra {
                         bases.insert(b);
@@ -610,9 +770,15 @@ impl Remote {
                     );
                 }
             }
-            if with_manifests {
+        }
+        // A chunk cut short by a malformed row: none of its keys count.
+        for k in &out.failed {
+            out.found.remove(k);
+        }
+        if with_manifests {
+            {
                 let mut c = self.cache();
-                for r in refs.iter().chain(bases.iter()) {
+                for r in &refs {
                     if !manifests.contains_key(r) && !c.has_stored_manifest(r) {
                         c.set_manifest(r.clone(), Manifest::Absent);
                     }
@@ -620,9 +786,16 @@ impl Remote {
                 for (root, m) in manifests {
                     c.set_manifest(root, m);
                 }
+                bases.retain(|b| !c.has_stored_manifest(b));
+            }
+            // The bases: once for all the chunks. One that cannot be read
+            // now is read when it is asked for.
+            if !bases.is_empty() {
+                let bases: Vec<String> = bases.into_iter().collect();
+                let _ = self.fetch_roots(t, &bases);
             }
         }
-        Ok(out)
+        out
     }
 
     pub(crate) fn read_values(&self, envs: &mut [&mut StoredEnvelope]) -> Result<(), StoreError> {
@@ -639,24 +812,59 @@ impl Remote {
         if misses.is_empty() {
             return Ok(());
         }
-        let t = self.ready()?;
+        let served = misses.len() < envs.len();
+        // Values that cannot be read now read as such (their units run),
+        // unless none could be served at all: then the call fails, as a
+        // store that cannot be used does.
+        let fail = |envs: &mut [&mut StoredEnvelope], misses: &[usize], e: StoreError| {
+            if !served {
+                return Err(e);
+            }
+            let why = format!("could not be read from the store: {e}");
+            for &i in misses {
+                envs[i].set_error(why.clone());
+            }
+            Ok(())
+        };
+        let t = match self.ready() {
+            Ok(t) => t,
+            Err(e) => return fail(envs, &misses, e),
+        };
         let step = Step::start(KIND);
+        let (n0, b0) = (self.conn.requests(), self.conn.received());
         let keys: BTreeSet<String> = misses.iter().map(|&i| envs[i].key.clone()).collect();
         let n = keys.len();
         // Whoever reads a value verifies it next, which reads the manifest
-        // it references and that manifest's base: they come in the same
-        // request.
+        // it references and that manifest's base: they come with it.
         let read = {
             let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
-            self.query_values(t, &keys, true)?
+            self.query_values(t, &keys, true)
         };
+        let mut read = read;
+        if read.found.is_empty()
+            && !served
+            && let Some(e) = read.error.take()
+        {
+            return Err(e);
+        }
+        let why = read
+            .error
+            .as_ref()
+            .map(|e| format!("could not be read from the store: {e}"));
         for &i in &misses {
-            match read.get(&envs[i].key) {
+            match read.found.get(&envs[i].key) {
                 Some((v, _)) => v.clone().apply(envs[i]),
+                None if read.failed.contains(&envs[i].key) => {
+                    envs[i].set_error(why.clone().unwrap_or_default());
+                }
                 None => envs[i].set_error(GONE),
             }
         }
-        step.done(format_args!("read {n} value(s)"));
+        step.done(format_args!(
+            "read {n} value(s), {} request(s), {}",
+            self.conn.requests() - n0,
+            megabytes(self.conn.received() - b0)
+        ));
         Ok(())
     }
 
@@ -854,6 +1062,41 @@ impl Remote {
         Ok(())
     }
 
+    /// Read these manifests (not their bases) into the cache; the ones not
+    /// stored are cached as absent.
+    fn fetch_roots(&self, t: &Tables, roots: &[String]) -> Result<(), StoreError> {
+        for chunk in roots.chunks(CHUNK) {
+            let r = self.query(
+                READ,
+                &t.manifests_of,
+                vec![json_list(chunk.iter().map(String::as_str))],
+            );
+            let rows = Fail::or_absent(r, Vec::new)?;
+            let mut c = self.cache();
+            let mut got: BTreeSet<String> = BTreeSet::new();
+            for row in rows {
+                let Some(root) = row.first().and_then(col_text) else {
+                    continue;
+                };
+                let m = match (row.get(1), row.get(2)) {
+                    (Some(v), Some(e)) => match col_value(v, e) {
+                        Ok(b) => Manifest::Bytes(b),
+                        Err(why) => Manifest::Unreadable(why),
+                    },
+                    _ => return Err(malformed("manifests")),
+                };
+                got.insert(root.clone());
+                c.set_manifest(root, m);
+            }
+            for r in chunk {
+                if !got.contains(r) {
+                    c.set_manifest(r.clone(), Manifest::Absent);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn manifest_roots(&self) -> Result<Vec<String>, StoreError> {
         let t = self.ready()?;
         let r = self.query(READ, &t.shared.manifest_roots, Vec::new());
@@ -933,7 +1176,7 @@ impl Remote {
         }
         let t = self.ready()?;
         let step = Step::start(KIND);
-        let n0 = self.conn.requests();
+        let (n0, b0) = (self.conn.requests(), self.conn.received());
         let mut tks: Vec<String> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for id in test_ids {
@@ -978,23 +1221,38 @@ impl Remote {
                 .filter(|k| !c.has_value(k))
                 .collect()
         };
+        // A request that failed leaves its values uncached, to be read
+        // again when they are asked for (`read_values`, which marks only
+        // the ones that fail again as unreadable), and says so; the rest
+        // is read.
+        let mut h = Hydration::default();
         if !want.is_empty() {
-            let mut read = self.query_values(t, &want, true)?;
+            let mut read = self.query_values(t, &want, true);
             let mut c = self.cache();
             for k in &want {
-                match read.remove(*k) {
+                match read.found.remove(*k) {
                     Some((v, _)) => c.set_value((*k).to_owned(), v),
+                    None if read.failed.contains(*k) => {}
                     None => c.set_value((*k).to_owned(), Value::Unreadable(GONE.to_owned())),
                 }
             }
+            if let Some(e) = read.error {
+                h.unresolved = read.failed.len();
+                eprintln!(
+                    "vci: warning: could not prefetch {} stored value(s) from {}: {e}; they are read again when asked for",
+                    read.failed.len(),
+                    self.location(false)
+                );
+            }
         }
         step.done(format_args!(
-            "prefetch {} unit(s), {} value(s), {} request(s)",
+            "prefetch {} unit(s), {} value(s), {} request(s), {}",
             tks.len(),
             want.len(),
-            self.conn.requests() - n0
+            self.conn.requests() - n0,
+            megabytes(self.conn.received() - b0)
         ));
-        Ok(Hydration::default())
+        Ok(h)
     }
 
     // ---- hints ---------------------------------------------------------------------------
@@ -1045,7 +1303,21 @@ impl Remote {
 
     /// Remember these memo entries (and forget those older than a week,
     /// once per handle). Never creates the tables; failures are ignored.
+    /// Only the entries the server does not hold already are written (a
+    /// second plan of the same tree, which `passing_on` read, writes
+    /// none), as a hint: given at most [`HINT_TIMEOUT`] behind other
+    /// writers, never sent again after it, never latching the breaker.
+    ///
+    /// [`HINT_TIMEOUT`]: crate::conn::HINT_TIMEOUT
     pub(crate) fn remember_passing(&self, tree16: &str, items: &[(String, String)]) {
+        if items.is_empty() {
+            return;
+        }
+        let known = self.passing_on(tree16);
+        let items: Vec<&(String, String)> = items
+            .iter()
+            .filter(|(tk, k)| known.get(tk) != Some(k))
+            .collect();
         if items.is_empty() {
             return;
         }
@@ -1067,7 +1339,7 @@ impl Remote {
                 &[(at - vci_store_sqlite::sql::MEMO_KEEP_SECS).to_string()],
             ));
         }
-        if self.write(WRITE, &stmts).is_ok() {
+        if self.write(HINT, &stmts).is_ok() {
             let mut m = self.memo_cache();
             let e = m.entry(tree16.to_owned()).or_default();
             for (tk, k) in items {
@@ -1076,8 +1348,13 @@ impl Remote {
         }
     }
 
-    /// Flag `name`. Never creates the tables; failures are ignored.
+    /// Flag `name`, as a hint (see [`Remote::remember_passing`]): nothing
+    /// is sent when the flags read once per handle hold it already. Never
+    /// creates the tables; failures are ignored.
     pub(crate) fn set_flag(&self, name: &str) {
+        if self.flag(name) {
+            return;
+        }
         let Ok(t) = self.ready() else {
             return;
         };
@@ -1085,12 +1362,33 @@ impl Remote {
             return;
         }
         let sql = inline(&t.shared.flag_put, &[text(name), now().to_string()]);
-        if self.write(WRITE, &[sql]).is_ok()
+        if self.write(HINT, &[sql]).is_ok()
             && let Some(f) = self.flags().as_mut()
         {
             f.insert(name.to_owned());
         }
     }
+}
+
+/// The rows of one request, or why there are none.
+type Rows = Result<Vec<Vec<V>>, StoreError>;
+
+/// What [`Remote::query_values`] read.
+#[derive(Default)]
+struct Values {
+    /// Key -> its value and the manifest it references.
+    found: HashMap<String, (Value, Option<String>)>,
+    /// The keys whose request failed.
+    failed: BTreeSet<String>,
+    /// Why (the first failure).
+    error: Option<StoreError>,
+}
+
+/// `bytes` as the timing lines show them.
+pub(crate) fn megabytes(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let mb = bytes as f64 / 1e6;
+    format!("{mb:.1} MB")
 }
 
 /// A unit's listing as unread entries.

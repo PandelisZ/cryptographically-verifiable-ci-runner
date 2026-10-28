@@ -223,8 +223,10 @@ Supporting types:
   only by key (`NewAttestation::copy_of`).
 - `Hydration`, `FetchOutcome`, `PushOutcome`, `PushStatus` and `PushMode`. `PushStatus` and `PushMode` are
   `#[non_exhaustive]`, so other crates match them with a wildcard arm.
-- `Caps { shared_writes, lazy_values, keeps_hints }`, which is non-exhaustive: build it from `Caps::LOCAL` with the
-  `with_*` methods.
+- `Caps { shared_writes, lazy_values, keeps_hints, remote_reads }`, which is non-exhaustive: build it from
+  `Caps::LOCAL` with the `with_*` methods. `remote_reads` (2.8.2, the libSQL store's remote mode) says that every value
+  read comes over the network, its bytes and requests costing time: the plan then reads only the candidates it checks
+  first (section 5).
 - `StoreStatus`, `Prefetch` (non-exhaustive) and `WriteBatch` (with `BatchEnd`).
 - `StoreError` (non-exhaustive).
 - `FailedStore`, which stands in for a store that could not be selected or opened.
@@ -503,10 +505,15 @@ only the plan's `mark_not_fetched` does.
    - `status()`, then `list_units(ids)` for every unit.
    - For each unit the plan reads the same choice plus its two newest candidates (`READ_FIRST`), and calls
      `mark_not_fetched` on the rest. It records the keys it set aside, per unit (`SetAside`): the plan never infers
-     them from the error text. One `read_values` reads the chosen ones.
+     them from the error text. One `read_values` reads the chosen ones. On a store whose reads go over the network
+     (`Caps::remote_reads`, 2.8.2) it reads the choice alone: the newest two were a second request of 1,170 to 1,462
+     values (30 to 45 MB) per vex plan on Turso, for the few units whose first choice fails, which round 2 reads.
 2. **Round 2** (`hydrate_more`), for the units the first pass did not skip that have candidates. A unit whose
-   memo-named candidate was read and failed on its inputs (an `entry:` difference) is left out: its inputs changed,
-   and it runs (2.7.32).
+   memo-named candidate was read and failed on its inputs (an `entry:` difference) has changed inputs: no candidate
+   issued before that one is read for it (2.7.32), and only those issued after it are, when some were set aside or
+   not fetched (2.8.2: the attestation a pull request's earlier push made on the changed inputs, which `READ_FIRST`
+   used to read in round 1); without such a candidate it runs, as before. The keys never read are kept for the later
+   rounds and the reads (`older`); round 2's prefetch then names the others (`choose`).
    - `unread`: the units with keys set aside, or with a candidate a lazy store reports not fetched. `roots`: the
      manifests and bases the checks found not fetched. With neither, the plan is done.
    - `prefetch(Units{unread, choose: None})` and `prefetch(Manifests{roots})`. A fetch that resolved values evicts
@@ -701,7 +708,11 @@ So on a store with `Caps::shared_writes` (`cmds::store_mode(shared_writes, push)
 
 - **Never fail.** Any problem (no store, a read-only file, an unreachable server, a role without INSERT) makes reads
   return empty or `false` and makes writes do nothing.
-- **Bounded time.** Hints use the backend's normal timeouts, and the circuit breaker cuts them off.
+- **Bounded time.** Hints use the backend's normal timeouts, and the circuit breaker cuts them off. On a libSQL server
+  (2.8.2) a hint's write waits at most 5 s (or the request timeout, if shorter) behind other writers for the server's
+  one write lock, is never sent again, and never latches the breaker: nothing waits for it to be stored.
+- **Only what is new.** The libSQL store's `set_flag` sends nothing for a flag it read as set, and `remember_passing`
+  writes only the entries `passing_on` did not return for that tree: a second plan of the same tree writes none.
 - **Never trusted.** The memo only orders reads. Every candidate is still verified. Flags only start the Rails boot
   early.
 - **Stored keys must match listings**, which is why key strings are identical across backends.
@@ -2203,9 +2214,9 @@ instead of about 3,000 round trips. Inside a deferred batch:
 
 `vci-store-libsql` holds `LibsqlFactory` (kind `libsql`, registered under vci-cli's cargo feature `libsql`, on by
 default), `LibsqlStore` (`open(&Selection, &OpenContext)`, which does no I/O; `mode()`, `path()`, `namespace()`,
-`requests()`, every HTTP request sent, and `retries()`, those sent again (a busy server, a stream the server no
-longer knew, a connection lost under the request); doc-hidden
-`__execute_for_test` and `__query_for_test`), `LibsqlError` (the payload of `StoreError::Backend` for unexpected
+`requests()`, every HTTP request sent, `retries()`, those sent again (a busy server, a stream the server no
+longer knew, a connection lost under the request, a deadline that ran out), and `received()`, the bytes of values
+read, as stored; doc-hidden `__execute_for_test`, `__query_for_test` and `__compress_for_test`), `LibsqlError` (the payload of `StoreError::Backend` for unexpected
 errors), `table_prefix(namespace)` and the testkit (below). The modules are `conn` (the URL and the token, the TLS
 connector, the runtime, the pool, the circuit breaker, deadlines, error classification and scrubbing, the guard
 against the client's panics, SQL literals), `remote` (the tables of a namespace, reads, prefetch, hints), `cache`,
@@ -2214,15 +2225,16 @@ against the client's panics, SQL literals), `remote` (the tables of a namespace,
 | mode | selected by | reads | writes | `caps` |
 |---|---|---|---|---|
 | local | `VCI_STORE=libsql` with no `VCI_STORE_URL`, or `VCI_STORE_URL=file:<path>` | a file, `<git common dir>/vci-store.libsql` by default | the file | `LOCAL.with_hints(true)` |
-| remote | a `libsql://` `VCI_STORE_URL` (or `https://`/`http://` with `VCI_STORE=libsql`) | the server, through a per-handle cache | the server, one request per batch | `with_shared_writes(true).with_hints(true)` |
-| replica | remote, plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true` | a local file synced from the server at its first use and at each later prefetch | the server, then written through to the file | as remote |
+| remote | a `libsql://` `VCI_STORE_URL` (or `https://`/`http://` with `VCI_STORE=libsql`) | the server, through a per-handle cache | the server, one request per batch (a few MiB each) | `with_shared_writes(true).with_hints(true).with_remote_reads(true)` |
+| replica | remote, plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true` | a local file synced from the server at its first use and at each later prefetch | the server, then written through to the file | `with_shared_writes(true).with_hints(true)` |
 
 **Crate.** `vci-store-libsql` depends on `vci-store`, `vci-core`, `vci-store-sqlite` (the schema SQL and the file
 format), `serde_json`, `libsql = { version = "=0.10.0", default-features = false, features = ["remote"] }` (the Hrana
 client: HTTP, in Rust), and, for the connector it hands libsql, `hyper` 0.14 (`client`, `http1`, `tcp`; the version
 libsql's connector trait is written against), `http` 0.2, `tower-service` 0.3, `tokio` (`rt`, `time`, `net`),
 `tokio-rustls` 0.26 and the PostgreSQL store's pins `rustls = "=0.23.45"` (`ring`, `std`, `tls12`) and
-`webpki-roots = "=1.0.9"`. One `rustls` resolves and `cargo tree -i aws-lc-rs` is empty. libsql 0.10.0 was published
+`webpki-roots = "=1.0.9"`, and `zstd = "=0.13.3"` without its optional features (2.8.2: values stored compressed,
+below; the reference C library, built with the C compiler the bundled SQLite already needs). One `rustls` resolves and `cargo tree -i aws-lc-rs` is empty. libsql 0.10.0 was published
 on 13 October 2026, twelve days before it was pinned, not the two weeks decision 13 asks for; it is the version the
 work was specified against. Two of libsql's features are left off on purpose:
 
@@ -2303,6 +2315,18 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
 - **The log** names every slot and root a write touched (a put, a removal, a manifest), for replicas. Entries older
   than 30 days are deleted once per handle by its first write, which records the newest deleted `seq` in
   `vci_schema.log_floor`: a replica that last synced before it syncs everything.
+- **Values compressed** (2.8.2). A value's `encoding` column, there since schema v1 for this, says how its bytes are
+  stored: 0 as they are, 1 as one zstd frame (level 6). Every reader from 2.8.2 reads both, decompressing at most
+  5,000,000 bytes (no value vci stores is larger; past that the value reads as unreadable, its unit runs), and the
+  key, the signature and every check cover the bytes as they were, so verification is unchanged. Writers compress
+  when `VCI_STORE_COMPRESS=zstd` (`off` or unset: as they are; any other value is a `Config` error). The schema stays
+  version 1, since the tables do not change: a 2.8.1 reader reads a compressed value as one `in an encoding this vci
+  cannot read (1)`, so that unit runs (never a wrong skip), and a 2.8.1 writer replaces a compressed row of a slot it
+  puts with its own, as it is (its upsert rewrites a row whose encoding is not 0). So a namespace takes compressed
+  writes once every reader is 2.8.2 or later; until then the rows written raw and compressed coexist, and rows written
+  before stay as they are until a unit is attested again. On vex's values (JSON) zstd stores envelopes and manifests
+  about 3x smaller (16.1 MB to 5.45 MB over 825 sampled rows; their reads 2.7x faster from a laptop). A value of an
+  encoding above 1 says `a newer vci wrote it`.
 
 ### Connection handling
 
@@ -2327,7 +2351,17 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   timeout too, so a server or proxy that accepts and never answers, sends headers and stalls, or trickles bytes costs
   5 s (`Timeout{operation: "the server's first answer"}`), not the request timeout. Every other request is given up
   after the request timeout (`VCI_STORE_TIMEOUT_SECS`, 30 s; ten minutes for `vci prune`,
-  `OpenContext::long_running`), and a pool checkout after the connect timeout. While the server answers that the
+  `OpenContext::long_running`), and a pool checkout after the connect timeout. A request whose deadline runs out once
+  the server has answered the handle (2.8.2) is sent once more, on a new connection, with a deadline of its own
+  (counted in `retries()`): a large read answered slowly while other jobs write, or a write that waited for the lock,
+  costs that call a second try instead of the handle (`OnTimeout::Resend`). Only the same request out of time again
+  (`TRIES_AFTER_TIMEOUT`; counted per request, so that requests sent at once do not use up each other's try) latches
+  the breaker;
+  a deadline before any answer latches it at once, as before, and a request whose try comes after another latched it
+  is not sent again. A hint's write (`Op::hint`: the memo and the flags) has a deadline of
+  `HINT_TIMEOUT`, 5 s, or the request timeout if shorter, is never sent again and never latches
+  (`OnTimeout::FailAlone`); a request of values sent beside others fails alone the same way, and the read sends its
+  keys again itself ("Reads", below). While the server answers that the
   database is locked, that it is out of connections (HTTP 429) or that it interrupted the statement, the request is
   tried again with growing pauses until its deadline (`Timeout{operation: "waiting for another writer"}` then). A
   server stream idle for more than 4 s is reset before use (servers expire idle streams after about 10 s), and a
@@ -2363,9 +2397,12 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   lost under a request every time the request is sent (or once, before the server has answered the handle; above),
   HTTP 401, or 403 on a read (`the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)`, or `the
   server refused the token …`, `… from [store] token_command (<command>)` for the command's), 404 (`no libsql database
-  there`), other HTTP error status (a 5xx, a proxy's page), answer the client cannot read, or deadline that ran out is
-  latched, and every later call of the handle fails at once with `… (failed earlier in this process; not retried)`.
-  Busy retries, `Denied`, `Unsupported`, `Backend` and a read whose rows were cut off are not latched.
+  there`), other HTTP error status (a 5xx, a proxy's page), answer the client cannot read, deadline before the server
+  first answered, or request out of time twice is latched, and every later call of the handle fails at once with `…
+  (failed earlier in this process; not retried)`. Busy retries, `Denied`, `Unsupported`, `Backend`, a read whose rows
+  were cut off, one deadline that ran out (sent again, above) and a hint's write are not latched. 2.8.1 latched the
+  first deadline: one vex job's 30 s read made its plan run every unit, and one 30 s write lost the run's remaining
+  800 attestations.
 - **Statements the server refuses.** `sqld` reports a statement's error (a batch step's as a Hrana API error, a
   cursor step's as `error at step N`) with HTTP 200: the server works, so it is `Backend(LibsqlError)` (`<url>: the
   server refused a statement: …`), not latched; the transaction it was in was rolled back (its stream closes with
@@ -2411,20 +2448,37 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
 The cache is `vci-store-postgres`'s, with the same rules (section 17, "Reads and the per-handle cache"): filled only
 by `prefetch` and `read_values`' manifest read-ahead, kept current by this handle's own writes, values moved out on
 their first read, capped at 256 MiB. Each read is one statement whatever the number of keys, the keys bound as one
-JSON array (`IN (SELECT value FROM json_each(?1))`), 5,000 to a request:
+JSON array (`IN (SELECT value FROM json_each(?1))`), 5,000 to a request, but for values (below):
 
 | method | on a cache miss |
 |---|---|
 | `list_units` | `SELECT test_key, key, target FROM <a> WHERE test_key IN (…) ORDER BY test_key, key` |
-| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference and those manifests' bases, which go to the cache |
+| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference (but those cached already), 250 keys to a request; then the bases those manifests name and the cache lacks, in one more request; all go to the cache |
 | `manifest`, `manifests` | `root = ?1`; `root IN (…)` |
 | `read_units` | fully cached units from the cache (values kept); the rest in one statement with values |
 | `list_all`, `count`, `manifest_roots`, `read_all` | one statement each, never cached |
 | `orphan_manifests` | one statement: empty when a row's `ref_state` is 0, else the roots no row references |
 
-**`prefetch(Units{ids, choose})` is two requests**: the listings of every unit (from the server even when cached, which
-is where other writers' changes are picked up), then the values `choose` picks that are not cached, with their
-manifests and bases. `prefetch(Manifests)` is one request for the roots not cached as stored, with their bases.
+**`prefetch(Units{ids, choose})`** is the listings of every unit in one request (from the server even when cached,
+which is where other writers' changes are picked up), then the values `choose` picks that are not cached, with their
+manifests and bases, as `read_values` reads them. `prefetch(Manifests)` is one request for the roots not cached as
+stored, with their bases.
+
+**Values, 250 to a request** (2.8.2, `VALUES_PER_REQUEST`), up to the pool's connections at once (`min(VCI_JOBS,
+4)`), each request with the manifests its attestations reference but those cached already (the roots cached, at most
+4,096, are bound as a second JSON array), each base once for the whole read. 2.8.1 read a plan's 1,600 to 2,000 values
+(60 to 85 MB on vex's Turso) in one request that took 2 to 22 s, and repeated the bases in each of a plan's reads.
+Requests sent at once share the connection's bandwidth, so one of them whose deadline runs out
+(`OnTimeout::FailAlone`) fails alone, latching nothing and not sent again by itself, and no more are sent at once: the
+read sends the keys of that request, and of those not sent yet, again, one request at a time and 125 to a request
+(`OnTimeout::Latch`: one of those out of time was the second try, and latches the breaker, after which the rest fail at
+once). A server that stops answering costs at most two deadlines there, as elsewhere. A request that fails otherwise,
+or again, costs only its keys: `prefetch` leaves them uncached, counts them
+in `Hydration::unresolved` and warns (`vci: warning: could not prefetch N stored value(s) from <url> namespace <ns>: …;
+they are read again when asked for`), and `read_values` reads them again when asked; a `read_values` request that fails marks its keys
+`Unreadable("could not be read from the store: …")`, so their units run, and the call fails only when it could serve
+no key at all (from the cache or the server), as a store that cannot be used does. The timing lines carry the bytes
+read: `prefetch N unit(s), M value(s), R request(s), X MB` and `read M value(s), R request(s), X MB`.
 Hrana's batch could carry several statements in one HTTP request; one statement per read already does, so a plan of
 1,200 units is the status, the flags, the memo, two prefetches of two requests and the descriptions of the statements
 on each connection: `a_plan_costs_a_handful_of_requests` checks at most 8 requests for the status and a prefetch of
@@ -2445,11 +2499,19 @@ had to promote to the write lock, a promotion that fails at once under concurren
 back as `database is locked`, and vci sent the batch again) and can abort `sqld` 0.24 (section 21, item 17). A
 namespace whose `vci_schema` row exists sends no DDL at all (one read per handle). The statements:
 
-1. the manifests, one multi-row upsert (the value replaced only when it differs or is unreadable; `put_at` refreshed);
-2. the removed keys (`DELETE … WHERE key IN (…)`) and the emptied slots;
-3. the attestations, one multi-row upsert on the slot, replacing the key, the value and the columns derived from them
-   when either changed;
-4. the log rows of every slot and root touched, and once per handle the log's prune.
+1. the manifests, one multi-row upsert (the value and its encoding replaced; `put_at` refreshed);
+2. the manifests this write leaves without a reference (2.8.2, `superseded_manifests`): the change log's rows naming
+   them, then their deletion, both computed before the attestations change. A manifest goes when an attestation this
+   write removes, empties or puts over (by key or by slot) references it, and nothing else does: no other attestation,
+   no manifest as its base, nothing this write puts (an attestation's reference, a manifest or its base), no
+   attestation of an unknown reference (`ref_state` 0), and it was put before the grace period (an hour; none for `vci
+   prune`), the hour another writer has to reference a manifest it put outside its attestation's transaction. 2.8.1
+   left them all to `vci prune`: of vex's 49,749 manifests (806 MB) on 27 October only 4,538 (74 MB) were referenced,
+   each `vci run` adding one orphan per unit it attested again;
+3. the removed keys (`DELETE … WHERE key IN (…)`) and the emptied slots;
+4. the attestations, one multi-row upsert on the slot, replacing the key, the value, its encoding and the columns
+   derived from them when any changed;
+5. the log rows of every slot and root touched, and once per handle the log's prune.
 
 **A batch sent again.** A batch whose connection was lost under it is sent again (above, "Lost connections"), and the
 server may have committed it and lost only the answer. It is one transaction ending in `COMMIT`, applied whole or not
@@ -2478,8 +2540,11 @@ holds the write lock until the server expires its stream, and the batch sent aga
 writer, within its deadline.
 
 Values travel as SQL literals, since the batch takes SQL text only: UTF-8 bytes without NUL as text cast
-to a blob (`CAST('…' AS BLOB)`, the same bytes), anything else as hex. A queue of 2,000 writes or 8 MiB is written
-early, in a request and transaction of its own (a failed early write fails `finish`). A write outside a batch is a
+to a blob (`CAST('…' AS BLOB)`, the same bytes), anything else (a compressed value) as hex. A queue of 2,000 writes or
+4 MiB of values (as they are; 8 MiB before 2.8.2) is written early, in a request and transaction of its own (a failed
+early write fails `finish`). A request holds the server's one write lock while it is applied: vex's 8 MiB batches held
+it 15 to 26 s on Turso while other jobs wrote, every other writer (the hints included) queued behind them, and the
+queue passed the 30 s deadline. The timing line says what went: `write batch: … R request(s), X MB[ compressed]`. A write outside a batch is a
 batch of one: `put` one request (an unhinted put first reads its slot's key), `put_manifest` two (it compares the
 stored bytes first), `remove` two (it reads which keys exist first). `remove_manifests` reads the removable roots (put
 before the grace period, an hour, none for `vci prune`; not referenced; nobody's base), then deletes them with the
@@ -2500,8 +2565,9 @@ The SQLite and PostgreSQL stores and git-meta have no such limit, and the local 
 
 `a_plan_costs_a_handful_of_requests` writes 300 units (600 attestations and 300 manifests) in at most 6 requests; the
 release-build test `many_units_are_listed_and_read_quickly` (1,200 units of 18 KB against a local `sqld`) wrote them
-in 0.64 s and 8 requests (three transactions: the queue flushes at 8 MiB), and listed and read them on a new handle in
-0.10 s and 4 requests.
+in 0.64 s and 8 requests (three transactions: the queue flushed at 8 MiB), and listed and read them on a new handle in
+0.10 s and 4 requests; with 2.8.2, 0.47 s and 12 requests (six transactions at 4 MiB), and 0.04 s and 11 requests
+(the values five requests of 250, four at once).
 
 ### The replica mode
 
@@ -2613,12 +2679,37 @@ namespace of git-meta's size (vex's held about 24,000 attestations, and its plan
 the largest pilot namespace held 3,276), a read-only token's refusal, and Turso's quotas. A vex pull request (#2214)
 proposes moving its Rails jobs to Turso; it is under review.
 
+**2.8.2 against Turso's hosted service** (27 October 2026, from a laptop in California to aws-eu-west-1, about 150 ms
+of round trip and 1 to 4 MB/s): `vci plan --project vex-api --base-ref origin/master` in a 10-day-old vex checkout,
+1,992 Rails units, every write refused by a measurement build of each version. The laptop cannot
+run vex's Rails checks (its probe refuses rbenv's load path), so this is the plan's first round, where its reads are.
+Namespaces: vex's own (read only), a copy of its 3,695 attestations with the 3,323 manifests and bases they reference
+(made with `INSERT … SELECT` on the server), and the same copy with every value compressed (zstd 6: attestations 60.7
+to 20.1 MB, manifests 57.7 to 18.0 MB):
+
+| namespace | vci | plan, median (range) | values read | requests |
+|---|---|---|---|---|
+| vex's own | 2.8.1 | 34.0 s (30.7-38.5) | 1,652 prefetched (20.6-25.4 s) + 669 more (6.9-11.1 s), 91.1 MB | 7 statements |
+| vex's own | 2.8.2 | 15.5 s (12.2-17.8) | 1,652, 62.4 MB (10.4-15.8 s) | 15-17 |
+| copy | 2.8.1 | 28.6 s (27.1-36.6) | 1,652 (22.4-30.0 s) + 238 more (2.5-4.5 s), 71.2 MB | 7 statements |
+| copy | 2.8.2 | 17.4 s (13.2-20.5) | 1,652, 62.7 MB (11.3-18.5 s) | 15 |
+| copy, compressed | 2.8.2 | 9.2 s (8.2-11.5) | 1,652, 21.7 MB (6.4-9.5 s) | 15 |
+
+Six runs of each, interleaved. 2.8.2 reads the same 1,652 values 2.8.1 prefetches, in seven requests four at a time, and not the 238 to 669 newest
+candidates 2.8.1 then read in a second request; the listing (1.6 s, 0.66 MB for 2,090 keys) is the same. With
+`VCI_STORE_TIMEOUT_SECS=5` 2.8.1's single read ran out of time and its plan read nothing, twice; 2.8.2 read all 1,652
+values in each of three runs (15-35 s), the requests that ran out of time beside others read again on their own.
+From vex's runners, which read 8 to 45 MB/s, the bytes count for less and the server's time per value (about 3 ms
+raw) for more; not measured there yet.
+
 ### fetch, push, hints, operations
 
 - `vci fetch`, `vci push`, `--remote` and `--rewrite-history` behave as on any store without an exchange (section 7).
 - **Hints** (remote and replica): the memo and the flags are the namespace's tables on the server, as PostgreSQL's:
-  every flag read once per handle, `passing_on` memoized per tree, `remember_passing` one request (with the 7-day memo
-  prune, once per handle), every error swallowed, never creating the tables. Local: the file's tables.
+  every flag read once per handle, `passing_on` memoized per tree, `remember_passing` one request of the entries the
+  server does not hold (with the 7-day memo prune, once per handle; none when nothing is new), `set_flag` nothing when
+  the flag is set, each write a hint's (5 s, never sent again, never latching), every error swallowed, never creating
+  the tables. Local: the file's tables.
 - **Turso.** A database per organization or per repository; a full-access token for the trusted jobs that store
   (`vci ci --push` on protected branches, and developers whose `vci run` should store, through `[store]
   token_command`) and a read-only one for pull-request jobs and machines that only plan (`turso db tokens create <db>

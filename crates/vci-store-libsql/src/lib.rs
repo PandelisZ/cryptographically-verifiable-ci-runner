@@ -15,8 +15,9 @@
 //!   when the store first connects): every read and write goes to the
 //!   server over Hrana (HTTP),
 //!   through the `libsql` crate. Reads are served from a per-handle cache
-//!   that a prefetch fills in two requests; writes are batched into one
-//!   transactional request. Each repository's records live under a
+//!   that a prefetch fills (values a few hundred to a request); writes are
+//!   batched into transactional requests of a few megabytes, values
+//!   compressed with `VCI_STORE_COMPRESS=zstd`. Each repository's records live under a
 //!   namespace (`VCI_STORE_NAMESPACE`, else the repository id) in tables of
 //!   their own. Writes are shared at once (the publication gate applies).
 //! * **Replica** (a remote URL plus `VCI_STORE_SYNC=replica`,
@@ -28,8 +29,9 @@
 //!   run read it with a warning, `vci store`, fetch, push and prune fail.
 //!
 //! Every wait is bounded (the connect timeout for a connection and for the
-//! server's first answer, the request timeout for a request), the first
-//! failure to reach the server latches a circuit breaker, every error is a
+//! server's first answer, the request timeout for a request, sent once
+//! more when it runs out), the first failure to reach the server or a
+//! request out of time twice latches a circuit breaker, every error is a
 //! [`StoreError`] whose message carries neither the URL's token nor
 //! `VCI_STORE_TOKEN`, and no error is [`StoreError::Backend`] when the
 //! store cannot be used (a statement the server refuses is).
@@ -71,6 +73,26 @@ use replica::Replica;
 /// `VCI_STORE_SYNC=off`: no `fsync` in the local file (local and replica
 /// modes).
 const ENV_SYNC: &str = "VCI_STORE_SYNC";
+
+/// `VCI_STORE_COMPRESS=zstd`: write values to a server compressed (remote
+/// and replica modes). Every vci from 2.8.2 reads them either way; 2.8.1
+/// and earlier read a compressed value as one they cannot read (its unit
+/// runs), so it is turned on once every reader of the namespace is 2.8.2
+/// or later. `off` (or unset): as they are.
+const ENV_COMPRESS: &str = "VCI_STORE_COMPRESS";
+
+/// Whether `VCI_STORE_COMPRESS` asks for compressed writes; any value but
+/// `zstd` and `off` is refused.
+fn compress_setting() -> Result<bool, StoreError> {
+    match std::env::var(ENV_COMPRESS) {
+        Err(_) => Ok(false),
+        Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => Ok(false),
+        Ok(v) if v.eq_ignore_ascii_case("zstd") => Ok(true),
+        Ok(v) => Err(StoreError::Config(format!(
+            "${ENV_COMPRESS}={v:?}: expected zstd or off"
+        ))),
+    }
+}
 
 /// Opens the libSQL store (`VCI_STORE=libsql`, or a `libsql://`
 /// `VCI_STORE_URL`).
@@ -198,6 +220,7 @@ impl LibsqlStore {
             Arc::clone(&cx.repo_id),
             cx.git_common_dir.clone(),
             grace,
+            compress_setting()?,
         ));
         Ok(LibsqlStore {
             inner: match mode {
@@ -254,6 +277,21 @@ impl LibsqlStore {
     /// the repository id); `None` in the local mode.
     pub fn namespace(&self) -> Option<Result<String, StoreError>> {
         self.remote().map(|r| r.ns().map(str::to_owned))
+    }
+
+    /// Write values compressed from now on (`VCI_STORE_COMPRESS=zstd`), or
+    /// not (tests).
+    #[doc(hidden)]
+    pub fn __compress_for_test(&self, on: bool) {
+        if let Some(r) = self.remote() {
+            r.set_compress(on);
+        }
+    }
+
+    /// Bytes of values (and other text and blob columns) read from the
+    /// server so far, as stored (tests of what a plan reads).
+    pub fn received(&self) -> u64 {
+        self.remote().map_or(0, |r| r.conn.received())
     }
 
     /// Run `statements` on the server in one transaction, behind the
@@ -370,7 +408,11 @@ impl AttestationStore for LibsqlStore {
     fn caps(&self) -> Caps {
         match &self.inner {
             Inner::Local(_) => Caps::LOCAL.with_hints(true),
-            _ => Caps::LOCAL.with_shared_writes(true).with_hints(true),
+            Inner::Remote(_) => Caps::LOCAL
+                .with_shared_writes(true)
+                .with_hints(true)
+                .with_remote_reads(true),
+            Inner::Replica(_) => Caps::LOCAL.with_shared_writes(true).with_hints(true),
         }
     }
 

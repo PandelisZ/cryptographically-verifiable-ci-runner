@@ -213,6 +213,17 @@ impl Cache {
             .is_some_and(|m| !matches!(m, Manifest::Absent))
     }
 
+    /// Up to `cap` roots cached as stored (readable or not), which a read of
+    /// values need not bring down again.
+    pub(crate) fn stored_roots(&self, cap: usize) -> Vec<&str> {
+        self.manifests
+            .iter()
+            .filter(|(_, m)| !matches!(m, Manifest::Absent))
+            .map(|(r, _)| r.as_str())
+            .take(cap)
+            .collect()
+    }
+
     /// The cached answer for `root`: `None` when it is not cached,
     /// `Some(None)` when it is cached as not stored.
     pub(crate) fn manifest(&self, root: &str) -> Option<Option<StoredManifest>> {

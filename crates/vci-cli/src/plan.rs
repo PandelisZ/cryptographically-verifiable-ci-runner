@@ -15,7 +15,8 @@ use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
 use vci_core::{CheckoutCache, EntryKind, InputManifest, Observation, PREDICATE_TYPE, RepoPath};
 use vci_git::Repo;
 use vci_store::{
-    AttestationStore, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, ValueState,
+    AttestationStore, Choose, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest,
+    ValueState,
 };
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
@@ -1577,6 +1578,17 @@ fn plan_with(
                 .as_deref()
                 .and_then(|b| ctx.repo.tree_of(b).ok());
             let memos = passing_memos(store, head.as_deref(), base.as_deref());
+            // On a server, only the candidates the prefetch read (2.8.2):
+            // the newest few of every unit were a second request of 1,200
+            // to 1,500 values (30 to 45 MB on vex's Turso) per plan, for the
+            // few units whose first choice fails, which the next round reads
+            // (`hydrate_more`, newer candidates first after an inputs
+            // failure).
+            let read_first = if store.caps().remote_reads {
+                0
+            } else {
+                READ_FIRST
+            };
             let mut read: Vec<&mut StoredEnvelope> = Vec::new();
             for (id, cands) in m.iter_mut() {
                 let memo = cands
@@ -1592,7 +1604,7 @@ fn plan_with(
                 // one before it usually passes, without a second round.
                 let mut by_age: Vec<usize> = (0..cands.len()).collect();
                 by_age.sort_by_key(|&i| std::cmp::Reverse(cands[i].issued));
-                chosen.extend(by_age.into_iter().take(READ_FIRST));
+                chosen.extend(by_age.into_iter().take(read_first));
                 for (i, c) in cands.iter_mut().enumerate() {
                     if chosen.contains(&i) {
                         read.push(c);
@@ -1879,6 +1891,17 @@ fn hydrate_more(
                 })
         })
     };
+    // The remembered attestation of a unit whose inputs changed, as read:
+    // its key and when it was issued.
+    let remembered = |f: &TestFile, cands: &[StoredEnvelope]| -> Option<Option<i64>> {
+        let k = memos.get(&vci_core::test_key(f.test_id.as_str()))?;
+        cands.iter().find(|c| c.key == *k).map(|c| c.issued)
+    };
+    // The keys never read for that reason: a unit whose inputs changed
+    // since its remembered attestation reads only the candidates issued
+    // after it (2.8.2), which a pull request's earlier push or another
+    // branch made on the changed inputs, never the older ones.
+    let mut older: BTreeSet<String> = BTreeSet::new();
     // The candidates as last read (the store's rows are re-read for the
     // units a round read again).
     let mut current: BTreeMap<String, Vec<StoredEnvelope>> = BTreeMap::new();
@@ -1898,16 +1921,31 @@ fn hydrate_more(
             }
             let mine: Vec<&TestFile> = files.iter().filter(|f| f.project == pi).collect();
             for (f, out) in mine.iter().zip(verdicts.iter()) {
-                if out.skip || out.candidates.is_empty() || inputs_changed(f, out) {
+                if out.skip || out.candidates.is_empty() {
                     continue;
                 }
                 let id = f.test_id.as_str();
-                ids.insert(id);
                 let cands = current
                     .get(id)
                     .or_else(|| by_id.get(id))
                     .map(Vec::as_slice)
                     .unwrap_or_default();
+                if inputs_changed(f, out) {
+                    // Only the candidates issued after the remembered one
+                    // (none when it says nothing of when it was issued).
+                    let since = remembered(f, cands).flatten();
+                    let newer = |c: &StoredEnvelope| matches!((c.issued, since), (Some(i), Some(m)) if i > m);
+                    older.extend(cands.iter().filter(|c| !newer(c)).map(|c| c.key.clone()));
+                    let pending = cands.iter().any(|c| {
+                        newer(c)
+                            && (c.not_fetched()
+                                || set_aside.get(id).is_some_and(|s| s.contains(&c.key)))
+                    });
+                    if !pending {
+                        continue;
+                    }
+                }
+                ids.insert(id);
                 if set_aside.contains_key(id) || cands.iter().any(StoredEnvelope::not_fetched) {
                     unread.insert(id);
                 }
@@ -1924,10 +1962,15 @@ fn hydrate_more(
         let t = std::time::Instant::now();
         let unread_ids: Vec<&str> = unread.iter().copied().collect();
         let root_ids: Vec<&str> = roots.iter().map(String::as_str).collect();
+        let skip_older = |cands: &[StoredEnvelope]| -> Vec<usize> {
+            (0..cands.len())
+                .filter(|&i| !older.contains(&cands[i].key))
+                .collect()
+        };
         let h = store
             .prefetch(Prefetch::Units {
                 test_ids: &unread_ids,
-                choose: None,
+                choose: (!older.is_empty()).then_some(&skip_older as Choose<'_>),
             })
             .and_then(|mut h| {
                 h.add(store.prefetch(Prefetch::Manifests { roots: &root_ids })?);
@@ -1967,7 +2010,7 @@ fn hydrate_more(
             .filter(|id| resolved > 0 || set_aside.contains_key(*id))
             .collect();
         let only = (resolved == 0).then_some(&set_aside);
-        let readable = read_again(store, &again, only, by_id, &mut current, round);
+        let readable = read_again(store, &again, only, &older, by_id, &mut current, round);
         for id in &again {
             set_aside.remove(*id);
         }
@@ -2031,13 +2074,14 @@ fn hydrate_more(
 /// Read again, in one batch (2.7.23: one unit at a time took 9 s for 2,000
 /// units on a laptop), the candidates of the units `ids` that hold no value
 /// (as last read: `current`, else the lookup's `by_id`), only the ones
-/// `only` holds for their unit when given, and keep them in `current`.
-/// Returns how many became readable: none when the store cannot be read
-/// (those units' verdicts stand, and they run).
+/// `only` holds for their unit when given, never the keys in `never`, and
+/// keep them in `current`. Returns how many became readable: none when the
+/// store cannot be read (those units' verdicts stand, and they run).
 fn read_again(
     store: &dyn AttestationStore,
     ids: &[&str],
     only: Option<&SetAside>,
+    never: &BTreeSet<String>,
     by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
     current: &mut BTreeMap<String, Vec<StoredEnvelope>>,
     round: usize,
@@ -2066,7 +2110,9 @@ fn read_again(
         .flat_map(|(id, c)| {
             let keys = only.map(|o| o.get(id.as_str()));
             c.iter_mut().filter(move |c| {
-                !readable(c) && keys.is_none_or(|k| k.is_some_and(|k| k.contains(&c.key)))
+                !readable(c)
+                    && !never.contains(&c.key)
+                    && keys.is_none_or(|k| k.is_some_and(|k| k.contains(&c.key)))
             })
         })
         .collect();
@@ -4371,10 +4417,18 @@ adapter = "pytest"
         let by_id = BTreeMap::from([(id.to_owned(), listed)]);
         let mut current = BTreeMap::new();
         let read = |only, current: &mut BTreeMap<String, Vec<StoredEnvelope>>| {
-            read_again(&store, &[id], only, &by_id, current, 2)
+            read_again(&store, &[id], only, &BTreeSet::new(), &by_id, current, 2)
         };
         assert_eq!(
-            read_again(&store, &[], Some(&set_aside), &by_id, &mut current, 2),
+            read_again(
+                &store,
+                &[],
+                Some(&set_aside),
+                &BTreeSet::new(),
+                &by_id,
+                &mut current,
+                2
+            ),
             0
         );
         assert!(current.is_empty());

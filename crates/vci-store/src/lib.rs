@@ -633,6 +633,12 @@ pub struct Caps {
     /// The hint methods ([`AttestationStore::passing_on`],
     /// [`AttestationStore::flag`]) keep what they are given.
     pub keeps_hints: bool,
+    /// Every value read comes over the network from a server, its bytes
+    /// and its requests costing time (the libSQL store's remote mode): a
+    /// plan reads only the candidates it checks first, and the others for
+    /// the units those do not skip. Elsewhere it also reads each unit's
+    /// newest few at once.
+    pub remote_reads: bool,
 }
 
 impl Caps {
@@ -641,6 +647,7 @@ impl Caps {
         shared_writes: false,
         lazy_values: false,
         keeps_hints: false,
+        remote_reads: false,
     };
 
     /// These capabilities with [`Caps::shared_writes`] set to `v`.
@@ -652,6 +659,12 @@ impl Caps {
     /// These capabilities with [`Caps::lazy_values`] set to `v`.
     pub const fn with_lazy_values(mut self, v: bool) -> Self {
         self.lazy_values = v;
+        self
+    }
+
+    /// These capabilities with [`Caps::remote_reads`] set to `v`.
+    pub const fn with_remote_reads(mut self, v: bool) -> Self {
+        self.remote_reads = v;
         self
     }
 

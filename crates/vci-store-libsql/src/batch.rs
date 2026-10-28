@@ -11,7 +11,10 @@
 //! removed otherwise; per root the last manifest. It is written as the
 //! manifests, the removed keys, the emptied slots, then the attestations,
 //! each one statement with its values as literals, plus the change log a
-//! replica syncs from, in one transaction. A queue of [`FLUSH_WRITES`]
+//! replica syncs from, in one transaction; the manifests the write leaves
+//! without a reference go in the same transaction (2.8.2,
+//! `superseded_manifests`), and values are compressed when
+//! `VCI_STORE_COMPRESS=zstd`. A queue of [`FLUSH_WRITES`]
 //! attestations and removals, or of [`FLUSH_BYTES`], is written early in a
 //! transaction of its own; a failed early write fails `finish`.
 //!
@@ -33,16 +36,18 @@ use vci_store::{
 };
 
 use crate::conn::{
-    Fail, KIND, MAX_RECORD, READ, TOO_BIG, WRITE, blob, col_int, col_text, json_list, opt_int,
-    opt_text, text,
+    Fail, KIND, MAX_RECORD, RAW, READ, TOO_BIG, WRITE, ZSTD, blob, col_int, col_text, compress,
+    json_list, opt_int, opt_text, text,
 };
 use crate::remote::{LOG_KEEP_SECS, Remote, Tables, now};
 
 /// Attestations and removals queued before they are written early.
 pub(crate) const FLUSH_WRITES: usize = 2_000;
-/// Bytes queued before they are written early: one request stays a few
-/// megabytes.
-pub(crate) const FLUSH_BYTES: usize = 8 << 20;
+/// Bytes queued (values as they are) before they are written early: one
+/// request stays a few megabytes, so that it holds the server's one write
+/// lock for a few seconds, not the 15 to 26 s that 8 MB took on Turso
+/// while other jobs wrote (2.8.1), which made every other writer wait.
+pub(crate) const FLUSH_BYTES: usize = 4 << 20;
 
 /// One queued attestation.
 #[derive(Debug, Clone)]
@@ -433,10 +438,15 @@ pub(crate) fn put_manifest_now(
 ) -> Result<bool, StoreError> {
     check_manifest(root, bytes)?;
     let t = remote.ready()?;
+    let packed = remote.compress().then(|| compress(bytes)).flatten();
     let r = remote.query(
         READ,
-        &t.shared.manifest_same,
-        vec![V::Text(root.to_owned()), V::Blob(bytes.to_vec())],
+        &t.manifest_same,
+        vec![
+            V::Text(root.to_owned()),
+            V::Blob(bytes.to_vec()),
+            packed.map_or(V::Null, V::Blob),
+        ],
     );
     let same = Fail::or_absent(r, Vec::new)?
         .first()
@@ -611,21 +621,32 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
     let at = now();
     let (a, log) = (&t.names.attestations, &t.log);
     let mut stmts: Vec<String> = Vec::new();
+    let mut sent = 0usize;
+    // A value as written: `encoding, value` literals.
+    let mut value = |b: &[u8]| -> String {
+        let lit = match remote.compress().then(|| compress(b)).flatten() {
+            Some(z) => format!("{ZSTD}, {}", blob(&z)),
+            None => format!("{RAW}, {}", blob(b)),
+        };
+        sent += lit.len();
+        lit
+    };
     if !p.manifests.is_empty() {
         let rows: Vec<String> = p
             .manifests
             .iter()
             .map(|(root, (base, bytes))| {
                 format!(
-                    "({}, {}, {at}, 0, {})",
+                    "({}, {}, {at}, {})",
                     text(root),
                     opt_text(base.as_deref()),
-                    blob(bytes)
+                    value(bytes)
                 )
             })
             .collect();
-        stmts.push(t.shared.upsert_manifests(&rows.join(", ")));
+        stmts.push(t.upsert_manifests(&rows.join(", ")));
     }
+    stmts.extend(superseded_manifests(remote, t, p, at)?);
     // Removals before the upsert: a put queued after a removal of its slot
     // replaces the slot anyway, and an emptied slot has no put.
     let mut removed_slots: Vec<Slot> = Vec::new();
@@ -667,11 +688,11 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
                     opt_text(hint.as_ref().and_then(|h| h.tree.as_deref())),
                     opt_text(r.manifest_ref.as_deref()),
                     r.ref_state,
-                    blob(&r.value)
+                    value(&r.value)
                 )
             })
             .collect();
-        stmts.push(t.shared.upsert_attestations(&rows.join(", ")));
+        stmts.push(t.upsert_attestations(&rows.join(", ")));
     }
     let slots: Vec<&Slot> = removed_slots
         .iter()
@@ -702,13 +723,97 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
         Err(Fail::Store(e)) => return Err(e),
     }
     step.done(format_args!(
-        "write batch: {} manifest(s), {} attestation(s), {} removal(s), {} request(s)",
+        "write batch: {} manifest(s), {} attestation(s), {} removal(s), {} request(s), {}{}",
         p.manifests.len(),
         p.attestations.len(),
         p.removals.len() + p.emptied.len(),
-        remote.conn.requests() - n0
+        remote.conn.requests() - n0,
+        crate::remote::megabytes(u64::try_from(sent).unwrap_or(u64::MAX)),
+        if remote.compress() { " compressed" } else { "" }
     ));
     Ok(())
+}
+
+/// The statements that remove the manifests this write leaves without a
+/// reference (2.8.2): before the write, the attestations it removes or
+/// replaces (the keys it removes, the slots it empties, the slots it puts
+/// to) reference them, and once it is done nothing will. One is kept when
+/// any other attestation references it, a manifest uses it as its base,
+/// this write references it (an attestation it puts, a manifest it puts or
+/// that one's base), any attestation's reference is unknown, or it was put
+/// within the grace period (the hour another writer has to reference a
+/// manifest it put before its attestation; `vci prune` removes the rest).
+/// The change log names the roots removed, as `remove_manifests` does.
+/// Before 2.8.2 a superseded attestation's manifest stayed until `vci
+/// prune`: 90% of vex's manifests (730 MB) were such orphans.
+fn superseded_manifests(
+    remote: &Remote,
+    t: &Tables,
+    p: &Pending,
+    at: i64,
+) -> Result<Vec<String>, StoreError> {
+    let slots: Vec<&Slot> = p.emptied.iter().chain(p.attestations.keys()).collect();
+    if p.removals.is_empty() && slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (a, m, log) = (&t.names.attestations, &t.names.manifests, &t.log);
+    // An attestation this write removes or replaces (`x`: its alias).
+    let affected = |x: &str| -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !p.removals.is_empty() {
+            parts.push(format!(
+                "{x}.key IN ({})",
+                p.removals
+                    .iter()
+                    .map(|k| text(k))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !slots.is_empty() {
+            parts.push(format!(
+                "({x}.test_key, {x}.signer, {x}.storage_key) IN (VALUES {})",
+                slots
+                    .iter()
+                    .map(|(tk, s, k)| format!("({}, {}, {})", text(tk), text(s), text(k)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        format!("({})", parts.join(" OR "))
+    };
+    let mut keep: BTreeSet<&str> = p
+        .attestations
+        .values()
+        .filter_map(|r| r.manifest_ref.as_deref())
+        .collect();
+    for (root, (base, _)) in &p.manifests {
+        keep.insert(root);
+        keep.extend(base.as_deref());
+    }
+    let keep = if keep.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "AND r.root NOT IN ({}) ",
+            keep.iter().map(|r| text(r)).collect::<Vec<_>>().join(", ")
+        )
+    };
+    let cut = at.saturating_sub(i64::try_from(remote.grace.as_secs()).unwrap_or(i64::MAX));
+    let doomed = format!(
+        "SELECT r.root FROM {m} AS r WHERE r.root IN \
+           (SELECT d.manifest_ref FROM {a} AS d WHERE {} AND d.manifest_ref IS NOT NULL) \
+         {keep}AND r.put_at <= {cut} \
+         AND NOT EXISTS (SELECT 1 FROM {a} AS o WHERE o.manifest_ref = r.root AND NOT {}) \
+         AND NOT EXISTS (SELECT 1 FROM {m} AS b WHERE b.base = r.root) \
+         AND NOT EXISTS (SELECT 1 FROM {a} WHERE ref_state = 0)",
+        affected("d"),
+        affected("o")
+    );
+    Ok(vec![
+        format!("INSERT INTO {log} (root, at) SELECT root, {at} FROM ({doomed})"),
+        format!("DELETE FROM {m} WHERE root IN ({doomed})"),
+    ])
 }
 
 /// What a write changes besides the server: this handle's cache (it reads

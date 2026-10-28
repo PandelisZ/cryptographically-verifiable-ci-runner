@@ -1402,7 +1402,8 @@ executables run at once in `vci run` and `vci ci`; default: the number of CPUs; 
 time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory
 holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`). The attestation store: `VCI_STORE`, `VCI_STORE_URL`,
 `VCI_STORE_NAMESPACE`, `VCI_STORE_CONNECT_TIMEOUT_SECS`, `VCI_STORE_TIMEOUT_SECS` (since 2.8.0; see [Choosing a
-store](#choosing-a-store)).
+store](#choosing-a-store)), `VCI_STORE_COMPRESS` (`zstd`: the libSQL store writes values to its server compressed;
+since 2.8.2, see [libSQL](#libsql-turso)).
 
 Every collector directory is resolved to its real path before use, and what a test process reads of vci's own
 collector files is never an input, whichever path reached them: Homebrew installs them in
@@ -1915,7 +1916,7 @@ The store has three modes:
 
 | mode | selected by | reads | writes |
 |---|---|---|---|
-| remote | a `libsql://` `VCI_STORE_URL` or `[store] url` (an `https://` or `http://` one with `VCI_STORE=libsql` or `[store] backend = "libsql"`) | from the server, a plan in about a dozen requests | to the server, a project's units in one request |
+| remote | a `libsql://` `VCI_STORE_URL` or `[store] url` (an `https://` or `http://` one with `VCI_STORE=libsql` or `[store] backend = "libsql"`) | from the server, a plan in a few dozen requests | to the server, a project's units in requests of a few MiB |
 | replica | the same plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<file>` or `[store.libsql] replica = true` | from a local file, `<git common dir>/vci-store.libsql`, synced from the server when a command first reads it (and at its later prefetches) | to the server, then to the file |
 | local | `VCI_STORE=libsql` without a URL, or `VCI_STORE_URL=file:<path>` (no `?query` or `#fragment`) | from `<git common dir>/vci-store.libsql` | to the file |
 
@@ -1947,9 +1948,21 @@ The store has three modes:
   plain HTTP (a local `sqld`, `turso dev`).
 - **Bounded time.** Connecting, and waiting for the server's first answer, takes at most 5 s
   (`VCI_STORE_CONNECT_TIMEOUT_SECS`): a server or proxy that accepts and never answers costs that. A later request
-  waits at most 30 s (`VCI_STORE_TIMEOUT_SECS`; ten minutes for `vci prune`). After the first failure every later call
-  of the command fails at once, so a server that is down costs one timeout, and the plan runs everything. A statement
+  waits at most 30 s (`VCI_STORE_TIMEOUT_SECS`; ten minutes for `vci prune`); one that runs out of time is sent once
+  more on a new connection (since 2.8.2), so a slow answer while other jobs write costs that request a second try. A
+  server that cannot be reached, or a request out of time twice, makes every later call of the command fail at
+  once, so a server that is down costs one or two timeouts, and the plan runs everything. A plan reads its values
+  250 to a request (since 2.8.2), so a request that fails costs only its own units, which run. The plan's memo and
+  flags are written only when new, and each such write waits at most 5 s and never stops the command. A statement
   the server refuses (a trigger, say) stops nothing else: `vci run` reports it and exits 2 after the run.
+- **Compressed values** (since 2.8.2). `VCI_STORE_COMPRESS=zstd` stores each attestation and input manifest compressed
+  (about 3x smaller for vex's, which makes the plan's reads and `vci run`'s writes that much shorter). Every vci from
+  2.8.2 reads both forms; 2.8.1 and earlier read a compressed value as one they cannot read, and run its unit (never
+  skip it wrongly). So set it for every writer of a database (CI's jobs, and developers who store) once every machine
+  that plans from it runs 2.8.2 or later; values stored before stay as they were until their units are attested again.
+- **Superseded manifests go with their attestations** (since 2.8.2): a write that replaces or removes an attestation
+  also removes the input manifest only it referenced, once that was stored more than an hour before (vex's database
+  held ten unreferenced manifests for each referenced one, 730 MB). `vci prune` removes the ones left from earlier.
 - **A record of 5,000,000 bytes or more is not stored on a server.** `sqld` refuses such a row, so vci refuses a unit
   whose attestation or input manifest is that large, alone (`signing or storing failed: the libsql store does not
   support storing a record of 5,000,000 bytes or more …`, keeping the tests' exit code), and stores the rest of the
@@ -1967,8 +1980,9 @@ The store has three modes:
   local-mode store, or one that is not a database, is never used as a replica, and stores nothing.
 - **The local mode** is the SQLite store under another name: the same file format, writes and limits (see
   [SQLite](#sqlite)); a `vci-store.sqlite` can be copied to `vci-store.libsql` and back.
-- **Cost.** A plan reads a server in about a dozen requests whatever the number of units, and `vci run` writes a
-  project's units in one (a new request every 2,000 records or 8 MiB). On a synthetic store of 1,200 Go units attested
+- **Cost.** A plan reads a server in a few dozen requests (its values 250 to a request, up to four at once), and `vci
+  run` writes a project's units in requests of at most 2,000 records or 4 MiB (8 MiB before 2.8.2; a request holds
+  the database's one write lock while it is applied). On a synthetic store of 1,200 Go units attested
   three times (3,600 attestations of about 3 KB) on a local `sqld`, the store's part of a plan that skipped every unit
   took 0.5-0.6 s remote against 0.01 s from a SQLite file, a replica's first sync of everything 0.6-9 s on a heavily
   loaded laptop and a sync with nothing new 0.04 s, and `vci run` wrote 1,200 attestations and manifests in one
