@@ -1958,14 +1958,18 @@ The store has three modes:
   request brings the input manifests and base manifests its values need; a request out of time is read again in
   halves, not whole. The whole read is given two timeouts (one more per 800 values beyond 1,600), the units not read
   by then running, and once a read ran out of time the plan's later reads of values end when it did, so a slow link
-  costs the plan that once, not once per round. `vci run` writes its units in transactions of about a megabyte, one
-  after the other with a short pause between them (since 2.8.2), so that none holds the database's one write lock
-  for long, and never splits a unit across two transactions; a transaction that runs out of time asks the server
-  whether it was stored and is sent again as it was after a pause if not (each transaction carries a nonce, so that
-  should the first copy commit late, whichever copy comes second is refused and it is applied once), and only the
-  units whose transaction still fails are not attested (`signing or storing failed: storing the batch: …`); the rest
-  are. A command spends at most two timeouts in all on writes that fail (60 s at the default) before it stops
-  writing. The plan's memo and flags are written only when new, and each such write waits at most 5 s and never
+  costs the plan that once, not once per round. `vci run` writes its units in transactions of at most a megabyte, one
+  right after the other (since 2.8.2), so that none holds the database's one write lock for long, halving them (down
+  to 128 KiB) while one takes more than a third of the timeout and doubling them again while one takes less than a
+  tenth, and never splits a unit across two transactions; a transaction that runs out of time asks the server
+  (within a quarter of the timeout, at most 5 s) whether it was stored and is sent again as it was after a pause if
+  not (each transaction carries a nonce, so that should the first copy commit late, whichever copy comes second is
+  refused and it is applied once), and only the units whose transaction still fails are not attested (`signing or
+  storing failed: storing the batch: …`); the rest are. A command spends at most two timeouts in all on writes that
+  fail (60 s at the default) before it stops writing, and at most six timeouts on writes in all, those that succeed
+  included (180 s at the default, plus the transaction under way): then the units it has not stored are not attested
+  (`this process's writes … timed out after 180s`) and run again next time, so a slow server costs a job a bounded
+  time. The timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`) sets both. The plan's memo and flags are written only when new, and each such write waits at most 5 s and never
   stops the command. A statement the server refuses (a trigger, say) costs the unit it writes: `vci run` reports it
   and exits 2 after the run.
 - **Compressed values** (since 2.8.2). `[store] compress = "zstd"` in `vci.toml`, or `VCI_STORE_COMPRESS=zstd` (which

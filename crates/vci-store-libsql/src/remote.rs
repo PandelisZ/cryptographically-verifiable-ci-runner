@@ -354,6 +354,12 @@ pub(crate) struct Remote {
     /// The time spent on write transactions that failed and the pauses
     /// before they were sent again ([`Remote::spend_on_writes`]).
     write_spent: Mutex<Duration>,
+    /// The time spent writing, all writes that ended so far
+    /// ([`Remote::writing_out_of_time`]).
+    write_time: Mutex<Duration>,
+    /// The most bytes of values the next transaction of a write sends
+    /// ([`Remote::size_writes_from`]).
+    tx_bytes: AtomicUsize,
     /// Roots a read of values found to be bases: a later read does not
     /// bring them again while they are cached.
     bases: Mutex<BTreeSet<String>>,
@@ -402,6 +408,8 @@ impl Remote {
             compress: AtomicBool::new(compress),
             values_until: Mutex::new(None),
             write_spent: Mutex::new(Duration::ZERO),
+            write_time: Mutex::new(Duration::ZERO),
+            tx_bytes: AtomicUsize::new(crate::batch::TX_BYTES),
             bases: Mutex::new(BTreeSet::new()),
         }
     }
@@ -551,6 +559,69 @@ impl Remote {
             .unwrap_or_else(PoisonError::into_inner);
         *spent += d;
         *spent < self.write_retry_time()
+    }
+
+    /// The time this process may spend on writes in all
+    /// ([`crate::batch::WRITE_TIME_DEADLINES`] request timeouts).
+    fn write_time_budget(&self) -> Duration {
+        self.conn
+            .timeout()
+            .saturating_mul(crate::batch::WRITE_TIME_DEADLINES)
+    }
+
+    /// Count `d` (a write that ended) against the process's time for
+    /// writes.
+    pub(crate) fn spent_writing(&self, d: Duration) {
+        *self
+            .write_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += d;
+    }
+
+    /// Whether the process has spent its time for writes, with `now` spent
+    /// by the write under way: its units still queued are then lost at
+    /// once ([`Remote::write_time_error`]), and so is every later write's.
+    pub(crate) fn writing_out_of_time(&self, now: Duration) -> bool {
+        let spent = *self
+            .write_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        spent + now >= self.write_time_budget()
+    }
+
+    /// Why a unit was lost once the process spent its time for writes.
+    pub(crate) fn write_time_error(&self) -> StoreError {
+        StoreError::Timeout {
+            backend: KIND,
+            operation: "this process's writes (the server took them too slowly)",
+            after: self.write_time_budget(),
+        }
+    }
+
+    /// The most bytes of values the next transaction of a write sends.
+    pub(crate) fn tx_bytes(&self) -> usize {
+        self.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Size the next transactions from the time one took (sent, waited for
+    /// the write lock, committed, or ran out of time): half as large when
+    /// it took more than a third of the request timeout (down to
+    /// [`crate::batch::TX_MIN_BYTES`]), twice as large when it took less
+    /// than a tenth (up to [`crate::batch::TX_BYTES`]). Under other
+    /// writers a transaction of about 1 MB took 23 to 31 s on vex's Turso
+    /// database, at the edge of the 30 s timeout; a smaller one holds the
+    /// write lock for less, so every writer waits less for it.
+    pub(crate) fn size_writes_from(&self, took: Duration) {
+        let t = self.conn.timeout();
+        let cur = self.tx_bytes();
+        let next = if took > t / 3 {
+            (cur / 2).max(crate::batch::TX_MIN_BYTES)
+        } else if took < t / 10 {
+            cur.saturating_mul(2).min(crate::batch::TX_BYTES)
+        } else {
+            cur
+        };
+        self.tx_bytes.store(next, Ordering::Relaxed);
     }
 
     /// The process's time for writes that fail ran out (`last` the last

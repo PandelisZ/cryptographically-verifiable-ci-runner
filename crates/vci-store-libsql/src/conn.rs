@@ -465,6 +465,12 @@ pub(crate) struct Op {
     /// [`HINT_TIMEOUT`], never sent again after its deadline, and never
     /// latching the breaker.
     pub(crate) hint: bool,
+    /// The question whether a write transaction was committed (a read of
+    /// one row by its key): given at most [`Conn::probe_timeout`], so that
+    /// when the server answers neither the write nor the question, the
+    /// write is sent again within the process's retry time rather than the
+    /// question using it up.
+    pub(crate) probe: bool,
     /// What a deadline that ran out does, once the server has answered
     /// the handle (before that it latches the breaker).
     pub(crate) on_timeout: OnTimeout,
@@ -489,23 +495,27 @@ pub(crate) enum OnTimeout {
 pub(crate) const READ: Op = Op {
     verb: "read",
     hint: false,
+    probe: false,
     on_timeout: OnTimeout::Resend,
 };
 pub(crate) const WRITE: Op = Op {
     verb: "write",
     hint: false,
+    probe: false,
     on_timeout: OnTimeout::Resend,
 };
 /// A hint's write ([`Op::hint`]).
 pub(crate) const HINT: Op = Op {
     verb: "write",
     hint: true,
+    probe: false,
     on_timeout: OnTimeout::FailAlone,
 };
 /// A request of a read of values, first sent ([`OnTimeout::FailAlone`]).
 pub(crate) const READ_SHARED: Op = Op {
     verb: "read",
     hint: false,
+    probe: false,
     on_timeout: OnTimeout::FailAlone,
 };
 /// A read sent again by its caller after a [`READ_SHARED`] ran out of
@@ -513,6 +523,7 @@ pub(crate) const READ_SHARED: Op = Op {
 pub(crate) const READ_AGAIN: Op = Op {
     verb: "read",
     hint: false,
+    probe: false,
     on_timeout: OnTimeout::Latch,
 };
 /// A write transaction of the store's batches, whose caller asks, when
@@ -521,13 +532,16 @@ pub(crate) const READ_AGAIN: Op = Op {
 const WRITE_ONCE: Op = Op {
     verb: "write",
     hint: false,
+    probe: false,
     on_timeout: OnTimeout::FailAlone,
 };
-/// The question whether such a write was committed: unanswered in time,
-/// it fails alone (the write is then sent again, which is safe).
+/// The question whether such a write was committed, given at most
+/// [`Conn::probe_timeout`]: unanswered in time, it fails alone (the write
+/// is then sent again, which is safe: its guard refuses a second copy).
 const PROBE: Op = Op {
     verb: "read",
     hint: false,
+    probe: true,
     on_timeout: OnTimeout::FailAlone,
 };
 
@@ -843,6 +857,18 @@ impl Conn {
     /// The request timeout.
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// The deadline of the question whether a write transaction out of
+    /// time was committed ([`Conn::batch_checked`]): a quarter of the
+    /// request timeout, at most [`HINT_TIMEOUT`] (5 s at the default 30 s).
+    /// It is a read of one row by its key, which does not wait for the
+    /// write lock. 2.8.2 as first reviewed gave it the whole request
+    /// timeout, so that while the server answered nothing one try of a
+    /// transaction cost two timeouts (60 s), the process's whole retry
+    /// time, and the transaction was never sent again.
+    pub(crate) fn probe_timeout(&self) -> Duration {
+        (self.timeout / 4).min(HINT_TIMEOUT)
     }
 
     /// Bytes of text and blob columns read so far (values as stored).
@@ -1282,6 +1308,11 @@ impl Conn {
             (self.first_answer_timeout(), "the server's first answer")
         } else if op.hint {
             (self.timeout.min(HINT_TIMEOUT), "a hint's write")
+        } else if op.probe {
+            (
+                self.probe_timeout(),
+                "the question whether a write was committed",
+            )
         } else {
             (self.timeout, "a request")
         };
@@ -1674,7 +1705,8 @@ impl Conn {
     /// the transaction is applied: its nonce in the change log, `crate::
     /// batch::Tx`) asks the server whether it committed it. One that has
     /// committed is `Ok`; one that has not (or whose question went
-    /// unanswered) is the timeout, which latches nothing: the caller sends
+    /// unanswered within [`Conn::probe_timeout`]) is the timeout, which
+    /// latches nothing: the caller sends
     /// it again as it was, within the process's retry time
     /// (`Remote::spend_on_writes`). The question is a read, which does not
     /// wait for the write lock, so a transaction still waiting for it

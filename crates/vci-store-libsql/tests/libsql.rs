@@ -676,6 +676,9 @@ struct Shared {
     /// The bytes of each write request sent on (a request holding `BEGIN
     /// IMMEDIATE`), in order.
     write_sizes: Mutex<Vec<usize>>,
+    /// When each write request sent on began, and when the last byte of
+    /// its answer was passed on, in order.
+    write_times: Mutex<Vec<(Instant, Option<Instant>)>>,
 }
 
 impl Shared {
@@ -815,6 +818,15 @@ impl Proxy {
     /// The size of each write request sent on, in order.
     fn write_sizes(&self) -> Vec<usize> {
         self.shared.write_sizes.lock().unwrap().clone()
+    }
+
+    /// The time from the end of each write's answer to the start of the
+    /// next write.
+    fn write_gaps(&self) -> Vec<Duration> {
+        let t = self.shared.write_times.lock().unwrap();
+        t.windows(2)
+            .filter_map(|w| Some(w[1].0.saturating_duration_since(w[0].1?)))
+            .collect()
     }
 
     /// How many bytes it passed on from the server.
@@ -1073,6 +1085,7 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                     if write {
                         sh.writes.fetch_add(1, Ordering::SeqCst);
                         sh.write_sizes.lock().unwrap().push(0);
+                        sh.write_times.lock().unwrap().push((Instant::now(), None));
                     }
                 }
                 if writing && let Some(last) = sh.write_sizes.lock().unwrap().last_mut() {
@@ -1124,6 +1137,9 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                     sh.throttle(n);
                     if !send_all(&client, &buf[..n]) {
                         return;
+                    }
+                    if writing && let Some(last) = sh.write_times.lock().unwrap().last_mut() {
+                        last.1 = Some(Instant::now());
                     }
                     (moved, waiting, last) = (true, false, Instant::now());
                 }
@@ -4239,4 +4255,185 @@ fn a_read_of_values_behind_a_long_wait_for_each_answer_takes_few_rounds() {
     );
     let all: Vec<_> = r.list_units(&ids).unwrap().into_iter().flatten().collect();
     assert_eq!(all.len(), n);
+}
+
+/// A batch of small units written as many transactions.
+fn small_batch(
+    s: &LibsqlStore,
+    tag: &str,
+    n: usize,
+    pad: usize,
+) -> (vci_store::Finished, Vec<String>) {
+    s.__compress_for_test(false);
+    let pad = "p".repeat(pad);
+    let b = s.batch().unwrap();
+    let keys = (0..n)
+        .map(|i| {
+            let u = format!("src/{tag}/{i}.test.ts");
+            s.put_for_test(
+                &u,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{u}{pad}")),
+            )
+            .unwrap()
+            .key
+        })
+        .collect();
+    (b.finish_partial().unwrap(), keys)
+}
+
+/// A write that runs out of time while the server answers nothing, not
+/// even the question whether it committed, is sent again: the question
+/// has a short deadline of its own (a quarter of the request timeout, at
+/// most 5 s), so one try costs about one request timeout. 2.8.2 as first
+/// reviewed gave the question the whole request timeout: one try cost two
+/// (60 s at the default), the whole of the process's retry time, the
+/// breaker latched and the units were lost without being sent again.
+#[test]
+fn a_write_whose_question_goes_unanswered_is_sent_again() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s request timeout: 4 s of retry time; the question 0.5 s.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    // The tables made first.
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    proxy.hold_writes(1);
+    let held = proxy.stalled();
+    let (f, keys, took) = std::thread::scope(|sc| {
+        // Once the write is held, the question after it goes unanswered too.
+        sc.spawn(|| {
+            let t = Instant::now();
+            while proxy.stalled() == held && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            proxy.stall_cursors(1);
+        });
+        let t = Instant::now();
+        let (f, keys) = small_batch(&s, "q", 4, 100);
+        (f, keys, t.elapsed())
+    });
+    assert_eq!(proxy.stalled() - held, 2, "the write and its question held");
+    assert_eq!(f.lost_count(), 0, "sent again: {:?}", f.into_error());
+    assert!(took < Duration::from_secs(6), "{took:?}");
+    s.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    let r = testkit::open_remote(&ns).unwrap();
+    let on_server: Vec<String> = r.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert!(keys.iter().all(|k| on_server.contains(k)));
+}
+
+/// A write's transactions go one right after the other: no pause between
+/// them. 2.8.2 as first reviewed paused a quarter of each transaction's
+/// time (200 ms to 2 s, randomized) for other writers' small writes, which
+/// cost a lone writer about 10% of its time and showed no benefit for the
+/// small writes on vex's Turso database.
+#[test]
+fn a_write_sends_its_transactions_without_a_pause() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 30);
+    s.status().unwrap();
+    // 64 attestations a transaction: 10 transactions.
+    let (f, _) = small_batch(&s, "gap", 640, 100);
+    assert_eq!(f.lost_count(), 0);
+    let mut gaps = proxy.write_gaps();
+    assert!(gaps.len() >= 9, "{gaps:?}");
+    gaps.sort();
+    let median = gaps[gaps.len() / 2];
+    assert!(median < Duration::from_millis(60), "paused: {gaps:?}");
+}
+
+/// A process's writes stop once they took six request timeouts in all,
+/// even when every transaction commits in time: the units still queued are
+/// lost at once (their units run again next time), the ones stored stay,
+/// nothing is latched, and a later write of the process is lost at once
+/// too. 2.8.2 as first reviewed bounded only the time of writes that
+/// failed, so a Rails job's 800 units, each transaction committing just
+/// within the timeout behind other writers, could take minutes.
+#[test]
+fn a_process_writes_for_a_bounded_time_in_all() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 1 s request timeout: 6 s of writes in all.
+    let s = proxied(&proxy, token.as_deref(), &ns, 1);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // Each answer held 250 ms: within the timeout, and the transactions
+    // keep their size (between a tenth and a third of it).
+    proxy.delay_answers(250);
+    let t = Instant::now();
+    // 64 a transaction: 40 transactions, more than 10 s without the bound.
+    let (f, keys) = small_batch(&s, "slow", 2_560, 100);
+    let took = t.elapsed();
+    let lost = f.lost_count();
+    assert!(lost > 0 && lost < keys.len(), "lost {lost}");
+    assert!(
+        took >= Duration::from_secs(6) && took < Duration::from_millis(7_500),
+        "{took:?}"
+    );
+    let why = f.into_error().unwrap().to_string();
+    assert!(why.contains("this process's writes"), "{why}");
+    // Not latched; a later write of the process is lost at once.
+    proxy.delay_answers(0);
+    s.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    let t = Instant::now();
+    let (f, _) = small_batch(&s, "later", 4, 100);
+    assert_eq!(f.lost_count(), 4);
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t.elapsed()
+    );
+    let r = testkit::open_remote(&ns).unwrap();
+    assert_eq!(r.list_all().unwrap().len(), 1 + keys.len() - lost);
+}
+
+/// A write's transactions are made smaller when they commit slowly (more
+/// than a third of the request timeout each), down to 128 KiB, and larger
+/// again, up to 1 MiB, when they commit fast (less than a tenth): behind
+/// other writers on vex's Turso database transactions of about 1 MB took
+/// 23 to 31 s, at the edge of the 30 s timeout, where 2.8.2 as first
+/// reviewed kept sending 1 MiB.
+#[test]
+fn a_write_sizes_its_transactions_from_their_commit_times() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    // The tables made first.
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // Each answer held 0.8 s: more than a third of the 2 s timeout.
+    proxy.delay_answers(800);
+    let w0 = proxy.write_sizes().len();
+    // 80 units of about 25 kB as sent: 2 MB, 5 transactions.
+    let (f, _) = small_batch(&s, "big", 80, 20_000);
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let slow: Vec<usize> = proxy.write_sizes()[w0..].to_vec();
+    assert!(slow.len() >= 4, "{slow:?}");
+    assert!(slow[0] > 900_000, "{slow:?}");
+    assert!(slow[1] < slow[0] * 6 / 10, "halved: {slow:?}");
+    assert!(slow[3] < 250_000, "down to 128 KiB: {slow:?}");
+    // Fast again: they grow back.
+    proxy.delay_answers(0);
+    let w1 = proxy.write_sizes().len();
+    let (f, _) = small_batch(&s, "fast", 80, 20_000);
+    assert_eq!(f.lost_count(), 0);
+    let fast: Vec<usize> = proxy.write_sizes()[w1..].to_vec();
+    assert!(fast.iter().any(|&b| b > 900_000), "grown back: {fast:?}");
 }

@@ -21,15 +21,20 @@
 //! **Short transactions** (2.8.2). A queue is written as transactions of
 //! whole units (every write of one test key, with the manifests its
 //! attestations reference and their bases) of at most [`TX_BYTES`] as
-//! sent or [`TX_UNITS`] attestations, one after the other, with a short
-//! pause between them ([`yield_pause`]): each holds the server's one write
-//! lock for one to a few seconds, not the 15 to 37 s an 8 MB transaction
-//! held it on Turso (2.8.1). Another job's write (a hint, a shared
-//! manifest, its own units) still waits behind every writer's transaction
-//! that is waiting too: beside three processes writing at once on vex's
-//! Turso database a manifest put waited up to 25 s and one-row writes up
-//! to 47 s, with or without the pause, and a hint was sometimes dropped
-//! at its 5 s deadline (section 18 of `docs/STORE-BACKENDS.md`).
+//! sent or [`TX_UNITS`] attestations, one right after the other: each
+//! holds the server's one write lock for one to a few seconds, not the 15
+//! to 37 s an 8 MB transaction held it on Turso (2.8.1). A transaction
+//! that took more than a third of the request timeout (behind other
+//! writers) makes the next ones half as large, down to [`TX_MIN_BYTES`],
+//! and one that took less than a tenth twice as large again
+//! ([`crate::remote::Remote::size_writes_from`]). Another job's write (a
+//! hint, a shared manifest, its own units) still waits behind every
+//! writer's transaction that is waiting too: beside three processes
+//! writing at once on vex's Turso database a manifest put waited up to
+//! 25 s and one-row writes up to 47 s, and a hint was sometimes dropped at
+//! its 5 s deadline (section 18 of `docs/STORE-BACKENDS.md`). A draft
+//! paused between transactions for them; that cost a lone writer about
+//! 10% and showed no benefit, and is gone.
 //!
 //! **Failures cost their own units.** A transaction that ran out of time
 //! (or waited for the lock until then) is asked about first
@@ -44,7 +49,12 @@
 //! request timeouts in all: past that the circuit breaker latches (a
 //! server that cannot take writes is given up within a bounded time, not
 //! once per transaction), and every write still queued fails at once. A
-//! server that cannot be reached latches it at once, as before.
+//! server that cannot be reached latches it at once, as before. The time
+//! a process spends on writes in all, those that succeed included, is
+//! bounded by [`WRITE_TIME_DEADLINES`] request timeouts (plus the
+//! transaction under way when it runs out): past that every unit still
+//! queued, and every later write's, is lost at once, latching nothing, so
+//! that a server that takes writes slowly costs a job a bounded time.
 //!
 //! A record a server would refuse as too big ([`MAX_RECORD`] bytes or
 //! more: `sqld` keeps rows under 5,000,000 bytes) is refused before it is
@@ -94,13 +104,22 @@ pub(crate) const TX_UNITS: usize = 64;
 /// default 30 s timeout. Past it the circuit breaker latches.
 pub(crate) const WRITE_RETRY_DEADLINES: u32 = 2;
 
-/// The pause after a transaction committed, before the next one of the
-/// same write is sent, as a share of the time it took ([`yield_pause`]).
-const YIELD_SHARE: f64 = 0.25;
-/// The shortest such pause (before it is randomized).
-const YIELD_MIN: Duration = Duration::from_millis(200);
-/// The longest such pause (before it is randomized).
-const YIELD_MAX: Duration = Duration::from_secs(2);
+/// The smallest a transaction's bytes are made ([`Remote::tx_bytes`])
+/// when transactions commit slowly.
+pub(crate) const TX_MIN_BYTES: usize = 128 << 10;
+
+/// The time a process may spend on writes in all (transactions that
+/// committed, failed or were asked about, and the pauses before one was
+/// sent again), in request timeouts: 180 s at the default 30 s timeout.
+/// Past it, every unit still queued is lost at once (vci run runs them
+/// again next time) rather than the job waiting on. 2.8.2 as first
+/// reviewed bounded only the time of writes that failed: on vex's Turso
+/// database three processes writing 150 units each at once took up to
+/// 88 s each, so a Rails job's 800 units could take minutes. Three
+/// writing 800 units each (28 to 31 MB) on a quiet database spent 99 to
+/// 131 s each on writes (28 October 2026), which a bound of four timeouts
+/// would have cut short.
+pub(crate) const WRITE_TIME_DEADLINES: u32 = 6;
 
 /// The most times one unit's writes are sent (each failure costing part
 /// of the process's retry time).
@@ -897,29 +916,28 @@ fn units(mut p: Pending) -> Vec<Pending> {
     out
 }
 
-/// Units packed, in order, into transactions of at most [`TX_BYTES`] as
-/// sent and [`TX_UNITS`] attestations; a unit larger than that alone is a
+/// The next transaction's units, taken in order from `fresh`: at most
+/// `cap` bytes of values as sent ([`Remote::tx_bytes`], at most
+/// [`TX_BYTES`]) and a share of [`TX_UNITS`] attestations as large as
+/// `cap`'s of [`TX_BYTES`]; a unit larger than that alone is a
 /// transaction of its own. Compressed values are counted at two thirds of
 /// their size: zstd makes vex's JSON about a third as large, and its bytes
 /// travel as a hex literal, twice that.
-fn pack(units: Vec<Pending>, compressed: bool) -> Vec<Vec<Pending>> {
+fn next_group(fresh: &mut VecDeque<Pending>, cap: usize, compressed: bool) -> Option<Vec<Pending>> {
     let sent = |b: usize| if compressed { b * 2 / 3 } else { b };
-    let mut out: Vec<Vec<Pending>> = Vec::new();
-    let (mut cur, mut bytes, mut n): (Vec<Pending>, usize, usize) = (Vec::new(), 0, 0);
-    for u in units {
+    let max_units = (TX_UNITS * cap / TX_BYTES).max(4);
+    let mut cur: Vec<Pending> = Vec::new();
+    let (mut bytes, mut n) = (0usize, 0usize);
+    while let Some(u) = fresh.front() {
         let (b, k) = (sent(u.bytes), u.attestations.len());
-        if !cur.is_empty() && (bytes + b > TX_BYTES || n + k > TX_UNITS) {
-            out.push(std::mem::take(&mut cur));
-            (bytes, n) = (0, 0);
+        if !cur.is_empty() && (bytes + b > cap || n + k > max_units) {
+            break;
         }
         bytes += b;
         n += k;
-        cur.push(u);
+        cur.extend(fresh.pop_front());
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
+    (!cur.is_empty()).then_some(cur)
 }
 
 /// Whether a failed transaction is worth sending again: it ran out of time
@@ -961,14 +979,6 @@ fn jitter(base: Duration) -> Duration {
     base.mul_f64(0.5 + f64::from(nanos % 1000) / 1000.0)
 }
 
-/// The pause after a transaction committed before the next one of the
-/// same write is sent ([`YIELD_SHARE`] of the time it took, between
-/// [`YIELD_MIN`] and [`YIELD_MAX`], randomized): another job's write that
-/// waits for the lock takes it meanwhile.
-fn yield_pause(took: Duration) -> Duration {
-    jitter(took.mul_f64(YIELD_SHARE).clamp(YIELD_MIN, YIELD_MAX))
-}
-
 /// A transaction's nonce: a root no manifest has, logged by the
 /// transaction ([`Tx`]).
 fn nonce(remote: &Remote) -> String {
@@ -987,13 +997,15 @@ fn nonce(remote: &Remote) -> String {
     )
 }
 
-/// Write `p` as transactions of whole units ([`units`], [`pack`]), one
-/// after the other, pausing briefly after each one stored
-/// ([`yield_pause`]); after each one stored, bring the cache up to date and
-/// run the queue's hook. A transaction that fails is sent again (as it was:
-/// [`Tx`]) or split as the module docs say, within the process's retry
-/// time ([`Remote::spend_on_writes`]); the units whose transaction still
-/// fails are lost, and the rest is stored. A manifest `stored` holds with
+/// Write `p` as transactions of whole units ([`units`], [`next_group`]),
+/// one after the other, each as large as the last ones' commit times say
+/// ([`Remote::size_writes_from`]); after each one stored, bring the cache
+/// up to date and run the queue's hook. A transaction that fails is sent
+/// again (as it was: [`Tx`]) or split as the module docs say, within the
+/// process's retry time ([`Remote::spend_on_writes`]); the units whose
+/// transaction still fails are lost, and the rest is stored. Once the
+/// process has spent its time for writes ([`Remote::writing_out_of_time`])
+/// every unit still queued is lost at once. A manifest `stored` holds with
 /// the same bytes is not sent again, and those stored are added to it;
 /// `also_keep`: roots that writes still queued reference, which no
 /// transaction removes as superseded.
@@ -1007,6 +1019,7 @@ pub(crate) fn write_all(
     if p.is_empty() {
         return w;
     }
+    let began = Instant::now();
     let mut keep = p.referenced();
     keep.extend(also_keep.iter().cloned());
     let counts = (
@@ -1016,12 +1029,36 @@ pub(crate) fn write_all(
     );
     let step = Step::start(KIND);
     let n0 = remote.conn.requests();
-    let mut queue: VecDeque<(Vec<Pending>, u32, Option<Tx>)> = pack(units(p), remote.compress())
-        .into_iter()
-        .map(|t| (t, 0, None))
-        .collect();
+    let compressed = remote.compress();
+    // Units not sent yet, and transactions to send (again) first.
+    let mut fresh: VecDeque<Pending> = units(p).into();
+    let mut queue: VecDeque<(Vec<Pending>, u32, Option<Tx>)> = VecDeque::new();
     let (mut txs, mut bytes, mut longest, mut lost) = (0usize, 0usize, Duration::ZERO, 0usize);
-    while let Some((group, tries, again)) = queue.pop_front() {
+    let mut lose = |w: &mut Written, failed: Vec<Vec<Pending>>, why: StoreError| {
+        let keys: Vec<String> = failed.iter().flatten().flat_map(Pending::keys).collect();
+        if keys.is_empty() {
+            w.other.get_or_insert(why);
+        } else {
+            lost += keys.len();
+            w.lost.lose(keys, why);
+        }
+    };
+    loop {
+        let (group, tries, again) = match queue.pop_front() {
+            Some(next) => next,
+            None => match next_group(&mut fresh, remote.tx_bytes(), compressed) {
+                Some(g) => (g, 0, None),
+                None => break,
+            },
+        };
+        if remote.writing_out_of_time(began.elapsed()) {
+            // Every unit still queued, at once.
+            let mut failed = vec![group];
+            failed.extend(queue.drain(..).map(|(g, _, _)| g));
+            failed.extend(fresh.drain(..).map(|u| vec![u]));
+            lose(&mut w, failed, remote.write_time_error());
+            break;
+        }
         let t = Instant::now();
         let built = match again {
             Some(tx) => Ok(tx),
@@ -1053,13 +1090,13 @@ pub(crate) fn write_all(
             (Ok(n), Some(tx)) => {
                 txs += 1;
                 bytes += n;
+                if n > 0 {
+                    remote.size_writes_from(took);
+                }
                 for (root, (_, b)) in &tx.p.manifests {
                     stored.insert(root.clone(), vci_core::blake3_hex(b));
                 }
                 settle(remote, &tx.p);
-                if !queue.is_empty() {
-                    std::thread::sleep(yield_pause(took));
-                }
                 continue;
             }
             (Ok(_), None) => continue,
@@ -1075,10 +1112,13 @@ pub(crate) fn write_all(
                 *why = l;
             }
             failed.extend(queue.drain(..).map(|(g, _, _)| g));
+            failed.extend(fresh.drain(..).map(|u| vec![u]));
         };
         if remote.conn.check().is_err() || hopeless(&why) {
             give_up(&mut why, &mut failed);
         } else if worth_again(&why) && tries + 1 < MAX_TRIES {
+            // Out of time: the transactions after it are made smaller.
+            remote.size_writes_from(took);
             // Time spent on a write that failed, and the pause before it is
             // sent again, count against the process's retry time.
             let pause = backoff(tries);
@@ -1105,14 +1145,9 @@ pub(crate) fn write_all(
             queue.push_front((group, tries, None));
             continue;
         }
-        let keys: Vec<String> = failed.iter().flatten().flat_map(Pending::keys).collect();
-        if keys.is_empty() {
-            w.other.get_or_insert(why);
-        } else {
-            lost += keys.len();
-            w.lost.lose(keys, why);
-        }
+        lose(&mut w, failed, why);
     }
+    remote.spent_writing(began.elapsed());
     step.done(format_args!(
         "write batch: {} manifest(s), {} attestation(s), {} removal(s), {txs} transaction(s), {} request(s), {}{}, longest {:.2}s{}",
         counts.0,
@@ -1120,7 +1155,7 @@ pub(crate) fn write_all(
         counts.2,
         remote.conn.requests() - n0,
         crate::remote::megabytes(u64::try_from(bytes).unwrap_or(u64::MAX)),
-        if remote.compress() { " compressed" } else { "" },
+        if compressed { " compressed" } else { "" },
         longest.as_secs_f64(),
         if lost > 0 {
             format!(", {lost} attestation(s) not stored")
