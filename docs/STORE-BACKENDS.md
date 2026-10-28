@@ -2462,7 +2462,7 @@ JSON array (`IN (SELECT value FROM json_each(?1))`), 5,000 to a request, but for
 | method | on a cache miss |
 |---|---|
 | `list_units` | `SELECT test_key, key, target FROM <a> WHERE test_key IN (…) ORDER BY test_key, key` |
-| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference (but those cached already), 250 keys to a request; then the bases those manifests name and the cache lacks, in one more request; all go to the cache |
+| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference (but those cached already), 100 keys to a request; then the bases those manifests name and the cache lacks, in one more request; all go to the cache |
 | `manifest`, `manifests` | `root = ?1`; `root IN (…)` |
 | `read_units` | fully cached units from the cache (values kept); the rest in one statement with values |
 | `list_all`, `count`, `manifest_roots`, `read_all` | one statement each, never cached |
@@ -2473,25 +2473,28 @@ which is where other writers' changes are picked up), then the values `choose` p
 manifests and bases, as `read_values` reads them. `prefetch(Manifests)` is one request for the roots not cached as
 stored, with their bases.
 
-**Values, 250 to a request** (2.8.2, `VALUES_PER_REQUEST`), each request with the manifests its attestations reference but those cached already (the roots cached, at most
+**Values, 100 to a request** (2.8.2, `VALUES_PER_REQUEST`; about 4 MB of vex's), each request with the manifests its attestations reference but those cached already (the roots cached, at most
 4,096, are bound as a second JSON array), each base once for the whole read. 2.8.1 read a plan's 1,600 to 2,000 values
 (60 to 85 MB on vex's Turso) in one request that took 2 to 22 s, and repeated the bases in each of a plan's reads.
-The first request goes alone, and how long it took sets how many go at once after it (`at_once`), up to the pool's
-connections (`min(VCI_JOBS, 4)`): requests sent at once share the link's bandwidth, each then taking about as many
-times longer, so as many go at once as would still take at most a third of the request timeout, at least one. On CI's
-runners a request of 250 is answered in well under a second and four go at once; from a laptop at about 2 MB/s, where
-one takes 4 to 5 s alone, two do; below about 1 MB/s, one at a time. The first draft sent four at once from the start:
-behind a proxy limited to 3 MB/s (a vex-api plan, 1,647 values, 63 MB, `VCI_STORE_TIMEOUT_SECS=10`) all four ran out
-of time together after 10 s, 30 MB read and thrown away, and the read took 42.5 s; at 0.8 MB/s, 121 s, 12 deadlines.
-One sent beside others whose deadline runs out (`OnTimeout::FailAlone`) fails alone, latching nothing and not sent
+Two requests go at once at first; after each answered within a third of the request timeout one more may be out at
+once, after each that took more than half of it one fewer, at least one and at most the pool's connections
+(`min(VCI_JOBS, 4)`). Requests sent at once may share the link's bandwidth, each then taking about as many times
+longer: the review's first draft sent four of 250 at once from the start, and behind a proxy limited to 3 MB/s (a
+vex-api plan, 1,647 values, 63 MB, `VCI_STORE_TIMEOUT_SECS=10`) all four ran out of time together after 10 s, 30 MB
+read and thrown away, and the read took 42.5 s; at 0.8 MB/s, 121 s, 12 deadlines. On vex's Turso database from a
+laptop, though, a connection is limited more than the link is (a request of 250 took 6.5 to 7 s alone and 7 to 11 s
+three at once), so going one at a time made the plan slower (prefetch 35 to 42 s against 19 to 32 s), and requests of
+250 left one straggler of 15 to 19 s holding up the read. Requests of 100 reach four at once within their first few
+answers there and each takes 1 to 8 s; see the measurements below. One sent beside others whose deadline runs out (`OnTimeout::FailAlone`) fails alone, latching nothing and not sent
 again by itself, and no more are sent at once: the read sends the keys of that request again, one request at a time
-and 125 to a request, and those of the requests never sent at full size (`OnTimeout::Latch`: one of those out of time
+and 50 to a request, and those of the requests never sent at full size (`OnTimeout::Latch`: one of those out of time
 was the second try, and latches the breaker, after which the rest fail at once). **The whole read is given two
 request timeouts** (`VALUES_DEADLINES`, `Conn::query_until`): no request runs past them (one they cut short fails
 alone, latching nothing), and the keys not read by then fail as below, so a slow link costs a plan's read of values
 at most two deadlines, as a server that stops answering does, never many (2.8.1 gave up after one, and every unit
 ran). `a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once` checks both behind a proxy limited to 1.7 and
-1 MB/s. A request that fails otherwise,
+1 MB/s: every value read once, where four requests of 250 at once ran out of time and read 13 MB for 7.8, and the read
+stopped after 6 s, where it took 11.6 s. A request that fails otherwise,
 or again, costs only its keys: `prefetch` leaves them uncached, counts them
 in `Hydration::unresolved` and warns (`vci: warning: could not prefetch N stored value(s) from <url> namespace <ns>: …;
 they are read again when asked for`), and `read_values` reads them again when asked; a `read_values` request that fails marks its keys
@@ -2500,7 +2503,7 @@ no key at all (from the cache or the server), as a store that cannot be used doe
 read: `prefetch N unit(s), M value(s), R request(s), X MB` and `read M value(s), R request(s), X MB`.
 Hrana's batch could carry several statements in one HTTP request; one statement per read already does, so a plan of
 1,200 units is the status, the flags, the memo, two prefetches of two requests and the descriptions of the statements
-on each connection: `a_plan_costs_a_handful_of_requests` checks at most 8 requests for the status and a prefetch of
+on each connection: `a_plan_costs_a_handful_of_requests` checks at most 10 requests (8 before the values went 100 to a request) for the status and a prefetch of
 300 units, and none for the listings, the batch read and 300 manifest reads from 8 threads after it.
 
 ### Writes (remote and replica modes)
@@ -2586,7 +2589,7 @@ The SQLite and PostgreSQL stores and git-meta have no such limit, and the local 
 release-build test `many_units_are_listed_and_read_quickly` (1,200 units of 18 KB against a local `sqld`) wrote them
 in 0.64 s and 8 requests (three transactions: the queue flushed at 8 MiB), and listed and read them on a new handle in
 0.10 s and 4 requests; with 2.8.2, 0.47 s and 12 requests (six transactions at 4 MiB), and 0.04 s and 11 requests
-(the values five requests of 250, four at once).
+(the values five requests of 250, four at once; 100 to a request since).
 
 ### The replica mode
 
@@ -2720,6 +2723,14 @@ to 20.1 MB, manifests 57.7 to 18.0 MB):
 | copy | 2.8.1 | 28.6 s (27.1-36.6) | 1,652 (22.4-30.0 s) + 238 more (2.5-4.5 s), 71.2 MB | 7 statements |
 | copy | 2.8.2 | 17.4 s (13.2-20.5) | 1,652, 62.7 MB (11.3-18.5 s) | 15 |
 | copy, compressed | 2.8.2 | 9.2 s (8.2-11.5) | 1,652, 21.7 MB (6.4-9.5 s) | 15 |
+
+The rows marked 2.8.2 above are the review's first draft (250 values a request, four at once from the start). After
+the review (100 a request, two at once at first, the read within two deadlines), measured the same way later the same
+day on vex's own namespace, six runs each interleaved with the first draft, when the link was slower: the plan 28.0 s
+median (23.0-40.5), prefetch 21.9 s (19.9-37.6), 25-29 requests, against the first draft's 34.8 s (23.4-49.8) and
+32.3 s (20.4-46.9), 15-17 requests; both read the same 1,652 values, 62.4 MB, none out of time. A version that sent
+the first request of 250 alone and grew from one took 38 to 45 s (prefetch 35 to 42 s), and one that started at two
+with 250 a request 26.5 to 36.3 s: a request of 250 took 4.7 to 19.3 s, one straggler holding up the end of the read.
 
 Six runs of each, interleaved. 2.8.2 reads the same 1,652 values 2.8.1 prefetches, in seven requests four at a time, and not the 238 to 669 newest
 candidates 2.8.1 then read in a second request; the listing (1.6 s, 0.66 MB for 2,090 keys) is the same. With

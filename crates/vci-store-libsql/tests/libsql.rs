@@ -226,8 +226,10 @@ fn a_plan_costs_a_handful_of_requests() {
         after_prefetch,
         "the listings, the values and the manifests came from the cache"
     );
+    // The status, the listing, three requests of 100 values and the
+    // statements' descriptions on each connection.
     assert!(
-        after_prefetch <= 8,
+        after_prefetch <= 10,
         "status and prefetch took {after_prefetch} requests"
     );
 }
@@ -3085,7 +3087,7 @@ fn superseding_removes_the_manifests_left_without_a_reference() {
     }
 }
 
-/// Values are read 250 to a request: a request that fails costs only its
+/// Values are read 100 to a request: a request that fails costs only its
 /// own keys. A prefetch says how many it could not read (a warning) and
 /// leaves them to be read when asked for; a read that fails
 /// for some keys marks only those as unreadable (their units run), never
@@ -3241,7 +3243,7 @@ fn a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once() {
     };
     let ns = testkit::namespace();
     let w = testkit::open_remote(&ns).unwrap();
-    // Five requests of values, about 1.6 MB each as they travel.
+    // About 7.8 MB of values as they travel.
     let n = 1_250;
     let ids: Vec<String> = (0..n).map(unit).collect();
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();

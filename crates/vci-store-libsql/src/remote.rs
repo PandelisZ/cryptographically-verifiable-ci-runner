@@ -47,29 +47,18 @@ pub(crate) const SUPPORTED: u32 = 1;
 const CHUNK: usize = 5_000;
 
 /// Attestation values per request, each with the manifest it references:
-/// a few megabytes (vex's Rails values: about 37 kB each stored as they
-/// are, 13 kB compressed), so that one request is answered within seconds
-/// even while other jobs write, and one that fails costs only its own
-/// units. Up to the pool's connections are read at once.
-pub(crate) const VALUES_PER_REQUEST: usize = 250;
+/// about 4 MB of vex's Rails values (about 37 kB each stored as they are,
+/// 13 kB compressed), so that one request is answered within a few seconds
+/// even on a slow link, a slow one costs little of the read, and one that
+/// fails costs only its own units. Up to the pool's connections are read at
+/// once, as many as answer well within the timeout (`Remote::query_values`).
+/// 250 (9 MB) took 6 to 19 s a request from a laptop, one straggler
+/// holding up the read.
+pub(crate) const VALUES_PER_REQUEST: usize = 100;
 
 /// A read of values is given this many request timeouts in all
 /// (`Remote::query_values`).
 const VALUES_DEADLINES: u32 = 2;
-
-/// How many requests of values go at once, the first alone having taken
-/// `alone`: as many as, sharing the link's bandwidth (each then takes as
-/// many times longer), still take at most a third of the request timeout;
-/// at least one.
-fn at_once(timeout: Duration, alone: Duration) -> usize {
-    let n = timeout.as_secs_f64() / (3.0 * alone.as_secs_f64().max(0.001));
-    if n.is_finite() && n >= 1.0 {
-        // At most a few: the caller caps it at the pool's size.
-        n.min(64.0) as usize
-    } else {
-        1
-    }
-}
 
 /// The most roots a read of values names as already cached (not sent
 /// again): the bases and shared manifests an earlier request brought.
@@ -677,11 +666,12 @@ impl Remote {
     /// once: the manifests with their attestations (but those cached
     /// already), then the bases not cached in one more request.
     ///
-    /// The first request goes alone, and how long it took sets how many go
-    /// at once after it ([`at_once`], at most the pool's connections): on
-    /// a link whose bandwidth is the limit, requests sent at once share it
-    /// and each takes as much longer, so they are sent at once only while
-    /// that many still take well under the request timeout. One sent
+    /// Two requests go at once at first; after each answered within a
+    /// third of the request timeout one more may be out at once, after each
+    /// that took more than half of it one fewer (at least one, at most the
+    /// pool's connections): requests sent at once may share the link's
+    /// bandwidth, so on a slow link they go one or two at a time instead of
+    /// four running out of time together, and on a fast one four. One sent
     /// beside others that runs out of time fails alone and stops the
     /// others from being sent; its keys are read again one request at a
     /// time, half as many to a request, and those never sent at full size.
@@ -723,83 +713,84 @@ impl Remote {
             Some(Fail::or_absent(r, Vec::new))
         };
         let is_timeout = |r: &Option<Rows>| matches!(r, Some(Err(StoreError::Timeout { .. })));
-        let mut answers: Vec<Option<Rows>> = (0..chunks.len()).map(|_| None).collect();
-        let t0 = Instant::now();
-        answers[0] = ask(READ, chunks[0]);
-        let alone = t0.elapsed();
-        let rest = &chunks[1..];
-        let workers = if matches!(answers[0], Some(Ok(_))) {
-            at_once(timeout, alone).min(self.conn.max()).min(rest.len())
-        } else {
-            1
-        };
-        // Whether each of the rest went beside others.
-        let mut shared = vec![false; rest.len()];
-        if workers <= 1 {
-            for (chunk, answer) in rest.iter().zip(answers[1..].iter_mut()) {
-                *answer = ask(READ, chunk);
-            }
-        } else {
-            shared.fill(true);
-            let next = AtomicUsize::new(0);
-            // A request ran out of time: no more are sent at once.
-            let slow = AtomicBool::new(false);
-            let done: Mutex<Vec<Option<Rows>>> =
-                Mutex::new((0..rest.len()).map(|_| None).collect());
-            std::thread::scope(|sc| {
-                for _ in 0..workers {
-                    sc.spawn(|| {
-                        while !slow.load(Ordering::Relaxed) {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(chunk) = rest.get(i) else {
-                                break;
-                            };
-                            let r = ask(READ_SHARED, chunk);
-                            if r.is_none() || is_timeout(&r) {
-                                slow.store(true, Ordering::Relaxed);
-                            }
-                            done.lock().unwrap_or_else(PoisonError::into_inner)[i] = r;
+        let n = chunks.len();
+        let max = self.conn.max().clamp(1, n);
+        // How many requests may be out at once: two at first, one more
+        // after each answered within a third of the timeout, one fewer after
+        // each that took more than half of it.
+        let allowed = AtomicUsize::new(2.min(max));
+        let next = AtomicUsize::new(0);
+        // A request sent beside others ran out of time (or the read's time
+        // did): no more are sent at once.
+        let slow = AtomicBool::new(false);
+        // Each request's answer (`None`: not sent), and whether it went
+        // beside others.
+        let done: Mutex<Vec<(Option<Rows>, bool)>> =
+            Mutex::new((0..n).map(|_| (None, false)).collect());
+        std::thread::scope(|sc| {
+            for w in 0..max {
+                let (allowed, next, slow, done, ask, chunks) =
+                    (&allowed, &next, &slow, &done, &ask, &chunks);
+                sc.spawn(move || {
+                    while !slow.load(Ordering::Relaxed) && next.load(Ordering::Relaxed) < n {
+                        if w >= allowed.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
                         }
-                    });
-                }
-            });
-            for (a, r) in answers[1..]
-                .iter_mut()
-                .zip(done.into_inner().unwrap_or_else(PoisonError::into_inner))
-            {
-                *a = r;
-            }
-            // A request sent beside others that ran out of time: its keys
-            // again, one request at a time, half as many to a request; one
-            // never sent: at full size. One out of time now latches the
-            // breaker (it was the second try), and the rest then fail at
-            // once.
-            for ((chunk, answer), beside) in
-                rest.iter().zip(answers[1..].iter_mut()).zip(shared.iter())
-            {
-                if !*beside {
-                    continue;
-                }
-                if answer.is_none() {
-                    *answer = ask(READ_AGAIN, chunk);
-                    continue;
-                }
-                if !is_timeout(answer) {
-                    continue;
-                }
-                let mut rows = Vec::new();
-                let mut again = Some(Ok(()));
-                for half in chunk.chunks(chunk.len().div_ceil(2).max(1)) {
-                    match ask(READ_AGAIN, half) {
-                        Some(Ok(r)) => rows.extend(r),
-                        other => {
-                            again = other.map(|r| r.map(drop));
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(chunk) = chunks.get(i) else {
                             break;
+                        };
+                        let beside = allowed.load(Ordering::Relaxed) > 1;
+                        let t = Instant::now();
+                        let r = ask(if beside { READ_SHARED } else { READ }, chunk);
+                        let took = t.elapsed();
+                        if r.is_none() || (beside && is_timeout(&r)) {
+                            slow.store(true, Ordering::Relaxed);
+                        } else if matches!(r, Some(Ok(_))) {
+                            let _ = allowed.try_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
+                                Some(if took < timeout / 3 {
+                                    (a + 1).min(max)
+                                } else if took > timeout / 2 {
+                                    a.saturating_sub(1).max(1)
+                                } else {
+                                    a
+                                })
+                            });
+                        }
+                        done.lock().unwrap_or_else(PoisonError::into_inner)[i] = (r, beside);
+                    }
+                });
+            }
+        });
+        let mut answers: Vec<Option<Rows>> = Vec::with_capacity(n);
+        // A request sent beside others that ran out of time: its keys
+        // again, one request at a time, half as many to a request; one never
+        // sent: at full size. One out of time now latches the breaker (it
+        // was the second try), and the rest then fail at once.
+        for (chunk, (answer, beside)) in chunks
+            .iter()
+            .zip(done.into_inner().unwrap_or_else(PoisonError::into_inner))
+        {
+            let answer = match answer {
+                None => ask(READ_AGAIN, chunk),
+                Some(r) if beside && matches!(r, Err(StoreError::Timeout { .. })) => {
+                    let mut rows = Vec::new();
+                    let mut again = Some(Ok(()));
+                    for half in chunk.chunks(chunk.len().div_ceil(2).max(1)) {
+                        match ask(READ_AGAIN, half) {
+                            Some(Ok(r)) => rows.extend(r),
+                            other => {
+                                again = other.map(|r| r.map(drop));
+                                break;
+                            }
                         }
                     }
+                    again.map(|r| r.map(|()| rows))
                 }
-                *answer = again.map(|r| r.map(|()| rows));
-            }
+                other => other,
+            };
+            answers.push(answer);
         }
         let answers: Vec<Rows> = answers
             .into_iter()

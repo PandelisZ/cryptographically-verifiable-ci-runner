@@ -1952,9 +1952,9 @@ The store has three modes:
   more on a new connection (since 2.8.2), so a slow answer while other jobs write costs that request a second try. A
   server that cannot be reached, or a request out of time twice, makes every later call of the command fail at
   once, so a server that is down costs one or two timeouts, and the plan runs everything. A plan reads its values
-  250 to a request (since 2.8.2), so a request that fails costs only its own units, which run: the first alone, then
-  as many at once (at most four) as its time says still fit well within the timeout on a link they share, and the
-  whole read within two timeouts, the units not read by then running. A write that runs out of time asks the server
+  100 to a request (since 2.8.2), so a request that fails costs only its own units, which run: two at once at first,
+  then more (at most four) while they answer within a third of the timeout and fewer when one takes more than half
+  of it, and the whole read within two timeouts, the units not read by then running. A write that runs out of time asks the server
   whether it was stored before it is sent again. The plan's memo and
   flags are written only when new, and each such write waits at most 5 s and never stops the command. A statement
   the server refuses (a trigger, say) stops nothing else: `vci run` reports it and exits 2 after the run.
@@ -1985,7 +1985,7 @@ The store has three modes:
   local-mode store, or one that is not a database, is never used as a replica, and stores nothing.
 - **The local mode** is the SQLite store under another name: the same file format, writes and limits (see
   [SQLite](#sqlite)); a `vci-store.sqlite` can be copied to `vci-store.libsql` and back.
-- **Cost.** A plan reads a server in a few dozen requests (its values 250 to a request, up to four at once), and `vci
+- **Cost.** A plan reads a server in a few dozen requests (its values 100 to a request, up to four at once), and `vci
   run` writes a project's units in requests of at most 2,000 records or 4 MiB (8 MiB before 2.8.2; a request holds
   the database's one write lock while it is applied). On a synthetic store of 1,200 Go units attested
   three times (3,600 attestations of about 3 KB) on a local `sqld`, the store's part of a plan that skipped every unit
