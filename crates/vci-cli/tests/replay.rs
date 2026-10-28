@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use vci_attest::{Envelope, Frame, FrameSig, Statement, Subject};
+use vci_attest::{Envelope, Frame, FrameExt, FrameSig, Statement, Subject};
 use vci_core::{
     ABSENT_HASH, Context, Descriptor, Encoded, EntryKind, EnvEntry, External, Hdr, InputEntry,
     InputManifest, PREDICATE_TYPE, PREDICATE_TYPE_V2, Predicate, RepoPath, ResolvedManifest,

@@ -6,7 +6,7 @@
 use base64::Engine as _;
 use ssh_key::{HashAlg, PublicKey, SshSig};
 use vci_attest::keyless::{material_from_json, to_stored_json};
-use vci_attest::{AllowedSigners, Envelope, Frame, FrameSig, is_frame, verify_envelope};
+use vci_attest::{AllowedSigners, Envelope, Frame, FrameExt, FrameSig, is_frame, verify_envelope};
 
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 

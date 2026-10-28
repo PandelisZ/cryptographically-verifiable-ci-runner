@@ -1,10 +1,12 @@
-//! Core data model for `vci`: repo paths, input manifests, the input root and
-//! the attestation predicate. See `docs/PLAN.md` and `docs/CONTRACTS.md`.
+//! Core data model for `vci`: repo paths, input manifests, the input root,
+//! the attestation predicate, the store format 3 objects and the record
+//! frame every store reads values through ([`frame`]). See `docs/PLAN.md` and `docs/CONTRACTS.md`.
 //!
 //! Safety rule: **fail open**. Every function here errs towards reporting an
 //! error or a mismatch, which makes the caller run the test, rather than ever
 //! claiming inputs are unchanged when they might not be.
 
+pub mod frame;
 pub mod hash;
 pub mod manifest;
 pub mod objects;
@@ -12,6 +14,10 @@ pub mod path;
 pub mod predicate;
 
 pub mod metrics;
+pub use frame::{
+    BUNDLE_MEDIA_TYPE, FRAME_FIRST_LINE, Frame, FrameError, FrameSig, MAX_RECORD, SigstoreMaterial,
+    VarintError, is_frame, sshsig_armor, sshsig_dearmor,
+};
 pub use hash::{ABSENT_HASH, blake3_hex};
 pub use manifest::{
     AUTOLOAD_MARK, CheckoutCache, ENTRIES_ROOT_DOMAIN, EntryKind, EnvEntry, External, InputEntry,

@@ -604,18 +604,20 @@ pub fn object_from_base64(text: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("object base64: {e}"))
 }
 
-/// A stored record decoded by its first byte ([`decode_record`]).
+/// A stored record told apart by its first byte ([`decode_record`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Record {
+pub enum Record<'a> {
     /// Format 1: a DSSE envelope JSON (every record before vci 2.9, and the
-    /// records `[store] record_format = 1` writes), parsed as today's path
-    /// parses it. The caller keeps the bytes: verification and
-    /// `vci explain` use them as they are.
-    FormatOne(vci_attest::Envelope),
+    /// records `[store] record_format = 1` writes), the value as stored and
+    /// not parsed here: the reader parses the envelope as today's path
+    /// does (vci-attest's `Envelope::from_json`, which this crate does not
+    /// depend on), and verification and `vci explain` use the bytes as
+    /// they are.
+    FormatOne(&'a [u8]),
     /// Format 3: the text frame of STORE-V2 section 1.2, decoded under its
-    /// rules ([`vci_attest::Frame::decode`]) and bounded at
-    /// [`vci_attest::MAX_RECORD`].
-    FormatThree(vci_attest::Frame),
+    /// rules ([`vci_core::Frame::decode`]) and bounded at
+    /// [`vci_core::MAX_RECORD`].
+    FormatThree(vci_core::Frame),
 }
 
 /// Why a stored value is not a record ([`decode_record`]). A reader turns
@@ -626,11 +628,8 @@ pub enum RecordError {
     Empty,
     /// The first byte is neither `{` (format 1) nor `v` (format 3).
     FirstByte(u8),
-    /// A format-1 value that is not an envelope, with today's text
-    /// ([`vci_attest::VerifyError`]'s display).
-    Envelope(String),
     /// A format-3 value that breaks a frame rule.
-    Frame(vci_attest::FrameError),
+    Frame(vci_core::FrameError),
 }
 
 impl fmt::Display for RecordError {
@@ -641,7 +640,6 @@ impl fmt::Display for RecordError {
                 f,
                 "the record starts with byte {b:#04x}, not '{{' (an envelope) or 'v' (a frame)"
             ),
-            RecordError::Envelope(e) => f.write_str(e),
             RecordError::Frame(e) => write!(f, "frame: {e}"),
         }
     }
@@ -650,20 +648,20 @@ impl fmt::Display for RecordError {
 impl std::error::Error for RecordError {}
 
 /// Decode a stored value as the record it is, by its first byte: `{` is a
-/// format-1 envelope JSON, parsed exactly as before vci 2.9
-/// ([`vci_attest::Envelope::from_json`], unbounded as it always was); `v` is
-/// a format-3 frame, decoded under the rules of STORE-V2 section 1.6 and
-/// bounded at [`vci_attest::MAX_RECORD`] (a `vci3z` first line is refused
-/// too). Every reader of values in this crate and in vci-cli goes through
-/// it, so that the two formats are told apart in one place. The bytes carry
-/// no trust: the caller verifies the signature and recomputes every digest.
-pub fn decode_record(bytes: &[u8]) -> Result<Record, RecordError> {
+/// format-1 envelope JSON, handed on as the bytes for the reader to parse
+/// exactly as before vci 2.9 (vci-attest's `Envelope::from_json`, unbounded
+/// as it always was; a value that is not an envelope fails there, as it
+/// did); `v` is a format-3 frame, decoded under the rules of STORE-V2
+/// section 1.6 and bounded at [`vci_core::MAX_RECORD`] (a `vci3z` first
+/// line is refused too). Every reader of values in this crate and in
+/// vci-cli goes through it, so that the two formats are told apart in one
+/// place. The bytes carry no trust: the caller verifies the signature and
+/// recomputes every digest.
+pub fn decode_record(bytes: &[u8]) -> Result<Record<'_>, RecordError> {
     match bytes.first() {
         None => Err(RecordError::Empty),
-        Some(b'{') => vci_attest::Envelope::from_json(bytes)
-            .map(Record::FormatOne)
-            .map_err(|e| RecordError::Envelope(e.to_string())),
-        Some(b'v') => vci_attest::Frame::decode(bytes)
+        Some(b'{') => Ok(Record::FormatOne(bytes)),
+        Some(b'v') => vci_core::Frame::decode(bytes)
             .map(Record::FormatThree)
             .map_err(RecordError::Frame),
         Some(&b) => Err(RecordError::FirstByte(b)),
@@ -2657,7 +2655,7 @@ pub mod key {
     /// trust.
     pub fn envelope_manifest_ref(bytes: &[u8]) -> ManifestRef {
         use base64::Engine as _;
-        if vci_attest::is_frame(bytes) {
+        if vci_core::is_frame(bytes) {
             return match super::decode_record(bytes) {
                 Ok(_) => ManifestRef::Inline,
                 Err(_) => ManifestRef::Unknown,

@@ -55,10 +55,10 @@ fn frame(hdr: &str, tables: &str, shape: &[u8; 32]) -> Vec<u8> {
         "predicateType": vci_core::PREDICATE_TYPE_V2,
         "predicate": {"hdr": hdr, "tables": tables},
     });
-    vci_attest::Frame {
+    vci_core::Frame {
         statement: statement.to_string().into_bytes(),
         keyid: "SHA256:k".into(),
-        sig: vci_attest::FrameSig::SshSig(vec![1, 2, 3]),
+        sig: vci_core::FrameSig::SshSig(vec![1, 2, 3]),
         descriptor,
     }
     .encode()
@@ -70,17 +70,15 @@ fn frame(hdr: &str, tables: &str, shape: &[u8; 32]) -> Vec<u8> {
 fn decode_record_tells_the_formats_apart_by_the_first_byte() {
     let one = envelope(Some(&hex64(1)));
     match decode_record(&one) {
-        Ok(Record::FormatOne(e)) => {
-            assert_eq!(e.payload_type, "application/vnd.in-toto+json");
-            assert_eq!(e.signatures.len(), 1);
-        }
+        // The bytes as stored, for the reader to parse as an envelope.
+        Ok(Record::FormatOne(bytes)) => assert_eq!(bytes, one.as_slice()),
         other => panic!("{other:?}"),
     }
     let three = frame(&hex64(1), &hex64(2), &[3; 32]);
     match decode_record(&three) {
         Ok(Record::FormatThree(f)) => {
             assert_eq!(f.keyid, "SHA256:k");
-            assert_eq!(f.sig, vci_attest::FrameSig::SshSig(vec![1, 2, 3]));
+            assert_eq!(f.sig, vci_core::FrameSig::SshSig(vec![1, 2, 3]));
             assert_eq!(
                 vci_core::Descriptor::shape_id(&f.descriptor).unwrap(),
                 [3; 32]
@@ -92,26 +90,28 @@ fn decode_record_tells_the_formats_apart_by_the_first_byte() {
     assert_eq!(decode_record(b""), Err(RecordError::Empty));
     assert_eq!(decode_record(b"x"), Err(RecordError::FirstByte(b'x')));
     assert_eq!(decode_record(b" {"), Err(RecordError::FirstByte(b' ')));
-    assert!(matches!(
+    // A `{` value is handed on unparsed: the envelope parse that refuses
+    // it is the reader's, as before.
+    assert_eq!(
         decode_record(b"{not json"),
-        Err(RecordError::Envelope(_))
-    ));
+        Ok(Record::FormatOne(b"{not json"))
+    );
     assert!(matches!(
         decode_record(b"vci3z\n{}\nAA==\nAA=="),
-        Err(RecordError::Frame(vci_attest::FrameError::FirstLine(_)))
+        Err(RecordError::Frame(vci_core::FrameError::FirstLine(_)))
     ));
     let mut cut = three.clone();
     cut.truncate(cut.len() - 1);
     assert!(matches!(
         decode_record(&cut),
-        Err(RecordError::Frame(vci_attest::FrameError::Base64 { .. }))
+        Err(RecordError::Frame(vci_core::FrameError::Base64 { .. }))
     ));
     let mut big = b"vci3\n{".to_vec();
-    big.resize(vci_attest::MAX_RECORD + 1, b' ');
+    big.resize(vci_core::MAX_RECORD + 1, b' ');
     assert_eq!(
         decode_record(&big),
-        Err(RecordError::Frame(vci_attest::FrameError::TooLarge(
-            vci_attest::MAX_RECORD + 1
+        Err(RecordError::Frame(vci_core::FrameError::TooLarge(
+            vci_core::MAX_RECORD + 1
         )))
     );
     // The display of each, for the `envelope` check's text.
@@ -121,7 +121,7 @@ fn decode_record_tells_the_formats_apart_by_the_first_byte() {
     );
     assert_eq!(RecordError::Empty.to_string(), "the record is empty");
     assert!(
-        RecordError::Frame(vci_attest::FrameError::Nul)
+        RecordError::Frame(vci_core::FrameError::Nul)
             .to_string()
             .starts_with("frame: ")
     );

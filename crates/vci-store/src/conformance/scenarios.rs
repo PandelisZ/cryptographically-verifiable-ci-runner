@@ -2110,10 +2110,10 @@ impl Run3 {
         }
         .encode(&self.tables)
         .expect("a descriptor");
-        let record = vci_attest::Frame {
+        let record = vci_core::Frame {
             statement: statement.to_string().into_bytes(),
             keyid: "SHA256:conformance".into(),
-            sig: vci_attest::FrameSig::SshSig(vec![0x53, 0x53, 0x48, seed as u8]),
+            sig: vci_core::FrameSig::SshSig(vec![0x53, 0x53, 0x48, seed as u8]),
             descriptor,
         }
         .encode()

@@ -33,77 +33,29 @@ pub use root::{TRUSTED_ROOT_FILE, TrustedRoot};
 pub use sign::{Instance, KeylessError, KeylessSigner, token_claims};
 pub use tsa::{Timestamp, verify_timestamp};
 
-/// Media type of the bundles vci writes.
-pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
+pub use vci_core::frame::{
+    BUNDLE_MEDIA_TYPE, CertificateChain, RawBytes, Rfc3161Timestamp, SigstoreMaterial,
+    TimestampVerificationData, VerificationMaterial,
+};
 
 /// Clock skew allowed between a timestamp and the verifier's clock.
 const FUTURE_SKEW: i64 = 300;
 
-/// The `sigstore` member of a stored envelope.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SigstoreMaterial {
-    pub media_type: String,
-    pub verification_material: VerificationMaterial,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct VerificationMaterial {
-    /// v0.3: the leaf certificate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub certificate: Option<RawBytes>,
-    /// v0.1/v0.2: the chain, leaf first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub x509_certificate_chain: Option<CertificateChain>,
-    /// Kept as read; vci neither writes nor checks transparency log entries.
-    #[serde(default)]
-    pub tlog_entries: Vec<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp_verification_data: Option<TimestampVerificationData>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RawBytes {
-    /// Standard base64 of DER.
-    pub raw_bytes: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct CertificateChain {
-    pub certificates: Vec<RawBytes>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct TimestampVerificationData {
-    #[serde(default)]
-    pub rfc3161_timestamps: Vec<Rfc3161Timestamp>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Rfc3161Timestamp {
-    /// Standard base64 of the DER `TimeStampResp`.
-    pub signed_timestamp: String,
-}
-
-impl SigstoreMaterial {
-    fn leaf_der(&self) -> Result<Vec<u8>, String> {
-        let vm = &self.verification_material;
-        let raw = match (&vm.certificate, &vm.x509_certificate_chain) {
-            (Some(c), _) => &c.raw_bytes,
-            (None, Some(ch)) => {
-                &ch.certificates
-                    .first()
-                    .ok_or("empty x509CertificateChain")?
-                    .raw_bytes
-            }
-            (None, None) => return Err("the bundle has no certificate".into()),
-        };
-        b64_decode(raw).map_err(|e| format!("certificate base64: {e}"))
-    }
+/// The DER of the bundle's leaf certificate (v0.3 `certificate`, else the
+/// first of a v0.1/v0.2 chain).
+fn leaf_der(material: &SigstoreMaterial) -> Result<Vec<u8>, String> {
+    let vm = &material.verification_material;
+    let raw = match (&vm.certificate, &vm.x509_certificate_chain) {
+        (Some(c), _) => &c.raw_bytes,
+        (None, Some(ch)) => {
+            &ch.certificates
+                .first()
+                .ok_or("empty x509CertificateChain")?
+                .raw_bytes
+        }
+        (None, None) => return Err("the bundle has no certificate".into()),
+    };
+    b64_decode(raw).map_err(|e| format!("certificate base64: {e}"))
 }
 
 /// The stored JSON: the envelope's fields plus `sigstore`.
@@ -191,8 +143,7 @@ pub fn verify_keyless(
             ));
         }
     };
-    let leaf = material
-        .leaf_der()
+    let leaf = leaf_der(material)
         .and_then(|d| x509::Cert::parse(&d))
         .map_err(VerifyError::Malformed)?;
 

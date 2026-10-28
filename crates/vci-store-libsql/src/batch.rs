@@ -172,7 +172,7 @@ impl Row {
 }
 
 /// Whether a value is a format-3 record frame: its first byte is `v`
-/// (`vci_attest::is_frame`; STORE-V2 section 5 detects the format by it).
+/// (`vci_core::is_frame`; STORE-V2 section 5 detects the format by it).
 /// A frame is never stored compressed, so the byte is there to read on the
 /// server too (`format_one_rows`, the replica's sync by `seq`).
 fn is_frame(value: &[u8]) -> bool {

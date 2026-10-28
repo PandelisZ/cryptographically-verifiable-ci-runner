@@ -3604,6 +3604,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
+ "vci-core",
  "x509-cert",
 ]
 
@@ -3642,6 +3643,7 @@ dependencies = [
 name = "vci-core"
 version = "2.8.1"
 dependencies = [
+ "base64 0.23.1",
  "blake3",
  "camino",
  "mimalloc",
@@ -3676,7 +3678,6 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
- "vci-attest",
  "vci-core",
 ]
 

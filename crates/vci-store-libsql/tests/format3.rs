@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use vci_attest::FrameExt as _;
 use vci_core::ObjectKind;
 use vci_store::conformance::scenarios::Run3;
 use vci_store::{
