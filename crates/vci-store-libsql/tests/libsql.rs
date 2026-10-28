@@ -636,6 +636,40 @@ struct Shared {
     cut_next: AtomicUsize,
     /// Cursor requests to let through before `cut_next` applies.
     pass_cursors: AtomicUsize,
+    /// The next this many writes are sent on to the server, and its
+    /// answer is never passed on: held until the client gives up.
+    swallow_writes: AtomicUsize,
+    /// The next this many writes are never sent on, nor answered.
+    hold_writes: AtomicUsize,
+    /// Writes sent on to the server.
+    writes: AtomicUsize,
+    /// Bytes a second passed on from the server to the clients, all its
+    /// connections together (0: as fast as they come).
+    rate: AtomicUsize,
+    /// When the bytes passed on so far at `rate` are through.
+    rate_next: Mutex<Option<Instant>>,
+    /// Bytes passed on from the server to the clients.
+    passed: AtomicUsize,
+}
+
+impl Shared {
+    /// Wait until `n` more bytes may go to a client at `rate`.
+    fn throttle(&self, n: usize) {
+        self.passed.fetch_add(n, Ordering::SeqCst);
+        let rate = self.rate.load(Ordering::SeqCst);
+        if rate == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let at = {
+            let mut next = self.rate_next.lock().unwrap();
+            let start = next.filter(|t| *t > now).unwrap_or(now);
+            let at = start + Duration::from_secs_f64(n as f64 / rate as f64);
+            *next = Some(at);
+            at
+        };
+        std::thread::sleep(at.saturating_duration_since(now));
+    }
 }
 
 /// The test server's `host:port` and token, when it speaks plain HTTP (a
@@ -716,6 +750,32 @@ impl Proxy {
     /// Never answer a write from now on, or stop.
     fn stall_writes(&self, on: bool) {
         self.shared.stall_writes.store(on, Ordering::SeqCst);
+    }
+
+    /// Send the next `n` writes on, and never pass on their answers.
+    fn swallow_writes(&self, n: usize) {
+        self.shared.swallow_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Never send on, nor answer, the next `n` writes.
+    fn hold_writes(&self, n: usize) {
+        self.shared.hold_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// How many bytes it passed on from the server.
+    fn passed(&self) -> usize {
+        self.shared.passed.load(Ordering::SeqCst)
+    }
+
+    /// How many writes it sent on to the server.
+    fn writes(&self) -> usize {
+        self.shared.writes.load(Ordering::SeqCst)
+    }
+
+    /// Pass on at most `bytes` a second from the server, all connections
+    /// together (0: no limit).
+    fn limit_rate(&self, bytes: usize) {
+        self.shared.rate.store(bytes, Ordering::SeqCst);
     }
 
     /// How many requests it held unanswered.
@@ -827,6 +887,8 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
     let mut waiting = false;
     // The answer to the request sent is to be cut off: what came of it.
     let mut cutting: Option<Vec<u8>> = None;
+    // The answer to the request sent is never passed on.
+    let mut swallowing = false;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         if server.is_some()
@@ -883,7 +945,8 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                         && sh.stall_cursors.load(Ordering::SeqCst) > 0
                         && !take_one(&sh.pass_cursors)
                         && take_one(&sh.stall_cursors);
-                    if stall_one || (write && sh.stall_writes.load(Ordering::SeqCst)) {
+                    let hold_one = write && take_one(&sh.hold_writes);
+                    if stall_one || hold_one || (write && sh.stall_writes.load(Ordering::SeqCst)) {
                         // Held: read what the client sends until it closes.
                         sh.stalled.fetch_add(1, Ordering::SeqCst);
                         while !sh.gone.load(Ordering::SeqCst) {
@@ -901,6 +964,10 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                         && take_one(&sh.cut_next);
                     cutting = ((sh.cut_cursors.load(Ordering::SeqCst) && cursor) || cut_one)
                         .then(Vec::new);
+                    swallowing = write && take_one(&sh.swallow_writes);
+                    if write {
+                        sh.writes.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 if !send_all(s, &buf[..n]) {
                     return;
@@ -916,6 +983,18 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                 return;
             }
             Some(n) => {
+                if swallowing {
+                    // The server answered; the client never hears it.
+                    sh.stalled.fetch_add(1, Ordering::SeqCst);
+                    while !sh.gone.load(Ordering::SeqCst) {
+                        match take(&client, &mut buf) {
+                            Some(0) => return,
+                            Some(_) => {}
+                            None => std::thread::sleep(Duration::from_millis(2)),
+                        }
+                    }
+                    return;
+                }
                 if let Some(head) = &mut cutting {
                     // The headers and the first bytes of the body, then a
                     // FIN.
@@ -928,6 +1007,7 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                     }
                     (moved, last) = (true, Instant::now());
                 } else {
+                    sh.throttle(n);
                     if !send_all(&client, &buf[..n]) {
                         return;
                     }
@@ -3119,8 +3199,9 @@ fn a_request_of_values_out_of_time_beside_others_is_read_again_alone() {
     let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
     let r = proxied(&proxy, token.as_deref(), &ns, 2);
     r.status().unwrap();
-    // The listing goes through, then one request of values is held.
-    proxy.stall_after(1, 1);
+    // The listing and the first request of values (sent alone) go
+    // through, then one of those sent at once is held.
+    proxy.stall_after(2, 1);
     let t = Instant::now();
     let h = r
         .prefetch(Prefetch::Units {
@@ -3144,4 +3225,167 @@ fn a_request_of_values_out_of_time_beside_others_is_read_again_alone() {
     );
     r.status()
         .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+}
+
+/// On a link whose bandwidth is the limit, requests of values sent at
+/// once share it and each takes as much longer: the first request goes
+/// alone, and how long it took sets how many go at once, so that none runs
+/// out of time beside others (2.8.2 as first written sent four at once,
+/// all four ran out of time, and their keys were read again in halves);
+/// and the whole read is given two request timeouts, the keys not read by
+/// then failed (their units run), nothing latched.
+#[test]
+fn a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    // Five requests of values, about 1.6 MB each as they travel.
+    let n = 1_250;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let pad = "p".repeat(3_000);
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{pad}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let prefetch = |rate: usize| {
+        let r = proxied(&proxy, token.as_deref(), &ns, 3);
+        r.status().unwrap();
+        proxy.limit_rate(rate);
+        let (t, b) = (Instant::now(), proxy.passed());
+        let h = r
+            .prefetch(Prefetch::Units {
+                test_ids: &ids,
+                choose: None,
+            })
+            .unwrap();
+        let (took, bytes) = (t.elapsed(), proxy.passed() - b);
+        proxy.limit_rate(0);
+        r.status()
+            .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+        (h, took, bytes)
+    };
+    let (h, _, all) = prefetch(0);
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    // About 1 s a request alone: one at a time, about 5 s, every value
+    // read once (four at once took 4 s each and ran out of time after 3 s,
+    // and their keys were read again).
+    let (h, took, bytes) = prefetch(1_700_000);
+    assert_eq!(h.unresolved, 0, "{h:?} in {took:?}");
+    assert!(took < Duration::from_millis(6_500), "{took:?}");
+    assert!(bytes < all + all / 10, "read twice: {bytes} of {all}");
+    assert_eq!(proxy.stalled(), 0);
+    // About 2 s a request alone: the read stops after two request
+    // timeouts (6 s), with the values read by then (it took about 13 s).
+    let (h, took, _) = prefetch(1_000_000);
+    assert!(h.unresolved > 0 && h.unresolved < n, "{h:?} in {took:?}");
+    assert!(took < Duration::from_secs(7), "{took:?}");
+}
+
+/// A write whose deadline ran out while the server committed it (it waited
+/// for the write lock, and the client gave up first) is not sent again: the
+/// client asks the server whether it holds the write's attestation first
+/// (it was sent again, waited for the lock again and wrote its change log
+/// a second time). One the server never got is sent again, once.
+#[test]
+fn a_write_out_of_time_is_sent_again_only_when_the_server_lacks_it() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let put = |n: u8, unit: &str| {
+        s.put_for_test(unit, S1, &hex64(n), Some(&hint(1)), &envelope(None, unit))
+    };
+    put(1, "src/a.test.ts").unwrap();
+    let logged = |unit: &str| {
+        s.__query_for_test(&format!(
+            "SELECT count(*) FROM {p}log WHERE test_key = '{}'",
+            vci_core::test_key(unit)
+        ))
+        .unwrap()[0][0]
+            .clone()
+    };
+
+    // Committed, its answer lost: asked about, not sent again.
+    proxy.swallow_writes(1);
+    let (w0, r0) = (proxy.writes(), s.retries());
+    let t = Instant::now();
+    put(2, "src/b.test.ts").unwrap_or_else(|e| panic!("committed: {e}"));
+    assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(proxy.stalled(), 1);
+    assert_eq!(proxy.writes() - w0, 1, "not sent again");
+    assert!(s.retries() > r0);
+    assert_eq!(logged("src/b.test.ts"), "1");
+
+    // Never reached the server: sent again, once.
+    proxy.hold_writes(1);
+    let w0 = proxy.writes();
+    put(3, "src/c.test.ts").unwrap_or_else(|e| panic!("sent again: {e}"));
+    assert_eq!(proxy.stalled(), 2);
+    assert_eq!(proxy.writes() - w0, 1, "sent again");
+    assert_eq!(logged("src/c.test.ts"), "1");
+    assert_eq!(s.list_all().unwrap().len(), 3);
+}
+
+/// A replica synced by a vci that could not read some values (2.8.1, while
+/// another vci wrote them compressed) left them out yet moved its mark past
+/// them, so syncing what changed since never brings them back: a sidecar
+/// written by such a vci (its `v` older than this one's) is synced in full
+/// once, and the values come back.
+#[test]
+fn a_replica_synced_by_an_older_vci_is_synced_in_full_once() {
+    let Some((w, ns)) = remote() else { return };
+    let p = table_prefix(&ns);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica.libsql");
+    let side = dir.path().join("replica.libsql.sync");
+    let units = ["src/a.test.ts", "src/b.test.ts"];
+    for u in units {
+        w.put_for_test(u, S1, &hex64(1), Some(&hint(1)), &envelope(None, u))
+            .unwrap();
+    }
+    // b's value in an encoding no vci reads: the sync leaves it out.
+    let tk = vci_core::test_key("src/b.test.ts");
+    let set = |enc: u8| {
+        w.__execute_for_test(&[format!(
+            "UPDATE {p}attestations SET encoding = {enc} WHERE test_key = '{tk}'"
+        )])
+        .unwrap();
+    };
+    set(9);
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    let got = r.read_units(&units).unwrap();
+    assert_eq!(got[0].len(), 1);
+    assert!(got[1].is_empty(), "left out: {:?}", got[1]);
+    drop(r);
+    // Readable now, with no change in the log: as a value 2.8.1 could not
+    // read is to this vci. The sidecar as 2.8.1 wrote it.
+    set(0);
+    let text = std::fs::read_to_string(&side).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["v"] = serde_json::json!(1);
+    std::fs::write(&side, v.to_string()).unwrap();
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    let got = r.read_units(&units).unwrap();
+    assert_eq!(got[1].len(), 1, "synced in full");
+    drop(r);
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&side).unwrap()).unwrap();
+    assert!(v["v"].as_i64().unwrap() >= 2, "{v}");
 }

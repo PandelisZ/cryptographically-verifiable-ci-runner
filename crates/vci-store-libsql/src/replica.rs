@@ -107,10 +107,21 @@ struct Changes {
     roots: BTreeSet<String>,
 }
 
+/// What `<file>.sync`'s `v` says: which values the vci that synced the
+/// file could read. 1 (2.8.1 and before) read only values stored as they
+/// are; 2 (2.8.2) reads zstd frames too. A sync leaves out a value it
+/// cannot read (its unit runs) yet moves the mark past it, so the changes
+/// after the mark never bring it back: a file whose sidecar has an older
+/// `v` (or none) is synced in full once, and has every value this vci
+/// reads. A vci that reads a new encoding raises it.
+const SYNC_FORMAT: i64 = 2;
+
 /// `<file>.sync`: which server and namespace the file copies, and up to
 /// which entry of its log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Sidecar {
+    /// [`SYNC_FORMAT`] of the vci that synced the file (0: none said).
+    format: i64,
     source: String,
     seq: i64,
     /// The fingerprint of entry `seq` (its time, slot or root).
@@ -301,6 +312,7 @@ impl Replica {
         let text = std::fs::read_to_string(sidecar(&self.path)).ok()?;
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
         Some(Sidecar {
+            format: v["v"].as_i64().unwrap_or(0),
             source: v["source"].as_str()?.to_owned(),
             seq: v["seq"].as_i64()?,
             mark: v["mark"].as_str().map(str::to_owned),
@@ -320,7 +332,7 @@ impl Replica {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let body = json!({
-            "v": 1,
+            "v": SYNC_FORMAT,
             "source": s.source,
             "seq": s.seq,
             "mark": s.mark,
@@ -414,10 +426,12 @@ impl Replica {
                 // above the floor) and must be the same one.
                 || (c.floor < last && c.mark_then != s.mark)
                 || c.epoch.is_none()
-                || c.epoch != s.epoch)
+                || c.epoch != s.epoch
+                || s.format < SYNC_FORMAT)
         {
             // Older than the log, or the log is not the one the file was
-            // synced from (dropped and created again, restored): all.
+            // synced from (dropped and created again, restored), or synced
+            // by a vci that left out values this one reads: all.
             full = true;
             changes = self.changes(0, true).map_err(SyncFail::Server)?;
         }
@@ -449,6 +463,7 @@ impl Replica {
         let (na, nm) = (changes.attestations.len(), changes.manifests.len());
         apply_changes(store, &changes, full).map_err(|e| SyncFail::File(e.to_string()))?;
         let after = Sidecar {
+            format: SYNC_FORMAT,
             source,
             seq: changes.seq,
             mark: changes.mark_now.clone(),

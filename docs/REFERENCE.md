@@ -1952,13 +1952,18 @@ The store has three modes:
   more on a new connection (since 2.8.2), so a slow answer while other jobs write costs that request a second try. A
   server that cannot be reached, or a request out of time twice, makes every later call of the command fail at
   once, so a server that is down costs one or two timeouts, and the plan runs everything. A plan reads its values
-  250 to a request (since 2.8.2), so a request that fails costs only its own units, which run. The plan's memo and
+  250 to a request (since 2.8.2), so a request that fails costs only its own units, which run: the first alone, then
+  as many at once (at most four) as its time says still fit well within the timeout on a link they share, and the
+  whole read within two timeouts, the units not read by then running. A write that runs out of time asks the server
+  whether it was stored before it is sent again. The plan's memo and
   flags are written only when new, and each such write waits at most 5 s and never stops the command. A statement
   the server refuses (a trigger, say) stops nothing else: `vci run` reports it and exits 2 after the run.
 - **Compressed values** (since 2.8.2). `VCI_STORE_COMPRESS=zstd` stores each attestation and input manifest compressed
   (about 3x smaller for vex's, which makes the plan's reads and `vci run`'s writes that much shorter). Every vci from
   2.8.2 reads both forms; 2.8.1 and earlier read a compressed value as one they cannot read, and run its unit (never
-  skip it wrongly). So set it for every writer of a database (CI's jobs, and developers who store) once every machine
+  skip it wrongly). A replica file (`VCI_STORE_SYNC=replica`) that 2.8.1 synced while compressed values were written
+  left them out and keeps lacking them after the upgrade until it syncs in full, which 2.8.2 does once on a file
+  2.8.1 synced (deleting `<file>.sync` beside it forces that with any version). So set it for every writer of a database (CI's jobs, and developers who store) once every machine
   that plans from it runs 2.8.2 or later; values stored before stay as they were until their units are attested again.
 - **Superseded manifests go with their attestations** (since 2.8.2): a write that replaces or removes an attestation
   also removes the input manifest only it referenced, once that was stored more than an hour before (vex's database

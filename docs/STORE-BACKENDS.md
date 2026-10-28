@@ -2321,7 +2321,8 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   key, the signature and every check cover the bytes as they were, so verification is unchanged. Writers compress
   when `VCI_STORE_COMPRESS=zstd` (`off` or unset: as they are; any other value is a `Config` error). The schema stays
   version 1, since the tables do not change: a 2.8.1 reader reads a compressed value as one `in an encoding this vci
-  cannot read (1)`, so that unit runs (never a wrong skip), and a 2.8.1 writer replaces a compressed row of a slot it
+  cannot read (1)`, so that unit runs (never a wrong skip; a 2.8.1 replica leaves such a value out of its file, and
+  2.8.2 syncs a file 2.8.1 synced in full once, see "The replica mode"), and a 2.8.1 writer replaces a compressed row of a slot it
   puts with its own, as it is (its upsert rewrites a row whose encoding is not 0). So a namespace takes compressed
   writes once every reader is 2.8.2 or later; until then the rows written raw and compressed coexist, and rows written
   before stay as they are until a unit is attested again. On vex's values (JSON) zstd stores envelopes and manifests
@@ -2354,7 +2355,15 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   `OpenContext::long_running`), and a pool checkout after the connect timeout. A request whose deadline runs out once
   the server has answered the handle (2.8.2) is sent once more, on a new connection, with a deadline of its own
   (counted in `retries()`): a large read answered slowly while other jobs write, or a write that waited for the lock,
-  costs that call a second try instead of the handle (`OnTimeout::Resend`). Only the same request out of time again
+  costs that call a second try instead of the handle (`OnTimeout::Resend`). A write batch that stores an attestation
+  or a manifest first asks whether the server committed it (`Conn::batch_checked`: one of its attestations with its
+  `stored_at`, else one of its manifests with its `put_at`, a read that needs no write lock): a batch that ran out of
+  time waiting for the lock usually commits after the client gave up, and sent again it would wait for the lock again
+  and write its change log rows a second time, under the very load that made it late. One the server holds is not
+  sent again; one it does not is sent again once, out of time again latching the breaker. The server may still commit
+  the first after the question was answered; applied twice the batch is safe (below), and its upserts rewrite only
+  rows that differ (the manifests' since 2.8.2 too: value, encoding, base, or a later `put_at`), so the second costs
+  little but the log's rows. Only the same request out of time again
   (`TRIES_AFTER_TIMEOUT`; counted per request, so that requests sent at once do not use up each other's try) latches
   the breaker;
   a deadline before any answer latches it at once, as before, and a request whose try comes after another latched it
@@ -2464,15 +2473,25 @@ which is where other writers' changes are picked up), then the values `choose` p
 manifests and bases, as `read_values` reads them. `prefetch(Manifests)` is one request for the roots not cached as
 stored, with their bases.
 
-**Values, 250 to a request** (2.8.2, `VALUES_PER_REQUEST`), up to the pool's connections at once (`min(VCI_JOBS,
-4)`), each request with the manifests its attestations reference but those cached already (the roots cached, at most
+**Values, 250 to a request** (2.8.2, `VALUES_PER_REQUEST`), each request with the manifests its attestations reference but those cached already (the roots cached, at most
 4,096, are bound as a second JSON array), each base once for the whole read. 2.8.1 read a plan's 1,600 to 2,000 values
 (60 to 85 MB on vex's Turso) in one request that took 2 to 22 s, and repeated the bases in each of a plan's reads.
-Requests sent at once share the connection's bandwidth, so one of them whose deadline runs out
-(`OnTimeout::FailAlone`) fails alone, latching nothing and not sent again by itself, and no more are sent at once: the
-read sends the keys of that request, and of those not sent yet, again, one request at a time and 125 to a request
-(`OnTimeout::Latch`: one of those out of time was the second try, and latches the breaker, after which the rest fail at
-once). A server that stops answering costs at most two deadlines there, as elsewhere. A request that fails otherwise,
+The first request goes alone, and how long it took sets how many go at once after it (`at_once`), up to the pool's
+connections (`min(VCI_JOBS, 4)`): requests sent at once share the link's bandwidth, each then taking about as many
+times longer, so as many go at once as would still take at most a third of the request timeout, at least one. On CI's
+runners a request of 250 is answered in well under a second and four go at once; from a laptop at about 2 MB/s, where
+one takes 4 to 5 s alone, two do; below about 1 MB/s, one at a time. The first draft sent four at once from the start:
+behind a proxy limited to 3 MB/s (a vex-api plan, 1,647 values, 63 MB, `VCI_STORE_TIMEOUT_SECS=10`) all four ran out
+of time together after 10 s, 30 MB read and thrown away, and the read took 42.5 s; at 0.8 MB/s, 121 s, 12 deadlines.
+One sent beside others whose deadline runs out (`OnTimeout::FailAlone`) fails alone, latching nothing and not sent
+again by itself, and no more are sent at once: the read sends the keys of that request again, one request at a time
+and 125 to a request, and those of the requests never sent at full size (`OnTimeout::Latch`: one of those out of time
+was the second try, and latches the breaker, after which the rest fail at once). **The whole read is given two
+request timeouts** (`VALUES_DEADLINES`, `Conn::query_until`): no request runs past them (one they cut short fails
+alone, latching nothing), and the keys not read by then fail as below, so a slow link costs a plan's read of values
+at most two deadlines, as a server that stops answering does, never many (2.8.1 gave up after one, and every unit
+ran). `a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once` checks both behind a proxy limited to 1.7 and
+1 MB/s. A request that fails otherwise,
 or again, costs only its keys: `prefetch` leaves them uncached, counts them
 in `Hydration::unresolved` and warns (`vci: warning: could not prefetch N stored value(s) from <url> namespace <ns>: …;
 they are read again when asked for`), and `read_values` reads them again when asked; a `read_values` request that fails marks its keys
@@ -2573,16 +2592,23 @@ in 0.64 s and 8 requests (three transactions: the queue flushed at 8 MiB), and l
 
 The replica is a SQLite store file (the local mode's format), by default `<git common dir>/vci-store.libsql`, else
 `VCI_STORE_REPLICA` (absolute or relative to the git common directory) or `[store.libsql] path`. Beside it,
-`<file>.sync` (JSON: `{"v": 1, "source": "<url> namespace <ns>", "seq": N, "mark": "<at>:<slot or root>", "epoch":
+`<file>.sync` (JSON: `{"v": 2, "source": "<url> namespace <ns>", "seq": N, "mark": "<at>:<slot or root>", "epoch":
 <created_at>}`) says which server and namespace it copies, up to which log entry, that entry's fingerprint (when it
-was written and what it names) and when the namespace was created.
+was written and what it names) and when the namespace was created. `v` (`SYNC_FORMAT`) says which values the vci that
+synced the file reads: 1 (2.8.1 and earlier) only values stored as they are, 2 (2.8.2) zstd frames too. A sync leaves
+out a value it cannot read (its unit runs) yet moves the mark past it, so syncing what changed since never brings it
+back: a file 2.8.1 synced while another vci wrote compressed values lacks them after the upgrade, until their slots
+are written again or the log's floor passes the mark (30 days). A sidecar whose `v` is older than this vci's (or
+missing) is therefore synced in full once (`a_replica_synced_by_an_older_vci_is_synced_in_full_once`). Removing
+`<file>.sync` forces a full sync with any version.
 
 - **The sync**, the first time the store is read (`warm()` starts it on a thread at the start of a plan), and again
   at each later `prefetch` (the plan's later rounds, `vci run`'s before supersession: section 4's "the next prefetch
   of the same data must pick them up"): one request reads, in one snapshot, the namespace's schema version (a newer
   one is `Incompatible`), the log's high-water mark and floor, the fingerprints of the entry the file was synced to
   and of the last one, when the namespace was created, and every attestation and manifest the log names after `seq`.
-  Everything is read when the file is new, copies another source, is older than the log floor, or when the log is not
+  Everything is read when the file is new, copies another source, was synced by an older vci (`v`, above), is older
+  than the log floor, or when the log is not
   the one the file was synced from: its high-water mark is below `seq`, the entry at `seq` is not the one recorded,
   or the namespace was created at another time (it was dropped and created again, or restored to an earlier point).
   It is applied to the file in one transaction: each slot and root touched ends as the server has it (keys of the

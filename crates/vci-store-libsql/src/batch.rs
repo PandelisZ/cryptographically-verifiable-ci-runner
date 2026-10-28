@@ -710,7 +710,24 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
         ));
         stmts.push(format!("DELETE FROM {log} WHERE at < {cut}"));
     }
-    match remote.write(WRITE, &stmts) {
+    // Whether the server applied this batch, asked before it is sent again
+    // after its deadline: one of its attestations as it wrote it, else one
+    // of its manifests (only removals: sent again, they cost little).
+    let committed = if let Some(r) = p.attestations.values().next() {
+        Some(format!(
+            "SELECT 1 FROM {a} WHERE key = {} AND stored_at = {at}",
+            text(&r.key)
+        ))
+    } else {
+        p.manifests.keys().next().map(|root| {
+            format!(
+                "SELECT 1 FROM {} WHERE root = {} AND put_at = {at}",
+                t.names.manifests,
+                text(root)
+            )
+        })
+    };
+    match remote.write_checked(WRITE, &stmts, committed.as_deref()) {
         Ok(()) => {}
         // Only removals, and no tables: nothing to remove.
         Err(Fail::Absent) if only_removals => return Ok(()),
