@@ -84,18 +84,24 @@ const VALUES_MIN: usize = 25;
 const VALUES_MAX: usize = 400;
 
 /// The size of the next request of values, after one of `last` values
-/// took `took`: as many as fit in `target` at that pace (which assumes
-/// the time grows with the size, as it does on a link whose bandwidth is
-/// the limit), at most four times `last`, between [`VALUES_MIN`] and
-/// [`VALUES_MAX`].
-fn next_size(last: usize, took: Duration, target: Duration) -> usize {
-    let took = took.as_secs_f64().max(0.001);
+/// took `took`, on a link where every answer waits `wait` whatever its
+/// size (`Conn::fastest`): as many as fit in what `target` leaves beyond
+/// that wait (at least a third of `target`) at the pace of the time
+/// beyond it, which grows with the size on a link whose bandwidth is the
+/// limit; at most four times `last`, between [`VALUES_MIN`] and
+/// [`VALUES_MAX`]. A draft of 2.8.2 sized them from the whole time, so
+/// that with each answer held 3 s they hardly grew (vex-api's prefetch
+/// sent 12 to 14 requests where 2.8.1 sent 4).
+fn next_size(last: usize, took: Duration, target: Duration, wait: Duration) -> usize {
+    let wait = wait.min(took).as_secs_f64();
+    let beyond = (took.as_secs_f64() - wait).max(0.001);
+    let room = (target.as_secs_f64() - wait).max(target.as_secs_f64() / 3.0);
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    let fit = (last as f64 * target.as_secs_f64() / took) as usize;
+    let fit = (last as f64 * room / beyond).min(1e9) as usize;
     fit.min(last.saturating_mul(4))
         .clamp(VALUES_MIN, VALUES_MAX)
 }
@@ -763,10 +769,11 @@ impl Remote {
     /// once as the pool has connections (at most one per request), and
     /// later requests are sized from the answers: as many keys as the last
     /// answer suggests fit in [`VALUES_TARGET`] of the request timeout,
-    /// between [`VALUES_MIN`] and [`VALUES_MAX`], at most four times as many
-    /// as the last. On a link with a long wait for each answer but bandwidth
-    /// to spare, requests grow and few are sent; on a slow link they stay
-    /// small. After each answer that took more than half of the timeout one
+    /// beyond the wait every answer has (the handle's shortest answer,
+    /// `Conn::fastest`), between [`VALUES_MIN`] and [`VALUES_MAX`], at
+    /// most four times as many as the last (`next_size`). On a link with a
+    /// long wait for each answer but bandwidth to spare, requests grow and
+    /// few are sent; on a slow link they stay small. After each answer that took more than half of the timeout one
     /// fewer request is out at once (at least one), after each within a
     /// third one more: requests sent at once may share a slow link's
     /// bandwidth. A request that runs out of time is not sent again whole:
@@ -923,7 +930,13 @@ impl Remote {
                                     a
                                 })
                             });
-                            let sized = next_size(range.len(), took, target);
+                            // The wait for each of its requests (a
+                            // statement's description first, on a
+                            // connection that had none).
+                            let wait = self.conn.fastest().saturating_mul(
+                                u32::try_from(crate::conn::last_requests().max(1)).unwrap_or(1),
+                            );
+                            let sized = next_size(range.len(), took, target, wait);
                             next.lock().unwrap_or_else(PoisonError::into_inner).1 = sized;
                         }
                         done.lock()

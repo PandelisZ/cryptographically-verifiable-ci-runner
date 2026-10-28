@@ -648,6 +648,13 @@ struct Shared {
     swallow_writes: AtomicUsize,
     /// The next this many writes are never sent on, nor answered.
     hold_writes: AtomicUsize,
+    /// The next this many writes are sent on `late_ms` after they arrived
+    /// (once the client gave up on them), and never answered: a write that
+    /// waited for the write lock past its deadline and then committed.
+    late_writes: AtomicUsize,
+    late_ms: AtomicUsize,
+    /// Late writes sent on and answered.
+    late_done: AtomicUsize,
     /// Writes sent on to the server.
     writes: AtomicUsize,
     /// Bytes a second passed on from the server to the clients, all its
@@ -790,6 +797,13 @@ impl Proxy {
     /// Never send on, nor answer, the next `n` writes.
     fn hold_writes(&self, n: usize) {
         self.shared.hold_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Send the next `n` writes on `ms` milliseconds late, and never
+    /// answer them.
+    fn late_writes(&self, n: usize, ms: usize) {
+        self.shared.late_ms.store(ms, Ordering::SeqCst);
+        self.shared.late_writes.store(n, Ordering::SeqCst);
     }
 
     /// Hold each answer `ms` milliseconds before passing on its first
@@ -999,6 +1013,43 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                             && take_one(&sh.stall_cursors)
                     });
                     let hold_one = write && take_one(&sh.hold_writes);
+                    if write && take_one(&sh.late_writes) {
+                        // The whole request, sent on late; its answer
+                        // read and dropped.
+                        let mut request = buf[..n].to_vec();
+                        let mut quiet = Instant::now();
+                        while quiet.elapsed() < Duration::from_millis(50) {
+                            match take(&client, &mut buf) {
+                                Some(0) => break,
+                                Some(m) => {
+                                    request.extend_from_slice(&buf[..m]);
+                                    quiet = Instant::now();
+                                }
+                                None => std::thread::sleep(Duration::from_millis(1)),
+                            }
+                        }
+                        sh.stalled.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(
+                            sh.late_ms.load(Ordering::SeqCst) as u64,
+                        ));
+                        sh.writes.fetch_add(1, Ordering::SeqCst);
+                        if send_all(s, &request) {
+                            // Its answer: until it pauses 100 ms once begun.
+                            let until = Instant::now() + Duration::from_secs(10);
+                            let mut quiet: Option<Instant> = None;
+                            while Instant::now() < until
+                                && quiet.is_none_or(|q| q.elapsed() < Duration::from_millis(100))
+                            {
+                                match take(s, &mut buf) {
+                                    Some(0) => break,
+                                    Some(_) => quiet = Some(Instant::now()),
+                                    None => std::thread::sleep(Duration::from_millis(1)),
+                                }
+                            }
+                            sh.late_done.fetch_add(1, Ordering::SeqCst);
+                        }
+                        return;
+                    }
                     if stall_one || hold_one || (write && sh.stall_writes.load(Ordering::SeqCst)) {
                         // Held: read what the client sends until it closes.
                         sh.stalled.fetch_add(1, Ordering::SeqCst);
@@ -3939,6 +3990,253 @@ fn a_read_of_values_on_a_link_slow_to_answer_takes_few_round_trips() {
     // connection one more: the listing (2), the first requests (2), the
     // later ones (1 or 2), with time to spare.
     assert!(took < Duration::from_millis(3_600), "{took:?}");
+    let all: Vec<_> = r.list_units(&ids).unwrap().into_iter().flatten().collect();
+    assert_eq!(all.len(), n);
+}
+
+// ---- 2.8.2: the write review's findings ----------------------------------------------------
+
+/// A batch's queue is written early when it holds 4 MiB, but never in the
+/// middle of a unit: a unit's manifest, its attestation and the removal of
+/// the attestation it supersedes, queued one after the other, are written
+/// in one transaction, so that a write the server refuses loses the whole
+/// unit. A draft of 2.8.2 wrote the queue as soon as it was full: (1) a
+/// manifest that filled it went in one transaction, refused, while its
+/// attestation went in the next, stored and reported as attested on a
+/// manifest that was never stored; (2) an attestation that filled it went
+/// in one transaction, refused, while the removal of the attestation it
+/// supersedes went in the next and deleted it.
+#[test]
+fn an_early_write_of_a_batch_never_splits_a_unit() {
+    let Some((s, ns)) = remote() else { return };
+    s.__compress_for_test(false);
+    let p = table_prefix(&ns);
+    // About 2 MB an envelope (its payload base64): two fill the queue but
+    // for 194 kB.
+    let fill = "f".repeat(1_500_000);
+    let fills = |s: &LibsqlStore, tag: &str| {
+        for i in 0..2 {
+            s.put_for_test(
+                &format!("src/fill-{tag}{i}.test.ts"),
+                S1,
+                &hex64(9),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{fill}")),
+            )
+            .unwrap();
+        }
+    };
+
+    // The tables, and the attestation (2) supersedes.
+    let old = s
+        .put_for_test(
+            "src/u.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(1)),
+            &envelope(None, "old"),
+        )
+        .unwrap();
+
+    // (1) The manifest fills the queue; the server refuses it.
+    let paths: Vec<String> = (0..2_400).map(|j| format!("src/split/{j}.rs")).collect();
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let m = manifest(&paths);
+    let bytes = m.to_compact();
+    assert!(bytes.len() > 200_000, "{}", bytes.len());
+    s.__execute_for_test(&[format!(
+        "CREATE TRIGGER {p}no_m BEFORE INSERT ON {p}manifests WHEN NEW.root = '{}' \
+         BEGIN SELECT RAISE(ABORT, 'mboom'); END",
+        m.root()
+    )])
+    .unwrap();
+    let b = s.batch().unwrap();
+    fills(&s, "a");
+    s.put_manifest(&m.root(), bytes.as_bytes()).unwrap();
+    let put = s
+        .put_for_test(
+            "src/m.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(2)),
+            &envelope(Some(&m.root()), "m"),
+        )
+        .unwrap();
+    let f = b.finish_partial().unwrap();
+    match f.lost(&put.key) {
+        Some(e) => assert!(e.to_string().contains("mboom"), "{e}"),
+        None => panic!(
+            "the unit whose manifest was refused is not lost: {:?}",
+            f.warnings
+        ),
+    }
+    assert_eq!(f.lost_count(), 1);
+    let srv = testkit::open_remote(&ns).unwrap();
+    assert!(srv.manifest(&m.root()).unwrap().is_none());
+    assert!(
+        keys_of(&srv, "src/m.test.ts").is_empty(),
+        "an attestation stored without its manifest"
+    );
+    assert_eq!(keys_of(&srv, "src/fill-a0.test.ts").len(), 1);
+    assert_eq!(keys_of(&srv, "src/fill-a1.test.ts").len(), 1);
+
+    // (2) The attestation fills the queue; the server refuses it, and the
+    // attestation it supersedes stays.
+    let bad = hex64(0xbb);
+    s.__execute_for_test(&[format!(
+        "CREATE TRIGGER {p}no_u BEFORE INSERT ON {p}attestations WHEN NEW.storage_key = '{bad}' \
+         BEGIN SELECT RAISE(ABORT, 'uboom'); END"
+    )])
+    .unwrap();
+    let b = s.batch().unwrap();
+    fills(&s, "b");
+    let new = s
+        .put_for_test(
+            "src/u.test.ts",
+            S1,
+            &bad,
+            Some(&hint(2)),
+            &envelope(None, &format!("new{}", "n".repeat(200_000))),
+        )
+        .unwrap();
+    s.remove(vec![old.clone()]).unwrap();
+    let f = b.finish_partial().unwrap();
+    match f.lost(&new.key) {
+        Some(e) => assert!(e.to_string().contains("uboom"), "{e}"),
+        None => panic!("the refused unit is not lost"),
+    }
+    let srv = testkit::open_remote(&ns).unwrap();
+    assert_eq!(
+        keys_of(&srv, "src/u.test.ts"),
+        vec![old.key.clone()],
+        "the superseded attestation was removed though its successor was refused"
+    );
+    assert_eq!(keys_of(&srv, "src/fill-b1.test.ts").len(), 1);
+}
+
+/// A write transaction that waits for the write lock past its deadline is
+/// asked about (not committed yet: the question is a read, which does not
+/// wait for the lock) and sent again, and the first send then commits
+/// after all: the transaction is applied once, not twice. A draft of 2.8.2
+/// sent it again in halves, and the server applied both (on vex's Turso
+/// database the original committed after the question, and every slot of
+/// it was written and logged twice). The proxy sends the first send on
+/// 3 s late, after the copy (the write's deadline is 2 s); `sqld` itself
+/// drops a write that waits for the lock once its client is gone.
+#[test]
+fn a_write_committed_after_the_question_is_applied_once() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    s.__compress_for_test(false);
+    s.put_for_test(
+        "src/seed.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "seed"),
+    )
+    .unwrap();
+    let units = [
+        "src/a.test.ts",
+        "src/b.test.ts",
+        "src/c.test.ts",
+        "src/d.test.ts",
+    ];
+    proxy.late_writes(1, 3_000);
+    let r0 = s.retries();
+    let b = s.batch().unwrap();
+    let keys: Vec<String> = units
+        .iter()
+        .map(|u| {
+            s.put_for_test(u, S1, &hex64(2), Some(&hint(2)), &envelope(None, u))
+                .unwrap()
+                .key
+        })
+        .collect();
+    let f = b.finish_partial().unwrap();
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    assert_eq!(proxy.stalled(), 1);
+    assert!(s.retries() > r0, "it ran out of time and was asked about");
+    // The first send reaches the server now.
+    let t = Instant::now();
+    while proxy.shared.late_done.load(Ordering::SeqCst) == 0
+        && t.elapsed() < Duration::from_secs(15)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(proxy.shared.late_done.load(Ordering::SeqCst), 1);
+    let r = testkit::open_remote(&ns).unwrap();
+    for (u, k) in units.iter().zip(&keys) {
+        assert_eq!(keys_of(&r, u), vec![k.clone()]);
+        let logged = r
+            .__query_for_test(&format!(
+                "SELECT count(*) FROM {p}log WHERE test_key = '{}'",
+                vci_core::test_key(u)
+            ))
+            .unwrap();
+        assert_eq!(logged, vec![vec!["1".to_owned()]], "{u} applied twice");
+    }
+}
+
+/// On a link where every answer waits 3 s for its first byte (and bytes
+/// then come fast), the requests of a read of values grow to their most
+/// after the first answers: the time beyond the shortest answer is what
+/// sizes them, not the whole time an answer took. A draft of 2.8.2 sized
+/// them from the whole time, so the 3 s wait kept them at about 150 values
+/// and vex-api's prefetch sent 12 to 14 requests where 2.8.1 sent 4.
+#[test]
+fn a_read_of_values_behind_a_long_wait_for_each_answer_takes_few_rounds() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 1_500;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    proxy.delay_answers(3_000);
+    let r = proxied(&proxy, token.as_deref(), &ns, 30);
+    r.status().unwrap();
+    let c0 = proxy.cursors();
+    let t = Instant::now();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    let took = t.elapsed();
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    let cursors = proxy.cursors() - c0;
+    // The listing, four requests of 100 at once, then the other 1,100 in
+    // three of up to 400 at once: 8 requests in about 15 s, where the
+    // draft sent 16 in 21 s (each a statement described, then run, on a
+    // new connection: two waits).
+    assert!(cursors <= 8, "{cursors} requests in {took:?}");
+    assert!(
+        took < Duration::from_secs(18),
+        "{cursors} requests in {took:?}"
+    );
     let all: Vec<_> = r.list_units(&ids).unwrap().into_iter().flatten().collect();
     assert_eq!(all.len(), n);
 }

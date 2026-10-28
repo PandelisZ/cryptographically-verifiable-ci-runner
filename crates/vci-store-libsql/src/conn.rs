@@ -531,6 +531,18 @@ const PROBE: Op = Op {
     on_timeout: OnTimeout::FailAlone,
 };
 
+thread_local! {
+    /// How many requests the last call of this thread that succeeded sent
+    /// ([`last_requests`]).
+    static LAST_REQUESTS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many requests the last call of this thread that succeeded sent in
+/// its try that succeeded (2: a statement described first, then run).
+pub(crate) fn last_requests() -> u64 {
+    LAST_REQUESTS.with(Cell::get)
+}
+
 /// The longest a hint's write waits ([`Op::hint`]): it waits behind other
 /// writers for the server's one write lock, and nothing waits for it to
 /// be stored.
@@ -765,6 +777,10 @@ pub(crate) struct Conn {
     /// Bytes of the values (and other text and blob columns) read, as
     /// stored (compressed values compressed): what the timing lines show.
     received: AtomicU64,
+    /// The shortest time a request of this handle took to be answered, in
+    /// microseconds (`u64::MAX`: none yet): the wait every answer has,
+    /// whatever its size ([`Conn::fastest`]).
+    fastest_us: AtomicU64,
 }
 
 impl Conn {
@@ -797,6 +813,7 @@ impl Conn {
             retries: AtomicU64::new(0),
             answered: AtomicBool::new(false),
             received: AtomicU64::new(0),
+            fastest_us: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -831,6 +848,18 @@ impl Conn {
     /// Bytes of text and blob columns read so far (values as stored).
     pub(crate) fn received(&self) -> u64 {
         self.received.load(Ordering::Relaxed)
+    }
+
+    /// The shortest time a request of this handle took to be answered
+    /// (zero before any was): about the wait for each answer that does not
+    /// grow with its size (the round trip, the server's own time, a
+    /// proxy's), which a read of values leaves out when it sizes its
+    /// requests (`Remote::query_values`).
+    pub(crate) fn fastest(&self) -> Duration {
+        match self.fastest_us.load(Ordering::Relaxed) {
+            u64::MAX => Duration::ZERO,
+            us => Duration::from_micros(us),
+        }
     }
 
     /// Whether the server has answered a request of this handle.
@@ -1274,6 +1303,7 @@ impl Conn {
             let fresh = c.used.elapsed() > STREAM_IDLE;
             // This attempt's requests (other threads send theirs at once).
             let sent = AtomicU64::new(0);
+            let tried = Instant::now();
             let r = guarded(|| {
                 rt.block_on(async {
                     if fresh {
@@ -1296,6 +1326,14 @@ impl Conn {
             match r {
                 Ok(Ok(v)) => {
                     self.answered.store(true, Ordering::Relaxed);
+                    // Each of its requests (a statement's description and
+                    // the statement) waited for its answer in turn.
+                    LAST_REQUESTS.with(|l| l.set(sent));
+                    let each = tried.elapsed() / u32::try_from(sent.max(1)).unwrap_or(u32::MAX);
+                    self.fastest_us.fetch_min(
+                        u64::try_from(each.as_micros()).unwrap_or(u64::MAX - 1),
+                        Ordering::Relaxed,
+                    );
                     self.give_back(Some(c));
                     return Ok(v);
                 }
@@ -1633,19 +1671,17 @@ impl Conn {
     /// A write transaction of the store's batches (`crate::batch`): sent
     /// once, and when its deadline runs out (or it waited for the write
     /// lock until then), `committed` (a read that returns a row only once
-    /// the transaction is applied, such as one of its attestations with its
-    /// `stored_at`) asks the server whether it committed it: a transaction
-    /// that timed out waiting for the lock often commits after the client
-    /// gave up, and sending it again would wait for the lock again and
-    /// write its change log rows a second time, under the very load that
-    /// made it late. One that has committed is `Ok`; one that has not (or
-    /// whose question went unanswered) is the timeout, which latches
-    /// nothing: the caller sends it again, in halves, within the process's
-    /// retry time (`Remote::spend_on_writes`). The server may still commit
-    /// the first one after the question was answered: the transaction is
-    /// then applied twice, which is safe (see [`Conn::batch`]) and, its
-    /// upserts writing only rows that differ, costs little but the log's
-    /// rows.
+    /// the transaction is applied: its nonce in the change log, `crate::
+    /// batch::Tx`) asks the server whether it committed it. One that has
+    /// committed is `Ok`; one that has not (or whose question went
+    /// unanswered) is the timeout, which latches nothing: the caller sends
+    /// it again as it was, within the process's retry time
+    /// (`Remote::spend_on_writes`). The question is a read, which does not
+    /// wait for the write lock, so a transaction still waiting for it
+    /// answers "not committed" and may commit afterwards (on vex's Turso
+    /// database it did, 30 s after the client gave up): the transaction's
+    /// first statement then refuses whichever of the two copies comes
+    /// second, so it is applied once.
     pub(crate) fn batch_checked(
         &self,
         statements: &[String],

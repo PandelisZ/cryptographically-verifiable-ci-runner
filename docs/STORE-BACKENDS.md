@@ -2366,14 +2366,19 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   (counted in `retries()`): a large read answered slowly while other jobs write, or a write that waited for the lock,
   costs that call a second try instead of the handle (`OnTimeout::Resend`). A transaction of a write batch is sent once
   (`WRITE_ONCE`, `Conn::batch_checked`) and, when its deadline runs out (or it waited for the lock until then), first
-  asks whether the server committed it (one of its attestations with its `stored_at`, else one of its manifests with
-  its `put_at`, a read that needs no write lock; unanswered in time, it counts as not committed): a transaction that
-  ran out of time waiting for the lock usually commits after the client gave up, and sent again it would wait for the
-  lock again and write its change log rows a second time, under the very load that made it late. One the server holds
-  is stored; one it does not is the batch's to send again, in halves, within the process's time for writes that fail
-  ("Writes", below), latching nothing itself. The server may still commit the first after the question was answered;
-  applied twice the transaction is safe (below), and its upserts rewrite only rows that differ (the manifests' since
-  2.8.2 too: value, encoding, base, or a later `put_at`), so the second costs little but the log's rows. Only the same
+  asks whether the server committed it (whether the change log holds the transaction's nonce, below, a read that
+  needs no write lock; unanswered in time, it counts as not committed). One the server holds is stored; one it does
+  not is the batch's to send again, as it was, within the process's time for writes that fail ("Writes", below),
+  latching nothing itself. Since the question does not wait for the lock, a transaction still waiting for it is "not
+  committed" and may commit afterwards: on vex's Turso database on 28 October two transactions that ran out of time
+  at 30.7 s committed after the question, and a draft of 2.8.2, which then sent them again in halves, applied all 18
+  of their slots twice, each copy waiting for the lock again under the very load that made the first late. So each
+  transaction of a batch carries a nonce (a random 64-hex root no manifest has, `batch::Tx`), logged with its rows,
+  and begins with a guard that fails it with the nonce in the error (`json_extract` of a bad path, run only on a row)
+  when the log already holds that nonce at the transaction's time: whichever copy commits second is refused, the
+  refusal counts as stored, and the transaction is applied once
+  (`a_write_committed_after_the_question_is_applied_once`: a proxy sends the first copy on 3 s late, after the
+  second committed; one log row per slot). Only the same
   request out of time again
   (`TRIES_AFTER_TIMEOUT`; counted per request, so that requests sent at once do not use up each other's try) latches
   the breaker;
@@ -2490,13 +2495,20 @@ stored, with their bases.
 vex's Turso) in one request that took 2 to 22 s, and one request out of time made the whole plan run every unit. Now
 the first requests take 100 keys each (`VALUES_PER_REQUEST`, about 4 MB of vex's) and go **as many at once as the
 handle sends** (`Conn::max`, `min(VCI_JOBS, 4)`, at most one per request); each later request takes as many keys as
-the last answer says fit in `VALUES_TARGET` of the request timeout (15%, 4.5 s at the default 30 s), at most four
-times the last request and between `VALUES_MIN` (25) and `VALUES_MAX` (400, about 15 MB of vex's). The pace assumes
-that time grows with size, which on a link whose bandwidth is the limit it does, and on one with a long wait for each
-answer but bandwidth to spare it overestimates, so there requests grow and few are sent: vex-api's 1,652 values went
-in 9 to 10 requests on vex's Turso database from a laptop (four of 100, then larger), and in two rounds of requests
-behind a proxy that held each answer 1 s (`a_read_of_values_on_a_link_slow_to_answer_takes_few_round_trips`: four of
-100, then three of 400). After each answer that took more than half of the timeout one fewer request is out at once
+the last answer says fit in `VALUES_TARGET` of the request timeout (15%, 4.5 s at the default 30 s) beyond the wait
+every answer has, at most four times the last request and between `VALUES_MIN` (25) and `VALUES_MAX` (400, about 15
+MB of vex's) (`next_size`). That wait is the handle's shortest answer (`Conn::fastest`: the time of each successful
+try divided by its requests, a statement's description and the statement), once per request the answer took (two
+on a connection whose statement was not described yet); the pace is the time beyond it, which grows with the size
+on a link whose bandwidth is the limit, and the room is what the target leaves beyond the wait, at least a third of
+it. So on a link with a long wait for each answer but bandwidth to spare requests grow and few are sent: vex-api's
+1,652 values went in 9 to 10 requests on vex's Turso database from a laptop (four of 100, then larger), in two
+rounds behind a proxy that held each answer 1 s (`a_read_of_values_on_a_link_slow_to_answer_takes_few_round_trips`:
+four of 100, then three of 400), and in 9 requests with each answer held 3 s
+(`a_read_of_values_behind_a_long_wait_for_each_answer_takes_few_rounds`: 1,500 values in 8 requests and 15 s). A
+draft of 2.8.2 sized them from the whole time an answer took, so a 3 s wait kept them small: behind that proxy
+vex-api's prefetch sent 13 requests in 12.2 to 13.2 s against 2.8.1's 4 in 12.3 to 12.6 s, and the test's read 16
+requests in 21 s. After each answer that took more than half of the timeout one fewer request is out at once
 (at least one), after each within a third one more: requests sent at once may share a slow link's bandwidth, and then
 take as many times longer (behind a proxy limited to 2 MB/s, vex-api's four first requests took 10.3 s each, the
 next ones were sized to 43 values and took about 4 s each, and the plan read all 1,652 values in 42 s where 2.8.1's
@@ -2589,11 +2601,28 @@ about a third as large, and its bytes travel as hex, twice that). A manifest a t
 with a later one. The roots the whole queue references are kept by every transaction's `superseded_manifests`, so an
 early transaction never removes a manifest a later one references.
 
+A queue written early (2,000 writes or 4 MiB) is cut at a unit's end (`Pending::take_whole_units`): the writes of
+the unit queued last stay queued, since `vci run` queues a unit's manifest, then its attestation, then the removals
+of what it supersedes, and so do the manifests no attestation taken references (the next unit's, put before its
+attestation), with copies of every base and of the manifests the units left queued reference; a manifest an early
+write stored is not sent again with the same bytes. A draft of 2.8.2 wrote the whole queue as soon as it was full,
+which could cut a unit in two (`an_early_write_of_a_batch_never_splits_a_unit`, against `sqld` with a trigger that
+refuses one write): a manifest that filled the queue went in one transaction, refused, while its attestation went in
+the next, stored and reported as attested on a manifest never stored (the next plan ran it, unable to read the
+manifest); and an attestation that filled the queue went in one transaction, refused, while the removal of the one
+it supersedes went in the next and deleted it. Only losses that latch nothing could do this (a refusal, or a
+transaction out of time with retry time left).
+
+Between one transaction and the next of the same write a writer pauses (`yield_pause`: a quarter of the time the
+last one took, between 200 ms and 2 s, randomized between half and one and a half of that), so that another job's
+write waiting for the lock can take it; a write's last transaction is followed by no pause.
+
 **A failure costs its own units.** A transaction that ran out of time (or waited for the lock until its deadline), or
 whose stream the server dropped, is asked about first (`Conn::batch_checked`, "Connection handling" above: committed,
-it is stored), then sent again after a pause (250 ms doubling with each try up to 4 s, randomized between half and one
-and a half of that, so that jobs that failed together do not come back together), in two halves when it holds more
-than one unit, at most `MAX_TRIES` (4) times for a unit. A transaction the server refuses (`Backend`, `Unsupported`)
+it is stored), then sent again as it was after a pause (250 ms doubling with each try up to 4 s, randomized between
+half and one and a half of that, so that jobs that failed together do not come back together), at most `MAX_TRIES`
+(4) times for a unit; its guard applies it once whichever copy the server commits (above). A draft of 2.8.2 sent it
+again in halves, which a first copy committed late then doubled. A transaction the server refuses (`Backend`, `Unsupported`)
 is split in halves down to the unit it refuses (`a_statement_the_server_refuses_latches_nothing`: one unit lost, the
 other stored). Whatever still fails loses only its units: `BatchEnd::finish_partial` names their keys
 (`vci_store::Finished::lost`), `vci run` refuses those units ("signing or storing failed: storing the batch: …") and
@@ -2612,7 +2641,10 @@ what went: `write batch: M manifest(s), A attestation(s), R removal(s), T transa
 compressed], longest Ys[, L attestation(s) not stored]`.
 
 **A batch sent again.** A batch whose connection was lost under it is sent again (above, "Lost connections"), and the
-server may have committed it and lost only the answer. It is one transaction ending in `COMMIT`, applied whole or not
+server may have committed it and lost only the answer. A transaction of the store's batches (every `put`,
+`put_manifest` and `remove`, in a batch or not) carries its nonce and guard (above), so its second copy is refused
+and it is applied once; what follows holds for the other writes (the schema, `remove_manifests`, the flags and the
+memo). It is one transaction ending in `COMMIT`, applied whole or not
 at all, and its values are literals fixed when it was built (the manifests' `put_at`, the attestations' `stored_at`
 and the log's `at` included), so the same text goes again, and applied twice in a row it leaves the rows as applied
 once, but for the log's: the upserts of manifests, attestations and the memo write the same rows (the second time
@@ -2823,7 +2855,8 @@ request after the values.
 as `vci run` does: a batch of units, each one of vex's real attestations (21.2 kB on average) and its real input
 manifest (15.2 kB), under a new test id, written with `put_manifest` and `put` and finished. 500 units (16.4 MB) from
 one process, or 350 (11.2 to 13.6 MB) from each of three at once; 2.8.1, 2.8.2, and 2.8.2 with
-`VCI_STORE_COMPRESS=zstd`, in turn:
+`VCI_STORE_COMPRESS=zstd`, in turn, each at its own time, so that a row compares loads as much as versions (the
+interleaved rounds below replace its comparisons):
 
 | run (UTC) | vci | per process | longest request | requests that ran out of time | attestations lost |
 |---|---|---|---|---|---|
@@ -2861,6 +2894,45 @@ run whose 4.8 MB request ran out of time, one write that waited 56 s while the s
 single small write fared better beside 2.8.1 than beside 2.8.2's stream of 1 MB transactions; once a large request
 is applied, every other writer waits for it, up to the 56 s above. Not measured: Rails jobs on vex's runners with
 2.8.2 (whose network is faster than this laptop's), and a database whose every writer runs 2.8.2.
+
+*Writes, interleaved* (the write review, 28 October 2026, 07:07 to 07:27 UTC). The review found that the rows above
+for 2.8.2 with and without compression came from different times (04:26 and 04:29) under 2.8.1's own writes, and
+that in its own interleaved runs the order flipped from round to round, raw 2.8.2 being no faster per process than
+2.8.1 on a quiet database. So the writes were measured again after the review's fixes, in rounds: three processes at
+once, 100 of vex's units each (3.2 to 4.5 MB as they are), into a fresh scratch namespace, the configurations one
+after the other within a round; vex's CI (2.8.1) committed the attestations a minute shown meanwhile (its change
+log), in 8 MB requests. Seconds per process; nothing lost unless said:
+
+| round (UTC) | vex's CI a minute | 2.8.2 | 2.8.2 zstd | a draft, zstd | 2.8.1 |
+|---|---|---|---|---|---|
+| 07:07-07:09 | 4-17 | 10.3, 16.4, 24.2 | 20.2, 20.2, 21.1 | 11.6, 11.4, 13.1 | 7.2, 5.1, 12.5 |
+| 07:09-07:12 | 7-369 | 98.4, 34.5, 80.7 (2 out of time, sent again) | 8.2, 10.9, 9.8 | 5.3, 11.0, 10.9 | 28.0, 23.3, 18.7 |
+| 07:12-07:17 | 4-909 | 16.3, 15.2, 17.7 | 95.4, 95.6, 104.9 (1 out of time in each) | 42.5, 62.4, 68.6 | 10.3; 30.0 and 30.0, each losing its 100 |
+
+and, against a draft without the pause between transactions (raw both):
+
+| round (UTC) | vex's CI a minute | 2.8.2 | a draft | one-row writes every 0.5 s beside 2.8.2 / the draft |
+|---|---|---|---|---|
+| 07:18-07:21 | 2-2,073 | 61.5 s each, every unit reported lost (2 out of time in each, the minute of retries spent; 80 committed after the client gave up) | the same (82 committed) | none in time / 19.1 s for the first |
+| 07:21-07:24 | 2,027-2,073 | 127.8, 128.4, 132.4 (2 out of time in each, sent again) | 14.5, 13.1, 21.0 | 0.8-46.9 s / 0.7-5.8 s |
+| 07:24-07:26 | 784-847 | 12.4, 16.1, 14.5 | 114.6, 115.0, 113.7 (1 out of time in each) | 0.7-3.5 s / 0.7-44.9 s |
+
+What these show: the time a write takes is the database's load, not the version's encoding or pause; compressed and
+raw trade places from round to round, so compression buys a smaller database, not faster writes. On a quiet database
+2.8.2 writes no faster per process than 2.8.1 (10 to 24 s against 5 to 13 s): its gain is the units it no longer
+loses (2.8.1 lost 200 of 300 in the third round). When the whole database stalls (every transaction of every process
+out of time at the same 30.7 s, a one-row write beside them waiting 19 to 47 s), 2.8.2 gives up within its minute of
+retries as 2.8.1 gives up at once, and its timed-out transactions may still commit (reported lost, then stored, which
+costs a test run, never a wrong skip). Applied twice: the drafts sent at least 7 transactions again and the server
+applied 130 of their units twice (41 and 89, in two rounds); 2.8.2 sent at least 15 again and applied none twice
+(the nonce, "Connection handling" above). Small writes 4 s into the writes (a manifest put outside a batch, then a
+flag): beside 2.8.2 the manifest 0.5 to 24.7 s and the flag dropped at its deadline in 1 of 6 runs; beside the zstd
+draft 1.1 to 17.5 s and 1 of 3; beside 2.8.1 4.1 to 30.3 s. The pause between transactions shows no effect this load
+lets one see.
+
+*Reads behind a 3 s wait* (the write review's fourth finding). On the local copy behind a proxy holding each answer
+3 s, three interleaved runs each (07:06 to 07:11 UTC): 2.8.2's plan took 24.5, 24.5 and 25.5 s, its prefetch 9.1 to
+10.1 s in 9 requests; the draft's 27.5 to 28.6 s, 12.2 to 13.2 s in 13; 2.8.1's 31.0 to 35.4 s, 12.3 to 12.6 s in 4.
 
 ### fetch, push, hints, operations
 
@@ -3251,7 +3323,10 @@ Still open:
     thirds of their size compressed rather than a third. Parameters (base64 in Hrana's JSON, a third larger) would
     need one request per statement with libsql 0.10.0's API, or a Hrana client of vci's own.
 19. **Small writes beside a stream of short transactions.** On 28 October (section 18, "Measured") a flag set 4 s
-    into a 2.8.2 `vci run`'s writes was dropped at its 5 s deadline in each of three runs, where beside 2.8.1, still
-    sending its first 8 MB, it took 0.2 s; a one-row write every 1.2 s waited at most 16.9 s beside 2.8.2 and up to
-    56 s beside 2.8.1. Whether a pause between a batch's transactions would let other writers in sooner, and how
-    either behaves once every job of a database runs 2.8.2 (vex's CI ran 2.8.1 throughout), is not measured.
+    into a draft 2.8.2 `vci run`'s writes was dropped at its 5 s deadline in each of three runs, where beside 2.8.1,
+    still sending its first 8 MB, it took 0.2 s; a one-row write every 1.2 s waited at most 16.9 s beside 2.8.2 and
+    up to 56 s beside 2.8.1. 2.8.2 now pauses between a write's transactions (`yield_pause`); in interleaved rounds
+    that morning a manifest put beside three 2.8.2 writers still took up to 24.7 s and one-row writes up to 46.9 s,
+    as beside a draft without the pause, while vex's CI's 8 MB requests set the pace. How small writes fare once
+    every job of a database runs 2.8.2, and whether hints and single manifest puts need a path of their own (or
+    smaller transactions), is not known.

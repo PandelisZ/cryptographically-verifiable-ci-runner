@@ -1953,14 +1953,16 @@ The store has three modes:
   server that cannot be reached, or a request out of time twice, makes every later call of the command fail at
   once, so a server that is down costs one or two timeouts, and the plan runs everything. A plan reads its values in
   several requests (since 2.8.2), so a request that fails costs only its own units, which run: 100 values to each of
-  the first ones, as many at once as `min(VCI_JOBS, 4)`, then requests sized from how long the answers took (each
-  aimed at 15% of the timeout, 25 to 400 values), fewer at once when one takes more than half of the timeout; each
+  the first ones, as many at once as `min(VCI_JOBS, 4)`, then requests sized from how long the answers took beyond
+  the wait every answer has (each aimed at 15% of the timeout, 25 to 400 values), fewer at once when one takes more than half of the timeout; each
   request brings the input manifests and base manifests its values need; a request out of time is read again in
   halves, not whole. The whole read is given two timeouts (one more per 800 values beyond 1,600), the units not read
   by then running, and once a read ran out of time the plan's later reads of values end when it did, so a slow link
   costs the plan that once, not once per round. `vci run` writes its units in transactions of about a megabyte, one
-  after the other (since 2.8.2), so that none holds the database's one write lock for long; a transaction that runs
-  out of time asks the server whether it was stored, is sent again in halves after a pause if not, and only the
+  after the other with a short pause between them (since 2.8.2), so that none holds the database's one write lock
+  for long, and never splits a unit across two transactions; a transaction that runs out of time asks the server
+  whether it was stored and is sent again as it was after a pause if not (each transaction carries a nonce, so that
+  should the first copy commit late, whichever copy comes second is refused and it is applied once), and only the
   units whose transaction still fails are not attested (`signing or storing failed: storing the batch: …`); the rest
   are. A command spends at most two timeouts in all on writes that fail (60 s at the default) before it stops
   writing. The plan's memo and flags are written only when new, and each such write waits at most 5 s and never
@@ -1968,8 +1970,10 @@ The store has three modes:
   and exits 2 after the run.
 - **Compressed values** (since 2.8.2). `[store] compress = "zstd"` in `vci.toml`, or `VCI_STORE_COMPRESS=zstd` (which
   wins: `VCI_STORE_COMPRESS=off` turns it off for one command), stores each attestation and input manifest
-  compressed (about 3x smaller for vex's; they travel at about two thirds of their size, as hex: from a laptop to
-  vex's Turso database 500 units were written in 19.5 to 30.7 s compressed against 145 to 214 s as they are).
+  compressed (about 3x smaller for vex's; they travel at about two thirds of their size, as hex). On vex's Turso database,
+  measured from a laptop while vex's CI wrote, the time a write took swung more with that load than with
+  compression (three processes of 100 units each, interleaved: 8.2 to 104.9 s compressed, 10.3 to 132.4 s as they are), so
+  compression is no promise of faster writes on a busy database.
   `vci store info` shows `compress` and where it came from. A vci older than 2.8.2 refuses a `vci.toml` that sets
   `[store] compress`. Every vci from
   2.8.2 reads both forms; 2.8.1 and earlier read a compressed value as one they cannot read, and run its unit (never

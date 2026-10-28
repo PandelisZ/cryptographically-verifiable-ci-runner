@@ -15,21 +15,28 @@
 //! go in the same transaction (2.8.2, `superseded_manifests`), and values
 //! are compressed when `VCI_STORE_COMPRESS=zstd` or `[store] compress`
 //! asks for it. A queue of [`FLUSH_WRITES`] attestations and removals, or
-//! of [`FLUSH_BYTES`], is written early.
+//! of [`FLUSH_BYTES`], is written early, its whole units only
+//! ([`Pending::take_whole_units`]).
 //!
 //! **Short transactions** (2.8.2). A queue is written as transactions of
 //! whole units (every write of one test key, with the manifests its
 //! attestations reference and their bases) of at most [`TX_BYTES`] as
-//! sent or [`TX_UNITS`] attestations, one after the other: each holds the
-//! server's one write lock for a second or two, so that another job's
-//! write (a hint, a shared manifest, its own units) waits that long, not
-//! the 15 to 37 s an 8 MB transaction held it on Turso (2.8.1).
+//! sent or [`TX_UNITS`] attestations, one after the other, with a short
+//! pause between them ([`yield_pause`]): each holds the server's one write
+//! lock for one to a few seconds, not the 15 to 37 s an 8 MB transaction
+//! held it on Turso (2.8.1). Another job's write (a hint, a shared
+//! manifest, its own units) still waits behind every writer's transaction
+//! that is waiting too: beside three processes writing at once on vex's
+//! Turso database a manifest put waited up to 25 s and one-row writes up
+//! to 47 s, with or without the pause, and a hint was sometimes dropped
+//! at its 5 s deadline (section 18 of `docs/STORE-BACKENDS.md`).
 //!
 //! **Failures cost their own units.** A transaction that ran out of time
 //! (or waited for the lock until then) is asked about first
 //! ([`crate::conn::Conn::batch_checked`]: one the server committed is not
-//! sent again), then sent again after a pause, in halves when it holds
-//! more than one unit; one the server refused is split down to the unit
+//! sent again), then sent again as it was after a pause; whichever of the
+//! two the server applies second is refused as already committed ([`Tx`]),
+//! so it is applied once. One the server refused is split down to the unit
 //! that it refuses. Only the units whose transaction still fails are lost
 //! ([`vci_store::Finished::lost`]): `vci run` refuses those and reports the
 //! rest as stored. The time a process spends on writes that failed and on
@@ -87,6 +94,14 @@ pub(crate) const TX_UNITS: usize = 64;
 /// default 30 s timeout. Past it the circuit breaker latches.
 pub(crate) const WRITE_RETRY_DEADLINES: u32 = 2;
 
+/// The pause after a transaction committed, before the next one of the
+/// same write is sent, as a share of the time it took ([`yield_pause`]).
+const YIELD_SHARE: f64 = 0.25;
+/// The shortest such pause (before it is randomized).
+const YIELD_MIN: Duration = Duration::from_millis(200);
+/// The longest such pause (before it is randomized).
+const YIELD_MAX: Duration = Duration::from_secs(2);
+
 /// The most times one unit's writes are sent (each failure costing part
 /// of the process's retry time).
 const MAX_TRIES: u32 = 4;
@@ -116,6 +131,10 @@ pub(crate) struct Pending {
     pub(crate) emptied: BTreeSet<Slot>,
     pub(crate) removals: BTreeSet<String>,
     bytes: usize,
+    /// The test key of the last put or removal queued: its unit may still
+    /// be queuing writes (the removals of what it supersedes follow its
+    /// put), so an early write leaves it in the queue.
+    last: Option<String>,
     after: Option<After>,
 }
 
@@ -141,8 +160,91 @@ impl Pending {
             emptied: std::mem::take(&mut self.emptied),
             removals: std::mem::take(&mut self.removals),
             bytes: std::mem::take(&mut self.bytes),
+            last: None,
             after: self.after.clone(),
         }
+    }
+
+    /// The bytes it holds, counted again.
+    fn recount(&mut self) {
+        self.bytes = self
+            .attestations
+            .values()
+            .map(|r| r.value.len() + r.key.len())
+            .chain(self.manifests.values().map(|(_, b)| b.len()))
+            .sum();
+    }
+
+    /// The writes of whole units, for an early write: everything but the
+    /// writes of the unit queued last (the removals of what it supersedes
+    /// may follow), which stay queued with the manifests no attestation
+    /// taken references (the next unit's, put before its attestation).
+    /// The manifests the taken attestations reference, and their bases,
+    /// go with them; copies stay queued of those the units left queued
+    /// reference too and of every base, so that a later transaction never
+    /// relies on one an earlier transaction lost (an early write's stored
+    /// manifests are not sent again: [`Open::stored`]). A queue split
+    /// anywhere else could store an attestation whose manifest was lost,
+    /// or remove a superseded attestation whose successor was lost (a
+    /// draft of 2.8.2).
+    fn take_whole_units(&mut self) -> Pending {
+        let mut out = self.take();
+        if let Some(tk) = self.last.clone() {
+            let slots: Vec<Slot> = out
+                .attestations
+                .keys()
+                .filter(|s| s.0 == tk)
+                .cloned()
+                .collect();
+            for slot in slots {
+                if let Some(r) = out.attestations.remove(&slot) {
+                    self.attestations.insert(slot, r);
+                }
+            }
+            let emptied: Vec<Slot> = out.emptied.iter().filter(|s| s.0 == tk).cloned().collect();
+            for slot in emptied {
+                out.emptied.remove(&slot);
+                self.emptied.insert(slot);
+            }
+            let removals: Vec<String> = out
+                .removals
+                .iter()
+                .filter(|k| key::parse_key(k).is_some_and(|(t, _, _)| t == tk))
+                .cloned()
+                .collect();
+            for k in removals {
+                out.removals.remove(&k);
+                self.removals.insert(k);
+            }
+        }
+        let manifests = std::mem::take(&mut out.manifests);
+        // The roots these attestations reference, and those roots' bases.
+        let reach = |atts: &BTreeMap<Slot, Row>| -> BTreeSet<String> {
+            let mut roots = BTreeSet::new();
+            for r in atts.values() {
+                if let Some(root) = &r.manifest_ref {
+                    roots.insert(root.clone());
+                    if let Some((Some(base), _)) = manifests.get(root) {
+                        roots.insert(base.clone());
+                    }
+                }
+            }
+            roots
+        };
+        let taken = reach(&out.attestations);
+        let left = reach(&self.attestations);
+        let bases: BTreeSet<&String> = manifests.values().filter_map(|(b, _)| b.as_ref()).collect();
+        for (root, m) in &manifests {
+            if taken.contains(root) {
+                out.manifests.insert(root.clone(), m.clone());
+            }
+            if !taken.contains(root) || left.contains(root) || bases.contains(root) {
+                self.manifests.insert(root.clone(), m.clone());
+            }
+        }
+        out.recount();
+        self.recount();
+        out
     }
 
     /// An empty queue with this one's hook.
@@ -183,12 +285,20 @@ impl Pending {
     }
 }
 
-/// An open batch: its queue, and what its early writes lost.
+/// An open batch: its queue, what its early writes lost, and the
+/// manifests they stored.
 #[derive(Default)]
 struct Open {
     queue: Pending,
     lost: Finished,
+    /// The manifests the batch's early writes stored, by root, with a hash
+    /// of their bytes: a later transaction does not send them again.
+    stored: Stored,
 }
+
+/// Manifests a transaction stored, by root, with the BLAKE3 of their
+/// bytes.
+pub(crate) type Stored = HashMap<String, String>;
 
 thread_local! {
     /// The batches open on this thread, by store handle.
@@ -236,6 +346,7 @@ pub(crate) fn open(remote: &Arc<Remote>, after: Option<After>) -> Result<WriteBa
                         ..Pending::default()
                     },
                     lost: Finished::default(),
+                    stored: Stored::default(),
                 });
                 true
             }
@@ -270,12 +381,13 @@ impl BatchEnd for End {
         let Open {
             queue,
             lost: mut done,
+            mut stored,
         } = OPEN
             .try_with(|o| o.borrow_mut().remove(&self.remote.id))
             .ok()
             .flatten()
             .unwrap_or_default();
-        let w = write_all(&self.remote, queue);
+        let w = write_all(&self.remote, queue, &mut stored, &BTreeSet::new());
         if let Some(e) = w.other {
             done.warnings.push(format!(
                 "writes of the batch that no attestation depends on were not stored: {e}"
@@ -286,14 +398,25 @@ impl BatchEnd for End {
     }
 }
 
-/// Write the queue early when it is full; what it loses is reported when
-/// the batch finishes.
+/// Write the queue's whole units early when it is full
+/// ([`Pending::take_whole_units`]); what it loses is reported when the
+/// batch finishes.
 fn flush_if_full(remote: &Remote) {
-    let Some(p) = with_pending(remote, |p| p.full().then(|| p.take())).flatten() else {
+    let Some((p, mut stored, keep)) = with_open(remote, |o| {
+        if !o.queue.full() {
+            return None;
+        }
+        let p = o.queue.take_whole_units();
+        // What stays queued references these: no transaction of this
+        // write removes them as superseded.
+        Some((p, std::mem::take(&mut o.stored), o.queue.referenced()))
+    })
+    .flatten() else {
         return;
     };
-    let w = write_all(remote, p);
+    let w = write_all(remote, p, &mut stored, &keep);
     with_open(remote, |o| {
+        o.stored = stored;
         if let Some(e) = w.other {
             o.lost.warnings.push(format!(
                 "writes of the batch that no attestation depends on were not stored: {e}"
@@ -431,6 +554,7 @@ pub(crate) fn put(remote: &Remote, att: &NewAttestation<'_>) -> Result<StoredEnv
         // The put replaces the slot whatever was queued for it.
         p.removals.remove(&key);
         p.emptied.remove(&slot);
+        p.last = Some(slot.0.clone());
         p.bytes += row.value.len() + row.key.len();
         if let Some(old) = p.attestations.insert(slot, row) {
             p.bytes = p.bytes.saturating_sub(old.value.len() + old.key.len());
@@ -471,6 +595,7 @@ pub(crate) fn remove(
     with_pending(remote, |p| {
         for e in &doomed {
             if let Some((tk, signer, sk)) = key::parse_key(&e.key) {
+                p.last = Some(tk.to_owned());
                 let slot: Slot = (tk.to_owned(), signer.to_owned(), sk.to_owned());
                 if p.attestations.get(&slot).is_some_and(|r| r.key == e.key)
                     && let Some(old) = p.attestations.remove(&slot)
@@ -662,7 +787,8 @@ pub(crate) fn remove_manifests_now(
 
 // ---- writing a queue -------------------------------------------------------------------
 
-/// The statements that log these slots and roots for replicas.
+/// The statements that log these slots and roots for replicas (a
+/// transaction's nonce among the roots: no manifest has it).
 fn log_rows(log: &str, slots: &[&Slot], roots: &[&str], at: i64) -> Option<String> {
     let mut values: Vec<String> = slots
         .iter()
@@ -693,7 +819,7 @@ pub(crate) struct Written {
 
 /// Write `p` ([`write_all`]); the first failure, if any part was lost.
 pub(crate) fn write(remote: &Remote, p: Pending) -> Result<(), StoreError> {
-    let w = write_all(remote, p);
+    let w = write_all(remote, p, &mut Stored::default(), &BTreeSet::new());
     match (w.lost.into_error(), w.other) {
         (Some(e), _) | (None, Some(e)) => Err(e),
         (None, None) => Ok(()),
@@ -824,25 +950,65 @@ fn hopeless(e: &StoreError) -> bool {
 /// try up to 4 s, between half and one and a half of that (jobs that
 /// failed together do not come back together).
 fn backoff(tries: u32) -> Duration {
-    let base = Duration::from_millis(250).saturating_mul(1 << tries.min(4));
+    jitter(Duration::from_millis(250).saturating_mul(1 << tries.min(4)))
+}
+
+/// Between half and one and a half of `base`.
+fn jitter(base: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     base.mul_f64(0.5 + f64::from(nanos % 1000) / 1000.0)
 }
 
+/// The pause after a transaction committed before the next one of the
+/// same write is sent ([`YIELD_SHARE`] of the time it took, between
+/// [`YIELD_MIN`] and [`YIELD_MAX`], randomized): another job's write that
+/// waits for the lock takes it meanwhile.
+fn yield_pause(took: Duration) -> Duration {
+    jitter(took.mul_f64(YIELD_SHARE).clamp(YIELD_MIN, YIELD_MAX))
+}
+
+/// A transaction's nonce: a root no manifest has, logged by the
+/// transaction ([`Tx`]).
+fn nonce(remote: &Remote) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    vci_core::blake3_hex(
+        format!(
+            "vci transaction {} {} {nanos} {}",
+            std::process::id(),
+            remote.id,
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+        .as_bytes(),
+    )
+}
+
 /// Write `p` as transactions of whole units ([`units`], [`pack`]), one
-/// after the other; after each one stored, bring the cache up to date and
-/// run the queue's hook. A transaction that fails is sent again or split
-/// as the module docs say, within the process's retry time
-/// ([`Remote::spend_on_writes`]); the units whose transaction still fails
-/// are lost, and the rest is stored.
-pub(crate) fn write_all(remote: &Remote, p: Pending) -> Written {
+/// after the other, pausing briefly after each one stored
+/// ([`yield_pause`]); after each one stored, bring the cache up to date and
+/// run the queue's hook. A transaction that fails is sent again (as it was:
+/// [`Tx`]) or split as the module docs say, within the process's retry
+/// time ([`Remote::spend_on_writes`]); the units whose transaction still
+/// fails are lost, and the rest is stored. A manifest `stored` holds with
+/// the same bytes is not sent again, and those stored are added to it;
+/// `also_keep`: roots that writes still queued reference, which no
+/// transaction removes as superseded.
+pub(crate) fn write_all(
+    remote: &Remote,
+    p: Pending,
+    stored: &mut Stored,
+    also_keep: &BTreeSet<String>,
+) -> Written {
     let mut w = Written::default();
     if p.is_empty() {
         return w;
     }
-    let keep = p.referenced();
+    let mut keep = p.referenced();
+    keep.extend(also_keep.iter().cloned());
     let counts = (
         p.manifests.len(),
         p.attestations.len(),
@@ -850,46 +1016,65 @@ pub(crate) fn write_all(remote: &Remote, p: Pending) -> Written {
     );
     let step = Step::start(KIND);
     let n0 = remote.conn.requests();
-    let mut queue: VecDeque<(Vec<Pending>, u32)> = pack(units(p), remote.compress())
+    let mut queue: VecDeque<(Vec<Pending>, u32, Option<Tx>)> = pack(units(p), remote.compress())
         .into_iter()
-        .map(|t| (t, 0))
+        .map(|t| (t, 0, None))
         .collect();
-    // Roots a stored transaction wrote: not sent again with a later one.
-    let mut written: BTreeSet<String> = BTreeSet::new();
     let (mut txs, mut bytes, mut longest, mut lost) = (0usize, 0usize, Duration::ZERO, 0usize);
-    while let Some((group, tries)) = queue.pop_front() {
-        let mut tx = group[0].empty_like();
-        for u in &group {
-            tx.merge(u.clone());
-        }
-        tx.manifests.retain(|r, _| !written.contains(r));
-        if tx.is_empty() {
-            continue;
-        }
+    while let Some((group, tries, again)) = queue.pop_front() {
         let t = Instant::now();
-        let r = send(remote, &tx, &keep);
+        let built = match again {
+            Some(tx) => Ok(tx),
+            None => {
+                let mut p = group[0].empty_like();
+                for u in &group {
+                    p.merge(u.clone());
+                }
+                // Not again what a stored transaction wrote.
+                p.manifests.retain(|r, (_, b)| {
+                    stored.get(r).is_none_or(|h| *h != vci_core::blake3_hex(b))
+                });
+                if p.is_empty() {
+                    continue;
+                }
+                prepare(remote, p, &keep)
+            }
+        };
+        let (tx, r) = match built {
+            Ok(tx) => {
+                let r = send(remote, &tx);
+                (Some(tx), r)
+            }
+            Err(e) => (None, Err(e)),
+        };
         let took = t.elapsed();
         longest = longest.max(took);
-        let e = match r {
-            Ok(n) => {
+        let e = match (r, tx) {
+            (Ok(n), Some(tx)) => {
                 txs += 1;
                 bytes += n;
-                written.extend(tx.manifests.keys().cloned());
-                settle(remote, &tx);
+                for (root, (_, b)) in &tx.p.manifests {
+                    stored.insert(root.clone(), vci_core::blake3_hex(b));
+                }
+                settle(remote, &tx.p);
+                if !queue.is_empty() {
+                    std::thread::sleep(yield_pause(took));
+                }
                 continue;
             }
-            Err(e) => e,
+            (Ok(_), None) => continue,
+            (Err(e), tx) => (e, tx),
         };
+        let (mut why, tx) = e;
         // What failed: these units, or (the breaker latched, the token may
         // not write, the server takes no more writes) every unit still
         // queued.
         let mut failed = vec![group];
-        let mut why = e;
         let mut give_up = |why: &mut StoreError, failed: &mut Vec<Vec<Pending>>| {
             if let Err(l) = remote.conn.check() {
                 *why = l;
             }
-            failed.extend(queue.drain(..).map(|(g, _)| g));
+            failed.extend(queue.drain(..).map(|(g, _, _)| g));
         };
         if remote.conn.check().is_err() || hopeless(&why) {
             give_up(&mut why, &mut failed);
@@ -899,14 +1084,11 @@ pub(crate) fn write_all(remote: &Remote, p: Pending) -> Written {
             let pause = backoff(tries);
             if remote.spend_on_writes(took + pause) {
                 std::thread::sleep(pause);
-                // In halves when it holds more than one unit: a half that is
-                // stored is kept when the other is not.
-                let mut group = failed.pop().unwrap_or_default();
-                if group.len() > 1 {
-                    let second = group.split_off(group.len() / 2);
-                    queue.push_front((second, tries + 1));
-                }
-                queue.push_front((group, tries + 1));
+                // As it was sent: should the first commit after all (it
+                // waited for the lock while the server answered that it had
+                // not), one of the two is refused as already committed.
+                let group = failed.pop().unwrap_or_default();
+                queue.push_front((group, tries + 1, tx));
                 continue;
             }
             // The process's retry time ran out: the server cannot take
@@ -919,8 +1101,8 @@ pub(crate) fn write_all(remote: &Remote, p: Pending) -> Written {
             // Refused: split down to the unit the server refuses.
             let mut group = failed.pop().unwrap_or_default();
             let second = group.split_off(group.len() / 2);
-            queue.push_front((second, tries));
-            queue.push_front((group, tries));
+            queue.push_front((second, tries, None));
+            queue.push_front((group, tries, None));
             continue;
         }
         let keys: Vec<String> = failed.iter().flatten().flat_map(Pending::keys).collect();
@@ -949,28 +1131,97 @@ pub(crate) fn write_all(remote: &Remote, p: Pending) -> Written {
     w
 }
 
-/// Write `p` to the server in one transaction (one request, and when its
-/// deadline runs out, one more asking whether the server committed it);
-/// the bytes of values sent. `keep`: roots the whole queue references,
-/// which no transaction of it removes as superseded.
-fn send(remote: &Remote, p: &Pending, keep: &BTreeSet<String>) -> Result<usize, StoreError> {
-    if p.is_empty() {
+/// What a transaction's guard says, with its nonce, when the transaction
+/// was committed already.
+const COMMITTED: &str = "vci: this transaction was committed already";
+
+/// One transaction of a write, as sent: sent again as it is after its
+/// deadline. Its first statement is a guard that stops it when the change
+/// log holds its nonce (a root no manifest has, logged with the
+/// transaction's time), and its log rows write the nonce: whichever of
+/// the first send and a copy sent again commits first, the other is
+/// refused with the nonce in the error, which counts as stored. A
+/// transaction that ran out of time while it waited for the write lock
+/// often commits after the client asked whether it had (the question is
+/// a read, which does not wait for the lock): 2.8.2's drafts then sent it
+/// again in halves, and it was applied twice (on vex's Turso database 18
+/// slots in two of three writers, each a further 30 s under the very load
+/// that made it late).
+pub(crate) struct Tx {
+    /// What it writes.
+    p: Pending,
+    /// Its statements (none: nothing to write).
+    stmts: Vec<String>,
+    /// Whether the server holds its nonce (asked after its deadline).
+    probe: String,
+    nonce: String,
+    /// The bytes of values it sends.
+    sent: usize,
+    /// It prunes the change log.
+    prune: bool,
+    /// It only removes.
+    only_removals: bool,
+}
+
+/// Send `tx` (one request, and when its deadline runs out, one more asking
+/// whether the server committed it); the bytes of values sent.
+fn send(remote: &Remote, tx: &Tx) -> Result<usize, StoreError> {
+    if tx.stmts.is_empty() {
         return Ok(0);
     }
+    match remote.write_checked(&tx.stmts, Some(&tx.probe)) {
+        Ok(()) => {}
+        // Its guard: a send of it before this one committed.
+        Err(Fail::Store(e)) if e.to_string().contains(&tx.nonce) => {}
+        // Only removals, and no tables: nothing to remove.
+        Err(Fail::Absent) if tx.only_removals => return Ok(0),
+        Err(Fail::Absent) => {
+            return Err(StoreError::NotInitialized {
+                backend: KIND,
+                advice: "the namespace's tables went away while vci wrote: run it again".to_owned(),
+            });
+        }
+        Err(Fail::Store(e)) => return Err(e),
+    }
+    if tx.prune {
+        remote.log_pruned.store(true, Ordering::Relaxed);
+    }
+    Ok(tx.sent)
+}
+
+/// `p` as one transaction ([`Tx`]). `keep`: roots the whole queue
+/// references, which no transaction of it removes as superseded.
+fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, StoreError> {
     let only_removals = p.manifests.is_empty() && p.attestations.is_empty();
+    let nothing = |p: Pending| Tx {
+        p,
+        stmts: Vec::new(),
+        probe: String::new(),
+        nonce: String::new(),
+        sent: 0,
+        prune: false,
+        only_removals,
+    };
+    if p.is_empty() {
+        return Ok(nothing(p));
+    }
     let t = if only_removals {
         let t = remote.ready()?;
         if remote.version()?.is_none() {
             // Nothing stored, nothing to remove.
-            return Ok(0);
+            return Ok(nothing(p));
         }
         t
     } else {
         remote.ensure()?
     };
     let at = now();
+    let nonce = nonce(remote);
     let (a, log) = (&t.names.attestations, &t.log);
-    let mut stmts: Vec<String> = Vec::new();
+    let mut stmts: Vec<String> = vec![format!(
+        "SELECT json_extract('{{}}', '{COMMITTED} ' || root) FROM {log} \
+         WHERE at = {at} AND root = '{nonce}'"
+    )];
     let mut sent = 0usize;
     // A value as written: `encoding, value` literals.
     let mut value = |b: &[u8]| -> String {
@@ -996,7 +1247,7 @@ fn send(remote: &Remote, p: &Pending, keep: &BTreeSet<String>) -> Result<usize, 
             .collect();
         stmts.push(t.upsert_manifests(&rows.join(", ")));
     }
-    stmts.extend(superseded_manifests(remote, t, p, keep, at)?);
+    stmts.extend(superseded_manifests(remote, t, &p, keep, at)?);
     // Removals before the upsert: a put queued after a removal of its slot
     // replaces the slot anyway, and an emptied slot has no put.
     let mut removed_slots: Vec<Slot> = Vec::new();
@@ -1049,7 +1300,12 @@ fn send(remote: &Remote, p: &Pending, keep: &BTreeSet<String>) -> Result<usize, 
         .chain(p.emptied.iter())
         .chain(p.attestations.keys())
         .collect();
-    let roots: Vec<&str> = p.manifests.keys().map(String::as_str).collect();
+    let roots: Vec<&str> = p
+        .manifests
+        .keys()
+        .map(String::as_str)
+        .chain(std::iter::once(nonce.as_str()))
+        .collect();
     stmts.extend(log_rows(log, &slots, &roots, at));
     let prune = !remote.log_pruned.load(Ordering::Relaxed);
     if prune {
@@ -1061,39 +1317,16 @@ fn send(remote: &Remote, p: &Pending, keep: &BTreeSet<String>) -> Result<usize, 
         ));
         stmts.push(format!("DELETE FROM {log} WHERE at < {cut}"));
     }
-    // Whether the server applied this batch, asked before it is sent again
-    // after its deadline: one of its attestations as it wrote it, else one
-    // of its manifests (only removals: sent again, they cost little).
-    let committed = if let Some(r) = p.attestations.values().next() {
-        Some(format!(
-            "SELECT 1 FROM {a} WHERE key = {} AND stored_at = {at}",
-            text(&r.key)
-        ))
-    } else {
-        p.manifests.keys().next().map(|root| {
-            format!(
-                "SELECT 1 FROM {} WHERE root = {} AND put_at = {at}",
-                t.names.manifests,
-                text(root)
-            )
-        })
-    };
-    match remote.write_checked(&stmts, committed.as_deref()) {
-        Ok(()) => {}
-        // Only removals, and no tables: nothing to remove.
-        Err(Fail::Absent) if only_removals => return Ok(0),
-        Err(Fail::Absent) => {
-            return Err(StoreError::NotInitialized {
-                backend: KIND,
-                advice: "the namespace's tables went away while vci wrote: run it again".to_owned(),
-            });
-        }
-        Err(Fail::Store(e)) => return Err(e),
-    }
-    if prune {
-        remote.log_pruned.store(true, Ordering::Relaxed);
-    }
-    Ok(sent)
+    let probe = format!("SELECT 1 FROM {log} WHERE at = {at} AND root = '{nonce}'");
+    Ok(Tx {
+        p,
+        stmts,
+        probe,
+        nonce,
+        sent,
+        prune,
+        only_removals,
+    })
 }
 
 /// The statements that remove the manifests this write leaves without a
