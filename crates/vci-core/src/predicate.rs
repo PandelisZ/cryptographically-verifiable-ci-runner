@@ -487,8 +487,6 @@ impl VciPredicateV2 {
 pub enum PredicateError {
     #[error("{field} is not 64 lowercase hex digits: {value:?}")]
     Hex { field: &'static str, value: String },
-    #[error("the global manifest has externals or env entries")]
-    GlobalManifest,
     #[error("waived {0:?} is not in the waiver table")]
     Waiver(String),
     #[error("waived id {id} is not below the waiver table's length {len}")]
@@ -867,15 +865,19 @@ impl VciPredicate {
     /// The hdr object of this predicate's run (section 1.1: the fields that
     /// moved out of the statement). Every run at the same toolchain and
     /// global inputs makes the same one. The digests must be 64 lowercase
-    /// hex digits and the global manifest must be entries only.
+    /// hex digits; the global manifest's entries, externals and env are
+    /// carried sorted and distinct (the root does not depend on the order).
     pub fn hdr(&self) -> Result<Hdr, PredicateError> {
         let gm = &self.core.global_manifest;
-        if !gm.externals.is_empty() || !gm.env.is_empty() {
-            return Err(PredicateError::GlobalManifest);
-        }
         let mut global_manifest: Vec<InputEntry> = gm.entries.clone();
         global_manifest.sort();
         global_manifest.dedup();
+        let mut global_externals = gm.externals.clone();
+        global_externals.sort();
+        global_externals.dedup();
+        let mut global_env = gm.env.clone();
+        global_env.sort();
+        global_env.dedup();
         Ok(Hdr {
             repo_id: self.core.repo_id.clone(),
             adapter: self.core.adapter.clone(),
@@ -887,6 +889,8 @@ impl VciPredicate {
             env_config_digest: hex_field("envConfigDigest", &self.env_config_digest)?,
             global_input_root: hex_field("globalInputRoot", &self.core.global_input_root)?,
             global_manifest,
+            global_externals,
+            global_env,
             ignored_inputs: self.ignored_inputs.clone(),
             env_set: self.env_set.clone(),
             toolchain: self.core.toolchain.clone(),
@@ -1598,13 +1602,44 @@ mod tests {
                 ..
             })
         ));
-        // A global manifest with externals or env is not a hdr's.
-        let mut bad = p.clone();
-        bad.core.global_manifest.env.push(EnvEntry {
+        // A global manifest with env entries (node-test's and Vitest's hold
+        // NODE_OPTIONS: 12 of the 1,175 sample units) or externals is
+        // carried whole, sorted, so that the hdr's root is the signed one.
+        let mut with_env = p.clone();
+        with_env.core.global_manifest.env.push(EnvEntry {
             key: "TZ".into(),
             hash: crate::ABSENT_HASH.into(),
         });
-        assert_eq!(bad.hdr(), Err(PredicateError::GlobalManifest));
+        with_env.core.global_manifest.env.push(EnvEntry {
+            key: "NODE_OPTIONS".into(),
+            hash: "cd".repeat(32),
+        });
+        with_env.core.global_manifest.externals.push(External {
+            name: "node".into(),
+            version: "24.11.0".into(),
+        });
+        let h = with_env.hdr().unwrap();
+        assert_eq!(
+            h.global_env
+                .iter()
+                .map(|e| e.key.as_str())
+                .collect::<Vec<_>>(),
+            ["NODE_OPTIONS", "TZ"]
+        );
+        assert_eq!(h.global_externals, with_env.core.global_manifest.externals);
+        assert_eq!(
+            h.global_manifest().root(),
+            with_env.core.global_manifest.root()
+        );
+        let back = Hdr::decode(&h.encode().unwrap()).unwrap();
+        assert_eq!(back, h);
+        let tables = tables_for(&with_env);
+        let stmt = with_env.to_v2(&[1; 32], &[2; 32], &tables, "e").unwrap();
+        let v2 = ResolvedPredicate::v2(&stmt, &with_env.core.input_root, &back, &tables).unwrap();
+        assert_eq!(
+            v2.global_manifest().root(),
+            with_env.core.global_manifest.root()
+        );
     }
 
     #[test]

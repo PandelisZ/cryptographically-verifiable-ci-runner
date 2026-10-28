@@ -606,6 +606,83 @@ fn read_strings(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<String>, D
     Ok(out)
 }
 
+/// A sorted distinct list of `(name, version)` pairs (a tables object's
+/// externals, a hdr's global externals): `uv n`, then per pair the name
+/// prefix-coded and the version as a string.
+fn put_externals(
+    out: &mut Vec<u8>,
+    what: &'static str,
+    items: &[External],
+) -> Result<(), EncodeError> {
+    if !strictly_increasing(items) {
+        return Err(EncodeError::Unsorted(what));
+    }
+    put_uv(out, items.len() as u64);
+    let mut pw = PrefixWriter::default();
+    for x in items {
+        pw.write(out, &x.name);
+        put_str(out, &x.version);
+    }
+    Ok(())
+}
+
+fn read_externals(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<External>, DecodeError> {
+    let n = r.count(what, 3)?;
+    let mut out: Vec<External> = Vec::with_capacity(n);
+    let mut pr = PrefixReader::default();
+    for _ in 0..n {
+        let name = pr.read(r, what)?;
+        let version = r.str(what)?.to_owned();
+        let x = External { name, version };
+        if out.last().is_some_and(|p| *p >= x) {
+            return Err(DecodeError::Unsorted(what));
+        }
+        out.push(x);
+    }
+    Ok(out)
+}
+
+/// A list of env entries sorted and distinct by key (a hdr's global env):
+/// `uv n`, then per entry the key prefix-coded and the 32-byte hash
+/// ([`ABSENT_HASH`]'s zeros for an unset variable).
+fn put_env(out: &mut Vec<u8>, what: &'static str, items: &[EnvEntry]) -> Result<(), EncodeError> {
+    if !items.windows(2).all(|w| w[0].key < w[1].key) {
+        return Err(EncodeError::Unsorted(what));
+    }
+    put_uv(out, items.len() as u64);
+    let mut pw = PrefixWriter::default();
+    for e in items {
+        if !valid_env_key(&e.key) {
+            return Err(EncodeError::EnvKey(e.key.clone()));
+        }
+        pw.write(out, &e.key);
+        let hash = parse_hex32(&e.hash).ok_or_else(|| EncodeError::Hash {
+            path: format!("env:{}", e.key),
+            hash: e.hash.clone(),
+        })?;
+        out.extend_from_slice(&hash);
+    }
+    Ok(())
+}
+
+fn read_env(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<EnvEntry>, DecodeError> {
+    let n = r.count(what, 34)?;
+    let mut out: Vec<EnvEntry> = Vec::with_capacity(n);
+    let mut pr = PrefixReader::default();
+    for _ in 0..n {
+        let key = pr.read(r, what)?;
+        if !valid_env_key(&key) {
+            return Err(DecodeError::EnvKey(key));
+        }
+        if out.last().is_some_and(|p| p.key >= key) {
+            return Err(DecodeError::Unsorted(what));
+        }
+        let hash = hex32(&r.hash(what)?);
+        out.push(EnvEntry { key, hash });
+    }
+    Ok(out)
+}
+
 /// The delta coding of a sorted index list (rule 3): `uv n`, then the first
 /// index, then each next index as `previous + 1 + delta`.
 fn put_indices(out: &mut Vec<u8>, indices: &[usize]) {
@@ -704,9 +781,17 @@ pub struct Hdr {
     pub env_config_digest: [u8; 32],
     pub global_input_root: [u8; 32],
     /// The global manifest's entries, sorted and distinct ([`InputEntry`]'s
-    /// order); its `root()` must equal `global_input_root`, which the plan
-    /// checks per hdr.
+    /// order); with the externals and env below, its `root()` must equal
+    /// `global_input_root`, which the plan checks per hdr.
     pub global_manifest: Vec<InputEntry>,
+    /// The global manifest's externals, sorted and distinct (none today;
+    /// carried so that the hdr is the whole global manifest).
+    pub global_externals: Vec<External>,
+    /// The global manifest's env entries, sorted and distinct by key (the
+    /// adapter's global env keys: `NODE_OPTIONS` for Vitest and node-test,
+    /// `vci-cli`'s `global_env_keys`), each hash 32 bytes ([`ABSENT_HASH`]
+    /// for an unset variable).
+    pub global_env: Vec<EnvEntry>,
     /// `ignoredInputs`, in the predicate's order.
     pub ignored_inputs: Vec<String>,
     /// `envSet`, in the predicate's order.
@@ -737,8 +822,8 @@ impl Hdr {
     pub fn global_manifest(&self) -> InputManifest {
         InputManifest {
             entries: self.global_manifest.clone(),
-            externals: Vec::new(),
-            env: Vec::new(),
+            externals: self.global_externals.clone(),
+            env: self.global_env.clone(),
         }
     }
 
@@ -758,6 +843,12 @@ impl Hdr {
         out.extend_from_slice(&self.env_config_digest);
         out.extend_from_slice(&self.global_input_root);
         put_entries(&mut out, "global manifest entries", &self.global_manifest)?;
+        put_externals(
+            &mut out,
+            "global manifest externals",
+            &self.global_externals,
+        )?;
+        put_env(&mut out, "global manifest env", &self.global_env)?;
         for list in [&self.ignored_inputs, &self.env_set] {
             put_uv(&mut out, list.len() as u64);
             for s in list {
@@ -792,6 +883,8 @@ impl Hdr {
         h.env_config_digest = r.hash("envConfigDigest")?;
         h.global_input_root = r.hash("globalInputRoot")?;
         h.global_manifest = read_entries(&mut r, "global manifest entries")?;
+        h.global_externals = read_externals(&mut r, "global manifest externals")?;
+        h.global_env = read_env(&mut r, "global manifest env")?;
         for (what, list) in [
             ("ignoredInputs", &mut h.ignored_inputs),
             ("envSet", &mut h.env_set),
@@ -842,9 +935,6 @@ impl Tables {
         if !strictly_increasing(&self.waivers) {
             return Err(EncodeError::Unsorted("waiver table"));
         }
-        if !strictly_increasing(&self.externals) {
-            return Err(EncodeError::Unsorted("externals table"));
-        }
         if let Some(k) = self.env_names.iter().find(|k| !valid_env_key(k)) {
             return Err(EncodeError::EnvKey(k.clone()));
         }
@@ -854,12 +944,7 @@ impl Tables {
             put_str(&mut out, w);
         }
         put_strings(&mut out, "env names", &self.env_names)?;
-        put_uv(&mut out, self.externals.len() as u64);
-        let mut pw = PrefixWriter::default();
-        for x in &self.externals {
-            pw.write(&mut out, &x.name);
-            put_str(&mut out, &x.version);
-        }
+        put_externals(&mut out, "externals table", &self.externals)?;
         encoded(ObjectKind::Tables, out)
     }
 
@@ -880,18 +965,7 @@ impl Tables {
         if let Some(k) = env_names.iter().find(|k| !valid_env_key(k)) {
             return Err(DecodeError::EnvKey(k.clone()));
         }
-        let n = r.count("externals table", 3)?;
-        let mut externals: Vec<External> = Vec::with_capacity(n);
-        let mut pr = PrefixReader::default();
-        for _ in 0..n {
-            let name = pr.read(&mut r, "externals table")?;
-            let version = r.str("externals table")?.to_owned();
-            let x = External { name, version };
-            if externals.last().is_some_and(|p| *p >= x) {
-                return Err(DecodeError::Unsorted("externals table"));
-            }
-            externals.push(x);
-        }
+        let externals = read_externals(&mut r, "externals table")?;
         r.finish()?;
         Ok(Tables {
             waivers,
@@ -1947,6 +2021,20 @@ mod tests {
                 entry("target", EntryKind::Excluded, false, 0, &excluded_hash()),
                 entry("vendor", EntryKind::Dir, false, 0, &dir_type_hash()),
             ],
+            global_externals: vec![External {
+                name: "node".into(),
+                version: "24.11.0".into(),
+            }],
+            global_env: vec![
+                EnvEntry {
+                    key: "NODE_OPTIONS".into(),
+                    hash: h(5),
+                },
+                EnvEntry {
+                    key: "NODE_PATH".into(),
+                    hash: ABSENT_HASH.into(),
+                },
+            ],
             ignored_inputs: vec!["log/**".into(), "tmp/**".into()],
             env_set: vec!["TZ".into(), "LANG".into()],
             toolchain: Toolchain {
@@ -1980,9 +2068,17 @@ mod tests {
         other.toolchain.ruby_gems.push("zeitwerk==2.7.0".into());
         assert_ne!(object_id(&other.encode().unwrap()), object_id(&b));
         assert_eq!(back.global_manifest().entries, hdr.global_manifest);
+        assert_eq!(back.global_manifest().externals, hdr.global_externals);
+        assert_eq!(back.global_manifest().env, hdr.global_env);
+        assert_eq!(back.global_manifest().root(), hdr.global_manifest().root());
         // The constant hashes come back although they were not stored.
         assert_eq!(back.global_manifest[2].hash, ABSENT_HASH);
         assert_eq!(back.global_manifest[3].hash, excluded_hash());
+        assert_eq!(back.global_env[1].hash, ABSENT_HASH);
+        // The global env moves the id: a hdr is the whole global manifest.
+        let mut other = hdr.clone();
+        other.global_env[0].hash = h(6);
+        assert_ne!(object_id(&other.encode().unwrap()), object_id(&b));
         // Five global entries and a Rails toolchain: well under a kilobyte
         // (the real Rails hdr is 4.5 KB for 25 entries and 300 gems).
         assert!(b.len() < 1024, "{}", b.len());
@@ -2068,6 +2164,78 @@ mod tests {
         let mut hdr = sample_hdr();
         hdr.global_manifest[2].hash = h(9); // an absent entry with a hash
         assert!(matches!(hdr.encode(), Err(EncodeError::Hash { .. })));
+        // The global externals and env: sorted and distinct, valid keys,
+        // 32-byte hashes.
+        let mut hdr = sample_hdr();
+        hdr.global_externals.push(hdr.global_externals[0].clone());
+        assert_eq!(
+            hdr.encode(),
+            Err(EncodeError::Unsorted("global manifest externals"))
+        );
+        let mut hdr = sample_hdr();
+        hdr.global_env.swap(0, 1);
+        assert_eq!(
+            hdr.encode(),
+            Err(EncodeError::Unsorted("global manifest env"))
+        );
+        let mut hdr = sample_hdr();
+        hdr.global_env[1].key = hdr.global_env[0].key.clone();
+        assert_eq!(
+            hdr.encode(),
+            Err(EncodeError::Unsorted("global manifest env"))
+        );
+        let mut hdr = sample_hdr();
+        hdr.global_env[0].key = "NODE=OPTIONS".into();
+        assert_eq!(
+            hdr.encode(),
+            Err(EncodeError::EnvKey("NODE=OPTIONS".into()))
+        );
+        let mut hdr = sample_hdr();
+        hdr.global_env[0].hash = "zz".into();
+        assert!(matches!(hdr.encode(), Err(EncodeError::Hash { .. })));
+        // In bytes: a global env whose keys are not strictly increasing, or
+        // whose key is not an env name, is refused.
+        let good = sample_hdr().encode().unwrap();
+        let mut unsorted = sample_hdr();
+        unsorted.global_env = vec![
+            EnvEntry {
+                key: "B".into(),
+                hash: h(1),
+            },
+            EnvEntry {
+                key: "A".into(),
+                hash: h(1),
+            },
+        ];
+        let mut out = start(ObjectKind::Hdr, 64);
+        for _ in 0..7 {
+            put_str(&mut out, "");
+        }
+        out.extend_from_slice(&[0; 64]);
+        put_uv(&mut out, 0); // entries
+        put_uv(&mut out, 0); // externals
+        put_uv(&mut out, 2); // env
+        let mut pw = PrefixWriter::default();
+        for e in &unsorted.global_env {
+            pw.write(&mut out, &e.key);
+            out.extend_from_slice(&[1; 32]);
+        }
+        assert_eq!(
+            Hdr::decode(&out),
+            Err(DecodeError::Unsorted("global manifest env"))
+        );
+        let mut out = start(ObjectKind::Hdr, 64);
+        for _ in 0..7 {
+            put_str(&mut out, "");
+        }
+        out.extend_from_slice(&[0; 64]);
+        put_uv(&mut out, 0);
+        put_uv(&mut out, 0);
+        put_uv(&mut out, 1);
+        PrefixWriter::default().write(&mut out, "A=B");
+        out.extend_from_slice(&[1; 32]);
+        assert_eq!(Hdr::decode(&out), Err(DecodeError::EnvKey("A=B".into())));
+        assert_eq!(Hdr::decode(&good).unwrap(), sample_hdr());
         // In bytes: the same entry twice is not strictly increasing.
         let mut hdr = sample_hdr();
         hdr.global_manifest = vec![
