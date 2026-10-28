@@ -2998,7 +2998,7 @@ pub fn run_units(
                             label,
                             test_id: p.core.test_id.clone(),
                             input_root: p.core.input_root.clone(),
-                            storage_key: storage_key(p),
+                            storage_key: storage_key(&vci_core::ResolvedPredicate::v1(p)),
                             hint: crate::util::parse_rfc3339(&p.core.issued_at).ok().map(
                                 |issued| KeyHint {
                                     issued,
