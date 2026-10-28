@@ -32,8 +32,14 @@ Built and in use (vci 2.8.0):
   (section 7), `vci store info` exists, and none of `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` reaches a
   child process.
 - **The plan reads the candidates it set aside** even when a round fetched nothing (section 5).
-- **The conformance suite** (section 14): its 34 scenarios, run against git-meta, SQLite, PostgreSQL and libSQL (in
+- **The conformance suite** (section 14): its 42 scenarios, run against git-meta, SQLite, PostgreSQL and libSQL (in
   each of its three modes) from each backend's `tests/conformance.rs`.
+- **The trait's format-3 side** (2.9, STORE-V2 M2): the object methods (`get_objects`, `put_objects`,
+  `remove_objects`, `orphan_objects`, `prune_state_objects`), `Prefetch::Objects`, the listing `Columns` carried by a
+  put and answered by `columns`, `decode_record` over both formats, the batch order (objects, manifests, records,
+  removals) and the objects scenarios c35 to c42 (section 2, "Format-3 records", section 4, "Objects and columns",
+  section 6, section 14). Every object method has a default that returns `Unsupported`, so a backend is on format 3
+  once it sets `Caps::objects` (and `Caps::columns`) and overrides them; which backends have is in their sections.
 - **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14), the temporary libSQL server
   (`vci_store_libsql::testkit`, section 18) and the CI jobs that run all of the above (`store-stock-git`,
   `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`; the libSQL server is the
@@ -153,6 +159,42 @@ Manifests are content-addressed, written once, and shared by every attestation, 
 `vci_core::InputManifest::compact_base(bytes)` names the base without decoding the rest. `vci_store::decode_manifest`
 resolves it through the store.
 
+### Format-3 records, their columns and objects (vci 2.9, STORE-V2)
+
+From vci 2.9 an attestation's value may be a **text frame** instead of an envelope JSON, under the same key, target
+and slot:
+
+```
+value:   "vci3" LF <the signed statement bytes> LF base64(signature frame) LF base64(descriptor)
+columns: format, commit, platform, state, duration_ms, expires, hdr, tables, shape, state_obj   (nullable; the SQL stores)
+objects: id (64 hex, BLAKE3 of the bytes) -> kind (1 hdr, 2 tables, 3 shape, 4 state), put_at, bytes
+```
+
+- A value's **first byte** says its format: `{` is a format-1 envelope, `v` a format-3 frame. `vci_store::decode_record`
+  tells them apart and every reader goes through it; a frame is decoded under the rules of STORE-V2 section 1.6 and
+  bounded at 1 MiB (`vci_attest::MAX_RECORD`); an envelope is parsed exactly as before. The frame is UTF-8 without NUL,
+  so rule 3 stands and a frame travels through git-meta's string values and the libSQL text literal unchanged.
+- A frame's manifest is its **descriptor**, inside the record, which indexes into per-run **objects**: `hdr` (shared
+  by every run at the same toolchain and global inputs), `tables` (the waiver table, env names and externals of a
+  run's header group), `shape` (the paths and kinds of every unit of the run) and `state` (the attested sizes and
+  hashes, read only by `vci explain`). The statement names the hdr and the tables by id, the descriptor names the
+  shape; the state object is in no signed field (STORE-V2 section 4). `key::record_object_refs` reads those three ids
+  from a value, as `envelope_manifest_ref` reads a format-1 value's `manifestRef`; a frame's `ManifestRef` is `Inline`
+  (it names no stored manifest), so manifest collection goes on while both formats coexist.
+- Objects are **binary** (`vo`, a kind byte, a version, the body; the state object holds raw 32-byte hashes). SQLite
+  and PostgreSQL store them in a BLOB/BYTEA column; git-meta and libSQL store `object_to_base64` of the bytes in a
+  string value (keys `vci:object:<kind>:<id>` on git-meta, `key::object_key`) and decode on read, so `get_objects`
+  answers the same bytes on every backend and the reader recomputes the id of each. Puts are idempotent by id. An
+  object outlives its last referrer by a grace period (`OBJECT_GRACE`, one hour), and a state object is deleted after
+  `[store] explain_hashes_days` even while referenced.
+- The **columns** (`Columns`) are what the writer copies out of the statement it signed: the format, the commit, the
+  platform (`<os>-<arch>` from the hdr's toolchain), the result state and duration, the expiry, and the four object
+  ids. They pre-filter which old records supersession and prune read, give `last_durations` its numbers without a
+  value read, and let the orphan queries find an object's referrers. They are store data: supersession and prune
+  confirm them against the signed statement before a delete, and no verdict reads them. git-meta keeps none (its
+  hint is the key); the SQL stores keep them as nullable columns, `NULL` on a format-1 row. A backend says what it
+  keeps with `Caps::objects` and `Caps::columns`.
+
 ### Hints
 
 - **Memo**: `(tree16, test key) -> attestation key`, meaning "this attestation passed on that tree".
@@ -167,7 +209,9 @@ Both are best effort. They only order reads or start work early, and nothing abo
    everywhere also lets a copy between backends (a later `vci store copy`) move records unchanged.
 2. **Foreign keys are ignored, not errors.** A key that `parse_key` rejects never appears in a listing or a count.
 3. **UTF-8 only.** `put` and `put_manifest` reject other bytes, so any record can be copied into git-meta, which
-   stores strings.
+   stores strings. A format-3 frame is UTF-8 by construction. Objects (2.9) are the one binary value: a backend
+   that stores strings files them as base64 (`object_to_base64`) and decodes on read, so `get_objects` answers the
+   same bytes everywhere.
 4. **Bytewise order.** A unit's listing is sorted by key. `list_all` is sorted by (target, key). `manifest_roots`
    is sorted and deduplicated. SQLite's default `BINARY` collation is bytewise. PostgreSQL needs `COLLATE "C"`,
    because a linguistic collation such as en_US ignores `:`, `.` and `-` at its first level and would reorder hinted
@@ -205,7 +249,13 @@ that is correct for a backend whose values are always present and whose writes a
 | | `remove_manifests(&[&str]) -> usize` | yes | | orphan GC, prune |
 | | `put_for_test(test_id, signer, sk, hint, bytes)` | | `put(NewAttestation::for_test(..))` | run |
 | | `batch() -> WriteBatch` | | `WriteBatch::none()` | run's store loop |
-| prefetch | `prefetch(Prefetch)` | | no-op | plan, run, verify, prune |
+| objects (2.9) | `get_objects(&[&str]) -> Vec<StoredObject>` | | `Unsupported` | plan (hdr, tables and shape objects, then state objects), explain, verify |
+| | `put_objects(&[NewObject]) -> usize` | | `Unsupported` | run (the run's four objects, before its records) |
+| | `remove_objects(&[&str]) -> usize` (the orphan rule, one hour of grace) | | `Unsupported` | run after supersession, prune |
+| | `orphan_objects() -> Vec<String>` | | `Unsupported` | prune |
+| | `prune_state_objects(Duration) -> usize` | | `Unsupported` | prune, run's orphan pass |
+| columns (2.9) | `columns(&[&StoredEnvelope]) -> Vec<Columns>` | | every field `None` | supersession, last durations, prune |
+| prefetch | `prefetch(Prefetch)` (`Units`, `Manifests`, `Attestations`, `Objects`) | | no-op | plan, run, verify, prune |
 | | `warm()` | | no-op | plan start |
 | hints | `passing_on`, `remember_passing`, `flag`, `set_flag` | | keep nothing | plan |
 | reporting | `timing_report() -> Vec<String>` | | none | run |
@@ -234,6 +284,13 @@ Supporting types:
   `vci run` refuses only the units named there; `finish` (and every other caller) still treats any loss as the whole
   batch's.
 - `StoreError` (non-exhaustive).
+- Format 3 (2.9): `Columns` (a plain struct of `Option` fields, built as `Columns { format: Some(3),
+  ..Columns::default() }`; the default is "none"), carried by `NewAttestation::columns`
+  (`with_columns`) and answered by `columns`; `StoredObject` and `NewObject` (`validate` computes the id); `Record`
+  and `decode_record` with `RecordError`; `ObjectRefs` and `key::record_object_refs`; `key::object_key`,
+  `parse_object_key`, `check_object_id` and `OBJECT_PREFIX`; `object_kind`, `object_to_base64` and
+  `object_from_base64`; `OBJECT_GRACE` and `MAX_OBJECTS_ANSWER`. `Caps::objects` and `Caps::columns` say what a
+  backend keeps.
 - `FailedStore`, which stands in for a store that could not be selected or opened.
 - `BackendFactory`, `OpenContext`, `MissingBackend` and `open()`, the registry. A new backend is a new crate plus one
   registration line in vci-cli's `store::factories`.
@@ -356,9 +413,13 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
 4. Identical bytes under the same key are a no-op: no write, no timestamp, no log entry.
 5. Outside a deferred batch, the write is durable and visible to this store's later reads when the call returns.
    With `Caps::shared_writes`, it is visible to every reader.
-6. **Manifest first.** The caller stores the referenced manifest before the attestation (run.rs does). A backend
-   keeps that order visible, so no reader sees an attestation without its manifest. In a deferred batch, `finish`
-   writes manifests first.
+6. **Manifest and objects first.** The caller stores the referenced manifest, and for a format-3 record the objects
+   its statement and descriptor name (`put_objects`), before the attestation (run.rs does). A backend keeps that
+   order visible, so no reader sees an attestation without its manifest or its objects. In a deferred batch, `finish`
+   writes objects, then manifests, first.
+7. **Columns** (2.9). `NewAttestation::columns` is kept with the record where `Caps::columns` and given back by
+   `columns`; elsewhere it is ignored. `validate` checks its object ids (`what` = `object id`) before anything is
+   written.
 
 - **Returns** `NewAttestation::stored(key)`: `bytes` set, `issued` and `tree` from the key.
 - **Fail open**: the run refuses that unit ("signing or storing failed: …"), and the test result stands. The exit
@@ -411,6 +472,49 @@ Every stored manifest root, sorted and deduplicated, with no values read. Used b
 - `vci prune` passes one root per call and prints `removed project vci:manifest:<root> (unreferenced manifest)` for
   each root it asked to remove, whatever the count returned. That is exact for git-meta; see section 21 for stores
   that keep roots.
+
+### Objects and columns (format 3, vci 2.9)
+
+Every method here has a default: the five object methods return `StoreError::Unsupported` (`"format-3 objects"`)
+after validating their arguments, and `columns` answers `Columns::default()` per entry. A backend that keeps
+objects sets `Caps::objects` (and `Caps::columns` when it keeps the columns) and overrides them all; until then a
+writer stays on format 1 and the objects scenarios of the conformance suite skip. The contracts, as the trait docs
+state them:
+
+- **`get_objects(ids) -> Vec<StoredObject>`**: the objects stored under these ids, in the order asked, **leaving
+  out** the ids the store does not hold (the caller matches by id; a missing object fails the candidates naming it)
+  and answering a repeated id once. `bytes` are the object itself, base64-decoded on a text backend (a text that does
+  not decode is left out too), so `vci_core::object_id(&bytes)` is the id on every backend and the reader recomputes
+  it. Every id is validated first (`check_object_id`, `what` = `object id`). An answer that would pass
+  `MAX_OBJECTS_ANSWER` (64 MiB) is refused as `Invalid` (`what` = `objects`) before it is allocated. A lazy store
+  answers from what it holds here: `prefetch(Prefetch::Objects { ids })` first. Cost: one round trip for tens of ids.
+- **`put_objects(objects) -> usize`**: each under the BLAKE3 of its bytes, **idempotent by id**: an id already stored
+  is not written again but its `put_at` is refreshed, so a concurrent writer's objects (queued before its records)
+  start their grace at its own put. `NewObject::validate` first (non-empty, within the kind's bound, headed by the
+  magic `vo` and the kind byte, `what` = `object`); nothing is written on failure. Returns how many were not stored
+  before (inside a deferred batch, possibly every one).
+- **`remove_objects(ids) -> usize`**: the **orphan rule**. An object goes only when no stored attestation references
+  it (its `hdr`, `tables`, `shape` or `state_obj` column; without columns, the ids its records' statements and
+  descriptors name, `key::record_object_refs`) and it was put more than `OBJECT_GRACE` (one hour) ago. Every id is
+  validated first. Returns how many were removed. A **state object on a store without columns** has no visible
+  referrer (its id is in no signed field), so such a store keeps it, counts it nowhere, and leaves it to
+  `prune_state_objects`. Removing an object still referenced only makes its units run. Inside a deferred batch a
+  backend may queue the removal after the batch's removals and apply the rule at `finish`, or apply it at once: the
+  batch's own objects are within their grace either way.
+- **`orphan_objects() -> Vec<String>`**: the ids `remove_objects` would remove now, sorted; state objects left out on
+  a store without columns. A store with columns reads no value; one without reads every value and answers empty
+  when any record's references are unknown (`ObjectRefs::Unknown`), as `orphan_manifests` does.
+- **`prune_state_objects(older_than) -> usize`**: every state object (kind 4) put more than `older_than` ago,
+  **whether or not a record references it** (`[store] explain_hashes_days`): the records stay valid and `vci explain`
+  prints the observed value without the attested hash. Other kinds are never touched. A backend with deletion
+  records for replicas (`gone` rows) writes one per removal.
+- **`columns(envs) -> Vec<Columns>`**: the listing columns of these listed records, one per entry in input order,
+  matched by key; `Columns::default()` for a record stored without them, a format-1 row, a key no longer stored, and
+  everything on a store without `Caps::columns`. Values are not read. Cost: one round trip whatever the length, or
+  the listing's own cache. A put without columns on a store that keeps them clears the slot's columns; a put of the
+  same bytes with other columns replaces them (the bytes being a no-op does not make the columns one).
+- **Fail open**: a plan whose `get_objects` fails runs the candidates that needed them; `vci run` warns on a failed
+  `remove_objects` or `prune_state_objects` as it does on a failed manifest collection; prune exits 2.
 
 ### Provided reads
 
@@ -601,6 +705,14 @@ been measured on one yet.
     fails `finish`.
   - Inside a deferred batch, `put` returns the entry it will store. An unhinted put first looks up the slot's existing
     key (one read). `vci run` always passes a hint.
+- **Format 3 (2.9), every backend**: a deferred batch's `finish` applies its writes **in this order**, atomically or
+  as transactions each cut between whole units: the object puts (`put_objects`), then the manifests, then the
+  attestations, then the removals with the deletion records a backend keeps for its replicas (`gone` rows), then any
+  `remove_objects` queued in the batch. So no reader, on the store or on a replica syncing it by `seq`, sees a
+  record whose objects or manifest are missing, or a unit with neither its old nor its new record. A `put_objects`
+  inside a deferred batch may count every object as new. The write model per 800-unit partition is 4 object puts,
+  N record puts, ~1.2 N removals and their `gone` rows (STORE-V2 section 2.1), flushed early at the backend's write
+  count and sent on libSQL as transactions bounded by bytes.
 
 **How `vci run` stores a project's units** (`StoreLoop` in run.rs):
 
@@ -1383,7 +1495,15 @@ What the scenarios can and cannot check through the trait:
 
 - **Branching.** Scenarios branch only on `Caps` and on `exchange().is_some()`.
 - **Optional hooks.** `World` hooks that return `None` or `false` skip that part of a scenario and say so on stderr:
-  `backing_exists`, `unreachable` with `secret`, `read_only`, `inject_raw`, `make_unreadable`, `failing_batches`.
+  `backing_exists`, `unreachable` with `secret`, `read_only`, `inject_raw`, `make_unreadable`, `failing_batches`,
+  and (2.9) `age_objects(i, ids, by)`, which moves peer `i`'s objects' `put_at` back by `by` behind the backend's
+  back, so that c37, c38 and c42 can cross the one-hour grace and the state TTL without waiting (`UPDATE objects SET
+  put_at = put_at - ?` on a SQL store).
+- **Objects (2.9).** c35 to c39 and c42 run only on a store whose `Caps::objects` is set and skip otherwise, after c35
+  has checked that every object method of such a store is `Unsupported`; c36's validation and c40's and c41's
+  format-3 records run everywhere (a store without `Caps::columns` answers none in c40 and skips its second half).
+  The fixtures are `conformance::scenarios::Run3` (a run's four objects built with vci-core's encoders, their ids, and
+  format-3 records with the columns a writer would copy from their statements) and `RunIds`.
 - **Environment.** The suite never sets environment variables (unsafe in Rust 2024, and racy). Each backend runs it
   in its own test binary.
 
@@ -1427,6 +1547,14 @@ whose base64 payload carries `predicate.manifestRef`.
 | c32 | concurrent_readers_and_writer | 16 threads of list_units, manifest and read_values while one writer puts and removes: no `Err`, no torn values |
 | c33 | key_and_target_parity | stored keys and targets equal `key::attestation_key_hinted` and `key::target_label` |
 | c34 | copy_keeps_keys_and_targets | `put(NewAttestation::copy_of(..))` into a second world keeps keys, targets and bytes |
+| c35 | objects_round_trip_and_idempotent_put | (2.9) a run's four objects read back byte for byte with their kinds and ids (the binary state object through a text backend's base64); a re-put stores nothing new; unknown ids left out, duplicates answered once; another peer reads them; without `Caps::objects` every object method is `Unsupported` |
+| c36 | objects_are_validated_and_bounded | `Invalid` object id (not 64 lowercase hex) and object (empty, over its kind's bound, not headed by `vo` and the kind byte); one bad object among good writes none; a put whose columns name a bad id writes nothing |
+| c37 | orphan_rule_keeps_referenced_and_recent_objects | via `age_objects`: nothing within the grace goes; past it only an unreferenced object; a put, identical bytes included, restarts the grace; without the record its objects are orphans, the state object excepted on a store without columns |
+| c38 | state_objects_expire_even_while_referenced | via `age_objects`: `prune_state_objects` removes an aged state object a record still references and no other kind; the record stays readable |
+| c39 | objects_are_visible_before_their_record | in a batch, a reader on another handle that sees the record gets its objects; after `finish` both are there, on another peer too |
+| c40 | columns_match_the_put | `columns` gives back what the put passed, in input order; none for a format-1 record, a put without them, a removed key, and everything without `Caps::columns`; a re-put without columns clears them, with others replaces them; a copy with `with_columns` keeps them |
+| c41 | mixed_formats_in_one_namespace | an envelope and a frame of one unit side by side: key order, byte-exact reads, `decode_record` tells them apart, the frame's `ManifestRef` is `Inline` so `orphan_manifests` goes on, `record_object_refs` names its objects; `count` sees both |
+| c42 | object_deletions_reach_peers | objects and a frame reach another peer (a replica, by `seq`), and so do the record's removal and, aged past the grace, the objects' (`gone` rows): the peer lists nothing, reads the stale entry as `GONE`, gets no object |
 
 Backends keep their own tests for what is theirs:
 

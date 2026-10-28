@@ -15,6 +15,19 @@
 //!   once per input root under `vci:manifest:<root>` ([`key::manifest_key`]).
 //!   It may list its entries on top of a *base* manifest stored the same way.
 //!
+//! From vci 2.9 (store format 3, STORE-V2) an attestation's value may
+//! instead be a **text frame** (first byte `v`, first line `vci3`): the
+//! signed statement bytes, the signature and a descriptor of the unit's
+//! inputs that indexes into per-run **objects** (`hdr`, `tables`, `shape`,
+//! `state`: binary, content-addressed by BLAKE3, [`StoredObject`]). A
+//! format-1 value starts with `{`; [`decode_record`] tells them apart, and
+//! a reader of either goes through it. A store that keeps objects says so
+//! with [`Caps::objects`]; one that also keeps the record's listing
+//! [`Columns`] (commit, platform, result, expiry and the object ids, copied
+//! by the writer from the statement it signed) says [`Caps::columns`].
+//! Until a backend keeps them, the object methods return
+//! [`StoreError::Unsupported`] and a writer stays on format 1.
+//!
 //! | backend    | crate                | where the records are                                         | [`Exchange`] |
 //! |------------|----------------------|---------------------------------------------------------------|--------------|
 //! | `git-meta` | `vci-git`            | `<git common dir>/git-meta.sqlite` (`.git/git-meta.sqlite`, shared by every worktree), published on `refs/meta/main` | yes: `vci fetch` / `vci push` |
@@ -82,6 +95,8 @@
 //! | [`status`] (`Ready`)                            | the store can be absent (no file, no schema) or versioned       |
 //! | hints: [`passing_on`], [`flag`] (keep nothing)  | the backend can keep two small tables                           |
 //! | [`exchange`] (`None`)                           | writes reach other machines only through a push and a fetch     |
+//! | objects: [`get_objects`], [`put_objects`], [`remove_objects`], [`orphan_objects`], [`prune_state_objects`] (`Unsupported`) | the backend keeps format-3 objects ([`Caps::objects`]) |
+//! | [`columns`] (none)                              | the backend keeps the listing columns ([`Caps::columns`])       |
 //!
 //! Then add a [`BackendFactory`] and register it in vci-cli's
 //! `store::factories` (one line, or a [`MissingBackend`] when its cargo
@@ -117,9 +132,11 @@
 //!    threads at once: the `--fetch` thread, the probe threads, the plan's
 //!    `VCI_JOBS` verifying threads, and the run's supersession workers.
 //!    Pools, per-thread connections and caches are the backend's business.
-//! 6. **Writes** are validated first, idempotent, UTF-8 only, and a put of
-//!    the same (unit, signer, storage key) replaces the earlier key
-//!    atomically ([`AttestationStore::put`]).
+//! 6. **Writes** are validated first, idempotent, UTF-8 only (a record or
+//!    a manifest; an object is binary, and a backend that stores strings
+//!    files it as base64, [`object_to_base64`]), and a put of the same
+//!    (unit, signer, storage key) replaces the earlier key atomically
+//!    ([`AttestationStore::put`]).
 //! 7. **Removal.** When [`AttestationStore::remove`] returns (or, inside a
 //!    deferred [`WriteBatch`], when the batch finishes), no later read of
 //!    this store returns the removed entries. Where the store has an
@@ -160,6 +177,12 @@
 //! [`passing_on`]: AttestationStore::passing_on
 //! [`flag`]: AttestationStore::flag
 //! [`exchange`]: AttestationStore::exchange
+//! [`get_objects`]: AttestationStore::get_objects
+//! [`put_objects`]: AttestationStore::put_objects
+//! [`remove_objects`]: AttestationStore::remove_objects
+//! [`orphan_objects`]: AttestationStore::orphan_objects
+//! [`prune_state_objects`]: AttestationStore::prune_state_objects
+//! [`columns`]: AttestationStore::columns
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -171,9 +194,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use key::{
-    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, attestation_key, attestation_key_hinted,
-    envelope_manifest_ref, manifest_key, parse_key, parse_key_hint, parse_manifest_key,
-    target_label, test_key,
+    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, OBJECT_PREFIX, ObjectRefs, attestation_key,
+    attestation_key_hinted, envelope_manifest_ref, manifest_key, object_key, parse_key,
+    parse_key_hint, parse_manifest_key, parse_object_key, record_object_refs, target_label,
+    test_key,
 };
 
 pub mod credential;
@@ -401,6 +425,251 @@ impl StoredManifest {
     }
 }
 
+// ---- format-3 records, their columns and objects (STORE-V2) --------------------
+
+/// The listing columns of a format-3 record (STORE-V2 section 2.1): what
+/// the writer copied out of the statement it signed, so that supersession,
+/// `last_durations` and `vci prune` can choose which records to read
+/// without reading values, and the orphan queries can find what an object
+/// is referenced by. The SQL backends keep them as nullable columns; git-meta
+/// keeps none. Every field is `None` on a store that keeps no columns, on a
+/// format-1 row, and on a record stored without them.
+///
+/// Columns are **store data**: they choose, order and pre-filter, and a
+/// writer who edits one costs a reader one value read at most, never a
+/// wrong deletion or a wrong skip. Supersession and prune confirm them
+/// against the signed statement before deleting, and no verdict reads
+/// them. Readers match them to a record by key
+/// ([`AttestationStore::columns`]).
+///
+/// Writers and tests build it with a struct literal over
+/// [`Columns::default`] (every field `None`), `Columns { format: Some(3),
+/// ..Columns::default() }`, so it has no private fields and is not
+/// `#[non_exhaustive]`; a column added later is a new `Option` field that
+/// such literals leave `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Columns {
+    /// The record's format: 1 (an envelope JSON) or 3 (a frame).
+    pub format: Option<u8>,
+    /// `predicate.commit`, the commit the unit was attested at.
+    pub commit: Option<String>,
+    /// `<os>-<arch>` from the hdr's toolchain.
+    pub platform: Option<String>,
+    /// `predicate.result.state` (`passed`, `failed`).
+    pub state: Option<String>,
+    /// `predicate.result.duration_ms`.
+    pub duration_ms: Option<u64>,
+    /// `predicate.expiresAt`, in seconds since the epoch.
+    pub expires: Option<i64>,
+    /// The hdr object the statement names ([`key::OBJECT_ID_LEN`] lowercase
+    /// hex).
+    pub hdr: Option<String>,
+    /// The tables object the statement names.
+    pub tables: Option<String>,
+    /// The shape object the record's descriptor names.
+    pub shape: Option<String>,
+    /// The run's state object. It is in no signed field (STORE-V2 section
+    /// 4), so only the writer can say it; a store that keeps no columns
+    /// cannot tell which state object a record uses.
+    pub state_obj: Option<String>,
+}
+
+impl Columns {
+    /// The object ids these columns reference, in the order hdr, tables,
+    /// shape, state, each where set.
+    pub fn object_ids(&self) -> impl Iterator<Item = &str> {
+        [&self.hdr, &self.tables, &self.shape, &self.state_obj]
+            .into_iter()
+            .filter_map(|c| c.as_deref())
+    }
+
+    /// Whether every field is `None`.
+    pub fn is_empty(&self) -> bool {
+        *self == Columns::default()
+    }
+
+    /// Check the object ids (`what` = `object id`) before anything is
+    /// written.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        for id in self.object_ids() {
+            key::check_object_id(id)?;
+        }
+        Ok(())
+    }
+}
+
+/// One object read back from a store ([`AttestationStore::get_objects`]):
+/// the bytes are the object itself (binary, whatever form the backend keeps
+/// them in), so that [`vci_core::object_id`] of them is `id` when the store
+/// is honest, which the reader checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    /// The id the store filed the object under, 64 lowercase hex.
+    pub id: String,
+    /// The kind the store filed the object under. Store data: the decoder
+    /// trusts the kind byte inside the bytes.
+    pub kind: vci_core::ObjectKind,
+    /// The object's bytes, decoded from base64 where the backend stores
+    /// text.
+    pub bytes: Vec<u8>,
+}
+
+/// One object to store ([`AttestationStore::put_objects`]). The id is
+/// computed from the bytes by the store, so a stored id is always the
+/// BLAKE3 of the bytes it files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewObject<'a> {
+    /// The object's kind, which must be the kind byte inside `bytes`.
+    pub kind: vci_core::ObjectKind,
+    /// The encoded object (`vo`, the kind byte, the version, the body).
+    pub bytes: &'a [u8],
+}
+
+impl<'a> NewObject<'a> {
+    /// An object of `kind` with these bytes.
+    pub fn new(kind: vci_core::ObjectKind, bytes: &'a [u8]) -> Self {
+        NewObject { kind, bytes }
+    }
+
+    /// Check the object before anything is written (`what` = `object`):
+    /// non-empty, at most [`vci_core::ObjectKind::max_bytes`] of its kind,
+    /// and headed by the object magic and this kind's byte, so that the
+    /// store's kind column cannot disagree with the hashed bytes. Returns
+    /// the id the object is stored under.
+    pub fn validate(&self) -> Result<String, StoreError> {
+        let b = self.bytes;
+        if b.is_empty() {
+            return Err(StoreError::invalid("object", "", "must not be empty"));
+        }
+        if b.len() > self.kind.max_bytes() {
+            return Err(StoreError::invalid(
+                "object",
+                &format!("{} bytes of kind {}", b.len(), self.kind),
+                "is over the bound of its kind",
+            ));
+        }
+        if b.len() < 4 || &b[..2] != OBJECT_MAGIC || b[2] != self.kind as u8 {
+            return Err(StoreError::invalid(
+                "object",
+                &format!("kind {}", self.kind),
+                "must start with the object magic and this kind's byte",
+            ));
+        }
+        Ok(vci_core::objects::hex32(&vci_core::object_id(b)))
+    }
+}
+
+/// The first two bytes of every object (`vci_core::objects`).
+const OBJECT_MAGIC: &[u8; 2] = b"vo";
+
+/// How long after its put an object is kept whatever references it, so that
+/// a concurrent writer's records, queued after their objects, never lose
+/// them to another run's orphan collection (STORE-V2 section 2.1).
+pub const OBJECT_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The most bytes one [`AttestationStore::get_objects`] answer may hold
+/// (STORE-V2 section 4): a backend stops and returns
+/// [`StoreError::Invalid`] (`what` = `objects`) past it instead of
+/// allocating more.
+pub const MAX_OBJECTS_ANSWER: usize = 64 << 20;
+
+/// The object kind a store's kind column or key segment names, or `None`
+/// for a value no kind has (a foreign row, skipped as rule 2 says).
+pub fn object_kind(byte: u8) -> Option<vci_core::ObjectKind> {
+    use vci_core::ObjectKind::*;
+    Some(match byte {
+        1 => Hdr,
+        2 => Tables,
+        3 => Shape,
+        4 => State,
+        _ => return None,
+    })
+}
+
+/// The base64 text a backend that stores strings (git-meta, libSQL) files an
+/// object as: RFC 4648 section 4, padded, no line breaks, so that the two
+/// text backends and `vci store copy` agree byte for byte.
+pub fn object_to_base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The object bytes behind [`object_to_base64`]'s text, or why the text is
+/// not that (the reader then treats the object as missing: its candidates
+/// fail, the unit runs).
+pub fn object_from_base64(text: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|e| format!("object base64: {e}"))
+}
+
+/// A stored record decoded by its first byte ([`decode_record`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Record {
+    /// Format 1: a DSSE envelope JSON (every record before vci 2.9, and the
+    /// records `[store] record_format = 1` writes), parsed as today's path
+    /// parses it. The caller keeps the bytes: verification and
+    /// `vci explain` use them as they are.
+    FormatOne(vci_attest::Envelope),
+    /// Format 3: the text frame of STORE-V2 section 1.2, decoded under its
+    /// rules ([`vci_attest::Frame::decode`]) and bounded at
+    /// [`vci_attest::MAX_RECORD`].
+    FormatThree(vci_attest::Frame),
+}
+
+/// Why a stored value is not a record ([`decode_record`]). A reader turns
+/// it into a failed `envelope` check: the unit runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordError {
+    /// The value is empty.
+    Empty,
+    /// The first byte is neither `{` (format 1) nor `v` (format 3).
+    FirstByte(u8),
+    /// A format-1 value that is not an envelope, with today's text
+    /// ([`vci_attest::VerifyError`]'s display).
+    Envelope(String),
+    /// A format-3 value that breaks a frame rule.
+    Frame(vci_attest::FrameError),
+}
+
+impl fmt::Display for RecordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RecordError::Empty => f.write_str("the record is empty"),
+            RecordError::FirstByte(b) => write!(
+                f,
+                "the record starts with byte {b:#04x}, not '{{' (an envelope) or 'v' (a frame)"
+            ),
+            RecordError::Envelope(e) => f.write_str(e),
+            RecordError::Frame(e) => write!(f, "frame: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RecordError {}
+
+/// Decode a stored value as the record it is, by its first byte: `{` is a
+/// format-1 envelope JSON, parsed exactly as before vci 2.9
+/// ([`vci_attest::Envelope::from_json`], unbounded as it always was); `v` is
+/// a format-3 frame, decoded under the rules of STORE-V2 section 1.6 and
+/// bounded at [`vci_attest::MAX_RECORD`] (a `vci3z` first line is refused
+/// too). Every reader of values in this crate and in vci-cli goes through
+/// it, so that the two formats are told apart in one place. The bytes carry
+/// no trust: the caller verifies the signature and recomputes every digest.
+pub fn decode_record(bytes: &[u8]) -> Result<Record, RecordError> {
+    match bytes.first() {
+        None => Err(RecordError::Empty),
+        Some(b'{') => vci_attest::Envelope::from_json(bytes)
+            .map(Record::FormatOne)
+            .map_err(|e| RecordError::Envelope(e.to_string())),
+        Some(b'v') => vci_attest::Frame::decode(bytes)
+            .map(Record::FormatThree)
+            .map_err(RecordError::Frame),
+        Some(&b) => Err(RecordError::FirstByte(b)),
+    }
+}
+
 /// One attestation to store ([`AttestationStore::put`]).
 ///
 /// It carries the unit's target label and test key rather than its test id,
@@ -422,12 +691,19 @@ pub struct NewAttestation<'a> {
     /// same (test key, signer, storage key), or uses the plain key when
     /// there is none.
     pub hint: Option<&'a KeyHint>,
-    /// The DSSE envelope: non-empty UTF-8.
+    /// The record: a DSSE envelope JSON (format 1) or a text frame (format
+    /// 3), non-empty UTF-8 either way.
     pub envelope: &'a [u8],
+    /// The listing columns the writer copied from the statement it signed
+    /// (STORE-V2 section 2.1), for a format-3 record. `None` stores the
+    /// record without columns (a format-1 record, or a copy from a store
+    /// that keeps none); a backend that keeps no columns ignores them.
+    pub columns: Option<&'a Columns>,
 }
 
 impl<'a> NewAttestation<'a> {
-    /// The record `vci run` stores for a test unit.
+    /// The record `vci run` stores for a test unit, without columns
+    /// ([`NewAttestation::with_columns`] adds them).
     pub fn for_test(
         test_id: &str,
         signer: &'a str,
@@ -442,13 +718,16 @@ impl<'a> NewAttestation<'a> {
             storage_key,
             hint,
             envelope,
+            columns: None,
         }
     }
 
     /// The same record again, for a copy between stores. Pass
     /// `key::parse_key_hint(&record.key).as_ref()` as `hint` so the copy
-    /// keeps its key. `record` must have been read
-    /// ([`ValueState::Read`]).
+    /// keeps its key, and chain [`NewAttestation::with_columns`] with the
+    /// source's [`AttestationStore::columns`] answer so a format-3 record
+    /// keeps its state object reference, which the record itself does not
+    /// carry. `record` must have been read ([`ValueState::Read`]).
     pub fn copy_of(record: &'a StoredEnvelope, hint: Option<&'a KeyHint>) -> Self {
         NewAttestation {
             target: record.target.clone(),
@@ -457,13 +736,20 @@ impl<'a> NewAttestation<'a> {
             storage_key: &record.storage_key,
             hint,
             envelope: &record.bytes,
+            columns: None,
         }
+    }
+
+    /// This record with these listing columns.
+    pub fn with_columns(mut self, columns: &'a Columns) -> Self {
+        self.columns = Some(columns);
+        self
     }
 
     /// Check every argument before anything is written, with vci-git's
     /// `what` names and reasons: `signer_id`, `storage_key`, `test_key`,
-    /// `target`, `envelope`. Every backend calls this first. Returns the
-    /// envelope as text.
+    /// `target`, `envelope`, and `object id` for the columns. Every backend
+    /// calls this first. Returns the record as text.
     pub fn validate(&self) -> Result<&'a str, StoreError> {
         key::check_signer(self.signer)?;
         key::check_hex("storage_key", self.storage_key)?;
@@ -477,6 +763,9 @@ impl<'a> NewAttestation<'a> {
         }
         if self.envelope.is_empty() {
             return Err(StoreError::invalid("envelope", "", "must not be empty"));
+        }
+        if let Some(c) = self.columns {
+            c.validate()?;
         }
         key::check_utf8("envelope", self.envelope)
     }
@@ -639,16 +928,49 @@ pub struct Caps {
     /// the units those do not skip. Elsewhere it also reads each unit's
     /// newest few at once.
     pub remote_reads: bool,
+    /// The store keeps format-3 objects (STORE-V2 section 1.3):
+    /// [`AttestationStore::get_objects`], [`put_objects`],
+    /// [`remove_objects`], [`orphan_objects`] and [`prune_state_objects`]
+    /// are implemented. Otherwise their defaults return
+    /// [`StoreError::Unsupported`], a writer stays on format 1, and the
+    /// objects conformance scenarios skip.
+    ///
+    /// [`put_objects`]: AttestationStore::put_objects
+    /// [`remove_objects`]: AttestationStore::remove_objects
+    /// [`orphan_objects`]: AttestationStore::orphan_objects
+    /// [`prune_state_objects`]: AttestationStore::prune_state_objects
+    pub objects: bool,
+    /// The store keeps the listing columns a put passes ([`Columns`]) and
+    /// gives them back from [`AttestationStore::columns`]. The SQL stores
+    /// do; git-meta keeps none (its hint is the key). Without them the
+    /// orphan rule cannot see a record's state object, which is then kept
+    /// until [`AttestationStore::prune_state_objects`] (section 2.2).
+    pub columns: bool,
 }
 
 impl Caps {
-    /// A local store whose values are always present, keeping no hints.
+    /// A local store whose values are always present, keeping no hints, no
+    /// objects and no columns.
     pub const LOCAL: Caps = Caps {
         shared_writes: false,
         lazy_values: false,
         keeps_hints: false,
         remote_reads: false,
+        objects: false,
+        columns: false,
     };
+
+    /// These capabilities with [`Caps::objects`] set to `v`.
+    pub const fn with_objects(mut self, v: bool) -> Self {
+        self.objects = v;
+        self
+    }
+
+    /// These capabilities with [`Caps::columns`] set to `v`.
+    pub const fn with_columns(mut self, v: bool) -> Self {
+        self.columns = v;
+        self
+    }
 
     /// These capabilities with [`Caps::shared_writes`] set to `v`.
     pub const fn with_shared_writes(mut self, v: bool) -> Self {
@@ -709,6 +1031,14 @@ pub enum Prefetch<'a> {
     /// Every attestation's value (manifests excluded), before a full scan
     /// such as `vci prune`.
     Attestations,
+    /// These format-3 objects (STORE-V2 section 1.3), before
+    /// [`AttestationStore::get_objects`] reads them: a lazy store fetches
+    /// their blobs in one batch (git-meta), a network store loads them into
+    /// its cache in one request.
+    Objects {
+        /// The object ids, 64 lowercase hex each.
+        ids: &'a [&'a str],
+    },
 }
 
 impl fmt::Debug for Prefetch<'_> {
@@ -724,6 +1054,9 @@ impl fmt::Debug for Prefetch<'_> {
                 .field("roots", &roots.len())
                 .finish(),
             Prefetch::Attestations => f.write_str("Attestations"),
+            Prefetch::Objects { ids } => {
+                f.debug_struct("Objects").field("ids", &ids.len()).finish()
+            }
         }
     }
 }
@@ -1245,13 +1578,22 @@ pub trait AttestationStore: Send + Sync {
     ///   may leave several records, as an [`Exchange`] store may after a
     ///   merge. Readers tolerate them (every record is verified), and the
     ///   slot's next put collapses them.
-    /// * Identical bytes under the same key are a no-op.
+    /// * Identical bytes under the same key are a no-op (a store that keeps
+    ///   columns still stores the columns given).
     /// * Outside a deferred [`WriteBatch`], the write is durable and visible
     ///   to this store's later reads when the call returns (to every reader
     ///   when [`Caps::shared_writes`]).
     /// * The caller stores the referenced manifest first
-    ///   ([`AttestationStore::put_manifest`]); a backend keeps that order
-    ///   visible, so no reader sees an attestation before its manifest.
+    ///   ([`AttestationStore::put_manifest`]) and, for a format-3 record,
+    ///   the objects its statement and descriptor name first
+    ///   ([`AttestationStore::put_objects`]); a backend keeps that order
+    ///   visible, so no reader sees an attestation before its manifest or
+    ///   its objects.
+    /// * [`NewAttestation::columns`] are kept with the record where
+    ///   [`Caps::columns`], and given back by [`AttestationStore::columns`];
+    ///   elsewhere they are ignored. A put without columns on a store that
+    ///   keeps them clears the slot's columns (the record then reads as one
+    ///   without them).
     ///
     /// Returns the stored entry ([`NewAttestation::stored`]).
     ///
@@ -1293,6 +1635,138 @@ pub trait AttestationStore: Send + Sync {
     ///
     /// Used by: run.rs (orphans after supersession), `vci prune`.
     fn remove_manifests(&self, roots: &[&str]) -> Result<usize, StoreError>;
+
+    // ---- objects and columns (provided: Unsupported until a backend keeps them)
+
+    /// The format-3 objects stored under these ids (STORE-V2 section 1.3),
+    /// in the order asked, **leaving out** the ids the store does not hold
+    /// (the caller matches by id and fails the candidates naming a missing
+    /// one; duplicates are answered once). Each answer's `bytes` are the
+    /// object itself, base64-decoded on a backend that stores text
+    /// ([`object_from_base64`]; one whose text does not decode is left out
+    /// too), so that [`vci_core::object_id`] of them is its id on every
+    /// backend; the reader recomputes it and trusts nothing else. Every id
+    /// is validated first ([`key::check_object_id`], `what` = `object id`).
+    /// An answer that would pass [`MAX_OBJECTS_ANSWER`] is refused as
+    /// [`StoreError::Invalid`] (`what` = `objects`) before it is allocated.
+    /// Cost: one round trip for tens of ids (a plan names ~11 hdr and ~50
+    /// tables and shapes), or the cache [`Prefetch::Objects`] filled.
+    ///
+    /// Default: [`StoreError::Unsupported`] (`"format-3 objects"`), as every
+    /// method of this section while [`Caps::objects`] is false.
+    ///
+    /// Used by: plan.rs (the hdr, tables and shape objects of a round's
+    /// candidates, then the state objects of the entry-failing ones),
+    /// `vci explain`, `vci verify`, a copy between stores.
+    fn get_objects(&self, ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+        for id in ids {
+            key::check_object_id(id)?;
+        }
+        Err(self.objects_unsupported())
+    }
+
+    /// Store these objects, each under the BLAKE3 of its bytes, **idempotent
+    /// by id**: an id already stored is not written again, but its `put_at`
+    /// is refreshed, so that the grace period ([`OBJECT_GRACE`]) of a
+    /// concurrent writer's objects starts at its own put and another run's
+    /// orphan collection cannot take them in between. Every object is
+    /// validated first ([`NewObject::validate`]: non-empty, within its
+    /// kind's bound, headed by the object magic and the kind byte); nothing
+    /// is written on failure. A backend that stores text files
+    /// [`object_to_base64`] of the bytes. Returns how many were not stored
+    /// before (inside a deferred batch: possibly every one).
+    ///
+    /// Used by: run.rs (the run's hdr, tables, shape and state objects,
+    /// queued before the first record that names them), a copy between
+    /// stores.
+    fn put_objects(&self, objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
+        for o in objects {
+            o.validate()?;
+        }
+        Err(self.objects_unsupported())
+    }
+
+    /// Remove these objects **under the orphan rule**: an object is removed
+    /// only when no stored attestation references it (its `hdr`, `tables`,
+    /// `shape` or `state_obj` column, [`Columns`]; or, on a backend without
+    /// columns, the ids its records' statements and descriptors name,
+    /// [`key::record_object_refs`]) and it was put more than [`OBJECT_GRACE`]
+    /// ago, so that a concurrent writer whose records are queued behind its
+    /// objects never loses them. Every id is validated first. Returns how
+    /// many were removed. A state object (kind 4) is in no signed field, so
+    /// a backend without columns cannot see its referrers and keeps it
+    /// (never counts it): [`prune_state_objects`] is what removes it there.
+    /// Removing an object still referenced only makes its units run.
+    /// Inside a deferred batch a backend may queue the removal after the
+    /// batch's removals and apply the rule at `finish`, or apply it at once:
+    /// the batch's own objects are within their grace either way.
+    ///
+    /// Used by: run.rs after supersession (the superseded records' object
+    /// ids), `vci prune` (with [`orphan_objects`]).
+    ///
+    /// [`prune_state_objects`]: AttestationStore::prune_state_objects
+    /// [`orphan_objects`]: AttestationStore::orphan_objects
+    fn remove_objects(&self, ids: &[&str]) -> Result<usize, StoreError> {
+        for id in ids {
+            key::check_object_id(id)?;
+        }
+        Err(self.objects_unsupported())
+    }
+
+    /// The ids of every stored object [`remove_objects`] would remove now:
+    /// referenced by no stored attestation and older than [`OBJECT_GRACE`];
+    /// sorted, state objects left out on a backend without columns. Values
+    /// are not read on a backend with columns; one without them reads every
+    /// value, and answers empty when any record's references are unknown
+    /// ([`ObjectRefs::Unknown`]), as [`orphan_manifests`] does.
+    ///
+    /// Used by: `vci prune`, then [`remove_objects`].
+    ///
+    /// [`remove_objects`]: AttestationStore::remove_objects
+    /// [`orphan_manifests`]: AttestationStore::orphan_manifests
+    fn orphan_objects(&self) -> Result<Vec<String>, StoreError> {
+        Err(self.objects_unsupported())
+    }
+
+    /// Remove every state object (kind 4) put more than `older_than` ago,
+    /// **whether or not a record references it** (STORE-V2 section 1.3:
+    /// `[store] explain_hashes_days`, two days by default): the records
+    /// stay valid, and `vci explain` then prints the observed value without
+    /// the attested hash. Other kinds are never touched. Returns how many
+    /// were removed. Where the backend keeps deletion records for replicas
+    /// (`gone` rows), each removal gets one.
+    ///
+    /// Used by: `vci prune`, run.rs's orphan pass.
+    fn prune_state_objects(&self, older_than: std::time::Duration) -> Result<usize, StoreError> {
+        let _ = older_than;
+        Err(self.objects_unsupported())
+    }
+
+    /// The listing columns of these listed records ([`Columns`]), one per
+    /// entry in order, matched by key. [`Columns::default`] (every field
+    /// `None`) for a record stored without columns, a format-1 row, a key
+    /// the store no longer holds, and every record on a backend that keeps
+    /// none ([`Caps::columns`] false, the default here). Values are not
+    /// read. Cost: one round trip, whatever the length, or the listing's
+    /// own cache.
+    ///
+    /// Used by: run.rs supersession (which old records to read: commit and
+    /// platform pre-filter, confirmed against the signed statement before a
+    /// delete) and `last_durations` (`duration_ms`, `issued`), `vci prune`
+    /// (`expires` as a pre-filter, confirmed by a read), a copy between
+    /// stores.
+    fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
+        Ok(vec![Columns::default(); envs.len()])
+    }
+
+    /// The error every default of the objects section returns.
+    #[doc(hidden)]
+    fn objects_unsupported(&self) -> StoreError {
+        StoreError::Unsupported {
+            backend: self.kind(),
+            operation: "format-3 objects",
+        }
+    }
 
     // ---- reads (provided) ------------------------------------------------
 
@@ -1436,18 +1910,28 @@ pub trait AttestationStore: Send + Sync {
     /// writes through this store may share a session, a connection or a
     /// transaction. For a [`WriteBatch::deferred`] batch they become durable
     /// only at [`WriteBatch::finish`]: `put` returns the entry it will store,
-    /// `put_manifest` may report `true`, `remove` may return every entry it
-    /// was asked to remove, and reads made while the batch is open need not
-    /// see the batch's writes. `finish` applies them in order (manifests,
-    /// then attestations, then removals) and atomically, or fails. The
-    /// default groups nothing. Callers ignore an `Err` from `batch` itself
-    /// (they write without one) but never an `Err` from `finish`.
+    /// `put_manifest` may report `true`, `put_objects` may count every
+    /// object, `remove` may return every entry it was asked to remove, and
+    /// reads made while the batch is open need not see the batch's writes.
+    /// `finish` applies them **in this order**, atomically or as
+    /// transactions each cut between whole units, or fails: the objects
+    /// ([`AttestationStore::put_objects`]), then the manifests, then the
+    /// attestations, then the removals ([`AttestationStore::remove`]) with
+    /// the deletion records a backend keeps for its replicas (`gone` rows),
+    /// then any [`AttestationStore::remove_objects`] queued in it; so that
+    /// no reader, on this store or on a replica syncing it, sees a record
+    /// whose objects or manifest are missing, or a unit with neither its
+    /// old nor its new record. The default groups nothing. Callers ignore
+    /// an `Err` from `batch` itself (they write without one) but never an
+    /// `Err` from `finish`.
     ///
     /// Used by: run.rs. Every unit of a project is stored inside one batch,
-    /// finished right after that project's units. A deferred batch's units
-    /// are reported as attested only once it finishes `Ok`; if it fails,
-    /// each of them is refused. An immediate batch's units are reported as
-    /// each is stored, and a failure to finish it is a warning.
+    /// finished right after that project's units: the run's objects first,
+    /// then per unit its record and the removal of what it supersedes. A
+    /// deferred batch's units are reported as attested only once it
+    /// finishes `Ok`; if it fails, each of them is refused. An immediate
+    /// batch's units are reported as each is stored, and a failure to
+    /// finish it is a warning.
     fn batch(&self) -> Result<WriteBatch, StoreError> {
         Ok(WriteBatch::none())
     }
@@ -1690,6 +2174,24 @@ impl AttestationStore for FailedStore {
     fn remove_manifests(&self, _roots: &[&str]) -> Result<usize, StoreError> {
         Err(self.error())
     }
+    fn get_objects(&self, _ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+        Err(self.error())
+    }
+    fn put_objects(&self, _objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
+        Err(self.error())
+    }
+    fn remove_objects(&self, _ids: &[&str]) -> Result<usize, StoreError> {
+        Err(self.error())
+    }
+    fn orphan_objects(&self) -> Result<Vec<String>, StoreError> {
+        Err(self.error())
+    }
+    fn prune_state_objects(&self, _older_than: std::time::Duration) -> Result<usize, StoreError> {
+        Err(self.error())
+    }
+    fn columns(&self, _envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
+        Err(self.error())
+    }
     fn batch(&self) -> Result<WriteBatch, StoreError> {
         Err(self.error())
     }
@@ -1851,6 +2353,11 @@ pub mod key {
     pub const KEY_PREFIX: &str = "vci:attestation";
     /// Key namespace of the stored input manifests.
     pub const MANIFEST_PREFIX: &str = "vci:manifest";
+    /// Key namespace of the format-3 objects on a backend that files them
+    /// by key (git-meta: `vci:object:<kind>:<id>`, STORE-V2 section 2.2).
+    pub const OBJECT_PREFIX: &str = "vci:object";
+    /// Length of an object id: 32 bytes of BLAKE3 as lowercase hex.
+    pub const OBJECT_ID_LEN: usize = 64;
     /// Length of a signer id.
     pub const SIGNER_ID_LEN: usize = 16;
     /// Shortest hex id a key segment may hold (test key, storage key, root).
@@ -2034,24 +2541,119 @@ pub mod key {
         is_hex_id(root).then_some(root)
     }
 
-    /// Which stored manifest an envelope's (unverified) payload names.
+    /// Whether `s` is an object id: exactly 64 lowercase hex characters
+    /// (one spelling per id, so that it indexes as text and travels 1:1).
+    pub fn is_object_id(s: &str) -> bool {
+        s.len() == OBJECT_ID_LEN && lower_hex(s)
+    }
+
+    /// [`is_object_id`], as an error (`what` = `object id`).
+    pub fn check_object_id(s: &str) -> Result<(), StoreError> {
+        if s.len() != OBJECT_ID_LEN {
+            return Err(StoreError::invalid(
+                "object id",
+                s,
+                "must be exactly 64 characters",
+            ));
+        }
+        if !lower_hex(s) {
+            return Err(StoreError::invalid("object id", s, "must be lowercase hex"));
+        }
+        Ok(())
+    }
+
+    /// The key of the object with this kind and id on a backend that files
+    /// objects by key: `vci:object:<kind>:<id>`, the kind as its byte in
+    /// decimal (`1` hdr, `2` tables, `3` shape, `4` state).
+    pub fn object_key(kind: vci_core::ObjectKind, id: &str) -> String {
+        format!("{OBJECT_PREFIX}:{}:{id}", kind as u8)
+    }
+
+    /// The (kind, id) an object key names, if the key has vci's shape (a
+    /// kind byte no kind has makes it foreign: `None`).
+    pub fn parse_object_key(key: &str) -> Option<(vci_core::ObjectKind, &str)> {
+        let rest = key.strip_prefix(OBJECT_PREFIX)?.strip_prefix(':')?;
+        let (kind, id) = rest.split_once(':')?;
+        let kind = super::object_kind(kind.parse::<u8>().ok()?)?;
+        is_object_id(id).then_some((kind, id))
+    }
+
+    /// Which format-3 objects a stored record's (unverified) value names,
+    /// for a backend without columns that collects orphans by scanning
+    /// values ([`AttestationStore::orphan_objects`]).
+    ///
+    /// [`AttestationStore::orphan_objects`]: crate::AttestationStore::orphan_objects
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ObjectRefs {
+        /// A format-3 record: the hdr and tables ids its statement names
+        /// and the shape id its descriptor starts with, sorted and
+        /// distinct. The state object is in no field of the record.
+        Named(Vec<String>),
+        /// A format-1 record, which names no object.
+        FormatOne,
+        /// Unknown: the value is no record, or its statement or descriptor
+        /// does not parse. A garbage collector then keeps every object.
+        Unknown,
+    }
+
+    /// The object ids a stored record names ([`ObjectRefs`]): the
+    /// statement's `predicate.hdr` and `predicate.tables` and the
+    /// descriptor's shape id. A backend may record them at put time; they
+    /// decide only what to keep, never what to trust.
+    pub fn record_object_refs(bytes: &[u8]) -> ObjectRefs {
+        let frame = match super::decode_record(bytes) {
+            Ok(super::Record::FormatOne(_)) => return ObjectRefs::FormatOne,
+            Ok(super::Record::FormatThree(f)) => f,
+            Err(_) => return ObjectRefs::Unknown,
+        };
+        let Ok(st) = serde_json::from_slice::<serde_json::Value>(&frame.statement) else {
+            return ObjectRefs::Unknown;
+        };
+        let mut ids = Vec::with_capacity(3);
+        for field in ["hdr", "tables"] {
+            match st["predicate"][field].as_str() {
+                Some(id) if is_object_id(id) => ids.push(id.to_owned()),
+                _ => return ObjectRefs::Unknown,
+            }
+        }
+        match vci_core::Descriptor::shape_id(&frame.descriptor) {
+            Ok(shape) => ids.push(vci_core::objects::hex32(&shape)),
+            Err(_) => return ObjectRefs::Unknown,
+        }
+        ids.sort();
+        ids.dedup();
+        ObjectRefs::Named(ids)
+    }
+
+    /// Which stored manifest a record's (unverified) value names.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum ManifestRef {
         /// `predicate.manifestRef`, a hex input root.
         Root(String),
-        /// None: the manifest is inline (attestations made before vci 1.9.0).
+        /// None: the record names no stored manifest, because its manifest
+        /// is inline (attestations made before vci 1.9.0) or because it is
+        /// a format-3 record, whose descriptor is in the record and whose
+        /// objects are not manifests ([`record_object_refs`]).
         Inline,
         /// Unknown: the envelope, its payload or its predicate does not
-        /// parse, or `manifestRef` is not a hex id. A garbage collector then
-        /// keeps every manifest.
+        /// parse, `manifestRef` is not a hex id, or a format-3 value breaks
+        /// a frame rule. A garbage collector then keeps every manifest.
         Unknown,
     }
 
-    /// The `manifestRef` of a stored DSSE envelope's vci predicate. A backend
-    /// may store it in an indexed column at put time; it decides only what
-    /// to keep and prefetch, never what to trust.
+    /// The `manifestRef` of a stored DSSE envelope's vci predicate, or
+    /// [`ManifestRef::Inline`] for a well-formed format-3 frame (which
+    /// names none). A backend may store it in an indexed column at put
+    /// time; it decides only what to keep and prefetch, never what to
+    /// trust.
     pub fn envelope_manifest_ref(bytes: &[u8]) -> ManifestRef {
         use base64::Engine as _;
+        if vci_attest::is_frame(bytes) {
+            return match super::decode_record(bytes) {
+                Ok(_) => ManifestRef::Inline,
+                Err(_) => ManifestRef::Unknown,
+            };
+        }
         let Ok(env) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return ManifestRef::Unknown;
         };
@@ -4256,6 +4858,15 @@ pub mod conformance {
         fn failing_batches(&self) -> Option<Arc<dyn AttestationStore>> {
             None
         }
+        /// Make peer `i`'s objects `ids` look put `by` earlier, behind the
+        /// backend's back (`put_at` moved back), so that the objects
+        /// scenarios can cross the grace period
+        /// ([`OBJECT_GRACE`](crate::OBJECT_GRACE)) and the state TTL
+        /// without waiting. Returns whether it could.
+        fn age_objects(&self, i: usize, ids: &[&str], by: std::time::Duration) -> bool {
+            let _ = (i, ids, by);
+            false
+        }
     }
 
     /// Values shared by the scenarios. They match the git-meta tests'.
@@ -4309,6 +4920,11 @@ macro_rules! conformance_suite {
             c29_remove_manifests_keeps_referenced_and_recent, c30_failed_batch_reports_and_loses,
             c31_failed_store_fails_every_call, c32_concurrent_readers_and_writer,
             c33_key_and_target_parity, c34_copy_keeps_keys_and_targets,
+            c35_objects_round_trip_and_idempotent_put, c36_objects_are_validated_and_bounded,
+            c37_orphan_rule_keeps_referenced_and_recent_objects,
+            c38_state_objects_expire_even_while_referenced,
+            c39_objects_are_visible_before_their_record, c40_columns_match_the_put,
+            c41_mixed_formats_in_one_namespace, c42_object_deletions_reach_peers,
         );
     };
 }

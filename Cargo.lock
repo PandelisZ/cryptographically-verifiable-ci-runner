@@ -3675,6 +3675,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "vci-attest",
  "vci-core",
 ]
 
