@@ -37,10 +37,13 @@
 //!
 //! The sizes of every statement, signature frame, descriptor, record and
 //! object are collected and, when `VCI_PAIRS` names the 1,175-unit sample
-//! (`scratchpad/wr/pairs.json`), written as `replay-numbers.json` and
-//! compared with the design's size model (`design/final/numbers.json`),
-//! flagging any figure off by more than 10%. Without `VCI_PAIRS` the test
-//! over the real sample is skipped; the synthetic sample below runs always.
+//! (`scratchpad/wr/pairs.json`), printed and compared with the design's
+//! size model (`design/final/numbers.json` beside the sample, or
+//! `VCI_NUMBERS`), flagging any figure off by more than 10%; the figures
+//! and the comparison are written to the file `VCI_REPLAY_OUT` names
+//! (`design/final/replay-numbers.json` is kept that way) and nowhere
+//! otherwise. Without `VCI_PAIRS` the test over the real sample is
+//! skipped; the synthetic sample below runs always.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -475,11 +478,11 @@ fn assert_parity(
     assert_eq!(a.project_name(), b.project_name(), "{at}");
     assert_eq!(a.platform_specific(), b.platform_specific(), "{at}");
     assert_eq!(a.arch_specific(), b.arch_specific(), "{at}");
-    // v1 may repeat a waived string; the ids are sorted and distinct.
-    let mut waived_v1 = a.waived();
-    waived_v1.sort_unstable();
-    waived_v1.dedup();
-    assert_eq!(waived_v1, b.waived(), "{at}");
+    // v1 may repeat a waived string or list them unsorted; the ids are
+    // sorted and distinct, so the two versions meet on the canonical list
+    // (what the storage key is computed over, STORE-V2 section 1.1).
+    assert_eq!(a.waived_canonical(), b.waived(), "{at}");
+    assert_eq!(b.waived(), b.waived_canonical(), "{at}");
     assert_eq!(a.cfg_predicates(), b.cfg_predicates(), "{at}");
     assert_eq!(a.declared_inputs(), b.declared_inputs(), "{at}");
     assert_eq!(a.env_set(), b.env_set(), "{at}");
@@ -569,7 +572,10 @@ fn replay(units: &[Unit]) -> Value {
             "adapter": r.key.adapter,
             "units": r.units,
             "hdr_count": r.hdr.len(),
-            "hdr_bytes": r.hdr.iter().map(|h| h.bytes.len()).collect::<Vec<_>>(),
+            // The sorted distinct sizes, as `measure.py` lists them
+            // (`sorted({hdr_sizes[i] for i in hdr_ids})`), so that the
+            // comparison's per-run sum is over the same statistic.
+            "hdr_bytes": r.hdr.iter().map(|h| h.bytes.len()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>(),
             "tables_count": r.tables.len(),
             "tables_bytes": r.tables.iter().map(|t| t.1).collect::<Vec<_>>(),
             "shape_bytes": r.shape_bytes,
@@ -1299,14 +1305,9 @@ fn the_real_sample_replays() {
         .parent()
         .and_then(Path::parent)
         .map(|p| p.join("design").join("final"));
-    let out = std::env::var_os("VCI_REPLAY_OUT")
-        .map(PathBuf::from)
-        .or_else(|| {
-            final_dir
-                .clone()
-                .filter(|d| d.is_dir())
-                .map(|d| d.join("replay-numbers.json"))
-        });
+    // Written only where `VCI_REPLAY_OUT` says: a test does not write
+    // outside the target directory on its own.
+    let out = std::env::var_os("VCI_REPLAY_OUT").map(PathBuf::from);
     if let Some(out) = &out {
         std::fs::write(out, serde_json::to_string_pretty(&figures).unwrap())
             .expect("write replay-numbers.json");

@@ -1857,6 +1857,239 @@ fn from_observed_reproduces_the_root_for_every_kind() {
     assert_ne!(back.root(), m.root());
 }
 
+/// STORE-V2 section 1.6 (end) and section 6 M1: the ten store-side
+/// mutations the security review's harness ran
+/// (`design/review-security-v2/attack-output.txt`, unit #896), here on a
+/// run of two units over `every_kind_repo` whose objects go through
+/// `Run::build`, the encoders and the decoders, and whose descriptor is
+/// resolved and observed at HEAD through the `CheckoutCache`. Each
+/// mutation of the decoded shape, tables or descriptor either fails a
+/// decoder rule or gives an observed manifest whose `root()` is not the
+/// signed one. A file's kind and exec bit come from HEAD, never from the
+/// shape's label, so the exec mutation is run with the change at HEAD it
+/// would hide (and shown to change nothing without it).
+#[test]
+fn the_security_harness_mutations_each_move_the_root_or_fail_a_decoder_rule() {
+    let (r, obs) = every_kind_repo();
+    let env = env_of(&[("TZ", "UTC")]);
+    let m = every_kind_manifest(&r, &obs, &env);
+    let signed = m.root();
+    // Another unit of the run, reading a file this one does not.
+    let other = capture(&r.root, &[read("src/b.rb")]);
+    let waived: Vec<String> = vec![];
+    let units = [
+        UnitInputs {
+            header: 0,
+            group: None,
+            manifest: &m,
+            waived: &waived,
+        },
+        UnitInputs {
+            header: 0,
+            group: None,
+            manifest: &other,
+            waived: &waived,
+        },
+    ];
+    let run = Run::build(&units).unwrap();
+    let shape = Shape::decode(&run.shape.bytes).unwrap();
+    let tables = Tables::decode(&run.tables[0].bytes).unwrap();
+    let d = Descriptor::decode(&run.units[0].descriptor.encode(&tables).unwrap(), &tables).unwrap();
+    assert_eq!(d.group, None);
+    let cache = CheckoutCache::new(&r.root);
+
+    // The plan's path over store objects: every object through its encoder
+    // and decoder (so a mutation the decoders refuse stops here), the
+    // descriptor resolved, the set observed at HEAD, the root compared.
+    let root_of = |shape: &Shape,
+                   tables: &Tables,
+                   d: &Descriptor,
+                   cache: &CheckoutCache|
+     -> Result<String, DecodeError> {
+        let shape = Shape::decode(&shape.encode().unwrap())?;
+        let tables = Tables::decode(&tables.encode().unwrap())?;
+        let d = Descriptor::decode(&d.encode(&tables).unwrap(), &tables)?;
+        let resolved = d.resolve(&shape, &tables)?;
+        let observed = InputManifest::observe(&resolved.set, cache, &[]).unwrap();
+        Ok(
+            InputManifest::from_observed(&resolved.set, observed, resolved.externals, resolved.env)
+                .unwrap()
+                .root(),
+        )
+    };
+    assert_eq!(root_of(&shape, &tables, &d, &cache).unwrap(), signed);
+    let index = |path: &str, kind: EntryKind| {
+        shape
+            .entries
+            .iter()
+            .position(|e| e.path.as_str() == path && e.kind == kind)
+            .unwrap_or_else(|| panic!("{path} {kind:?} in the shape"))
+    };
+    let a_rb = index("src/a.rb", EntryKind::File);
+    let b_rb = index("src/b.rb", EntryKind::File);
+    assert!(d.own.contains(&a_rb) && !d.own.contains(&b_rb));
+    // A shape row added at its sorted place, referenced by the descriptor.
+    let with_row = |shape: &Shape, d: &Descriptor, e: ShapeEntry| -> (Shape, Descriptor) {
+        let mut s = shape.clone();
+        let pos = s.entries.partition_point(|x| *x < e);
+        s.entries.insert(pos, e);
+        let mut x = d.clone();
+        x.own = x
+            .own
+            .iter()
+            .map(|&i| if i >= pos { i + 1 } else { i })
+            .collect();
+        x.own.push(pos);
+        x.own.sort_unstable();
+        (s, x)
+    };
+    let se = |path: &str, kind: EntryKind, exec: bool| ShapeEntry {
+        path: rp(path),
+        kind,
+        exec,
+    };
+
+    // 1. Shape kind relabel d -> t on a listed directory: observed type-only.
+    let mut s = shape.clone();
+    s.entries[index("build", EntryKind::DirListing)].kind = EntryKind::Dir;
+    assert_ne!(
+        root_of(&s, &tables, &d, &cache).unwrap(),
+        signed,
+        "kind relabel"
+    );
+
+    // 2. Descriptor index swapped to another unit's path of the same kind.
+    let mut x = d.clone();
+    x.own = x
+        .own
+        .iter()
+        .map(|&i| if i == a_rb { b_rb } else { i })
+        .collect();
+    x.own.sort_unstable();
+    assert_ne!(
+        root_of(&shape, &tables, &x, &cache).unwrap(),
+        signed,
+        "index swap"
+    );
+
+    // 3. An own entry omitted.
+    let mut x = d.clone();
+    x.own.retain(|&i| i != a_rb);
+    assert_ne!(
+        root_of(&shape, &tables, &x, &cache).unwrap(),
+        signed,
+        "omitted entry"
+    );
+
+    // 4. An env (idx, hash) override changed (TZ is the set name).
+    let tz = tables.env_names.iter().position(|k| k == "TZ").unwrap();
+    assert_eq!(d.env_values.len(), 1);
+    assert_eq!(d.env_values[0].0, tz);
+    let mut x = d.clone();
+    x.env_values[0].1 = [7; 32];
+    assert_ne!(
+        root_of(&shape, &tables, &x, &cache).unwrap(),
+        signed,
+        "env override changed"
+    );
+
+    // 5. An env bitmap bit cleared: a read name dropped (HOME, unset) moves
+    // the root; the set name's bit cleared with its override kept is a
+    // decoder rule (section 1.6 rule 4), at decode and at resolve.
+    let home = tables.env_names.iter().position(|k| k == "HOME").unwrap();
+    let mut x = d.clone();
+    x.env_read.retain(|&i| i != home);
+    assert_ne!(
+        root_of(&shape, &tables, &x, &cache).unwrap(),
+        signed,
+        "env bit cleared"
+    );
+    let mut x = d.clone();
+    x.env_read.retain(|&i| i != tz);
+    let bytes = x.encode(&tables).unwrap();
+    assert_eq!(
+        Descriptor::decode(&bytes, &tables),
+        Err(DecodeError::EnvOverride("the name's bitmap bit is clear"))
+    );
+    assert_eq!(
+        x.resolve(&shape, &tables),
+        Err(DecodeError::EnvOverride("the name's bitmap bit is clear"))
+    );
+
+    // 6. An externals pair changed in the tables, and the bit cleared.
+    let mut t = tables.clone();
+    t.externals[0].version = "8.1.4".into();
+    assert_ne!(
+        root_of(&shape, &t, &d, &cache).unwrap(),
+        signed,
+        "externals pair changed"
+    );
+    let mut x = d.clone();
+    x.externals.clear();
+    assert_ne!(
+        root_of(&shape, &tables, &x, &cache).unwrap(),
+        signed,
+        "externals bit cleared"
+    );
+
+    // 7. An x row added under a listed d: the listing is observed without
+    // the child and the exclusion itself is an entry.
+    let (s, x) = with_row(&shape, &d, se("build/keep.txt", EntryKind::Excluded, false));
+    assert_ne!(
+        root_of(&s, &tables, &x, &cache).unwrap(),
+        signed,
+        "x under a d"
+    );
+
+    // 8. The exec bit: the observer reports HEAD's mode, so the shape's bit
+    // alone changes nothing on an unchanged file, and the change at HEAD
+    // it would hide moves the root whatever the shape says.
+    #[cfg(unix)]
+    {
+        let mut s = shape.clone();
+        let run_i = index("bin/run", EntryKind::File);
+        assert!(s.entries[run_i].exec);
+        s.entries[run_i].exec = false;
+        assert_eq!(root_of(&s, &tables, &d, &cache).unwrap(), signed);
+        r.chmod("bin/run", 0o644);
+        let changed = CheckoutCache::new(&r.root);
+        assert_ne!(
+            root_of(&s, &tables, &d, &changed).unwrap(),
+            signed,
+            "exec bit flipped"
+        );
+        assert_ne!(root_of(&shape, &tables, &d, &changed).unwrap(), signed);
+        r.chmod("bin/run", 0o755);
+        assert_eq!(
+            root_of(&shape, &tables, &d, &CheckoutCache::new(&r.root)).unwrap(),
+            signed
+        );
+    }
+
+    // 9. Section confusion: an entry named "externals" with the externals
+    // cleared is an absent entry and an empty list, both in the root.
+    let (s, mut x) = with_row(&shape, &d, se("externals", EntryKind::Absent, false));
+    x.externals.clear();
+    assert_ne!(
+        root_of(&s, &tables, &x, &cache).unwrap(),
+        signed,
+        "section confusion"
+    );
+
+    // 10. The same path twice through two shape rows (f, 0) and (f, 1), both
+    // referenced: two observed entries of one file. An equal row twice is
+    // refused by the encoder here and by the decoder in
+    // tests/adversarial.rs (shape_entries_duplicated_or_out_of_order).
+    let (s, x) = with_row(&shape, &d, se("src/a.rb", EntryKind::File, true));
+    assert_ne!(
+        root_of(&s, &tables, &x, &cache).unwrap(),
+        signed,
+        "duplicate rows"
+    );
+    let (s, _) = with_row(&shape, &d, se("src/a.rb", EntryKind::File, false));
+    assert_eq!(s.encode(), Err(EncodeError::Unsorted("shape entries")));
+}
+
 /// The observation must follow the set it was made from, one entry per
 /// element in order; anything else is a caller's error, never a manifest
 /// whose root could match.

@@ -24,7 +24,7 @@ pub use objects::{
 pub use path::{PathError, RepoPath};
 pub use predicate::{
     Context, PREDICATE_TYPE, PREDICATE_TYPE_V2, PRIVILEGES_DIFF, PYTHON_LIBS_DIFF, Predicate,
-    PredicateError, RUBY_LIBS_DIFF, ResolvedPredicate, TestResult, Toolchain, VciPredicate,
+    PredicateError, RUBY_LIBS_DIFF, ResolvedPredicate, TestResult, Toolchain, V2View, VciPredicate,
     VciPredicateV2, sorted_compact_json, test_key,
 };
 

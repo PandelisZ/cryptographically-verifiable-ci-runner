@@ -580,13 +580,27 @@ fn check_waived_ids(ids: &[u16], len: usize) -> Result<(), PredicateError> {
 #[derive(Debug, Clone, Copy)]
 pub enum ResolvedPredicate<'a> {
     V1(&'a VciPredicate),
-    V2 {
-        statement: &'a VciPredicateV2,
-        /// The subject's digest (v2 carries the input root nowhere else).
-        input_root: &'a str,
-        hdr: &'a Hdr,
-        tables: &'a Tables,
-    },
+    V2(V2View<'a>),
+}
+
+/// A v2 statement with the decoded objects it names, made only by
+/// [`ResolvedPredicate::v2`] (the fields are private), so that a view
+/// whose waived ids were never checked against the waiver table cannot
+/// exist:
+///
+/// ```compile_fail
+/// use vci_core::{Hdr, ResolvedPredicate, Tables, VciPredicateV2};
+/// fn make<'a>(s: &'a VciPredicateV2, h: &'a Hdr, t: &'a Tables) -> ResolvedPredicate<'a> {
+///     ResolvedPredicate::V2(vci_core::V2View { statement: s, input_root: "", hdr: h, tables: t })
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct V2View<'a> {
+    statement: &'a VciPredicateV2,
+    /// The subject's digest (v2 carries the input root nowhere else).
+    input_root: &'a str,
+    hdr: &'a Hdr,
+    tables: &'a Tables,
 }
 
 impl<'a> ResolvedPredicate<'a> {
@@ -604,82 +618,82 @@ impl<'a> ResolvedPredicate<'a> {
         tables: &'a Tables,
     ) -> Result<Self, PredicateError> {
         check_waived_ids(&statement.waived, tables.waivers.len())?;
-        Ok(ResolvedPredicate::V2 {
+        Ok(ResolvedPredicate::V2(V2View {
             statement,
             input_root,
             hdr,
             tables,
-        })
+        }))
     }
 
     /// 1 or 2.
     pub fn version(&self) -> u8 {
         match self {
             ResolvedPredicate::V1(_) => 1,
-            ResolvedPredicate::V2 { .. } => 2,
+            ResolvedPredicate::V2(_) => 2,
         }
     }
 
     pub fn tool_version(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.tool_version,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.tool_version,
+            ResolvedPredicate::V2(v) => &v.hdr.tool_version,
         }
     }
 
     pub fn adapter(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.adapter,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.adapter,
+            ResolvedPredicate::V2(v) => &v.hdr.adapter,
         }
     }
 
     pub fn test_id(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.test_id,
-            ResolvedPredicate::V2 { statement, .. } => &statement.test_id,
+            ResolvedPredicate::V2(v) => &v.statement.test_id,
         }
     }
 
     pub fn argv(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.core.argv,
-            ResolvedPredicate::V2 { statement, .. } => &statement.argv,
+            ResolvedPredicate::V2(v) => &v.statement.argv,
         }
     }
 
     pub fn repo_id(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.repo_id,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.repo_id,
+            ResolvedPredicate::V2(v) => &v.hdr.repo_id,
         }
     }
 
     pub fn commit(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.commit,
-            ResolvedPredicate::V2 { statement, .. } => &statement.commit,
+            ResolvedPredicate::V2(v) => &v.statement.commit,
         }
     }
 
     pub fn tree_dirty(&self) -> bool {
         match self {
             ResolvedPredicate::V1(p) => p.core.tree_dirty,
-            ResolvedPredicate::V2 { statement, .. } => statement.tree_dirty,
+            ResolvedPredicate::V2(v) => v.statement.tree_dirty,
         }
     }
 
     pub fn tree(&self) -> Option<&'a str> {
         match self {
             ResolvedPredicate::V1(p) => p.core.tree.as_deref(),
-            ResolvedPredicate::V2 { statement, .. } => statement.tree.as_deref(),
+            ResolvedPredicate::V2(v) => v.statement.tree.as_deref(),
         }
     }
 
     pub fn toolchain(&self) -> &'a Toolchain {
         match self {
             ResolvedPredicate::V1(p) => &p.core.toolchain,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.toolchain,
+            ResolvedPredicate::V2(v) => &v.hdr.toolchain,
         }
     }
 
@@ -687,7 +701,7 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn global_input_root(&self) -> Cow<'a, str> {
         match self {
             ResolvedPredicate::V1(p) => Cow::Borrowed(&p.core.global_input_root),
-            ResolvedPredicate::V2 { hdr, .. } => Cow::Owned(hex32(&hdr.global_input_root)),
+            ResolvedPredicate::V2(v) => Cow::Owned(hex32(&v.hdr.global_input_root)),
         }
     }
 
@@ -695,7 +709,7 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn input_root(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.input_root,
-            ResolvedPredicate::V2 { input_root, .. } => input_root,
+            ResolvedPredicate::V2(v) => v.input_root,
         }
     }
 
@@ -704,35 +718,35 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn global_manifest(&self) -> Cow<'a, InputManifest> {
         match self {
             ResolvedPredicate::V1(p) => Cow::Borrowed(&p.core.global_manifest),
-            ResolvedPredicate::V2 { hdr, .. } => Cow::Owned(hdr.global_manifest()),
+            ResolvedPredicate::V2(v) => Cow::Owned(v.hdr.global_manifest()),
         }
     }
 
     pub fn result(&self) -> &'a TestResult {
         match self {
             ResolvedPredicate::V1(p) => &p.core.result,
-            ResolvedPredicate::V2 { statement, .. } => &statement.result,
+            ResolvedPredicate::V2(v) => &v.statement.result,
         }
     }
 
     pub fn tainted(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.core.tainted,
-            ResolvedPredicate::V2 { statement, .. } => &statement.tainted,
+            ResolvedPredicate::V2(v) => &v.statement.tainted,
         }
     }
 
     pub fn issued_at(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.issued_at,
-            ResolvedPredicate::V2 { statement, .. } => &statement.issued_at,
+            ResolvedPredicate::V2(v) => &v.statement.issued_at,
         }
     }
 
     pub fn expires_at(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.core.expires_at,
-            ResolvedPredicate::V2 { statement, .. } => &statement.expires_at,
+            ResolvedPredicate::V2(v) => &v.statement.expires_at,
         }
     }
 
@@ -740,42 +754,42 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn env_config_digest(&self) -> Cow<'a, str> {
         match self {
             ResolvedPredicate::V1(p) => Cow::Borrowed(&p.env_config_digest),
-            ResolvedPredicate::V2 { hdr, .. } => Cow::Owned(hex32(&hdr.env_config_digest)),
+            ResolvedPredicate::V2(v) => Cow::Owned(hex32(&v.hdr.env_config_digest)),
         }
     }
 
     pub fn project_dir(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.project_dir,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.project_dir,
+            ResolvedPredicate::V2(v) => &v.hdr.project_dir,
         }
     }
 
     pub fn runner_project(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.runner_project,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.runner_project,
+            ResolvedPredicate::V2(v) => &v.hdr.runner_project,
         }
     }
 
     pub fn project_name(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.project_name,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.project_name,
+            ResolvedPredicate::V2(v) => &v.hdr.project_name,
         }
     }
 
     pub fn platform_specific(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.platform_specific,
-            ResolvedPredicate::V2 { statement, .. } => &statement.platform_specific,
+            ResolvedPredicate::V2(v) => &v.statement.platform_specific,
         }
     }
 
     pub fn arch_specific(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.arch_specific,
-            ResolvedPredicate::V2 { statement, .. } => &statement.arch_specific,
+            ResolvedPredicate::V2(v) => &v.statement.arch_specific,
         }
     }
 
@@ -784,48 +798,61 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn waived(&self) -> Vec<&'a str> {
         match self {
             ResolvedPredicate::V1(p) => p.waived.iter().map(String::as_str).collect(),
-            ResolvedPredicate::V2 {
-                statement, tables, ..
-            } => statement
+            ResolvedPredicate::V2(v) => v
+                .statement
                 .waived
                 .iter()
-                .map(|&i| tables.waivers[usize::from(i)].as_str())
+                .map(|&i| v.tables.waivers[usize::from(i)].as_str())
                 .collect(),
         }
+    }
+
+    /// The waived strings sorted and distinct: the form a v2 statement
+    /// carries (its ids are sorted and distinct, so a v1 list's repeats and
+    /// order are not in it) and the one the storage key is computed over
+    /// for both versions (STORE-V2 section 1.1), so that a v1 and a v2
+    /// record of the same facts key the same slot. A v1 list that repeats
+    /// a string or is unsorted (most of the Rails sample) has another 2.8
+    /// key, which section 5.1 says.
+    pub fn waived_canonical(&self) -> Vec<&'a str> {
+        let mut w = self.waived();
+        w.sort_unstable();
+        w.dedup();
+        w
     }
 
     pub fn cfg_predicates(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.cfg_predicates,
-            ResolvedPredicate::V2 { statement, .. } => &statement.cfg_predicates,
+            ResolvedPredicate::V2(v) => &v.statement.cfg_predicates,
         }
     }
 
     pub fn declared_inputs(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.declared_inputs,
-            ResolvedPredicate::V2 { statement, .. } => &statement.declared_inputs,
+            ResolvedPredicate::V2(v) => &v.statement.declared_inputs,
         }
     }
 
     pub fn env_set(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.env_set,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.env_set,
+            ResolvedPredicate::V2(v) => &v.hdr.env_set,
         }
     }
 
     pub fn rails_inputs(&self) -> &'a str {
         match self {
             ResolvedPredicate::V1(p) => &p.rails_inputs,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.rails_inputs,
+            ResolvedPredicate::V2(v) => &v.hdr.rails_inputs,
         }
     }
 
     pub fn ignored_inputs(&self) -> &'a [String] {
         match self {
             ResolvedPredicate::V1(p) => &p.ignored_inputs,
-            ResolvedPredicate::V2 { hdr, .. } => &hdr.ignored_inputs,
+            ResolvedPredicate::V2(v) => &v.hdr.ignored_inputs,
         }
     }
 
@@ -833,7 +860,7 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn hdr_id(&self) -> Option<&'a str> {
         match self {
             ResolvedPredicate::V1(_) => None,
-            ResolvedPredicate::V2 { statement, .. } => Some(&statement.hdr),
+            ResolvedPredicate::V2(v) => Some(&v.statement.hdr),
         }
     }
 
@@ -841,7 +868,7 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn tables_id(&self) -> Option<&'a str> {
         match self {
             ResolvedPredicate::V1(_) => None,
-            ResolvedPredicate::V2 { statement, .. } => Some(&statement.tables),
+            ResolvedPredicate::V2(v) => Some(&v.statement.tables),
         }
     }
 
@@ -849,7 +876,7 @@ impl<'a> ResolvedPredicate<'a> {
     pub fn entries_root(&self) -> Option<&'a str> {
         match self {
             ResolvedPredicate::V1(_) => None,
-            ResolvedPredicate::V2 { statement, .. } => Some(&statement.entries_root),
+            ResolvedPredicate::V2(v) => Some(&v.statement.entries_root),
         }
     }
 }

@@ -1306,14 +1306,15 @@ impl Descriptor {
         for &i in &self.externals {
             externals.push(tables.externals[table("external", i, tables.externals.len())?].clone());
         }
+        // An extra the table holds is refused whether or not its bit is set
+        // (one encoding per externals list: a pair in the table is a bit).
+        for x in &self.extras {
+            if tables.externals.binary_search(x).is_ok() {
+                return Err(DecodeError::Extra(format!("{} {}", x.name, x.version)));
+            }
+        }
         externals.extend(self.extras.iter().cloned());
         externals.sort();
-        if let Some(w) = externals.windows(2).find(|w| w[0] == w[1]) {
-            return Err(DecodeError::Extra(format!(
-                "{} {}",
-                w[0].name, w[0].version
-            )));
-        }
         Ok(ResolvedManifest {
             set,
             externals,
@@ -2791,13 +2792,33 @@ mod tests {
             Descriptor::decode(&b, &t),
             Err(DecodeError::Unsorted("inline externals"))
         );
-        // An extra the table holds is the bitmap's job.
+        // An extra the table holds is the bitmap's job: refused when it is
+        // also selected by its bit (rails 8.1.3, bit 2) and when it is not
+        // (rack 3.2.8, bit 1 clear), so that one externals list has one
+        // encoding.
         let mut d = sample_descriptor();
         d.extras = vec![ext("rails", "8.1.3")];
         let d = Descriptor::decode(&d.encode(&t).unwrap(), &t).unwrap();
         assert_eq!(
             d.resolve(&sample_shape(), &t),
             Err(DecodeError::Extra("rails 8.1.3".into()))
+        );
+        let mut d = sample_descriptor();
+        d.externals = vec![0, 2];
+        d.extras = vec![ext("rack", "3.2.8")];
+        let d = Descriptor::decode(&d.encode(&t).unwrap(), &t).unwrap();
+        assert_eq!(
+            d.resolve(&sample_shape(), &t),
+            Err(DecodeError::Extra("rack 3.2.8".into()))
+        );
+        // The same list by its bits alone resolves.
+        let mut d = sample_descriptor();
+        d.externals = vec![0, 1, 2];
+        d.extras = vec![];
+        let d = Descriptor::decode(&d.encode(&t).unwrap(), &t).unwrap();
+        assert_eq!(
+            d.resolve(&sample_shape(), &t).unwrap().externals,
+            t.externals
         );
         let mut b = good.clone();
         b.push(0);
