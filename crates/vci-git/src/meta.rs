@@ -32,6 +32,19 @@
 //!   Content-addressed: written once, shared by every attestation, unit and
 //!   signer with that root, and trusted only when its recomputed root is
 //!   the root an attestation signed.
+//! * Format-3 objects (vci 2.9, STORE-V2 section 2.2: a run's `hdr`,
+//!   `tables`, `shape` and `state`): target `project`, key
+//!   `vci:object:<kind>:<id>` (the kind as its byte in decimal, the id the
+//!   BLAKE3 of the bytes), so the tree path is `vci/object/<kind>/<id>/
+//!   __value`; the value is the base64 text of the bytes
+//!   (`vci_store::object_to_base64`), since a git-meta string value is
+//!   UTF-8 and the state object holds raw hashes. A format-3 record is the
+//!   text frame of section 1.2, stored as any other attestation value. A
+//!   vci before 2.9 lists neither (its key prefix is `vci:attestation:`),
+//!   reads a frame as text that is not an envelope, and runs the unit.
+//!   The row's `last_timestamp` is when the object was last put or fetched
+//!   here: the orphan rule's grace period counts from it, and an idempotent
+//!   put moves it to now.
 //!
 //! Nothing here is trusted: keys and values are hints. `vci plan` verifies
 //! every envelope's signature against the base commit's `allowed_signers` and
@@ -105,6 +118,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use git_meta_lib::tree::format::{parse_path_parts, parse_tree};
 use git_meta_lib::tree::model::{Key, ParsedTree, Tombstone, TreeValue};
 use git_meta_lib::{MetaValue, Session, Target, TargetType};
+
+use vci_core::ObjectKind;
+use vci_store::ObjectRefs;
+use vci_store::key::{OBJECT_PREFIX, object_key, parse_object_key};
 
 use crate::GitError;
 use crate::cmd::{IDENTITY, command_error};
@@ -220,7 +237,7 @@ pub fn store_notes() -> Vec<String> {
     STORE_NOTES.lock().map(|n| n.clone()).unwrap_or_default()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -497,6 +514,29 @@ fn remove_key_sql(
     )?
     .execute(rusqlite::params![ty, value, key, email, timestamp])?;
     Ok(true)
+}
+
+/// Move the time of `key`'s last write on `target` to `timestamp` without
+/// changing its value: an idempotent put of a format-3 object restarts its
+/// grace period (STORE-V2 section 2.1). Whether the row existed.
+fn touch_sql(
+    db: &rusqlite::Connection,
+    target: &Target,
+    key: &str,
+    timestamp: i64,
+) -> rusqlite::Result<bool> {
+    let n = db
+        .prepare_cached(
+            "UPDATE metadata SET last_timestamp = ?4
+             WHERE target_type = ?1 AND target_value = ?2 AND key = ?3 AND last_timestamp < ?4",
+        )?
+        .execute(rusqlite::params![
+            target.target_type().as_str(),
+            target.value().unwrap_or(""),
+            key,
+            timestamp
+        ])?;
+    Ok(n > 0)
 }
 
 /// [`set_string_sql`] of a key git-meta accepts (its `validate_key`).
@@ -1126,6 +1166,105 @@ impl Reader {
         Ok(out)
     }
 
+    /// Every stored format-3 object (see the module docs), values not read:
+    /// its kind, its id, when it was last put or fetched here and whether
+    /// its value is fetched; sorted by kind, then id. A key of the object
+    /// prefix no kind has, or whose value is not a string, is foreign and
+    /// left out.
+    pub fn object_rows(&self) -> Result<Vec<ObjectRow>, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(Vec::new());
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let prefix = format!("{OBJECT_PREFIX}:");
+        let upper = format!("{OBJECT_PREFIX};");
+        let ty = TargetType::Project.as_str();
+        let mut stmt = db
+            .prepare(
+                "SELECT key, last_timestamp, is_promised FROM metadata
+                 WHERE target_type = ?1 AND target_value = '' AND key >= ?2 AND key < ?3
+                   AND value_type = 'string'",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let rows = stmt
+            .query_map(rusqlite::params![ty, prefix, upper], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })
+            .map_err(|e| sql_err(path, e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (key, put_at, promised) = r.map_err(|e| sql_err(path, e))?;
+            if let Some((kind, id)) = parse_object_key(&key) {
+                out.push(ObjectRow {
+                    kind,
+                    id: id.to_owned(),
+                    put_at,
+                    fetched: !promised,
+                });
+            }
+        }
+        out.sort_by(|a, b| (a.kind as u8, &a.id).cmp(&(b.kind as u8, &b.id)));
+        Ok(out)
+    }
+
+    /// The stored object of this kind and id, as stored (its base64 text):
+    /// `None` when the store has none, `Some(Err)` when its value cannot be
+    /// read (not fetched, a blob missing from the object database).
+    pub fn object(
+        &self,
+        kind: ObjectKind,
+        id: &str,
+    ) -> Result<Option<Result<Vec<u8>, String>>, GitError> {
+        let key = object_key(kind, id);
+        let ty = TargetType::Project.as_str().to_owned();
+        let rows = self.rows(
+            "SELECT target_type, target_value, key, value, value_type, is_git_ref, is_promised
+             FROM metadata WHERE target_type = ?1 AND target_value = '' AND key = ?2",
+            &[&ty, &key],
+        )?;
+        let Some(row) = rows.into_iter().find(|r| r.key == key) else {
+            return Ok(None);
+        };
+        if row.value_type != "string" {
+            return Ok(Some(Err(format!(
+                "a {} value, not a string",
+                row.value_type
+            ))));
+        }
+        Ok(Some(self.value_bytes(row)))
+    }
+
+    /// The stored objects among `ids` (each 64 lowercase hex, distinct), in
+    /// the order asked, leaving out the ids the store does not hold: the id,
+    /// the kind it is filed under (the lowest kind when a forged store files
+    /// one id under two), and its text as [`Reader::object`] reads it. One
+    /// listing of the object keys, then one lookup per object held.
+    pub fn objects(&self, ids: &[&str]) -> Result<Vec<ObjectText>, GitError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut kinds: BTreeMap<&str, ObjectKind> = BTreeMap::new();
+        for r in self.object_rows()? {
+            if let Some(id) = ids.iter().find(|i| **i == r.id) {
+                kinds.entry(id).or_insert(r.kind);
+            }
+        }
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(kind) = kinds.get(id) else {
+                continue;
+            };
+            if let Some(text) = self.object(*kind, id)? {
+                out.push(((*id).to_owned(), *kind, text));
+            }
+        }
+        Ok(out)
+    }
+
     /// Every stored attestation for `test_id`. Entries whose key does not
     /// have vci's shape or whose value is not a string are ignored; entries
     /// whose value cannot be read are returned with [`StoredEnvelope::error`]
@@ -1229,6 +1368,26 @@ impl Reader {
     }
 }
 
+/// One stored object as [`Reader::objects`] reads it: its id, the kind it is
+/// filed under, and its base64 text or why it cannot be read.
+pub type ObjectText = (String, ObjectKind, Result<Vec<u8>, String>);
+
+/// One stored format-3 object as [`Reader::object_rows`] lists it (value
+/// not read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRow {
+    /// The kind its key files it under.
+    pub kind: ObjectKind,
+    /// Its id, 64 lowercase hex.
+    pub id: String,
+    /// When it was last put or fetched here (git-meta's `last_timestamp`,
+    /// milliseconds since the epoch): the orphan rule's grace period and
+    /// the state TTL count from it.
+    pub put_at: i64,
+    /// Whether its value is here (a promised row's is not).
+    pub fetched: bool,
+}
+
 thread_local! {
     /// The queries [`Reader`]s ran on this thread ([`reader_queries`]).
     static READER_QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1268,6 +1427,9 @@ struct KeySnapshot {
     tombstone_blobs: BTreeMap<Key, String>,
     /// The blob of each stored input manifest, by input root.
     manifest_blobs: BTreeMap<String, String>,
+    /// The blob of each stored format-3 object, by key
+    /// (`vci:object:<kind>:<id>`).
+    object_blobs: BTreeMap<String, String>,
     /// Entries of a target git-meta reads that are neither a string value
     /// nor a whole-key deletion record (a set or list value, or a member
     /// deletion record), by path: only git-meta's own merge reads those.
@@ -2282,6 +2444,12 @@ impl<'a> AttestStore<'a> {
             validate::hex_id("input root", root)?;
             keys.push(manifest_key(root));
         }
+        self.remove_project_keys(keys)
+    }
+
+    /// Delete these keys of the `project` target in one session (tombstones,
+    /// which `push` publishes). Returns how many existed.
+    fn remove_project_keys(&self, keys: Vec<String>) -> Result<usize, GitError> {
         if keys.is_empty() {
             return Ok(0);
         }
@@ -2317,6 +2485,115 @@ impl<'a> AttestStore<'a> {
     /// How many attestations are stored (values not read).
     pub fn count(&self) -> Result<usize, GitError> {
         self.reader()?.count()
+    }
+
+    // ---- format-3 objects (vci 2.9) --------------------------------------
+
+    /// Store format-3 objects (see the module docs), each given as its kind,
+    /// its id (the BLAKE3 of its bytes, which the caller computed and
+    /// checked) and its base64 text, under `vci:object:<kind>:<id>` on the
+    /// `project` target. An object already stored with these bytes is not
+    /// written again, but its row's time of last write moves to now, so
+    /// that its grace period restarts (an orphan collection elsewhere cannot
+    /// take an object a run just put). Returns how many were not stored
+    /// before.
+    pub fn put_objects(&self, objects: &[(ObjectKind, String, String)]) -> Result<usize, GitError> {
+        if objects.is_empty() {
+            return Ok(0);
+        }
+        let project = Target::project();
+        let batched = self.in_batch(|db, session, written| {
+            let now = now_ms();
+            let mut new = 0;
+            for (kind, id, text) in objects {
+                let key = object_key(*kind, id);
+                if current_is(db, session, &project, &key, text)? {
+                    touch_sql(db, &project, &key, now).map_err(write_err)?;
+                } else {
+                    set_string(db, &project, &key, text, session.email(), now)?;
+                    written.push((project.clone(), key));
+                    new += 1;
+                }
+            }
+            Ok(new)
+        });
+        if let Some(r) = batched {
+            return r;
+        }
+        let session = self.write_session()?;
+        let handle = session.target(&project);
+        let mut stored = Vec::new();
+        let mut same = Vec::new();
+        for (kind, id, text) in objects {
+            let key = object_key(*kind, id);
+            let current = handle.get_value(&key).ok().flatten();
+            if current == Some(MetaValue::String(text.clone())) {
+                same.push(key);
+            } else {
+                handle.set(&key, text.as_str()).map_err(meta_err)?;
+                stored.push(key);
+            }
+        }
+        if !stored.is_empty() {
+            self.stamp_written(stored.iter().map(|k| (&project, k.as_str())))?;
+        }
+        if !same.is_empty() {
+            let Some((path, db)) = self.db_rw()? else {
+                return Err(GitError::Store(
+                    "the git-meta store is gone right after a write".to_owned(),
+                ));
+            };
+            let now = now_ms();
+            for key in &same {
+                touch_sql(&db, &project, key, now).map_err(|e| sql_err(&path, e))?;
+            }
+        }
+        Ok(stored.len())
+    }
+
+    /// Delete the stored objects with these keys (`vci:object:<kind>:<id>`,
+    /// as [`vci_store::key::object_key`] spells them) in one session
+    /// (tombstones, which `push` publishes). The caller applied the orphan
+    /// rule or the state TTL; nothing is checked here. Returns how many
+    /// existed.
+    pub fn remove_object_keys(&self, keys: Vec<String>) -> Result<usize, GitError> {
+        self.remove_project_keys(keys)
+    }
+
+    /// The ids of every format-3 object a stored attestation names (its
+    /// statement's hdr and tables and its descriptor's shape:
+    /// [`vci_store::key::record_object_refs`]), from every attestation's
+    /// value in one pass; `None` when one cannot be decided, because its
+    /// value cannot be read or is a record whose statement or descriptor
+    /// does not parse: it might name any object, so a collector then keeps
+    /// every object. A value not fetched yet is undecided too, unless
+    /// `fetched_only`: the merge's put-back reads only what this clone
+    /// relied on (a promised row is skipped, as for manifests), while the
+    /// orphan scan has fetched every attestation first and keeps every
+    /// object when one still is not here. A state object is in no signed
+    /// field and is never named.
+    pub fn referenced_objects(
+        &self,
+        fetched_only: bool,
+    ) -> Result<Option<BTreeSet<String>>, GitError> {
+        let mut out = BTreeSet::new();
+        for e in self.list(None)? {
+            if e.not_fetched() {
+                if fetched_only {
+                    continue;
+                }
+                return Ok(None);
+            }
+            if e.error.is_some() {
+                return Ok(None);
+            }
+            match vci_store::key::record_object_refs(&e.bytes) {
+                ObjectRefs::Named(ids) => out.extend(ids),
+                ObjectRefs::FormatOne => {}
+                ObjectRefs::Unknown => return Ok(None),
+            }
+        }
+        Ok(Some(out))
     }
 
     // ---- lazy values -----------------------------------------------------
@@ -2558,6 +2835,26 @@ impl<'a> AttestStore<'a> {
         let owned: BTreeSet<String> = roots.iter().map(|r| (*r).to_owned()).collect();
         out.add(self.hydrate_bases_with(&mut ctx, &remote, &owned)?);
         Ok(out)
+    }
+
+    /// Fetch the stored format-3 objects with these ids that were not
+    /// fetched yet, whatever their kind, in one `git fetch` of object ids
+    /// (see [`AttestStore::hydrate_units`]; the objects of a plan's
+    /// candidates are a few per run).
+    pub fn hydrate_objects<'s>(
+        &self,
+        ids: impl IntoIterator<Item = &'s str>,
+    ) -> Result<Hydration, GitError> {
+        let ids: BTreeSet<&str> = ids.into_iter().collect();
+        if ids.is_empty() || self.reader()?.promised()? == 0 {
+            return Ok(Hydration::default());
+        }
+        let _lock = self.exchange_lock()?;
+        let remote = self.value_remote()?;
+        self.hydrate_locked(&remote, |k| {
+            k.target_type == TargetType::Project
+                && parse_object_key(&k.key).is_some_and(|(_, id)| ids.contains(id))
+        })
     }
 
     /// Fetch every stored attestation not fetched yet (input manifests
@@ -4254,6 +4551,7 @@ impl<'a> AttestStore<'a> {
         let mut tombstones = BTreeSet::new();
         let mut tombstone_blobs = BTreeMap::new();
         let mut manifest_blobs = BTreeMap::new();
+        let mut object_blobs = BTreeMap::new();
         let mut others = Vec::new();
         for (mode, kind, oid, path) in &records {
             let oid_str = || String::from_utf8_lossy(oid).into_owned();
@@ -4279,6 +4577,11 @@ impl<'a> AttestStore<'a> {
                                             && let Some(root) = parse_manifest_key(&k.key)
                                         {
                                             manifest_blobs.insert(root.to_owned(), oid_str());
+                                        }
+                                        if k.target_type == TargetType::Project
+                                            && parse_object_key(&k.key).is_some()
+                                        {
+                                            object_blobs.insert(k.key.clone(), oid_str());
                                         }
                                         value_blobs.insert(k.clone(), oid_str());
                                         values.insert(k);
@@ -4338,6 +4641,7 @@ impl<'a> AttestStore<'a> {
             tombstones,
             tombstone_blobs,
             manifest_blobs,
+            object_blobs,
             others,
             bad,
             clean_tree,
@@ -5612,6 +5916,10 @@ impl<'a> AttestStore<'a> {
                 .as_ref()
                 .map(|s| s.manifest_blobs.clone())
                 .unwrap_or_default();
+            let remote_object_blobs = tip_snap
+                .as_ref()
+                .map(|s| s.object_blobs.clone())
+                .unwrap_or_default();
             // The merge from paths knows what it dropped; only git-meta's
             // full merge needs the store's attestation keys listed before
             // and after (2.7.23: 1.1-1.9 s each on vex's runners).
@@ -5622,12 +5930,20 @@ impl<'a> AttestStore<'a> {
                 .transpose()?;
             step("list the store's attestation keys", t);
             let t = std::time::Instant::now();
-            let manifests_before: BTreeSet<String> = if side {
-                BTreeSet::new()
+            let (manifests_before, objects_before): (BTreeSet<String>, BTreeSet<String>) = if side {
+                (BTreeSet::new(), BTreeSet::new())
             } else {
-                self.reader()?.manifest_roots()?.into_iter().collect()
+                let reader = self.reader()?;
+                (
+                    reader.manifest_roots()?.into_iter().collect(),
+                    reader
+                        .object_rows()?
+                        .into_iter()
+                        .map(|r| object_key(r.kind, &r.id))
+                        .collect(),
+                )
             };
-            step("list the store's manifests", t);
+            step("list the store's manifests and objects", t);
             let local_before = self.read_ref(&local_ref)?;
             let started = std::time::Instant::now();
             // From the trees' paths (see `materialize_lazy`); git-meta's
@@ -5723,8 +6039,19 @@ impl<'a> AttestStore<'a> {
                         "put back {back} input manifest(s) that attestations here reference, which a `vci prune` or supersession elsewhere deleted; the next `vci push` publishes them"
                     ));
                 }
+                let back = self.restore_referenced_objects(
+                    &session,
+                    &objects_before,
+                    local_before.as_deref(),
+                    &remote_object_blobs,
+                )?;
+                if back > 0 {
+                    report.note(format!(
+                        "put back {back} object(s) that attestations here reference, which a `vci prune` or supersession elsewhere deleted; the next `vci push` publishes them"
+                    ));
+                }
             }
-            step("put back manifests attestations reference", t);
+            step("put back manifests and objects attestations reference", t);
             // Materialize may have applied tombstones or legacy deletes.
             let t = std::time::Instant::now();
             self.serialize_checked(&session, &local_ref)?;
@@ -6846,6 +7173,133 @@ impl<'a> AttestStore<'a> {
         self.stamp_written(put_back.iter().map(|k| (&project, k.as_str())))?;
         part(&format!("put back {back}"));
         Ok(back)
+    }
+
+    /// [`AttestStore::restore_referenced_manifests`] for format-3 objects
+    /// (`docs/CONTRACTS.md`'s put-back rule applied to objects, by id): put
+    /// back the objects this merge left deleted although an attestation in
+    /// the store names them (its statement's hdr and tables, its
+    /// descriptor's shape), from the tip's blobs (`tip_blobs`, by key) or
+    /// the local commit before the merge. Only objects whose key the store
+    /// held before (`before`) or the tip holds are candidates, and the
+    /// bytes put back must be the base64 of bytes whose BLAKE3 is the id
+    /// they are stored under. A state object is in no signed field, so it
+    /// is never put back: `prune_state_objects` deleted it on purpose, or it
+    /// was an orphan. Returns how many were put back.
+    fn restore_referenced_objects(
+        &self,
+        session: &Session,
+        before: &BTreeSet<String>,
+        local_before: Option<&str>,
+        tip_blobs: &BTreeMap<String, String>,
+    ) -> Result<usize, GitError> {
+        let store = session.store();
+        let deleted: BTreeSet<String> =
+            guarded("reading the store", || store.get_all_tombstones())?
+                .into_iter()
+                .filter(|t| t.target_type == TargetType::Project)
+                .filter(|t| parse_object_key(&t.key).is_some())
+                .map(|t| t.key)
+                .filter(|k| before.contains(k) || tip_blobs.contains_key(k))
+                .collect();
+        if deleted.is_empty() {
+            return Ok(0);
+        }
+        let handle = session.target(&Target::project());
+        let mut candidates: BTreeMap<String, (ObjectKind, String)> = BTreeMap::new();
+        for key in deleted {
+            let Some((kind, id)) = parse_object_key(&key) else {
+                continue;
+            };
+            if kind != ObjectKind::State && handle.get_value(&key).ok().flatten().is_none() {
+                candidates.insert(key.clone(), (kind, id.to_owned()));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        // Which attestations name them needs every attestation this clone
+        // holds read (one it never fetched is not one its plans relied on,
+        // as for manifests); one that cannot be read might name any of
+        // them, so then every candidate is put back.
+        let referenced = self.referenced_objects(true)?;
+        let wanted: Vec<&String> = candidates
+            .iter()
+            .filter(|(_, (_, id))| referenced.as_ref().is_none_or(|r| r.contains(id)))
+            .map(|(k, _)| k)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        // The objects' directory of the local commit before the merge,
+        // `project/vci/object`, listed once (as the manifests' is).
+        let mut local_blobs: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(local) = local_before {
+            let prefix = guarded("building a git-meta tree path", || {
+                git_meta_lib::tree_paths::tree_path(&Target::project(), wanted[0])
+            })?;
+            // project/vci/object/<kind>/<id>/__value: drop the last three parts.
+            let dir = prefix
+                .trim_end_matches(&format!("/{VALUE_BLOB}"))
+                .rsplitn(3, '/')
+                .last()
+                .map(str::to_owned)
+                .unwrap_or_default();
+            let listing = self
+                .repo
+                .git()
+                .args(["ls-tree", "-r", "-z", local, "--"])
+                .arg(&dir)
+                .run()?;
+            for (_, kind, oid, path) in split_ls_tree(&listing) {
+                if kind != b"blob" {
+                    continue;
+                }
+                let path = String::from_utf8_lossy(path);
+                if let Some(rest) = path.strip_prefix(&format!("{dir}/"))
+                    && let Some(rest) = rest.strip_suffix(&format!("/{VALUE_BLOB}"))
+                    && let Some((kind, id)) = rest.split_once('/')
+                {
+                    local_blobs.insert(
+                        format!("{OBJECT_PREFIX}:{kind}:{id}"),
+                        String::from_utf8_lossy(oid).into_owned(),
+                    );
+                }
+            }
+        }
+        let oids: BTreeSet<String> = wanted
+            .iter()
+            .flat_map(|k| [tip_blobs.get(*k), local_blobs.get(*k)])
+            .flatten()
+            .cloned()
+            .collect();
+        let bytes = self.read_blobs(&oids)?;
+        let project = Target::project();
+        let mut put_back: Vec<String> = Vec::new();
+        for key in wanted {
+            let (_, id) = &candidates[key];
+            for oid in [tip_blobs.get(key), local_blobs.get(key)]
+                .into_iter()
+                .flatten()
+            {
+                let Some(b) = bytes.get(oid) else {
+                    continue;
+                };
+                let Ok(text) = std::str::from_utf8(b) else {
+                    continue;
+                };
+                let is_id = vci_store::object_from_base64(text)
+                    .is_ok_and(|o| vci_core::objects::hex32(&vci_core::object_id(&o)) == *id);
+                if !is_id {
+                    continue;
+                }
+                guarded("putting back an object", || handle.set(key, text))?;
+                put_back.push(key.clone());
+                break;
+            }
+        }
+        self.stamp_written(put_back.iter().map(|k| (&project, k.as_str())))?;
+        Ok(put_back.len())
     }
 
     /// The input manifests among `candidates` that a stored attestation

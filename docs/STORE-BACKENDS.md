@@ -1498,7 +1498,8 @@ What the scenarios can and cannot check through the trait:
   `backing_exists`, `unreachable` with `secret`, `read_only`, `inject_raw`, `make_unreadable`, `failing_batches`,
   and (2.9) `age_objects(i, ids, by)`, which moves peer `i`'s objects' `put_at` back by `by` behind the backend's
   back, so that c37, c38 and c42 can cross the one-hour grace and the state TTL without waiting (`UPDATE objects SET
-  put_at = put_at - ?` on a SQL store).
+  put_at = put_at - ?` on a SQL store; on git-meta `UPDATE metadata SET last_timestamp = last_timestamp - ?` for the
+  object's key of each kind in `.git/git-meta.sqlite`).
 - **Objects (2.9).** c35 to c39 and c42 run only on a store whose `Caps::objects` is set and skip otherwise, after c35
   has checked that every object method of such a store is `Unsupported`; c36's validation and c40's and c41's
   format-3 records run everywhere (a store without `Caps::columns` answers none in c40 and skips its second half).
@@ -1635,7 +1636,7 @@ impl From<GitError> for StoreError { … }
 - `location` is `".git/git-meta.sqlite (exchanged on refs/meta/main)"`, whatever `meta.namespace` is set to; in a
   linked worktree, `"<common git dir>/git-meta.sqlite, shared by every worktree of the repository (exchanged on
   refs/meta/main)"`, by the absolute path git gives (`Repo::common_git_dir`).
-- `caps` is `LOCAL.with_lazy_values(true).with_hints(true)`.
+- `caps` is `LOCAL.with_lazy_values(true).with_hints(true).with_objects(true)` (2.9: objects kept, no columns).
 - `status` is `Reader::has_store` on a pooled reader, mapped to ``Absent{advice: "run `vci fetch`"}`` or
   `Ready{None}`.
 - `count` is `Reader::count`.
@@ -1705,6 +1706,7 @@ still uses that worktree's own file. `crates/vci-git/tests/store_worktrees.rs` c
 | `Units{choose: None}` | `hydrate_units` |
 | `Manifests` | `hydrate_manifests` |
 | `Attestations` | `hydrate_attestations` |
+| `Objects{ids}` | `hydrate_objects` (2.9): the promised rows of `vci:object:<kind>:<id>` for any kind and an id in `ids`, their blobs in one `git fetch --stdin` of object ids (`FETCH_BLOB_BATCH`), as the manifests' |
 | a future variant | `Hydration::default()` |
 
 Every call then empties the reader pool.
@@ -1713,6 +1715,58 @@ Every call then empties the reader pool.
 `AttestStore::list(None)`, skipping values still not fetched. On any other unreadable value or `ManifestRef::Unknown`
 the answer is empty. Otherwise it returns the roots minus the referenced ones minus the undecided ones (section 4 on
 how it differs from 2.7 for malformed envelopes).
+
+**Objects (format 3, vci 2.9; STORE-V2 section 2.2).** An object is a string value of the `project` target under the
+key `vci:object:<kind>:<id>` (`key::object_key`: the kind as its byte in decimal, the id 64 lowercase hex), so its tree
+path is `project/vci/object/<kind>/<id>/__value`: four blobs and a few trees per run where format 1 filed ~800
+manifest blobs. The value is `object_to_base64` of the bytes (rule 3 stands: a git-meta value is UTF-8, and the state
+object holds raw hashes), decoded in `get_objects`; a format-3 record is the text frame, stored like any other
+attestation value and read through the same lossy-UTF-8 path, which leaves it byte-identical. Nothing changed in the
+`git-meta.sqlite` `value` column, `materialize` or fast-import. The row's `last_timestamp` is the object's `put_at`:
+the time it was last put here, or fetched (the merge marks a fetched row with the merge's time).
+
+- `put_objects`: `NewObject::validate` on each (the id comes from the bytes), then `AttestStore::put_objects` with the
+  base64 text: inside a batch on its connection (`current_is`, then `set` or, for identical bytes, an `UPDATE` of the
+  row's `last_timestamp` to now, so that the grace restarts), outside one through git-meta's `set` and the same
+  `UPDATE`. Returns how many were not stored before, exact inside a batch too.
+- `get_objects`: ids validated and made distinct in the order asked; on a pooled reader `Reader::objects`: one range
+  query of the object keys (`key >= 'vci:object:' AND key < 'vci:object;'` on the `project` target, values not read)
+  to find each id's kind, then one indexed lookup per object held, its value through `value_bytes` (inline, a blob
+  through `cat-file`, or not fetched). A promised row, a missing blob or a text that is not base64 is **left out**
+  (prefetch `Objects` first); the answer is refused as `Invalid{objects}` once the decoded sizes would pass
+  `MAX_OBJECTS_ANSWER`, before that decode.
+- `remove_objects` and `orphan_objects` apply the orphan rule at once, as the referrer scan `orphan_manifests` is:
+  `hydrate_attestations` first (every attestation not fetched yet is fetched: a run's records are on every path target,
+  so any of them could name an object; `vci prune` has prefetched them already), the pool emptied, then
+  `AttestStore::referenced_objects` reads every attestation value once (`AttestStore::list(None)`) and collects the ids
+  `key::record_object_refs` names (the statement's hdr and tables, the descriptor's shape; a format-1 envelope names
+  none). A value still not fetched (offline), unreadable, or a record whose statement or descriptor does not parse makes
+  the answer empty (nothing removed): it might name any object. Otherwise an object of kind 1, 2 or 3 that no record
+  names and whose `last_timestamp` is more than `OBJECT_GRACE` ago is an orphan; `remove_objects` deletes the orphans
+  among its ids (tombstones, published by the next push; `remove_project_keys`, the path `remove_manifests` takes) and
+  `orphan_objects` lists them all, sorted. **State objects are never orphans here**: git-meta keeps no columns, and a
+  state object's id is in no signed field, so nothing can name it; `prune_state_objects` is what removes them. Inside a
+  batch the scan reads the store as committed before the batch, so a record the batch removed still counts as a
+  referrer and its objects go at a later call.
+- `prune_state_objects(older_than)`: the object rows of kind 4 whose `last_timestamp` is older than that, deleted
+  whatever names them (values not read).
+- `columns` is the default: `Columns::default()` for every entry (the hint is the key; the columns a put passes are
+  ignored).
+- **The merge's put-back rule applies to objects by id** (`restore_referenced_objects`, beside
+  `restore_referenced_manifests`): after a fetch merged a tip that deleted an object, the deletion records of object
+  keys the store held before the merge or the tip holds are candidates; the ones a local attestation names
+  (`referenced_objects`; every candidate when one cannot be read; a promised row, never relied on here, is skipped)
+  are put back from the tip's blob or the local commit before the merge (`project/vci/object` listed once), when the
+  blob's base64 decodes to bytes whose BLAKE3 is the id, and stamped as written for the next push. A state object is
+  never put back: its deletion was a `prune_state_objects` or an orphan collection. The fetch's notes say `put back N
+  object(s) that attestations here reference, …`.
+- **git-meta's auto-prune** (`meta:prune:max-keys`, `meta:prune:max-size`, which vci warns about) counts an object as
+  one key: a few per run instead of ~800 manifests.
+- **A vci before 2.9** on the same metadata lists neither objects (its listings take the `vci:attestation:` prefix;
+  `count`, `list_all` and `manifest_roots` are unchanged by them) nor deletes them (it never deletes a key it does not
+  parse), and reads a frame as text that is not an envelope: `Envelope::from_json` (a serde_json parse) fails without a
+  panic, the `envelope` check fails, and the unit runs (STORE-V2 section 5, rule 5). Its manifest collector then keeps
+  every manifest, since it cannot tell what the frame names.
 
 **Other provided methods**:
 
@@ -1774,7 +1828,15 @@ worlds with hinted, unhinted, promised and missing-blob entries: listings match,
 targeted and equal to the default, error mapping, the pool seeing a store created later and being refreshed after a
 prefetch, `orphan_manifests` against a re-implementation of 2.7's logic, the batch (one transaction since 2.8, the
 same rows as its calls one by one, a failed stamp after its commit a warning, a refused write in git-meta's text),
-the timing line, `put` keeping `put_hinted`'s keys, and the factory.
+the timing line, `put` keeping `put_hinted`'s keys, and the factory. `crates/vci-git/tests/store_objects.rs` (6 tests,
+2.9) checks what the objects scenarios cannot see: the base64 value at `project/vci/object/<kind>/<id>/__value` in the
+remote's tree and the older listings that never see it, a frame read back byte for byte through the lossy path and
+refused by a serde_json envelope parse without an error (and `Inline` for manifest collection), promised object rows
+fetched by one `Prefetch::Objects` (4 resolved, 4 blobs) and left out before it, the merge putting back the three named
+objects another clone deleted (not the state object) and publishing them, the orphan scan keeping every object while
+the record cannot be fetched and fetching it once online, and an idempotent put inside a batch restarting the grace.
+The conformance world's `age_objects` moves `last_timestamp` in `.git/git-meta.sqlite`, so c35 to c42 run in full
+(c40's columns half skips: git-meta keeps none).
 
 ---
 

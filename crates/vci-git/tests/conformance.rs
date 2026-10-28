@@ -19,9 +19,11 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use git_meta_lib::{Session, Target};
+use vci_core::ObjectKind;
 use vci_git::{AttestStore, GitMetaStore, Repo};
 use vci_store::conformance::{StoreFactory, World};
 use vci_store::{AttestationStore, PushMode};
@@ -208,6 +210,34 @@ impl World for GitWorld {
             rusqlite::params![format!("{:040x}", 0xdead_u32), key],
         )
         .is_ok_and(|n| n == 1)
+    }
+
+    /// An object's time of last write is its row's `last_timestamp`
+    /// (milliseconds), whatever kind it is filed under.
+    fn age_objects(&self, i: usize, ids: &[&str], by: Duration) -> bool {
+        let db = self.dir(i).join(".git/git-meta.sqlite");
+        let Ok(db) = rusqlite::Connection::open(db) else {
+            return false;
+        };
+        let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        for id in ids {
+            for kind in [
+                ObjectKind::Hdr,
+                ObjectKind::Tables,
+                ObjectKind::Shape,
+                ObjectKind::State,
+            ] {
+                let moved = db.execute(
+                    "UPDATE metadata SET last_timestamp = last_timestamp - ?1
+                     WHERE target_type = 'project' AND key = ?2",
+                    rusqlite::params![by, vci_store::key::object_key(kind, id)],
+                );
+                if moved.is_err() {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
