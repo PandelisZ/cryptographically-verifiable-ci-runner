@@ -475,10 +475,11 @@ pub(crate) enum OnTimeout {
     /// Sent once more, on a new connection, with a deadline of its own;
     /// out of time again, it latches the breaker.
     Resend,
-    /// Fails alone, latching nothing: a hint, or one of the requests a
-    /// read of values sends at once (`Remote::query_values`), which share
-    /// the connection's bandwidth, so that one out of time may well be in
-    /// time alone: the read sends its keys again itself.
+    /// Fails alone, latching nothing: a hint, or a request of a read of
+    /// values (`Remote::query_values`), which may share the connection's
+    /// bandwidth with others, so that one out of time may well be in time
+    /// alone or at half the size: the read sends its keys again itself, in
+    /// halves.
     FailAlone,
     /// Latches the breaker: the request sent again by its caller.
     Latch,
@@ -500,7 +501,7 @@ pub(crate) const HINT: Op = Op {
     hint: true,
     on_timeout: OnTimeout::FailAlone,
 };
-/// A read sent beside others ([`OnTimeout::FailAlone`]).
+/// A request of a read of values, first sent ([`OnTimeout::FailAlone`]).
 pub(crate) const READ_SHARED: Op = Op {
     verb: "read",
     hint: false,

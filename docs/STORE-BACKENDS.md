@@ -2462,7 +2462,7 @@ JSON array (`IN (SELECT value FROM json_each(?1))`), 5,000 to a request, but for
 | method | on a cache miss |
 |---|---|
 | `list_units` | `SELECT test_key, key, target FROM <a> WHERE test_key IN (…) ORDER BY test_key, key` |
-| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference (but those cached already), 100 keys to a request; then the bases those manifests name and the cache lacks, in one more request; all go to the cache |
+| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference (but those cached already), 100 keys to a request; then the bases those manifests name and the cache lacks, in one more request (in the same statement when the keys fit in one request, `values_with_bases`); all go to the cache |
 | `manifest`, `manifests` | `root = ?1`; `root IN (…)` |
 | `read_units` | fully cached units from the cache (values kept); the rest in one statement with values |
 | `list_all`, `count`, `manifest_roots`, `read_all` | one statement each, never cached |
@@ -2485,19 +2485,35 @@ read and thrown away, and the read took 42.5 s; at 0.8 MB/s, 121 s, 12 deadlines
 laptop, though, a connection is limited more than the link is (a request of 250 took 6.5 to 7 s alone and 7 to 11 s
 three at once), so going one at a time made the plan slower (prefetch 35 to 42 s against 19 to 32 s), and requests of
 250 left one straggler of 15 to 19 s holding up the read. Requests of 100 reach four at once within their first few
-answers there and each takes 1 to 8 s; see the measurements below. One sent beside others whose deadline runs out (`OnTimeout::FailAlone`) fails alone, latching nothing and not sent
-again by itself, and no more are sent at once: the read sends the keys of that request again, one request at a time
-and 50 to a request, and those of the requests never sent at full size (`OnTimeout::Latch`: one of those out of time
-was the second try, and latches the breaker, after which the rest fail at once). **The whole read is given two
-request timeouts** (`VALUES_DEADLINES`, `Conn::query_until`): no request runs past them (one they cut short fails
-alone, latching nothing), and the keys not read by then fail as below, so a slow link costs a plan's read of values
-at most two deadlines, as a server that stops answering does, never many (2.8.1 gave up after one, and every unit
-ran). `a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once` checks both behind a proxy limited to 1.7 and
-1 MB/s: every value read once, where four requests of 250 at once ran out of time and read 13 MB for 7.8, and the read
-stopped after 6 s, where it took 11.6 s. A request that fails otherwise,
-or again, costs only its keys: `prefetch` leaves them uncached, counts them
-in `Hydration::unresolved` and warns (`vci: warning: could not prefetch N stored value(s) from <url> namespace <ns>: …;
-they are read again when asked for`), and `read_values` reads them again when asked; a `read_values` request that fails marks its keys
+answers there and each takes 1 to 8 s; see the measurements below. A request of values whose deadline runs out
+(`OnTimeout::FailAlone`, alone or beside others) fails alone, latching nothing and not sent again whole, and no more
+are sent at once: the read sends the keys of that request again, one request at a time and 50 to a request, each half
+counting on its own (one answered is kept when the other fails), and those of the requests never sent at full size
+(`OnTimeout::Latch`: one of those out of time was the second try, and latches the breaker, after which the rest fail
+at once). The review's first draft sent a read of one request again whole, which on a link too slow for it within
+the timeout ran out of the read's time too and read nothing, where a half may fit in what is left
+(`a_lone_request_of_values_out_of_time_is_read_again_in_halves`); and it threw away a half answered beside one that
+was not, which the plan's next read then read again
+(`a_read_of_values_out_of_time_keeps_its_halves_and_reads_no_more`).
+**The whole read is given two request timeouts** (`VALUES_DEADLINES`, `Conn::query_until`), one more for each 800
+values beyond 1,600 (`VALUES_PER_DEADLINE`: about 30 MB of vex's, 1 MB/s at the default 30 s; vex-api's 2,195 values,
+81.5 MB, took 29.9 to 58.6 s of a fixed 60 s from a laptop on 27 October, the plan 31.8 to 61.6 s): no request runs
+past them (one they cut short fails alone, latching nothing), and the keys not read by then fail as below.
+**They are the handle's** (`Remote::values_until`): once a read of values had a request run out of time, every later
+read of values by the same handle ends when that read had to, so the keys that failed are not asked for again and a
+round's new keys fail at once, their units running. The review's first draft gave each read its own two deadlines,
+and a plan reads values up to five times (the prefetch, its read of the candidates, then a prefetch and a read again
+in each of rounds 2 and 3): behind a proxy at 1 MB/s with a 5 s timeout, vex-api's plan took 22.1 s (2.8.1: 6.7 s),
+its read of the candidates spending another 10 s on the keys the prefetch had just failed, and vex-roder's round 2
+twice 10 s; with the default 30 s a slow round cost about 120 s where 2.8.1 latched after 30 s. So a slow link costs
+a plan one read's time, as a server that stops answering does, never one per read (2.8.1 gave up after one deadline,
+and every unit ran). `a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once` checks the pace behind a proxy
+limited to 1.7 and 1 MB/s: every value read once, where four requests of 250 at once ran out of time and read 13 MB
+for 7.8, and the read stopped after 6 s, where it took 11.6 s; `a_large_read_of_values_is_given_a_timeout_per_800_values`
+the third deadline for 1,700 values. A request that fails otherwise, or before the read's time ran out, costs only its
+keys: `prefetch` leaves them uncached, counts them in `Hydration::unresolved` and warns (`vci: warning: could not
+prefetch N stored value(s) from <url> namespace <ns>: …; they are read again when asked for`, or `their units run`
+once the handle's time for values ran out), and `read_values` reads them again when asked; a `read_values` request that fails marks its keys
 `Unreadable("could not be read from the store: …")`, so their units run, and the call fails only when it could serve
 no key at all (from the cache or the server), as a store that cannot be used does. The timing lines carry the bytes
 read: `prefetch N unit(s), M value(s), R request(s), X MB` and `read M value(s), R request(s), X MB`.
@@ -2731,6 +2747,24 @@ median (23.0-40.5), prefetch 21.9 s (19.9-37.6), 25-29 requests, against the fir
 32.3 s (20.4-46.9), 15-17 requests; both read the same 1,652 values, 62.4 MB, none out of time. A version that sent
 the first request of 250 alone and grew from one took 38 to 45 s (prefetch 35 to 42 s), and one that started at two
 with 250 a request 26.5 to 36.3 s: a request of 250 took 4.7 to 19.3 s, one straggler holding up the end of the read.
+
+These plans read 1,652 values (62.4 MB). In the review of the draft that evening the same plan read 2,181 to 2,196
+values (81.5 MB, 30 requests): six interleaved runs read every value each time, the prefetch taking 29.9, 36.0, 40.9, 43.0, 45.6 and 58.6 s (the plan 31.8 to 61.6 s, median about 45.8 s;
+requests of 3.6 MB took 1.4 to 17.5 s), close to the two deadlines (60 s) a read then had, while 2.8.1's one request
+of about 100 MB ran out of time in each run and every unit ran (34.0 to 36.1 s). Hence the deadline per 800 values
+above; `VCI_STORE_COMPRESS=zstd` makes the same read about 3x smaller.
+
+After that review (the handle's time for values, halves kept, a lone request read in halves, the bases in a read of
+one request, a deadline per 800 values), measured at about 02:45 UTC on 28 October against the draft, read only:
+vex-api's plan, three interleaved runs each, read 1,652 values (62.4 MB, 25 requests) in a prefetch of 6.2 to 6.3 s
+(the draft 6.5 to 7.4 s), the plan 7.8 to 8.2 s (8.0 to 9.0 s); vex-roder's (1 unit), four each, read round 2's
+values in 2 requests and 0.83 to 0.98 s, where the draft took 4 to 7 requests and 1.63 to 2.91 s, the plan 3.6 s
+median (3.56-4.28) against 4.6 s (4.32-9.77). On a local copy of vex's namespace (5,918 attestations) behind a proxy
+with a 5 s timeout: at 1 MB/s vex-api's plan took 18.7 s (the draft 22.1 s, 2.8.1 7.1 s, which read no value), its
+read of the candidates no time and no request where the draft's spent 10 s failing again, and it read 150 values
+where the draft and 2.8.1 read none (its prefetch had three deadlines for 1,652 values, 15 s); at 100 kB/s
+vex-roder's plan took 12.9 s (the draft 22.8 s, 2.8.1 10.0 s), round 2 10.1 s where the draft's took 20.1 s; a server
+that stops answering after five answers cost 12.6 s against 10.7 s (both latched before the values).
 
 Six runs of each, interleaved. 2.8.2 reads the same 1,652 values 2.8.1 prefetches, in seven requests four at a time, and not the 238 to 669 newest
 candidates 2.8.1 then read in a second request; the listing (1.6 s, 0.66 MB for 2,090 keys) is the same. With

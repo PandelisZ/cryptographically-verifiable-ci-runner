@@ -652,6 +652,12 @@ struct Shared {
     rate_next: Mutex<Option<Instant>>,
     /// Bytes passed on from the server to the clients.
     passed: AtomicUsize,
+    /// What the next cursor requests get, in order, before any other
+    /// setting: `true` never answered (as `stall_cursors`), `false` sent
+    /// on.
+    schedule: Mutex<std::collections::VecDeque<bool>>,
+    /// Cursor requests that reached it.
+    cursors: AtomicUsize,
 }
 
 impl Shared {
@@ -747,6 +753,17 @@ impl Proxy {
     fn stall_after(&self, pass: usize, n: usize) {
         self.shared.pass_cursors.store(pass, Ordering::SeqCst);
         self.shared.stall_cursors.store(n, Ordering::SeqCst);
+    }
+
+    /// The next cursor requests, in order: `true` never answered, `false`
+    /// sent on.
+    fn schedule(&self, next: &[bool]) {
+        *self.shared.schedule.lock().unwrap() = next.iter().copied().collect();
+    }
+
+    /// How many cursor requests (a read's rows) reached it.
+    fn cursors(&self) -> usize {
+        self.shared.cursors.load(Ordering::SeqCst)
     }
 
     /// Never answer a write from now on, or stop.
@@ -943,10 +960,20 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                         n.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
                             .is_ok()
                     };
-                    let stall_one = cursor
-                        && sh.stall_cursors.load(Ordering::SeqCst) > 0
-                        && !take_one(&sh.pass_cursors)
-                        && take_one(&sh.stall_cursors);
+                    if cursor {
+                        sh.cursors.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let scheduled = if cursor {
+                        sh.schedule.lock().unwrap().pop_front()
+                    } else {
+                        None
+                    };
+                    let stall_one = scheduled.unwrap_or_else(|| {
+                        cursor
+                            && sh.stall_cursors.load(Ordering::SeqCst) > 0
+                            && !take_one(&sh.pass_cursors)
+                            && take_one(&sh.stall_cursors)
+                    });
                     let hold_one = write && take_one(&sh.hold_writes);
                     if stall_one || hold_one || (write && sh.stall_writes.load(Ordering::SeqCst)) {
                         // Held: read what the client sends until it closes.
@@ -3295,6 +3322,254 @@ fn a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once() {
     let (h, took, _) = prefetch(1_000_000);
     assert!(h.unresolved > 0 && h.unresolved < n, "{h:?} in {took:?}");
     assert!(took < Duration::from_secs(7), "{took:?}");
+}
+
+/// A request of values that ran out of time is read again in halves, and a
+/// half that is answered counts though the other is not (2.8.2 as first
+/// reviewed dropped the rows of the whole request, and the plan read that
+/// half again); and once a read of values ran out of time, the handle's
+/// later reads of values end when it did: the keys that failed are not
+/// asked for again (2.8.2 as first reviewed gave the plan's read of its
+/// candidates, and each round, two more request timeouts each on the same
+/// slow link). Nothing is latched.
+#[test]
+fn a_read_of_values_out_of_time_keeps_its_halves_and_reads_no_more() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 200;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &i.to_string()),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let r = proxied(&proxy, token.as_deref(), &ns, 2);
+    r.status().unwrap();
+    // The listing goes through; both requests of values (sent at once)
+    // are held; then the first half of the first is answered, and its
+    // second half held until the read's time runs out.
+    proxy.schedule(&[false, true, true, false, true]);
+    let t = Instant::now();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    let took = t.elapsed();
+    assert_eq!(proxy.stalled(), 3, "in {took:?}");
+    assert_eq!(h.unresolved, 150, "{h:?} in {took:?}");
+    assert!(took < Duration::from_secs(6), "{took:?}");
+    let c0 = proxy.cursors();
+    let t = Instant::now();
+    let mut listed = r.list_units(&ids).unwrap();
+    let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+    r.read_values(&mut refs).unwrap();
+    assert_eq!(
+        proxy.cursors(),
+        c0,
+        "the keys that failed were asked for again"
+    );
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let read = listed
+        .iter()
+        .flatten()
+        .filter(|e| matches!(e.state(), ValueState::Read(_)))
+        .count();
+    assert_eq!(read, 50);
+    for e in listed.iter().flatten() {
+        match e.state() {
+            ValueState::Read(_) => {}
+            ValueState::Unreadable(why) => {
+                assert!(why.contains("could not be read from the store"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    r.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+}
+
+/// A read of values in one request whose deadline runs out is read again
+/// in halves, not sent again whole: on a link too slow for the whole
+/// request within the timeout, the first half is read within the read's
+/// time (2.8.2 as first reviewed sent it again whole, which ran out of the
+/// read's time too, and read nothing).
+#[test]
+fn a_lone_request_of_values_out_of_time_is_read_again_in_halves() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 100;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let pad = "p".repeat(3_000);
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{pad}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let read = |rate: usize| {
+        let r = proxied(&proxy, token.as_deref(), &ns, 2);
+        r.status().unwrap();
+        let mut listed = r.list_units(&ids).unwrap();
+        let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+        proxy.limit_rate(rate);
+        let (t, b) = (Instant::now(), proxy.passed());
+        let ok = r.read_values(&mut refs);
+        let (took, bytes) = (t.elapsed(), proxy.passed() - b);
+        proxy.limit_rate(0);
+        drop(refs);
+        let read = listed
+            .iter()
+            .flatten()
+            .filter(|e| matches!(e.state(), ValueState::Read(_)))
+            .count();
+        (ok.map(|()| read), took, bytes)
+    };
+    let (got, _, all) = read(0);
+    assert_eq!(got.unwrap(), n);
+    // The whole request in 2.5 s (the timeout is 2 s), a half in 1.25 s.
+    let (got, took, _) = read(all * 2 / 5);
+    let got = got.unwrap_or_else(|e| panic!("nothing read in {took:?}: {e}"));
+    assert!(got >= n / 2 && got < n, "{got} in {took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+}
+
+/// A large read of values is given one more request timeout for each 800
+/// values beyond 1,600: on a link that reads it in about two and a half
+/// timeouts, every value is read (2.8.2 as first reviewed gave every read
+/// two, and vex-api's 2,195 values took 29.9 to 58.6 s of its 60 s from a
+/// laptop).
+#[test]
+fn a_large_read_of_values_is_given_a_timeout_per_800_values() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 1_700;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let pad = "p".repeat(1_000);
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{pad}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let prefetch = |rate: usize| {
+        let r = proxied(&proxy, token.as_deref(), &ns, 2);
+        r.status().unwrap();
+        let mut listed = r.list_units(&ids).unwrap();
+        let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+        proxy.limit_rate(rate);
+        let (t, b) = (Instant::now(), proxy.passed());
+        r.read_values(&mut refs).unwrap();
+        let (took, bytes) = (t.elapsed(), proxy.passed() - b);
+        proxy.limit_rate(0);
+        drop(refs);
+        let read = listed
+            .iter()
+            .flatten()
+            .filter(|e| matches!(e.state(), ValueState::Read(_)))
+            .count();
+        (read, took, bytes)
+    };
+    let (read, _, all) = prefetch(0);
+    assert_eq!(read, n);
+    // All of it in 5 s: two timeouts are 4 s, three 6 s.
+    let (read, took, _) = prefetch(all / 5);
+    assert_eq!(read, n, "in {took:?}");
+    assert!(took < Duration::from_secs(7), "{took:?}");
+}
+
+/// A read of values that fits in one request brings the bases of the
+/// manifests it references in that request: a small project's prefetch is
+/// the listing and one request (2.8.2 as first reviewed read the bases in
+/// one more, sequential request).
+#[test]
+fn a_small_read_of_values_brings_its_bases_in_the_same_request() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let w = testkit::open_remote(&ns).unwrap();
+    let base = manifest(&["src/base.rs"]);
+    w.put_manifest(&base.root(), base.to_compact().as_bytes())
+        .unwrap();
+    // A manifest on that base.
+    let top = hex64(0xee);
+    w.__execute_for_test(&[format!(
+        "INSERT INTO {p}manifests (root, base, put_at, encoding, value) \
+         VALUES ('{top}', '{}', 1, 0, CAST('{{}}' AS BLOB))",
+        base.root()
+    )])
+    .unwrap();
+    let ids = ["src/a.test.ts", "src/b.test.ts", "src/c.test.ts"];
+    for id in ids {
+        w.put_for_test(id, S1, &hex64(1), Some(&hint(1)), &envelope(Some(&top), id))
+            .unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let r = proxied(&proxy, token.as_deref(), &ns, 30);
+    r.status().unwrap();
+    let c0 = proxy.cursors();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    assert_eq!(
+        proxy.cursors() - c0,
+        2,
+        "the listing and one request of values"
+    );
+    assert!(r.manifest(&top).unwrap().unwrap().is_read());
+    assert!(r.manifest(&base.root()).unwrap().unwrap().is_read());
+    assert_eq!(
+        proxy.cursors() - c0,
+        2,
+        "the manifests came with the values"
+    );
 }
 
 /// A write whose deadline ran out while the server committed it (it waited

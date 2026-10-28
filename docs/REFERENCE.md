@@ -1954,7 +1954,10 @@ The store has three modes:
   once, so a server that is down costs one or two timeouts, and the plan runs everything. A plan reads its values
   100 to a request (since 2.8.2), so a request that fails costs only its own units, which run: two at once at first,
   then more (at most four) while they answer within a third of the timeout and fewer when one takes more than half
-  of it, and the whole read within two timeouts, the units not read by then running. A write that runs out of time asks the server
+  of it; a request out of time is read again in halves, not whole. The whole read is given two timeouts (one more per
+  800 values beyond 1,600), the units not read by then running, and once a read ran out of time the plan's later reads
+  of values end when it did, so a slow link costs the plan that once, not once per round. A read that fits in one
+  request brings its base manifests in it. A write that runs out of time asks the server
   whether it was stored before it is sent again. The plan's memo and
   flags are written only when new, and each such write waits at most 5 s and never stops the command. A statement
   the server refuses (a trigger, say) stops nothing else: `vci run` reports it and exits 2 after the run.

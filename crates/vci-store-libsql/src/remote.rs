@@ -10,11 +10,13 @@
 //! * **Reads** are served from a per-handle cache ([`crate::cache`]) that
 //!   [`AttestationStore::prefetch`] fills: the listings in one request,
 //!   then the chosen values with their manifests, [`VALUES_PER_REQUEST`]
-//!   to a request, the first alone and then as many at once as its time
-//!   allows (at most the pool's size), within two request timeouts in
-//!   all, then their bases in one more; a request that fails costs only
-//!   its own keys. A miss is
-//!   read the same way (the keys a JSON array bound to `json_each`).
+//!   to a request, two at once at first and then as many as their times
+//!   allow (at most the pool's size), within two request timeouts (one
+//!   more per 800 values beyond 1,600) for the handle once one ran out of
+//!   time, then their bases in one more (in the
+//!   same request when there is one); a request that fails costs only its
+//!   own keys. A miss is read the same way (the keys a JSON array bound to
+//!   `json_each`).
 //! * **Writes** are queued in a deferred batch ([`crate::batch`]) and sent
 //!   as one transactional request; a write outside a batch is a batch of
 //!   one.
@@ -56,9 +58,15 @@ const CHUNK: usize = 5_000;
 /// holding up the read.
 pub(crate) const VALUES_PER_REQUEST: usize = 100;
 
-/// A read of values is given this many request timeouts in all
+/// A read of values is given at least this many request timeouts in all
 /// (`Remote::query_values`).
 const VALUES_DEADLINES: u32 = 2;
+
+/// And one more request timeout for each this many values beyond
+/// `VALUES_DEADLINES` of them (about 30 MB of vex's as they are stored,
+/// 1 MB/s at the default 30 s): a read of vex-api's 2,195 values (81.5 MB)
+/// from a laptop took 29.9 to 58.6 s, against two timeouts' 60 s.
+const VALUES_PER_DEADLINE: usize = 800;
 
 /// The most roots a read of values names as already cached (not sent
 /// again): the bases and shared manifests an earlier request brought.
@@ -93,6 +101,7 @@ pub(crate) struct Tables {
     pub(crate) ddl: Vec<String>,
     list_units: String,
     values: String,
+    values_with_bases: String,
     manifests_and_bases: String,
     manifests_of: String,
     read_units: String,
@@ -214,6 +223,17 @@ impl Tables {
                    AND root IN (SELECT manifest_ref FROM {a} WHERE key IN ({set})) \
                    AND root NOT IN (SELECT value FROM json_each(?3))"
             ),
+            // The same, with the bases of those manifests too: a read of one
+            // request (a small project) brings them in it, not one more.
+            values_with_bases: format!(
+                "SELECT 0, key, value, encoding, manifest_ref FROM {a} WHERE key IN ({set}) \
+                 UNION ALL \
+                 SELECT 1, root, value, encoding, base FROM {m} WHERE ?2 = 1 \
+                   AND root NOT IN (SELECT value FROM json_each(?3)) \
+                   AND (root IN (SELECT manifest_ref FROM {a} WHERE key IN ({set})) \
+                     OR root IN (SELECT base FROM {m} WHERE base IS NOT NULL AND \
+                       root IN (SELECT manifest_ref FROM {a} WHERE key IN ({set}))))"
+            ),
             manifests_and_bases: format!(
                 "SELECT root, value, encoding, base FROM {m} WHERE root IN ({set}) \
                  OR root IN (SELECT base FROM {m} WHERE base IS NOT NULL AND root IN ({set}))"
@@ -302,6 +322,12 @@ pub(crate) struct Remote {
     pub(crate) grace: Duration,
     /// Write values compressed (`VCI_STORE_COMPRESS=zstd`).
     compress: AtomicBool,
+    /// When this handle's reads of values must end, once one had a request
+    /// run out of time: that read's end (`Remote::query_values`). A slow
+    /// link costs a process one read's time of reading values, not that
+    /// for each read (the prefetch, the plan's read of its candidates,
+    /// each later round's).
+    values_until: Mutex<Option<Instant>>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -345,6 +371,7 @@ impl Remote {
             log_pruned: AtomicBool::new(false),
             grace,
             compress: AtomicBool::new(compress),
+            values_until: Mutex::new(None),
         }
     }
 
@@ -664,32 +691,68 @@ impl Remote {
     /// cache (the ones not stored as absent). The keys go
     /// [`VALUES_PER_REQUEST`] to a request, each manifest and base at most
     /// once: the manifests with their attestations (but those cached
-    /// already), then the bases not cached in one more request.
+    /// already), then the bases not cached in one more request; a read of
+    /// one request brings its bases in it (`Tables::values_with_bases`),
+    /// so that a small project pays one request, not two.
     ///
     /// Two requests go at once at first; after each answered within a
     /// third of the request timeout one more may be out at once, after each
     /// that took more than half of it one fewer (at least one, at most the
     /// pool's connections): requests sent at once may share the link's
     /// bandwidth, so on a slow link they go one or two at a time instead of
-    /// four running out of time together, and on a fast one four. One sent
-    /// beside others that runs out of time fails alone and stops the
-    /// others from being sent; its keys are read again one request at a
-    /// time, half as many to a request, and those never sent at full size.
+    /// four running out of time together, and on a fast one four. A request
+    /// that runs out of time is not sent again whole: it stops the others
+    /// from being sent, and its keys are read again one request at a time,
+    /// half as many to a request, a half that fails costing only its own
+    /// keys; the requests never sent go at full size.
     ///
-    /// The whole read is given [`VALUES_DEADLINES`] request timeouts: no
+    /// The whole read is given [`VALUES_DEADLINES`] request timeouts, one
+    /// more for each [`VALUES_PER_DEADLINE`] keys beyond that many: no
     /// request runs past them, and the keys not read by then are failed.
-    /// A request that fails (after the deadline's one retry, see
-    /// `Conn::run`) leaves its keys out of [`Values::found`] and in
-    /// [`Values::failed`]: the others are read.
+    /// Those are the handle's for every read of values: once a read had a
+    /// request run out of time, the reads after it end when it had to, so
+    /// that the plan's later reads (of the candidates, and each round's)
+    /// do not each wait as long again for the same slow link
+    /// (`Remote::values_until`). A request that fails leaves its keys out
+    /// of [`Values::found`] and in [`Values::failed`]: the others are read.
     fn query_values(&self, t: &Tables, keys: &[&str], with_manifests: bool) -> Values {
         let mut out = Values::default();
         if keys.is_empty() {
             return out;
         }
         let timeout = self.conn.timeout();
-        let budget = timeout.saturating_mul(VALUES_DEADLINES);
-        let until = Instant::now() + budget;
+        let deadlines = u32::try_from(keys.len().div_ceil(VALUES_PER_DEADLINE))
+            .unwrap_or(u32::MAX)
+            .max(VALUES_DEADLINES);
+        let budget = timeout.saturating_mul(deadlines);
+        let earlier = *self
+            .values_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let until = match earlier {
+            Some(u) => u.min(Instant::now() + budget),
+            None => Instant::now() + budget,
+        };
+        let out_of_time = |earlier: bool| StoreError::Timeout {
+            backend: KIND,
+            operation: if earlier {
+                "a read of values (an earlier one ran out of this process's time for them)"
+            } else {
+                "a read of values (its keys not read within its time)"
+            },
+            after: budget,
+        };
+        if Instant::now() >= until {
+            out.failed.extend(keys.iter().map(|k| (*k).to_owned()));
+            out.error = Some(out_of_time(true));
+            return out;
+        }
         let chunks: Vec<&[&str]> = keys.chunks(VALUES_PER_REQUEST).collect();
+        let sql = if with_manifests && chunks.len() == 1 {
+            &t.values_with_bases
+        } else {
+            &t.values
+        };
         let exclude = if with_manifests {
             let c = self.cache();
             json_list(c.stored_roots(EXCLUDE_CAP))
@@ -702,7 +765,7 @@ impl Remote {
             }
             let r = self.conn.query_until(
                 op,
-                &t.values,
+                sql,
                 vec![
                     json_list(chunk.iter().copied()),
                     V::Integer(i64::from(with_manifests)),
@@ -720,13 +783,11 @@ impl Remote {
         // each that took more than half of it.
         let allowed = AtomicUsize::new(2.min(max));
         let next = AtomicUsize::new(0);
-        // A request sent beside others ran out of time (or the read's time
-        // did): no more are sent at once.
+        // A request ran out of time (or the read's time did): no more are
+        // sent at once.
         let slow = AtomicBool::new(false);
-        // Each request's answer (`None`: not sent), and whether it went
-        // beside others.
-        let done: Mutex<Vec<(Option<Rows>, bool)>> =
-            Mutex::new((0..n).map(|_| (None, false)).collect());
+        // Each request's answer (`None`: not sent).
+        let done: Mutex<Vec<Option<Rows>>> = Mutex::new((0..n).map(|_| None).collect());
         std::thread::scope(|sc| {
             for w in 0..max {
                 let (allowed, next, slow, done, ask, chunks) =
@@ -741,11 +802,12 @@ impl Remote {
                         let Some(chunk) = chunks.get(i) else {
                             break;
                         };
-                        let beside = allowed.load(Ordering::Relaxed) > 1;
                         let t = Instant::now();
-                        let r = ask(if beside { READ_SHARED } else { READ }, chunk);
+                        // Never sent again whole after its deadline: read
+                        // again in halves below.
+                        let r = ask(READ_SHARED, chunk);
                         let took = t.elapsed();
-                        if r.is_none() || (beside && is_timeout(&r)) {
+                        if r.is_none() || is_timeout(&r) {
                             slow.store(true, Ordering::Relaxed);
                         } else if matches!(r, Some(Ok(_))) {
                             let _ = allowed.try_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
@@ -758,65 +820,58 @@ impl Remote {
                                 })
                             });
                         }
-                        done.lock().unwrap_or_else(PoisonError::into_inner)[i] = (r, beside);
+                        done.lock().unwrap_or_else(PoisonError::into_inner)[i] = r;
                     }
                 });
             }
         });
-        let mut answers: Vec<Option<Rows>> = Vec::with_capacity(n);
-        // A request sent beside others that ran out of time: its keys
-        // again, one request at a time, half as many to a request; one never
+        // The keys of each request (or half of one) and its answer. A
+        // request that ran out of time: its keys again, one request at a
+        // time, half as many to a request, each half on its own; one never
         // sent: at full size. One out of time now latches the breaker (it
         // was the second try), and the rest then fail at once.
-        for (chunk, (answer, beside)) in chunks
+        let mut pieces: Vec<(&[&str], Rows)> = Vec::with_capacity(n);
+        let mut ran_out = false;
+        let mut settle = |a: Option<Rows>| -> Rows {
+            ran_out |= a.is_none() || matches!(a, Some(Err(StoreError::Timeout { .. })));
+            a.unwrap_or_else(|| Err(out_of_time(false)))
+        };
+        for (chunk, answer) in chunks
             .iter()
             .zip(done.into_inner().unwrap_or_else(PoisonError::into_inner))
         {
-            let answer = match answer {
-                None => ask(READ_AGAIN, chunk),
-                Some(r) if beside && matches!(r, Err(StoreError::Timeout { .. })) => {
-                    let mut rows = Vec::new();
-                    let mut again = Some(Ok(()));
+            match answer {
+                None => pieces.push((chunk, settle(ask(READ_AGAIN, chunk)))),
+                Some(Err(StoreError::Timeout { .. })) => {
                     for half in chunk.chunks(chunk.len().div_ceil(2).max(1)) {
-                        match ask(READ_AGAIN, half) {
-                            Some(Ok(r)) => rows.extend(r),
-                            other => {
-                                again = other.map(|r| r.map(drop));
-                                break;
-                            }
-                        }
+                        pieces.push((half, settle(ask(READ_AGAIN, half))));
                     }
-                    again.map(|r| r.map(|()| rows))
                 }
-                other => other,
-            };
-            answers.push(answer);
+                Some(other) => pieces.push((chunk, other)),
+            }
         }
-        let answers: Vec<Rows> = answers
-            .into_iter()
-            .map(|a| {
-                a.unwrap_or(Err(StoreError::Timeout {
-                    backend: KIND,
-                    operation: "a read of values (its keys not read within its time)",
-                    after: budget,
-                }))
-            })
-            .collect();
+        if ran_out {
+            let mut u = self
+                .values_until
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *u = Some(u.map_or(until, |e| e.min(until)));
+        }
         let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
         let mut bases: BTreeSet<String> = BTreeSet::new();
         let mut refs: BTreeSet<String> = BTreeSet::new();
-        for (chunk, answer) in chunks.iter().zip(answers) {
+        for (piece, answer) in pieces {
             let rows = match answer {
                 Ok(rows) => rows,
                 Err(e) => {
-                    out.failed.extend(chunk.iter().map(|k| (*k).to_owned()));
+                    out.failed.extend(piece.iter().map(|k| (*k).to_owned()));
                     out.error.get_or_insert(e);
                     continue;
                 }
             };
             for row in rows {
                 if row.len() < 5 {
-                    out.failed.extend(chunk.iter().map(|k| (*k).to_owned()));
+                    out.failed.extend(piece.iter().map(|k| (*k).to_owned()));
                     out.error.get_or_insert_with(|| malformed("values"));
                     break;
                 }
@@ -847,7 +902,7 @@ impl Remote {
                 }
             }
         }
-        // A chunk cut short by a malformed row: none of its keys count.
+        // A request cut short by a malformed row: none of its keys count.
         for k in &out.failed {
             out.found.remove(k);
         }
@@ -864,14 +919,23 @@ impl Remote {
                 }
                 bases.retain(|b| !c.has_stored_manifest(b));
             }
-            // The bases: once for all the chunks. One that cannot be read
-            // now is read when it is asked for.
+            // The bases not brought already: once for all the requests. One
+            // that cannot be read now is read when it is asked for.
             if !bases.is_empty() {
                 let bases: Vec<String> = bases.into_iter().collect();
                 let _ = self.fetch_roots(t, &bases);
             }
         }
         out
+    }
+
+    /// Whether this handle's time for reading values ran out
+    /// (`Remote::values_until`).
+    fn values_out_of_time(&self) -> bool {
+        self.values_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|u| Instant::now() >= u)
     }
 
     pub(crate) fn read_values(&self, envs: &mut [&mut StoredEnvelope]) -> Result<(), StoreError> {
@@ -1300,7 +1364,8 @@ impl Remote {
         // A request that failed leaves its values uncached, to be read
         // again when they are asked for (`read_values`, which marks only
         // the ones that fail again as unreadable), and says so; the rest
-        // is read.
+        // is read. One that ran out of time used up the handle's time for
+        // values: asked for, they fail at once, and their units run.
         let mut h = Hydration::default();
         if !want.is_empty() {
             let mut read = self.query_values(t, &want, true);
@@ -1314,8 +1379,13 @@ impl Remote {
             }
             if let Some(e) = read.error {
                 h.unresolved = read.failed.len();
+                let then = if self.values_out_of_time() {
+                    "their units run"
+                } else {
+                    "they are read again when asked for"
+                };
                 eprintln!(
-                    "vci: warning: could not prefetch {} stored value(s) from {}: {e}; they are read again when asked for",
+                    "vci: warning: could not prefetch {} stored value(s) from {}: {e}; {then}",
                     read.failed.len(),
                     self.location(false)
                 );
