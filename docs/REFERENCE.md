@@ -1403,7 +1403,11 @@ time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (t
 holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`). The attestation store: `VCI_STORE`, `VCI_STORE_URL`,
 `VCI_STORE_NAMESPACE`, `VCI_STORE_CONNECT_TIMEOUT_SECS`, `VCI_STORE_TIMEOUT_SECS` (since 2.8.0; see [Choosing a
 store](#choosing-a-store)), `VCI_STORE_COMPRESS` (`zstd`: the libSQL store writes values to its server compressed,
-`off`: not; it wins over `[store] compress`; since 2.8.2, see [libSQL](#libsql-turso)).
+`off`: not; it wins over `[store] compress`; since 2.8.2, see [libSQL](#libsql-turso)), `VCI_STORE_RECORD_FORMAT`
+(`3`, the default, or `1`: the record format `vci run` writes; wins over `[store] record_format`; since 2.9.0),
+`VCI_STORE_EXPLAIN_HASHES` (`true`, the default, or `false`: whether `vci run` writes the run's state object; wins
+over `[store] explain_hashes`; since 2.9.0), `VCI_STORE_EXPLAIN_HASHES_DAYS` (days a state object is kept while
+referenced, default 2, at most 365; wins over `[store] explain_hashes_days`; since 2.9.0).
 
 Every collector directory is resolved to its real path before use, and what a test process reads of vci's own
 collector files is never an input, whichever path reached them: Homebrew installs them in
@@ -2459,6 +2463,11 @@ extra = ["testdata/**"]
 # timeout = "30s"        # one statement or wait (VCI_STORE_TIMEOUT_SECS wins)
 # compress = "zstd"      # since 2.8.2: the libsql store writes values compressed; "off" (default); VCI_STORE_COMPRESS wins;
 #                        # only once every vci reading the repository is 2.8.2 or later (older ones refuse the key)
+# record_format = 3      # since 2.9.0: 3 (default) writes format-3 records; 1 writes the envelope JSON a vci 2.8 reads,
+#                        # for one release; VCI_STORE_RECORD_FORMAT wins (older vci refuse the key)
+# explain_hashes = true  # since 2.9.0: write the run's state object (the attested hashes `vci explain` prints; no verdict
+#                        # reads it); false: do not; VCI_STORE_EXPLAIN_HASHES wins
+# explain_hashes_days = 2  # since 2.9.0: days a state object is kept while referenced, 0 to 365; VCI_STORE_EXPLAIN_HASHES_DAYS wins
 
 # [store.sqlite]
 # path = "vci-store.sqlite"   # relative to the git common directory, no `..` (absolute: VCI_STORE_URL=sqlite:<path>)

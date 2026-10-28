@@ -2768,6 +2768,19 @@ pub mod select {
     /// `zstd`: the libSQL store writes values to its server compressed;
     /// `off`: as they are. Wins over `[store] compress`.
     pub const ENV_COMPRESS: &str = "VCI_STORE_COMPRESS";
+    /// `3` (the default): `vci run` writes format-3 records (STORE-V2
+    /// section 1.2, vci 2.9); `1`: the format-1 envelope JSON a vci 2.8
+    /// reads, for one release (section 5), for a fleet that cannot upgrade
+    /// every reader at once. Wins over `[store] record_format`.
+    pub const ENV_RECORD_FORMAT: &str = "VCI_STORE_RECORD_FORMAT";
+    /// `true` (the default) or `false`: whether `vci run` writes the run's
+    /// state object (the attested sizes and hashes `vci explain` prints;
+    /// no verdict reads it). Wins over `[store] explain_hashes`.
+    pub const ENV_EXPLAIN_HASHES: &str = "VCI_STORE_EXPLAIN_HASHES";
+    /// Days a state object is kept while records reference it (default 2):
+    /// `vci prune` and `vci run`'s orphan pass remove an older one. Wins
+    /// over `[store] explain_hashes_days`.
+    pub const ENV_EXPLAIN_HASHES_DAYS: &str = "VCI_STORE_EXPLAIN_HASHES_DAYS";
     /// Every variable this module reads. The e2e harnesses remove them all.
     pub const ENV_VARS: &[&str] = &[
         ENV_STORE,
@@ -2779,6 +2792,9 @@ pub mod select {
         ENV_REPLICA,
         ENV_SYNC,
         ENV_COMPRESS,
+        ENV_RECORD_FORMAT,
+        ENV_EXPLAIN_HASHES,
+        ENV_EXPLAIN_HASHES_DAYS,
     ];
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
@@ -2808,6 +2824,13 @@ pub mod select {
     pub const DEFAULT_MANIFEST_GRACE: Duration = Duration::from_secs(3600);
     /// The longest connect or statement timeout accepted.
     pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+    /// The record format `vci run` writes when nothing chooses one.
+    pub const DEFAULT_RECORD_FORMAT: u8 = 3;
+    /// The days a state object is kept while referenced, when nothing
+    /// chooses them (STORE-V2 section 1.3).
+    pub const DEFAULT_EXPLAIN_HASHES_DAYS: u32 = 2;
+    /// The most days `explain_hashes_days` may name.
+    pub const MAX_EXPLAIN_HASHES_DAYS: u32 = 365;
 
     /// A `vci.toml` key that is refused: it deserializes from anything
     /// (without keeping or echoing the value) so the error can name the key.
@@ -2843,6 +2866,29 @@ pub mod select {
         /// refuses a `vci.toml` that sets it (an unknown key).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub compress: Option<String>,
+        /// `3` (the default, since 2.9.0): `vci run` writes format-3
+        /// records (STORE-V2 section 1.2); `1`: the format-1 envelope JSON
+        /// a vci 2.8 reads, kept for one release (section 5) for a fleet
+        /// that cannot upgrade every reader at once. Every vci from 2.9.0
+        /// reads both. `VCI_STORE_RECORD_FORMAT` wins over it. A vci older
+        /// than 2.9.0 refuses a `vci.toml` that sets it (an unknown key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub record_format: Option<u8>,
+        /// `true` (the default, since 2.9.0): `vci run` writes the run's
+        /// state object, the attested sizes and hashes `vci explain` and the
+        /// plan's failure text print beside the observed ones; `false`:
+        /// it does not (the run writes three objects, the plan says `entry:
+        /// <path> changed` without the attested hash). No verdict reads
+        /// it. `VCI_STORE_EXPLAIN_HASHES` wins over it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub explain_hashes: Option<bool>,
+        /// Days a state object is kept while records reference it (default
+        /// 2, since 2.9.0, at most 365): `vci prune` and `vci run`'s
+        /// orphan pass remove an older one, the records stay valid and
+        /// `explain` prints the observed value and `attested hash not
+        /// loaded`. `VCI_STORE_EXPLAIN_HASHES_DAYS` wins over it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub explain_hashes_days: Option<u32>,
         /// `[store.sqlite]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sqlite: Option<SqliteSettings>,
@@ -3863,6 +3909,18 @@ pub mod select {
         /// Write values to a libSQL server compressed (`VCI_STORE_COMPRESS`,
         /// else `[store] compress`, else off).
         pub compress: Sourced<bool>,
+        /// The record format `vci run` writes, 3 or 1
+        /// (`VCI_STORE_RECORD_FORMAT`, else `[store] record_format`, else
+        /// [`DEFAULT_RECORD_FORMAT`]).
+        pub record_format: Sourced<u8>,
+        /// Whether `vci run` writes the run's state object
+        /// (`VCI_STORE_EXPLAIN_HASHES`, else `[store] explain_hashes`, else
+        /// true).
+        pub explain_hashes: Sourced<bool>,
+        /// Days a state object is kept while referenced
+        /// (`VCI_STORE_EXPLAIN_HASHES_DAYS`, else `[store]
+        /// explain_hashes_days`, else [`DEFAULT_EXPLAIN_HASHES_DAYS`]).
+        pub explain_hashes_days: Sourced<u32>,
         /// `[store.sqlite]` as resolved.
         pub sqlite: SqliteSelection,
         /// `[store.postgres]` as resolved.
@@ -3902,6 +3960,9 @@ pub mod select {
                 connect_timeout: Sourced::default_value(DEFAULT_CONNECT_TIMEOUT),
                 timeout: Sourced::default_value(DEFAULT_TIMEOUT),
                 compress: Sourced::default_value(false),
+                record_format: Sourced::default_value(DEFAULT_RECORD_FORMAT),
+                explain_hashes: Sourced::default_value(true),
+                explain_hashes_days: Sourced::default_value(DEFAULT_EXPLAIN_HASHES_DAYS),
                 sqlite: SqliteSelection { path: None },
                 postgres: PostgresSelection {
                     schema: Sourced::default_value(DEFAULT_SCHEMA.to_owned()),
@@ -4049,6 +4110,21 @@ pub mod select {
                 "timeout",
                 format!("{:?}", self.timeout.value),
                 self.timeout.source,
+            ));
+            v.push(line(
+                "record_format",
+                self.record_format.value.to_string(),
+                self.record_format.source,
+            ));
+            v.push(line(
+                "explain_hashes",
+                self.explain_hashes.value.to_string(),
+                self.explain_hashes.source,
+            ));
+            v.push(line(
+                "explain_hashes_days",
+                self.explain_hashes_days.value.to_string(),
+                self.explain_hashes_days.source,
             ));
             v
         }
@@ -4213,6 +4289,56 @@ pub mod select {
             });
         }
         Ok(Sourced::default_value(false))
+    }
+
+    /// A setting with an environment form, a `vci.toml` form and a default,
+    /// parsed by `parse` (`None`: refused with `expected`), the environment
+    /// winning over the file.
+    fn setting<T: Copy, F>(
+        var: &dyn Fn(&'static str) -> Option<String>,
+        env_key: &'static str,
+        file_value: Option<F>,
+        file_name: &'static str,
+        default: T,
+        expected: &str,
+        parse: impl Fn(&str) -> Option<T>,
+    ) -> Result<Sourced<T>, StoreError>
+    where
+        F: fmt::Display,
+    {
+        if let Some(v) = var(env_key) {
+            let value = parse(&v).ok_or_else(|| {
+                StoreError::Config(format!("${env_key} = {v:?}: expected {expected}"))
+            })?;
+            return Ok(Sourced {
+                value,
+                source: Source::Env(env_key),
+            });
+        }
+        if let Some(v) = file_value {
+            let text = v.to_string();
+            let value = parse(text.trim()).ok_or_else(|| {
+                StoreError::Config(format!(
+                    "vci.toml [store] {file_name} = {text}: expected {expected}"
+                ))
+            })?;
+            return Ok(Sourced {
+                value,
+                source: Source::File,
+            });
+        }
+        Ok(Sourced::default_value(default))
+    }
+
+    /// `true` or `false` in any case, `1` or `0`.
+    fn parse_bool(v: &str) -> Option<bool> {
+        if v.eq_ignore_ascii_case("true") || v == "1" {
+            Some(true)
+        } else if v.eq_ignore_ascii_case("false") || v == "0" {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     fn is_sql_identifier(s: &str) -> bool {
@@ -4650,6 +4776,41 @@ pub mod select {
                 kind.source
             ));
         }
+        let record_format = setting(
+            &var,
+            ENV_RECORD_FORMAT,
+            file.and_then(|f| f.record_format),
+            "record_format",
+            DEFAULT_RECORD_FORMAT,
+            "3 (format-3 records, the default) or 1 (the envelope JSON a vci 2.8 reads)",
+            |v| match v {
+                "3" => Some(3),
+                "1" => Some(1),
+                _ => None,
+            },
+        )?;
+        let explain_hashes = setting(
+            &var,
+            ENV_EXPLAIN_HASHES,
+            file.and_then(|f| f.explain_hashes),
+            "explain_hashes",
+            true,
+            "true or false",
+            parse_bool,
+        )?;
+        let explain_hashes_days = setting(
+            &var,
+            ENV_EXPLAIN_HASHES_DAYS,
+            file.and_then(|f| f.explain_hashes_days),
+            "explain_hashes_days",
+            DEFAULT_EXPLAIN_HASHES_DAYS,
+            "a number of days, 0 to 365",
+            |v| {
+                v.parse::<u32>()
+                    .ok()
+                    .filter(|d| *d <= MAX_EXPLAIN_HASHES_DAYS)
+            },
+        )?;
         let schema = match f_pg.and_then(|p| p.schema.clone()) {
             Some(s) => Sourced {
                 value: s,
@@ -4720,6 +4881,9 @@ pub mod select {
             connect_timeout,
             timeout,
             compress,
+            record_format,
+            explain_hashes,
+            explain_hashes_days,
             sqlite,
             postgres: PostgresSelection {
                 schema,

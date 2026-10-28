@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vci_store::select::{
-    self, ENV_COMPRESS, ENV_CONNECT_TIMEOUT, ENV_NAMESPACE, ENV_REPLICA, ENV_STORE, ENV_STORE_URL,
-    ENV_SYNC, ENV_TIMEOUT, ENV_TOKEN, LibsqlMode, Secret, Selection, Source, StoreSettings,
-    TokenCommand, redact, resolve,
+    self, DEFAULT_EXPLAIN_HASHES_DAYS, DEFAULT_RECORD_FORMAT, ENV_COMPRESS, ENV_CONNECT_TIMEOUT,
+    ENV_EXPLAIN_HASHES, ENV_EXPLAIN_HASHES_DAYS, ENV_NAMESPACE, ENV_RECORD_FORMAT, ENV_REPLICA,
+    ENV_STORE, ENV_STORE_URL, ENV_SYNC, ENV_TIMEOUT, ENV_TOKEN, LibsqlMode, Secret, Selection,
+    Source, StoreSettings, TokenCommand, redact, resolve,
 };
 use vci_store::{
     AttestationStore, BackendFactory, FailedStore, MissingBackend, OpenContext, StoreError,
@@ -1853,4 +1854,194 @@ fn compression_comes_from_the_environment_then_vci_toml() {
         "{:?}",
         s.warnings
     );
+}
+
+/// `[store] record_format` (STORE-V2 section 5): 3 by default, 1 for the
+/// envelope JSON a vci 2.8 reads; `VCI_STORE_RECORD_FORMAT` wins over the
+/// file; anything but 3 or 1 is refused naming the key, never the backend.
+#[test]
+fn the_record_format_is_3_unless_1_is_asked_for() {
+    let rf = |vars: &[(&str, &str)], toml: Option<&str>| {
+        sel(vars, toml).map(|s| (s.record_format.value, s.record_format.source))
+    };
+    assert_eq!(DEFAULT_RECORD_FORMAT, 3);
+    assert_eq!(rf(&[], None).unwrap(), (3, Source::Default));
+    assert_eq!(
+        rf(&[], Some("[store]\nrecord_format = 3")).unwrap(),
+        (3, Source::File)
+    );
+    assert_eq!(
+        rf(&[], Some("[store]\nrecord_format = 1")).unwrap(),
+        (1, Source::File)
+    );
+    assert_eq!(
+        rf(
+            &[(ENV_RECORD_FORMAT, "3")],
+            Some("[store]\nrecord_format = 1")
+        )
+        .unwrap(),
+        (3, Source::Env(ENV_RECORD_FORMAT))
+    );
+    assert_eq!(
+        rf(&[(ENV_RECORD_FORMAT, " 1 ")], None).unwrap(),
+        (1, Source::Env(ENV_RECORD_FORMAT))
+    );
+    // An empty variable is unset.
+    assert_eq!(
+        rf(
+            &[(ENV_RECORD_FORMAT, "")],
+            Some("[store]\nrecord_format = 1")
+        )
+        .unwrap(),
+        (1, Source::File)
+    );
+    for bad in ["2", "0", "4", "03", "three", "-1"] {
+        let m = config_err(&[(ENV_RECORD_FORMAT, bad)], None);
+        assert!(
+            m.contains(ENV_RECORD_FORMAT) && m.contains("3") && m.contains("1"),
+            "{bad}: {m}"
+        );
+    }
+    for bad in ["2", "0", "4", "255"] {
+        let m = config_err(&[], Some(&format!("[store]\nrecord_format = {bad}")));
+        assert!(
+            m.contains("[store] record_format") && m.contains(bad),
+            "{bad}: {m}"
+        );
+    }
+    // Not a number in the file: serde refuses it before resolve.
+    assert!(toml::from_str::<OnlyStore>("[store]\nrecord_format = \"3\"").is_err());
+    assert!(toml::from_str::<OnlyStore>("[store]\nrecord_format = 300").is_err());
+    // The setting is the same on every backend.
+    assert_eq!(
+        rf(
+            &[(ENV_STORE_URL, PG_URL)],
+            Some("[store]\nrecord_format = 1")
+        )
+        .unwrap(),
+        (1, Source::File)
+    );
+    assert!(
+        sel(&[], Some("[store]\nrecord_format = 1"))
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+}
+
+/// `[store] explain_hashes` (STORE-V2 section 1.3): true by default;
+/// `VCI_STORE_EXPLAIN_HASHES` (`true`/`false`, `1`/`0`, any case) wins.
+#[test]
+fn explain_hashes_is_on_unless_turned_off() {
+    let eh = |vars: &[(&str, &str)], toml: Option<&str>| {
+        sel(vars, toml).map(|s| (s.explain_hashes.value, s.explain_hashes.source))
+    };
+    assert_eq!(eh(&[], None).unwrap(), (true, Source::Default));
+    assert_eq!(
+        eh(&[], Some("[store]\nexplain_hashes = false")).unwrap(),
+        (false, Source::File)
+    );
+    assert_eq!(
+        eh(&[], Some("[store]\nexplain_hashes = true")).unwrap(),
+        (true, Source::File)
+    );
+    assert_eq!(
+        eh(
+            &[(ENV_EXPLAIN_HASHES, "true")],
+            Some("[store]\nexplain_hashes = false")
+        )
+        .unwrap(),
+        (true, Source::Env(ENV_EXPLAIN_HASHES))
+    );
+    for (v, want) in [("FALSE", false), ("0", false), ("1", true), ("True", true)] {
+        assert_eq!(
+            eh(&[(ENV_EXPLAIN_HASHES, v)], None).unwrap(),
+            (want, Source::Env(ENV_EXPLAIN_HASHES)),
+            "{v}"
+        );
+    }
+    for bad in ["yes", "no", "off", "2"] {
+        let m = config_err(&[(ENV_EXPLAIN_HASHES, bad)], None);
+        assert!(
+            m.contains(ENV_EXPLAIN_HASHES) && m.contains("true or false"),
+            "{bad}: {m}"
+        );
+    }
+    // The file takes a boolean only.
+    assert!(toml::from_str::<OnlyStore>("[store]\nexplain_hashes = \"false\"").is_err());
+    assert!(toml::from_str::<OnlyStore>("[store]\nexplain_hashes = 0").is_err());
+}
+
+/// `[store] explain_hashes_days` (STORE-V2 section 1.3): 2 by default, 0
+/// to 365; `VCI_STORE_EXPLAIN_HASHES_DAYS` wins.
+#[test]
+fn explain_hashes_days_is_two_by_default_and_at_most_a_year() {
+    let days = |vars: &[(&str, &str)], toml: Option<&str>| {
+        sel(vars, toml).map(|s| (s.explain_hashes_days.value, s.explain_hashes_days.source))
+    };
+    assert_eq!(DEFAULT_EXPLAIN_HASHES_DAYS, 2);
+    assert_eq!(days(&[], None).unwrap(), (2, Source::Default));
+    assert_eq!(
+        days(&[], Some("[store]\nexplain_hashes_days = 14")).unwrap(),
+        (14, Source::File)
+    );
+    assert_eq!(
+        days(&[], Some("[store]\nexplain_hashes_days = 0")).unwrap(),
+        (0, Source::File)
+    );
+    assert_eq!(
+        days(&[], Some("[store]\nexplain_hashes_days = 365")).unwrap(),
+        (365, Source::File)
+    );
+    assert_eq!(
+        days(
+            &[(ENV_EXPLAIN_HASHES_DAYS, "7")],
+            Some("[store]\nexplain_hashes_days = 14")
+        )
+        .unwrap(),
+        (7, Source::Env(ENV_EXPLAIN_HASHES_DAYS))
+    );
+    for bad in ["366", "-1", "2d", "1.5", "two"] {
+        let m = config_err(&[(ENV_EXPLAIN_HASHES_DAYS, bad)], None);
+        assert!(
+            m.contains(ENV_EXPLAIN_HASHES_DAYS) && m.contains("365"),
+            "{bad}: {m}"
+        );
+    }
+    let m = config_err(&[], Some("[store]\nexplain_hashes_days = 366"));
+    assert!(
+        m.contains("[store] explain_hashes_days") && m.contains("366"),
+        "{m}"
+    );
+    assert!(toml::from_str::<OnlyStore>("[store]\nexplain_hashes_days = -1").is_err());
+    assert!(toml::from_str::<OnlyStore>("[store]\nexplain_hashes_days = \"2d\"").is_err());
+    // `vci store info` shows the three with their sources.
+    let s = sel(
+        &[(ENV_EXPLAIN_HASHES, "false")],
+        Some("[store]\nrecord_format = 1\nexplain_hashes_days = 3"),
+    )
+    .unwrap();
+    let lines: Vec<(&str, String, Source)> = s
+        .describe()
+        .into_iter()
+        .filter(|l| l.name.starts_with("record_format") || l.name.starts_with("explain_hashes"))
+        .map(|l| (l.name, l.value, l.source))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            ("record_format", "1".to_owned(), Source::File),
+            (
+                "explain_hashes",
+                "false".to_owned(),
+                Source::Env(ENV_EXPLAIN_HASHES)
+            ),
+            ("explain_hashes_days", "3".to_owned(), Source::File),
+        ]
+    );
+    // Selection::for_backend has the defaults.
+    let d = Selection::for_backend("sqlite");
+    assert_eq!(d.record_format.value, 3);
+    assert!(d.explain_hashes.value);
+    assert_eq!(d.explain_hashes_days.value, 2);
 }
