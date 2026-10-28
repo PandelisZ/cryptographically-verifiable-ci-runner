@@ -13,12 +13,19 @@
 //! in a `sigstore` member and verify against `.vci/identities.toml` and a
 //! committed trust root instead of `allowed_signers`.
 //!
+//! The format-3 record ([`Frame`], store format 3 of vci 2.9) carries the
+//! same statement bytes and signature as a text frame: the SSHSIG as its
+//! binary blob instead of base64 of its armor, and the unit's descriptor
+//! beside them; it converts to and from the [`Envelope`] without a byte of
+//! difference, so verification is unchanged.
+//!
 //! Everything here is fail-closed with respect to trust: any doubt produces an
 //! error, which callers turn into "run the test".
 
 #[cfg(unix)]
 mod agent;
 mod allowed_signers;
+mod frame;
 pub mod keyless;
 mod sign;
 mod verify;
@@ -29,6 +36,10 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 pub use allowed_signers::{AllowedSigner, AllowedSigners, AllowedSignersError};
+pub use frame::{
+    FRAME_FIRST_LINE, Frame, FrameError, FrameSig, MAX_RECORD, VarintError, is_frame, sshsig_armor,
+    sshsig_dearmor,
+};
 pub use sign::{SignError, SshSigner, sign_payload, sign_statement};
 pub use verify::{Verified, VerifyError, verify_envelope};
 
