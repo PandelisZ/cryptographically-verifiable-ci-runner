@@ -227,7 +227,12 @@ Supporting types:
   `Caps::LOCAL` with the `with_*` methods. `remote_reads` (2.8.2, the libSQL store's remote mode) says that every value
   read comes over the network, its bytes and requests costing time: the plan then reads only the candidates it checks
   first (section 5).
-- `StoreStatus`, `Prefetch` (non-exhaustive) and `WriteBatch` (with `BatchEnd`).
+- `StoreStatus`, `Prefetch` (non-exhaustive) and `WriteBatch` (with `BatchEnd`). `WriteBatch::finish_partial` (2.8.2)
+  returns a `Finished`: the warnings, and the keys of the attestations the batch did not store, each with its error
+  (`Finished::lost`), every other write being durable; a backend that writes a batch as several transactions
+  overrides `BatchEnd::finish_partial` (the libSQL store), and the default is `finish`'s answer with nothing lost.
+  `vci run` refuses only the units named there; `finish` (and every other caller) still treats any loss as the whole
+  batch's.
 - `StoreError` (non-exhaustive).
 - `FailedStore`, which stands in for a store that could not be selected or opened.
 - `BackendFactory`, `OpenContext`, `MissingBackend` and `open()`, the registry. A new backend is a new crate plus one
@@ -2225,7 +2230,7 @@ against the client's panics, SQL literals), `remote` (the tables of a namespace,
 | mode | selected by | reads | writes | `caps` |
 |---|---|---|---|---|
 | local | `VCI_STORE=libsql` with no `VCI_STORE_URL`, or `VCI_STORE_URL=file:<path>` | a file, `<git common dir>/vci-store.libsql` by default | the file | `LOCAL.with_hints(true)` |
-| remote | a `libsql://` `VCI_STORE_URL` (or `https://`/`http://` with `VCI_STORE=libsql`) | the server, through a per-handle cache | the server, one request per batch (a few MiB each) | `with_shared_writes(true).with_hints(true).with_remote_reads(true)` |
+| remote | a `libsql://` `VCI_STORE_URL` (or `https://`/`http://` with `VCI_STORE=libsql`) | the server, through a per-handle cache | the server, a batch as transactions of whole units of at most 1 MiB, one request each | `with_shared_writes(true).with_hints(true).with_remote_reads(true)` |
 | replica | remote, plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true` | a local file synced from the server at its first use and at each later prefetch | the server, then written through to the file | `with_shared_writes(true).with_hints(true)` |
 
 **Crate.** `vci-store-libsql` depends on `vci-store`, `vci-core`, `vci-store-sqlite` (the schema SQL and the file
@@ -2319,7 +2324,11 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   stored: 0 as they are, 1 as one zstd frame (level 6). Every reader from 2.8.2 reads both, decompressing at most
   5,000,000 bytes (no value vci stores is larger; past that the value reads as unreadable, its unit runs), and the
   key, the signature and every check cover the bytes as they were, so verification is unchanged. Writers compress
-  when `VCI_STORE_COMPRESS=zstd` (`off` or unset: as they are; any other value is a `Config` error). The schema stays
+  when `VCI_STORE_COMPRESS=zstd`, else when `vci.toml` says `[store] compress = "zstd"` (the variable wins, `off`
+  turning it off for one command; unset and absent: as they are; any other value is a `Config` error; `vci store
+  info` shows `compress` and where it came from; another store ignores `[store] compress` with a warning). A vci older
+  than 2.8.2 refuses a `vci.toml` with `[store] compress` (an unknown key of `[store]`), which is why it belongs there
+  only once every vci that reads the repository is 2.8.2 or later. The schema stays
   version 1, since the tables do not change: a 2.8.1 reader reads a compressed value as one `in an encoding this vci
   cannot read (1)`, so that unit runs (never a wrong skip; a 2.8.1 replica leaves such a value out of its file, and
   2.8.2 syncs a file 2.8.1 synced in full once, see "The replica mode"), and a 2.8.1 writer replaces a compressed row of a slot it
@@ -2355,21 +2364,24 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   `OpenContext::long_running`), and a pool checkout after the connect timeout. A request whose deadline runs out once
   the server has answered the handle (2.8.2) is sent once more, on a new connection, with a deadline of its own
   (counted in `retries()`): a large read answered slowly while other jobs write, or a write that waited for the lock,
-  costs that call a second try instead of the handle (`OnTimeout::Resend`). A write batch that stores an attestation
-  or a manifest first asks whether the server committed it (`Conn::batch_checked`: one of its attestations with its
-  `stored_at`, else one of its manifests with its `put_at`, a read that needs no write lock): a batch that ran out of
-  time waiting for the lock usually commits after the client gave up, and sent again it would wait for the lock again
-  and write its change log rows a second time, under the very load that made it late. One the server holds is not
-  sent again; one it does not is sent again once, out of time again latching the breaker. The server may still commit
-  the first after the question was answered; applied twice the batch is safe (below), and its upserts rewrite only
-  rows that differ (the manifests' since 2.8.2 too: value, encoding, base, or a later `put_at`), so the second costs
-  little but the log's rows. Only the same request out of time again
+  costs that call a second try instead of the handle (`OnTimeout::Resend`). A transaction of a write batch is sent once
+  (`WRITE_ONCE`, `Conn::batch_checked`) and, when its deadline runs out (or it waited for the lock until then), first
+  asks whether the server committed it (one of its attestations with its `stored_at`, else one of its manifests with
+  its `put_at`, a read that needs no write lock; unanswered in time, it counts as not committed): a transaction that
+  ran out of time waiting for the lock usually commits after the client gave up, and sent again it would wait for the
+  lock again and write its change log rows a second time, under the very load that made it late. One the server holds
+  is stored; one it does not is the batch's to send again, in halves, within the process's time for writes that fail
+  ("Writes", below), latching nothing itself. The server may still commit the first after the question was answered;
+  applied twice the transaction is safe (below), and its upserts rewrite only rows that differ (the manifests' since
+  2.8.2 too: value, encoding, base, or a later `put_at`), so the second costs little but the log's rows. Only the same
+  request out of time again
   (`TRIES_AFTER_TIMEOUT`; counted per request, so that requests sent at once do not use up each other's try) latches
   the breaker;
   a deadline before any answer latches it at once, as before, and a request whose try comes after another latched it
   is not sent again. A hint's write (`Op::hint`: the memo and the flags) has a deadline of
   `HINT_TIMEOUT`, 5 s, or the request timeout if shorter, is never sent again and never latches
-  (`OnTimeout::FailAlone`); a request of values sent beside others fails alone the same way, and the read sends its
+  (`OnTimeout::FailAlone`), not even when its connection cannot be made or is lost (the calls that need the server
+  find that out themselves); a request of values sent beside others fails alone the same way, and the read sends its
   keys again itself ("Reads", below). While the server answers that the
   database is locked, that it is out of connections (HTTP 429) or that it interrupted the statement, the request is
   tried again with growing pauses until its deadline (`Timeout{operation: "waiting for another writer"}` then). A
@@ -2407,11 +2419,12 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   HTTP 401, or 403 on a read (`the server asks for a token: set $VCI_STORE_TOKEN (or [store] token_command)`, or `the
   server refused the token …`, `… from [store] token_command (<command>)` for the command's), 404 (`no libsql database
   there`), other HTTP error status (a 5xx, a proxy's page), answer the client cannot read, deadline before the server
-  first answered, or request out of time twice is latched, and every later call of the handle fails at once with `…
-  (failed earlier in this process; not retried)`. Busy retries, `Denied`, `Unsupported`, `Backend`, a read whose rows
-  were cut off, one deadline that ran out (sent again, above) and a hint's write are not latched. 2.8.1 latched the
-  first deadline: one vex job's 30 s read made its plan run every unit, and one 30 s write lost the run's remaining
-  800 attestations.
+  first answered, request out of time twice, or a process's writes failing for longer than its time for them
+  ("Writes", below) is latched, and every later call of the handle fails at once with `… (failed earlier in this
+  process; not retried)`. Busy retries, `Denied`, `Unsupported`, `Backend`, a read whose rows were cut off, one
+  deadline that ran out (sent again, above), a write transaction out of time (sent again by its batch) and a hint's
+  write are not latched. 2.8.1 latched the first deadline: one vex job's 30 s read made its plan run every unit, and
+  one 30 s write lost the run's remaining 800 attestations (44 of 207 vex Rails jobs on 27 October).
 - **Statements the server refuses.** `sqld` reports a statement's error (a batch step's as a Hrana API error, a
   cursor step's as `error at step N`) with HTTP 200: the server works, so it is `Backend(LibsqlError)` (`<url>: the
   server refused a statement: …`), not latched; the transaction it was in was rolled back (its stream closes with
@@ -2462,7 +2475,7 @@ JSON array (`IN (SELECT value FROM json_each(?1))`), 5,000 to a request, but for
 | method | on a cache miss |
 |---|---|
 | `list_units` | `SELECT test_key, key, target FROM <a> WHERE test_key IN (…) ORDER BY test_key, key` |
-| `read_values` | the values of the keys and, in the same statement (`UNION ALL`), the manifests they reference (but those cached already), 100 keys to a request; then the bases those manifests name and the cache lacks, in one more request (in the same statement when the keys fit in one request, `values_with_bases`); all go to the cache |
+| `read_values` | the values of the keys and, in the same statement (`UNION ALL`, `values_with_bases`), the manifests they reference and those manifests' bases, but the bases cached already or brought by an earlier answer of the same read; 100 keys to each of the first requests, later ones sized from the answers; all go to the cache |
 | `manifest`, `manifests` | `root = ?1`; `root IN (…)` |
 | `read_units` | fully cached units from the cache (values kept); the rest in one statement with values |
 | `list_all`, `count`, `manifest_roots`, `read_all` | one statement each, never cached |
@@ -2473,62 +2486,68 @@ which is where other writers' changes are picked up), then the values `choose` p
 manifests and bases, as `read_values` reads them. `prefetch(Manifests)` is one request for the roots not cached as
 stored, with their bases.
 
-**Values, 100 to a request** (2.8.2, `VALUES_PER_REQUEST`; about 4 MB of vex's), each request with the manifests its attestations reference but those cached already (the roots cached, at most
-4,096, are bound as a second JSON array), each base once for the whole read. 2.8.1 read a plan's 1,600 to 2,000 values
-(60 to 85 MB on vex's Turso) in one request that took 2 to 22 s, and repeated the bases in each of a plan's reads.
-Two requests go at once at first; after each answered within a third of the request timeout one more may be out at
-once, after each that took more than half of it one fewer, at least one and at most the pool's connections
-(`min(VCI_JOBS, 4)`). Requests sent at once may share the link's bandwidth, each then taking about as many times
-longer: the review's first draft sent four of 250 at once from the start, and behind a proxy limited to 3 MB/s (a
-vex-api plan, 1,647 values, 63 MB, `VCI_STORE_TIMEOUT_SECS=10`) all four ran out of time together after 10 s, 30 MB
-read and thrown away, and the read took 42.5 s; at 0.8 MB/s, 121 s, 12 deadlines. On vex's Turso database from a
-laptop, though, a connection is limited more than the link is (a request of 250 took 6.5 to 7 s alone and 7 to 11 s
-three at once), so going one at a time made the plan slower (prefetch 35 to 42 s against 19 to 32 s), and requests of
-250 left one straggler of 15 to 19 s holding up the read. Requests of 100 reach four at once within their first few
-answers there and each takes 1 to 8 s; see the measurements below. A request of values whose deadline runs out
+**Values, in requests sized from the answers** (2.8.2). 2.8.1 read a plan's 1,600 to 2,000 values (60 to 85 MB on
+vex's Turso) in one request that took 2 to 22 s, and one request out of time made the whole plan run every unit. Now
+the first requests take 100 keys each (`VALUES_PER_REQUEST`, about 4 MB of vex's) and go **as many at once as the
+handle sends** (`Conn::max`, `min(VCI_JOBS, 4)`, at most one per request); each later request takes as many keys as
+the last answer says fit in `VALUES_TARGET` of the request timeout (15%, 4.5 s at the default 30 s), at most four
+times the last request and between `VALUES_MIN` (25) and `VALUES_MAX` (400, about 15 MB of vex's). The pace assumes
+that time grows with size, which on a link whose bandwidth is the limit it does, and on one with a long wait for each
+answer but bandwidth to spare it overestimates, so there requests grow and few are sent: vex-api's 1,652 values went
+in 9 to 10 requests on vex's Turso database from a laptop (four of 100, then larger), and in two rounds of requests
+behind a proxy that held each answer 1 s (`a_read_of_values_on_a_link_slow_to_answer_takes_few_round_trips`: four of
+100, then three of 400). After each answer that took more than half of the timeout one fewer request is out at once
+(at least one), after each within a third one more: requests sent at once may share a slow link's bandwidth, and then
+take as many times longer (behind a proxy limited to 2 MB/s, vex-api's four first requests took 10.3 s each, the
+next ones were sized to 43 values and took about 4 s each, and the plan read all 1,652 values in 42 s where 2.8.1's
+one request ran out of time at 30 s; see "Measured"). **Each request brings the manifests and bases of its own
+values** (`values_with_bases`), but the bases cached already (those an earlier read of the handle found to be bases,
+`Remote::bases`) or brought by an answer of the same read before it was sent, bound as a second JSON array (at most
+4,096 roots): no request of bases follows the values (the 2.8.2 draft read them in one more request after the
+values, a round trip on the plan's path). **The statements are described ahead**: libsql's `prepare` sends Hrana's
+`describe` once per statement and connection, one more round trip before a connection's first read; the store's
+`warm()` (at the start of a plan) has the listing's and the values' statements described on `Conn::max` connections
+at once (`Conn::describe_ahead`), after the status and the flags, and the pool holds one connection more than that,
+so the plan's other reads (its memo, say) do not wait for one; a read takes an idle connection that has its statement
+described when there is one. A request of values whose deadline runs out
 (`OnTimeout::FailAlone`, alone or beside others) fails alone, latching nothing and not sent again whole, and no more
-are sent at once: the read sends the keys of that request again, one request at a time and 50 to a request, each half
-counting on its own (one answered is kept when the other fails), and those of the requests never sent at full size
+are sent at once: the read sends the keys of that request again, one request at a time and in halves, each half
+counting on its own (one answered is kept when the other fails), and the keys never sent at the last size
 (`OnTimeout::Latch`: one of those out of time was the second try, and latches the breaker, after which the rest fail
-at once). The review's first draft sent a read of one request again whole, which on a link too slow for it within
-the timeout ran out of the read's time too and read nothing, where a half may fit in what is left
-(`a_lone_request_of_values_out_of_time_is_read_again_in_halves`); and it threw away a half answered beside one that
-was not, which the plan's next read then read again
-(`a_read_of_values_out_of_time_keeps_its_halves_and_reads_no_more`).
+at once) (`a_lone_request_of_values_out_of_time_is_read_again_in_halves`,
+`a_read_of_values_out_of_time_keeps_its_halves_and_reads_no_more`).
 **The whole read is given two request timeouts** (`VALUES_DEADLINES`, `Conn::query_until`), one more for each 800
-values beyond 1,600 (`VALUES_PER_DEADLINE`: about 30 MB of vex's, 1 MB/s at the default 30 s; vex-api's 2,195 values,
-81.5 MB, took 29.9 to 58.6 s of a fixed 60 s from a laptop on 27 October, the plan 31.8 to 61.6 s): no request runs
-past them (one they cut short fails alone, latching nothing), and the keys not read by then fail as below.
+values beyond 1,600 (`VALUES_PER_DEADLINE`: about 30 MB of vex's, 1 MB/s at the default 30 s): no request runs past
+them (one they cut short fails alone, latching nothing), and the keys not read by then fail as below.
 **They are the handle's** (`Remote::values_until`): once a read of values had a request run out of time, every later
 read of values by the same handle ends when that read had to, so the keys that failed are not asked for again and a
-round's new keys fail at once, their units running. The review's first draft gave each read its own two deadlines,
-and a plan reads values up to five times (the prefetch, its read of the candidates, then a prefetch and a read again
-in each of rounds 2 and 3): behind a proxy at 1 MB/s with a 5 s timeout, vex-api's plan took 22.1 s (2.8.1: 6.7 s),
-its read of the candidates spending another 10 s on the keys the prefetch had just failed, and vex-roder's round 2
-twice 10 s; with the default 30 s a slow round cost about 120 s where 2.8.1 latched after 30 s. So a slow link costs
-a plan one read's time, as a server that stops answering does, never one per read (2.8.1 gave up after one deadline,
-and every unit ran). `a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once` checks the pace behind a proxy
-limited to 1.7 and 1 MB/s: every value read once, where four requests of 250 at once ran out of time and read 13 MB
-for 7.8, and the read stopped after 6 s, where it took 11.6 s; `a_large_read_of_values_is_given_a_timeout_per_800_values`
-the third deadline for 1,700 values. A request that fails otherwise, or before the read's time ran out, costs only its
-keys: `prefetch` leaves them uncached, counts them in `Hydration::unresolved` and warns (`vci: warning: could not
-prefetch N stored value(s) from <url> namespace <ns>: …; they are read again when asked for`, or `their units run`
-once the handle's time for values ran out), and `read_values` reads them again when asked; a `read_values` request that fails marks its keys
-`Unreadable("could not be read from the store: …")`, so their units run, and the call fails only when it could serve
-no key at all (from the cache or the server), as a store that cannot be used does. The timing lines carry the bytes
-read: `prefetch N unit(s), M value(s), R request(s), X MB` and `read M value(s), R request(s), X MB`.
+round's new keys fail at once, their units running. A plan reads values up to five times (the prefetch, its read of
+the candidates, then a prefetch and a read again in each of rounds 2 and 3), so a slow link costs a plan one read's
+time, as a server that stops answering does, never one per read (2.8.1 gave up after one deadline, and every unit
+ran). `a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once` checks the pace behind a proxy limited to 1.7
+and 1 MB/s (every value read once at 1.7 MB/s; at 1 MB/s the read stops after its two deadlines, nothing latched),
+and `a_large_read_of_values_is_given_a_timeout_per_800_values` the third deadline for 1,700 values. A request that
+fails otherwise, or before the read's time ran out, costs only its keys: `prefetch` leaves them uncached, counts them
+in `Hydration::unresolved` and warns (`vci: warning: could not prefetch N stored value(s) from <url> namespace <ns>:
+…; they are read again when asked for`, or `their units run` once the handle's time for values ran out), and
+`read_values` reads them again when asked; a `read_values` request that fails marks its keys `Unreadable("could not be
+read from the store: …")`, so their units run, and the call fails only when it could serve no key at all (from the
+cache or the server), as a store that cannot be used does. The timing lines carry the bytes read: `prefetch N
+unit(s), M value(s), R request(s), X MB` and `read M value(s), R request(s), X MB`.
 Hrana's batch could carry several statements in one HTTP request; one statement per read already does, so a plan of
 1,200 units is the status, the flags, the memo, two prefetches of two requests and the descriptions of the statements
-on each connection: `a_plan_costs_a_handful_of_requests` checks at most 10 requests (8 before the values went 100 to a request) for the status and a prefetch of
-300 units, and none for the listings, the batch read and 300 manifest reads from 8 threads after it.
+on each connection: `a_plan_costs_a_handful_of_requests` checks at most 10 requests (8 in 2.8.1, whose values went in
+one request) for the status and a prefetch of 300 units, and none for the listings, the batch read and 300 manifest
+reads from 8 threads after it.
 
 ### Writes (remote and replica modes)
 
 `batch()` is deferred, with PostgreSQL's queue (section 17, "Writes"): per slot the last put, the slots a removal
 emptied, the removed keys, per root the last manifest, and `remove_manifests` keeping what the open batch will write
-or reference. `finish` writes the queue as **one request**: a Hrana batch of `BEGIN IMMEDIATE`, the statements below
-and `COMMIT`, each step run only when the one before it succeeded (libsql's `execute_batch`), with the stream's closing
-in the same request, so that a batch that stopped part way is rolled back as the server closes the stream's connection
+or reference. `finish` writes the queue as **short transactions of whole units** (2.8.2, below), one after the
+other; each transaction is **one request**: a Hrana batch of `BEGIN IMMEDIATE`, the statements below and `COMMIT`,
+each step run only when the one before it succeeded (libsql's `execute_batch`), with the stream's closing in the same
+request, so that a batch that stopped part way is rolled back as the server closes the stream's connection
 (a connection libsql still believes in a transaction after such a batch is replaced first, so every batch closes its
 stream). Every write vci sends is such a batch, a namespace's first `CREATE TABLE`s included, so each takes the write
 lock before its first statement. Under libsql's transactional batch (a deferred `BEGIN`), a namespace's first batch
@@ -2549,7 +2568,48 @@ namespace whose `vci_schema` row exists sends no DDL at all (one read per handle
 3. the removed keys (`DELETE … WHERE key IN (…)`) and the emptied slots;
 4. the attestations, one multi-row upsert on the slot, replacing the key, the value, its encoding and the columns
    derived from them when any changed;
-5. the log rows of every slot and root touched, and once per handle the log's prune.
+5. the log rows of every slot and root touched, and once per handle the log's prune (by its first transaction that
+   commits).
+
+**Short transactions** (2.8.2). 2.8.1 sent a project's queue in one transaction, flushed early at 8 MiB: on vex's CI
+each such request took about 15 s to commit (about 0.5 MB/s) even alone, held the database's one write lock while
+it was applied, and every other writer (a job's flags and memo, a shared manifest, its own units) queued behind it
+for 10 to 30 s; 44 of 207 Rails jobs on 27 October passed the 30 s deadline and latched the store, losing about 800
+attestations each (39% of units not attested, against 2% on git-meta). The time a transaction takes grows faster than
+its size: from a laptop to vex's Turso database on 28 October (while vex's CI wrote too), three runs each, a
+transaction of 0.25 MB committed in 1.3-2.8 s, 0.5 MB in 1.5-1.7 s, 1 MB in 1.8-3.7 s, 2 MB in 2.5-10.6 s, 4 MB in
+5.0-10.2 s and 8 MB in 33.6-36.8 s, and a one-row write sent 3.3 s into an 8 MB one waited until it committed (7.8 s).
+So the queue is split by unit (test key): a unit's attestation, the slots it empties, the keys it removes, and the
+queued manifests its attestations reference with their queued bases go in the same transaction, so that an
+attestation is never stored without its manifest nor a superseded one removed without its successor; manifests no
+queued attestation references (and removals of keys that name no unit) go first. Units are packed, in order, into
+transactions of at most `TX_BYTES` (1 MiB) of values as sent and `TX_UNITS` (64) attestations, a unit larger than that
+alone being a transaction of its own; compressed values count at two thirds of their size (zstd makes vex's JSON
+about a third as large, and its bytes travel as hex, twice that). A manifest a transaction stored is not sent again
+with a later one. The roots the whole queue references are kept by every transaction's `superseded_manifests`, so an
+early transaction never removes a manifest a later one references.
+
+**A failure costs its own units.** A transaction that ran out of time (or waited for the lock until its deadline), or
+whose stream the server dropped, is asked about first (`Conn::batch_checked`, "Connection handling" above: committed,
+it is stored), then sent again after a pause (250 ms doubling with each try up to 4 s, randomized between half and one
+and a half of that, so that jobs that failed together do not come back together), in two halves when it holds more
+than one unit, at most `MAX_TRIES` (4) times for a unit. A transaction the server refuses (`Backend`, `Unsupported`)
+is split in halves down to the unit it refuses (`a_statement_the_server_refuses_latches_nothing`: one unit lost, the
+other stored). Whatever still fails loses only its units: `BatchEnd::finish_partial` names their keys
+(`vci_store::Finished::lost`), `vci run` refuses those units ("signing or storing failed: storing the batch: …") and
+reports the rest as attested, and what a lost unit would have superseded stays. **A process's time for writes that
+fail is bounded**: the time of every transaction that failed out of time and of the pauses before sending one again
+counts against `WRITE_RETRY_DEADLINES` (2) request timeouts, 60 s at the default, for the handle
+(`Remote::spend_on_writes`); past it the breaker latches (`writes kept failing (…), and this process spent the 60s it
+may on writes that fail`) and every transaction still queued fails at once, so a server that takes no writes costs a
+process about two timeouts, not one per transaction (`writes_out_of_time_are_sent_again_within_a_bounded_time`: a
+held transaction sent again and the batch stored whole; a server that stops taking writes after the first
+transaction: that transaction's units stored, the rest lost within 9 s at a 2 s timeout, the handle latched). A
+server that cannot be reached latches at once, as before; so do a token that may not write and a server that takes
+no more writes (`Denied`), which lose every unit still queued with that error. An early write (a queue of 2,000
+writes or 4 MiB, below) loses its units the same way, and `finish` reports them with the rest. The timing line says
+what went: `write batch: M manifest(s), A attestation(s), R removal(s), T transaction(s), N request(s), X MB[
+compressed], longest Ys[, L attestation(s) not stored]`.
 
 **A batch sent again.** A batch whose connection was lost under it is sent again (above, "Lost connections"), and the
 server may have committed it and lost only the answer. It is one transaction ending in `COMMIT`, applied whole or not
@@ -2579,11 +2639,8 @@ writer, within its deadline.
 
 Values travel as SQL literals, since the batch takes SQL text only: UTF-8 bytes without NUL as text cast
 to a blob (`CAST('…' AS BLOB)`, the same bytes), anything else (a compressed value) as hex. A queue of 2,000 writes or
-4 MiB of values (as they are; 8 MiB before 2.8.2) is written early, in a request and transaction of its own (a failed
-early write fails `finish`). A request holds the server's one write lock while it is applied: vex's 8 MiB batches held
-it 15 to 26 s on Turso while other jobs wrote, every other writer (the hints included) queued behind them, and the
-queue passed the 30 s deadline. The timing line says what went: `write batch: … R request(s), X MB[ compressed]`. A write outside a batch is a
-batch of one: `put` one request (an unhinted put first reads its slot's key), `put_manifest` two (it compares the
+4 MiB of values (as they are; 8 MiB before 2.8.2) is written early, as transactions of its own (above). A write
+outside a batch is a batch of one, with the same retries: `put` one request (an unhinted put first reads its slot's key), `put_manifest` two (it compares the
 stored bytes first), `remove` two (it reads which keys exist first). `remove_manifests` reads the removable roots (put
 before the grace period, an hour, none for `vci prune`; not referenced; nobody's base), then deletes them with the
 same conditions and logs them: two requests.
@@ -2601,11 +2658,12 @@ is reported attested on a base that was not stored.
 A server with a lower limit refuses the batch as `Unsupported` too, not latched. vex's largest manifest is 1.98 MB.
 The SQLite and PostgreSQL stores and git-meta have no such limit, and the local mode, a SQLite file, has none either.
 
-`a_plan_costs_a_handful_of_requests` writes 300 units (600 attestations and 300 manifests) in at most 6 requests; the
-release-build test `many_units_are_listed_and_read_quickly` (1,200 units of 18 KB against a local `sqld`) wrote them
-in 0.64 s and 8 requests (three transactions: the queue flushed at 8 MiB), and listed and read them on a new handle in
-0.10 s and 4 requests; with 2.8.2, 0.47 s and 12 requests (six transactions at 4 MiB), and 0.04 s and 11 requests
-(the values five requests of 250, four at once; 100 to a request since).
+`a_plan_costs_a_handful_of_requests` writes 300 units (600 attestations and 300 manifests) in one request per 64
+attestations and the schema's; `a_batch_is_written_as_short_transactions_of_whole_units` writes 120 units of about
+40 kB in requests of at most 1.6 MB each (the statements' text and its JSON escapes), every attestation with its
+manifest. With 2.8.1 the release-build test `many_units_are_listed_and_read_quickly` (1,200 units of 18 KB against a
+local `sqld`) wrote them in 0.64 s and 8 requests (three transactions: the queue flushed at 8 MiB), and listed and
+read them on a new handle in 0.10 s and 4 requests (not measured again).
 
 ### The replica mode
 
@@ -2724,54 +2782,85 @@ namespace of git-meta's size (vex's held about 24,000 attestations, and its plan
 the largest pilot namespace held 3,276), a read-only token's refusal, and Turso's quotas. A vex pull request (#2214)
 proposes moving its Rails jobs to Turso; it is under review.
 
-**2.8.2 against Turso's hosted service** (27 October 2026, from a laptop in California to aws-eu-west-1, about 150 ms
-of round trip and 1 to 4 MB/s): `vci plan --project vex-api --base-ref origin/master` in a 10-day-old vex checkout,
-1,992 Rails units, every write refused by a measurement build of each version. The laptop cannot
-run vex's Rails checks (its probe refuses rbenv's load path), so this is the plan's first round, where its reads are.
-Namespaces: vex's own (read only), a copy of its 3,695 attestations with the 3,323 manifests and bases they reference
-(made with `INSERT … SELECT` on the server), and the same copy with every value compressed (zstd 6: attestations 60.7
-to 20.1 MB, manifests 57.7 to 18.0 MB):
+**2.8.2 against Turso's hosted service** (28 October 2026, 04:00 to 05:05 UTC, from a laptop in California to vex's
+database in aws-eu-west-1, about 0.65 s for a trivial request on a new connection; vex's CI, all on 2.8.1, wrote to
+the same database throughout, about 1,400 attestations every ten minutes, so the write lock was contended as in
+production). Earlier drafts of 2.8.2 were measured on 27 October; their numbers, in this section's history, are
+superseded by these.
 
-| namespace | vci | plan, median (range) | values read | requests |
-|---|---|---|---|---|
-| vex's own | 2.8.1 | 34.0 s (30.7-38.5) | 1,652 prefetched (20.6-25.4 s) + 669 more (6.9-11.1 s), 91.1 MB | 7 statements |
-| vex's own | 2.8.2 | 15.5 s (12.2-17.8) | 1,652, 62.4 MB (10.4-15.8 s) | 15-17 |
-| copy | 2.8.1 | 28.6 s (27.1-36.6) | 1,652 (22.4-30.0 s) + 238 more (2.5-4.5 s), 71.2 MB | 7 statements |
-| copy | 2.8.2 | 17.4 s (13.2-20.5) | 1,652, 62.7 MB (11.3-18.5 s) | 15 |
-| copy, compressed | 2.8.2 | 9.2 s (8.2-11.5) | 1,652, 21.7 MB (6.4-9.5 s) | 15 |
+*Reads.* `vci plan --project vex-api --base-ref origin/master` in a vex checkout of 17 October, 1,992 Rails units, on
+vex's own namespace, read only (every write refused by a measurement build of each version); the laptop cannot run
+vex's Rails checks, so this is the plan's first round, where its reads are. Six runs of each, interleaved, 04:54 to
+04:56 UTC:
 
-The rows marked 2.8.2 above are the review's first draft (250 values a request, four at once from the start). After
-the review (100 a request, two at once at first, the read within two deadlines), measured the same way later the same
-day on vex's own namespace, six runs each interleaved with the first draft, when the link was slower: the plan 28.0 s
-median (23.0-40.5), prefetch 21.9 s (19.9-37.6), 25-29 requests, against the first draft's 34.8 s (23.4-49.8) and
-32.3 s (20.4-46.9), 15-17 requests; both read the same 1,652 values, 62.4 MB, none out of time. A version that sent
-the first request of 250 alone and grew from one took 38 to 45 s (prefetch 35 to 42 s), and one that started at two
-with 250 a request 26.5 to 36.3 s: a request of 250 took 4.7 to 19.3 s, one straggler holding up the end of the read.
+| vci | plan, median (range) | prefetch | the candidates' read | read, as stored | requests of values |
+|---|---|---|---|---|---|
+| 2.8.1 | 13.2 s (12.1-16.4) | 7.1-9.4 s | 3.2-5.5 s | about 99 MB | 2 |
+| 2.8.2 | 7.3 s (6.5-10.1) | 4.2-8.1 s | 0.02-0.05 s | 63.5 MB | 8-9 |
 
-These plans read 1,652 values (62.4 MB). In the review of the draft that evening the same plan read 2,181 to 2,196
-values (81.5 MB, 30 requests): six interleaved runs read every value each time, the prefetch taking 29.9, 36.0, 40.9, 43.0, 45.6 and 58.6 s (the plan 31.8 to 61.6 s, median about 45.8 s;
-requests of 3.6 MB took 1.4 to 17.5 s), close to the two deadlines (60 s) a read then had, while 2.8.1's one request
-of about 100 MB ran out of time in each run and every unit ran (34.0 to 36.1 s). Hence the deadline per 800 values
-above; `VCI_STORE_COMPRESS=zstd` makes the same read about 3x smaller.
+An interleaved set 17 minutes earlier, with a build of 2.8.2 that differed in when the statements were described
+ahead, the pool's spare connection and the requests' size target, gave 12.9 s (12.5-16.4) against 7.8 s (7.1-8.6).
+2.8.2 reads the 1,652 values 2.8.1 prefetches, in requests of 100 four at once and then larger ones, and not the 988
+to 1,203 newest candidates 2.8.1 then reads in a second request.
 
-After that review (the handle's time for values, halves kept, a lone request read in halves, the bases in a read of
-one request, a deadline per 800 values), measured at about 02:45 UTC on 28 October against the draft, read only:
-vex-api's plan, three interleaved runs each, read 1,652 values (62.4 MB, 25 requests) in a prefetch of 6.2 to 6.3 s
-(the draft 6.5 to 7.4 s), the plan 7.8 to 8.2 s (8.0 to 9.0 s); vex-roder's (1 unit), four each, read round 2's
-values in 2 requests and 0.83 to 0.98 s, where the draft took 4 to 7 requests and 1.63 to 2.91 s, the plan 3.6 s
-median (3.56-4.28) against 4.6 s (4.32-9.77). On a local copy of vex's namespace (5,918 attestations) behind a proxy
-with a 5 s timeout: at 1 MB/s vex-api's plan took 18.7 s (the draft 22.1 s, 2.8.1 7.1 s, which read no value), its
-read of the candidates no time and no request where the draft's spent 10 s failing again, and it read 150 values
-where the draft and 2.8.1 read none (its prefetch had three deadlines for 1,652 values, 15 s); at 100 kB/s
-vex-roder's plan took 12.9 s (the draft 22.8 s, 2.8.1 10.0 s), round 2 10.1 s where the draft's took 20.1 s; a server
-that stops answering after five answers cost 12.6 s against 10.7 s (both latched before the values).
+On a copy of vex's namespace (5,728 attestations, copied with their manifests and bases, the memo and the flags) on a
+local `sqld`, behind a proxy, five runs of each interleaved (04:48 to 04:52 UTC):
 
-Six runs of each, interleaved. 2.8.2 reads the same 1,652 values 2.8.1 prefetches, in seven requests four at a time, and not the 238 to 669 newest
-candidates 2.8.1 then read in a second request; the listing (1.6 s, 0.66 MB for 2,090 keys) is the same. With
-`VCI_STORE_TIMEOUT_SECS=5` 2.8.1's single read ran out of time and its plan read nothing, twice; 2.8.2 read all 1,652
-values in each of three runs (15-35 s), the requests that ran out of time beside others read again on their own.
-From vex's runners, which read 8 to 45 MB/s, the bytes count for less and the server's time per value (about 3 ms
-raw) for more; not measured there yet.
+| link | vci | plan, median (range) | prefetch |
+|---|---|---|---|
+| every answer held 1 s, bandwidth unlimited | 2.8.1 | 13.5 s (10.6-16.6) | 4.2-5.9 s, then the candidates' read 1.2-6.7 s |
+| every answer held 1 s, bandwidth unlimited | 2.8.2 | 9.1 s (8.4-9.9) | 3.2-4.6 s, 9 requests |
+| 2 MB/s, two runs each | 2.8.1 | 31.2-31.5 s | its one request of values ran out of time (30 s), the store latched, the plan read nothing (every unit would run) |
+| 2 MB/s, two runs each | 2.8.2 | 43.9-47.7 s | every value read, 42.4-42.6 s in 37-38 requests (four of 100 at 10.3 s each, then about 43 a request at about 4 s each) |
+
+Across the four interleaved sets run that morning with each answer held 1 s (18 runs of 2.8.1), 2.8.1's plan took
+10.5 to 16.6 s (two first, cold runs 22.1 and 25.8 s); 2.8.2 as committed took 8.4 to 9.9 s (the set above). The review of the draft had found 2.8.2 slower there (16.5-17.6 s
+against 11-14 s): requests of 100 two at a time, a describe on each new connection, and the bases in one more
+request after the values.
+
+*Writes.* A scratch namespace seeded on the server (`INSERT … SELECT`) with vex's 1,200 newest attestations and the
+1,176 manifests they reference, then `vci run`'s writes replayed into it by a measurement program that opens the store
+as `vci run` does: a batch of units, each one of vex's real attestations (21.2 kB on average) and its real input
+manifest (15.2 kB), under a new test id, written with `put_manifest` and `put` and finished. 500 units (16.4 MB) from
+one process, or 350 (11.2 to 13.6 MB) from each of three at once; 2.8.1, 2.8.2, and 2.8.2 with
+`VCI_STORE_COMPRESS=zstd`, in turn:
+
+| run (UTC) | vci | per process | longest request | requests that ran out of time | attestations lost |
+|---|---|---|---|---|---|
+| one process, 04:16 | 2.8.1 | about 30 s | the first 8 MB, out of time at 30 s | 1, then latched | 500 of 500 |
+| one process, 04:23 | 2.8.1 | 45.6 s | 29.1 s (8 MB) | 0 | 0 |
+| one process, 04:31 | 2.8.1 | 30.0 s | the first 8 MB, out of time at 30 s | 1, then latched | 500 of 500 |
+| one process, 04:17 | 2.8.2 | 213.9 s, 19 transactions | 26.4 s | 0 | 0 |
+| one process, 04:32 | 2.8.2 | 145.0 s, 19 transactions | 25.6 s | 0 | 0 |
+| one process, 04:21 | 2.8.2 zstd | 30.7 s, 11 transactions | 8.1 s | 0 | 0 |
+| one process, 04:35 | 2.8.2 zstd | 19.5 s, 12 transactions | 2.6 s | 0 | 0 |
+| three processes, 04:25 | 2.8.1 | 30.0, 30.0, 50.5 s | out of time at 30 s in each | 3, each latched | 1,050 of 1,050 |
+| three processes, 04:26 | 2.8.2 | 95.1, 119.9, 132.8 s | 25.9 s | 0 | 0 |
+| three processes, 04:29 | 2.8.2 zstd | 28.6, 30.1, 37.8 s | 9.9 s | 0 | 0 |
+
+The time a transaction took swung with vex's CI's own writes: in the run of 04:32 the first two 4.2 MB flushes (five
+transactions each) took 82.6 and 51.9 s, the last two 5.6 and 4.9 s. 2.8.1's lost units were not all missing from the server: its
+requests that ran out of time were applied after the client gave up (the scratch namespace held about 1,000 of the
+attestations 2.8.1 reported lost), but `vci run` cannot know which, and reports them all as not attested.
+Compressed, the values travel at about two thirds of their size (zstd's third, sent as hex), and the longest
+transaction of a flush took 1.5 to 9.9 s.
+
+*A small write while others write.* A process that started 4 s after the writers put one manifest outside a batch
+(`put_manifest`, a transaction of its own) and set a flag (a hint, at most 5 s):
+
+| beside | the manifest | the flag |
+|---|---|---|
+| 2.8.1 writers (four runs) | 0.53-0.78 s | 0.18-0.22 s |
+| 2.8.2 writers (three runs) | 0.96-10.9 s | 5.33-5.36 s: dropped at its deadline each time, nothing latched |
+| 2.8.2 writers, zstd (three runs) | 0.90-4.16 s | 0.98-1.21 s |
+
+and a one-row write every 1.2 s for 40 s (05:00 to 05:04 UTC) while one process wrote 150 units: beside 2.8.2, 9 and
+18 writes, 0.66 to 16.9 s (all but 5 under 2.2 s); beside 2.8.1, 7 writes of 0.68 to 18.7 s (5 over 2 s) and, in the
+run whose 4.8 MB request ran out of time, one write that waited 56 s while the server went on applying it. A write
+4 s into 2.8.1's batch arrives while its first 8 MB are still being sent, before the server takes the lock, so the
+single small write fared better beside 2.8.1 than beside 2.8.2's stream of 1 MB transactions; once a large request
+is applied, every other writer waits for it, up to the 56 s above. Not measured: Rails jobs on vex's runners with
+2.8.2 (whose network is faster than this laptop's), and a database whose every writer runs 2.8.2.
 
 ### fetch, push, hints, operations
 
@@ -3157,3 +3246,12 @@ Still open:
     its scenarios slow as the tables of earlier runs accumulate (four runs in a row took 10, 28, 42 and 50 s; 15 to
     18 s for the remote ones at 7,500 schema objects, against 2.5 to 4.8 s at a few hundred, in an earlier
     measurement).
+18. **Compressed values travel as hex.** A libSQL write is SQL text (libsql's `execute_batch` takes no parameters),
+    so a zstd frame, which is not UTF-8, is sent as a hex literal, twice its size: vex's values travel at about two
+    thirds of their size compressed rather than a third. Parameters (base64 in Hrana's JSON, a third larger) would
+    need one request per statement with libsql 0.10.0's API, or a Hrana client of vci's own.
+19. **Small writes beside a stream of short transactions.** On 28 October (section 18, "Measured") a flag set 4 s
+    into a 2.8.2 `vci run`'s writes was dropped at its 5 s deadline in each of three runs, where beside 2.8.1, still
+    sending its first 8 MB, it took 0.2 s; a one-row write every 1.2 s waited at most 16.9 s beside 2.8.2 and up to
+    56 s beside 2.8.1. Whether a pause between a batch's transactions would let other writers in sooner, and how
+    either behaves once every job of a database runs 2.8.2 (vex's CI ran 2.8.1 throughout), is not measured.

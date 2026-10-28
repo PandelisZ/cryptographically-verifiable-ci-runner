@@ -233,6 +233,9 @@ enum Slot {
         line: String,
         superseded: usize,
         dropped: BTreeSet<String>,
+        /// The key it was stored under: a batch that loses some of its
+        /// writes names them by key ([`vci_store::Finished::lost`]).
+        key: String,
     },
 }
 
@@ -430,6 +433,7 @@ impl<'s> StoreLoop<'s> {
                 line,
                 superseded,
                 dropped,
+                key: stored.key.clone(),
             });
         } else {
             self.done.superseded += superseded;
@@ -480,8 +484,11 @@ impl<'s> StoreLoop<'s> {
     /// End the batch, then report every unit in order. A deferred batch
     /// that fails stored nothing: each unit it held is refused ("signing
     /// or storing failed") and counted as an error, and what it would have
-    /// superseded stays. What failed after the batch's writes were durable
-    /// (git-meta's log re-stamp) is a warning after them.
+    /// superseded stays. A batch that lost some of its units' writes and
+    /// stored the rest (the libSQL store, which writes a batch as several
+    /// short transactions) refuses only those units. What failed after the
+    /// batch's writes were durable (git-meta's log re-stamp) is a warning
+    /// after them.
     fn finish(self) -> Stored {
         let StoreLoop {
             store,
@@ -495,7 +502,8 @@ impl<'s> StoreLoop<'s> {
         } = self;
         let deferred = batch.as_ref().is_some_and(WriteBatch::defers_writes);
         let mut after = Vec::new();
-        let failed = match batch.map(WriteBatch::finish) {
+        let mut lost = vci_store::Finished::default();
+        let failed = match batch.map(WriteBatch::finish_partial) {
             Some(Err(e)) if deferred => Some(e),
             Some(Err(e)) => {
                 // Every write was durable already.
@@ -505,8 +513,9 @@ impl<'s> StoreLoop<'s> {
                 ));
                 None
             }
-            Some(Ok(warnings)) => {
-                after = warnings;
+            Some(Ok(mut finished)) => {
+                after = std::mem::take(&mut finished.warnings);
+                lost = finished;
                 None
             }
             None => None,
@@ -524,7 +533,8 @@ impl<'s> StoreLoop<'s> {
                     line,
                     superseded,
                     dropped,
-                } => match &failed {
+                    key,
+                } => match failed.as_ref().or_else(|| lost.lost(&key)) {
                     None => {
                         lines.push(Some(line));
                         done.superseded += superseded;
@@ -4448,6 +4458,53 @@ mod tests {
         // Nothing of the batch stored; the earlier attestation kept.
         assert_eq!(s.keys(), [old.key]);
         assert!(s.roots().is_empty());
+    }
+
+    /// A deferred batch that lost one unit's writes and stored the rest
+    /// (the libSQL store writes a batch as several short transactions)
+    /// refuses that unit alone: the others are attested and reported, and
+    /// what the lost one would have superseded stays.
+    #[test]
+    fn a_batch_that_loses_one_unit_refuses_it_alone() {
+        let s = crate::store::mem::MemStore::new()
+            .deferred(true)
+            .losing(Some("src/a.test.ts"));
+        let old = earlier(&s, "src/a.test.ts");
+        let m = InputManifest::default();
+        let (ra, rc) = (root('a'), root('c'));
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        let mut a = unit("src/a.test.ts", &m, &ra);
+        a.doomed = vec![old.clone()];
+        sl.attest(a);
+        sl.attest(unit("src/c.test.ts", &m, &rc));
+        let done = sl.finish();
+        assert_eq!((done.attested, done.refused, done.superseded), (1, 1, 0));
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(done.store_failures.len(), 1, "{:?}", done.store_failures);
+        let why = "storing the batch: memory store unavailable: a write timed out";
+        assert_eq!(done.store_failures[0], format!("src/a.test.ts: {why}"));
+        let lines = said.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!("vci: not attesting src/a.test.ts: signing or storing failed: {why}")
+        );
+        assert!(
+            lines[1].starts_with("vci: attested src/c.test.ts "),
+            "{lines:?}"
+        );
+        let ids: Vec<(&str, bool)> = done
+            .outcomes
+            .iter()
+            .map(|o| (o.test_id.as_str(), o.attested))
+            .collect();
+        assert_eq!(ids, [("src/a.test.ts", false), ("src/c.test.ts", true)]);
+        // c stored, a's earlier attestation kept.
+        let keys = s.keys();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(keys.contains(&old.key));
     }
 
     /// A store that cannot be used refuses its units without failing the

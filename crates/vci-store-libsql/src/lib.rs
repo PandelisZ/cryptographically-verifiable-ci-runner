@@ -13,13 +13,15 @@
 //!   `http://`, or `[store] url`; the token in `VCI_STORE_TOKEN` or an
 //!   `authToken` query parameter, else printed by `[store] token_command`
 //!   when the store first connects): every read and write goes to the
-//!   server over Hrana (HTTP),
-//!   through the `libsql` crate. Reads are served from a per-handle cache
-//!   that a prefetch fills (values a few hundred to a request); writes are
-//!   batched into transactional requests of a few megabytes, values
-//!   compressed with `VCI_STORE_COMPRESS=zstd`. Each repository's records live under a
-//!   namespace (`VCI_STORE_NAMESPACE`, else the repository id) in tables of
-//!   their own. Writes are shared at once (the publication gate applies).
+//!   server over Hrana (HTTP), through the `libsql` crate. Reads are
+//!   served from a per-handle cache that a prefetch fills (values in
+//!   requests sized from the answers); writes are batched and sent as
+//!   transactions of whole units of about a megabyte, one after the other,
+//!   a transaction that fails sent again within the process's time for
+//!   that and costing only its own units, values compressed with
+//!   `VCI_STORE_COMPRESS=zstd` or `[store] compress`. Each repository's
+//!   records live under a namespace (`VCI_STORE_NAMESPACE`, else the
+//!   repository id) in tables of their own. Writes are shared at once (the publication gate applies).
 //! * **Replica** (a remote URL plus `VCI_STORE_SYNC=replica`,
 //!   `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true`): reads
 //!   come from a local file synced from the server when the store is first
@@ -30,8 +32,10 @@
 //!
 //! Every wait is bounded (the connect timeout for a connection and for the
 //! server's first answer, the request timeout for a request, sent once
-//! more when it runs out), the first failure to reach the server or a
-//! request out of time twice latches a circuit breaker, every error is a
+//! more when it runs out; a batch's writes that fail, two request timeouts
+//! in all per process), the first failure to reach the server, a request
+//! out of time twice, or writes that keep failing past that time latch a
+//! circuit breaker, every error is a
 //! [`StoreError`] whose message carries neither the URL's token nor
 //! `VCI_STORE_TOKEN`, and no error is [`StoreError::Backend`] when the
 //! store cannot be used (a statement the server refuses is).
@@ -74,20 +78,25 @@ use replica::Replica;
 /// modes).
 const ENV_SYNC: &str = "VCI_STORE_SYNC";
 
-/// `VCI_STORE_COMPRESS=zstd`: write values to a server compressed (remote
-/// and replica modes). Every vci from 2.8.2 reads them either way; 2.8.1
-/// and earlier read a compressed value as one they cannot read (its unit
-/// runs), so it is turned on once every reader of the namespace is 2.8.2
-/// or later. `off` (or unset): as they are.
-const ENV_COMPRESS: &str = "VCI_STORE_COMPRESS";
+/// `VCI_STORE_COMPRESS=zstd` (or `[store] compress = "zstd"` in
+/// `vci.toml`; the variable wins): write values to a server compressed
+/// (remote and replica modes). Every vci from 2.8.2 reads them either way;
+/// 2.8.1 and earlier read a compressed value as one they cannot read (its
+/// unit runs), so it is turned on once every reader of the namespace is
+/// 2.8.2 or later. `off` (or unset): as they are.
+const ENV_COMPRESS: &str = select::ENV_COMPRESS;
 
-/// Whether `VCI_STORE_COMPRESS` asks for compressed writes; any value but
-/// `zstd` and `off` is refused.
-fn compress_setting() -> Result<bool, StoreError> {
+/// Whether values are written compressed: `VCI_STORE_COMPRESS` when set
+/// (any value but `zstd` and `off` is refused), else the selection's
+/// (`[store] compress`, resolved with the variable by
+/// [`select::resolve`]; read here again for a selection built without the
+/// environment).
+fn compress_setting(sel: &Selection) -> Result<bool, StoreError> {
     match std::env::var(ENV_COMPRESS) {
-        Err(_) => Ok(false),
-        Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => Ok(false),
-        Ok(v) if v.eq_ignore_ascii_case("zstd") => Ok(true),
+        Err(_) => Ok(sel.compress.value),
+        Ok(v) if v.trim().is_empty() => Ok(sel.compress.value),
+        Ok(v) if v.trim().eq_ignore_ascii_case("off") => Ok(false),
+        Ok(v) if v.trim().eq_ignore_ascii_case("zstd") => Ok(true),
         Ok(v) => Err(StoreError::Config(format!(
             "${ENV_COMPRESS}={v:?}: expected zstd or off"
         ))),
@@ -220,7 +229,7 @@ impl LibsqlStore {
             Arc::clone(&cx.repo_id),
             cx.git_common_dir.clone(),
             grace,
-            compress_setting()?,
+            compress_setting(sel)?,
         ));
         Ok(LibsqlStore {
             inner: match mode {
@@ -594,7 +603,9 @@ impl AttestationStore for LibsqlStore {
 
     /// Local: the file read through once. Remote: the schema version and
     /// the flags asked for on a thread (which opens the connection and its
-    /// TLS session). Replica: the sync, on a thread. Neither while the
+    /// TLS session), then the statements of the plan's reads described on
+    /// the pool's connections but one (after the flags, which the plan's
+    /// first checks wait for). Replica: the sync, on a thread. Neither while the
     /// token is `[store] token_command`'s and the command has not run: a
     /// warm-up thread is never joined, so the command would run for a
     /// command that may never read the store and could outlive vci; it
@@ -611,6 +622,7 @@ impl AttestationStore for LibsqlStore {
                     .spawn(move || {
                         let _ = r.status();
                         let _ = r.flag("");
+                        r.describe_ahead();
                     });
             }
             Inner::Replica(p) => {
@@ -734,6 +746,29 @@ mod tests {
             Err(StoreError::Config(m)) => assert!(m.contains("VCI_STORE_URL"), "{m}"),
             other => panic!("expected Config, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// `[store] compress` (the selection's) turns compressed writes on;
+    /// `VCI_STORE_COMPRESS`, when set, wins.
+    #[test]
+    fn compression_follows_the_selection_unless_the_variable_says() {
+        let mut s = sel(Some("libsql://db-org.turso.io"), LibsqlMode::Remote);
+        let on = |s: &Selection| {
+            let st = LibsqlStore::open(s, &cx(false)).unwrap();
+            st.remote().unwrap().compress()
+        };
+        let env = std::env::var(ENV_COMPRESS).ok();
+        let forced = match env.as_deref().map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("zstd") => Some(true),
+            Some(v) if v.eq_ignore_ascii_case("off") => Some(false),
+            _ => None,
+        };
+        assert_eq!(on(&s), forced.unwrap_or(false));
+        s.compress = Sourced {
+            value: true,
+            source: Source::File,
+        };
+        assert_eq!(on(&s), forced.unwrap_or(true));
     }
 
     #[test]

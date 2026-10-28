@@ -738,6 +738,80 @@ pub trait BatchEnd {
     /// `Ok` carries warnings: what failed once the writes were durable, and
     /// lost none of them (git-meta's re-stamp of its log after the commit).
     fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError>;
+
+    /// [`BatchEnd::finish`], for a backend that writes a batch as several
+    /// transactions and can lose some of them while the rest is stored (the
+    /// libSQL store on a server): `Ok` names the attestations that were not
+    /// stored ([`Finished::lost`]), each with why, and every other write of
+    /// the batch is durable. `Err` still means every write is lost. The
+    /// default is [`BatchEnd::finish`]'s answer, with nothing lost.
+    fn finish_partial(self: Box<Self>) -> Result<Finished, StoreError> {
+        self.finish().map(Finished::stored)
+    }
+}
+
+/// What a batch that finished stored and lost ([`WriteBatch::finish_partial`]).
+#[derive(Debug, Default)]
+pub struct Finished {
+    /// What failed once the writes were durable ([`BatchEnd::finish`]'s
+    /// warnings), and writes lost that no attestation depends on.
+    pub warnings: Vec<String>,
+    /// The keys of the attestations not stored, each with the index of why
+    /// in `errors`.
+    lost: BTreeMap<String, usize>,
+    errors: Vec<StoreError>,
+}
+
+impl Finished {
+    /// Everything stored, with these warnings.
+    pub fn stored(warnings: Vec<String>) -> Finished {
+        Finished {
+            warnings,
+            ..Finished::default()
+        }
+    }
+
+    /// The attestations under `keys` were not stored, because of `why`.
+    pub fn lose(&mut self, keys: impl IntoIterator<Item = String>, why: StoreError) {
+        let i = self.errors.len();
+        let before = self.lost.len();
+        for k in keys {
+            self.lost.entry(k).or_insert(i);
+        }
+        if self.lost.len() > before {
+            self.errors.push(why);
+        }
+    }
+
+    /// Everything `other` lost or warned of, too.
+    pub fn absorb(&mut self, other: Finished) {
+        self.warnings.extend(other.warnings);
+        let mut by_error: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (k, i) in other.lost {
+            by_error.entry(i).or_default().push(k);
+        }
+        for (i, e) in other.errors.into_iter().enumerate() {
+            if let Some(keys) = by_error.remove(&i) {
+                self.lose(keys, e);
+            }
+        }
+    }
+
+    /// Why the attestation stored under `key` was not stored, if it was not.
+    pub fn lost(&self, key: &str) -> Option<&StoreError> {
+        self.lost.get(key).and_then(|&i| self.errors.get(i))
+    }
+
+    /// How many attestations were not stored.
+    pub fn lost_count(&self) -> usize {
+        self.lost.len()
+    }
+
+    /// The first reason an attestation was not stored, if one was not
+    /// (what [`BatchEnd::finish`] reports when it cannot say which).
+    pub fn into_error(self) -> Option<StoreError> {
+        self.errors.into_iter().next()
+    }
 }
 
 /// An open write batch ([`AttestationStore::batch`]).
@@ -799,6 +873,17 @@ impl WriteBatch {
         match self.end.take() {
             Some(e) => e.finish(),
             None => Ok(Vec::new()),
+        }
+    }
+
+    /// End the batch as [`WriteBatch::finish`] does, but when the backend
+    /// stored some of its attestations and lost others, say which were lost
+    /// ([`Finished::lost`]) instead of failing the whole batch: callers
+    /// report every other write as stored.
+    pub fn finish_partial(mut self) -> Result<Finished, StoreError> {
+        match self.end.take() {
+            Some(e) => e.finish_partial(),
+            None => Ok(Finished::default()),
         }
     }
 }
@@ -2071,6 +2156,9 @@ pub mod select {
     pub const ENV_CONNECT_TIMEOUT: &str = "VCI_STORE_CONNECT_TIMEOUT_SECS";
     /// Seconds one statement or request may take (default 30).
     pub const ENV_TIMEOUT: &str = "VCI_STORE_TIMEOUT_SECS";
+    /// `zstd`: the libSQL store writes values to its server compressed;
+    /// `off`: as they are. Wins over `[store] compress`.
+    pub const ENV_COMPRESS: &str = "VCI_STORE_COMPRESS";
     /// Every variable this module reads. The e2e harnesses remove them all.
     pub const ENV_VARS: &[&str] = &[
         ENV_STORE,
@@ -2081,6 +2169,7 @@ pub mod select {
         ENV_TOKEN,
         ENV_REPLICA,
         ENV_SYNC,
+        ENV_COMPRESS,
     ];
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
@@ -2137,6 +2226,14 @@ pub mod select {
         /// The statement or request timeout, as `"30s"`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub timeout: Option<String>,
+        /// `"zstd"`: the libSQL store writes values to its server (remote
+        /// and replica modes) compressed, which every vci from 2.8.2 reads
+        /// and 2.8.1 and earlier read as values they cannot read (their
+        /// units run); `"off"` (the default): as they are.
+        /// `VCI_STORE_COMPRESS` wins over it. A vci older than 2.8.2
+        /// refuses a `vci.toml` that sets it (an unknown key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub compress: Option<String>,
         /// `[store.sqlite]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sqlite: Option<SqliteSettings>,
@@ -3154,6 +3251,9 @@ pub mod select {
         pub connect_timeout: Sourced<Duration>,
         /// The longest wait for one statement or request.
         pub timeout: Sourced<Duration>,
+        /// Write values to a libSQL server compressed (`VCI_STORE_COMPRESS`,
+        /// else `[store] compress`, else off).
+        pub compress: Sourced<bool>,
         /// `[store.sqlite]` as resolved.
         pub sqlite: SqliteSelection,
         /// `[store.postgres]` as resolved.
@@ -3192,6 +3292,7 @@ pub mod select {
                 namespace: None,
                 connect_timeout: Sourced::default_value(DEFAULT_CONNECT_TIMEOUT),
                 timeout: Sourced::default_value(DEFAULT_TIMEOUT),
+                compress: Sourced::default_value(false),
                 sqlite: SqliteSelection { path: None },
                 postgres: PostgresSelection {
                     schema: Sourced::default_value(DEFAULT_SCHEMA.to_owned()),
@@ -3321,6 +3422,11 @@ pub mod select {
                                 Source::Default,
                             ),
                         });
+                        v.push(line(
+                            "compress",
+                            if self.compress.value { "zstd" } else { "off" }.to_owned(),
+                            self.compress.source,
+                        ));
                     }
                 }
                 _ => {}
@@ -3459,6 +3565,45 @@ pub mod select {
             });
         }
         Ok(Sourced::default_value(default))
+    }
+
+    /// Whether values are written compressed: `VCI_STORE_COMPRESS`, else
+    /// `[store] compress`, else off. `zstd` or `off` (any case), anything
+    /// else refused.
+    fn compress_setting(
+        var: &dyn Fn(&'static str) -> Option<String>,
+        file_value: Option<&str>,
+    ) -> Result<Sourced<bool>, StoreError> {
+        let parse = |v: &str| -> Option<bool> {
+            if v.eq_ignore_ascii_case("zstd") {
+                Some(true)
+            } else if v.is_empty() || v.eq_ignore_ascii_case("off") {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        if let Some(v) = var(ENV_COMPRESS) {
+            let value = parse(&v).ok_or_else(|| {
+                StoreError::Config(format!("${ENV_COMPRESS} = {v:?}: expected zstd or off"))
+            })?;
+            return Ok(Sourced {
+                value,
+                source: Source::Env(ENV_COMPRESS),
+            });
+        }
+        if let Some(v) = file_value {
+            let value = parse(v.trim()).ok_or_else(|| {
+                StoreError::Config(format!(
+                    "vci.toml [store] compress = {v:?}: expected \"zstd\" or \"off\""
+                ))
+            })?;
+            return Ok(Sourced {
+                value,
+                source: Source::File,
+            });
+        }
+        Ok(Sourced::default_value(false))
     }
 
     fn is_sql_identifier(s: &str) -> bool {
@@ -3889,6 +4034,13 @@ pub mod select {
             "timeout",
             DEFAULT_TIMEOUT,
         )?;
+        let compress = compress_setting(&var, file.and_then(|f| f.compress.as_deref()))?;
+        if compress.source == Source::File && k != "libsql" {
+            warnings.push(format!(
+                "vci.toml [store] compress is ignored: only the libsql store compresses, and the store is {k} (from {})",
+                kind.source
+            ));
+        }
         let schema = match f_pg.and_then(|p| p.schema.clone()) {
             Some(s) => Sourced {
                 value: s,
@@ -3958,6 +4110,7 @@ pub mod select {
             namespace,
             connect_timeout,
             timeout,
+            compress,
             sqlite,
             postgres: PostgresSelection {
                 schema,

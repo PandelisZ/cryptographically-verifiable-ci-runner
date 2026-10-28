@@ -23,8 +23,8 @@
 //!   timeout. Every other request is given up after the request timeout,
 //!   and, once the server has answered the handle, sent once more on a new
 //!   connection with a deadline of its own (a hint's write, at most
-//!   [`HINT_TIMEOUT`], is not; a write that can be asked about is sent
-//!   again only when the server did not commit it, see
+//!   [`HINT_TIMEOUT`], is not; a transaction of a write batch is asked
+//!   about and left to its batch to send again, see
 //!   [`Conn::batch_checked`]). The first failure to reach the server, a
 //!   deadline before the server first answered, and a request out of time
 //!   again when sent again ([`TRIES_AFTER_TIMEOUT`]) latch the circuit
@@ -131,7 +131,8 @@ pub(crate) fn is_no_writes(e: &StoreError) -> bool {
     matches!(e, StoreError::Denied { detail, .. } if detail.contains(TAKES_NO_WRITES))
 }
 
-/// The most connections one handle opens.
+/// The most requests one handle sends at once (its pool holds one
+/// connection more, see [`Conn::checkout`]).
 const MAX_POOL: usize = 4;
 
 /// The error of a libSQL request that is not a store error of its own
@@ -514,18 +515,20 @@ pub(crate) const READ_AGAIN: Op = Op {
     hint: false,
     on_timeout: OnTimeout::Latch,
 };
-/// A write whose caller asks, when its deadline runs out, whether the
-/// server committed it before sending it again ([`Conn::batch_checked`]).
+/// A write transaction of the store's batches, whose caller asks, when
+/// its deadline runs out, whether the server committed it, and sends it
+/// again itself ([`Conn::batch_checked`]): it fails alone.
 const WRITE_ONCE: Op = Op {
     verb: "write",
     hint: false,
     on_timeout: OnTimeout::FailAlone,
 };
-/// That write sent again: out of time again, it latches the breaker.
-const WRITE_AGAIN: Op = Op {
-    verb: "write",
+/// The question whether such a write was committed: unanswered in time,
+/// it fails alone (the write is then sent again, which is safe).
+const PROBE: Op = Op {
+    verb: "read",
     hint: false,
-    on_timeout: OnTimeout::Latch,
+    on_timeout: OnTimeout::FailAlone,
 };
 
 /// The longest a hint's write waits ([`Op::hint`]): it waits behind other
@@ -814,7 +817,8 @@ impl Conn {
         self.retries.load(Ordering::Relaxed)
     }
 
-    /// The most connections this handle opens (requests it sends at once).
+    /// The most requests this handle sends at once (a read of values); the
+    /// pool holds one connection more.
     pub(crate) fn max(&self) -> usize {
         self.max
     }
@@ -928,18 +932,26 @@ impl Conn {
         })
     }
 
-    /// A connection from the pool, a new one when none is idle and the pool
-    /// is not full; waiting at most the connect timeout otherwise.
-    fn checkout(&self) -> Result<Pooled, StoreError> {
+    /// A connection from the pool (one that has `sql` described, when one
+    /// that is idle has), a new one when none is idle and the pool is not
+    /// full; waiting at most the connect timeout otherwise. The pool holds
+    /// one connection more than requests are sent at once ([`Conn::max`]):
+    /// the one the plan's other reads use while the others read values or
+    /// are described ahead ([`Conn::describe_ahead`]).
+    fn checkout(&self, sql: Option<&str>) -> Result<Pooled, StoreError> {
         self.check()?;
         let db = self.database()?;
         let deadline = Instant::now() + self.connect_timeout;
         let mut p = self.lock_pool();
         loop {
+            let described = sql.and_then(|s| p.idle.iter().rposition(|c| c.stmts.contains_key(s)));
+            if let Some(i) = described {
+                return Ok(p.idle.remove(i));
+            }
             if let Some(c) = p.idle.pop() {
                 return Ok(c);
             }
-            if p.open < self.max {
+            if p.open < self.max + 1 {
                 p.open += 1;
                 drop(p);
                 let connected = guarded(|| db.connect()).unwrap_or_else(|()| {
@@ -1222,6 +1234,7 @@ impl Conn {
         op: Op,
         bounded_first: bool,
         until: Option<Instant>,
+        sql: Option<&str>,
         mut f: F,
     ) -> Result<T, Fail>
     where
@@ -1232,7 +1245,7 @@ impl Conn {
         ) -> Pin<Box<dyn Future<Output = libsql::Result<T>> + 'a>>,
     {
         let rt = self.runtime()?;
-        let mut c = self.checkout()?;
+        let mut c = self.checkout(sql)?;
         // A server that accepts and never answers (a frozen server, a
         // stuck proxy) costs the connect timeout, not the request timeout.
         let first = bounded_first && !self.answered();
@@ -1332,13 +1345,15 @@ impl Conn {
                         std::thread::sleep(wait);
                         if let Err(e) = self.renew(rt, &mut c) {
                             self.give_back(None);
-                            return Err(Fail::Store(self.latch(e)));
+                            return Err(Fail::Store(if op.hint { e } else { self.latch(e) }));
                         }
                         continue;
                     }
                     self.give_back((!class.lost).then_some(c));
+                    // A hint never latches: nothing waits for it, and the
+                    // calls that need the server find out themselves.
                     return Err(match class.fail {
-                        Fail::Store(e) if class.latch => Fail::Store(self.latch(e)),
+                        Fail::Store(e) if class.latch && !op.hint => Fail::Store(self.latch(e)),
                         other => other,
                     });
                 }
@@ -1465,7 +1480,8 @@ impl Conn {
     ) -> Result<Vec<Vec<libsql::Value>>, Fail> {
         let sql = sql.to_owned();
         let first = self.first_answer_timeout();
-        let rows = self.run(op, false, until, move |c, n, answered| {
+        let described = sql.clone();
+        let rows = self.run(op, false, until, Some(&described), move |c, n, answered| {
             let (sql, params) = (sql.clone(), params.clone());
             Box::pin(async move {
                 if !c.stmts.contains_key(&sql) {
@@ -1512,6 +1528,42 @@ impl Conn {
         self.received
             .fetch_add(u64::try_from(got).unwrap_or(u64::MAX), Ordering::Relaxed);
         Ok(rows)
+    }
+
+    /// Have the server describe `sqls` on as many connections as requests
+    /// go at once ([`Conn::max`]), at once, so that the reads that use them
+    /// later send
+    /// only their own request (the description, which libsql's statements
+    /// need, is one more round trip per statement and connection: about a
+    /// second each behind a link that waits that long for every answer).
+    /// Done by the store's warm-up, while the command works on other
+    /// things; a statement already described on a connection is not sent
+    /// again, and a failure only leaves the description to the read.
+    pub(crate) fn describe_ahead(&self, sqls: &[&str]) {
+        std::thread::scope(|sc| {
+            for _ in 0..self.max {
+                sc.spawn(|| {
+                    // Fails alone: a description out of time latches
+                    // nothing (the read describes it again).
+                    let _ = self.run(READ_SHARED, false, None, None, |c, n, answered| {
+                        let todo: Vec<String> = sqls
+                            .iter()
+                            .filter(|s| !c.stmts.contains_key(**s))
+                            .map(|s| (*s).to_owned())
+                            .collect();
+                        Box::pin(async move {
+                            for sql in todo {
+                                n.fetch_add(1, Ordering::Relaxed);
+                                let st = c.conn.prepare(&sql).await?;
+                                answered.store(true, Ordering::Relaxed);
+                                c.stmts.insert(sql, st);
+                            }
+                            Ok(())
+                        })
+                    });
+                });
+            }
+        });
     }
 
     /// Apply `statements` (literals only, no parameters) in one
@@ -1575,44 +1627,53 @@ impl Conn {
     /// batch sent again waits for it as for any other writer, within its
     /// deadline.
     pub(crate) fn batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
-        self.batch_checked(op, statements, None)
+        self.send_batch(op, statements)
     }
 
-    /// [`Conn::batch`], and when its deadline runs out (`op` being
-    /// [`WRITE`]), `committed` (a read that returns a row only once the
-    /// batch is applied, such as one of its attestations with its
-    /// `stored_at`) asks the server whether it committed it before it is
-    /// sent again: a batch that timed out waiting for the write lock often
-    /// commits after the client gave up, and sending it again would wait
-    /// for the lock again and write its change log rows a second time,
-    /// under the very load that made it late. One that has committed is
-    /// not sent again; one that has not is, once (out of time again, the
-    /// breaker latches). The server may still commit the first one after
-    /// the question was answered: the batch is then applied twice, which
-    /// is safe (see [`Conn::batch`]) and, its upserts writing only rows
-    /// that differ, costs little but the log's rows.
+    /// A write transaction of the store's batches (`crate::batch`): sent
+    /// once, and when its deadline runs out (or it waited for the write
+    /// lock until then), `committed` (a read that returns a row only once
+    /// the transaction is applied, such as one of its attestations with its
+    /// `stored_at`) asks the server whether it committed it: a transaction
+    /// that timed out waiting for the lock often commits after the client
+    /// gave up, and sending it again would wait for the lock again and
+    /// write its change log rows a second time, under the very load that
+    /// made it late. One that has committed is `Ok`; one that has not (or
+    /// whose question went unanswered) is the timeout, which latches
+    /// nothing: the caller sends it again, in halves, within the process's
+    /// retry time (`Remote::spend_on_writes`). The server may still commit
+    /// the first one after the question was answered: the transaction is
+    /// then applied twice, which is safe (see [`Conn::batch`]) and, its
+    /// upserts writing only rows that differ, costs little but the log's
+    /// rows.
     pub(crate) fn batch_checked(
         &self,
-        op: Op,
         statements: &[String],
         committed: Option<&str>,
     ) -> Result<(), Fail> {
-        let Some(probe) = committed.filter(|_| op.on_timeout == OnTimeout::Resend && !op.hint)
-        else {
-            return self.send_batch(op, statements);
+        let r = self.send_batch(WRITE_ONCE, statements);
+        let Some(probe) = committed else {
+            return r;
         };
-        match self.send_batch(WRITE_ONCE, statements) {
-            Err(Fail::Store(StoreError::Timeout { .. }))
+        match r {
+            Err(Fail::Store(e @ StoreError::Timeout { .. }))
                 if self.answered() && self.check().is_ok() =>
             {
                 self.retries.fetch_add(1, Ordering::Relaxed);
-                if !self.query(READ, probe, Vec::new())?.is_empty() {
-                    return Ok(());
+                match self.query(PROBE, probe, Vec::new()) {
+                    Ok(rows) if !rows.is_empty() => Ok(()),
+                    _ => Err(Fail::Store(e)),
                 }
-                self.send_batch(WRITE_AGAIN, statements)
             }
             other => other,
         }
+    }
+
+    /// Latch the circuit breaker with `e` (a timeout or an unavailable
+    /// server) from outside a request: the process's time for writes that
+    /// fail ran out (`Remote::spend_on_writes`).
+    pub(crate) fn latch_now(&self, e: StoreError) -> StoreError {
+        self.latch(e)
     }
 
     fn send_batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
@@ -1621,7 +1682,7 @@ impl Conn {
         }
         let sql = format!("BEGIN IMMEDIATE;\n{};\nCOMMIT", statements.join(";\n"));
         let db = self.database()?;
-        self.run(op, true, None, move |c, n, _| {
+        self.run(op, true, None, None, move |c, n, _| {
             let sql = sql.clone();
             // libsql closes the stream with the batch only while it believes
             // the stream is outside a transaction, and a batch that stopped

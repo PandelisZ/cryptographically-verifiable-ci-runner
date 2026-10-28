@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vci_store::select::{
-    self, ENV_CONNECT_TIMEOUT, ENV_NAMESPACE, ENV_REPLICA, ENV_STORE, ENV_STORE_URL, ENV_SYNC,
-    ENV_TIMEOUT, ENV_TOKEN, LibsqlMode, Secret, Selection, Source, StoreSettings, TokenCommand,
-    redact, resolve,
+    self, ENV_COMPRESS, ENV_CONNECT_TIMEOUT, ENV_NAMESPACE, ENV_REPLICA, ENV_STORE, ENV_STORE_URL,
+    ENV_SYNC, ENV_TIMEOUT, ENV_TOKEN, LibsqlMode, Secret, Selection, Source, StoreSettings,
+    TokenCommand, redact, resolve,
 };
 use vci_store::{
     AttestationStore, BackendFactory, FailedStore, MissingBackend, OpenContext, StoreError,
@@ -1796,4 +1796,61 @@ fn token_command_applies_to_stores_that_take_a_credential() {
     }
     // A selection made without one has none.
     assert_eq!(Selection::for_backend("libsql").token_command, None);
+}
+
+/// Compression of a libSQL server's values: `VCI_STORE_COMPRESS`, else
+/// `[store] compress`, else off; `zstd` or `off` in any case, anything else
+/// refused; ignored with a warning for a store that does not compress.
+#[test]
+fn compression_comes_from_the_environment_then_vci_toml() {
+    const LIBSQL: &str = "libsql://db-org.turso.io";
+    let compress = |vars: &[(&str, &str)], toml: Option<&str>| {
+        sel(vars, toml).map(|s| (s.compress.value, s.compress.source))
+    };
+    let url = (ENV_STORE_URL, LIBSQL);
+    assert_eq!(compress(&[url], None).unwrap(), (false, Source::Default));
+    assert_eq!(
+        compress(&[url], Some("[store]\ncompress = \"zstd\"")).unwrap(),
+        (true, Source::File)
+    );
+    assert_eq!(
+        compress(&[url], Some("[store]\ncompress = \"OFF\"")).unwrap(),
+        (false, Source::File)
+    );
+    assert_eq!(
+        compress(
+            &[url, (ENV_COMPRESS, "off")],
+            Some("[store]\ncompress = \"zstd\"")
+        )
+        .unwrap(),
+        (false, Source::Env(ENV_COMPRESS))
+    );
+    assert_eq!(
+        compress(&[url, (ENV_COMPRESS, "ZSTD")], None).unwrap(),
+        (true, Source::Env(ENV_COMPRESS))
+    );
+    let m = config_err(&[url], Some("[store]\ncompress = \"gzip\""));
+    assert!(m.contains("[store] compress") && m.contains("zstd"), "{m}");
+    let m = config_err(&[url, (ENV_COMPRESS, "lz4")], None);
+    assert!(m.contains(ENV_COMPRESS), "{m}");
+    let s = sel(&[url], Some("[store]\ncompress = \"zstd\"")).unwrap();
+    assert!(
+        s.describe()
+            .iter()
+            .any(|l| l.name == "compress" && l.value == "zstd" && l.source == Source::File)
+    );
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    // Another store does not compress: a warning.
+    let s = sel(
+        &[(ENV_STORE, "sqlite")],
+        Some("[store]\ncompress = \"zstd\""),
+    )
+    .unwrap();
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.contains("[store] compress is ignored")),
+        "{:?}",
+        s.warnings
+    );
 }

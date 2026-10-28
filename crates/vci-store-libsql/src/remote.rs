@@ -9,17 +9,16 @@
 //!   transaction; reads never do.
 //! * **Reads** are served from a per-handle cache ([`crate::cache`]) that
 //!   [`AttestationStore::prefetch`] fills: the listings in one request,
-//!   then the chosen values with their manifests, [`VALUES_PER_REQUEST`]
-//!   to a request, two at once at first and then as many as their times
-//!   allow (at most the pool's size), within two request timeouts (one
-//!   more per 800 values beyond 1,600) for the handle once one ran out of
-//!   time, then their bases in one more (in the
-//!   same request when there is one); a request that fails costs only its
-//!   own keys. A miss is read the same way (the keys a JSON array bound to
+//!   then the chosen values with their manifests and bases,
+//!   [`VALUES_PER_REQUEST`] to each of the first requests (as many at once
+//!   as the handle sends) and later ones sized from the answers, within two
+//!   request timeouts (one more per 800 values beyond 1,600) for the handle
+//!   once one ran out of time; a request that fails costs only its own
+//!   keys. A miss is read the same way (the keys a JSON array bound to
 //!   `json_each`).
 //! * **Writes** are queued in a deferred batch ([`crate::batch`]) and sent
-//!   as one transactional request; a write outside a batch is a batch of
-//!   one.
+//!   as transactions of whole units, one request each; a write outside a
+//!   batch is a batch of one.
 //!
 //! [`AttestationStore::prefetch`]: vci_store::AttestationStore::prefetch
 
@@ -48,14 +47,13 @@ pub(crate) const SUPPORTED: u32 = 1;
 /// Keys, test keys or roots per request.
 const CHUNK: usize = 5_000;
 
-/// Attestation values per request, each with the manifest it references:
-/// about 4 MB of vex's Rails values (about 37 kB each stored as they are,
-/// 13 kB compressed), so that one request is answered within a few seconds
-/// even on a slow link, a slow one costs little of the read, and one that
-/// fails costs only its own units. Up to the pool's connections are read at
-/// once, as many as answer well within the timeout (`Remote::query_values`).
-/// 250 (9 MB) took 6 to 19 s a request from a laptop, one straggler
-/// holding up the read.
+/// Attestation values in each of the first requests of a read, each with
+/// the manifest it references: about 4 MB of vex's Rails values (about 37
+/// kB each stored as they are, 13 kB compressed), so that one request is
+/// answered within a few seconds even on a slow link, a slow one costs
+/// little of the read, and one that fails costs only its own units. Later
+/// requests are sized from the answers (`next_size`). 250 (9 MB) took 6 to
+/// 19 s a request from a laptop, one straggler holding up the read.
 pub(crate) const VALUES_PER_REQUEST: usize = 100;
 
 /// A read of values is given at least this many request timeouts in all
@@ -69,8 +67,38 @@ const VALUES_DEADLINES: u32 = 2;
 const VALUES_PER_DEADLINE: usize = 800;
 
 /// The most roots a read of values names as already cached (not sent
-/// again): the bases and shared manifests an earlier request brought.
+/// again): the bases an earlier request brought.
 const EXCLUDE_CAP: usize = 4_096;
+
+/// What a request of values is sized to take, as a share of the request
+/// timeout (4.5 s at the default 30 s): well within the third that lets
+/// one more request go at once, and small enough that one slow answer
+/// costs little of the read.
+const VALUES_TARGET: f64 = 0.15;
+
+/// The fewest values a request is sized to.
+const VALUES_MIN: usize = 25;
+
+/// The most values a request is sized to (about 15 MB of vex's as they
+/// are stored, 5 MB compressed).
+const VALUES_MAX: usize = 400;
+
+/// The size of the next request of values, after one of `last` values
+/// took `took`: as many as fit in `target` at that pace (which assumes
+/// the time grows with the size, as it does on a link whose bandwidth is
+/// the limit), at most four times `last`, between [`VALUES_MIN`] and
+/// [`VALUES_MAX`].
+fn next_size(last: usize, took: Duration, target: Duration) -> usize {
+    let took = took.as_secs_f64().max(0.001);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let fit = (last as f64 * target.as_secs_f64() / took) as usize;
+    fit.min(last.saturating_mul(4))
+        .clamp(VALUES_MIN, VALUES_MAX)
+}
 
 /// How long the change log keeps an entry. A replica that last synced
 /// before the oldest entry kept syncs everything again.
@@ -100,7 +128,6 @@ pub(crate) struct Tables {
     /// The DDL: `vci_schema`, the SQLite store's tables, the log.
     pub(crate) ddl: Vec<String>,
     list_units: String,
-    values: String,
     values_with_bases: String,
     manifests_and_bases: String,
     manifests_of: String,
@@ -212,19 +239,9 @@ impl Tables {
                 "SELECT test_key, key, target FROM {a} WHERE test_key IN ({set}) ORDER BY test_key, key"
             ),
             // The values of these keys (?1), and when ?2 is 1, the
-            // manifests they reference but those named in ?3 (cached
-            // already), each with the name of its base: one request. The
-            // bases are read once for all the requests of a read
-            // (`Remote::query_values`).
-            values: format!(
-                "SELECT 0, key, value, encoding, manifest_ref FROM {a} WHERE key IN ({set}) \
-                 UNION ALL \
-                 SELECT 1, root, value, encoding, base FROM {m} WHERE ?2 = 1 \
-                   AND root IN (SELECT manifest_ref FROM {a} WHERE key IN ({set})) \
-                   AND root NOT IN (SELECT value FROM json_each(?3))"
-            ),
-            // The same, with the bases of those manifests too: a read of one
-            // request (a small project) brings them in it, not one more.
+            // manifests they reference and those manifests' bases, but those
+            // named in ?3 (cached already, or brought by another request of
+            // the read), each with the name of its base: one request.
             values_with_bases: format!(
                 "SELECT 0, key, value, encoding, manifest_ref FROM {a} WHERE key IN ({set}) \
                  UNION ALL \
@@ -328,6 +345,12 @@ pub(crate) struct Remote {
     /// for each read (the prefetch, the plan's read of its candidates,
     /// each later round's).
     values_until: Mutex<Option<Instant>>,
+    /// The time spent on write transactions that failed and the pauses
+    /// before they were sent again ([`Remote::spend_on_writes`]).
+    write_spent: Mutex<Duration>,
+    /// Roots a read of values found to be bases: a later read does not
+    /// bring them again while they are cached.
+    bases: Mutex<BTreeSet<String>>,
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -372,6 +395,8 @@ impl Remote {
             grace,
             compress: AtomicBool::new(compress),
             values_until: Mutex::new(None),
+            write_spent: Mutex::new(Duration::ZERO),
+            bases: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -383,6 +408,14 @@ impl Remote {
     /// Write values compressed from now on, or not (tests).
     pub(crate) fn set_compress(&self, on: bool) {
         self.compress.store(on, Ordering::Relaxed);
+    }
+
+    fn bases(&self) -> BTreeSet<String> {
+        self.bases_mut().clone()
+    }
+
+    fn bases_mut(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        self.bases.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn cache(&self) -> MutexGuard<'_, Cache> {
@@ -483,15 +516,48 @@ impl Remote {
         self.conn.batch(op, statements)
     }
 
-    /// [`Remote::write`], asking `committed` whether the server applied it
-    /// before it is sent again after its deadline ([`Conn::batch_checked`]).
+    /// A transaction of the store's batches: [`Remote::write`] sent once,
+    /// asking `committed` whether the server applied it when its deadline
+    /// ran out ([`Conn::batch_checked`]).
     pub(crate) fn write_checked(
         &self,
-        op: crate::conn::Op,
         statements: &[String],
         committed: Option<&str>,
     ) -> Result<(), Fail> {
-        self.conn.batch_checked(op, statements, committed)
+        self.conn.batch_checked(statements, committed)
+    }
+
+    /// The time this process may spend on write transactions that failed
+    /// and on the pauses before sending them again
+    /// ([`crate::batch::WRITE_RETRY_DEADLINES`] request timeouts).
+    fn write_retry_time(&self) -> Duration {
+        self.conn
+            .timeout()
+            .saturating_mul(crate::batch::WRITE_RETRY_DEADLINES)
+    }
+
+    /// Count `d` against the process's time for writes that fail; whether
+    /// some is left.
+    pub(crate) fn spend_on_writes(&self, d: Duration) -> bool {
+        let mut spent = self
+            .write_spent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *spent += d;
+        *spent < self.write_retry_time()
+    }
+
+    /// The process's time for writes that fail ran out (`last` the last
+    /// failure): the breaker latches, and every later call fails at once.
+    pub(crate) fn writes_out_of_time(&self, last: &StoreError) -> StoreError {
+        self.conn.latch_now(StoreError::unavailable(
+            KIND,
+            format!(
+                "{}: writes kept failing ({last}), and this process spent the {:?} it may on writes that fail",
+                self.conn.display(),
+                self.write_retry_time()
+            ),
+        ))
     }
 
     // ---- the schema ---------------------------------------------------------------
@@ -688,23 +754,25 @@ impl Remote {
 
     /// The values of these keys (with the manifest each references), and
     /// when `with_manifests`, those manifests and their bases into the
-    /// cache (the ones not stored as absent). The keys go
-    /// [`VALUES_PER_REQUEST`] to a request, each manifest and base at most
-    /// once: the manifests with their attestations (but those cached
-    /// already), then the bases not cached in one more request; a read of
-    /// one request brings its bases in it (`Tables::values_with_bases`),
-    /// so that a small project pays one request, not two.
+    /// cache (the ones not stored as absent), each request bringing the
+    /// manifests and bases of its own values (`Tables::values_with_bases`)
+    /// but the bases already cached or brought by an answer before it was
+    /// sent: no request of bases follows.
     ///
-    /// Two requests go at once at first; after each answered within a
-    /// third of the request timeout one more may be out at once, after each
-    /// that took more than half of it one fewer (at least one, at most the
-    /// pool's connections): requests sent at once may share the link's
-    /// bandwidth, so on a slow link they go one or two at a time instead of
-    /// four running out of time together, and on a fast one four. A request
-    /// that runs out of time is not sent again whole: it stops the others
-    /// from being sent, and its keys are read again one request at a time,
-    /// half as many to a request, a half that fails costing only its own
-    /// keys; the requests never sent go at full size.
+    /// The keys go [`VALUES_PER_REQUEST`] to the first requests, as many at
+    /// once as the pool has connections (at most one per request), and
+    /// later requests are sized from the answers: as many keys as the last
+    /// answer suggests fit in [`VALUES_TARGET`] of the request timeout,
+    /// between [`VALUES_MIN`] and [`VALUES_MAX`], at most four times as many
+    /// as the last. On a link with a long wait for each answer but bandwidth
+    /// to spare, requests grow and few are sent; on a slow link they stay
+    /// small. After each answer that took more than half of the timeout one
+    /// fewer request is out at once (at least one), after each within a
+    /// third one more: requests sent at once may share a slow link's
+    /// bandwidth. A request that runs out of time is not sent again whole:
+    /// it stops the others from being sent, and its keys are read again one
+    /// request at a time, half as many to a request, a half that fails
+    /// costing only its own keys; the keys never sent go at the last size.
     ///
     /// The whole read is given [`VALUES_DEADLINES`] request timeouts, one
     /// more for each [`VALUES_PER_DEADLINE`] keys beyond that many: no
@@ -747,65 +815,101 @@ impl Remote {
             out.error = Some(out_of_time(true));
             return out;
         }
-        let chunks: Vec<&[&str]> = keys.chunks(VALUES_PER_REQUEST).collect();
-        let sql = if with_manifests && chunks.len() == 1 {
-            &t.values_with_bases
-        } else {
-            &t.values
-        };
-        let exclude = if with_manifests {
+        // Bases not to bring again: those cached already, then those an
+        // answer of this read brought.
+        let bases: Mutex<BTreeSet<String>> = Mutex::new(if with_manifests {
+            let known = self.bases();
             let c = self.cache();
-            json_list(c.stored_roots(EXCLUDE_CAP))
+            known
+                .iter()
+                .filter(|b| c.has_stored_manifest(b))
+                .take(EXCLUDE_CAP)
+                .cloned()
+                .collect()
         } else {
-            json_list(std::iter::empty())
-        };
+            BTreeSet::new()
+        });
         let ask = |op: Op, chunk: &[&str]| -> Option<Rows> {
             if Instant::now() >= until {
                 return None;
             }
+            let exclude = {
+                let b = bases.lock().unwrap_or_else(PoisonError::into_inner);
+                json_list(b.iter().take(EXCLUDE_CAP).map(String::as_str))
+            };
             let r = self.conn.query_until(
                 op,
-                sql,
+                &t.values_with_bases,
                 vec![
                     json_list(chunk.iter().copied()),
                     V::Integer(i64::from(with_manifests)),
-                    exclude.clone(),
+                    exclude,
                 ],
                 Some(until),
             );
-            Some(Fail::or_absent(r, Vec::new))
+            let r = Fail::or_absent(r, Vec::new);
+            if let Ok(rows) = &r {
+                // The bases this answer brought: a manifest row (1) whose
+                // root another manifest row names as its base.
+                let named: BTreeSet<&str> = rows
+                    .iter()
+                    .filter(|row| row.first().and_then(col_int) == Some(1))
+                    .filter_map(|row| match row.get(4) {
+                        Some(V::Text(b)) => Some(b.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !named.is_empty() {
+                    let mut b = bases.lock().unwrap_or_else(PoisonError::into_inner);
+                    for row in rows {
+                        if row.first().and_then(col_int) == Some(1)
+                            && let Some(V::Text(root)) = row.get(1)
+                            && named.contains(root.as_str())
+                        {
+                            b.insert(root.clone());
+                        }
+                    }
+                }
+            }
+            Some(r)
         };
         let is_timeout = |r: &Option<Rows>| matches!(r, Some(Err(StoreError::Timeout { .. })));
-        let n = chunks.len();
-        let max = self.conn.max().clamp(1, n);
-        // How many requests may be out at once: two at first, one more
-        // after each answered within a third of the timeout, one fewer after
-        // each that took more than half of it.
-        let allowed = AtomicUsize::new(2.min(max));
-        let next = AtomicUsize::new(0);
+        let n = keys.len();
+        let max = self.conn.max().clamp(1, n.div_ceil(VALUES_PER_REQUEST));
+        // How many requests may be out at once: as many as there are
+        // connections at first, one fewer after each answer that took more
+        // than half the timeout, one more after each within a third.
+        let allowed = AtomicUsize::new(max);
+        // The next key to send, and how many keys the next request takes.
+        let next: Mutex<(usize, usize)> = Mutex::new((0, VALUES_PER_REQUEST));
         // A request ran out of time (or the read's time did): no more are
         // sent at once.
         let slow = AtomicBool::new(false);
-        // Each request's answer (`None`: not sent).
-        let done: Mutex<Vec<Option<Rows>>> = Mutex::new((0..n).map(|_| None).collect());
+        // Each request's keys (a range of `keys`) and answer.
+        let done: Mutex<Vec<(std::ops::Range<usize>, Option<Rows>)>> = Mutex::new(Vec::new());
+        let target = timeout.mul_f64(VALUES_TARGET);
         std::thread::scope(|sc| {
             for w in 0..max {
-                let (allowed, next, slow, done, ask, chunks) =
-                    (&allowed, &next, &slow, &done, &ask, &chunks);
+                let (allowed, next, slow, done, ask) = (&allowed, &next, &slow, &done, &ask);
                 sc.spawn(move || {
-                    while !slow.load(Ordering::Relaxed) && next.load(Ordering::Relaxed) < n {
+                    while !slow.load(Ordering::Relaxed) {
                         if w >= allowed.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_millis(5));
                             continue;
                         }
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(chunk) = chunks.get(i) else {
-                            break;
+                        let range = {
+                            let mut g = next.lock().unwrap_or_else(PoisonError::into_inner);
+                            if g.0 >= n {
+                                break;
+                            }
+                            let lo = g.0;
+                            g.0 = (lo + g.1).min(n);
+                            lo..g.0
                         };
                         let t = Instant::now();
                         // Never sent again whole after its deadline: read
                         // again in halves below.
-                        let r = ask(READ_SHARED, chunk);
+                        let r = ask(READ_SHARED, &keys[range.clone()]);
                         let took = t.elapsed();
                         if r.is_none() || is_timeout(&r) {
                             slow.store(true, Ordering::Relaxed);
@@ -819,27 +923,33 @@ impl Remote {
                                     a
                                 })
                             });
+                            let sized = next_size(range.len(), took, target);
+                            next.lock().unwrap_or_else(PoisonError::into_inner).1 = sized;
                         }
-                        done.lock().unwrap_or_else(PoisonError::into_inner)[i] = r;
+                        done.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((range, r));
                     }
                 });
             }
         });
         // The keys of each request (or half of one) and its answer. A
         // request that ran out of time: its keys again, one request at a
-        // time, half as many to a request, each half on its own; one never
-        // sent: at full size. One out of time now latches the breaker (it
-        // was the second try), and the rest then fail at once.
-        let mut pieces: Vec<(&[&str], Rows)> = Vec::with_capacity(n);
+        // time, half as many to a request, each half on its own; keys never
+        // sent: at the last size. One out of time now latches the breaker
+        // (it was the second try), and the rest then fail at once.
+        let (sent_up_to, size) = *next.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut answers = done.into_inner().unwrap_or_else(PoisonError::into_inner);
+        answers.sort_by_key(|(r, _)| r.start);
+        let mut pieces: Vec<(&[&str], Rows)> = Vec::with_capacity(answers.len() + 1);
         let mut ran_out = false;
         let mut settle = |a: Option<Rows>| -> Rows {
             ran_out |= a.is_none() || matches!(a, Some(Err(StoreError::Timeout { .. })));
             a.unwrap_or_else(|| Err(out_of_time(false)))
         };
-        for (chunk, answer) in chunks
-            .iter()
-            .zip(done.into_inner().unwrap_or_else(PoisonError::into_inner))
-        {
+        let unsent = &keys[sent_up_to.min(n)..];
+        for (range, answer) in answers {
+            let chunk = &keys[range];
             match answer {
                 None => pieces.push((chunk, settle(ask(READ_AGAIN, chunk)))),
                 Some(Err(StoreError::Timeout { .. })) => {
@@ -850,6 +960,9 @@ impl Remote {
                 Some(other) => pieces.push((chunk, other)),
             }
         }
+        for chunk in unsent.chunks(size.max(1)) {
+            pieces.push((chunk, settle(ask(READ_AGAIN, chunk))));
+        }
         if ran_out {
             let mut u = self
                 .values_until
@@ -858,7 +971,9 @@ impl Remote {
             *u = Some(u.map_or(until, |e| e.min(until)));
         }
         let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
-        let mut bases: BTreeSet<String> = BTreeSet::new();
+        let mut named_bases: BTreeSet<String> = BTreeSet::new();
+        // Every manifest an answer brought.
+        let mut brought: BTreeSet<String> = BTreeSet::new();
         let mut refs: BTreeSet<String> = BTreeSet::new();
         for (piece, answer) in pieces {
             let rows = match answer {
@@ -890,8 +1005,9 @@ impl Remote {
                     out.found.insert(name, (v, extra));
                 } else {
                     if let Some(b) = extra {
-                        bases.insert(b);
+                        named_bases.insert(b);
                     }
+                    brought.insert(name.clone());
                     manifests.insert(
                         name,
                         match v {
@@ -907,24 +1023,27 @@ impl Remote {
             out.found.remove(k);
         }
         if with_manifests {
-            {
-                let mut c = self.cache();
-                for r in &refs {
-                    if !manifests.contains_key(r) && !c.has_stored_manifest(r) {
-                        c.set_manifest(r.clone(), Manifest::Absent);
-                    }
+            let mut c = self.cache();
+            for r in &refs {
+                if !manifests.contains_key(r) && !c.has_stored_manifest(r) {
+                    c.set_manifest(r.clone(), Manifest::Absent);
                 }
-                for (root, m) in manifests {
-                    c.set_manifest(root, m);
+            }
+            for (root, m) in manifests {
+                c.set_manifest(root, m);
+            }
+            // A base the answers named and that is neither cached nor among
+            // them was not stored (a request brings every base it names
+            // but those cached or brought already).
+            let excluded = bases.lock().unwrap_or_else(PoisonError::into_inner);
+            for b in &named_bases {
+                if !excluded.contains(b) && !brought.contains(b) && c.manifest(b).is_none() {
+                    c.set_manifest(b.clone(), Manifest::Absent);
                 }
-                bases.retain(|b| !c.has_stored_manifest(b));
             }
-            // The bases not brought already: once for all the requests. One
-            // that cannot be read now is read when it is asked for.
-            if !bases.is_empty() {
-                let bases: Vec<String> = bases.into_iter().collect();
-                let _ = self.fetch_roots(t, &bases);
-            }
+            drop(excluded);
+            drop(c);
+            self.bases_mut().extend(named_bases);
         }
         out
     }
@@ -1202,41 +1321,6 @@ impl Remote {
         Ok(())
     }
 
-    /// Read these manifests (not their bases) into the cache; the ones not
-    /// stored are cached as absent.
-    fn fetch_roots(&self, t: &Tables, roots: &[String]) -> Result<(), StoreError> {
-        for chunk in roots.chunks(CHUNK) {
-            let r = self.query(
-                READ,
-                &t.manifests_of,
-                vec![json_list(chunk.iter().map(String::as_str))],
-            );
-            let rows = Fail::or_absent(r, Vec::new)?;
-            let mut c = self.cache();
-            let mut got: BTreeSet<String> = BTreeSet::new();
-            for row in rows {
-                let Some(root) = row.first().and_then(col_text) else {
-                    continue;
-                };
-                let m = match (row.get(1), row.get(2)) {
-                    (Some(v), Some(e)) => match col_value(v, e) {
-                        Ok(b) => Manifest::Bytes(b),
-                        Err(why) => Manifest::Unreadable(why),
-                    },
-                    _ => return Err(malformed("manifests")),
-                };
-                got.insert(root.clone());
-                c.set_manifest(root, m);
-            }
-            for r in chunk {
-                if !got.contains(r) {
-                    c.set_manifest(r.clone(), Manifest::Absent);
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn manifest_roots(&self) -> Result<Vec<String>, StoreError> {
         let t = self.ready()?;
         let r = self.query(READ, &t.shared.manifest_roots, Vec::new());
@@ -1399,6 +1483,16 @@ impl Remote {
             megabytes(self.conn.received() - b0)
         ));
         Ok(h)
+    }
+
+    /// Have the statements a plan's reads use (the listing, the values)
+    /// described ahead on every connection of the pool
+    /// ([`Conn::describe_ahead`]); the store's warm-up does it.
+    pub(crate) fn describe_ahead(&self) {
+        if let Ok(t) = self.ready() {
+            self.conn
+                .describe_ahead(&[t.list_units.as_str(), t.values_with_bases.as_str()]);
+        }
     }
 
     // ---- hints ---------------------------------------------------------------------------

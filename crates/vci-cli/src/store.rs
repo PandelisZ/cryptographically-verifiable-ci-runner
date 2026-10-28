@@ -278,8 +278,8 @@ pub mod mem {
     use std::sync::{Arc, Mutex};
 
     use vci_store::{
-        AttestationStore, BatchEnd, Caps, GONE, NewAttestation, StoreError, StoredEnvelope,
-        StoredManifest, WriteBatch, key,
+        AttestationStore, BatchEnd, Caps, Finished, GONE, NewAttestation, StoreError,
+        StoredEnvelope, StoredManifest, WriteBatch, key,
     };
 
     /// What the store holds.
@@ -327,6 +327,9 @@ pub mod mem {
         fail: Mutex<Option<String>>,
         /// A warning every batch's `finish` gives after applying its writes.
         warn: Mutex<Option<String>>,
+        /// A test whose writes every batch loses alone (the rest stored):
+        /// `finish_partial` names its attestations as lost.
+        lose: Mutex<Option<String>>,
         writes: AtomicUsize,
         batches: AtomicUsize,
     }
@@ -389,6 +392,14 @@ pub mod mem {
             self
         }
 
+        /// Make every batch lose the writes of `test_id` alone and store the
+        /// rest, as a store that writes a batch as several transactions
+        /// can (`finish` then fails the whole batch), or not with `None`.
+        pub fn losing(self, test_id: Option<&str>) -> Self {
+            *self.state.lose.lock().unwrap() = test_id.map(str::to_owned);
+            self
+        }
+
         /// Make every batch's `finish` store its writes and then warn
         /// `what` (a failure after the commit, such as git-meta's log
         /// re-stamp), or not warn again with `None`.
@@ -425,12 +436,43 @@ pub mod mem {
 
     impl BatchEnd for MemBatch {
         fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError> {
+            let f = self.finish_partial()?;
+            if f.lost_count() > 0 {
+                return Err(f.into_error().unwrap());
+            }
+            Ok(f.warnings)
+        }
+
+        fn finish_partial(self: Box<Self>) -> Result<Finished, StoreError> {
             let warnings: Vec<String> = self.0.warn.lock().unwrap().iter().cloned().collect();
+            let mut done = Finished::stored(warnings);
             let Some(ops) = self.0.pending.lock().unwrap().take() else {
-                return Ok(warnings);
+                return Ok(done);
             };
             if let Some(why) = self.0.fail.lock().unwrap().clone() {
                 return Err(StoreError::unavailable("memory", why));
+            }
+            // The losing test's writes: lost alone.
+            let losing = self.0.lose.lock().unwrap().as_deref().map(key::test_key);
+            let of_losing = |k: &str| {
+                losing
+                    .as_deref()
+                    .is_some_and(|tk| key::parse_key(k).is_some_and(|(t, _, _)| t == tk))
+            };
+            let mut lost = Vec::new();
+            let ops: Vec<Op> = ops
+                .into_iter()
+                .filter(|op| match op {
+                    Op::Put(k, ..) if of_losing(k) => {
+                        lost.push(k.clone());
+                        false
+                    }
+                    Op::Remove(k) => !of_losing(k),
+                    _ => true,
+                })
+                .collect();
+            if !lost.is_empty() {
+                done.lose(lost, StoreError::unavailable("memory", "a write timed out"));
             }
             // Manifests, then attestations, then removals (the contract's
             // order for a deferred batch).
@@ -445,7 +487,7 @@ pub mod mem {
             for op in manifests.into_iter().chain(puts).chain(removals) {
                 self.0.apply(op);
             }
-            Ok(warnings)
+            Ok(done)
         }
     }
 

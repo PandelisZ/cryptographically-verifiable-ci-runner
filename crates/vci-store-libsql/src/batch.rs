@@ -11,12 +11,33 @@
 //! removed otherwise; per root the last manifest. It is written as the
 //! manifests, the removed keys, the emptied slots, then the attestations,
 //! each one statement with its values as literals, plus the change log a
-//! replica syncs from, in one transaction; the manifests the write leaves
-//! without a reference go in the same transaction (2.8.2,
-//! `superseded_manifests`), and values are compressed when
-//! `VCI_STORE_COMPRESS=zstd`. A queue of [`FLUSH_WRITES`]
-//! attestations and removals, or of [`FLUSH_BYTES`], is written early in a
-//! transaction of its own; a failed early write fails `finish`.
+//! replica syncs from; the manifests the write leaves without a reference
+//! go in the same transaction (2.8.2, `superseded_manifests`), and values
+//! are compressed when `VCI_STORE_COMPRESS=zstd` or `[store] compress`
+//! asks for it. A queue of [`FLUSH_WRITES`] attestations and removals, or
+//! of [`FLUSH_BYTES`], is written early.
+//!
+//! **Short transactions** (2.8.2). A queue is written as transactions of
+//! whole units (every write of one test key, with the manifests its
+//! attestations reference and their bases) of at most [`TX_BYTES`] as
+//! sent or [`TX_UNITS`] attestations, one after the other: each holds the
+//! server's one write lock for a second or two, so that another job's
+//! write (a hint, a shared manifest, its own units) waits that long, not
+//! the 15 to 37 s an 8 MB transaction held it on Turso (2.8.1).
+//!
+//! **Failures cost their own units.** A transaction that ran out of time
+//! (or waited for the lock until then) is asked about first
+//! ([`crate::conn::Conn::batch_checked`]: one the server committed is not
+//! sent again), then sent again after a pause, in halves when it holds
+//! more than one unit; one the server refused is split down to the unit
+//! that it refuses. Only the units whose transaction still fails are lost
+//! ([`vci_store::Finished::lost`]): `vci run` refuses those and reports the
+//! rest as stored. The time a process spends on writes that failed and on
+//! the pauses between them is bounded by [`WRITE_RETRY_DEADLINES`]
+//! request timeouts in all: past that the circuit breaker latches (a
+//! server that cannot take writes is given up within a bounded time, not
+//! once per transaction), and every write still queued fails at once. A
+//! server that cannot be reached latches it at once, as before.
 //!
 //! A record a server would refuse as too big ([`MAX_RECORD`] bytes or
 //! more: `sqld` keeps rows under 5,000,000 bytes) is refused before it is
@@ -25,14 +46,15 @@
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use libsql::Value as V;
 use vci_store::timing::Step;
 use vci_store::{
-    BatchEnd, ManifestRef, NewAttestation, StoreError, StoredEnvelope, WriteBatch, key,
+    BatchEnd, Finished, ManifestRef, NewAttestation, StoreError, StoredEnvelope, WriteBatch, key,
 };
 
 use crate::conn::{
@@ -43,11 +65,31 @@ use crate::remote::{LOG_KEEP_SECS, Remote, Tables, now};
 
 /// Attestations and removals queued before they are written early.
 pub(crate) const FLUSH_WRITES: usize = 2_000;
-/// Bytes queued (values as they are) before they are written early: one
-/// request stays a few megabytes, so that it holds the server's one write
-/// lock for a few seconds, not the 15 to 26 s that 8 MB took on Turso
-/// while other jobs wrote (2.8.1), which made every other writer wait.
+/// Bytes queued (values as they are) before they are written early, as
+/// transactions of at most [`TX_BYTES`].
 pub(crate) const FLUSH_BYTES: usize = 4 << 20;
+
+/// The most bytes of values one transaction sends (as sent: compressed
+/// when values are), unless one unit's writes alone are more. On vex's
+/// Turso database from a laptop a transaction of 1 MB committed in 1.7 to
+/// 3.7 s, of 2 MB in 2.5 to 10.6 s, of 4 MB in 5 to 10 s and of 8 MB in
+/// 34 to 37 s (27 October 2026, while vex's CI wrote too): the time per
+/// megabyte grows with the size, and every other writer waits for it.
+pub(crate) const TX_BYTES: usize = 1 << 20;
+
+/// The most attestations one transaction stores (about 30 of vex's units,
+/// 36 kB each with their manifests as they are, fit in [`TX_BYTES`]).
+pub(crate) const TX_UNITS: usize = 64;
+
+/// The time a process may spend on write transactions that failed (ran
+/// out of time, waited for the lock until their deadline) and on the
+/// pauses before sending them again, in request timeouts: 60 s at the
+/// default 30 s timeout. Past it the circuit breaker latches.
+pub(crate) const WRITE_RETRY_DEADLINES: u32 = 2;
+
+/// The most times one unit's writes are sent (each failure costing part
+/// of the process's retry time).
+const MAX_TRIES: u32 = 4;
 
 /// One queued attestation.
 #[derive(Debug, Clone)]
@@ -66,7 +108,7 @@ pub(crate) type Slot = (String, String, String);
 pub(crate) type After = Arc<dyn Fn(&Pending) + Send + Sync>;
 
 /// What a batch holds and has not written yet.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Pending {
     pub(crate) manifests: BTreeMap<String, (Option<String>, Vec<u8>)>,
     pub(crate) attestations: BTreeMap<Slot, Row>,
@@ -74,9 +116,6 @@ pub(crate) struct Pending {
     pub(crate) emptied: BTreeSet<Slot>,
     pub(crate) removals: BTreeSet<String>,
     bytes: usize,
-    /// An early write failed: the batch fails, and later writes are
-    /// dropped.
-    failed: Option<StoreError>,
     after: Option<After>,
 }
 
@@ -93,8 +132,8 @@ impl Pending {
             || self.bytes >= FLUSH_BYTES
     }
 
-    /// The queue, leaving an empty one (and the failure and the hook) in
-    /// place.
+    /// The queue, leaving an empty one (and what was lost, and the hook)
+    /// in place.
     fn take(&mut self) -> Pending {
         Pending {
             manifests: std::mem::take(&mut self.manifests),
@@ -102,22 +141,71 @@ impl Pending {
             emptied: std::mem::take(&mut self.emptied),
             removals: std::mem::take(&mut self.removals),
             bytes: std::mem::take(&mut self.bytes),
-            failed: None,
             after: self.after.clone(),
         }
     }
+
+    /// An empty queue with this one's hook.
+    fn empty_like(&self) -> Pending {
+        Pending {
+            after: self.after.clone(),
+            ..Pending::default()
+        }
+    }
+
+    /// Add `other`'s writes (of other units) to this queue.
+    fn merge(&mut self, other: Pending) {
+        self.manifests.extend(other.manifests);
+        self.attestations.extend(other.attestations);
+        self.emptied.extend(other.emptied);
+        self.removals.extend(other.removals);
+        self.bytes += other.bytes;
+    }
+
+    /// The keys of the attestations it stores.
+    fn keys(&self) -> impl Iterator<Item = String> + '_ {
+        self.attestations.values().map(|r| r.key.clone())
+    }
+
+    /// Every root it references once written (its attestations' manifests,
+    /// its manifests and their bases): no transaction of it removes them.
+    fn referenced(&self) -> BTreeSet<String> {
+        let mut roots: BTreeSet<String> = self
+            .attestations
+            .values()
+            .filter_map(|r| r.manifest_ref.clone())
+            .collect();
+        for (root, (base, _)) in &self.manifests {
+            roots.insert(root.clone());
+            roots.extend(base.clone());
+        }
+        roots
+    }
+}
+
+/// An open batch: its queue, and what its early writes lost.
+#[derive(Default)]
+struct Open {
+    queue: Pending,
+    lost: Finished,
 }
 
 thread_local! {
     /// The batches open on this thread, by store handle.
-    static OPEN: RefCell<HashMap<u64, Pending>> = RefCell::new(HashMap::new());
+    static OPEN: RefCell<HashMap<u64, Open>> = RefCell::new(HashMap::new());
 }
 
 /// Run `f` on this thread's open batch of `remote`, if there is one.
-fn with_pending<T>(remote: &Remote, f: impl FnOnce(&mut Pending) -> T) -> Option<T> {
+fn with_open<T>(remote: &Remote, f: impl FnOnce(&mut Open) -> T) -> Option<T> {
     OPEN.try_with(|o| o.borrow_mut().get_mut(&remote.id).map(f))
         .ok()
         .flatten()
+}
+
+/// Run `f` on the queue of this thread's open batch of `remote`, if there
+/// is one.
+fn with_pending<T>(remote: &Remote, f: impl FnOnce(&mut Pending) -> T) -> Option<T> {
+    with_open(remote, |o| f(&mut o.queue))
 }
 
 /// Whether a batch of `remote` is open on this thread.
@@ -130,18 +218,7 @@ pub(crate) fn is_open(remote: &Remote) -> bool {
 /// or `None` without an open batch. `remove_manifests` keeps them: the
 /// server cannot see them yet.
 pub(crate) fn queued_roots(remote: &Remote) -> Option<BTreeSet<String>> {
-    with_pending(remote, |p| {
-        let mut roots: BTreeSet<String> = p
-            .attestations
-            .values()
-            .filter_map(|r| r.manifest_ref.clone())
-            .collect();
-        for (root, (base, _)) in &p.manifests {
-            roots.insert(root.clone());
-            roots.extend(base.clone());
-        }
-        roots
-    })
+    with_pending(remote, |p| p.referenced())
 }
 
 /// Open a deferred batch on this thread; `after` runs once each part of it
@@ -153,9 +230,12 @@ pub(crate) fn open(remote: &Arc<Remote>, after: Option<After>) -> Result<WriteBa
         .try_with(|o| match o.borrow_mut().entry(remote.id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(v) => {
-                v.insert(Pending {
-                    after,
-                    ..Pending::default()
+                v.insert(Open {
+                    queue: Pending {
+                        after,
+                        ..Pending::default()
+                    },
+                    lost: Finished::default(),
                 });
                 true
             }
@@ -174,32 +254,53 @@ struct End {
 }
 
 impl BatchEnd for End {
+    /// Any write lost fails the whole batch (what a caller that cannot
+    /// tell which were lost must assume).
     fn finish(self: Box<Self>) -> Result<Vec<String>, StoreError> {
-        let p = OPEN
+        let f = self.finish_partial()?;
+        if f.lost_count() > 0 {
+            return Err(f
+                .into_error()
+                .unwrap_or_else(|| StoreError::other("a write of the batch was lost")));
+        }
+        Ok(f.warnings)
+    }
+
+    fn finish_partial(self: Box<Self>) -> Result<Finished, StoreError> {
+        let Open {
+            queue,
+            lost: mut done,
+        } = OPEN
             .try_with(|o| o.borrow_mut().remove(&self.remote.id))
             .ok()
             .flatten()
             .unwrap_or_default();
-        if let Some(e) = p.failed {
-            return Err(e);
+        let w = write_all(&self.remote, queue);
+        if let Some(e) = w.other {
+            done.warnings.push(format!(
+                "writes of the batch that no attestation depends on were not stored: {e}"
+            ));
         }
-        write(&self.remote, &p).map(|()| Vec::new())
+        done.absorb(w.lost);
+        Ok(done)
     }
 }
 
-/// Write the queue early when it is full.
+/// Write the queue early when it is full; what it loses is reported when
+/// the batch finishes.
 fn flush_if_full(remote: &Remote) {
-    let Some(p) = with_pending(remote, |p| {
-        (p.failed.is_none() && p.full()).then(|| p.take())
-    })
-    .flatten() else {
+    let Some(p) = with_pending(remote, |p| p.full().then(|| p.take())).flatten() else {
         return;
     };
-    if let Err(e) = write(remote, &p) {
-        with_pending(remote, |p| {
-            p.failed.get_or_insert(e);
-        });
-    }
+    let w = write_all(remote, p);
+    with_open(remote, |o| {
+        if let Some(e) = w.other {
+            o.lost.warnings.push(format!(
+                "writes of the batch that no attestation depends on were not stored: {e}"
+            ));
+        }
+        o.lost.absorb(w.lost);
+    });
 }
 
 /// The manifest an envelope's (unverified) payload references, as the
@@ -327,9 +428,6 @@ pub(crate) fn put(remote: &Remote, att: &NewAttestation<'_>) -> Result<StoredEnv
     };
     let row = row_of(att, key.clone());
     with_pending(remote, |p| {
-        if p.failed.is_some() {
-            return;
-        }
         // The put replaces the slot whatever was queued for it.
         p.removals.remove(&key);
         p.emptied.remove(&slot);
@@ -349,9 +447,6 @@ pub(crate) fn put_manifest(remote: &Remote, root: &str, bytes: &[u8]) -> Result<
     remote.ready()?;
     let base = manifest_base(bytes);
     let changed = with_pending(remote, |p| {
-        if p.failed.is_some() {
-            return true;
-        }
         let same = p.manifests.get(root).is_some_and(|(_, b)| b == bytes);
         p.bytes += bytes.len();
         if let Some((_, old)) = p.manifests.insert(root.to_owned(), (base, bytes.to_vec())) {
@@ -374,9 +469,6 @@ pub(crate) fn remove(
     }
     remote.ready()?;
     with_pending(remote, |p| {
-        if p.failed.is_some() {
-            return;
-        }
         for e in &doomed {
             if let Some((tk, signer, sk)) = key::parse_key(&e.key) {
                 let slot: Slot = (tk.to_owned(), signer.to_owned(), sk.to_owned());
@@ -424,7 +516,7 @@ pub(crate) fn put_now(
     };
     p.attestations
         .insert(slot_of(att), row_of(att, key.clone()));
-    write(remote, &p)?;
+    write(remote, p)?;
     Ok(att.stored(key))
 }
 
@@ -458,7 +550,7 @@ pub(crate) fn put_manifest_now(
     };
     p.manifests
         .insert(root.to_owned(), (manifest_base(bytes), bytes.to_vec()));
-    write(remote, &p)?;
+    write(remote, p)?;
     Ok(!same)
 }
 
@@ -485,9 +577,9 @@ pub(crate) fn remove_now(
         .filter_map(|row| row.first().and_then(col_text))
         .collect();
     if !existing.is_empty() {
-        send(
+        write(
             remote,
-            &Pending {
+            Pending {
                 removals: existing.clone(),
                 ..Pending::default()
             },
@@ -589,35 +681,293 @@ fn log_rows(log: &str, slots: &[&Slot], roots: &[&str], at: i64) -> Option<Strin
     })
 }
 
-/// Write `p` in one transaction (one request), then bring the cache up to
-/// date and run the queue's hook.
-pub(crate) fn write(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
-    if p.is_empty() {
-        return Ok(());
-    }
-    send(remote, p)?;
-    settle(remote, p);
-    Ok(())
+/// What [`write_all`] could not store.
+#[derive(Default)]
+pub(crate) struct Written {
+    /// The attestations not stored, by key, with why.
+    pub(crate) lost: Finished,
+    /// Why a transaction holding no attestation (manifests nothing queued
+    /// references, removals of keys that name no unit) was not stored.
+    pub(crate) other: Option<StoreError>,
 }
 
-/// Write `p` to the server in one transaction (one request).
-fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
+/// Write `p` ([`write_all`]); the first failure, if any part was lost.
+pub(crate) fn write(remote: &Remote, p: Pending) -> Result<(), StoreError> {
+    let w = write_all(remote, p);
+    match (w.lost.into_error(), w.other) {
+        (Some(e), _) | (None, Some(e)) => Err(e),
+        (None, None) => Ok(()),
+    }
+}
+
+/// A queue's writes by unit (test key), each with the queued manifests
+/// its attestations reference and their bases: what one transaction keeps
+/// together, so that an attestation is never stored without its manifest
+/// nor a superseded one removed without its successor stored. The writes
+/// of no unit (manifests nothing queued references, a removal of a key
+/// that names no unit) come first, as one.
+fn units(mut p: Pending) -> Vec<Pending> {
+    let empty = p.empty_like();
+    let mut by: BTreeMap<String, Pending> = BTreeMap::new();
+    let mut rest = empty.clone();
+    for (slot, row) in std::mem::take(&mut p.attestations) {
+        let g = by.entry(slot.0.clone()).or_insert_with(|| empty.clone());
+        g.bytes += row.value.len() + row.key.len();
+        g.attestations.insert(slot, row);
+    }
+    for slot in std::mem::take(&mut p.emptied) {
+        by.entry(slot.0.clone())
+            .or_insert_with(|| empty.clone())
+            .emptied
+            .insert(slot);
+    }
+    for k in std::mem::take(&mut p.removals) {
+        match key::parse_key(&k) {
+            Some((tk, _, _)) => {
+                by.entry(tk.to_owned())
+                    .or_insert_with(|| empty.clone())
+                    .removals
+                    .insert(k);
+            }
+            None => {
+                rest.removals.insert(k);
+            }
+        }
+    }
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for g in by.values_mut() {
+        let refs: BTreeSet<String> = g
+            .attestations
+            .values()
+            .filter_map(|r| r.manifest_ref.clone())
+            .collect();
+        for r in refs {
+            let Some(m) = p.manifests.get(&r) else {
+                continue;
+            };
+            let base = m.0.clone();
+            for root in std::iter::once(r).chain(base) {
+                if let Some(m) = p.manifests.get(&root)
+                    && !g.manifests.contains_key(&root)
+                {
+                    g.bytes += m.1.len();
+                    g.manifests.insert(root.clone(), m.clone());
+                    used.insert(root);
+                }
+            }
+        }
+    }
+    for (root, m) in std::mem::take(&mut p.manifests) {
+        if !used.contains(&root) {
+            rest.bytes += m.1.len();
+            rest.manifests.insert(root, m);
+        }
+    }
+    let mut out = Vec::with_capacity(by.len() + 1);
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out.extend(by.into_values());
+    out
+}
+
+/// Units packed, in order, into transactions of at most [`TX_BYTES`] as
+/// sent and [`TX_UNITS`] attestations; a unit larger than that alone is a
+/// transaction of its own. Compressed values are counted at two thirds of
+/// their size: zstd makes vex's JSON about a third as large, and its bytes
+/// travel as a hex literal, twice that.
+fn pack(units: Vec<Pending>, compressed: bool) -> Vec<Vec<Pending>> {
+    let sent = |b: usize| if compressed { b * 2 / 3 } else { b };
+    let mut out: Vec<Vec<Pending>> = Vec::new();
+    let (mut cur, mut bytes, mut n): (Vec<Pending>, usize, usize) = (Vec::new(), 0, 0);
+    for u in units {
+        let (b, k) = (sent(u.bytes), u.attestations.len());
+        if !cur.is_empty() && (bytes + b > TX_BYTES || n + k > TX_UNITS) {
+            out.push(std::mem::take(&mut cur));
+            (bytes, n) = (0, 0);
+        }
+        bytes += b;
+        n += k;
+        cur.push(u);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Whether a failed transaction is worth sending again: it ran out of time
+/// (or waited for the write lock until then), or the server dropped its
+/// stream; not when the breaker latched meanwhile (the server cannot be
+/// reached), nor for a refusal (sent again it is refused again).
+fn worth_again(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::Timeout { .. } | StoreError::Unavailable { .. }
+    )
+}
+
+/// Whether a failed transaction says that no other will be stored either:
+/// the token may not write, the server takes no more writes, the tables
+/// went away, the store is not configured or too new.
+fn hopeless(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::Denied { .. }
+            | StoreError::NotInitialized { .. }
+            | StoreError::Config(_)
+            | StoreError::Incompatible { .. }
+    )
+}
+
+/// A pause before a transaction is sent again: 250 ms, doubling with each
+/// try up to 4 s, between half and one and a half of that (jobs that
+/// failed together do not come back together).
+fn backoff(tries: u32) -> Duration {
+    let base = Duration::from_millis(250).saturating_mul(1 << tries.min(4));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    base.mul_f64(0.5 + f64::from(nanos % 1000) / 1000.0)
+}
+
+/// Write `p` as transactions of whole units ([`units`], [`pack`]), one
+/// after the other; after each one stored, bring the cache up to date and
+/// run the queue's hook. A transaction that fails is sent again or split
+/// as the module docs say, within the process's retry time
+/// ([`Remote::spend_on_writes`]); the units whose transaction still fails
+/// are lost, and the rest is stored.
+pub(crate) fn write_all(remote: &Remote, p: Pending) -> Written {
+    let mut w = Written::default();
     if p.is_empty() {
-        return Ok(());
+        return w;
+    }
+    let keep = p.referenced();
+    let counts = (
+        p.manifests.len(),
+        p.attestations.len(),
+        p.removals.len() + p.emptied.len(),
+    );
+    let step = Step::start(KIND);
+    let n0 = remote.conn.requests();
+    let mut queue: VecDeque<(Vec<Pending>, u32)> = pack(units(p), remote.compress())
+        .into_iter()
+        .map(|t| (t, 0))
+        .collect();
+    // Roots a stored transaction wrote: not sent again with a later one.
+    let mut written: BTreeSet<String> = BTreeSet::new();
+    let (mut txs, mut bytes, mut longest, mut lost) = (0usize, 0usize, Duration::ZERO, 0usize);
+    while let Some((group, tries)) = queue.pop_front() {
+        let mut tx = group[0].empty_like();
+        for u in &group {
+            tx.merge(u.clone());
+        }
+        tx.manifests.retain(|r, _| !written.contains(r));
+        if tx.is_empty() {
+            continue;
+        }
+        let t = Instant::now();
+        let r = send(remote, &tx, &keep);
+        let took = t.elapsed();
+        longest = longest.max(took);
+        let e = match r {
+            Ok(n) => {
+                txs += 1;
+                bytes += n;
+                written.extend(tx.manifests.keys().cloned());
+                settle(remote, &tx);
+                continue;
+            }
+            Err(e) => e,
+        };
+        // What failed: these units, or (the breaker latched, the token may
+        // not write, the server takes no more writes) every unit still
+        // queued.
+        let mut failed = vec![group];
+        let mut why = e;
+        let mut give_up = |why: &mut StoreError, failed: &mut Vec<Vec<Pending>>| {
+            if let Err(l) = remote.conn.check() {
+                *why = l;
+            }
+            failed.extend(queue.drain(..).map(|(g, _)| g));
+        };
+        if remote.conn.check().is_err() || hopeless(&why) {
+            give_up(&mut why, &mut failed);
+        } else if worth_again(&why) && tries + 1 < MAX_TRIES {
+            // Time spent on a write that failed, and the pause before it is
+            // sent again, count against the process's retry time.
+            let pause = backoff(tries);
+            if remote.spend_on_writes(took + pause) {
+                std::thread::sleep(pause);
+                // In halves when it holds more than one unit: a half that is
+                // stored is kept when the other is not.
+                let mut group = failed.pop().unwrap_or_default();
+                if group.len() > 1 {
+                    let second = group.split_off(group.len() / 2);
+                    queue.push_front((second, tries + 1));
+                }
+                queue.push_front((group, tries + 1));
+                continue;
+            }
+            // The process's retry time ran out: the server cannot take
+            // writes now. Latched, so that every later call fails at once.
+            why = remote.writes_out_of_time(&why);
+            give_up(&mut why, &mut failed);
+        } else if worth_again(&why) {
+            remote.spend_on_writes(took);
+        } else if failed[0].len() > 1 {
+            // Refused: split down to the unit the server refuses.
+            let mut group = failed.pop().unwrap_or_default();
+            let second = group.split_off(group.len() / 2);
+            queue.push_front((second, tries));
+            queue.push_front((group, tries));
+            continue;
+        }
+        let keys: Vec<String> = failed.iter().flatten().flat_map(Pending::keys).collect();
+        if keys.is_empty() {
+            w.other.get_or_insert(why);
+        } else {
+            lost += keys.len();
+            w.lost.lose(keys, why);
+        }
+    }
+    step.done(format_args!(
+        "write batch: {} manifest(s), {} attestation(s), {} removal(s), {txs} transaction(s), {} request(s), {}{}, longest {:.2}s{}",
+        counts.0,
+        counts.1,
+        counts.2,
+        remote.conn.requests() - n0,
+        crate::remote::megabytes(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        if remote.compress() { " compressed" } else { "" },
+        longest.as_secs_f64(),
+        if lost > 0 {
+            format!(", {lost} attestation(s) not stored")
+        } else {
+            String::new()
+        }
+    ));
+    w
+}
+
+/// Write `p` to the server in one transaction (one request, and when its
+/// deadline runs out, one more asking whether the server committed it);
+/// the bytes of values sent. `keep`: roots the whole queue references,
+/// which no transaction of it removes as superseded.
+fn send(remote: &Remote, p: &Pending, keep: &BTreeSet<String>) -> Result<usize, StoreError> {
+    if p.is_empty() {
+        return Ok(0);
     }
     let only_removals = p.manifests.is_empty() && p.attestations.is_empty();
     let t = if only_removals {
         let t = remote.ready()?;
         if remote.version()?.is_none() {
             // Nothing stored, nothing to remove.
-            return Ok(());
+            return Ok(0);
         }
         t
     } else {
         remote.ensure()?
     };
-    let step = Step::start(KIND);
-    let n0 = remote.conn.requests();
     let at = now();
     let (a, log) = (&t.names.attestations, &t.log);
     let mut stmts: Vec<String> = Vec::new();
@@ -646,7 +996,7 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
             .collect();
         stmts.push(t.upsert_manifests(&rows.join(", ")));
     }
-    stmts.extend(superseded_manifests(remote, t, p, at)?);
+    stmts.extend(superseded_manifests(remote, t, p, keep, at)?);
     // Removals before the upsert: a put queued after a removal of its slot
     // replaces the slot anyway, and an emptied slot has no put.
     let mut removed_slots: Vec<Slot> = Vec::new();
@@ -701,7 +1051,8 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
         .collect();
     let roots: Vec<&str> = p.manifests.keys().map(String::as_str).collect();
     stmts.extend(log_rows(log, &slots, &roots, at));
-    if !remote.log_pruned.swap(true, Ordering::Relaxed) {
+    let prune = !remote.log_pruned.load(Ordering::Relaxed);
+    if prune {
         let cut = at.saturating_sub(LOG_KEEP_SECS);
         stmts.push(format!(
             "UPDATE vci_schema SET log_floor = max(log_floor, \
@@ -727,10 +1078,10 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
             )
         })
     };
-    match remote.write_checked(WRITE, &stmts, committed.as_deref()) {
+    match remote.write_checked(&stmts, committed.as_deref()) {
         Ok(()) => {}
         // Only removals, and no tables: nothing to remove.
-        Err(Fail::Absent) if only_removals => return Ok(()),
+        Err(Fail::Absent) if only_removals => return Ok(0),
         Err(Fail::Absent) => {
             return Err(StoreError::NotInitialized {
                 backend: KIND,
@@ -739,16 +1090,10 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
         }
         Err(Fail::Store(e)) => return Err(e),
     }
-    step.done(format_args!(
-        "write batch: {} manifest(s), {} attestation(s), {} removal(s), {} request(s), {}{}",
-        p.manifests.len(),
-        p.attestations.len(),
-        p.removals.len() + p.emptied.len(),
-        remote.conn.requests() - n0,
-        crate::remote::megabytes(u64::try_from(sent).unwrap_or(u64::MAX)),
-        if remote.compress() { " compressed" } else { "" }
-    ));
-    Ok(())
+    if prune {
+        remote.log_pruned.store(true, Ordering::Relaxed);
+    }
+    Ok(sent)
 }
 
 /// The statements that remove the manifests this write leaves without a
@@ -757,7 +1102,8 @@ fn send(remote: &Remote, p: &Pending) -> Result<(), StoreError> {
 /// to) reference them, and once it is done nothing will. One is kept when
 /// any other attestation references it, a manifest uses it as its base,
 /// this write references it (an attestation it puts, a manifest it puts or
-/// that one's base), any attestation's reference is unknown, or it was put
+/// that one's base; with a queue written as several transactions, any of
+/// the queue's), any attestation's reference is unknown, or it was put
 /// within the grace period (the hour another writer has to reference a
 /// manifest it put before its attestation; `vci prune` removes the rest).
 /// The change log names the roots removed, as `remove_manifests` does.
@@ -767,6 +1113,7 @@ fn superseded_manifests(
     remote: &Remote,
     t: &Tables,
     p: &Pending,
+    keep: &BTreeSet<String>,
     at: i64,
 ) -> Result<Vec<String>, StoreError> {
     let slots: Vec<&Slot> = p.emptied.iter().chain(p.attestations.keys()).collect();
@@ -799,11 +1146,12 @@ fn superseded_manifests(
         }
         format!("({})", parts.join(" OR "))
     };
-    let mut keep: BTreeSet<&str> = p
-        .attestations
-        .values()
-        .filter_map(|r| r.manifest_ref.as_deref())
-        .collect();
+    let mut keep: BTreeSet<&str> = keep.iter().map(String::as_str).collect();
+    keep.extend(
+        p.attestations
+            .values()
+            .filter_map(|r| r.manifest_ref.as_deref()),
+    );
     for (root, (base, _)) in &p.manifests {
         keep.insert(root);
         keep.extend(base.as_deref());
