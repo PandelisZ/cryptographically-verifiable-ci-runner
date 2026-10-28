@@ -674,6 +674,140 @@ fn a_replica_behind_the_purge_horizon_syncs_everything() {
     );
 }
 
+/// A row in the replica file at `path` that the server never held: what a
+/// full sync drops and a sync of the changes keeps.
+fn plant_row(path: &Path, unit: &str) -> String {
+    let test_key = key::test_key(unit);
+    let k = format!("vci:attestation:{test_key}:{S1}:{}", hex64(0x77));
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.busy_timeout(Duration::from_secs(20)).unwrap();
+    db.execute(
+        "INSERT INTO attestations (key, test_key, signer, storage_key, target, issued, tree16, \
+         manifest_ref, ref_state, stored_at, value) \
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, 2, 1, ?6)",
+        rusqlite::params![
+            k,
+            test_key,
+            S1,
+            hex64(0x77),
+            key::target_label(unit),
+            envelope("planted"),
+        ],
+    )
+    .unwrap();
+    k
+}
+
+/// A replica file a vci 2.8 kept (its sidecar says `v` 1 and no format-3
+/// cursor; it synced the log, so the file holds the namespace's format-1
+/// rows and none of its format-3 rows, which the log never named) is
+/// synced in full once by this vci (STORE-V2 section 5, gate 7): the
+/// format-3 row comes, its columns and objects answer from the server, a
+/// row the server never held goes, and the sidecar then says `v` 3 with
+/// the format-3 cursor at the counter. From there the syncs are by `seq`:
+/// a new format-3 row and a removal arrive, and a row the file holds that
+/// the server never named stays, which a full sync would not leave.
+#[test]
+fn a_2_8_replica_file_is_synced_in_full_once_then_by_seq() {
+    let Some((writer, ns)) = remote() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica.libsql");
+    let side = dir.path().join("replica.libsql.sync");
+    let sidecar = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&side).unwrap_or_default())
+            .unwrap_or_default()
+    };
+    let counter = || -> i64 {
+        count(
+            &writer,
+            &format!("SELECT seq FROM vci_schema WHERE ns = '{ns}'"),
+        )
+    };
+    let unit1 = "src/f3/one.test.ts";
+    let unit3 = "src/f3/three.test.ts";
+    let planted = "src/f3/planted.test.ts";
+    let units = [unit1, unit3, planted];
+    let keys_of = |r: &LibsqlStore| -> Vec<Vec<String>> {
+        r.list_units(&units)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.into_iter().map(|e| e.key).collect())
+            .collect()
+    };
+
+    // The server: a format-1 row (in the log) and a run's objects and a
+    // format-3 row (by seq).
+    let e1 = writer
+        .put_for_test(unit1, S1, &hex64(1), Some(&hint(1)), &envelope("one"))
+        .unwrap();
+    let run = Run3::build(&["src/f3/old.ts"]);
+    writer.put_objects(&run.new_objects()).unwrap();
+    let (rec, cols) = run.record(unit3, 1, 8);
+    let e3 = put3(&writer, unit3, &hex64(3), Some(&hint(3)), &rec, &cols);
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    assert_eq!(
+        keys_of(&r),
+        vec![vec![e1.key.clone()], vec![e3.key.clone()], vec![]]
+    );
+    drop(r);
+
+    // The file as 2.8 left it: without the format-3 row, with a row of
+    // its own, and a sidecar from before the format-3 cursor.
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            db.execute(
+                "DELETE FROM attestations WHERE key = ?1",
+                rusqlite::params![e3.key]
+            )
+            .unwrap(),
+            1
+        );
+    }
+    let k_planted = plant_row(&path, planted);
+    let mut v = sidecar();
+    assert_eq!(v["v"].as_i64(), Some(3), "{v}");
+    v["v"] = serde_json::json!(1);
+    v.as_object_mut().unwrap().remove("seq2");
+    std::fs::write(&side, v.to_string()).unwrap();
+
+    // Synced in full once: the format-3 row is back, the planted row gone.
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    assert_eq!(
+        keys_of(&r),
+        vec![vec![e1.key.clone()], vec![e3.key.clone()], vec![]],
+        "synced in full"
+    );
+    let got = r.read_units(&[unit3]).unwrap().remove(0);
+    assert_eq!(got[0].state(), ValueState::Read(&rec));
+    assert_eq!(r.columns(&[&got[0]]).unwrap(), vec![cols.clone()]);
+    assert_eq!(r.get_objects(&run.id_refs()).unwrap().len(), 4);
+    drop(r);
+    let v = sidecar();
+    assert_eq!(v["v"].as_i64(), Some(3), "{v}");
+    assert_eq!(v["seq2"].as_i64(), Some(counter()), "{v}");
+    let cursor = counter();
+
+    // By seq from here: a put and a removal arrive; a planted row stays.
+    let k_planted2 = plant_row(&path, planted);
+    assert_eq!(k_planted2, k_planted);
+    let (rec4, cols4) = run.record(unit3, 1, 9);
+    let e4 = put3(&writer, unit3, &hex64(4), Some(&hint(4)), &rec4, &cols4);
+    writer.remove(vec![e3.clone()]).unwrap();
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    assert_eq!(
+        keys_of(&r),
+        vec![vec![e1.key.clone()], vec![e4.key.clone()], vec![k_planted]],
+        "the changes since the cursor, and nothing else touched"
+    );
+    drop(r);
+    let v = sidecar();
+    assert_eq!(v["seq2"].as_i64(), Some(cursor + 2), "{v}");
+    assert_eq!(counter(), cursor + 2);
+}
+
 /// The `gone` rows past the purge horizon (30 days, or the policy's
 /// `max_ttl` when longer) are deleted by a handle's first write, the newest
 /// of them recorded as the floor.

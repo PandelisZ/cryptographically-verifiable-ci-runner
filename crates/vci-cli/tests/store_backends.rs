@@ -27,8 +27,11 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::Value;
+use vci_store::conformance::scenarios::Run3;
+use vci_store::{AttestationStore, Columns, NewAttestation, Record, decode_record, key};
 use vci_store_libsql::testkit as libsql_kit;
 use vci_store_postgres::testkit::{self, PgDb};
+use vci_store_sqlite::{SqliteOptions, SqliteStore};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -464,7 +467,23 @@ impl World {
     /// `vci <args>` with only `env` added to a scrubbed environment: no
     /// store configured unless `env` configures one.
     fn vci_bare(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        let mut cmd = Command::cargo_bin("vci").unwrap();
+        self.command(Command::cargo_bin("vci").unwrap(), args, env)
+    }
+
+    /// `vci <args>` of another build of vci, `bin`, on the world's store.
+    fn vci_other(&self, bin: &Path, args: &[&str]) -> Output {
+        let env: Vec<(&str, &str)> = self
+            .backend
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        self.command(Command::new(bin), args, &env)
+    }
+
+    /// `cmd <args>` in the repository with `env` added to a scrubbed
+    /// environment (metrics go to the world's own log).
+    fn command(&self, mut cmd: Command, args: &[&str], env: &[(&str, &str)]) -> Output {
         cmd.current_dir(&self.work)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
@@ -479,7 +498,11 @@ impl World {
         }
         let out = cmd.output().unwrap();
         eprintln!(
-            "$ vci {} {env:?} -> {:?}\n{}{}",
+            "$ {} {} {env:?} -> {:?}\n{}{}",
+            Path::new(cmd.get_program())
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             args.join(" "),
             out.status.code(),
             String::from_utf8_lossy(&out.stdout),
@@ -1976,4 +1999,149 @@ fn a_shared_input_manifest_the_store_refuses_is_not_relied_on() {
     );
     let ex = w.explain("a");
     assert!(ex.contains("a: SKIP"), "{ex}");
+}
+
+// ---------------------------------------------------------------------------
+// 9. A vci 2.8 binary on a SQLite file this vci wrote.
+
+/// The vci 2.8 binary `VCI_TEST_VCI_2_8` names, or `None` (the test is
+/// skipped, with a message) when it is unset. What it names must say it
+/// is a 2.8 when asked `--version`.
+fn vci_2_8() -> Option<PathBuf> {
+    let Some(p) = std::env::var_os("VCI_TEST_VCI_2_8") else {
+        eprintln!("SKIPPED: VCI_TEST_VCI_2_8 names no vci 2.8 binary");
+        return None;
+    };
+    let p = PathBuf::from(p);
+    let out = Command::new(&p)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("VCI_TEST_VCI_2_8={}: {e}", p.display()));
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert!(
+        v.starts_with("vci 2.8."),
+        "VCI_TEST_VCI_2_8={} says {v:?}, not a vci 2.8",
+        p.display()
+    );
+    Some(p)
+}
+
+/// A vci 2.8 binary on the SQLite file this vci wrote (STORE-V2 section 5,
+/// gate 2): the file has the format-3 layout (the nullable columns and
+/// the `objects` table, which this vci's first write added) and holds a
+/// run's four objects and, in the slot of a's record, a format-3 frame
+/// with its columns. 2.8 plans with no error: it lists the keys (which
+/// did not change), reads a value it cannot parse and runs a (fail open)
+/// while b, c and d are skipped on their format-1 rows; its `vci explain`
+/// and `vci prune --dry-run` exit 0 too; and its own `vci run a` stores a
+/// format-1 value, which this vci reads (every unit skipped), beside the
+/// objects 2.8 never saw. 2.8 writes into the slot the frame holds (same
+/// inputs, same storage key; the key's hint is its own) and its upsert
+/// sets the key and the value alone: the frame's columns stay beside the
+/// format-1 value, which every reader of the columns treats as a
+/// pre-filter confirmed by a read (`decode_record` goes by the value's
+/// first byte), so that the only effect is that the frame's objects stay
+/// referenced while the row lives. Were 2.8 to take another slot, the
+/// frame would stay as it was.
+#[test]
+fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
+    let Some(old) = vci_2_8() else {
+        return;
+    };
+    let Some(w) = World::new(Backend::sqlite()) else {
+        return;
+    };
+    let out = attest_all(&w);
+    let keys = attested_keys(&out, "sqlite");
+    let file = w.work.join(".git/vci-store.sqlite");
+
+    // Through the trait: a run's objects, and a's record replaced in its
+    // slot by a frame of that run.
+    let run = Run3::build(&["a/a.go", "a/a_test.go"]);
+    let (frame, columns) = run.record("a", 2, 28);
+    {
+        let s = SqliteStore::open_path(&file, SqliteOptions::default());
+        let caps = s.caps();
+        assert!(
+            caps.objects && caps.columns,
+            "the file this vci wrote has the format-3 layout: {caps:?}"
+        );
+        assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
+        let a = s
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.key == keys["a"])
+            .expect("a's record");
+        let hint = key::parse_key_hint(&a.key);
+        let e = s
+            .put(&NewAttestation {
+                hint: hint.as_ref(),
+                envelope: &frame,
+                columns: Some(&columns),
+                ..NewAttestation::copy_of(&a, None)
+            })
+            .unwrap();
+        assert_eq!(e.key, a.key, "the frame took the slot");
+        assert_eq!(s.columns(&[&e]).unwrap(), vec![columns.clone()]);
+    }
+
+    // 2.8 plans: exit 0, nothing it calls an error, a runs, the rest skip.
+    let out = w.vci_other(&old, &["plan", "--base-ref", "main", "--format", "json"]);
+    let plan = parse_plan(&out);
+    assert_eq!(plan.run, set(&["a"]), "{plan:?}");
+    assert_eq!(plan.skip, set(&["b", "c", "d"]), "{plan:?}");
+    assert!(
+        !stderr(&out).contains("error"),
+        "2.8 reports no error:\n{}",
+        stderr(&out)
+    );
+    let out = w.vci_other(&old, &["explain", "a", "--base-ref", "main"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = w.vci_other(&old, &["prune", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    // 2.8 runs a and stores it as it always did.
+    let key_path = w.key.to_str().unwrap().to_owned();
+    let out = w.vci_other(&old, &["run", "a", "--key", &key_path]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let new_keys = attested_keys(&out, "sqlite");
+    assert_eq!(new_keys.len(), 1, "{}", text(&out));
+    let new_key = &new_keys["a"];
+
+    // This vci skips every unit, a on 2.8's row.
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+    assert_eq!(plan.by["a"].0, *new_key, "{plan:?}");
+    let s = SqliteStore::open_path(&file, SqliteOptions::default());
+    let all = s.read_all().unwrap();
+    let row = all.iter().find(|e| e.key == *new_key).expect("2.8's row");
+    assert!(
+        matches!(decode_record(&row.bytes), Ok(Record::FormatOne(_))),
+        "a format-1 value"
+    );
+    let got = s.columns(&[row]).unwrap().remove(0);
+    if slot_and_tree(new_key).0 == slot_and_tree(&keys["a"]).0 {
+        assert_ne!(*new_key, keys["a"], "2.8's own hint");
+        assert_eq!(
+            got, columns,
+            "2.8 wrote into the frame's slot and set the key and the value alone: the frame's columns stay"
+        );
+    } else {
+        assert_eq!(got, Columns::default(), "a new row has no columns");
+        let f = all
+            .iter()
+            .find(|e| e.key == keys["a"])
+            .expect("the frame is still there when 2.8 took another slot");
+        assert!(matches!(
+            decode_record(&f.bytes),
+            Ok(Record::FormatThree(_))
+        ));
+        assert_eq!(s.columns(&[f]).unwrap(), vec![columns]);
+    }
+    assert_eq!(
+        s.get_objects(&run.id_refs()).unwrap().len(),
+        4,
+        "the objects are untouched"
+    );
 }
