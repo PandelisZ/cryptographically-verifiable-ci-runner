@@ -1,0 +1,56 @@
+units 1175; today 36320 B/unit (42.68 MB)
+v2 statement 1100.3 B mean (p50 1100, max 1601)
+v2 sig frame 234 B (312 base64); descriptor 271.5 B mean (p50 247, max 957; base64 mean 363.4)
+v2 text record 1782.7 B mean (p50 1760, p90 1917, max 2707); binary frame would be 1609.9
+  rails: 1780.3 B mean, max 2707, n 1158
+  cargo: 2254.6 B mean, max 2700, n 5
+  node-test: 1816.2 B mean, max 2489, n 12
+hdr objects: 11 distinct in the sample, {'n': 11, 'mean': 1182.8, 'p50': 762, 'p90': 1098, 'max': 4494, 'sum': 13011}; rails [4494]
+tables objects: 10, {'n': 10, 'mean': 26194.8, 'p50': 19387, 'p90': 74319, 'max': 74319, 'sum': 261948}; big run 19387, 185-unit run 9313
+run 2cb18b86 vex-api    rails     units  973 hdr 1 [4494] tables 1 [19387] shape 123264 B / 6639 (zstd 36687) state 285128 B (zstd 193690) conflicts 0
+run 90ce3d34 vex-api    rails     units  185 hdr 1 [4494] tables 1 [9313] shape 24662 B / 1076 (zstd 8675) state 60758 B (zstd 44056) conflicts 0
+run f3c0a5cc vex-web    node-test units    5 hdr 5 [745, 748, 754, 762] tables 5 [184, 661, 206, 184, 184] shape 3911 B / 610 (zstd 774) state 5182 B (zstd 1567) conflicts 0
+run b50b9ac1 vex-web    node-test units    5 hdr 5 [745, 748, 754, 762] tables 5 [184, 661, 206, 184, 184] shape 3911 B / 610 (zstd 774) state 5182 B (zstd 1568) conflicts 0
+run 3603e2ba rust       cargo     units    3 hdr 2 [955, 984] tables 2 [66586, 21927] shape 3483 B / 224 (zstd 1632) state 11124 B (zstd 9623) conflicts 0
+run 3603e2ba vex-roder  cargo     units    1 hdr 1 [1098] tables 1 [74319] shape 5 B / 0 (zstd 18) state 5 B (zstd 18) conflicts 0
+run 14d59b4a vex-web    node-test units    1 hdr 1 [754] tables 1 [365] shape 4920 B / 762 (zstd 1018) state 6376 B (zstd 1833) conflicts 0
+run 2cb18b86 vex-web    node-test units    1 hdr 1 [754] tables 1 [365] shape 4920 B / 762 (zstd 1018) state 6376 B (zstd 1826) conflicts 0
+run 3603e2ba rust       cargo     units    1 hdr 1 [955] tables 1 [69000] shape 4099 B / 275 (zstd 1874) state 13466 B (zstd 11746) conflicts 0
+groups estimate: {'entries_per_group': 440, 'groups_per_run': 9, 'index_bytes': 5940, 'shape_bytes_low_high': [14109, 79463], 'state_bytes_low_high': [18896, 170071], 'used_in_totals': 'high'}
+at rest 1175: {'records': 2094702, 'hdr': 13011, 'tables': 261948, 'shape': 173175, 'groups_est': 715167, 'state': 393597, 'total_verdict_path': 3258003, 'total_with_state': 3651600, 'per_unit_with_state': 3108, 'per_unit_without_state': 2773, 'ratio_vs_today': 11.7, 'ratio_vs_today_without_state': 13.1}
+curve (units: hdr, tables, shape, state, entries):
+     1: [4494, 9982, 2023, 5321, 101]
+     2: [4494, 10096, 1612, 4212, 82]
+     5: [4494, 10507, 6566, 17027, 326]
+    10: [4494, 10519, 8979, 23362, 443]
+    22: [4494, 10906, 14533, 37184, 701]
+    45: [4494, 12329, 22124, 55741, 1101]
+    67: [4494, 12342, 28814, 71935, 1408]
+   108: [4494, 13846, 36000, 89563, 1820]
+   187: [4494, 14692, 48642, 117697, 2413]
+   231: [4494, 15805, 58577, 143102, 2937]
+   260: [4494, 15832, 58876, 143368, 3043]
+   328: [4494, 16520, 65699, 155556, 3288]
+   363: [4494, 16788, 69758, 165025, 3557]
+   516: [4494, 17683, 89216, 213363, 4763]
+   540: [4494, 17993, 89194, 212064, 4567]
+   588: [4494, 17853, 92308, 217306, 4782]
+   800: [4494, 18929, 108967, 252918, 5767]
+   867: [4494, 19138, 115339, 267755, 6139]
+   973: [4494, 19387, 123264, 285128, 6639]
+partition 516: {'units': 516, 'records': 929705, 'hdr': 4494, 'tables': 19387, 'shape': 91223, 'shape_zstd': 28993, 'groups_est': 79463, 'state': 218305, 'state_zstd': 151016, 'total': 1342577, 'today': 19731018, 'rows': 520}
+writes per record 3.4; second flush above 587 units
+partition_328: {'units': 328, 'rows': 332, 'records_bytes': 583951, 'hdr': 4494, 'tables': 16520, 'shape': 98278, 'state': 225285, 'objects_bytes': 344577, 'bytes_at_rest': 928529, 'libsql_wire_bytes': 1043391, 'libsql_object_wire_bytes': 459440, 'writes': 1119, 'flushes': 1, 'transactions_at_1MiB': 1}
+partition_540: {'units': 540, 'rows': 544, 'records_bytes': 961384, 'hdr': 4494, 'tables': 17993, 'shape': 142831, 'state': 326861, 'objects_bytes': 492180, 'bytes_at_rest': 1453564, 'libsql_wire_bytes': 1617628, 'libsql_object_wire_bytes': 656244, 'writes': 1840, 'flushes': 1, 'transactions_at_1MiB': 2}
+partition_800: {'units': 800, 'rows': 804, 'records_bytes': 1424272, 'hdr': 4494, 'tables': 19387, 'shape': 220894, 'state': 508528, 'objects_bytes': 753303, 'bytes_at_rest': 2177575, 'libsql_wire_bytes': 2428684, 'libsql_object_wire_bytes': 1004412, 'writes': 2724, 'flushes': 2, 'transactions_at_1MiB': 3}
+partition_800_no_state: {'units': 800, 'rows': 804, 'records_bytes': 1424272, 'hdr': 4494, 'tables': 19387, 'shape': 220894, 'state': 0, 'objects_bytes': 244775, 'bytes_at_rest': 1669047, 'libsql_wire_bytes': 1750644, 'libsql_object_wire_bytes': 326372, 'writes': 2724, 'flushes': 2, 'transactions_at_1MiB': 2}
+partition_970: {'units': 970, 'rows': 974, 'records_bytes': 1726930, 'hdr': 4494, 'tables': 19379, 'shape': 202502, 'state': 454707, 'objects_bytes': 681083, 'bytes_at_rest': 2408014, 'libsql_wire_bytes': 2635042, 'libsql_object_wire_bytes': 908112, 'writes': 3302, 'flushes': 2, 'transactions_at_1MiB': 3}
+plan: today 60.5 MB; listing 0.83 + records 2.93 MB; by runs {"4": {"verdict_bytes_ceiling": 4738085, "with_state_for_explain": 6772197}, "10": {"verdict_bytes_ceiling": 6206735, "with_state_for_explain": 11292015}, "20": {"verdict_bytes_ceiling": 8654485, "with_state_for_explain": 18825045}, "50": {"verdict_bytes_ceiling": 15997735, "with_state_for_explain": 41424135}}
+plan objects, runs from newest per (unit,signer): 45 runs; tables 0.50 MB + shape 0.80 MB + hdr 49 KB (11 distinct; ceiling one per run 0.20 MB) = 1.35 MB expected, 1.50 MB ceiling; state of all runs 1.89 MB; shape cap headroom 11.2x
+plan objects, runs from every live candidate: 59 runs; tables 0.66 MB + shape 1.20 MB + hdr 49 KB (11 distinct; ceiling one per run 0.27 MB) = 1.91 MB expected, 2.13 MB ceiling; state of all runs 2.81 MB; shape cap headroom 7.9x
+per day attempted: {'units': 76725, 'jobs_with_a_line': 142, 'mean': 540, 'max': 972, 'records_mb': 136.59667130829015, 'hdr_ceiling_mb': 0.638148, 'tables_mb': 2.359634838994245, 'shape_mb': 18.75736108036288, 'state_mb': 42.44033649802423, 'total_mb': 200.7921517256715, 'total_without_state_mb': 158.35181522764728, 'today_mb': 2786.658333893617}
+per day attested: {'units': 46644, 'jobs_with_a_line': 142, 'mean': 328, 'max': 970, 'records_mb': 83.04223051813472, 'hdr_ceiling_mb': 0.462882, 'tables_mb': 1.6299086680343289, 'shape_mb': 11.710090279400255, 'state_mb': 26.589642737841917, 'total_mb': 123.43475420341122, 'total_without_state_mb': 96.8451114655693, 'today_mb': 1694.1139306110638}
+records attempted/day (wb) 53650, removals/day 64383 (1.20 per record), memo rows/day 189293
+steady state: {'records_mb': 42.72818652849741, 'hdr_mb_ceiling_14d': 8.934072, 'tables_shape_mb_ceiling_14d': 295.6379428709998, 'state_mb_2d': 84.88067299604846, 'state_mb_if_14d': 594.1647109723392, 'gone_rows_30d': 1931490, 'gone_mb_30d': 413.33886, 'gone_rows_day': 64383, 'gone_mb_day': 13.777962, 'total_mb_ceiling': 845.5197343955457}
+turso tx s by MB: {'0.25': {'min': 1.34, 'max': 2.78, 'mean': 1.8}, '0.5': {'min': 1.54, 'max': 1.69, 'mean': 1.6}, '1': {'min': 1.75, 'max': 3.66, 'mean': 2.5}, '2': {'min': 2.48, 'max': 10.56, 'mean': 7.0}, '4': {'min': 5.02, 'max': 10.16, 'mean': 6.8}, '8': {'min': 33.6, 'max': 36.78, 'mean': 35.6}}
+stability: {'units_at_more_than_one_commit': 6, 'same_path_kind_set': 6, 'same_root': 0, 'entries_common_to_two_largest_runs': 813, 'same_size_and_hash': 804}

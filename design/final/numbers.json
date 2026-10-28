@@ -1,0 +1,886 @@
+{
+ "units": 1175,
+ "frame": "vci3 LF statement LF base64(sig frame) LF base64(descriptor); records with an apostrophe (doubled by the libSQL text literal): 0, apostrophes per record 0.0",
+ "runs": [
+  {
+   "commit": "2cb18b86",
+   "issued": "2026-10-28T04:11:29Z",
+   "project": "vex-api",
+   "adapter": "rails",
+   "units": 973,
+   "hdr_count": 1,
+   "hdr_bytes": [
+    4494
+   ],
+   "tables_count": 1,
+   "tables_bytes": [
+    19387
+   ],
+   "shape_bytes": 123264,
+   "shape_entries": 6639,
+   "shape_zstd": 36687,
+   "state_bytes": 285128,
+   "state_zstd": 193690,
+   "state_entries": 6639,
+   "conflicts": 0
+  },
+  {
+   "commit": "90ce3d34",
+   "issued": "2026-10-28T04:06:21Z",
+   "project": "vex-api",
+   "adapter": "rails",
+   "units": 185,
+   "hdr_count": 1,
+   "hdr_bytes": [
+    4494
+   ],
+   "tables_count": 1,
+   "tables_bytes": [
+    9313
+   ],
+   "shape_bytes": 24662,
+   "shape_entries": 1076,
+   "shape_zstd": 8675,
+   "state_bytes": 60758,
+   "state_zstd": 44056,
+   "state_entries": 1076,
+   "conflicts": 0
+  },
+  {
+   "commit": "f3c0a5cc",
+   "issued": "2026-10-28T04:09:10Z",
+   "project": "vex-web",
+   "adapter": "node-test",
+   "units": 5,
+   "hdr_count": 5,
+   "hdr_bytes": [
+    745,
+    748,
+    754,
+    762
+   ],
+   "tables_count": 5,
+   "tables_bytes": [
+    184,
+    661,
+    206,
+    184,
+    184
+   ],
+   "shape_bytes": 3911,
+   "shape_entries": 610,
+   "shape_zstd": 774,
+   "state_bytes": 5182,
+   "state_zstd": 1567,
+   "state_entries": 610,
+   "conflicts": 0
+  },
+  {
+   "commit": "b50b9ac1",
+   "issued": "2026-10-28T04:10:29Z",
+   "project": "vex-web",
+   "adapter": "node-test",
+   "units": 5,
+   "hdr_count": 5,
+   "hdr_bytes": [
+    745,
+    748,
+    754,
+    762
+   ],
+   "tables_count": 5,
+   "tables_bytes": [
+    184,
+    661,
+    206,
+    184,
+    184
+   ],
+   "shape_bytes": 3911,
+   "shape_entries": 610,
+   "shape_zstd": 774,
+   "state_bytes": 5182,
+   "state_zstd": 1568,
+   "state_entries": 610,
+   "conflicts": 0
+  },
+  {
+   "commit": "3603e2ba",
+   "issued": "2026-10-28T04:06:52Z",
+   "project": "rust",
+   "adapter": "cargo",
+   "units": 3,
+   "hdr_count": 2,
+   "hdr_bytes": [
+    955,
+    984
+   ],
+   "tables_count": 2,
+   "tables_bytes": [
+    66586,
+    21927
+   ],
+   "shape_bytes": 3483,
+   "shape_entries": 224,
+   "shape_zstd": 1632,
+   "state_bytes": 11124,
+   "state_zstd": 9623,
+   "state_entries": 224,
+   "conflicts": 0
+  },
+  {
+   "commit": "3603e2ba",
+   "issued": "2026-10-28T04:07:12Z",
+   "project": "vex-roder",
+   "adapter": "cargo",
+   "units": 1,
+   "hdr_count": 1,
+   "hdr_bytes": [
+    1098
+   ],
+   "tables_count": 1,
+   "tables_bytes": [
+    74319
+   ],
+   "shape_bytes": 5,
+   "shape_entries": 0,
+   "shape_zstd": 18,
+   "state_bytes": 5,
+   "state_zstd": 18,
+   "state_entries": 0,
+   "conflicts": 0
+  },
+  {
+   "commit": "14d59b4a",
+   "issued": "2026-10-28T04:13:42Z",
+   "project": "vex-web",
+   "adapter": "node-test",
+   "units": 1,
+   "hdr_count": 1,
+   "hdr_bytes": [
+    754
+   ],
+   "tables_count": 1,
+   "tables_bytes": [
+    365
+   ],
+   "shape_bytes": 4920,
+   "shape_entries": 762,
+   "shape_zstd": 1018,
+   "state_bytes": 6376,
+   "state_zstd": 1833,
+   "state_entries": 762,
+   "conflicts": 0
+  },
+  {
+   "commit": "2cb18b86",
+   "issued": "2026-10-28T04:11:05Z",
+   "project": "vex-web",
+   "adapter": "node-test",
+   "units": 1,
+   "hdr_count": 1,
+   "hdr_bytes": [
+    754
+   ],
+   "tables_count": 1,
+   "tables_bytes": [
+    365
+   ],
+   "shape_bytes": 4920,
+   "shape_entries": 762,
+   "shape_zstd": 1018,
+   "state_bytes": 6376,
+   "state_zstd": 1826,
+   "state_entries": 762,
+   "conflicts": 0
+  },
+  {
+   "commit": "3603e2ba",
+   "issued": "2026-10-28T04:07:12Z",
+   "project": "rust",
+   "adapter": "cargo",
+   "units": 1,
+   "hdr_count": 1,
+   "hdr_bytes": [
+    955
+   ],
+   "tables_count": 1,
+   "tables_bytes": [
+    69000
+   ],
+   "shape_bytes": 4099,
+   "shape_entries": 275,
+   "shape_zstd": 1874,
+   "state_bytes": 13466,
+   "state_zstd": 11746,
+   "state_entries": 275,
+   "conflicts": 0
+  }
+ ],
+ "today": {
+  "envelope": {
+   "n": 1175,
+   "mean": 21166.3,
+   "p50": 21742,
+   "p90": 21822,
+   "max": 24574,
+   "sum": 24870450
+  },
+  "manifest": {
+   "n": 1175,
+   "mean": 15153.7,
+   "p50": 11372,
+   "p90": 25264,
+   "max": 98539,
+   "sum": 17805647
+  },
+  "per_unit": 36320,
+  "total": 42676097
+ },
+ "v2": {
+  "statement": {
+   "n": 1175,
+   "mean": 1100.3,
+   "p50": 1100,
+   "p90": 1142,
+   "max": 1601,
+   "sum": 1292873
+  },
+  "sig_frame": {
+   "n": 1175,
+   "mean": 234,
+   "p50": 234,
+   "p90": 234,
+   "max": 234,
+   "sum": 274950
+  },
+  "sig_frame_base64": 312,
+  "descriptor": {
+   "n": 1175,
+   "mean": 271.5,
+   "p50": 247,
+   "p90": 361,
+   "max": 957,
+   "sum": 319070
+  },
+  "descriptor_base64_mean": 363.4,
+  "record": {
+   "n": 1175,
+   "mean": 1782.7,
+   "p50": 1760,
+   "p90": 1917,
+   "max": 2707,
+   "sum": 2094702
+  },
+  "binary_record_for_comparison": {
+   "n": 1175,
+   "mean": 1609.9,
+   "p50": 1595,
+   "p90": 1715,
+   "max": 2423,
+   "sum": 1891593
+  },
+  "record_by_adapter": {
+   "rails": {
+    "n": 1158,
+    "mean": 1780.3,
+    "p50": 1760,
+    "p90": 1913,
+    "max": 2707,
+    "sum": 2061635
+   },
+   "cargo": {
+    "n": 5,
+    "mean": 2254.6,
+    "p50": 2438,
+    "p90": 2700,
+    "max": 2700,
+    "sum": 11273
+   },
+   "node-test": {
+    "n": 12,
+    "mean": 1816.2,
+    "p50": 1673,
+    "p90": 2489,
+    "max": 2489,
+    "sum": 21794
+   }
+  },
+  "own_entries": {
+   "n": 1175,
+   "mean": 56.5,
+   "p50": 29,
+   "p90": 137,
+   "max": 762,
+   "sum": 66333
+  },
+  "hdr": {
+   "distinct_in_sample": 11,
+   "bytes": {
+    "n": 11,
+    "mean": 1182.8,
+    "p50": 762,
+    "p90": 1098,
+    "max": 4494,
+    "sum": 13011
+   },
+   "rails_bytes": [
+    4494
+   ]
+  },
+  "tables": {
+   "count": 10,
+   "bytes": {
+    "n": 10,
+    "mean": 26194.8,
+    "p50": 19387,
+    "p90": 74319,
+    "max": 74319,
+    "sum": 261948
+   },
+   "big_run": 19387,
+   "run_185": 9313
+  },
+  "shape": {
+   "bytes_sum": 173175,
+   "zstd_sum": 52470,
+   "big_run": {
+    "bytes": 123264,
+    "entries": 6639,
+    "zstd": 36687,
+    "bytes_per_entry": 18.6
+   }
+  },
+  "state": {
+   "bytes_sum": 393597,
+   "zstd_sum": 265927,
+   "big_run": {
+    "bytes": 285128,
+    "entries": 6639,
+    "zstd": 193690,
+    "bytes_per_entry": 42.9
+   }
+  },
+  "groups_estimate": {
+   "entries_per_group": 440,
+   "groups_per_run": 9,
+   "index_bytes": 5940,
+   "shape_bytes_low_high": [
+    14109,
+    79463
+   ],
+   "state_bytes_low_high": [
+    18896,
+    170071
+   ],
+   "used_in_totals": "high"
+  },
+  "at_rest_1175": {
+   "records": 2094702,
+   "hdr": 13011,
+   "tables": 261948,
+   "shape": 173175,
+   "groups_est": 715167,
+   "state": 393597,
+   "total_verdict_path": 3258003,
+   "total_with_state": 3651600,
+   "per_unit_with_state": 3108,
+   "per_unit_without_state": 2773,
+   "ratio_vs_today": 11.7,
+   "ratio_vs_today_without_state": 13.1
+  },
+  "curve_hdr_tables_shape_state_entries": {
+   "1": [
+    4494,
+    9982,
+    2023,
+    5321,
+    101
+   ],
+   "2": [
+    4494,
+    10096,
+    1612,
+    4212,
+    82
+   ],
+   "5": [
+    4494,
+    10507,
+    6566,
+    17027,
+    326
+   ],
+   "10": [
+    4494,
+    10519,
+    8979,
+    23362,
+    443
+   ],
+   "22": [
+    4494,
+    10906,
+    14533,
+    37184,
+    701
+   ],
+   "45": [
+    4494,
+    12329,
+    22124,
+    55741,
+    1101
+   ],
+   "67": [
+    4494,
+    12342,
+    28814,
+    71935,
+    1408
+   ],
+   "108": [
+    4494,
+    13846,
+    36000,
+    89563,
+    1820
+   ],
+   "187": [
+    4494,
+    14692,
+    48642,
+    117697,
+    2413
+   ],
+   "231": [
+    4494,
+    15805,
+    58577,
+    143102,
+    2937
+   ],
+   "260": [
+    4494,
+    15832,
+    58876,
+    143368,
+    3043
+   ],
+   "328": [
+    4494,
+    16520,
+    65699,
+    155556,
+    3288
+   ],
+   "363": [
+    4494,
+    16788,
+    69758,
+    165025,
+    3557
+   ],
+   "516": [
+    4494,
+    17683,
+    89216,
+    213363,
+    4763
+   ],
+   "540": [
+    4494,
+    17993,
+    89194,
+    212064,
+    4567
+   ],
+   "588": [
+    4494,
+    17853,
+    92308,
+    217306,
+    4782
+   ],
+   "800": [
+    4494,
+    18929,
+    108967,
+    252918,
+    5767
+   ],
+   "867": [
+    4494,
+    19138,
+    115339,
+    267755,
+    6139
+   ],
+   "973": [
+    4494,
+    19387,
+    123264,
+    285128,
+    6639
+   ]
+  }
+ },
+ "partition_516": {
+  "units": 516,
+  "records": 929705,
+  "hdr": 4494,
+  "tables": 19387,
+  "shape": 91223,
+  "shape_zstd": 28993,
+  "groups_est": 79463,
+  "state": 218305,
+  "state_zstd": 151016,
+  "total": 1342577,
+  "today": 19731018,
+  "rows": 520
+ },
+ "vex_scale": {
+  "assumptions": {
+   "units_per_partition": 800,
+   "jobs_per_day": 164,
+   "units_listed": 2305,
+   "candidates_per_unit": 1.9,
+   "values_per_plan": 1644,
+   "today_base_bytes": 50000,
+   "key_bytes": 190,
+   "removals_per_record": 1.2,
+   "flush_writes": 2000,
+   "flush_bytes": 4194304,
+   "tx_bytes": 1048576
+  },
+  "writes_per_record": 3.4,
+  "second_flush_above_units": 587,
+  "partition_800": {
+   "units": 800,
+   "rows": 804,
+   "records_bytes": 1424272,
+   "hdr": 4494,
+   "tables": 19387,
+   "shape": 220894,
+   "state": 508528,
+   "objects_bytes": 753303,
+   "bytes_at_rest": 2177575,
+   "libsql_wire_bytes": 2428684,
+   "libsql_object_wire_bytes": 1004412,
+   "writes": 2724,
+   "flushes": 2,
+   "transactions_at_1MiB": 3
+  },
+  "partition_800_no_state": {
+   "units": 800,
+   "rows": 804,
+   "records_bytes": 1424272,
+   "hdr": 4494,
+   "tables": 19387,
+   "shape": 220894,
+   "state": 0,
+   "objects_bytes": 244775,
+   "bytes_at_rest": 1669047,
+   "libsql_wire_bytes": 1750644,
+   "libsql_object_wire_bytes": 326372,
+   "writes": 2724,
+   "flushes": 2,
+   "transactions_at_1MiB": 2
+  },
+  "partition_970": {
+   "units": 970,
+   "rows": 974,
+   "records_bytes": 1726930,
+   "hdr": 4494,
+   "tables": 19379,
+   "shape": 202502,
+   "state": 454707,
+   "objects_bytes": 681083,
+   "bytes_at_rest": 2408014,
+   "libsql_wire_bytes": 2635042,
+   "libsql_object_wire_bytes": 908112,
+   "writes": 3302,
+   "flushes": 2,
+   "transactions_at_1MiB": 3
+  },
+  "partition_540": {
+   "units": 540,
+   "rows": 544,
+   "records_bytes": 961384,
+   "hdr": 4494,
+   "tables": 17993,
+   "shape": 142831,
+   "state": 326861,
+   "objects_bytes": 492180,
+   "bytes_at_rest": 1453564,
+   "libsql_wire_bytes": 1617628,
+   "libsql_object_wire_bytes": 656244,
+   "writes": 1840,
+   "flushes": 1,
+   "transactions_at_1MiB": 2
+  },
+  "partition_328": {
+   "units": 328,
+   "rows": 332,
+   "records_bytes": 583951,
+   "hdr": 4494,
+   "tables": 16520,
+   "shape": 98278,
+   "state": 225285,
+   "objects_bytes": 344577,
+   "bytes_at_rest": 928529,
+   "libsql_wire_bytes": 1043391,
+   "libsql_object_wire_bytes": 459440,
+   "writes": 1119,
+   "flushes": 1,
+   "transactions_at_1MiB": 1
+  },
+  "partition_today": {
+   "bytes": 29506066,
+   "rows": 1609,
+   "libsql_wire_bytes_hex_or_text": "JSON travels 1:1; 29.5 MB"
+  },
+  "plan_read": {
+   "today_bytes": 60542320,
+   "listing_bytes": 832105,
+   "records_bytes": 2926880,
+   "by_runs_touched": {
+    "4": {
+     "verdict_bytes_ceiling": 4738085,
+     "with_state_for_explain": 6772197
+    },
+    "10": {
+     "verdict_bytes_ceiling": 6206735,
+     "with_state_for_explain": 11292015
+    },
+    "20": {
+     "verdict_bytes_ceiling": 8654485,
+     "with_state_for_explain": 18825045
+    },
+    "50": {
+     "verdict_bytes_ceiling": 15997735,
+     "with_state_for_explain": 41424135
+    }
+   },
+   "production_spread": {
+    "newest per (unit,signer)": {
+     "runs": 45,
+     "tables": 497787,
+     "shape": 797844,
+     "hdr_ceiling_one_per_run": 202230,
+     "hdr_expected": 49434,
+     "verdict_objects_expected": 1345065,
+     "verdict_objects_ceiling": 1497861,
+     "state_all_runs": 1888698,
+     "one_ctx_per_run_as_before": 1497861,
+     "sizes": [
+      867,
+      363,
+      260,
+      236,
+      231,
+      108,
+      45,
+      41,
+      24,
+      22,
+      17,
+      6,
+      6,
+      5,
+      5,
+      4,
+      4,
+      3,
+      3,
+      3,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+     ]
+    },
+    "every live candidate": {
+     "runs": 59,
+     "tables": 657842,
+     "shape": 1202123,
+     "hdr_ceiling_one_per_run": 265146,
+     "hdr_expected": 49434,
+     "verdict_objects_expected": 1909399,
+     "verdict_objects_ceiling": 2125111,
+     "state_all_runs": 2813582,
+     "one_ctx_per_run_as_before": 2125111,
+     "sizes": [
+      884,
+      841,
+      566,
+      365,
+      283,
+      276,
+      236,
+      108,
+      52,
+      43,
+      29,
+      28,
+      23,
+      10,
+      6,
+      6,
+      5,
+      5,
+      5,
+      4,
+      4,
+      3,
+      3,
+      3,
+      3,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+     ]
+    }
+   },
+   "shape_cap_bytes": 16777216,
+   "state_cap_count": 16
+  },
+  "per_day": {
+   "attempted": {
+    "units": 76725,
+    "jobs_with_a_line": 142,
+    "mean": 540,
+    "max": 972,
+    "records_mb": 136.59667130829015,
+    "hdr_ceiling_mb": 0.638148,
+    "tables_mb": 2.359634838994245,
+    "shape_mb": 18.75736108036288,
+    "state_mb": 42.44033649802423,
+    "total_mb": 200.7921517256715,
+    "total_without_state_mb": 158.35181522764728,
+    "today_mb": 2786.658333893617
+   },
+   "attested": {
+    "units": 46644,
+    "jobs_with_a_line": 142,
+    "mean": 328,
+    "max": 970,
+    "records_mb": 83.04223051813472,
+    "hdr_ceiling_mb": 0.462882,
+    "tables_mb": 1.6299086680343289,
+    "shape_mb": 11.710090279400255,
+    "state_mb": 26.589642737841917,
+    "total_mb": 123.43475420341122,
+    "total_without_state_mb": 96.8451114655693,
+    "today_mb": 1694.1139306110638
+   },
+   "records_attempted_from_wb": 53650,
+   "removals": 64383,
+   "memo_rows_today": 189293,
+   "log_rows_today": "~400k"
+  },
+  "steady_state": {
+   "records_mb": 42.72818652849741,
+   "hdr_mb_ceiling_14d": 8.934072,
+   "tables_shape_mb_ceiling_14d": 295.6379428709998,
+   "state_mb_2d": 84.88067299604846,
+   "state_mb_if_14d": 594.1647109723392,
+   "gone_rows_30d": 1931490,
+   "gone_mb_30d": 413.33886,
+   "gone_rows_day": 64383,
+   "gone_mb_day": 13.777962,
+   "total_mb_ceiling": 845.5197343955457
+  },
+  "turso_tx_seconds_by_mb": {
+   "0.25": {
+    "min": 1.34,
+    "max": 2.78,
+    "mean": 1.8
+   },
+   "0.5": {
+    "min": 1.54,
+    "max": 1.69,
+    "mean": 1.6
+   },
+   "1": {
+    "min": 1.75,
+    "max": 3.66,
+    "mean": 2.5
+   },
+   "2": {
+    "min": 2.48,
+    "max": 10.56,
+    "mean": 7.0
+   },
+   "4": {
+    "min": 5.02,
+    "max": 10.16,
+    "mean": 6.8
+   },
+   "8": {
+    "min": 33.6,
+    "max": 36.78,
+    "mean": 35.6
+   }
+  }
+ },
+ "stability": {
+  "units_at_more_than_one_commit": 6,
+  "same_path_kind_set": 6,
+  "same_root": 0,
+  "entries_common_to_two_largest_runs": 813,
+  "same_size_and_hash": 804
+ }
+}

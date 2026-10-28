@@ -1,0 +1,11 @@
+run A 973 units; run B 185 units; units of B also in A: 0
+
+today:
+  commit A (973 units): {'commit': 1, 'tree': 8936, 'blob': 1955} objects, raw {'commit': 1009, 'tree': 589867, 'blob': 36935381}; pack of A alone 3.88 MB
+  push of B (185 units): new objects {'commit': 1, 'tree': 1761, 'blob': 379}, raw bytes {'commit': 1057, 'tree': 244071, 'blob': 5919410}; thin pack sent 0.643 MB  (3.47 KB per unit)
+  repacked repository (A+B): 4.47 MB
+
+v2:
+  commit A (973 units): {'commit': 1, 'tree': 7962, 'blob': 977} objects, raw {'commit': 1009, 'tree': 466749, 'blob': 2336037}; pack of A alone 1.34 MB
+  push of B (185 units): new objects {'commit': 1, 'tree': 1573, 'blob': 188}, raw bytes {'commit': 1057, 'tree': 131026, 'blob': 434738}; thin pack sent 0.272 MB  (1.47 KB per unit)
+  repacked repository (A+B): 1.58 MB
