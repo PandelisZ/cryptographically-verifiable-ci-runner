@@ -221,6 +221,7 @@ mod local {
         /// The local file has the SQLite store's `objects` table.
         fn age_objects(&self, _i: usize, ids: &[&str], by: Duration) -> bool {
             let list = ids.iter().map(|i| lit(i)).collect::<Vec<_>>().join(", ");
+            // Every id must be there (the SQLite world checks the same).
             self.raw().is_some_and(|db| {
                 db.execute(
                     &format!(
@@ -229,7 +230,7 @@ mod local {
                     ),
                     [],
                 )
-                .is_ok()
+                .is_ok_and(|n| n == ids.len())
             })
         }
     }

@@ -220,21 +220,27 @@ impl World for GitWorld {
             return false;
         };
         let by = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
+        // Every id must be there, under exactly one kind (the SQLite and
+        // PostgreSQL worlds check the same).
         for id in ids {
+            let mut moved = 0;
             for kind in [
                 ObjectKind::Hdr,
                 ObjectKind::Tables,
                 ObjectKind::Shape,
                 ObjectKind::State,
             ] {
-                let moved = db.execute(
+                match db.execute(
                     "UPDATE metadata SET last_timestamp = last_timestamp - ?1
                      WHERE target_type = 'project' AND key = ?2",
                     rusqlite::params![by, vci_store::key::object_key(kind, id)],
-                );
-                if moved.is_err() {
-                    return false;
+                ) {
+                    Ok(n) => moved += n,
+                    Err(_) => return false,
                 }
+            }
+            if moved != 1 {
+                return false;
             }
         }
         true

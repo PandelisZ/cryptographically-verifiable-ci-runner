@@ -69,8 +69,16 @@ impl SchemaSql {
                 "SELECT version, to_regclass($1) IS NOT NULL FROM \"{s}\".schema_version"
             ),
             objects_regclass: format!("\"{s}\".objects"),
+            // Counted by the value, as the SQLite store counts: a frame
+            // starts with `v`; anything else is a format-1 row or needs
+            // the manifests. The `format` column is not trusted here: a
+            // 2.8 writer's upsert sets the key and the value alone,
+            // leaving a frame's `3` beside the format-1 value it wrote
+            // into the slot, and a frame put without columns (a copy out
+            // of git-meta) has NULL.
             format_one_rows: format!(
-                "SELECT count(*) FROM \"{s}\".attestations WHERE format IS DISTINCT FROM 3"
+                "SELECT count(*) FROM \"{s}\".attestations \
+                 WHERE substring(value from 1 for 1) <> '\\x76'::bytea"
             ),
             finish: format!(
                 "DROP TABLE IF EXISTS \"{s}\".manifests; \

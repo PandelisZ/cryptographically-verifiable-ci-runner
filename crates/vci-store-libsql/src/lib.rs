@@ -52,7 +52,7 @@ mod replica;
 #[doc(hidden)]
 pub mod testkit;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -702,18 +702,23 @@ impl AttestationStore for LibsqlStore {
         }
     }
 
-    /// On a server: applied at once under the orphan rule, keeping (and
-    /// not counting) the objects an open batch on this thread has queued,
-    /// which the server does not hold yet or whose grace the batch
-    /// refreshes when it finishes.
+    /// On a server: inside an open batch of this thread, queued and
+    /// applied under the orphan rule after everything else of the batch
+    /// (the records it removes no longer reference them) in its last
+    /// transaction, counting nothing, as PostgreSQL's batch does; the
+    /// objects the batch itself puts are left out (the server does not
+    /// hold them yet, or holds them with a `put_at` the batch refreshes).
+    /// Outside a batch, applied at once.
     fn remove_objects(&self, ids: &[&str]) -> Result<usize, StoreError> {
         let remote = match &self.inner {
             Inner::Local(s) => return s.remove_objects(ids),
             Inner::Remote(r) => r,
             Inner::Replica(p) => &p.remote,
         };
-        let keep = batch::queued_objects(remote).unwrap_or_default();
-        remote.remove_objects_now(ids, &keep)
+        if batch::is_open(remote) {
+            return batch::remove_objects(remote, ids);
+        }
+        remote.remove_objects_now(ids, &BTreeSet::new())
     }
 
     fn orphan_objects(&self) -> Result<Vec<String>, StoreError> {

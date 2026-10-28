@@ -576,10 +576,14 @@ impl Tables {
             // The sync of a namespace with the format-3 tables: the old
             // log's rows as `sync` below, nine columns each (the header
             // row (0) adds the `seq` counter and the `gone` floor), then
-            // the attestations whose `seq` is past the format-3 cursor
-            // (5: key, target, value, encoding) and the `gone` rows past
-            // it (6: key or NULL, object id or NULL, at). A full sync
-            // brings every attestation as row kind 1 and needs neither.
+            // the format-3 records (a frame: the value's first byte is
+            // `v`, and a frame is never compressed) whose `seq` is past
+            // the format-3 cursor (5: key, target, value, encoding) and
+            // the `gone` rows past it (6: key or NULL, object id or NULL,
+            // at). A format-1 row this vci wrote has a `seq` too, but the
+            // old log names its slot (kind 1), so kind 5 leaves it out
+            // rather than send it twice. A full sync brings every
+            // attestation as row kind 1 and needs neither.
             sync_v2: format!(
                 "SELECT 0, {mark_then}, {mark_now}, \
                    (SELECT created_at FROM vci_schema WHERE ns = ?3), \
@@ -605,7 +609,7 @@ impl Tables {
                  SELECT 4, root, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM ({touched_roots}) WHERE ?2 = 0 \
                  UNION ALL \
                  SELECT 5, key, target, value, encoding, NULL, NULL, NULL, NULL FROM {a} \
-                   WHERE ?2 = 0 AND seq > ?4 \
+                   WHERE ?2 = 0 AND seq > ?4 AND hex(substr(value, 1, 1)) = '76' \
                  UNION ALL \
                  SELECT 6, key, object, NULL, NULL, at, NULL, NULL, NULL FROM {g} \
                    WHERE ?2 = 0 AND seq > ?4"
@@ -901,11 +905,21 @@ impl Remote {
         }
     }
 
-    /// Forget objects this handle removed.
+    /// Remember that this handle removed these objects.
     fn objects_removed(&self, ids: &[String]) {
         let mut c = self.objects_cache();
         for id in ids {
             c.insert(id.clone(), None);
+        }
+    }
+
+    /// Forget what this handle holds of these objects: a batch asked the
+    /// server to remove them under the orphan rule, and whether each went
+    /// is known to the server alone (read again when asked for).
+    pub(crate) fn objects_forget(&self, ids: &[String]) {
+        let mut c = self.objects_cache();
+        for id in ids {
+            c.remove(id);
         }
     }
 
@@ -1390,7 +1404,13 @@ impl Remote {
 
     /// How many rows of the namespace are not format-3 records: what
     /// `vci store upgrade --finish` would have to wait for (STORE-V2
-    /// section 5 step 4 refuses while one exists).
+    /// section 5 step 4 refuses while one exists). Counted by the value,
+    /// as the SQLite store counts: a frame is never stored compressed and
+    /// starts with `v`; anything else is a format-1 row or needs the
+    /// manifests. The `format` column is not trusted here: a 2.8 writer's
+    /// upsert sets the key and the value alone, leaving a frame's `3`
+    /// beside the format-1 value it wrote into the slot, and a frame put
+    /// without columns (a copy out of git-meta) has NULL.
     pub(crate) fn format_one_rows(&self) -> Result<usize, StoreError> {
         let t = self.ready()?;
         if self.version()?.is_none() {
@@ -1398,7 +1418,7 @@ impl Remote {
         }
         let sql = if self.v2()? {
             format!(
-                "SELECT count(*) FROM {} WHERE format IS NOT 3",
+                "SELECT count(*) FROM {} WHERE encoding <> 0 OR hex(substr(value, 1, 1)) <> '76'",
                 t.names.attestations
             )
         } else {

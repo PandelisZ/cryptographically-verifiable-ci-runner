@@ -2007,7 +2007,11 @@ fn a_shared_input_manifest_the_store_refuses_is_not_relied_on() {
 
 /// The vci 2.8 binary `VCI_TEST_VCI_2_8` names, or `None` (the test is
 /// skipped, with a message) when it is unset. What it names must say it
-/// is a 2.8 when asked `--version`.
+/// is a 2.8 when asked `--version`, and must not be this build's own vci
+/// (whose version is still a 2.8.x while this branch is unreleased, so
+/// the version alone cannot tell them apart): with the branch's binary the
+/// test below would pass without a 2.8 involved, since its plan and run
+/// are still the format-1 paths at M2.
 fn vci_2_8() -> Option<PathBuf> {
     let Some(p) = std::env::var_os("VCI_TEST_VCI_2_8") else {
         eprintln!("SKIPPED: VCI_TEST_VCI_2_8 names no vci 2.8 binary");
@@ -2023,6 +2027,14 @@ fn vci_2_8() -> Option<PathBuf> {
         v.starts_with("vci 2.8."),
         "VCI_TEST_VCI_2_8={} says {v:?}, not a vci 2.8",
         p.display()
+    );
+    let ours = Path::new(env!("CARGO_BIN_EXE_vci"));
+    let same = std::fs::read(&p).unwrap_or_default() == std::fs::read(ours).unwrap_or_default();
+    assert!(
+        !same,
+        "VCI_TEST_VCI_2_8={} is this build's own vci ({}), not a 2.8: build one from a 2.8 commit (e6244e7)",
+        p.display(),
+        ours.display()
     );
     Some(p)
 }

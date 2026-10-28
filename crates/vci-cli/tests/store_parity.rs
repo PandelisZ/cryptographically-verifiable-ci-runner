@@ -590,9 +590,17 @@ fn script(site: &Site, fx: &Fixtures) -> Transcript {
         w.remove_objects(&ids).unwrap()
     ));
 
-    // 2. A batch: a third run's objects and a record of it, and the first
-    // envelope's removal. Counts inside a deferred batch may differ, so
-    // only what is visible after the finish is recorded.
+    // 2. A batch: a third run's objects and a record of it, the first
+    // envelope's removal, and `remove_objects` of every id, b's shape aged
+    // past the grace first. Counts inside a deferred batch may differ (a
+    // backend may queue the object removals and apply the rule when the
+    // batch finishes, or apply it at once), so only what is visible after
+    // the finish is recorded: b's shape, referenced by nothing, is gone
+    // on every backend; a's objects (referenced) and c's (the batch's
+    // own) stay. An object a record the batch itself removes referenced
+    // is backend-defined (git-meta reads the store as committed before
+    // the batch) and is not in the script.
+    site.age(&[&fx.b.ids.shape], OBJECT_GRACE * 2);
     let (rec_c, cols_c) = fx.c.record(UNIT_A, 1, 13);
     let h5 = hint(5);
     let batch = w.batch().unwrap();
@@ -602,15 +610,22 @@ fn script(site: &Site, fx: &Fixtures) -> Transcript {
         NewAttestation::for_test(UNIT_A, S1, &hex64(5), Some(&h5), &rec_c).with_columns(&cols_c),
     );
     w.remove(vec![e1.clone()]).unwrap();
+    w.remove_objects(&ids).unwrap();
     batch.finish().unwrap();
     t.say(format!("batch put: {}", ec.key));
     snapshot(&mut t, site, "2", &asked, &roots);
 
-    // 3. Past the grace, only b's shape is an orphan; a's state object
-    // expires at two days while a's records still name it; without a's
-    // two records, its shape is an orphan (c's record still names the hdr
-    // and the tables the runs share), and both manifests are orphans.
-    site.age(&ids, OBJECT_GRACE * 2);
+    // 3. Past the grace, nothing is an orphan (b's shape went with the
+    // batch); a's state object expires at two days while a's records
+    // still name it; without a's two records, its shape is an orphan
+    // (c's record still names the hdr and the tables the runs share), and
+    // both manifests are orphans.
+    let stored: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| *id != fx.b.ids.shape)
+        .collect();
+    site.age(&stored, OBJECT_GRACE * 2);
     t.say(format!(
         "orphan_objects past the grace: {}",
         w.orphan_objects().unwrap().join(" ")
@@ -712,8 +727,8 @@ fn every_backend_answers_the_same_script_alike() {
         "put_objects a again: 0",
         "put_objects b.shape: 1",
         "remove_objects within the grace: 0",
-        &format!("orphan_objects past the grace: {}", fx.b.ids.shape),
-        "remove_objects past the grace: 1",
+        "orphan_objects past the grace: ",
+        "remove_objects past the grace: 0",
         "prune_state_objects young: 0",
         "prune_state_objects aged: 1",
         &format!("orphan_objects without a's records: {}", fx.a.ids.shape),
@@ -725,6 +740,21 @@ fn every_backend_answers_the_same_script_alike() {
             "{want:?} not in the transcript:\n{text}"
         );
     }
+    // b's shape, aged past the grace and referenced by nothing, went with
+    // the batch's `remove_objects` on every backend.
+    let objects = |n: &str| {
+        reference
+            .lines
+            .iter()
+            .find(|l| l.starts_with(&format!("{n} objects: ")))
+            .unwrap_or_else(|| panic!("snapshot {n}"))
+    };
+    assert!(objects("1").contains(&fx.b.ids.shape));
+    assert!(
+        !objects("2").contains(&fx.b.ids.shape),
+        "b's shape went with the batch: {}",
+        objects("2")
+    );
     assert_eq!(fx.a.ids.hdr, fx.c.ids.hdr, "the runs share a header");
     assert!(
         text.contains("2 record") && text.contains("frame shape=") && text.contains(": envelope;"),

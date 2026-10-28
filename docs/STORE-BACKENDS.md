@@ -499,8 +499,12 @@ state them:
   validated first. Returns how many were removed. A **state object on a store without columns** has no visible
   referrer (its id is in no signed field), so such a store keeps it, counts it nowhere, and leaves it to
   `prune_state_objects`. Removing an object still referenced only makes its units run. Inside a deferred batch a
-  backend may queue the removal after the batch's removals and apply the rule at `finish`, or apply it at once: the
-  batch's own objects are within their grace either way.
+  backend may queue the removal after the batch's removals and apply the rule at `finish` (PostgreSQL, libSQL), or
+  apply it at once (SQLite, inside its transaction; git-meta, on the store as committed before the batch): the
+  batch's own objects are within their grace either way. On a store with lazy values (git-meta) this and
+  `orphan_objects` fetch every attestation value not fetched yet and read every value (any record on any target
+  can name an object), so `vci run` calls `remove_objects` after supersession only on a store with
+  `Caps::columns` and leaves git-meta's to `vci prune`, which has read every value already.
 - **`orphan_objects() -> Vec<String>`**: the ids `remove_objects` would remove now, sorted; state objects left out on
   a store without columns. A store with columns reads no value; one without reads every value and answers empty
   when any record's references are unknown (`ObjectRefs::Unknown`), as `orphan_manifests` does.
@@ -713,7 +717,9 @@ been measured on one yet.
   as transactions each cut between whole units: the object puts (`put_objects`), then the manifests, then the
   attestations, then the removals with the deletion records a backend keeps for its replicas (`gone` rows), then any
   `remove_objects` queued in the batch. So no reader, on the store or on a replica syncing it by `seq`, sees a
-  record whose objects or manifest are missing, or a unit with neither its old nor its new record. A `put_objects`
+  record whose objects or manifest are missing, or a unit with neither its old nor its new record. On libSQL, whose
+  batch is several transactions, the objects go in the first and again in every later one until a transaction that
+  carries them commits (section 18), so a lost first transaction never leaves a stored record without its objects. A `put_objects`
   inside a deferred batch may count every object as new. The write model per 800-unit partition is 4 object puts,
   N record puts, ~1.2 N removals and their `gone` rows (STORE-V2 section 2.1), flushed early at the backend's write
   count and sent on libSQL as transactions bounded by bytes.
@@ -1752,7 +1758,9 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   `orphan_objects` lists them all, sorted. **State objects are never orphans here**: git-meta keeps no columns, and a
   state object's id is in no signed field, so nothing can name it; `prune_state_objects` is what removes them. Inside a
   batch the scan reads the store as committed before the batch, so a record the batch removed still counts as a
-  referrer and its objects go at a later call.
+  referrer and its objects go at a later call. Both calls read every value (there is no scoped referrer scan for
+  objects: a manifest's referrers are on the paths it lists, an object's can be any record), which is `vci prune`'s
+  cost and not a per-run one: `vci run` does not call them on a store without columns (section 4).
 - `prune_state_objects(older_than)`: the object rows of kind 4 whose `last_timestamp` is older than that, deleted
   whatever names them (values not read).
 - `columns` is the default: `Columns::default()` for every entry (the hint is the key; the columns a put passes are
@@ -2370,8 +2378,11 @@ the additions missing asks again at its next check, since any writer may add the
   recipe is run again after it (below, "Roles").
 - (2.9) The version stays **1** while a format-1 row can exist, so a 2.8 vci keeps reading the rows it parses and
   writing rows with NULL in the new columns. `PgStore::upgrade_finish` (`vci store upgrade --finish`) ends the
-  window: under the advisory lock it counts the rows of the schema, **in every namespace**, whose `format` is not 3,
-  and with any returns `Finish::FormatOneRows(n)` and changes nothing; with none it drops `manifests` and sets
+  window: under the advisory lock it counts the rows of the schema, **in every namespace**, whose value does not
+  start with `v` (`substring(value from 1 for 1) <> '\x76'`: format-1 rows, and anything that is not a frame; never
+  the `format` column, which a 2.8 writer's upsert leaves as it was beside the format-1 value it writes into a
+  frame's slot, and which a frame put without columns, a copy out of git-meta, lacks), and with any returns
+  `Finish::FormatOneRows(n)` and changes nothing; with none it drops `manifests` and sets
   `schema_version.version = 2` (`vci_version`, `migrated_at` and `migrated_by` updated), which this vci reads
   (`SUPPORTED` is 2; a new schema is created at 1) and a 2.8 vci refuses as newer than it. Idempotent. After it a
   manifest read answers none, `remove_manifests` 0, and `put_manifest` `NotInitialized` (a batch holding one fails
@@ -2788,7 +2799,9 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   request) and only what is missing is sent, so the upgrade is idempotent and two writers upgrading at once are
   safe (whoever's `ALTER TABLE` comes second is refused, `duplicate column`, reads the columns again and sends what is
   still missing). `LibsqlStore::upgrade()` (`vci store upgrade --begin`) does the same ahead of a rollout and says
-  whether anything was sent; `finish_upgrade()` (`--finish`) counts the rows that are not format-3 records and is
+  whether anything was sent; `upgrade_finish()` (`--finish`) counts the rows that are not format-3 records (`encoding <> 0 OR
+  hex(substr(value, 1, 1)) <> '76'`: by the value, as the SQLite store counts, since a frame is never stored
+  compressed and starts with `v`, and the `format` column is what a 2.8 writer's upsert leaves stale) and is
   refused while one exists, and at zero is `Unsupported` in this release: dropping `manifests` and the change log
   needs every statement that names them branched on a version 2, which a later vci carries. A handle that found a
   namespace without the layout answers no objects and no columns for the rest of the process; a write of its
@@ -2797,7 +2810,9 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   and the policy's `max_ttl` (`LibsqlStore::set_max_ttl`, which vci-cli passes from the policy; 30 days without it),
   are deleted once per handle by its first write, the newest purged `seq` kept in `vci_schema.gone_floor`.
 - **Values compressed** (2.8.2). A value's `encoding` column, there since schema v1 for this, says how its bytes are
-  stored: 0 as they are, 1 as one zstd frame (level 6). Every reader from 2.8.2 reads both, decompressing at most
+  stored: 0 as they are, 1 as one zstd frame (level 6). A format-3 record frame (2.9) is never compressed, whatever
+  the setting: its first byte says its format on the server (the `--finish` count, the replica's sync by `seq`), and
+  it is under 2 kB of mostly base64. Every reader from 2.8.2 reads both, decompressing at most
   5,000,000 bytes (no value vci stores is larger; past that the value reads as unreadable, its unit runs), and the
   key, the signature and every check cover the bytes as they were, so verification is unchanged. Writers compress
   when `VCI_STORE_COMPRESS=zstd`, else when `vci.toml` says `[store] compress = "zstd"` (the variable wins, `off`
@@ -3084,10 +3099,18 @@ transaction of format-3 records is sized by its bytes alone (200 records of the 
 transaction; `TX_UNITS` would have made four). An object whose base64 would reach a server's row limit (5,000,000
 bytes) is refused as `Unsupported` before it is queued, as a record is. `put_objects` outside a batch is a batch of
 one (one request asks which ids are stored, for the count); inside a batch it queues, and the count is what the batch
-did not hold already. `remove_objects` is applied at once, under the orphan rule of section 4 (one request asks which
-of the ids are orphans as of now minus the grace, one transaction removes them with the rule repeated and a `gone`
-row each), keeping the ids an open batch on the thread has queued, which the server does not hold yet or whose grace
-the batch refreshes when it finishes. `prune_state_objects` is the same two requests over `kind = 4 AND put_at <
+did not hold already. `remove_objects` outside a batch is applied at once, under the orphan rule of section 4 (one
+request asks which of the ids are orphans as of now minus the grace, one transaction removes them with the rule
+repeated and a `gone` row each); inside a batch on the thread it is queued (`Pending::object_removals`, the ids the
+batch itself puts left out: the server does not hold them yet, or holds them with a `put_at` the batch refreshes),
+counts nothing, stays queued through an early write, and goes as the last statements of the queue's last
+transaction, after the removals of the records that referenced the objects, the rule in the SQL and a `gone` row
+each; the handle's object cache then forgets the ids asked about, since whether each went is the server's to say.
+A batch's objects are sent in its first transaction and, until a transaction carrying them commits, again in every
+later one (`write_all` keeps them aside; an upsert that at most refreshes `put_at` once they are there), so that a
+first transaction lost (refused, out of time past the retries) never leaves a stored record without the objects it
+names: a transaction of objects alone that was lost is no warning unless no later transaction stored them, and the
+objects an early write could not store are queued again for the batch's next write. `prune_state_objects` is the same two requests over `kind = 4 AND put_at <
 cut`. `orphan_objects` is one read. `columns` answers what an open batch on the thread queued for a key first, then
 one request per 5,000 keys. `get_objects` answers from the handle's object cache (a `prefetch(Objects)`, or its own
 writes, which `settle` caches) and asks the server for the rest in one request per 5,000 ids; each id answered leaves
@@ -3270,8 +3293,9 @@ sidecar whose `v` is older than this vci's (or missing) is therefore synced in f
 version.
 
 **Store format 3** (2.9). A format-3 put writes no log row, so the sync reads, in the same request as the log's rows,
-the attestations whose `seq` is past `seq2` (each row's slot then ends as the server has it, like a slot the log
-names) and the `gone` rows past it (the keys they name leave the file; the object ids are left out, since the file
+the frames (`hex(substr(value, 1, 1)) = '76'`; a format-1 row this vci wrote has a `seq` too, but the old log names
+its slot, so it is synced once) whose `seq` is past `seq2` (each row's slot then ends as the server has it, like a
+slot the log names) and the `gone` rows past it (the keys they name leave the file; the object ids are left out, since the file
 keeps no objects). The statement with those branches is sent first; a namespace without the layout refuses it (a
 column or the `gone` table missing) and the plain statement follows, so a 2.9 replica of a 2.8 namespace costs one
 more request a sync until the namespace is upgraded, and one of a 2.9 namespace none. Everything is synced again

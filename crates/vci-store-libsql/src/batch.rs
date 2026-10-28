@@ -83,7 +83,7 @@ use libsql::Value as V;
 use vci_core::ObjectKind;
 use vci_store::timing::Step;
 use vci_store::{
-    BatchEnd, Columns, Finished, ManifestRef, NewAttestation, NewObject, StoreError,
+    BatchEnd, Columns, Finished, ManifestRef, NewAttestation, NewObject, OBJECT_GRACE, StoreError,
     StoredEnvelope, WriteBatch, key, object_to_base64,
 };
 
@@ -162,11 +162,21 @@ pub(crate) struct Row {
 }
 
 impl Row {
-    /// A format-3 record (its columns say so): logged for replicas by its
-    /// `seq`, not by a row of the old change log.
+    /// A format-3 record (its value is a frame, whatever columns the put
+    /// passed: a copy out of git-meta passes none): logged for replicas by
+    /// its `seq`, not by a row of the old change log, and not counted
+    /// against [`TX_UNITS`].
     fn is_format_three(&self) -> bool {
-        self.columns.as_ref().is_some_and(|c| c.format == Some(3))
+        is_frame(&self.value)
     }
+}
+
+/// Whether a value is a format-3 record frame: its first byte is `v`
+/// (`vci_attest::is_frame`; STORE-V2 section 5 detects the format by it).
+/// A frame is never stored compressed, so the byte is there to read on the
+/// server too (`format_one_rows`, the replica's sync by `seq`).
+fn is_frame(value: &[u8]) -> bool {
+    value.first() == Some(&b'v')
 }
 
 /// (test key, signer, storage key).
@@ -191,6 +201,11 @@ pub(crate) struct Pending {
     /// Slots whose queued put was removed again: they end empty.
     pub(crate) emptied: BTreeSet<Slot>,
     pub(crate) removals: BTreeSet<String>,
+    /// Object ids to remove under the orphan rule, after everything else
+    /// of the batch (the records it removes no longer reference them),
+    /// as PostgreSQL's batch does: the last statements of the queue's
+    /// last transaction, so an early write leaves them queued.
+    pub(crate) object_removals: BTreeSet<String>,
     bytes: usize,
     /// The test key of the last put or removal queued: its unit may still
     /// be queuing writes (the removals of what it supersedes follow its
@@ -214,6 +229,18 @@ impl Pending {
             && self.attestations.is_empty()
             && self.emptied.is_empty()
             && self.removals.is_empty()
+            && self.object_removals.is_empty()
+    }
+
+    /// Nothing but objects: a transaction of these lost costs no unit, and
+    /// the objects are sent again with the next one ([`write_all`]).
+    fn only_objects(&self) -> bool {
+        !self.objects.is_empty()
+            && self.manifests.is_empty()
+            && self.attestations.is_empty()
+            && self.emptied.is_empty()
+            && self.removals.is_empty()
+            && self.object_removals.is_empty()
     }
 
     fn full(&self) -> bool {
@@ -230,6 +257,7 @@ impl Pending {
             attestations: std::mem::take(&mut self.attestations),
             emptied: std::mem::take(&mut self.emptied),
             removals: std::mem::take(&mut self.removals),
+            object_removals: std::mem::take(&mut self.object_removals),
             bytes: std::mem::take(&mut self.bytes),
             last: None,
             after: self.after.clone(),
@@ -261,6 +289,8 @@ impl Pending {
     /// draft of 2.8.2).
     fn take_whole_units(&mut self) -> Pending {
         let mut out = self.take();
+        // The object removals come after everything else of the batch.
+        self.object_removals = std::mem::take(&mut out.object_removals);
         if let Some(tk) = self.last.clone() {
             let slots: Vec<Slot> = out
                 .attestations
@@ -334,6 +364,7 @@ impl Pending {
         self.attestations.extend(other.attestations);
         self.emptied.extend(other.emptied);
         self.removals.extend(other.removals);
+        self.object_removals.extend(other.object_removals);
         self.bytes += other.bytes;
     }
 
@@ -404,12 +435,25 @@ pub(crate) fn queued_roots(remote: &Remote) -> Option<BTreeSet<String>> {
     with_pending(remote, |p| p.referenced())
 }
 
-/// The ids of the objects the open batch of `remote` on this thread has
-/// queued, or `None` without an open batch. `remove_objects` keeps them:
-/// the server does not hold them yet, or holds them with a `put_at` the
-/// batch refreshes when it finishes.
-pub(crate) fn queued_objects(remote: &Remote) -> Option<BTreeSet<String>> {
-    with_pending(remote, |p| p.objects.keys().cloned().collect())
+/// Queue the removal of `ids` under the orphan rule in this thread's open
+/// batch, applied after everything else of it (its removals included) in
+/// its last transaction; every id validated first. The ids the batch
+/// itself puts are left out: the server does not hold them yet, or holds
+/// them with a `put_at` the batch refreshes. Counts nothing: what goes is
+/// known only then.
+pub(crate) fn remove_objects(remote: &Remote, ids: &[&str]) -> Result<usize, StoreError> {
+    for id in ids {
+        key::check_object_id(id)?;
+    }
+    remote.ready()?;
+    with_pending(remote, |p| {
+        for id in ids {
+            if !p.objects.contains_key(*id) {
+                p.object_removals.insert((*id).to_owned());
+            }
+        }
+    });
+    Ok(0)
 }
 
 /// The columns the open batch of `remote` on this thread queued for the
@@ -549,6 +593,11 @@ fn flush_if_full(remote: &Remote) {
     let w = write_all(remote, p, &mut stored, &keep);
     with_open(remote, |o| {
         o.stored = stored;
+        // Objects no transaction stored go out again with the next write.
+        if !w.unstored.is_empty() {
+            o.queue.objects.extend(w.unstored);
+            o.queue.recount();
+        }
         if let Some(e) = w.other {
             o.lost.warnings.push(format!(
                 "writes of the batch that no attestation depends on were not stored: {e}"
@@ -956,8 +1005,13 @@ pub(crate) struct Written {
     /// The attestations not stored, by key, with why.
     pub(crate) lost: Finished,
     /// Why a transaction holding no attestation (manifests nothing queued
-    /// references, removals of keys that name no unit) was not stored.
+    /// references, removals of keys that name no unit, object removals)
+    /// was not stored.
     pub(crate) other: Option<StoreError>,
+    /// The queued objects no transaction stored (every transaction carried
+    /// them and was lost, so no attestation was stored either): an open
+    /// batch queues them again for its next write.
+    pub(crate) unstored: BTreeMap<String, (ObjectKind, Vec<u8>)>,
 }
 
 /// Write `p` ([`write_all`]); the first failure, if any part was lost.
@@ -1033,16 +1087,26 @@ fn units(mut p: Pending) -> Vec<Pending> {
         }
     }
     // The objects go first, with the writes of no unit: every record of
-    // the queue may name them, and a record is never stored before them.
+    // the queue may name them, and a record is never stored before them
+    // (`write_all` sends them again with every later transaction until
+    // one stores them).
     for (id, o) in std::mem::take(&mut p.objects) {
         rest.bytes += object_sent_len(&o.1);
         rest.objects.insert(id, o);
     }
-    let mut out = Vec::with_capacity(by.len() + 1);
+    let mut out = Vec::with_capacity(by.len() + 2);
     if !rest.is_empty() {
         out.push(rest);
     }
     out.extend(by.into_values());
+    // The object removals last: after the removals of the records that
+    // referenced them (a transaction of their own only when the last
+    // unit's transaction is full).
+    if !p.object_removals.is_empty() {
+        let mut last = empty;
+        last.object_removals = std::mem::take(&mut p.object_removals);
+        out.push(last);
+    }
     out
 }
 
@@ -1168,17 +1232,28 @@ pub(crate) fn write_all(
     let step = Step::start(KIND);
     let n0 = remote.conn.requests();
     let compressed = remote.compress();
+    // The queued objects, until a transaction stores them: every
+    // transaction sent carries those still unstored, so that no record is
+    // stored before the objects it names (section 6 of
+    // `docs/STORE-BACKENDS.md`) even when the transaction that held them
+    // alone (the first) was lost. Once stored they are not sent again.
+    let mut unstored: BTreeMap<String, (ObjectKind, Vec<u8>)> = p.objects.clone();
     // Units not sent yet, and transactions to send (again) first.
     let mut fresh: VecDeque<Pending> = units(p).into();
     let mut queue: VecDeque<(Vec<Pending>, u32, Option<Tx>)> = VecDeque::new();
     let (mut txs, mut bytes, mut longest, mut lost) = (0usize, 0usize, Duration::ZERO, 0usize);
+    // Why a transaction of objects alone was lost: reported only if no
+    // later transaction stores them.
+    let mut objects_why: Option<StoreError> = None;
     let mut lose = |w: &mut Written, failed: Vec<Vec<Pending>>, why: StoreError| {
         let keys: Vec<String> = failed.iter().flatten().flat_map(Pending::keys).collect();
-        if keys.is_empty() {
-            w.other.get_or_insert(why);
-        } else {
+        if !keys.is_empty() {
             lost += keys.len();
             w.lost.lose(keys, why);
+        } else if failed.iter().flatten().all(Pending::only_objects) {
+            objects_why = Some(why);
+        } else {
+            w.other.get_or_insert(why);
         }
     };
     loop {
@@ -1209,6 +1284,11 @@ pub(crate) fn write_all(
                 let mut p = group[0].empty_like();
                 for u in &group {
                     p.merge(u.clone());
+                }
+                // The objects no transaction stored yet, with every
+                // transaction until one does.
+                for (id, o) in &unstored {
+                    p.objects.entry(id.clone()).or_insert_with(|| o.clone());
                 }
                 // Not again what a stored transaction wrote.
                 p.manifests.retain(|r, (_, b)| {
@@ -1242,6 +1322,9 @@ pub(crate) fn write_all(
                 }
                 for (root, (_, b)) in &tx.p.manifests {
                     stored.insert(root.clone(), vci_core::blake3_hex(b));
+                }
+                for id in tx.p.objects.keys() {
+                    unstored.remove(id);
                 }
                 settle(remote, &tx.p);
                 continue;
@@ -1295,6 +1378,12 @@ pub(crate) fn write_all(
             continue;
         }
         lose(&mut w, failed, why);
+    }
+    if !unstored.is_empty() {
+        if let Some(why) = objects_why {
+            w.other.get_or_insert(why);
+        }
+        w.unstored = unstored;
     }
     remote.spent_writing(began.elapsed());
     step.done(format_args!(
@@ -1429,9 +1518,14 @@ fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, S
             .collect();
         stmts.push(t.upsert_objects(&rows.join(", ")));
     }
-    // A value as written: its `encoding` and its literal.
+    // A value as written: its `encoding` and its literal. A format-3 frame
+    // (under 2 kB, mostly base64) is never compressed: its first byte says
+    // its format on the server too (`format_one_rows`, the sync by `seq`).
     let mut value = |b: &[u8]| -> (i64, String) {
-        let (enc, lit) = match remote.compress().then(|| compress(b)).flatten() {
+        let packed = (remote.compress() && !is_frame(b))
+            .then(|| compress(b))
+            .flatten();
+        let (enc, lit) = match packed {
             Some(z) => (ZSTD, blob(&z)),
             None => (RAW, blob(b)),
         };
@@ -1514,6 +1608,19 @@ fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, S
             })
             .collect();
         stmts.push(t.upsert_attestations(&rows.join(", ")));
+    }
+    // The queued object removals, under the orphan rule as outside a batch
+    // (the rule is in the statements), after the removals of the records
+    // that referenced them; a `gone` row each.
+    if !p.object_removals.is_empty() {
+        let list = p
+            .object_removals
+            .iter()
+            .map(|id| text(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cut = at.saturating_sub(i64::try_from(OBJECT_GRACE.as_secs()).unwrap_or(i64::MAX));
+        stmts.extend(t.remove_objects(&list, cut, at, &ns));
     }
     // The old change log, for 2.8 replicas: the slots removed or emptied
     // and the format-1 puts; a format-3 record is synced by its `seq`.
@@ -1655,6 +1762,10 @@ fn superseded_manifests(
 /// its own writes and removals), then the queue's hook (a replica's file).
 fn settle(remote: &Remote, p: &Pending) {
     remote.objects_put(&p.objects);
+    // Which of the removals the rule let through is known to the server
+    // alone: forgotten here, and read again when asked for.
+    let asked: Vec<String> = p.object_removals.iter().cloned().collect();
+    remote.objects_forget(&asked);
     {
         let mut c = remote.cache();
         for (root, (_, bytes)) in &p.manifests {

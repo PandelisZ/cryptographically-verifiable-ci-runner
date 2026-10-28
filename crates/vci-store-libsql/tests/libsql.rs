@@ -648,6 +648,12 @@ struct Shared {
     swallow_writes: AtomicUsize,
     /// The next this many writes are never sent on, nor answered.
     hold_writes: AtomicUsize,
+    /// The next this many writes are sent on with their `BEGIN IMMEDIATE`
+    /// misspelt, so the server refuses them (a syntax error: the
+    /// transaction is rolled back and answered at once, nothing is held).
+    break_writes: AtomicUsize,
+    /// Writes sent on broken.
+    broken: AtomicUsize,
     /// The next this many writes are sent on `late_ms` after they arrived
     /// (once the client gave up on them), and never answered: a write that
     /// waited for the write lock past its deadline and then committed.
@@ -800,6 +806,17 @@ impl Proxy {
     /// Never send on, nor answer, the next `n` writes.
     fn hold_writes(&self, n: usize) {
         self.shared.hold_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Send the next `n` writes on with their first statement misspelt:
+    /// the server refuses each (rolled back, answered at once).
+    fn break_writes(&self, n: usize) {
+        self.shared.break_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// How many writes it sent on broken.
+    fn broken(&self) -> usize {
+        self.shared.broken.load(Ordering::SeqCst)
     }
 
     /// Send the next `n` writes on `ms` milliseconds late, and never
@@ -1025,6 +1042,16 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                             && take_one(&sh.stall_cursors)
                     });
                     let hold_one = write && take_one(&sh.hold_writes);
+                    if write
+                        && take_one(&sh.break_writes)
+                        && let Some(i) = buf[..n].windows(15).position(|w| w == b"BEGIN IMMEDIATE")
+                    {
+                        // `BEGIN IMMEDIAT`: a syntax error the server
+                        // answers with at once; the same length, so the
+                        // request's framing holds.
+                        buf[i..i + 15].copy_from_slice(b"BEGIN IMMEDIAT ");
+                        sh.broken.fetch_add(1, Ordering::SeqCst);
+                    }
                     if write && take_one(&sh.late_writes) {
                         // The whole request, sent on late; its answer
                         // read and dropped.
@@ -3733,6 +3760,131 @@ fn a_write_out_of_time_is_sent_again_only_when_the_server_lacks_it() {
     assert_eq!(proxy.writes() - w0, 1, "sent again");
     assert_eq!(logged("src/c.test.ts"), "1");
     assert_eq!(s.list_all().unwrap().len(), 3);
+}
+
+/// A batch's objects go out first, in a transaction of their own when they
+/// fill one (here, with a manifest nothing references that fills it);
+/// when that transaction is lost, every later transaction of the batch
+/// carries the objects until one stores them, so that no record is stored
+/// on the server without the objects it names (section 6: objects, then
+/// records; STORE-V2 section 6's M2 row). A batch whose every transaction
+/// is refused stores neither, and its units are lost.
+#[test]
+fn a_batch_stores_no_record_without_its_objects() {
+    use vci_store::conformance::scenarios::Run3;
+    use vci_store::{NewAttestation, WriteBatch};
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let s = proxied(&proxy, token.as_deref(), &ns, 10);
+    // The namespace and its layout first: the DDL is a write of its own.
+    s.put_for_test(
+        "src/objects/first.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "first"),
+    )
+    .unwrap();
+    let units = ["src/objects/a.test.ts", "src/objects/b.test.ts"];
+    let stored_objects = |ids: &[&str]| -> i64 {
+        let list = ids
+            .iter()
+            .map(|i| format!("'{i}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.__query_for_test(&format!(
+            "SELECT count(*) FROM {p}objects WHERE id IN ({list})"
+        ))
+        .unwrap()[0][0]
+            .parse()
+            .unwrap()
+    };
+    let stored_records = |unit: &str| -> i64 {
+        s.__query_for_test(&format!(
+            "SELECT count(*) FROM {p}attestations WHERE test_key = '{}'",
+            vci_core::test_key(unit)
+        ))
+        .unwrap()[0][0]
+            .parse()
+            .unwrap()
+    };
+    // A manifest nothing references fills the first transaction (over
+    // `TX_BYTES`), so the objects go with it and the records after it.
+    let filler = vec![b'x'; 1_200_000];
+    let queue = |run: &Run3, seed: u32, root: &str| -> WriteBatch {
+        let b = s.batch().unwrap();
+        s.put_objects(&run.new_objects()).unwrap();
+        s.put_manifest(root, &filler).unwrap();
+        for (i, unit) in units.iter().enumerate() {
+            let (rec, cols) = run.record(unit, 1, seed + i as u32);
+            s.put(
+                &NewAttestation::for_test(unit, S1, &hex64(seed as u8), Some(&hint(1)), &rec)
+                    .with_columns(&cols),
+            )
+            .unwrap();
+        }
+        b
+    };
+
+    // The objects' transaction refused: the records' carries them.
+    let run = Run3::build(&["src/objects/a.ts"]);
+    proxy.break_writes(1);
+    let w0 = proxy.writes();
+    let f = queue(&run, 10, &hex64(0x91)).finish_partial().unwrap();
+    assert_eq!(proxy.broken(), 1);
+    assert_eq!(
+        proxy.writes() - w0,
+        2,
+        "the objects alone, then the records with them"
+    );
+    assert_eq!(f.lost_count(), 0, "{f:?}");
+    assert_eq!(
+        f.warnings.len(),
+        1,
+        "the manifest was not stored: {:?}",
+        f.warnings
+    );
+    assert!(f.warnings[0].contains("not stored"), "{:?}", f.warnings);
+    assert_eq!(stored_objects(&run.id_refs()), 4, "stored with the records");
+    for unit in units {
+        assert_eq!(stored_records(unit), 1, "{unit}");
+    }
+    assert!(s.manifest(&hex64(0x91)).unwrap().is_none(), "lost");
+
+    // Every transaction refused (the records' is split down to its units,
+    // each sent with the objects and refused): nothing stored, every unit
+    // lost.
+    let run2 = Run3::build(&["src/objects/b.ts"]);
+    proxy.break_writes(4);
+    let w0 = proxy.writes();
+    let f = queue(&run2, 20, &hex64(0x92)).finish_partial().unwrap();
+    assert_eq!(proxy.broken(), 5);
+    assert_eq!(
+        proxy.writes() - w0,
+        4,
+        "the objects alone, both units, each unit"
+    );
+    assert_eq!(f.lost_count(), 2, "{f:?}");
+    // The runs share their hdr and tables (stored above); this run's
+    // shape and state object were never stored.
+    assert_eq!(
+        stored_objects(&[&run2.ids.shape, &run2.ids.state]),
+        0,
+        "never stored"
+    );
+    assert_eq!(stored_objects(&run2.id_refs()), 2);
+    for unit in units {
+        assert_eq!(
+            stored_records(unit),
+            1,
+            "{unit}: the first batch's record, not this one's"
+        );
+    }
+    assert!(s.manifest(&hex64(0x92)).unwrap().is_none());
 }
 
 /// A replica synced by a vci that could not read some values (2.8.1, while

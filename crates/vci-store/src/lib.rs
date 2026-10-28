@@ -1698,11 +1698,18 @@ pub trait AttestationStore: Send + Sync {
     /// (never counts it): [`prune_state_objects`] is what removes it there.
     /// Removing an object still referenced only makes its units run.
     /// Inside a deferred batch a backend may queue the removal after the
-    /// batch's removals and apply the rule at `finish`, or apply it at once:
-    /// the batch's own objects are within their grace either way.
+    /// batch's removals and apply the rule at `finish` (PostgreSQL,
+    /// libSQL), or apply it at once (SQLite in its transaction; git-meta on
+    /// the store as committed before the batch): the batch's own objects
+    /// are within their grace either way. On a backend with lazy values
+    /// ([`Caps::lazy_values`], git-meta) this and [`orphan_objects`] fetch
+    /// every attestation value not fetched yet and read every value: any
+    /// record on any target can name an object, so there is no scoped
+    /// referrer scan. That is `vci prune`'s cost, not a per-run one.
     ///
     /// Used by: run.rs after supersession (the superseded records' object
-    /// ids), `vci prune` (with [`orphan_objects`]).
+    /// ids), on a store with [`Caps::columns`] only (git-meta's go at
+    /// `vci prune`); `vci prune` (with [`orphan_objects`]).
     ///
     /// [`prune_state_objects`]: AttestationStore::prune_state_objects
     /// [`orphan_objects`]: AttestationStore::orphan_objects
@@ -1716,11 +1723,13 @@ pub trait AttestationStore: Send + Sync {
     /// The ids of every stored object [`remove_objects`] would remove now:
     /// referenced by no stored attestation and older than [`OBJECT_GRACE`];
     /// sorted, state objects left out on a backend without columns. Values
-    /// are not read on a backend with columns; one without them reads every
-    /// value, and answers empty when any record's references are unknown
-    /// ([`ObjectRefs::Unknown`]), as [`orphan_manifests`] does.
+    /// are not read on a backend with columns; one without them fetches
+    /// every value not fetched yet and reads every value, and answers empty
+    /// when any record's references are unknown ([`ObjectRefs::Unknown`]),
+    /// as [`orphan_manifests`] does.
     ///
-    /// Used by: `vci prune`, then [`remove_objects`].
+    /// Used by: `vci prune` (which has read every value already), then
+    /// [`remove_objects`].
     ///
     /// [`remove_objects`]: AttestationStore::remove_objects
     /// [`orphan_manifests`]: AttestationStore::orphan_manifests

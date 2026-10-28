@@ -526,6 +526,142 @@ fn remove_objects_keeps_an_open_batchs_objects() {
     );
 }
 
+/// Inside a batch, `remove_objects` is queued and applied under the orphan
+/// rule after everything else of the batch (as PostgreSQL's batch does):
+/// the objects of a record the batch removes go with it, in the batch's
+/// last transaction, with a `gone` row each; the batch's own objects are
+/// left out.
+#[test]
+fn remove_objects_in_a_batch_follows_the_batchs_removals() {
+    let Some((s, ns)) = remote() else {
+        return;
+    };
+    let p = table_prefix(&ns);
+    let run = Run3::build(&["src/f3/gone.ts"]);
+    s.put_objects(&run.new_objects()).unwrap();
+    let (rec, cols) = run.record(UNIT, 1, 41);
+    let e = put3(&s, UNIT, &hex64(1), Some(&hint(1)), &rec, &cols);
+    let list = run
+        .id_refs()
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    s.__execute_for_test(&[format!(
+        "UPDATE {p}objects SET put_at = put_at - {} WHERE id IN ({list})",
+        OBJECT_GRACE.as_secs() * 2
+    )])
+    .unwrap();
+    assert!(s.orphan_objects().unwrap().is_empty(), "referenced");
+    let fresh = Run3::build(&["src/f3/kept.ts"]);
+    let b = s.batch().unwrap();
+    assert_eq!(s.remove(vec![e]).unwrap().len(), 1);
+    assert_eq!(s.put_objects(&fresh.new_objects()).unwrap(), 4);
+    let mut ids = run.id_refs();
+    ids.extend(fresh.id_refs());
+    assert_eq!(s.remove_objects(&ids).unwrap(), 0, "queued: counts nothing");
+    assert_eq!(
+        count(
+            &s,
+            &format!("SELECT count(*) FROM {p}objects WHERE id IN ({list})")
+        ),
+        4,
+        "nothing is applied before the batch finishes"
+    );
+    b.finish().unwrap();
+    // The two runs share their hdr and their tables (the same header and
+    // env names): those are the batch's own, kept; the removed record's
+    // shape and state object went with it.
+    let gone: Vec<String> = rows(
+        &s,
+        &format!("SELECT object FROM {p}gone WHERE object IN ({list}) ORDER BY object"),
+    )
+    .into_iter()
+    .filter_map(|r| r.into_iter().next())
+    .collect();
+    let mut expected = vec![run.ids.shape.clone(), run.ids.state.clone()];
+    expected.sort();
+    assert_eq!(gone, expected, "a gone row each for what went");
+    assert_eq!(
+        count(
+            &s,
+            &format!("SELECT count(*) FROM {p}objects WHERE id IN ({list})")
+        ),
+        2,
+        "the removed record's shape and state object went with it"
+    );
+    let mut kept: Vec<String> = s
+        .get_objects(&run.id_refs())
+        .unwrap()
+        .iter()
+        .map(|o| o.id.clone())
+        .collect();
+    kept.sort();
+    let mut shared = vec![run.ids.hdr.clone(), run.ids.tables.clone()];
+    shared.sort();
+    assert_eq!(kept, shared, "what the batch's own record names stays");
+    assert_eq!(
+        s.get_objects(&fresh.id_refs()).unwrap().len(),
+        4,
+        "the batch's own objects are kept"
+    );
+}
+
+/// `upgrade_finish` counts a format-1 row by its value, not by the
+/// `format` column: a 2.8 writer's upsert sets the key and the value
+/// alone (section 9 of vci-cli's store_backends), so a format-1 value in
+/// a slot whose columns still say 3 is counted, and a frame put without
+/// columns (what a copy out of git-meta passes) is not.
+#[test]
+fn upgrade_finish_counts_rows_by_their_value() {
+    let Some((s, ns)) = remote() else {
+        return;
+    };
+    let p = table_prefix(&ns);
+    let run = Run3::build(&["src/f3/count.ts"]);
+    s.put_objects(&run.new_objects()).unwrap();
+    let (rec, cols) = run.record(UNIT, 1, 31);
+    let e = put3(&s, UNIT, &hex64(1), Some(&hint(1)), &rec, &cols);
+    let format = |key: &str| {
+        one(
+            &s,
+            &format!("SELECT format FROM {p}attestations WHERE key = '{key}'"),
+        )
+    };
+    assert_eq!(format(&e.key), "3");
+    // What 2.8 does to the frame's slot: the value alone.
+    let hex: String = envelope("2.8").iter().map(|b| format!("{b:02x}")).collect();
+    s.__execute_for_test(&[format!(
+        "UPDATE {p}attestations SET value = X'{hex}', encoding = 0 WHERE key = '{}'",
+        e.key
+    )])
+    .unwrap();
+    assert_eq!(format(&e.key), "3", "the frame's columns stay");
+    assert!(
+        matches!(s.upgrade_finish(), Ok(Finish::FormatOneRows(1))),
+        "a format-1 value under a 3"
+    );
+    // Without it, a frame put without columns does not hold the window.
+    s.remove(vec![e]).unwrap();
+    let (rec2, _) = run.record(UNIT, 1, 32);
+    let e2 = s
+        .put(&NewAttestation::for_test(
+            UNIT,
+            S1,
+            &hex64(2),
+            Some(&hint(2)),
+            &rec2,
+        ))
+        .unwrap();
+    assert_eq!(format(&e2.key), "NULL");
+    match s.upgrade_finish() {
+        Err(StoreError::Unsupported { operation, .. }) => {
+            assert!(operation.contains("finishing"), "{operation}");
+        }
+        other => panic!("expected no format-1 row, got {other:?}"),
+    }
+}
+
 /// A format-3 record is under 2 kB: a transaction holds as many as fit
 /// in its bytes, not `TX_UNITS` of them.
 #[test]

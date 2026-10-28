@@ -1,5 +1,5 @@
 //! The PostgreSQL backend's own tests (store plan step C, tests 1 to 15,
-//! then the format-3 tests 16 to 22 of STORE-V2 section 2.1).
+//! then the format-3 tests 16 to 23 of STORE-V2 section 2.1).
 //!
 //! Tests 1 and 2 need no server. The others need one
 //! (`VCI_TEST_POSTGRES_URL`, see `common`) and are skipped, saying so,
@@ -1932,6 +1932,59 @@ fn upgrade_finish_closes_the_migration_window() {
     assert_eq!(fresh.count().unwrap(), 2);
     assert_eq!(fresh.upgrade_finish().unwrap(), Finish::Done, "idempotent");
     assert_eq!(fresh.upgrade_begin().map_err(|e| e.to_string()), Ok(()));
+}
+
+/// Test 23: `upgrade_finish` counts a format-1 row by its value's first
+/// byte, not by the `format` column: a 2.8 writer's upsert sets the key
+/// and the value alone (section 9 of vci-cli's store_backends: the frame's
+/// columns stay), so a format-1 value in a slot whose columns still say 3
+/// is counted, and a frame put without columns (what a copy out of
+/// git-meta passes) is not.
+#[test]
+fn upgrade_finish_counts_rows_by_their_value() {
+    let Some(db) = pg() else { return };
+    let s = db.open();
+    let run = Run3::build(&["src/t23/a.ts"]);
+    s.put_objects(&run.new_objects()).unwrap();
+    let e3 = put3(&s, &run, UNIT_A, &hex64(3), 23);
+    let format = |key: &str| -> Option<i16> {
+        db.query(&format!(
+            "SELECT format FROM {{schema}}.attestations WHERE key = '{key}'"
+        ))[0]
+            .get(0)
+    };
+    assert_eq!(format(&e3.key), Some(3));
+    // What 2.8 does to the frame's slot: the key and the value alone.
+    let hex: String = envelope(None, 1)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    db.query(&format!(
+        "UPDATE {{schema}}.attestations SET value = decode('{hex}', 'hex') WHERE key = '{}'",
+        e3.key
+    ));
+    assert_eq!(format(&e3.key), Some(3), "the frame's columns stay");
+    assert_eq!(
+        s.upgrade_finish().unwrap(),
+        Finish::FormatOneRows(1),
+        "a format-1 value under a 3"
+    );
+    assert!(has_table(&db, "manifests"));
+    // Without it, a frame put without columns does not hold the window.
+    s.remove(vec![e3]).unwrap();
+    let (rec, _cols) = run.record(UNIT_B, 1, 24);
+    let e4 = s
+        .put(&NewAttestation::for_test(
+            UNIT_B,
+            S1,
+            &hex64(4),
+            Some(&hint(4)),
+            &rec,
+        ))
+        .unwrap();
+    assert_eq!(format(&e4.key), None);
+    assert_eq!(s.upgrade_finish().unwrap(), Finish::Done);
+    assert!(!has_table(&db, "manifests"));
 }
 
 /// Test 20: an objects answer past `MAX_OBJECTS_ANSWER` is refused on its
