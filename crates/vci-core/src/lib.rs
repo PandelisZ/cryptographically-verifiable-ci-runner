@@ -14,8 +14,8 @@ pub mod predicate;
 pub mod metrics;
 pub use hash::{ABSENT_HASH, blake3_hex};
 pub use manifest::{
-    AUTOLOAD_MARK, CheckoutCache, EntryKind, EnvEntry, External, InputEntry, InputManifest,
-    ManifestError, Mismatch, Observation, autoload_name, env_value_hash,
+    AUTOLOAD_MARK, CheckoutCache, ENTRIES_ROOT_DOMAIN, EntryKind, EnvEntry, External, InputEntry,
+    InputManifest, ManifestError, Mismatch, Observation, autoload_name, env_value_hash,
 };
 pub use objects::{
     DecodeError, Descriptor, EncodeError, Encoded, Hdr, ObjectId, ObjectKind, ResolvedManifest,
@@ -23,8 +23,9 @@ pub use objects::{
 };
 pub use path::{PathError, RepoPath};
 pub use predicate::{
-    PREDICATE_TYPE, PRIVILEGES_DIFF, PYTHON_LIBS_DIFF, Predicate, RUBY_LIBS_DIFF, TestResult,
-    Toolchain, test_key,
+    Context, PREDICATE_TYPE, PREDICATE_TYPE_V2, PRIVILEGES_DIFF, PYTHON_LIBS_DIFF, Predicate,
+    PredicateError, RUBY_LIBS_DIFF, ResolvedPredicate, TestResult, Toolchain, VciPredicate,
+    VciPredicateV2, sorted_compact_json, test_key,
 };
 
 #[cfg(test)]

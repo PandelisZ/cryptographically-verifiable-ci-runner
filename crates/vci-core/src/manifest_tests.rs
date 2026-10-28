@@ -341,6 +341,98 @@ fn empty_manifest_root_is_stable() {
     assert_eq!(a.len(), 64);
 }
 
+// -------------------------------------------------------- entries root ----
+
+/// The signed `entriesRoot` of a format-3 statement: changing its encoding
+/// changes this value and breaks supersession's "same files" test between
+/// records made before and after. Update only deliberately, with a version
+/// bump of the domain tag.
+const GOLDEN_ENTRIES_ROOT: &str =
+    "bdc967d7fefdc83434a533ec62f5e16fd6d3b796d9692dd3fef3c72ced1ea4f2";
+
+/// Independent re-implementation of the encoding documented on
+/// `InputManifest::entries_root`: the domain tag, then the entries section
+/// exactly as `root` writes it.
+#[test]
+fn golden_entries_root_is_pinned_and_matches_documented_encoding() {
+    fn lp(h: &mut blake3::Hasher, b: &[u8]) {
+        h.update(&(b.len() as u64).to_le_bytes());
+        h.update(b);
+    }
+    fn n(h: &mut blake3::Hasher, v: u64) {
+        h.update(&v.to_le_bytes());
+    }
+    let m = golden_manifest();
+    let mut h = blake3::Hasher::new();
+    lp(&mut h, b"vci/entries-root/v1");
+    lp(&mut h, b"entries");
+    n(&mut h, 5);
+    for (path, kind, exec, size, hash) in [
+        ("a.txt", "file", 0u64, 5u64, b3(b"hello")),
+        ("bin/run.sh", "file", 1, 10, b3(b"#!/bin/sh\n")),
+        ("link", "symlink", 0, 5, b3(b"a.txt")),
+        ("missing.json", "absent", 0, 0, ABSENT_HASH.to_owned()),
+        ("src", "dirListing", 0, 2, m.entries[0].hash.clone()),
+    ] {
+        lp(&mut h, path.as_bytes());
+        lp(&mut h, kind.as_bytes());
+        n(&mut h, exec);
+        n(&mut h, size);
+        lp(&mut h, hash.as_bytes());
+    }
+    let expected = h.finalize().to_hex().to_string();
+    assert_eq!(ENTRIES_ROOT_DOMAIN, b"vci/entries-root/v1");
+    assert_eq!(m.entries_root(), expected);
+    assert_eq!(m.entries_root(), GOLDEN_ENTRIES_ROOT);
+    assert_ne!(m.entries_root(), m.root());
+}
+
+#[test]
+fn entries_root_depends_on_the_entries_only() {
+    let m = golden_manifest();
+    let r0 = m.entries_root();
+    // Order-independent.
+    let mut r = m.clone();
+    r.entries.reverse();
+    assert_eq!(r.entries_root(), r0);
+    // Externals and env do not enter it (they are the unit's own and are
+    // checked on their lists); the root changes, the entries root does not.
+    let mut r = m.clone();
+    r.externals.clear();
+    r.env.clear();
+    assert_eq!(r.entries_root(), r0);
+    assert_ne!(r.root(), m.root());
+    // Every field of an entry enters it.
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(r0.clone());
+    for (name, f) in [
+        (
+            "path",
+            (|m: &mut InputManifest| m.entries[1].path = rp("a.txu")) as fn(&mut InputManifest),
+        ),
+        ("kind", |m| m.entries[1].kind = EntryKind::Symlink),
+        ("exec", |m| m.entries[1].exec = true),
+        ("size", |m| m.entries[1].size = 6),
+        ("hash", |m| m.entries[1].hash = b3(b"hellp")),
+        ("drop", |m| {
+            m.entries.remove(3);
+        }),
+        ("dup", |m| {
+            let e = m.entries[1].clone();
+            m.entries.push(e)
+        }),
+    ] {
+        let mut v = m.clone();
+        f(&mut v);
+        let r = v.entries_root();
+        assert_ne!(r, r0, "entries root did not change for {name}");
+        assert!(seen.insert(r), "entries root collided for {name}");
+    }
+    let empty = InputManifest::default().entries_root();
+    assert_eq!(empty.len(), 64);
+    assert_ne!(empty, InputManifest::default().root());
+}
+
 // ------------------------------------------------------------- capture ----
 
 fn sample_repo() -> Repo {
@@ -1560,4 +1652,247 @@ fn compact_on_a_base_round_trips() {
         ))),
         Err(ManifestError::MissingBase(_))
     ));
+}
+
+// ------------------------------------------- observe and from_observed ----
+
+/// A checkout and the observations of one unit over every entry kind: a
+/// plain and an executable file, a symlink (Unix), an absent probe, a
+/// listing whose excluded child is left out, a type-only directory, an
+/// autoload directory with a hit, a normalized hit and a miss.
+fn every_kind_repo() -> (Repo, Vec<(RepoPath, Observation)>) {
+    let r = Repo::new();
+    r.write("src/a.rb", "a\n");
+    r.write("src/b.rb", "b\n");
+    r.write("bin/run", "#!/bin/sh\n");
+    #[cfg(unix)]
+    r.chmod("bin/run", 0o755);
+    r.mkdir("build/target");
+    r.write("build/keep.txt", "k\n");
+    r.write("app/models/user.rb", "class User; end\n");
+    r.write("app/models/html_parser.rb", "class HTMLParser; end\n");
+    #[cfg(unix)]
+    r.symlink("src/link.rb", "a.rb");
+    let mut obs = vec![
+        read("src/a.rb"),
+        read("bin/run"),
+        probe("src/missing.rb"),
+        readdir("build"),
+        (rp("build/target"), Observation::Exclude),
+        (rp("src"), Observation::Stat),
+        (rp("app/models/.vci-autoload"), Observation::AutoloadDir),
+        (rp(".vci-autoload/user"), Observation::AutoloadMiss),
+        (rp(".vci-autoload/htmlparser"), Observation::AutoloadMiss),
+        (rp(".vci-autoload/nothing"), Observation::AutoloadMiss),
+    ];
+    #[cfg(unix)]
+    obs.push(read("src/link.rb"));
+    (r, obs)
+}
+
+fn every_kind_manifest(r: &Repo, obs: &[(RepoPath, Observation)], env: &Env) -> InputManifest {
+    let externals = vec![External {
+        name: "rails".into(),
+        version: "8.1.3".into(),
+    }];
+    InputManifest::capture_with_env(
+        &r.root,
+        obs,
+        externals,
+        &["TZ".to_owned(), "HOME".to_owned()],
+        |k| env.get(k).cloned(),
+    )
+    .unwrap_or_else(|e| panic!("capture failed: {e}"))
+}
+
+/// The plan's `inputs` check for a format-3 record (STORE-V2 section 1.5
+/// step 8): the attested `(path, kind, exec)` set observed at HEAD, made a
+/// manifest with the attested externals and env, has the signed root exactly
+/// when nothing changed; a changed file, a replaced kind, a new autoload
+/// definition and a new child in a listing each move it, and a git-ignored
+/// child left out does not.
+#[test]
+fn from_observed_reproduces_the_root_for_every_kind() {
+    let (r, obs) = every_kind_repo();
+    let env = env_of(&[("TZ", "UTC")]);
+    let m = every_kind_manifest(&r, &obs, &env);
+    let kinds: std::collections::BTreeSet<EntryKind> = m.entries.iter().map(|e| e.kind).collect();
+    for k in [
+        EntryKind::File,
+        EntryKind::Absent,
+        EntryKind::DirListing,
+        EntryKind::Dir,
+        EntryKind::Excluded,
+        EntryKind::AutoloadMiss,
+        EntryKind::AutoloadDir,
+    ] {
+        assert!(kinds.contains(&k), "{k:?} not captured: {:#?}", m.entries);
+    }
+    #[cfg(unix)]
+    {
+        assert!(kinds.contains(&EntryKind::Symlink));
+        assert!(entry(&m, "bin/run").exec);
+    }
+    assert_eq!(entry(&m, ".vci-autoload/user").size, 1);
+    assert_eq!(entry(&m, ".vci-autoload/htmlparser").size, 1);
+    assert_eq!(entry(&m, ".vci-autoload/nothing").size, 0);
+    assert_eq!(entry(&m, "build").size, 1, "target is left out");
+
+    let resolved = ResolvedManifest::of(&m);
+    assert_eq!(resolved.set.len(), m.entries.len());
+    let cache = CheckoutCache::new(&r.root);
+    let observed = InputManifest::observe(&resolved.set, &cache, &[]).unwrap();
+    assert_eq!(observed.len(), resolved.set.len());
+    let back = InputManifest::from_observed(
+        &resolved.set,
+        observed,
+        resolved.externals.clone(),
+        resolved.env.clone(),
+    )
+    .unwrap();
+    assert_eq!(back, m);
+    assert_eq!(back.root(), m.root());
+    assert_eq!(back.entries_root(), m.entries_root());
+    assert!(
+        m.diff_against_cache(&cache, |k| env.get(k).cloned(), &[])
+            .unwrap()
+            .is_empty()
+    );
+
+    // The observation set is the attested one with whatever is there now;
+    // a reordered set observes the same entries.
+    let mut shuffled = resolved.set.clone();
+    shuffled.reverse();
+    let observed = InputManifest::observe(&shuffled, &cache, &[]).unwrap();
+    let back = InputManifest::from_observed(
+        &shuffled,
+        observed,
+        resolved.externals.clone(),
+        resolved.env.clone(),
+    )
+    .unwrap();
+    assert_eq!(back.root(), m.root());
+
+    // A git-ignored child of a listed directory: the listing changes unless
+    // the plan passes it as excluded, as diff_against_cache does.
+    r.write("build/ignored.log", "x\n");
+    let cache = CheckoutCache::new(&r.root);
+    let root_of = |extra: &[RepoPath], cache: &CheckoutCache| {
+        let observed = InputManifest::observe(&resolved.set, cache, extra).unwrap();
+        InputManifest::from_observed(
+            &resolved.set,
+            observed,
+            resolved.externals.clone(),
+            resolved.env.clone(),
+        )
+        .unwrap()
+    };
+    assert_ne!(root_of(&[], &cache).root(), m.root());
+    assert_eq!(root_of(&[rp("build/ignored.log")], &cache).root(), m.root());
+    assert_eq!(
+        whats(
+            &m.diff_against_cache(&cache, |k| env.get(k).cloned(), &[rp("build/ignored.log")])
+                .unwrap()
+        ),
+        Vec::<&str>::new()
+    );
+    r.rm("build/ignored.log");
+
+    // A changed file: the root moves, and the observed entry names it.
+    r.write("src/a.rb", "changed\n");
+    let cache = CheckoutCache::new(&r.root);
+    let now = root_of(&[], &cache);
+    assert_ne!(now.root(), m.root());
+    assert_ne!(now.entries_root(), m.entries_root());
+    let changed: Vec<&str> = now
+        .entries
+        .iter()
+        .zip(&m.entries)
+        .filter(|(a, b)| a != b)
+        .map(|(a, _)| a.path.as_str())
+        .collect();
+    assert_eq!(changed, ["src/a.rb"]);
+    assert_eq!(
+        whats(
+            &m.diff_against_cache(&cache, |k| env.get(k).cloned(), &[])
+                .unwrap()
+        ),
+        ["entry:src/a.rb"]
+    );
+    r.write("src/a.rb", "a\n");
+
+    // A file replaced by a directory: the kind found is reported (the
+    // attested kind only chose how to look), and the root moves.
+    r.rm("bin/run");
+    r.mkdir("bin/run");
+    let cache = CheckoutCache::new(&r.root);
+    let now = root_of(&[], &cache);
+    assert_eq!(entry(&now, "bin/run").kind, EntryKind::DirListing);
+    assert_ne!(now.root(), m.root());
+    r.rm("bin/run");
+    r.write("bin/run", "#!/bin/sh\n");
+    #[cfg(unix)]
+    r.chmod("bin/run", 0o755);
+
+    // A file added to the autoload directory defines the missed constant.
+    r.write("app/models/nothing.rb", "class Nothing; end\n");
+    let cache = CheckoutCache::new(&r.root);
+    let now = root_of(&[], &cache);
+    assert_eq!(entry(&now, ".vci-autoload/nothing").size, 1);
+    assert_ne!(now.root(), m.root());
+    r.rm("app/models/nothing.rb");
+
+    // Everything put back: the root again.
+    let cache = CheckoutCache::new(&r.root);
+    assert_eq!(root_of(&[], &cache).root(), m.root());
+
+    // The attested externals and env enter the root as given: a store that
+    // moved an external or an env value changes the root (and is caught by
+    // their own checks), the files being the same.
+    let mut other = resolved.clone();
+    other.externals[0].version = "8.1.4".into();
+    let observed = InputManifest::observe(&other.set, &cache, &[]).unwrap();
+    let back =
+        InputManifest::from_observed(&other.set, observed, other.externals, other.env).unwrap();
+    assert_ne!(back.root(), m.root());
+}
+
+/// The observation must follow the set it was made from, one entry per
+/// element in order; anything else is a caller's error, never a manifest
+/// whose root could match.
+#[test]
+fn from_observed_requires_the_observation_to_follow_the_set() {
+    let m = golden_manifest();
+    let set = ResolvedManifest::of(&m).set;
+    let mut sorted = m.entries.clone();
+    sorted.sort();
+    let ok = InputManifest::from_observed(&set, sorted.clone(), m.externals.clone(), m.env.clone())
+        .unwrap();
+    assert_eq!(ok.root(), m.root());
+    assert_eq!(ok.entries, sorted);
+    // Unsorted observed entries are sorted into the manifest.
+    let mut rev = sorted.clone();
+    rev.reverse();
+    let mut set_rev = set.clone();
+    set_rev.reverse();
+    let ok =
+        InputManifest::from_observed(&set_rev, rev, m.externals.clone(), m.env.clone()).unwrap();
+    assert_eq!(ok.entries, sorted);
+    // One entry short.
+    let e = InputManifest::from_observed(&set, sorted[1..].to_vec(), vec![], vec![]).unwrap_err();
+    assert!(matches!(e, ManifestError::Observed(_)), "{e}");
+    // Another path at an index.
+    let mut swapped = sorted.clone();
+    swapped.swap(0, 1);
+    let e = InputManifest::from_observed(&set, swapped, vec![], vec![]).unwrap_err();
+    assert!(
+        matches!(&e, ManifestError::Observed(s) if s.contains("bin/run.sh") && s.contains("a.txt")),
+        "{e}"
+    );
+    // The kind may differ (HEAD's kind is what was found): no error, the
+    // root decides.
+    let mut other_kind = sorted.clone();
+    other_kind[0].kind = EntryKind::Absent;
+    let ok = InputManifest::from_observed(&set, other_kind, vec![], vec![]).unwrap();
+    assert_ne!(ok.root(), m.root());
 }
