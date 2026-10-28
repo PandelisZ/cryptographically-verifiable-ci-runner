@@ -80,16 +80,18 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use libsql::Value as V;
+use vci_core::ObjectKind;
 use vci_store::timing::Step;
 use vci_store::{
-    BatchEnd, Finished, ManifestRef, NewAttestation, StoreError, StoredEnvelope, WriteBatch, key,
+    BatchEnd, Columns, Finished, ManifestRef, NewAttestation, NewObject, StoreError,
+    StoredEnvelope, WriteBatch, key, object_to_base64,
 };
 
 use crate::conn::{
     Fail, KIND, MAX_RECORD, RAW, READ, TOO_BIG, WRITE, ZSTD, blob, col_int, col_text, compress,
     json_list, opt_int, opt_text, text,
 };
-use crate::remote::{LOG_KEEP_SECS, Remote, Tables, now};
+use crate::remote::{LOG_KEEP_SECS, Remote, Tables, now, seq_of};
 
 /// Attestations and removals queued before they are written early.
 pub(crate) const FLUSH_WRITES: usize = 2_000;
@@ -153,7 +155,18 @@ pub(crate) struct Row {
     pub(crate) target: String,
     manifest_ref: Option<String>,
     ref_state: i64,
+    /// The listing columns the put passed ([`Columns`]; `None`: a put
+    /// without them, which clears the slot's).
+    pub(crate) columns: Option<Columns>,
     pub(crate) value: Vec<u8>,
+}
+
+impl Row {
+    /// A format-3 record (its columns say so): logged for replicas by its
+    /// `seq`, not by a row of the old change log.
+    fn is_format_three(&self) -> bool {
+        self.columns.as_ref().is_some_and(|c| c.format == Some(3))
+    }
 }
 
 /// (test key, signer, storage key).
@@ -162,9 +175,17 @@ pub(crate) type Slot = (String, String, String);
 /// What is done after a queue was written (a replica writes it through).
 pub(crate) type After = Arc<dyn Fn(&Pending) + Send + Sync>;
 
+/// The bytes an object takes as sent: its base64 text.
+fn object_sent_len(bytes: &[u8]) -> usize {
+    bytes.len().div_ceil(3) * 4
+}
+
 /// What a batch holds and has not written yet.
 #[derive(Default, Clone)]
 pub(crate) struct Pending {
+    /// Format-3 objects by id (STORE-V2 section 1.3): written before any
+    /// record, as base64 text.
+    pub(crate) objects: BTreeMap<String, (ObjectKind, Vec<u8>)>,
     pub(crate) manifests: BTreeMap<String, (Option<String>, Vec<u8>)>,
     pub(crate) attestations: BTreeMap<Slot, Row>,
     /// Slots whose queued put was removed again: they end empty.
@@ -179,8 +200,17 @@ pub(crate) struct Pending {
 }
 
 impl Pending {
+    /// An empty queue with this hook.
+    pub(crate) fn with_after(after: Option<After>) -> Pending {
+        Pending {
+            after,
+            ..Pending::default()
+        }
+    }
+
     fn is_empty(&self) -> bool {
-        self.manifests.is_empty()
+        self.objects.is_empty()
+            && self.manifests.is_empty()
             && self.attestations.is_empty()
             && self.emptied.is_empty()
             && self.removals.is_empty()
@@ -195,6 +225,7 @@ impl Pending {
     /// in place.
     fn take(&mut self) -> Pending {
         Pending {
+            objects: std::mem::take(&mut self.objects),
             manifests: std::mem::take(&mut self.manifests),
             attestations: std::mem::take(&mut self.attestations),
             emptied: std::mem::take(&mut self.emptied),
@@ -206,12 +237,13 @@ impl Pending {
     }
 
     /// The bytes it holds, counted again.
-    fn recount(&mut self) {
+    pub(crate) fn recount(&mut self) {
         self.bytes = self
             .attestations
             .values()
             .map(|r| r.value.len() + r.key.len())
             .chain(self.manifests.values().map(|(_, b)| b.len()))
+            .chain(self.objects.values().map(|(_, b)| object_sent_len(b)))
             .sum();
     }
 
@@ -297,6 +329,7 @@ impl Pending {
 
     /// Add `other`'s writes (of other units) to this queue.
     fn merge(&mut self, other: Pending) {
+        self.objects.extend(other.objects);
         self.manifests.extend(other.manifests);
         self.attestations.extend(other.attestations);
         self.emptied.extend(other.emptied);
@@ -369,6 +402,65 @@ pub(crate) fn is_open(remote: &Remote) -> bool {
 /// server cannot see them yet.
 pub(crate) fn queued_roots(remote: &Remote) -> Option<BTreeSet<String>> {
     with_pending(remote, |p| p.referenced())
+}
+
+/// The ids of the objects the open batch of `remote` on this thread has
+/// queued, or `None` without an open batch. `remove_objects` keeps them:
+/// the server does not hold them yet, or holds them with a `put_at` the
+/// batch refreshes when it finishes.
+pub(crate) fn queued_objects(remote: &Remote) -> Option<BTreeSet<String>> {
+    with_pending(remote, |p| p.objects.keys().cloned().collect())
+}
+
+/// The columns the open batch of `remote` on this thread queued for the
+/// attestation under `key` (none for a put without them), or `None` when
+/// no queued put stores that key.
+pub(crate) fn queued_columns(remote: &Remote, key: &str) -> Option<Columns> {
+    with_pending(remote, |p| {
+        p.attestations
+            .values()
+            .find(|r| r.key == key)
+            .map(|r| r.columns.clone().unwrap_or_default())
+    })
+    .flatten()
+}
+
+/// Check `objects` as every backend does ([`NewObject::validate`]) and
+/// that the server would take each row (its base64 under [`MAX_RECORD`]);
+/// the objects by id. Nothing is queued on failure.
+pub(crate) fn queue_objects(
+    remote: &Remote,
+    objects: &[NewObject<'_>],
+) -> Result<BTreeMap<String, (ObjectKind, Vec<u8>)>, StoreError> {
+    let mut out = BTreeMap::new();
+    for o in objects {
+        let id = o.validate()?;
+        check_size(object_sent_len(o.bytes) + 64 + 64)?;
+        out.entry(id).or_insert_with(|| (o.kind, o.bytes.to_vec()));
+    }
+    remote.ready()?;
+    Ok(out)
+}
+
+/// Queue `objects` in this thread's open batch (they are written before
+/// any record of it); how many the batch did not hold already (a deferred
+/// batch cannot know what the server holds).
+pub(crate) fn put_objects(remote: &Remote, objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
+    let queued = queue_objects(remote, objects)?;
+    let new = with_pending(remote, |p| {
+        let mut new = 0;
+        for (id, (kind, bytes)) in queued {
+            if !p.objects.contains_key(&id) {
+                new += 1;
+                p.bytes += object_sent_len(&bytes);
+                p.objects.insert(id, (kind, bytes));
+            }
+        }
+        new
+    })
+    .unwrap_or(0);
+    flush_if_full(remote);
+    Ok(new)
 }
 
 /// Open a deferred batch on this thread; `after` runs once each part of it
@@ -544,6 +636,7 @@ fn row_of(att: &NewAttestation<'_>, key: String) -> Row {
         target: att.target.clone(),
         manifest_ref,
         ref_state,
+        columns: att.columns.cloned(),
         value: att.envelope.to_vec(),
     }
 }
@@ -939,6 +1032,12 @@ fn units(mut p: Pending) -> Vec<Pending> {
             rest.manifests.insert(root, m);
         }
     }
+    // The objects go first, with the writes of no unit: every record of
+    // the queue may name them, and a record is never stored before them.
+    for (id, o) in std::mem::take(&mut p.objects) {
+        rest.bytes += object_sent_len(&o.1);
+        rest.objects.insert(id, o);
+    }
     let mut out = Vec::with_capacity(by.len() + 1);
     if !rest.is_empty() {
         out.push(rest);
@@ -949,18 +1048,25 @@ fn units(mut p: Pending) -> Vec<Pending> {
 
 /// The next transaction's units, taken in order from `fresh`: at most
 /// `cap` bytes of values as sent ([`Remote::tx_bytes`], at most
-/// [`TX_BYTES`]) and a share of [`TX_UNITS`] attestations as large as
-/// `cap`'s of [`TX_BYTES`]; a unit larger than that alone is a
-/// transaction of its own. Compressed values are counted at two thirds of
-/// their size: zstd makes vex's JSON about a third as large, and its bytes
-/// travel as a hex literal, twice that.
+/// [`TX_BYTES`]) and a share of [`TX_UNITS`] format-1 attestations as
+/// large as `cap`'s of [`TX_BYTES`] (a format-3 record is under 2 kB, so
+/// its transactions are sized by bytes alone, STORE-V2 section 2.1); a
+/// unit larger than that alone is a transaction of its own. Compressed
+/// values are counted at two thirds of their size: zstd makes vex's JSON
+/// about a third as large, and its bytes travel as a hex literal, twice
+/// that.
 fn next_group(fresh: &mut VecDeque<Pending>, cap: usize, compressed: bool) -> Option<Vec<Pending>> {
     let sent = |b: usize| if compressed { b * 2 / 3 } else { b };
     let max_units = (TX_UNITS * cap / TX_BYTES).max(4);
     let mut cur: Vec<Pending> = Vec::new();
     let (mut bytes, mut n) = (0usize, 0usize);
     while let Some(u) = fresh.front() {
-        let (b, k) = (sent(u.bytes), u.attestations.len());
+        let k = u
+            .attestations
+            .values()
+            .filter(|r| !r.is_format_three())
+            .count();
+        let b = sent(u.bytes);
         if !cur.is_empty() && (bytes + b > cap || n + k > max_units) {
             break;
         }
@@ -1127,6 +1233,7 @@ pub(crate) fn write_all(
             (Ok(n), Some(tx)) => {
                 txs += 1;
                 bytes += n;
+                remote.committed(tx.stmts.iter().map(String::len).sum());
                 remote.stored_writes(n);
                 // A copy sent again measures no commit of its size: its
                 // guard may have refused it at once.
@@ -1269,7 +1376,7 @@ fn send(remote: &Remote, tx: &Tx) -> Result<usize, StoreError> {
 /// `p` as one transaction ([`Tx`]). `keep`: roots the whole queue
 /// references, which no transaction of it removes as superseded.
 fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, StoreError> {
-    let only_removals = p.manifests.is_empty() && p.attestations.is_empty();
+    let only_removals = p.objects.is_empty() && p.manifests.is_empty() && p.attestations.is_empty();
     let nothing = |p: Pending| Tx {
         p,
         stmts: Vec::new(),
@@ -1292,62 +1399,97 @@ fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, S
     } else {
         remote.ensure()?
     };
+    // The format-3 columns and tables, in a request of their own (STORE-V2
+    // section 5): never part of this transaction.
+    remote.ensure_v2()?;
     let at = now();
     let nonce = nonce(remote);
-    let (a, log) = (&t.names.attestations, &t.log);
-    let mut stmts: Vec<String> = vec![format!(
-        "SELECT json_extract('{{}}', '{COMMITTED} ' || root) FROM {log} \
-         WHERE at = {at} AND root = '{nonce}'"
-    )];
+    let ns = remote.ns()?.to_owned();
+    let seq = seq_of(&ns);
+    let (a, log, g) = (&t.names.attestations, &t.log, &t.gone);
+    let mut stmts: Vec<String> = vec![
+        format!(
+            "SELECT json_extract('{{}}', '{COMMITTED} ' || root) FROM {log} \
+             WHERE at = {at} AND root = '{nonce}'"
+        ),
+        Tables::bump_seq(&ns),
+    ];
     let mut sent = 0usize;
-    // A value as written: `encoding, value` literals.
-    let mut value = |b: &[u8]| -> String {
-        let lit = match remote.compress().then(|| compress(b)).flatten() {
-            Some(z) => format!("{ZSTD}, {}", blob(&z)),
-            None => format!("{RAW}, {}", blob(b)),
+    // The objects first (section 6: a record is never stored before the
+    // objects it names), as base64 text.
+    if !p.objects.is_empty() {
+        let rows: Vec<String> = p
+            .objects
+            .iter()
+            .map(|(id, (kind, bytes))| {
+                let lit = text(&object_to_base64(bytes));
+                sent += lit.len();
+                format!("({}, {}, {at}, {seq}, {lit})", text(id), *kind as u8)
+            })
+            .collect();
+        stmts.push(t.upsert_objects(&rows.join(", ")));
+    }
+    // A value as written: its `encoding` and its literal.
+    let mut value = |b: &[u8]| -> (i64, String) {
+        let (enc, lit) = match remote.compress().then(|| compress(b)).flatten() {
+            Some(z) => (ZSTD, blob(&z)),
+            None => (RAW, blob(b)),
         };
         sent += lit.len();
-        lit
+        (enc, lit)
     };
     if !p.manifests.is_empty() {
         let rows: Vec<String> = p
             .manifests
             .iter()
             .map(|(root, (base, bytes))| {
+                let (enc, lit) = value(bytes);
                 format!(
-                    "({}, {}, {at}, {})",
+                    "({}, {}, {at}, {enc}, {lit})",
                     text(root),
-                    opt_text(base.as_deref()),
-                    value(bytes)
+                    opt_text(base.as_deref())
                 )
             })
             .collect();
         stmts.push(t.upsert_manifests(&rows.join(", ")));
+        remote.noted_manifests();
     }
-    stmts.extend(superseded_manifests(remote, t, &p, keep, at)?);
+    // The manifests this write leaves unreferenced, where one may exist
+    // (a namespace past the migration window has none, and the statements
+    // repeat every key and slot of the write four times).
+    if remote.manifests_may_exist() {
+        stmts.extend(superseded_manifests(remote, t, &p, keep, at)?);
+    }
     // Removals before the upsert: a put queued after a removal of its slot
-    // replaces the slot anyway, and an emptied slot has no put.
+    // replaces the slot anyway, and an emptied slot has no put. Each key
+    // removed gets a `gone` row first, for the replicas syncing by `seq`.
     let mut removed_slots: Vec<Slot> = Vec::new();
     if !p.removals.is_empty() {
+        let list = p
+            .removals
+            .iter()
+            .map(|k| text(k))
+            .collect::<Vec<_>>()
+            .join(", ");
         stmts.push(format!(
-            "DELETE FROM {a} WHERE key IN ({})",
-            p.removals
-                .iter()
-                .map(|k| text(k))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "INSERT INTO {g} (seq, key, at) SELECT {seq}, key, {at} FROM {a} WHERE key IN ({list})"
         ));
+        stmts.push(format!("DELETE FROM {a} WHERE key IN ({list})"));
         removed_slots.extend(p.removals.iter().filter_map(|k| {
             key::parse_key(k).map(|(t, s, x)| (t.to_owned(), s.to_owned(), x.to_owned()))
         }));
     }
     for (tk, signer, sk) in &p.emptied {
-        stmts.push(format!(
-            "DELETE FROM {a} WHERE test_key = {} AND signer = {} AND storage_key = {}",
+        let slot = format!(
+            "test_key = {} AND signer = {} AND storage_key = {}",
             text(tk),
             text(signer),
             text(sk)
+        );
+        stmts.push(format!(
+            "INSERT INTO {g} (seq, key, at) SELECT {seq}, key, {at} FROM {a} WHERE {slot}"
         ));
+        stmts.push(format!("DELETE FROM {a} WHERE {slot}"));
     }
     if !p.attestations.is_empty() {
         let rows: Vec<String> = p
@@ -1355,8 +1497,9 @@ fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, S
             .iter()
             .map(|((tk, signer, sk), r)| {
                 let hint = key::parse_key_hint(&r.key);
+                let (enc, lit) = value(&r.value);
                 format!(
-                    "({}, {}, {}, {}, {}, {}, {}, {}, {}, {at}, {})",
+                    "({}, {}, {}, {}, {}, {}, {}, {}, {}, {at}, {enc}, {}, {seq}, {lit})",
                     text(&r.key),
                     text(tk),
                     text(signer),
@@ -1366,16 +1509,23 @@ fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, S
                     opt_text(hint.as_ref().and_then(|h| h.tree.as_deref())),
                     opt_text(r.manifest_ref.as_deref()),
                     r.ref_state,
-                    value(&r.value)
+                    Tables::column_literals(r.columns.as_ref()),
                 )
             })
             .collect();
         stmts.push(t.upsert_attestations(&rows.join(", ")));
     }
+    // The old change log, for 2.8 replicas: the slots removed or emptied
+    // and the format-1 puts; a format-3 record is synced by its `seq`.
     let slots: Vec<&Slot> = removed_slots
         .iter()
         .chain(p.emptied.iter())
-        .chain(p.attestations.keys())
+        .chain(
+            p.attestations
+                .iter()
+                .filter(|(_, r)| !r.is_format_three())
+                .map(|(slot, _)| slot),
+        )
         .collect();
     let roots: Vec<&str> = p
         .manifests
@@ -1390,9 +1540,19 @@ fn prepare(remote: &Remote, p: Pending, keep: &BTreeSet<String>) -> Result<Tx, S
         stmts.push(format!(
             "UPDATE vci_schema SET log_floor = max(log_floor, \
                coalesce((SELECT max(seq) FROM {log} WHERE at < {cut}), 0)) WHERE ns = {}",
-            text(remote.ns()?)
+            text(&ns)
         ));
         stmts.push(format!("DELETE FROM {log} WHERE at < {cut}"));
+        // The `gone` rows past the purge horizon, their newest `seq` kept
+        // as the floor a replica's cursor must be past (else it syncs
+        // everything).
+        let horizon = at.saturating_sub(remote.gone_keep_secs());
+        stmts.push(format!(
+            "UPDATE vci_schema SET gone_floor = max(gone_floor, \
+               coalesce((SELECT max(seq) FROM {g} WHERE at < {horizon}), 0)) WHERE ns = {}",
+            text(&ns)
+        ));
+        stmts.push(format!("DELETE FROM {g} WHERE at < {horizon}"));
     }
     let probe = format!("SELECT 1 FROM {log} WHERE at = {at} AND root = '{nonce}'");
     Ok(Tx {
@@ -1494,6 +1654,7 @@ fn superseded_manifests(
 /// What a write changes besides the server: this handle's cache (it reads
 /// its own writes and removals), then the queue's hook (a replica's file).
 fn settle(remote: &Remote, p: &Pending) {
+    remote.objects_put(&p.objects);
     {
         let mut c = remote.cache();
         for (root, (_, bytes)) in &p.manifests {

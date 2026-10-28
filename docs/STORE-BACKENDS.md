@@ -2665,9 +2665,9 @@ against the client's panics, SQL literals), `remote` (the tables of a namespace,
 
 | mode | selected by | reads | writes | `caps` |
 |---|---|---|---|---|
-| local | `VCI_STORE=libsql` with no `VCI_STORE_URL`, or `VCI_STORE_URL=file:<path>` | a file, `<git common dir>/vci-store.libsql` by default | the file | `LOCAL.with_hints(true)` |
-| remote | a `libsql://` `VCI_STORE_URL` (or `https://`/`http://` with `VCI_STORE=libsql`) | the server, through a per-handle cache | the server, a batch as transactions of whole units of at most 1 MiB, one request each | `with_shared_writes(true).with_hints(true).with_remote_reads(true)` |
-| replica | remote, plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true` | a local file synced from the server at its first use and at each later prefetch | the server, then written through to the file | `with_shared_writes(true).with_hints(true)` |
+| local | `VCI_STORE=libsql` with no `VCI_STORE_URL`, or `VCI_STORE_URL=file:<path>` | a file, `<git common dir>/vci-store.libsql` by default | the file | the SQLite store's (`LOCAL.with_hints(true).with_objects(true).with_columns(true)`, section 16) |
+| remote | a `libsql://` `VCI_STORE_URL` (or `https://`/`http://` with `VCI_STORE=libsql`) | the server, through a per-handle cache | the server, a batch as transactions of whole units of at most 1 MiB, one request each | `with_shared_writes(true).with_hints(true).with_remote_reads(true).with_objects(true).with_columns(true)` |
+| replica | remote, plus `VCI_STORE_SYNC=replica`, `VCI_STORE_REPLICA=<path>` or `[store.libsql] replica = true` | a local file synced from the server at its first use and at each later prefetch; objects and columns from the server | the server, then written through to the file | `with_shared_writes(true).with_hints(true).with_objects(true).with_columns(true)` |
 
 **Crate.** `vci-store-libsql` depends on `vci-store`, `vci-core`, `vci-store-sqlite` (the schema SQL and the file
 format), `serde_json`, `libsql = { version = "=0.10.0", default-features = false, features = ["remote"] }` (the Hrana
@@ -2753,9 +2753,49 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   handle says so without a request. A token that may not create tables gets `NotInitialized{advice: "the first vci
   run with a token allowed to create tables creates them"}`.
 - **Bytewise order** comes with SQLite's `BINARY` collation, as in section 16.
-- **The log** names every slot and root a write touched (a put, a removal, a manifest), for replicas. Entries older
-  than 30 days are deleted once per handle by its first write, which records the newest deleted `seq` in
-  `vci_schema.log_floor`: a replica that last synced before it syncs everything.
+- **The log** names every slot and root a write touched (a format-1 put, a removal, a manifest), for replicas.
+  Entries older than 30 days are deleted once per handle by its first write, which records the newest deleted `seq`
+  in `vci_schema.log_floor`: a replica that last synced before it syncs everything. A format-3 put writes no log
+  row: a replica syncs it by its `seq` (below).
+- **Store format 3** (2.9, STORE-V2 section 2.1). The schema stays version 1; a namespace gains nullable columns and
+  two tables, and its `vci_schema` row says so with `v2 = 1`:
+
+  ```sql
+  ALTER TABLE vci_schema ADD COLUMN v2 INTEGER NOT NULL DEFAULT 0;         -- the layout below is there
+  ALTER TABLE vci_schema ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;        -- the write counter, one step per transaction
+  ALTER TABLE vci_schema ADD COLUMN gone_floor INTEGER NOT NULL DEFAULT 0; -- gone rows up to it were purged
+  ALTER TABLE <prefix>attestations ADD COLUMN format INTEGER;   -- then commit_id, platform, state TEXT, duration_ms,
+                                                               -- expires INTEGER, hdr, tables_id, shape, state_obj TEXT,
+                                                               -- seq INTEGER (the Columns of section 2, NULL on a format-1 row)
+  CREATE INDEX IF NOT EXISTS <prefix>attestations_hdr ON <prefix>attestations (hdr) WHERE hdr IS NOT NULL;   -- and
+    -- _tables (tables_id), _shape (shape), _state (state_obj), _seq (seq)
+  CREATE TABLE IF NOT EXISTS <prefix>objects (id TEXT NOT NULL PRIMARY KEY, kind INTEGER NOT NULL,
+    put_at INTEGER NOT NULL, seq INTEGER, bytes TEXT NOT NULL);           -- base64 of the object (object_to_base64)
+  CREATE INDEX IF NOT EXISTS <prefix>objects_seq ON <prefix>objects (seq);
+  CREATE INDEX IF NOT EXISTS <prefix>objects_kind_put ON <prefix>objects (kind, put_at);
+  CREATE TABLE IF NOT EXISTS <prefix>gone (seq INTEGER NOT NULL, key TEXT, object TEXT, at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS <prefix>gone_seq ON <prefix>gone (seq);  -- and _at (at)
+  ```
+
+  Objects are **base64 text**: a batch is one SQL string of literals, and a blob literal is hex, twice the bytes;
+  `get_objects` decodes (a text that is not base64 reads as not stored). A namespace 2.9 creates has the layout from
+  its first request (one DDL transaction: the v1 tables, `vci_schema` made with the three columns when it is new, the
+  eleven `ALTER TABLE`s on the attestations table just made, the two tables, the row with `v2 = 1`). A namespace a
+  2.8 made is **upgraded in a request of its own** before 2.9's first write transaction on it (never inside a
+  batch, STORE-V2 section 5: the version query reads `v2` with the version, in one request, so a handle learns the
+  layout at no extra cost; a database whose `vci_schema` predates 2.9 answers `no such column` and the version alone
+  is asked once more): the columns `vci_schema` and the attestations table have are read (`pragma_table_info`, one
+  request) and only what is missing is sent, so the upgrade is idempotent and two writers upgrading at once are
+  safe (whoever's `ALTER TABLE` comes second is refused, `duplicate column`, reads the columns again and sends what is
+  still missing). `LibsqlStore::upgrade()` (`vci store upgrade --begin`) does the same ahead of a rollout and says
+  whether anything was sent; `finish_upgrade()` (`--finish`) counts the rows that are not format-3 records and is
+  refused while one exists, and at zero is `Unsupported` in this release: dropping `manifests` and the change log
+  needs every statement that names them branched on a version 2, which a later vci carries. A handle that found a
+  namespace without the layout answers no objects and no columns for the rest of the process; a write of its
+  upgrades the namespace first. The `gone` table holds the deletions a replica syncs: a row per removed key and per
+  removed object, with the removing transaction's `seq`; rows older than the purge horizon, the larger of 30 days
+  and the policy's `max_ttl` (`LibsqlStore::set_max_ttl`, which vci-cli passes from the policy; 30 days without it),
+  are deleted once per handle by its first write, the newest purged `seq` kept in `vci_schema.gone_floor`.
 - **Values compressed** (2.8.2). A value's `encoding` column, there since schema v1 for this, says how its bytes are
   stored: 0 as they are, 1 as one zstd frame (level 6). Every reader from 2.8.2 reads both, decompressing at most
   5,000,000 bytes (no value vci stores is larger; past that the value reads as unreadable, its unit runs), and the
@@ -3010,20 +3050,49 @@ had to promote to the write lock, a promotion that fails at once under concurren
 back as `database is locked`, and vci sent the batch again) and can abort `sqld` 0.24 (section 21, item 17). A
 namespace whose `vci_schema` row exists sends no DDL at all (one read per handle). The statements:
 
-1. the manifests, one multi-row upsert (the value and its encoding replaced; `put_at` refreshed);
-2. the manifests this write leaves without a reference (2.8.2, `superseded_manifests`): the change log's rows naming
+0. the transaction's guard (its nonce, below) and the step of the namespace's write counter (`UPDATE vci_schema SET
+   seq = seq + 1`, 2.9): every row the transaction writes carries that `seq`, one value per transaction, so a
+   replica syncing `seq > cursor` sees a transaction whole or not at all;
+1. the format-3 objects (2.9), one multi-row upsert as base64 text: an id stored already keeps its bytes and its
+   `seq` and gets its `put_at` refreshed (the grace counts from the latest put). They come first because a record
+   is never stored before the objects it names (section 6): a queue's objects go with the writes of no unit, ahead
+   of the first unit, and a batch flushed early sends every object queued so far with its first transaction;
+2. the manifests, one multi-row upsert (the value and its encoding replaced; `put_at` refreshed);
+3. the manifests this write leaves without a reference (2.8.2, `superseded_manifests`): the change log's rows naming
    them, then their deletion, both computed before the attestations change. A manifest goes when an attestation this
    write removes, empties or puts over (by key or by slot) references it, and nothing else does: no other attestation,
    no manifest as its base, nothing this write puts (an attestation's reference, a manifest or its base), no
    attestation of an unknown reference (`ref_state` 0), and it was put before the grace period (an hour; none for `vci
    prune`), the hour another writer has to reference a manifest it put outside its attestation's transaction. 2.8.1
    left them all to `vci prune`: of vex's 49,749 manifests (806 MB) on 27 October only 4,538 (74 MB) were referenced,
-   each `vci run` adding one orphan per unit it attested again;
-3. the removed keys (`DELETE … WHERE key IN (…)`) and the emptied slots;
-4. the attestations, one multi-row upsert on the slot, replacing the key, the value, its encoding and the columns
-   derived from them when any changed;
-5. the log rows of every slot and root touched, and once per handle the log's prune (by its first transaction that
-   commits).
+   each `vci run` adding one orphan per unit it attested again. Sent only where a manifest may exist (2.9: the
+   version query also asks `EXISTS (SELECT 1 FROM <prefix>manifests)`, once per handle, and a handle that puts a
+   manifest sends them from then on): the two statements repeat every key and slot of the write twice each, about
+   1 MB of SQL for an 800-unit partition with its removals, dead weight on a namespace past the migration window;
+4. for each removed key and emptied slot a `gone` row (2.9: `INSERT INTO <prefix>gone (seq, key, at) SELECT …` from
+   the rows about to go), then the removed keys (`DELETE … WHERE key IN (…)`) and the emptied slots;
+5. the attestations, one multi-row upsert on the slot, replacing the key, the value, its encoding, the listing
+   columns (`Columns`, `NULL` each for a put without them) and `seq` when the key, the value, the encoding or any
+   column differs: the same bytes put with other columns replace the columns, and the same batch applied again
+   rewrites nothing;
+6. the log rows of every slot removed or emptied and of every format-1 put (a format-3 put is synced by its `seq`),
+   of every root touched and of the nonce, and once per handle (by its first transaction that commits) the log's
+   prune and the `gone` purge at the horizon.
+
+A format-3 record is under 2 kB, so `next_group` counts only format-1 attestations against `TX_UNITS`: a
+transaction of format-3 records is sized by its bytes alone (200 records of the conformance fixture are one
+transaction; `TX_UNITS` would have made four). An object whose base64 would reach a server's row limit (5,000,000
+bytes) is refused as `Unsupported` before it is queued, as a record is. `put_objects` outside a batch is a batch of
+one (one request asks which ids are stored, for the count); inside a batch it queues, and the count is what the batch
+did not hold already. `remove_objects` is applied at once, under the orphan rule of section 4 (one request asks which
+of the ids are orphans as of now minus the grace, one transaction removes them with the rule repeated and a `gone`
+row each), keeping the ids an open batch on the thread has queued, which the server does not hold yet or whose grace
+the batch refreshes when it finishes. `prune_state_objects` is the same two requests over `kind = 4 AND put_at <
+cut`. `orphan_objects` is one read. `columns` answers what an open batch on the thread queued for a key first, then
+one request per 5,000 keys. `get_objects` answers from the handle's object cache (a `prefetch(Objects)`, or its own
+writes, which `settle` caches) and asks the server for the rest in one request per 5,000 ids; each id answered leaves
+the cache, as a value read does, so the next call sees another writer's removal (c42). The answer is bounded at
+`MAX_OBJECTS_ANSWER` while it is decoded.
 
 **Short transactions** (2.8.2). 2.8.1 sent a project's queue in one transaction, flushed early at 8 MiB: on vex's CI
 each such request took about 15 s to commit (about 0.5 MB/s) even alone, held the database's one write lock while
@@ -3188,15 +3257,30 @@ read them on a new handle in 0.10 s and 4 requests (not measured again).
 
 The replica is a SQLite store file (the local mode's format), by default `<git common dir>/vci-store.libsql`, else
 `VCI_STORE_REPLICA` (absolute or relative to the git common directory) or `[store.libsql] path`. Beside it,
-`<file>.sync` (JSON: `{"v": 2, "source": "<url> namespace <ns>", "seq": N, "mark": "<at>:<slot or root>", "epoch":
-<created_at>}`) says which server and namespace it copies, up to which log entry, that entry's fingerprint (when it
-was written and what it names) and when the namespace was created. `v` (`SYNC_FORMAT`) says which values the vci that
-synced the file reads: 1 (2.8.1 and earlier) only values stored as they are, 2 (2.8.2) zstd frames too. A sync leaves
-out a value it cannot read (its unit runs) yet moves the mark past it, so syncing what changed since never brings it
-back: a file 2.8.1 synced while another vci wrote compressed values lacks them after the upgrade, until their slots
-are written again or the log's floor passes the mark (30 days). A sidecar whose `v` is older than this vci's (or
-missing) is therefore synced in full once (`a_replica_synced_by_an_older_vci_is_synced_in_full_once`). Removing
-`<file>.sync` forces a full sync with any version.
+`<file>.sync` (JSON: `{"v": 3, "source": "<url> namespace <ns>", "seq": N, "mark": "<at>:<slot or root>", "epoch":
+<created_at>, "seq2": M}`) says which server and namespace it copies, up to which log entry, that entry's fingerprint
+(when it was written and what it names), when the namespace was created, and (2.9) up to which value of the
+namespace's write counter the format-3 rows were synced. `v` (`SYNC_FORMAT`) says which values the vci that synced
+the file reads: 1 (2.8.1 and earlier) only values stored as they are, 2 (2.8.2) zstd frames too, 3 (2.9) format-3
+records and deletions by `seq`. A sync leaves out a value it cannot read (its unit runs) yet moves the mark past it,
+so syncing what changed since never brings it back: a file 2.8.1 synced while another vci wrote compressed values
+lacks them after the upgrade, until their slots are written again or the log's floor passes the mark (30 days). A
+sidecar whose `v` is older than this vci's (or missing) is therefore synced in full once
+(`a_replica_synced_by_an_older_vci_is_synced_in_full_once`). Removing `<file>.sync` forces a full sync with any
+version.
+
+**Store format 3** (2.9). A format-3 put writes no log row, so the sync reads, in the same request as the log's rows,
+the attestations whose `seq` is past `seq2` (each row's slot then ends as the server has it, like a slot the log
+names) and the `gone` rows past it (the keys they name leave the file; the object ids are left out, since the file
+keeps no objects). The statement with those branches is sent first; a namespace without the layout refuses it (a
+column or the `gone` table missing) and the plain statement follows, so a 2.9 replica of a 2.8 namespace costs one
+more request a sync until the namespace is upgraded, and one of a 2.9 namespace none. Everything is synced again
+when `seq2` is older than `vci_schema.gone_floor` (deletions the file never saw were purged at the horizon, STORE-V2
+section 2.1) or past the counter (the namespace was restored to an earlier point), beside the log's own rules. The
+sync brings the file **no objects and no columns** in this release (section 16's file could keep them; the sync does
+not read them yet): a replica's `get_objects`, `columns`, `orphan_objects`, `remove_objects`, `prune_state_objects`
+and `prefetch(Objects)` ask the server, as `orphan_manifests` does, and a write's objects and columns are not written
+through. When the sync reads `objects WHERE seq > ?`, the `gone` object rows and the columns, the file can answer.
 
 - **The sync**, the first time the store is read (`warm()` starts it on a thread at the start of a plan), and again
   at each later `prefetch` (the plan's later rounds, `vci run`'s before supersession: section 4's "the next prefetch
@@ -3256,6 +3340,21 @@ syncs the whole namespace before it reads locally, more than a remote plan reads
 pilot found it no faster there ("Measured", below).
 
 ### Measured
+
+**Store format 3, one 800-unit partition against a local `sqld`** (2.9; `tests/format3.rs`,
+`an_800_unit_partition_is_a_few_transactions` with `VCI_PAIRS` naming the 1,175-unit vex sample, release build,
+macOS arm64; Turso's numbers come with the pilot). The largest run's first 800 units make 4 objects (one hdr, one
+tables, the shape, the state: 329,446 B at rest, 439 KB as base64) and 800 records (1,417,069 B, 1,771 B each). The
+first `vci run`'s batch (the objects, then the records, no removals) is **2 transactions**, 1,869,145 B of values and
+objects as literals and 2,581,879 B of SQL in all (the keys, the slot columns, the ten listing columns and the
+`seq` subquery add about 890 B a row), 6 requests with the namespace's creation (the version, the DDL, the version
+again, two transactions), 0.18 s. A second run of the same units under other storage keys, superseding the first's
+(800 records put, the 4 objects re-put, 800 removals with their `gone` rows and log rows): **2 transactions**, the
+same 1,869,145 B of literals, 3,029,929 B of SQL, 2 requests, 0.20 s. Against the design's model (STORE-V2 section 3:
+2.43 MB on the wire in 3 transactions of at most 1 MiB, with 1.2 N removals): the literals are 1.87 MB, the SQL around
+them 0.7 MB for the puts and 0.45 MB for 800 removals, and the two transactions are 0.93 and 0.94 MB. With the
+manifest-collection statements (now skipped where the namespace holds no manifest) the second run was 4,152,653 B
+of SQL: their four repetitions of 800 keys and 800 slots cost 1.1 MB.
 
 On prove-perf's synthetic world (1,200 Go packages, each attested at three commits: 3,600 attestations of about 3 KB
 and 3,601 manifests on a local `sqld` 0.24.32, written there by three `vci run`s in the remote mode), release build,

@@ -3695,6 +3695,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "vci-attest",
  "vci-core",
  "vci-store",
  "vci-store-sqlite",

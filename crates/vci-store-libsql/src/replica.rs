@@ -90,6 +90,17 @@ struct Changes {
     seq: i64,
     /// Entries up to this one were dropped from the log.
     floor: i64,
+    /// The namespace's format-3 counter (`vci_schema.seq`, STORE-V2
+    /// section 2.1): the position every write transaction stamps on the
+    /// rows it touches; 0 on a namespace without the format-3 layout.
+    seq2: i64,
+    /// `gone` rows up to this `seq` were purged: a file whose format-3
+    /// cursor is older missed deletions and syncs everything.
+    gone_floor: i64,
+    /// The keys whose `gone` rows are past the cursor: removed on the
+    /// server (object ids in `gone` are left out: the file keeps no
+    /// objects).
+    removed: BTreeSet<String>,
     /// The fingerprint of the entry the file was synced to, as the log
     /// holds it now (`None`: gone, or the file was synced to none).
     mark_then: Option<String>,
@@ -109,12 +120,13 @@ struct Changes {
 
 /// What `<file>.sync`'s `v` says: which values the vci that synced the
 /// file could read. 1 (2.8.1 and before) read only values stored as they
-/// are; 2 (2.8.2) reads zstd frames too. A sync leaves out a value it
-/// cannot read (its unit runs) yet moves the mark past it, so the changes
-/// after the mark never bring it back: a file whose sidecar has an older
-/// `v` (or none) is synced in full once, and has every value this vci
-/// reads. A vci that reads a new encoding raises it.
-const SYNC_FORMAT: i64 = 2;
+/// are; 2 (2.8.2) reads zstd frames too; 3 (2.9) syncs format-3 records
+/// and deletions by `seq` beside the log (`seq2`). A sync leaves out a
+/// value it cannot read (its unit runs) yet moves the mark past it, so
+/// the changes after the mark never bring it back: a file whose sidecar
+/// has an older `v` (or none) is synced in full once, and has every value
+/// this vci reads. A vci that reads a new encoding raises it.
+const SYNC_FORMAT: i64 = 3;
 
 /// `<file>.sync`: which server and namespace the file copies, and up to
 /// which entry of its log.
@@ -128,6 +140,8 @@ struct Sidecar {
     mark: Option<String>,
     /// When the namespace was created.
     epoch: Option<i64>,
+    /// The format-3 cursor: `vci_schema.seq` as of the sync (0: none).
+    seq2: i64,
 }
 
 /// Why a sync did not happen.
@@ -317,6 +331,7 @@ impl Replica {
             seq: v["seq"].as_i64()?,
             mark: v["mark"].as_str().map(str::to_owned),
             epoch: v["epoch"].as_i64(),
+            seq2: v["seq2"].as_i64().unwrap_or(0),
         })
     }
 
@@ -337,6 +352,7 @@ impl Replica {
             "seq": s.seq,
             "mark": s.mark,
             "epoch": s.epoch,
+            "seq2": s.seq2,
         })
         .to_string();
         std::fs::write(&tmp, body)?;
@@ -416,8 +432,9 @@ impl Replica {
         let same = found.as_ref().filter(|s| s.source == source);
         let step = Step::start(KIND);
         let last = same.map_or(0, |s| s.seq);
-        let mut full = last == 0;
-        let mut changes = self.changes(last, full).map_err(SyncFail::Server)?;
+        let last2 = same.map_or(0, |s| s.seq2);
+        let mut full = last == 0 && last2 == 0;
+        let mut changes = self.changes(last, last2, full).map_err(SyncFail::Server)?;
         if let (Some(c), Some(s)) = (&changes, same)
             && !full
             && (c.floor > last
@@ -427,13 +444,18 @@ impl Replica {
                 || (c.floor < last && c.mark_then != s.mark)
                 || c.epoch.is_none()
                 || c.epoch != s.epoch
-                || s.format < SYNC_FORMAT)
+                || s.format < SYNC_FORMAT
+                // The format-3 cursor is older than the `gone` purge
+                // horizon (deletions it never saw were purged), or past
+                // the counter (restored to an earlier point).
+                || c.gone_floor > last2
+                || c.seq2 < last2)
         {
             // Older than the log, or the log is not the one the file was
             // synced from (dropped and created again, restored), or synced
             // by a vci that left out values this one reads: all.
             full = true;
-            changes = self.changes(0, true).map_err(SyncFail::Server)?;
+            changes = self.changes(0, 0, true).map_err(SyncFail::Server)?;
         }
         let Some(changes) = changes else {
             // The server holds nothing for this namespace (its tables are
@@ -468,6 +490,7 @@ impl Replica {
             seq: changes.seq,
             mark: changes.mark_now.clone(),
             epoch: changes.epoch,
+            seq2: changes.seq2,
         };
         if let Err(e) = self.write_sidecar(&after) {
             eprintln!(
@@ -499,22 +522,48 @@ impl Replica {
         apply_changes(store, &Changes::default(), true).map_err(|e| SyncFail::File(e.to_string()))
     }
 
-    /// What changed on the server since `last` (everything when `full`);
-    /// `None` when the server holds nothing for this namespace. The
-    /// namespace's schema version comes with it: a newer one is refused.
-    fn changes(&self, last: i64, full: bool) -> Result<Option<Changes>, StoreError> {
+    /// What changed on the server since log entry `last` and format-3
+    /// position `last2` (everything when `full`); `None` when the server
+    /// holds nothing for this namespace. The namespace's schema version
+    /// comes with it: a newer one is refused. The statement for a
+    /// namespace with the format-3 layout is sent first (the attestations
+    /// and `gone` rows past `last2` come in the same request as the log's):
+    /// refused by a namespace without the layout (a column or the `gone`
+    /// table missing), the plain one follows, so a 2.9 replica of a 2.8
+    /// namespace costs one more request a sync until the namespace is
+    /// upgraded, and one of a 2.9 namespace none.
+    fn changes(&self, last: i64, last2: i64, full: bool) -> Result<Option<Changes>, StoreError> {
         let t = self.remote.ready()?;
         let ns = self.remote.ns()?.to_owned();
-        let r = self.remote.query(
-            READ,
-            &t.sync,
-            vec![V::Integer(last), V::Integer(i64::from(full)), V::Text(ns)],
-        );
+        let params = vec![V::Integer(last), V::Integer(i64::from(full)), V::Text(ns)];
+        let mut v2 = true;
+        let mut r = if self.remote.v2_known_no() {
+            v2 = false;
+            self.remote.query(READ, &t.sync, params.clone())
+        } else {
+            let mut with = params.clone();
+            with.push(V::Integer(last2));
+            self.remote.query(READ, &t.sync_v2, with)
+        };
+        if v2
+            && match &r {
+                Err(Fail::Absent) => true,
+                Err(Fail::Store(e)) => e
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("no such column"),
+                Ok(_) => false,
+            }
+        {
+            v2 = false;
+            r = self.remote.query(READ, &t.sync, params);
+        }
         let rows = match r {
             Ok(rows) => rows,
             Err(Fail::Absent) => return Ok(None),
             Err(Fail::Store(e)) => return Err(e),
         };
+        self.remote.found_v2(v2);
         let mut c = Changes::default();
         let mut version = None;
         for row in rows {
@@ -529,12 +578,25 @@ impl Replica {
                     c.epoch = col_int(&row[3]);
                     c.seq = col_int(&row[5]).unwrap_or(0);
                     c.floor = col_int(&row[6]).unwrap_or(0);
+                    c.seq2 = row.get(7).and_then(col_int).unwrap_or(0);
+                    c.gone_floor = row.get(8).and_then(col_int).unwrap_or(0);
                 }
                 Some(1) => {
                     if let (Some(k), Some(t)) = (col_text(&row[1]), col_text(&row[2])) {
                         c.attestations.push((k, t, col_value(&row[3], &row[4])));
                     }
                 }
+                // A row written by `seq`: its slot ends as the server has
+                // it, like a slot the log names.
+                Some(5) => {
+                    if let (Some(k), Some(t)) = (col_text(&row[1]), col_text(&row[2])) {
+                        if let Some((tk, s, x)) = key::parse_key(&k) {
+                            c.slots.insert(format!("{tk}:{s}:{x}"));
+                        }
+                        c.attestations.push((k, t, col_value(&row[3], &row[4])));
+                    }
+                }
+                Some(6) => c.removed.extend(col_text(&row[1])),
                 Some(2) => c.slots.extend(col_text(&row[1])),
                 Some(3) => {
                     if let Some(r) = col_text(&row[1]) {
@@ -672,7 +734,7 @@ fn apply_changes(store: &SqliteStore, c: &Changes, full: bool) -> Result<(), Sto
         .filter(|e| {
             let slot = format!("{}:{}:{}", e.test_key, e.signer, e.storage_key);
             let kept = remote_keys.get(&slot).is_some_and(|k| **k == e.key);
-            !kept && (full || c.slots.contains(&slot))
+            !kept && (full || c.slots.contains(&slot) || c.removed.contains(&e.key))
         })
         .collect();
     if !gone.is_empty() {

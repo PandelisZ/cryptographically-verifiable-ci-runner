@@ -62,13 +62,15 @@ use vci_store::select::{
     self, Credential, DEFAULT_LIBSQL_FILE, DEFAULT_MANIFEST_GRACE, LibsqlMode, Selection,
 };
 use vci_store::{
-    AttestationStore, BackendFactory, Caps, Hydration, NewAttestation, OpenContext, Prefetch,
-    StoreError, StoreStatus, StoredEnvelope, StoredManifest, WriteBatch, key,
+    AttestationStore, BackendFactory, Caps, Columns, Hydration, NewAttestation, NewObject,
+    OpenContext, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, StoredObject,
+    WriteBatch, key,
 };
 use vci_store_sqlite::{SqliteOptions, SqliteStore};
 
 pub use conn::LibsqlError;
 pub use remote::table_prefix;
+pub use vci_store_sqlite::Finish;
 
 use conn::{Conn, KIND, LONG_RUNNING_TIMEOUT, Target};
 use remote::Remote;
@@ -345,6 +347,62 @@ impl LibsqlStore {
             .collect())
     }
 
+    /// `vci store upgrade --begin`: bring the namespace to the format-3
+    /// layout (STORE-V2 section 2.1: the nullable columns, the `objects`
+    /// and `gone` tables, `vci_schema.v2 = 1`) in one request of its own,
+    /// ahead of the first 2.9 write, which would otherwise do the same
+    /// before its batch. Idempotent; whether anything was sent. Local: the
+    /// file's ([`SqliteStore::upgrade_begin`]).
+    pub fn upgrade_begin(&self) -> Result<bool, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.upgrade_begin(),
+            Inner::Remote(r) => r.upgrade(),
+            Inner::Replica(p) => p.remote.upgrade(),
+        }
+    }
+
+    /// `vci store upgrade --finish`. Local: the file's
+    /// ([`SqliteStore::upgrade_finish`]). On a server: refused with the
+    /// count while a row of the namespace is not a format-3 record
+    /// ([`Finish::FormatOneRows`], STORE-V2 section 5 step 4); at zero the
+    /// step that drops the `manifests` table and the change log is
+    /// [`StoreError::Unsupported`] in this release (the statements of a
+    /// version-2 namespace are a later vci's), and the namespace stays at
+    /// version 1, which every 2.8 and 2.9 reads.
+    pub fn upgrade_finish(&self) -> Result<Finish, StoreError> {
+        let r = match &self.inner {
+            Inner::Local(s) => return s.upgrade_finish(),
+            Inner::Remote(r) => r,
+            Inner::Replica(p) => &p.remote,
+        };
+        let n = r.format_one_rows()?;
+        if n > 0 {
+            return Ok(Finish::FormatOneRows(n));
+        }
+        Err(StoreError::Unsupported {
+            backend: KIND,
+            operation: "finishing the format-3 upgrade (dropping the manifests table and the change log): a later vci does it",
+        })
+    }
+
+    /// The policy's `max_ttl`: the server's `gone` rows (the deletions a
+    /// replica syncs) are purged after the larger of it and 30 days, so
+    /// that no record a replica could still serve outlives the deletion it
+    /// would have synced. Without it, 30 days.
+    pub fn set_max_ttl(&self, max_ttl: Duration) {
+        if let Some(r) = self.remote() {
+            r.set_max_ttl(max_ttl);
+        }
+    }
+
+    /// Write transactions this handle committed on the server, the bytes
+    /// of values and objects sent in them as literals, and the bytes of
+    /// their statements in all (tests of the write model; zeros in the
+    /// local mode).
+    pub fn written(&self) -> (u64, u64, u64) {
+        self.remote().map_or((0, 0, 0), |r| r.written())
+    }
+
     /// The local store behind the local mode, or the replica (synced the
     /// first time it is asked for).
     fn local(&self) -> Result<&SqliteStore, StoreError> {
@@ -414,14 +472,24 @@ impl AttestationStore for LibsqlStore {
         }
     }
 
+    /// Local: the SQLite store's (objects and columns as its file keeps
+    /// them). Remote and replica: objects and columns on the server (a
+    /// replica's file keeps neither; its object and column reads ask the
+    /// server, as `orphan_manifests` does).
     fn caps(&self) -> Caps {
         match &self.inner {
-            Inner::Local(_) => Caps::LOCAL.with_hints(true),
+            Inner::Local(s) => s.caps(),
             Inner::Remote(_) => Caps::LOCAL
                 .with_shared_writes(true)
                 .with_hints(true)
-                .with_remote_reads(true),
-            Inner::Replica(_) => Caps::LOCAL.with_shared_writes(true).with_hints(true),
+                .with_remote_reads(true)
+                .with_objects(true)
+                .with_columns(true),
+            Inner::Replica(_) => Caps::LOCAL
+                .with_shared_writes(true)
+                .with_hints(true)
+                .with_objects(true)
+                .with_columns(true),
         }
     }
 
@@ -593,11 +661,84 @@ impl AttestationStore for LibsqlStore {
             Inner::Local(s) => s.prefetch(what),
             Inner::Remote(r) => r.prefetch(what),
             Inner::Replica(p) if p.degraded() => p.remote.prefetch(what),
+            // A replica's objects are the server's.
+            Inner::Replica(p) if matches!(what, Prefetch::Objects { .. }) => {
+                p.remote.prefetch(what)
+            }
             // The first use syncs; a later prefetch syncs what changed.
             Inner::Replica(p) => {
                 p.prefetch()?;
                 Ok(Hydration::default())
             }
+        }
+    }
+
+    // ---- objects and columns (store format 3) ----
+
+    /// Local: the file's. Remote and replica: the server's, the handle's
+    /// own writes included (its cache).
+    fn get_objects(&self, ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.get_objects(ids),
+            Inner::Remote(r) => r.get_objects(ids),
+            Inner::Replica(p) => p.remote.get_objects(ids),
+        }
+    }
+
+    /// Remote and replica: queued in the open batch of this thread (written
+    /// before any record of it), else one transaction now.
+    fn put_objects(&self, objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.put_objects(objects),
+            Inner::Remote(r) if batch::is_open(r) => batch::put_objects(r, objects),
+            Inner::Remote(r) => r.put_objects_now(objects, None),
+            Inner::Replica(p) if batch::is_open(&p.remote) => {
+                batch::put_objects(&p.remote, objects)
+            }
+            Inner::Replica(p) => {
+                p.writable()?;
+                p.remote.put_objects_now(objects, Some(&p.after()))
+            }
+        }
+    }
+
+    /// On a server: applied at once under the orphan rule, keeping (and
+    /// not counting) the objects an open batch on this thread has queued,
+    /// which the server does not hold yet or whose grace the batch
+    /// refreshes when it finishes.
+    fn remove_objects(&self, ids: &[&str]) -> Result<usize, StoreError> {
+        let remote = match &self.inner {
+            Inner::Local(s) => return s.remove_objects(ids),
+            Inner::Remote(r) => r,
+            Inner::Replica(p) => &p.remote,
+        };
+        let keep = batch::queued_objects(remote).unwrap_or_default();
+        remote.remove_objects_now(ids, &keep)
+    }
+
+    fn orphan_objects(&self) -> Result<Vec<String>, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.orphan_objects(),
+            Inner::Remote(r) => r.orphan_objects(),
+            Inner::Replica(p) => p.remote.orphan_objects(),
+        }
+    }
+
+    fn prune_state_objects(&self, older_than: Duration) -> Result<usize, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.prune_state_objects(older_than),
+            Inner::Remote(r) => r.prune_state_objects(older_than),
+            Inner::Replica(p) => p.remote.prune_state_objects(older_than),
+        }
+    }
+
+    /// Remote and replica: the server's (what an open batch on this thread
+    /// queued for a key first).
+    fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.columns(envs),
+            Inner::Remote(r) => r.columns(envs),
+            Inner::Replica(p) => p.remote.columns(envs),
         }
     }
 
