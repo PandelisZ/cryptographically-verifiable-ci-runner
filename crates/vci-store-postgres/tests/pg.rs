@@ -1930,7 +1930,11 @@ fn upgrade_finish_closes_the_migration_window() {
     }
     put3(&fresh, &run, UNIT_B, &hex64(4), 20);
     assert_eq!(fresh.count().unwrap(), 2);
-    assert_eq!(fresh.upgrade_finish().unwrap(), Finish::Done, "idempotent");
+    assert_eq!(
+        fresh.upgrade_finish().unwrap(),
+        Finish::Already,
+        "idempotent: at version 2 already"
+    );
     assert_eq!(fresh.upgrade_begin().map_err(|e| e.to_string()), Ok(()));
 }
 

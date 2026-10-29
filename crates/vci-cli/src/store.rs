@@ -358,6 +358,10 @@ pub mod mem {
         lose: Mutex<Option<String>>,
         writes: AtomicUsize,
         batches: AtomicUsize,
+        /// How many times `columns` and `get_objects` were called: what a
+        /// server would answer with a request each.
+        columns_calls: AtomicUsize,
+        object_reads: AtomicUsize,
     }
 
     impl State {
@@ -472,6 +476,18 @@ pub mod mem {
         /// `remove`, `remove_manifests`), and batches opened.
         pub fn writes(&self) -> usize {
             self.state.writes.load(Ordering::SeqCst) + self.state.batches.load(Ordering::SeqCst)
+        }
+
+        /// How many times [`AttestationStore::columns`] was called (a
+        /// request each on a server).
+        pub fn columns_calls(&self) -> usize {
+            self.state.columns_calls.load(Ordering::SeqCst)
+        }
+
+        /// How many times [`AttestationStore::get_objects`] was called (a
+        /// request each on a server).
+        pub fn object_reads(&self) -> usize {
+            self.state.object_reads.load(Ordering::SeqCst)
         }
 
         /// The stored attestations' keys.
@@ -649,6 +665,7 @@ pub mod mem {
         }
 
         fn get_objects(&self, ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+            self.state.object_reads.fetch_add(1, Ordering::SeqCst);
             for id in ids {
                 key::check_object_id(id)?;
             }
@@ -748,6 +765,7 @@ pub mod mem {
         }
 
         fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
+            self.state.columns_calls.fetch_add(1, Ordering::SeqCst);
             let d = self.state.data.lock().unwrap();
             Ok(envs
                 .iter()

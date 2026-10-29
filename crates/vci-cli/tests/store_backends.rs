@@ -6,7 +6,7 @@
 //! server, and a replica of one), the publication gate of a shared store,
 //! failing open when a store cannot be used, git-meta when nothing is
 //! configured, and a vci 2.8 binary (`VCI_TEST_VCI_2_8`) on a SQLite file
-//! this vci wrote.
+//! and on a git-meta store this vci wrote.
 //!
 //! A copy of `fixtures/go-abcd` in a throwaway git repository. Needs `go`,
 //! `git` and `ssh-keygen` on PATH; every test prints `SKIPPED:` and returns
@@ -514,11 +514,17 @@ impl World {
 
     /// `vci run --key` of `units` (every unit when empty); it must exit 0.
     fn run(&self, units: &[&str]) -> Output {
+        self.run_env(units, &[])
+    }
+
+    /// [`World::run`] with `env` set (`VCI_STORE_RECORD_FORMAT=1` for a
+    /// run that stores format-1 records and their manifests, as 2.8 did).
+    fn run_env(&self, units: &[&str], env: &[(&str, &str)]) -> Output {
         let key = self.key.to_str().unwrap().to_owned();
         let mut args = vec!["run"];
         args.extend_from_slice(units);
         args.extend(["--key", &key]);
-        let out = self.vci(&args, &[]);
+        let out = self.vci(&args, env);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
         out
     }
@@ -727,12 +733,13 @@ fn prune_dry_run(w: &World) -> (Vec<String>, String) {
 }
 
 /// Edit a file: the plan runs that unit only. Its second attestation on
-/// this branch supersedes the first, and the first one's manifest, which
-/// nothing references any more, is removed: by the run itself on SQLite
-/// and libSQL's local file; on a shared store (PostgreSQL, a libSQL
-/// server), which keeps an unreferenced manifest put less than an hour ago
-/// (`manifest_grace`), by `vci prune`. `vci prune --dry-run` lists nothing
-/// else.
+/// this branch supersedes the first; a format-3 run (the default) stores
+/// no manifest, and the superseded run's objects are within their hour of
+/// grace, so `vci prune --dry-run` lists nothing. On a shared store
+/// (PostgreSQL, a libSQL server) the same again with `record_format = 1`,
+/// as 2.8 wrote: the superseded attestation's manifest, which nothing
+/// references any more, is kept by the run (`manifest_grace`: put less
+/// than an hour ago) and removed by `vci prune`, which lists nothing else.
 fn edit_supersede_prune(backend: Backend) {
     let kind = backend.kind;
     let shared = backend.shared;
@@ -748,12 +755,6 @@ fn edit_supersede_prune(backend: Backend) {
     let out = w.run(&["a"]);
     assert!(!stderr(&out).contains("superseded"), "{}", text(&out));
     let first = attested_keys(&out, kind)["a"].clone();
-    let first_root = stderr(&out)
-        .lines()
-        .find(|l| l.starts_with("vci: attested a ("))
-        .and_then(|l| l.split(", root ").nth(1))
-        .map(|r| r[..16].to_owned())
-        .unwrap();
     assert_eq!(w.info()["count"], UNITS.len() + 1);
     let (listed, _) = prune_dry_run(&w);
     assert!(
@@ -790,9 +791,48 @@ fn edit_supersede_prune(backend: Backend) {
         )),
         "{summary}"
     );
+    assert!(
+        listed.is_empty(),
+        "a format-3 run stores no manifest, and the superseded run's objects are within their grace: {listed:?}"
+    );
     if shared {
-        // Within the grace period, the run kept the orphan; prune (no
+        // The same with format-1 records: the first one's manifest is
+        // the orphan. Within the grace period, the run kept it; prune (no
         // grace) removes it, and only it.
+        let f1 = [("VCI_STORE_RECORD_FORMAT", "1")];
+        w.touch("a/a.go", "edit 3");
+        w.commit("edit a a third time");
+        let out = w.run_env(&["a"], &f1);
+        assert!(
+            stderr(&out).contains("vci: removed 1 superseded attestation(s) "),
+            "{}",
+            text(&out)
+        );
+        let first_root = stderr(&out)
+            .lines()
+            .find(|l| l.starts_with("vci: attested a ("))
+            .and_then(|l| l.split(", root ").nth(1))
+            .map(|r| r[..16].to_owned())
+            .unwrap();
+        let (listed, _) = prune_dry_run(&w);
+        assert!(listed.is_empty(), "its manifest is referenced: {listed:?}");
+        w.touch("a/a.go", "edit 4");
+        w.commit("edit a a fourth time");
+        let out = w.run_env(&["a"], &f1);
+        assert!(
+            stderr(&out).contains("vci: removed 1 superseded attestation(s) "),
+            "{}",
+            text(&out)
+        );
+        assert_eq!(w.info()["count"], UNITS.len() + 1, "one in, one out");
+        let (listed, summary) = prune_dry_run(&w);
+        assert!(
+            summary.contains(&format!(
+                "vci prune: 0 expired (dry run), {} current, 0 unreadable (left alone)",
+                UNITS.len() + 1
+            )),
+            "{summary}"
+        );
         assert_eq!(listed.len(), 1, "{listed:?}");
         let prefix = format!("would remove project vci:manifest:{first_root}");
         assert!(listed[0].starts_with(&prefix), "{listed:?}");
@@ -808,8 +848,6 @@ fn edit_supersede_prune(backend: Backend) {
         );
         let (listed, _) = prune_dry_run(&w);
         assert!(listed.is_empty(), "{listed:?}");
-    } else {
-        assert!(listed.is_empty(), "the run removed the orphan: {listed:?}");
     }
     assert!(
         summary.contains("unreferenced input manifest(s) (dry run)"),
@@ -1959,7 +1997,8 @@ fn a_libsql_server_that_blocks_writes_keeps_the_tests_exit_code() {
 /// does; on a libSQL server a base of 5,000,000 bytes or more is refused
 /// the same way) is not relied on: each unit's manifest is stored whole
 /// instead, so every unit `vci run` reports attested verifies, and the
-/// next plan skips it.
+/// next plan skips it. A format-1 run (`record_format = 1`): a format-3
+/// run stores no manifest.
 #[test]
 fn a_shared_input_manifest_the_store_refuses_is_not_relied_on() {
     use vci_store::AttestationStore as _;
@@ -1982,7 +2021,7 @@ fn a_shared_input_manifest_the_store_refuses_is_not_relied_on() {
     )])
     .unwrap();
     let key = w.key.to_str().unwrap().to_owned();
-    let out = w.vci(&["run", "--key", &key], &[]);
+    let out = w.vci(&["run", "--key", &key], &[("VCI_STORE_RECORD_FORMAT", "1")]);
     let all = text(&out);
     assert!(
         all.contains("vci: warning: storing the units' shared input manifest: ")
@@ -2003,7 +2042,7 @@ fn a_shared_input_manifest_the_store_refuses_is_not_relied_on() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. A vci 2.8 binary on a SQLite file this vci wrote.
+// 9. A vci 2.8 binary on a SQLite file and a git-meta store this vci wrote.
 
 /// The vci 2.8 binary `VCI_TEST_VCI_2_8` names, or `None` (the test is
 /// skipped, with a message) when it is unset. What it names must say it
@@ -2091,7 +2130,10 @@ fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
         assert_eq!(ids.len(), 4, "hdr, tables, shape, state: {ids:?}");
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         assert_eq!(s.get_objects(&refs).unwrap().len(), 4);
-        let a = all.iter().position(|e| e.key == keys["a"]).expect("a's record");
+        let a = all
+            .iter()
+            .position(|e| e.key == keys["a"])
+            .expect("a's record");
         (columns[a].clone(), ids)
     };
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
@@ -2112,7 +2154,11 @@ fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     {
         let s = SqliteStore::open_path(&file, SqliteOptions::default());
-        assert_eq!(s.list_all().unwrap().len(), UNITS.len(), "2.8 removed nothing");
+        assert_eq!(
+            s.list_all().unwrap().len(),
+            UNITS.len(),
+            "2.8 removed nothing"
+        );
         assert_eq!(s.get_objects(&id_refs).unwrap().len(), 4);
     }
 
@@ -2163,6 +2209,101 @@ fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
     let out = w.vci_other(&old, &["explain", "a", "--base-ref", "main"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(stdout(&out).contains("a: SKIP"), "{}", text(&out));
+    // This vci's prune reads the value under the frame's columns (the
+    // store holds a manifest: the migration window) and finds its
+    // manifest referenced: nothing is listed, nothing removed.
+    let roots = s.manifest_roots().unwrap();
+    assert!(!roots.is_empty(), "2.8 stored a's manifest");
+    let (listed, summary) = prune_dry_run(&w);
+    assert!(listed.is_empty(), "{listed:?}\n{summary}");
+    let out = w.vci(&["prune"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out), "", "{}", text(&out));
+    assert_eq!(s.manifest_roots().unwrap(), roots);
+    assert_eq!(s.list_all().unwrap().len(), UNITS.len());
+    // 2.8's own prune on the mixed store removes no manifest (STORE-V2
+    // section 5 step 3: a record it cannot read keeps every manifest).
+    let out = w.vci_other(&old, &["prune", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        !stdout(&out).contains("vci:manifest:"),
+        "2.8 would remove no manifest: {}",
+        text(&out)
+    );
+    let out = w.vci_other(&old, &["prune"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        s.manifest_roots().unwrap(),
+        roots,
+        "2.8 removed no manifest"
+    );
+    assert_eq!(s.list_all().unwrap().len(), UNITS.len());
+    assert_eq!(s.get_objects(&id_refs).unwrap().len(), 4);
+}
+
+/// A vci 2.8 binary on the git-meta store this vci wrote (STORE-V2 section
+/// 5, gate 5): it lists the attestation keys it knows (unchanged), ignores
+/// the `vci:object:` keys, reads frames it cannot parse and runs every
+/// unit (fail open) with no error; its `vci prune` deletes nothing (a
+/// record it cannot read keeps every manifest, and it never deletes a key
+/// it does not parse); its own `vci run a` stores a format-1 value, which
+/// this vci reads beside the objects, every unit skipped.
+#[test]
+fn a_2_8_binary_fails_open_on_a_format_3_git_meta_store() {
+    let Some(old) = vci_2_8() else {
+        return;
+    };
+    let Some(w) = World::new(Backend::git_meta()) else {
+        return;
+    };
+    attest_all(&w);
+    assert_eq!(w.info()["count"], UNITS.len());
+
+    // 2.8 plans: exit 0, nothing it calls an error, every unit runs.
+    let out = w.vci_other(&old, &["plan", "--base-ref", "main", "--format", "json"]);
+    let plan = parse_plan(&out);
+    assert_eq!(plan.run, set(UNITS), "{plan:?}");
+    assert!(plan.skip.is_empty(), "{plan:?}");
+    assert!(
+        !stderr(&out).contains("error"),
+        "2.8 reports no error:\n{}",
+        stderr(&out)
+    );
+    let out = w.vci_other(&old, &["explain", "a", "--base-ref", "main"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    // 2.8's prune: nothing listed, nothing deleted; this vci still skips.
+    let out = w.vci_other(&old, &["prune", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out), "", "{}", text(&out));
+    let out = w.vci_other(&old, &["prune"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out), "", "{}", text(&out));
+    assert_eq!(w.info()["count"], UNITS.len(), "2.8 removed nothing");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(
+        plan.skip,
+        set(UNITS),
+        "the frames and their objects are intact: {plan:?}"
+    );
+
+    // 2.8 runs a and stores it as it always did; this vci skips every
+    // unit, a on 2.8's row.
+    let key_path = w.key.to_str().unwrap().to_owned();
+    let out = w.vci_other(&old, &["run", "a", "--key", &key_path]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let new_keys = attested_keys(&out, "git-meta");
+    assert_eq!(new_keys.len(), 1, "{}", text(&out));
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+    assert_eq!(plan.by["a"].0, new_keys["a"], "{plan:?}");
+    assert_eq!(w.info()["count"], UNITS.len());
+    // 2.8's prune on the mixed store: a's manifest is referenced, the
+    // frames keep the rest; nothing goes.
+    let out = w.vci_other(&old, &["prune"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out), "", "{}", text(&out));
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2304,8 +2445,10 @@ fn sqlite_store_upgrade_begins_and_finishes() {
 /// references them, the state object goes at `--older-than 0` whether or
 /// not one does, and the orphans go once their hour of grace has passed
 /// (aged here behind the store's back), on `--objects` alone, which
-/// leaves every attestation as it is. The world's own format-1 rows are
-/// read as before and kept.
+/// leaves every attestation as it is. The world's own format-3 rows are
+/// described by their columns and kept without a read; its run's state
+/// object goes with the test's at `--older-than 0`, its other objects stay
+/// referenced.
 #[test]
 fn sqlite_prunes_format_3_records_by_columns_confirmed_by_the_statement() {
     let Some(w) = World::new(Backend::sqlite()) else {
@@ -2402,8 +2545,8 @@ fn sqlite_prunes_format_3_records_by_columns_confirmed_by_the_statement() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(stdout(&out), "");
     assert!(
-        stderr(&out).contains("vci prune: 1 state object(s) older than 0 day(s) removed"),
-        "{}",
+        stderr(&out).contains("vci prune: 2 state object(s) older than 0 day(s) removed"),
+        "the test's run's and the world's own run's: {}",
         text(&out)
     );
     assert!(!stderr(&out).contains(" expired"), "{}", text(&out));
@@ -2457,4 +2600,257 @@ fn sqlite_prunes_format_3_records_by_columns_confirmed_by_the_statement() {
     );
     let (plan, _) = w.plan(&[]);
     assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+}
+
+/// During the migration window (STORE-V2 section 5) a vci 2.8 that reuses
+/// a frame's slot leaves the frame's columns (`format = 3`, its expiry and
+/// object ids) beside its format-1 value, whose `manifestRef` names a
+/// stored manifest. `vci prune` never takes a column for the row's format:
+/// while the store holds an input manifest every row is read, the value
+/// under the stale columns is a format-1 record that references its
+/// manifest, and the manifest is neither listed nor removed. Here the
+/// slot is reused by this vci with `record_format = 1` and the frame's
+/// columns put back behind the store's back, as 2.8's upsert leaves them.
+#[test]
+fn sqlite_prune_reads_a_format_1_value_under_a_frames_columns_before_counting_manifests() {
+    let Some(w) = World::new(Backend::sqlite()) else {
+        return;
+    };
+    let out = attest_all(&w);
+    let keys = attested_keys(&out, "sqlite");
+    let file = w.work.join(".git/vci-store.sqlite");
+    let out = w.run_env(&["a"], &[("VCI_STORE_RECORD_FORMAT", "1")]);
+    let a_key = attested_keys(&out, "sqlite")["a"].clone();
+    assert_eq!(
+        slot_and_tree(&a_key).0,
+        slot_and_tree(&keys["a"]).0,
+        "the same inputs: the same slot"
+    );
+    {
+        let db = rusqlite::Connection::open(&file).unwrap();
+        let n = db
+            .execute(
+                "UPDATE attestations SET format = 3,
+                   expires = (SELECT expires FROM attestations WHERE key = ?2),
+                   hdr = (SELECT hdr FROM attestations WHERE key = ?2),
+                   tables_id = (SELECT tables_id FROM attestations WHERE key = ?2),
+                   shape = (SELECT shape FROM attestations WHERE key = ?2),
+                   state_obj = (SELECT state_obj FROM attestations WHERE key = ?2)
+                 WHERE key = ?1",
+                rusqlite::params![a_key, keys["b"]],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+    let roots = {
+        let s = SqliteStore::open_path(&file, SqliteOptions::default());
+        let all = s.read_all().unwrap();
+        let row = all.iter().find(|e| e.key == a_key).expect("a's row");
+        assert!(
+            matches!(decode_record(&row.bytes), Ok(Record::FormatOne(_))),
+            "a format-1 value"
+        );
+        assert_eq!(
+            s.columns(&[row]).unwrap()[0].format,
+            Some(3),
+            "under the frame's columns"
+        );
+        let roots = s.manifest_roots().unwrap();
+        assert!(!roots.is_empty(), "its manifest is stored");
+        roots
+    };
+    let (listed, summary) = prune_dry_run(&w);
+    assert!(
+        listed.is_empty(),
+        "the value under the frame's columns references its manifest: {listed:?}\n{summary}"
+    );
+    assert!(
+        summary.contains(&format!(
+            "vci prune: 0 expired (dry run), {} current, 0 unreadable (left alone)",
+            UNITS.len()
+        )) && summary.contains("vci prune: 0 unreferenced input manifest(s) (dry run)"),
+        "{summary}"
+    );
+    let out = w.vci(&["prune"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out), "", "{}", text(&out));
+    assert!(
+        stderr(&out).contains("vci prune: 0 unreferenced input manifest(s) removed"),
+        "{}",
+        text(&out)
+    );
+    let s = SqliteStore::open_path(&file, SqliteOptions::default());
+    assert_eq!(s.manifest_roots().unwrap(), roots, "every manifest stays");
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+}
+
+/// `vci prune --superseded` (and `--keep`) on a store with columns orders
+/// a unit's records by the hint in their keys only to choose which units
+/// to read: a unit with a record beyond `keep` by the hints has its
+/// records read, and the signed `issuedAt` decides which are the newest.
+/// A key hint edited to make an older record the newest costs the unit's
+/// reads and never the deletion of the genuinely newer record.
+#[test]
+fn sqlite_prune_keep_orders_a_unit_by_the_signed_issue_time_not_by_the_key_hint() {
+    let Some(w) = World::new(Backend::sqlite()) else {
+        return;
+    };
+    attest_all(&w);
+    let file = w.work.join(".git/vci-store.sqlite");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let run = Run3::build(&["a/a.go", "a/a_test.go"]);
+    let older = frame_of(&run, now - 7_200, now + 31_000_000, now + 31_000_000);
+    let newer = frame_of(&run, now - 3_600, now + 31_000_000, now + 31_000_000);
+    let signer = "4".repeat(16);
+    let put = |s: &SqliteStore, sk: &str, issued: i64, (frame, columns): &(Vec<u8>, Columns)| {
+        let hint = vci_store::KeyHint { issued, tree: None };
+        let e = s
+            .put(
+                &NewAttestation::for_test("a", &signer, sk, Some(&hint), frame)
+                    .with_columns(columns),
+            )
+            .unwrap();
+        (e.key, e.target)
+    };
+    let ((k_older, target), (k_newer, _)) = {
+        let s = SqliteStore::open_path(&file, SqliteOptions::default());
+        assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
+        (
+            put(&s, "e1", now - 7_200, &older),
+            put(&s, "e2", now - 3_600, &newer),
+        )
+    };
+    // The older record's key hint edited to say it was issued just now.
+    let lying = vci_store::key::attestation_key_hinted(
+        &vci_store::key::test_key("a"),
+        &signer,
+        "e1",
+        &vci_store::KeyHint {
+            issued: now,
+            tree: None,
+        },
+    );
+    {
+        let db = rusqlite::Connection::open(&file).unwrap();
+        let n = db
+            .execute(
+                "UPDATE attestations SET key = ?2, issued = ?3 WHERE key = ?1",
+                rusqlite::params![k_older, lying, now],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+    let out = w.vci(&["prune", "--superseded"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        stdout(&out),
+        format!("removed {target} {lying} (superseded)\n"),
+        "the record whose signed issuedAt is older goes, whatever its hint says: {}",
+        text(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains(&format!(
+            "vci prune: {target} {k_newer}: left alone: its signed statement does not confirm the store's columns"
+        )) && err.contains(&format!(
+            "vci prune: 0 expired, 1 superseded, {} current, 0 unreadable (left alone), 1 unconfirmed (left alone)",
+            UNITS.len() + 1
+        )),
+        "{err}"
+    );
+    let s = SqliteStore::open_path(&file, SqliteOptions::default());
+    let left: BTreeSet<String> = s.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert!(
+        left.contains(&k_newer) && !left.contains(&lying),
+        "{left:?}"
+    );
+    assert_eq!(left.len(), UNITS.len() + 1);
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+}
+
+/// `vci store upgrade --begin` and `--finish` on PostgreSQL (STORE-V2
+/// section 5 step 4), as on SQLite: `--finish` is refused with the count
+/// while a format-1 attestation remains, and once only format-3 records
+/// remain it drops the manifests and sets schema version 2, which `vci
+/// store info` reports and a second `--finish` finds done; the frame and
+/// its objects are still read.
+#[test]
+fn postgres_store_upgrade_begins_and_finishes() {
+    let Some(b) = Backend::postgres() else { return };
+    let Some(w) = World::new(b) else { return };
+    let key = w.key.to_str().unwrap().to_owned();
+    let out = w.vci(&["run", "--key", &key], &[("VCI_STORE_RECORD_FORMAT", "1")]);
+    assert_eq!(
+        attested_keys(&out, "postgres").len(),
+        UNITS.len(),
+        "{}",
+        text(&out)
+    );
+    let out = w.vci(&["store", "upgrade", "--begin"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("the format-3 columns and tables are present"),
+        "{}",
+        text(&out)
+    );
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stdout(&out).contains(&format!(
+            "not finished: {} attestation(s) are not format-3 records",
+            UNITS.len()
+        )),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(w.info()["schemaVersion"], 1);
+
+    // Only format-3 records remain: a run's objects and one frame.
+    let run = Run3::build(&["a/a.go", "a/a_test.go"]);
+    let (frame, columns) = frame_of(&run, 1_700_000_000, 1_900_000_000, 1_900_000_000);
+    let s = w.backend.db.as_ref().unwrap().open();
+    let all = s.list_all().unwrap();
+    assert_eq!(s.remove(all).unwrap().len(), UNITS.len());
+    assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
+    let hint = vci_store::KeyHint {
+        issued: 1_700_000_000,
+        tree: None,
+    };
+    s.put(
+        &NewAttestation::for_test("a", &"3".repeat(16), "aa", Some(&hint), &frame)
+            .with_columns(&columns),
+    )
+    .unwrap();
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("upgraded to schema version 2"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(w.info()["schemaVersion"], 2);
+    assert_eq!(w.info()["count"], 1);
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("at schema version 2 already"),
+        "{}",
+        text(&out)
+    );
+    let out = w.vci(&["store", "upgrade", "--begin"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let s = w.backend.db.as_ref().unwrap().open();
+    assert_eq!(s.get_objects(&run.id_refs()).unwrap().len(), 4);
+    assert_eq!(s.list_all().unwrap().len(), 1);
+    let (listed, summary) = prune_dry_run(&w);
+    assert!(listed.is_empty(), "{listed:?}");
+    assert!(
+        summary.contains("vci prune: 0 expired (dry run), 1 current, 0 unreadable (left alone)"),
+        "{summary}"
+    );
 }

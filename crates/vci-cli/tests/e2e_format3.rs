@@ -1,6 +1,7 @@
 //! The plan over a store format 3 record (STORE-V2 section 1.5): a unit's
-//! format-1 attestation, as `vci run` 2.8 stores it, is rewritten by the
-//! test into the four objects of section 1.3, a v2 statement signed by the
+//! format-1 attestation, as `vci run` 2.8 stores it (here `vci run` with
+//! `record_format = 1`), is rewritten by the test into the four objects of
+//! section 1.3, a v2 statement signed by the
 //! same key and the text frame of section 1.2 (exactly what `vci run` 2.9
 //! writes once run.rs is on format 3), and `vci plan` must then skip the
 //! unit from the frame alone, name the entry that changed when its fixture
@@ -179,8 +180,13 @@ impl World {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// `vci run B` writing a format-1 record (`record_format = 1`: what
+    /// `vci run` 2.8 stores, which [`rewrite_as_format3`] then rewrites by
+    /// hand; a run under the format-3 default would store the frame
+    /// itself).
     fn run(&self, env: &[(&str, &str)]) {
-        self.vci_ok(&["run", B, "--key", self.key.to_str().unwrap()], env);
+        let env = [env, &[("VCI_STORE_RECORD_FORMAT", "1")]].concat();
+        self.vci_ok(&["run", B, "--key", self.key.to_str().unwrap()], &env);
     }
 
     /// (skipped, run) of `vci plan --base-ref main`.

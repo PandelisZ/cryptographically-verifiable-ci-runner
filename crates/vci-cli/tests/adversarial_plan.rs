@@ -310,7 +310,7 @@ impl World {
         let tk = vci_core::test_key(unit);
         let mut rows: Vec<Row> = db
             .prepare(
-                "SELECT key, signer, storage_key, issued, tree16, value, format, hdr, tables_id, shape, state_obj
+                "SELECT key, signer, issued, tree16, value, format, hdr, tables_id, shape, state_obj
                  FROM attestations WHERE test_key = ?1",
             )
             .unwrap()
@@ -318,15 +318,14 @@ impl World {
                 Ok(Row {
                     key: r.get(0)?,
                     signer: r.get(1)?,
-                    storage_key: r.get(2)?,
-                    issued: r.get(3)?,
-                    tree16: r.get(4)?,
-                    value: r.get(5)?,
-                    format: r.get(6)?,
-                    hdr: r.get(7)?,
-                    tables: r.get(8)?,
-                    shape: r.get(9)?,
-                    state_obj: r.get(10)?,
+                    issued: r.get(2)?,
+                    tree16: r.get(3)?,
+                    value: r.get(4)?,
+                    format: r.get(5)?,
+                    hdr: r.get(6)?,
+                    tables: r.get(7)?,
+                    shape: r.get(8)?,
+                    state_obj: r.get(9)?,
                 })
             })
             .unwrap()
@@ -384,7 +383,6 @@ impl World {
 struct Row {
     key: String,
     signer: String,
-    storage_key: String,
     issued: Option<i64>,
     tree16: Option<String>,
     value: Vec<u8>,
@@ -613,6 +611,11 @@ fn a_record_under_another_trusted_signers_segment_fails_signer() {
     assert_eq!(run, set(&[B]), "B runs: {run:?} skip {skip:?}");
     let ex = w.explain(B);
     assert!(ex.contains("failed check: signer"), "{ex}");
+    assert!(
+        ex.contains("signer id (the store key's signer segment)")
+            && ex.contains(&format!("{mine} (the signer id of the verified key)")),
+        "the check's text names the segment and the verified key's id: {ex}"
+    );
     assert!(ex.contains(&other), "{ex}");
     assert!(ex.contains(&mine), "{ex}");
     assert!(

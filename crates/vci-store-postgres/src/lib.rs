@@ -369,6 +369,7 @@ impl PgStore {
     /// dropped and the version set to 2 in one transaction, after which a
     /// 2.8 vci refuses the schema as newer than it; otherwise
     /// [`Finish::FormatOneRows`] says how many such rows remain and
+    /// nothing changes; at version 2 already, [`Finish::Already`] and
     /// nothing changes. Not undone: a version-2 schema cannot store a
     /// manifest again ([`StoreError::NotInitialized`]).
     pub fn upgrade_finish(&self) -> Result<Finish, StoreError> {

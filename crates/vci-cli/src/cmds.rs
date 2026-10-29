@@ -1862,8 +1862,9 @@ struct Pruned {
     expired: usize,
     kept: usize,
     unreadable: usize,
-    /// Candidates the columns named whose signed statement did not
-    /// confirm them (left alone; a store with columns only).
+    /// Candidates the columns or the key hints named whose signed
+    /// statement did not confirm them (left alone; a store with columns
+    /// only).
     unconfirmed: usize,
     older: usize,
     /// Manifests the remaining attestations reference; `None` once one of
@@ -1882,11 +1883,14 @@ struct Pruned {
 /// Since 2.9 (store format 3): on a store that keeps listing columns
 /// (SQLite, PostgreSQL, libSQL) the listing's columns and key hints say
 /// which records are expired or beyond `--keep` without a value read, and
-/// those candidates alone are read, their signed statement confirming the
-/// columns before a delete ([`prune_by_columns`]); a format-1 row, or one
-/// without columns, is read as before. Then the objects no attestation
-/// references and the state objects older than `explain_hashes_days` (or
-/// `--older-than`) go; `--objects` does only that.
+/// those candidates (and, for `--keep`, the rest of their unit's records)
+/// alone are read, their signed statement deciding before a delete
+/// ([`prune_by_columns`]); a format-1 row, or one without columns, is read
+/// as before, and so is every row while the store holds an input manifest
+/// (a vci 2.8 may have written a format-1 value under a frame's columns).
+/// Then the objects no attestation references and the state objects older
+/// than `explain_hashes_days` (or `--older-than`) go; `--objects` does
+/// only that.
 pub fn prune(args: PruneArgs) -> Result<i32> {
     let PruneArgs {
         dry_run,
@@ -2059,16 +2063,19 @@ fn prune_by_values(
     Ok(p)
 }
 
-/// Why a listed record is a candidate for deletion on a store with
-/// columns, from its columns and key hint alone; its signed statement
-/// confirms it before a delete.
+/// What a listed record is read for on a store with columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Why {
-    /// The `expires` column says it has expired.
+enum Role {
+    /// The columns do not describe it (a format-1 row, which has none; a
+    /// record without a hint; a frame put without columns), or the store
+    /// is in the migration window: read and treated as before.
+    Read,
+    /// The `expires` column says it has expired: a candidate the signed
+    /// statement must confirm.
     Expired,
-    /// The key hint's `issued` puts it beyond `keep` for its unit and
-    /// signer, and the hint's tree is at no ref's tip.
-    Superseded,
+    /// Its unit and signer have a row beyond `keep` by the hints (or a row
+    /// read whole): the signed statements order the group.
+    Contested,
 }
 
 /// The attestations pass on a store with listing columns (STORE-V2 section
@@ -2077,11 +2084,18 @@ enum Why {
 /// the key hint, its issue time and tree, without a value read. A record
 /// the columns do not describe (a format-1 row, which has none; a record
 /// without a hint; a frame put without columns) is read and treated as
-/// before. The expired and the beyond-`keep` candidates are then read and
-/// deleted only when the signed statement agrees with the columns and the
-/// hint ([`confirm`]): the columns pre-filter and order, the value decides
-/// (`decode_record` by its first byte), so a store writer who edits a
-/// column can cause one extra value read, never a wrong deletion.
+/// before, and so is every record while the store holds an input manifest
+/// (the migration window of section 5: a vci 2.8 that reuses a frame's
+/// slot leaves the frame's columns beside its format-1 value, and only the
+/// value says what the row is and which manifest it references). The
+/// expired candidates are then read and deleted only when the signed
+/// statement agrees ([`confirm_expired`]); a unit and signer with a record
+/// beyond `keep` by the hints has every described record read, and the
+/// signed `issuedAt`, `expiresAt` and tree order the group as they do on a
+/// store without columns. The columns pre-filter and order, the value
+/// decides (`decode_record` by its first byte), so a store writer who
+/// edits a column or a key's hint can cause extra value reads (the row's,
+/// or its unit's), never a wrong deletion.
 fn prune_by_columns(
     store: &dyn AttestationStore,
     dry_run: bool,
@@ -2092,28 +2106,105 @@ fn prune_by_columns(
     let all = store.list_all()?;
     let refs: Vec<&StoredEnvelope> = all.iter().collect();
     let columns = store.columns(&refs)?;
-    let (mut described, mut to_read): (Vec<(StoredEnvelope, i64)>, Vec<StoredEnvelope>) =
-        (Vec::new(), Vec::new());
+    let window = !store.manifest_roots()?.is_empty();
+    let mut described: Vec<(StoredEnvelope, i64)> = Vec::new();
+    let mut rows: Vec<(StoredEnvelope, Role)> = Vec::new();
+    // The units and signers whose records the signed statements order.
+    let mut contested: BTreeSet<(String, String)> = BTreeSet::new();
     for (e, c) in all.into_iter().zip(columns) {
         match (c.format, c.expires, e.issued) {
-            (Some(3), Some(expires), Some(_)) => described.push((e, expires)),
-            _ => to_read.push(e),
+            (Some(3), Some(expires), Some(_)) if !window => described.push((e, expires)),
+            _ => {
+                contested.insert((e.test_key.clone(), e.signer.clone()));
+                rows.push((e, Role::Read));
+            }
         }
     }
     let mut p = Pruned {
         referenced: Some(BTreeSet::new()),
         ..Pruned::default()
     };
-    // The records read whole, as before: what they say decides.
-    if !to_read.is_empty() {
-        let mut refs: Vec<&mut StoredEnvelope> = to_read.iter_mut().collect();
+    // The described records: expired by the column, to confirm; the rest
+    // ordered by the hints, and the groups with a record beyond `keep`
+    // (not on a tree at some ref's tip) read whole.
+    let mut by_hint: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
+    let mut hinted: Vec<StoredEnvelope> = Vec::new();
+    for (e, expires) in described {
+        if expires <= now {
+            rows.push((e, Role::Expired));
+        } else {
+            by_hint
+                .entry((e.test_key.clone(), e.signer.clone()))
+                .or_default()
+                .push((e.issued.expect("described"), e.key.clone()));
+            hinted.push(e);
+        }
+    }
+    let keep_by_hint = keep_newest(&mut by_hint, keep);
+    let mut hint_doomed: BTreeSet<String> = BTreeSet::new();
+    for e in &hinted {
+        let live = e
+            .tree
+            .as_deref()
+            .is_some_and(|t16| live_trees.iter().any(|t| t.starts_with(t16)));
+        if !keep_by_hint.contains(&e.key) && !live {
+            hint_doomed.insert(e.key.clone());
+            contested.insert((e.test_key.clone(), e.signer.clone()));
+        }
+    }
+    for e in hinted {
+        if contested.contains(&(e.test_key.clone(), e.signer.clone())) {
+            rows.push((e, Role::Contested));
+        } else {
+            // Current without a read: outside the window no manifest
+            // exists for it to reference.
+            p.kept += 1;
+        }
+    }
+    // One read of everything the statements must decide.
+    if !rows.is_empty() {
+        let mut refs: Vec<&mut StoredEnvelope> = rows.iter_mut().map(|(e, _)| e).collect();
         store.read_values(&mut refs)?;
     }
     let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
     let mut current: Vec<(EnvelopeMeta, StoredEnvelope)> = Vec::new();
-    for e in to_read {
+    let unreadable = |p: &mut Pruned, e: &StoredEnvelope| {
+        p.unreadable += 1;
+        // Left alone, so whatever it references stays: the manifest it
+        // names when that much can be read, else none is removed.
+        let r = unreadable_manifest_ref(&e.bytes);
+        match (r, p.referenced.as_mut()) {
+            (Some(r), Some(set)) => {
+                set.insert(r);
+            }
+            (Some(_), None) => {}
+            (None, _) => p.referenced = None,
+        }
+    };
+    for (e, role) in rows {
         if e.error.is_some() {
             p.referenced = None;
+        }
+        if role == Role::Expired {
+            match confirm_expired(&e, now) {
+                Ok(()) => {
+                    p.expired += 1;
+                    delete(store, dry_run, &e, "")?;
+                }
+                Err(Left::Unreadable) => unreadable(&mut p, &e),
+                Err(Left::Unconfirmed(m)) => {
+                    p.unconfirmed += 1;
+                    p.kept += 1;
+                    eprintln!(
+                        "vci prune: {} {}: left alone: its signed statement does not confirm the store's columns",
+                        e.target, e.key
+                    );
+                    if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
+                        set.insert(r.clone());
+                    }
+                }
+            }
+            continue;
         }
         match record_meta(&e.bytes) {
             Some(m) if m.expires_at <= now => {
@@ -2128,36 +2219,11 @@ fn prune_by_columns(
                     .push((m.issued_at, e.key.clone()));
                 current.push((m, e));
             }
-            None => {
-                p.unreadable += 1;
-                let r = unreadable_manifest_ref(&e.bytes);
-                match (r, p.referenced.as_mut()) {
-                    (Some(r), Some(set)) => {
-                        set.insert(r);
-                    }
-                    (Some(_), None) => {}
-                    (None, _) => p.referenced = None,
-                }
-            }
+            None => unreadable(&mut p, &e),
         }
     }
-    // The records the columns describe: candidates by the columns and the
-    // hint, read below; the rest current without a read (a format-3
-    // record names no stored manifest).
-    let mut candidates: Vec<(StoredEnvelope, Why)> = Vec::new();
-    let mut by_hint: Vec<StoredEnvelope> = Vec::new();
-    for (e, expires) in described {
-        if expires <= now {
-            candidates.push((e, Why::Expired));
-        } else {
-            p.kept += 1;
-            by_unit
-                .entry((e.test_key.clone(), e.signer.clone()))
-                .or_default()
-                .push((e.issued.expect("described"), e.key.clone()));
-            by_hint.push(e);
-        }
-    }
+    // The keys kept per unit and signer: the `keep` newest by the signed
+    // issue time.
     let keep_keys = keep_newest(&mut by_unit, keep);
     for (m, e) in current {
         let live = m.tree.as_deref().is_some_and(|t| live_trees.contains(t));
@@ -2165,66 +2231,23 @@ fn prune_by_columns(
             if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
                 set.insert(r.clone());
             }
+            if hint_doomed.contains(&e.key) {
+                p.unconfirmed += 1;
+                eprintln!(
+                    "vci prune: {} {}: left alone: its signed statement does not confirm the store's columns",
+                    e.target, e.key
+                );
+            }
             continue;
         }
         p.older += 1;
         p.kept -= 1;
         delete(store, dry_run, &e, " (superseded)")?;
     }
-    for e in by_hint {
-        let live = e
-            .tree
-            .as_deref()
-            .is_some_and(|t16| live_trees.iter().any(|t| t.starts_with(t16)));
-        if keep_keys.contains(&e.key) || live {
-            continue;
-        }
-        p.kept -= 1;
-        candidates.push((e, Why::Superseded));
-    }
-    // The confirming read: the candidates' values, in one call.
-    if !candidates.is_empty() {
-        let mut refs: Vec<&mut StoredEnvelope> = candidates.iter_mut().map(|(e, _)| e).collect();
-        store.read_values(&mut refs)?;
-    }
-    for (e, why) in candidates {
-        match confirm(&e, why, live_trees, now) {
-            Ok(Why::Expired) => {
-                p.expired += 1;
-                delete(store, dry_run, &e, "")?;
-            }
-            Ok(Why::Superseded) => {
-                p.older += 1;
-                delete(store, dry_run, &e, " (superseded)")?;
-            }
-            Err(Left::Unreadable) => {
-                p.unreadable += 1;
-                let r = unreadable_manifest_ref(&e.bytes);
-                match (r, p.referenced.as_mut()) {
-                    (Some(r), Some(set)) => {
-                        set.insert(r);
-                    }
-                    (Some(_), None) => {}
-                    (None, _) => p.referenced = None,
-                }
-            }
-            Err(Left::Unconfirmed(m)) => {
-                p.unconfirmed += 1;
-                p.kept += 1;
-                eprintln!(
-                    "vci prune: {} {}: left alone: its signed statement does not confirm the store's columns",
-                    e.target, e.key
-                );
-                if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
-                    set.insert(r.clone());
-                }
-            }
-        }
-    }
     Ok(p)
 }
 
-/// Why a candidate was left alone ([`confirm`]).
+/// Why a candidate was left alone ([`confirm_expired`]).
 enum Left {
     /// Its value could not be read or is no record.
     Unreadable,
@@ -2233,36 +2256,19 @@ enum Left {
     Unconfirmed(Box<EnvelopeMeta>),
 }
 
-/// Whether the signed statement of a read candidate agrees with the columns
-/// and the hint that named it: an expired candidate's `expiresAt` has
-/// passed; a superseded candidate's `issuedAt` is the hint's `issued` (the
-/// ordering it lost was on its signed value), its `expiresAt` has not
-/// passed (else it is expired), and its signed tree is at no ref's tip.
-/// A format-1 value in the slot (a vci 2.8 wrote it over a frame during the
-/// migration window, leaving the frame's columns) is read through today's
-/// envelope path: the columns never choose the parser.
-fn confirm(
-    e: &StoredEnvelope,
-    why: Why,
-    live_trees: &BTreeSet<String>,
-    now: i64,
-) -> Result<Why, Left> {
+/// Whether the signed statement of a read candidate agrees with the
+/// `expires` column that named it: its `expiresAt` has passed. A format-1
+/// value in the slot (a vci 2.8 wrote it over a frame during the migration
+/// window, leaving the frame's columns) is read through today's envelope
+/// path: the columns never choose the parser.
+fn confirm_expired(e: &StoredEnvelope, now: i64) -> Result<(), Left> {
     let Some(m) = record_meta(&e.bytes) else {
         return Err(Left::Unreadable);
     };
     if m.expires_at <= now {
-        return Ok(Why::Expired);
-    }
-    match why {
-        Why::Expired => Err(Left::Unconfirmed(Box::new(m))),
-        Why::Superseded => {
-            let live = m.tree.as_deref().is_some_and(|t| live_trees.contains(t));
-            if Some(m.issued_at) == e.issued && !live {
-                Ok(Why::Superseded)
-            } else {
-                Err(Left::Unconfirmed(Box::new(m)))
-            }
-        }
+        Ok(())
+    } else {
+        Err(Left::Unconfirmed(Box::new(m)))
     }
 }
 
@@ -2309,7 +2315,9 @@ fn unreadable_manifest_ref(bytes: &[u8]) -> Option<String> {
 
 /// The manifests pass: the base manifests the referenced ones list their
 /// entries on top of (vci 2.1.8) are referenced too; then every stored
-/// manifest nothing references goes. Returns how many.
+/// manifest nothing references goes. Returns how many went (on a dry run,
+/// how many would): one the backend kept by its own rule is said so and
+/// not counted.
 fn prune_manifests(
     store: &dyn AttestationStore,
     dry_run: bool,
@@ -2351,13 +2359,21 @@ fn prune_manifests(
                 if set.contains(&root) {
                     continue;
                 }
-                manifests += 1;
                 let key = vci_git::manifest_key(&root);
                 if dry_run {
+                    manifests += 1;
                     println!("would remove project {key} (unreferenced manifest)");
-                } else {
-                    store.remove_manifests(&[root.as_str()])?;
+                } else if store.remove_manifests(&[root.as_str()])? == 1 {
+                    manifests += 1;
                     println!("removed project {key} (unreferenced manifest)");
+                } else {
+                    // The backend's own rule kept it: a referrer it knows
+                    // of (a writer that stored one since the listing), or
+                    // its grace period on a shared store.
+                    eprintln!(
+                        "vci prune: project {key}: kept by the {} store (referenced, or put within its grace period)",
+                        store.kind()
+                    );
                 }
             }
         }
@@ -2592,6 +2608,7 @@ pub fn store_upgrade(begin: bool) -> Result<i32> {
             } else {
                 let f = match store.upgrade_finish()? {
                     vci_store_postgres::Finish::Done => Done::Finished,
+                    vci_store_postgres::Finish::Already => Done::Already,
                     vci_store_postgres::Finish::FormatOneRows(n) => {
                         Done::FormatOneRows(usize::try_from(n).unwrap_or(usize::MAX))
                     }
@@ -2787,82 +2804,34 @@ mod tests {
         e
     }
 
-    /// The columns and the hint only name a candidate: the signed
-    /// statement decides. An expired column is confirmed by a signed
-    /// `expiresAt` that has passed, in either format (a 2.8 writer's
-    /// format-1 value under a frame's columns included); a superseded
-    /// candidate by a signed `issuedAt` equal to the hint's and a tree at no
-    /// ref's tip; anything else is left alone, and a value that is no
-    /// record is unreadable.
+    /// The `expires` column only names a candidate: the signed statement
+    /// decides. It is confirmed by a signed `expiresAt` that has passed, in
+    /// either format (a 2.8 writer's format-1 value under a frame's
+    /// columns included); a statement that says otherwise leaves the
+    /// record alone with what it references, and a value that is no record
+    /// is unreadable.
     #[test]
     fn confirm_deletes_only_what_the_signed_statement_says() {
         let now = 5_000;
-        let live: BTreeSet<String> = ["t".repeat(40)].into_iter().collect();
-        let t16 = "t".repeat(16);
         for (what, bytes) in [
             ("format 1", both_formats(&statement(1_000, 2_000, None)).0),
             ("format 3", both_formats(&statement(1_000, 2_000, None)).1),
         ] {
             let e = candidate(1_000, None, bytes);
-            assert!(
-                matches!(confirm(&e, Why::Expired, &live, now), Ok(Why::Expired)),
-                "{what}"
-            );
-            // Expired by the signed statement, whatever named it.
-            assert!(
-                matches!(confirm(&e, Why::Superseded, &live, now), Ok(Why::Expired)),
-                "{what}"
-            );
+            assert!(confirm_expired(&e, now).is_ok(), "{what}");
         }
         // The column said expired; the statement says not.
         let e = candidate(1_000, None, both_formats(&statement(1_000, 9_000, None)).1);
         assert!(matches!(
-            confirm(&e, Why::Expired, &live, now),
-            Err(Left::Unconfirmed(_))
-        ));
-        // Superseded: the signed issue time is the hint's and the tree is not live.
-        assert!(matches!(
-            confirm(&e, Why::Superseded, &live, now),
-            Ok(Why::Superseded)
-        ));
-        // The hint's issue time is not the signed one: the ordering was on
-        // store data, not on the statement.
-        let e = candidate(1_500, None, both_formats(&statement(1_000, 9_000, None)).1);
-        assert!(matches!(
-            confirm(&e, Why::Superseded, &live, now),
-            Err(Left::Unconfirmed(_))
-        ));
-        // The signed tree is at a ref's tip (whatever the hint said).
-        let e = candidate(
-            1_000,
-            Some(&t16),
-            both_formats(&statement(1_000, 9_000, Some(&"t".repeat(40)))).1,
-        );
-        assert!(matches!(
-            confirm(&e, Why::Superseded, &live, now),
-            Err(Left::Unconfirmed(_))
-        ));
-        let e = candidate(
-            1_000,
-            Some(&t16),
-            both_formats(&statement(1_000, 9_000, Some(&"u".repeat(40)))).0,
-        );
-        assert!(matches!(
-            confirm(&e, Why::Superseded, &live, now),
-            Ok(Why::Superseded)
+            confirm_expired(&e, now),
+            Err(Left::Unconfirmed(m)) if m.issued_at == 1_000
         ));
         // No record at all.
         let e = candidate(1_000, None, b"vci3z\n{}\nAA==\nAA==\n".to_vec());
-        assert!(matches!(
-            confirm(&e, Why::Expired, &live, now),
-            Err(Left::Unreadable)
-        ));
+        assert!(matches!(confirm_expired(&e, now), Err(Left::Unreadable)));
         let mut e = candidate(1_000, None, Vec::new());
         e.set_error("gone");
-        assert!(matches!(
-            confirm(&e, Why::Expired, &live, now),
-            Err(Left::Unreadable)
-        ));
+        assert!(matches!(confirm_expired(&e, now), Err(Left::Unreadable)));
     }
 
     /// Of each unit and signer, the `keep` newest by issue time are kept.

@@ -428,8 +428,12 @@ fn object_ids(
     BTreeSet<String>,
     BTreeSet<String>,
 ) {
-    let mut out: (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) =
-        Default::default();
+    let mut out: (
+        BTreeSet<String>,
+        BTreeSet<String>,
+        BTreeSet<String>,
+        BTreeSet<String>,
+    ) = Default::default();
     for r in all.values() {
         let c = &r.columns;
         out.0.extend(c.hdr.clone());
@@ -517,7 +521,11 @@ fn an_edited_input_at_the_next_commit_runs_its_unit_alone_and_the_rerun_shares_t
     w.write("NOTES", "first\n");
     w.commit("feature 1");
     w.run(&[], SQLITE);
-    assert_eq!(w.plan(SQLITE).0, set(UNITS), "the first run skips every unit");
+    assert_eq!(
+        w.plan(SQLITE).0,
+        set(UNITS),
+        "the first run skips every unit"
+    );
     let s = w.sqlite();
     let first = records(&s);
     assert_eq!(first.len(), UNITS.len());
@@ -532,7 +540,10 @@ fn an_edited_input_at_the_next_commit_runs_its_unit_alone_and_the_rerun_shares_t
     let attested_b_json = vci_core::blake3_hex(w.read("fixtures/b.json").as_bytes());
 
     // The same set (B still reads fixtures/b.json), another root.
-    w.write("fixtures/b.json", "{ \"greeting\": \"hello\", \"edited\": true }\n");
+    w.write(
+        "fixtures/b.json",
+        "{ \"greeting\": \"hello\", \"edited\": true }\n",
+    );
     w.commit("edit b.json");
     let (skip, run) = w.plan(SQLITE);
     assert_eq!(skip, set(&[A, C, D]), "the unchanged units skip");
@@ -551,7 +562,8 @@ fn an_edited_input_at_the_next_commit_runs_its_unit_alone_and_the_rerun_shares_t
 
     let out = w.run(&[B], &[SQLITE, &[("VCI_TIMING", "1")]].concat());
     assert!(
-        stderr(&out).contains("format-3 run: 1 hdr, 1 tables, 1 shape, 1 state object(s) over 1 unit(s)"),
+        stderr(&out)
+            .contains("format-3 run: 1 hdr, 1 tables, 1 shape, 1 state object(s) over 1 unit(s)"),
         "{}",
         stderr(&out)
     );
@@ -565,7 +577,10 @@ fn an_edited_input_at_the_next_commit_runs_its_unit_alone_and_the_rerun_shares_t
     assert!(!second.contains_key(&b_first), "B's first record is gone");
     let b = record_of(&second, B);
     assert_eq!(b.v2.as_ref().unwrap().commit, w.head());
-    assert_eq!(b.columns.hdr, b_hdr, "the hdr is shared with B's first record");
+    assert_eq!(
+        b.columns.hdr, b_hdr,
+        "the hdr is shared with B's first record"
+    );
     assert!(
         !shapes.contains(b.columns.shape.as_ref().unwrap()),
         "the second run's shape is new: {:?} not in {shapes:?}",
@@ -682,7 +697,10 @@ fn a_failing_unit_keeps_the_others_records(env: &[(&str, &str)]) {
         "{err}"
     );
     assert!(err.contains("vci: 3 attested, 1 not attested"), "{err}");
-    assert_eq!(attested_keys(&out).keys().cloned().collect::<BTreeSet<_>>(), set(&[A, C, D]));
+    assert_eq!(
+        attested_keys(&out).keys().cloned().collect::<BTreeSet<_>>(),
+        set(&[A, C, D])
+    );
     let (skip, run) = w.plan(env);
     assert_eq!(skip, set(&[A, C, D]), "what the run stored skips");
     assert_eq!(run, set(&[B]));
@@ -691,12 +709,19 @@ fn a_failing_unit_keeps_the_others_records(env: &[(&str, &str)]) {
         let all = records(&s);
         assert_eq!(all.len(), 3);
         let (hdrs, tables, shapes, states) = object_ids(&all);
-        assert_eq!((hdrs.len(), shapes.len(), states.len()), (3, 1, 1), "{hdrs:?}");
+        assert_eq!(
+            (hdrs.len(), shapes.len(), states.len()),
+            (3, 1, 1),
+            "{hdrs:?}"
+        );
         assert!(!tables.is_empty());
         let shape_id = shapes.iter().next().unwrap().as_str();
         let shape = Shape::decode(&s.get_objects(&[shape_id]).unwrap()[0].bytes).unwrap();
         let paths: BTreeSet<&str> = shape.entries.iter().map(|e| e.path.as_str()).collect();
-        assert!(paths.contains("src/a.ts") && paths.contains("src/d.ts"), "{paths:?}");
+        assert!(
+            paths.contains("src/a.ts") && paths.contains("src/d.ts"),
+            "{paths:?}"
+        );
         assert!(
             !paths.contains("src/b.ts") && !paths.contains("fixtures/b.json"),
             "B's inputs are not in the shape: {paths:?}"
@@ -759,7 +784,10 @@ fn explain_prints_the_format_1_entry_text_with_the_unsigned_label_or_not_loaded(
             && expected1.contains(&vci_core::blake3_hex(original.as_bytes())),
         "{expected1}"
     );
-    assert!(actual1.contains(&vci_core::blake3_hex(edited.as_bytes())), "{actual1}");
+    assert!(
+        actual1.contains(&vci_core::blake3_hex(edited.as_bytes())),
+        "{actual1}"
+    );
     assert!(!three.contains(HASH_NOT_LOADED), "{three}");
 
     let none = snapshot(&[SQLITE, &[("VCI_STORE_EXPLAIN_HASHES", "false")]].concat());
@@ -793,7 +821,10 @@ fn verify_envelope_of_a_format_3_record_is_the_dsse_envelope_in_toto_tooling_rea
         &["verify", record.to_str().unwrap(), "--base-ref", "main"],
         SQLITE,
     );
-    assert!(out.contains("VALID signature by trusted@example.com"), "{out}");
+    assert!(
+        out.contains("VALID signature by trusted@example.com"),
+        "{out}"
+    );
     assert!(
         out.contains("(set resolved from the run's shape object; root not recomputed"),
         "{out}"
@@ -802,7 +833,11 @@ fn verify_envelope_of_a_format_3_record_is_the_dsse_envelope_in_toto_tooling_rea
 
     let printed = w.vci_ok(&["verify", record.to_str().unwrap(), "--envelope"], SQLITE);
     let envelope = Envelope::from_json(printed.as_bytes()).unwrap();
-    assert_eq!(envelope.payload_bytes().unwrap(), frame.statement, "the statement as signed");
+    assert_eq!(
+        envelope.payload_bytes().unwrap(),
+        frame.statement,
+        "the statement as signed"
+    );
     let st: Statement = serde_json::from_slice(&frame.statement).unwrap();
     assert_eq!(st.predicate_type, PREDICATE_TYPE_V2);
     let signers = vci_attest::AllowedSigners::parse(&w.read(".vci/allowed_signers")).unwrap();
@@ -814,9 +849,15 @@ fn verify_envelope_of_a_format_3_record_is_the_dsse_envelope_in_toto_tooling_rea
     // needs the record's descriptor or a manifest file.
     let rebuilt = w.base.join("b.rebuilt.json");
     std::fs::write(&rebuilt, printed.as_bytes()).unwrap();
-    let out = w.vci(&["verify", rebuilt.to_str().unwrap(), "--base-ref", "main"], SQLITE);
+    let out = w.vci(
+        &["verify", rebuilt.to_str().unwrap(), "--base-ref", "main"],
+        SQLITE,
+    );
     let text = stdout(&out);
-    assert!(text.contains("VALID signature by trusted@example.com"), "{text}");
+    assert!(
+        text.contains("VALID signature by trusted@example.com"),
+        "{text}"
+    );
     assert!(text.contains("without its record's descriptor"), "{text}");
     // Tampered inside the frame: INVALID.
     let mut tampered = frame.clone();
@@ -828,7 +869,10 @@ fn verify_envelope_of_a_format_3_record_is_the_dsse_envelope_in_toto_tooling_rea
     tampered.statement[pos + 8] = b'2';
     let bad = w.base.join("b.tampered.vci3");
     std::fs::write(&bad, tampered.encode().unwrap()).unwrap();
-    let out = w.vci(&["verify", bad.to_str().unwrap(), "--base-ref", "main"], SQLITE);
+    let out = w.vci(
+        &["verify", bad.to_str().unwrap(), "--base-ref", "main"],
+        SQLITE,
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(stdout(&out).contains("INVALID"), "{}", stdout(&out));
 }
@@ -852,10 +896,15 @@ fn supersession_across_moved_on_commits_removes_the_right_records_and_their_obje
     w.run(&[], SQLITE);
     let s = w.sqlite();
     let first = records(&s);
-    let keys1: BTreeMap<String, String> =
-        first.values().map(|r| (r.unit.clone(), r.e.key.clone())).collect();
+    let keys1: BTreeMap<String, String> = first
+        .values()
+        .map(|r| (r.unit.clone(), r.e.key.clone()))
+        .collect();
     let (hdrs, tables1, shapes1, states1) = object_ids(&first);
-    assert_eq!((hdrs.len(), shapes1.len(), states1.len()), (UNITS.len(), 1, 1));
+    assert_eq!(
+        (hdrs.len(), shapes1.len(), states1.len()),
+        (UNITS.len(), 1, 1)
+    );
     let hdr_b = record_of(&first, B).columns.hdr.clone().unwrap();
     let run1: BTreeSet<String> = hdrs
         .iter()
@@ -865,7 +914,10 @@ fn supersession_across_moved_on_commits_removes_the_right_records_and_their_obje
         .cloned()
         .collect();
 
-    w.write("src/a.ts", "export const add = (x: number, y: number) => x + y; // edited\n");
+    w.write(
+        "src/a.ts",
+        "export const add = (x: number, y: number) => x + y; // edited\n",
+    );
     w.commit("edit a.ts");
     assert_eq!(w.plan(SQLITE), (set(&[B, C, D]), set(&[A])));
 
@@ -878,8 +930,11 @@ fn supersession_across_moved_on_commits_removes_the_right_records_and_their_obje
     let now = records(&s);
     assert_eq!(now.len(), 5, "B's first record is kept beside the new one");
     assert!(now.contains_key(&keys1[B]));
-    let b_prod_objects: BTreeSet<String> =
-        now[&b_prod].columns.object_ids().map(str::to_owned).collect();
+    let b_prod_objects: BTreeSet<String> = now[&b_prod]
+        .columns
+        .object_ids()
+        .map(str::to_owned)
+        .collect();
     assert!(b_prod_objects.contains(&hdr_b), "B's hdr is shared");
 
     // Every unit at the moved-on commit, the first run's objects past the
@@ -892,7 +947,10 @@ fn supersession_across_moved_on_commits_removes_the_right_records_and_their_obje
     w.age_objects(&ids, Duration::from_secs(7_200));
     let out = w.run(&[], SQLITE);
     let err = stderr(&out);
-    assert!(err.contains("vci: removed 1 superseded attestation(s)"), "{err}");
+    assert!(
+        err.contains("vci: removed 1 superseded attestation(s)"),
+        "{err}"
+    );
     let keys2 = attested_keys(&out);
     let after = records(&s);
     let referenced: BTreeSet<String> = after
@@ -900,7 +958,10 @@ fn supersession_across_moved_on_commits_removes_the_right_records_and_their_obje
         .flat_map(|r| r.columns.object_ids().map(str::to_owned))
         .collect();
     let gone: BTreeSet<String> = run1.difference(&referenced).cloned().collect();
-    assert!(gone.is_superset(&states1), "the first run's state object: {gone:?}");
+    assert!(
+        gone.is_superset(&states1),
+        "the first run's state object: {gone:?}"
+    );
     assert!(
         err.contains(&format!(
             "vci: removed {} object(s) no attestation references any more",
@@ -909,18 +970,36 @@ fn supersession_across_moved_on_commits_removes_the_right_records_and_their_obje
         "{gone:?}: {err}"
     );
     let kept: BTreeSet<String> = run1.intersection(&referenced).cloned().collect();
-    assert_eq!(held(&s, &run1), kept, "of the first run's objects, the referenced ones stay");
+    assert_eq!(
+        held(&s, &run1),
+        kept,
+        "of the first run's objects, the referenced ones stay"
+    );
     assert_eq!(after.len(), 5, "A, B, C, D and B's production record");
-    assert!(!after.contains_key(&keys1[A]), "A's first record was superseded");
+    assert!(
+        !after.contains_key(&keys1[A]),
+        "A's first record was superseded"
+    );
     for u in [B, C, D] {
-        assert!(!after.contains_key(&keys1[u]), "{u}'s first record was replaced");
+        assert!(
+            !after.contains_key(&keys1[u]),
+            "{u}'s first record was replaced"
+        );
         assert_eq!(slot(&keys2[u]), slot(&keys1[u]), "{u}: in its slot");
     }
-    assert_ne!(slot(&keys2[A]), slot(&keys1[A]), "A: other inputs, another slot");
+    assert_ne!(
+        slot(&keys2[A]),
+        slot(&keys1[A]),
+        "A: other inputs, another slot"
+    );
     assert!(after.contains_key(&b_prod), "the production record stays");
     let (hdrs2, _, _, _) = object_ids(&after);
     assert_eq!(hdrs2, hdrs, "the hdrs are shared across the runs");
-    assert_eq!(held(&s, &referenced), referenced, "every referenced object is held");
+    assert_eq!(
+        held(&s, &referenced),
+        referenced,
+        "every referenced object is held"
+    );
     assert_eq!(w.plan(SQLITE).0, set(UNITS));
     assert_eq!(
         w.plan(&[SQLITE, &[("NODE_ENV", "production")]].concat()).0,
@@ -946,7 +1025,10 @@ fn prune_objects_removes_the_state_object_and_the_records_stay(env: &[(&str, &st
             .unwrap()
     };
     let before = objects(&w);
-    assert!(before >= 4, "hdr, tables, shape and state objects: {before}");
+    assert!(
+        before >= 4,
+        "hdr, tables, shape and state objects: {before}"
+    );
     // The state TTL compares whole seconds.
     std::thread::sleep(Duration::from_millis(1_100));
     let out = w.vci(&["prune", "--objects", "--older-than", "0"], env);
@@ -959,12 +1041,22 @@ fn prune_objects_removes_the_state_object_and_the_records_stay(env: &[(&str, &st
     assert_eq!(stdout(&out), "", "no attestation or manifest line");
     assert_eq!(objects(&w), before - 1, "the state object alone");
     assert_eq!(w.info(env)["count"], UNITS.len());
-    assert_eq!(w.plan(env).0, set(UNITS), "the records are valid without it");
-    w.write("fixtures/b.json", "{ \"greeting\": \"hello\", \"edited\": true }\n");
+    assert_eq!(
+        w.plan(env).0,
+        set(UNITS),
+        "the records are valid without it"
+    );
+    w.write(
+        "fixtures/b.json",
+        "{ \"greeting\": \"hello\", \"edited\": true }\n",
+    );
     let (skip, run) = w.plan(env);
     assert_eq!((skip, run), (set(&[A, C, D]), set(&[B])));
     let ex = w.explain(B, env);
-    assert!(ex.contains(&format!("entry: changed ({HASH_NOT_LOADED})")), "{ex}");
+    assert!(
+        ex.contains(&format!("entry: changed ({HASH_NOT_LOADED})")),
+        "{ex}"
+    );
     assert!(!ex.contains(UNSIGNED_LABEL), "{ex}");
     if env == SQLITE {
         let s = w.sqlite();
@@ -1044,10 +1136,18 @@ fn store_upgrade_finish_is_refused_until_the_expired_format_1_rows_are_pruned() 
         .collect();
     want.sort();
     assert_eq!(removed, want, "{}", text(&out));
-    assert!(stderr(&out).contains("vci prune: 2 expired, 2 current"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("vci prune: 2 expired, 2 current"),
+        "{}",
+        stderr(&out)
+    );
     let out = w.vci(&["store", "upgrade", "--finish"], SQLITE);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    assert!(stdout(&out).contains("upgraded to schema version 2"), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("upgraded to schema version 2"),
+        "{}",
+        text(&out)
+    );
     let info = w.info(SQLITE);
     assert_eq!(info["schemaVersion"], 2);
     assert_eq!(info["count"], 2);

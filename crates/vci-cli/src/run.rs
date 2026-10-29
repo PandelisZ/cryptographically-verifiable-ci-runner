@@ -2806,8 +2806,6 @@ pub fn run_units(
     // as 2.8 wrote (`[store] record_format = 1`, or a store without them).
     let settings = RecordSettings::of(&ctx.repo);
     let format3 = settings.format3(store);
-    // The platform of each hdr object supersession met, read once.
-    let hdr_platforms = HdrPlatforms::default();
     let selected_ids: Vec<&str> = selected
         .iter()
         .map(|&i| files[i].test_id.as_str())
@@ -2820,9 +2818,20 @@ pub fn run_units(
         choose: None,
     });
     // What the units took last time (any signer's newest attestation), to
-    // hand the runner the longest first.
+    // hand the runner the longest first; with it, on a store with columns,
+    // every stored record's columns and the platform of every hdr they
+    // name, for supersession (one listing, one columns round trip and one
+    // objects read for the run, not one per unit).
     let t = std::time::Instant::now();
-    let durations = last_durations(store, &selected_ids);
+    let UnitRecords {
+        durations,
+        columns: unit_columns,
+    } = last_durations(store, &selected_ids);
+    let hdr_platforms = HdrPlatforms::default();
+    hdr_platforms.preload(
+        store,
+        unit_columns.values().filter_map(|c| c.hdr.as_deref()),
+    );
     crate::plan::timing(
         &format!(
             "read the last duration of {} unit(s) ({} recorded)",
@@ -3209,6 +3218,7 @@ pub fn run_units(
                             &signer,
                             &moved_on,
                             &live_trees,
+                            &unit_columns,
                             &hdr_platforms,
                         )
                     } else {
@@ -3507,6 +3517,11 @@ enum OldFiles {
     EntriesRoot(String),
 }
 
+/// The same signer's stored records of the unit that the new record
+/// supersedes, with the object ids each names. `columns` are the
+/// listing columns of the unit's records as [`last_durations`] fetched
+/// them for the whole run, by key; a record not in them (stored since) is
+/// read as if it had none.
 #[allow(clippy::too_many_arguments)]
 fn superseded_by(
     store: &dyn AttestationStore,
@@ -3516,6 +3531,7 @@ fn superseded_by(
     signer: &str,
     moved_on: &MovedOn,
     live_trees: &BTreeSet<String>,
+    columns: &BTreeMap<String, Columns>,
     hdrs: &HdrPlatforms,
 ) -> Vec<Doomed> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
@@ -3673,11 +3689,12 @@ fn superseded_by(
         Vec::new()
     };
     // The same signer's records of the unit, read. On a store with listing
-    // columns (STORE-V2 section 1.4 step 5) the columns pre-filter which
-    // to read: one made at the same commit or for another platform is
-    // skipped without a read (a column that lies costs one read, never a
-    // deletion: every fact below comes from the signed statement). Without
-    // them (git-meta), the backend's own targeted read of the unit.
+    // columns (STORE-V2 section 1.4 step 5) the columns, fetched once for
+    // the run's units, pre-filter which to read: one made at the same
+    // commit or for another platform is skipped without a read (a column
+    // that lies costs one read, never a deletion: every fact below comes
+    // from the signed statement). Without them (git-meta), the backend's
+    // own targeted read of the unit.
     let t = std::time::Instant::now();
     let mut candidates: Vec<(StoredEnvelope, Columns)> = if store.caps().columns {
         let mine: Vec<StoredEnvelope> = match store.list_units(&[test_id]) {
@@ -3688,20 +3705,7 @@ fn superseded_by(
         .filter(|e| e.signer == signer)
         .collect();
         supersede_add(0, t);
-        let refs: Vec<&StoredEnvelope> = mine.iter().collect();
-        let columns = store
-            .columns(&refs)
-            .ok()
-            .filter(|c| c.len() == mine.len())
-            .unwrap_or_else(|| vec![Columns::default(); mine.len()]);
-        let mut chosen: Vec<(StoredEnvelope, Columns)> = mine
-            .into_iter()
-            .zip(columns)
-            .filter(|(_, c)| {
-                c.commit.as_deref() != Some(p.core.commit.as_str())
-                    && !c.platform.as_deref().is_some_and(|pl| pl != platform)
-            })
-            .collect();
+        let mut chosen = old_records_to_read(mine, columns, &p.core.commit, &platform);
         let t = std::time::Instant::now();
         let mut refs: Vec<&mut StoredEnvelope> = chosen.iter_mut().map(|(e, _)| e).collect();
         if let Err(e) = store.read_values(&mut refs) {
@@ -3831,9 +3835,10 @@ fn shared_manifest_bases(
 /// read; a unit none of whose records has the column (format-1 rows, as
 /// 2.8 and `record_format = 1` write them) is read and decoded by its
 /// first byte, as every unit is on a store without columns. Best effort: a
-/// unit that cannot be read has none.
-fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
+/// unit that cannot be read has none. The columns fetched (one round trip
+/// for every unit's records) come back by key for supersession.
+fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecords {
+    let mut out = UnitRecords::default();
     let newest_read = |cands: &[StoredEnvelope]| -> Option<u64> {
         cands
             .iter()
@@ -3848,7 +3853,7 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> BTreeMap<S
         };
         for (id, cands) in test_ids.iter().zip(units) {
             if let Some(d) = newest_read(&cands) {
-                out.insert((*id).to_owned(), d);
+                out.durations.insert((*id).to_owned(), d);
             }
         }
         return out;
@@ -3872,9 +3877,14 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> BTreeMap<S
             .zip(&cols)
             .filter_map(|(e, c)| c.duration_ms.map(|d| (e.issued.unwrap_or(0), d)))
             .max_by_key(|(issued, _)| *issued);
+        for (e, c) in cands.iter().zip(&cols) {
+            if !c.is_empty() {
+                out.columns.insert(e.key.clone(), c.clone());
+            }
+        }
         match newest {
             Some((_, d)) => {
-                out.insert((*id).to_owned(), d);
+                out.durations.insert((*id).to_owned(), d);
             }
             None => to_read.extend(cands.into_iter().map(|e| (ui, e))),
         }
@@ -3894,10 +3904,22 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> BTreeMap<S
     }
     for (ui, cands) in by_unit {
         if let Some(d) = newest_read(&cands) {
-            out.insert(test_ids[ui].to_owned(), d);
+            out.durations.insert(test_ids[ui].to_owned(), d);
         }
     }
     out
+}
+
+/// What [`last_durations`] read of the selected units' stored records: the
+/// last duration of each unit, and on a store with columns every listed
+/// record's columns by key (those that are not empty), which supersession
+/// takes from here instead of asking the store per unit (STORE-V2 section
+/// 3 budgets a run's supersession no request but the doomed records'
+/// reads).
+#[derive(Default)]
+struct UnitRecords {
+    durations: BTreeMap<String, u64>,
+    columns: BTreeMap<String, Columns>,
 }
 
 /// A stored record's issue time and recorded duration, by its first byte
@@ -4160,6 +4182,28 @@ fn columns_for(p: &VciPredicate, v2: &VciPredicateV2, shape: &str, state: Option
     }
 }
 
+/// Of the unit's listed records, those supersession reads, each with its
+/// listing columns from `columns` (by key; [`Columns::default`] for a
+/// record not in them): the columns leave out a record made at `commit` or
+/// for another platform than `platform` without a read.
+fn old_records_to_read(
+    mine: Vec<StoredEnvelope>,
+    columns: &BTreeMap<String, Columns>,
+    commit: &str,
+    platform: &str,
+) -> Vec<(StoredEnvelope, Columns)> {
+    mine.into_iter()
+        .map(|e| {
+            let c = columns.get(&e.key).cloned().unwrap_or_default();
+            (e, c)
+        })
+        .filter(|(_, c)| {
+            c.commit.as_deref() != Some(commit)
+                && !c.platform.as_deref().is_some_and(|pl| pl != platform)
+        })
+        .collect()
+}
+
 /// What supersession and [`last_durations`] read from a format-3 record's
 /// signed statement (unverified, as [`crate::cmds::envelope_meta`] is for a
 /// format-1 one: nothing here decides a verdict). `None` for a statement
@@ -4194,14 +4238,50 @@ fn frame_meta(frame: &Frame) -> Option<FrameMeta> {
 }
 
 /// The platform (`toolchain.os`, `toolchain.arch`) of each hdr object
-/// supersession met this run, by id: read once each
-/// ([`AttestationStore::get_objects`]), the id recomputed over the bytes
-/// and the object decoded; `None` for one the store lacks or that does not
-/// decode to its id (its records are kept).
+/// supersession met this run, by id: the ones the units' listing columns
+/// name read in one `get_objects` before the units run
+/// ([`HdrPlatforms::preload`]), any other once when met, the id
+/// recomputed over the bytes and the object decoded; `None` for one the
+/// store lacks or that does not decode to its id (its records are kept).
 #[derive(Default)]
 struct HdrPlatforms(std::sync::Mutex<BTreeMap<String, Option<(String, String)>>>);
 
 impl HdrPlatforms {
+    /// The platforms of these hdr ids (the ones the units' listing columns
+    /// name, distinct), read in one `get_objects` before the per-unit
+    /// pass; an id the store lacks is remembered as such.
+    fn preload<'a>(&self, store: &dyn AttestationStore, ids: impl Iterator<Item = &'a str>) {
+        let ids: BTreeSet<&str> = ids.filter(|id| vci_store::key::is_object_id(id)).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let ids: Vec<&str> = ids.into_iter().collect();
+        let Ok(objects) = store.get_objects(&ids) else {
+            return;
+        };
+        let mut found: BTreeMap<String, Option<(String, String)>> =
+            ids.iter().map(|id| ((*id).to_owned(), None)).collect();
+        for o in objects {
+            if found.contains_key(&o.id) {
+                found.insert(o.id.clone(), Self::platform_of(&o.id, &o.bytes));
+            }
+        }
+        if let Ok(mut m) = self.0.lock() {
+            m.extend(found);
+        }
+    }
+
+    /// The platform of the hdr `bytes` claim to be `id`: the id recomputed
+    /// over the bytes and the object decoded.
+    fn platform_of(id: &str, bytes: &[u8]) -> Option<(String, String)> {
+        if vci_core::objects::hex32(&vci_core::object_id(bytes)) != id {
+            return None;
+        }
+        Hdr::decode(bytes)
+            .ok()
+            .map(|h| (h.toolchain.os, h.toolchain.arch))
+    }
+
     fn of(&self, store: &dyn AttestationStore, id: &str) -> Option<(String, String)> {
         if let Some(known) = self.0.lock().ok().and_then(|m| m.get(id).cloned()) {
             return known;
@@ -4210,9 +4290,7 @@ impl HdrPlatforms {
             .get_objects(&[id])
             .ok()
             .and_then(|objects| objects.into_iter().find(|o| o.id == id))
-            .filter(|o| vci_core::objects::hex32(&vci_core::object_id(&o.bytes)) == id)
-            .and_then(|o| Hdr::decode(&o.bytes).ok())
-            .map(|h| (h.toolchain.os, h.toolchain.arch));
+            .and_then(|o| Self::platform_of(&o.id, &o.bytes));
         if let Ok(mut m) = self.0.lock() {
             m.insert(id.to_owned(), found.clone());
         }
@@ -5974,9 +6052,23 @@ mod tests {
         put("d", "ab", 40, b"garbage", None);
         let got = last_durations(&s, &["a", "b", "c", "d"]);
         assert_eq!(
-            got,
+            got.durations,
             BTreeMap::from([("a".to_owned(), 40), ("b".to_owned(), 70)])
         );
+        // One columns request for every unit's records, which come back
+        // by key (the format-1 rows, which have none, left out).
+        assert_eq!(s.columns_calls(), 1);
+        let a_tk = vci_store::key::test_key("a");
+        let keys = s.keys();
+        let a_keys: Vec<&String> = keys
+            .iter()
+            .filter(|k| vci_store::key::parse_key(k).is_some_and(|(tk, _, _)| tk == a_tk))
+            .collect();
+        assert_eq!(a_keys.len(), 2);
+        assert_eq!(got.columns.len(), 2, "{:?}", got.columns.keys());
+        for k in a_keys {
+            assert!(got.columns.contains_key(k), "{k}");
+        }
         // Without columns: every value read.
         let s = crate::store::mem::MemStore::new();
         s.put_for_test("a", SIGNER, "ab", None, &old_frame).unwrap();
@@ -5984,9 +6076,85 @@ mod tests {
         s.put_for_test("b", SIGNER, "ab", None, &envelope).unwrap();
         let got = last_durations(&s, &["a", "b", "c"]);
         assert_eq!(
-            got,
+            got.durations,
             BTreeMap::from([("a".to_owned(), 40), ("b".to_owned(), 70)])
         );
+        assert!(got.columns.is_empty());
+    }
+
+    /// Supersession's pre-filter takes the columns [`last_durations`]
+    /// fetched for the run, by key, and asks the store for none: a record
+    /// made at the new record's commit or for another platform is left
+    /// out without a read, one without columns (stored since, or a
+    /// format-1 row) is read, and the platform of every hdr the columns
+    /// name is read in one `get_objects` before the units run.
+    #[test]
+    fn supersession_takes_the_columns_and_hdr_platforms_fetched_once_for_the_run() {
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let commit = "c".repeat(40);
+        let hdr = Hdr {
+            toolchain: vci_core::Toolchain {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let hdr_bytes = hdr.encode().unwrap();
+        let hdr_id = vci_core::objects::hex32(&vci_core::object_id(&hdr_bytes));
+        s.put_objects(&[NewObject::new(ObjectKind::Hdr, &hdr_bytes)])
+            .unwrap();
+        let with = |commit: &str, platform: &str| Columns {
+            format: Some(3),
+            commit: Some(commit.to_owned()),
+            platform: Some(platform.to_owned()),
+            duration_ms: Some(5),
+            hdr: Some(hdr_id.clone()),
+            ..Columns::default()
+        };
+        let frame = frame_with("a", "2026-01-01T00:00:00Z", 30, PREDICATE_TYPE_V2);
+        let put = |sk: &str, issued: i64, c: Option<&Columns>| {
+            let hint = KeyHint { issued, tree: None };
+            let mut att = NewAttestation::for_test("a", SIGNER, sk, Some(&hint), &frame);
+            if let Some(c) = c {
+                att = att.with_columns(c);
+            }
+            s.put(&att).unwrap().key
+        };
+        let same_commit = put("ab", 10, Some(&with(&commit, "linux-x86_64")));
+        let other_platform = put("cd", 20, Some(&with(&"d".repeat(40), "darwin-arm64")));
+        let older = put("ef", 30, Some(&with(&"d".repeat(40), "linux-x86_64")));
+        let bare = put("ee", 40, None);
+        let records = last_durations(&s, &["a"]);
+        assert_eq!(s.columns_calls(), 1);
+        assert_eq!(records.columns.len(), 3);
+        let hdrs = HdrPlatforms::default();
+        hdrs.preload(
+            &s,
+            records.columns.values().filter_map(|c| c.hdr.as_deref()),
+        );
+        assert_eq!(s.object_reads(), 1, "one read for the distinct hdr ids");
+        let mine = s.list_units(&["a"]).unwrap().remove(0);
+        let chosen = old_records_to_read(mine, &records.columns, &commit, "linux-x86_64");
+        let keys: BTreeSet<&str> = chosen.iter().map(|(e, _)| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([older.as_str(), bare.as_str()]),
+            "{keys:?}"
+        );
+        assert!(!keys.contains(same_commit.as_str()) && !keys.contains(other_platform.as_str()));
+        let bare_columns = &chosen.iter().find(|(e, _)| e.key == bare).unwrap().1;
+        assert_eq!(
+            *bare_columns,
+            Columns::default(),
+            "a record without columns is read"
+        );
+        assert_eq!(
+            hdrs.of(&s, &hdr_id),
+            Some(("linux".to_owned(), "x86_64".to_owned()))
+        );
+        assert_eq!(s.columns_calls(), 1, "no columns request per unit");
+        assert_eq!(s.object_reads(), 1, "no hdr read per unit");
     }
 
     /// `[store]` decides the format: 3 on a store that keeps objects, else

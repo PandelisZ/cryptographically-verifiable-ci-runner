@@ -345,6 +345,8 @@ pub(crate) fn ensure(inner: &Inner) -> Result<(), StoreError> {
 pub enum Finish {
     /// The window is closed: `manifests` is gone and the version is 2.
     Done,
+    /// The schema was at version 2 already: nothing changed.
+    Already,
     /// Refused: this many rows of the schema (every namespace) are not
     /// format-3 records, and a 2.8 vci may still read them.
     FormatOneRows(u64),
@@ -354,7 +356,8 @@ pub enum Finish {
 /// section 5 step 4): when no row of the schema holds anything but a
 /// format-3 record, drop `manifests` and set the version to
 /// [`SUPPORTED`], in one transaction under the advisory lock; a schema
-/// already there is left as it is. Refused with the count otherwise.
+/// at that version already is left as it is ([`Finish::Already`]).
+/// Refused with the count otherwise.
 pub(crate) fn finish(inner: &Inner) -> Result<Finish, StoreError> {
     inner.ready()?;
     ensure(inner)?;
@@ -365,6 +368,12 @@ pub(crate) fn finish(inner: &Inner) -> Result<Finish, StoreError> {
             "SELECT pg_advisory_xact_lock(hashtext($1))",
             &[(&sql.lock_key, Type::TEXT)],
         )?;
+        let rows = tx.query(&sql.version, &[(&sql.objects_regclass, Type::TEXT)])?;
+        let version: i32 = rows.first().map(|r| r.try_get(0)).transpose()?.unwrap_or(0);
+        if version.max(0) as u32 >= SUPPORTED {
+            tx.commit()?;
+            return Ok(Finish::Already);
+        }
         let rows = tx.query(&sql.format_one_rows, &[])?;
         let n: i64 = rows.first().map(|r| r.try_get(0)).transpose()?.unwrap_or(0);
         if n > 0 {

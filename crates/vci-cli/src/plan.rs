@@ -424,6 +424,9 @@ struct Verifier<'a> {
     collisions: Mutex<HashMap<String, Result<(), String>>>,
     /// The checks of each shared base manifest, made once (see [`BaseCheck`]).
     base_checks: Mutex<HashMap<String, Arc<BaseCheck>>>,
+    /// The case-folded prefixes and collisions of each shape group, made
+    /// once per `(shape id, group)` (see [`GroupCase`]).
+    group_cases: Mutex<HashMap<(String, u8), Arc<GroupCase>>>,
     /// Where the verdicts phase spends its time (`VCI_TIMING=1`).
     timers: Timers,
 }
@@ -784,6 +787,11 @@ struct ObjectCache {
     shapes_named: BTreeSet<String>,
     /// How many state objects were loaded, against [`STATE_OBJECTS`].
     states: usize,
+    /// The state object each read format-3 candidate's listing column
+    /// names, by record key: fetched in one `columns` call per round
+    /// beside the verdict objects ([`preload_objects`]), so that a failing
+    /// candidate costs no store request for its text.
+    state_by_key: HashMap<String, String>,
 }
 
 /// Loads (once each) the format-3 objects a plan's candidates name
@@ -1039,22 +1047,24 @@ impl ObjectLoader {
     /// failure text of a candidate that failed on an entry: named by the
     /// record's listing column on a store that keeps columns (the state id
     /// is in no signed field, so only the writer can say it, and what it
-    /// says is labelled unsigned), loaded up to [`STATE_OBJECTS`] per plan.
-    /// `None` when the store keeps no columns, the column is empty, the cap
-    /// is reached, or the object is missing or malformed: the text then
-    /// says the attested hash was not loaded. No verdict reads it.
+    /// says is labelled unsigned), which the round's one `columns` call
+    /// fetched ([`preload_objects`]); loaded up to [`STATE_OBJECTS`] per
+    /// plan, the cap checked before the store is asked. `None` when the
+    /// store keeps no columns, the column is empty, the cap is reached, or
+    /// the object is missing or malformed: the text then says the attested
+    /// hash was not loaded. No verdict reads it.
     fn state_for(
         &self,
         store: &dyn AttestationStore,
         timers: &Timers,
         s: &StoredEnvelope,
     ) -> Option<Arc<State>> {
-        if !store.caps().columns {
-            return None;
-        }
-        let id = store.columns(&[s]).ok()?.into_iter().next()?.state_obj?;
-        parse_hex32(&id)?;
-        let cached = self.lock().by_id.get(&id).cloned();
+        let (id, cached) = {
+            let c = self.lock();
+            let id = c.state_by_key.get(&s.key)?.clone();
+            let cached = c.by_id.get(&id).cloned();
+            (id, cached)
+        };
         let r = match cached {
             Some(r) => r,
             None => {
@@ -1072,6 +1082,27 @@ impl ObjectLoader {
         match r {
             Ok(Object::State(st)) => Some(st),
             _ => None,
+        }
+    }
+
+    /// Remember which state object each of these read format-3 records'
+    /// listing columns names (one `columns` call, on a store that keeps
+    /// them), for [`Self::state_for`]. A column that names no object, or
+    /// not a well-formed id, names none.
+    fn note_state_objects(&self, store: &dyn AttestationStore, cands: &[&StoredEnvelope]) {
+        if cands.is_empty() || !store.caps().columns {
+            return;
+        }
+        let Ok(columns) = store.columns(cands) else {
+            return;
+        };
+        let mut c = self.lock();
+        for (s, col) in cands.iter().zip(columns) {
+            if let Some(id) = col.state_obj
+                && parse_hex32(&id).is_some()
+            {
+                c.state_by_key.insert(s.key.clone(), id);
+            }
         }
     }
 
@@ -1096,15 +1127,17 @@ impl ObjectLoader {
     }
 }
 
-/// The verdict objects (hdr, tables, shape) the format-3 candidates among
-/// `cands` name, in candidate-priority order (the order [`Verifier::verdict`]
-/// tries candidates: made on this checkout's tree first, then newest
-/// issued), loaded in one batch (section 1.5 step 5). Only values that were
-/// read and decode as frames name anything; a candidate whose statement or
-/// descriptor does not parse is left to its check.
 /// The object ids one candidate names, with its rank in the verdict's order.
 type RankedIds = ((bool, Option<i64>), Vec<(ObjectKind, String)>);
 
+/// The verdict objects (hdr, tables, shape) the format-3 candidates among
+/// `cands` name, in candidate-priority order (the order [`Verifier::verdict`]
+/// tries candidates: made on this checkout's tree first, then newest
+/// issued), loaded in one batch (section 1.5 step 5), and the state object
+/// each of those candidates' listing columns names, in one `columns` call
+/// (for the failure text, step 9). Only values that were read and decode
+/// as frames name anything; a candidate whose statement or descriptor does
+/// not parse is left to its check.
 fn preload_objects<'a>(
     store: &dyn AttestationStore,
     objects: &ObjectLoader,
@@ -1114,6 +1147,7 @@ fn preload_objects<'a>(
 ) {
     let head16: Option<String> = head_tree.map(|t| t.chars().take(16).collect());
     let mut ranked: Vec<RankedIds> = Vec::new();
+    let mut frames: Vec<&StoredEnvelope> = Vec::new();
     for s in cands {
         if s.error.is_some() {
             continue;
@@ -1121,6 +1155,7 @@ fn preload_objects<'a>(
         let Ok(Record::FormatThree(frame)) = decode_record(&s.bytes) else {
             continue;
         };
+        frames.push(s);
         let mut ids = Vec::with_capacity(3);
         if let Ok(st) = serde_json::from_slice::<vci_attest::Statement>(&frame.statement)
             && let Ok(p) = serde_json::from_value::<VciPredicateV2>(st.predicate)
@@ -1137,6 +1172,7 @@ fn preload_objects<'a>(
     if ranked.is_empty() {
         return;
     }
+    objects.note_state_objects(store, &frames);
     ranked.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
     let wanted: Vec<(ObjectKind, String)> = ranked.into_iter().flat_map(|(_, ids)| ids).collect();
     objects.load(store, timers, &wanted);
@@ -1630,6 +1666,68 @@ impl Verifier<'_> {
             .unwrap_or_else(|p| p.into_inner())
             .insert(root.to_owned(), bc.clone());
         Some(bc)
+    }
+}
+
+/// The case-collision check of a shape group, made once for every format-3
+/// candidate whose descriptor extends it (STORE-V2 section 1.5 step 8; the
+/// format-3 counterpart of [`BaseCheck`]'s prefixes): a vex unit's set is
+/// ~2,700 group entries and ~150 of its own, and folding every path of
+/// every candidate cost 1.5 ms of the 2.9 ms a candidate's step 8 takes
+/// (`tests/replay.rs`, the synthetic vex unit). A candidate folds its own
+/// entries against these; a collision among them or with the group falls
+/// back to the full check over its whole set.
+struct GroupCase {
+    /// The group's case-folded prefixes ([`InputManifest::case_prefix_index`]).
+    prefixes: BTreeMap<String, String>,
+    /// The group's own case collisions.
+    collisions: Result<(), String>,
+}
+
+impl Verifier<'_> {
+    /// The case-collision check of group `g` of the shape `shape_id`, made
+    /// once (see [`GroupCase`]); `None` for a group the shape does not have.
+    fn group_case(&self, shape_id: &str, g: u8, shape: &Shape) -> Option<Arc<GroupCase>> {
+        let key = (shape_id.to_owned(), g);
+        if let Some(c) = self
+            .group_cases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+        {
+            return Some(c.clone());
+        }
+        let group = shape.groups.get(g as usize)?;
+        let paths = InputManifest {
+            entries: group
+                .iter()
+                .filter_map(|&i| shape.entries.get(i))
+                .map(path_entry)
+                .collect(),
+            externals: vec![],
+            env: vec![],
+        };
+        let gc = Arc::new(GroupCase {
+            prefixes: paths.case_prefix_index(),
+            collisions: paths.check_case_collisions().map_err(|e| e.to_string()),
+        });
+        self.group_cases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, gc.clone());
+        Some(gc)
+    }
+}
+
+/// A shape entry as an entry of a manifest of paths only (no attested size
+/// or hash), for the checks that look at paths and kinds.
+fn path_entry(e: &ShapeEntry) -> InputEntry {
+    InputEntry {
+        path: e.path.clone(),
+        kind: e.kind,
+        exec: e.exec,
+        size: 0,
+        hash: String::new(),
     }
 }
 
@@ -2265,6 +2363,7 @@ fn plan_with(
                     globals: Mutex::default(),
                     collisions: Mutex::default(),
                     base_checks: Mutex::default(),
+                    group_cases: Mutex::default(),
                     timers: Timers::default(),
                 }),
             },
@@ -3254,29 +3353,59 @@ impl Verifier<'_> {
         // Lookups instead of listings (2.5.0) only where the base policy
         // accepts what they leave out.
         self.autoload_policy(resolved.set.iter().map(|e| e.kind))?;
-        // The paths as a manifest, for the checks that look at paths and
-        // kinds only (no attested size or hash is at hand, nor needed).
-        let paths = InputManifest {
+        // The whole set as a manifest of paths, for a check that needs all
+        // of them (made only then: it is ~2,850 clones on vex).
+        let all_paths = || InputManifest {
+            entries: resolved.set.iter().map(path_entry).collect(),
+            externals: vec![],
+            env: vec![],
+        };
+        // Case collisions: the group's part once per (shape, group), the
+        // own entries folded against it (see `GroupCase`); without a
+        // group, or on a collision, the whole set.
+        let t = std::time::Instant::now();
+        let group_case = descriptor
+            .group
+            .and_then(|g| self.group_case(&shape_id, g, &shape));
+        let collisions = match &group_case {
+            Some(gc) if gc.collisions.is_err() => gc.collisions.clone(),
+            Some(gc) => {
+                let own = InputManifest {
+                    entries: descriptor
+                        .own
+                        .iter()
+                        .filter_map(|&i| shape.entries.get(i))
+                        .map(path_entry)
+                        .collect(),
+                    externals: vec![],
+                    env: vec![],
+                };
+                if own.entries.len() == descriptor.own.len()
+                    && !own.prefixes_collide_with(0, &gc.prefixes)
+                {
+                    Ok(())
+                } else {
+                    self.case_collisions(input_root, &all_paths())
+                }
+            }
+            None => self.case_collisions(input_root, &all_paths()),
+        };
+        Timers::add(&self.timers.collisions, t);
+        collisions.map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
+        // The children git ignores under the listed directories (what the
+        // listing hashes leave out): asked about the listings alone.
+        let t = std::time::Instant::now();
+        let listings = InputManifest {
             entries: resolved
                 .set
                 .iter()
-                .map(|e| InputEntry {
-                    path: e.path.clone(),
-                    kind: e.kind,
-                    exec: e.exec,
-                    size: 0,
-                    hash: String::new(),
-                })
+                .filter(|e| e.kind == EntryKind::DirListing)
+                .map(path_entry)
                 .collect(),
             externals: vec![],
             env: vec![],
         };
-        let t = std::time::Instant::now();
-        let collisions = self.case_collisions(input_root, &paths);
-        Timers::add(&self.timers.collisions, t);
-        collisions.map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
-        let t = std::time::Instant::now();
-        let extra = self.ignored.of(self.checkout, &paths);
+        let extra = self.ignored.of(self.checkout, &listings);
         Timers::add(&self.timers.ignored, t);
         Timers::count(&self.timers.rehashed);
         let t = std::time::Instant::now();
@@ -5537,6 +5666,59 @@ adapter = "pytest"
             "{got:?}"
         );
         assert!(got.iter().all(|m| m.what.starts_with("entry:")));
+    }
+
+    /// The state objects for the failure text are named by one `columns`
+    /// call per round, made with the verdict objects' load, and loaded
+    /// one at a time up to the cap, which is checked before the store is
+    /// asked: a plan with many entry-failing candidates sends the store
+    /// no request per candidate (STORE-V2 section 1.5 step 9, section 3).
+    #[test]
+    fn state_objects_are_named_by_one_columns_call_per_round_and_capped_before_any_read() {
+        use vci_store::conformance::scenarios::Run3;
+        use vci_store::{KeyHint, NewAttestation};
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let run = Run3::build(&["src/a.ts", "src/b.ts"]);
+        s.put_objects(&run.new_objects()).unwrap();
+        let signer = "2".repeat(16);
+        let mut stored = Vec::new();
+        for (i, unit) in ["src/a.ts", "src/b.ts", "src/c.ts"].iter().enumerate() {
+            let (bytes, mut columns) = run.record(unit, 1, 1);
+            if i == 2 {
+                // A column naming no state object: none for the text.
+                columns.state_obj = None;
+            }
+            let hint = KeyHint {
+                issued: 10 + i as i64,
+                tree: None,
+            };
+            let att = NewAttestation::for_test(unit, &signer, "ab", Some(&hint), &bytes)
+                .with_columns(&columns);
+            let mut e = s.put(&att).unwrap();
+            e.set_value(bytes);
+            stored.push(e);
+        }
+        let objects = ObjectLoader::default();
+        let timers = Timers::default();
+        preload_objects(&s, &objects, &timers, stored.iter(), None);
+        assert_eq!(s.columns_calls(), 1, "one columns call for the round");
+        let reads = s.object_reads();
+        assert!(objects.state_for(&s, &timers, &stored[0]).is_some());
+        assert_eq!(s.object_reads(), reads + 1, "the state object, once");
+        assert!(objects.state_for(&s, &timers, &stored[1]).is_some());
+        assert_eq!(
+            s.object_reads(),
+            reads + 1,
+            "the same run's state object: cached"
+        );
+        assert!(objects.state_for(&s, &timers, &stored[2]).is_none());
+        assert_eq!(s.columns_calls(), 1, "no columns call per candidate");
+        // Past the cap: no read at all.
+        objects.lock().states = STATE_OBJECTS;
+        objects.lock().by_id.clear();
+        assert!(objects.state_for(&s, &timers, &stored[0]).is_none());
+        assert_eq!(s.object_reads(), reads + 1);
+        assert_eq!(s.columns_calls(), 1);
     }
 
     /// Candidates are checked newest first since 2.1, but the reason still

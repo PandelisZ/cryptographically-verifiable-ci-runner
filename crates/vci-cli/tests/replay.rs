@@ -347,6 +347,7 @@ fn replay_run(key: &RunKey, units: &[&Unit]) -> RunFigures {
         let d = Descriptor::decode(&back.descriptor, &ctx.tables)
             .unwrap_or_else(|e| panic!("{}", at(&format!("descriptor decode: {e}"))));
         assert_eq!(d, rec.descriptor);
+        time_step8(&d, &shape, &ctx.tables);
         let resolved_manifest = d
             .resolve(&shape, &ctx.tables)
             .unwrap_or_else(|e| panic!("{}", at(&format!("descriptor resolve: {e}"))));
@@ -1278,6 +1279,130 @@ fn the_synthetic_sample_replays() {
 /// `replay-numbers.json` (default: `design/final/replay-numbers.json` beside
 /// the sample's `wr` directory when that directory exists); `VCI_NUMBERS`
 /// the model's `numbers.json` to compare with (default: next to the output).
+/// The per-candidate work of the plan's step 8 (STORE-V2 section 1.5;
+/// `Verifier::inputs_v2`) over one unit of the sample, timed: the
+/// descriptor resolved against the shape and tables, the paths as a
+/// manifest and its case-collision check, every path observed through a
+/// `CheckoutCache` (an empty checkout: every path absent, each observed
+/// once and then answered from the cache, as a plan's are), the manifest
+/// of the observation and its root. What a candidate costs on top of the
+/// per-plan memoized work; printed per candidate and for a plan of 1,644
+/// and 4,000 candidates by [`the_real_sample_replays`].
+fn time_step8(d: &Descriptor, shape: &Shape, tables: &Tables) {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<(tempfile::TempDir, vci_core::CheckoutCache)> = OnceLock::new();
+    let (_, cache) = CACHE.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let cache = vci_core::CheckoutCache::new(&root);
+        (dir, cache)
+    });
+    let t = std::time::Instant::now();
+    let resolved = d.resolve(shape, tables).unwrap();
+    let t_resolve = t.elapsed();
+    let t = std::time::Instant::now();
+    let paths = InputManifest {
+        entries: resolved
+            .set
+            .iter()
+            .map(|e| InputEntry {
+                path: e.path.clone(),
+                kind: e.kind,
+                exec: e.exec,
+                size: 0,
+                hash: String::new(),
+            })
+            .collect(),
+        externals: vec![],
+        env: vec![],
+    };
+    let _ = paths.check_case_collisions();
+    let t_collisions = t.elapsed();
+    let t = std::time::Instant::now();
+    let observed = InputManifest::observe(&resolved.set, cache, &[]).unwrap();
+    let t_observe = t.elapsed();
+    let t = std::time::Instant::now();
+    let m = InputManifest::from_observed(&resolved.set, observed, resolved.externals, resolved.env)
+        .unwrap();
+    let _ = m.root();
+    let t_root = t.elapsed();
+    let mut s = STEP8
+        .get_or_init(|| Mutex::new(Step8::default()))
+        .lock()
+        .unwrap();
+    s.candidates += 1;
+    s.entries += resolved.set.len();
+    s.resolve += t_resolve;
+    s.collisions += t_collisions;
+    s.observe += t_observe;
+    s.root += t_root;
+}
+
+/// [`time_step8`] over a synthetic vex-shaped unit: a group of 2,700
+/// shared entries (the sample's compact manifests are deltas on bases the
+/// file does not hold, so the sample alone measures the ~56 own entries)
+/// and 150 own entries, for `candidates` candidates of one descriptor
+/// (the per-candidate cost does not depend on which); what the shared part
+/// costs per candidate, which a per-group memo would save.
+fn time_step8_synthetic(candidates: usize) {
+    let path = |p: String| RepoPath::new(&p).unwrap();
+    let mut entries: Vec<ShapeEntry> = Vec::new();
+    for i in 0..2_700 {
+        let kind = if i % 90 == 0 {
+            EntryKind::DirListing
+        } else {
+            EntryKind::File
+        };
+        entries.push(ShapeEntry {
+            path: path(format!("app/models/dir{}/model_{i:04}.rb", i / 90)),
+            kind,
+            exec: false,
+        });
+    }
+    for i in 0..150 {
+        entries.push(ShapeEntry {
+            path: path(format!("test/models/model_{i:04}_test.rb")),
+            kind: EntryKind::File,
+            exec: false,
+        });
+    }
+    entries.sort();
+    entries.dedup();
+    let group: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.path.as_str().starts_with("app/"))
+        .map(|(i, _)| i)
+        .collect();
+    let own: Vec<usize> = (0..entries.len()).filter(|i| !group.contains(i)).collect();
+    let shape = Shape {
+        entries,
+        groups: vec![group],
+    };
+    let tables = Tables::default();
+    let d = Descriptor {
+        shape: [0; 32],
+        group: Some(0),
+        own,
+        ..Descriptor::default()
+    };
+    for _ in 0..candidates {
+        time_step8(&d, &shape, &tables);
+    }
+}
+
+#[derive(Default)]
+struct Step8 {
+    candidates: usize,
+    entries: usize,
+    resolve: std::time::Duration,
+    collisions: std::time::Duration,
+    observe: std::time::Duration,
+    root: std::time::Duration,
+}
+
+static STEP8: std::sync::OnceLock<std::sync::Mutex<Step8>> = std::sync::OnceLock::new();
+
 #[test]
 fn the_real_sample_replays() {
     let Ok(pairs_path) = std::env::var("VCI_PAIRS") else {
@@ -1306,6 +1431,28 @@ fn the_real_sample_replays() {
     for r in figures["runs"].as_array().unwrap() {
         println!("{}", serde_json::to_string(r).unwrap());
     }
+    let report = |what: &str| {
+        let Some(s) = STEP8.get() else { return };
+        let mut s = s.lock().unwrap();
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1e3 / s.candidates as f64;
+        let total = s.resolve + s.collisions + s.observe + s.root;
+        println!(
+            "plan step 8 per candidate, {what} ({} candidates, {:.0} entries each, the first observation of every path included): resolve {:.3} ms, paths + case collisions {:.3} ms, observe {:.3} ms, from_observed + root {:.3} ms; {:.3} ms in all = {:.1} thread-s for 1,644 candidates, {:.1} thread-s for 4,000",
+            s.candidates,
+            s.entries as f64 / s.candidates as f64,
+            per(s.resolve),
+            per(s.collisions),
+            per(s.observe),
+            per(s.root),
+            per(total),
+            per(total) * 1_644.0 / 1e3,
+            per(total) * 4_000.0 / 1e3
+        );
+        *s = Step8::default();
+    };
+    report("the sample's own entries");
+    time_step8_synthetic(400);
+    report("a synthetic vex unit of 2,700 group and 150 own entries");
 
     let final_dir = pairs_path
         .parent()

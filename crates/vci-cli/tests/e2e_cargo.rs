@@ -4097,9 +4097,7 @@ fn cargo_run_with_several_hdr_groups_is_written_and_planned() {
     let (code, err) = w.run_env(&[], &[("VCI_TIMING", "1")]);
     assert_eq!(code, Some(0), "{err}");
     assert!(
-        err.contains(
-            "format-3 run: 4 hdr, 4 tables, 1 shape, 1 state object(s) over 5 unit(s)"
-        ),
+        err.contains("format-3 run: 4 hdr, 4 tables, 1 shape, 1 state object(s) over 5 unit(s)"),
         "{err}"
     );
     assert_eq!(w.plan(&work, "main").skip, set(&all));
@@ -4130,10 +4128,16 @@ fn cargo_run_with_several_hdr_groups_is_written_and_planned() {
         let o = objects.iter().find(|o| o.id == hdr_of[unit]).unwrap();
         let hdr = vci_core::Hdr::decode(&o.bytes).unwrap();
         assert_eq!(hdr.adapter, "cargo");
-        let paths: BTreeSet<&str> = hdr.global_manifest.iter().map(|e| e.path.as_str()).collect();
+        let paths: BTreeSet<&str> = hdr
+            .global_manifest
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
         let own = format!("{dir}/Cargo.toml");
         assert!(
-            paths.contains(own.as_str()) && paths.contains("Cargo.toml") && paths.contains("Cargo.lock"),
+            paths.contains(own.as_str())
+                && paths.contains("Cargo.toml")
+                && paths.contains("Cargo.lock"),
             "{unit}'s global manifest: {paths:?}"
         );
         for other in ["a", "b", "c", "d"] {

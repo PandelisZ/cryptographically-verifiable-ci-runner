@@ -2380,7 +2380,11 @@ fn shared_inputs_run_only_their_dependents_and_the_newest_candidate_wins() {
         &["run", S1, S2, S3, "--key", &trusted],
         &[("VCI_STORE_RECORD_FORMAT", Some("1"))],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let all = w.plan(&work, "main");
     assert_eq!(all.skip, set(&[S1, S2, S3]), "{all:?}");
 

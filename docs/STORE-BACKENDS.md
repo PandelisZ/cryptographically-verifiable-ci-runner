@@ -372,8 +372,10 @@ The gates, in order (STORE-V2 section 5):
    one change and expect the skip rate to dip for at most one `max_ttl` window.
 3. **2.8's `vci prune` during the window** stops collecting manifests once one frame exists: a record it cannot
    parse sets its referenced set to unknown, and it then removes no manifest at all (it cannot know what the
-   unreadable record names). Keep the window short, or run 2.9's `vci prune` once during it: it collects both, a
-   format-1 record as before and a format-3 one through its columns and a confirming read.
+   unreadable record names). Keep the window short, or run 2.9's `vci prune` once during it: it collects both,
+   reading every record while a manifest remains (a 2.8 writer may have left a format-1 value, with its
+   `manifestRef`, under a frame's columns) and, once none does, a format-3 record through its columns and a
+   confirming read.
 4. **`vci store upgrade --finish`**, manual, once no format-1 row remains: drops `manifests` (SQLite and PostgreSQL;
    the libSQL store refuses it at zero in this release, since every statement that names `manifests` and the change
    log has to branch on version 2 first) and sets `vci_schema.version = 2`, after which a 2.8 binary reports the
@@ -1659,9 +1661,10 @@ Hence `AttestationStore: Send + Sync`.
     (`Prefetch::Objects` first on a lazy store) under a 16 MiB verdict-object cap, recomputes each id, checks the hdr
     once per `(project, hdr id)`, resolves the descriptor and observes the resolved set at HEAD (`inputs`), and loads
     at most 16 state objects, named by the records' `state_obj` column, for the failure text;
-  - prune (cmds.rs) lists with `list_all` and `columns` on a store that keeps them, reads only the expired and
-    beyond-`keep` candidates and the rows the columns do not describe, confirms each delete from the signed
-    statement, then `orphan_objects`, `remove_objects` and `prune_state_objects` (`--objects` runs only these,
+  - prune (cmds.rs) lists with `list_all` and `columns` on a store that keeps them, reads the expired candidates,
+    the records of a unit with one beyond `keep` by the hints, the rows the columns do not describe, and every row
+    while a manifest remains (`manifest_roots`), confirms each delete from the signed statement (expiry; the
+    unit's order by the signed `issuedAt`), then `orphan_objects`, `remove_objects` and `prune_state_objects` (`--objects` runs only these,
     `--older-than DAYS` sets the state age for one run); git-meta's prune reads every value as before;
   - `vci store upgrade --begin` and `--finish` reach `SqliteStore`, `PgStore` and `LibsqlStore` directly (the trait
     has no upgrade method: the DDL is an operator action on one concrete backend); `vci verify` decodes a frame to
@@ -2620,8 +2623,9 @@ the additions missing asks again at its next check, since any writer may add the
   frame's slot, and which a frame put without columns, a copy out of git-meta, lacks), and with any returns
   `Finish::FormatOneRows(n)` and changes nothing; with none it drops `manifests` and sets
   `schema_version.version = 2` (`vci_version`, `migrated_at` and `migrated_by` updated), which this vci reads
-  (`SUPPORTED` is 2; a new schema is created at 1) and a 2.8 vci refuses as newer than it. Idempotent. After it a
-  manifest read answers none, `remove_manifests` 0, and `put_manifest` `NotInitialized` (a batch holding one fails
+  (`SUPPORTED` is 2; a new schema is created at 1) and a 2.8 vci refuses as newer than it. Idempotent: at version 2
+  already it answers `Finish::Already` and changes nothing (`vci store upgrade --finish` then says so, as on
+  SQLite). After it a manifest read answers none, `remove_manifests` 0, and `put_manifest` `NotInitialized` (a batch holding one fails
   the same way): not undone.
 - **Reads never run DDL.** A missing relation (SQLSTATE 42P01 or 3F000) reads as an empty store, `Absent{advice:
   "the first vci run with a role allowed to create schema <s> creates it"}`, so a SELECT-only role works.
