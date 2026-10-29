@@ -1980,6 +1980,18 @@ pub trait AttestationStore: Send + Sync {
     /// Used by: plan.rs, at the start of a plan.
     fn warm(&self) {}
 
+    /// The policy's `max_ttl`, the longest a record written by this
+    /// process can live: a backend that keeps deletion records for its
+    /// replicas (the libSQL store's `gone` rows, STORE-V2 section 2.1)
+    /// purges them after the larger of it and 30 days, so that no record a
+    /// replica could still serve outlives the deletion it would have
+    /// synced. Never fails. Default: nothing.
+    ///
+    /// Used by: run.rs, after opening the store.
+    fn set_max_ttl(&self, max_ttl: std::time::Duration) {
+        let _ = max_ttl;
+    }
+
     // ---- hints (provided; best effort, never fail) ------------------------
 
     /// The attestations a plan remembered passing on the tree whose id

@@ -493,6 +493,11 @@ impl AttestationStore for LibsqlStore {
         }
     }
 
+    /// [`LibsqlStore::set_max_ttl`]: the `gone` purge horizon on a server.
+    fn set_max_ttl(&self, max_ttl: Duration) {
+        LibsqlStore::set_max_ttl(self, max_ttl);
+    }
+
     fn status(&self) -> Result<StoreStatus, StoreError> {
         match &self.inner {
             Inner::Local(s) => s.status(),

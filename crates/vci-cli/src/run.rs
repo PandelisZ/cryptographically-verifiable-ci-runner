@@ -8,11 +8,16 @@ use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use vci_adapter::Observed;
 use vci_attest::keyless::KeylessSigner;
-use vci_attest::{Statement, Subject};
+use vci_attest::{FrameExt, Statement, Subject};
 use vci_core::{
-    External, InputManifest, Observation, PREDICATE_TYPE, Predicate, RepoPath, Toolchain,
+    Encoded, External, Frame, Hdr, InputManifest, ObjectKind, Observation, PREDICATE_TYPE,
+    PREDICATE_TYPE_V2, Predicate, RepoPath, Tables, Toolchain, UnitInputs, UnitRecord,
+    VciPredicateV2, sorted_compact_json,
 };
-use vci_store::{AttestationStore, KeyHint, Prefetch, StoreError, StoredEnvelope, WriteBatch};
+use vci_store::{
+    AttestationStore, Columns, KeyHint, NewAttestation, NewObject, Prefetch, Record, StoreError,
+    StoredEnvelope, WriteBatch, decode_record,
+};
 
 use crate::ctx::{
     Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo, storage_key,
@@ -185,17 +190,35 @@ struct ToStore {
     input_root: String,
     /// How many entries its input manifest has.
     entries: usize,
-    /// Its input manifest, encoded (on the shared manifest when there is
-    /// one, vci 2.1.8), stored before the attestation.
-    manifest: String,
+    /// A format-1 record's input manifest, encoded (on the shared manifest
+    /// when there is one, vci 2.1.8), stored before the attestation. A
+    /// format-3 record has none: its inputs are its descriptor and the
+    /// run's objects (STORE-V2 section 1.2).
+    manifest: Option<String>,
     storage_key: String,
     hint: Option<KeyHint>,
+    /// The record: a DSSE envelope JSON (format 1) or a text frame
+    /// (format 3).
     envelope: Vec<u8>,
+    /// A format-3 record's listing columns, copied from the statement it
+    /// signed (section 2.1); `None` for a format-1 record.
+    columns: Option<Columns>,
     /// The same signer's attestations of the unit that storing this one
     /// supersedes ([`superseded_by`]).
     doomed: Vec<StoredEnvelope>,
+    /// The object ids each doomed record (by key) names, removed under the
+    /// orphan rule once per run ([`drop_orphan_objects`]).
+    doomed_objects: BTreeMap<String, Vec<String>>,
     /// The taints a policy waived.
     waived: Vec<String>,
+}
+
+/// One signed unit of either format, before it is made ready to store.
+struct Signed {
+    /// The record bytes ([`ToStore::envelope`]).
+    record: Vec<u8>,
+    /// The listing columns ([`ToStore::columns`]).
+    columns: Option<Columns>,
 }
 
 /// What [`run_units`]' writer thread does for one unit, in unit order.
@@ -211,7 +234,7 @@ enum Job {
     /// it could not be signed.
     Attestable {
         warnings: Vec<String>,
-        unit: Result<ToStore, (String, anyhow::Error)>,
+        unit: Result<Box<ToStore>, (String, anyhow::Error)>,
     },
 }
 
@@ -233,6 +256,7 @@ enum Slot {
         line: String,
         superseded: usize,
         dropped: BTreeSet<String>,
+        dropped_objects: BTreeSet<String>,
         /// The key it was stored under: a batch that loses some of its
         /// writes names them by key ([`vci_store::Finished::lost`]).
         key: String,
@@ -256,11 +280,18 @@ struct Stored {
     store_failures: Vec<String>,
     /// The input roots the removed attestations referenced.
     dropped_roots: BTreeSet<String>,
+    /// The object ids the removed format-3 attestations named.
+    dropped_objects: BTreeSet<String>,
     /// Seconds storing and removing (manifests, then attestations, then
     /// removals), of which storing manifests and removing.
     store_secs: f64,
     manifest_secs: f64,
     remove_secs: f64,
+    /// The bytes of the run's objects put, of the records stored, and the
+    /// batches opened (the metrics lines).
+    objects_bytes: usize,
+    records_bytes: usize,
+    batches: usize,
 }
 
 /// One project's store loop in [`run_units`]: each unit in order, refused
@@ -283,6 +314,11 @@ struct StoreLoop<'s> {
     /// A deferred batch's report, in order.
     held: Vec<Held>,
     done: Stored,
+    /// Why the run's objects could not be put ([`StoreLoop::put_objects`]),
+    /// and whether the store cannot be used ([`store_unusable`]): every
+    /// format-3 unit after it is refused, since its record would name
+    /// objects the store does not hold.
+    objects_failed: Option<(String, bool)>,
     /// Where the lines go (stderr; a test collects them).
     say: &'s mut dyn FnMut(&str),
 }
@@ -302,6 +338,10 @@ impl<'s> StoreLoop<'s> {
             StoreMode::Write => store.batch().ok(),
             StoreMode::SignOnly => None,
         };
+        let done = Stored {
+            batches: usize::from(batch.is_some()),
+            ..Stored::default()
+        };
         StoreLoop {
             store,
             mode,
@@ -310,9 +350,41 @@ impl<'s> StoreLoop<'s> {
             batch,
             slots: Vec::new(),
             held: Vec::new(),
-            done: Stored::default(),
+            done,
+            objects_failed: None,
             say,
         }
+    }
+
+    /// Put the run's format-3 objects (STORE-V2 section 1.4 step 4: the
+    /// hdr and tables objects, the shape, the state), before any record
+    /// that names them, inside the batch. A put the store refuses is a
+    /// warning here and refuses every format-3 unit after it
+    /// ([`StoreLoop::objects_failed`]), so that no record names an object
+    /// the store does not hold. Signing only, nothing is put.
+    fn put_objects(&mut self, objects: &[RunObject]) {
+        if self.mode == StoreMode::SignOnly || objects.is_empty() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let news: Vec<NewObject<'_>> = objects
+            .iter()
+            .map(|o| NewObject::new(o.kind, &o.bytes))
+            .collect();
+        match self.store.put_objects(&news) {
+            Ok(_) => {
+                self.done.objects_bytes += objects.iter().map(|o| o.bytes.len()).sum::<usize>();
+            }
+            Err(e) => {
+                self.note(format!(
+                    "vci: warning: storing the run's {} object(s) in the {} store: {e}",
+                    objects.len(),
+                    self.store.kind()
+                ));
+                self.objects_failed = Some((e.to_string(), store_unusable(&e)));
+            }
+        }
+        self.done.store_secs += t.elapsed().as_secs_f64();
     }
 
     fn deferred(&self) -> bool {
@@ -343,7 +415,7 @@ impl<'s> StoreLoop<'s> {
                     self.note(w);
                 }
                 match unit {
-                    Ok(u) => self.attest(u),
+                    Ok(u) => self.attest(*u),
                     Err((label, e)) => self.failed(&label, &e),
                 }
             }
@@ -407,7 +479,19 @@ impl<'s> StoreLoop<'s> {
         let entries = u.entries;
         let root = u.input_root[..16.min(u.input_root.len())].to_owned();
         let waived = u.waived.clone();
-        let (stored, superseded, dropped, warnings) = match self.write(u) {
+        if u.columns.is_some()
+            && let Some((why, unusable)) = &self.objects_failed
+        {
+            // Its record would name objects the store did not take.
+            let e = if *unusable {
+                StoreError::unavailable(self.store.kind(), why.clone())
+            } else {
+                StoreError::other(why.clone())
+            };
+            let e = anyhow::Error::from(e).context("storing the run's objects");
+            return self.failed(&label, &e);
+        }
+        let (stored, superseded, dropped, dropped_objects, warnings) = match self.write(u) {
             Ok(x) => x,
             Err(e) => return self.failed(&label, &e),
         };
@@ -433,37 +517,54 @@ impl<'s> StoreLoop<'s> {
                 line,
                 superseded,
                 dropped,
+                dropped_objects,
                 key: stored.key.clone(),
             });
         } else {
             self.done.superseded += superseded;
             self.done.dropped_roots.extend(dropped);
+            self.done.dropped_objects.extend(dropped_objects);
             (self.say)(&line);
             self.slots.push(Slot::Done(outcome));
         }
     }
 
-    /// Store `u` (the manifest first: an attestation is never stored
-    /// without the manifest it references) and remove what it supersedes:
-    /// the entry stored, how many were removed, the roots they referenced,
-    /// and the warnings about removals that failed.
+    /// Store `u` (a format-1 record's manifest first: an attestation is
+    /// never stored without the manifest it references; a format-3
+    /// record's objects went first, [`StoreLoop::put_objects`]) and remove
+    /// what it supersedes: the entry stored, how many were removed, the
+    /// roots and the object ids they referenced, and the warnings about
+    /// removals that failed.
     #[allow(clippy::type_complexity)]
     fn write(
         &mut self,
         u: ToStore,
-    ) -> Result<(StoredEnvelope, usize, BTreeSet<String>, Vec<String>)> {
+    ) -> Result<(
+        StoredEnvelope,
+        usize,
+        BTreeSet<String>,
+        BTreeSet<String>,
+        Vec<String>,
+    )> {
         let t = std::time::Instant::now();
-        self.store
-            .put_manifest(&u.input_root, u.manifest.as_bytes())
-            .context("storing the input manifest")?;
-        self.done.manifest_secs += t.elapsed().as_secs_f64();
-        let stored = self.store.put_for_test(
+        if let Some(m) = &u.manifest {
+            self.store
+                .put_manifest(&u.input_root, m.as_bytes())
+                .context("storing the input manifest")?;
+            self.done.manifest_secs += t.elapsed().as_secs_f64();
+        }
+        let mut att = NewAttestation::for_test(
             &u.test_id,
             self.signer,
             &u.storage_key,
             u.hint.as_ref(),
             &u.envelope,
-        )?;
+        );
+        if let Some(c) = &u.columns {
+            att = att.with_columns(c);
+        }
+        let stored = self.store.put(&att)?;
+        self.done.records_bytes += u.envelope.len();
         // Never the one just stored (the same storage key: the same
         // inputs, replaced).
         let doomed: Vec<_> = u
@@ -473,12 +574,20 @@ impl<'s> StoreLoop<'s> {
             .collect();
         let t_remove = std::time::Instant::now();
         let mut dropped = BTreeSet::new();
+        let mut dropped_objects = BTreeSet::new();
         let mut warnings = Vec::new();
-        let superseded =
-            remove_superseded(self.store, &u.test_id, doomed, &mut dropped, &mut warnings);
+        let superseded = remove_superseded(
+            self.store,
+            &u.test_id,
+            doomed,
+            &u.doomed_objects,
+            &mut dropped,
+            &mut dropped_objects,
+            &mut warnings,
+        );
         self.done.remove_secs += t_remove.elapsed().as_secs_f64();
         self.done.store_secs += t.elapsed().as_secs_f64();
-        Ok((stored, superseded, dropped, warnings))
+        Ok((stored, superseded, dropped, dropped_objects, warnings))
     }
 
     /// End the batch, then report every unit in order. A deferred batch
@@ -533,12 +642,14 @@ impl<'s> StoreLoop<'s> {
                     line,
                     superseded,
                     dropped,
+                    dropped_objects,
                     key,
                 } => match failed.as_ref().or_else(|| lost.lost(&key)) {
                     None => {
                         lines.push(Some(line));
                         done.superseded += superseded;
                         done.dropped_roots.extend(dropped);
+                        done.dropped_objects.extend(dropped_objects);
                         done.outcomes.push(outcome);
                     }
                     Some(e) => {
@@ -1212,11 +1323,13 @@ enum Verdict {
         taints: Vec<String>,
     },
     /// Attestable: the warnings to print first (whole lines), and the signed
-    /// envelope to store, or why it could not be signed.
+    /// record to store, or why it could not be signed. A format-1 record
+    /// is signed with the verdict; a format-3 one once the run's objects
+    /// are built, since its statement names them (`None` until then).
     Attestable {
         a: Box<Attestable>,
         warnings: Vec<String>,
-        signed: Result<Vec<u8>>,
+        signed: Option<Result<Signed>>,
     },
 }
 
@@ -2312,6 +2425,30 @@ impl Signer<'_> {
                 .context("signing keylessly (OIDC)"),
         }
     }
+
+    /// Sign a format-3 statement's bytes exactly as they are (STORE-V2
+    /// section 1.1: the writer's bytes are what the signature covers and
+    /// what the store holds) and frame the signature with the unit's
+    /// descriptor (section 1.2): the record before its text encoding.
+    fn sign_frame(&self, statement: Vec<u8>, descriptor: Vec<u8>) -> Result<Frame> {
+        let framed = |r: Result<Frame, vci_core::FrameError>| {
+            r.map_err(|e| anyhow::anyhow!("framing the signature: {e}"))
+        };
+        match self {
+            Signer::Ssh(key, signer) => {
+                let env = signer
+                    .sign_payload(&statement)
+                    .with_context(|| format!("signing with {}", key.path))?;
+                framed(Frame::from_envelope(&env, descriptor))
+            }
+            Signer::Keyless(k) => {
+                let (env, m) = k
+                    .sign_payload(&statement)
+                    .context("signing keylessly (OIDC)")?;
+                framed(Frame::from_keyless(&env, &m, descriptor))
+            }
+        }
+    }
 }
 
 /// `--oidc [INSTANCE]`: a keyless signer for the job's identity (fails
@@ -2573,6 +2710,10 @@ pub fn run_units(
         bail!("no test files to run");
     }
     let involved: BTreeSet<usize> = selected.iter().map(|&i| files[i].project).collect();
+    // The longest `max_ttl` of the involved projects: how long a record of
+    // this run can live, which a store that keeps deletion records for its
+    // replicas purges them after (STORE-V2 section 2.1).
+    let mut max_ttl_secs: i64 = 0;
     for &pi in &involved {
         let p = &ctx.projects[pi];
         let max = p.policy.max_ttl_secs()?;
@@ -2584,6 +2725,7 @@ pub fn run_units(
                 p.label()
             );
         }
+        max_ttl_secs = max_ttl_secs.max(max);
     }
     for &i in &selected {
         let f = &files[i];
@@ -2656,6 +2798,16 @@ pub fn run_units(
 
     let store = crate::store::for_repo(&ctx.repo);
     let store = &*store;
+    store.set_max_ttl(std::time::Duration::from_secs(
+        u64::try_from(max_ttl_secs).unwrap_or(0),
+    ));
+    // What this run writes: format-3 records with the run's objects
+    // (STORE-V2 section 1.4) on a store that keeps objects, else format 1
+    // as 2.8 wrote (`[store] record_format = 1`, or a store without them).
+    let settings = RecordSettings::of(&ctx.repo);
+    let format3 = settings.format3(store);
+    // The platform of each hdr object supersession met, read once.
+    let hdr_platforms = HdrPlatforms::default();
     let selected_ids: Vec<&str> = selected
         .iter()
         .map(|&i| files[i].test_id.as_str())
@@ -2690,6 +2842,7 @@ pub fn run_units(
     // is never superseded, whatever its commit (vci 2.1.12).
     let live_trees: BTreeSet<String> = ctx.repo.live_trees().unwrap_or_default();
     let mut dropped_roots = BTreeSet::new();
+    let mut dropped_objects = BTreeSet::new();
     let mut outcomes: Vec<UnitOutcome> = Vec::new();
     let mut exit: Option<i32> = Some(0);
     let jobs = check_jobs();
@@ -2881,9 +3034,18 @@ pub fn run_units(
                     let t = std::time::Instant::now();
                     let warnings = attested_warnings(&checkout, project, label, &a);
                     add(&tm_warn, t);
-                    let t = std::time::Instant::now();
-                    let signed = sign_predicate(&key, &a.predicate);
-                    add(&tm_sign, t);
+                    // A format-1 record is signed here; a format-3 one once
+                    // the run's objects are built below, since its
+                    // statement names them.
+                    let signed = (!format3).then(|| {
+                        let t = std::time::Instant::now();
+                        let signed = sign_predicate(&key, &a.predicate).map(|record| Signed {
+                            record,
+                            columns: None,
+                        });
+                        add(&tm_sign, t);
+                        signed
+                    });
                     // What it supersedes is found when it is made ready to
                     // store, while the writer stores the units before it.
                     Verdict::Attestable {
@@ -2901,8 +3063,78 @@ pub fn run_units(
         // stored and reported in order.
         let mut verdicts: Vec<Option<Verdict>> = (0..units.len()).map(|_| None).collect();
         in_order(&units, jobs, verdict, |i, v| verdicts[i] = Some(v));
+        // Format 3: the run's objects over every attestable unit (STORE-V2
+        // section 1.4 steps 1 and 2), then each unit signed on the pool
+        // (step 3), so nothing is stored before every unit is signed.
+        let run3: Option<Run3> = if format3 {
+            let t = std::time::Instant::now();
+            let attestable: Vec<(usize, &Attestable, String)> = verdicts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| match v {
+                    Some(Verdict::Attestable { a, .. }) => {
+                        Some((i, a.as_ref(), group_key(units[i].0)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let built = build_run3(&attestable, settings.explain_hashes);
+            crate::plan::timing(
+                &format!(
+                    "{}: build the run's format-3 objects over {} unit(s)",
+                    project.label(),
+                    attestable.len()
+                ),
+                t,
+            );
+            match built {
+                Ok(run) => {
+                    let indices: Vec<usize> = run.units.keys().copied().collect();
+                    let mut signed: BTreeMap<usize, Result<Signed>> = BTreeMap::new();
+                    let sign = |&i: &usize| {
+                        let t = std::time::Instant::now();
+                        let r = match &verdicts[i] {
+                            Some(Verdict::Attestable { a, .. }) => {
+                                sign_format3(&key, a, &run, &run.units[&i])
+                            }
+                            _ => Err(anyhow::anyhow!("not attestable")),
+                        };
+                        add(&tm_sign, t);
+                        r
+                    };
+                    in_order(&indices, jobs, sign, |k, r| {
+                        signed.insert(indices[k], r);
+                    });
+                    for (i, why) in &run.failed {
+                        signed.insert(*i, Err(anyhow::anyhow!("{why}")));
+                    }
+                    for (i, r) in signed {
+                        if let Some(Verdict::Attestable { signed, .. }) = &mut verdicts[i] {
+                            *signed = Some(r);
+                        }
+                    }
+                    Some(run)
+                }
+                Err(e) => {
+                    // No unit of the project is stored: each is refused
+                    // with why, as a unit that could not be signed.
+                    for v in verdicts.iter_mut().flatten() {
+                        if let Verdict::Attestable { signed, .. } = v {
+                            *signed = Some(Err(anyhow::anyhow!("{e}")));
+                        }
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let t = std::time::Instant::now();
-        let mut manifest_bases = shared_manifest_bases(&verdicts, &units);
+        let mut manifest_bases = if format3 {
+            BTreeMap::new()
+        } else {
+            shared_manifest_bases(&verdicts, &units)
+        };
         if !manifest_bases.is_empty() && mode == StoreMode::Write {
             // A base the store refused is not relied on: its units' manifests
             // are encoded whole instead (each then stored, or refused with
@@ -2963,6 +3195,7 @@ pub fn run_units(
                     warnings,
                     signed,
                 } => {
+                    let signed = signed.unwrap_or_else(|| Err(anyhow::anyhow!("not signed")));
                     let t = std::time::Instant::now();
                     // The same signer's stored attestations of the unit it
                     // supersedes, removed once it is stored; signing only,
@@ -2976,22 +3209,32 @@ pub fn run_units(
                             &signer,
                             &moved_on,
                             &live_trees,
+                            &hdr_platforms,
                         )
                     } else {
                         Vec::new()
                     };
                     add(&tm_supersede, t);
+                    let doomed_objects: BTreeMap<String, Vec<String>> = doomed
+                        .iter()
+                        .filter(|d| !d.objects.is_empty())
+                        .map(|d| (d.env.key.clone(), d.objects.clone()))
+                        .collect();
+                    let doomed: Vec<StoredEnvelope> = doomed.into_iter().map(|d| d.env).collect();
                     let p = &a.predicate;
                     let unit = match signed {
                         Err(e) => Err((label, e)),
-                        Ok(envelope) => Ok(ToStore {
-                            manifest: match mode {
-                                StoreMode::SignOnly => String::new(),
-                                StoreMode::Write => {
-                                    match manifest_bases.get(&group_key(units[i].0)) {
+                        Ok(Signed { record, columns }) => Ok(Box::new(ToStore {
+                            // A format-1 record's manifest, encoded on its
+                            // group's shared one; a format-3 record has
+                            // none (its inputs are in the run's objects).
+                            manifest: match (mode, &columns) {
+                                (StoreMode::SignOnly, _) | (StoreMode::Write, Some(_)) => None,
+                                (StoreMode::Write, None) => {
+                                    Some(match manifest_bases.get(&group_key(units[i].0)) {
                                         Some(b) => a.manifest.to_compact_on(b),
                                         None => a.manifest.to_compact(),
-                                    }
+                                    })
                                 }
                             },
                             entries: a.manifest.entries.len(),
@@ -3009,10 +3252,12 @@ pub fn run_units(
                                         .map(|t| t.chars().take(16).collect()),
                                 },
                             ),
-                            envelope,
+                            envelope: record,
+                            columns,
                             doomed,
+                            doomed_objects,
                             waived: p.waived.clone(),
-                        }),
+                        })),
                     };
                     Job::Attestable { warnings, unit }
                 }
@@ -3021,9 +3266,14 @@ pub fn run_units(
         let (signer_id, owner) = (signer.as_str(), Owner::of(project));
         let done = std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let run3 = run3.as_ref();
             let writer = scope.spawn(move || {
                 let mut say = |l: &str| eprintln!("{l}");
                 let mut stores = StoreLoop::new(store, mode, signer_id, owner, &mut say);
+                // The run's objects before any record that names them.
+                if let Some(r) = run3 {
+                    stores.put_objects(&r.objects);
+                }
                 for job in rx {
                     stores.apply(job);
                 }
@@ -3047,6 +3297,23 @@ pub fn run_units(
         errors.extend(done.errors);
         store_failures.extend(done.store_failures);
         dropped_roots.extend(done.dropped_roots);
+        dropped_objects.extend(done.dropped_objects);
+        if let Some(r) = &run3 {
+            crate::plan::timing(
+                &format!(
+                    "{}: format-3 run: {} hdr, {} tables, 1 shape, {} state object(s) over {} unit(s); objects {} bytes put, records {} bytes stored, {} batch(es)",
+                    project.label(),
+                    r.headers.len(),
+                    r.tables.len(),
+                    usize::from(r.state.is_some()),
+                    r.units.len(),
+                    done.objects_bytes,
+                    done.records_bytes,
+                    done.batches
+                ),
+                t_check,
+            );
+        }
         crate::plan::timing(
             &format!(
                 "check, sign and store {} unit(s) of {} ({jobs} at a time)",
@@ -3076,7 +3343,7 @@ pub fn run_units(
             let ns =
                 |i: usize| SUPERSEDE_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
             vci_core::timing_line!(
-                "{}: supersession thread-seconds: list {:.1}, read payloads {:.1}, moved on {:.1}, manifests {:.1}; {} earlier commit(s) asked about",
+                "{}: supersession thread-seconds: list {:.1}, read payloads {:.1}, moved on {:.1}, manifests or headers {:.1}; {} earlier commit(s) asked about",
                 project.label(),
                 ns(0),
                 ns(1),
@@ -3114,6 +3381,19 @@ pub fn run_units(
         if orphans > 0 {
             eprintln!(
                 "vci: removed {orphans} input manifest(s) no attestation references any more"
+            );
+        }
+        let orphans = drop_orphan_objects(store, &dropped_objects);
+        if orphans > 0 {
+            eprintln!("vci: removed {orphans} object(s) no attestation references any more");
+        }
+    }
+    if format3 && mode == StoreMode::Write {
+        let aged = prune_state_objects(store, settings.explain_hashes_days);
+        if aged > 0 {
+            eprintln!(
+                "vci: removed {aged} state object(s) older than {} day(s) ([store] explain_hashes_days)",
+                settings.explain_hashes_days
             );
         }
     }
@@ -3196,6 +3476,38 @@ fn supersede_add(i: usize, t: std::time::Instant) {
     );
 }
 
+/// An earlier record [`superseded_by`] found, with the object ids it names
+/// (its listing columns' and, for a format-3 record, its statement's hdr
+/// and tables and its descriptor's shape), removed under the orphan rule
+/// once the run has stored ([`drop_orphan_objects`]).
+struct Doomed {
+    env: StoredEnvelope,
+    objects: Vec<String>,
+}
+
+/// What supersession reads from an old record of either format: the v1
+/// fields of [`crate::cmds::EnvelopeMeta`], or the format-3 statement's
+/// ([`frame_meta`]) with the platform resolved through its hdr object.
+struct OldRecord {
+    test_id: String,
+    commit: String,
+    os: String,
+    arch: String,
+    issued_at: i64,
+    tree: Option<String>,
+    files: OldFiles,
+}
+
+/// How an old record names its files, for supersession's "same files"
+/// test.
+enum OldFiles {
+    /// Format 1: by its manifest (`manifestRef`, or inline before 1.9.0).
+    Manifest(Option<String>),
+    /// Format 3: by its signed `entriesRoot`.
+    EntriesRoot(String),
+}
+
+#[allow(clippy::too_many_arguments)]
 fn superseded_by(
     store: &dyn AttestationStore,
     repo: &vci_git::Repo,
@@ -3204,42 +3516,29 @@ fn superseded_by(
     signer: &str,
     moved_on: &MovedOn,
     live_trees: &BTreeSet<String>,
-) -> Vec<StoredEnvelope> {
+    hdrs: &HdrPlatforms,
+) -> Vec<Doomed> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
     let tc = &p.core.toolchain;
+    let platform = format!("{}-{}", tc.os, tc.arch);
     let mut entries: Vec<&vci_core::InputEntry> = manifest.entries.iter().collect();
     entries.sort();
-    let keep = |e: &StoredEnvelope| {
-        if e.error.is_some() {
-            return true;
-        }
-        let t = std::time::Instant::now();
-        let meta = crate::cmds::envelope_meta(&e.bytes);
-        supersede_add(1, t);
-        let Some(m) = meta else {
-            return true;
-        };
-        if m.test_id != p.core.test_id
-            || m.commit == p.core.commit
-            || m.os != tc.os
-            || m.arch != tc.arch
-            || issued.is_none_or(|i| m.issued_at > i)
-            || m.tree.as_deref().is_some_and(|t| live_trees.contains(t))
-        {
-            return true;
-        }
-        // Whether its commit was moved on from: one answer per commit (two
-        // threads may ask about the same commit at once; same answer), so
-        // before reading its manifest (2.3.1: decoding every older
-        // attestation's manifest first took about 215 thread-seconds of a
-        // full vex job, where most were made on commits others contain).
-        // Asked once per commit: a thread that finds another asking waits
-        // for its answer (16 threads used to ask about the same commits at
-        // once, each walking every ref's history).
+    // The new manifest's entries root, for a format-3 old record's "same
+    // files" test (STORE-V2 section 1.4 step 5), computed when first met.
+    let entries_root = std::sync::OnceLock::new();
+    // Whether its commit was moved on from: one answer per commit (two
+    // threads may ask about the same commit at once; same answer), so
+    // before reading its manifest (2.3.1: decoding every older
+    // attestation's manifest first took about 215 thread-seconds of a
+    // full vex job, where most were made on commits others contain).
+    // Asked once per commit: a thread that finds another asking waits
+    // for its answer (16 threads used to ask about the same commits at
+    // once, each walking every ref's history).
+    let moved = |commit: &str| -> bool {
         let cell = moved_on
             .commits
             .lock()
-            .map(|mut c| c.entry(m.commit.clone()).or_default().clone())
+            .map(|mut c| c.entry(commit.to_owned()).or_default().clone())
             .unwrap_or_default();
         let t = std::time::Instant::now();
         let moved = *cell.get_or_init(|| {
@@ -3261,61 +3560,173 @@ fn superseded_by(
             });
             let t = std::time::Instant::now();
             let moved = match only {
-                Some(only) => repo.moved_on_given(&m.commit, &p.core.commit, only),
-                None => repo.moved_on(&m.commit, &p.core.commit),
+                Some(only) => repo.moved_on_given(commit, &p.core.commit, only),
+                None => repo.moved_on(commit, &p.core.commit),
             }
             .unwrap_or(false);
             if vci_core::metrics::on() {
                 vci_core::timing_line!(
                     "supersession: whether {} was moved on from ({moved}): {:.2}s",
-                    &m.commit[..m.commit.len().min(12)],
+                    &commit[..commit.len().min(12)],
                     t.elapsed().as_secs_f64()
                 );
             }
             moved
         });
         supersede_add(2, t);
-        if !moved {
-            return true;
-        }
-        let t = std::time::Instant::now();
-        let old = match &m.manifest_ref {
-            // The same root: the same inputs.
-            Some(r) if *r == p.core.input_root => return true,
-            Some(r) => store
-                .manifest_decoded(r)
-                .ok()
-                .flatten()
-                .and_then(Result::ok)
-                .filter(|o| o.root() == *r),
-            None => crate::cmds::envelope_inline_manifest(&e.bytes),
-        };
-        supersede_add(3, t);
-        let Some(old) = old else {
-            return true;
-        };
-        let mut old_entries: Vec<&vci_core::InputEntry> = old.entries.iter().collect();
-        old_entries.sort();
-        old_entries == entries
+        moved
     };
-    let t = std::time::Instant::now();
-    let listed = store
-        .read_units(&[p.core.test_id.as_str()])
-        .map(|mut units| units.pop().unwrap_or_default());
-    supersede_add(0, t);
-    match listed {
-        Ok(all) => all
-            .into_iter()
-            .filter(|e| e.signer == signer && !keep(e))
-            .collect(),
-        Err(e) => {
-            eprintln!(
-                "vci: warning: {}: cannot read its stored attestations to supersede them: {e}",
-                p.core.test_id
-            );
-            Vec::new()
+    // The record's facts, from its signed statement (unverified, as
+    // today: the key's signer segment and the columns only chose it); a
+    // format-3 record's platform through its hdr object, which must decode
+    // to its signed id. `None` keeps the record.
+    let old_record = |e: &StoredEnvelope| -> Option<(OldRecord, Vec<String>)> {
+        match decode_record(&e.bytes).ok()? {
+            Record::FormatOne(bytes) => {
+                let m = crate::cmds::envelope_meta(bytes)?;
+                let old = OldRecord {
+                    test_id: m.test_id,
+                    commit: m.commit,
+                    os: m.os,
+                    arch: m.arch,
+                    issued_at: m.issued_at,
+                    tree: m.tree,
+                    files: OldFiles::Manifest(m.manifest_ref),
+                };
+                Some((old, Vec::new()))
+            }
+            Record::FormatThree(frame) => {
+                let m = frame_meta(&frame)?;
+                let t = std::time::Instant::now();
+                let found = hdrs.of(store, &m.hdr);
+                supersede_add(3, t);
+                let (os, arch) = found?;
+                let mut objects = vec![m.hdr.clone(), m.tables.clone()];
+                if let Ok(shape) = vci_core::Descriptor::shape_id(&frame.descriptor) {
+                    objects.push(vci_core::objects::hex32(&shape));
+                }
+                let old = OldRecord {
+                    test_id: m.test_id,
+                    commit: m.commit,
+                    os,
+                    arch,
+                    issued_at: m.issued_at,
+                    tree: m.tree,
+                    files: OldFiles::EntriesRoot(m.entries_root),
+                };
+                Some((old, objects))
+            }
         }
-    }
+    };
+    // Whether the new record supersedes this old one: `None` keeps it,
+    // `Some(ids)` dooms it with the object ids it names.
+    let judge = |e: &StoredEnvelope, c: &Columns| -> Option<Vec<String>> {
+        if e.error.is_some() {
+            return None;
+        }
+        let (m, mut objects) = old_record(e)?;
+        if m.test_id != p.core.test_id
+            || m.commit == p.core.commit
+            || m.os != tc.os
+            || m.arch != tc.arch
+            || issued.is_none_or(|i| m.issued_at > i)
+            || m.tree.as_deref().is_some_and(|t| live_trees.contains(t))
+            || !moved(&m.commit)
+        {
+            return None;
+        }
+        let same_files = match &m.files {
+            OldFiles::EntriesRoot(r) => *r == *entries_root.get_or_init(|| manifest.entries_root()),
+            // The same root: the same inputs.
+            OldFiles::Manifest(Some(r)) if *r == p.core.input_root => true,
+            OldFiles::Manifest(r) => {
+                let t = std::time::Instant::now();
+                let old = match r {
+                    Some(r) => store
+                        .manifest_decoded(r)
+                        .ok()
+                        .flatten()
+                        .and_then(Result::ok)
+                        .filter(|o| o.root() == *r),
+                    None => crate::cmds::envelope_inline_manifest(&e.bytes),
+                };
+                supersede_add(3, t);
+                let old = old?;
+                let mut old_entries: Vec<&vci_core::InputEntry> = old.entries.iter().collect();
+                old_entries.sort();
+                old_entries == entries
+            }
+        };
+        if same_files {
+            return None;
+        }
+        objects.extend(c.object_ids().map(str::to_owned));
+        objects.sort_unstable();
+        objects.dedup();
+        Some(objects)
+    };
+    let test_id = p.core.test_id.as_str();
+    let cannot_read = |e: &StoreError| {
+        eprintln!(
+            "vci: warning: {test_id}: cannot read its stored attestations to supersede them: {e}"
+        );
+        Vec::new()
+    };
+    // The same signer's records of the unit, read. On a store with listing
+    // columns (STORE-V2 section 1.4 step 5) the columns pre-filter which
+    // to read: one made at the same commit or for another platform is
+    // skipped without a read (a column that lies costs one read, never a
+    // deletion: every fact below comes from the signed statement). Without
+    // them (git-meta), the backend's own targeted read of the unit.
+    let t = std::time::Instant::now();
+    let mut candidates: Vec<(StoredEnvelope, Columns)> = if store.caps().columns {
+        let mine: Vec<StoredEnvelope> = match store.list_units(&[test_id]) {
+            Ok(mut units) => units.pop().unwrap_or_default(),
+            Err(e) => return cannot_read(&e),
+        }
+        .into_iter()
+        .filter(|e| e.signer == signer)
+        .collect();
+        supersede_add(0, t);
+        let refs: Vec<&StoredEnvelope> = mine.iter().collect();
+        let columns = store
+            .columns(&refs)
+            .ok()
+            .filter(|c| c.len() == mine.len())
+            .unwrap_or_else(|| vec![Columns::default(); mine.len()]);
+        let mut chosen: Vec<(StoredEnvelope, Columns)> = mine
+            .into_iter()
+            .zip(columns)
+            .filter(|(_, c)| {
+                c.commit.as_deref() != Some(p.core.commit.as_str())
+                    && !c.platform.as_deref().is_some_and(|pl| pl != platform)
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let mut refs: Vec<&mut StoredEnvelope> = chosen.iter_mut().map(|(e, _)| e).collect();
+        if let Err(e) = store.read_values(&mut refs) {
+            return cannot_read(&e);
+        }
+        supersede_add(1, t);
+        chosen
+    } else {
+        let mine = match store.read_units(&[test_id]) {
+            Ok(mut units) => units.pop().unwrap_or_default(),
+            Err(e) => return cannot_read(&e),
+        };
+        supersede_add(1, t);
+        mine.into_iter()
+            .filter(|e| e.signer == signer)
+            .map(|e| (e, Columns::default()))
+            .collect()
+    };
+    candidates
+        .drain(..)
+        .filter_map(|(e, c)| {
+            let objects = judge(&e, &c)?;
+            Some(Doomed { env: e, objects })
+        })
+        .collect()
 }
 
 /// Delete what [`superseded_by`] found, once the new attestation is stored.
@@ -3326,7 +3737,9 @@ fn remove_superseded(
     store: &dyn AttestationStore,
     test_id: &str,
     doomed: Vec<StoredEnvelope>,
+    doomed_objects: &BTreeMap<String, Vec<String>>,
     dropped_roots: &mut BTreeSet<String>,
+    dropped_objects: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> usize {
     if doomed.is_empty() {
@@ -3335,7 +3748,12 @@ fn remove_superseded(
     match store.remove(doomed) {
         Ok(removed) => {
             for e in &removed {
-                if let Some(r) = crate::cmds::envelope_meta(&e.bytes).and_then(|m| m.manifest_ref) {
+                if let Some(ids) = doomed_objects.get(&e.key) {
+                    dropped_objects.extend(ids.iter().cloned());
+                }
+                if let Ok(Record::FormatOne(bytes)) = decode_record(&e.bytes)
+                    && let Some(r) = crate::cmds::envelope_meta(bytes).and_then(|m| m.manifest_ref)
+                {
                     dropped_roots.insert(r);
                 }
             }
@@ -3371,7 +3789,9 @@ fn shared_manifest_bases(
     let mut shared: BTreeMap<String, (usize, BTreeSet<&vci_core::InputEntry>)> = BTreeMap::new();
     for (i, v) in verdicts.iter().enumerate() {
         let Some(Verdict::Attestable {
-            a, signed: Ok(_), ..
+            a,
+            signed: Some(Ok(_)),
+            ..
         }) = v
         else {
             continue;
@@ -3406,24 +3826,434 @@ fn shared_manifest_bases(
 
 /// The last recorded duration (`result.durationMs`) of each of these units:
 /// its newest stored attestation's, by any signer, when one records it.
-/// Best effort: a unit that cannot be read has none.
+/// On a store with listing columns ([`vci_store::Caps::columns`]) from the
+/// columns (`duration_ms`, and `issued` from the key), without a value
+/// read; a unit none of whose records has the column (format-1 rows, as
+/// 2.8 and `record_format = 1` write them) is read and decoded by its
+/// first byte, as every unit is on a store without columns. Best effort: a
+/// unit that cannot be read has none.
 fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
-    let Ok(units) = store.read_units(test_ids) else {
-        return out;
-    };
-    for (id, cands) in test_ids.iter().zip(units) {
-        let newest = cands
+    let newest_read = |cands: &[StoredEnvelope]| -> Option<u64> {
+        cands
             .iter()
             .filter(|e| e.error.is_none())
-            .filter_map(|e| crate::cmds::envelope_meta(&e.bytes))
-            .filter_map(|m| m.duration_ms.map(|d| (m.issued_at, d)))
+            .filter_map(|e| record_duration(&e.bytes))
+            .max_by_key(|(issued, _)| *issued)
+            .map(|(_, d)| d)
+    };
+    if !store.caps().columns {
+        let Ok(units) = store.read_units(test_ids) else {
+            return out;
+        };
+        for (id, cands) in test_ids.iter().zip(units) {
+            if let Some(d) = newest_read(&cands) {
+                out.insert((*id).to_owned(), d);
+            }
+        }
+        return out;
+    }
+    let Ok(units) = store.list_units(test_ids) else {
+        return out;
+    };
+    // One columns round trip for every unit's records.
+    let refs: Vec<&StoredEnvelope> = units.iter().flatten().collect();
+    let columns = store
+        .columns(&refs)
+        .ok()
+        .filter(|c| c.len() == refs.len())
+        .unwrap_or_else(|| vec![Columns::default(); refs.len()]);
+    let mut columns = columns.into_iter();
+    let mut to_read: Vec<(usize, StoredEnvelope)> = Vec::new();
+    for (ui, (id, cands)) in test_ids.iter().zip(units).enumerate() {
+        let cols: Vec<Columns> = columns.by_ref().take(cands.len()).collect();
+        let newest = cands
+            .iter()
+            .zip(&cols)
+            .filter_map(|(e, c)| c.duration_ms.map(|d| (e.issued.unwrap_or(0), d)))
             .max_by_key(|(issued, _)| *issued);
-        if let Some((_, d)) = newest {
-            out.insert((*id).to_owned(), d);
+        match newest {
+            Some((_, d)) => {
+                out.insert((*id).to_owned(), d);
+            }
+            None => to_read.extend(cands.into_iter().map(|e| (ui, e))),
+        }
+    }
+    if to_read.is_empty() {
+        return out;
+    }
+    {
+        let mut refs: Vec<&mut StoredEnvelope> = to_read.iter_mut().map(|(_, e)| e).collect();
+        if store.read_values(&mut refs).is_err() {
+            return out;
+        }
+    }
+    let mut by_unit: BTreeMap<usize, Vec<StoredEnvelope>> = BTreeMap::new();
+    for (ui, e) in to_read {
+        by_unit.entry(ui).or_default().push(e);
+    }
+    for (ui, cands) in by_unit {
+        if let Some(d) = newest_read(&cands) {
+            out.insert(test_ids[ui].to_owned(), d);
         }
     }
     out
+}
+
+/// A stored record's issue time and recorded duration, by its first byte
+/// (unverified): a format-1 envelope's `issuedAt` and `result.durationMs`,
+/// a format-3 statement's.
+fn record_duration(bytes: &[u8]) -> Option<(i64, u64)> {
+    match decode_record(bytes).ok()? {
+        Record::FormatOne(b) => {
+            let m = crate::cmds::envelope_meta(b)?;
+            Some((m.issued_at, m.duration_ms?))
+        }
+        Record::FormatThree(f) => {
+            let m = frame_meta(&f)?;
+            Some((m.issued_at, m.duration_ms))
+        }
+    }
+}
+
+// ---------------------------------------------------------------- format 3
+
+/// What `[store]` says `vci run` writes (STORE-V2 sections 1.3 and 5): the
+/// record format, whether the run's state object is written, and how long
+/// a state object is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordSettings {
+    format: u8,
+    explain_hashes: bool,
+    explain_hashes_days: u32,
+}
+
+impl RecordSettings {
+    /// The settings the repository's store was opened with
+    /// ([`crate::store::selection_of`]), else the defaults (a store that
+    /// could not be selected is one nothing is written to).
+    fn of(repo: &vci_git::Repo) -> Self {
+        match crate::store::selection_of(repo) {
+            Some(s) => RecordSettings {
+                format: s.record_format.value,
+                explain_hashes: s.explain_hashes.value,
+                explain_hashes_days: s.explain_hashes_days.value,
+            },
+            None => RecordSettings {
+                format: vci_store::select::DEFAULT_RECORD_FORMAT,
+                explain_hashes: true,
+                explain_hashes_days: vci_store::select::DEFAULT_EXPLAIN_HASHES_DAYS,
+            },
+        }
+    }
+
+    /// Whether this run writes format-3 records: `record_format = 3` on a
+    /// store that keeps objects ([`vci_store::Caps::objects`]); otherwise
+    /// format 1, exactly as 2.8 wrote it.
+    fn format3(&self, store: &dyn AttestationStore) -> bool {
+        self.format == 3 && store.caps().objects
+    }
+}
+
+/// One of a run's format-3 objects, encoded, in the order they are put.
+struct RunObject {
+    kind: ObjectKind,
+    bytes: Vec<u8>,
+    id: vci_core::ObjectId,
+}
+
+/// What one attestable unit takes from a built run: its header group, its
+/// descriptor and waived ids, and its manifest's entries root.
+struct Unit3 {
+    header: usize,
+    record: UnitRecord,
+    entries_root: String,
+}
+
+/// A run's format-3 objects (STORE-V2 section 1.4 steps 1 and 2) and each
+/// attestable unit's part of them (step 3), built once per project after
+/// the tests: the hdr per header group (content-addressed, so a run at the
+/// same toolchain and global inputs names the one before), the tables per
+/// header group, the shape over every unit (its groups today's shared
+/// bases) and the state over every entry (unless `explain_hashes =
+/// false`).
+struct Run3 {
+    /// In put order: the hdr objects, the tables, the shape, the state.
+    objects: Vec<RunObject>,
+    /// Per header group: the hdr id and the tables id.
+    headers: Vec<(vci_core::ObjectId, vci_core::ObjectId)>,
+    tables: Vec<Encoded<Tables>>,
+    /// The shape's id, hex.
+    shape: String,
+    /// The state object's id, hex, when it is written.
+    state: Option<String>,
+    /// By unit index.
+    units: BTreeMap<usize, Unit3>,
+    /// Units whose header object could not be made, with why: refused.
+    failed: BTreeMap<usize, String>,
+}
+
+/// Build the run over `units` (unit index, the unit, its shared-base group
+/// key). Fails as a whole when the shape, state or a tables object cannot
+/// be encoded.
+fn build_run3(
+    units: &[(usize, &Attestable, String)],
+    explain_hashes: bool,
+) -> Result<Run3, String> {
+    let mut header_of: BTreeMap<String, usize> = BTreeMap::new();
+    let mut hdrs: Vec<RunObject> = Vec::new();
+    let mut inputs: Vec<UnitInputs<'_>> = Vec::with_capacity(units.len());
+    let mut indices: Vec<usize> = Vec::with_capacity(units.len());
+    let mut entries_roots: Vec<String> = Vec::with_capacity(units.len());
+    let mut failed = BTreeMap::new();
+    for (i, a, group) in units {
+        let bytes = a
+            .predicate
+            .hdr()
+            .map_err(|e| e.to_string())
+            .and_then(|h| h.encode().map_err(|e| e.to_string()));
+        let bytes = match bytes {
+            Ok(b) => b,
+            Err(e) => {
+                failed.insert(*i, format!("encoding the run's header object: {e}"));
+                continue;
+            }
+        };
+        let id = vci_core::object_id(&bytes);
+        let hex = vci_core::objects::hex32(&id);
+        let header = match header_of.get(&hex) {
+            Some(h) => *h,
+            None => {
+                let h = hdrs.len();
+                header_of.insert(hex, h);
+                hdrs.push(RunObject {
+                    kind: ObjectKind::Hdr,
+                    bytes,
+                    id,
+                });
+                h
+            }
+        };
+        inputs.push(UnitInputs {
+            header,
+            group: Some(group.as_str()),
+            manifest: &a.manifest,
+            waived: &a.predicate.waived,
+        });
+        indices.push(*i);
+        entries_roots.push(a.manifest.entries_root());
+    }
+    let run =
+        vci_core::Run::build(&inputs).map_err(|e| format!("building the run's objects: {e}"))?;
+    let vci_core::Run {
+        shape,
+        state,
+        tables,
+        units: records,
+    } = run;
+    let headers: Vec<(vci_core::ObjectId, vci_core::ObjectId)> = hdrs
+        .iter()
+        .zip(&tables)
+        .map(|(h, t)| (h.id, t.id))
+        .collect();
+    let mut objects = hdrs;
+    objects.extend(tables.iter().map(|t| RunObject {
+        kind: ObjectKind::Tables,
+        bytes: t.bytes.clone(),
+        id: t.id,
+    }));
+    objects.push(RunObject {
+        kind: ObjectKind::Shape,
+        bytes: shape.bytes,
+        id: shape.id,
+    });
+    let state_id = explain_hashes.then(|| {
+        objects.push(RunObject {
+            kind: ObjectKind::State,
+            bytes: state.bytes,
+            id: state.id,
+        });
+        vci_core::objects::hex32(&state.id)
+    });
+    let units: BTreeMap<usize, Unit3> = indices
+        .into_iter()
+        .zip(inputs)
+        .zip(records)
+        .zip(entries_roots)
+        .map(|(((i, u), record), entries_root)| {
+            (
+                i,
+                Unit3 {
+                    header: u.header,
+                    record,
+                    entries_root,
+                },
+            )
+        })
+        .collect();
+    Ok(Run3 {
+        objects,
+        headers,
+        tables,
+        shape: vci_core::objects::hex32(&shape.id),
+        state: state_id,
+        units,
+        failed,
+    })
+}
+
+/// Sign unit `u` of a built run as a format-3 record (STORE-V2 section 1.4
+/// step 3): the v2 statement (the hdr and tables ids, the entries root,
+/// the waived ids) as compact sorted-key JSON, signed over those bytes
+/// exactly as a format-1 statement is signed, the descriptor, the text
+/// frame; with the listing columns copied from what was signed.
+fn sign_format3(key: &Signer<'_>, a: &Attestable, run: &Run3, u: &Unit3) -> Result<Signed> {
+    let (hdr, tables_id) = &run.headers[u.header];
+    let tables = &run.tables[u.header].value;
+    let p = &a.predicate;
+    let v2 = p
+        .to_v2(hdr, tables_id, tables, &u.entries_root)
+        .map_err(|e| anyhow::anyhow!("the v2 statement: {e}"))?;
+    let mut digest = BTreeMap::new();
+    digest.insert("blake3".to_owned(), p.core.input_root.clone());
+    let stmt = Statement::new(
+        vec![Subject {
+            name: p.core.test_id.clone(),
+            digest,
+        }],
+        PREDICATE_TYPE_V2,
+        serde_json::to_value(&v2)?,
+    );
+    let statement = sorted_compact_json(&stmt)?.into_bytes();
+    let descriptor = u
+        .record
+        .descriptor
+        .encode(tables)
+        .map_err(|e| anyhow::anyhow!("encoding the descriptor: {e}"))?;
+    let frame = key.sign_frame(statement, descriptor)?;
+    let record = frame
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encoding the record: {e}"))?;
+    let columns = columns_for(p, &v2, &run.shape, run.state.as_deref());
+    Ok(Signed {
+        record: record.into_bytes(),
+        columns: Some(columns),
+    })
+}
+
+/// A format-3 record's listing columns (STORE-V2 section 2.1), copied from
+/// the statement it signs and the hdr it names; the state object is the
+/// writer's alone to say.
+fn columns_for(p: &VciPredicate, v2: &VciPredicateV2, shape: &str, state: Option<&str>) -> Columns {
+    let tc = &p.core.toolchain;
+    Columns {
+        format: Some(3),
+        commit: Some(v2.commit.clone()),
+        platform: Some(format!("{}-{}", tc.os, tc.arch)),
+        state: Some(v2.result.state.clone()),
+        duration_ms: Some(v2.result.duration_ms),
+        expires: crate::util::parse_rfc3339(&v2.expires_at).ok(),
+        hdr: Some(v2.hdr.clone()),
+        tables: Some(v2.tables.clone()),
+        shape: Some(shape.to_owned()),
+        state_obj: state.map(str::to_owned),
+    }
+}
+
+/// What supersession and [`last_durations`] read from a format-3 record's
+/// signed statement (unverified, as [`crate::cmds::envelope_meta`] is for a
+/// format-1 one: nothing here decides a verdict). `None` for a statement
+/// that is not a v2 predicate.
+struct FrameMeta {
+    test_id: String,
+    issued_at: i64,
+    commit: String,
+    tree: Option<String>,
+    entries_root: String,
+    hdr: String,
+    tables: String,
+    duration_ms: u64,
+}
+
+fn frame_meta(frame: &Frame) -> Option<FrameMeta> {
+    let v: serde_json::Value = serde_json::from_slice(&frame.statement).ok()?;
+    if v["predicateType"].as_str() != Some(PREDICATE_TYPE_V2) {
+        return None;
+    }
+    let p: VciPredicateV2 = serde_json::from_value(v["predicate"].clone()).ok()?;
+    Some(FrameMeta {
+        test_id: p.test_id,
+        issued_at: crate::util::parse_rfc3339(&p.issued_at).ok()?,
+        commit: p.commit,
+        tree: p.tree,
+        entries_root: p.entries_root,
+        hdr: p.hdr,
+        tables: p.tables,
+        duration_ms: p.result.duration_ms,
+    })
+}
+
+/// The platform (`toolchain.os`, `toolchain.arch`) of each hdr object
+/// supersession met this run, by id: read once each
+/// ([`AttestationStore::get_objects`]), the id recomputed over the bytes
+/// and the object decoded; `None` for one the store lacks or that does not
+/// decode to its id (its records are kept).
+#[derive(Default)]
+struct HdrPlatforms(std::sync::Mutex<BTreeMap<String, Option<(String, String)>>>);
+
+impl HdrPlatforms {
+    fn of(&self, store: &dyn AttestationStore, id: &str) -> Option<(String, String)> {
+        if let Some(known) = self.0.lock().ok().and_then(|m| m.get(id).cloned()) {
+            return known;
+        }
+        let found = store
+            .get_objects(&[id])
+            .ok()
+            .and_then(|objects| objects.into_iter().find(|o| o.id == id))
+            .filter(|o| vci_core::objects::hex32(&vci_core::object_id(&o.bytes)) == id)
+            .and_then(|o| Hdr::decode(&o.bytes).ok())
+            .map(|h| (h.toolchain.os, h.toolchain.arch));
+        if let Ok(mut m) = self.0.lock() {
+            m.insert(id.to_owned(), found.clone());
+        }
+        found
+    }
+}
+
+/// After supersession, on a store with listing columns: remove the objects
+/// the superseded records named that no record references any more
+/// ([`AttestationStore::remove_objects`]: the orphan rule, with its hour
+/// of grace), once per run. On git-meta, whose referrer scan reads every
+/// value, they are left to `vci prune` (STORE-V2 section 2.2). Returns how
+/// many were removed.
+fn drop_orphan_objects(store: &dyn AttestationStore, ids: &BTreeSet<String>) -> usize {
+    if ids.is_empty() || !store.caps().columns {
+        return 0;
+    }
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    match store.remove_objects(&ids) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("vci: warning: cannot remove the unreferenced objects: {e}");
+            0
+        }
+    }
+}
+
+/// The state TTL of `vci run`'s orphan pass (STORE-V2 section 1.3): state
+/// objects put more than `days` days ago are removed whether or not a
+/// record references one (the records stay valid; `vci explain` then
+/// prints the observed value without the attested hash). Returns how many
+/// were removed.
+fn prune_state_objects(store: &dyn AttestationStore, days: u32) -> usize {
+    let older_than = std::time::Duration::from_secs(u64::from(days) * 86_400);
+    match store.prune_state_objects(older_than) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("vci: warning: cannot remove the run's aged state objects: {e}");
+            0
+        }
+    }
 }
 
 /// `items` for the runner: those without a recorded duration first, in
@@ -4266,14 +5096,16 @@ mod tests {
             test_id: label.to_owned(),
             input_root: root.to_owned(),
             entries: manifest.entries.len(),
-            manifest: manifest.to_compact(),
+            manifest: Some(manifest.to_compact()),
             storage_key: "abcd".to_owned(),
             hint: Some(KeyHint {
                 issued: 7,
                 tree: None,
             }),
             envelope: format!("{{\"unit\":\"{label}\"}}").into_bytes(),
+            columns: None,
             doomed: vec![],
+            doomed_objects: BTreeMap::new(),
             waived: vec![],
         }
     }
@@ -4318,7 +5150,7 @@ mod tests {
         );
         sl.apply(Job::Attestable {
             warnings: vec!["vci: warning: src/c.test.ts: w".into()],
-            unit: Ok(unit("src/c.test.ts", &m, &rc)),
+            unit: Ok(Box::new(unit("src/c.test.ts", &m, &rc))),
         });
         // Not stored yet, so nothing is reported yet.
         assert_eq!(s.keys(), std::slice::from_ref(&old.key));
@@ -4630,5 +5462,547 @@ mod tests {
         assert_eq!(v["units"][0]["stored"], false);
         assert!(v["units"][1].get("stored").is_none());
         assert_eq!(v["units"][2]["stored"], false);
+    }
+
+    // ---- format 3 ------------------------------------------------------
+
+    /// A unit as `check_one` makes one, over `files` (its own entries),
+    /// `globals` (its global manifest's) and `waived`: a go unit on linux,
+    /// passed in 42 ms.
+    fn sample_attestable(
+        test_id: &str,
+        globals: &[&str],
+        files: &[&str],
+        waived: &[&str],
+    ) -> Attestable {
+        let entry = |p: &str| vci_core::InputEntry {
+            path: RepoPath::new(p).unwrap(),
+            kind: vci_core::EntryKind::File,
+            exec: false,
+            size: 3,
+            hash: vci_core::blake3_hex(p.as_bytes()),
+        };
+        let gm = InputManifest {
+            entries: globals.iter().map(|p| entry(p)).collect(),
+            externals: vec![],
+            env: vec![],
+        };
+        let manifest = InputManifest {
+            entries: files.iter().map(|p| entry(p)).collect(),
+            externals: vec![External {
+                name: crate::ctx::CONFIG_EXTERNAL.to_owned(),
+                version: "cfg".to_owned(),
+            }],
+            env: vec![vci_core::EnvEntry {
+                key: "TZ".to_owned(),
+                hash: vci_core::ABSENT_HASH.to_owned(),
+            }],
+        };
+        let core = Predicate {
+            tool_version: TOOL_VERSION.to_owned(),
+            adapter: "go".to_owned(),
+            test_id: test_id.to_owned(),
+            argv: vec!["go".to_owned(), "test".to_owned()],
+            repo_id: "r".repeat(64),
+            commit: "c".repeat(40),
+            tree_dirty: false,
+            tree: Some("d".repeat(40)),
+            toolchain: Toolchain {
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                go: "1.26.0".to_owned(),
+                ..Default::default()
+            },
+            global_input_root: gm.root(),
+            input_root: manifest.root(),
+            manifest: None,
+            manifest_ref: Some(manifest.root()),
+            global_manifest: gm,
+            result: vci_core::TestResult {
+                state: "passed".to_owned(),
+                tests: 2,
+                failed: 0,
+                skipped: 0,
+                duration_ms: 42,
+            },
+            tainted: vec![],
+            issued_at: rfc3339(1_800_000_000),
+            expires_at: rfc3339(1_800_000_000 + 86_400),
+        };
+        Attestable {
+            predicate: VciPredicate {
+                core,
+                env_config_digest: "e".repeat(64),
+                project_dir: String::new(),
+                runner_project: String::new(),
+                project_name: String::new(),
+                platform_specific: vec![],
+                arch_specific: vec![],
+                waived: waived.iter().map(|w| (*w).to_owned()).collect(),
+                cfg_predicates: vec![],
+                declared_inputs: vec![],
+                env_set: vec![],
+                rails_inputs: String::new(),
+                ignored_inputs: vec![],
+            },
+            manifest,
+        }
+    }
+
+    /// A throwaway ed25519 key, as `--key` loads it.
+    fn ssh_signer(dir: &Utf8Path) -> (Signer<'static>, String) {
+        let path = dir.join("key");
+        let st = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "t", "-f"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let key = keys::discover(Some(&path), dir).unwrap();
+        let public = key.public.clone();
+        let signer = vci_attest::SshSigner::load_for(&key.path, &key.blob);
+        (Signer::Ssh(key, signer), public)
+    }
+
+    /// A format-3 record whose statement is a v2 predicate with these
+    /// facts, framed with a synthetic signature (for what reads the
+    /// statement without verifying it).
+    fn frame_with(
+        test_id: &str,
+        issued_at: &str,
+        duration_ms: u64,
+        predicate_type: &str,
+    ) -> Vec<u8> {
+        let stmt = serde_json::json!({
+            "_type": vci_attest::STATEMENT_TYPE,
+            "subject": [{"name": test_id, "digest": {"blake3": "1".repeat(64)}}],
+            "predicateType": predicate_type,
+            "predicate": {
+                "argv": ["go", "test"],
+                "commit": "c".repeat(40),
+                "entriesRoot": "2".repeat(64),
+                "expiresAt": "2027-01-02T00:00:00Z",
+                "hdr": "a".repeat(64),
+                "issuedAt": issued_at,
+                "result": {"state": "passed", "tests": 1, "failed": 0, "skipped": 0, "durationMs": duration_ms},
+                "tables": "b".repeat(64),
+                "testId": test_id,
+                "tree": "d".repeat(40),
+                "treeDirty": false,
+                "waived": [0]
+            }
+        });
+        let frame = Frame {
+            statement: sorted_compact_json(&stmt).unwrap().into_bytes(),
+            keyid: "SHA256:x".to_owned(),
+            sig: vci_core::FrameSig::SshSig(vec![1, 2, 3]),
+            descriptor: vec![0; 33],
+        };
+        frame.encode().unwrap().into_bytes()
+    }
+
+    /// A format-1 record (a DSSE envelope, unsigned) with these facts.
+    fn envelope_with(test_id: &str, issued_at: &str, duration_ms: u64) -> Vec<u8> {
+        let stmt = serde_json::json!({
+            "_type": vci_attest::STATEMENT_TYPE,
+            "subject": [{"name": test_id, "digest": {"blake3": "1".repeat(64)}}],
+            "predicateType": PREDICATE_TYPE,
+            "predicate": {
+                "testId": test_id,
+                "issuedAt": issued_at,
+                "expiresAt": "2027-01-02T00:00:00Z",
+                "commit": "c".repeat(40),
+                "toolchain": {"os": "linux", "arch": "x86_64"},
+                "manifestRef": "3".repeat(64),
+                "result": {"state": "passed", "tests": 1, "failed": 0, "skipped": 0, "durationMs": duration_ms}
+            }
+        });
+        vci_attest::Envelope {
+            payload_type: vci_attest::PAYLOAD_TYPE.to_owned(),
+            payload: vci_core::frame::b64_encode(serde_json::to_vec(&stmt).unwrap().as_slice()),
+            signatures: vec![],
+        }
+        .to_json()
+    }
+
+    /// The run's objects are built per header group (STORE-V2 section 1.4
+    /// steps 1 and 2): units at the same global inputs share one hdr and
+    /// one tables object, the shape spans every unit with the shared-base
+    /// group as an index list, and the state is left out under
+    /// `explain_hashes = false`. Each unit's record (step 3) is a frame
+    /// whose statement names its hdr and tables and carries its entries
+    /// root and waived ids, signed over the exact bytes so that today's
+    /// verification accepts the rebuilt envelope, whose descriptor resolves
+    /// to the unit's manifest, and whose columns are copied from it.
+    #[test]
+    fn a_format_3_run_is_built_per_header_group_and_each_unit_signed_as_a_frame() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        let (signer, public) = ssh_signer(&dir);
+        let a = sample_attestable(
+            "a",
+            &["go.mod"],
+            &["a/a.go", "a/a_test.go", "lib/common.go"],
+            &["go:net dial", "go:env HOME"],
+        );
+        let b = sample_attestable("b", &["go.mod"], &["b/b.go", "lib/common.go"], &[]);
+        let c = sample_attestable(
+            "c",
+            &["go.mod", "go.sum"],
+            &["c/c.go", "lib/common.go"],
+            &[],
+        );
+        let units = [
+            (0, &a, String::new()),
+            (1, &b, String::new()),
+            (2, &c, String::new()),
+        ];
+        let run = build_run3(&units, true).unwrap();
+        assert!(run.failed.is_empty());
+        assert_eq!(
+            run.headers.len(),
+            2,
+            "a and b share their hdr; c has its own"
+        );
+        assert_eq!(run.tables.len(), 2);
+        let kinds: Vec<ObjectKind> = run.objects.iter().map(|o| o.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ObjectKind::Hdr,
+                ObjectKind::Hdr,
+                ObjectKind::Tables,
+                ObjectKind::Tables,
+                ObjectKind::Shape,
+                ObjectKind::State
+            ]
+        );
+        assert!(run.state.is_some());
+        assert_eq!(run.units[&0].header, run.units[&1].header);
+        assert_ne!(run.units[&0].header, run.units[&2].header);
+        for o in &run.objects {
+            assert_eq!(vci_core::object_id(&o.bytes), o.id, "content-addressed");
+        }
+        let shape = vci_core::Shape::decode(&run.objects[4].bytes).unwrap();
+        assert_eq!(
+            shape.entries.len(),
+            5,
+            "the distinct paths of the three units"
+        );
+        assert_eq!(shape.groups.len(), 1, "the three units' common entry");
+        assert_eq!(shape.groups[0].len(), 1);
+        assert_eq!(
+            run.tables[run.units[&0].header].value.waivers,
+            ["go:env HOME", "go:net dial"]
+        );
+        let lean = build_run3(&units, false).unwrap();
+        assert_eq!(lean.objects.len(), 5);
+        assert!(lean.state.is_none());
+        assert_eq!(lean.shape, run.shape, "the same shape without the state");
+
+        let allowed = vci_attest::AllowedSigners::parse(&format!(
+            "t@example.com namespaces=\"vci-attest\" {public}\n"
+        ))
+        .unwrap();
+        for (i, u) in [(0usize, &a), (1, &b), (2, &c)] {
+            let unit = &run.units[&i];
+            let signed = sign_format3(&signer, u, &run, unit).unwrap();
+            let Ok(Record::FormatThree(frame)) = decode_record(&signed.record) else {
+                panic!("a frame: {:?}", String::from_utf8_lossy(&signed.record));
+            };
+            // The statement: compact, sorted keys, the v2 predicate.
+            let stmt: Statement = serde_json::from_slice(&frame.statement).unwrap();
+            assert_eq!(stmt.predicate_type, PREDICATE_TYPE_V2);
+            assert_eq!(
+                sorted_compact_json(&stmt).unwrap().as_bytes(),
+                &frame.statement[..]
+            );
+            assert_eq!(stmt.subject[0].name, u.predicate.core.test_id);
+            assert_eq!(stmt.subject[0].digest["blake3"], u.manifest.root());
+            let (hdr, tables) = &run.headers[unit.header];
+            let m = frame_meta(&frame).unwrap();
+            assert_eq!(m.test_id, u.predicate.core.test_id);
+            assert_eq!(m.hdr, vci_core::objects::hex32(hdr));
+            assert_eq!(m.tables, vci_core::objects::hex32(tables));
+            assert_eq!(m.entries_root, u.manifest.entries_root());
+            assert_eq!(m.duration_ms, 42);
+            assert_eq!(m.commit, "c".repeat(40));
+            let waived = &stmt.predicate["waived"];
+            if i == 0 {
+                assert_eq!(waived, &serde_json::json!([0, 1]));
+            } else {
+                assert!(waived.is_null(), "{waived}");
+            }
+            // Signed over those bytes: today's verification accepts the
+            // envelope rebuilt from the frame.
+            let env = vci_attest::Envelope::from_frame(&frame);
+            let v = vci_attest::verify_envelope(&env, &allowed, 1_800_000_100).unwrap();
+            assert_eq!(v.payload, frame.statement);
+            // The descriptor resolves to the unit's manifest.
+            let tables_obj = &run.tables[unit.header].value;
+            let d = vci_core::Descriptor::decode(&frame.descriptor, tables_obj).unwrap();
+            assert_eq!(d.shape, vci_core::objects::parse_hex32(&run.shape).unwrap());
+            assert_eq!(
+                d.resolve(&shape, tables_obj).unwrap(),
+                vci_core::ResolvedManifest::of(&u.manifest)
+            );
+            // The columns, from what was signed.
+            assert_eq!(
+                signed.columns,
+                Some(Columns {
+                    format: Some(3),
+                    commit: Some("c".repeat(40)),
+                    platform: Some("linux-x86_64".to_owned()),
+                    state: Some("passed".to_owned()),
+                    duration_ms: Some(42),
+                    expires: Some(1_800_000_000 + 86_400),
+                    hdr: Some(m.hdr.clone()),
+                    tables: Some(m.tables.clone()),
+                    shape: Some(run.shape.clone()),
+                    state_obj: run.state.clone(),
+                })
+            );
+            // The storage key is the one the v1 view gives.
+            assert_eq!(
+                storage_key(&vci_core::ResolvedPredicate::v1(&u.predicate)).len(),
+                64
+            );
+        }
+    }
+
+    /// A format-3 unit is stored after the run's objects, inside the same
+    /// deferred batch, with its columns and without a manifest; what it
+    /// supersedes is removed and the object ids the old record named are
+    /// collected for the orphan pass, which removes only what no record
+    /// references any more.
+    #[test]
+    fn a_format_3_unit_is_stored_after_the_runs_objects_with_its_columns() {
+        use vci_store::conformance::scenarios::Run3 as Sample;
+        let s = crate::store::mem::MemStore::new()
+            .objects(true)
+            .deferred(true);
+        let old = earlier(&s, "a");
+        let run = Sample::build(&["a/a.go"]);
+        let objects: Vec<RunObject> = run
+            .objects
+            .iter()
+            .map(|(k, b)| RunObject {
+                kind: *k,
+                bytes: b.clone(),
+                id: vci_core::object_id(b),
+            })
+            .collect();
+        let (frame, columns) = run.record("a", 1, 3);
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        sl.put_objects(&objects);
+        assert!(s.object_ids().is_empty(), "deferred");
+        let mut u = unit("a", &InputManifest::default(), &root('a'));
+        u.manifest = None;
+        u.envelope = frame.clone();
+        u.columns = Some(columns.clone());
+        u.doomed = vec![old.clone()];
+        u.doomed_objects = BTreeMap::from([(old.key.clone(), vec!["f".repeat(64)])]);
+        sl.attest(u);
+        let done = sl.finish();
+        assert_eq!((done.attested, done.refused, done.superseded), (1, 0, 1));
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(done.dropped_objects, BTreeSet::from(["f".repeat(64)]));
+        assert!(done.dropped_roots.is_empty());
+        let bytes: usize = run.objects.iter().map(|(_, b)| b.len()).sum();
+        assert_eq!(
+            (done.objects_bytes, done.records_bytes, done.batches),
+            (bytes, frame.len(), 1)
+        );
+        assert_eq!(s.object_ids().len(), 4);
+        assert!(s.roots().is_empty(), "no manifest for a format-3 record");
+        let keys = s.keys();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert_ne!(keys[0], old.key);
+        assert_eq!(s.value_of(&keys[0]), Some(frame));
+        assert_eq!(s.columns_of(&keys[0]), Some(columns));
+        let lines = said.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("vci: attested a (0 inputs, root aaaaaaaaaaaaaaaa) as memory project vci:attestation:"), "{lines:?}");
+
+        // The orphan pass: another run's shape and state (its hdr and
+        // tables are the same objects) are unreferenced and go; this
+        // run's shape, which the record's columns name, stays.
+        let other = Sample::build(&["b/b.go"]);
+        assert_eq!(s.put_objects(&other.new_objects()).unwrap(), 2);
+        assert_eq!(s.object_ids().len(), 6);
+        let ids: BTreeSet<String> = [
+            other.ids.shape.clone(),
+            other.ids.state.clone(),
+            run.ids.shape.clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(drop_orphan_objects(&s, &ids), 2);
+        let left = s.object_ids();
+        assert_eq!(left.len(), 4);
+        assert!(left.contains(&run.ids.shape));
+        assert!(!left.contains(&other.ids.shape));
+        // Without columns, the pass is left to `vci prune`.
+        let no_columns = crate::store::mem::MemStore::new();
+        assert_eq!(drop_orphan_objects(&no_columns, &ids), 0);
+    }
+
+    /// A store that refuses the run's objects refuses every format-3 unit
+    /// (its record would name objects the store does not hold), each as a
+    /// store failure when the store cannot be used, while a format-1 unit
+    /// of the same loop is stored as before.
+    #[test]
+    fn objects_the_store_refuses_refuse_the_format_3_units_only() {
+        use vci_store::conformance::scenarios::Run3 as Sample;
+        let s = crate::store::mem::MemStore::new();
+        let run = Sample::build(&["a/a.go"]);
+        let objects: Vec<RunObject> = run
+            .objects
+            .iter()
+            .map(|(k, b)| RunObject {
+                kind: *k,
+                bytes: b.clone(),
+                id: vci_core::object_id(b),
+            })
+            .collect();
+        let (frame, columns) = run.record("a", 1, 3);
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::Write, SIGNER, owner(), &mut say);
+        sl.put_objects(&objects);
+        let mut a = unit("a", &InputManifest::default(), &root('a'));
+        a.manifest = None;
+        a.envelope = frame;
+        a.columns = Some(columns);
+        sl.attest(a);
+        sl.attest(unit("b", &InputManifest::default(), &root('b')));
+        let done = sl.finish();
+        assert_eq!((done.attested, done.refused), (1, 1));
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(done.store_failures.len(), 1, "{:?}", done.store_failures);
+        let lines = said.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "vci: warning: storing the run's 4 object(s) in the memory store: the memory store does not support format-3 objects"
+        );
+        assert_eq!(
+            lines[1],
+            "vci: not attesting a: signing or storing failed: storing the run's objects: memory store unavailable: the memory store does not support format-3 objects"
+        );
+        assert!(lines[2].starts_with("vci: attested b "), "{lines:?}");
+        assert_eq!(s.keys().len(), 1);
+        assert!(s.object_ids().is_empty());
+        // Signing only puts nothing and refuses nothing.
+        let s = crate::store::mem::MemStore::new().shared(true);
+        let said = Said::default();
+        let mut say = |l: &str| said.0.borrow_mut().push(l.to_owned());
+        let mut sl = StoreLoop::new(&s, StoreMode::SignOnly, SIGNER, owner(), &mut say);
+        sl.put_objects(&objects);
+        assert!(sl.objects_failed.is_none());
+        assert_eq!(s.writes(), 0);
+    }
+
+    /// What supersession and `last_durations` read from a record of either
+    /// format, by its first byte: a v2 statement's facts from a frame, a v1
+    /// predicate's from an envelope; nothing from a value that is neither
+    /// or whose statement is not a v2 predicate.
+    #[test]
+    fn frame_meta_and_record_duration_read_either_format() {
+        let f = frame_with("src/a.go", "2026-05-01T00:00:00Z", 55, PREDICATE_TYPE_V2);
+        let Ok(Record::FormatThree(frame)) = decode_record(&f) else {
+            panic!("a frame");
+        };
+        let m = frame_meta(&frame).unwrap();
+        assert_eq!(m.test_id, "src/a.go");
+        assert_eq!(
+            m.issued_at,
+            crate::util::parse_rfc3339("2026-05-01T00:00:00Z").unwrap()
+        );
+        assert_eq!(m.commit, "c".repeat(40));
+        assert_eq!(m.tree.as_deref(), Some("d".repeat(40).as_str()));
+        assert_eq!(m.entries_root, "2".repeat(64));
+        assert_eq!((m.hdr, m.tables), ("a".repeat(64), "b".repeat(64)));
+        assert_eq!(m.duration_ms, 55);
+        assert_eq!(record_duration(&f), Some((m.issued_at, 55)));
+        let v1_in_a_frame = frame_with("src/a.go", "2026-05-01T00:00:00Z", 55, PREDICATE_TYPE);
+        let Ok(Record::FormatThree(frame)) = decode_record(&v1_in_a_frame) else {
+            panic!("a frame");
+        };
+        assert!(frame_meta(&frame).is_none());
+        assert_eq!(record_duration(&v1_in_a_frame), None);
+        let e = envelope_with("src/a.go", "2026-04-01T00:00:00Z", 66);
+        assert_eq!(
+            record_duration(&e),
+            Some((
+                crate::util::parse_rfc3339("2026-04-01T00:00:00Z").unwrap(),
+                66
+            ))
+        );
+        assert_eq!(record_duration(b"xyz"), None);
+        assert_eq!(record_duration(b""), None);
+    }
+
+    /// `last_durations` takes the newest duration from the listing columns
+    /// where a store keeps them, reads the units none of whose records has
+    /// one (format-1 rows), and on a store without columns reads every
+    /// unit, decoding each value by its first byte.
+    #[test]
+    fn last_durations_take_columns_first_and_read_the_rest() {
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let with = |d: u64| Columns {
+            format: Some(3),
+            duration_ms: Some(d),
+            ..Columns::default()
+        };
+        let put = |id: &str, sk: &str, issued: i64, value: &[u8], c: Option<&Columns>| {
+            let hint = KeyHint { issued, tree: None };
+            let mut att = NewAttestation::for_test(id, SIGNER, sk, Some(&hint), value);
+            if let Some(c) = c {
+                att = att.with_columns(c);
+            }
+            s.put(&att).unwrap();
+        };
+        let old_frame = frame_with("a", "2026-01-01T00:00:00Z", 30, PREDICATE_TYPE_V2);
+        let new_frame = frame_with("a", "2026-02-01T00:00:00Z", 40, PREDICATE_TYPE_V2);
+        put("a", "ab", 10, &old_frame, Some(&with(30)));
+        put("a", "cd", 20, &new_frame, Some(&with(40)));
+        let envelope = envelope_with("b", "2026-03-01T00:00:00Z", 70);
+        put("b", "ab", 30, &envelope, None);
+        put("d", "ab", 40, b"garbage", None);
+        let got = last_durations(&s, &["a", "b", "c", "d"]);
+        assert_eq!(
+            got,
+            BTreeMap::from([("a".to_owned(), 40), ("b".to_owned(), 70)])
+        );
+        // Without columns: every value read.
+        let s = crate::store::mem::MemStore::new();
+        s.put_for_test("a", SIGNER, "ab", None, &old_frame).unwrap();
+        s.put_for_test("a", SIGNER, "cd", None, &new_frame).unwrap();
+        s.put_for_test("b", SIGNER, "ab", None, &envelope).unwrap();
+        let got = last_durations(&s, &["a", "b", "c"]);
+        assert_eq!(
+            got,
+            BTreeMap::from([("a".to_owned(), 40), ("b".to_owned(), 70)])
+        );
+    }
+
+    /// `[store]` decides the format: 3 on a store that keeps objects, else
+    /// 1 (a store without objects, or `record_format = 1`).
+    #[test]
+    fn the_record_format_is_3_only_on_a_store_with_objects() {
+        let s3 = RecordSettings {
+            format: 3,
+            explain_hashes: true,
+            explain_hashes_days: 2,
+        };
+        let s1 = RecordSettings { format: 1, ..s3 };
+        let with = crate::store::mem::MemStore::new().objects(true);
+        let without = crate::store::mem::MemStore::new();
+        assert!(s3.format3(&with));
+        assert!(!s3.format3(&without));
+        assert!(!s1.format3(&with));
     }
 }

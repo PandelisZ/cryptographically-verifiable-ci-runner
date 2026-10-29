@@ -277,9 +277,10 @@ pub mod mem {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use vci_core::ObjectKind;
     use vci_store::{
-        AttestationStore, BatchEnd, Caps, Finished, GONE, NewAttestation, StoreError,
-        StoredEnvelope, StoredManifest, WriteBatch, key,
+        AttestationStore, BatchEnd, Caps, Columns, Finished, GONE, NewAttestation, NewObject,
+        StoreError, StoredEnvelope, StoredManifest, StoredObject, WriteBatch, key,
     };
 
     /// What the store holds.
@@ -287,8 +288,12 @@ pub mod mem {
     struct Data {
         /// Attestations by key: (target, bytes).
         attestations: BTreeMap<String, (String, Vec<u8>)>,
+        /// The listing columns of the attestations put with some, by key.
+        columns: BTreeMap<String, Columns>,
         /// Manifests by root.
         manifests: BTreeMap<String, Vec<u8>>,
+        /// Format-3 objects by id: kind, bytes, when put.
+        objects: BTreeMap<String, (ObjectKind, Vec<u8>, std::time::Instant)>,
     }
 
     impl Data {
@@ -302,19 +307,37 @@ pub mod mem {
                 .collect()
         }
 
-        fn put(&mut self, key: String, target: String, bytes: Vec<u8>) {
+        fn put(
+            &mut self,
+            key: String,
+            target: String,
+            bytes: Vec<u8>,
+            columns: Option<Box<Columns>>,
+        ) {
             for k in self.same_slot(&key) {
                 self.attestations.remove(&k);
+                self.columns.remove(&k);
+            }
+            if let Some(c) = columns {
+                self.columns.insert(key.clone(), *c);
             }
             self.attestations.insert(key, (target, bytes));
+        }
+
+        /// Whether a stored attestation's columns name `id`.
+        fn referenced(&self, id: &str) -> bool {
+            self.columns
+                .values()
+                .any(|c| c.object_ids().any(|o| o == id))
         }
     }
 
     /// A write waiting for its deferred batch to finish.
     enum Op {
-        Put(String, String, Vec<u8>),
+        Put(String, String, Vec<u8>, Option<Box<Columns>>),
         Manifest(String, Vec<u8>),
         Remove(String),
+        Objects(Vec<(ObjectKind, String, Vec<u8>)>),
     }
 
     #[derive(Default)]
@@ -324,6 +347,9 @@ pub mod mem {
         pending: Mutex<Option<Vec<Op>>>,
         shared: AtomicBool,
         deferred: AtomicBool,
+        /// Whether the store keeps objects and columns
+        /// ([`Caps::objects`], [`Caps::columns`]).
+        objects: AtomicBool,
         fail: Mutex<Option<String>>,
         /// A warning every batch's `finish` gives after applying its writes.
         warn: Mutex<Option<String>>,
@@ -349,12 +375,19 @@ pub mod mem {
         fn apply(&self, op: Op) {
             let mut d = self.data.lock().unwrap();
             match op {
-                Op::Put(k, t, b) => d.put(k, t, b),
+                Op::Put(k, t, b, c) => d.put(k, t, b, c),
                 Op::Manifest(r, b) => {
                     d.manifests.insert(r, b);
                 }
                 Op::Remove(k) => {
                     d.attestations.remove(&k);
+                    d.columns.remove(&k);
+                }
+                Op::Objects(objects) => {
+                    let now = std::time::Instant::now();
+                    for (kind, id, bytes) in objects {
+                        d.objects.insert(id, (kind, bytes, now));
+                    }
                 }
             }
         }
@@ -383,6 +416,33 @@ pub mod mem {
         pub fn deferred(self, v: bool) -> Self {
             self.state.deferred.store(v, Ordering::SeqCst);
             self
+        }
+
+        /// Keep format-3 objects and listing columns ([`Caps::objects`],
+        /// [`Caps::columns`]), as the SQL stores do; the orphan rule
+        /// without its grace.
+        pub fn objects(self, v: bool) -> Self {
+            self.state.objects.store(v, Ordering::SeqCst);
+            self
+        }
+
+        /// The stored objects' ids.
+        pub fn object_ids(&self) -> Vec<String> {
+            let d = self.state.data.lock().unwrap();
+            d.objects.keys().cloned().collect()
+        }
+
+        /// The listing columns of the attestation stored under `key`, when
+        /// it was put with some.
+        pub fn columns_of(&self, key: &str) -> Option<Columns> {
+            let d = self.state.data.lock().unwrap();
+            d.columns.get(key).cloned()
+        }
+
+        /// The stored bytes of the attestation under `key`.
+        pub fn value_of(&self, key: &str) -> Option<Vec<u8>> {
+            let d = self.state.data.lock().unwrap();
+            d.attestations.get(key).map(|(_, b)| b.clone())
         }
 
         /// Make every batch's `finish` fail with `why` (and lose its
@@ -474,17 +534,24 @@ pub mod mem {
             if !lost.is_empty() {
                 done.lose(lost, StoreError::unavailable("memory", "a write timed out"));
             }
-            // Manifests, then attestations, then removals (the contract's
-            // order for a deferred batch).
-            let (mut manifests, mut puts, mut removals) = (Vec::new(), Vec::new(), Vec::new());
+            // Objects, then manifests, then attestations, then removals
+            // (the contract's order for a deferred batch).
+            let (mut objects, mut manifests, mut puts, mut removals) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for op in ops {
                 match op {
+                    Op::Objects(..) => objects.push(op),
                     Op::Manifest(..) => manifests.push(op),
                     Op::Put(..) => puts.push(op),
                     Op::Remove(..) => removals.push(op),
                 }
             }
-            for op in manifests.into_iter().chain(puts).chain(removals) {
+            for op in objects
+                .into_iter()
+                .chain(manifests)
+                .chain(puts)
+                .chain(removals)
+            {
                 self.0.apply(op);
             }
             Ok(done)
@@ -497,7 +564,11 @@ pub mod mem {
         }
 
         fn caps(&self) -> Caps {
-            Caps::LOCAL.with_shared_writes(self.state.shared.load(Ordering::SeqCst))
+            let objects = self.state.objects.load(Ordering::SeqCst);
+            Caps::LOCAL
+                .with_shared_writes(self.state.shared.load(Ordering::SeqCst))
+                .with_objects(objects)
+                .with_columns(objects)
         }
 
         fn list_units(&self, test_ids: &[&str]) -> Result<Vec<Vec<StoredEnvelope>>, StoreError> {
@@ -561,11 +632,127 @@ pub mod mem {
                         .unwrap_or_else(|| att.plain_key())
                 }
             };
-            let op = Op::Put(key.clone(), att.target.clone(), att.envelope.to_vec());
+            let columns = att
+                .columns
+                .filter(|_| self.state.objects.load(Ordering::SeqCst))
+                .map(|c| Box::new(c.clone()));
+            let op = Op::Put(
+                key.clone(),
+                att.target.clone(),
+                att.envelope.to_vec(),
+                columns,
+            );
             if let Some(op) = self.state.queue(op) {
                 self.state.apply(op);
             }
             Ok(att.stored(key))
+        }
+
+        fn get_objects(&self, ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+            for id in ids {
+                key::check_object_id(id)?;
+            }
+            if !self.state.objects.load(Ordering::SeqCst) {
+                return Err(self.objects_unsupported());
+            }
+            let d = self.state.data.lock().unwrap();
+            let mut seen = std::collections::BTreeSet::new();
+            Ok(ids
+                .iter()
+                .filter(|id| seen.insert(**id))
+                .filter_map(|id| {
+                    d.objects.get(*id).map(|(kind, bytes, _)| StoredObject {
+                        id: (*id).to_owned(),
+                        kind: *kind,
+                        bytes: bytes.clone(),
+                    })
+                })
+                .collect())
+        }
+
+        fn put_objects(&self, objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
+            self.wrote();
+            let mut items = Vec::with_capacity(objects.len());
+            for o in objects {
+                items.push((o.kind, o.validate()?, o.bytes.to_vec()));
+            }
+            if !self.state.objects.load(Ordering::SeqCst) {
+                return Err(self.objects_unsupported());
+            }
+            let new = {
+                let d = self.state.data.lock().unwrap();
+                items
+                    .iter()
+                    .filter(|(_, id, _)| !d.objects.contains_key(id))
+                    .count()
+            };
+            if let Some(op) = self.state.queue(Op::Objects(items)) {
+                self.state.apply(op);
+            }
+            Ok(new)
+        }
+
+        fn remove_objects(&self, ids: &[&str]) -> Result<usize, StoreError> {
+            for id in ids {
+                key::check_object_id(id)?;
+            }
+            if !self.state.objects.load(Ordering::SeqCst) {
+                return Err(self.objects_unsupported());
+            }
+            self.wrote();
+            let mut d = self.state.data.lock().unwrap();
+            let doomed: Vec<String> = ids
+                .iter()
+                .filter(|id| d.objects.contains_key(**id) && !d.referenced(id))
+                .map(|id| (*id).to_owned())
+                .collect();
+            for id in &doomed {
+                d.objects.remove(id);
+            }
+            Ok(doomed.len())
+        }
+
+        fn orphan_objects(&self) -> Result<Vec<String>, StoreError> {
+            if !self.state.objects.load(Ordering::SeqCst) {
+                return Err(self.objects_unsupported());
+            }
+            let d = self.state.data.lock().unwrap();
+            Ok(d.objects
+                .keys()
+                .filter(|id| !d.referenced(id))
+                .cloned()
+                .collect())
+        }
+
+        fn prune_state_objects(
+            &self,
+            older_than: std::time::Duration,
+        ) -> Result<usize, StoreError> {
+            if !self.state.objects.load(Ordering::SeqCst) {
+                return Err(self.objects_unsupported());
+            }
+            self.wrote();
+            let mut d = self.state.data.lock().unwrap();
+            let doomed: Vec<String> = d
+                .objects
+                .iter()
+                .filter(|(_, (kind, _, at))| {
+                    *kind == ObjectKind::State && at.elapsed() >= older_than
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &doomed {
+                d.objects.remove(id);
+            }
+            Ok(doomed.len())
+        }
+
+        fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
+            let d = self.state.data.lock().unwrap();
+            Ok(envs
+                .iter()
+                .map(|e| d.columns.get(&e.key).cloned().unwrap_or_default())
+                .collect())
         }
 
         fn put_manifest(&self, root: &str, bytes: &[u8]) -> Result<bool, StoreError> {
