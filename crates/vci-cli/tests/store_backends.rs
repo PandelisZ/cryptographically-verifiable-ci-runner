@@ -2158,3 +2158,297 @@ fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
         "the objects are untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 10. `vci store upgrade` and `vci prune` on store format 3 (M3, STORE-V2
+// sections 2.1 "Prune" and 5).
+
+/// A format-3 frame of `run` for unit `a` whose statement carries these
+/// RFC 3339 times, with the columns a writer copies out of it (`expires`
+/// as `column_expires`, which a test may set apart from the statement):
+/// the fixture's descriptor and signature, a statement shaped as `vci run`
+/// signs one.
+fn frame_of(run: &Run3, issued: i64, expires: i64, column_expires: i64) -> (Vec<u8>, Columns) {
+    let (bytes, mut columns) = run.record("a", 2, 1);
+    let Ok(Record::FormatThree(mut frame)) = decode_record(&bytes) else {
+        panic!("the fixture's record is a frame")
+    };
+    let rfc = |t: i64| {
+        jiff::Timestamp::from_second(t)
+            .unwrap()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    frame.statement = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{"name": "a", "digest": {"blake3": "9".repeat(64)}}],
+        "predicateType": vci_core::PREDICATE_TYPE_V2,
+        "predicate": {
+            "argv": [], "commit": "c".repeat(40), "entriesRoot": "0".repeat(64),
+            "expiresAt": rfc(expires), "hdr": run.ids.hdr, "issuedAt": rfc(issued),
+            "result": {"state": "passed", "tests": 1, "failed": 0, "skipped": 0, "durationMs": 10},
+            "tables": run.ids.tables, "testId": "a", "treeDirty": false,
+        },
+    })
+    .to_string()
+    .into_bytes();
+    columns.expires = Some(column_expires);
+    (frame.encode().unwrap().into_bytes(), columns)
+}
+
+/// `vci store upgrade --begin` is idempotent on the SQLite file this vci's
+/// first write laid out; `--finish` is refused with the count while a
+/// format-1 attestation remains (exit 1; counted by the value, so a run
+/// with `record_format = 1` counts), and once only format-3 records
+/// remain it drops the manifests and sets schema version 2, which `vci
+/// store info` then reports and a second `--finish` finds done. Neither
+/// flag is a usage error; git-meta has no schema to upgrade.
+#[test]
+fn sqlite_store_upgrade_begins_and_finishes() {
+    let Some(w) = World::new(Backend::sqlite()) else {
+        return;
+    };
+    let key = w.key.to_str().unwrap().to_owned();
+    let out = w.vci(&["run", "--key", &key], &[("VCI_STORE_RECORD_FORMAT", "1")]);
+    assert_eq!(
+        attested_keys(&out, "sqlite").len(),
+        UNITS.len(),
+        "{}",
+        text(&out)
+    );
+    let file = w.work.join(".git/vci-store.sqlite");
+
+    let out = w.vci(&["store", "upgrade", "--begin"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("the format-3 columns and tables are present"),
+        "the first write laid them out: {}",
+        text(&out)
+    );
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stdout(&out).contains(&format!(
+            "not finished: {} attestation(s) are not format-3 records",
+            UNITS.len()
+        )),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(w.info()["schemaVersion"], 1);
+
+    // Only format-3 records remain: a run's objects and one frame.
+    let run = Run3::build(&["a/a.go", "a/a_test.go"]);
+    let (frame, columns) = frame_of(&run, 1_700_000_000, 1_900_000_000, 1_900_000_000);
+    {
+        let s = SqliteStore::open_path(&file, SqliteOptions::default());
+        let all = s.list_all().unwrap();
+        assert_eq!(s.remove(all).unwrap().len(), UNITS.len());
+        assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
+        let hint = vci_store::KeyHint {
+            issued: 1_700_000_000,
+            tree: None,
+        };
+        s.put(
+            &NewAttestation::for_test("a", &"3".repeat(16), "aa", Some(&hint), &frame)
+                .with_columns(&columns),
+        )
+        .unwrap();
+    }
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("upgraded to schema version 2"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(w.info()["schemaVersion"], 2);
+    assert_eq!(w.info()["count"], 1);
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("at schema version 2 already"),
+        "{}",
+        text(&out)
+    );
+    let out = w.vci(&["store", "upgrade", "--begin"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = w.vci(&["store", "upgrade"], &[]);
+    assert_eq!(out.status.code(), Some(2), "a usage error: {}", text(&out));
+    // The frame and its objects are still read.
+    let s = SqliteStore::open_path(&file, SqliteOptions::default());
+    assert_eq!(s.get_objects(&run.id_refs()).unwrap().len(), 4);
+    assert_eq!(s.list_all().unwrap().len(), 1);
+
+    // git-meta: nothing to upgrade.
+    let out = w.vci_bare(&["store", "upgrade", "--begin"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("git-meta has no schema"),
+        "{}",
+        text(&out)
+    );
+}
+
+/// `vci prune` on a SQLite file with format-3 records (STORE-V2 section
+/// 2.1 "Prune"): the listing's columns name the expired candidates
+/// without a value read, and a candidate goes only when its signed
+/// statement confirms the column (a record whose `expires` column lies is
+/// read once and left alone); the run's objects stay while a record
+/// references them, the state object goes at `--older-than 0` whether or
+/// not one does, and the orphans go once their hour of grace has passed
+/// (aged here behind the store's back), on `--objects` alone, which
+/// leaves every attestation as it is. The world's own format-1 rows are
+/// read as before and kept.
+#[test]
+fn sqlite_prunes_format_3_records_by_columns_confirmed_by_the_statement() {
+    let Some(w) = World::new(Backend::sqlite()) else {
+        return;
+    };
+    attest_all(&w);
+    let file = w.work.join(".git/vci-store.sqlite");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let run = Run3::build(&["a/a.go", "a/a_test.go"]);
+    // expired: signed and column agree; lying: the column says expired,
+    // the statement says a year from now; current: both a year from now.
+    let expired = frame_of(&run, now - 7_200, now - 3_600, now - 3_600);
+    let lying = frame_of(&run, now - 7_000, now + 31_000_000, now - 3_600);
+    let current = frame_of(&run, now - 6_000, now + 31_000_000, now + 31_000_000);
+    let signer = "4".repeat(16);
+    // The key and the target label the store files it under.
+    let put = |s: &SqliteStore, sk: &str, issued: i64, (frame, columns): &(Vec<u8>, Columns)| {
+        let hint = vci_store::KeyHint { issued, tree: None };
+        let e = s
+            .put(
+                &NewAttestation::for_test("a", &signer, sk, Some(&hint), frame)
+                    .with_columns(columns),
+            )
+            .unwrap();
+        (e.key, e.target)
+    };
+    let ((k_expired, target), (k_lying, _), (k_current, _)) = {
+        let s = SqliteStore::open_path(&file, SqliteOptions::default());
+        assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
+        (
+            put(&s, "e1", now - 7_200, &expired),
+            put(&s, "e2", now - 7_000, &lying),
+            put(&s, "e3", now - 6_000, &current),
+        )
+    };
+    let keys = |s: &SqliteStore| -> BTreeSet<String> {
+        s.list_all().unwrap().into_iter().map(|e| e.key).collect()
+    };
+    // The state TTL compares whole seconds: a put this second is not yet
+    // older than `now`.
+    std::thread::sleep(Duration::from_millis(1_100));
+
+    let (listed, summary) = prune_dry_run(&w);
+    assert_eq!(
+        listed,
+        vec![format!("would remove {target} {k_expired}")],
+        "{summary}"
+    );
+    assert!(
+        summary.contains(&format!(
+            "vci prune: 1 expired (dry run), {} current, 0 unreadable (left alone), 1 unconfirmed (left alone)",
+            UNITS.len() + 2
+        )),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(&format!("vci prune: {target} {k_lying}: left alone")),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("vci prune: 0 unreferenced object(s) (dry run)"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("state objects older than 2 day(s): removed on a run without --dry-run"),
+        "{summary}"
+    );
+    let s = SqliteStore::open_path(&file, SqliteOptions::default());
+    assert_eq!(keys(&s).len(), UNITS.len() + 3, "a dry run removes nothing");
+
+    let out = w.vci(&["prune"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out), format!("removed {target} {k_expired}\n"));
+    let err = stderr(&out);
+    assert!(
+        err.contains("vci prune: 0 unreferenced object(s) removed")
+            && err.contains("vci prune: 0 state object(s) older than 2 day(s) removed"),
+        "{err}"
+    );
+    let left = keys(&s);
+    assert!(!left.contains(&k_expired) && left.contains(&k_lying) && left.contains(&k_current));
+    assert_eq!(left.len(), UNITS.len() + 2);
+    assert_eq!(
+        s.get_objects(&run.id_refs()).unwrap().len(),
+        4,
+        "referenced"
+    );
+
+    // The state object alone, at once; the attestations untouched.
+    let out = w.vci(&["prune", "--objects", "--older-than", "0"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).contains("vci prune: 1 state object(s) older than 0 day(s) removed"),
+        "{}",
+        text(&out)
+    );
+    assert!(!stderr(&out).contains(" expired"), "{}", text(&out));
+    assert_eq!(s.get_objects(&run.id_refs()).unwrap().len(), 3);
+    assert_eq!(keys(&s).len(), UNITS.len() + 2);
+
+    // Nothing references the run any more: within the grace hour the
+    // objects stay; aged past it they go.
+    let doomed: Vec<_> = s
+        .list_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.key == k_lying || e.key == k_current)
+        .collect();
+    assert_eq!(s.remove(doomed).unwrap().len(), 2);
+    let out = w.vci(&["prune", "--objects", "--dry-run"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("vci prune: 0 unreferenced object(s) (dry run)"),
+        "{}",
+        text(&out)
+    );
+    drop(s);
+    {
+        let db = rusqlite::Connection::open(&file).unwrap();
+        db.execute("UPDATE objects SET put_at = put_at - 7200", [])
+            .unwrap();
+    }
+    let out = w.vci(&["prune", "--objects"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let mut lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
+    lines.sort();
+    let mut want: Vec<String> = run
+        .named()
+        .iter()
+        .map(|id| format!("removed project object {id} (unreferenced object)"))
+        .collect();
+    want.sort();
+    assert_eq!(lines, want);
+    assert!(
+        stderr(&out).contains("vci prune: 3 unreferenced object(s) removed"),
+        "{}",
+        text(&out)
+    );
+    let s = SqliteStore::open_path(&file, SqliteOptions::default());
+    assert!(s.get_objects(&run.id_refs()).unwrap().is_empty());
+    assert_eq!(
+        keys(&s).len(),
+        UNITS.len(),
+        "the world's own rows are untouched"
+    );
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+}

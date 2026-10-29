@@ -155,9 +155,12 @@ enum Cmd {
         trusted_root: Option<Utf8PathBuf>,
         #[arg(long)]
         base_ref: Option<String>,
-        /// The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it). Default: read from the repository's attestation store (git-meta by default) when run inside the repository.
+        /// The input manifest the attestation references (its compact encoding, as `git meta get project vci:manifest:<root>` prints it; for a format-3 record, the compact JSON of its resolved manifest). Default: read from the repository's attestation store (git-meta by default) when run inside the repository; a format-3 record then has its set resolved from the run's objects and its root checked only against this file.
         #[arg(long, value_name = "FILE")]
         manifest: Option<Utf8PathBuf>,
+        /// Print the DSSE envelope JSON of the record and verify nothing: for a format-3 record (since 2.9.0, the text frame a store holds) the envelope rebuilt from it, the statement bytes unchanged and the signature re-armored, which in-toto tooling verifies as it does a stored envelope; for an envelope, its bytes as read.
+        #[arg(long = "envelope")]
+        print_envelope: bool,
     },
     /// Publish local attestations from the attestation store (git-meta by default: push refs/meta/main with merge and retry; a SQLite, PostgreSQL or libSQL store has nothing to push).
     Push {
@@ -185,6 +188,12 @@ enum Cmd {
         /// How many of a unit's attestations by the same signer to keep, newest first; one made on a tree some branch or tag still has at its tip is always kept. Every stored attestation costs each plan a download.
         #[arg(long, default_value_t = 2)]
         keep: usize,
+        /// Only the objects (since 2.9.0): remove the objects of store format 3 no attestation references (hdr, tables, shape and state objects put more than an hour ago) and the state objects older than --older-than, and leave every attestation and input manifest alone. Without it, `vci prune` does this after the attestations and manifests.
+        #[arg(long)]
+        objects: bool,
+        /// Remove the state objects (the attested sizes and hashes `vci explain` prints; no verdict reads them) put more than this many days ago, whether or not an attestation references them, for this run. Default: `[store] explain_hashes_days` (2).
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u32>,
     },
     /// Print the effective environment policy of each project: what vci sets, hashes, ignores and removes (docs/ENV.md).
     Env {
@@ -240,6 +249,15 @@ enum StoreCmd {
     Info {
         #[arg(long, value_enum, default_value = "text")]
         format: EnvFormat,
+    },
+    /// Since 2.9.0: the store format 3 migration of a SQLite, PostgreSQL or libSQL store (git-meta has no schema; docs/STORE-BACKENDS.md). `--begin` adds the format-3 columns and tables in a request of its own, ahead of a rollout (idempotent; the first `vci run` of this vci does the same before its first write). `--finish` ends the migration window once every attestation is a format-3 record: it drops the input manifests and sets schema version 2, after which a vci before 2.9 reads the store as too new and fails open; refused, with the count, while a format-1 attestation remains (exit 1). Exits 2 when the store cannot be opened.
+    Upgrade {
+        /// Add the format-3 columns and tables (idempotent).
+        #[arg(long, required_unless_present = "finish", conflicts_with = "finish")]
+        begin: bool,
+        /// Drop the input manifests and set schema version 2, once no format-1 attestation remains.
+        #[arg(long)]
+        finish: bool,
     },
 }
 
@@ -401,6 +419,7 @@ fn main() {
             trusted_root,
             base_ref,
             manifest,
+            print_envelope,
         } => cmds::verify(
             &envelope,
             cmds::VerifyTrust {
@@ -410,6 +429,7 @@ fn main() {
             },
             base_ref.as_deref(),
             manifest.as_deref(),
+            print_envelope,
         ),
         Cmd::Push {
             remote,
@@ -420,7 +440,15 @@ fn main() {
             dry_run,
             superseded,
             keep,
-        } => cmds::prune(dry_run, superseded, keep),
+            objects,
+            older_than,
+        } => cmds::prune(cmds::PruneArgs {
+            dry_run,
+            superseded,
+            keep,
+            objects_only: objects,
+            older_than,
+        }),
         Cmd::Env {
             base_ref,
             project,
@@ -445,6 +473,9 @@ fn main() {
         Cmd::Store {
             cmd: StoreCmd::Info { format },
         } => cmds::store_info(matches!(format, EnvFormat::Json)),
+        Cmd::Store {
+            cmd: StoreCmd::Upgrade { begin, finish: _ },
+        } => cmds::store_upgrade(begin),
         Cmd::Metrics {
             last,
             command,
@@ -560,6 +591,85 @@ mod tests {
             help.contains("else `[store] backend` in the working tree's vci.toml, else the scheme of its `[store] url`, else git-meta"),
             "{help}"
         );
+    }
+
+    /// `vci store upgrade --begin | --finish` (2.9): one of the two, never
+    /// both and never neither; it is `store`, not `vci upgrade` (the
+    /// alias of `vci update`).
+    #[test]
+    fn store_upgrade_parses_one_step() {
+        for (args, want_begin) in [
+            (vec!["vci", "store", "upgrade", "--begin"], true),
+            (vec!["vci", "store", "upgrade", "--finish"], false),
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert_eq!(cli.cmd.name(), "store");
+            let Cmd::Store {
+                cmd: StoreCmd::Upgrade { begin, finish },
+            } = cli.cmd
+            else {
+                panic!("{args:?}: not store upgrade")
+            };
+            assert_eq!(begin, want_begin, "{args:?}");
+            assert_eq!(finish, !want_begin, "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["vci", "store", "upgrade"]).is_err());
+        assert!(Cli::try_parse_from(["vci", "store", "upgrade", "--begin", "--finish"]).is_err());
+        let help = Cli::try_parse_from(["vci", "store", "upgrade", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("sets schema version 2"), "{help}");
+        assert!(help.contains("git-meta has no schema"), "{help}");
+    }
+
+    /// `vci prune --objects [--older-than DAYS]` and `vci verify
+    /// --envelope` (2.9) parse beside the flags they had, which keep their
+    /// defaults.
+    #[test]
+    fn prune_objects_and_verify_envelope_parse() {
+        let cli = Cli::try_parse_from(["vci", "prune", "--objects", "--older-than", "0"]).unwrap();
+        let Cmd::Prune {
+            dry_run,
+            superseded,
+            keep,
+            objects,
+            older_than,
+        } = cli.cmd
+        else {
+            panic!("not prune")
+        };
+        assert!(objects && !dry_run && !superseded);
+        assert_eq!((keep, older_than), (2, Some(0)));
+        let cli = Cli::try_parse_from(["vci", "prune"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Prune {
+                objects: false,
+                older_than: None,
+                keep: 2,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["vci", "prune", "--older-than", "soon"]).is_err());
+        let cli = Cli::try_parse_from(["vci", "verify", "rec.txt", "--envelope"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Verify {
+                print_envelope: true,
+                ref manifest,
+                ref envelope,
+                ..
+            } if manifest.is_none() && envelope == "rec.txt"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["vci", "verify", "-"]).unwrap().cmd,
+            Cmd::Verify {
+                print_envelope: false,
+                ..
+            }
+        ));
     }
 
     /// `vci update` (and its alias `vci upgrade`) sits beside `vci store
