@@ -136,6 +136,15 @@ struct World {
     untrusted: PathBuf,
     gitconfig: PathBuf,
     ruby_bin: PathBuf,
+    /// Every `vci run` of this world writes format-1 records
+    /// (`VCI_STORE_RECORD_FORMAT=1`: the envelope with its input manifest,
+    /// as vci 2.8 wrote), for a test whose assertions hold only for that
+    /// form: a stored manifest (`stored_predicate`, the per-slot bases) or
+    /// the per-entry explain text on git-meta (a format-3 record there
+    /// names no state object, so an edited entry is reported as changed
+    /// with the attested hash not loaded; tests/e2e_m3.rs covers that
+    /// text).
+    format1: std::sync::atomic::AtomicBool,
 }
 
 fn keygen(path: &Path, comment: &str) {
@@ -219,6 +228,7 @@ impl World {
             base,
             _tmp: tmp,
             ruby_bin,
+            format1: std::sync::atomic::AtomicBool::new(false),
         };
         keygen(&w.trusted, "trusted");
         keygen(&w.untrusted, "untrusted");
@@ -364,6 +374,9 @@ end"##;
         for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
+        if self.format1.load(std::sync::atomic::Ordering::Relaxed) {
+            cmd.env("VCI_STORE_RECORD_FORMAT", "1");
+        }
         // `vci run` of several files runs them in batch mode, as it does
         // by default; VCI_E2E_RAILS_PER_FILE=1 runs every test one process
         // per file instead (to compare).
@@ -495,6 +508,8 @@ const ALL: &[&str] = &[A, B, C, D];
 #[test]
 fn rails_end_to_end_verification_steps() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
 
     // Step 1: attest B, then plan: skip B; run A, C, D.
@@ -909,6 +924,8 @@ fn rails_database_contents_are_not_an_input() {
     let Some(w) = World::build(&toml, copy_rails_fixture) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let dblist = "test/lib/dblist_test.rb";
     w.put(
@@ -1196,6 +1213,8 @@ fn rails_database_server_and_other_database_files() {
 #[test]
 fn rails_multi_database_schema_files_and_named_files() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let db = w.read("config/database.yml");
     w.put(
@@ -2029,6 +2048,8 @@ fn rails_active_storage_with_libvips() {
     let Some(w) = World::build(VCI_TOML, copy_vips_fixture) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let vips = Command::new(w.ruby_bin.join("bundle"))
         .args(["exec", "ruby", "-e", "require 'vips'"])
         .current_dir(&w.work)
@@ -3111,6 +3132,8 @@ fn rails_long_file_runs_as_shards() {
 fn rails_slot_failure_from_an_earlier_file_passes_on_its_own() {
     const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     // A table of its own: fixture tables are reloaded before each
     // non-transactional test, so a leftover row in `widgets` would not be
     // seen; a table the schema does not have persists in the slot's
@@ -3188,6 +3211,13 @@ fn batch_gives_what_one_process_per_file_gives(batch: &[(&str, &str)]) {
     let in_slots = batch.iter().any(|(k, _)| *k == "VCI_RAILS_JOBS");
     let Some(alone) = World::new() else { return };
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): the per-slot bases below are
+    // the stored manifests' (vci 2.1.8), which a format-3 run does not
+    // write.
+    alone
+        .format1
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     add_batch_files(&alone);
     add_batch_files(&w);
     let files: Vec<&str> = BATCH_FILES.iter().map(|(f, _)| *f).collect();
@@ -3426,6 +3456,8 @@ fn rails_slots_give_what_one_process_per_file_gives() {
     batch_gives_what_one_process_per_file_gives(SLOTS);
 
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let collide = |n: &str| {
         format!(
             "require \"test_helper\"\n\nclass Collide{n}Test < ActiveSupport::TestCase\n  self.use_transactional_tests = false\n\n  test \"owns its row\" do\n    Widget.create!(name: \"collide\", size: {n})\n    sleep 2\n    assert_equal [{n}], Widget.where(name: \"collide\").pluck(:size)\n  ensure\n    Widget.where(name: \"collide\").delete_all\n  end\nend\n"
@@ -3505,6 +3537,8 @@ fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
     let Some(w) = World::build(&toml, copy_rails_fixture) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let asks = "test/models/asks_test.rb";
     let plain = "test/models/plain_test.rb";
@@ -3671,6 +3705,8 @@ fn rails_inputs_loose_skips_boot_file_changes_and_strict_does_not() {
         let Some(w) = World::build(&toml, copy_rails_fixture) else {
             return;
         };
+        // Format-1 records (`World::format1`): this test asserts what only that form holds.
+        w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
         let work = w.work.clone();
         let mode = if strict { "strict" } else { "loose" };
         let stderr = strip_ansi(&w.run(&work, &[B, D], &w.trusted));

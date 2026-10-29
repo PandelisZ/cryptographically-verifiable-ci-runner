@@ -116,6 +116,14 @@ struct World {
     untrusted: PathBuf,
     gitconfig: PathBuf,
     fixture: Fixture,
+    /// Every `vci run` of this world writes format-1 records
+    /// (`VCI_STORE_RECORD_FORMAT=1`: the envelope with its input manifest,
+    /// as vci 2.8 wrote), for a test whose assertions hold only for that
+    /// form: a stored manifest, the envelope's JSON, or the per-entry
+    /// explain text on git-meta (a format-3 record there names no state
+    /// object, so an edited entry is reported as changed with the attested
+    /// hash not loaded; tests/e2e_m3.rs covers that text).
+    format1: std::sync::atomic::AtomicBool,
 }
 
 impl World {
@@ -143,6 +151,7 @@ impl World {
             base,
             _tmp: tmp,
             fixture,
+            format1: std::sync::atomic::AtomicBool::new(false),
         };
         keygen(&w.trusted, "trusted");
         keygen(&w.untrusted, "untrusted");
@@ -274,6 +283,9 @@ impl World {
         }
         // An unset TZ (the machine's zone) refuses every file.
         cmd.env("TZ", "UTC");
+        if self.format1.load(std::sync::atomic::Ordering::Relaxed) {
+            cmd.env("VCI_STORE_RECORD_FORMAT", "1");
+        }
         for (k, v) in env {
             match v {
                 Some(v) => cmd.env(k, v),
@@ -374,6 +386,8 @@ fn refused_line<'a>(stderr: &'a str, id: &str) -> &'a str {
 #[test]
 fn end_to_end_verification_steps() {
     let w = World::new();
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
 
     // Step 1: attest B, then plan: skip B only.
@@ -1250,6 +1264,8 @@ adapter = "node-test"
 hash = ["TZ"]
 "#;
     let w = World::new_with(Fixture::Pnpm, &[], toml);
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let lib = "apps/web/src/lib.test.ts";
     let ms = "apps/web/src/ms.test.ts";
@@ -1836,6 +1852,8 @@ fn ci_partitions_cover_every_unit_once() {
 #[test]
 fn listings_leave_out_what_git_ignores() {
     let w = World::new();
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     const L: &str = "src/list.test.mjs";
     w.write(".gitignore", "*.local\n");
@@ -1952,6 +1970,8 @@ fn strip_key_hints(text: &str) -> String {
 #[test]
 fn units_checked_and_signed_at_once_match_one_at_a_time() {
     let w = World::new();
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let mut files: Vec<String> = [A, B, C, D].iter().map(|s| (*s).to_owned()).collect();
     let read = |name: &str, path: &str| {

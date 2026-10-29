@@ -97,6 +97,14 @@ struct World {
     trusted: PathBuf,
     untrusted: PathBuf,
     gitconfig: PathBuf,
+    /// Every `vci run` of this world writes format-1 records
+    /// (`VCI_STORE_RECORD_FORMAT=1`: the envelope with its input manifest,
+    /// as vci 2.8 wrote), for a test whose assertions hold only for that
+    /// form: a stored manifest or the per-entry explain text on git-meta
+    /// (a format-3 record there names no state object, so an edited entry
+    /// is reported as changed with the attested hash not loaded;
+    /// tests/e2e_m3.rs covers that text).
+    format1: std::sync::atomic::AtomicBool,
 }
 
 fn keygen(path: &Path, comment: &str) {
@@ -184,6 +192,7 @@ impl World {
             gitconfig,
             base,
             _tmp: tmp,
+            format1: std::sync::atomic::AtomicBool::new(false),
         };
         keygen(&w.trusted, "trusted");
         keygen(&w.untrusted, "untrusted");
@@ -248,6 +257,9 @@ impl World {
             .env("NO_COLOR", "1");
         for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
+        }
+        if self.format1.load(std::sync::atomic::Ordering::Relaxed) {
+            cmd.env("VCI_STORE_RECORD_FORMAT", "1");
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -359,6 +371,8 @@ const D: &str = "d";
 #[test]
 fn go_end_to_end_verification_steps() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
 
     // Step 1: attest b, then plan: skip b; run a, c, d. Packages without
@@ -1021,6 +1035,8 @@ fn go_project_in_a_subdirectory() {
     let Some(w) = World::build(&toml, |d| copy_go_fixture(&d.join("svc")), &["svc"]) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     w.run(&work, "svc/b", &w.trusted);
     let p = w.plan(&work, "main");
@@ -1157,6 +1173,8 @@ fn go_other_go_version_runs() {
 #[test]
 fn deferred_candidates_are_read_when_present_locally() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let src = w.read("d/d.go");
     let state = |n: usize| format!("{src}\n// state {n}\n");
@@ -1372,6 +1390,8 @@ func TestLink(t *testing.T) {
 #[test]
 fn go_symlink_targets_read_through_the_standard_library_are_inputs() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     for (pkg, src) in [("rl", RL_TEST), ("rr", RR_TEST), ("rv", RV_TEST)] {
         w.put(&format!("{pkg}/{pkg}_test.go"), src);
@@ -1661,6 +1681,8 @@ fn go_assembly_include_outside_the_package_is_an_input() {
         return;
     }
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     w.put("as/as.go", AS_GO);
     w.put("as/as_arm64.s", AS_ARM64);

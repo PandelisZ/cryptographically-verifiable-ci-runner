@@ -2826,12 +2826,10 @@ pub fn run_units(
     let UnitRecords {
         durations,
         columns: unit_columns,
+        hdrs: unit_hdrs,
     } = last_durations(store, &selected_ids);
     let hdr_platforms = HdrPlatforms::default();
-    hdr_platforms.preload(
-        store,
-        unit_columns.values().filter_map(|c| c.hdr.as_deref()),
-    );
+    hdr_platforms.preload(store, unit_hdrs.iter().map(String::as_str));
     crate::plan::timing(
         &format!(
             "read the last duration of {} unit(s) ({} recorded)",
@@ -3855,6 +3853,12 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
             if let Some(d) = newest_read(&cands) {
                 out.durations.insert((*id).to_owned(), d);
             }
+            out.hdrs.extend(
+                cands
+                    .iter()
+                    .filter(|e| e.error.is_none())
+                    .filter_map(|e| hdr_named(&e.bytes)),
+            );
         }
         return out;
     }
@@ -3881,6 +3885,7 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
             if !c.is_empty() {
                 out.columns.insert(e.key.clone(), c.clone());
             }
+            out.hdrs.extend(c.hdr.clone());
         }
         match newest {
             Some((_, d)) => {
@@ -3906,6 +3911,12 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
         if let Some(d) = newest_read(&cands) {
             out.durations.insert(test_ids[ui].to_owned(), d);
         }
+        out.hdrs.extend(
+            cands
+                .iter()
+                .filter(|e| e.error.is_none())
+                .filter_map(|e| hdr_named(&e.bytes)),
+        );
     }
     out
 }
@@ -3920,6 +3931,19 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
 struct UnitRecords {
     durations: BTreeMap<String, u64>,
     columns: BTreeMap<String, Columns>,
+    /// The hdr objects the units' format-3 records name (by their columns,
+    /// or by the statements of the records read on a store without
+    /// columns), for [`HdrPlatforms::preload`].
+    hdrs: BTreeSet<String>,
+}
+
+/// The hdr id a stored value names when it is a format-3 record with a v2
+/// statement (unverified, as everything [`last_durations`] reads).
+fn hdr_named(bytes: &[u8]) -> Option<String> {
+    match decode_record(bytes) {
+        Ok(Record::FormatThree(frame)) => frame_meta(&frame).map(|m| m.hdr),
+        _ => None,
+    }
 }
 
 /// A stored record's issue time and recorded duration, by its first byte
@@ -4247,15 +4271,23 @@ fn frame_meta(frame: &Frame) -> Option<FrameMeta> {
 struct HdrPlatforms(std::sync::Mutex<BTreeMap<String, Option<(String, String)>>>);
 
 impl HdrPlatforms {
-    /// The platforms of these hdr ids (the ones the units' listing columns
-    /// name, distinct), read in one `get_objects` before the per-unit
-    /// pass; an id the store lacks is remembered as such.
+    /// The platforms of these hdr ids (the ones the units' records name,
+    /// distinct), read in one `get_objects` before the per-unit pass (on a
+    /// store whose values a fetch leaves out, git-meta's blobless clone,
+    /// after one `Prefetch::Objects`: `get_objects` fetches nothing, and
+    /// without it a clone that never read the hdr would keep every old
+    /// record as made for an unknown platform); an id the store lacks is
+    /// remembered as such.
     fn preload<'a>(&self, store: &dyn AttestationStore, ids: impl Iterator<Item = &'a str>) {
         let ids: BTreeSet<&str> = ids.filter(|id| vci_store::key::is_object_id(id)).collect();
         if ids.is_empty() {
             return;
         }
         let ids: Vec<&str> = ids.into_iter().collect();
+        if store.caps().lazy_values {
+            // A failure leaves the objects missing: their records are kept.
+            let _ = store.prefetch(Prefetch::Objects { ids: &ids });
+        }
         let Ok(objects) = store.get_objects(&ids) else {
             return;
         };
@@ -4285,6 +4317,9 @@ impl HdrPlatforms {
     fn of(&self, store: &dyn AttestationStore, id: &str) -> Option<(String, String)> {
         if let Some(known) = self.0.lock().ok().and_then(|m| m.get(id).cloned()) {
             return known;
+        }
+        if store.caps().lazy_values {
+            let _ = store.prefetch(Prefetch::Objects { ids: &[id] });
         }
         let found = store
             .get_objects(&[id])
@@ -6128,11 +6163,13 @@ mod tests {
         let records = last_durations(&s, &["a"]);
         assert_eq!(s.columns_calls(), 1);
         assert_eq!(records.columns.len(), 3);
-        let hdrs = HdrPlatforms::default();
-        hdrs.preload(
-            &s,
-            records.columns.values().filter_map(|c| c.hdr.as_deref()),
+        assert_eq!(
+            records.hdrs,
+            BTreeSet::from([hdr_id.clone()]),
+            "the hdr the columns name, once"
         );
+        let hdrs = HdrPlatforms::default();
+        hdrs.preload(&s, records.hdrs.iter().map(String::as_str));
         assert_eq!(s.object_reads(), 1, "one read for the distinct hdr ids");
         let mine = s.list_units(&["a"]).unwrap().remove(0);
         let chosen = old_records_to_read(mine, &records.columns, &commit, "linux-x86_64");

@@ -384,8 +384,12 @@ fn end_to_end_verification_steps() {
     let w = World::new();
     let work = w.work.clone();
 
-    // Step 1: attest B, then plan: skip B; run A, C, D.
-    w.run(&work, B, &w.trusted);
+    // Step 1: attest B, then plan: skip B; run A, C, D. B and C are
+    // format-1 records (`run_format1`): steps 2, 3 and 7 assert the
+    // per-entry text with the attested hash, which a format-3 record on
+    // git-meta does not give (tests/e2e_m3.rs covers that text); D and A
+    // are the default's frames, so the later plans read a mixed store.
+    w.run_format1(&work, B, &w.trusted);
     let p = w.plan(&work, "main");
     assert_eq!(p.skip, set(&[B]), "step 1");
     assert_eq!(p.run, set(&[A, C, D]), "step 1");
@@ -414,7 +418,7 @@ fn end_to_end_verification_steps() {
     assert_eq!(w.plan(&work, "main").skip, set(&[B]), "step 2: restored");
 
     // Step 3: attest C, edit impl-x.ts (reached only via a computed import) -> C runs.
-    w.run(&work, C, &w.trusted);
+    w.run_format1(&work, C, &w.trusted);
     assert_eq!(w.plan(&work, "main").skip, set(&[B, C]), "step 3");
     let impl_x = w.read("src/impl-x.ts");
     w.write("src/impl-x.ts", "export const name = \"x\"; // edited\n");

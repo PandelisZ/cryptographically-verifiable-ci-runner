@@ -785,7 +785,9 @@ read). Since vci 2.9.0 the old records are **read** and `commit`, the platform (
 the hdr for a format-3 record), `issuedAt` and the files come from each one's signed statement: "same files"
 compares the two records' `entriesRoot` (a format-1 record's is computed from its stored manifest); on a store that
 keeps listing columns (SQLite, PostgreSQL, libSQL) the columns, fetched once for the run's units, only choose which
-old records to read, so a column someone edited costs one read and never a wrong deletion. `vci run` then removes, on such a store, the superseded
+old records to read, so a column someone edited costs one read and never a wrong deletion; on git-meta, whose
+fetch leaves values out, the hdr objects the old records name are prefetched once for the run before their
+platform is read (a record whose hdr the store lacks is kept). `vci run` then removes, on such a store, the superseded
 records' objects that no record references any more (an hour of grace after a put; on git-meta, whose referrer scan
 reads every value, they are left to `vci prune`), and the run's state objects older than `[store]
 explain_hashes_days`. `vci prune` reads the expired candidates and the records of every unit with one beyond `keep` by the keys' hints (and
