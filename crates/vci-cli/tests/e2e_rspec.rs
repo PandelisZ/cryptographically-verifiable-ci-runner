@@ -584,12 +584,9 @@ fn rspec_end_to_end_verification_steps() {
     assert!(!work.join("spec/examples.txt").exists());
     // The runner is in the attestation: argv and the toolchain.
     let stored = AttestStore::new(&store_for(&work)).list(Some(B)).unwrap();
-    let env: Value = serde_json::from_slice(&stored[0].bytes).unwrap();
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(env["payload"].as_str().unwrap())
-        .unwrap();
-    let st: Value = serde_json::from_slice(&payload).unwrap();
-    let st = store_common::inline_statement_manifest(&store_for(&work), st);
+    let st = serde_json::json!({
+        "predicate": store_common::predicate_of(&store_for(&work), &stored[0].bytes)
+    });
     let argv: Vec<&str> = st["predicate"]["argv"]
         .as_array()
         .unwrap()
@@ -812,7 +809,7 @@ fn rspec_end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -1952,12 +1949,9 @@ fn rspec_bundle_installed_in_the_repository() {
     }
     for id in [D, gem_read] {
         let stored = AttestStore::new(&store_for(&work)).list(Some(id)).unwrap();
-        let env: Value = serde_json::from_slice(&stored.last().unwrap().bytes).unwrap();
-        let payload = base64::engine::general_purpose::STANDARD
-            .decode(env["payload"].as_str().unwrap())
-            .unwrap();
-        let st: Value = serde_json::from_slice(&payload).unwrap();
-        let st = store_common::inline_statement_manifest(&store_for(&work), st);
+        let st = serde_json::json!({
+            "predicate": store_common::predicate_of(&store_for(&work), &stored.last().unwrap().bytes)
+        });
         let m = &st["predicate"]["manifest"];
         let inside: Vec<&Value> = m["entries"]
             .as_array()
@@ -2065,12 +2059,9 @@ end
 /// attestation.
 fn entries_of(work: &Path, id: &str) -> BTreeSet<(String, String)> {
     let stored = AttestStore::new(&store_for(work)).list(Some(id)).unwrap();
-    let env: Value = serde_json::from_slice(&stored.last().unwrap().bytes).unwrap();
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(env["payload"].as_str().unwrap())
-        .unwrap();
-    let st: Value = serde_json::from_slice(&payload).unwrap();
-    let st = store_common::inline_statement_manifest(&store_for(work), st);
+    let st = serde_json::json!({
+        "predicate": store_common::predicate_of(&store_for(work), &stored.last().unwrap().bytes)
+    });
     let mut out = BTreeSet::new();
     for m in ["manifest", "globalManifest"] {
         for e in st["predicate"][m]["entries"].as_array().unwrap() {

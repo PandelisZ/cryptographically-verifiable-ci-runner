@@ -18,6 +18,7 @@ use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
 mod env_common;
+mod store_common;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -488,7 +489,7 @@ fn pytest_end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -750,14 +751,13 @@ fn pytest_ignore_taints_result_skipped() {
         stderr.contains(&format!("vci: attested {skip} (waived: result:skipped) (")),
         "{stderr}"
     );
-    let b64 = base64::engine::general_purpose::STANDARD;
     let stored = AttestStore::new(&store_for(&work))
         .list(Some(skip))
         .unwrap();
     assert_eq!(stored.len(), 1);
-    let env: Value = serde_json::from_slice(&stored[0].bytes).unwrap();
-    let st: Value =
-        serde_json::from_slice(&b64.decode(env["payload"].as_str().unwrap()).unwrap()).unwrap();
+    let st = serde_json::json!({
+        "predicate": store_common::predicate_of(&store_for(&work), &stored[0].bytes)
+    });
     assert_eq!(
         st["predicate"]["waived"],
         serde_json::json!(["result:skipped:1 of 2"])

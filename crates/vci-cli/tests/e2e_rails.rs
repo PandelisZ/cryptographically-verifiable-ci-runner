@@ -630,7 +630,7 @@ fn rails_end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -1906,12 +1906,7 @@ fn rails_init_writes_the_rails_template() {
 /// The predicate stored for `id` (the newest one).
 fn stored_predicate(work: &Path, id: &str) -> Value {
     let stored = AttestStore::new(&store_for(work)).list(Some(id)).unwrap();
-    let env: Value = serde_json::from_slice(&stored.last().unwrap().bytes).unwrap();
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(env["payload"].as_str().unwrap())
-        .unwrap();
-    let st: Value = serde_json::from_slice(&payload).unwrap();
-    store_common::inline_manifest(&store_for(work), st["predicate"].clone())
+    store_common::predicate_of(&store_for(work), &stored.last().unwrap().bytes)
 }
 
 /// A Minitest file that never loads Rails (it requires only minitest and a

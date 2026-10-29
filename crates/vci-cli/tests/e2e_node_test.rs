@@ -525,7 +525,7 @@ fn end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -699,17 +699,11 @@ fn run_refuses_unattestable_test_files() {
 /// The predicates stored for `test_id`.
 fn predicates(dir: &Path, test_id: &str) -> Vec<Value> {
     let repo = store_for(dir);
-    let b64 = base64::engine::general_purpose::STANDARD;
     AttestStore::new(&repo)
         .list(Some(test_id))
         .unwrap()
         .iter()
-        .map(|s| {
-            let env: Value = serde_json::from_slice(&s.bytes).unwrap();
-            let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
-            let st: Value = serde_json::from_slice(&payload).unwrap();
-            store_common::inline_manifest(&repo, st["predicate"].clone())
-        })
+        .map(|s| store_common::predicate_of(&repo, &s.bytes))
         .collect()
 }
 

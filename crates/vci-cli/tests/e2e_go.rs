@@ -308,17 +308,11 @@ impl World {
     /// The predicates stored for `test_id`.
     fn predicates(&self, test_id: &str) -> Vec<Value> {
         let repo = store_for(&self.work);
-        let b64 = base64::engine::general_purpose::STANDARD;
         AttestStore::new(&repo)
             .list(Some(test_id))
             .unwrap()
             .iter()
-            .map(|s| {
-                let env: Value = serde_json::from_slice(&s.bytes).unwrap();
-                let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
-                let st: Value = serde_json::from_slice(&payload).unwrap();
-                store_common::inline_manifest(&repo, st["predicate"].clone())
-            })
+            .map(|s| store_common::predicate_of(&repo, &s.bytes))
             .collect()
     }
 }

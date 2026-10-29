@@ -414,17 +414,11 @@ impl World {
     /// The predicates stored for `test_id`.
     fn predicates(&self, test_id: &str) -> Vec<Value> {
         let repo = store_for(&self.work);
-        let b64 = base64::engine::general_purpose::STANDARD;
         AttestStore::new(&repo)
             .list(Some(test_id))
             .unwrap()
             .iter()
-            .map(|s| {
-                let env: Value = serde_json::from_slice(&s.bytes).unwrap();
-                let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
-                let st: Value = serde_json::from_slice(&payload).unwrap();
-                store_common::inline_manifest(&repo, st["predicate"].clone())
-            })
+            .map(|s| store_common::predicate_of(&repo, &s.bytes))
             .collect()
     }
 }
@@ -2839,6 +2833,8 @@ fn cargo_prune_keeps_the_newest_n_per_signer() {
 // ---- manifests by reference (vci 1.9.0) -----------------------------------
 
 /// The stored statements of `test_id`, as signed (no manifest inlined).
+/// The stored records of `test_id` with their statements, the predicate
+/// in its v1 form ([`store_common::predicate_of`]).
 fn raw_statements(work: &Path, test_id: &str) -> Vec<(vci_git::StoredEnvelope, Value)> {
     let b64 = base64::engine::general_purpose::STANDARD;
     AttestStore::new(&store_for(work))
@@ -2846,9 +2842,15 @@ fn raw_statements(work: &Path, test_id: &str) -> Vec<(vci_git::StoredEnvelope, V
         .unwrap()
         .into_iter()
         .map(|s| {
-            let env: Value = serde_json::from_slice(&s.bytes).unwrap();
+            let env: Value =
+                serde_json::from_slice(&store_common::envelope_json(&s.bytes)).unwrap();
             let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
-            let st: Value = serde_json::from_slice(&payload).unwrap();
+            let mut st: Value = serde_json::from_slice(&payload).unwrap();
+            // A format-3 record's v2 statement, read as the v1 fields
+            // (`inputRoot` and the rest; no `manifestRef`).
+            if st["predicateType"] == vci_core::PREDICATE_TYPE_V2 {
+                st["predicate"] = store_common::predicate_of(&store_for(work), &s.bytes);
+            }
             (s, st)
         })
         .collect()
@@ -3710,7 +3712,8 @@ fn cargo_prune_keeps_the_manifest_of_an_unparsable_attestation() {
     let root = st["predicate"]["inputRoot"].as_str().unwrap().to_owned();
     st["predicate"]["issuedAt"] = "2026-10-16T21:20:19.5+00:00 (a later format)".into();
     let b64 = base64::engine::general_purpose::STANDARD;
-    let mut env: Value = serde_json::from_slice(&stored.bytes).unwrap();
+    let mut env: Value =
+        serde_json::from_slice(&store_common::envelope_json(&stored.bytes)).unwrap();
     env["payload"] = b64.encode(serde_json::to_vec(&st).unwrap()).into();
     store
         .put(
@@ -4074,4 +4077,84 @@ fn every_command_appends_its_steps_to_the_metrics_log() {
             .success()
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+}
+
+/// A run of every unit of the fixture has several header groups (STORE-V2
+/// sections 1.3 and 1.4; the M3 tests row of section 6): each crate's
+/// units read that crate's `Cargo.toml` as a global input, so a's two
+/// units share one hdr and b, c and d have one each, with a tables object
+/// per group and one shape and state for the run. Every record names its
+/// group's hdr, which decodes to a global manifest listing the crate's
+/// manifest with the workspace's and the lock file; the plan skips every
+/// unit; and an edit of one crate's `Cargo.toml` runs that crate's units
+/// alone, the entry named.
+#[test]
+fn cargo_run_with_several_hdr_groups_is_written_and_planned() {
+    use vci_store::AttestationStore as _;
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let all = [A_LIB, A_DOC, B, C, D];
+    let (code, err) = w.run_env(&[], &[("VCI_TIMING", "1")]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        err.contains(
+            "format-3 run: 4 hdr, 4 tables, 1 shape, 1 state object(s) over 5 unit(s)"
+        ),
+        "{err}"
+    );
+    assert_eq!(w.plan(&work, "main").skip, set(&all));
+
+    let store = vci_git::GitMetaStore::new(store_for(&work));
+    let mut hdr_of: std::collections::BTreeMap<&str, String> = Default::default();
+    for unit in all {
+        let mut listed = store.list_units(&[unit]).unwrap().remove(0);
+        assert_eq!(listed.len(), 1, "one record of {unit}");
+        let mut refs: Vec<&mut vci_store::StoredEnvelope> = listed.iter_mut().collect();
+        store.read_values(&mut refs).unwrap();
+        let e = listed.remove(0);
+        let Ok(vci_store::Record::FormatThree(frame)) = vci_store::decode_record(&e.bytes) else {
+            panic!("{unit}: a format-3 frame");
+        };
+        let st: vci_attest::Statement = serde_json::from_slice(&frame.statement).unwrap();
+        assert_eq!(st.predicate_type, vci_core::PREDICATE_TYPE_V2);
+        let p: vci_core::VciPredicateV2 = serde_json::from_value(st.predicate.clone()).unwrap();
+        hdr_of.insert(unit, p.hdr);
+    }
+    assert_eq!(hdr_of[A_LIB], hdr_of[A_DOC], "a's units share a hdr");
+    let distinct: BTreeSet<&str> = hdr_of.values().map(String::as_str).collect();
+    assert_eq!(distinct.len(), 4, "{hdr_of:?}");
+    let ids: Vec<&str> = distinct.iter().copied().collect();
+    let objects = store.get_objects(&ids).unwrap();
+    assert_eq!(objects.len(), 4, "every hdr is stored");
+    for (unit, dir) in [(A_LIB, "a"), (B, "b"), (C, "c"), (D, "d")] {
+        let o = objects.iter().find(|o| o.id == hdr_of[unit]).unwrap();
+        let hdr = vci_core::Hdr::decode(&o.bytes).unwrap();
+        assert_eq!(hdr.adapter, "cargo");
+        let paths: BTreeSet<&str> = hdr.global_manifest.iter().map(|e| e.path.as_str()).collect();
+        let own = format!("{dir}/Cargo.toml");
+        assert!(
+            paths.contains(own.as_str()) && paths.contains("Cargo.toml") && paths.contains("Cargo.lock"),
+            "{unit}'s global manifest: {paths:?}"
+        );
+        for other in ["a", "b", "c", "d"] {
+            if other != dir {
+                assert!(
+                    !paths.contains(format!("{other}/Cargo.toml").as_str()),
+                    "{unit}'s global manifest lists only its crate: {paths:?}"
+                );
+            }
+        }
+    }
+
+    // One crate's manifest edited: its units run on their group's hdr,
+    // the others skip on theirs.
+    let toml = w.read("b/Cargo.toml");
+    w.put("b/Cargo.toml", &format!("{toml}\n# edited\n"));
+    let p = w.plan(&work, "main");
+    assert_eq!(p.run, set(&[B]), "{p:?}");
+    assert_eq!(p.skip, set(&[A_LIB, A_DOC, C, D]), "{p:?}");
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains("b/Cargo.toml"), "{ex}");
+    w.put("b/Cargo.toml", &toml);
+    assert_eq!(w.plan(&work, "main").skip, set(&all));
 }

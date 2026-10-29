@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::Value;
 use vci_store::conformance::scenarios::Run3;
-use vci_store::{AttestationStore, Columns, NewAttestation, Record, decode_record, key};
+use vci_store::{AttestationStore, Columns, NewAttestation, Record, decode_record};
 use vci_store_libsql::testkit as libsql_kit;
 use vci_store_postgres::testkit::{self, PgDb};
 use vci_store_sqlite::{SqliteOptions, SqliteStore};
@@ -2040,22 +2040,20 @@ fn vci_2_8() -> Option<PathBuf> {
 }
 
 /// A vci 2.8 binary on the SQLite file this vci wrote (STORE-V2 section 5,
-/// gate 2): the file has the format-3 layout (the nullable columns and
-/// the `objects` table, which this vci's first write added) and holds a
-/// run's four objects and, in the slot of a's record, a format-3 frame
-/// with its columns. 2.8 plans with no error: it lists the keys (which
-/// did not change), reads a value it cannot parse and runs a (fail open)
-/// while b, c and d are skipped on their format-1 rows; its `vci explain`
-/// and `vci prune --dry-run` exit 0 too; and its own `vci run a` stores a
-/// format-1 value, which this vci reads (every unit skipped), beside the
-/// objects 2.8 never saw. 2.8 writes into the slot the frame holds (same
-/// inputs, same storage key; the key's hint is its own) and its upsert
-/// sets the key and the value alone: the frame's columns stay beside the
-/// format-1 value, which every reader of the columns treats as a
-/// pre-filter confirmed by a read (`decode_record` goes by the value's
-/// first byte), so that the only effect is that the frame's objects stay
-/// referenced while the row lives. Were 2.8 to take another slot, the
-/// frame would stay as it was.
+/// gate 2): `vci run` laid out the format-3 columns and the `objects`
+/// table, stored the run's four objects and, for every unit, a format-3
+/// frame with its columns. 2.8 plans with no error: it lists the keys
+/// (which did not change), reads values it cannot parse and runs every
+/// unit (fail open); its `vci explain` and `vci prune --dry-run` exit 0
+/// too; and its own `vci run a` stores a format-1 value, which this vci
+/// reads (every unit skipped, a on 2.8's row) beside the objects 2.8 never
+/// saw. 2.8 writes into the slot a's frame holds (same inputs, same
+/// storage key; the key's hint is its own) and its upsert sets the key and
+/// the value alone: the frame's columns stay beside the format-1 value,
+/// which every reader of the columns treats as a pre-filter confirmed by a
+/// read (`decode_record` goes by the value's first byte), so that the only
+/// effect is that the frame's objects stay referenced while the row lives.
+/// Were 2.8 to take another slot, the frame would stay as it was.
 #[test]
 fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
     let Some(old) = vci_2_8() else {
@@ -2068,42 +2066,41 @@ fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
     let keys = attested_keys(&out, "sqlite");
     let file = w.work.join(".git/vci-store.sqlite");
 
-    // Through the trait: a run's objects, and a's record replaced in its
-    // slot by a frame of that run.
-    let run = Run3::build(&["a/a.go", "a/a_test.go"]);
-    let (frame, columns) = run.record("a", 2, 28);
-    {
+    // What this vci wrote, through the trait: frames with columns naming
+    // the run's objects, which are stored.
+    let (columns, ids) = {
         let s = SqliteStore::open_path(&file, SqliteOptions::default());
         let caps = s.caps();
         assert!(
             caps.objects && caps.columns,
             "the file this vci wrote has the format-3 layout: {caps:?}"
         );
-        assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
-        let a = s
-            .list_all()
-            .unwrap()
-            .into_iter()
-            .find(|e| e.key == keys["a"])
-            .expect("a's record");
-        let hint = key::parse_key_hint(&a.key);
-        let e = s
-            .put(&NewAttestation {
-                hint: hint.as_ref(),
-                envelope: &frame,
-                columns: Some(&columns),
-                ..NewAttestation::copy_of(&a, None)
-            })
-            .unwrap();
-        assert_eq!(e.key, a.key, "the frame took the slot");
-        assert_eq!(s.columns(&[&e]).unwrap(), vec![columns.clone()]);
-    }
+        let all = s.read_all().unwrap();
+        assert_eq!(all.len(), UNITS.len());
+        let columns = s.columns(&all.iter().collect::<Vec<_>>()).unwrap();
+        let mut ids: BTreeSet<String> = BTreeSet::new();
+        for (e, c) in all.iter().zip(&columns) {
+            assert!(
+                matches!(decode_record(&e.bytes), Ok(Record::FormatThree(_))),
+                "{}: a format-3 frame",
+                e.key
+            );
+            assert_eq!(c.format, Some(3), "{}: {c:?}", e.key);
+            ids.extend(c.object_ids().map(str::to_owned));
+        }
+        assert_eq!(ids.len(), 4, "hdr, tables, shape, state: {ids:?}");
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        assert_eq!(s.get_objects(&refs).unwrap().len(), 4);
+        let a = all.iter().position(|e| e.key == keys["a"]).expect("a's record");
+        (columns[a].clone(), ids)
+    };
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
 
-    // 2.8 plans: exit 0, nothing it calls an error, a runs, the rest skip.
+    // 2.8 plans: exit 0, nothing it calls an error, every unit runs.
     let out = w.vci_other(&old, &["plan", "--base-ref", "main", "--format", "json"]);
     let plan = parse_plan(&out);
-    assert_eq!(plan.run, set(&["a"]), "{plan:?}");
-    assert_eq!(plan.skip, set(&["b", "c", "d"]), "{plan:?}");
+    assert_eq!(plan.run, set(UNITS), "{plan:?}");
+    assert!(plan.skip.is_empty(), "{plan:?}");
     assert!(
         !stderr(&out).contains("error"),
         "2.8 reports no error:\n{}",
@@ -2113,6 +2110,11 @@ fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let out = w.vci_other(&old, &["prune", "--dry-run"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    {
+        let s = SqliteStore::open_path(&file, SqliteOptions::default());
+        assert_eq!(s.list_all().unwrap().len(), UNITS.len(), "2.8 removed nothing");
+        assert_eq!(s.get_objects(&id_refs).unwrap().len(), 4);
+    }
 
     // 2.8 runs a and stores it as it always did.
     let key_path = w.key.to_str().unwrap().to_owned();
@@ -2153,10 +2155,14 @@ fn a_2_8_binary_fails_open_on_a_format_3_sqlite_file() {
         assert_eq!(s.columns(&[f]).unwrap(), vec![columns]);
     }
     assert_eq!(
-        s.get_objects(&run.id_refs()).unwrap().len(),
+        s.get_objects(&id_refs).unwrap().len(),
         4,
         "the objects are untouched"
     );
+    // 2.8's explain of a reads its own row.
+    let out = w.vci_other(&old, &["explain", "a", "--base-ref", "main"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(stdout(&out).contains("a: SKIP"), "{}", text(&out));
 }
 
 // ---------------------------------------------------------------------------

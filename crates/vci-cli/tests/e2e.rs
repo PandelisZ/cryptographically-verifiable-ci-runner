@@ -16,6 +16,7 @@ use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
 mod env_common;
+mod store_common;
 
 /// `vci` without the store selection variables
 /// ([`vci_store::select::ENV_VARS`]): a store a developer exported
@@ -275,6 +276,25 @@ impl World {
         let _ = out;
     }
 
+    /// `vci run` writing a format-1 record (`[store] record_format = 1`,
+    /// what vci 2.8 wrote: the envelope with its input manifest), for the
+    /// tests of what only that form holds. A format-3 record on git-meta
+    /// (no listing columns name the run's state object) reports an edited
+    /// entry as changed with the attested hash not loaded, without naming
+    /// it: tests/e2e_format3.rs and tests/e2e_m3.rs cover that text.
+    fn run_format1(&self, dir: &Path, file: &str, key: &Path) {
+        let out = self.vci_env(
+            dir,
+            &["run", file, "--key", key.to_str().unwrap()],
+            &[("VCI_STORE_RECORD_FORMAT", Some("1"))],
+        );
+        assert!(
+            out.status.success(),
+            "vci run {file} (record_format = 1): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     fn plan(&self, dir: &Path, base: &str) -> Plan {
         let out = self.vci_ok(dir, &["plan", "--base-ref", base, "--format", "json"]);
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -421,7 +441,7 @@ fn end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -1460,8 +1480,9 @@ fn explain_shows_attested_as_expected_and_checkout_as_actual() {
     let work = w.work.clone();
     let mut c = Checks::default();
 
-    // Inputs: expected = attested content, actual = checkout.
-    w.run(&work, B, &w.trusted);
+    // Inputs: expected = attested content, actual = checkout (a format-1
+    // record: its manifest holds the attested hash; see `run_format1`).
+    w.run_format1(&work, B, &w.trusted);
     let original = w.read("fixtures/b.json");
     w.write("fixtures/b.json", "{ \"greeting\": \"changed\" }\n");
     let ex = w.explain(&work, B, "main");
@@ -2353,7 +2374,13 @@ fn shared_inputs_run_only_their_dependents_and_the_newest_candidate_wins() {
     w.git(&work, &["checkout", "-q", "-B", "feature", "main"]);
 
     let trusted = w.trusted.to_str().unwrap().to_owned();
-    w.vci_ok(&work, &["run", S1, S2, S3, "--key", &trusted]);
+    // Format-1 records, whose failure text names the entry (`run_format1`).
+    let out = w.vci_env(
+        &work,
+        &["run", S1, S2, S3, "--key", &trusted],
+        &[("VCI_STORE_RECORD_FORMAT", Some("1"))],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let all = w.plan(&work, "main");
     assert_eq!(all.skip, set(&[S1, S2, S3]), "{all:?}");
 
@@ -2412,11 +2439,14 @@ fn verify_reads_a_format_3_record_and_prints_its_envelope() {
     use vci_attest::FrameExt as _;
     let w = World::new();
     let work = w.work.clone();
-    w.run(&work, B, &w.trusted);
+    // A v1 statement (its manifest in the store), framed by the test; the
+    // record `vci run` writes (a v2 statement) is verified in
+    // `verify_reports_a_v2_record_from_the_runs_objects` and e2e_m3.rs.
+    w.run_format1(&work, B, &w.trusted);
     let repo = store_for(&work);
     let stored = AttestStore::new(&repo).list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
-    let envelope = stored[0].bytes.clone();
+    let envelope = store_common::envelope_json(&stored[0].bytes);
     // The descriptor is opaque to a v1 statement's verification.
     let frame = vci_core::Frame::from_stored_json(&envelope, vec![0; 33]).unwrap();
     let record = w.base.join("b.vci3");
