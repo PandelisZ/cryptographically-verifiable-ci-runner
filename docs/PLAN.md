@@ -71,13 +71,14 @@ Supported Vitest: `>=3.2 <6`, developed against 5.0.x, 4.1.x in the test matrix.
 - **Paths**: canonicalized, repo-relative, `/` separators, no `..`, byte-exact. Case-fold collisions make the file non-attestable.
 - **Predicate** (`predicateType` custom, modeled on in-toto test-result): tool version, adapter, test id, canonical per-file argv, repo id (root commit), commit (informational), toolchain (node, vitest, vite, os, arch), global input root, input root, full manifest, result, `issued_at`, `expires_at`.
 - **Envelope**: DSSE with `payloadType: application/vnd.in-toto+json`. Signature is SSHSIG over the PAE bytes, namespace `vci-attest`. Signing shells out to `ssh-keygen -Y sign` (supports agent and hardware keys); verification is pure Rust. Stored payload bytes are verified as-is, never re-serialized.
+- **Store format 3** (vci 2.9; design in STORE-V2, the contract in docs/CONTRACTS.md "Store format 3 and predicate v2", the store side in docs/STORE-BACKENDS.md section 2): the stored record is a text frame (`vci3`, the signed statement bytes, the signature frame, a descriptor) whose predicate (`https://vci.dev/test-attestation/v2`) carries the unit's own facts and the ids of two objects, a `hdr` shared by every run at the same toolchain and global inputs and a per-run `tables` object; the descriptor indexes a per-run `shape` object of paths and kinds, and the attested hashes live in a per-run `state` object that only `explain` reads. One SSHSIG (or Sigstore bundle) per unit over the exact statement bytes, the same keys, slots and `root()`; a vci before 2.9 reads a frame as a value it cannot parse and runs the unit.
 
 ## Verification (`vci plan`)
 
 1. Read `.vci/allowed_signers` and `vci.toml` from the **base commit** via `git show`. Missing means run all.
 2. List test files via `vitest list --filesOnly --json`.
 3. Compute global input root and toolchain digest.
-4. Per test file, per candidate envelope, check in order: envelope shape; SSHSIG and namespace; signer in base `allowed_signers` (honouring `namespaces=`, `valid-after`, `valid-before`; `cert-authority` rejected in v1); not expired and TTL within policy; repo id, test id, argv, toolchain match; result passed and untainted; every manifest entry rehashed from checkout and root matches; env hashes match.
+4. Per test file, per candidate envelope, check in order: envelope shape; SSHSIG and namespace; signer in base `allowed_signers` (honouring `namespaces=`, `valid-after`, `valid-before`; `cert-authority` rejected in v1), and since 2.9 the store key's signer segment is the verified key's; not expired and TTL within policy; repo id, test id, argv, toolchain match; result passed and untainted; every manifest entry rehashed from checkout and root matches (a format-3 record's set of paths and kinds is resolved from its descriptor and the run's objects, every id recomputed, then observed at HEAD and the root of the observation compared with the signed one); env hashes match.
 5. First fully passing candidate gives SKIP; otherwise RUN with the first failing check recorded for `explain`.
 
 ## Git storage (git-meta)
@@ -90,6 +91,9 @@ format, database or ref layout of its own.
   `vci:attestation:<blake3(test_id)>:<signer>:<storage_key>`; value the DSSE envelope.
 - Different signers and different inputs write different keys; git-meta's three-way (and baseless two-way) merge keeps
   keys added on either side. The same signer re-attesting the same inputs rewrites one key.
+- Since vci 2.9 a run's four objects are `project` keys `vci:object:<kind>:<id>` (base64 of the bytes; the id is their
+  BLAKE3), a few per run where format 1 filed one manifest per unit; a clone that deletes one puts it back at its
+  next merge when a local attestation still names it, as it does a manifest.
 - `vci push` / `vci fetch` follow `git meta push` / `git meta pull` on `refs/meta/main`, and interoperate with them.
   They first make the SQLite store cover the shared `refs/meta/local/main` (worktrees, lost stores), refuse any
   serialization or push that drops a value without a deletion record, leave out tree entries git-meta cannot read, and

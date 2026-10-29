@@ -281,6 +281,16 @@ the user anything else that handles a token, such as the site's 1Password pipeli
    end, and the next pull request's plan has `SKIP` lines and no `running everything: reading attestations from
    <kind>`. Nothing in CI shows whether the repository's token is read-only (pull-request jobs never write); if unsure,
    `turso db tokens invalidate <db>` and set the secrets again.
+8. Store format 3 (vci 2.9): a store written by 2.9 holds a new record format a 2.8 vci cannot read (it runs those
+   units, never skips them wrongly), so upgrade in this order, each step with the user's go-ahead: the action pinned
+   to 2.9 and every developer on 2.9 in one change (`[store] record_format = 1` in `vci.toml`, or
+   `VCI_STORE_RECORD_FORMAT=1` on the vci step, keeps the old format while that takes longer); `vci store upgrade
+   --begin` once on the shared store before the first 2.9 job (idempotent; the first 2.9 `vci run` does it otherwise,
+   in a request of its own); a 2.9 `vci prune` once during the window, since a 2.8 prune stops collecting input
+   manifests as soon as one new record exists; and `vci store upgrade --finish`, by the user, only once no old record
+   remains (it is refused with the count until then; on libSQL it is refused in this release even at zero), after
+   which a 2.8 vci fails open on that store for good. A libSQL replica (`VCI_STORE_SYNC=replica`) synced by 2.8 is
+   synced in full once by 2.9, and keeps no objects: cut off from its server it verifies no format-3 record.
 
 A job that runs untrusted code (a fork's, or any job you would not hand a write credential) gets a read-only token or
 none: its tests can read the token from the environment the job's shell or vci started with, whatever vci removes.

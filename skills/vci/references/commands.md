@@ -226,6 +226,8 @@ Options:
 - Deletes expired attestations from the local store as deletion records; publish them with `vci push`. Never needed for correctness: expired attestations are simply not accepted.
 - Since 2.0 it first fetches every attestation a blobless fetch left out (one batch; on a large store most of what a fetch downloaded before 2.0).
 - Since 1.9.0 it then deletes the stored input manifests (`project` key `vci:manifest:<root>`) that no remaining attestation references and prints `vci prune: N unreferenced input manifest(s) removed` (`(dry run)` with `--dry-run`); none while an attestation cannot be read.
+- Since 2.2 `--keep N` (default 2) keeps only the newest N attestations of a unit by the same signer (`--superseded` is `--keep 1`), except one made on a tree some branch or tag still has at its tip.
+- Since 2.9.0 it also collects store format 3's objects: `removed project object <id> (unreferenced object)` for a hdr, tables, shape or state object no attestation references (put more than an hour ago), then `vci prune: N state object(s) older than D day(s) removed` for the state objects (the attested hashes `vci explain` prints; no verdict reads them) older than `--older-than DAYS` (default `[store] explain_hashes_days`, 2), whether or not an attestation references them. `--objects` runs only these two passes and leaves every attestation and manifest alone. On SQLite, PostgreSQL and libSQL it reads only the candidates its columns and hints name and deletes one only when its signed statement confirms them (`N unconfirmed (left alone)` otherwise); on git-meta it reads every value as before. A `--dry-run` lists the orphan objects and prints `state objects older than D day(s): removed on a run without --dry-run`.
 
 ## vci verify
 
@@ -256,6 +258,8 @@ Options:
 - An SSH-signed envelope is checked against `.vci/allowed_signers`, a keyless one (since 2.0, a `sigstore` member) against `.vci/identities.toml` and `.vci/sigstore-trusted-root.json`, at `--base-ref` or HEAD. Once any of `--allowed-signers`, `--identities`, `--trusted-root` is given, only the given files are used: an envelope whose kind needs one that was not given is INVALID.
 - Since 1.9.0 an attestation references its input manifest instead of embedding it: `vci verify` reads it from `--manifest FILE` (as `git meta get project vci:manifest:<root>` prints it) or else from the repository's attestation store, whichever it is (since 2.8.0), checks that its root is the signed input root, and exits 1 when it is missing, corrupt or another manifest. Reading the store runs `[store] token_command` and sends what it prints to `[store] url`, as every command that reads the store does, so in a checkout you have not reviewed run it with `VCI_STORE=git-meta` (SKILL.md, "Before you start"). A `--manifest FILE` in the compact encoding, built on a base manifest, reads that base from the store too.
 
+- Since 2.9.0 the file may be a store format 3 record (the `vci3` text frame a store holds, as `vci explain --json` or a store's own tools print it): it is verified as the DSSE envelope rebuilt from it, its input set is resolved from the run's objects in the repository's store, and its root is recomputed only against `--manifest FILE` (the compact JSON of the resolved manifest); without the file it prints `root not recomputed: the attested hashes are in no signed object, pass --manifest FILE` and exits 0. `--envelope` prints the record's envelope JSON and verifies nothing (exit 0; a file that is neither a frame nor an envelope exits 2), for in-toto tooling.
+
 ## vci store info
 
 ```text
@@ -285,6 +289,26 @@ Options:
   `vci: not storing N attestation(s): the <kind> store is shared and vci ci was not given --push`. Plain `vci run`
   always stores.
 
+## vci store upgrade
+
+```text
+Usage: vci store upgrade (--begin | --finish)
+
+Options:
+      --begin   Add the format-3 columns and tables (idempotent)
+      --finish  Drop the input manifests and set schema version 2, once no format-1 attestation remains
+```
+
+- Since 2.9.0: the store format 3 migration of a SQLite, PostgreSQL or libSQL store (git-meta has no schema: `store:
+  git-meta has no schema: nothing to upgrade`). `--begin` adds the columns and tables in a request of its own ahead
+  of a rollout and prints `the format-3 columns and tables are added|present`; the first `vci run` of 2.9 does the
+  same on a store that lacks them. `--finish` ends the migration window: `upgraded to schema version 2: the input
+  manifests are dropped, and a vci before 2.9 reads this store as too new and fails open`, or `at schema version 2
+  already`, or the refusal `not finished: N attestation(s) are not format-3 records ...` (exit 1) while a format-1
+  attestation remains; on libSQL it is refused at zero too in this release. Exit 2 when the store cannot be opened.
+- Both are the user's to run (SKILL.md, "Store format 3"): never run `--finish` unasked, since a 2.8 vci then fails
+  open on that store for good.
+
 ## Environment variables
 
 | Variable | Meaning |
@@ -302,6 +326,8 @@ Options:
 | `VCI_STORE_SYNC` | `replica` reads a libSQL server through a local replica; `off` turns off SQLite syncing |
 | `VCI_STORE_REPLICA` | The libSQL replica's file (asks for the replica mode) |
 | `VCI_STORE_CONNECT_TIMEOUT_SECS`, `VCI_STORE_TIMEOUT_SECS` | A network store's connect bound (5) and request bound (30), in seconds |
+| `VCI_STORE_RECORD_FORMAT` | Since 2.9.0: `3` (the default) writes store format 3 records, `1` the envelope JSON a vci 2.8 reads, for one release; wins over `[store] record_format`. The user's choice |
+| `VCI_STORE_EXPLAIN_HASHES`, `VCI_STORE_EXPLAIN_HASHES_DAYS` | Since 2.9.0: whether `vci run` writes the run's state object (`true`, the default; no verdict reads it) and the days it is kept while referenced (2, at most 365); win over `[store] explain_hashes` and `explain_hashes_days` |
 
 The `[env]` policy (docs/ENV.md) is three lists: `set` (vci sets the variable in every test process, on every machine), `hash` (taken from the machine and hashed: another value re-runs) and `ignore` (taken from the machine, never hashed: put secrets there). Each runner adds a short built-in list: built-in hash (`TZ`, and per runner what the runtime reads natively, e.g. `RUSTFLAGS`, `GOFLAGS`, `PYTHONHASHSEED`, Node's `LANG`) and built-in ignore (`PATH`, `HOME`, `TMPDIR`, caches; hashed only when a test reads one). Every other variable, `CI` included, is removed from the test process in `vci run`, `vci ci` and the plan's probes. `vci env` prints the effective lists. The old names `global` and `pass_through` still work, with a warning.
 

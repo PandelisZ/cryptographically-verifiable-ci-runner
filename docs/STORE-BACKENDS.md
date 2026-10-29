@@ -40,6 +40,15 @@ Built and in use (vci 2.8.0):
   removals) and the objects scenarios c35 to c42 (section 2, "Format-3 records", section 4, "Objects and columns",
   section 6, section 14). Every object method has a default that returns `Unsupported`, so a backend is on format 3
   once it sets `Caps::objects` (and `Caps::columns`) and overrides them; which backends have is in their sections.
+- **The commands on format 3** (2.9, STORE-V2 M3): `vci run` writes format-3 records and a run's four objects on a
+  store that keeps objects (format 1, as 2.8 wrote it, on one that does not or under `[store] record_format = 1`),
+  supersedes from the old records' signed statements with the listing columns as a pre-filter, and removes the
+  superseded run's unreferenced objects and the aged state objects; the plan tells a value's format by its first
+  byte, verifies a frame as the DSSE envelope rebuilt from it, resolves its descriptor against the run's objects
+  and observes the resolved set at HEAD; `vci prune` reads only what its columns and the signed statements confirm
+  and collects objects (`--objects`, `--older-than`); `vci store upgrade --begin` and `--finish`, `vci verify
+  --envelope` and `--manifest FILE` for a frame (section 2, "The frame and the decoder rules", "Migration from
+  format 1"; section 13).
 - **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14), the temporary libSQL server
   (`vci_store_libsql::testkit`, section 18) and the CI jobs that run all of the above (`store-stock-git`,
   `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`; the libSQL server is the
@@ -171,9 +180,12 @@ objects: id (64 hex, BLAKE3 of the bytes) -> kind (1 hdr, 2 tables, 3 shape, 4 s
 ```
 
 - A value's **first byte** says its format: `{` is a format-1 envelope, `v` a format-3 frame. `vci_store::decode_record`
-  tells them apart and every reader goes through it; a frame is decoded under the rules of STORE-V2 section 1.6 and
-  bounded at 1 MiB (`vci_attest::MAX_RECORD`); an envelope is parsed exactly as before. The frame is UTF-8 without NUL,
-  so rule 3 stands and a frame travels through git-meta's string values and the libSQL text literal unchanged.
+  tells them apart and every reader goes through it; a frame is decoded under the rules below ("The frame and the
+  decoder rules") and bounded at 1 MiB (`vci_core::MAX_RECORD`); an envelope is parsed exactly as before. The frame
+  is UTF-8 without NUL, so rule 3 stands and a frame travels through git-meta's string values and the libSQL text
+  literal unchanged. A column never chooses the parser: a 2.8 writer that reuses a slot holding a frame sets the key
+  and the value alone and leaves the frame's columns beside its envelope, so the columns pre-filter and order reads
+  and nothing more, and whatever deletes confirms from the decoded signed statement.
 - A frame's manifest is its **descriptor**, inside the record, which indexes into per-run **objects**: `hdr` (shared
   by every run at the same toolchain and global inputs), `tables` (the waiver table, env names and externals of a
   run's header group), `shape` (the paths and kinds of every unit of the run) and `state` (the attested sizes and
@@ -194,6 +206,197 @@ objects: id (64 hex, BLAKE3 of the bytes) -> kind (1 hdr, 2 tables, 3 shape, 4 s
   confirm them against the signed statement before a delete, and no verdict reads them. git-meta keeps none (its
   hint is the key); the SQL stores keep them as nullable columns, `NULL` on a format-1 row. A backend says what it
   keeps with `Caps::objects` and `Caps::columns`.
+
+### The frame and the decoder rules (format 3)
+
+The record is UTF-8 text without NUL (`vci_core::Frame`, `crates/vci-core/src/frame.rs`):
+
+```
+record     = "vci3" LF statement LF sig LF descriptor
+statement  = the in-toto Statement exactly as signed: compact JSON with every object's keys sorted
+             (`vci_core::sorted_compact_json`), predicateType https://vci.dev/test-attestation/v2; it holds no LF
+             and no NUL (JSON escapes both inside strings, the serializer writes no whitespace) and starts with `{`
+sig        = base64(sig_frame)
+descriptor = base64(descriptor_bytes)
+base64     = RFC 4648 section 4, `=` padding, no line breaks, canonical (rule 1)
+
+sig_frame        = u8 sig_kind (1 = SSHSIG, 2 = Sigstore bundle)
+                   uv keyid_len, keyid       the envelope's `keyid` (`SHA256:<b64 of the key blob hash>`, or the keyless
+                                             signer id): a hint, never trusted
+                   uv sig_len, sig           kind 1: the SSHSIG blob, the bytes inside the PEM armor (180 B for ed25519);
+                                             kind 2: `{"sig": <signatures[0].sig>, "sigstore": <the stored envelope's
+                                             sigstore member>}`
+descriptor_bytes = 32 B shape id              the run's shape object
+                   u8 group                   index into shape.groups; 0xff = none (what 2.8 called the base)
+                   uv n; n x uv               the unit's own entries: sorted indices into shape.entries, delta-coded (rule 3)
+                   uv k; k x (uv idx, 32 B)   env variables with a value: index into tables.envNames, the attested BLAKE3
+                   bitmap(tables.envNames)    one bit per name, ceil(len/8) bytes: the unit read it (ABSENT_HASH unless above)
+                   bitmap(tables.externals)   one bit per (name, version) pair of the tables object
+                   uv m; m x (str, str)       externals not in the table (never written; accepted, rule 3)
+```
+
+`uv` is an unsigned LEB128 varint, strings are `uv len` + UTF-8. The statement is the v2 predicate (`VciPredicateV2`:
+the unit's `testId`, `argv`, `commit`, `tree`, `treeDirty`, `issuedAt`, `expiresAt`, `result`, `tainted`,
+`entriesRoot`, `waived` as sorted distinct u16 ids into the tables object's waiver table, `declaredInputs`,
+`platformSpecific`, `archSpecific`, `cfgPredicates`, and the two object ids `hdr` and `tables`) under the subject
+`[{name: testId, digest: {blake3: inputRoot}}]`, as docs/CONTRACTS.md says. A frame decodes to exactly a format-1
+`Envelope` (the statement bytes, the signature re-armored: `Frame::to_stored_json`, which `vci verify --envelope` and
+`vci explain --json` print) and, through its objects, to the format-1 manifest's set minus the attested file hashes.
+
+**Objects** are bytes whose id is the BLAKE3 of them (`vci_core::object_id`; 64 lowercase hex in statements, columns
+and keys), encoded as the magic `vo`, a kind byte, a version byte and the body (`crates/vci-core/src/objects.rs`);
+sorted path lists are prefix-coded (`uv` bytes shared with the previous path, `uv` suffix length, the suffix), which
+is the whole gain (a 46 B mean path costs 18.6 B per shape entry, kind byte included), so the encoding is written by
+hand rather than by a serializer.
+
+- **hdr** (kind 1, at most 1 MiB): `repoId`, `adapter`, `projectName`, `projectDir`, `runnerProject`, `toolVersion`,
+  `railsInputs`, `envConfigDigest`, `globalInputRoot`, the **whole global manifest** (entries with kind, exec bit,
+  size and hash; externals; env with each value's hash), `ignoredInputs`, `envSet` and the toolchain (its scalar
+  fields as sorted compact JSON, then `goEnv`, `pythonDists`, `rubyGems`, `rustCfg` as prefix-coded lists in that
+  order). Content-addressed by what is in it, so every run at the same toolchain and global inputs names the same
+  one and the plan checks it once per project.
+- **tables** (kind 2, at most 4 MiB): per run and header group, the `waiverTable` (sorted distinct waived strings),
+  `envNames` (the sorted union of env keys the group's units read) and `externals` (the sorted union of `(name,
+  version)` pairs) the statements' ids and the descriptors' bits index.
+- **shape** (kind 3, at most 8 MiB): `entries`, the sorted distinct `(path, kind, exec)` over every unit of the run,
+  one kind byte each (`f l a d t x m u`, bit 7 the exec bit); `groups`, the run's shared bases (2.8's
+  `shared_manifest_bases`), each a delta-coded sorted index list into `entries`, at most 255. No sizes and no hashes:
+  nothing in a shape depends on file content.
+- **state** (kind 4, at most 16 MiB): the sorted `(path, kind, exec, size, hash)` over every entry of every unit of
+  the run, duplicates of a `(path, kind)` with different values (a file written during the run) side by side. **No
+  verdict reads it**: it exists so that `vci explain` and the plan's failure text can print the attested size and
+  hash beside the observed one, which is why it has its own retention (`[store] explain_hashes_days`, 2 by default)
+  and its own switch (`[store] explain_hashes = false` writes three objects per run).
+
+**The decoder rules.** They make two writers produce the same bytes for the same content and one id per content, and
+make the decoders refuse what the security review's harness showed changes the root anyway. A value or object that
+breaks one fails the candidate's `envelope`, `statement` or `inputs` check and the unit runs.
+
+1. **Frame.** The first line is exactly `vci3`; exactly three LF in the record; the statement is the bytes between
+   the first and second LF, non-empty, first byte `{`; the two base64 fields are canonical: a length that is a
+   multiple of 4, the alphabet of RFC 4648 section 4, padding only at the end, unused trailing bits zero, no
+   whitespace. Anything else fails `envelope`. The signature is checked over the statement bytes as found, never
+   re-serialized. A compressed record, should a later release want one, takes another first line (`vci3z`), which
+   2.9 refuses: 2.9 never decompresses anything.
+2. **Varints.** `uv` is minimal LEB128: no continuation byte followed by a zero byte, at most 10 bytes, values past
+   `u64::MAX` refused. A non-minimal encoding would give one content two ids, and an idempotent put by id would
+   store both.
+3. **Delta-coded indices.** The first index is absolute; each next one is `previous + 1 + delta`, so a list is
+   strictly increasing and distinct by construction. Every entry index is below the shape's entry count, every env
+   index below the tables' env-name count, every externals bit within the table, and `group` below the shape's
+   group count or `0xff`. An inline external the tables object holds is refused whether or not its bit is set (a
+   pair in the table is a bit), so an externals list has one encoding; the inline list is itself strictly
+   increasing.
+4. **Env overrides.** An `(idx, hash)` whose bitmap bit is clear is refused; so is one listing `ABSENT_HASH` (the
+   bitmap says it already) and a duplicate or unsorted `idx` list.
+5. **Paths.** Every path in a shape, a state, a global manifest and an inline external is a canonical `RepoPath`
+   (relative; no empty, `.` or `..` component; no NUL; no trailing slash); an autoload-miss entry (`u`) has the
+   `<AUTOLOAD_MARK>/<const>` form. The entry lists of shape and state are strictly increasing in `(path, kind, exec)`
+   and distinct; `groups` lists are strictly increasing and in range; a shape has at most 255 groups.
+6. **Kinds.** A kind byte's low 7 bits name one of `f l a d t x m u`; bit 7 is exec. The `objects.kind` column (and
+   the key's `<kind>` segment on git-meta) is store data used only to choose which table or path to read: the
+   decoder trusts the kind byte inside the hashed bytes and refuses an object whose inner kind is not the one the
+   statement or descriptor expects.
+7. **Statement values.** `waived` ids are sorted, distinct and below the waiver table's length, checked where the
+   resolved view is made (`ResolvedPredicate::v2`, its only constructor). The storage key is computed from the
+   decoded values of the resolved view, never from bytes, and over the waived list sorted and distinct
+   (`waived_canonical`) for both predicate versions, so a writer's serialization choices cannot move a slot.
+8. **Bounds.** The counts in every list are checked against the bytes remaining before anything is allocated; a
+   record over 1 MiB, a hdr over 1 MiB, a tables over 4 MiB, a shape over 8 MiB, a state over 16 MiB or a
+   `get_objects` answer over 64 MiB is refused.
+
+The ten store-side mutations the security review ran against `root()` (a kind relabel, an index swapped to another
+unit's path, an omitted entry, an env override and a bitmap flip, an externals pair, an `x` hidden under a `d`, the
+exec bit, section confusion, duplicate rows) are negative test vectors in vci-core
+(`manifest_tests.rs::the_security_harness_mutations_each_move_the_root_or_fail_a_decoder_rule`): each is refused by
+a decoder or gives the set observed at HEAD another root than the signed one. A file's kind and exec bit enter the
+root as the observer finds them at HEAD, never as the shape labels them.
+
+### Measured (format 3)
+
+The replay check (`crates/vci-cli/tests/replay.rs`, with `VCI_PAIRS` naming the 1,175 real vex units of 28 October
+2026: 9 runs, 18 header groups, 1,158 Rails, 12 node and 5 cargo units; its figures as it writes them to
+`replay-numbers.json`) builds every unit's format-3 record and its run's objects from the sample's envelopes and
+manifests, and checks what the design claims: for all 1,175 units the descriptor resolves to the manifest's set,
+externals and env, `entriesRoot` is reproduced, and every v1 accessor of the resolved view answers what the v1
+predicate did (1,175 of 1,175 each); the 47 object ids are recomputed; the signed subject digest is reproduced for the
+3 units that list no base manifest (the sample holds the deltas and not the 11 bases they reference; the full check
+is the end-to-end suites' job, where the bases are in the store); no state object held a conflicting duplicate.
+
+| | format 1 (the sample's own values) | format 3 (replayed) |
+|---|---:|---:|
+| statement, signed | inside the envelope: 21,166 B mean, p50 21,742, max 24,574 (the payload as base64, the armored signature, the keyid) | 1,100 B mean, p50 1,099, p90 1,142, max 1,591 (a cargo unit) |
+| signature | inside the envelope | 234 B frame (312 B as base64) |
+| manifest / descriptor | 15,154 B mean (p50 11,372, max 98,539) | 271 B mean, p50 247, p90 361, max 957 (a node unit with 762 own entries) |
+| **record** | **36,320 B** per unit (envelope + manifest) | **1,782 B mean, p50 1,760, p90 1,917, max 2,707**; Rails 1,780 B, node 1,804 B, cargo 2,245 B |
+| hdr, shared across runs | (in every envelope) | 11 distinct over the 9 runs, 13,296 B in all; 4,489 B for both Rails runs, 796-813 B node, 951-1,094 B cargo |
+| tables, per run and group | (in every envelope and manifest) | 10 objects, 261,948 B: 19,387 B for the 973-unit Rails run, 9,313 B for the 185-unit one, 184-661 B node, 69,000-74,319 B cargo (the crate list with versions) |
+| shape, per run | (in every manifest) | 173,195 B: 123,265 B for 973 units (6,639 entries, 18.6 B each), 24,674 B for 185 |
+| state, per run (explain only) | (in every manifest) | 393,597 B: 285,128 B for 973 units (43 B an entry), 60,758 B for 185 |
+| **at rest, 1,175 units, 9 runs** | **42,676,097 B** | **2,936,328 B, 2,499 B a unit: 14.5x**; 2,542,731 B and 16.8x without the state objects |
+
+The sample holds no base manifest, so the shape and state above carry no groups (one run had one group of 7
+entries); the design's model added nine disjoint groups of ~440 entries per run as a worst case (3,651,600 B at
+rest, 11.7x), which the first real run should measure (STORE-V2 section 7). The other numbers of the design are
+estimates from that model and from vex's production logs, not measurements of this code: the 800-unit partition's
+2.18 MB at rest and 2.43 MB on the libSQL wire in three transactions of at most 1 MiB (13.5x), a plan's reads of
+5.1-5.9 MB against 81-87 MB at vex's spread of 45-59 runs behind the live candidates (15x), 201 MB a day written at
+vex against 2.79 GB (13.9x), and the git-meta push of 1.2 MB against 2.8 MB for 800 units (2.4x, 18% fewer objects:
+from a real-git experiment on the sample's two largest runs). What the code has been measured at: one 800-unit
+partition against a local `sqld` (section 18, "Measured": 4 objects of 329,446 B and 800 records of 1,417,069 B,
+written in 2 transactions and 0.18 s; the superseding run in 2 transactions and 0.20 s). **No format-3 write or plan
+has been measured against Turso's hosted service yet**; the transaction sizing of 1 MiB and the 1.8-3.7 s of lock per
+transaction come from 2.8.2's measurements with JSON values of the same byte count (section 18), and are to be
+re-run with real frames and base64 objects before the first production rollout.
+
+### Migration from format 1
+
+The gates, in order (STORE-V2 section 5):
+
+1. **vci 2.9.0 reads format 1 and 3 and writes format 3** on a store that keeps objects; `[store] record_format = 1`
+   (or `VCI_STORE_RECORD_FORMAT=1`) keeps writing format 1 for one release, for fleets that cannot upgrade every
+   reader at once. The value's first byte says its format; keys and slots are shared, so a format-3 record
+   overwrites the format-1 record of its slot and vice versa, with one exception: a unit whose 2.8 record's `waived`
+   list repeated a string or was unsorted (1,158 of the sample's 1,175 units repeat one and 1,163 are unsorted,
+   STORE-V2 section 1.1) keys
+   another slot under 2.9, since the key now takes the list sorted and distinct, and its 2.8 record stays beside the
+   new one as a second candidate until supersession or expiry removes it: fail-open, one more candidate per such
+   unit.
+2. **The SQL schema, DDL first.** `vci_schema.version` stays 1 while a format-1 row can exist; the nullable columns,
+   the `objects` and `gone` tables and the `v2 = 1` row are added by `vci store upgrade --begin` (idempotent, ahead of
+   a rollout) or by 2.9's first write on a namespace that lacks them, in a request of its own before its batch
+   (sections 16 to 18). A **2.8 binary** on such a store sees version 1, lists keys with its own parser (the keys are
+   unchanged), reads a frame it cannot parse and fails `envelope`: the unit runs; it keeps planning on any format-1
+   rows until they expire; its own writes are format-1 rows with NULL in the new columns, which 2.9 reads through the
+   v1 path. Nothing breaks; skips are lost per unit until the binary is upgraded, so pin the action and the binary in
+   one change and expect the skip rate to dip for at most one `max_ttl` window.
+3. **2.8's `vci prune` during the window** stops collecting manifests once one frame exists: a record it cannot
+   parse sets its referenced set to unknown, and it then removes no manifest at all (it cannot know what the
+   unreadable record names). Keep the window short, or run 2.9's `vci prune` once during it: it collects both, a
+   format-1 record as before and a format-3 one through its columns and a confirming read.
+4. **`vci store upgrade --finish`**, manual, once no format-1 row remains: drops `manifests` (SQLite and PostgreSQL;
+   the libSQL store refuses it at zero in this release, since every statement that names `manifests` and the change
+   log has to branch on version 2 first) and sets `vci_schema.version = 2`, after which a 2.8 binary reports the
+   store as too new and fails open. It is refused, with the count, while a format-1 row exists; the count is by the
+   value's first byte, never by the `format` column (a 2.8 writer's upsert leaves the column stale, and a frame copied
+   in without columns has NULL).
+5. **git-meta** has no schema: a 2.8 clone reads the keys it knows and the values it cannot parse (fail open),
+   ignores `vci:object:` keys (rule 2), and never deletes a key it does not parse. No bytes path and no value-type
+   change in `git-meta.sqlite`.
+6. **Existing records** keep working until they expire or are superseded by the next run; nothing is re-signed (a
+   format-1 statement's bytes are what was signed and stay readable). `vci prune` then drops the `manifests` rows.
+7. **Replicas.** A 2.9 libSQL replica syncs the old log for format-1 rows and `seq`/`gone` for frames; its objects
+   and columns come from the server in 2.9.0 (section 18). A replica file a 2.8 synced is synced in full once, as is a
+   2.9 replica whose cursor is older than the `gone` purge horizon. A 2.8 replica syncs format-1 rows only and never
+   sees a format-3 deletion: it keeps superseded rows until their signed expiry (fail-open: their inputs mismatch at
+   HEAD), so upgrade the replica's binary with the rest.
+8. **Plan JSON and `vci explain`**: the same keys, targets and check names, plus the `signer` check's new failure
+   text; `by.metaKey` byte-identical. `expected`/`actual` texts unchanged in content where the run's state object is
+   loaded, labelled `attested (unsigned, from the run's state object)`; otherwise the observed value and `(attested
+   hash not loaded)`.
+9. **Rollback.** 2.9 with `record_format = 1` writes what 2.8 writes; a store that already holds frames serves them
+   to 2.8 as fail-open units. Downgrading the binary after `--finish` is not supported (the `manifests` table is
+   gone).
 
 ### Hints
 
@@ -974,6 +1177,13 @@ url = "postgres://vci@db.internal:5432/ci?sslmode=verify-full"  # the server, ne
 token_command = ["op", "read", "op://ci/vci-store/password"]    # prints the credential (below); VCI_STORE_TOKEN wins
 connect_timeout = "5s"        # overridden by VCI_STORE_CONNECT_TIMEOUT_SECS
 timeout = "30s"               # one statement or request; overridden by VCI_STORE_TIMEOUT_SECS
+compress = "off"              # 2.8.2, libSQL only: "zstd" stores format-1 values compressed; VCI_STORE_COMPRESS wins
+record_format = 3             # 2.9: 3 (default) writes format-3 records on a store that keeps objects; 1 writes the
+                              # envelope JSON a vci 2.8 reads, for one release; VCI_STORE_RECORD_FORMAT wins
+explain_hashes = true         # 2.9: write the run's state object (the attested hashes `vci explain` prints; no verdict
+                              # reads it); false writes three objects a run; VCI_STORE_EXPLAIN_HASHES wins
+explain_hashes_days = 2       # 2.9: a state object older than this is removed even while referenced, by `vci run`'s
+                              # orphan pass and `vci prune` (0 to 365); VCI_STORE_EXPLAIN_HASHES_DAYS wins
 
 [store.sqlite]
 path = "vci-store.sqlite"     # relative to the git common directory, no `..`; absolute only via VCI_STORE_URL
@@ -1431,6 +1641,32 @@ Hence `AttestationStore: Send + Sync`.
     is stored in the repository's git-meta store …`, stays literal, because no store could be opened there;
   - `vci init` keeps `setup_git_meta` on vci-git, guarded by `kind() == "git-meta"`;
   - `vci ci` applies the publication gate (`store_mode`) and `vci store info` is new.
+- **Format 3 (2.9)** on the trait:
+  - `vci run` (run.rs) groups the attestable units by header tuple, builds the run's hdr per group, tables per group,
+    one shape and one state (`vci_core::Run::build`; no state under `explain_hashes = false`), signs each unit's v2
+    statement as it signs a v1 one, and queues one deferred batch: `put_objects` first, then per unit `put` with its
+    `Columns`, then its supersession removals. Supersession reads the old records' signed statements (`commit`, the
+    platform through the hdr, `issuedAt`, `entriesRoot` for "same files"), the columns only pre-filtering which old
+    records to read; `last_durations` reads the columns on a store that keeps them and the values on git-meta. After
+    the batch, on a store with `Caps::columns`, `remove_objects` of the superseded records' object ids once per run
+    (git-meta's referrer scan reads every value, so its orphans are left to `vci prune`), then
+    `prune_state_objects(explain_hashes_days)` on every format-3 write run; `set_max_ttl` is passed the largest
+    `policy.max_ttl` of the projects involved (the libSQL `gone` purge horizon). A store without `Caps::objects`, and
+    a `FailedStore`, is written in format 1, as `record_format = 1` is;
+  - the plan (plan.rs) tells a value's format with `decode_record`, verifies a frame as the envelope rebuilt from it,
+    compares the key's signer segment with the verified key's signer id (`signer`), loads the hdr, tables and shape
+    objects its format-3 candidates name through one `get_objects` per round in candidate-priority order
+    (`Prefetch::Objects` first on a lazy store) under a 16 MiB verdict-object cap, recomputes each id, checks the hdr
+    once per `(project, hdr id)`, resolves the descriptor and observes the resolved set at HEAD (`inputs`), and loads
+    at most 16 state objects, named by the records' `state_obj` column, for the failure text;
+  - prune (cmds.rs) lists with `list_all` and `columns` on a store that keeps them, reads only the expired and
+    beyond-`keep` candidates and the rows the columns do not describe, confirms each delete from the signed
+    statement, then `orphan_objects`, `remove_objects` and `prune_state_objects` (`--objects` runs only these,
+    `--older-than DAYS` sets the state age for one run); git-meta's prune reads every value as before;
+  - `vci store upgrade --begin` and `--finish` reach `SqliteStore`, `PgStore` and `LibsqlStore` directly (the trait
+    has no upgrade method: the DDL is an operator action on one concrete backend); `vci verify` decodes a frame to
+    its envelope (`--envelope` prints it and verifies nothing), resolves the set from the run's objects and checks the
+    root only against `--manifest FILE`.
 - `envpolicy::build_child_env` drops `NEVER_TO_CHILDREN`; `metrics::write` takes the store kind.
 - **e2e harnesses** remove `vci_store::select::ENV_VARS`: the scrub loops of e2e_cargo, e2e_go, e2e_pytest, e2e_rails
   and e2e_rspec chain them, the `env_remove` lists of e2e, e2e_chain and e2e_node_test too, and ad-hoc `vci` commands
@@ -3378,7 +3614,11 @@ same 1,869,145 B of literals, 3,029,929 B of SQL, 2 requests, 0.20 s. Against th
 2.43 MB on the wire in 3 transactions of at most 1 MiB, with 1.2 N removals): the literals are 1.87 MB, the SQL around
 them 0.7 MB for the puts and 0.45 MB for 800 removals, and the two transactions are 0.93 and 0.94 MB. With the
 manifest-collection statements (now skipped where the namespace holds no manifest) the second run was 4,152,653 B
-of SQL: their four repetitions of 800 keys and 800 slots cost 1.1 MB.
+of SQL: their four repetitions of 800 keys and 800 slots cost 1.1 MB. These are the only format-3 measurements of
+the store so far, and they are of a local `sqld` on a laptop: the lock times per transaction (1.8-3.7 s for 1 MiB),
+the number of requests a plan makes and the plan's reads against Turso's hosted service are the design's estimates
+from 2.8.2's measurements of JSON values and from vex's production logs (section 2, "Measured (format 3)"), to be
+measured on Turso before the first production rollout.
 
 On prove-perf's synthetic world (1,200 Go packages, each attested at three commits: 3,600 attestations of about 3 KB
 and 3,601 manifests on a local `sqld` 0.24.32, written there by three `vci run`s in the remote mode), release build,

@@ -224,6 +224,24 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
 - **When to push.** git-meta: `vci push` after `vci run`. SQLite, PostgreSQL, libSQL: `vci run` stored them; nothing
   to push. `vci ci --push` is what stores on a shared store in CI, and only trusted CI jobs (the default branch, with
   CI's key or OIDC) run it: never run `vci ci --push` yourself.
+- **Store format 3 (vci 2.9).** vci 2.9 reads two record formats and writes the new one: a text frame (`vci3`, the
+  signed statement, the signature, a descriptor) whose statement names two per-run objects by digest, the descriptor
+  a third, and the attested file hashes a fourth, the **state object**, which only `vci explain` reads and which is
+  removed after `[store] explain_hashes_days` (2) even while records reference it (the records stay valid; `explain`
+  then prints `(attested hash not loaded)`), or never written under `[store] explain_hashes = false`: both are the
+  user's policy choice, never yours. A vci before 2.9 reads a format-3 record as one it cannot parse and runs the
+  unit (fail-open), so a mixed fleet loses skips, never gains wrong ones. The migration order, which the user
+  decides and runs: every runner and developer on 2.9 (the action pinned in one change; `[store] record_format = 1`
+  keeps writing the old format meanwhile), `vci store upgrade --begin` on a SQLite, PostgreSQL or libSQL store ahead
+  of the rollout (idempotent; 2.9's first `vci run` does it otherwise), a 2.9 `vci prune` once during the window (a
+  2.8 prune stops collecting manifests once a format-3 record exists), and `vci store upgrade --finish` only once
+  no format-1 record remains, after which a 2.8 vci fails open on that store for good: **never run `--finish`
+  unasked**, and report its refusal (`not finished: N attestation(s) are not format-3 records`) rather than working
+  around it. `vci prune --objects [--older-than DAYS]` removes the objects no record references and the aged
+  state objects without touching attestations. Diagnosing: a 2.8 vci shows a format-3 record as `failed check:
+  envelope` (upgrade it); `failed check: signer` with `signer id (the store key's signer segment)` means the record
+  sits under another signer's slot (re-attest); `statement` naming a hdr or tables object means the run's objects
+  are missing or altered in the store (re-attest; `vci prune --dry-run` lists what the store holds).
 - **SQLite and libSQL's local file stay on this machine.** CI sees what they hold only if it shares the file (a cache of
   `.git/vci-store.sqlite`, say). A local `SKIP` there says nothing about CI: never tell the user that CI will skip a
   unit on that basis (rule 8). `vci store info` shows which: `store: sqlite`, or `store: libsql` with `(local)` after
@@ -301,9 +319,9 @@ run `vci fetch` online``: run again with network access.
 
 | `failed check:` | Usual cause | Action |
 |---|---|---|
-| `inputs` | A file changed after attesting (`entry:<path>` names it) | Re-run `vci run <unit>` |
+| `inputs` | A file changed after attesting (`entry:<path>` names it; since vci 2.9 `entry: changed (attested hash not loaded)` names none, when the run's state object was removed or not loaded) | Re-run `vci run <unit>` |
 | `toolchain` | Different Python/Node/Go/rustc/Ruby/bundle/package versions, or OS/arch under the policy | Pin versions (runners.md); report to the user |
-| `signer` | Key not in the base branch's `allowed_signers`, or expired; for CI's keyless attestations, an identity in no `[[identity]]` of the base `identities.toml`; on main, a signer not in `no_skip_refs_except` | The user adds the key or identity on the default branch; on main this is expected |
+| `signer` | Key not in the base branch's `allowed_signers`, or expired; for CI's keyless attestations, an identity in no `[[identity]]` of the base `identities.toml`; on main, a signer not in `no_skip_refs_except`; since vci 2.9, `signer id (the store key's signer segment)`: the record sits under another signer's slot | The user adds the key or identity on the default branch; on main this is expected; a wrong slot: re-attest |
 | `signature` (CI's keyless attestations) | The base `.vci/sigstore-trusted-root.json` is missing or stale (GitHub renews its intermediate yearly) | Report to the user: refresh it with `gh attestation trusted-root` on the default branch |
 | `expiry` | Attestation expired (default TTL 14 days, policy max 30) | Re-attest |
 | `global-inputs`, `externals` | Lockfile, runner config or dependency versions changed | Re-attest after the change |
