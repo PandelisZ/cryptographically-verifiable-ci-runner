@@ -11,12 +11,17 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 use vci_attest::keyless::{IDENTITIES_FILE, Identities, TRUSTED_ROOT_FILE, TrustedRoot};
-use vci_attest::{AllowedSigners, Envelope, VerifyError, verify_envelope};
-use vci_core::{CheckoutCache, EntryKind, InputManifest, Observation, PREDICATE_TYPE, RepoPath};
+use vci_attest::{AllowedSigners, Envelope, Frame, VerifyError, verify_envelope};
+use vci_core::objects::{hex32, parse_hex32};
+use vci_core::{
+    CheckoutCache, Descriptor, EntryKind, Hdr, InputEntry, InputManifest, Mismatch, ObjectKind,
+    Observation, PREDICATE_TYPE, PREDICATE_TYPE_V2, RepoPath, ResolvedPredicate, Shape, ShapeEntry,
+    State, Tables, VciPredicateV2, env_value_hash, object_id,
+};
 use vci_git::Repo;
 use vci_store::{
-    AttestationStore, Choose, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest,
-    ValueState,
+    AttestationStore, Choose, Prefetch, Record, StoreError, StoreStatus, StoredEnvelope,
+    StoredManifest, ValueState, decode_record,
 };
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
@@ -399,6 +404,13 @@ struct Verifier<'a> {
     natives: std::sync::OnceLock<Result<vci_adapter::InstalledExternals, String>>,
     /// The input manifests candidates reference, read from the local store.
     manifests: ManifestLoader,
+    /// The format-3 objects (hdr, tables, shape; state for the failure text)
+    /// the plan's candidates name, loaded once for the whole plan.
+    objects: &'a ObjectLoader,
+    /// The checks of each hdr object that depend on nothing but the hdr and
+    /// the checkout (its global manifest's root and rehash), made once per
+    /// hdr id for this project (STORE-V2 section 1.5 step 6).
+    hdr_checks: Mutex<HashMap<String, Result<(), Failure>>>,
     /// The checkout, each path observed once for the whole plan.
     checkout: &'a CheckoutCache,
     /// The git-ignored children of listed directories, found once per plan.
@@ -713,6 +725,566 @@ impl ManifestLoader {
     }
 }
 
+/// The verdict-object byte cap of a plan (STORE-V2 section 1.5): the hdr,
+/// tables and shape objects its candidates name are loaded in
+/// candidate-priority order up to this many bytes, and a candidate whose
+/// objects would pass it fails `inputs` (the count is logged).
+const VERDICT_OBJECT_BYTES: usize = 16 << 20;
+
+/// How many state objects a plan loads for its failure text (section 1.5
+/// step 9): they are explain-only and the largest objects, so past this
+/// count a failing entry is reported without its attested hash.
+const STATE_OBJECTS: usize = 16;
+
+/// A decoded format-3 object, shared by every candidate naming it.
+#[derive(Clone)]
+enum Object {
+    Hdr(Arc<Hdr>),
+    Tables(Arc<Tables>),
+    Shape(Arc<Shape>),
+    State(Arc<State>),
+}
+
+impl Object {
+    fn kind(&self) -> ObjectKind {
+        match self {
+            Object::Hdr(_) => ObjectKind::Hdr,
+            Object::Tables(_) => ObjectKind::Tables,
+            Object::Shape(_) => ObjectKind::Shape,
+            Object::State(_) => ObjectKind::State,
+        }
+    }
+}
+
+/// Why a format-3 object a candidate names is not at hand, as the `what`
+/// and `actual` of the failed check's detail (`statement` for a hdr or
+/// tables object, `inputs` for a shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObjectUnavailable {
+    what: String,
+    actual: String,
+    /// The object was not loaded because the plan's verdict-object byte cap
+    /// was reached before it (counted in the plan's metrics line).
+    past_cap: bool,
+}
+
+#[derive(Default)]
+struct ObjectCache {
+    /// By id: the decoded object, or why it is not at hand. An id is decoded
+    /// once for the whole plan; a candidate naming it with another kind than
+    /// it decoded to fails on that (the kind byte inside the bytes decides).
+    by_id: HashMap<String, Result<Object, ObjectUnavailable>>,
+    /// The bytes of the hdr, tables and shape objects loaded so far, against
+    /// [`VERDICT_OBJECT_BYTES`].
+    verdict_bytes: usize,
+    /// How many objects of each kind were loaded and decoded.
+    loaded: [usize; 4],
+    /// Every shape id a candidate named, loaded or not: the distinct runs
+    /// the plan's candidates come from.
+    shapes_named: BTreeSet<String>,
+    /// How many state objects were loaded, against [`STATE_OBJECTS`].
+    states: usize,
+}
+
+/// Loads (once each) the format-3 objects a plan's candidates name
+/// (STORE-V2 section 1.5 steps 5 and 9): the hdr and tables objects a
+/// statement names and the shape its descriptor names, in one
+/// `get_objects` per round ([`preload_objects`]), and on demand for an id
+/// that was not in the round's batch; the state object of a run only for
+/// the failure text of a candidate that failed on an entry, up to
+/// [`STATE_OBJECTS`] of them. Every object's BLAKE3 is recomputed and must
+/// be its id; a mismatch, a missing object or a decode failure is kept as
+/// the reason every candidate naming the object fails. Nothing here is
+/// trusted beyond that: a store's kind column or key segment never chooses
+/// a decoder (the kind byte inside the hashed bytes does), and a listing
+/// column only says which state object to load for the text.
+#[derive(Default)]
+struct ObjectLoader {
+    cache: Mutex<ObjectCache>,
+    /// Candidates that failed because an object they name is past the
+    /// verdict-object cap.
+    past_cap: std::sync::atomic::AtomicUsize,
+}
+
+impl ObjectLoader {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ObjectCache> {
+        self.cache.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Decode `bytes` as the object `id` of `kind` and keep it (or why not).
+    /// The id is checked first; then the decoder of the kind the caller
+    /// expects, which refuses an object of another kind (bounded by the
+    /// kind's size limit, outside the lock); then, for a verdict object,
+    /// the byte cap. A later insert of an id already kept as loaded is a
+    /// no-op; one kept as unavailable is replaced (a round that fetched
+    /// more may make it readable).
+    fn insert(&self, kind: ObjectKind, id: &str, bytes: &[u8]) {
+        let found = hex32(&object_id(bytes));
+        let decoded: Result<Object, ObjectUnavailable> = if found != id {
+            Err(ObjectUnavailable {
+                what: format!("{kind} object {id} corrupt"),
+                actual: format!("its BLAKE3 is {found}, not its id"),
+                past_cap: false,
+            })
+        } else {
+            let malformed = |e: vci_core::DecodeError| ObjectUnavailable {
+                what: format!("{kind} object {id} malformed"),
+                actual: e.to_string(),
+                past_cap: false,
+            };
+            match kind {
+                ObjectKind::Hdr => Hdr::decode(bytes).map(|h| Object::Hdr(Arc::new(h))),
+                ObjectKind::Tables => Tables::decode(bytes).map(|t| Object::Tables(Arc::new(t))),
+                ObjectKind::Shape => Shape::decode(bytes).map(|s| Object::Shape(Arc::new(s))),
+                ObjectKind::State => State::decode(bytes).map(|s| Object::State(Arc::new(s))),
+            }
+            .map_err(malformed)
+        };
+        let mut c = self.lock();
+        if matches!(c.by_id.get(id), Some(Ok(_))) {
+            return;
+        }
+        let decoded = match decoded {
+            Ok(o) if kind != ObjectKind::State => {
+                if c.verdict_bytes + bytes.len() > VERDICT_OBJECT_BYTES {
+                    Err(ObjectUnavailable {
+                        what: format!("{kind} object {id} not loaded"),
+                        actual: format!(
+                            "{} bytes would pass the plan's verdict-object cap of {} bytes ({} loaded)",
+                            bytes.len(),
+                            VERDICT_OBJECT_BYTES,
+                            c.verdict_bytes
+                        ),
+                        past_cap: true,
+                    })
+                } else {
+                    c.verdict_bytes += bytes.len();
+                    c.loaded[kind as usize - 1] += 1;
+                    Ok(o)
+                }
+            }
+            Ok(o) => {
+                c.loaded[kind as usize - 1] += 1;
+                Ok(o)
+            }
+            Err(e) => Err(e),
+        };
+        c.by_id.insert(id.to_owned(), decoded);
+    }
+
+    /// Load the objects of `wanted` not loaded yet, in one `get_objects`
+    /// (after a `Prefetch::Objects` on a lazy store), keeping each in the
+    /// order given: the caller orders them by candidate priority, so that
+    /// the byte cap falls on the least likely candidates.
+    fn load(&self, store: &dyn AttestationStore, timers: &Timers, wanted: &[(ObjectKind, String)]) {
+        let mut ids: Vec<&str> = Vec::new();
+        {
+            let mut c = self.lock();
+            for (kind, id) in wanted {
+                if *kind == ObjectKind::Shape {
+                    c.shapes_named.insert(id.clone());
+                }
+                if !matches!(c.by_id.get(id), Some(Ok(_))) && !ids.contains(&id.as_str()) {
+                    ids.push(id);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        let t_read = std::time::Instant::now();
+        if store.caps().lazy_values {
+            // A failure here leaves the objects missing: their candidates
+            // fail, and a later round asks again.
+            let _ = store.prefetch(Prefetch::Objects { ids: &ids });
+        }
+        let got = store.get_objects(&ids);
+        Timers::add(&timers.manifest_read, t_read);
+        let t_decode = std::time::Instant::now();
+        match got {
+            Ok(objects) => {
+                let by_id: HashMap<&str, &[u8]> = objects
+                    .iter()
+                    .map(|o| (o.id.as_str(), o.bytes.as_slice()))
+                    .collect();
+                for (kind, id) in wanted {
+                    if !ids.contains(&id.as_str()) {
+                        continue;
+                    }
+                    match by_id.get(id.as_str()) {
+                        Some(bytes) => self.insert(*kind, id, bytes),
+                        None => {
+                            let what = if store.caps().lazy_values {
+                                format!("{kind} object {id} not in the store: run `vci fetch`")
+                            } else {
+                                format!("{kind} object {id} not in the store")
+                            };
+                            let mut c = self.lock();
+                            if !matches!(c.by_id.get(id), Some(Ok(_))) {
+                                c.by_id.insert(
+                                    id.clone(),
+                                    Err(ObjectUnavailable {
+                                        what,
+                                        actual: format!("missing from the {} store", store.kind()),
+                                        past_cap: false,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let mut c = self.lock();
+                for (kind, id) in wanted {
+                    if !matches!(c.by_id.get(id), Some(Ok(_))) {
+                        c.by_id.insert(
+                            id.clone(),
+                            Err(ObjectUnavailable {
+                                what: format!("{kind} object {id} cannot be read from the store"),
+                                actual: e.to_string(),
+                                past_cap: false,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        Timers::add(&timers.manifest_decode, t_decode);
+    }
+
+    /// The object `id`, expected to be of `kind`: from the cache, else
+    /// loaded now (an id the round's batch did not name).
+    fn get(
+        &self,
+        store: &dyn AttestationStore,
+        timers: &Timers,
+        kind: ObjectKind,
+        id: &str,
+    ) -> Result<Object, ObjectUnavailable> {
+        let not_hex = || ObjectUnavailable {
+            what: format!("{kind} object id {id:?}"),
+            actual: "not 64 lowercase hex digits".to_owned(),
+            past_cap: false,
+        };
+        if parse_hex32(id).is_none() {
+            return Err(not_hex());
+        }
+        let cached = self.lock().by_id.get(id).cloned();
+        let r = match cached {
+            Some(r) => r,
+            None => {
+                self.load(store, timers, &[(kind, id.to_owned())]);
+                self.lock()
+                    .by_id
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| Err(not_hex()))
+            }
+        };
+        match r {
+            Ok(o) if o.kind() == kind => Ok(o),
+            Ok(o) => Err(ObjectUnavailable {
+                what: format!("{kind} object {id} is of another kind"),
+                actual: format!("a {} object", o.kind()),
+                past_cap: false,
+            }),
+            Err(e) => {
+                if e.past_cap {
+                    self.past_cap
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn hdr(
+        &self,
+        store: &dyn AttestationStore,
+        timers: &Timers,
+        id: &str,
+    ) -> Result<Arc<Hdr>, ObjectUnavailable> {
+        match self.get(store, timers, ObjectKind::Hdr, id)? {
+            Object::Hdr(h) => Ok(h),
+            _ => unreachable!("get checks the kind"),
+        }
+    }
+
+    fn tables(
+        &self,
+        store: &dyn AttestationStore,
+        timers: &Timers,
+        id: &str,
+    ) -> Result<Arc<Tables>, ObjectUnavailable> {
+        match self.get(store, timers, ObjectKind::Tables, id)? {
+            Object::Tables(t) => Ok(t),
+            _ => unreachable!("get checks the kind"),
+        }
+    }
+
+    fn shape(
+        &self,
+        store: &dyn AttestationStore,
+        timers: &Timers,
+        id: &str,
+    ) -> Result<Arc<Shape>, ObjectUnavailable> {
+        match self.get(store, timers, ObjectKind::Shape, id)? {
+            Object::Shape(s) => Ok(s),
+            _ => unreachable!("get checks the kind"),
+        }
+    }
+
+    /// The state object of the run the record `s` belongs to, for the
+    /// failure text of a candidate that failed on an entry: named by the
+    /// record's listing column on a store that keeps columns (the state id
+    /// is in no signed field, so only the writer can say it, and what it
+    /// says is labelled unsigned), loaded up to [`STATE_OBJECTS`] per plan.
+    /// `None` when the store keeps no columns, the column is empty, the cap
+    /// is reached, or the object is missing or malformed: the text then
+    /// says the attested hash was not loaded. No verdict reads it.
+    fn state_for(
+        &self,
+        store: &dyn AttestationStore,
+        timers: &Timers,
+        s: &StoredEnvelope,
+    ) -> Option<Arc<State>> {
+        if !store.caps().columns {
+            return None;
+        }
+        let id = store.columns(&[s]).ok()?.into_iter().next()?.state_obj?;
+        parse_hex32(&id)?;
+        let cached = self.lock().by_id.get(&id).cloned();
+        let r = match cached {
+            Some(r) => r,
+            None => {
+                {
+                    let mut c = self.lock();
+                    if c.states >= STATE_OBJECTS {
+                        return None;
+                    }
+                    c.states += 1;
+                }
+                self.load(store, timers, &[(ObjectKind::State, id.clone())]);
+                self.lock().by_id.get(&id).cloned()?
+            }
+        };
+        match r {
+            Ok(Object::State(st)) => Some(st),
+            _ => None,
+        }
+    }
+
+    /// The plan's metrics line (`VCI_TIMING=1`): objects loaded per kind,
+    /// their bytes, the candidates past the cap and the distinct runs the
+    /// candidates named.
+    fn report(&self) {
+        if !vci_core::metrics::on() {
+            return;
+        }
+        let c = self.lock();
+        vci_core::timing_line!(
+            "objects: {} hdr, {} tables, {} shape, {} state, {} bytes, {} candidate(s) past the cap, {} distinct run(s)",
+            c.loaded[0],
+            c.loaded[1],
+            c.loaded[2],
+            c.loaded[3],
+            c.verdict_bytes,
+            self.past_cap.load(std::sync::atomic::Ordering::Relaxed),
+            c.shapes_named.len()
+        );
+    }
+}
+
+/// The verdict objects (hdr, tables, shape) the format-3 candidates among
+/// `cands` name, in candidate-priority order (the order [`Verifier::verdict`]
+/// tries candidates: made on this checkout's tree first, then newest
+/// issued), loaded in one batch (section 1.5 step 5). Only values that were
+/// read and decode as frames name anything; a candidate whose statement or
+/// descriptor does not parse is left to its check.
+/// The object ids one candidate names, with its rank in the verdict's order.
+type RankedIds = ((bool, Option<i64>), Vec<(ObjectKind, String)>);
+
+fn preload_objects<'a>(
+    store: &dyn AttestationStore,
+    objects: &ObjectLoader,
+    timers: &Timers,
+    cands: impl Iterator<Item = &'a StoredEnvelope>,
+    head_tree: Option<&str>,
+) {
+    let head16: Option<String> = head_tree.map(|t| t.chars().take(16).collect());
+    let mut ranked: Vec<RankedIds> = Vec::new();
+    for s in cands {
+        if s.error.is_some() {
+            continue;
+        }
+        let Ok(Record::FormatThree(frame)) = decode_record(&s.bytes) else {
+            continue;
+        };
+        let mut ids = Vec::with_capacity(3);
+        if let Ok(st) = serde_json::from_slice::<vci_attest::Statement>(&frame.statement)
+            && let Ok(p) = serde_json::from_value::<VciPredicateV2>(st.predicate)
+        {
+            ids.push((ObjectKind::Hdr, p.hdr));
+            ids.push((ObjectKind::Tables, p.tables));
+        }
+        if let Ok(shape) = Descriptor::shape_id(&frame.descriptor) {
+            ids.push((ObjectKind::Shape, hex32(&shape)));
+        }
+        let same_tree = s.tree.is_some() && s.tree == head16;
+        ranked.push(((same_tree, issued_hint(s)), ids));
+    }
+    if ranked.is_empty() {
+        return;
+    }
+    ranked.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+    let wanted: Vec<(ObjectKind, String)> = ranked.into_iter().flat_map(|(_, ids)| ids).collect();
+    objects.load(store, timers, &wanted);
+}
+
+/// The signer id ([`crate::keys::signer_id`]: the first 16 hex digits of
+/// SHA-256 over the public key blob) of the key an SSHSIG verification
+/// reports by its `SHA256:` fingerprint, which is the base64 of that same
+/// digest: the key's signer segment in a store key must equal it (STORE-V2
+/// section 1.5 step 4). `None` for a fingerprint of another form.
+fn signer_id_of_fingerprint(fingerprint: &str) -> Option<String> {
+    use base64::Engine as _;
+    let b64 = fingerprint.strip_prefix("SHA256:")?;
+    let digest = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(b64)
+        .ok()?;
+    if digest.len() != 32 {
+        return None;
+    }
+    Some(hex::encode(digest)[..16].to_owned())
+}
+
+/// What an entry's kind is called in the failure text when only the shape
+/// is at hand (no attested size or hash).
+fn kind_label(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::File => "file",
+        EntryKind::Symlink => "symlink",
+        EntryKind::Absent => "absent",
+        EntryKind::DirListing => "dirListing",
+        EntryKind::Dir => "directory",
+        EntryKind::Excluded => "excluded",
+        EntryKind::AutoloadMiss => "autoload lookup",
+        EntryKind::AutoloadDir => "autoload directory",
+    }
+}
+
+/// An entry as `vci explain` prints it (`expected`/`actual` of an
+/// `entry:` detail): what [`InputManifest::diff_against_cache`] prints for
+/// a format-1 record, so that the texts match where the state is loaded.
+fn describe_entry(e: &InputEntry) -> String {
+    match e.kind {
+        EntryKind::Absent => "absent".to_owned(),
+        EntryKind::File => format!("file exec={} size={} blake3={}", e.exec, e.size, e.hash),
+        EntryKind::Symlink => format!("symlink size={} blake3={}", e.size, e.hash),
+        EntryKind::DirListing => format!("dirListing entries={} blake3={}", e.size, e.hash),
+        EntryKind::Dir => "directory".to_owned(),
+        EntryKind::Excluded => "excluded (build output, not an input)".to_owned(),
+        EntryKind::AutoloadDir => "an autoload directory (its listing is not an input)".to_owned(),
+        EntryKind::AutoloadMiss if e.size == 0 => {
+            "no file or directory defines the constant".to_owned()
+        }
+        EntryKind::AutoloadMiss => format!(
+            "{} file(s) or directories define the constant, blake3={}",
+            e.size, e.hash
+        ),
+    }
+}
+
+/// The label of a hash the failure text prints from a state object, which
+/// nothing the signer signed binds (STORE-V2 section 1.5 step 9).
+const UNSIGNED_LABEL: &str = "attested (unsigned, from the run's state object)";
+/// The text when the attested hash is not at hand (no state object, or
+/// past the count cap).
+const HASH_NOT_LOADED: &str = "attested hash not loaded";
+
+/// The `entry:` mismatches of a format-3 candidate whose observed root is
+/// not the signed one (section 1.5 step 9): with the run's state object,
+/// every observed entry whose attested value (by path) is not the observed
+/// one, the attested value labelled [`UNSIGNED_LABEL`]; without it, every
+/// entry whose observed kind or exec bit is not the shape's, and when no
+/// entry differs that way one line saying the entries changed and the
+/// attested hash was not loaded. Never empty: the root differs, so the
+/// candidate fails `inputs` on an entry, which round 2 keys on.
+fn entry_mismatches(
+    set: &[ShapeEntry],
+    observed: &InputManifest,
+    state: Option<&State>,
+    input_root: &str,
+) -> Vec<Mismatch> {
+    let compared = |kind: EntryKind| !matches!(kind, EntryKind::AutoloadDir | EntryKind::Excluded);
+    let mut out = Vec::new();
+    match state {
+        Some(st) => {
+            for o in &observed.entries {
+                if !compared(o.kind) {
+                    continue;
+                }
+                let attested = st.lookup(&o.path);
+                let same = |a: &InputEntry| {
+                    a.kind == o.kind && a.exec == o.exec && a.size == o.size && a.hash == o.hash
+                };
+                if attested.is_empty() {
+                    out.push(Mismatch {
+                        what: format!("entry:{}", o.path),
+                        expected: format!("changed ({HASH_NOT_LOADED}: the run's state object does not list the path)"),
+                        actual: describe_entry(o),
+                    });
+                } else if !attested.iter().any(same) {
+                    let values: Vec<String> = attested.iter().map(describe_entry).collect();
+                    out.push(Mismatch {
+                        what: format!("entry:{}", o.path),
+                        expected: format!("{} ({UNSIGNED_LABEL})", values.join(" or ")),
+                        actual: describe_entry(o),
+                    });
+                }
+            }
+        }
+        None => {
+            let by_path: HashMap<&str, &ShapeEntry> =
+                set.iter().map(|e| (e.path.as_str(), e)).collect();
+            for o in &observed.entries {
+                if !compared(o.kind) {
+                    continue;
+                }
+                if let Some(a) = by_path.get(o.path.as_str())
+                    && (a.kind != o.kind || a.exec != o.exec)
+                {
+                    let exec = if a.kind == EntryKind::File {
+                        format!(" exec={}", a.exec)
+                    } else {
+                        String::new()
+                    };
+                    out.push(Mismatch {
+                        what: format!("entry:{}", o.path),
+                        expected: format!(
+                            "{}{exec} changed ({HASH_NOT_LOADED})",
+                            kind_label(a.kind)
+                        ),
+                        actual: describe_entry(o),
+                    });
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(Mismatch {
+            what: format!("entry: changed ({HASH_NOT_LOADED})"),
+            expected: format!("input root {input_root}"),
+            actual: format!(
+                "input root {} (recomputed from the files at HEAD; which entries changed is known only from the run's state object, which is not at hand)",
+                observed.root()
+            ),
+        });
+    }
+    out
+}
+
 /// The children git ignores of the directories input manifests list, found
 /// once per directory for the whole plan: what
 /// [`crate::run::ignored_listing_children`] finds for one manifest (a
@@ -912,8 +1484,13 @@ fn issued_hint(s: &StoredEnvelope) -> Option<i64> {
     if s.error.is_some() {
         return None;
     }
-    let payload = Envelope::from_json(&s.bytes).ok()?.payload_bytes().ok()?;
-    let st: Statement = serde_json::from_slice(&payload).ok()?;
+    let st: Statement = match decode_record(&s.bytes).ok()? {
+        Record::FormatOne(bytes) => {
+            let payload = Envelope::from_json(bytes).ok()?.payload_bytes().ok()?;
+            serde_json::from_slice(&payload).ok()?
+        }
+        Record::FormatThree(frame) => serde_json::from_slice(&frame.statement).ok()?,
+    };
     parse_rfc3339(&st.predicate.issued_at).ok()
 }
 
@@ -1542,6 +2119,9 @@ fn plan_with(
     // The candidates read only for the units the first pass cannot skip
     // (`hydrate_more`), by unit.
     let mut set_aside = SetAside::new();
+    // The format-3 objects the candidates name, loaded once per plan.
+    let objects = ObjectLoader::default();
+    let load_timers = Timers::default();
     if !res.projects.iter().all(|p| p.run_all.is_some()) {
         // A fetch downloads keys, not values: fetch the values this plan
         // reads (the candidates of the units it verifies, then the input
@@ -1619,6 +2199,17 @@ fn plan_with(
             }
             store.read_values(&mut read)?;
             timing("read the candidates", t);
+            // The verdict objects of the format-3 candidates just read, in
+            // one batch (STORE-V2 section 1.5 step 5).
+            let t = std::time::Instant::now();
+            preload_objects(
+                store,
+                &objects,
+                &load_timers,
+                m.values().flatten(),
+                head.as_deref(),
+            );
+            timing("load the verdict objects", t);
             Ok(m)
         });
         match looked_up {
@@ -1667,6 +2258,8 @@ fn plan_with(
                     rails_gems: r.rails_gems,
                     natives: std::sync::OnceLock::new(),
                     manifests: ManifestLoader::default(),
+                    objects: &objects,
+                    hdr_checks: Mutex::default(),
                     checkout: &checkout,
                     ignored: &ignored,
                     globals: Mutex::default(),
@@ -1733,6 +2326,7 @@ fn plan_with(
         res,
     );
     timing("verdicts again for what was fetched meanwhile", t);
+    objects.report();
     // What passed on this tree, for the plans whose base commit it is
     // (2.7.29; see `passing_memos`).
     if let Some(head) = head_tree.as_deref() {
@@ -2023,6 +2617,19 @@ fn hydrate_more(
                 t,
             );
             return;
+        }
+        // The verdict objects of the candidates of the units checked again
+        // (the ones just read, and the ones whose objects a round could not
+        // load before), in one batch.
+        if let Some(v) = verifiers.iter().flatten().next() {
+            let cands = ids.iter().flat_map(|id| {
+                current
+                    .get(*id)
+                    .or_else(|| by_id.get(*id))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+            });
+            preload_objects(store, v.objects, &v.timers, cands, v.head_tree.as_deref());
         }
         // Checked again with every candidate readable.
         let fresh = &current;
@@ -2386,7 +2993,7 @@ impl Verifier<'_> {
         &self,
         env: &Envelope,
         m: &vci_attest::keyless::SigstoreMaterial,
-    ) -> Result<vci_attest::Verified, Failure> {
+    ) -> Result<vci_attest::keyless::KeylessVerified, Failure> {
         const EXPECTED: &str = "a Sigstore signature, certified and timestamped by an authority of base .vci/sigstore-trusted-root.json, by an identity in base .vci/identities.toml";
         let trust = self.keyless.ok_or_else(|| {
             Failure::one(
@@ -2405,19 +3012,325 @@ impl Verifier<'_> {
             .root
             .as_ref()
             .map_err(|e| Failure::one("signer", 3, e.clone(), EXPECTED, e.clone()))?;
-        vci_attest::keyless::verify_keyless(env, m, ids, root, self.now)
-            .map(|v| v.verified)
-            .map_err(|e| {
-                let (check, rank, what) = match &e {
-                    VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => {
-                        ("envelope", 1, "envelope".to_owned())
+        vci_attest::keyless::verify_keyless(env, m, ids, root, self.now).map_err(|e| {
+            let (check, rank, what) = match &e {
+                VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => {
+                    ("envelope", 1, "envelope".to_owned())
+                }
+                VerifyError::UnknownIdentity(m) => ("signer", 3, m.clone()),
+                VerifyError::Untrusted(m) => ("signature", 2, m.clone()),
+                _ => ("signature", 2, "signature verification".to_owned()),
+            };
+            Failure::one(check, rank, what, EXPECTED, e.to_string())
+        })
+    }
+
+    /// The checks of a hdr object's global manifest that depend on nothing
+    /// but the hdr and the checkout (STORE-V2 section 1.5 step 6): its
+    /// root is the attested `globalInputRoot`, and every entry rehashes
+    /// the same at HEAD. Made once per hdr id for this project; a format-1
+    /// candidate (no hdr id) runs them itself, as before.
+    fn global_check(
+        &self,
+        hdr_id: Option<&str>,
+        gm: &InputManifest,
+        global_input_root: &str,
+    ) -> Result<(), Failure> {
+        if let Some(id) = hdr_id
+            && let Some(r) = self
+                .hdr_checks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(id)
+        {
+            return r.clone();
+        }
+        let r = (|| {
+            if gm.root() != global_input_root {
+                return Err(Failure::one(
+                    "global-inputs",
+                    14,
+                    "globalInputRoot",
+                    global_input_root.to_owned(),
+                    format!("{} (recomputed from the attested manifest)", gm.root()),
+                ));
+            }
+            let gextra = self.ignored.of(self.checkout, gm);
+            let gdiff = gm
+                .diff_against_cache(self.checkout, lookup(&self.child), &gextra)
+                .map_err(|e| {
+                    Failure::one("global-inputs", 14, "rehash", "re-hashable", e.to_string())
+                })?;
+            if !gdiff.is_empty() {
+                return Err(Failure {
+                    check: "global-inputs",
+                    rank: 14,
+                    details: gdiff
+                        .into_iter()
+                        .map(|m| Detail {
+                            what: m.what,
+                            expected: m.expected,
+                            actual: m.actual,
+                        })
+                        .collect(),
+                });
+            }
+            Ok(())
+        })();
+        if let Some(id) = hdr_id {
+            self.hdr_checks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.to_owned(), r.clone());
+        }
+        r
+    }
+
+    /// The per-file inputs of a format-1 candidate: the manifest inline, or
+    /// the stored one the attestation references (trusted only through the
+    /// signed root), rehashed against the checkout. Returns the manifest
+    /// and every mismatch (`entry:` and `env:`), as before store format 3.
+    fn inputs_v1(&self, p: &VciPredicate) -> Result<(Arc<InputManifest>, Vec<Mismatch>), Failure> {
+        let m: Arc<InputManifest> = match (&p.core.manifest, &p.core.manifest_ref) {
+            (Some(m), _) => Arc::new(m.clone()),
+            (None, Some(r)) => {
+                self.manifests
+                    .load(self.store, r, &self.timers)
+                    .map_err(|(what, actual)| {
+                        Failure::one(
+                            "inputs",
+                            15,
+                            what,
+                            format!(
+                                "the input manifest, {} project {}",
+                                self.store.kind(),
+                                vci_store::manifest_key(r)
+                            ),
+                            actual,
+                        )
+                    })?
+            }
+            (None, None) => {
+                return Err(Failure::one(
+                    "statement",
+                    4,
+                    "manifest / manifestRef",
+                    "neither",
+                    "exactly one of manifest and manifestRef",
+                ));
+            }
+        };
+        if m.root() != p.core.input_root {
+            return Err(Failure::one(
+                "inputs",
+                15,
+                "inputRoot",
+                p.core.input_root.clone(),
+                format!("{} (recomputed from the attested manifest)", m.root()),
+            ));
+        }
+        // Lookups instead of listings (2.5.0) only where the base policy
+        // accepts what they leave out.
+        self.autoload_policy(m.entries.iter().map(|e| e.kind))?;
+        // The shared base's part of the checks, made once (2.7.30, see
+        // `BaseCheck`); the entries after the base's are this unit's own.
+        let base_check = self
+            .manifests
+            .base_root_of(&p.core.input_root)
+            .and_then(|b| self.base_check(&b));
+        let own_from = base_check
+            .as_ref()
+            .map(|bc| m.entries.iter().take_while(|e| bc.set.contains(e)).count())
+            .unwrap_or(0);
+        let t = std::time::Instant::now();
+        let collisions = match &base_check {
+            Some(bc) if bc.collisions.is_err() => bc.collisions.clone(),
+            Some(bc) if !m.prefixes_collide_with(own_from, &bc.prefixes) => Ok(()),
+            _ => self.case_collisions(&p.core.input_root, &m),
+        };
+        Timers::add(&self.timers.collisions, t);
+        collisions.map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
+        let t = std::time::Instant::now();
+        // (The base's part is borrowed: cloning its thousand paths for each
+        // of 4,000 candidates cost more than the check.)
+        let extra: std::borrow::Cow<'_, [RepoPath]> = match &base_check {
+            Some(bc) => {
+                let own = self.ignored.of_from(self.checkout, &m, own_from);
+                if own.is_empty() {
+                    std::borrow::Cow::Borrowed(&bc.extra)
+                } else {
+                    let mut e = bc.extra.clone();
+                    e.extend(own);
+                    e.sort();
+                    e.dedup();
+                    std::borrow::Cow::Owned(e)
+                }
+            }
+            None => std::borrow::Cow::Owned(self.ignored.of(self.checkout, &m)),
+        };
+        Timers::add(&self.timers.ignored, t);
+        Timers::count(&self.timers.rehashed);
+        let t = std::time::Instant::now();
+        let mut diff = m
+            .diff_against_cache_from(self.checkout, lookup(&self.child), &extra, own_from)
+            .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
+        if let Some(bc) = &base_check {
+            // The base's differences, except at paths this unit's own
+            // entries took over.
+            let own: HashSet<&str> = m.entries[own_from..]
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect();
+            diff.extend(
+                bc.mismatches
+                    .iter()
+                    .filter(|mm| {
+                        mm.what
+                            .strip_prefix("entry:")
+                            .is_none_or(|p| !own.contains(p))
+                    })
+                    .cloned(),
+            );
+        }
+        Timers::add(&self.timers.rehash, t);
+        Ok((m, diff))
+    }
+
+    /// The per-file inputs of a format-3 candidate (STORE-V2 section 1.5
+    /// step 8): the record's descriptor resolved against its tables object
+    /// and the shape it names (a shape missing, mismatched or malformed, an
+    /// index past either, fails `inputs`), its paths checked as a manifest's
+    /// are (autoload lookups the policy forbids, case collisions, the
+    /// children git ignores), every path observed at HEAD through the
+    /// checkout cache, and the manifest of the observation with the
+    /// attested externals and env, whose root must be the signed subject
+    /// digest: the files are then exactly the attested ones. Returns that
+    /// manifest and every mismatch: the `entry:` ones when the root
+    /// differs (from the run's state object where it is at hand, section
+    /// 1.5 step 9) and the `env:` ones of the attested env against the
+    /// child environment.
+    fn inputs_v2(
+        &self,
+        s: &StoredEnvelope,
+        frame: &Frame,
+        tables: &Tables,
+        input_root: &str,
+    ) -> Result<(Arc<InputManifest>, Vec<Mismatch>), Failure> {
+        let inputs = |what: String, expected: String, actual: String| {
+            Failure::one("inputs", 15, what, expected, actual)
+        };
+        let shape_id = Descriptor::shape_id(&frame.descriptor).map_err(|e| {
+            inputs(
+                "descriptor".into(),
+                "a descriptor naming the run's shape object".into(),
+                e.to_string(),
+            )
+        })?;
+        let shape_id = hex32(&shape_id);
+        let shape = self
+            .objects
+            .shape(self.store, &self.timers, &shape_id)
+            .map_err(|u| {
+                inputs(
+                    u.what,
+                    format!("the shape object {shape_id} the descriptor names"),
+                    u.actual,
+                )
+            })?;
+        let descriptor = Descriptor::decode(&frame.descriptor, tables).map_err(|e| {
+            inputs(
+                "descriptor".into(),
+                "a descriptor over the record's tables object".into(),
+                e.to_string(),
+            )
+        })?;
+        let resolved = descriptor.resolve(&shape, tables).map_err(|e| {
+            inputs(
+                "descriptor".into(),
+                format!("a descriptor over the shape object {shape_id} and the tables object"),
+                e.to_string(),
+            )
+        })?;
+        // Lookups instead of listings (2.5.0) only where the base policy
+        // accepts what they leave out.
+        self.autoload_policy(resolved.set.iter().map(|e| e.kind))?;
+        // The paths as a manifest, for the checks that look at paths and
+        // kinds only (no attested size or hash is at hand, nor needed).
+        let paths = InputManifest {
+            entries: resolved
+                .set
+                .iter()
+                .map(|e| InputEntry {
+                    path: e.path.clone(),
+                    kind: e.kind,
+                    exec: e.exec,
+                    size: 0,
+                    hash: String::new(),
+                })
+                .collect(),
+            externals: vec![],
+            env: vec![],
+        };
+        let t = std::time::Instant::now();
+        let collisions = self.case_collisions(input_root, &paths);
+        Timers::add(&self.timers.collisions, t);
+        collisions.map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
+        let t = std::time::Instant::now();
+        let extra = self.ignored.of(self.checkout, &paths);
+        Timers::add(&self.timers.ignored, t);
+        Timers::count(&self.timers.rehashed);
+        let t = std::time::Instant::now();
+        let observed = InputManifest::observe(&resolved.set, self.checkout, &extra)
+            .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
+        let m =
+            InputManifest::from_observed(&resolved.set, observed, resolved.externals, resolved.env)
+                .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
+        let mut diff = Vec::new();
+        if m.root() != input_root {
+            let state = self.objects.state_for(self.store, &self.timers, s);
+            diff = entry_mismatches(&resolved.set, &m, state.as_deref(), input_root);
+        }
+        Timers::add(&self.timers.rehash, t);
+        // The attested env against the child environment, as the format-1
+        // rehash compares it.
+        let env = lookup(&self.child);
+        for e in &m.env {
+            let act = env_value_hash(env(&e.key).as_deref());
+            if act != e.hash {
+                let show = |h: &str| {
+                    if h == vci_core::ABSENT_HASH {
+                        "unset".to_owned()
+                    } else {
+                        format!("blake3={h}")
                     }
-                    VerifyError::UnknownIdentity(m) => ("signer", 3, m.clone()),
-                    VerifyError::Untrusted(m) => ("signature", 2, m.clone()),
-                    _ => ("signature", 2, "signature verification".to_owned()),
                 };
-                Failure::one(check, rank, what, EXPECTED, e.to_string())
-            })
+                diff.push(Mismatch {
+                    what: format!("env:{}", e.key),
+                    expected: show(&e.hash),
+                    actual: show(&act),
+                });
+            }
+        }
+        Ok((Arc::new(m), diff))
+    }
+
+    /// Lookups instead of listings (2.5.0) only where the base policy
+    /// accepts what they leave out.
+    fn autoload_policy(&self, kinds: impl IntoIterator<Item = EntryKind>) -> Result<(), Failure> {
+        if !self.project.policy.rails_autoload_lookups
+            && kinds
+                .into_iter()
+                .any(|k| matches!(k, EntryKind::AutoloadMiss | EntryKind::AutoloadDir))
+        {
+            return Err(Failure::one(
+                "inputs",
+                15,
+                "autoload lookups",
+                "directory listings (policy.rails_autoload_lookups = true in the base branch's vci.toml accepts lookups)",
+                "the attestation records the constants its tests looked up in autoload directories, not their listings",
+            ));
+        }
+        Ok(())
     }
 
     fn check(
@@ -2438,58 +3351,106 @@ impl Verifier<'_> {
                 "a readable DSSE envelope",
             ));
         }
-        // Envelope shape.
-        let env = Envelope::from_json(&s.bytes).map_err(|e| {
+        // The record's format, by its first byte: `{` a DSSE envelope JSON
+        // (format 1), `v` a text frame (format 3, decoded under the rules
+        // of STORE-V2 section 1.6); the store's columns never choose.
+        let record = decode_record(&s.bytes).map_err(|e| {
             Failure::one(
                 "envelope",
                 1,
-                "envelope JSON",
+                "record",
                 format!("unparseable: {e}"),
-                "a DSSE envelope",
+                "a DSSE envelope (format 1) or a vci3 frame (format 3)",
             )
         })?;
-
-        // A keyless envelope (a `sigstore` member): certificate, timestamp,
-        // signature and identity against the base identities.toml and
-        // trust root.
-        let material = vci_attest::keyless::material_from_json(&s.bytes).map_err(|e| {
-            Failure::one(
-                "envelope",
-                1,
-                "envelope JSON",
-                format!("unparseable: {e}"),
-                "a DSSE envelope",
-            )
-        })?;
+        // Envelope shape, and for a keyless envelope (a `sigstore` member)
+        // its material: certificate, timestamp, signature and identity are
+        // checked against the base identities.toml and trust root.
+        let (env, material, frame) = match &record {
+            Record::FormatOne(bytes) => {
+                let env = Envelope::from_json(bytes).map_err(|e| {
+                    Failure::one(
+                        "envelope",
+                        1,
+                        "envelope JSON",
+                        format!("unparseable: {e}"),
+                        "a DSSE envelope",
+                    )
+                })?;
+                let material = vci_attest::keyless::material_from_json(bytes).map_err(|e| {
+                    Failure::one(
+                        "envelope",
+                        1,
+                        "envelope JSON",
+                        format!("unparseable: {e}"),
+                        "a DSSE envelope",
+                    )
+                })?;
+                (env, material, None)
+            }
+            Record::FormatThree(frame) => (
+                Envelope::from_frame(frame),
+                frame.sigstore().cloned(),
+                Some(frame),
+            ),
+        };
         Timers::count(&self.timers.candidates);
         let t_sig = std::time::Instant::now();
-        let verified = match material {
-            Some(m) => self.verify_keyless(&env, &m)?,
+        // Signature over the statement bytes exactly as stored, and the
+        // signer id the verified key or identity has.
+        let (verified, signer_id) = match material {
+            Some(m) => {
+                let k = self.verify_keyless(&env, &m)?;
+                let id = k.identity.signer_id();
+                (k.verified, Some(id))
+            }
             // Signature, namespace, signer trust (base allowed_signers).
-            None => verify_envelope(&env, self.allowed, self.now).map_err(|e| {
-                let (check, rank) = match &e {
-                    VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => ("envelope", 1),
-                    VerifyError::BadSignature(_) | VerifyError::NoSignatures => ("signature", 2),
-                    VerifyError::WrongNamespace(_) => ("signature", 2),
-                    VerifyError::UnknownSigner(_) | VerifyError::CertAuthorityRejected(_) => {
-                        ("signer", 3)
-                    }
-                    VerifyError::SignerNotValidNow(_) => ("signer", 3),
-                    VerifyError::Untrusted(_) => ("signature", 2),
-                    VerifyError::UnknownIdentity(_) => ("signer", 3),
-                };
-                Failure::one(
-                    check,
-                    rank,
-                    "signature verification",
-                    "a valid signature by a key in base allowed_signers",
-                    e.to_string(),
-                )
-            })?,
+            None => {
+                let v = verify_envelope(&env, self.allowed, self.now).map_err(|e| {
+                    let (check, rank) = match &e {
+                        VerifyError::Malformed(_) | VerifyError::WrongPayloadType(_) => {
+                            ("envelope", 1)
+                        }
+                        VerifyError::BadSignature(_) | VerifyError::NoSignatures => {
+                            ("signature", 2)
+                        }
+                        VerifyError::WrongNamespace(_) => ("signature", 2),
+                        VerifyError::UnknownSigner(_) | VerifyError::CertAuthorityRejected(_) => {
+                            ("signer", 3)
+                        }
+                        VerifyError::SignerNotValidNow(_) => ("signer", 3),
+                        VerifyError::Untrusted(_) => ("signature", 2),
+                        VerifyError::UnknownIdentity(_) => ("signer", 3),
+                    };
+                    Failure::one(
+                        check,
+                        rank,
+                        "signature verification",
+                        "a valid signature by a key in base allowed_signers",
+                        e.to_string(),
+                    )
+                })?;
+                let id = signer_id_of_fingerprint(&v.fingerprint);
+                (v, id)
+            }
         };
         Timers::add(&self.timers.signature, t_sig);
         info.principal = Some(verified.principal.clone());
         info.fingerprint = Some(verified.fingerprint.clone());
+        // The key's signer segment must be the verified key's signer id
+        // (STORE-V2 section 1.5 step 4): a record copied under another
+        // signer's slot is not that signer's, and would otherwise stay
+        // there until that signer's history deleted it.
+        let signer_id = signer_id.unwrap_or_default();
+        if s.signer != signer_id {
+            return Err(Failure::one(
+                "signer",
+                3,
+                "signer id (the store key's signer segment)",
+                s.signer.clone(),
+                format!("{signer_id} (the signer id of the verified key)"),
+            ));
+        }
         if let Some(r) = &self.no_skip_ref
             && !self
                 .project
@@ -2503,18 +3464,25 @@ impl Verifier<'_> {
             ));
         }
 
-        // Statement / predicate shape.
+        // Statement / predicate shape: the v1 predicate in a format-1
+        // record, the v2 predicate (its hdr and tables objects by signed
+        // id, STORE-V2 section 1.5 step 5) in a format-3 record.
         let st = &verified.statement;
-        if st.predicate_type != PREDICATE_TYPE {
+        let predicate_type = if frame.is_some() {
+            PREDICATE_TYPE_V2
+        } else {
+            PREDICATE_TYPE
+        };
+        if st.predicate_type != predicate_type {
             return Err(Failure::one(
                 "statement",
                 4,
                 "predicateType",
                 st.predicate_type.clone(),
-                PREDICATE_TYPE,
+                predicate_type,
             ));
         }
-        let p: VciPredicate = serde_json::from_value(st.predicate.clone()).map_err(|e| {
+        let unparseable = |e: serde_json::Error| {
             Failure::one(
                 "statement",
                 4,
@@ -2522,80 +3490,145 @@ impl Verifier<'_> {
                 format!("unparseable: {e}"),
                 "a vci test predicate",
             )
-        })?;
-        info.issued_at = Some(p.core.issued_at.clone());
-        info.expires_at = Some(p.core.expires_at.clone());
-        info.rails_inputs = p.rails_inputs.clone();
-        let global_now = if p.rails_inputs.is_empty() {
+        };
+        /// The predicate as parsed, with the objects a v2 one names.
+        enum Owned {
+            V1(Box<VciPredicate>),
+            V2(Box<VciPredicateV2>, Arc<Hdr>, Arc<Tables>),
+        }
+        let input_root: String;
+        let owned: Owned = match frame {
+            None => {
+                let p: VciPredicate =
+                    serde_json::from_value(st.predicate.clone()).map_err(unparseable)?;
+                // The input manifest: inline (before vci 1.9.0) or by
+                // reference to the signed input root, exactly one of them.
+                match (&p.core.manifest, &p.core.manifest_ref) {
+                    (Some(_), None) => {}
+                    (None, Some(r)) if *r == p.core.input_root => {}
+                    (None, Some(r)) => {
+                        return Err(Failure::one(
+                            "statement",
+                            4,
+                            "manifestRef",
+                            r.clone(),
+                            format!("{} (inputRoot)", p.core.input_root),
+                        ));
+                    }
+                    (m, r) => {
+                        return Err(Failure::one(
+                            "statement",
+                            4,
+                            "manifest / manifestRef",
+                            format!(
+                                "{} and {}",
+                                if m.is_some() {
+                                    "manifest"
+                                } else {
+                                    "no manifest"
+                                },
+                                if r.is_some() {
+                                    "manifestRef"
+                                } else {
+                                    "no manifestRef"
+                                }
+                            ),
+                            "exactly one of manifest and manifestRef",
+                        ));
+                    }
+                }
+                let subject_ok = st.subject.len() == 1
+                    && st.subject[0].name == p.core.test_id
+                    && st.subject[0].digest.get("blake3") == Some(&p.core.input_root);
+                if !subject_ok {
+                    return Err(Failure::one(
+                        "statement",
+                        4,
+                        "subject",
+                        format!("{:?}", st.subject),
+                        format!("{} blake3={}", p.core.test_id, p.core.input_root),
+                    ));
+                }
+                input_root = p.core.input_root.clone();
+                Owned::V1(Box::new(p))
+            }
+            Some(_) => {
+                let p: VciPredicateV2 =
+                    serde_json::from_value(st.predicate.clone()).map_err(unparseable)?;
+                // The subject names the unit and its input root (a v2
+                // statement carries the root nowhere else).
+                let digest = (st.subject.len() == 1 && st.subject[0].name == p.test_id)
+                    .then(|| st.subject[0].digest.get("blake3"))
+                    .flatten()
+                    .filter(|d| parse_hex32(d).is_some());
+                let Some(digest) = digest else {
+                    return Err(Failure::one(
+                        "statement",
+                        4,
+                        "subject",
+                        format!("{:?}", st.subject),
+                        format!("{} blake3=<64 lowercase hex digits>", p.test_id),
+                    ));
+                };
+                input_root = digest.clone();
+                let object = |what: &'static str, id: &str, u: ObjectUnavailable| {
+                    Failure::one(
+                        "statement",
+                        4,
+                        u.what,
+                        format!("the {what} object {id} the statement names"),
+                        u.actual,
+                    )
+                };
+                let hdr = self
+                    .objects
+                    .hdr(self.store, &self.timers, &p.hdr)
+                    .map_err(|u| object("hdr", &p.hdr, u))?;
+                let tables = self
+                    .objects
+                    .tables(self.store, &self.timers, &p.tables)
+                    .map_err(|u| object("tables", &p.tables, u))?;
+                Owned::V2(Box::new(p), hdr, tables)
+            }
+        };
+        let p: ResolvedPredicate<'_> = match &owned {
+            Owned::V1(p) => ResolvedPredicate::v1(p),
+            Owned::V2(p, hdr, tables) => ResolvedPredicate::v2(p, &input_root, hdr, tables)
+                .map_err(|e| {
+                    Failure::one(
+                        "statement",
+                        4,
+                        "waived",
+                        format!("{:?}", p.waived),
+                        format!("sorted distinct ids into the tables object's waiver table: {e}"),
+                    )
+                })?,
+        };
+        info.issued_at = Some(p.issued_at().to_owned());
+        info.expires_at = Some(p.expires_at().to_owned());
+        info.rails_inputs = p.rails_inputs().to_owned();
+        let global_now = if p.rails_inputs().is_empty() {
             &globals_now.all
         } else {
             &globals_now.ignored
         };
-        // The input manifest: inline (before vci 1.9.0) or by reference to
-        // the signed input root, exactly one of them.
-        match (&p.core.manifest, &p.core.manifest_ref) {
-            (Some(_), None) => {}
-            (None, Some(r)) if *r == p.core.input_root => {}
-            (None, Some(r)) => {
-                return Err(Failure::one(
-                    "statement",
-                    4,
-                    "manifestRef",
-                    r.clone(),
-                    format!("{} (inputRoot)", p.core.input_root),
-                ));
-            }
-            (m, r) => {
-                return Err(Failure::one(
-                    "statement",
-                    4,
-                    "manifest / manifestRef",
-                    format!(
-                        "{} and {}",
-                        if m.is_some() {
-                            "manifest"
-                        } else {
-                            "no manifest"
-                        },
-                        if r.is_some() {
-                            "manifestRef"
-                        } else {
-                            "no manifestRef"
-                        }
-                    ),
-                    "exactly one of manifest and manifestRef",
-                ));
-            }
-        }
-        let subject_ok = st.subject.len() == 1
-            && st.subject[0].name == p.core.test_id
-            && st.subject[0].digest.get("blake3") == Some(&p.core.input_root);
-        if !subject_ok {
-            return Err(Failure::one(
-                "statement",
-                4,
-                "subject",
-                format!("{:?}", st.subject),
-                format!("{} blake3={}", p.core.test_id, p.core.input_root),
-            ));
-        }
 
         // Expiry and TTL policy.
-        let issued = parse_rfc3339(&p.core.issued_at).map_err(|e| {
+        let issued = parse_rfc3339(p.issued_at()).map_err(|e| {
             Failure::one(
                 "expiry",
                 5,
                 "issuedAt",
-                p.core.issued_at.clone(),
+                p.issued_at(),
                 format!("RFC 3339 required ({e})"),
             )
         })?;
-        let expires = parse_rfc3339(&p.core.expires_at).map_err(|e| {
+        let expires = parse_rfc3339(p.expires_at()).map_err(|e| {
             Failure::one(
                 "expiry",
                 5,
                 "expiresAt",
-                p.core.expires_at.clone(),
+                p.expires_at(),
                 format!("RFC 3339 required ({e})"),
             )
         })?;
@@ -2604,7 +3637,7 @@ impl Verifier<'_> {
                 "expiry",
                 5,
                 "issuedAt",
-                p.core.issued_at.clone(),
+                p.issued_at(),
                 format!(
                     "now is {} (issuedAt must not be later)",
                     crate::util::rfc3339(self.now)
@@ -2616,7 +3649,7 @@ impl Verifier<'_> {
                 "expiry",
                 5,
                 "expiresAt",
-                p.core.expires_at.clone(),
+                p.expires_at(),
                 format!(
                     "now is {} (expiresAt must be later)",
                     crate::util::rfc3339(self.now)
@@ -2634,39 +3667,39 @@ impl Verifier<'_> {
         }
 
         // Identity: repo, test, adapter, argv.
-        if p.core.repo_id != self.repo_id {
+        if p.repo_id() != self.repo_id {
             return Err(Failure::one(
                 "repo",
                 6,
                 "repoId",
-                p.core.repo_id.clone(),
+                p.repo_id(),
                 self.repo_id.clone(),
             ));
         }
-        if p.core.test_id != f.test_id.as_str() {
+        if p.test_id() != f.test_id.as_str() {
             return Err(Failure::one(
                 "test-id",
                 7,
                 "testId",
-                p.core.test_id.clone(),
+                p.test_id(),
                 f.test_id.as_str(),
             ));
         }
         let adapter = self.project.adapter.as_ref();
-        if p.core.adapter != adapter.name() {
+        if p.adapter() != adapter.name() {
             return Err(Failure::one(
                 "adapter",
                 8,
                 "adapter",
-                p.core.adapter.clone(),
+                p.adapter(),
                 adapter.name(),
             ));
         }
         let argv = adapter.canonical_argv(&self.project.rel, &f.project_rel);
-        if p.core.argv != argv
-            || p.project_dir != self.project.rel
-            || p.runner_project != f.runner_project
-            || p.project_name != self.project.name
+        if p.argv() != argv
+            || p.project_dir() != self.project.rel
+            || p.runner_project() != f.runner_project
+            || p.project_name() != self.project.name
         {
             return Err(Failure::one(
                 "argv",
@@ -2674,7 +3707,10 @@ impl Verifier<'_> {
                 "argv / project",
                 format!(
                     "{:?} project {:?} runner project {:?} vci project {:?}",
-                    p.core.argv, p.project_dir, p.runner_project, p.project_name
+                    p.argv(),
+                    p.project_dir(),
+                    p.runner_project(),
+                    p.project_name()
                 ),
                 format!(
                     "{argv:?} project {:?} runner project {:?} vci project {:?}",
@@ -2684,7 +3720,7 @@ impl Verifier<'_> {
         }
 
         // Toolchain (adapter-specific tools; see Toolchain::diff).
-        let tc = &p.core.toolchain;
+        let tc = p.toolchain();
         let now_tc = crate::run::toolchain_for(adapter.name(), &self.versions);
         let libraries = self.project.policy.libraries_for(&f.project_rel);
         let mut tdiff = toolchain_diff(&self.project.policy, libraries, tc, &now_tc);
@@ -2695,22 +3731,22 @@ impl Verifier<'_> {
             platform,
             &tc.os,
             &tc.arch,
-            &p.platform_specific,
+            p.platform_specific(),
             std::env::consts::OS,
             std::env::consts::ARCH,
         ));
-        if p.core.adapter == "go" {
+        if p.adapter() == "go" {
             tdiff.extend(go_arch_diff(
                 platform,
                 &tc.arch,
-                &p.arch_specific,
+                p.arch_specific(),
                 std::env::consts::ARCH,
             ));
         }
         // Cargo: target-dependent cfg predicates of the unit's code must
         // evaluate here as they did on the attesting host.
-        if !p.cfg_predicates.is_empty() && tc.rust_cfg != now_tc.rust_cfg {
-            for pred in &p.cfg_predicates {
+        if !p.cfg_predicates().is_empty() && tc.rust_cfg != now_tc.rust_cfg {
+            for pred in p.cfg_predicates() {
                 let differs =
                     vci_adapter::cfg_predicate_differs(pred, &tc.rust_cfg, &now_tc.rust_cfg)
                         .unwrap_or(true);
@@ -2740,12 +3776,13 @@ impl Verifier<'_> {
 
         // Env configuration digest (base config).
         let fenv = self.project.file_env(&f.project_rel);
-        if p.env_config_digest != fenv.digest() {
+        let env_config_digest = p.env_config_digest();
+        if *env_config_digest != *fenv.digest() {
             return Err(Failure::one(
                 "env-config",
                 11,
                 "envConfigDigest (the [env] lists of the base vci.toml, or vci's built-in lists, differ from the attestation's; attestations made before vci 1.6.0 all differ once)",
-                p.env_config_digest.clone(),
+                env_config_digest.into_owned(),
                 fenv.digest(),
             ));
         }
@@ -2753,25 +3790,27 @@ impl Verifier<'_> {
         // Result. A pass with skipped tests counts only when the attestation
         // recorded the skips as waived (`result:skipped`), which the base
         // policy must still waive (below).
-        let r = &p.core.result;
+        let r = p.result();
+        let waived = p.waived();
         let skips_waived = r.state == "passed"
             && r.failed == 0
-            && p.waived
+            && waived
                 .iter()
                 .any(|w| w.starts_with(crate::run::RESULT_SKIPPED_TAINT));
         let no_tests_waived = r.state == "no-tests"
             && r.failed == 0
-            && p.waived
-                .iter()
-                .any(|w| w == crate::run::RESULT_NO_TESTS_TAINT);
-        if !(r.is_pass() || skips_waived || no_tests_waived) || !p.core.tainted.is_empty() {
+            && waived.contains(&crate::run::RESULT_NO_TESTS_TAINT);
+        if !(r.is_pass() || skips_waived || no_tests_waived) || !p.tainted().is_empty() {
             return Err(Failure::one(
                 "result",
                 12,
                 "result",
                 format!(
                     "{} failed={} skipped={} tainted={:?}",
-                    r.state, r.failed, r.skipped, p.core.tainted
+                    r.state,
+                    r.failed,
+                    r.skipped,
+                    p.tainted()
                 ),
                 "passed, untainted (required; skipped tests only with policy.ignore_taints waiving result:skipped)",
             ));
@@ -2779,12 +3818,12 @@ impl Verifier<'_> {
         // Declared inputs (`[[inputs]]`) must be exactly the base config's:
         // a declaration added later names files the attestation never hashed.
         let declared = self.project.extra_inputs(&f.project_rel);
-        if p.declared_inputs != declared {
+        if p.declared_inputs() != declared.as_slice() {
             return Err(Failure::one(
                 "inputs-config",
                 12,
                 "declared inputs ([[inputs]] extra)",
-                format!("{:?}", p.declared_inputs),
+                format!("{:?}", p.declared_inputs()),
                 format!("{declared:?} (base vci.toml)"),
             ));
         }
@@ -2794,7 +3833,7 @@ impl Verifier<'_> {
             &self.project.policy,
             self.project.adapter.name(),
             &declared,
-            &p.waived,
+            &waived,
         );
         if !not_waived.is_empty() {
             return Err(Failure {
@@ -2803,7 +3842,7 @@ impl Verifier<'_> {
                 details: not_waived,
             });
         }
-        if p.core.tree_dirty && !self.project.policy.allow_dirty {
+        if p.tree_dirty() && !self.project.policy.allow_dirty {
             return Err(Failure::one(
                 "dirty",
                 13,
@@ -2814,39 +3853,13 @@ impl Verifier<'_> {
         }
 
         // Global inputs: attested manifest is self-consistent, still matches
-        // the checkout, and the current global input set is the same.
-        let gm = &p.core.global_manifest;
-        if gm.root() != p.core.global_input_root {
-            return Err(Failure::one(
-                "global-inputs",
-                14,
-                "globalInputRoot",
-                p.core.global_input_root.clone(),
-                format!("{} (recomputed from the attested manifest)", gm.root()),
-            ));
-        }
-        let gextra = self.ignored.of(self.checkout, gm);
-        let gdiff = gm
-            .diff_against_cache(self.checkout, lookup(&self.child), &gextra)
-            .map_err(|e| {
-                Failure::one("global-inputs", 14, "rehash", "re-hashable", e.to_string())
-            })?;
-        if !gdiff.is_empty() {
-            return Err(Failure {
-                check: "global-inputs",
-                rank: 14,
-                details: gdiff
-                    .into_iter()
-                    .map(|m| Detail {
-                        what: m.what,
-                        expected: m.expected,
-                        actual: m.actual,
-                    })
-                    .collect(),
-            });
-        }
+        // the checkout (once per hdr for a format-3 record), and the current
+        // global input set is the same.
+        let gm = p.global_manifest();
+        let global_input_root = p.global_input_root();
+        self.global_check(p.hdr_id(), &gm, &global_input_root)?;
         match global_now {
-            Ok(now) if now.root() == p.core.global_input_root => {}
+            Ok(now) if now.root() == *global_input_root => {}
             Ok(now) => {
                 let attested: BTreeSet<&str> = gm.entries.iter().map(|e| e.path.as_str()).collect();
                 let current: BTreeSet<&str> = now.entries.iter().map(|e| e.path.as_str()).collect();
@@ -2856,7 +3869,7 @@ impl Verifier<'_> {
                     "global-inputs",
                     14,
                     format!("global input set (new: {added:?}, gone: {removed:?})"),
-                    p.core.global_input_root.clone(),
+                    global_input_root.into_owned(),
                     now.root(),
                 ));
             }
@@ -2865,130 +3878,23 @@ impl Verifier<'_> {
                     "global-inputs",
                     14,
                     "computing current global inputs",
-                    p.core.global_input_root.clone(),
+                    global_input_root.into_owned(),
                     format!("error: {e}"),
                 ));
             }
         }
 
-        // Per-file inputs: the manifest inline, or the stored one the
-        // attestation references (trusted only through the signed root).
-        let loaded;
-        let m: &InputManifest = match (&p.core.manifest, &p.core.manifest_ref) {
-            (Some(m), _) => m,
-            (None, Some(r)) => {
-                loaded = self.manifests.load(self.store, r, &self.timers).map_err(
-                    |(what, actual)| {
-                        Failure::one(
-                            "inputs",
-                            15,
-                            what,
-                            format!(
-                                "the input manifest, {} project {}",
-                                self.store.kind(),
-                                vci_store::manifest_key(r)
-                            ),
-                            actual,
-                        )
-                    },
-                )?;
-                &loaded
+        // Per-file inputs: the manifest inline or by reference (format 1),
+        // or the descriptor resolved and observed at HEAD (format 3); then
+        // the mismatches of its files and its env.
+        let (m, diff) = match (&owned, frame) {
+            (Owned::V1(p1), _) => self.inputs_v1(p1)?,
+            (Owned::V2(_, _, tables), Some(frame)) => {
+                self.inputs_v2(s, frame, tables, &input_root)?
             }
-            (None, None) => {
-                return Err(Failure::one(
-                    "statement",
-                    4,
-                    "manifest / manifestRef",
-                    "neither",
-                    "exactly one of manifest and manifestRef",
-                ));
-            }
+            (Owned::V2(..), None) => unreachable!("a v2 predicate comes from a frame"),
         };
-        if m.root() != p.core.input_root {
-            return Err(Failure::one(
-                "inputs",
-                15,
-                "inputRoot",
-                p.core.input_root.clone(),
-                format!("{} (recomputed from the attested manifest)", m.root()),
-            ));
-        }
-        // Lookups instead of listings (2.5.0) only where the base policy
-        // accepts what they leave out.
-        if !self.project.policy.rails_autoload_lookups
-            && m.entries
-                .iter()
-                .any(|e| matches!(e.kind, EntryKind::AutoloadMiss | EntryKind::AutoloadDir))
-        {
-            return Err(Failure::one(
-                "inputs",
-                15,
-                "autoload lookups",
-                "directory listings (policy.rails_autoload_lookups = true in the base branch's vci.toml accepts lookups)",
-                "the attestation records the constants its tests looked up in autoload directories, not their listings",
-            ));
-        }
-        // The shared base's part of the checks, made once (2.7.30, see
-        // `BaseCheck`); the entries after the base's are this unit's own.
-        let base_check = self
-            .manifests
-            .base_root_of(&p.core.input_root)
-            .and_then(|b| self.base_check(&b));
-        let own_from = base_check
-            .as_ref()
-            .map(|bc| m.entries.iter().take_while(|e| bc.set.contains(e)).count())
-            .unwrap_or(0);
-        let t = std::time::Instant::now();
-        let collisions = match &base_check {
-            Some(bc) if bc.collisions.is_err() => bc.collisions.clone(),
-            Some(bc) if !m.prefixes_collide_with(own_from, &bc.prefixes) => Ok(()),
-            _ => self.case_collisions(&p.core.input_root, m),
-        };
-        Timers::add(&self.timers.collisions, t);
-        collisions.map_err(|e| Failure::one("inputs", 15, "case collisions", "none", e))?;
-        let t = std::time::Instant::now();
-        // (The base's part is borrowed: cloning its thousand paths for each
-        // of 4,000 candidates cost more than the check.)
-        let extra: std::borrow::Cow<'_, [RepoPath]> = match &base_check {
-            Some(bc) => {
-                let own = self.ignored.of_from(self.checkout, m, own_from);
-                if own.is_empty() {
-                    std::borrow::Cow::Borrowed(&bc.extra)
-                } else {
-                    let mut e = bc.extra.clone();
-                    e.extend(own);
-                    e.sort();
-                    e.dedup();
-                    std::borrow::Cow::Owned(e)
-                }
-            }
-            None => std::borrow::Cow::Owned(self.ignored.of(self.checkout, m)),
-        };
-        Timers::add(&self.timers.ignored, t);
-        Timers::count(&self.timers.rehashed);
-        let t = std::time::Instant::now();
-        let mut diff = m
-            .diff_against_cache_from(self.checkout, lookup(&self.child), &extra, own_from)
-            .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
-        if let Some(bc) = &base_check {
-            // The base's differences, except at paths this unit's own
-            // entries took over.
-            let own: HashSet<&str> = m.entries[own_from..]
-                .iter()
-                .map(|e| e.path.as_str())
-                .collect();
-            diff.extend(
-                bc.mismatches
-                    .iter()
-                    .filter(|mm| {
-                        mm.what
-                            .strip_prefix("entry:")
-                            .is_none_or(|p| !own.contains(p))
-                    })
-                    .cloned(),
-            );
-        }
-        Timers::add(&self.timers.rehash, t);
+        let m: &InputManifest = &m;
         let (env_diff, file_diff): (Vec<_>, Vec<_>) =
             diff.into_iter().partition(|m| m.what.starts_with("env:"));
         // An attestation made before 2.0.2 recorded reads of built-in ignore
@@ -3504,14 +4410,15 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
 /// `policy.go_allow_net`) must match it, or for Cargo's
 /// `cargo:undeclared-reads` the unit must still declare `[[inputs]]`. One
 /// recorded under the removed `policy.rails_allow_db` never is.
-fn not_waived(
+fn not_waived<S: AsRef<str>>(
     policy: &crate::config::Policy,
     adapter: &str,
     declared: &[String],
-    waived: &[String],
+    waived: &[S],
 ) -> Vec<Detail> {
     let mut out = Vec::new();
     for w in waived {
+        let w = w.as_ref();
         let key = crate::run::taint_key(w);
         let why = if w.starts_with(LEGACY_RAILS_NETWORK_DB_WAIVER) {
             // Written by vci before 1.4.0 under policy.rails_allow_db (and by
@@ -3539,7 +4446,7 @@ fn not_waived(
         };
         out.push(Detail {
             what: format!("waived taint {key}"),
-            expected: w.clone(),
+            expected: w.to_owned(),
             actual: why,
         });
     }
@@ -4460,6 +5367,176 @@ adapter = "pytest"
             ]
         );
         assert_eq!(read(None, &mut current), 0);
+    }
+
+    /// The signer id the plan compares the key's signer segment with is
+    /// derived from the SSHSIG verification's `SHA256:` fingerprint, and is
+    /// `keys::signer_id` of the same key blob (both are SHA-256 of it).
+    #[test]
+    fn signer_id_follows_from_the_fingerprint() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let blob = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00 0123456789abcdef0123456789abcdef";
+        let digest = sha2::Sha256::digest(blob);
+        let fp = format!(
+            "SHA256:{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
+        );
+        assert_eq!(
+            signer_id_of_fingerprint(&fp).as_deref(),
+            Some(crate::keys::signer_id(blob).as_str())
+        );
+        assert_eq!(signer_id_of_fingerprint("MD5:aa:bb"), None);
+        assert_eq!(signer_id_of_fingerprint("SHA256:AAAA"), None);
+        assert_eq!(signer_id_of_fingerprint("oidc repo:a/b"), None);
+    }
+
+    /// An object is kept only under the id its bytes hash to, decoded by
+    /// the kind byte inside them (a candidate expecting another kind fails),
+    /// counted against the verdict-object cap unless it is a state object,
+    /// and asked of the store once a candidate names it (a store without
+    /// objects answers with its error).
+    #[test]
+    fn objects_are_checked_by_id_kind_and_cap() {
+        use std::sync::atomic::Ordering;
+        let loader = ObjectLoader::default();
+        let timers = Timers::default();
+        let store = crate::store::mem::MemStore::new();
+        let tables = Tables {
+            waivers: vec!["rails:net".into()],
+            env_names: vec![],
+            externals: vec![],
+        };
+        let bytes = tables.encode().unwrap();
+        let id = hex32(&object_id(&bytes));
+        loader.insert(ObjectKind::Tables, &id, &bytes);
+        assert_eq!(
+            loader.tables(&store, &timers, &id).unwrap().waivers,
+            tables.waivers
+        );
+        let e = loader.hdr(&store, &timers, &id).unwrap_err();
+        assert!(e.what.contains("is of another kind"), "{e:?}");
+        assert_eq!(e.actual, "a tables object");
+        // Under a wrong id: corrupt, whatever the bytes.
+        let wrong = hex32(&[7; 32]);
+        loader.insert(ObjectKind::Tables, &wrong, &bytes);
+        let e = loader.tables(&store, &timers, &wrong).unwrap_err();
+        assert!(
+            e.what.contains("corrupt") && e.actual.contains(&id),
+            "{e:?}"
+        );
+        // Bytes that do not decode under their own id: malformed.
+        let junk = b"vo\x02\x01junk";
+        let jid = hex32(&object_id(junk));
+        loader.insert(ObjectKind::Tables, &jid, junk);
+        let e = loader.tables(&store, &timers, &jid).unwrap_err();
+        assert!(e.what.contains("malformed"), "{e:?}");
+        // An id no round named: asked of the store now, which keeps none.
+        let missing = hex32(&[9; 32]);
+        let e = loader.tables(&store, &timers, &missing).unwrap_err();
+        assert!(e.what.contains("cannot be read from the store"), "{e:?}");
+        assert!(e.actual.contains("format-3 objects"), "{e:?}");
+        let e = loader.tables(&store, &timers, "nope").unwrap_err();
+        assert!(e.actual.contains("64 lowercase hex"), "{e:?}");
+        // The cap: a verdict object past it is not kept, and the candidate
+        // naming it is counted; a state object is outside the cap.
+        let sb = Shape::default().encode().unwrap();
+        let sid = hex32(&object_id(&sb));
+        loader.lock().verdict_bytes = VERDICT_OBJECT_BYTES - sb.len() + 1;
+        loader.insert(ObjectKind::Shape, &sid, &sb);
+        let e = loader.shape(&store, &timers, &sid).unwrap_err();
+        assert!(e.past_cap && e.what.contains("not loaded"), "{e:?}");
+        assert_eq!(loader.past_cap.load(Ordering::Relaxed), 1);
+        let stb = State::default().encode().unwrap();
+        let stid = hex32(&object_id(&stb));
+        loader.insert(ObjectKind::State, &stid, &stb);
+        assert!(matches!(
+            loader.lock().by_id.get(&stid),
+            Some(Ok(Object::State(_)))
+        ));
+        assert_eq!(loader.lock().loaded, [0, 1, 0, 1]);
+        // An unavailable object is replaced by a later load; a loaded one
+        // stays.
+        loader.lock().verdict_bytes = 0;
+        loader.insert(ObjectKind::Shape, &sid, &sb);
+        assert!(loader.shape(&store, &timers, &sid).is_ok());
+        loader.insert(ObjectKind::Shape, &sid, b"vo\x03\x01junk");
+        assert!(loader.shape(&store, &timers, &sid).is_ok());
+        assert_eq!(loader.lock().verdict_bytes, sb.len());
+    }
+
+    /// The `entry:` text of a format-3 candidate whose observed root is not
+    /// the signed one: from the run's state object, each entry whose
+    /// attested value (any of them, when the run saw several) is not the
+    /// observed one, labelled unsigned; without it, the entries whose kind
+    /// or exec bit changed, else one line saying the entries changed; a
+    /// state object that does not list a path says so. Never empty.
+    #[test]
+    fn entry_text_from_the_state_object_or_without_it() {
+        let path = |p: &str| RepoPath::new(p).unwrap();
+        let file = |p: &str, hash: &str| InputEntry {
+            path: path(p),
+            kind: EntryKind::File,
+            exec: false,
+            size: 3,
+            hash: hash.into(),
+        };
+        let set: Vec<ShapeEntry> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|p| ShapeEntry {
+                path: path(p),
+                kind: EntryKind::File,
+                exec: false,
+            })
+            .collect();
+        let observed = InputManifest {
+            entries: vec![file("a.txt", "aa"), file("b.txt", "bb")],
+            externals: vec![],
+            env: vec![],
+        };
+        let state = State {
+            entries: vec![
+                file("a.txt", "aa"),
+                file("b.txt", "b0"),
+                file("b.txt", "b1"),
+            ],
+        };
+        let got = entry_mismatches(&set, &observed, Some(&state), "root");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].what, "entry:b.txt");
+        assert_eq!(
+            got[0].expected,
+            format!(
+                "file exec=false size=3 blake3=b0 or file exec=false size=3 blake3=b1 ({UNSIGNED_LABEL})"
+            )
+        );
+        assert_eq!(got[0].actual, "file exec=false size=3 blake3=bb");
+        let got = entry_mismatches(&set, &observed, None, "root");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].what, "entry: changed (attested hash not loaded)");
+        assert_eq!(got[0].expected, "input root root");
+        assert!(
+            got[0]
+                .actual
+                .starts_with(&format!("input root {}", observed.root()))
+        );
+        let mut gone = observed.clone();
+        gone.entries[1] = InputEntry::absent(path("b.txt"));
+        let got = entry_mismatches(&set, &gone, None, "root");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].what, "entry:b.txt");
+        assert_eq!(
+            got[0].expected,
+            "file exec=false changed (attested hash not loaded)"
+        );
+        assert_eq!(got[0].actual, "absent");
+        let got = entry_mismatches(&set, &gone, Some(&State::default()), "root");
+        assert_eq!(got.len(), 2);
+        assert!(
+            got[0].expected.contains("does not list the path"),
+            "{got:?}"
+        );
+        assert!(got.iter().all(|m| m.what.starts_with("entry:")));
     }
 
     /// Candidates are checked newest first since 2.1, but the reason still
