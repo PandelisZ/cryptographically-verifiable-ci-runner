@@ -171,6 +171,11 @@ resolves it through the store.
 
 ### Format-3 records, their columns and objects (vci 2.9, STORE-V2)
 
+The design this section implements, with every decision the reviews changed and the scripts behind its numbers, is
+[docs/design/STORE-V2.md](design/STORE-V2.md) (cited below as STORE-V2), its decisions
+[docs/design/STORE-V2-DECISIONS.md](design/STORE-V2-DECISIONS.md), and the measurement scripts and their outputs
+[docs/design/measure/](design/measure/).
+
 From vci 2.9 an attestation's value may be a **text frame** instead of an envelope JSON, under the same key, target
 and slot:
 
@@ -319,7 +324,7 @@ root as the observer finds them at HEAD, never as the shape labels them.
 
 The replay check (`crates/vci-cli/tests/replay.rs`, with `VCI_PAIRS` naming the 1,175 real vex units of 28 October
 2026: 9 runs, 18 header groups, 1,158 Rails, 12 node and 5 cargo units; its figures as it writes them to
-`replay-numbers.json`) builds every unit's format-3 record and its run's objects from the sample's envelopes and
+[`docs/design/measure/replay-numbers.json`](design/measure/replay-numbers.json)) builds every unit's format-3 record and its run's objects from the sample's envelopes and
 manifests, and checks what the design claims: for all 1,175 units the descriptor resolves to the manifest's set,
 externals and env, `entriesRoot` is reproduced, and every v1 accessor of the resolved view answers what the v1
 predicate did (1,175 of 1,175 each); the 47 object ids are recomputed; the signed subject digest is reproduced for the
@@ -345,10 +350,14 @@ estimates from that model and from vex's production logs, not measurements of th
 2.18 MB at rest and 2.43 MB on the libSQL wire in three transactions of at most 1 MiB (13.5x), a plan's reads of
 5.1-5.9 MB against 81-87 MB at vex's spread of 45-59 runs behind the live candidates (15x), 201 MB a day written at
 vex against 2.79 GB (13.9x), and the git-meta push of 1.2 MB against 2.8 MB for 800 units (2.4x, 18% fewer objects:
-from a real-git experiment on the sample's two largest runs). What the code has been measured at: one 800-unit
-partition against a local `sqld` (section 18, "Measured": 4 objects of 329,446 B and 800 records of 1,417,069 B,
-written in 2 transactions and 0.18 s; the superseding run in 2 transactions and 0.20 s). **No format-3 write or plan
-has been measured against Turso's hosted service yet**; the transaction sizing of 1 MiB and the 1.8-3.7 s of lock per
+from a real-git experiment on the sample's two largest runs). What the code has been measured at, all against a
+local `sqld` on loopback (section 18, "Measured"; STORE-V2 section 10): one 800-unit partition in the test suite (4
+objects of 329,446 B and 800 records of 1,417,069 B, written in 2 transactions and 0.18 s; the superseding run in 2
+transactions and 0.20 s); 800 real Rails units written as a run writes them, **2 transactions and 2.59 MB of SQL
+against 33 transactions and 30.24 MB for format 1 (11.7x), 2.46 MB at rest against 28.86 MB (11.7x)**; and a vex-api
+plan of 1,156 candidates reading **2.9 MB against 43 MB (15x)**, 4.79 s median wall against 2.8.1's 4.29 s on the same
+loopback store, where the 43 MB cost 0.15 s. **No format-3 write or plan has been measured against Turso's hosted
+service yet**; the transaction sizing of 1 MiB and the 1.8-3.7 s of lock per
 transaction come from 2.8.2's measurements with JSON values of the same byte count (section 18), and are to be
 re-run with real frames and base64 objects before the first production rollout.
 
@@ -3635,8 +3644,33 @@ same 1,869,145 B of literals, 3,029,929 B of SQL, 2 requests, 0.20 s. Against th
 2.43 MB on the wire in 3 transactions of at most 1 MiB, with 1.2 N removals): the literals are 1.87 MB, the SQL around
 them 0.7 MB for the puts and 0.45 MB for 800 removals, and the two transactions are 0.93 and 0.94 MB. With the
 manifest-collection statements (now skipped where the namespace holds no manifest) the second run was 4,152,653 B
-of SQL: their four repetitions of 800 keys and 800 slots cost 1.1 MB. These are the only format-3 measurements of
-the store so far, and they are of a local `sqld` on a laptop: the lock times per transaction (1.8-3.7 s for 1 MiB),
+of SQL: their four repetitions of 800 keys and 800 slots cost 1.1 MB. **sqld, at vex scale** (STORE-V2 section 10; scripts, `results.json` and write-ups in
+[docs/design/measure/sqld/](design/measure/sqld/); 29 October 2026, `sqld` 0.24.32 on 127.0.0.1, 14-CPU Mac,
+release builds). *Writes*, one writer, 800 real Rails units, medians of 3 clean repetitions: format 3 is **2
+transactions of at most 1 MiB in 1 flush** (longest 0.09 s), **2.59 MB of SQL** (1.87 MB of literals; 2.68 MB on
+TCP), store write 0.15 s, process wall 0.60 s, 0 units lost, **2.46 MB and 806 rows at rest** (800 attestation rows of
+2.02 MB, 2,529 B a row around a 1,774 B record; 4 objects of 0.44 MB as base64: hdr 5,988, tables 24,900, shape
+122,304, state 286,076 B; 2 log rows). STORE-V2 section 3 said 2.43 MB on the wire (+6.6% measured), 2-3
+transactions, 2.18 MB and 804 rows at rest (+13%: the objects as base64, the keys and the columns), a 1,783 B record.
+Format 1 through the same store (`VCI_STORE_RECORD_FORMAT=1`): 33 transactions in 7 flushes, 30.24 MB of SQL (28.18
+MB of literals; 31.21 MB on TCP), 0.86 s, 1.23 s of wall, 0 lost, 28.86 MB and 3,233 rows at rest (800 envelopes of
+21,774 B, 800 manifests of 13,419 B, 1,633 log rows); 2.8.1's store (2.8.1 plus the turso-reads 1 MiB transactions,
+not the released binary): 33 transactions in 7 flushes, 31.03 MB on TCP, 0.69 s, 28.82 MB and 3,233 rows. Today
+against format 3: **11.7x on the wire, 11.7x at rest, 16x the transactions** (the design's 13.5x counts the 9 base
+manifests a run writes, which the replays did not). Three format-3 writers at once stored every unit in 4 of 4
+attempts; three format-1 writers have no clean local number, since `sqld` 0.24.32's write lock stalled for good in 25
+of 25 attempts (section 21, item 17). *Plans*, vex-api, 1,156 candidates, medians of 7 runs: store-v2 on format 3
+4.79 s of wall (3.1-11.4), 0.07 s fetching values, 1.61 s loading the verdict objects (a serial decode of every
+candidate's frame the design did not count), 0.84 s of verdicts, 14 requests, **2.9 MB read**, 1,156 skips, 192 MB
+of RSS; store-v2 on format 1 5.27 s, 43.3 MB, 283 MB; vci 2.8.1 on format 1 4.29 s, 4 requests of ~43 MB, 280 MB;
+vci 2.8.1 on format 3 fails open in 1.25 s, every candidate `envelope: envelope JSON`. Production's plan 1 on Turso
+(2.8.1, 164 jobs of 27 October) took 13.12 s median. The caveats: on loopback the times are the store's own cost
+without the link or Turso's lock waits (transactions, bytes and rows carry over, times do not); the write side's
+records are built by `crates/vci-store-libsql/examples/replay3.rs`, not by `vci run`; the plan side has one candidate
+per unit and a checkout re-observed so that every candidate skips.
+
+These and the paragraph above are the only format-3 measurements of the store so far, and they are of a local `sqld`
+on a laptop: the lock times per transaction (1.8-3.7 s for 1 MiB),
 the number of requests a plan makes and the plan's reads against Turso's hosted service are the design's estimates
 from 2.8.2's measurements of JSON values and from vex's production logs (section 2, "Measured (format 3)"), to be
 measured on Turso before the first production rollout.

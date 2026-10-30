@@ -697,7 +697,7 @@ mod tests {
     /// The same over the real units of `VCI_PAIRS` (the 1,175-unit sample
     /// STORE-V2 was measured on; skipped without it), and how many of
     /// their keys move from 2.8.1's because the waived list enters sorted
-    /// and distinct: DECISIONS.md says 1,163 of 1,175 (their slots are
+    /// and distinct: STORE-V2-DECISIONS.md says 1,163 of 1,175 (their slots are
     /// re-created once; the old rows expire).
     #[test]
     fn storage_key_over_the_real_sample_matches_both_views_and_counts_the_moved_slots() {

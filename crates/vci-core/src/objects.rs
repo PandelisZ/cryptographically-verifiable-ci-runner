@@ -1,4 +1,4 @@
-//! Store format 3 (`design/STORE-V2.md`, "store format 3, predicate v2"):
+//! Store format 3 (`docs/design/STORE-V2.md`, "store format 3, predicate v2"):
 //! the per-run objects a unit's record points at and the descriptor inside
 //! the record that indexes them.
 //!

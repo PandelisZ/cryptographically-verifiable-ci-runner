@@ -1,4 +1,4 @@
-//! Adversarial inputs for the store format 3 decoders (`design/STORE-V2.md`
+//! Adversarial inputs for the store format 3 decoders (`docs/design/STORE-V2.md`
 //! section 1.6 and section 4): the record frame, every object kind, the
 //! descriptor, the context and the v2 statement's own fields are fed malformed, oversized,
 //! duplicated, conflicting, out-of-range, non-minimal, non-canonical,

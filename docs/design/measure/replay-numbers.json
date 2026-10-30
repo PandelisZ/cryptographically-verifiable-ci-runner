@@ -1,0 +1,1329 @@
+{
+  "checks": {
+    "baseless_units": 3,
+    "entries_root_recomputed": 1175,
+    "object_ids_recomputed": 47,
+    "own_entries_root_recomputed": 1175,
+    "resolved_set_externals_env_equal_manifest": 1175,
+    "root_is_subject_digest": 3,
+    "state_conflicts": 0,
+    "subject_digest_is_file_root": 1175,
+    "v1_accessor_parity": 1175
+  },
+  "comparison": [
+    {
+      "delta_pct": -0.0,
+      "figure": "v2.statement.mean",
+      "flag": false,
+      "model": 1100.3,
+      "replay": 1100.2
+    },
+    {
+      "delta_pct": -0.1,
+      "figure": "v2.statement.p50",
+      "flag": false,
+      "model": 1100.0,
+      "replay": 1099.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.statement.p90",
+      "flag": false,
+      "model": 1142.0,
+      "replay": 1142.0
+    },
+    {
+      "delta_pct": -0.6,
+      "figure": "v2.statement.max",
+      "flag": false,
+      "model": 1601.0,
+      "replay": 1591.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "v2.statement.sum",
+      "flag": false,
+      "model": 1292873.0,
+      "replay": 1292679.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.sig_frame.mean",
+      "flag": false,
+      "model": 234.0,
+      "replay": 234.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.sig_frame.p50",
+      "flag": false,
+      "model": 234.0,
+      "replay": 234.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.sig_frame.p90",
+      "flag": false,
+      "model": 234.0,
+      "replay": 234.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.sig_frame.max",
+      "flag": false,
+      "model": 234.0,
+      "replay": 234.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.sig_frame.sum",
+      "flag": false,
+      "model": 274950.0,
+      "replay": 274950.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "v2.descriptor.mean",
+      "flag": false,
+      "model": 271.5,
+      "replay": 271.4
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.descriptor.p50",
+      "flag": false,
+      "model": 247.0,
+      "replay": 247.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.descriptor.p90",
+      "flag": false,
+      "model": 361.0,
+      "replay": 361.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.descriptor.max",
+      "flag": false,
+      "model": 957.0,
+      "replay": 957.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "v2.descriptor.sum",
+      "flag": false,
+      "model": 319070.0,
+      "replay": 318919.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "v2.record.mean",
+      "flag": false,
+      "model": 1782.7,
+      "replay": 1782.4
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.record.p50",
+      "flag": false,
+      "model": 1760.0,
+      "replay": 1760.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.record.p90",
+      "flag": false,
+      "model": 1917.0,
+      "replay": 1917.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.record.max",
+      "flag": false,
+      "model": 2707.0,
+      "replay": 2707.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "v2.record.sum",
+      "flag": false,
+      "model": 2094702.0,
+      "replay": 2094292.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.own_entries.mean",
+      "flag": false,
+      "model": 56.5,
+      "replay": 56.5
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.own_entries.p50",
+      "flag": false,
+      "model": 29.0,
+      "replay": 29.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.own_entries.p90",
+      "flag": false,
+      "model": 137.0,
+      "replay": 137.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.own_entries.max",
+      "flag": false,
+      "model": 762.0,
+      "replay": 762.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.own_entries.sum",
+      "flag": false,
+      "model": 66333.0,
+      "replay": 66333.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "v2.record_by_adapter.rails.mean",
+      "flag": false,
+      "model": 1780.3,
+      "replay": 1780.2
+    },
+    {
+      "delta_pct": -0.4,
+      "figure": "v2.record_by_adapter.cargo.mean",
+      "flag": false,
+      "model": 2254.6,
+      "replay": 2244.6
+    },
+    {
+      "delta_pct": -0.7,
+      "figure": "v2.record_by_adapter.node-test.mean",
+      "flag": false,
+      "model": 1816.2,
+      "replay": 1804.2
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.hdr.distinct_in_sample",
+      "flag": false,
+      "model": 11.0,
+      "replay": 11.0
+    },
+    {
+      "delta_pct": 2.2,
+      "figure": "v2.hdr.bytes.sum",
+      "flag": false,
+      "model": 13011.0,
+      "replay": 13296.0
+    },
+    {
+      "delta_pct": -0.1,
+      "figure": "v2.hdr.bytes.max",
+      "flag": false,
+      "model": 4494.0,
+      "replay": 4489.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.tables.count",
+      "flag": false,
+      "model": 10.0,
+      "replay": 10.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.tables.bytes.sum",
+      "flag": false,
+      "model": 261948.0,
+      "replay": 261948.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.shape.bytes_sum",
+      "flag": false,
+      "model": 173175.0,
+      "replay": 173195.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "v2.state.bytes_sum",
+      "flag": false,
+      "model": 393597.0,
+      "replay": 393597.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "today.total",
+      "flag": false,
+      "model": 42676097.0,
+      "replay": 42676097.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "at_rest.records",
+      "flag": false,
+      "model": 2094702.0,
+      "replay": 2094292.0
+    },
+    {
+      "delta_pct": 2.2,
+      "figure": "at_rest.hdr",
+      "flag": false,
+      "model": 13011.0,
+      "replay": 13296.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "at_rest.tables",
+      "flag": false,
+      "model": 261948.0,
+      "replay": 261948.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "at_rest.shape",
+      "flag": false,
+      "model": 173175.0,
+      "replay": 173195.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "at_rest.state",
+      "flag": false,
+      "model": 393597.0,
+      "replay": 393597.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "at_rest.total (model less groups_est)",
+      "flag": false,
+      "model": 2936433.0,
+      "replay": 2936328.0
+    },
+    {
+      "delta_pct": -19.6,
+      "figure": "at_rest.total (model with groups_est)",
+      "flag": true,
+      "model": 3651600.0,
+      "replay": 2936328.0
+    },
+    {
+      "delta_pct": -0.0,
+      "figure": "at_rest.total_without_state (model less groups_est)",
+      "flag": false,
+      "model": 2542836.0,
+      "replay": 2542731.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "at_rest.ratio_vs_today (model less groups_est)",
+      "flag": false,
+      "model": 14.5,
+      "replay": 14.5
+    },
+    {
+      "delta_pct": 23.9,
+      "figure": "at_rest.ratio_vs_today (model with groups_est)",
+      "flag": true,
+      "model": 11.7,
+      "replay": 14.5
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): units",
+      "flag": false,
+      "model": 973.0,
+      "replay": 973.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): hdr_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": -0.1,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): hdr_bytes sum",
+      "flag": false,
+      "model": 4494.0,
+      "replay": 4489.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): tables_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): tables_bytes sum",
+      "flag": false,
+      "model": 19387.0,
+      "replay": 19387.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): shape_bytes",
+      "flag": false,
+      "model": 123264.0,
+      "replay": 123265.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): shape_entries",
+      "flag": false,
+      "model": 6639.0,
+      "replay": 6639.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): state_bytes",
+      "flag": false,
+      "model": 285128.0,
+      "replay": 285128.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): state_entries",
+      "flag": false,
+      "model": 6639.0,
+      "replay": 6639.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-api 2026-10-28T04:11:29Z (973 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): units",
+      "flag": false,
+      "model": 185.0,
+      "replay": 185.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): hdr_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": -0.1,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): hdr_bytes sum",
+      "flag": false,
+      "model": 4494.0,
+      "replay": 4489.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): tables_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): tables_bytes sum",
+      "flag": false,
+      "model": 9313.0,
+      "replay": 9313.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): shape_bytes",
+      "flag": false,
+      "model": 24662.0,
+      "replay": 24674.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): shape_entries",
+      "flag": false,
+      "model": 1076.0,
+      "replay": 1076.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): state_bytes",
+      "flag": false,
+      "model": 60758.0,
+      "replay": 60758.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): state_entries",
+      "flag": false,
+      "model": 1076.0,
+      "replay": 1076.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 90ce3d34 vex-api 2026-10-28T04:06:21Z (185 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): units",
+      "flag": false,
+      "model": 5.0,
+      "replay": 5.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): hdr_count",
+      "flag": false,
+      "model": 5.0,
+      "replay": 5.0
+    },
+    {
+      "delta_pct": 6.8,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): hdr_bytes sum",
+      "flag": false,
+      "model": 3009.0,
+      "replay": 3213.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): tables_count",
+      "flag": false,
+      "model": 5.0,
+      "replay": 5.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): tables_bytes sum",
+      "flag": false,
+      "model": 1419.0,
+      "replay": 1419.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): shape_bytes",
+      "flag": false,
+      "model": 3911.0,
+      "replay": 3912.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): shape_entries",
+      "flag": false,
+      "model": 610.0,
+      "replay": 610.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): state_bytes",
+      "flag": false,
+      "model": 5182.0,
+      "replay": 5182.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): state_entries",
+      "flag": false,
+      "model": 610.0,
+      "replay": 610.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run f3c0a5cc vex-web 2026-10-28T04:09:10Z (5 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): units",
+      "flag": false,
+      "model": 5.0,
+      "replay": 5.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): hdr_count",
+      "flag": false,
+      "model": 5.0,
+      "replay": 5.0
+    },
+    {
+      "delta_pct": 6.8,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): hdr_bytes sum",
+      "flag": false,
+      "model": 3009.0,
+      "replay": 3213.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): tables_count",
+      "flag": false,
+      "model": 5.0,
+      "replay": 5.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): tables_bytes sum",
+      "flag": false,
+      "model": 1419.0,
+      "replay": 1419.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): shape_bytes",
+      "flag": false,
+      "model": 3911.0,
+      "replay": 3912.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): shape_entries",
+      "flag": false,
+      "model": 610.0,
+      "replay": 610.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): state_bytes",
+      "flag": false,
+      "model": 5182.0,
+      "replay": 5182.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): state_entries",
+      "flag": false,
+      "model": 610.0,
+      "replay": 610.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run b50b9ac1 vex-web 2026-10-28T04:10:29Z (5 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): units",
+      "flag": false,
+      "model": 3.0,
+      "replay": 3.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): hdr_count",
+      "flag": false,
+      "model": 2.0,
+      "replay": 2.0
+    },
+    {
+      "delta_pct": -0.4,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): hdr_bytes sum",
+      "flag": false,
+      "model": 1939.0,
+      "replay": 1931.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): tables_count",
+      "flag": false,
+      "model": 2.0,
+      "replay": 2.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): tables_bytes sum",
+      "flag": false,
+      "model": 88513.0,
+      "replay": 88513.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): shape_bytes",
+      "flag": false,
+      "model": 3483.0,
+      "replay": 3484.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): shape_entries",
+      "flag": false,
+      "model": 224.0,
+      "replay": 224.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): state_bytes",
+      "flag": false,
+      "model": 11124.0,
+      "replay": 11124.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): state_entries",
+      "flag": false,
+      "model": 224.0,
+      "replay": 224.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:06:52Z (3 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): units",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): hdr_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": -0.4,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): hdr_bytes sum",
+      "flag": false,
+      "model": 1098.0,
+      "replay": 1094.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): tables_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): tables_bytes sum",
+      "flag": false,
+      "model": 74319.0,
+      "replay": 74319.0
+    },
+    {
+      "delta_pct": 20.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): shape_bytes",
+      "flag": true,
+      "model": 5.0,
+      "replay": 6.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): shape_entries",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): state_bytes",
+      "flag": false,
+      "model": 5.0,
+      "replay": 5.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): state_entries",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba vex-roder 2026-10-28T04:07:12Z (1 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): units",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): hdr_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 6.8,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): hdr_bytes sum",
+      "flag": false,
+      "model": 754.0,
+      "replay": 805.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): tables_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): tables_bytes sum",
+      "flag": false,
+      "model": 365.0,
+      "replay": 365.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): shape_bytes",
+      "flag": false,
+      "model": 4920.0,
+      "replay": 4921.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): shape_entries",
+      "flag": false,
+      "model": 762.0,
+      "replay": 762.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): state_bytes",
+      "flag": false,
+      "model": 6376.0,
+      "replay": 6376.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): state_entries",
+      "flag": false,
+      "model": 762.0,
+      "replay": 762.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 14d59b4a vex-web 2026-10-28T04:13:42Z (1 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): units",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): hdr_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 6.8,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): hdr_bytes sum",
+      "flag": false,
+      "model": 754.0,
+      "replay": 805.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): tables_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): tables_bytes sum",
+      "flag": false,
+      "model": 365.0,
+      "replay": 365.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): shape_bytes",
+      "flag": false,
+      "model": 4920.0,
+      "replay": 4921.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): shape_entries",
+      "flag": false,
+      "model": 762.0,
+      "replay": 762.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): state_bytes",
+      "flag": false,
+      "model": 6376.0,
+      "replay": 6376.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): state_entries",
+      "flag": false,
+      "model": 762.0,
+      "replay": 762.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 2cb18b86 vex-web 2026-10-28T04:11:05Z (1 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): units",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): hdr_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": -0.4,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): hdr_bytes sum",
+      "flag": false,
+      "model": 955.0,
+      "replay": 951.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): tables_count",
+      "flag": false,
+      "model": 1.0,
+      "replay": 1.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): tables_bytes sum",
+      "flag": false,
+      "model": 69000.0,
+      "replay": 69000.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): shape_bytes",
+      "flag": false,
+      "model": 4099.0,
+      "replay": 4100.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): shape_entries",
+      "flag": false,
+      "model": 275.0,
+      "replay": 275.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): state_bytes",
+      "flag": false,
+      "model": 13466.0,
+      "replay": 13466.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): state_entries",
+      "flag": false,
+      "model": 275.0,
+      "replay": 275.0
+    },
+    {
+      "delta_pct": 0.0,
+      "figure": "run 3603e2ba rust 2026-10-28T04:07:12Z (1 units): conflicts",
+      "flag": false,
+      "model": 0.0,
+      "replay": 0.0
+    }
+  ],
+  "model": "docs/design/measure/numbers.json",
+  "runs": [
+    {
+      "adapter": "rails",
+      "commit": "2cb18b86",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        4489
+      ],
+      "hdr_count": 1,
+      "issued": "2026-10-28T04:11:29Z",
+      "project": "vex-api",
+      "root_is_subject_units": 1,
+      "shape_bytes": 123265,
+      "shape_entries": 6639,
+      "state_bytes": 285128,
+      "state_entries": 6639,
+      "tables_bytes": [
+        19387
+      ],
+      "tables_count": 1,
+      "units": 973
+    },
+    {
+      "adapter": "rails",
+      "commit": "90ce3d34",
+      "conflicts": 0,
+      "group_entries": 7,
+      "groups": 1,
+      "hdr_bytes": [
+        4489
+      ],
+      "hdr_count": 1,
+      "issued": "2026-10-28T04:06:21Z",
+      "project": "vex-api",
+      "root_is_subject_units": 0,
+      "shape_bytes": 24674,
+      "shape_entries": 1076,
+      "state_bytes": 60758,
+      "state_entries": 1076,
+      "tables_bytes": [
+        9313
+      ],
+      "tables_count": 1,
+      "units": 185
+    },
+    {
+      "adapter": "node-test",
+      "commit": "b50b9ac1",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        796,
+        799,
+        805,
+        813
+      ],
+      "hdr_count": 5,
+      "issued": "2026-10-28T04:10:29Z",
+      "project": "vex-web",
+      "root_is_subject_units": 0,
+      "shape_bytes": 3912,
+      "shape_entries": 610,
+      "state_bytes": 5182,
+      "state_entries": 610,
+      "tables_bytes": [
+        184,
+        661,
+        206,
+        184,
+        184
+      ],
+      "tables_count": 5,
+      "units": 5
+    },
+    {
+      "adapter": "node-test",
+      "commit": "f3c0a5cc",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        796,
+        799,
+        805,
+        813
+      ],
+      "hdr_count": 5,
+      "issued": "2026-10-28T04:09:10Z",
+      "project": "vex-web",
+      "root_is_subject_units": 0,
+      "shape_bytes": 3912,
+      "shape_entries": 610,
+      "state_bytes": 5182,
+      "state_entries": 610,
+      "tables_bytes": [
+        184,
+        661,
+        206,
+        184,
+        184
+      ],
+      "tables_count": 5,
+      "units": 5
+    },
+    {
+      "adapter": "cargo",
+      "commit": "3603e2ba",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        951,
+        980
+      ],
+      "hdr_count": 2,
+      "issued": "2026-10-28T04:06:52Z",
+      "project": "rust",
+      "root_is_subject_units": 0,
+      "shape_bytes": 3484,
+      "shape_entries": 224,
+      "state_bytes": 11124,
+      "state_entries": 224,
+      "tables_bytes": [
+        66586,
+        21927
+      ],
+      "tables_count": 2,
+      "units": 3
+    },
+    {
+      "adapter": "node-test",
+      "commit": "14d59b4a",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        805
+      ],
+      "hdr_count": 1,
+      "issued": "2026-10-28T04:13:42Z",
+      "project": "vex-web",
+      "root_is_subject_units": 1,
+      "shape_bytes": 4921,
+      "shape_entries": 762,
+      "state_bytes": 6376,
+      "state_entries": 762,
+      "tables_bytes": [
+        365
+      ],
+      "tables_count": 1,
+      "units": 1
+    },
+    {
+      "adapter": "node-test",
+      "commit": "2cb18b86",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        805
+      ],
+      "hdr_count": 1,
+      "issued": "2026-10-28T04:11:05Z",
+      "project": "vex-web",
+      "root_is_subject_units": 1,
+      "shape_bytes": 4921,
+      "shape_entries": 762,
+      "state_bytes": 6376,
+      "state_entries": 762,
+      "tables_bytes": [
+        365
+      ],
+      "tables_count": 1,
+      "units": 1
+    },
+    {
+      "adapter": "cargo",
+      "commit": "3603e2ba",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        951
+      ],
+      "hdr_count": 1,
+      "issued": "2026-10-28T04:07:12Z",
+      "project": "rust",
+      "root_is_subject_units": 0,
+      "shape_bytes": 4100,
+      "shape_entries": 275,
+      "state_bytes": 13466,
+      "state_entries": 275,
+      "tables_bytes": [
+        69000
+      ],
+      "tables_count": 1,
+      "units": 1
+    },
+    {
+      "adapter": "cargo",
+      "commit": "3603e2ba",
+      "conflicts": 0,
+      "group_entries": 0,
+      "groups": 0,
+      "hdr_bytes": [
+        1094
+      ],
+      "hdr_count": 1,
+      "issued": "2026-10-28T04:07:12Z",
+      "project": "vex-roder",
+      "root_is_subject_units": 0,
+      "shape_bytes": 6,
+      "shape_entries": 0,
+      "state_bytes": 5,
+      "state_entries": 0,
+      "tables_bytes": [
+        74319
+      ],
+      "tables_count": 1,
+      "units": 1
+    }
+  ],
+  "signatures": "not verified: the statement bytes changed (v2) and the keys are not here; each record carries its unit's real SSHSIG blob",
+  "today": {
+    "envelope": {
+      "max": 24574,
+      "mean": 21166.3,
+      "n": 1175,
+      "p50": 21742,
+      "p90": 21822,
+      "sum": 24870450
+    },
+    "manifest": {
+      "max": 98539,
+      "mean": 15153.7,
+      "n": 1175,
+      "p50": 11372,
+      "p90": 25264,
+      "sum": 17805647
+    },
+    "per_unit": 36320,
+    "total": 42676097
+  },
+  "units": 1175,
+  "v2": {
+    "at_rest": {
+      "hdr": 13296,
+      "per_unit": 2499,
+      "per_unit_without_state": 2164,
+      "ratio_vs_today": 14.5,
+      "ratio_vs_today_without_state": 16.8,
+      "records": 2094292,
+      "shape": 173195,
+      "state": 393597,
+      "tables": 261948,
+      "total": 2936328,
+      "total_without_state": 2542731
+    },
+    "descriptor": {
+      "max": 957,
+      "mean": 271.4,
+      "n": 1175,
+      "p50": 247,
+      "p90": 361,
+      "sum": 318919
+    },
+    "hdr": {
+      "bytes": {
+        "max": 4489,
+        "mean": 1208.7,
+        "n": 11,
+        "p50": 813,
+        "p90": 1094,
+        "sum": 13296
+      },
+      "distinct_in_sample": 11
+    },
+    "own_entries": {
+      "max": 762,
+      "mean": 56.5,
+      "n": 1175,
+      "p50": 29,
+      "p90": 137,
+      "sum": 66333
+    },
+    "record": {
+      "max": 2707,
+      "mean": 1782.4,
+      "n": 1175,
+      "p50": 1760,
+      "p90": 1917,
+      "sum": 2094292
+    },
+    "record_by_adapter": {
+      "cargo": {
+        "max": 2690,
+        "mean": 2244.6,
+        "n": 5,
+        "p50": 2428,
+        "p90": 2690,
+        "sum": 11223
+      },
+      "node-test": {
+        "max": 2477,
+        "mean": 1804.2,
+        "n": 12,
+        "p50": 1661,
+        "p90": 2477,
+        "sum": 21650
+      },
+      "rails": {
+        "max": 2707,
+        "mean": 1780.2,
+        "n": 1158,
+        "p50": 1760,
+        "p90": 1913,
+        "sum": 2061419
+      }
+    },
+    "shape": {
+      "bytes_sum": 173195,
+      "entries_sum": 10958,
+      "group_entries": 7,
+      "groups": 1
+    },
+    "sig_frame": {
+      "max": 234,
+      "mean": 234.0,
+      "n": 1175,
+      "p50": 234,
+      "p90": 234,
+      "sum": 274950
+    },
+    "state": {
+      "bytes_sum": 393597,
+      "entries_sum": 10958
+    },
+    "statement": {
+      "max": 1591,
+      "mean": 1100.2,
+      "n": 1175,
+      "p50": 1099,
+      "p90": 1142,
+      "sum": 1292679
+    },
+    "tables": {
+      "bytes": {
+        "max": 74319,
+        "mean": 26194.8,
+        "n": 10,
+        "p50": 19387,
+        "p90": 74319,
+        "sum": 261948
+      },
+      "count": 10,
+      "header_groups": 18
+    }
+  }
+}

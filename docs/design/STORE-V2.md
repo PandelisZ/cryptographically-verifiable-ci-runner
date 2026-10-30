@@ -1,8 +1,10 @@
 # STORE-V2: store format 3, predicate v2
 
-The final design for vci's store, built from the four drafts under `design/design-*/DESIGN.md`, the three
-judges' reviews, and revised after the security review and the performance/operations review of
-`design/CRITIQUE.md` (every change and its reason is in `design/DECISIONS.md`). Base: **design-dedup** (per-unit
+The final design for vci's store, built from four drafts (design-dedup, design-manifest, design-radical,
+design-tree), three judges' reviews, and revised after a security review and a performance/operations review
+(collected as the critique; every change and its reason is in
+[STORE-V2-DECISIONS.md](STORE-V2-DECISIONS.md)). The drafts, the judges' reviews and the critique are not in the
+repository; where this text cites them it says what they found. Base: **design-dedup** (per-unit
 signature over a small statement, per-run context by signed digest, trust model unchanged). Grafted: the
 manifest/radical split of the observation *set* from its *values* (the per-unit record names paths and kinds; file
 hashes move to one per-run object that only `explain` reads), tree's index columns and v1/v2 coexistence flag,
@@ -11,16 +13,19 @@ supersession. Not taken: a per-run (Merkle) signature in the first release, dire
 dependency-set-without-attested-values gate, trained zstd dictionaries, tree seals, git-meta checkpoints. Section 9
 says where each judge's flaw and each critique finding is resolved.
 
-Numbers come from `design/final/measure.py` run on the 1,175 real vex units of `scratchpad/wr/pairs.json`
-(`design/final/numbers.json`, printed as `design/final/measure-output.txt`), on the production logs of 27 October
-2026 (`scratchpad/prodlogs/rails.json`: 164 Rails jobs), on the live listing of vex-api of 27 October 15:20
-(`scratchpad/meas/keys.json`: 3,833 keys) and on the Turso transaction timings of `scratchpad/wr/txsize.json`; the
-git-meta figures from `design/final/gitmeta.py` (a real-git experiment, output `design/final/gitmeta.txt`).
-File:line references are to vci 2.8.1 at `/Users/pz/w/cryptographically-verifiable-ci` unless they name the
-`turso-reads` worktree (2.8.1 plus the libSQL write and read fixes: `crates/vci-store-libsql/src/batch.rs`,
-`conn.rs`). Vocabulary as in `design/understand-code/CONTRACT.md`: unit, candidate, slot `(test key, signer,
-storage key)`, root (`InputManifest::root()`, `manifest.rs:1130`), global manifest, run (one `vci run` of one
-project: one partition; a vex Rails job is one partition, `cmds.rs:49-72`).
+Numbers come from the measurement scripts in [docs/design/measure/](measure/): `measure.py` run on the private
+1,175-unit vex sample (`pairs.json`: the envelope, compact manifest and root of 1,175 real vex units of 28 October
+2026), on the 27 October production logs (`rails.json`: 164 Rails jobs), on a production listing of vex-api of
+27 October 15:20 (`keys.json`: 3,833 keys) and on the Turso transaction timings by size (`txsize.json`), none of
+which is in the repository (vex's data); its output is `measure/numbers.json`, printed as
+`measure/measure-output.txt`. The git-meta figures are from `measure/gitmeta.py` (a real-git experiment, output
+`measure/gitmeta.txt`); the replay check's figures (`crates/vci-cli/tests/replay.rs` over the same sample) are
+`measure/replay-numbers.json`; the local `sqld` measurements of section 10 are under `measure/sqld/`.
+File:line references are to vci 2.8.1 (the `v2.8.1` tag) unless they name the `turso-reads` branch (2.8.1 plus
+the libSQL write and read fixes: `crates/vci-store-libsql/src/batch.rs`, `conn.rs`). Vocabulary as in
+docs/CONTRACTS.md: unit, candidate, slot `(test key, signer, storage key)`, root (`InputManifest::root()`,
+`manifest.rs:1130`), global manifest, run (one `vci run` of one project: one partition; a vex Rails job is one
+partition, `cmds.rs:49-72`).
 
 ## 0. Summary
 
@@ -56,7 +61,7 @@ Measured 1,100 B mean (p50 1,100, max 1,601: a cargo unit with `cfgPredicates`).
 | field | bytes | what it binds |
 |---|---:|---|
 | `subject[0].name` = testId, `subject[0].digest.blake3` = inputRoot | ~160 | the unit and its input set (unchanged: `plan.rs:2523-2534`) |
-| `predicate.hdr` (64 hex) | 72 | the header object: repo id, adapter, project name and dir, runner project, tool version, `envConfigDigest`, `globalInputRoot`, `globalManifest` entries, `ignoredInputs`, `railsInputs`, `envSet`, `toolchain` (gem/dist/cfg lists included). Content-addressed, so every run at the same toolchain and global inputs names the same one (11 distinct across the sample's 9 runs and 18 header groups; one per base tree for Rails) |
+| `predicate.hdr` (64 hex) | 72 | the header object: repo id, adapter, project name and dir, runner project, tool version, `envConfigDigest`, `globalInputRoot`, the whole `globalManifest` (entries, externals, env), `ignoredInputs`, `railsInputs`, `envSet`, `toolchain` (gem/dist/cfg lists included). Content-addressed, so every run at the same toolchain and global inputs names the same one (11 distinct across the sample's 9 runs and 18 header groups; one per base tree for Rails) |
 | `predicate.tables` (64 hex) | 76 | the per-run tables object: the waiver table, the env-name table, the externals table (unions over the units of the run that share the hdr) |
 | `predicate.testId`, `predicate.argv` | ~165 | no replay across units or argv (`plan.rs:2588-2631`; argv kept inline because the plan compares it and it is 100 B) |
 | `predicate.commit`, `tree`, `treeDirty` | ~100 | supersession, prune, choosing |
@@ -77,7 +82,11 @@ payload, the armored signature. The split of the old single `ctx` into `hdr` and
 The storage key (`ctx.rs:88-176`) is computed over the same values as today, read through the resolved view
 (statement fields plus hdr fields, decoded values, never bytes), so a slot's identity is the same function of the
 same facts: the same signer re-attesting the same inputs, toolchain and waived set overwrites its record; a
-different waived set is another slot.
+different waived set is another slot. One value changes form: `waived` enters the key **sorted and distinct**
+(`ResolvedPredicate::waived_canonical()`, the same for a v1 and a v2 record), because a v2 statement carries
+ids that are sorted and distinct and so cannot reproduce a v1 list's order or repeats; 2.8 joined the list as
+signed, and 1,158 of the 1,175 sample units repeat a waived string (1,163 are unsorted), so for those units
+2.9's key is not 2.8's (section 5.1).
 
 ### 1.2 The record frame (the slot's value)
 
@@ -136,13 +145,18 @@ paths is the whole gain (46 B mean path to 18.6 B per shape entry including its 
 serializer would not do it.
 
 **`hdr` (kind 1).** `repoId`, `adapter`, `projectName`, `projectDir`, `runnerProject`, `toolVersion`,
-`railsInputs`, `envConfigDigest` (32 B), `globalInputRoot` (32 B), `globalManifest` entries (sorted;
-prefix-coded path, kind byte with the exec bit, `uv size`, 32 B hash except for the constant-hash kinds
-absent/excluded/autoload-dir), `ignoredInputs`, `envSet`, `toolchain` (the scalar fields as compact JSON, then
-`rubyGems`/`pythonDists`/`goEnv`/`rustCfg` as prefix-coded sorted lists). Content-addressed by what is in it, so
-it is **shared across runs**: measured 4,494 B for every Rails unit of the sample (one hdr for the 973-unit and
-the 185-unit runs each; they differ by base tree), 745-762 B for node, 955-1,098 B for cargo; 11 distinct hdr
-objects across the 9 runs and 18 header groups of the sample.
+`railsInputs`, `envConfigDigest` (32 B), `globalInputRoot` (32 B), then the **whole global manifest**: its
+entries (sorted distinct; prefix-coded path, kind byte with the exec bit, `uv size`, 32 B hash except for the
+constant-hash kinds absent/excluded/autoload-dir), its externals (sorted distinct `(name, version)` pairs, names
+prefix-coded; none in the sample) and its env (sorted distinct keys, prefix-coded, each with a 32 B value hash,
+`ABSENT_HASH` for an unset variable: `NODE_OPTIONS` for the twelve node units, `vci-cli`'s `global_env_keys`),
+so that `Hdr::global_manifest().root()` is the `globalInputRoot` the plan checks per hdr; then `ignoredInputs`,
+`envSet`, and `toolchain` (the scalar fields as compact sorted-key JSON, then `goEnv`, `pythonDists`,
+`rubyGems`, `rustCfg` as prefix-coded sorted lists in that fixed order, without names). Content-addressed by
+what is in it, so it is **shared across runs**: measured 4,489 B for every Rails unit of the sample (one hdr for
+the 973-unit and the 185-unit runs each; they differ by base tree), 796-813 B for node (the model's 745-762 B
+left the global env entry out: +51 B), 955-1,098 B for cargo; 11 distinct hdr objects across the 9 runs and 18
+header groups of the sample.
 
 **`tables` (kind 2).** Per run and header group: `waiverTable` (sorted distinct waived strings of the units
 sharing the hdr), `envNames` (sorted union of env keys any of those units read, prefix-coded), `externals` (sorted
@@ -206,6 +220,20 @@ Per project, after the tests (`run_units`, `run.rs:2406`):
    statement**; "same files" compares the two statements' `entriesRoot`. The listing columns (commit, platform,
    issued, tree16) only pre-filter which old records to read (an old record whose columns say "other platform" or
    "same commit" is skipped without a read; a column edited to say "moved on" costs one read, not a deletion).
+   *Amended after the whole-branch review:* not while the store holds an input manifest (section 5 step 3): a 2.8
+   writer's upsert sets a slot's key and value alone, so its format-1 value can sit beside a frame's columns naming
+   another commit, and the pre-filter would leave a record the run should supersede unread (a missed deletion,
+   never a wrong one); `last_durations` asks `manifest_roots` once a run and every record of the unit is read
+   while one remains, as prune reads every row then.
+   The columns come from `last_durations`' one `columns` round trip for every selected unit's records, by record
+   key (a record stored since is read as if it had none), and the platforms of the hdr ids they name from one
+   `get_objects` before the units run, so that supersession sends the store nothing per unit but the doomed
+   records' reads (M3 review: it asked `columns` per unit, ~800 requests a partition on Turso). On a store without
+   columns the hdr ids come from the statements `last_durations` read, and on one whose values a fetch leaves out
+   (git-meta's blobless clone, section 2.2) the preload issues one `Prefetch::Objects` for them before
+   `get_objects`, which fetches nothing: without it a clone that had never read the hdr kept every old record as
+   made for an unknown platform and superseded nothing
+   (`cargo_two_blobless_clones_supersede_the_same_attestation_and_both_push`, which 2.8 passed with format 1).
    Then `remove_objects` with the orphan rule (section 2) for the superseded records' `hdr`, `tables`, `shape` and
    `state` ids.
 6. `last_durations` (`run.rs:3400`): `duration_ms` and `issued` from the listing columns on SQL stores; on
@@ -241,14 +269,22 @@ A partial or cancelled job stores what it signed: every unit is its own record, 
    `globalManifest.root() == globalInputRoot`, rehash every global entry, compare the current global set's root
    (`plan.rs:2633-2830`). Today this runs per candidate (25 global entries x 1,644); here per hdr, ~11 times per
    plan at the production spread (one per base tree the live candidates were made at), where one ctx per run
-   would have run it 45-59 times.
+   would have run it 45-59 times. (M3: what the code memoizes per `(project, hdr id)` is the global manifest's
+   root check and the rehash of its entries, the parts that cost; repo id, adapter, project, `envConfigDigest`,
+   toolchain and platform are scalar compares that still run per candidate over the resolved view.)
 7. **Per candidate**: expiry, test id, argv, result, waived ids (resolved through the tables object, re-matched
    against the base policy by key), declared inputs, dirty tree: scalars from the statement, unchanged checks.
 8. **inputs**: resolve the descriptor against its tables object and shape: paths and kinds =
    `shape.entries[groups[g]] ∪ shape.entries[own indices]` (an index past the shape's length fails `inputs`), env
    entries = names from the bitmap with `ABSENT_HASH`, overridden by the `(idx, hash)` list, externals = pairs
    from the bitmap plus inline extras. Refuse autoload lookups the policy forbids, check case collisions and
-   git-ignored children on the paths as today (`plan.rs:2869-2905`). **Observe every path at HEAD** through the
+   git-ignored children on the paths as today (`plan.rs:2869-2905`); the case-collision check of a shape group is
+   made once per `(shape id, group)` (as `BaseCheck` does per base root) and a candidate folds its own entries
+   against it, and the git-ignored children are asked about the listed directories alone (memoized per
+   directory). The rest is per candidate, and measured: on the pairs replay with a synthetic vex unit of 2,700
+   group and 150 own entries, step 8 cost 2.9 ms per candidate before the memo (1.5 ms of it the case
+   collisions; observing 2,850 cached paths 0.7 ms; the manifest and its root 0.6 ms), 4.8 thread-seconds at
+   1,644 candidates and 11.7 at 4,000, under a second of wall on the plan's pool (`tests/replay.rs`, M3 review). **Observe every path at HEAD** through the
    per-plan `CheckoutCache` (`manifest.rs:1469`: kind, exec, size, hash; listing hashes for `d` minus the
    manifest's `x` entries; autoload misses through the `u` dirs); env keys re-hashed from the child environment.
    Build the `InputManifest` from the observed entries, the attested externals and the attested env, and require
@@ -261,7 +297,9 @@ A partial or cancelled job stores what it signed: every unit is its own record, 
    externals and env, so root equality tests the files only.
 9. A failing `inputs` candidate is reported as today (`entry: <path> changed`, expected/actual) once the plan
    has the run's `state` object; the plan loads state objects for the runs of entry-failing candidates up to a
-   count (`plan.state_objects = 16`, ~5 MB) in candidate-priority order and prints `entry: <path> changed
+   count (`plan.state_objects = 16`, ~5 MB) in candidate-priority order (the state id is the record's listing
+   column, fetched in one `columns` call per round beside the verdict objects' load, and the count cap is checked
+   before the store is asked) and prints `entry: <path> changed
    (attested hash not loaded)` past it or when the object was pruned (section 1.3). A hash printed from a state
    object is labelled `attested (unsigned, from the run's state object)`, because the object is bound by nothing
    the signer signed: a store writer who replaces it can only mislabel this text, never a verdict. This is
@@ -286,7 +324,7 @@ digest.
 ### 1.6 Decoder rules
 
 These rules make two writers produce the same bytes for the same content and one id per content, and make the
-decoders refuse what the harness of the security review (`design/review-security-v2/attack-output.txt`) showed
+decoders refuse what the harness of the security review (its attack run, not in the repository) showed
 changes the root anyway. They go into `docs/CONTRACTS.md` as one paragraph under "Manifests by reference" (the
 line: *a format-3 record and its objects are decoded under the rules of STORE-BACKENDS.md section N; a value or
 object that breaks one fails the candidate's `envelope`, `statement` or `inputs` check, and the unit runs*).
@@ -301,7 +339,9 @@ object that breaks one fails the candidate's `envelope`, `statement` or `inputs`
 3. **Delta-coded indices.** The first index is absolute (`prev = -1`, so the first delta is the index itself);
    each next index is `previous + 1 + delta`. Entries are therefore strictly increasing and distinct by
    construction; every index must be below the shape's entry count, every env index below the tables' env-name
-   count, every externals bit within the table, and `group` below the shape's group count or `0xff`.
+   count, every externals bit within the table, and `group` below the shape's group count or `0xff`. An inline
+   external the tables object holds is refused whether or not its bit is set (a pair in the table is a bit), so
+   an externals list has one encoding; the inline list is itself strictly increasing.
 4. **Env overrides.** An `(idx, hash)` override whose bitmap bit is clear is refused; so is an override listing
    `ABSENT_HASH` (the bitmap already says it) and a duplicate or unsorted `idx` list. The root would be the
    same either way for a well-formed descriptor; the rule keeps one encoding per content.
@@ -314,17 +354,26 @@ object that breaks one fails the candidate's `envelope`, `statement` or `inputs`
    column (and the key's `<kind>` segment on git-meta) is store data used only to choose which table or path to
    read; the decoder trusts the kind byte inside the hashed bytes and refuses an object whose inner kind is not
    the one the statement or descriptor expects.
-7. **Statement values.** `waived` ids are sorted, distinct, below the waiver table's length; `storage_key` is
-   computed from the decoded values of the resolved view (`ctx.rs:88-176`), never from bytes, so a writer's
-   serialization choices cannot move a slot.
+7. **Statement values.** `waived` ids are sorted, distinct, below the waiver table's length (checked where the
+   view is made, `ResolvedPredicate::v2`, the only constructor of the v2 view, so no view with an unchecked id
+   exists); `storage_key` is computed from the decoded values of the resolved view (`ctx.rs:88-176`), never
+   from bytes, so a writer's serialization choices cannot move a slot, and over the waived list sorted and
+   distinct (`waived_canonical()`) for both versions, since a v2 statement carries no other form (section 1.1).
 8. **Bounds** (section 4): the counts in every list are checked against the bytes remaining before anything is
    allocated; a record over 1 MiB, a hdr over 1 MiB, a tables over 4 MiB, a shape over 8 MiB, a state over 16 MiB
    or a `get_objects` answer over 64 MiB is refused.
 
 The ten store-side mutations the harness ran against `root()` on unit #896 (kind relabel, index swap, omitted
 entry, env override and bitmap, externals pair, an `x` under a `d`, exec bit, section confusion, duplicate rows)
-are M1's negative test vectors (section 6), so the observe-then-root refactor cannot regress into comparing
-values the store supplied.
+are M1's negative test vectors (section 6,
+`manifest_tests.rs::the_security_harness_mutations_each_move_the_root_or_fail_a_decoder_rule`): each is applied
+to the decoded shape, tables or descriptor of a run built by `Run::build` over a checkout of every entry kind,
+and either a decoder refuses it (the env bit cleared under a kept override; an equal shape row twice) or the
+set observed at HEAD through the `CheckoutCache` has another `root()` than the signed one. A file's kind and
+exec bit enter the root as the observer finds them at HEAD, never as the shape labels them, so the exec-bit
+vector is the change at HEAD the flipped label would hide (the label alone changes nothing on an unchanged
+file, which is the harness's last line). The observe-then-root refactor therefore cannot regress into
+comparing values the store supplied.
 
 ## 2. Per-backend layout
 
@@ -401,8 +450,15 @@ counter row's lock is held to commit, which hands out `seq` in commit order and 
 namespace for the length of a transaction (an ordering cost, not a safety one); on libSQL there is one writer.
 
 **libSQL replica log.** The per-slot, per-root `log` table (`remote.rs:112`, ~400k rows/day) is not written for
-format-3 records. A replica syncs `attestations WHERE seq > ?`, `objects WHERE seq > ?` and `gone WHERE seq >
-?`; a first sync reads the namespace (one listing, the values, the objects). `gone` grows by the removals: ~64k
+format-3 records. A replica syncs `attestations WHERE seq > ?` (the frames: a format-1 row this vci writes is in
+the old log and is synced by it, once) and `gone WHERE seq > ?`; a first sync reads the namespace (one listing,
+the values). **In 2.9.0 the replica file keeps no objects and no columns**: a replica's `get_objects`, `columns`,
+`prefetch(Objects)`, `orphan_objects`, `remove_objects` and `prune_state_objects` ask the server (as
+`orphan_manifests` does), and a write's objects and columns are not written through (M2 review, STORE-V2-DECISIONS.md). What
+that costs: a replica plan reads its verdict objects from the server, 1.4-1.9 MB per plan at vex (section 3), and
+a replica cut off from the server verifies no format-3 candidate (every such unit runs: fail-open). Syncing
+`objects WHERE seq > ?` (base64 text decoded into the file's BLOB column), the object ids of `gone` and the columns
+is a 2.9.x change, with no change to the server's tables. `gone` grows by the removals: ~64k
 rows and 13.8 MB a day at vex (214 B a row: the key, `seq`, `at`, the object id when it is an object), purged
 after **max(30 days, the policy's `max_ttl`)**, so that no record a replica could still serve outlives the
 deletion it would have synced (a `gone` row younger than every unexpired record it could affect); 1.93 M rows and
@@ -422,10 +478,17 @@ mean, 309 KB max, up to 24 rows per tree with 12 shards). The memo stays optiona
 it, and with `tree16` a column the chooser works without it (open question 5).
 
 **Prune** (`cmds.rs:1637-1800`): `list_all` with the hint columns gives expiry, issued, tree, unit, signer per
-key without values; the expired and the beyond-`keep` candidates are then **read** (1.8 KB each) and their
-signed `expiresAt`/`issuedAt`/`commit`/`tree` confirm the columns before a delete, so a store writer who edits a
-column can cause at most one extra value read, not a wrong deletion. Then `orphan_objects()` and the state TTL.
-`vci prune --objects --older-than <days>` overrides `explain_hashes_days` for one run.
+key without values; the expired candidates are then **read** (1.8 KB each) and deleted only when the signed
+`expiresAt` has passed; a unit and signer with a record beyond `keep` by the hints has every described record
+read, and the signed `issuedAt` and `tree` order the group as they do on a store without columns (a record the
+hints put beyond `keep` that the statements keep is left alone as unconfirmed). So a store writer who edits a
+column or a key's hint can cause extra value reads (the row's, or its unit's), not a wrong deletion. While the
+store holds an input manifest (the migration window, section 5 step 3: a 2.8 writer that reuses a frame's slot
+leaves the frame's columns beside its format-1 value, and only the value says what the row is and which manifest
+it references) every row is read, as 2.8 read them; once no manifest remains the columns describe the format-3
+rows and nothing a column could hide references anything. A manifest the backend keeps against the delete (a
+referrer stored since the listing, or a shared store's grace) is said so and not counted. Then `orphan_objects()`
+and the state TTL. `vci prune --objects --older-than <days>` overrides `explain_hashes_days` for one run.
 
 ### 2.2 git-meta (`refs/meta/main`)
 
@@ -439,8 +502,14 @@ per 800-unit partition, today 17 MB + 45 MB) and `vci prune` reads every value (
 
 Objects: keys `vci:object:<kind>:<id hex>` under target `project`, paths `vci/object/<kind>/<id>/__value`: four
 blobs and a few trees per run (today: 800 manifest blobs and 9 bases per run, ~1,600 trees). `prefetch(Objects
-{ids})` fetches their blobs in the existing batch path; `orphan_objects` is the referrer scan `orphan_manifests`
-does today, over ~4 roots per run instead of ~800. The merge-time "put back a manifest another clone
+{ids})` fetches their blobs in the existing batch path. `orphan_objects` and `remove_objects` **read every
+value**: any record on any target can name an object, so there is no scoped referrer scan like
+`hydrate_manifest_referrers`' (a manifest's referrers are on the paths it lists), and the scan fetches every
+attestation not fetched yet (`hydrate_attestations`) and reads each value once. That is `vci prune`'s cost (24,000 x
+1.8 KB = 43 MB on vex, above), not a per-run one: `vci run` calls `remove_objects` after supersession only on a
+store with columns (SQLite, PostgreSQL, libSQL), and on git-meta leaves the superseded run's objects to `vci
+prune`, which has read every value already; the per-partition budget above holds. (M2 review, STORE-V2-DECISIONS.md.) The
+merge-time "put back a manifest another clone
 references" rule (`docs/CONTRACTS.md` "A clone deletes a manifest knowing only its own attestations") applies to
 objects as written, by id. `meta:prune:max-keys` counts objects as keys: a few per run instead of 800.
 
@@ -450,7 +519,7 @@ its bytes: 0.33 MB per 800-unit partition, 1.0 MB with the state object), decode
 says UTF-8 only; both stand, and `vci-git` gets no bytes read path, no change to `materialize`, `fast-import` or
 the `git-meta.sqlite` `value` column. The earlier draft's bytes path was the plan's top risk and is gone.
 
-**Pack growth, measured** (`design/final/gitmeta.py`: git-meta's tree layout built from the 973-unit run as commit
+**Pack growth, measured** (`docs/design/measure/gitmeta.py`: git-meta's tree layout built from the 973-unit run as commit
 A and the 185-unit run pushed as commit B, today's values against text frames and base64 objects, real `git
 pack-objects --thin` and `git repack -adf`): today's push of B is 0.643 MB (3.47 KB per unit), 1,761 trees + 379
 blobs; format 3's is 0.272 MB (1.47 KB per unit), 1,573 trees + 188 blobs; the pack of A alone 3.88 MB against
@@ -468,8 +537,8 @@ by this design.
 
 ## 3. Measured numbers
 
-Script: `design/final/measure.py` (`python3 -I measure.py ../../wr/pairs.json ../../prodlogs/rails.json
-../../meas/keys.json ../../wr/txsize.json .`), output `numbers.json` and `measure-output.txt`. Bases/groups are
+Script: `docs/design/measure/measure.py` (`python3 -I measure.py <pairs.json> <rails.json> <keys.json>
+<txsize.json> <out dir>`, the private inputs of the preamble), output `numbers.json` and `measure-output.txt`. Bases/groups are
 estimated (section 1.3) and every total uses the high estimate; "today" is the file's own envelopes and manifests
 plus 9 bases of 50 KB per run where a run is counted. Per-run objects for a run of N units come from the measured
 curve of random N-unit subsets of the 973-unit run (`numbers.json` `curve_hdr_tables_shape_state_entries`), groups
@@ -481,7 +550,7 @@ scaled by N/800.
 | signature | 477 B JSON field | 234 B frame (180 B SSHSIG + keyid), 312 B as base64 | |
 | manifest / descriptor | 15,154 B (p50 11,372, max 98,539) | 272 B (p50 247, max 957), 363 B as base64 | |
 | **record** | **36,320 B** | **1,783 B** (p50 1,760, p90 1,917, max 2,707; binary frame would be 1,610) | 20x |
-| hdr, shared across runs | (in every envelope: 14.1 KB x N) | 4,494 B Rails; 0.75 KB node; 1.0-1.1 KB cargo | 11 distinct / 9 runs |
+| hdr, shared across runs | (in every envelope: 14.1 KB x N) | 4,489 B Rails; 0.8 KB node; 1.0-1.1 KB cargo | 11 distinct / 9 runs |
 | tables per run | (in every envelope and manifest) | 19,387 B (973 units); 9,313 B (185 units); 0.2-0.7 KB node; 22-74 KB cargo | the externals list |
 | shape per run | (in every manifest) | 123,264 B / 6,639 entries (973 units); 24,662 B (185 units) | 18.6 B/entry |
 | state per run (explain only, 2 days) | (in every manifest) | 285,128 B (973 units); 60,758 B (185 units) | 43 B/entry; 1.5x under zstd |
@@ -497,12 +566,12 @@ scaled by N/800.
 | plan: per-run verdict objects (tables + shape + groups), plus hdr once per base tree | ~450 KB of bases per run | 240 KB per 800-unit run; 2-9 KB per run of ≤ 5 units; hdr 4.5 KB each, ~11 per plan | |
 | **plan total, candidates from 4 / 10 / 20 / 50 runs** (today: 1,644 values + 9 bases of 50 KB per run; format 3 at the ceiling of one hdr per run) | 62 / 65 / 70 / 83 MB | **4.7 / 6.2 / 8.7 / 16.0 MB**; +0.5 MB per run whose state object is loaded for failure text (capped at 16) | 13x / 10x / 8x / 5x |
 | **plan total at the production spread** (`keys.json`: live candidates from 59 runs, the newest per unit and signer from 45) | ~81-87 MB | **5.1 MB (45 runs) to 5.7 MB (59 runs)** expected with 11 hdr; 5.3-5.9 MB at the one-hdr-per-run ceiling; verdict objects 1.35-1.91 MB (ceiling 1.50-2.13 MB), 7.9x under the 16 MiB cap | 15x |
-| plan requests (libSQL) | list 1, prefetch 4, manifests 1-2, memo 2-3 | list 1, read_values 1-2, get_objects 1, state 0-1, memo 1-2 | |
+| plan requests (libSQL) | list 1, prefetch 4, manifests 1-2, memo 2-3 | list 1, read_values 1-2, get_objects 1, columns 1 (per round, for the state ids), state 0-1, memo 1-2 | |
 | signature checks per plan | 1,644 | 1,644 (0.3 thread-s measured; not a cost) + 1,644 signer-segment compares | |
 | per day at vex (`rails.json`: 164 Rails jobs = 164 runs, 76,725 units attempted, mean 540, max 972) | 2.79 GB written | records 137 MB + hdr ≤ 0.6 + tables 2.4 + shape 18.8 + state 42.4 = **201 MB** (158 MB without state) | 13.9x (17.6x) |
 | per day at the attested count (46,644 units, mean 328) | 1.69 GB | 123 MB (97 MB without state) | 13.7x |
 | libSQL log rows / `gone` rows / memo rows per day | ~400k / - / ~189k | 0 / ~64k (13.8 MB) / ~189k | |
-| `vci run`: last_durations, supersession reads | 17 MB + 45 MB | 0 + ~2.7 MB (SQL; 800 units x 1.9 old records x 1.8 KB), 1.45 + ~2.7 MB (git-meta) | |
+| `vci run`: last_durations, supersession reads | 17 MB + 45 MB | 0 + ~2.7 MB (SQL; 800 units x 1.9 old records x 1.8 KB; one listing, one `columns` and one `get_objects` of the hdr ids for the run, no request per unit), 1.45 + ~2.7 MB (git-meta) | |
 | `vci prune` reads | every value, ~870 MB at 24k records | columns + ~1.8 KB per doomed record (SQL); 43 MB (git-meta) | |
 | a dead run (every record superseded) | 800 manifests + 9 bases, never collected by `vci run` | 4 objects, 0.75 MB (0.25 MB after the state's two days), collected by `vci run`'s orphan pass or `vci prune` | |
 | cross-commit stability (6 units at 2 commits) | | same `(path, kind)` set 6/6; same root 0/6; 804 of 813 entries common to the two largest runs keep size and hash | why hashes left the record |
@@ -538,7 +607,7 @@ with the 20-30 s store stalls gone.
 
 Against `docs/CONTRACTS.md` "vci-cli predicate and storage" and "Manifests by reference", and
 `docs/STORE-BACKENDS.md` section 1 ("The store is never trusted", rules 1-4). The security review's harness
-(`design/review-security-v2/attack/src/main.rs`, output `attack-output.txt`) ran vci 2.8.1's real
+(a program run outside the repository) ran vci 2.8.1's real
 `InputManifest::root()` on a real vex unit against ten store-side mutations and found no wrong skip; its findings
 were documentation accuracy and spec tightening, resolved below and in section 1.6.
 
@@ -631,7 +700,11 @@ Version gates, in order:
 1. **vci 2.9.0** reads format 1 and 3, writes format 3 (`[store] record_format = 1` keeps writing format 1 for
    one release, for fleets that cannot upgrade every reader at once). Detection is by the value's first byte
    (`{` vs `v`); keys and slots are shared, so a format-3 record overwrites the format-1 record of its slot
-   and vice versa. `VciPredicate` (v1) and `ManifestLoader` stay for v1 records; v1 and v2 meet at
+   and vice versa, with one exception: a unit whose 2.8 record's `waived` list repeated a string or was unsorted
+   (almost every Rails unit of the sample) keys another slot under 2.9, since the key now takes the list sorted
+   and distinct (section 1.1); the 2.8 record then stays beside the new one as a second candidate until
+   supersession or expiry removes it, which is fail-open and costs one more candidate per such test.
+   `VciPredicate` (v1) and `ManifestLoader` stay for v1 records; v1 and v2 meet at
    `ResolvedPredicate` and the resolved manifest, and `Verifier::check` runs on the view.
 2. **SQL schema, DDL first**: `vci_schema.version` stays 1 while the migration window is open. The nullable
    columns, the `objects` and `gone` tables and the `v2 = 1` flag row are added by `vci store upgrade --begin`
@@ -647,9 +720,11 @@ Version gates, in order:
    record `envelope_meta` cannot parse it sets `referenced = None` (`cmds.rs:1703-1722`) and then removes no
    manifest at all, by design (it cannot know what the unreadable record references). vex's master attest jobs
    run `vci prune` after every project with the pinned binary (`vci.yml:203`), and the orphan pile grew by up to
-   16,231 manifests an hour at peak (`prodq/out.txt`), so the window should be short: land the action pin before
-   the next master push, or run 2.9's `prune` (which collects both) once during the window. 2.9's `prune` treats a
-   format-1 record as today and a format-3 record through its columns and confirming read.
+   16,231 manifests an hour at peak (a production query of 27 October), so the window should be short: land the action pin before
+   the next master push, or run 2.9's `prune` (which collects both) once during the window. 2.9's `prune` reads
+   every record while the store holds an input manifest (a 2.8 writer may have left its format-1 value, with its
+   `manifestRef`, under a frame's columns: M2 fact 1), and once none remains treats a format-3 record through its
+   columns and confirming read.
 4. **`vci store upgrade --finish`** (2.9, manual, on SQLite and PostgreSQL; 2.10 on libSQL, and 2.10 automatic
    when no format-1 row remains): drops `manifests` and the libSQL `log`, sets `vci_schema.version = 2`; from then
    on a 2.8 binary reports "store schema too new" and fails open as it does today for unknown versions. The `memo`
@@ -668,8 +743,8 @@ Version gates, in order:
    run; no re-signing (a format-1 statement's bytes are what was signed and stay readable). `vci prune` then
    drops the `manifests` rows. `vci store copy` between backends copies format-3 values byte for byte and objects
    decoded (BLOB on SQLite/PostgreSQL, base64 on libSQL and git-meta), objects before records.
-7. **Replicas**: a 2.9 libSQL replica syncs the old log for format-1 rows and `seq`/`gone` for format-3; a
-   replica file of a 2.8 namespace does one full resync (1.4-4.4 s today for 1,600-6,500 records, less with 13x
+7. **Replicas**: a 2.9 libSQL replica syncs the old log for format-1 rows and `seq`/`gone` for format-3 (its
+   objects and columns come from the server in 2.9.0, section 2.1); a replica file of a 2.8 namespace does one full resync (1.4-4.4 s today for 1,600-6,500 records, less with 13x
    fewer bytes), as does a 2.9 replica whose cursor is older than the `gone` purge horizon. A 2.8 replica syncs
    format-1 only and never sees format-3 deletions: it keeps superseded rows until their signed `expiresAt`
    (fail-open, their inputs mismatch at HEAD); the replica file should be upgraded with the binary.
@@ -680,7 +755,10 @@ Version gates, in order:
    `--manifest FILE` accepts the compact JSON of the resolved manifest (`to_compact`) for a format-3 record.
 9. **Rollback**: 2.9 with `record_format = 1` writes what 2.8 writes; a store that already holds format-3 rows
    serves them to 2.8 as fail-open units. Downgrading the binary after `--finish` is not supported (the
-   `manifests` table is gone); `--finish` is refused while a format-1 row exists and prints the count.
+   `manifests` table is gone); `--finish` is refused while a format-1 row exists and prints the count. The count is by the value's first
+   byte on every SQL backend (a frame starts with `v` and is never stored compressed), never by the `format`
+   column: a 2.8 writer's upsert sets the key and the value alone, so a format-1 value it writes into a frame's
+   slot sits beside the frame's `format = 3`, and a frame put without columns (a copy out of git-meta) has NULL.
 
 ## 6. Implementation plan by crate
 
@@ -694,25 +772,25 @@ of code, ~1,900 of tests and docs.
 | | `vci-core/src/predicate.rs` | `VciPredicateV2 { own, hdr: Hex32, tables: Hex32 }`, `Header` (from hdr), `Tables`, `ResolvedPredicate<'a>` giving the v1 accessors; `Toolchain` to/from the hdr encoding; waived ids | ~350 + 150 tests |
 | | `vci-core/src/manifest.rs` | `entries_root()`; `InputManifest::from_observed(resolved, observed entries)`; `to_compact` for export; `observe(set, &CheckoutCache)` factored out of `diff_against_cache_from` | ~200 + 100 tests |
 | | `vci-attest/src/lib.rs` | text record frame (`Envelope::from_frame`/`to_frame`, the `vci3` first line, canonical base64), raw SSHSIG in/out of armor, bundle kind, rebuild to DSSE JSON | ~250 + 100 tests |
-| | tests | round-trip and golden vectors from `pairs.json`-shaped fixtures; `root()` of a resolved manifest with the attested hashes equals the signed root for all 1,175 sample units (the replay check); the security harness's ten mutations as negative cases (each must change the root or fail a decoder rule); bounds and malformed-object cases; non-minimal varints, non-canonical base64, a clear-bit env override, a 256th group, a `..` path | |
+| | tests | round-trip and golden vectors from `pairs.json`-shaped fixtures; the replay check (`vci-cli/tests/replay.rs`, in vci-cli because it needs vci-attest's frame beside vci-core, and a dev-dependency of vci-core on vci-attest would put vci-attest's sources among the inputs of `vci attest crates/vci-core#lib`, which `e2e_cargo.rs` checks are clean): for all 1,175 sample units the descriptor resolves to the manifest's set, externals and env, and `root()` of the resolved set with the attested hashes equals the root of the unit's own entries and `entriesRoot` equals the signed one; the signed subject digest is reproduced for the three base-less units only, since the sample holds the deltas and not the 11 base manifests they reference (the full-set check against the subject digest for every unit is M3's end-to-end fixture, where the bases are in the store); the security harness's ten mutations as negative cases (each changes the root or fails a decoder rule, `manifest_tests.rs`); bounds and malformed-object cases; non-minimal varints, non-canonical base64, a clear-bit env override, a 256th group, a `..` path | |
 | **M2 store trait and backends** | `vci-store/src/lib.rs` | `get_objects`, `put_objects`, `remove_objects`, `orphan_objects`, `prune_state_objects(older_than)`, `Prefetch::Objects`; `StoredEnvelope` listing columns (optional, `None` on git-meta); `decode_record` over both formats; `WriteBatch` object puts and `gone`; conformance cases c-objects-1..n (idempotent put, orphan rule with grace, state TTL, bounds, ordering visible to readers, columns match the statement, base64 and BLOB forms read back equal) | ~600 + 500 tests |
 | | `vci-store-sqlite` | columns, `objects`, `gone`, `v2` flag; `vci store upgrade --begin` / `--finish` | ~400 |
 | | `vci-store-postgres` | same, `BYTEA`, `unnest` puts, the `seq` counter row lock noted in the docs | ~300 |
-| | `vci-store-libsql` | same with `objects.bytes TEXT` base64; the DDL request before the first batch; `seq` counter in the batch; replica sync of `attestations`/`objects`/`gone` by `seq` alongside the old log, the purge horizon and the full-resync rule; transactions sized by bytes only (`TX_UNITS` dropped for format-3 queues) | ~600 |
+| | `vci-store-libsql` | same with `objects.bytes TEXT` base64; the DDL request before the first batch; `seq` counter in the batch; replica sync of `attestations`/`gone` by `seq` alongside the old log (objects and columns from the server in 2.9.0, section 2.1), the purge horizon and the full-resync rule; transactions sized by bytes only (`TX_UNITS` dropped for format-3 queues); a batch's objects sent again with every transaction until one stores them, and its `remove_objects` queued after its removals as on PostgreSQL | ~600 |
 | | `vci-git/src/meta.rs`, `store.rs` | object keys and paths, blob fetch for objects, base64 codec in `get_objects`/`put_objects`, orphan scan over objects, put-back rule by id, state TTL in the orphan scan | ~400 |
 | | tests | the four-backend parity suite extended with objects and mixed format rows; a 2.8 binary against a 2.9 SQLite file (fail open, no error); replica resync, including a cursor past the purge horizon; a batch whose queue flushes twice | |
-| **M3 commands** | `vci-cli/src/run.rs` | header grouping, hdr/tables/shape/state construction (replacing `shared_manifest_bases`' output, keeping its grouping), descriptors, one batch; supersession from the old records' signed statements with column pre-filter + `entriesRoot`; `last_durations` from columns; orphan objects and state TTL | ~650 |
+| **M3 commands** | `vci-cli/src/run.rs` | header grouping, hdr/tables/shape/state construction (replacing `shared_manifest_bases`' output, keeping its grouping), descriptors, one batch; supersession from the old records' signed statements with column pre-filter + `entriesRoot`; `last_durations` from columns; orphan objects (`remove_objects` of the superseded run's ids on a store with columns; on git-meta left to `vci prune`, section 2.2) and state TTL | ~650 |
 | | `vci-cli/src/plan.rs` | `Verifier` over `ResolvedPredicate`; the `signer` segment check; hdr memo per `(project, id)`; `ObjectLoader` beside `ManifestLoader` with the 16 MiB verdict-object cap in candidate order; observe-then-root for `inputs`; state count cap and the unsigned label; plan metrics lines (`objects: N hdr, M tables, K shape, S state, B bytes, C past cap, R distinct runs`) | ~750 |
-| | `vci-cli/src/ctx.rs`, `cmds.rs` | `storage_key` over the resolved view (same string for the same facts, tested against v1 on the sample); prune from columns with confirmation reads, `--objects --older-than`; `vci store upgrade --begin/--finish`; export/verify forms | ~350 |
+| | `vci-cli/src/ctx.rs`, `cmds.rs` | `storage_key` over the resolved view with `waived_canonical()` (same string for the same facts in either version; tested against v1 on the sample over the canonical list, and the units whose 2.8 key differs counted); prune from columns with confirmation reads (every row read while a manifest remains; a unit beyond `keep` by the hints read whole and ordered by the signed `issuedAt`), `--objects --older-than`; `vci store upgrade --begin/--finish` (PostgreSQL's `Finish::Already` at version 2); export/verify forms | ~350 |
 | | docs | STORE-BACKENDS.md sections 2-4 and 15-18 (the frame grammar, the decoder rules, object forms per backend, the write model, `gone`), CONTRACTS.md (predicate v2, objects, the new invariant, the supersession paragraph), REFERENCE.md (`explain_hashes`, `explain_hashes_days`, `record_format`, `vci store upgrade`), PLAN.md, the agent skill | ~750 |
-| | tests | end-to-end fixture at two commits (same set, different root: the record is new, the shape is new, the hdr is shared, the plan skips the unchanged unit and names the changed entry); mixed v1/v2 plan; cancelled-run partial write; cargo/node multi-hdr run; a record moved under another signer's slot fails `signer`; `explain` snapshots with the unsigned label, the pruned-state text and the past-the-cap text | |
+| | tests | end-to-end fixture at two commits (same set, different root: the record is new, the shape is new, the hdr is shared, the plan skips the unchanged unit and names the changed entry); mixed v1/v2 plan; cancelled-run partial write (held at the batch level, where the cut happens: libSQL's `a_batch_stores_no_record_without_its_objects` and the stalled-proxy batch in `vci-store-libsql/tests/libsql.rs` show a batch cut between transactions keeping the first transaction's units with their objects and re-sending the objects with every later one, SQLite's one transaction leaves nothing or everything, and `e2e_m3.rs` (c) a unit refused mid-run keeps the others' records); cargo/node multi-hdr run; a record moved under another signer's slot fails `signer` (`adversarial_plan.rs`, `e2e_format3.rs`); a 2.8 binary on a git-meta store and `--finish` on PostgreSQL (`store_backends.rs`); `explain` snapshots with the unsigned label, the pruned-state text and the past-the-cap text | |
 | **M4 rollout at vex** | | `record_format = 3` default; `vci store upgrade --begin` on vex's namespaces, then the action pinned in one PR before the next master push; dashboards: per-plan objects fetched and bytes, distinct runs per plan, per-partition flushes, transactions and wire bytes, live runs per namespace, state objects pruned, `gone` rows | |
 | **M5 (optional, later)** | `vci-core/src/merkle.rs`, `run.rs`, `plan.rs` | one signed statement per run over an RFC 6962 tree of the units' statement digests (leaf = BLAKE3(0x00 ‖ stmt bytes), node = BLAKE3(0x01 ‖ l ‖ r), proof from (index, leafCount) and never from side tags in the record); per-unit records keep their statement bytes and gain `(run id, index, proof)` instead of a per-unit signature; the per-unit view keeps `Verifier::check` unchanged; `[attest] signature = "unit" \| "run"`. Only worth doing if keyless signing cost (one Fulcio cert and one TSA request per unit today) or signature CPU shows in a measurement; it changes the statement, not the store, because the objects already exist | ~1,200 |
 
 Order of risk: the observe-then-root refactor of `diff_against_cache_from` (M1/M3, covered by the 1,175-unit
 replay check and the harness's negative cases), the libSQL `seq` replica path with its purge horizon (M2,
 separable: the old log can stay for one release at two rows per unit), the transaction sizing on Turso (M2: re-run
-`scratchpad/wr/txsize.py` with real text frames and base64 objects before 2.9.0; the 1 MiB figures above are for
+the Turso transaction-size measurement (`txsize.py`, outside the repository) with real text frames and base64 objects before 2.9.0; the 1 MiB figures above are for
 JSON values of the same byte count). The git-meta bytes path, the earlier draft's top risk, no longer exists.
 
 ## 7. Open questions
@@ -732,7 +810,7 @@ JSON values of the same byte count). The git-meta bytes path, the earlier draft'
 4. **git-meta key paths.** Closed for 2.9: values stay strings and the measured gain is 2.4x bytes, 18% objects.
    Trees per record (7-8.5) are what remains; a two-level fan-out of the key path or filing under `project`
    changes `by.metaKey` and every clone's layout and is a 2.10 question, to be measured with
-   `design/final/gitmeta.py` before it is claimed.
+   `docs/design/measure/gitmeta.py` before it is claimed.
 5. **Memo.** Kept as it is. If the `tree16` column proves enough for the chooser in production (skip rate
    unchanged with the memo off for a day), drop it in 2.10.
 6. **`entriesRoot` domain and encoding** must be pinned in CONTRACTS.md before M1 ships (proposed: the entries
@@ -820,7 +898,7 @@ JSON values of the same byte count). The git-meta bytes path, the earlier draft'
 | finding (performance and operations review) | resolution |
 |---|---|
 | the libSQL batch travels as hex (4 MB on the wire, 5-10 s of lock, 16-30 s for 12 shards) | the record is a UTF-8 text frame and travels 1:1 (`conn.rs:1826`); objects go as base64 text on libSQL (1.33x) because the batch is one SQL string without hrana arguments (`conn.rs:1747-1767`); the state object has a 2-day TTL and an off switch; wire bytes 2.43 MB (1.75 MB without state) per 800-unit partition, sent as 2.8.2's ≤ 1 MiB transactions at 1.8-3.7 s each (sections 1.2, 1.4, 2.1, 3); `txsize.py` to be re-run with real frames (open question 10) |
-| git-meta gain is 2.5x / 18%, not 9x; trees untouched | section 2.2 rewritten from the real-git experiment re-run with the text frame (`design/final/gitmeta.txt`: 2.4x bytes, 18% fewer objects, trees unchanged); the 1.8 GB pack ~0.65-0.75 GB; the two-level fan-out is a 2.10 question (open question 4) |
+| git-meta gain is 2.5x / 18%, not 9x; trees untouched | section 2.2 rewritten from the real-git experiment re-run with the text frame (`docs/design/measure/gitmeta.txt`: 2.4x bytes, 18% fewer objects, trees unchanged); the 1.8 GB pack ~0.65-0.75 GB; the two-level fan-out is a 2.10 question (open question 4) |
 | at steady state the per-run objects are ~1 GB, two thirds explain-only state; "~50 live runs, 38 MB" unsupported | section 3's steady-state table rebuilt from the 164-run day: state at 2 days 85 MB (594 MB at 14), tables + shape ≤ 296 MB ceiling with the measured 59-run point, hdr shared, `gone` 413 MB, total ceiling ~850 MB; the live-runs count is an M3 plan metric and an M4 dashboard |
 | the 64-shape cap would be hit (59 runs observed 0.3 days into a window) | cap by bytes, 16 MiB of verdict objects per plan in candidate order (7.9x the measured 2.13 MB ceiling); the distinct-run count is logged; state keeps its count cap (sections 1.5, 4) |
 | memo2 is built on a misdiagnosis; one row per plan triples the bytes read | memo2 deleted; today's memo table and one-statement write kept; its lock wait shrinks with the batches (section 2.1) |
@@ -828,3 +906,85 @@ JSON values of the same byte count). The git-meta bytes path, the earlier draft'
 | per-day totals double count (164 runs/day, 327-540 units, not 328 x 800) | section 3's per-day rows rebuilt from `rails.json`: 164 runs, 76,725 units attempted (mean 540, max 972), 46,644 attested (mean 328): 201 MB/day (158 without state) against 2.79 GB; the 800-unit case is the partition maximum class only |
 | migration wrinkles: 2.8 prune stops manifest GC, DDL inside a 30 s request, 2.8 replicas never see `gone` | DDL in a request of its own or `vci store upgrade --begin` (sections 2.1, 5.2); the prune behaviour and the short-window advice (section 5.3); the 2.8 replica lag (section 5.7) |
 | ctx objects never dedupe across runs; 45-59 of them cost 0.7-0.9 MB per plan | the ctx is split into a shared hdr (4.5 KB, 11 distinct in the sample) and a per-run tables object (9-19 KB for Rails); per-hdr checks memoized per `(project, hdr id)`; 45-59 runs cost 49 KB of hdr plus 0.50-0.66 MB of tables instead of 0.70-0.92 MB of ctx (sections 1.1, 1.3, 1.5, 3) |
+
+## 10. Measured on a local sqld
+
+Two measurements of the implementation (branch store-v2 at 69b70f2, release builds) against a local `sqld`
+0.24.32 on 127.0.0.1, on a 14-CPU Mac (29 October 2026). Everything is labelled **sqld**: the store's own cost on
+loopback, without the link to Turso or Turso's lock waits, so the transactions, bytes and rows carry over and the
+times do not. The scripts, their `results.json` and the measurers' full write-ups (`RESULTS.md`) are in
+[measure/sqld/writes/](measure/sqld/writes/) and [measure/sqld/plan/](measure/sqld/plan/); the write side's records
+are built by `crates/vci-store-libsql/examples/replay3.rs`, the plan side's by
+`measure/sqld/plan/meas_plan_v2.rs` (a test file placed in `crates/vci-cli/tests/` for the run).
+
+### 10.1 Writes: one writer, 800 real Rails units
+
+Medians of 3 clean repetitions; the 800 units are the first of the 973-unit run of the private sample.
+
+| | section 3 (design) | format 3 (store-v2), sqld | format 1 (store-v2, `VCI_STORE_RECORD_FORMAT=1`), sqld | 2.8.1's store (2.8.1 + turso-reads), sqld |
+|---|---:|---:|---:|---:|
+| record | 1,783 B | 1,774 B mean | envelope 21,774 B + manifest 13,419 B | same bytes |
+| per-run objects (as base64 at rest) | hdr 4,489, tables 19,387, shape 123,264, state 285,128 B (973 units) | hdr 5,988, tables 24,900, shape 122,304, state 286,076 B (329,446 B raw) | - | - |
+| transactions | 2-3 of <= 1 MiB | **2** of <= 1 MiB in 1 flush, longest 0.09 s | 33 in 7 flushes | 33 in 7 flushes |
+| on the wire | 2.43 MB | **2.59 MB** of SQL (1.87 MB of literals; 2.68 MB on TCP): +6.6% | 30.24 MB of SQL (28.18 MB literals; 31.21 MB TCP) | 31.03 MB TCP |
+| store write / process wall | | 0.15 s / 0.60 s | 0.86 s / 1.23 s | 0.69 s / 0.77 s |
+| at rest | 2.18 MB, 804 rows | **2.46 MB, 806 rows**: +13% (800 attestation rows 2.02 MB = 2,529 B a row around a 1,774 B record; 4 objects 0.44 MB as base64; 2 log rows) | 28.86 MB, 3,233 rows (800 envelopes 17.82 MB, 800 manifests 10.85 MB, 1,633 log rows) | 28.82 MB, 3,233 rows |
+| units lost | | 0 | 0 | 0 |
+
+Ratios, today against format 3: **11.7x on the wire, 11.7x at rest, 16x the transactions** (the design said 13.5x;
+it counts the 9 base manifests of ~50 KB per run that neither replay writes, ~0.45 MB a run). The wire and at-rest
+figures are above the design's because it counted the record and object bytes, where the store sends and keeps the
+objects as base64 (+33% on 329 KB) and each row carries its key and nine listing columns (~750 B). The transaction
+count is 2 rather than 3 because 804 writes are one flush.
+
+The second run of the same 800 units at a moved-on commit (supersession and the orphan pass), format 3: finding what
+to supersede 0.06 s, 15 requests, 1.42 MB of old values read (design: ~2.7 MB with the listing; format 1: 17.42 MB);
+the batch of 800 puts and 800 removals 2 transactions, 3.05 MB of SQL, 0.14 s (format 1: 33 transactions, 31.31 MB,
+0.96 s); the orphan pass removed the old state object, the hdr, tables and shape being shared with the new run.
+
+**Three writers at once** (vex's partitions): format 3 stored 800 of 800 in 12 of 12 processes over 4 attempts, 2-3
+transactions each, store write 0.17-0.39 s, 7.60 MB and 2,417 rows at rest for 2,400 units; sqld's write lock stalled
+once, after every unit was stored. Format 1 (store-v2 and 2.8.1's store) has **no clean local number**: `sqld`
+0.24.32's write lock stalled for good in 25 of 25 attempts within the first flush (the documented stall,
+docs/STORE-BACKENDS.md section 21 item 17), each process losing the flush it was sending; the stalled attempts'
+partial numbers are in the write-up.
+
+Caveats: the records are built by the measurement example, not by `vci run`, so signing, observation and verdicts are
+outside the times, and the format-3 statements carry the real envelope's signature frame over a statement that
+signature does not cover (nothing on the write path checks it; the second run's format-1 envelopes have a renamed
+`manifestRef` for the same reason). 2.8.1's store is the libSQL store of 2.8.1 plus the turso-reads short
+transactions (1 MiB transactions, 4 MiB flushes), not the released 2.8.1 binary whose 5 batches of 6.6-8 MiB section
+3 cites (that binary writes only through `vci run`); its supersession path was not driven, format 1 through store-v2
+standing in. The hour of grace on objects and manifests was skipped by backdating `put_at` by 7,200 s before the
+second run, so `prune_state_objects(2 days)` removed nothing. Writers 1 and 2 take their 800 units from offsets 390
+and 780 of the 973 under distinct names, so their shape and state objects overlap writer 0's more than three real
+partitions' would; each process's own bytes are one partition's.
+
+### 10.2 Plans: vex-api, 1,156 candidates
+
+Medians over 7 runs, interleaved; vex-api at vex's `origin/master` of 28 October with the sample's units re-observed
+at that checkout (so every candidate whose files are still there skips), 2,061 files listed; the release store-v2
+binary against the released vci 2.8.1; each run a first plan with an empty memo.
+
+| binary on records | wall, median (min..max) | fetch values | load verdict objects | verdicts | store requests | read | skip / run | RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| store-v2 on format 3 | **4.79 s** (3.1..11.4) | 0.07 s | 1.61 s | 0.84 s | 14 | **2.9 MB** | 1156 / 905 | 192 MB |
+| store-v2 on format 1 | 5.27 s (3.4..6.1) | 0.10 s | - | 2.64 s | 12 | 43.3 MB | 1155 / 906 | 283 MB |
+| vci 2.8.1 on format 1 | 4.29 s (3.2..10.2) | 0.15 s | - | 2.73 s | 4 | ~43 MB | 1155 / 906 | 280 MB |
+| vci 2.8.1 on format 3 | 1.25 s | 0.07 s | - | 0.07 s | 4 | 2.6 MB | **0** / 2061 (every candidate `envelope: envelope JSON`: fail-open) | 53 MB |
+
+With vex-web, rust and vex-roder added: store-v2 on format 3 3.84 s (3.3..7.9), 3.3 MB, 1164 skips; on format 1 4.79 s,
+44.2 MB; 2.8.1 on format 1 5.07 s; 2.8.1 on format 3 1.40 s. **Bytes a plan reads: 2.9 MB against 43 MB, 15x**
+(section 3 said 2.93 MB of values plus the objects against 59.7 MB). The verdicts' thread-seconds on format 3:
+signature 0.2, globals 0.4, ignored children 4.0, rehash 2.8, and "externals" 16.2, which is the verdict threads
+waiting on the booted Rails probe that runs once a project on the first externals check (1.5-8 s of wall, in both
+formats: 32 thread-seconds on format 1). On loopback format 1's 43 MB cost 0.15 s, so format 3 is not faster in wall
+here; what it removes is the 40 MB a plan, 90 MB of RSS and 1.9 s of verdict wall, and what it adds is
+`load verdict objects`, a serial decode of every candidate's frame and statement (~1.4 ms a candidate) that section 3
+did not count. Production's figure for comparison (2.8.1 on Turso, the 164 Rails jobs of 27 October, plan 1
+medians): 13.12 s in all, of which fetching the stored values 5.46 s; the measurers' estimate for format 3 on Turso is
+the local figure plus ~1 s of round trips, 5-6 s, an estimate and not a measurement.
+
+The differences from production: one candidate per unit instead of ~1.9 (rounds 2-3 and the state objects for
+failure text never ran), loopback, a checkout re-observed so the inputs check passes by construction, and 14 Apple
+CPUs against the runners' 4-8 x86 ones.

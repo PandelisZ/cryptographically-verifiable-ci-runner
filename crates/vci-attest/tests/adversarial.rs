@@ -1,5 +1,5 @@
 //! Adversarial records against the envelope a frame rebuilds
-//! (`design/STORE-V2.md` section 1.6 rule 1, section 4): nothing a frame's
+//! (`docs/design/STORE-V2.md` section 1.6 rule 1, section 4): nothing a frame's
 //! base64 fields carry may change the bytes the signature is checked over.
 //! The decoder's own cases (malformed, oversized, truncated,
 //! section-confusing and non-canonical values) are vci-core's

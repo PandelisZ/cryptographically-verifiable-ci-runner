@@ -23,7 +23,7 @@ use crate::path::{PathError, RepoPath, strip_root};
 pub const MAX_SYMLINK_HOPS: usize = 40;
 
 /// Domain tag for [`InputManifest::entries_root`] (store format 3,
-/// `design/STORE-V2.md` section 1.1: the signed `entriesRoot`).
+/// `docs/design/STORE-V2.md` section 1.1: the signed `entriesRoot`).
 pub const ENTRIES_ROOT_DOMAIN: &[u8] = b"vci/entries-root/v1";
 
 /// `hash` of an [`EntryKind::Dir`] entry: BLAKE3 of the bytes `dir`.
@@ -981,7 +981,7 @@ fn capture_one(
 
 /// Observes every entry of `set[from..]` at `src`, in order: what a verifier
 /// finds at HEAD for an attested `(path, kind, exec)` set (store format 3,
-/// `design/STORE-V2.md` section 1.5 step 8), and what a diff compares with
+/// `docs/design/STORE-V2.md` section 1.5 step 8), and what a diff compares with
 /// the attested values. The attested kind only chooses how to look
 /// (type-only for a [`EntryKind::Dir`], the autoload index for an
 /// [`EntryKind::AutoloadMiss`]); the entry reports what is there now. An
@@ -1224,7 +1224,7 @@ impl InputManifest {
     }
 
     /// The signed `entriesRoot` of a format-3 statement (store format 3,
-    /// `design/STORE-V2.md` section 1.1): lowercase hex BLAKE3 of the domain
+    /// `docs/design/STORE-V2.md` section 1.1): lowercase hex BLAKE3 of the domain
     /// tag [`ENTRIES_ROOT_DOMAIN`] followed by the entries section exactly
     /// as [`Self::root`] encodes it (externals and env left out). `vci run`'s
     /// supersession compares two records' entries through it ("the same
@@ -1239,7 +1239,7 @@ impl InputManifest {
     /// Observes an attested `(path, kind, exec)` set (a descriptor resolved
     /// against its shape, [`crate::ResolvedManifest::set`]) at the checkout
     /// `cache` observes, one entry per element of `set` in its order, with
-    /// what is there now (store format 3, `design/STORE-V2.md` section 1.5
+    /// what is there now (store format 3, `docs/design/STORE-V2.md` section 1.5
     /// step 8). The attested kind chooses only how to look; a
     /// [`EntryKind::Dir`] is observed type-only, an [`EntryKind::AutoloadMiss`]
     /// through the set's [`EntryKind::AutoloadDir`] directories, a listing

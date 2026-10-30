@@ -2,7 +2,7 @@
 //!
 //! Two predicate versions: v1 ([`Predicate`] plus the vci-cli fields,
 //! together [`VciPredicate`]) carries every fact inline; v2
-//! ([`VciPredicateV2`], store format 3, `design/STORE-V2.md` section 1.1)
+//! ([`VciPredicateV2`], store format 3, `docs/design/STORE-V2.md` section 1.1)
 //! carries the unit's own facts and two digests, of a [`Hdr`] object (the
 //! facts every run at the same toolchain and global inputs shares) and of a
 //! [`Tables`] object (the waiver table its `waived` ids index). A verifier
@@ -393,7 +393,7 @@ pub struct VciPredicate {
     pub ignored_inputs: Vec<String>,
 }
 
-/// The v2 predicate (store format 3, `design/STORE-V2.md` section 1.1):
+/// The v2 predicate (store format 3, `docs/design/STORE-V2.md` section 1.1):
 /// the unit's own facts, the digests of its [`Hdr`] and [`Tables`] objects,
 /// the entries root and its waived taints as ids into the tables' waiver
 /// table. The subject carries the test id and the input root, as in v1;

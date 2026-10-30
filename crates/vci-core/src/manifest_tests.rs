@@ -1859,7 +1859,7 @@ fn from_observed_reproduces_the_root_for_every_kind() {
 
 /// STORE-V2 section 1.6 (end) and section 6 M1: the ten store-side
 /// mutations the security review's harness ran
-/// (`design/review-security-v2/attack-output.txt`, unit #896), here on a
+/// (the design security review's attack run, unit #896: docs/design/STORE-V2.md section 4), here on a
 /// run of two units over `every_kind_repo` whose objects go through
 /// `Run::build`, the encoders and the decoders, and whose descriptor is
 /// resolved and observed at HEAD through the `CheckoutCache`. Each

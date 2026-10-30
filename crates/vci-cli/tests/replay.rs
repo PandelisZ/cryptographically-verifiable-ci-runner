@@ -11,7 +11,7 @@
 //!
 //! For every unit: the envelope and the compact manifest are parsed; units
 //! are grouped into runs by (commit, issuedAt, projectName, adapter), the
-//! design's run (one `vci run` of one project; `design/final/measure.py`
+//! design's run (one `vci run` of one project; `docs/design/measure/measure.py`
 //! groups the same way), and inside a run into header groups by the hdr
 //! their predicate's facts make (section 1.4 step 1); [`Run::build`] makes
 //! the shape (its groups the distinct `base` ids of the compact manifests,
@@ -43,11 +43,11 @@
 //!
 //! The sizes of every statement, signature frame, descriptor, record and
 //! object are collected and, when `VCI_PAIRS` names the 1,175-unit sample
-//! (`scratchpad/wr/pairs.json`), printed and compared with the design's
-//! size model (`design/final/numbers.json` beside the sample, or
+//! (`pairs.json`, vex's data, not in the repository), printed and compared
+//! with the design's size model (`docs/design/measure/numbers.json`, or
 //! `VCI_NUMBERS`), flagging any figure off by more than 10%; the figures
 //! and the comparison are written to the file `VCI_REPLAY_OUT` names
-//! (`design/final/replay-numbers.json` is kept that way) and nowhere
+//! (`docs/design/measure/replay-numbers.json` is kept that way) and nowhere
 //! otherwise. Without `VCI_PAIRS` the test over the real sample is
 //! skipped; the synthetic sample below runs always.
 
@@ -1276,9 +1276,10 @@ fn the_synthetic_sample_replays() {
 // ---------------------------------------------------------------- the real sample
 
 /// `VCI_PAIRS` names the 1,175-unit sample; `VCI_REPLAY_OUT` where to write
-/// `replay-numbers.json` (default: `design/final/replay-numbers.json` beside
-/// the sample's `wr` directory when that directory exists); `VCI_NUMBERS`
-/// the model's `numbers.json` to compare with (default: next to the output).
+/// `replay-numbers.json` (nothing is written without it; the repository's
+/// copy is `docs/design/measure/replay-numbers.json`); `VCI_NUMBERS` the
+/// model's `numbers.json` to compare with (default:
+/// `docs/design/measure/numbers.json` in this repository).
 /// The per-candidate work of the plan's step 8 (STORE-V2 section 1.5;
 /// `Verifier::inputs_v2`) over one unit of the sample, timed: the
 /// descriptor resolved against the shape and tables, the paths as a
@@ -1454,10 +1455,7 @@ fn the_real_sample_replays() {
     time_step8_synthetic(400);
     report("a synthetic vex unit of 2,700 group and 150 own entries");
 
-    let final_dir = pairs_path
-        .parent()
-        .and_then(Path::parent)
-        .map(|p| p.join("design").join("final"));
+    let final_dir = Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/measure"));
     // Written only where `VCI_REPLAY_OUT` says: a test does not write
     // outside the target directory on its own.
     let out = std::env::var_os("VCI_REPLAY_OUT").map(PathBuf::from);

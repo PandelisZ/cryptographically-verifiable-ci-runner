@@ -682,7 +682,7 @@ the store: run `vci fetch` ``), unreadable or corrupt fails the `inputs` check: 
 `manifest`) verifies as before; an older vci cannot deserialize a new predicate (no `manifest`), so the unit runs there.
 `vci verify` reads the referenced manifest from `--manifest FILE`, else from the store of the repository it runs in.
 
-Store format 3 and predicate v2 (since vci 2.9.0; the design is STORE-V2, the store side docs/STORE-BACKENDS.md
+Store format 3 and predicate v2 (since vci 2.9.0; the design is docs/design/STORE-V2.md, the store side docs/STORE-BACKENDS.md
 section 2): a stored record may be a UTF-8 **text frame** instead of an envelope JSON, under the same key, target and
 slot: `vci3` LF the statement bytes exactly as signed LF base64 of the signature frame LF base64 of the descriptor.
 A value's first byte says its format (`{` an envelope, `v` a frame; `vci_store::decode_record`, which every reader
