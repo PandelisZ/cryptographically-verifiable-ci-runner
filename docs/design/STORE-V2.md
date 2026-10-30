@@ -910,9 +910,11 @@ JSON values of the same byte count). The git-meta bytes path, the earlier draft'
 ## 10. Measured on a local sqld
 
 Two measurements of the implementation (branch store-v2 at 69b70f2, release builds) against a local `sqld`
-0.24.32 on 127.0.0.1, on a 14-CPU Mac (29 October 2026). Everything is labelled **sqld**: the store's own cost on
+0.24.32 on 127.0.0.1, on a 14-CPU Mac (29 October 2026), and the plans again on 30 October after two fixes
+(section 10.2, "Re-measured"). Everything is labelled **sqld**: the store's own cost on
 loopback, without the link to Turso or Turso's lock waits, so the transactions, bytes and rows carry over and the
-times do not. The scripts, their `results.json` and the measurers' full write-ups (`RESULTS.md`) are in
+times do not. The scripts, their `results.json` / `results2.json` and the measurers' full write-ups (`RESULTS.md`,
+`RESULTS-2.md`) are in
 [measure/sqld/writes/](measure/sqld/writes/) and [measure/sqld/plan/](measure/sqld/plan/); the write side's records
 are built by `crates/vci-store-libsql/examples/replay3.rs`, the plan side's by
 `measure/sqld/plan/meas_plan_v2.rs` (a test file placed in `crates/vci-cli/tests/` for the run).
@@ -964,7 +966,9 @@ partitions' would; each process's own bytes are one partition's.
 
 Medians over 7 runs, interleaved; vex-api at vex's `origin/master` of 28 October with the sample's units re-observed
 at that checkout (so every candidate whose files are still there skips), 2,061 files listed; the release store-v2
-binary against the released vci 2.8.1; each run a first plan with an empty memo.
+binary against the released vci 2.8.1; each run a first plan with an empty memo. These walls include 0.5-0.7 s
+of vex's `[store] token_command` per plan, which the 30 October runs found had run (see "Re-measured" below): compare
+them with each other, not with the re-measured ones.
 
 | binary on records | wall, median (min..max) | fetch values | load verdict objects | verdicts | store requests | read | skip / run | RSS |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -980,11 +984,37 @@ signature 0.2, globals 0.4, ignored children 4.0, rehash 2.8, and "externals" 16
 waiting on the booted Rails probe that runs once a project on the first externals check (1.5-8 s of wall, in both
 formats: 32 thread-seconds on format 1). On loopback format 1's 43 MB cost 0.15 s, so format 3 is not faster in wall
 here; what it removes is the 40 MB a plan, 90 MB of RSS and 1.9 s of verdict wall, and what it adds is
-`load verdict objects`, a serial decode of every candidate's frame and statement (~1.4 ms a candidate) that section 3
-did not count. Production's figure for comparison (2.8.1 on Turso, the 164 Rails jobs of 27 October, plan 1
+`load verdict objects`, ~1.4 ms a candidate that section 3 did not count: not the candidate's own decode (8 ms
+for all 1,156) but the run's shape decoded again for every candidate naming it (the 125 KB shape 973 times),
+removed since (below). Production's figure for comparison (2.8.1 on Turso, the 164 Rails jobs of 27 October, plan 1
 medians): 13.12 s in all, of which fetching the stored values 5.46 s; the measurers' estimate for format 3 on Turso is
 the local figure plus ~1 s of round trips, 5-6 s, an estimate and not a measurement.
 
 The differences from production: one candidate per unit instead of ~1.9 (rounds 2-3 and the state objects for
 failure text never ran), loopback, a checkout re-observed so the inputs check passes by construction, and 14 Apple
 CPUs against the runners' 4-8 x86 ones.
+
+**Re-measured (30 October; `measure/sqld/plan/RESULTS-2.md`).** The same records rebuilt from scratch (a new key and
+checkout commit), every plan with a placeholder token in the store URL so that vex's `token_command` never runs (it
+had run in every plan above), medians of 7, seconds; `before` is store-v2 at 86bd306, `fix 1` adds eaa13b3 (each
+verdict object decoded once per round), `after` adds a397027 (the Rails boot started as soon as something says it is
+needed, and killed when unused); "flag set" is every plan after a store's first, "first plan" a store's first:
+
+| binary on records | wall, flag set | wall, first plan | load verdict objects | verdicts (flag set) | CPU user | requests | read |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| store-v2 before, format 3 | 2.77 (2.7..3.0) | **4.66** (4.5..5.6) | **1.46** | 0.41 | **3.96** | 9 | 2.9 MB |
+| store-v2 fix 1, format 3 | 2.61 (2.3..4.4) | **2.98** (2.9..8.5) | **0.03** | 1.70 | **2.57** | 9 | 2.9 MB |
+| store-v2 after, format 3 | **2.60** (2.4..5.4) | **3.16** (2.7..5.1) | 0.03 | 1.64 | 2.58 | 9 | 2.9 MB |
+| store-v2 after, format 1 | 2.62 (2.3..12.9) | 3.32 (2.8..3.5) | - | 1.58 | 2.86 | 7 | 43.3 MB |
+| vci 2.8.1, format 1 | 2.60 (2.5..5.6) | 3.25 (2.9..4.5) | - | 1.64 | 2.84 | 4 | ~43 MB |
+
+The decode fix takes 1.4 s of CPU off every format-3 plan (3.96 to 2.57 s of user time, which on a 4-CPU runner is
+wall) and 1.7 s off a store's first plan; with the flag set the wall moves only 0.16 s, since the 1.46 s used to
+overlap the Rails boot the flag starts at +0.15 s, and the verdicts now wait in "externals" for that boot (17.6-18.6
+thread-seconds) instead. A vex-api plan here is now the boot (1.7-4.1 s, 2.2 s typical) plus ~0.2-0.3 s; everything
+else of a format-3 plan is ~1.1 s of CPU-bound work, and format 3 is level with 2.8.1 on loopback (2.60 against
+2.60 s, first plan 3.16 against 3.25 s) while reading 2.9 MB against 43 MB with 90 MB less RSS. With the four projects
+(flag set): 3.14 s after, format 3, 2.95 s format 1, 2.80 s 2.8.1. Starting the boot from the round's tables objects
+on a first plan moved its start by 0.05-0.1 s (noise here); its worth is where the flag read is slow (a token
+command, Turso), and a store whose candidates keep failing before the externals check pays for one unused boot
+(`plan:natives-hint-unused:<project>`), not one per plan.

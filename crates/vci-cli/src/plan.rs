@@ -834,16 +834,26 @@ impl ObjectLoader {
     /// no-op, found before the bytes are hashed or decoded; one kept as
     /// unavailable is replaced (a round that fetched more may make it
     /// readable).
+    #[cfg(test)]
     fn insert(&self, kind: ObjectKind, id: &str, bytes: &[u8]) {
-        {
-            let mut c = self.lock();
-            if matches!(c.by_id.get(id), Some(Ok(_))) {
-                return;
-            }
-            c.decodes += 1;
+        if matches!(self.lock().by_id.get(id), Some(Ok(_))) {
+            return;
         }
+        let decoded = self.decode(kind, id, bytes);
+        self.keep(kind, id, bytes.len(), decoded);
+    }
+
+    /// `bytes` hashed and decoded as the object `id` of `kind` (outside the
+    /// lock), not yet kept.
+    fn decode(
+        &self,
+        kind: ObjectKind,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<Object, ObjectUnavailable> {
+        self.lock().decodes += 1;
         let found = hex32(&object_id(bytes));
-        let decoded: Result<Object, ObjectUnavailable> = if found != id {
+        if found != id {
             Err(ObjectUnavailable {
                 what: format!("{kind} object {id} corrupt"),
                 actual: format!("its BLAKE3 is {found}, not its id"),
@@ -862,26 +872,36 @@ impl ObjectLoader {
                 ObjectKind::State => State::decode(bytes).map(|s| Object::State(Arc::new(s))),
             }
             .map_err(malformed)
-        };
+        }
+    }
+
+    /// Keep `decoded`, the object `id` of `kind` and `len` bytes, unless the
+    /// id is kept as loaded already; a verdict object only within the byte
+    /// cap.
+    fn keep(
+        &self,
+        kind: ObjectKind,
+        id: &str,
+        len: usize,
+        decoded: Result<Object, ObjectUnavailable>,
+    ) {
         let mut c = self.lock();
         if matches!(c.by_id.get(id), Some(Ok(_))) {
             return;
         }
         let decoded = match decoded {
             Ok(o) if kind != ObjectKind::State => {
-                if c.verdict_bytes + bytes.len() > VERDICT_OBJECT_BYTES {
+                if c.verdict_bytes + len > VERDICT_OBJECT_BYTES {
                     Err(ObjectUnavailable {
                         what: format!("{kind} object {id} not loaded"),
                         actual: format!(
                             "{} bytes would pass the plan's verdict-object cap of {} bytes ({} loaded)",
-                            bytes.len(),
-                            VERDICT_OBJECT_BYTES,
-                            c.verdict_bytes
+                            len, VERDICT_OBJECT_BYTES, c.verdict_bytes
                         ),
                         past_cap: true,
                     })
                 } else {
-                    c.verdict_bytes += bytes.len();
+                    c.verdict_bytes += len;
                     c.loaded[kind as usize - 1] += 1;
                     Ok(o)
                 }
@@ -900,10 +920,13 @@ impl ObjectLoader {
     /// order given: the caller orders them by candidate priority, so that
     /// the byte cap falls on the least likely candidates. `wanted` names an
     /// object once per candidate (a run's 1,000 units name its one shape
-    /// 1,000 times); each `(kind, id)` is decoded at its first place in the
-    /// order only, which is where the cap is decided: a repeat of the same
-    /// bytes under the same kind would decode to the same result, and the
-    /// cap, which only grows, would refuse it again.
+    /// 1,000 times); each `(kind, id)` is hashed and decoded at its first
+    /// place in the order only, and that result is kept again at each later
+    /// place, as if it were decoded there: the same bytes under the same
+    /// kind decode the same, and the cap is checked at every place, so that
+    /// what is kept (an object, or the reason of the id's last place, with
+    /// the cap's count at that place) is what an insert at every place
+    /// would keep.
     fn load(&self, store: &dyn AttestationStore, timers: &Timers, wanted: &[(ObjectKind, String)]) {
         let mut ids: Vec<&str> = Vec::new();
         let mut asked: HashSet<&str> = HashSet::new();
@@ -936,13 +959,23 @@ impl ObjectLoader {
                     .iter()
                     .map(|o| (o.id.as_str(), o.bytes.as_slice()))
                     .collect();
-                let mut decoded: HashSet<(ObjectKind, &str)> = HashSet::new();
+                let mut decoded: HashMap<(ObjectKind, &str), Result<Object, ObjectUnavailable>> =
+                    HashMap::new();
                 for (kind, id) in wanted {
-                    if !asked.contains(id.as_str()) || !decoded.insert((*kind, id.as_str())) {
+                    if !asked.contains(id.as_str()) {
                         continue;
                     }
                     match by_id.get(id.as_str()) {
-                        Some(bytes) => self.insert(*kind, id, bytes),
+                        Some(bytes) => {
+                            if matches!(self.lock().by_id.get(id), Some(Ok(_))) {
+                                continue;
+                            }
+                            let d = decoded
+                                .entry((*kind, id.as_str()))
+                                .or_insert_with(|| self.decode(*kind, id, bytes))
+                                .clone();
+                            self.keep(*kind, id, bytes.len(), d);
+                        }
                         None => {
                             let what = if store.caps().lazy_values {
                                 format!("{kind} object {id} not in the store: run `vci fetch`")
@@ -1910,6 +1943,11 @@ struct Probed {
     files: Result<Vec<TestFile>, String>,
     warnings: Vec<String>,
     resolved: Option<Result<Resolved, String>>,
+    /// The boot may be started from the round's tables objects
+    /// ([`start_native_boots`]): a Rails project whose store has neither
+    /// flag, [`natives_flag`] (the boot started already) nor
+    /// [`unused_hint_flag`].
+    boot_hint: bool,
 }
 
 /// The per-project part of a [`Verifier`] that shells out.
@@ -1957,6 +1995,16 @@ fn natives_flag(project: &str) -> String {
     format!("plan:natives:{project}")
 }
 
+/// The store flag saying a plan of `project` started the boot from its
+/// tables objects ([`start_native_boots`]) and no verdict compared a native
+/// library: a later plan without [`natives_flag`] boots at its first
+/// externals check again, as before 2.9, so that a store whose candidates
+/// keep failing before that check (on their inputs, signer or toolchain)
+/// pays for one unused boot, not one per plan.
+fn unused_hint_flag(project: &str) -> String {
+    format!("plan:natives-hint-unused:{project}")
+}
+
 /// List a project's test files and, with `resolve`, resolve its toolchain
 /// and externals at the same time (both may shell out: uv, go, cargo, ruby;
 /// pytest and Minitest files are listed without a process).
@@ -1990,11 +2038,16 @@ fn probe_project(
         // (its connection, a token command), so it is asked on a thread of
         // its own and the listing does not wait for it (2.9). A first plan
         // (no flag) starts the boot once its candidates are read
-        // ([`start_native_boots`]).
+        // ([`start_native_boots`]), unless a plan before it started one that
+        // way for nothing ([`unused_hint_flag`], asked on the same thread
+        // only when the first flag is not set).
         let natives = (resolve && project.adapter.name() == "rails").then(|| {
             s.spawn(|| {
                 if store.flag(&natives_flag(&project.name)) {
                     project.adapter.start_native_externals(&env);
+                    false
+                } else {
+                    !store.flag(&unused_hint_flag(&project.name))
                 }
             })
         });
@@ -2010,13 +2063,14 @@ fn probe_project(
         // the runner `runner` does not select), as `vci run` prints it.
         let warnings = project.adapter.warnings(&env);
         let resolved = resolving.map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
-        if let Some(h) = natives {
-            h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
-        }
+        let boot_hint = natives
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .unwrap_or(false);
         Probed {
             files,
             warnings,
             resolved,
+            boot_hint,
         }
     })
 }
@@ -2078,21 +2132,26 @@ fn resolve_project(
 /// recorded, so a candidate whose own descriptor names none may start a
 /// boot no verdict reads; nothing is decided from it. Format 1 records
 /// keep their natives in manifests the verdicts load, and boot at the
-/// first check, as before.
+/// first check, as before. Only where `boot_hint` allows it (neither store
+/// flag is set): a hinted boot that no verdict reads sets
+/// [`unused_hint_flag`] after the verdicts, and later plans no longer start
+/// one from the hint. Which projects were started this way.
 fn start_native_boots(
     ctx: &Ctx,
     res: &PlanResult,
     resolved: &[Option<Result<Resolved, String>>],
+    boot_hint: &[bool],
     files: &[TestFile],
     by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
     objects: &ObjectLoader,
-) {
+) -> Vec<bool> {
+    let mut hinted = vec![false; ctx.projects.len()];
     for (pi, project) in ctx.projects.iter().enumerate() {
         let rails = matches!(&resolved[pi], Some(Ok(r)) if r.rails_gems.is_some());
         let Some(child) = res.projects[pi].child_env.as_ref() else {
             continue;
         };
-        if !rails || res.projects[pi].run_all.is_some() {
+        if !rails || !boot_hint[pi] || res.projects[pi].run_all.is_some() {
             continue;
         }
         let cands = files
@@ -2101,9 +2160,13 @@ fn start_native_boots(
             .filter_map(|f| by_id.get(f.test_id.as_str()))
             .flatten();
         if objects.names_native_library(cands) {
-            project.adapter.start_native_externals(&child.to_child_env());
+            project
+                .adapter
+                .start_native_externals(&child.to_child_env());
+            hinted[pi] = true;
         }
     }
+    hinted
 }
 
 fn plan_with(
@@ -2262,6 +2325,7 @@ fn plan_with(
     });
     let mut files: Vec<TestFile> = Vec::new();
     let mut resolved: Vec<Option<Result<Resolved, String>>> = Vec::new();
+    let mut boot_hint: Vec<bool> = Vec::new();
     for ((p, start), probed) in ctx.projects.iter().zip(starts).zip(probed) {
         for n in &start.notes {
             eprintln!("{n}");
@@ -2281,6 +2345,7 @@ fn plan_with(
             res.warnings.push(w);
         }
         resolved.push(probed.resolved);
+        boot_hint.push(probed.boot_hint);
         res.projects.push(ProjectPlan {
             name: p.name.clone(),
             path: p.rel.clone(),
@@ -2413,7 +2478,7 @@ fn plan_with(
             }
         }
     }
-    start_native_boots(&ctx, res, &resolved, &files, &by_id, &objects);
+    let hinted = start_native_boots(&ctx, res, &resolved, &boot_hint, &files, &by_id, &objects);
     let now = now_unix();
     // The checkout does not change during a plan: each path is observed once
     // for every candidate of every file (and every project).
@@ -2541,6 +2606,11 @@ fn plan_with(
         );
     }
     for (pi, (verifier, verdicts)) in verifiers.iter().zip(verdicts).enumerate() {
+        // A boot the hint started that no verdict read (they failed before
+        // the externals check): later plans do not start one from the hint.
+        if hinted[pi] && verifier.as_ref().is_ok_and(|v| v.natives.get().is_none()) {
+            store.set_flag(&unused_hint_flag(&res.projects[pi].name));
+        }
         match verifier {
             Err(r) => {
                 res.projects[pi].run_all.get_or_insert_with(|| r.clone());
@@ -5766,6 +5836,108 @@ adapter = "pytest"
         assert!(e.past_cap, "{e:?}");
     }
 
+    /// Decoding each `(kind, id)` once keeps what an insert at every place
+    /// of the round would keep: the same objects, bytes and counts, and for
+    /// an id that fails under every kind it is named with, the reason of its
+    /// last place. A shape past the cap at its first place, then named as
+    /// tables, then as a shape again, stays "not loaded" past the cap (not
+    /// the tables decode failure of its middle place), and its candidate is
+    /// counted.
+    #[test]
+    fn a_round_keeps_what_an_insert_at_every_place_keeps() {
+        use std::sync::atomic::Ordering;
+        use vci_store::conformance::scenarios::Run3;
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let run = Run3::build(&["src/a.ts", "src/b.ts"]);
+        s.put_objects(&run.new_objects()).unwrap();
+        let timers = Timers::default();
+        let objs: Vec<(String, Vec<u8>)> = (0..3)
+            .map(|i| {
+                (
+                    hex32(&object_id(&run.objects[i].1)),
+                    run.objects[i].1.clone(),
+                )
+            })
+            .collect();
+        let shape = objs[2].0.clone();
+        let shape_len = objs[2].1.len();
+        let total: usize = objs.iter().map(|(_, b)| b.len()).sum();
+
+        let loader = ObjectLoader::default();
+        loader.lock().verdict_bytes = VERDICT_OBJECT_BYTES - shape_len + 1;
+        loader.load(
+            &s,
+            &timers,
+            &[
+                (ObjectKind::Shape, shape.clone()),
+                (ObjectKind::Tables, shape.clone()),
+                (ObjectKind::Shape, shape.clone()),
+            ],
+        );
+        assert_eq!(loader.lock().decodes, 2);
+        let e = loader.shape(&s, &timers, &shape).unwrap_err();
+        assert!(e.past_cap && e.what.contains("not loaded"), "{e:?}");
+        assert_eq!(loader.past_cap.load(Ordering::Relaxed), 1);
+
+        // Every round of three places over the three ids under the three
+        // verdict kinds, from caps that refuse none, some or all of them.
+        type Kept = (
+            Vec<(String, Result<ObjectKind, ObjectUnavailable>)>,
+            usize,
+            [usize; 4],
+        );
+        let kept = |l: &ObjectLoader| -> Kept {
+            let c = l.lock();
+            let mut by_id: Vec<_> = c
+                .by_id
+                .iter()
+                .map(|(id, r)| {
+                    (
+                        id.clone(),
+                        r.as_ref().map(Object::kind).map_err(Clone::clone),
+                    )
+                })
+                .collect();
+            by_id.sort_by(|a, b| a.0.cmp(&b.0));
+            (by_id, c.verdict_bytes, c.loaded)
+        };
+        let places: Vec<(ObjectKind, usize)> =
+            [ObjectKind::Hdr, ObjectKind::Tables, ObjectKind::Shape]
+                .into_iter()
+                .flat_map(|k| (0..3).map(move |i| (k, i)))
+                .collect();
+        let starts = [
+            0,
+            VERDICT_OBJECT_BYTES - total,
+            VERDICT_OBJECT_BYTES - shape_len + 1,
+            VERDICT_OBJECT_BYTES - 1,
+        ];
+        let mut rounds = 0;
+        for a in &places {
+            for b in &places {
+                for c in &places {
+                    let wanted: Vec<(ObjectKind, String)> = [a, b, c]
+                        .iter()
+                        .map(|(k, i)| (*k, objs[*i].0.clone()))
+                        .collect();
+                    for start in starts {
+                        let once = ObjectLoader::default();
+                        once.lock().verdict_bytes = start;
+                        once.load(&s, &timers, &wanted);
+                        let every = ObjectLoader::default();
+                        every.lock().verdict_bytes = start;
+                        for (k, i) in [a, b, c] {
+                            every.insert(*k, &objs[*i].0, &objs[*i].1);
+                        }
+                        assert_eq!(kept(&once), kept(&every), "{wanted:?} from {start}");
+                        rounds += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(rounds, 729 * 4);
+    }
+
     /// A plan's first boot hint: a read candidate whose tables object lists
     /// a native library (`native:<file>`) names one; a candidate whose
     /// tables list none, whose tables are not loaded, or that was not read
@@ -5785,7 +5957,10 @@ adapter = "pytest"
                 .collect(),
         };
         let mut ids = Vec::new();
-        for t in [tables(&["native:libvips.42.dylib", "rack"]), tables(&["rack"])] {
+        for t in [
+            tables(&["native:libvips.42.dylib", "rack"]),
+            tables(&["rack"]),
+        ] {
             let bytes = t.encode().unwrap();
             let id = hex32(&object_id(&bytes));
             loader.insert(ObjectKind::Tables, &id, &bytes);
@@ -5808,8 +5983,12 @@ adapter = "pytest"
             c.tables_by_key.insert("plain".into(), ids[1].clone());
             c.tables_by_key.insert("unloaded".into(), hex32(&[5; 32]));
         }
-        let (vips, plain, unloaded, unread) =
-            (cand("vips"), cand("plain"), cand("unloaded"), cand("unread"));
+        let (vips, plain, unloaded, unread) = (
+            cand("vips"),
+            cand("plain"),
+            cand("unloaded"),
+            cand("unread"),
+        );
         assert!(loader.names_native_library([&plain, &vips].into_iter()));
         assert!(!loader.names_native_library([&plain, &unloaded, &unread].into_iter()));
         assert!(!loader.names_native_library(std::iter::empty()));

@@ -39,6 +39,30 @@
 # A child process of Active Record's schema maintenance (VCI_RAILS_MODE=engine,
 # set by the collector of its parent): not the test's, nothing to record.
 return if ENV["VCI_RAILS_MODE"] == "engine"
+# A boot vci started ahead of time (rails.rs, StartedProbe): VCI_RAILS_PROBE_PIPE
+# names its run directory, and its stdin is a pipe vci holds open, never
+# writes to and closes only by exiting, however it exits (a SIGTERM or a
+# SIGKILL runs none of vci's own cleanup). Once the pipe ends the boot is
+# nobody's: it removes its run directory and ends at once, instead of
+# booting the application beside whatever runs next. (A Bundler restart
+# keeps stdin and the variable; this runs again in the new process.)
+if ENV["VCI_RAILS_MODE"] == "probe" && !ENV["VCI_RAILS_PROBE_PIPE"].to_s.empty?
+  Thread.new(ENV["VCI_RAILS_PROBE_PIPE"]) do |dir|
+    begin
+      loop { STDIN.sysread(4096) }
+    rescue Exception # rubocop:disable Lint/RescueException
+      nil
+    end
+    if File.basename(dir).start_with?("vci-rails-")
+      begin
+        Process.spawn("/bin/rm", "-rf", dir, in: File::NULL, out: File::NULL, err: File::NULL)
+      rescue StandardError
+        nil
+      end
+    end
+    Process.exit!(1)
+  end
+end
 # A process a test started (`ruby -e`, `bin/rails runner`) in batch mode: it
 # inherits RUBYOPT and VCI_OUT but no test id (the batch gives a file's
 # process its id, not its environment), and it is not the batch's own

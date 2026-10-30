@@ -495,6 +495,13 @@ struct Probe {
 /// The script of the probe that boots the application.
 const BOOT_SCRIPT: &str = "require File.expand_path(\"config/environment\")";
 
+/// Env var (of a boot started ahead of time, [`StartedProbe`]): its run
+/// directory. Its stdin is then a pipe vci holds open and never writes to;
+/// when the pipe ends (vci exited, however: a SIGTERM or a SIGKILL runs
+/// none of vci's own cleanup), the collector removes that directory and
+/// ends the process.
+const RAILS_PROBE_PIPE_ENV: &str = "VCI_RAILS_PROBE_PIPE";
+
 /// The `-e` script of the probe that does not boot the application.
 fn light_script(rails_app: bool) -> String {
     format!("require \"bundler/setup\"; VciCollector::Probe.light!({rails_app})")
@@ -533,7 +540,8 @@ struct StartedProbe {
 /// the plan's exit for the rest of a boot nobody reads (seconds on vex);
 /// left alone (as before 2.9) it outlived vci, booting the application
 /// beside the tests `vci ci` runs next, in a run directory removed under
-/// it.
+/// it. When vci ends without dropping the adapter (a signal), the boot
+/// ends itself: its stdin pipe ends with vci ([`RAILS_PROBE_PIPE_ENV`]).
 impl Drop for StartedProbe {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -806,6 +814,7 @@ impl RailsAdapter {
             RAILS_SHARDS_ENV,
             RAILS_AUTOLOAD_ENV,
             "SPRING_SERVER_COMMAND",
+            RAILS_PROBE_PIPE_ENV,
         ] {
             c.env_remove(k);
         }
@@ -915,7 +924,10 @@ impl RailsAdapter {
         };
         let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
         script_args(&mut cmd, &dirs, "vci-probe.rb", BOOT_SCRIPT);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .env(RAILS_PROBE_PIPE_ENV, dirs.base.as_str())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let describe = describe(&cmd);
         if let Ok(child) = cmd.spawn() {
             *slot = Some(StartedProbe {
@@ -945,14 +957,19 @@ impl RailsAdapter {
             None
         };
         let (out, described) = match started {
-            Some(mut sp) => (
-                sp.child
+            Some(mut sp) => {
+                let mut child = sp
+                    .child
                     .take()
-                    .expect("a started probe holds its process until taken")
-                    .wait_with_output()
-                    .map_err(|e| self.not_installed(e))?,
-                std::mem::take(&mut sp.describe),
-            ),
+                    .expect("a started probe holds its process until taken");
+                // Its stdin stays open until it has finished:
+                // `wait_with_output` would close it first, which the boot
+                // takes for vci's exit.
+                let stdin = child.stdin.take();
+                let out = child.wait_with_output().map_err(|e| self.not_installed(e));
+                drop(stdin);
+                (out?, std::mem::take(&mut sp.describe))
+            }
             None => (
                 cmd.output().map_err(|e| self.not_installed(e))?,
                 describe(&cmd),

@@ -355,9 +355,9 @@ local `sqld` on loopback (section 18, "Measured"; STORE-V2 section 10): one 800-
 objects of 329,446 B and 800 records of 1,417,069 B, written in 2 transactions and 0.18 s; the superseding run in 2
 transactions and 0.20 s); 800 real Rails units written as a run writes them, **2 transactions and 2.59 MB of SQL
 against 33 transactions and 30.24 MB for format 1 (11.7x), 2.46 MB at rest against 28.86 MB (11.7x)**; and a vex-api
-plan of 1,156 candidates reading **2.9 MB against 43 MB (15x)**, 4.79 s median wall against 2.8.1's 4.29 s on the same
-loopback store, where the 43 MB cost 0.15 s. **No format-3 write or plan has been measured against Turso's hosted
-service yet**; the transaction sizing of 1 MiB and the 1.8-3.7 s of lock per
+plan of 1,156 candidates reading **2.9 MB against 43 MB (15x)**, 2.60 s median wall against 2.8.1's 2.60 s on the same
+loopback store (a store's first plan 3.16 s against 3.25 s), where the 43 MB cost 0.10 s. **No format-3 write or
+plan has been measured against Turso's hosted service yet**; the transaction sizing of 1 MiB and the 1.8-3.7 s of lock per
 transaction come from 2.8.2's measurements with JSON values of the same byte count (section 18), and are to be
 re-run with real frames and base64 objects before the first production rollout.
 
@@ -426,7 +426,9 @@ The gates, in order (STORE-V2 section 5):
 ### Hints
 
 - **Memo**: `(tree16, test key) -> attestation key`, meaning "this attestation passed on that tree".
-- **Flags**: a set of names, for example `plan:natives:<project>`.
+- **Flags**: a set of names: `plan:natives:<project>` (a plan compared native libraries: the next plans start the
+  Rails boot at once) and, since 2.9, `plan:natives-hint-unused:<project>` (a plan started the boot from its tables
+  objects and no verdict read it: the next plans without the first flag boot only at an externals check).
 
 Both are best effort. They only order reads or start work early, and nothing about trust depends on them.
 
@@ -3659,11 +3661,15 @@ not the released binary): 33 transactions in 7 flushes, 31.03 MB on TCP, 0.69 s,
 against format 3: **11.7x on the wire, 11.7x at rest, 16x the transactions** (the design's 13.5x counts the 9 base
 manifests a run writes, which the replays did not). Three format-3 writers at once stored every unit in 4 of 4
 attempts; three format-1 writers have no clean local number, since `sqld` 0.24.32's write lock stalled for good in 25
-of 25 attempts (section 21, item 17). *Plans*, vex-api, 1,156 candidates, medians of 7 runs: store-v2 on format 3
-4.79 s of wall (3.1-11.4), 0.07 s fetching values, 1.61 s loading the verdict objects (a serial decode of every
-candidate's frame the design did not count), 0.84 s of verdicts, 14 requests, **2.9 MB read**, 1,156 skips, 192 MB
-of RSS; store-v2 on format 1 5.27 s, 43.3 MB, 283 MB; vci 2.8.1 on format 1 4.29 s, 4 requests of ~43 MB, 280 MB;
-vci 2.8.1 on format 3 fails open in 1.25 s, every candidate `envelope: envelope JSON`. Production's plan 1 on Turso
+of 25 attempts (section 21, item 17). *Plans*, vex-api, 1,156 candidates, medians of 7 runs (re-measured on 30
+October, `docs/design/measure/sqld/plan/RESULTS-2.md`; the first runs' walls included 0.5-0.7 s of vex's
+`token_command` and a decode of the run's shape once per candidate, 1.46 s, since removed): store-v2 on format 3
+**2.60 s** of wall (2.4-5.4) with the natives flag set, every plan after a store's first, and 3.16 s (2.7-5.1) for a
+store's first plan, 0.05 s fetching values, 0.03 s loading the verdict objects (1.46 s before the fix), 1.64 s of
+verdicts, most of it waiting for the Rails boot that reads the native libraries (1.7-4.1 s, started with the
+toolchain), 2.58 s of CPU (3.96 s before), 9 requests, **2.9 MB read**, 1,156 skips, 193 MB of RSS; store-v2 on format
+1 2.62 s, 43.3 MB, 287 MB; vci 2.8.1 on format 1 2.60 s (first plan 3.25 s), 4 requests of ~43 MB, 281 MB; vci 2.8.1
+on format 3 fails open in 1.25 s, every candidate `envelope: envelope JSON`. Production's plan 1 on Turso
 (2.8.1, 164 jobs of 27 October) took 13.12 s median. The caveats: on loopback the times are the store's own cost
 without the link or Turso's lock waits (transactions, bytes and rows carry over, times do not); the write side's
 records are built by `crates/vci-store-libsql/examples/replay3.rs`, not by `vci run`; the plan side has one candidate
