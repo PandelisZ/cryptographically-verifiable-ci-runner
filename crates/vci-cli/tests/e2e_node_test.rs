@@ -1234,7 +1234,18 @@ fn ci_plain_run_is_one_node_process_with_the_script_flags() {
     );
     assert!(!stderr.contains("vci: node-test:"), "{stderr}");
     assert!(runners.is_empty());
-    assert!(!stderr.contains("add"), "{stderr}");
+    // A's test did not run: no spec-reporter line such as `✔ add (0.3ms)`.
+    // (A bare `contains("add")` also matched the random base commit hash in
+    // the --base-ref warning, e.g. 92ad4bc…2add591….)
+    assert!(
+        !stderr.lines().any(|l| {
+            l.trim_start()
+                .trim_start_matches(['✔', '✖', '﹣'])
+                .trim_start()
+                .starts_with("add (")
+        }),
+        "A must not run: {stderr}"
+    );
     let log: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
     assert_eq!(log["ran"].as_array().unwrap().len(), 0, "{log}");
 }
