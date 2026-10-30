@@ -2306,6 +2306,208 @@ fn a_2_8_binary_fails_open_on_a_format_3_git_meta_store() {
     assert_eq!(plan.skip, set(UNITS), "{plan:?}");
 }
 
+/// A vci 2.8 binary on the libSQL namespace this vci wrote (STORE-V2
+/// section 5, gates 2 to 4 on the store vex runs; `replica`: 2.8 and this
+/// vci read through a replica file, `VCI_STORE_SYNC=replica`, written by
+/// the server). This vci's first write laid out `vci_schema`'s columns
+/// (ALTERs with DEFAULTs), the nullable columns, the `objects` and `gone`
+/// tables, and put four frames with their columns and no change-log rows
+/// for them, the schema version staying 1. 2.8's `store info` reads the
+/// namespace, its plan runs every unit with no error (a replica syncs the
+/// old log, whose nonce rows carry no value), its `explain` and `prune`
+/// exit 0 and remove nothing, and its own `vci run a` stores a format-1
+/// row with its manifest, which this vci reads (every unit skipped, a on
+/// 2.8's row) and 2.8 skips on. `vci store upgrade --finish` is then
+/// refused with the count (exit 1), `--begin` finds the layout present,
+/// and once this vci has re-attested a (no format-1 row remains) `--finish`
+/// exits 2 with the libSQL store's refusal of this release: the namespace
+/// stays at version 1 (docs/STORE-BACKENDS.md, gate 4). After `vci prune
+/// --objects --older-than 0` an edited unit's explain names no attested
+/// hash.
+fn two_eight_on_a_libsql_namespace(replica: bool) {
+    let Some(old) = vci_2_8() else {
+        return;
+    };
+    let Some(backend) = Backend::libsql_server(replica) else {
+        return;
+    };
+    let ns = backend.server.as_ref().unwrap().1.clone();
+    let Some(w) = World::new(backend) else {
+        return;
+    };
+    let out = attest_all(&w);
+    let keys = attested_keys(&out, "libsql");
+    let s = libsql_kit::open_remote(&ns).expect("the server");
+    let ids: BTreeSet<String> = {
+        let all = s.read_all().unwrap();
+        assert_eq!(all.len(), UNITS.len());
+        let columns = s.columns(&all.iter().collect::<Vec<_>>()).unwrap();
+        let mut ids: BTreeSet<String> = BTreeSet::new();
+        for (e, c) in all.iter().zip(&columns) {
+            assert!(
+                matches!(decode_record(&e.bytes), Ok(Record::FormatThree(_))),
+                "{}: a format-3 frame",
+                e.key
+            );
+            assert_eq!(c.format, Some(3), "{}: {c:?}", e.key);
+            ids.extend(c.object_ids().map(str::to_owned));
+        }
+        assert_eq!(ids.len(), 4, "hdr, tables, shape, state: {ids:?}");
+        ids
+    };
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    assert_eq!(s.get_objects(&id_refs).unwrap().len(), 4);
+    assert_eq!(w.info()["schemaVersion"], 1);
+    assert!(s.manifest_roots().unwrap().is_empty(), "no manifest yet");
+
+    // 2.8 reads the namespace: store info, plan (every unit runs, no
+    // error; a replica syncs the log first), explain, prune.
+    let out = w.vci_other(&old, &["store", "info", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = w.vci_other(&old, &["plan", "--base-ref", "main", "--format", "json"]);
+    let plan = parse_plan(&out);
+    assert_eq!(plan.run, set(UNITS), "{plan:?}");
+    assert!(plan.skip.is_empty(), "{plan:?}");
+    assert!(
+        !stderr(&out).contains("error"),
+        "2.8 reports no error:\n{}",
+        stderr(&out)
+    );
+    let out = w.vci_other(&old, &["explain", "a", "--base-ref", "main"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = w.vci_other(&old, &["prune", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = w.vci_other(&old, &["prune"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        s.list_all().unwrap().len(),
+        UNITS.len(),
+        "2.8 removed nothing"
+    );
+    assert_eq!(s.get_objects(&id_refs).unwrap().len(), 4);
+
+    // 2.8 runs a and stores it as it always did: a format-1 row and its
+    // manifest, into the frame's slot or one of its own.
+    let key_path = w.key.to_str().unwrap().to_owned();
+    let out = w.vci_other(&old, &["run", "a", "--key", &key_path]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let new_keys = attested_keys(&out, "libsql");
+    assert_eq!(new_keys.len(), 1, "{}", text(&out));
+    let new_key = &new_keys["a"];
+    let roots = s.manifest_roots().unwrap();
+    assert_eq!(roots.len(), 1, "2.8 stored a's manifest: {roots:?}");
+    let all = s.read_all().unwrap();
+    let row = all.iter().find(|e| e.key == *new_key).expect("2.8's row");
+    assert!(
+        matches!(decode_record(&row.bytes), Ok(Record::FormatOne(_))),
+        "a format-1 value"
+    );
+    if slot_and_tree(new_key).0 == slot_and_tree(&keys["a"]).0 {
+        assert_ne!(*new_key, keys["a"], "2.8's own hint");
+        assert_eq!(all.len(), UNITS.len(), "2.8 reused the frame's slot");
+    } else {
+        assert_eq!(all.len(), UNITS.len() + 1, "2.8 took a slot of its own");
+    }
+    assert_eq!(
+        s.get_objects(&id_refs).unwrap().len(),
+        4,
+        "the objects are untouched"
+    );
+    // This vci skips every unit, a on 2.8's row; 2.8 (its replica synced
+    // again) skips a alone.
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+    assert_eq!(plan.by["a"].0, *new_key, "{plan:?}");
+    let out = w.vci_other(&old, &["plan", "--base-ref", "main", "--format", "json"]);
+    let plan = parse_plan(&out);
+    assert_eq!(plan.skip, set(&["a"]), "{plan:?}");
+    assert!(!stderr(&out).contains("error"), "{}", stderr(&out));
+    // This vci's prune reads every row while the manifest exists and
+    // finds it referenced: nothing goes.
+    let (listed, summary) = prune_dry_run(&w);
+    assert!(listed.is_empty(), "{listed:?}\n{summary}");
+    let out = w.vci(&["prune"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(s.manifest_roots().unwrap(), roots);
+
+    // The migration gates on libSQL: `--finish` refused with the count
+    // while 2.8's row remains; `--begin` finds the layout present.
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("not finished: 1 attestation(s) are not format-3 records"),
+        "{}",
+        text(&out)
+    );
+    let out = w.vci(&["store", "upgrade", "--begin"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("the format-3 columns and tables are present"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(w.info()["schemaVersion"], 1);
+    // This vci re-attests a: its frame takes the slot, no format-1 row
+    // remains, and `--finish` at zero is this release's refusal (exit 2):
+    // the namespace stays at version 1, which 2.8 keeps reading.
+    let out = w.run(&["a"]);
+    let again = attested_keys(&out, "libsql");
+    assert_eq!(again.len(), 1, "{}", text(&out));
+    let all = s.read_all().unwrap();
+    assert!(
+        all.iter()
+            .all(|e| matches!(decode_record(&e.bytes), Ok(Record::FormatThree(_)))),
+        "only frames remain: {:?}",
+        all.iter().map(|e| &e.key).collect::<Vec<_>>()
+    );
+    let out = w.vci(&["store", "upgrade", "--finish"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        stderr(&out).contains(
+            "the libsql store does not support finishing the format-3 upgrade (dropping the manifests table and the change log): a later vci does it"
+        ),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(w.info()["schemaVersion"], 1);
+    let out = w.vci_other(&old, &["store", "info", "--format", "json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "2.8 still reads it: {}",
+        text(&out)
+    );
+    let (plan, _) = w.plan(&[]);
+    assert_eq!(plan.skip, set(UNITS), "{plan:?}");
+
+    // The state objects removed: an edited unit's explain names no
+    // attested hash.
+    let out = w.vci(&["prune", "--objects", "--older-than", "0"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        !stderr(&out).contains("run `vci push`"),
+        "no push on a shared store: {}",
+        text(&out)
+    );
+    w.touch("b/b.go", "edited after attesting");
+    let ex = w.explain("b");
+    assert!(ex.contains("failed check: inputs"), "{ex}");
+    assert!(
+        ex.contains("entry: changed (attested hash not loaded)"),
+        "{ex}"
+    );
+}
+
+#[test]
+fn a_2_8_binary_fails_open_on_a_format_3_libsql_namespace() {
+    two_eight_on_a_libsql_namespace(false);
+}
+
+#[test]
+fn a_2_8_binary_fails_open_on_a_format_3_libsql_replica() {
+    two_eight_on_a_libsql_namespace(true);
+}
+
 // ---------------------------------------------------------------------------
 // 10. `vci store upgrade` and `vci prune` on store format 3 (M3, STORE-V2
 // sections 2.1 "Prune" and 5).

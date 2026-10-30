@@ -12,6 +12,7 @@
 # gh-trusted-root-2026-10-16.jsonl).
 #
 # Outputs: envelope.json (stored form: DSSE fields + sigstore member),
+# leaf-environment.der (a leaf with a deployment environment, extensions only),
 # expired-leaf.der, impostor-intermediate.der, trusted-root.json.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -108,4 +109,25 @@ root = {
 }
 json.dump(root, open("trusted-root.json", "w"), indent=1)
 PY
-echo "wrote envelope.json, expired-leaf.der, impostor-intermediate.der, trusted-root.json"
+# A leaf for another job of the same repository, with a deployment
+# environment (OID .23) and a self-hosted runner, expired in 2026; only its
+# extensions are read (identity.rs's unit test of the signer id).
+cat > "$work/leaf-env.ext" <<'EXT'
+keyUsage=critical,digitalSignature
+extendedKeyUsage=codeSigning
+subjectAltName=critical,URI:https://github.com/ComposalAI/vex/.github/workflows/deploy.yml@refs/heads/master
+1.3.6.1.4.1.57264.1.8=ASN1:UTF8String:https://token.actions.githubusercontent.com
+1.3.6.1.4.1.57264.1.9=ASN1:UTF8String:https://github.com/ComposalAI/vex/.github/workflows/deploy.yml@refs/heads/master
+1.3.6.1.4.1.57264.1.11=ASN1:UTF8String:self-hosted
+1.3.6.1.4.1.57264.1.12=ASN1:UTF8String:https://github.com/ComposalAI/vex
+1.3.6.1.4.1.57264.1.13=ASN1:UTF8String:0123456789abcdef0123456789abcdef01234567
+1.3.6.1.4.1.57264.1.14=ASN1:UTF8String:refs/heads/master
+1.3.6.1.4.1.57264.1.20=ASN1:UTF8String:push
+1.3.6.1.4.1.57264.1.21=ASN1:UTF8String:https://github.com/ComposalAI/vex/actions/runs/7/attempts/1
+1.3.6.1.4.1.57264.1.23=ASN1:UTF8String:production
+EXT
+openssl x509 -req -in "$work/leaf.csr" -CA "$work/int.pem" -CAkey "$work/int.key" -sha384 \
+  -not_before 20260101000000Z -not_after 20260101001000Z -set_serial 6 -extfile "$work/leaf-env.ext" \
+  -outform DER -out leaf-environment.der
+
+echo "wrote envelope.json, expired-leaf.der, impostor-intermediate.der, leaf-environment.der, trusted-root.json"

@@ -3570,7 +3570,21 @@ impl Verifier<'_> {
         // (STORE-V2 section 1.5 step 4): a record copied under another
         // signer's slot is not that signer's, and would otherwise stay
         // there until that signer's history deleted it.
-        let signer_id = signer_id.unwrap_or_default();
+        let Some(signer_id) = signer_id else {
+            // Unreachable with ssh-key's `SHA256:` fingerprints; a later
+            // vci-attest that reports another form fails closed here, with
+            // the fingerprint named rather than an empty expected id.
+            return Err(Failure::one(
+                "signer",
+                3,
+                "signer id (the store key's signer segment)",
+                s.signer.clone(),
+                format!(
+                    "no signer id can be derived from fingerprint {}",
+                    verified.fingerprint
+                ),
+            ));
+        };
         if s.signer != signer_id {
             return Err(Failure::one(
                 "signer",

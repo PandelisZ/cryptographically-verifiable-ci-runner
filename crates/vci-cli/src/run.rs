@@ -2827,6 +2827,7 @@ pub fn run_units(
         durations,
         columns: unit_columns,
         hdrs: unit_hdrs,
+        window: unit_window,
     } = last_durations(store, &selected_ids);
     let hdr_platforms = HdrPlatforms::default();
     hdr_platforms.preload(store, unit_hdrs.iter().map(String::as_str));
@@ -3217,6 +3218,7 @@ pub fn run_units(
                             &moved_on,
                             &live_trees,
                             &unit_columns,
+                            unit_window,
                             &hdr_platforms,
                         )
                     } else {
@@ -3530,6 +3532,7 @@ fn superseded_by(
     moved_on: &MovedOn,
     live_trees: &BTreeSet<String>,
     columns: &BTreeMap<String, Columns>,
+    window: bool,
     hdrs: &HdrPlatforms,
 ) -> Vec<Doomed> {
     let issued = crate::util::parse_rfc3339(&p.core.issued_at).ok();
@@ -3691,8 +3694,10 @@ fn superseded_by(
     // the run's units, pre-filter which to read: one made at the same
     // commit or for another platform is skipped without a read (a column
     // that lies costs one read, never a deletion: every fact below comes
-    // from the signed statement). Without them (git-meta), the backend's
-    // own targeted read of the unit.
+    // from the signed statement), except while the store holds a manifest
+    // (`window`: a 2.8 value under a frame's columns is read like any
+    // other). Without them (git-meta), the backend's own targeted read of
+    // the unit.
     let t = std::time::Instant::now();
     let mut candidates: Vec<(StoredEnvelope, Columns)> = if store.caps().columns {
         let mine: Vec<StoredEnvelope> = match store.list_units(&[test_id]) {
@@ -3703,7 +3708,7 @@ fn superseded_by(
         .filter(|e| e.signer == signer)
         .collect();
         supersede_add(0, t);
-        let mut chosen = old_records_to_read(mine, columns, &p.core.commit, &platform);
+        let mut chosen = old_records_to_read(mine, columns, &p.core.commit, &platform, window);
         let t = std::time::Instant::now();
         let mut refs: Vec<&mut StoredEnvelope> = chosen.iter_mut().map(|(e, _)| e).collect();
         if let Err(e) = store.read_values(&mut refs) {
@@ -3862,6 +3867,7 @@ fn last_durations(store: &dyn AttestationStore, test_ids: &[&str]) -> UnitRecord
         }
         return out;
     }
+    out.window = store.manifest_roots().map_or(true, |r| !r.is_empty());
     let Ok(units) = store.list_units(test_ids) else {
         return out;
     };
@@ -3935,6 +3941,14 @@ struct UnitRecords {
     /// or by the statements of the records read on a store without
     /// columns), for [`HdrPlatforms::preload`].
     hdrs: BTreeSet<String>,
+    /// The store still holds an input manifest (the migration window of
+    /// STORE-V2 section 5, or a writer on `record_format = 1`): a 2.8
+    /// writer's upsert sets a slot's key and value alone, so a format-1
+    /// value may sit beside a frame's stale columns, whose commit and
+    /// platform are not its own; supersession then reads every record of
+    /// the unit instead of pre-filtering by the columns
+    /// ([`old_records_to_read`]). `true` when the store could not say.
+    window: bool,
 }
 
 /// The hdr id a stored value names when it is a format-3 record with a v2
@@ -4209,12 +4223,16 @@ fn columns_for(p: &VciPredicate, v2: &VciPredicateV2, shape: &str, state: Option
 /// Of the unit's listed records, those supersession reads, each with its
 /// listing columns from `columns` (by key; [`Columns::default`] for a
 /// record not in them): the columns leave out a record made at `commit` or
-/// for another platform than `platform` without a read.
+/// for another platform than `platform` without a read, except while the
+/// store still holds an input manifest (`window`, [`UnitRecords::window`]):
+/// a 2.8 writer may then have left its format-1 value under a frame's
+/// columns, and every record is read, as `vci prune` reads them.
 fn old_records_to_read(
     mine: Vec<StoredEnvelope>,
     columns: &BTreeMap<String, Columns>,
     commit: &str,
     platform: &str,
+    window: bool,
 ) -> Vec<(StoredEnvelope, Columns)> {
     mine.into_iter()
         .map(|e| {
@@ -4222,8 +4240,9 @@ fn old_records_to_read(
             (e, c)
         })
         .filter(|(_, c)| {
-            c.commit.as_deref() != Some(commit)
-                && !c.platform.as_deref().is_some_and(|pl| pl != platform)
+            window
+                || (c.commit.as_deref() != Some(commit)
+                    && !c.platform.as_deref().is_some_and(|pl| pl != platform))
         })
         .collect()
 }
@@ -6171,8 +6190,15 @@ mod tests {
         let hdrs = HdrPlatforms::default();
         hdrs.preload(&s, records.hdrs.iter().map(String::as_str));
         assert_eq!(s.object_reads(), 1, "one read for the distinct hdr ids");
+        assert!(!records.window, "no manifest: the columns pre-filter");
         let mine = s.list_units(&["a"]).unwrap().remove(0);
-        let chosen = old_records_to_read(mine, &records.columns, &commit, "linux-x86_64");
+        let chosen = old_records_to_read(
+            mine,
+            &records.columns,
+            &commit,
+            "linux-x86_64",
+            records.window,
+        );
         let keys: BTreeSet<&str> = chosen.iter().map(|(e, _)| e.key.as_str()).collect();
         assert_eq!(
             keys,
@@ -6192,6 +6218,33 @@ mod tests {
         );
         assert_eq!(s.columns_calls(), 1, "no columns request per unit");
         assert_eq!(s.object_reads(), 1, "no hdr read per unit");
+
+        // While the store holds a manifest (a 2.8 writer may have put its
+        // format-1 value under a frame's stale columns), every record of
+        // the unit is read: the same-commit and other-platform columns
+        // leave nothing out.
+        s.put_manifest(&"9".repeat(64), b"{}").unwrap();
+        let records = last_durations(&s, &["a"]);
+        assert!(records.window, "a manifest exists: the window is open");
+        let mine = s.list_units(&["a"]).unwrap().remove(0);
+        let chosen = old_records_to_read(
+            mine,
+            &records.columns,
+            &commit,
+            "linux-x86_64",
+            records.window,
+        );
+        let keys: BTreeSet<&str> = chosen.iter().map(|(e, _)| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                same_commit.as_str(),
+                other_platform.as_str(),
+                older.as_str(),
+                bare.as_str()
+            ]),
+            "{keys:?}"
+        );
     }
 
     /// `[store]` decides the format: 3 on a store that keeps objects, else

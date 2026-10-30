@@ -631,6 +631,112 @@ fn a_record_under_another_trusted_signers_segment_fails_signer() {
     assert_eq!(w.plan().0, set(UNITS), "restored");
 }
 
+/// The keyless side of the signer-segment check (STORE-V2 section 1.5
+/// step 4 names both signer kinds). `vci run --oidc` writes the segment
+/// from the OIDC token's claims (`CertIdentity::from_claims`); the plan
+/// compares it with the id it builds from the Fulcio certificate's
+/// extensions (`CertIdentity::from_cert`), so the two must agree, or every
+/// keyless record would fail `signer` and no keyless unit ever skip.
+/// vci-attest's keyless fixture (a leaf from a local Fulcio-like
+/// authority with a real timestamp, trusted here at the base commit) is
+/// put into B's slot under the segment the claims give: the candidate
+/// passes `signature` and `signer` and fails `statement` (the fixture's
+/// statement is not a test predicate), so the segment check never sees
+/// the keyless id as foreign; under the SSH key's segment it fails
+/// `signer`, naming the certificate's id as the verified key's.
+#[test]
+fn a_keyless_record_passes_the_signer_segment_check_under_its_claims_id() {
+    use vci_attest::keyless::CertIdentity;
+    let fixtures = workspace_root().join("crates/vci-attest/tests/fixtures/keyless");
+    let w = World::new();
+    // The keyless trust at the base commit (main): the fixture's identity
+    // and trust root; the feature branch rebased on it.
+    w.git(&["checkout", "-q", "main"]);
+    w.write(
+        ".vci/identities.toml",
+        r#"
+[[identity]]
+principal = "github-actions"
+issuer = "https://token.actions.githubusercontent.com"
+repository = "ComposalAI/vex"
+workflow = ".github/workflows/vci.yml"
+ref = "refs/heads/master"
+"#,
+    );
+    std::fs::copy(
+        fixtures.join("trusted-root.json"),
+        w.work.join(".vci/sigstore-trusted-root.json"),
+    )
+    .unwrap();
+    w.git(&["add", "-A"]);
+    w.git(&["commit", "-q", "-m", "keyless trust"]);
+    w.git(&["checkout", "-q", "feature"]);
+    w.git(&["rebase", "-q", "main"]);
+    w.run();
+    assert_eq!(w.plan().0, set(UNITS));
+
+    // The segment `vci run --oidc` would write for the fixture's job: from
+    // the token claims the certificate's extensions were issued for.
+    let claims_id = CertIdentity::from_claims(&serde_json::json!({
+        "iss": "https://token.actions.githubusercontent.com",
+        "repository": "ComposalAI/vex",
+        "job_workflow_ref": "ComposalAI/vex/.github/workflows/vci.yml@refs/heads/master",
+        "ref": "refs/heads/master",
+        "event_name": "push",
+        "runner_environment": "github-hosted",
+    }))
+    .unwrap()
+    .signer_id();
+    let b = w.row(B);
+    let mine = signer_id_of(&w.key);
+    assert_eq!(b.signer, mine);
+    assert_ne!(claims_id, mine);
+    let envelope = std::fs::read(fixtures.join("envelope.json")).unwrap();
+    let keyless_key = b
+        .key
+        .replacen(&format!(":{mine}:"), &format!(":{claims_id}:"), 1);
+    assert_ne!(keyless_key, b.key);
+    let n = w
+        .db()
+        .execute(
+            "UPDATE attestations SET key = ?2, signer = ?3, value = ?4 WHERE key = ?1",
+            rusqlite::params![b.key, keyless_key, claims_id, envelope],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    let (skip, run) = w.plan();
+    assert_eq!(run, set(&[B]), "B runs: {run:?} skip {skip:?}");
+    let ex = w.explain(B);
+    assert!(
+        ex.contains("failed check: statement"),
+        "signature and signer pass; the fixture's statement is no test predicate: {ex}"
+    );
+    assert!(!ex.contains("failed check: signer"), "{ex}");
+    assert!(!ex.contains("failed check: signature"), "{ex}");
+    assert!(!ex.contains("failed check: envelope"), "{ex}");
+
+    // The same record under the SSH key's segment: `signer`, with the
+    // certificate's id as the verified key's.
+    let n = w
+        .db()
+        .execute(
+            "UPDATE attestations SET key = ?2, signer = ?3 WHERE key = ?1",
+            rusqlite::params![keyless_key, b.key, mine],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    let (skip, run) = w.plan();
+    assert_eq!(run, set(&[B]), "B runs: {run:?} skip {skip:?}");
+    let ex = w.explain(B);
+    assert!(ex.contains("failed check: signer"), "{ex}");
+    assert!(
+        ex.contains("signer id (the store key's signer segment)")
+            && ex.contains(&format!("{claims_id} (the signer id of the verified key)")),
+        "{ex}"
+    );
+    assert!(!ex.contains("failed check: statement"), "{ex}");
+}
+
 /// A vci 2.8 that reuses a slot holding a format-3 row writes its format-1
 /// value beside the slot's format-3 columns (M2 fact 1). The plan tells the
 /// value by its first byte and never by the columns: B is planned through

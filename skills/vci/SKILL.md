@@ -231,13 +231,19 @@ https://pandelisz.github.io/cryptographically-verifiable-ci-runner/stores.html.
   then prints `(attested hash not loaded)`), or never written under `[store] explain_hashes = false`: both are the
   user's policy choice, never yours. A vci before 2.9 reads a format-3 record as one it cannot parse and runs the
   unit (fail-open), so a mixed fleet loses skips, never gains wrong ones. The migration order, which the user
-  decides and runs: every runner and developer on 2.9 (the action pinned in one change; `[store] record_format = 1`
-  keeps writing the old format meanwhile), `vci store upgrade --begin` on a SQLite, PostgreSQL or libSQL store ahead
-  of the rollout (idempotent; 2.9's first `vci run` does it otherwise), a 2.9 `vci prune` once during the window (a
-  2.8 prune stops collecting manifests once a format-3 record exists), and `vci store upgrade --finish` only once
-  no format-1 record remains, after which a 2.8 vci fails open on that store for good: **never run `--finish`
-  unasked**, and report its refusal (`not finished: N attestation(s) are not format-3 records`) rather than working
-  around it. `vci prune --objects [--older-than DAYS]` removes the objects no record references and the aged
+  decides and runs: `vci store upgrade --begin` once on a SQLite, PostgreSQL or libSQL store before the first 2.9
+  job (optional and idempotent; 2.9's first `vci run` does it otherwise, in a request of its own), then every
+  runner and developer on 2.9 (the action pinned in one change; `[store] record_format = 1` keeps writing the old
+  format meanwhile), then a 2.9 `vci prune` once during the window (a 2.8 prune stops collecting manifests once a
+  format-3 record exists), and `vci store upgrade --finish` only once no format-1 record remains and where the
+  backend allows it (SQLite and PostgreSQL), after which a 2.8 vci fails open on that store for good: **never run
+  `--finish` unasked**, and report its refusal rather than working around it: `not finished: N attestation(s) are
+  not format-3 records` (exit 1), or on libSQL at zero `vci: error: the libsql store does not support finishing the
+  format-3 upgrade (dropping the manifests table and the change log): a later vci does it` (exit 2), which means the
+  migration on libSQL ends at the prune in this release: the namespace stays at schema version 1, a 2.8 writer is
+  never turned away (the user's guard is to rotate the Turso write token or `vci update` every machine that
+  writes), and each 2.8 write re-opens the manifest-collection path until a 2.9 prune removes its manifest; libSQL's
+  `--finish` lands in 2.10. `vci prune --objects [--older-than DAYS]` removes the objects no record references and the aged
   state objects without touching attestations. Diagnosing: a 2.8 vci shows a format-3 record as `failed check:
   envelope` (upgrade it); `failed check: signer` with `signer id (the store key's signer segment)` means the record
   sits under another signer's slot (re-attest); `statement` naming a hdr or tables object means the run's objects
@@ -319,7 +325,7 @@ run `vci fetch` online``: run again with network access.
 
 | `failed check:` | Usual cause | Action |
 |---|---|---|
-| `inputs` | A file changed after attesting (`entry:<path>` names it; since vci 2.9 `entry: changed (attested hash not loaded)` names none, when the run's state object was removed or not loaded) | Re-run `vci run <unit>` |
+| `inputs` | A file changed after attesting (`entry:<path>` names it, with both hashes, or since vci 2.9 with expected `<kind> exec=<bool> changed (attested hash not loaded)` for a kind or exec difference; `entry: changed (attested hash not loaded)` with both roots names none, when the run's state object was removed or not loaded) | Re-run `vci run <unit>` |
 | `toolchain` | Different Python/Node/Go/rustc/Ruby/bundle/package versions, or OS/arch under the policy | Pin versions (runners.md); report to the user |
 | `signer` | Key not in the base branch's `allowed_signers`, or expired; for CI's keyless attestations, an identity in no `[[identity]]` of the base `identities.toml`; on main, a signer not in `no_skip_refs_except`; since vci 2.9, `signer id (the store key's signer segment)`: the record sits under another signer's slot | The user adds the key or identity on the default branch; on main this is expected; a wrong slot: re-attest |
 | `signature` (CI's keyless attestations) | The base `.vci/sigstore-trusted-root.json` is missing or stale (GitHub renews its intermediate yearly) | Report to the user: refresh it with `gh attestation trusted-root` on the default branch |

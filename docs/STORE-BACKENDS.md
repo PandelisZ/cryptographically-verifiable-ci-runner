@@ -42,7 +42,8 @@ Built and in use (vci 2.8.0):
   once it sets `Caps::objects` (and `Caps::columns`) and overrides them; which backends have is in their sections.
 - **The commands on format 3** (2.9, STORE-V2 M3): `vci run` writes format-3 records and a run's four objects on a
   store that keeps objects (format 1, as 2.8 wrote it, on one that does not or under `[store] record_format = 1`),
-  supersedes from the old records' signed statements with the listing columns as a pre-filter, and removes the
+  supersedes from the old records' signed statements with the listing columns as a pre-filter (none while the store
+  holds an input manifest: every record of the unit is read then, as prune reads every row), and removes the
   superseded run's unreferenced objects and the aged state objects; the plan tells a value's format by its first
   byte, verifies a frame as the DSSE envelope rebuilt from it, resolves its descriptor against the run's objects
   and observes the resolved set at HEAD; `vci prune` reads only what its columns and the signed statements confirm
@@ -201,7 +202,9 @@ objects: id (64 hex, BLAKE3 of the bytes) -> kind (1 hdr, 2 tables, 3 shape, 4 s
   `[store] explain_hashes_days` even while referenced.
 - The **columns** (`Columns`) are what the writer copies out of the statement it signed: the format, the commit, the
   platform (`<os>-<arch>` from the hdr's toolchain), the result state and duration, the expiry, and the four object
-  ids. They pre-filter which old records supersession and prune read, give `last_durations` its numbers without a
+  ids. They pre-filter which old records supersession and prune read (while no input manifest remains in the store;
+  with one, a 2.8 writer may have left its format-1 value under a frame's stale columns, and every record is read:
+  prune every row, supersession every record of the unit), give `last_durations` its numbers without a
   value read, and let the orphan queries find an object's referrers. They are store data: supersession and prune
   confirm them against the signed statement before a delete, and no verdict reads them. git-meta keeps none (its
   hint is the key); the SQL stores keep them as nullable columns, `NULL` on a format-1 row. A backend says what it
@@ -240,8 +243,8 @@ the unit's `testId`, `argv`, `commit`, `tree`, `treeDirty`, `issuedAt`, `expires
 `entriesRoot`, `waived` as sorted distinct u16 ids into the tables object's waiver table, `declaredInputs`,
 `platformSpecific`, `archSpecific`, `cfgPredicates`, and the two object ids `hdr` and `tables`) under the subject
 `[{name: testId, digest: {blake3: inputRoot}}]`, as docs/CONTRACTS.md says. A frame decodes to exactly a format-1
-`Envelope` (the statement bytes, the signature re-armored: `Frame::to_stored_json`, which `vci verify --envelope` and
-`vci explain --json` print) and, through its objects, to the format-1 manifest's set minus the attested file hashes.
+`Envelope` (the statement bytes, the signature re-armored: `Frame::to_stored_json`, which `vci verify --envelope
+<record>` prints) and, through its objects, to the format-1 manifest's set minus the attested file hashes.
 
 **Objects** are bytes whose id is the BLAKE3 of them (`vci_core::object_id`; 64 lowercase hex in statements, columns
 and keys), encoded as the magic `vo`, a kind byte, a version byte and the body (`crates/vci-core/src/objects.rs`);
@@ -376,12 +379,23 @@ The gates, in order (STORE-V2 section 5):
    reading every record while a manifest remains (a 2.8 writer may have left a format-1 value, with its
    `manifestRef`, under a frame's columns) and, once none does, a format-3 record through its columns and a
    confirming read.
-4. **`vci store upgrade --finish`**, manual, once no format-1 row remains: drops `manifests` (SQLite and PostgreSQL;
-   the libSQL store refuses it at zero in this release, since every statement that names `manifests` and the change
-   log has to branch on version 2 first) and sets `vci_schema.version = 2`, after which a 2.8 binary reports the
-   store as too new and fails open. It is refused, with the count, while a format-1 row exists; the count is by the
+4. **`vci store upgrade --finish`**, manual, once no format-1 row remains: drops `manifests` (SQLite and PostgreSQL)
+   and sets `vci_schema.version = 2`, after which a 2.8 binary reports the store as too new and fails open (checked:
+   2.8.1's `vci store info` exits 2 with `schema version 2 is newer than this vci reads`, its plan runs every unit,
+   its run attests nothing). It is refused, with the count, while a format-1 row exists; the count is by the
    value's first byte, never by the `format` column (a 2.8 writer's upsert leaves the column stale, and a frame copied
-   in without columns has NULL).
+   in without columns has NULL). **On libSQL this release ends the migration here, at gate 3**: every statement that
+   names `manifests` and the change log has to branch on version 2 first, and that is 2.10's work (STORE-V2 section 5
+   step 4, section 21 below). `--finish` on a libSQL namespace is refused with the count while a format-1 row
+   remains (exit 1) and at zero prints `vci: error: the libsql store does not support finishing the format-3 upgrade
+   (dropping the manifests table and the change log): a later vci does it` and exits 2 (run it to read the count all
+   the same). The namespace stays at version 1, which 2.8 reads, so the `too new` guard never arrives there: a 2.8
+   binary that still holds a write token (a developer's stale install using `token_command`, a workflow left at 2.8)
+   keeps writing format-1 rows and manifests, and the operator's substitute guard is to rotate the Turso write token
+   or run `vci update` on every machine that writes. Each such write re-opens the migration window: prune and
+   supersession go back to reading every row while a manifest exists (gate 3), and every batch carries the
+   superseded-manifest statements again (section 18 measured them at 1.1 MB of SQL per 800 removals), until a 2.9
+   `vci prune` or supersession removes the manifest.
 5. **git-meta** has no schema: a 2.8 clone reads the keys it knows and the values it cannot parse (fail open),
    ignores `vci:object:` keys (rule 2), and never deletes a key it does not parse. No bytes path and no value-type
    change in `git-meta.sqlite`.
@@ -1185,7 +1199,9 @@ record_format = 3             # 2.9: 3 (default) writes format-3 records on a st
 explain_hashes = true         # 2.9: write the run's state object (the attested hashes `vci explain` prints; no verdict
                               # reads it); false writes three objects a run; VCI_STORE_EXPLAIN_HASHES wins
 explain_hashes_days = 2       # 2.9: a state object older than this is removed even while referenced, by `vci run`'s
-                              # orphan pass and `vci prune` (0 to 365); VCI_STORE_EXPLAIN_HASHES_DAYS wins
+                              # orphan pass and `vci prune` (0 to 365; 0 writes the run's state object and removes it
+                              # at the end of the same run: use explain_hashes = false instead); every writer applies
+                              # its own working tree's setting to the shared store; VCI_STORE_EXPLAIN_HASHES_DAYS wins
 
 [store.sqlite]
 path = "vci-store.sqlite"     # relative to the git common directory, no `..`; absolute only via VCI_STORE_URL
@@ -1649,7 +1665,8 @@ Hence `AttestationStore: Send + Sync`.
     statement as it signs a v1 one, and queues one deferred batch: `put_objects` first, then per unit `put` with its
     `Columns`, then its supersession removals. Supersession reads the old records' signed statements (`commit`, the
     platform through the hdr, `issuedAt`, `entriesRoot` for "same files"), the columns only pre-filtering which old
-    records to read; `last_durations` reads the columns on a store that keeps them and the values on git-meta. After
+    records to read, and none while the store holds a manifest (`UnitRecords::window`, one `manifest_roots` read a
+    run); `last_durations` reads the columns on a store that keeps them and the values on git-meta. After
     the batch, on a store with `Caps::columns`, `remove_objects` of the superseded records' object ids once per run
     (git-meta's referrer scan reads every value, so its orphans are left to `vci prune`), then
     `prune_state_objects(explain_hashes_days)` on every format-3 write run; `set_max_ttl` is passed the largest
@@ -4121,15 +4138,31 @@ Decided while building it:
     can abort `sqld` 0.24 (item 17 below); before, a namespace's first batch began by creating `vci_schema`, which
     only reads once it exists. It does not prevent `sqld`'s stalled write lock (item 17), which a stress test brought
     on whatever the transaction began with.
+29. **`vci prune`'s push hint is printed only on a store with an exchange** (2.9.0; the second half of what open
+    item 1 asked, as the whole-branch review found it firing after an object removal on libSQL): `exchange()` is
+    `Some` on git-meta alone, and SQLite, PostgreSQL and libSQL removed their rows at once, so their `vci push` has
+    nothing to do. The counts prune prints are still the first half of item 1.
+30. **Supersession reads every record of a unit while the store holds an input manifest** (2.9.0, the whole-branch
+    review): a 2.8 upsert sets a slot's key and value alone, so a format-1 value written at commit D can sit beside
+    a frame's columns saying commit C; the pre-filter by commit and platform would then leave a record of D unread at
+    a run on C (a revert), a missed deletion, never a wrong one. `last_durations` asks `manifest_roots` once a run on
+    a store with columns and `old_records_to_read` pre-filters only when it came back empty, as `prune_by_columns`
+    already keyed on it.
 
 Still open:
 
-1. **`vci prune`'s messages on a store without an exchange or that keeps roots.** Prune removes one manifest root per
-   call and prints `removed project vci:manifest:<root> (unreferenced manifest)` whatever `remove_manifests` returns
-   (and `removed <target> <key>` whatever `remove` returns). That is exact for git-meta and SQLite; PostgreSQL (grace
-   0 under prune) still keeps a root that became referenced or a base meanwhile and returns 0 for it. Prune also ends
-   with ``run `vci push` to publish the deletions`` on every store, though only git-meta has anything to publish.
-   Print from the returned count, and the hint only when `exchange()` is `Some` (a vci-cli change).
+1. **`vci prune`'s counts on a store that keeps roots.** Prune removes one manifest root per call and prints
+   `removed project vci:manifest:<root> (unreferenced manifest)` whatever `remove_manifests` returns (and `removed
+   <target> <key>` whatever `remove` returns). That is exact for git-meta and SQLite; PostgreSQL (grace 0 under
+   prune) still keeps a root that became referenced or a base meanwhile and returns 0 for it. Print from the returned
+   count (a vci-cli change). The push hint half of this item is decision 29.
+1a. **libSQL's `vci store upgrade --finish` lands in 2.10.** The statements of the libSQL store that name `manifests`
+   and the change log (the batch's superseded-manifest collection, the replica's sync of the old log, the status
+   read's `EXISTS (SELECT 1 FROM manifests)`, prune's manifest reads) each need a version-2 branch before the drop
+   can be sent, so 2.9.0 refuses `--finish` at zero on libSQL (gate 4 above; STORE-V2 section 5 step 4) and a Turso
+   namespace keeps schema version 1 for the whole release, with the consequences gate 4 lists: no `too new` guard
+   against a 2.8 writer, and a re-opened window per 2.8 write. 2.10 adds the branches, the drop of `manifests` and
+   the `log`, and `vci_schema.version = 2`.
 2. **PostgreSQL re-reads values in round 2.** `read_values` moves values out of the per-handle cache, so a round-2
    `prefetch(Units{choose: None})` fetches them again: a third of a plan's bytes when every unit runs (section 17).
    Keep values handed out in the cache (memory), or let prefetch skip keys this handle already returned.

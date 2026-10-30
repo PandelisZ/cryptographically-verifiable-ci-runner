@@ -877,6 +877,95 @@ fn verify_envelope_of_a_format_3_record_is_the_dsse_envelope_in_toto_tooling_rea
     assert!(stdout(&out).contains("INVALID"), "{}", stdout(&out));
 }
 
+/// `vci verify` takes the run's objects by the id asked for, recomputed
+/// over the bytes the store returned, as the plan does: another
+/// well-formed shape filed under the descriptor's shape id (a store row
+/// whose bytes are not its id) is refused as corrupt, the manifest line
+/// is INVALID and names the BLAKE3 found, and nothing of the planted
+/// shape's set is printed; the hdr and tables, which recompute, still
+/// resolve. Restored, the record is VALID again.
+#[test]
+fn verify_refuses_a_shape_object_whose_bytes_are_not_its_id() {
+    let w = World::new();
+    w.run(&[], SQLITE);
+    let all = records(&w.sqlite());
+    let b = record_of(&all, B);
+    let shape_id = b.columns.shape.clone().expect("B's shape column");
+    let record = w.base.join("b.vci3");
+    std::fs::write(&record, &b.e.bytes).unwrap();
+    let valid = w.vci_ok(
+        &["verify", record.to_str().unwrap(), "--base-ref", "main"],
+        SQLITE,
+    );
+    assert!(
+        valid.contains("(set resolved from the run's shape object; root not recomputed"),
+        "{valid}"
+    );
+    let db = rusqlite::Connection::open(w.sqlite_path()).unwrap();
+    db.busy_timeout(Duration::from_secs(20)).unwrap();
+    let genuine: Vec<u8> = db
+        .query_row(
+            "SELECT bytes FROM objects WHERE id = ?1",
+            [&shape_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // A well-formed shape of one entry, which decodes, under B's shape id.
+    let planted = Shape {
+        entries: vec![vci_core::ShapeEntry {
+            path: vci_core::RepoPath::new("planted/only.ts").unwrap(),
+            kind: vci_core::EntryKind::File,
+            exec: false,
+        }],
+        groups: vec![],
+    }
+    .encode()
+    .unwrap();
+    let found = vci_core::objects::hex32(&vci_core::object_id(&planted));
+    assert_ne!(found, shape_id);
+    assert_eq!(
+        db.execute(
+            "UPDATE objects SET bytes = ?2 WHERE id = ?1",
+            rusqlite::params![shape_id, planted],
+        )
+        .unwrap(),
+        1
+    );
+    let out = w.vci(
+        &["verify", record.to_str().unwrap(), "--base-ref", "main"],
+        SQLITE,
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "manifest: INVALID: the shape object {shape_id} is corrupt (its BLAKE3 is {found})"
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains("1 entries, 0 externals"),
+        "the planted shape's set is never resolved: {text}"
+    );
+    assert!(
+        !text.contains("repo id: (in the hdr object"),
+        "the hdr and tables still resolve: {text}"
+    );
+    assert_eq!(
+        db.execute(
+            "UPDATE objects SET bytes = ?2 WHERE id = ?1",
+            rusqlite::params![shape_id, genuine],
+        )
+        .unwrap(),
+        1
+    );
+    let restored = w.vci_ok(
+        &["verify", record.to_str().unwrap(), "--base-ref", "main"],
+        SQLITE,
+    );
+    assert_eq!(restored, valid, "restored");
+}
+
 // ---------------------------------------------------------------------------
 // (g) Supersession across runs at moved-on commits.
 
@@ -1039,6 +1128,11 @@ fn prune_objects_removes_the_state_object_and_the_records_stay(env: &[(&str, &st
         text(&out)
     );
     assert_eq!(stdout(&out), "", "no attestation or manifest line");
+    assert!(
+        !stderr(&out).contains("run `vci push`"),
+        "the store removed it at once; its push has nothing to publish: {}",
+        text(&out)
+    );
     assert_eq!(objects(&w), before - 1, "the state object alone");
     assert_eq!(w.info(env)["count"], UNITS.len());
     assert_eq!(

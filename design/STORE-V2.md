@@ -650,9 +650,16 @@ Version gates, in order:
    16,231 manifests an hour at peak (`prodq/out.txt`), so the window should be short: land the action pin before
    the next master push, or run 2.9's `prune` (which collects both) once during the window. 2.9's `prune` treats a
    format-1 record as today and a format-3 record through its columns and confirming read.
-4. **`vci store upgrade --finish`** (2.9, manual, or 2.10 automatic when no format-1 row remains): drops
-   `manifests` and the libSQL `log`, sets `vci_schema.version = 2`; from then on a 2.8 binary reports "store
-   schema too new" and fails open as it does today for unknown versions. The `memo` table stays.
+4. **`vci store upgrade --finish`** (2.9, manual, on SQLite and PostgreSQL; 2.10 on libSQL, and 2.10 automatic
+   when no format-1 row remains): drops `manifests` and the libSQL `log`, sets `vci_schema.version = 2`; from then
+   on a 2.8 binary reports "store schema too new" and fails open as it does today for unknown versions. The `memo`
+   table stays. *Amended after the whole-branch review:* on libSQL every statement that names `manifests` and the
+   log has to branch on version 2 first, which 2.9.0 does not carry, so its `--finish` is refused with the count
+   while a format-1 row remains and at zero prints `vci: error: the libsql store does not support finishing the
+   format-3 upgrade (dropping the manifests table and the change log): a later vci does it` (exit 2); a libSQL
+   namespace stays at version 1 for the whole of 2.9, the "too new" guard against a 2.8 writer never arrives there
+   (the operator rotates the write token or runs `vci update` on every machine that writes), and each 2.8 write
+   re-opens the window of step 3 until a 2.9 prune or supersession removes its manifest.
 5. **git-meta**: no schema; a 2.8 clone reads keys it knows and values it cannot parse (fail open), ignores
    `vci:object:` keys (rule 2), and never deletes keys it does not parse. A 2.8 client reading a `vci3` record
    through `from_utf8_lossy` gets the text and fails `envelope` (it is not JSON). No bytes path, no value-type

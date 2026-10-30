@@ -905,7 +905,10 @@ fn verified_details(
 struct RunObjects {
     hdr: Vec<u8>,
     tables: Vec<u8>,
-    shape: Option<Vec<u8>>,
+    /// `None` without a descriptor; otherwise the shape's bytes, or why
+    /// they could not be taken (missing, or not the id's bytes), which
+    /// fails the manifest line alone: the hdr and tables still resolve.
+    shape: Option<Result<Vec<u8>, String>>,
 }
 
 fn run_objects(
@@ -935,29 +938,35 @@ fn run_objects(
             store.kind()
         )
     })?;
+    // Every object is taken by the id asked for, recomputed over the bytes
+    // the store returned (docs/CONTRACTS.md: a reader recomputes the id of
+    // every object it loads), never by the store's own id column alone:
+    // the hdr and tables are checked again by `Context::decode`, the shape
+    // nowhere else.
     let take = |id: &str, what: &str| {
-        got.iter()
-            .find(|o| o.id == id)
-            .map(|o| o.bytes.clone())
-            .ok_or_else(|| {
-                format!(
-                    "the {what} object {id} is not in the {} store{}",
-                    store.kind(),
-                    if store.caps().lazy_values {
-                        " (run `vci fetch`)"
-                    } else {
-                        ""
-                    }
-                )
-            })
+        let o = got.iter().find(|o| o.id == id).ok_or_else(|| {
+            format!(
+                "the {what} object {id} is not in the {} store{}",
+                store.kind(),
+                if store.caps().lazy_values {
+                    " (run `vci fetch`)"
+                } else {
+                    ""
+                }
+            )
+        })?;
+        let found = vci_core::objects::hex32(&vci_core::object_id(&o.bytes));
+        if found != id {
+            return Err(format!(
+                "the {what} object {id} is corrupt (its BLAKE3 is {found})"
+            ));
+        }
+        Ok(o.bytes.clone())
     };
     Ok(RunObjects {
         hdr: take(&p.hdr, "hdr")?,
         tables: take(&p.tables, "tables")?,
-        shape: shape_id
-            .as_deref()
-            .map(|id| take(id, "shape"))
-            .transpose()?,
+        shape: shape_id.as_deref().map(|id| take(id, "shape")),
     })
 }
 
@@ -1068,9 +1077,12 @@ fn verify_manifest_v2(
     let ctx = ctx.as_ref().map_err(Clone::clone)?;
     let shape_bytes = objects
         .as_ref()
-        .ok()
-        .and_then(|o| o.shape.as_deref())
-        .ok_or_else(|| "the shape object could not be read".to_owned())?;
+        .map_err(Clone::clone)?
+        .shape
+        .as_ref()
+        .ok_or_else(|| "the shape object could not be read".to_owned())?
+        .as_deref()
+        .map_err(Clone::clone)?;
     let shape = vci_core::Shape::decode(shape_bytes).map_err(|e| format!("shape object: {e}"))?;
     let descriptor =
         vci_core::Descriptor::decode(d, &ctx.tables).map_err(|e| format!("descriptor: {e}"))?;
@@ -1968,7 +1980,10 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
             store.kind()
         );
     }
-    if removed > 0 && !dry_run {
+    // A store with an exchange (git-meta) publishes its deletions on push;
+    // SQLite, PostgreSQL and libSQL removed theirs at once, and their `vci
+    // push` has nothing to do.
+    if removed > 0 && !dry_run && store.exchange().is_some() {
         eprintln!(
             "vci prune: run `vci push` to publish the deletions (`vci push --rewrite-history` also drops the deleted values from what a fetch downloads)"
         );
