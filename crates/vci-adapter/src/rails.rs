@@ -520,10 +520,27 @@ pub struct RailsAdapter {
 
 /// A probe process started without waiting for it.
 struct StartedProbe {
-    child: std::process::Child,
+    /// The process, until a probe takes it to wait for it.
+    child: Option<std::process::Child>,
     describe: String,
     /// Its run directory, kept until it has finished.
     _dirs: RunDirs,
+}
+
+/// A boot started ahead of time that no probe took (the plan compared no
+/// native library after all) is killed and reaped when the adapter goes,
+/// before its run directory is removed. Waiting for it instead would hold
+/// the plan's exit for the rest of a boot nobody reads (seconds on vex);
+/// left alone (as before 2.9) it outlived vci, booting the application
+/// beside the tests `vci ci` runs next, in a run directory removed under
+/// it.
+impl Drop for StartedProbe {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl std::fmt::Debug for StartedProbe {
@@ -902,7 +919,7 @@ impl RailsAdapter {
         let describe = describe(&cmd);
         if let Ok(child) = cmd.spawn() {
             *slot = Some(StartedProbe {
-                child,
+                child: Some(child),
                 describe,
                 _dirs: dirs,
             });
@@ -928,11 +945,13 @@ impl RailsAdapter {
             None
         };
         let (out, described) = match started {
-            Some(sp) => (
+            Some(mut sp) => (
                 sp.child
+                    .take()
+                    .expect("a started probe holds its process until taken")
                     .wait_with_output()
                     .map_err(|e| self.not_installed(e))?,
-                sp.describe,
+                std::mem::take(&mut sp.describe),
             ),
             None => (
                 cmd.output().map_err(|e| self.not_installed(e))?,
@@ -2627,6 +2646,33 @@ impl Adapter for RailsAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boot started ahead of time that no probe took is killed and reaped
+    /// when it is dropped (the adapter going at the end of a plan that
+    /// compared no native library): the drop does not wait for the boot,
+    /// and no process is left behind.
+    #[test]
+    fn a_started_boot_nobody_took_is_killed_when_dropped() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+        let started = StartedProbe {
+            child: Some(child),
+            describe: "sleep 30".into(),
+            _dirs: RunDirs::new().unwrap(),
+        };
+        let t = std::time::Instant::now();
+        drop(started);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "the boot {pid} was left running");
+    }
 
     #[test]
     fn argv_env_lists_and_globals() {

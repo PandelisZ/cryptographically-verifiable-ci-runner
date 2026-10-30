@@ -791,6 +791,9 @@ struct ObjectCache {
     shapes_named: BTreeSet<String>,
     /// How many state objects were loaded, against [`STATE_OBJECTS`].
     states: usize,
+    /// The tables object each read format-3 candidate's statement names, by
+    /// record key ([`preload_objects`]), for [`ObjectLoader::names_native_library`].
+    tables_by_key: HashMap<String, String>,
     /// The state object each read format-3 candidate's listing column
     /// names, by record key: fetched in one `columns` call per round
     /// beside the verdict objects ([`preload_objects`]), so that a failing
@@ -1125,6 +1128,24 @@ impl ObjectLoader {
         }
     }
 
+    /// Whether a read format-3 candidate among `cands` names a loaded tables
+    /// object that lists a native library (an external `native:<file>`):
+    /// the hint that the plan will boot a Rails application for them
+    /// ([`start_native_boots`]). Unsigned until the candidate is checked,
+    /// and used for nothing else.
+    fn names_native_library<'a>(&self, cands: impl Iterator<Item = &'a StoredEnvelope>) -> bool {
+        let c = self.lock();
+        cands
+            .filter_map(|s| c.tables_by_key.get(&s.key))
+            .any(|id| match c.by_id.get(id) {
+                Some(Ok(Object::Tables(t))) => t
+                    .externals
+                    .iter()
+                    .any(|e| e.name.starts_with(crate::externals::NATIVE_PREFIX)),
+                _ => false,
+            })
+    }
+
     /// The plan's metrics line (`VCI_TIMING=1`): objects loaded per kind,
     /// their bytes, the candidates past the cap and the distinct runs the
     /// candidates named.
@@ -1167,6 +1188,7 @@ fn preload_objects<'a>(
     let head16: Option<String> = head_tree.map(|t| t.chars().take(16).collect());
     let mut ranked: Vec<RankedIds> = Vec::new();
     let mut frames: Vec<&StoredEnvelope> = Vec::new();
+    let mut tables_by_key: Vec<(String, String)> = Vec::new();
     for s in cands {
         if s.error.is_some() {
             continue;
@@ -1179,6 +1201,7 @@ fn preload_objects<'a>(
         if let Ok(st) = serde_json::from_slice::<vci_attest::Statement>(&frame.statement)
             && let Ok(p) = serde_json::from_value::<VciPredicateV2>(st.predicate)
         {
+            tables_by_key.push((s.key.clone(), p.tables.clone()));
             ids.push((ObjectKind::Hdr, p.hdr));
             ids.push((ObjectKind::Tables, p.tables));
         }
@@ -1192,6 +1215,7 @@ fn preload_objects<'a>(
         return;
     }
     objects.note_state_objects(store, &frames);
+    objects.lock().tables_by_key.extend(tables_by_key);
     ranked.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
     let wanted: Vec<(ObjectKind, String)> = ranked.into_iter().flat_map(|(_, ids)| ids).collect();
     objects.load(store, timers, &wanted);
@@ -1962,11 +1986,18 @@ fn probe_project(
         // application for them in the verdicts (about 3 s on vex), with
         // every verdict thread waiting; the boot is started here, beside
         // the fetch, and not waited for (2.7.26): the verdicts that need it
-        // wait for what is left of it.
-        if resolve && project.adapter.name() == "rails" && store.flag(&natives_flag(&project.name))
-        {
-            project.adapter.start_native_externals(&env);
-        }
+        // wait for what is left of it. The flag is the store's first answer
+        // (its connection, a token command), so it is asked on a thread of
+        // its own and the listing does not wait for it (2.9). A first plan
+        // (no flag) starts the boot once its candidates are read
+        // ([`start_native_boots`]).
+        let natives = (resolve && project.adapter.name() == "rails").then(|| {
+            s.spawn(|| {
+                if store.flag(&natives_flag(&project.name)) {
+                    project.adapter.start_native_externals(&env);
+                }
+            })
+        });
         let t = std::time::Instant::now();
         let files = project
             .adapter
@@ -1979,6 +2010,9 @@ fn probe_project(
         // the runner `runner` does not select), as `vci run` prints it.
         let warnings = project.adapter.warnings(&env);
         let resolved = resolving.map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+        if let Some(h) = natives {
+            h.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        }
         Probed {
             files,
             warnings,
@@ -2031,6 +2065,45 @@ fn resolve_project(
         })
     })()
     .map_err(|e| format!("{e:#}"))
+}
+
+/// Start the boot of each Rails project whose read format-3 candidates name
+/// a tables object listing a native library, before the verdicts (2.9): a
+/// plan that has not compared native libraries before (no store flag, so
+/// [`probe_project`] started nothing) would otherwise boot the application
+/// at its first externals check, with every verdict thread waiting from
+/// then on. Started, not waited for: the verdicts that compare a native
+/// library wait for what is left of it, and an unused one is killed when
+/// the adapter goes. A tables object lists what any unit of its run
+/// recorded, so a candidate whose own descriptor names none may start a
+/// boot no verdict reads; nothing is decided from it. Format 1 records
+/// keep their natives in manifests the verdicts load, and boot at the
+/// first check, as before.
+fn start_native_boots(
+    ctx: &Ctx,
+    res: &PlanResult,
+    resolved: &[Option<Result<Resolved, String>>],
+    files: &[TestFile],
+    by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
+    objects: &ObjectLoader,
+) {
+    for (pi, project) in ctx.projects.iter().enumerate() {
+        let rails = matches!(&resolved[pi], Some(Ok(r)) if r.rails_gems.is_some());
+        let Some(child) = res.projects[pi].child_env.as_ref() else {
+            continue;
+        };
+        if !rails || res.projects[pi].run_all.is_some() {
+            continue;
+        }
+        let cands = files
+            .iter()
+            .filter(|f| f.project == pi)
+            .filter_map(|f| by_id.get(f.test_id.as_str()))
+            .flatten();
+        if objects.names_native_library(cands) {
+            project.adapter.start_native_externals(&child.to_child_env());
+        }
+    }
 }
 
 fn plan_with(
@@ -2340,6 +2413,7 @@ fn plan_with(
             }
         }
     }
+    start_native_boots(&ctx, res, &resolved, &files, &by_id, &objects);
     let now = now_unix();
     // The checkout does not change during a plan: each path is observed once
     // for every candidate of every file (and every project).
@@ -5690,6 +5764,55 @@ adapter = "pytest"
         assert_eq!(loader.lock().decodes, 1);
         let e = loader.shape(&s, &timers, &shape).unwrap_err();
         assert!(e.past_cap, "{e:?}");
+    }
+
+    /// A plan's first boot hint: a read candidate whose tables object lists
+    /// a native library (`native:<file>`) names one; a candidate whose
+    /// tables list none, whose tables are not loaded, or that was not read
+    /// as a frame does not.
+    #[test]
+    fn a_tables_object_listing_a_native_library_is_the_boot_hint() {
+        let loader = ObjectLoader::default();
+        let tables = |names: &[&str]| Tables {
+            waivers: vec![],
+            env_names: vec![],
+            externals: names
+                .iter()
+                .map(|n| vci_core::External {
+                    name: (*n).into(),
+                    version: "1".into(),
+                })
+                .collect(),
+        };
+        let mut ids = Vec::new();
+        for t in [tables(&["native:libvips.42.dylib", "rack"]), tables(&["rack"])] {
+            let bytes = t.encode().unwrap();
+            let id = hex32(&object_id(&bytes));
+            loader.insert(ObjectKind::Tables, &id, &bytes);
+            ids.push(id);
+        }
+        let cand = |key: &str| StoredEnvelope {
+            target: "t".into(),
+            key: key.into(),
+            test_key: String::new(),
+            signer: String::new(),
+            storage_key: String::new(),
+            issued: None,
+            tree: None,
+            bytes: vec![],
+            error: None,
+        };
+        {
+            let mut c = loader.lock();
+            c.tables_by_key.insert("vips".into(), ids[0].clone());
+            c.tables_by_key.insert("plain".into(), ids[1].clone());
+            c.tables_by_key.insert("unloaded".into(), hex32(&[5; 32]));
+        }
+        let (vips, plain, unloaded, unread) =
+            (cand("vips"), cand("plain"), cand("unloaded"), cand("unread"));
+        assert!(loader.names_native_library([&plain, &vips].into_iter()));
+        assert!(!loader.names_native_library([&plain, &unloaded, &unread].into_iter()));
+        assert!(!loader.names_native_library(std::iter::empty()));
     }
 
     /// The `entry:` text of a format-3 candidate whose observed root is not
