@@ -16,6 +16,7 @@ use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
 mod env_common;
+mod store_common;
 
 /// `vci` without the store selection variables
 /// ([`vci_store::select::ENV_VARS`]): a store a developer exported
@@ -275,6 +276,25 @@ impl World {
         let _ = out;
     }
 
+    /// `vci run` writing a format-1 record (`[store] record_format = 1`,
+    /// what vci 2.8 wrote: the envelope with its input manifest), for the
+    /// tests of what only that form holds. A format-3 record on git-meta
+    /// (no listing columns name the run's state object) reports an edited
+    /// entry as changed with the attested hash not loaded, without naming
+    /// it: tests/e2e_format3.rs and tests/e2e_m3.rs cover that text.
+    fn run_format1(&self, dir: &Path, file: &str, key: &Path) {
+        let out = self.vci_env(
+            dir,
+            &["run", file, "--key", key.to_str().unwrap()],
+            &[("VCI_STORE_RECORD_FORMAT", Some("1"))],
+        );
+        assert!(
+            out.status.success(),
+            "vci run {file} (record_format = 1): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     fn plan(&self, dir: &Path, base: &str) -> Plan {
         let out = self.vci_ok(dir, &["plan", "--base-ref", base, "--format", "json"]);
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -364,8 +384,12 @@ fn end_to_end_verification_steps() {
     let w = World::new();
     let work = w.work.clone();
 
-    // Step 1: attest B, then plan: skip B; run A, C, D.
-    w.run(&work, B, &w.trusted);
+    // Step 1: attest B, then plan: skip B; run A, C, D. B and C are
+    // format-1 records (`run_format1`): steps 2, 3 and 7 assert the
+    // per-entry text with the attested hash, which a format-3 record on
+    // git-meta does not give (tests/e2e_m3.rs covers that text); D and A
+    // are the default's frames, so the later plans read a mixed store.
+    w.run_format1(&work, B, &w.trusted);
     let p = w.plan(&work, "main");
     assert_eq!(p.skip, set(&[B]), "step 1");
     assert_eq!(p.run, set(&[A, C, D]), "step 1");
@@ -394,7 +418,7 @@ fn end_to_end_verification_steps() {
     assert_eq!(w.plan(&work, "main").skip, set(&[B]), "step 2: restored");
 
     // Step 3: attest C, edit impl-x.ts (reached only via a computed import) -> C runs.
-    w.run(&work, C, &w.trusted);
+    w.run_format1(&work, C, &w.trusted);
     assert_eq!(w.plan(&work, "main").skip, set(&[B, C]), "step 3");
     let impl_x = w.read("src/impl-x.ts");
     w.write("src/impl-x.ts", "export const name = \"x\"; // edited\n");
@@ -421,7 +445,7 @@ fn end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -1460,8 +1484,9 @@ fn explain_shows_attested_as_expected_and_checkout_as_actual() {
     let work = w.work.clone();
     let mut c = Checks::default();
 
-    // Inputs: expected = attested content, actual = checkout.
-    w.run(&work, B, &w.trusted);
+    // Inputs: expected = attested content, actual = checkout (a format-1
+    // record: its manifest holds the attested hash; see `run_format1`).
+    w.run_format1(&work, B, &w.trusted);
     let original = w.read("fixtures/b.json");
     w.write("fixtures/b.json", "{ \"greeting\": \"changed\" }\n");
     let ex = w.explain(&work, B, "main");
@@ -2353,7 +2378,17 @@ fn shared_inputs_run_only_their_dependents_and_the_newest_candidate_wins() {
     w.git(&work, &["checkout", "-q", "-B", "feature", "main"]);
 
     let trusted = w.trusted.to_str().unwrap().to_owned();
-    w.vci_ok(&work, &["run", S1, S2, S3, "--key", &trusted]);
+    // Format-1 records, whose failure text names the entry (`run_format1`).
+    let out = w.vci_env(
+        &work,
+        &["run", S1, S2, S3, "--key", &trusted],
+        &[("VCI_STORE_RECORD_FORMAT", Some("1"))],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let all = w.plan(&work, "main");
     assert_eq!(all.skip, set(&[S1, S2, S3]), "{all:?}");
 
@@ -2398,4 +2433,204 @@ fn shared_inputs_run_only_their_dependents_and_the_newest_candidate_wins() {
     assert_eq!(by(&w), "trusted@example.com");
     let ex = w.explain(&work, S3, "main");
     assert!(ex.contains("trusted@example.com"), "{ex}");
+}
+
+/// `vci verify` on a format-3 record (the text frame a store holds since
+/// 2.9) verifies the DSSE envelope rebuilt from it, the statement bytes as
+/// signed and the signature re-armored: a frame around a stored
+/// attestation's statement and signature is VALID with its manifest
+/// verified from the store as the envelope is, a frame whose statement was
+/// edited is INVALID, and `--envelope` prints the rebuilt envelope, byte
+/// for byte what the store held before format 3.
+#[test]
+fn verify_reads_a_format_3_record_and_prints_its_envelope() {
+    use vci_attest::FrameExt as _;
+    let w = World::new();
+    let work = w.work.clone();
+    // A v1 statement (its manifest in the store), framed by the test; the
+    // record `vci run` writes (a v2 statement) is verified in
+    // `verify_reports_a_v2_record_from_the_runs_objects` and e2e_m3.rs.
+    w.run_format1(&work, B, &w.trusted);
+    let repo = store_for(&work);
+    let stored = AttestStore::new(&repo).list(Some(B)).unwrap();
+    assert_eq!(stored.len(), 1);
+    let envelope = store_common::envelope_json(&stored[0].bytes);
+    // The descriptor is opaque to a v1 statement's verification.
+    let frame = vci_core::Frame::from_stored_json(&envelope, vec![0; 33]).unwrap();
+    let record = w.base.join("b.vci3");
+    std::fs::write(&record, frame.encode().unwrap()).unwrap();
+    let out = w.vci_ok(
+        &work,
+        &["verify", record.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert!(
+        out.contains("VALID signature by trusted@example.com"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(root verified; git-meta project vci:manifest:"),
+        "{out}"
+    );
+    let printed = w.vci_ok(&work, &["verify", record.to_str().unwrap(), "--envelope"]);
+    assert_eq!(
+        printed.trim_end(),
+        String::from_utf8(envelope.clone()).unwrap().trim_end()
+    );
+    // The envelope printed verifies as the stored one does.
+    let rebuilt = w.base.join("b.rebuilt.json");
+    std::fs::write(&rebuilt, printed.as_bytes()).unwrap();
+    let out = w.vci_ok(
+        &work,
+        &["verify", rebuilt.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert!(out.contains("VALID signature by"), "{out}");
+    // A statement edited inside the frame fails the signature.
+    let mut tampered = frame.clone();
+    let pos = tampered
+        .statement
+        .windows(9)
+        .position(|x| x == b"\"tests\":1")
+        .expect("the statement holds the test count");
+    tampered.statement[pos + 8] = b'2';
+    let bad = w.base.join("b.tampered.vci3");
+    std::fs::write(&bad, tampered.encode().unwrap()).unwrap();
+    let out = w.vci(
+        &work,
+        &["verify", bad.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("INVALID"));
+    // Garbage is neither a record nor an envelope.
+    let junk = w.base.join("junk");
+    std::fs::write(&junk, b"vci3z\n{}\nAA==\nAA==\n").unwrap();
+    let out = w.vci(&work, &["verify", junk.to_str().unwrap(), "--envelope"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `vci verify` of a v2 record (a format-3 frame whose statement names a
+/// hdr and a tables object): the report's lines come from the resolved
+/// view over the run's objects in the repository's store (the repo id is
+/// in the hdr), the manifest line resolves the descriptor against the
+/// run's shape and tables when no file is given (the root is not
+/// recomputed then), and `--manifest FILE` with the compact JSON of the
+/// resolved manifest verifies its root against the signed subject digest,
+/// or fails it.
+#[test]
+fn verify_reports_a_v2_record_from_the_runs_objects() {
+    use vci_attest::FrameExt as _;
+    use vci_store::AttestationStore as _;
+    use vci_store::conformance::scenarios::{Run3, manifest_of};
+    let w = World::new();
+    let work = w.work.clone();
+    // The store exists once something was attested.
+    w.run(&work, A, &w.trusted);
+    let run = Run3::build(&["src/b.test.ts", "src/b.ts"]);
+    let store = vci_git::GitMetaStore::new(store_for(&work));
+    assert_eq!(store.put_objects(&run.new_objects()).unwrap(), 4);
+    let (bytes, _) = run.record(B, 2, 7);
+    let Ok(vci_store::Record::FormatThree(fixture)) = vci_store::decode_record(&bytes) else {
+        panic!("a frame")
+    };
+    let manifest = manifest_of(&["src/b.test.ts", "src/b.ts"]);
+    let root = manifest.root();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let rfc = |t: i64| {
+        jiff::Timestamp::from_second(t)
+            .unwrap()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let predicate = serde_json::json!({
+        "argv": ["vitest", "run"], "commit": "c".repeat(40), "entriesRoot": manifest.entries_root(),
+        "expiresAt": rfc(now + 86_400), "hdr": run.ids.hdr, "issuedAt": rfc(now),
+        "result": {"state": "passed", "tests": 1, "failed": 0, "skipped": 0, "durationMs": 10},
+        "tables": run.ids.tables, "testId": B, "treeDirty": false,
+    });
+    let statement = vci_attest::Statement::new(
+        vec![vci_attest::Subject {
+            name: B.to_owned(),
+            digest: [("blake3".to_owned(), root.clone())].into_iter().collect(),
+        }],
+        vci_core::PREDICATE_TYPE_V2,
+        predicate,
+    );
+    let envelope =
+        vci_attest::sign_statement(&statement, Utf8Path::from_path(&w.trusted).unwrap()).unwrap();
+    let frame = vci_core::Frame::from_envelope(&envelope, fixture.descriptor.clone()).unwrap();
+    let record = w.base.join("b.v2.vci3");
+    std::fs::write(&record, frame.encode().unwrap()).unwrap();
+
+    let out = w.vci_ok(
+        &work,
+        &["verify", record.to_str().unwrap(), "--base-ref", "main"],
+    );
+    assert!(
+        out.contains("VALID signature by trusted@example.com"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("predicateType: {}", vci_core::PREDICATE_TYPE_V2)),
+        "{out}"
+    );
+    assert!(out.contains(&format!("test: {B}")), "{out}");
+    assert!(out.contains("repo id: github.com/example/repo"), "{out}");
+    assert!(out.contains(&format!("input root: {root}")), "{out}");
+    assert!(
+        out.contains("manifest: 2 entries, 0 externals, 0 env (set resolved from the run's shape object; root not recomputed"),
+        "{out}"
+    );
+    assert!(!out.contains("EXPIRED"), "{out}");
+
+    let file = w.base.join("b.manifest.json");
+    std::fs::write(&file, manifest.to_compact()).unwrap();
+    let out = w.vci_ok(
+        &work,
+        &[
+            "verify",
+            record.to_str().unwrap(),
+            "--base-ref",
+            "main",
+            "--manifest",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.contains("manifest: 2 entries, 0 externals, 0 env (root verified; "),
+        "{out}"
+    );
+    let other = w.base.join("b.other.json");
+    std::fs::write(&other, manifest_of(&["src/b.test.ts"]).to_compact()).unwrap();
+    let out = w.vci(
+        &work,
+        &[
+            "verify",
+            record.to_str().unwrap(),
+            "--base-ref",
+            "main",
+            "--manifest",
+            other.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("VALID signature by"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "manifest: INVALID: {}: its root ",
+            other.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("is not the signed input root {root}")),
+        "{text}"
+    );
 }

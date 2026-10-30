@@ -178,6 +178,22 @@ impl World for PgWorld {
         rows.len() == 1
     }
 
+    /// Move these objects' `put_at` back behind the store's back (every
+    /// peer reads the same table). True when every id was there.
+    fn age_objects(&self, _i: usize, ids: &[&str], by: Duration) -> bool {
+        self.ensure_schema();
+        if ids.is_empty() {
+            return true;
+        }
+        let list = ids.iter().map(|id| lit(id)).collect::<Vec<_>>().join(", ");
+        let rows = self.db.query(&format!(
+            "UPDATE {{schema}}.objects SET put_at = put_at - make_interval(secs => {})
+             WHERE ns = 'test' AND id IN ({list}) RETURNING 1",
+            by.as_secs_f64()
+        ));
+        rows.len() == ids.len()
+    }
+
     /// A role that may read everything and write manifests, but not insert
     /// attestations: its deferred batches fail when they finish.
     fn failing_batches(&self) -> Option<Arc<dyn AttestationStore>> {

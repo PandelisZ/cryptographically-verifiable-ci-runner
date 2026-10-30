@@ -682,6 +682,91 @@ the store: run `vci fetch` ``), unreadable or corrupt fails the `inputs` check: 
 `manifest`) verifies as before; an older vci cannot deserialize a new predicate (no `manifest`), so the unit runs there.
 `vci verify` reads the referenced manifest from `--manifest FILE`, else from the store of the repository it runs in.
 
+Store format 3 and predicate v2 (since vci 2.9.0; the design is docs/design/STORE-V2.md, the store side docs/STORE-BACKENDS.md
+section 2): a stored record may be a UTF-8 **text frame** instead of an envelope JSON, under the same key, target and
+slot: `vci3` LF the statement bytes exactly as signed LF base64 of the signature frame LF base64 of the descriptor.
+A value's first byte says its format (`{` an envelope, `v` a frame; `vci_store::decode_record`, which every reader
+goes through); nothing a store holds beside the value (its listing columns, its key's segments) chooses the parser.
+The statement is an in-toto Statement with `predicateType` `https://vci.dev/test-attestation/v2`, written as compact
+JSON with every object's keys sorted (`vci_core::sorted_compact_json`); the writer's bytes are what the signature
+covers and what the store holds, and a reader never re-serializes them. Its predicate (`vci_core::VciPredicateV2`)
+carries the unit's own facts, `testId`, `argv`, `commit`, `tree`, `treeDirty`, `issuedAt`, `expiresAt`, `result`,
+`tainted`, `declaredInputs`, `platformSpecific`, `archSpecific`, `cfgPredicates`, `waived` as sorted distinct u16 ids
+into the tables object's waiver table, `entriesRoot`, and two object ids, `hdr` and `tables`; everything else of v1
+(`repoId`, `adapter`, `projectName`, `projectDir`, `runnerProject`, `toolVersion`, `envConfigDigest`,
+`globalInputRoot`, the whole `globalManifest`, `ignoredInputs`, `railsInputs`, `envSet`, `toolchain`) is in the hdr
+object and bound through its id; `manifestRef` and `manifest` are gone (the descriptor, inside the record, is the
+manifest). Statement subject: `[{ name: testId, digest: { blake3: inputRoot } }]`, as for v1. The **objects** of a run
+(`vci_core::objects`: `hdr`, kind 1, shared by every run at the same toolchain and global inputs; `tables`, kind 2,
+per run and header group; `shape`, kind 3, the sorted distinct `(path, kind, exec)` of every unit of the run and
+its groups; `state`, kind 4, the attested sizes and hashes, read by `vci explain` and the plan's failure text only)
+are bytes whose id is the BLAKE3 of them; a reader recomputes the id of every object it loads, and a mismatch, a
+missing object or a decode failure fails every candidate naming it. The state object is in no signed field: a hash
+printed from it is labelled `attested (unsigned, from the run's state object)`, and no verdict reads it.
+**`entriesRoot`** is BLAKE3 over the domain tag `vci/entries-root/v1` (`vci_core::ENTRIES_ROOT_DOMAIN`) followed by
+the manifest's entries section exactly as `root()` encodes it (`InputManifest::entries_root`); it decides only what
+`vci run` deletes (supersession's "same files" test, below) and enters no verdict. The **storage key** is computed
+over the resolved view of either predicate version (`vci_core::ResolvedPredicate`: the v1 accessors over a v1
+predicate, or over a v2 predicate with its hdr and tables decoded), from decoded values and never from bytes, and
+over the waived list **sorted and distinct** (`ResolvedPredicate::waived_canonical`) for both versions, since a v2
+statement carries ids that are sorted and distinct and cannot reproduce a v1 list's order or repeats; so a 2.8
+record whose `waived` list repeated a string or was unsorted sits in another slot than 2.9's record of the same
+facts, beside it, until supersession or expiry removes it. The **signer segment** of the key (the 16 hex after the
+test key) is checked since 2.9.0: after the signature verifies, it must equal the verified key's signer id (SSH: 16
+hex of SHA-256 over the public key blob, the same digest the `SHA256:` fingerprint is the base64 of; keyless:
+`CertIdentity::signer_id`), or the candidate fails `signer`, for a record of either format; 2.8 never compared it, so
+a record copied under another signer's slot stayed there until that signer's history deleted it. **Decoder rules**:
+a format-3 record and its objects are decoded under the rules of docs/STORE-BACKENDS.md section 2 ("The frame and
+the decoder rules": the frame and canonical base64, minimal varints, delta-coded strictly increasing indices in
+range, env overrides only where the bitmap says so, canonical `RepoPath`s, the kind byte inside the hashed bytes,
+sorted distinct waived ids, the size bounds); a value or object that breaks one fails the candidate's `envelope`,
+`statement` or `inputs` check, and the unit runs.
+
+The invariant: *a v2 predicate's `hdr` and `tables` name objects whose BLAKE3 is that id, and the candidate's manifest
+is the descriptor resolved against the tables and the shape it names, observed at HEAD, whose `root()` with the
+attested externals and env equals the subject digest; a predicate whose hdr, tables or shape is missing, mismatched
+or malformed under the decoder rules fails `statement` or `inputs` and the unit runs; the key's signer segment equals
+the verified key's signer id or the candidate fails `signer`; supersession and prune delete on the signed
+statement's values only.* Rules 1 (identical keys), 2 (foreign keys ignored), 3 (values are UTF-8) and 4 (bytewise
+order) of STORE-BACKENDS.md hold unchanged. What is trusted is what it was: the base commit's signer files, a
+signature over the exact statement bytes by a key or identity those files trust, and the digests the verifier
+recomputes; the descriptor is bound by the root, the hdr, tables and shape bytes by id and root, the state object
+never decides, and the hint and columns choose and pre-filter reads only.
+
+What vci-core gives the commands for this (beside `VciPredicate`, which stays for v1 records):
+
+```rust
+pub const PREDICATE_TYPE_V2: &str = "https://vci.dev/test-attestation/v2";
+pub struct VciPredicateV2 { /* the fields above; to_json writes the signed spelling, from_json checks the ids */ }
+pub struct Context { /* a v2 predicate's hdr and tables, decoded */ } impl Context { pub fn decode(p: &VciPredicateV2, hdr: &[u8], tables: &[u8]) -> Result<Self, PredicateError>; }
+pub enum ResolvedPredicate<'a> { V1(&'a VciPredicate), V2(V2View<'a>) }   // the v1 accessors over either; waived() resolved through the tables; waived_canonical() sorted and distinct
+pub const ENTRIES_ROOT_DOMAIN: &[u8] = b"vci/entries-root/v1";
+impl InputManifest {
+    pub fn entries_root(&self) -> String;
+    /// Observe a resolved set at HEAD through the plan's checkout cache (kind, exec, size, hash as found there).
+    pub fn observe(set: &[ShapeEntry], cache: &CheckoutCache, extra_excluded: &[RepoPath]) -> Result<Vec<InputEntry>, ManifestError>;
+    /// The manifest whose root() the plan compares with the subject digest: the observed entries, the attested externals and env.
+    pub fn from_observed(set: &[ShapeEntry], observed: Vec<InputEntry>, externals: Vec<External>, env: Vec<EnvEntry>) -> Result<Self, ManifestError>;
+}
+// crates/vci-core/src/frame.rs
+pub const FRAME_FIRST_LINE: &str = "vci3"; pub const MAX_RECORD: usize = 1 << 20;
+pub enum FrameSig { SshSig(Vec<u8>), Bundle { sig: String, material: SigstoreMaterial } }
+pub struct Frame { pub statement: Vec<u8>, pub keyid: String, pub sig: FrameSig, pub descriptor: Vec<u8> }
+impl Frame { pub fn decode(value: &[u8]) -> Result<Frame, FrameError>; pub fn encode(&self) -> Result<String, FrameError>; }
+pub fn is_frame(value: &[u8]) -> bool;
+// crates/vci-core/src/objects.rs
+pub fn object_id(bytes: &[u8]) -> ObjectId;        // BLAKE3 of the bytes
+pub enum ObjectKind { Hdr = 1, Tables = 2, Shape = 3, State = 4 }   // max_bytes(): 1, 4, 8, 16 MiB
+pub struct Hdr; pub struct Tables; pub struct Shape; pub struct State;   // encode() -> Vec<u8>, decode(&[u8]) under the decoder rules
+pub struct Descriptor { /* shape id, group, own entries, env, externals */ }
+impl Descriptor { pub fn decode(bytes: &[u8], tables: &Tables) -> Result<Self, DecodeError>; pub fn resolve(&self, shape: &Shape, tables: &Tables) -> Result<ResolvedManifest, DecodeError>; }
+pub struct Run { /* the hdr per group, tables per group, shape, state and each unit's descriptor */ }
+impl Run { pub fn build(units: &[UnitInputs<'_>]) -> Result<Run, EncodeError>; }
+// vci-store
+pub enum Record<'a> { FormatOne(&'a [u8]), FormatThree(vci_core::Frame) }
+pub fn decode_record(bytes: &[u8]) -> Result<Record<'_>, RecordError>;
+```
+
 Supersession on store (since vci 1.9.0): after storing an attestation, `vci run` deletes (git-meta tombstones,
 published by the next push) the same signer's other attestations of the same test id on the same `toolchain.os` and
 `toolchain.arch`, issued no later than the new one, whose manifest entries (files) differ from the new one's, made on
@@ -696,7 +781,20 @@ and ones whose payload or manifest cannot be read. It then deletes the stored ma
 referenced that no attestation left in the store references (none when one cannot be read). `vci prune` (also with
 `--superseded`) deletes the stored manifests no remaining attestation's `manifestRef` names (none when an
 attestation's value, or the `manifestRef` of one it leaves alone because its payload cannot be parsed, cannot be
-read).
+read). Since vci 2.9.0 the old records are **read** and `commit`, the platform (`toolchain.os` and `arch`, through
+the hdr for a format-3 record), `issuedAt` and the files come from each one's signed statement: "same files"
+compares the two records' `entriesRoot` (a format-1 record's is computed from its stored manifest); on a store that
+keeps listing columns (SQLite, PostgreSQL, libSQL) the columns, fetched once for the run's units, only choose which
+old records to read, so a column someone edited costs one read and never a wrong deletion; on git-meta, whose
+fetch leaves values out, the hdr objects the old records name are prefetched once for the run before their
+platform is read (a record whose hdr the store lacks is kept). `vci run` then removes, on such a store, the superseded
+records' objects that no record references any more (an hour of grace after a put; on git-meta, whose referrer scan
+reads every value, they are left to `vci prune`), and the run's state objects older than `[store]
+explain_hashes_days`. `vci prune` reads the expired candidates and the records of every unit with one beyond `keep` by the keys' hints (and
+every record while the store holds an input manifest, since a 2.8 writer may have left a format-1 value under a
+frame's columns), deletes an expired one only when its signed `expiresAt` has passed and orders a unit's records by
+their signed `issuedAt` and `tree`, counting a record the hints doomed and the statements keep as unconfirmed and
+left alone; then the unreferenced objects and the aged state objects (`--objects`, `--older-than DAYS`).
 
 A clone deletes a manifest knowing only its own attestations, so another clone may hold or have published one that
 references it. Every merge of a fetched tip (`vci fetch`, `vci push`, `--fetch`) puts back the manifests it leaves

@@ -68,9 +68,15 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputsConfig>,
     /// `[store]`: which attestation store vci uses, and its tuning
-    /// (docs/STORE-BACKENDS.md section 9). Accepted here so that a base
-    /// commit's `vci.toml` with `[store]` still parses for its policy. It
-    /// is never an input of a test (not part of
+    /// (docs/STORE-BACKENDS.md section 9), the keys of
+    /// [`vci_store::select::StoreSettings`]: since 2.9.0 also what `vci
+    /// run` writes (`record_format = 3`, the default, or `1` for one
+    /// release's worth of readers still on 2.8), whether it writes the
+    /// run's state object (`explain_hashes = true`) and how long a state
+    /// object is kept while referenced (`explain_hashes_days = 2`), each
+    /// with a `VCI_STORE_*` variable that wins over it. Accepted here so
+    /// that a base commit's `vci.toml` with `[store]` still parses for its
+    /// policy. It is never an input of a test (not part of
     /// [`crate::ctx::Project::config_hash_of`]), and the store is chosen
     /// from the working tree's file ([`working_tree_store`]), never from
     /// this.
@@ -1750,6 +1756,58 @@ mod tests {
         // Outside [store], toml's message (with its line) is kept.
         let e = format!("{:#}", Config::parse("adapter = [\n").unwrap_err());
         assert!(e.contains("TOML parse error"), "{e}");
+    }
+
+    /// The format-3 keys of `[store]` (2.9.0) parse with their defaults
+    /// unset, resolve to the design's defaults, and take the file's values
+    /// through [`working_tree_store`]; the plan's caps (16 MiB of verdict
+    /// objects, 16 state objects) are not keys.
+    #[test]
+    fn store_format_3_keys_parse_and_resolve() {
+        let c = Config::parse("adapter = \"go\"\n\n[store]\nbackend = \"sqlite\"\n").unwrap();
+        let s = c.store.as_ref().unwrap();
+        assert_eq!(
+            (s.record_format, s.explain_hashes, s.explain_hashes_days),
+            (None, None, None)
+        );
+        let r = vci_store::select::resolve(&|_| None, Some(s)).unwrap();
+        assert_eq!(r.record_format.value, 3);
+        assert!(r.explain_hashes.value);
+        assert_eq!(r.explain_hashes_days.value, 2);
+        let c = Config::parse(
+            "[store]\nrecord_format = 1\nexplain_hashes = false\nexplain_hashes_days = 7\n",
+        )
+        .unwrap();
+        let s = c.store.as_ref().unwrap();
+        assert_eq!(
+            (s.record_format, s.explain_hashes, s.explain_hashes_days),
+            (Some(1), Some(false), Some(7))
+        );
+        let r = vci_store::select::resolve(&|_| None, Some(s)).unwrap();
+        assert_eq!(r.record_format.value, 1);
+        assert!(!r.explain_hashes.value);
+        assert_eq!(r.explain_hashes_days.value, 7);
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            "[policy]\nmax_ttl = \"nonsense\"\n\n[store]\nrecord_format = 1\nexplain_hashes_days = 0\n",
+        )
+        .unwrap();
+        let s = working_tree_store(root).unwrap().unwrap();
+        assert_eq!(s.record_format, Some(1));
+        assert_eq!(s.explain_hashes_days, Some(0));
+        // A value of another type is refused by line, never echoed.
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            "[store]\nrecord_format = \"tomlS3cr3tEcho99\"\n",
+        )
+        .unwrap();
+        let e = working_tree_store(root).unwrap_err().to_string();
+        assert!(
+            e.contains("(line 2)") && !e.contains("tomlS3cr3tEcho99"),
+            "{e}"
+        );
     }
 
     /// A base commit's `vci.toml` with `[store]` parses (for its policy).

@@ -662,4 +662,64 @@ event = "pull_request*"
         assert!(glob_match("**", "anything/at/all"));
         assert!(glob_match("v?", "v1") && !glob_match("v?", "v/"));
     }
+
+    /// The two constructions of a signer id agree field for field: the
+    /// one `vci run` writes into the store key's signer segment from the
+    /// OIDC token's claims ([`CertIdentity::from_claims`]), and the one
+    /// the plan compares it with, built from the Fulcio certificate's
+    /// extensions ([`CertIdentity::from_cert`]). The fixture leaf
+    /// `tests/fixtures/keyless/leaf-environment.der` (made by `make.sh`)
+    /// carries a deployment environment (OID 1.3.6.1.4.1.57264.1.23,
+    /// `production`) and a runner environment (`self-hosted`), which both
+    /// constructions fold into the id; a job without the environment, or
+    /// on another runner environment, is another signer.
+    #[test]
+    fn from_cert_and_from_claims_give_one_signer_id_with_an_environment() {
+        let der = include_bytes!("../../tests/fixtures/keyless/leaf-environment.der");
+        let cert = Cert::parse(der).unwrap();
+        let from_cert = CertIdentity::from_cert(&cert).unwrap();
+        assert_eq!(from_cert.environment.as_deref(), Some("production"));
+        assert_eq!(from_cert.runner_environment.as_deref(), Some("self-hosted"));
+        let claims = |environment: Option<&str>, runner: &str| {
+            let mut c = serde_json::json!({
+                "iss": GHA,
+                "repository": "ComposalAI/vex",
+                "job_workflow_ref": "ComposalAI/vex/.github/workflows/deploy.yml@refs/heads/master",
+                "ref": "refs/heads/master",
+                "event_name": "push",
+                "runner_environment": runner,
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+            });
+            if let Some(e) = environment {
+                c["environment"] = serde_json::Value::String(e.to_owned());
+            }
+            CertIdentity::from_claims(&c).unwrap()
+        };
+        let from_claims = claims(Some("production"), "self-hosted");
+        assert_eq!(from_cert.issuer, from_claims.issuer);
+        assert_eq!(from_cert.repository, from_claims.repository);
+        assert_eq!(from_cert.workflow, from_claims.workflow);
+        assert_eq!(from_cert.workflow_ref, from_claims.workflow_ref);
+        assert_eq!(from_cert.ref_, from_claims.ref_);
+        assert_eq!(from_cert.event, from_claims.event);
+        assert_eq!(from_cert.environment, from_claims.environment);
+        assert_eq!(from_cert.runner_environment, from_claims.runner_environment);
+        assert_eq!(from_cert.signer_id(), from_claims.signer_id());
+        assert_ne!(
+            from_cert.signer_id(),
+            claims(None, "self-hosted").signer_id(),
+            "the environment is part of the id"
+        );
+        assert_ne!(
+            from_cert.signer_id(),
+            claims(Some("production"), "github-hosted").signer_id(),
+            "so is the runner environment"
+        );
+        // An empty environment claim is no environment, as an empty
+        // extension is none.
+        assert_eq!(
+            claims(Some(""), "self-hosted").signer_id(),
+            claims(None, "self-hosted").signer_id()
+        );
+    }
 }

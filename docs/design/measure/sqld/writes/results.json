@@ -1,0 +1,7434 @@
+{
+ "runs": [
+  {
+   "backdate": {
+    "backdated_manifests": 800,
+    "backdated_objects": 0,
+    "by_secs": 7200,
+    "ns": "m-m3-f1-1-1a"
+   },
+   "cfg": "f1",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 29397688,
+      "ns": "m-m3-f1-1-1a",
+      "prefix": "vci_903fb27a80ab169c_",
+      "rows": 7266,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 800
+        },
+        "bytes": 17821019,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 160000,
+        "rows": 800
+       },
+       "log": {
+        "bytes": 570441,
+        "rows": 4866
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.05,
+       "batch_transactions": 33,
+       "connections": 16,
+       "count_after": 800,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 13,
+       "find_secs": 0.077288792,
+       "flushes": 7,
+       "longest_tx_secs": 0.05,
+       "lost": 0,
+       "manifest_bytes": 10735028,
+       "object_bytes": 0,
+       "objects": 0,
+       "objects_new": 0,
+       "old_bytes_read": 17419544,
+       "old_hdr_objects": 0,
+       "old_records": 800,
+       "orphan_candidates": 800,
+       "orphan_manifests_found": 800,
+       "orphan_manifests_removed": 0,
+       "orphan_objects_removed": null,
+       "orphan_requests": 4,
+       "orphan_secs": 0.015618583,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.770325083,
+       "rc": 0,
+       "record_bytes": 17419544,
+       "removed": 800,
+       "requests_total": 54,
+       "retries_total": 0,
+       "sql_bytes": 31307273,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 28180172,
+       "transactions": 33,
+       "wall_secs": 1.389,
+       "wire_c2s_bytes": 32770561,
+       "wire_s2c_bytes": 39180773,
+       "write_requests": 33,
+       "write_retries": 0,
+       "write_secs": 0.897902625
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 28857250,
+      "ns": "m-m3-f1-1-1a",
+      "prefix": "vci_903fb27a80ab169c_",
+      "rows": 3233,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 800
+        },
+        "bytes": 17820755,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 190267,
+        "rows": 1633
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.04,
+       "batch_transactions": 33,
+       "connections": 4,
+       "count_after": 800,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 7,
+       "longest_tx_secs": 0.04,
+       "lost": 0,
+       "manifest_bytes": 10735028,
+       "object_bytes": 0,
+       "objects": 0,
+       "objects_new": 0,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.665371958,
+       "rc": 0,
+       "record_bytes": 17419544,
+       "removed": 0,
+       "requests_total": 40,
+       "retries_total": 0,
+       "sql_bytes": 30235138,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 28180172,
+       "transactions": 33,
+       "wall_secs": 1.074,
+       "wire_c2s_bytes": 31211313,
+       "wire_s2c_bytes": 277118,
+       "write_requests": 37,
+       "write_retries": 0,
+       "write_secs": 0.758980875
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "1a"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 800,
+    "backdated_objects": 0,
+    "by_secs": 7200,
+    "ns": "m-m3-f1-1-2a"
+   },
+   "cfg": "f1",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 29397688,
+      "ns": "m-m3-f1-1-2a",
+      "prefix": "vci_d2a6aa3a63178329_",
+      "rows": 7266,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 800
+        },
+        "bytes": 17821019,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 160000,
+        "rows": 800
+       },
+       "log": {
+        "bytes": 570441,
+        "rows": 4866
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.08,
+       "batch_transactions": 33,
+       "connections": 16,
+       "count_after": 800,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 13,
+       "find_secs": 0.101829917,
+       "flushes": 7,
+       "longest_tx_secs": 0.08,
+       "lost": 0,
+       "manifest_bytes": 10735028,
+       "object_bytes": 0,
+       "objects": 0,
+       "objects_new": 0,
+       "old_bytes_read": 17419544,
+       "old_hdr_objects": 0,
+       "old_records": 800,
+       "orphan_candidates": 800,
+       "orphan_manifests_found": 800,
+       "orphan_manifests_removed": 0,
+       "orphan_objects_removed": null,
+       "orphan_requests": 4,
+       "orphan_secs": 0.021898625,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 1.173541667,
+       "rc": 0,
+       "record_bytes": 17419544,
+       "removed": 800,
+       "requests_total": 54,
+       "retries_total": 0,
+       "sql_bytes": 31307273,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 28180172,
+       "transactions": 33,
+       "wall_secs": 1.898,
+       "wire_c2s_bytes": 32770561,
+       "wire_s2c_bytes": 39180800,
+       "write_requests": 33,
+       "write_retries": 0,
+       "write_secs": 1.292142209
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 28857250,
+      "ns": "m-m3-f1-1-2a",
+      "prefix": "vci_d2a6aa3a63178329_",
+      "rows": 3233,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 800
+        },
+        "bytes": 17820755,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 190267,
+        "rows": 1633
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.06,
+       "batch_transactions": 33,
+       "connections": 4,
+       "count_after": 800,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 7,
+       "longest_tx_secs": 0.06,
+       "lost": 0,
+       "manifest_bytes": 10735028,
+       "object_bytes": 0,
+       "objects": 0,
+       "objects_new": 0,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.839791125,
+       "rc": 0,
+       "record_bytes": 17419544,
+       "removed": 0,
+       "requests_total": 40,
+       "retries_total": 0,
+       "sql_bytes": 30235138,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 28180172,
+       "transactions": 33,
+       "wall_secs": 1.263,
+       "wire_c2s_bytes": 31211313,
+       "wire_s2c_bytes": 277124,
+       "write_requests": 37,
+       "write_retries": 0,
+       "write_secs": 0.930219625
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "2a"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 800,
+    "backdated_objects": 0,
+    "by_secs": 7200,
+    "ns": "m-m3-f1-1-3x"
+   },
+   "cfg": "f1",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 29397688,
+      "ns": "m-m3-f1-1-3x",
+      "prefix": "vci_84107fcaaf0ee698_",
+      "rows": 7266,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 800
+        },
+        "bytes": 17821019,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 160000,
+        "rows": 800
+       },
+       "log": {
+        "bytes": 570441,
+        "rows": 4866
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.04,
+       "batch_transactions": 33,
+       "connections": 16,
+       "count_after": 800,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 13,
+       "find_secs": 0.091778583,
+       "flushes": 7,
+       "longest_tx_secs": 0.04,
+       "lost": 0,
+       "manifest_bytes": 10735028,
+       "object_bytes": 0,
+       "objects": 0,
+       "objects_new": 0,
+       "old_bytes_read": 17419544,
+       "old_hdr_objects": 0,
+       "old_records": 800,
+       "orphan_candidates": 800,
+       "orphan_manifests_found": 800,
+       "orphan_manifests_removed": 0,
+       "orphan_objects_removed": null,
+       "orphan_requests": 4,
+       "orphan_secs": 0.020149625,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.856341333,
+       "rc": 0,
+       "record_bytes": 17419544,
+       "removed": 800,
+       "requests_total": 54,
+       "retries_total": 0,
+       "sql_bytes": 31307273,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 28180172,
+       "transactions": 33,
+       "wall_secs": 1.483,
+       "wire_c2s_bytes": 32770561,
+       "wire_s2c_bytes": 39180794,
+       "write_requests": 33,
+       "write_retries": 0,
+       "write_secs": 0.956545416
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 28857250,
+      "ns": "m-m3-f1-1-3x",
+      "prefix": "vci_84107fcaaf0ee698_",
+      "rows": 3233,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 800
+        },
+        "bytes": 17820755,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 190267,
+        "rows": 1633
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.1,
+       "batch_transactions": 33,
+       "connections": 4,
+       "count_after": 800,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 7,
+       "longest_tx_secs": 0.1,
+       "lost": 0,
+       "manifest_bytes": 10735028,
+       "object_bytes": 0,
+       "objects": 0,
+       "objects_new": 0,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.778467083,
+       "rc": 0,
+       "record_bytes": 17419544,
+       "removed": 0,
+       "requests_total": 40,
+       "retries_total": 0,
+       "sql_bytes": 30235138,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 28180172,
+       "transactions": 33,
+       "wall_secs": 1.225,
+       "wire_c2s_bytes": 31211313,
+       "wire_s2c_bytes": 277114,
+       "write_requests": 37,
+       "write_retries": 0,
+       "write_secs": 0.863040291
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "3x"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 5233973,
+      "ns": "m-m3-f1-3-1a",
+      "prefix": "vci_514e5864812c9e9e_",
+      "rows": 565,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 140
+        },
+        "bytes": 3121442,
+        "rows": 140
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 33037,
+        "rows": 285
+       },
+       "manifests": {
+        "bytes": 2079494,
+        "rows": 140
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.05,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.05,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.591,
+       "wire_c2s_bytes": 4545002,
+       "wire_s2c_bytes": 16576,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 89,
+       "batch_secs_longest": 30.03,
+       "batch_transactions": 1,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.03,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.591,
+       "wire_c2s_bytes": 3422183,
+       "wire_s2c_bytes": 7494,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 45,
+       "batch_secs_longest": 30.04,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.04,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.591,
+       "wire_c2s_bytes": 4433834,
+       "wire_s2c_bytes": 9644,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1a"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6298672,
+      "ns": "m-m3-f1-3-1b",
+      "prefix": "vci_0846920de90b15ed_",
+      "rows": 678,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 168
+        },
+        "bytes": 3747364,
+        "rows": 168
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 39666,
+        "rows": 342
+       },
+       "manifests": {
+        "bytes": 2511642,
+        "rows": 168
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.0,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.0,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.601,
+       "wire_c2s_bytes": 4545002,
+       "wire_s2c_bytes": 16524,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 61,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.6,
+       "wire_c2s_bytes": 4585879,
+       "wire_s2c_bytes": 21838,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 45,
+       "batch_secs_longest": 30.0,
+       "batch_transactions": 2,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.0,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.6,
+       "wire_c2s_bytes": 4452489,
+       "wire_s2c_bytes": 21824,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1b"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 24256941,
+      "ns": "m-m3-f1-3-1c",
+      "prefix": "vci_39372cde589db6a1_",
+      "rows": 2563,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 634
+        },
+        "bytes": 14137828,
+        "rows": 634
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 150623,
+        "rows": 1295
+       },
+       "manifests": {
+        "bytes": 9968490,
+        "rows": 634
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 36,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 8,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.565,
+       "wire_c2s_bytes": 12619265,
+       "wire_s2c_bytes": 36261,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 102,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 10,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.761,
+       "wire_c2s_bytes": 11456584,
+       "wire_s2c_bytes": 39028,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 126,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 9,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.881,
+       "wire_c2s_bytes": 12405553,
+       "wire_s2c_bytes": 32297,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1c"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6279927,
+      "ns": "m-m3-f1-3-1d",
+      "prefix": "vci_498fcd44be1e6368_",
+      "rows": 698,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 173
+        },
+        "bytes": 3855199,
+        "rows": 173
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 40836,
+        "rows": 352
+       },
+       "manifests": {
+        "bytes": 2383892,
+        "rows": 173
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 36,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 3,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 90.827,
+       "wire_c2s_bytes": 4596043,
+       "wire_s2c_bytes": 17695,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 89,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 1,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.914,
+       "wire_c2s_bytes": 3421767,
+       "wire_s2c_bytes": 6999,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 45,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.915,
+       "wire_c2s_bytes": 4433418,
+       "wire_s2c_bytes": 9136,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1d"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 26158689,
+      "ns": "m-m3-f1-3-1e",
+      "prefix": "vci_21b0b0c70207646f_",
+      "rows": 2796,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 698
+        },
+        "bytes": 15561380,
+        "rows": 698
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 165883,
+        "rows": 1425
+       },
+       "manifests": {
+        "bytes": 10431426,
+        "rows": 673
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 129,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 10,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.553,
+       "wire_c2s_bytes": 11535796,
+       "wire_s2c_bytes": 26783,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 3,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 9,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.552,
+       "wire_c2s_bytes": 9284445,
+       "wire_s2c_bytes": 36865,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 95,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 10,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.553,
+       "wire_c2s_bytes": 12454292,
+       "wire_s2c_bytes": 33689,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1e"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6298672,
+      "ns": "m-m3-f1-3-1f",
+      "prefix": "vci_540a6da643c07f77_",
+      "rows": 678,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 168
+        },
+        "bytes": 3747364,
+        "rows": 168
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 39666,
+        "rows": 342
+       },
+       "manifests": {
+        "bytes": 2511642,
+        "rows": 168
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.659,
+       "wire_c2s_bytes": 4545002,
+       "wire_s2c_bytes": 16522,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 61,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.659,
+       "wire_c2s_bytes": 4567224,
+       "wire_s2c_bytes": 9617,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 45,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.659,
+       "wire_c2s_bytes": 4433834,
+       "wire_s2c_bytes": 9616,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1f"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 16840857,
+      "ns": "m-m3-f1-3-1g",
+      "prefix": "vci_335615b9bd3135aa_",
+      "rows": 1802,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 446
+        },
+        "bytes": 9948633,
+        "rows": 446
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 105642,
+        "rows": 910
+       },
+       "manifests": {
+        "bytes": 6786582,
+        "rows": 446
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 68,
+       "batch_secs_longest": 30.04,
+       "batch_transactions": 7,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.04,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.227,
+       "wire_c2s_bytes": 9153142,
+       "wire_s2c_bytes": 20335,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.07,
+       "batch_transactions": 4,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.07,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.171,
+       "wire_c2s_bytes": 4666489,
+       "wire_s2c_bytes": 20808,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 44,
+       "batch_secs_longest": 30.03,
+       "batch_transactions": 7,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.03,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.35,
+       "wire_c2s_bytes": 8988531,
+       "wire_s2c_bytes": 20334,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1g"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6257033,
+      "ns": "m-m3-f1-3-1h",
+      "prefix": "vci_e496c714a2fbce4b_",
+      "rows": 654,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 162
+        },
+        "bytes": 3617231,
+        "rows": 162
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 38262,
+        "rows": 330
+       },
+       "manifests": {
+        "bytes": 2601540,
+        "rows": 162
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.904,
+       "wire_c2s_bytes": 4553400,
+       "wire_s2c_bytes": 21838,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 89,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 1,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.904,
+       "wire_c2s_bytes": 3440838,
+       "wire_s2c_bytes": 19710,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 23,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 3,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.904,
+       "wire_c2s_bytes": 5548369,
+       "wire_s2c_bytes": 18660,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1h"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6298672,
+      "ns": "m-m3-f1-3-2x",
+      "prefix": "vci_016671fba2b20d79_",
+      "rows": 678,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 168
+        },
+        "bytes": 3747364,
+        "rows": 168
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 39666,
+        "rows": 342
+       },
+       "manifests": {
+        "bytes": 2511642,
+        "rows": 168
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.06,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.06,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.801,
+       "wire_c2s_bytes": 4545002,
+       "wire_s2c_bytes": 16589,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 61,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.801,
+       "wire_c2s_bytes": 4567224,
+       "wire_s2c_bytes": 9641,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 45,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.8,
+       "wire_c2s_bytes": 4433418,
+       "wire_s2c_bytes": 9148,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "2x"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 17899991,
+      "ns": "m-m3-f1-3-2y",
+      "prefix": "vci_33c1fa6b7c466caf_",
+      "rows": 1944,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 481
+        },
+        "bytes": 10730901,
+        "rows": 481
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 113986,
+        "rows": 982
+       },
+       "manifests": {
+        "bytes": 7055104,
+        "rows": 481
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 68,
+       "batch_secs_longest": 30.1,
+       "batch_transactions": 7,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.1,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.127,
+       "wire_c2s_bytes": 9163399,
+       "wire_s2c_bytes": 27238,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 58,
+       "batch_secs_longest": 30.09,
+       "batch_transactions": 7,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.09,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.127,
+       "wire_c2s_bytes": 9053497,
+       "wire_s2c_bytes": 32558,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 65,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 6,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.128,
+       "wire_c2s_bytes": 7864856,
+       "wire_s2c_bytes": 30414,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "2y"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6298672,
+      "ns": "m-m3-f1-3-3x",
+      "prefix": "vci_b62a4a77760f1eaf_",
+      "rows": 678,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 168
+        },
+        "bytes": 3747364,
+        "rows": 168
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 39666,
+        "rows": 342
+       },
+       "manifests": {
+        "bytes": 2511642,
+        "rows": 168
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.07,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.07,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.723,
+       "wire_c2s_bytes": 4545002,
+       "wire_s2c_bytes": 16517,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 61,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.723,
+       "wire_c2s_bytes": 4567224,
+       "wire_s2c_bytes": 9623,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 45,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 2,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 60.723,
+       "wire_c2s_bytes": 4452489,
+       "wire_s2c_bytes": 21842,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "3x"
+  },
+  {
+   "cfg": "f1",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6298672,
+      "ns": "m-m3-f1-3-3y",
+      "prefix": "vci_ef32caa3a5b23e8b_",
+      "rows": 678,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "1": 168
+        },
+        "bytes": 3747364,
+        "rows": 168
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 39666,
+        "rows": 342
+       },
+       "manifests": {
+        "bytes": 2511642,
+        "rows": 168
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {},
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.07,
+       "batch_transactions": 2,
+       "connections": 9,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.07,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.26,
+       "wire_c2s_bytes": 4553400,
+       "wire_s2c_bytes": 21838,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 61,
+       "batch_secs_longest": 30.05,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.05,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.261,
+       "wire_c2s_bytes": 4567224,
+       "wire_s2c_bytes": 9618,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      },
+      {
+       "batch_not_stored": 45,
+       "batch_secs_longest": 30.07,
+       "batch_transactions": 2,
+       "connections": 7,
+       "count_after": null,
+       "doomed": null,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.07,
+       "lost": null,
+       "manifest_bytes": null,
+       "object_bytes": null,
+       "objects": null,
+       "objects_new": null,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": null,
+       "rc": 101,
+       "record_bytes": null,
+       "removed": null,
+       "requests_total": null,
+       "retries_total": null,
+       "sql_bytes": null,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": null,
+       "transactions": null,
+       "wall_secs": 61.261,
+       "wire_c2s_bytes": 4444091,
+       "wire_s2c_bytes": 16528,
+       "write_requests": null,
+       "write_retries": null,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "3y"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 0,
+    "backdated_objects": 4,
+    "by_secs": 7200,
+    "ns": "m-m3-f3-1-1a"
+   },
+   "cfg": "f3",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 2760707,
+      "ns": "m-m3-f3-1-1a",
+      "prefix": "vci_bb3885018b9752d2_",
+      "rows": 2409,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 800
+        },
+        "bytes": 2023372,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 159275,
+        "rows": 801
+       },
+       "log": {
+        "bytes": 125800,
+        "rows": 804
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 24900,
+          "rows": 1
+         },
+         "3": {
+          "bytes": 122304,
+          "rows": 1
+         },
+         "4": {
+          "bytes": 298764,
+          "rows": 1
+         }
+        },
+        "bytes": 452260,
+        "rows": 4
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.09,
+       "batch_transactions": 2,
+       "connections": 17,
+       "count_after": 800,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.057025625,
+       "flushes": 1,
+       "longest_tx_secs": 0.09,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 338963,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1419469,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.003358541,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.003895333,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 800,
+       "requests_total": 26,
+       "retries_total": 0,
+       "sql_bytes": 3050277,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1884233,
+       "transactions": 2,
+       "wall_secs": 0.66,
+       "wire_c2s_bytes": 3511004,
+       "wire_s2c_bytes": 3404436,
+       "write_requests": 2,
+       "write_retries": 0,
+       "write_secs": 0.147090375
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 2463094,
+      "ns": "m-m3-f3-1-1a",
+      "prefix": "vci_bb3885018b9752d2_",
+      "rows": 806,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 800
+        },
+        "bytes": 2023372,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 150,
+        "rows": 2
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 24900,
+          "rows": 1
+         },
+         "3": {
+          "bytes": 122304,
+          "rows": 1
+         },
+         "4": {
+          "bytes": 286076,
+          "rows": 1
+         }
+        },
+        "bytes": 439572,
+        "rows": 4
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.09,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 800,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.09,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 329446,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.003230166,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 0,
+       "requests_total": 9,
+       "retries_total": 0,
+       "sql_bytes": 2589103,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1871545,
+       "transactions": 2,
+       "wall_secs": 0.597,
+       "wire_c2s_bytes": 2678240,
+       "wire_s2c_bytes": 209829,
+       "write_requests": 6,
+       "write_retries": 0,
+       "write_secs": 0.153114625
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "1a"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 0,
+    "backdated_objects": 4,
+    "by_secs": 7200,
+    "ns": "m-m3-f3-1-2a"
+   },
+   "cfg": "f3",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 2760707,
+      "ns": "m-m3-f3-1-2a",
+      "prefix": "vci_6fbc798809784d8c_",
+      "rows": 2409,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 800
+        },
+        "bytes": 2023372,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 159275,
+        "rows": 801
+       },
+       "log": {
+        "bytes": 125800,
+        "rows": 804
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 24900,
+          "rows": 1
+         },
+         "3": {
+          "bytes": 122304,
+          "rows": 1
+         },
+         "4": {
+          "bytes": 298764,
+          "rows": 1
+         }
+        },
+        "bytes": 452260,
+        "rows": 4
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.08,
+       "batch_transactions": 2,
+       "connections": 17,
+       "count_after": 800,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.058136083,
+       "flushes": 1,
+       "longest_tx_secs": 0.08,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 338963,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1419469,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.003808917,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.003920292,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 800,
+       "requests_total": 26,
+       "retries_total": 0,
+       "sql_bytes": 3050277,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1884233,
+       "transactions": 2,
+       "wall_secs": 0.65,
+       "wire_c2s_bytes": 3511004,
+       "wire_s2c_bytes": 3404432,
+       "write_requests": 2,
+       "write_retries": 0,
+       "write_secs": 0.134454583
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 2463094,
+      "ns": "m-m3-f3-1-2a",
+      "prefix": "vci_6fbc798809784d8c_",
+      "rows": 806,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 800
+        },
+        "bytes": 2023372,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 150,
+        "rows": 2
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 24900,
+          "rows": 1
+         },
+         "3": {
+          "bytes": 122304,
+          "rows": 1
+         },
+         "4": {
+          "bytes": 286076,
+          "rows": 1
+         }
+        },
+        "bytes": 439572,
+        "rows": 4
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.07,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 800,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.07,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 329446,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002993291,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 0,
+       "requests_total": 9,
+       "retries_total": 0,
+       "sql_bytes": 2589103,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1871545,
+       "transactions": 2,
+       "wall_secs": 0.578,
+       "wire_c2s_bytes": 2678240,
+       "wire_s2c_bytes": 209820,
+       "write_requests": 6,
+       "write_retries": 0,
+       "write_secs": 0.139438916
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "2a"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 0,
+    "backdated_objects": 4,
+    "by_secs": 7200,
+    "ns": "m-m3-f3-1-3x"
+   },
+   "cfg": "f3",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 2760707,
+      "ns": "m-m3-f3-1-3x",
+      "prefix": "vci_18ccaddc35b52b6a_",
+      "rows": 2409,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 800
+        },
+        "bytes": 2023372,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 159275,
+        "rows": 801
+       },
+       "log": {
+        "bytes": 125800,
+        "rows": 804
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 24900,
+          "rows": 1
+         },
+         "3": {
+          "bytes": 122304,
+          "rows": 1
+         },
+         "4": {
+          "bytes": 298764,
+          "rows": 1
+         }
+        },
+        "bytes": 452260,
+        "rows": 4
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.08,
+       "batch_transactions": 2,
+       "connections": 17,
+       "count_after": 800,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.065356333,
+       "flushes": 1,
+       "longest_tx_secs": 0.08,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 338963,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1419469,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.003576667,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.0040025,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 800,
+       "requests_total": 26,
+       "retries_total": 0,
+       "sql_bytes": 3050277,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1884233,
+       "transactions": 2,
+       "wall_secs": 0.682,
+       "wire_c2s_bytes": 3511004,
+       "wire_s2c_bytes": 3404438,
+       "write_requests": 2,
+       "write_retries": 0,
+       "write_secs": 0.135338084
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 2463094,
+      "ns": "m-m3-f3-1-3x",
+      "prefix": "vci_18ccaddc35b52b6a_",
+      "rows": 806,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 800
+        },
+        "bytes": 2023372,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 150,
+        "rows": 2
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 24900,
+          "rows": 1
+         },
+         "3": {
+          "bytes": 122304,
+          "rows": 1
+         },
+         "4": {
+          "bytes": 286076,
+          "rows": 1
+         }
+        },
+        "bytes": 439572,
+        "rows": 4
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.09,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 800,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.09,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 329446,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.004471958,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 0,
+       "requests_total": 9,
+       "retries_total": 0,
+       "sql_bytes": 2589103,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1871545,
+       "transactions": 2,
+       "wall_secs": 0.647,
+       "wire_c2s_bytes": 2678240,
+       "wire_s2c_bytes": 209822,
+       "write_requests": 6,
+       "write_retries": 0,
+       "write_secs": 0.152016292
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "3x"
+  },
+  {
+   "cfg": "f3",
+   "ok": true,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 7604382,
+      "ns": "m-m3-f3-3-1a",
+      "prefix": "vci_999ef6323ffc54a2_",
+      "rows": 2417,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 2400
+        },
+        "bytes": 6115861,
+        "rows": 2400
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 525,
+        "rows": 7
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 75104,
+          "rows": 3
+         },
+         "3": {
+          "bytes": 420828,
+          "rows": 3
+         },
+         "4": {
+          "bytes": 985316,
+          "rows": 3
+         }
+        },
+        "bytes": 1487996,
+        "rows": 10
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.17,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.17,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 329446,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.00266175,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 0,
+       "requests_total": 9,
+       "retries_total": 0,
+       "sql_bytes": 2589103,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1871545,
+       "transactions": 2,
+       "wall_secs": 0.824,
+       "wire_c2s_bytes": 2678240,
+       "wire_s2c_bytes": 600279,
+       "write_requests": 6,
+       "write_retries": 0,
+       "write_secs": 0.291671417
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.1,
+       "batch_transactions": 3,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.1,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 410164,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002689792,
+       "rc": 0,
+       "record_bytes": 1451036,
+       "removed": 0,
+       "requests_total": 8,
+       "retries_total": 0,
+       "sql_bytes": 2731612,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 2010736,
+       "transactions": 3,
+       "wall_secs": 0.808,
+       "wire_c2s_bytes": 2811609,
+       "wire_s2c_bytes": 595009,
+       "write_requests": 5,
+       "write_retries": 0,
+       "write_secs": 0.241573708
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.16,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.16,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 384782,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002701834,
+       "rc": 0,
+       "record_bytes": 1431719,
+       "removed": 0,
+       "requests_total": 7,
+       "retries_total": 0,
+       "sql_bytes": 2675974,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1957579,
+       "transactions": 2,
+       "wall_secs": 0.824,
+       "wire_c2s_bytes": 2754854,
+       "wire_s2c_bytes": 593353,
+       "write_requests": 4,
+       "write_retries": 0,
+       "write_secs": 0.269386042
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1a"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 0,
+    "backdated_objects": 10,
+    "by_secs": 7200,
+    "ns": "m-m3-f3-3-1b"
+   },
+   "cfg": "f3",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 8514889,
+      "ns": "m-m3-f3-3-1b",
+      "prefix": "vci_e10c8db01e69688d_",
+      "rows": 7228,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 2400
+        },
+        "bytes": 6117695,
+        "rows": 2400
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 479662,
+        "rows": 2403
+       },
+       "log": {
+        "bytes": 379263,
+        "rows": 2415
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 75104,
+          "rows": 3
+         },
+         "3": {
+          "bytes": 420828,
+          "rows": 3
+         },
+         "4": {
+          "bytes": 1035588,
+          "rows": 3
+         }
+        },
+        "bytes": 1538269,
+        "rows": 10
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.13,
+       "batch_transactions": 2,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.063717583,
+       "flushes": 1,
+       "longest_tx_secs": 0.13,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 338963,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1419469,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.041500875,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.004661542,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 800,
+       "requests_total": 26,
+       "retries_total": 0,
+       "sql_bytes": 3050277,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1884233,
+       "transactions": 2,
+       "wall_secs": 0.736,
+       "wire_c2s_bytes": 3511004,
+       "wire_s2c_bytes": 3794835,
+       "write_requests": 2,
+       "write_retries": 0,
+       "write_secs": 0.182181667
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.18,
+       "batch_transactions": 3,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.066181917,
+       "flushes": 1,
+       "longest_tx_secs": 0.18,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 425129,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1451036,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.020389916,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.004615958,
+       "rc": 0,
+       "record_bytes": 1451036,
+       "removed": 800,
+       "requests_total": 27,
+       "retries_total": 0,
+       "sql_bytes": 3200293,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 2030688,
+       "transactions": 3,
+       "wall_secs": 0.929,
+       "wire_c2s_bytes": 3662416,
+       "wire_s2c_bytes": 3840027,
+       "write_requests": 3,
+       "write_retries": 0,
+       "write_secs": 0.359612
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.18,
+       "batch_transactions": 3,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.07473925,
+       "flushes": 1,
+       "longest_tx_secs": 0.18,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 398008,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1431719,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.002834417,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.004306459,
+       "rc": 0,
+       "record_bytes": 1431719,
+       "removed": 800,
+       "requests_total": 27,
+       "retries_total": 0,
+       "sql_bytes": 3144562,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1975211,
+       "transactions": 3,
+       "wall_secs": 0.929,
+       "wire_c2s_bytes": 3606684,
+       "wire_s2c_bytes": 3813995,
+       "write_requests": 3,
+       "write_retries": 0,
+       "write_secs": 0.379567292
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 7604382,
+      "ns": "m-m3-f3-3-1b",
+      "prefix": "vci_e10c8db01e69688d_",
+      "rows": 2417,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 2400
+        },
+        "bytes": 6115861,
+        "rows": 2400
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 525,
+        "rows": 7
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 75104,
+          "rows": 3
+         },
+         "3": {
+          "bytes": 420828,
+          "rows": 3
+         },
+         "4": {
+          "bytes": 985316,
+          "rows": 3
+         }
+        },
+        "bytes": 1487996,
+        "rows": 10
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.11,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 1320,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.11,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 329446,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.003048292,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 0,
+       "requests_total": 9,
+       "retries_total": 0,
+       "sql_bytes": 2589103,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1871545,
+       "transactions": 2,
+       "wall_secs": 0.652,
+       "wire_c2s_bytes": 2678240,
+       "wire_s2c_bytes": 336709,
+       "write_requests": 6,
+       "write_retries": 0,
+       "write_secs": 0.170929542
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.17,
+       "batch_transactions": 3,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.17,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 410164,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002831125,
+       "rc": 0,
+       "record_bytes": 1451036,
+       "removed": 0,
+       "requests_total": 8,
+       "retries_total": 0,
+       "sql_bytes": 2731612,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 2010736,
+       "transactions": 3,
+       "wall_secs": 0.84,
+       "wire_c2s_bytes": 2811609,
+       "wire_s2c_bytes": 594981,
+       "write_requests": 5,
+       "write_retries": 0,
+       "write_secs": 0.308137833
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.18,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.18,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 384782,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002759667,
+       "rc": 0,
+       "record_bytes": 1431719,
+       "removed": 0,
+       "requests_total": 7,
+       "retries_total": 0,
+       "sql_bytes": 2675974,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1957579,
+       "transactions": 2,
+       "wall_secs": 0.858,
+       "wire_c2s_bytes": 2754854,
+       "wire_s2c_bytes": 593324,
+       "write_requests": 4,
+       "write_retries": 0,
+       "write_secs": 0.348994209
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1b"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 0,
+    "backdated_objects": 10,
+    "by_secs": 7200,
+    "ns": "m-m3-f3-3-2a"
+   },
+   "cfg": "f3",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 8514935,
+      "ns": "m-m3-f3-3-2a",
+      "prefix": "vci_67e1d451b79f9ca7_",
+      "rows": 7228,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 2400
+        },
+        "bytes": 6117718,
+        "rows": 2400
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 479685,
+        "rows": 2403
+       },
+       "log": {
+        "bytes": 379263,
+        "rows": 2415
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 75104,
+          "rows": 3
+         },
+         "3": {
+          "bytes": 420828,
+          "rows": 3
+         },
+         "4": {
+          "bytes": 1035588,
+          "rows": 3
+         }
+        },
+        "bytes": 1538269,
+        "rows": 10
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.46,
+       "batch_transactions": 2,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.172155666,
+       "flushes": 1,
+       "longest_tx_secs": 0.46,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 338963,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1419469,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.012410041,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.004452125,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 800,
+       "requests_total": 26,
+       "retries_total": 0,
+       "sql_bytes": 3050277,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1884233,
+       "transactions": 2,
+       "wall_secs": 1.493,
+       "wire_c2s_bytes": 3511004,
+       "wire_s2c_bytes": 3794872,
+       "write_requests": 2,
+       "write_retries": 0,
+       "write_secs": 0.699012875
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.27,
+       "batch_transactions": 3,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.144101042,
+       "flushes": 1,
+       "longest_tx_secs": 0.27,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 425129,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1451036,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.181414416,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.004684,
+       "rc": 0,
+       "record_bytes": 1451036,
+       "removed": 800,
+       "requests_total": 27,
+       "retries_total": 0,
+       "sql_bytes": 3200293,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 2030688,
+       "transactions": 3,
+       "wall_secs": 1.471,
+       "wire_c2s_bytes": 3662416,
+       "wire_s2c_bytes": 3840055,
+       "write_requests": 3,
+       "write_retries": 0,
+       "write_secs": 0.501553041
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.46,
+       "batch_transactions": 3,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.157423042,
+       "flushes": 1,
+       "longest_tx_secs": 0.46,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 398008,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1431719,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.008228625,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.00424025,
+       "rc": 0,
+       "record_bytes": 1431719,
+       "removed": 800,
+       "requests_total": 27,
+       "retries_total": 0,
+       "sql_bytes": 3144562,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1975211,
+       "transactions": 3,
+       "wall_secs": 1.502,
+       "wire_c2s_bytes": 3606684,
+       "wire_s2c_bytes": 3814009,
+       "write_requests": 3,
+       "write_retries": 0,
+       "write_secs": 0.709959584
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 7604382,
+      "ns": "m-m3-f3-3-2a",
+      "prefix": "vci_67e1d451b79f9ca7_",
+      "rows": 2417,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 2400
+        },
+        "bytes": 6115861,
+        "rows": 2400
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 525,
+        "rows": 7
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 75104,
+          "rows": 3
+         },
+         "3": {
+          "bytes": 420828,
+          "rows": 3
+         },
+         "4": {
+          "bytes": 985316,
+          "rows": 3
+         }
+        },
+        "bytes": 1487996,
+        "rows": 10
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.23,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.23,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 329446,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.003731291,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 0,
+       "requests_total": 9,
+       "retries_total": 0,
+       "sql_bytes": 2589103,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1871545,
+       "transactions": 2,
+       "wall_secs": 1.065,
+       "wire_c2s_bytes": 2678240,
+       "wire_s2c_bytes": 600285,
+       "write_requests": 6,
+       "write_retries": 0,
+       "write_secs": 0.394499416
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.14,
+       "batch_transactions": 3,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.14,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 410164,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002774584,
+       "rc": 0,
+       "record_bytes": 1451036,
+       "removed": 0,
+       "requests_total": 8,
+       "retries_total": 0,
+       "sql_bytes": 2731612,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 2010736,
+       "transactions": 3,
+       "wall_secs": 1.028,
+       "wire_c2s_bytes": 2811609,
+       "wire_s2c_bytes": 595016,
+       "write_requests": 5,
+       "write_retries": 0,
+       "write_secs": 0.344836167
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.27,
+       "batch_transactions": 2,
+       "connections": 6,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.27,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 384782,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002778417,
+       "rc": 0,
+       "record_bytes": 1431719,
+       "removed": 0,
+       "requests_total": 12,
+       "retries_total": 0,
+       "sql_bytes": 2675974,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1957579,
+       "transactions": 2,
+       "wall_secs": 1.065,
+       "wire_c2s_bytes": 2773509,
+       "wire_s2c_bytes": 605603,
+       "write_requests": 9,
+       "write_retries": 0,
+       "write_secs": 0.391651667
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "2a"
+  },
+  {
+   "backdate": {
+    "backdated_manifests": 0,
+    "backdated_objects": 10,
+    "by_secs": 7200,
+    "ns": "m-m3-f3-3-3x"
+   },
+   "cfg": "f3",
+   "ok": true,
+   "phases": {
+    "supersede": {
+     "atrest": {
+      "bytes": 8514889,
+      "ns": "m-m3-f3-3-3x",
+      "prefix": "vci_b168c91f3190daef_",
+      "rows": 7228,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 2400
+        },
+        "bytes": 6117695,
+        "rows": 2400
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 479662,
+        "rows": 2403
+       },
+       "log": {
+        "bytes": 379263,
+        "rows": 2415
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 75104,
+          "rows": 3
+         },
+         "3": {
+          "bytes": 420828,
+          "rows": 3
+         },
+         "4": {
+          "bytes": 1035588,
+          "rows": 3
+         }
+        },
+        "bytes": 1538269,
+        "rows": 10
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.27,
+       "batch_transactions": 2,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.098354666,
+       "flushes": 1,
+       "longest_tx_secs": 0.27,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 338963,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1419469,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.007627542,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.00459625,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 800,
+       "requests_total": 26,
+       "retries_total": 0,
+       "sql_bytes": 3050277,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1884233,
+       "transactions": 2,
+       "wall_secs": 1.129,
+       "wire_c2s_bytes": 3511004,
+       "wire_s2c_bytes": 3794861,
+       "write_requests": 2,
+       "write_retries": 0,
+       "write_secs": 0.486660875
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.46,
+       "batch_transactions": 3,
+       "connections": 16,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.100693375,
+       "flushes": 1,
+       "longest_tx_secs": 0.46,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 425129,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1451036,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.005768542,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.006031709,
+       "rc": 0,
+       "record_bytes": 1451036,
+       "removed": 800,
+       "requests_total": 27,
+       "retries_total": 0,
+       "sql_bytes": 3200293,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 2030688,
+       "transactions": 3,
+       "wall_secs": 1.318,
+       "wire_c2s_bytes": 3662416,
+       "wire_s2c_bytes": 3840029,
+       "write_requests": 3,
+       "write_retries": 0,
+       "write_secs": 0.667879334
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.48,
+       "batch_transactions": 3,
+       "connections": 17,
+       "count_after": 2400,
+       "doomed": 800,
+       "error": null,
+       "find_requests": 15,
+       "find_secs": 0.099494083,
+       "flushes": 1,
+       "longest_tx_secs": 0.48,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 398008,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": 1431719,
+       "old_hdr_objects": 1,
+       "old_records": 800,
+       "orphan_candidates": 4,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": 1,
+       "orphan_requests": 5,
+       "orphan_secs": 0.014464625,
+       "orphan_sql_bytes": 0,
+       "orphan_transactions": 0,
+       "queued_secs": 0.005275292,
+       "rc": 0,
+       "record_bytes": 1431719,
+       "removed": 800,
+       "requests_total": 27,
+       "retries_total": 0,
+       "sql_bytes": 3144562,
+       "state_objects_pruned": 0,
+       "stored_literal_bytes": 1975211,
+       "transactions": 3,
+       "wall_secs": 1.317,
+       "wire_c2s_bytes": 3606684,
+       "wire_s2c_bytes": 3814008,
+       "write_requests": 3,
+       "write_retries": 0,
+       "write_secs": 0.671471834
+      }
+     ]
+    },
+    "write": {
+     "atrest": {
+      "bytes": 7604382,
+      "ns": "m-m3-f3-3-3x",
+      "prefix": "vci_b168c91f3190daef_",
+      "rows": 2417,
+      "tables": {
+       "attestations": {
+        "by_format": {
+         "3": 2400
+        },
+        "bytes": 6115861,
+        "rows": 2400
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "gone": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 525,
+        "rows": 7
+       },
+       "manifests": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "objects": {
+        "by_kind": {
+         "1": {
+          "bytes": 5988,
+          "rows": 1
+         },
+         "2": {
+          "bytes": 75104,
+          "rows": 3
+         },
+         "3": {
+          "bytes": 420828,
+          "rows": 3
+         },
+         "4": {
+          "bytes": 985316,
+          "rows": 3
+         }
+        },
+        "bytes": 1487996,
+        "rows": 10
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.2,
+       "batch_transactions": 2,
+       "connections": 4,
+       "count_after": 2373,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.2,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 329446,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002705125,
+       "rc": 0,
+       "record_bytes": 1419469,
+       "removed": 0,
+       "requests_total": 9,
+       "retries_total": 0,
+       "sql_bytes": 2589103,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1871545,
+       "transactions": 2,
+       "wall_secs": 0.956,
+       "wire_c2s_bytes": 2678240,
+       "wire_s2c_bytes": 593696,
+       "write_requests": 6,
+       "write_retries": 0,
+       "write_secs": 0.388909917
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.19,
+       "batch_transactions": 3,
+       "connections": 4,
+       "count_after": 2400,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.19,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 410164,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.003495333,
+       "rc": 0,
+       "record_bytes": 1451036,
+       "removed": 0,
+       "requests_total": 8,
+       "retries_total": 0,
+       "sql_bytes": 2731612,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 2010736,
+       "transactions": 3,
+       "wall_secs": 0.972,
+       "wire_c2s_bytes": 2811609,
+       "wire_s2c_bytes": 595023,
+       "write_requests": 5,
+       "write_retries": 0,
+       "write_secs": 0.391080583
+      },
+      {
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.17,
+       "batch_transactions": 2,
+       "connections": 6,
+       "count_after": 1359,
+       "doomed": 0,
+       "error": null,
+       "find_requests": null,
+       "find_secs": null,
+       "flushes": 1,
+       "longest_tx_secs": 0.17,
+       "lost": 0,
+       "manifest_bytes": 0,
+       "object_bytes": 384782,
+       "objects": 4,
+       "objects_new": 4,
+       "old_bytes_read": null,
+       "old_hdr_objects": null,
+       "old_records": null,
+       "orphan_candidates": null,
+       "orphan_manifests_found": null,
+       "orphan_manifests_removed": null,
+       "orphan_objects_removed": null,
+       "orphan_requests": null,
+       "orphan_secs": null,
+       "orphan_sql_bytes": null,
+       "orphan_transactions": null,
+       "queued_secs": 0.002795125,
+       "rc": 0,
+       "record_bytes": 1431719,
+       "removed": 0,
+       "requests_total": 12,
+       "retries_total": 0,
+       "sql_bytes": 2675974,
+       "state_objects_pruned": null,
+       "stored_literal_bytes": 1957579,
+       "transactions": 2,
+       "wall_secs": 0.765,
+       "wire_c2s_bytes": 2773509,
+       "wire_s2c_bytes": 351599,
+       "write_requests": 9,
+       "write_retries": 0,
+       "write_secs": 0.23655925
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "3x"
+  },
+  {
+   "cfg": "h281",
+   "ok": true,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 28819929,
+      "ns": "m-m3-h281-1-1a",
+      "prefix": "vci_f0bb99fe20fcac46_",
+      "rows": 3233,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 17783434,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 190267,
+        "rows": 1633
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_mb": 28.2,
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.04,
+       "batch_transactions": 33,
+       "connections": 5,
+       "error": null,
+       "flushes": 7,
+       "longest_tx_secs": 0.04,
+       "lost": 0,
+       "payload_mb": 28.154572,
+       "queued_secs": 0.561354125,
+       "rc": 0,
+       "requests": 38,
+       "retries": 0,
+       "transactions": 33,
+       "wall_secs": 0.721,
+       "wire_c2s_bytes": 31033030,
+       "wire_s2c_bytes": 71442,
+       "write_secs": 0.64520725
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "1a"
+  },
+  {
+   "cfg": "h281",
+   "ok": true,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 28819929,
+      "ns": "m-m3-h281-1-2a",
+      "prefix": "vci_7c81ac8dfa140e6e_",
+      "rows": 3233,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 17783434,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 190267,
+        "rows": 1633
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_mb": 28.2,
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.04,
+       "batch_transactions": 33,
+       "connections": 5,
+       "error": null,
+       "flushes": 7,
+       "longest_tx_secs": 0.04,
+       "lost": 0,
+       "payload_mb": 28.154572,
+       "queued_secs": 0.644000709,
+       "rc": 0,
+       "requests": 38,
+       "retries": 0,
+       "transactions": 33,
+       "wall_secs": 0.8,
+       "wire_c2s_bytes": 31033030,
+       "wire_s2c_bytes": 71440,
+       "write_secs": 0.729819959
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "2a"
+  },
+  {
+   "cfg": "h281",
+   "ok": true,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 28819929,
+      "ns": "m-m3-h281-1-3x",
+      "prefix": "vci_c4f054a1aa703987_",
+      "rows": 3233,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 17783434,
+        "rows": 800
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 190267,
+        "rows": 1633
+       },
+       "manifests": {
+        "bytes": 10846228,
+        "rows": 800
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": true,
+     "procs": [
+      {
+       "batch_mb": 28.2,
+       "batch_not_stored": 0,
+       "batch_secs_longest": 0.04,
+       "batch_transactions": 33,
+       "connections": 5,
+       "error": null,
+       "flushes": 7,
+       "longest_tx_secs": 0.04,
+       "lost": 0,
+       "payload_mb": 28.154572,
+       "queued_secs": 0.609962375,
+       "rc": 0,
+       "requests": 38,
+       "retries": 0,
+       "transactions": 33,
+       "wall_secs": 0.768,
+       "wire_c2s_bytes": 31033030,
+       "wire_s2c_bytes": 71441,
+       "write_secs": 0.690588417
+      }
+     ]
+    }
+   },
+   "procs": 1,
+   "rep": "3x"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 17951620,
+      "ns": "m-m3-h281-3-1a",
+      "prefix": "vci_bd94630654a54e76_",
+      "rows": 1908,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 10501782,
+        "rows": 472
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 111880,
+        "rows": 964
+       },
+       "manifests": {
+        "bytes": 7337958,
+        "rows": 472
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 5.2,
+       "batch_not_stored": 100,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 6,
+       "connections": 7,
+       "error": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 6,
+       "wall_secs": 60.89,
+       "wire_c2s_bytes": 8023001,
+       "wire_s2c_bytes": 20085,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 6.2,
+       "batch_not_stored": 58,
+       "batch_secs_longest": 30.03,
+       "batch_transactions": 7,
+       "connections": 7,
+       "error": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.03,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 7,
+       "wall_secs": 60.89,
+       "wire_c2s_bytes": 9097862,
+       "wire_s2c_bytes": 22069,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 6.2,
+       "batch_not_stored": 42,
+       "batch_secs_longest": 30.04,
+       "batch_transactions": 7,
+       "connections": 7,
+       "error": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.04,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 7,
+       "wall_secs": 60.89,
+       "wire_c2s_bytes": 8900577,
+       "wire_s2c_bytes": 22061,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1a"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6296035,
+      "ns": "m-m3-h281-3-1b",
+      "prefix": "vci_27c6c3fb7f87b58c_",
+      "rows": 690,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 3802480,
+        "rows": 171
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 40368,
+        "rows": 348
+       },
+       "manifests": {
+        "bytes": 2453187,
+        "rows": 171
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 2.0,
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.1,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.1,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.701,
+       "wire_c2s_bytes": 4524747,
+       "wire_s2c_bytes": 12144,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 59,
+       "batch_secs_longest": 30.1,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.1,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.701,
+       "wire_c2s_bytes": 4505639,
+       "wire_s2c_bytes": 12144,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 44,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.701,
+       "wire_c2s_bytes": 4413957,
+       "wire_s2c_bytes": 12138,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1b"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6296035,
+      "ns": "m-m3-h281-3-1c",
+      "prefix": "vci_7634ac809b59d9cd_",
+      "rows": 690,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 3802480,
+        "rows": 171
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 40368,
+        "rows": 348
+       },
+       "manifests": {
+        "bytes": 2453187,
+        "rows": 171
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 2.0,
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.05,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.05,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.408,
+       "wire_c2s_bytes": 4524747,
+       "wire_s2c_bytes": 12136,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 59,
+       "batch_secs_longest": 30.05,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.05,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.408,
+       "wire_c2s_bytes": 4505639,
+       "wire_s2c_bytes": 12134,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 44,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.407,
+       "wire_c2s_bytes": 4413957,
+       "wire_s2c_bytes": 12135,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1c"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 10483366,
+      "ns": "m-m3-h281-3-1d",
+      "prefix": "vci_463480c8c3bea57e_",
+      "rows": 1131,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 6233663,
+        "rows": 280
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 66259,
+        "rows": 571
+       },
+       "manifests": {
+        "bytes": 4183444,
+        "rows": 280
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 3,
+       "batch_secs_longest": 30.05,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.05,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.792,
+       "wire_c2s_bytes": 4697892,
+       "wire_s2c_bytes": 16115,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 59,
+       "batch_secs_longest": 30.21,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.21,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.792,
+       "wire_c2s_bytes": 4500740,
+       "wire_s2c_bytes": 8695,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 86,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 5,
+       "connections": 7,
+       "error": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 5,
+       "wall_secs": 60.791,
+       "wire_c2s_bytes": 6703662,
+       "wire_s2c_bytes": 18098,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1d"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 26408507,
+      "ns": "m-m3-h281-3-1e",
+      "prefix": "vci_9c8db269b336a070_",
+      "rows": 2806,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 15443008,
+        "rows": 694
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 165017,
+        "rows": 1418
+       },
+       "manifests": {
+        "bytes": 10800482,
+        "rows": 694
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 8.4,
+       "batch_not_stored": 129,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 10,
+       "connections": 7,
+       "error": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 10,
+       "wall_secs": 61.187,
+       "wire_c2s_bytes": 11494154,
+       "wire_s2c_bytes": 28034,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 9.2,
+       "batch_not_stored": 77,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 10,
+       "connections": 7,
+       "error": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 10,
+       "wall_secs": 61.188,
+       "wire_c2s_bytes": 12441226,
+       "wire_s2c_bytes": 28042,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 8.2,
+       "batch_not_stored": 126,
+       "batch_secs_longest": 30.07,
+       "batch_transactions": 10,
+       "connections": 9,
+       "error": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.07,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 10,
+       "wall_secs": 91.341,
+       "wire_c2s_bytes": 10112910,
+       "wire_s2c_bytes": 27217,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1e"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 12525524,
+      "ns": "m-m3-h281-3-1f",
+      "prefix": "vci_340aadeffde843d9_",
+      "rows": 1356,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 7480715,
+        "rows": 336
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 79440,
+        "rows": 684
+       },
+       "manifests": {
+        "bytes": 4965369,
+        "rows": 336
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 3,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.521,
+       "wire_c2s_bytes": 4697892,
+       "wire_s2c_bytes": 16121,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.521,
+       "wire_c2s_bytes": 4640445,
+       "wire_s2c_bytes": 16105,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.521,
+       "wire_c2s_bytes": 4551365,
+       "wire_s2c_bytes": 16121,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1f"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 36541724,
+      "ns": "m-m3-h281-3-1g",
+      "prefix": "vci_630725b9cb536b07_",
+      "rows": 3969,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 23084737,
+        "rows": 1038
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 247215,
+        "rows": 2119
+       },
+       "manifests": {
+        "bytes": 13209772,
+        "rows": 812
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 8.3,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.32,
+       "batch_transactions": 9,
+       "connections": 7,
+       "error": null,
+       "flushes": 3,
+       "longest_tx_secs": 30.32,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 9,
+       "wall_secs": 61.654,
+       "wire_c2s_bytes": 11508725,
+       "wire_s2c_bytes": 24149,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 14.3,
+       "batch_not_stored": 50,
+       "batch_secs_longest": 30.32,
+       "batch_transactions": 16,
+       "connections": 7,
+       "error": null,
+       "flushes": 5,
+       "longest_tx_secs": 30.32,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 16,
+       "wall_secs": 61.654,
+       "wire_c2s_bytes": 18044368,
+       "wire_s2c_bytes": 36552,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 15.4,
+       "batch_not_stored": 34,
+       "batch_secs_longest": 30.29,
+       "batch_transactions": 18,
+       "connections": 7,
+       "error": null,
+       "flushes": 5,
+       "longest_tx_secs": 30.29,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 18,
+       "wall_secs": 61.65,
+       "wire_c2s_bytes": 19198265,
+       "wire_s2c_bytes": 43943,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1g"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 34999254,
+      "ns": "m-m3-h281-3-1h",
+      "prefix": "vci_d8d3b956503cac8d_",
+      "rows": 3775,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 21243301,
+        "rows": 955
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 227315,
+        "rows": 1949
+       },
+       "manifests": {
+        "bytes": 13528638,
+        "rows": 871
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 11.5,
+       "batch_not_stored": 35,
+       "batch_secs_longest": 30.08,
+       "batch_transactions": 13,
+       "connections": 7,
+       "error": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.08,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 13,
+       "wall_secs": 61.452,
+       "wire_c2s_bytes": 14895145,
+       "wire_s2c_bytes": 31336,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 12.3,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.11,
+       "batch_transactions": 13,
+       "connections": 7,
+       "error": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.11,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 13,
+       "wall_secs": 61.463,
+       "wire_c2s_bytes": 13687214,
+       "wire_s2c_bytes": 30583,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 11.2,
+       "batch_not_stored": 34,
+       "batch_secs_longest": 30.09,
+       "batch_transactions": 13,
+       "connections": 7,
+       "error": null,
+       "flushes": 4,
+       "longest_tx_secs": 30.09,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 13,
+       "wall_secs": 61.479,
+       "wire_c2s_bytes": 14589552,
+       "wire_s2c_bytes": 34015,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "1h"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 12525524,
+      "ns": "m-m3-h281-3-2x",
+      "prefix": "vci_8e8fa3a46c02d252_",
+      "rows": 1356,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 7480715,
+        "rows": 336
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 79440,
+        "rows": 684
+       },
+       "manifests": {
+        "bytes": 4965369,
+        "rows": 336
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 3,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.439,
+       "wire_c2s_bytes": 4697892,
+       "wire_s2c_bytes": 16115,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.0,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.0,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.439,
+       "wire_c2s_bytes": 4640445,
+       "wire_s2c_bytes": 16116,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.44,
+       "wire_c2s_bytes": 4551365,
+       "wire_s2c_bytes": 16105,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "2x"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6296035,
+      "ns": "m-m3-h281-3-2y",
+      "prefix": "vci_035a189a631f0887_",
+      "rows": 690,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 3802480,
+        "rows": 171
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 40368,
+        "rows": 348
+       },
+       "manifests": {
+        "bytes": 2453187,
+        "rows": 171
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 2.0,
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.377,
+       "wire_c2s_bytes": 4519848,
+       "wire_s2c_bytes": 8692,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 59,
+       "batch_secs_longest": 30.0,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.0,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.377,
+       "wire_c2s_bytes": 4500740,
+       "wire_s2c_bytes": 8693,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 44,
+       "batch_secs_longest": 30.0,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.0,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.377,
+       "wire_c2s_bytes": 4413957,
+       "wire_s2c_bytes": 12126,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "2y"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 6296035,
+      "ns": "m-m3-h281-3-3x",
+      "prefix": "vci_03e29876d28b887d_",
+      "rows": 690,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 3802480,
+        "rows": 171
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 40368,
+        "rows": 348
+       },
+       "manifests": {
+        "bytes": 2453187,
+        "rows": 171
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 2.0,
+       "batch_not_stored": 69,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.357,
+       "wire_c2s_bytes": 4519848,
+       "wire_s2c_bytes": 8696,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 59,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.363,
+       "wire_c2s_bytes": 4505639,
+       "wire_s2c_bytes": 12134,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 2.1,
+       "batch_not_stored": 44,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 2,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 2,
+       "wall_secs": 60.357,
+       "wire_c2s_bytes": 4409058,
+       "wire_s2c_bytes": 8698,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "3x"
+  },
+  {
+   "cfg": "h281",
+   "ok": false,
+   "phases": {
+    "write": {
+     "atrest": {
+      "bytes": 12525524,
+      "ns": "m-m3-h281-3-3y",
+      "prefix": "vci_d2a2d2c3ae3417d4_",
+      "rows": 1356,
+      "tables": {
+       "attestations": {
+        "by_format": {},
+        "bytes": 7480715,
+        "rows": 336
+       },
+       "flags": {
+        "bytes": 0,
+        "rows": 0
+       },
+       "log": {
+        "bytes": 79440,
+        "rows": 684
+       },
+       "manifests": {
+        "bytes": 4965369,
+        "rows": 336
+       },
+       "memo": {
+        "bytes": 0,
+        "rows": 0
+       }
+      }
+     },
+     "clean": false,
+     "procs": [
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 3,
+       "batch_secs_longest": 30.02,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.02,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.518,
+       "wire_c2s_bytes": 4692993,
+       "wire_s2c_bytes": 12673,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.518,
+       "wire_c2s_bytes": 4635546,
+       "wire_s2c_bytes": 12680,
+       "write_secs": null
+      },
+      {
+       "batch_mb": 4.1,
+       "batch_not_stored": 2,
+       "batch_secs_longest": 30.01,
+       "batch_transactions": 4,
+       "connections": 7,
+       "error": null,
+       "flushes": 2,
+       "longest_tx_secs": 30.01,
+       "lost": null,
+       "payload_mb": null,
+       "queued_secs": null,
+       "rc": 101,
+       "requests": null,
+       "retries": null,
+       "transactions": 4,
+       "wall_secs": 60.518,
+       "wire_c2s_bytes": 4551365,
+       "wire_s2c_bytes": 16100,
+       "write_secs": null
+      }
+     ]
+    }
+   },
+   "procs": 3,
+   "rep": "3y"
+  }
+ ],
+ "summary": {
+  "f1/1/supersede": {
+   "atrest": {
+    "attestations": {
+     "bytes": 17821019,
+     "rows": 800
+    },
+    "flags": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "gone": {
+     "bytes": 160000,
+     "rows": 800
+    },
+    "log": {
+     "bytes": 570441,
+     "rows": 4866
+    },
+    "manifests": {
+     "bytes": 10846228,
+     "rows": 800
+    },
+    "memo": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "objects": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "total": {
+     "bytes": 29397688,
+     "rows": 7266
+    }
+   },
+   "attempts": 3,
+   "connections": {
+    "max": 16,
+    "median": 16,
+    "min": 16
+   },
+   "doomed": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "find_requests": {
+    "max": 13,
+    "median": 13,
+    "min": 13
+   },
+   "find_secs": {
+    "max": 0.102,
+    "median": 0.092,
+    "min": 0.077
+   },
+   "flushes": {
+    "max": 7,
+    "median": 7,
+    "min": 7
+   },
+   "longest_tx_secs": {
+    "max": 0.08,
+    "median": 0.05,
+    "min": 0.04
+   },
+   "lost": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "manifest_bytes": {
+    "max": 10735028,
+    "median": 10735028,
+    "min": 10735028
+   },
+   "object_bytes": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "objects": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "ok_attempts": 3,
+   "old_bytes_read": {
+    "max": 17419544,
+    "median": 17419544,
+    "min": 17419544
+   },
+   "orphan_candidates": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "orphan_manifests_found": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "orphan_manifests_removed": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "orphan_requests": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "orphan_secs": {
+    "max": 0.022,
+    "median": 0.02,
+    "min": 0.016
+   },
+   "processes": 3,
+   "record_bytes": {
+    "max": 17419544,
+    "median": 17419544,
+    "min": 17419544
+   },
+   "removed": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "sql_bytes": {
+    "max": 31307273,
+    "median": 31307273,
+    "min": 31307273
+   },
+   "stalled_attempts": 0,
+   "stored_literal_bytes": {
+    "max": 28180172,
+    "median": 28180172,
+    "min": 28180172
+   },
+   "transactions": {
+    "max": 33,
+    "median": 33,
+    "min": 33
+   },
+   "wall_secs": {
+    "max": 1.898,
+    "median": 1.483,
+    "min": 1.389
+   },
+   "wire_c2s_bytes": {
+    "max": 32770561,
+    "median": 32770561,
+    "min": 32770561
+   },
+   "wire_s2c_bytes": {
+    "max": 39180800,
+    "median": 39180794,
+    "min": 39180773
+   },
+   "write_requests": {
+    "max": 33,
+    "median": 33,
+    "min": 33
+   },
+   "write_retries": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "write_secs": {
+    "max": 1.292,
+    "median": 0.957,
+    "min": 0.898
+   }
+  },
+  "f1/1/write": {
+   "atrest": {
+    "attestations": {
+     "bytes": 17820755,
+     "rows": 800
+    },
+    "flags": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "gone": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "log": {
+     "bytes": 190267,
+     "rows": 1633
+    },
+    "manifests": {
+     "bytes": 10846228,
+     "rows": 800
+    },
+    "memo": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "objects": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "total": {
+     "bytes": 28857250,
+     "rows": 3233
+    }
+   },
+   "attempts": 3,
+   "connections": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "doomed": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "flushes": {
+    "max": 7,
+    "median": 7,
+    "min": 7
+   },
+   "longest_tx_secs": {
+    "max": 0.1,
+    "median": 0.06,
+    "min": 0.04
+   },
+   "lost": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "manifest_bytes": {
+    "max": 10735028,
+    "median": 10735028,
+    "min": 10735028
+   },
+   "object_bytes": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "objects": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "ok_attempts": 3,
+   "processes": 3,
+   "record_bytes": {
+    "max": 17419544,
+    "median": 17419544,
+    "min": 17419544
+   },
+   "removed": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "sql_bytes": {
+    "max": 30235138,
+    "median": 30235138,
+    "min": 30235138
+   },
+   "stalled_attempts": 0,
+   "stored_literal_bytes": {
+    "max": 28180172,
+    "median": 28180172,
+    "min": 28180172
+   },
+   "transactions": {
+    "max": 33,
+    "median": 33,
+    "min": 33
+   },
+   "wall_secs": {
+    "max": 1.263,
+    "median": 1.225,
+    "min": 1.074
+   },
+   "wire_c2s_bytes": {
+    "max": 31211313,
+    "median": 31211313,
+    "min": 31211313
+   },
+   "wire_s2c_bytes": {
+    "max": 277124,
+    "median": 277118,
+    "min": 277114
+   },
+   "write_requests": {
+    "max": 37,
+    "median": 37,
+    "min": 37
+   },
+   "write_retries": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "write_secs": {
+    "max": 0.93,
+    "median": 0.863,
+    "min": 0.759
+   }
+  },
+  "f3/1/supersede": {
+   "atrest": {
+    "attestations": {
+     "bytes": 2023372,
+     "rows": 800
+    },
+    "flags": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "gone": {
+     "bytes": 159275,
+     "rows": 801
+    },
+    "log": {
+     "bytes": 125800,
+     "rows": 804
+    },
+    "manifests": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "memo": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "objects": {
+     "bytes": 452260,
+     "rows": 4
+    },
+    "total": {
+     "bytes": 2760707,
+     "rows": 2409
+    }
+   },
+   "attempts": 3,
+   "connections": {
+    "max": 17,
+    "median": 17,
+    "min": 17
+   },
+   "doomed": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "find_requests": {
+    "max": 15,
+    "median": 15,
+    "min": 15
+   },
+   "find_secs": {
+    "max": 0.065,
+    "median": 0.058,
+    "min": 0.057
+   },
+   "flushes": {
+    "max": 1,
+    "median": 1,
+    "min": 1
+   },
+   "longest_tx_secs": {
+    "max": 0.09,
+    "median": 0.08,
+    "min": 0.08
+   },
+   "lost": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "manifest_bytes": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "object_bytes": {
+    "max": 338963,
+    "median": 338963,
+    "min": 338963
+   },
+   "objects": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "ok_attempts": 3,
+   "old_bytes_read": {
+    "max": 1419469,
+    "median": 1419469,
+    "min": 1419469
+   },
+   "orphan_candidates": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "orphan_objects_removed": {
+    "max": 1,
+    "median": 1,
+    "min": 1
+   },
+   "orphan_requests": {
+    "max": 5,
+    "median": 5,
+    "min": 5
+   },
+   "orphan_secs": {
+    "max": 0.004,
+    "median": 0.004,
+    "min": 0.003
+   },
+   "processes": 3,
+   "record_bytes": {
+    "max": 1419469,
+    "median": 1419469,
+    "min": 1419469
+   },
+   "removed": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "sql_bytes": {
+    "max": 3050277,
+    "median": 3050277,
+    "min": 3050277
+   },
+   "stalled_attempts": 0,
+   "state_objects_pruned": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "stored_literal_bytes": {
+    "max": 1884233,
+    "median": 1884233,
+    "min": 1884233
+   },
+   "transactions": {
+    "max": 2,
+    "median": 2,
+    "min": 2
+   },
+   "wall_secs": {
+    "max": 0.682,
+    "median": 0.66,
+    "min": 0.65
+   },
+   "wire_c2s_bytes": {
+    "max": 3511004,
+    "median": 3511004,
+    "min": 3511004
+   },
+   "wire_s2c_bytes": {
+    "max": 3404438,
+    "median": 3404436,
+    "min": 3404432
+   },
+   "write_requests": {
+    "max": 2,
+    "median": 2,
+    "min": 2
+   },
+   "write_retries": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "write_secs": {
+    "max": 0.147,
+    "median": 0.135,
+    "min": 0.134
+   }
+  },
+  "f3/1/write": {
+   "atrest": {
+    "attestations": {
+     "bytes": 2023372,
+     "rows": 800
+    },
+    "flags": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "gone": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "log": {
+     "bytes": 150,
+     "rows": 2
+    },
+    "manifests": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "memo": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "objects": {
+     "bytes": 439572,
+     "rows": 4
+    },
+    "total": {
+     "bytes": 2463094,
+     "rows": 806
+    }
+   },
+   "attempts": 3,
+   "connections": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "doomed": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "flushes": {
+    "max": 1,
+    "median": 1,
+    "min": 1
+   },
+   "longest_tx_secs": {
+    "max": 0.09,
+    "median": 0.09,
+    "min": 0.07
+   },
+   "lost": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "manifest_bytes": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "object_bytes": {
+    "max": 329446,
+    "median": 329446,
+    "min": 329446
+   },
+   "objects": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "ok_attempts": 3,
+   "processes": 3,
+   "record_bytes": {
+    "max": 1419469,
+    "median": 1419469,
+    "min": 1419469
+   },
+   "removed": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "sql_bytes": {
+    "max": 2589103,
+    "median": 2589103,
+    "min": 2589103
+   },
+   "stalled_attempts": 0,
+   "stored_literal_bytes": {
+    "max": 1871545,
+    "median": 1871545,
+    "min": 1871545
+   },
+   "transactions": {
+    "max": 2,
+    "median": 2,
+    "min": 2
+   },
+   "wall_secs": {
+    "max": 0.647,
+    "median": 0.597,
+    "min": 0.578
+   },
+   "wire_c2s_bytes": {
+    "max": 2678240,
+    "median": 2678240,
+    "min": 2678240
+   },
+   "wire_s2c_bytes": {
+    "max": 209829,
+    "median": 209822,
+    "min": 209820
+   },
+   "write_requests": {
+    "max": 6,
+    "median": 6,
+    "min": 6
+   },
+   "write_retries": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "write_secs": {
+    "max": 0.153,
+    "median": 0.152,
+    "min": 0.139
+   }
+  },
+  "f3/3/supersede": {
+   "atrest": {
+    "attestations": {
+     "bytes": 6117695,
+     "rows": 2400
+    },
+    "flags": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "gone": {
+     "bytes": 479662,
+     "rows": 2403
+    },
+    "log": {
+     "bytes": 379263,
+     "rows": 2415
+    },
+    "manifests": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "memo": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "objects": {
+     "bytes": 1538269,
+     "rows": 10
+    },
+    "total": {
+     "bytes": 8514889,
+     "rows": 7228
+    }
+   },
+   "attempts": 3,
+   "connections": {
+    "max": 17,
+    "median": 17,
+    "min": 16
+   },
+   "doomed": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "find_requests": {
+    "max": 15,
+    "median": 15,
+    "min": 15
+   },
+   "find_secs": {
+    "max": 0.172,
+    "median": 0.099,
+    "min": 0.064
+   },
+   "flushes": {
+    "max": 1,
+    "median": 1,
+    "min": 1
+   },
+   "longest_tx_secs": {
+    "max": 0.48,
+    "median": 0.27,
+    "min": 0.13
+   },
+   "lost": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "manifest_bytes": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "object_bytes": {
+    "max": 425129,
+    "median": 398008,
+    "min": 338963
+   },
+   "objects": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "ok_attempts": 3,
+   "old_bytes_read": {
+    "max": 1451036,
+    "median": 1431719,
+    "min": 1419469
+   },
+   "orphan_candidates": {
+    "max": 4,
+    "median": 4,
+    "min": 4
+   },
+   "orphan_objects_removed": {
+    "max": 1,
+    "median": 1,
+    "min": 1
+   },
+   "orphan_requests": {
+    "max": 5,
+    "median": 5,
+    "min": 5
+   },
+   "orphan_secs": {
+    "max": 0.181,
+    "median": 0.012,
+    "min": 0.003
+   },
+   "processes": 9,
+   "record_bytes": {
+    "max": 1451036,
+    "median": 1431719,
+    "min": 1419469
+   },
+   "removed": {
+    "max": 800,
+    "median": 800,
+    "min": 800
+   },
+   "sql_bytes": {
+    "max": 3200293,
+    "median": 3144562,
+    "min": 3050277
+   },
+   "stalled_attempts": 0,
+   "state_objects_pruned": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "stored_literal_bytes": {
+    "max": 2030688,
+    "median": 1975211,
+    "min": 1884233
+   },
+   "transactions": {
+    "max": 3,
+    "median": 3,
+    "min": 2
+   },
+   "wall_secs": {
+    "max": 1.502,
+    "median": 1.317,
+    "min": 0.736
+   },
+   "wire_c2s_bytes": {
+    "max": 3662416,
+    "median": 3606684,
+    "min": 3511004
+   },
+   "wire_s2c_bytes": {
+    "max": 3840055,
+    "median": 3814008,
+    "min": 3794835
+   },
+   "write_requests": {
+    "max": 3,
+    "median": 3,
+    "min": 2
+   },
+   "write_retries": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "write_secs": {
+    "max": 0.71,
+    "median": 0.502,
+    "min": 0.182
+   }
+  },
+  "f3/3/write": {
+   "atrest": {
+    "attestations": {
+     "bytes": 6115861.0,
+     "rows": 2400.0
+    },
+    "flags": {
+     "bytes": 0.0,
+     "rows": 0.0
+    },
+    "gone": {
+     "bytes": 0.0,
+     "rows": 0.0
+    },
+    "log": {
+     "bytes": 525.0,
+     "rows": 7.0
+    },
+    "manifests": {
+     "bytes": 0.0,
+     "rows": 0.0
+    },
+    "memo": {
+     "bytes": 0.0,
+     "rows": 0.0
+    },
+    "objects": {
+     "bytes": 1487996.0,
+     "rows": 10.0
+    },
+    "total": {
+     "bytes": 7604382.0,
+     "rows": 2417.0
+    }
+   },
+   "attempts": 4,
+   "connections": {
+    "max": 6,
+    "median": 4.0,
+    "min": 4
+   },
+   "doomed": {
+    "max": 0,
+    "median": 0.0,
+    "min": 0
+   },
+   "flushes": {
+    "max": 1,
+    "median": 1.0,
+    "min": 1
+   },
+   "longest_tx_secs": {
+    "max": 0.27,
+    "median": 0.17,
+    "min": 0.1
+   },
+   "lost": {
+    "max": 0,
+    "median": 0.0,
+    "min": 0
+   },
+   "manifest_bytes": {
+    "max": 0,
+    "median": 0.0,
+    "min": 0
+   },
+   "object_bytes": {
+    "max": 410164,
+    "median": 384782.0,
+    "min": 329446
+   },
+   "objects": {
+    "max": 4,
+    "median": 4.0,
+    "min": 4
+   },
+   "ok_attempts": 4,
+   "processes": 12,
+   "record_bytes": {
+    "max": 1451036,
+    "median": 1431719.0,
+    "min": 1419469
+   },
+   "removed": {
+    "max": 0,
+    "median": 0.0,
+    "min": 0
+   },
+   "sql_bytes": {
+    "max": 2731612,
+    "median": 2675974.0,
+    "min": 2589103
+   },
+   "stalled_attempts": 0,
+   "stored_literal_bytes": {
+    "max": 2010736,
+    "median": 1957579.0,
+    "min": 1871545
+   },
+   "transactions": {
+    "max": 3,
+    "median": 2.0,
+    "min": 2
+   },
+   "wall_secs": {
+    "max": 1.065,
+    "median": 0.849,
+    "min": 0.652
+   },
+   "wire_c2s_bytes": {
+    "max": 2811609,
+    "median": 2764181.5,
+    "min": 2678240
+   },
+   "wire_s2c_bytes": {
+    "max": 605603,
+    "median": 594995.0,
+    "min": 336709
+   },
+   "write_requests": {
+    "max": 9,
+    "median": 5.5,
+    "min": 4
+   },
+   "write_retries": {
+    "max": 0,
+    "median": 0.0,
+    "min": 0
+   },
+   "write_secs": {
+    "max": 0.394,
+    "median": 0.326,
+    "min": 0.171
+   }
+  },
+  "h281/1/write": {
+   "atrest": {
+    "attestations": {
+     "bytes": 17783434,
+     "rows": 800
+    },
+    "flags": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "log": {
+     "bytes": 190267,
+     "rows": 1633
+    },
+    "manifests": {
+     "bytes": 10846228,
+     "rows": 800
+    },
+    "memo": {
+     "bytes": 0,
+     "rows": 0
+    },
+    "total": {
+     "bytes": 28819929,
+     "rows": 3233
+    }
+   },
+   "attempts": 3,
+   "batch_mb": {
+    "max": 28.2,
+    "median": 28.2,
+    "min": 28.2
+   },
+   "connections": {
+    "max": 5,
+    "median": 5,
+    "min": 5
+   },
+   "flushes": {
+    "max": 7,
+    "median": 7,
+    "min": 7
+   },
+   "longest_tx_secs": {
+    "max": 0.04,
+    "median": 0.04,
+    "min": 0.04
+   },
+   "lost": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "ok_attempts": 3,
+   "payload_mb": {
+    "max": 28.155,
+    "median": 28.155,
+    "min": 28.155
+   },
+   "processes": 3,
+   "requests": {
+    "max": 38,
+    "median": 38,
+    "min": 38
+   },
+   "retries": {
+    "max": 0,
+    "median": 0,
+    "min": 0
+   },
+   "stalled_attempts": 0,
+   "transactions": {
+    "max": 33,
+    "median": 33,
+    "min": 33
+   },
+   "wall_secs": {
+    "max": 0.8,
+    "median": 0.768,
+    "min": 0.721
+   },
+   "wire_c2s_bytes": {
+    "max": 31033030,
+    "median": 31033030,
+    "min": 31033030
+   },
+   "wire_s2c_bytes": {
+    "max": 71442,
+    "median": 71441,
+    "min": 71440
+   },
+   "write_secs": {
+    "max": 0.73,
+    "median": 0.691,
+    "min": 0.645
+   }
+  }
+ },
+ "tag": "m3"
+}

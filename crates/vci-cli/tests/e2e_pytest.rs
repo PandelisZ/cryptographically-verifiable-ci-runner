@@ -18,6 +18,7 @@ use serde_json::Value;
 use vci_git::{AttestStore, Repo};
 
 mod env_common;
+mod store_common;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -79,6 +80,14 @@ struct World {
     trusted: PathBuf,
     untrusted: PathBuf,
     gitconfig: PathBuf,
+    /// Every `vci run` of this world writes format-1 records
+    /// (`VCI_STORE_RECORD_FORMAT=1`: the envelope with its input manifest,
+    /// as vci 2.8 wrote), for a test whose assertions hold only for that
+    /// form: the per-entry explain text on git-meta (a format-3 record
+    /// there names no state object, so an edited entry is reported as
+    /// changed with the attested hash not loaded; tests/e2e_m3.rs covers
+    /// that text).
+    format1: std::sync::atomic::AtomicBool,
 }
 
 fn keygen(path: &Path, comment: &str) {
@@ -176,6 +185,7 @@ impl World {
             gitconfig,
             base,
             _tmp: tmp,
+            format1: std::sync::atomic::AtomicBool::new(false),
         };
         keygen(&w.trusted, "trusted");
         keygen(&w.untrusted, "untrusted");
@@ -241,6 +251,9 @@ impl World {
             .env("NO_COLOR", "1");
         for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
+        }
+        if self.format1.load(std::sync::atomic::Ordering::Relaxed) {
+            cmd.env("VCI_STORE_RECORD_FORMAT", "1");
         }
         for (k, v) in env {
             cmd.env(k, v);
@@ -358,6 +371,8 @@ const D: &str = "tests/test_d.py";
 #[test]
 fn pytest_end_to_end_verification_steps() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
 
     // Step 1: attest B, then plan: skip B; run A, C, D.
@@ -488,7 +503,7 @@ fn pytest_end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -750,14 +765,13 @@ fn pytest_ignore_taints_result_skipped() {
         stderr.contains(&format!("vci: attested {skip} (waived: result:skipped) (")),
         "{stderr}"
     );
-    let b64 = base64::engine::general_purpose::STANDARD;
     let stored = AttestStore::new(&store_for(&work))
         .list(Some(skip))
         .unwrap();
     assert_eq!(stored.len(), 1);
-    let env: Value = serde_json::from_slice(&stored[0].bytes).unwrap();
-    let st: Value =
-        serde_json::from_slice(&b64.decode(env["payload"].as_str().unwrap()).unwrap()).unwrap();
+    let st = serde_json::json!({
+        "predicate": store_common::predicate_of(&store_for(&work), &stored[0].bytes)
+    });
     assert_eq!(
         st["predicate"]["waived"],
         serde_json::json!(["result:skipped:1 of 2"])
@@ -1074,6 +1088,8 @@ fn multi_project_vitest_and_pytest() {
     let Some(w) = World::build(MULTI_TOML, layout, &["py"]) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let (pb, pa, wb, wa) = (
         "py/tests/test_b.py",
@@ -1617,6 +1633,8 @@ fn pytest_libraries_any_loosens_nothing_else() {
     let Some(w) = World::build(&toml, copy_pytest_fixture, &["."]) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     w.run(&work, A, &w.trusted);
     w.run(&work, B, &w.trusted);

@@ -27,9 +27,17 @@
 //!   plan costs about a dozen statements whatever the number of units
 //!   ([`PgStore::statements`]). A missing schema reads as an empty store;
 //!   reads never create anything.
-//! * **Writes** create the schema on first use, under an advisory lock.
-//!   [`AttestationStore::batch`] is deferred: its writes are queued and
-//!   written in one transaction when it finishes.
+//! * **Writes** create the schema on first use, under an advisory lock, or
+//!   add the format-3 tables and columns (vci 2.9, STORE-V2) to a schema
+//!   that lacks them, in a request of their own. [`AttestationStore::batch`]
+//!   is deferred: its writes are queued and written in one transaction when
+//!   it finishes, objects first and removals last, every row numbered by
+//!   the namespace's `seq` counter in commit order.
+//! * **Format 3.** Objects are `bytea` rows of the `objects` table, the
+//!   listing columns ride on `attestations`, a removal leaves a `gone` row,
+//!   and [`PgStore::upgrade_begin`] and [`PgStore::upgrade_finish`] are the
+//!   two steps of `vci store upgrade` (section 17, "Objects, columns, `seq`
+//!   and `gone`").
 //! * **Hints** (the memo of passing attestations and the flags) live in two
 //!   server-side tables per namespace and never fail.
 
@@ -39,6 +47,7 @@
 mod batch;
 mod cache;
 mod conn;
+mod objects;
 mod read;
 mod schema;
 mod write;
@@ -49,18 +58,20 @@ pub mod testkit;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use postgres::types::Type;
 use vci_store::select::{self, Selection};
 use vci_store::{
-    AttestationStore, BackendFactory, Caps, Hydration, KeyHint, NewAttestation, OpenContext,
-    Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, WriteBatch, key,
+    AttestationStore, BackendFactory, Caps, Columns, Hydration, KeyHint, NewAttestation, NewObject,
+    OpenContext, Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, StoredObject,
+    WriteBatch, key,
 };
 
 pub use conn::PgError;
+pub use schema::Finish;
 
 use cache::Cache;
 use conn::{Conn, ConnSpec, Fail, KIND, LONG_RUNNING_TIMEOUT, Op};
@@ -130,8 +141,11 @@ pub(crate) struct Inner {
     pub(crate) read_sql: read::Sql,
     pub(crate) write_sql: write::Sql,
     pub(crate) batch_sql: batch::Sql,
-    /// The schema version, once known.
-    pub(crate) version: OnceLock<u32>,
+    pub(crate) objects_sql: objects::Sql,
+    /// The schema version, once known (0 until then).
+    pub(crate) version: AtomicU32,
+    /// Whether the format-3 tables and columns were seen or made.
+    pub(crate) v2: AtomicBool,
     cache: Mutex<Cache>,
     memo: Mutex<HashMap<String, BTreeMap<String, String>>>,
     flags: Mutex<Option<BTreeSet<String>>>,
@@ -303,8 +317,10 @@ impl PgStore {
                 read_sql: read::Sql::new(&schema),
                 write_sql: write::Sql::new(&schema),
                 batch_sql: batch::Sql::new(&schema),
+                objects_sql: objects::Sql::new(&schema),
                 schema,
-                version: OnceLock::new(),
+                version: AtomicU32::new(0),
+                v2: AtomicBool::new(false),
                 cache: Mutex::new(Cache::default()),
                 memo: Mutex::new(HashMap::new()),
                 flags: Mutex::new(None),
@@ -334,6 +350,30 @@ impl PgStore {
     /// repository id).
     pub fn namespace(&self) -> Result<String, StoreError> {
         self.inner.ns().map(str::to_owned)
+    }
+
+    /// `vci store upgrade --begin`: make sure the schema exists with its
+    /// format-3 tables and columns (STORE-V2 section 2.1), running the
+    /// DDL in a request of its own when something is missing, under the
+    /// advisory lock every first writer takes. Idempotent; what the first
+    /// write of this vci does anyway. A role that cannot create or alter
+    /// the schema gets [`StoreError::NotInitialized`].
+    pub fn upgrade_begin(&self) -> Result<(), StoreError> {
+        self.inner.ready()?;
+        schema::ensure(&self.inner)
+    }
+
+    /// `vci store upgrade --finish`: end the migration window (STORE-V2
+    /// section 5 step 4). When no row of the schema, in any namespace,
+    /// holds anything but a format-3 record, the `manifests` table is
+    /// dropped and the version set to 2 in one transaction, after which a
+    /// 2.8 vci refuses the schema as newer than it; otherwise
+    /// [`Finish::FormatOneRows`] says how many such rows remain and
+    /// nothing changes; at version 2 already, [`Finish::Already`] and
+    /// nothing changes. Not undone: a version-2 schema cannot store a
+    /// manifest again ([`StoreError::NotInitialized`]).
+    pub fn upgrade_finish(&self) -> Result<Finish, StoreError> {
+        schema::finish(&self.inner)
     }
 
     /// Run `SELECT pg_sleep(secs)` as any statement runs (tests of the
@@ -395,7 +435,11 @@ impl AttestationStore for PgStore {
     }
 
     fn caps(&self) -> Caps {
-        Caps::LOCAL.with_shared_writes(true).with_hints(true)
+        Caps::LOCAL
+            .with_shared_writes(true)
+            .with_hints(true)
+            .with_objects(true)
+            .with_columns(true)
     }
 
     fn status(&self) -> Result<StoreStatus, StoreError> {
@@ -467,6 +511,46 @@ impl AttestationStore for PgStore {
             }
             _ => write::remove_manifests(&self.inner, roots),
         }
+    }
+
+    fn get_objects(&self, ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+        objects::get_objects(&self.inner, ids)
+    }
+
+    /// Inside a deferred batch the objects are queued and written first
+    /// at `finish`; the count is of what the batch did not hold yet.
+    fn put_objects(&self, objs: &[NewObject<'_>]) -> Result<usize, StoreError> {
+        if batch::is_open(&self.inner) {
+            batch::put_objects(&self.inner, objs)
+        } else {
+            objects::put_objects(&self.inner, objs)
+        }
+    }
+
+    /// Inside a deferred batch the removal is queued and applied under the
+    /// orphan rule at `finish`, after the batch's removals (it then counts
+    /// nothing here).
+    fn remove_objects(&self, ids: &[&str]) -> Result<usize, StoreError> {
+        if batch::is_open(&self.inner) {
+            batch::remove_objects(&self.inner, ids)
+        } else {
+            objects::remove_objects(&self.inner, ids)
+        }
+    }
+
+    fn orphan_objects(&self) -> Result<Vec<String>, StoreError> {
+        objects::orphan_objects(&self.inner)
+    }
+
+    /// Applied at once, inside a batch too (a `gone` row per removal).
+    fn prune_state_objects(&self, older_than: Duration) -> Result<usize, StoreError> {
+        objects::prune_state_objects(&self.inner, older_than)
+    }
+
+    /// One statement per 5,000 keys; none on a schema without the
+    /// format-3 columns (every answer is then empty).
+    fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
+        objects::columns(&self.inner, envs)
     }
 
     fn read_units(&self, test_ids: &[&str]) -> Result<Vec<Vec<StoredEnvelope>>, StoreError> {
@@ -581,6 +665,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.kind(), "postgres");
         assert!(store.caps().shared_writes && store.caps().keeps_hints);
+        assert!(store.caps().objects && store.caps().columns);
         assert!(store.exchange().is_none());
         match f.open(&Selection::for_backend("postgres"), &cx(false)) {
             Err(StoreError::Config(m)) => assert!(m.contains("VCI_STORE_URL"), "{m}"),

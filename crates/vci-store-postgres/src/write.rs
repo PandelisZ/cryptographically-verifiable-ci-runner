@@ -1,6 +1,9 @@
 //! Writes outside a batch (`docs/STORE-BACKENDS.md` section 17, "Writes"):
 //! each is one statement, durable and visible to every reader when it
-//! returns. The first write creates the schema.
+//! returns. The first write creates the schema, or adds the format-3
+//! tables to one that lacks them. A put stores the listing columns given
+//! (NULL without) and takes a `seq`; a removal leaves a `gone` row per key
+//! (`objects`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,6 +12,7 @@ use vci_store::{ManifestRef, NewAttestation, StoreError, StoredEnvelope, key};
 
 use crate::Inner;
 use crate::conn::{Fail, KIND, WRITE};
+use crate::objects::{self, Cols};
 use crate::schema::{self, State};
 
 /// The write statements of one schema.
@@ -26,10 +30,12 @@ pub(crate) struct Sql {
 
 /// The upsert of one attestation. A conflict on the slot replaces the
 /// slot's record (whatever its key) in the same statement, so concurrent
-/// puts of one slot leave one row; identical bytes under the same key
-/// change nothing. When nothing changed, the stored key is read back in the
-/// same statement.
-fn put_sql(a: &str, hinted: bool) -> String {
+/// puts of one slot leave one row; identical bytes under the same key with
+/// the same columns change nothing (other columns replace the stored
+/// ones). When nothing changed, the stored key is read back in the same
+/// statement. The row's `seq` is taken from the namespace's counter first
+/// (`objects::take_seq`), one number per put, whether or not it is used.
+fn put_sql(a: &str, namespaces: &str, hinted: bool) -> String {
     let set = if hinted {
         "key = EXCLUDED.key, target = EXCLUDED.target, issued = EXCLUDED.issued, \
          tree16 = EXCLUDED.tree16,"
@@ -43,19 +49,27 @@ fn put_sql(a: &str, hinted: bool) -> String {
         "(a.value, a.encoding) IS DISTINCT FROM (EXCLUDED.value, EXCLUDED.encoding)"
     };
     format!(
-        "WITH up AS (\
+        "WITH s AS ({seq}), \
+         up AS (\
            INSERT INTO {a} AS a (ns, key, test_key, signer, storage_key, target, issued, tree16, \
-             manifest_ref, ref_state, value) \
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             manifest_ref, ref_state, value, {cols}, seq) \
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+             $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, (SELECT seq FROM s)) \
            ON CONFLICT (ns, test_key, signer, storage_key) DO UPDATE SET {set} \
              manifest_ref = EXCLUDED.manifest_ref, ref_state = EXCLUDED.ref_state, encoding = 0, \
-             value = EXCLUDED.value, stored_at = now(), stored_by = session_user \
-           WHERE {changed} \
+             value = EXCLUDED.value, {set_cols}, seq = EXCLUDED.seq, \
+             stored_at = now(), stored_by = session_user \
+           WHERE {changed} OR ({a_cols}) IS DISTINCT FROM ({x_cols}) \
            RETURNING a.key) \
          SELECT key FROM up \
          UNION ALL \
          SELECT key FROM {a} WHERE ns = $1 AND test_key = $3 AND signer = $4 AND storage_key = $5 \
-           AND NOT EXISTS (SELECT 1 FROM up)"
+           AND NOT EXISTS (SELECT 1 FROM up)",
+        seq = objects::take_seq(namespaces, "1"),
+        cols = objects::COLUMNS,
+        set_cols = objects::set_columns(),
+        a_cols = objects::columns_of("a"),
+        x_cols = objects::columns_of("EXCLUDED"),
     )
 }
 
@@ -63,9 +77,11 @@ impl Sql {
     pub(crate) fn new(s: &str) -> Sql {
         let a = format!("\"{s}\".attestations");
         let m = format!("\"{s}\".manifests");
+        let g = format!("\"{s}\".gone");
+        let n = format!("\"{s}\".namespaces");
         Sql {
-            put_hinted: put_sql(&a, true),
-            put_plain: put_sql(&a, false),
+            put_hinted: put_sql(&a, &n, true),
+            put_plain: put_sql(&a, &n, false),
             slot_key: format!(
                 "SELECT key FROM {a} WHERE ns = $1 AND test_key = $2 AND signer = $3 AND storage_key = $4"
             ),
@@ -83,7 +99,16 @@ impl Sql {
                  RETURNING COALESCE((SELECT value FROM old) IS DISTINCT FROM $4 \
                    OR (SELECT encoding FROM old) <> 0, true) AS changed"
             ),
-            remove: format!("DELETE FROM {a} WHERE ns = $1 AND key = ANY($2) RETURNING key"),
+            // A `gone` row per removed key, numbered after the deletion.
+            remove: format!(
+                "WITH d AS (DELETE FROM {a} WHERE ns = $1 AND key = ANY($2) RETURNING key), \
+                 s AS ({}), \
+                 g AS (INSERT INTO {g} (ns, seq, key) \
+                   SELECT $1, (SELECT seq FROM s) - (SELECT count(*) FROM d) \
+                     + row_number() OVER (ORDER BY key), key FROM d) \
+                 SELECT key FROM d",
+                objects::take_seq(&n, "count(*) FROM d HAVING count(*) > 0")
+            ),
             remove_manifests: format!(
                 "DELETE FROM {m} AS m WHERE m.ns = $1 AND m.root = ANY($2) \
                    AND m.put_at <= now() - make_interval(secs => $3) \
@@ -177,6 +202,7 @@ pub(crate) fn put(inner: &Inner, att: &NewAttestation<'_>) -> Result<StoredEnvel
     let issued: Option<i64> = hint.as_ref().map(|h| h.issued);
     let tree16: Option<String> = hint.and_then(|h| h.tree);
     let (mref, ref_state) = manifest_ref(att.envelope);
+    let cols = Cols::of(att.columns);
     let sql = if hinted.is_some() {
         &inner.write_sql.put_hinted
     } else {
@@ -197,6 +223,16 @@ pub(crate) fn put(inner: &Inner, att: &NewAttestation<'_>) -> Result<StoredEnvel
                 (&mref, Type::TEXT),
                 (&ref_state, Type::INT2),
                 (&att.envelope, Type::BYTEA),
+                (&cols.format, Type::INT2),
+                (&cols.commit, Type::TEXT),
+                (&cols.platform, Type::TEXT),
+                (&cols.state, Type::TEXT),
+                (&cols.duration_ms, Type::INT8),
+                (&cols.expires, Type::INT8),
+                (&cols.hdr, Type::TEXT),
+                (&cols.tables, Type::TEXT),
+                (&cols.shape, Type::TEXT),
+                (&cols.state_obj, Type::TEXT),
             ],
         )
     });
@@ -261,6 +297,9 @@ pub(crate) fn remove(
         return Ok(Vec::new());
     }
     let ns = inner.ready()?;
+    if !objects::there_for_removal(inner)? {
+        return Ok(Vec::new());
+    }
     let keys: BTreeSet<&str> = doomed.iter().map(|e| e.key.as_str()).collect();
     let keys: Vec<&str> = keys.into_iter().collect();
     let r = inner.conn.run(WRITE, |db| {

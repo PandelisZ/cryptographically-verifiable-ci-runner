@@ -1,6 +1,8 @@
 //! The queries behind the store's reads. Each function takes one
-//! connection whose file holds schema version 1; listings and batch reads
-//! run inside one read transaction, so they see one snapshot.
+//! connection whose file holds the schema (the caller has checked which
+//! version, and calls the format-3 reads only on a file that has the
+//! additions); listings and batch reads run inside one read transaction,
+//! so they see one snapshot.
 //!
 //! Rows are read leniently: a key that does not have vci's shape, or a
 //! column of an unexpected type (a row written behind vci's back), is
@@ -11,7 +13,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
-use vci_store::{GONE, StoredEnvelope, StoredManifest, key};
+use vci_store::{
+    Columns, GONE, MAX_OBJECTS_ANSWER, StoredEnvelope, StoredManifest, StoredObject, key,
+};
 
 use crate::schema::REF_UNKNOWN;
 use crate::sql::plain as sql;
@@ -226,6 +230,113 @@ pub(crate) fn passing_on(
 /// Whether `name` is flagged.
 pub(crate) fn flag(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     conn.query_row(&sql().flag, [name], |r| r.get(0))
+}
+
+/// The objects stored under these (validated) ids, in the order asked,
+/// missing ids left out and a repeated id answered once, in one read
+/// transaction: first their sizes (one index lookup each, bytes not read),
+/// so that an answer past [`MAX_OBJECTS_ANSWER`] is refused before any
+/// object is read (`Err(total)`); then the bytes. A row whose kind column
+/// names no kind is a foreign row and is left out.
+pub(crate) fn objects(
+    conn: &Connection,
+    ids: &[&str],
+) -> rusqlite::Result<Result<Vec<StoredObject>, usize>> {
+    let _snapshot = snapshot(conn)?;
+    let mut seen = BTreeSet::new();
+    let wanted: Vec<&str> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    let mut sizes = conn.prepare(&sql().object_size)?;
+    let mut total = 0usize;
+    let mut found: Vec<(&str, vci_core::ObjectKind)> = Vec::with_capacity(wanted.len());
+    for id in wanted {
+        let row: Option<(i64, i64)> = sizes
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((kind, len)) = row
+            && let Some(kind) = u8::try_from(kind).ok().and_then(vci_store::object_kind)
+        {
+            total = total.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+            if total > MAX_OBJECTS_ANSWER {
+                return Ok(Err(total));
+            }
+            found.push((id, kind));
+        }
+    }
+    let mut stmt = conn.prepare(&sql().object)?;
+    let mut out = Vec::with_capacity(found.len());
+    for (id, kind) in found {
+        let bytes: Option<Vec<u8>> = stmt
+            .query_row([id], |r| match r.get_ref(1)? {
+                ValueRef::Blob(b) => Ok(Some(b.to_vec())),
+                _ => Ok(None),
+            })
+            .optional()?
+            .flatten();
+        if let Some(bytes) = bytes {
+            out.push(StoredObject {
+                id: id.to_owned(),
+                kind,
+                bytes,
+            });
+        }
+    }
+    Ok(Ok(out))
+}
+
+/// The ids of the objects the orphan rule would remove now: no
+/// attestation's object-id column names them and they were put before
+/// `before`; sorted, one index scan and four index lookups per object, no
+/// value read. A row whose id is not an object id is foreign and left out.
+pub(crate) fn orphan_objects(conn: &Connection, before: i64) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(&sql().orphan_objects)?;
+    let mut rows = stmt.query([before])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        if let Some(id) = text(row.get_ref(0)?)
+            && key::is_object_id(&id)
+        {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Each entry's format-3 columns, matched by key, in one read transaction:
+/// [`Columns::default`] for a key no longer stored and for a row whose
+/// columns are `NULL` (a format-1 row, a record put without them). A
+/// column of an unexpected type reads as `None`.
+pub(crate) fn columns(
+    conn: &Connection,
+    envs: &[&StoredEnvelope],
+) -> rusqlite::Result<Vec<Columns>> {
+    if envs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _snapshot = snapshot(conn)?;
+    let mut stmt = conn.prepare(&sql().columns)?;
+    envs.iter()
+        .map(|e| {
+            let got = stmt
+                .query_row([&e.key], |r| {
+                    let int = |i: usize| r.get_ref(i).map(|v| v.as_i64().ok());
+                    let txt = |i: usize| r.get_ref(i).map(|v| v.as_str().ok().map(str::to_owned));
+                    Ok(Columns {
+                        format: int(0)?.and_then(|n| u8::try_from(n).ok()),
+                        commit: txt(1)?,
+                        platform: txt(2)?,
+                        state: txt(3)?,
+                        duration_ms: int(4)?.and_then(|n| u64::try_from(n).ok()),
+                        expires: int(5)?,
+                        hdr: txt(6)?,
+                        tables: txt(7)?,
+                        shape: txt(8)?,
+                        state_obj: txt(9)?,
+                    })
+                })
+                .optional()?;
+            Ok(got.unwrap_or_default())
+        })
+        .collect()
 }
 
 /// One read transaction on `conn`, so that several statements see one

@@ -1,4 +1,5 @@
-//! The PostgreSQL backend's own tests (store plan step C, tests 1 to 15).
+//! The PostgreSQL backend's own tests (store plan step C, tests 1 to 15,
+//! then the format-3 tests 16 to 23 of STORE-V2 section 2.1).
 //!
 //! Tests 1 and 2 need no server. The others need one
 //! (`VCI_TEST_POSTGRES_URL`, see `common`) and are skipped, saying so,
@@ -6,16 +7,17 @@
 
 mod common;
 
-use std::sync::Barrier;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use common::{cx, cx_for, pg, selection};
+use vci_store::conformance::scenarios::Run3;
 use vci_store::select::{Secret, Source, Sourced};
 use vci_store::{
-    AttestationStore, KeyHint, ManifestRef, Prefetch, StoreError, StoreStatus, StoredEnvelope,
-    ValueState, key,
+    AttestationStore, Columns, KeyHint, ManifestRef, NewAttestation, OBJECT_GRACE, Prefetch,
+    StoreError, StoreStatus, StoredEnvelope, ValueState, key,
 };
-use vci_store_postgres::PgStore;
+use vci_store_postgres::{Finish, PgStore};
 
 const S1: &str = "1111111111111111";
 const S2: &str = "2222222222222222";
@@ -699,7 +701,7 @@ fn absent_not_initialized_and_incompatible() {
     match fresh.status() {
         Err(StoreError::Incompatible {
             found: 99,
-            supported: 1,
+            supported: 2,
             ..
         }) => {}
         other => panic!("expected Incompatible, got {other:?}"),
@@ -1480,4 +1482,637 @@ fn application_name_names_vci_and_the_command() {
         assert_eq!(name, format!("vci {} {command}", env!("CARGO_PKG_VERSION")));
     }
     drop(s);
+}
+
+// ---- 16 to 22: format 3 (STORE-V2 section 2.1) ----------------------------------------
+
+/// Store a format-3 record of `run` for `unit` with its columns.
+fn put3(s: &PgStore, run: &Run3, unit: &str, storage_key: &str, seed: u32) -> StoredEnvelope {
+    let (rec, cols) = run.record(unit, 1, seed);
+    s.put(&NewAttestation::for_test(unit, S1, storage_key, None, &rec).with_columns(&cols))
+        .unwrap()
+}
+
+/// Move these objects' `put_at` back by `by`.
+fn age(db: &common::PgDb, ids: &[&str], by: Duration) {
+    let list = ids
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows = db.query(&format!(
+        "UPDATE {{schema}}.objects SET put_at = put_at - make_interval(secs => {})
+         WHERE ns = 'test' AND id IN ({list}) RETURNING 1",
+        by.as_secs_f64()
+    ));
+    assert_eq!(rows.len(), ids.len());
+}
+
+/// The `seq` of these attestation keys, in the order given.
+fn seq_of_keys(db: &common::PgDb, keys: &[&str]) -> Vec<i64> {
+    keys.iter()
+        .map(|k| {
+            db.count(&format!(
+                "SELECT seq FROM {{schema}}.attestations WHERE ns = 'test' AND key = '{k}'"
+            ))
+        })
+        .collect()
+}
+
+/// The `seq` of these object ids, in the order given.
+fn seq_of_objects(db: &common::PgDb, ids: &[&str]) -> Vec<i64> {
+    ids.iter()
+        .map(|id| {
+            db.count(&format!(
+                "SELECT seq FROM {{schema}}.objects WHERE ns = 'test' AND id = '{id}'"
+            ))
+        })
+        .collect()
+}
+
+/// Every `gone` row of namespace `test` as (seq, key, object), by seq.
+fn gone_rows(db: &common::PgDb) -> Vec<(i64, Option<String>, Option<String>)> {
+    db.query("SELECT seq, key, object FROM {schema}.gone WHERE ns = 'test' ORDER BY seq")
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// Make the schema look as a 2.8 vci left it: no format-3 tables, no
+/// format-3 columns.
+fn downgrade_to_2_8(db: &common::PgDb) {
+    db.sql(
+        "DROP TABLE {schema}.objects, {schema}.gone, {schema}.namespaces;
+         ALTER TABLE {schema}.attestations
+           DROP COLUMN format, DROP COLUMN commit_id, DROP COLUMN platform, DROP COLUMN state,
+           DROP COLUMN duration_ms, DROP COLUMN expires, DROP COLUMN hdr, DROP COLUMN tables_id,
+           DROP COLUMN shape, DROP COLUMN state_obj, DROP COLUMN seq",
+    );
+}
+
+fn has_table(db: &common::PgDb, name: &str) -> bool {
+    db.count(&format!(
+        "SELECT count(*) FROM pg_tables WHERE schemaname = '{{schema}}' AND tablename = '{name}'"
+    )) == 1
+}
+
+/// Test 16: a schema a 2.8 vci made reads as a store without columns or
+/// objects until a write of this vci adds the format-3 tables and columns
+/// in a request of its own, under the advisory lock, before the write; a
+/// role that cannot alter the schema is told so; a handle that saw the
+/// schema before the upgrade uses the additions once they are there.
+#[test]
+fn a_2_8_schema_is_upgraded_by_the_first_write_in_its_own_request() {
+    let Some(db) = pg() else { return };
+    let run = Run3::build(&["src/t16/a.ts"]);
+    let e1 = db
+        .open()
+        .put_for_test(UNIT_A, S1, &hex64(1), Some(&hint(1)), &envelope(None, 1))
+        .unwrap();
+    downgrade_to_2_8(&db);
+    assert!(!has_table(&db, "objects"));
+
+    let old = db.open();
+    assert_eq!(
+        old.status().unwrap(),
+        StoreStatus::Ready {
+            schema_version: Some(1)
+        }
+    );
+    let l = old.list_units(&[UNIT_A]).unwrap().remove(0);
+    assert_eq!(keys(&l), std::slice::from_ref(&e1.key));
+    let n = old.statements();
+    assert_eq!(old.columns(&[&l[0]]).unwrap(), [Columns::default()]);
+    assert!(
+        old.get_objects(&run.id_refs()).unwrap().is_empty(),
+        "no objects table: none"
+    );
+    assert!(old.orphan_objects().unwrap().is_empty());
+    assert!(
+        old.statements() - n <= 3,
+        "{} statements: the columns check, the objects read, the orphan read",
+        old.statements() - n
+    );
+    assert!(!has_table(&db, "objects"), "reads add nothing");
+
+    // A role allowed to write the rows but not to alter the tables.
+    let url = db.role(
+        "rows",
+        "GRANT USAGE ON SCHEMA {schema} TO {role}; \
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO {role}",
+    );
+    let w = db.open_as(&url);
+    match w.put_for_test(UNIT_B, S1, &hex64(2), Some(&hint(1)), &envelope(None, 1)) {
+        Err(StoreError::NotInitialized { advice, .. }) => {
+            assert!(
+                advice.contains("format-3") && advice.contains(&db.schema),
+                "{advice}"
+            )
+        }
+        other => panic!("expected NotInitialized, got {other:?}"),
+    }
+    match w.put_objects(&run.new_objects()) {
+        Err(StoreError::NotInitialized { .. }) => {}
+        other => panic!("expected NotInitialized, got {other:?}"),
+    }
+    assert!(
+        w.remove(vec![e1.clone()]).is_err(),
+        "a removal needs the gone table"
+    );
+    assert_eq!(
+        keys(&db.open().list_units(&[UNIT_A]).unwrap()[0]),
+        std::slice::from_ref(&e1.key),
+        "nothing was removed"
+    );
+    assert!(!has_table(&db, "objects"));
+
+    // The owner's first write adds them in a request of its own, then
+    // writes.
+    let s = db.open();
+    let n = s.statements();
+    let e2 = put3(&s, &run, UNIT_B, &hex64(2), 16);
+    let used = s.statements() - n;
+    eprintln!("the upgrade and the write took {used} statement(s)");
+    assert!(
+        (7..=8).contains(&used),
+        "{used}: the check, the DDL transaction (BEGIN, lock, DDL, version row, version, COMMIT), the put"
+    );
+    assert!(has_table(&db, "objects") && has_table(&db, "gone") && has_table(&db, "namespaces"));
+    assert_eq!(
+        s.status().unwrap(),
+        StoreStatus::Ready {
+            schema_version: Some(1)
+        },
+        "the version stays 1 while a format-1 row can exist"
+    );
+    let l = s.list_units(&[UNIT_B]).unwrap().remove(0);
+    assert_eq!(
+        s.columns(&[&l[0]]).unwrap()[0].hdr.as_deref(),
+        Some(run.ids.hdr.as_str())
+    );
+    assert_eq!(
+        seq_of_keys(&db, &[&e2.key]),
+        [1],
+        "the namespace's first number"
+    );
+
+    // The handle that saw the 2.8 schema learns of the additions at its
+    // next check, and the role may write rows once the new tables are
+    // granted to it (the docs' recipe: the GRANTs again after the
+    // upgrade), without running the DDL again.
+    db.sql(&format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {{schema}} TO \"{}_rows\"",
+        db.schema
+    ));
+    assert_eq!(old.put_objects(&run.new_objects()).unwrap(), 4);
+    assert_eq!(old.get_objects(&run.id_refs()).unwrap().len(), 4);
+    let l = old.list_units(&[UNIT_B]).unwrap().remove(0);
+    assert_eq!(
+        old.columns(&[&l[0]]).unwrap()[0].state.as_deref(),
+        Some("passed")
+    );
+    w.put_for_test(UNIT_C, S1, &hex64(3), Some(&hint(1)), &envelope(None, 1))
+        .unwrap();
+    assert_eq!(
+        w.remove(vec![e1]).unwrap().len(),
+        1,
+        "the role removes once the gone table is there"
+    );
+}
+
+/// Test 17: `seq` is handed out in commit order, each batch a block of its
+/// own (its objects, then its attestations, then its gone rows, in that
+/// order), two concurrent batches never interleaving; later writes number
+/// higher; removals of records and objects number their `gone` rows.
+#[test]
+fn seq_follows_commit_order_and_a_batch_is_one_block() {
+    let Some(db) = pg() else { return };
+    let runs: Vec<Run3> = (0..2)
+        .map(|i| Run3::build(&[&format!("src/t17/{i}.ts")]))
+        .collect();
+    let barrier = Arc::new(Barrier::new(2));
+    let records: Vec<StoredEnvelope> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let run = &runs[i];
+                let barrier = Arc::clone(&barrier);
+                let s = db.open();
+                scope.spawn(move || {
+                    let b = s.batch().unwrap();
+                    assert_eq!(s.put_objects(&run.new_objects()).unwrap(), 4);
+                    assert_eq!(
+                        s.put_objects(&run.new_objects()).unwrap(),
+                        0,
+                        "queued already"
+                    );
+                    let e = put3(&s, run, &format!("src/t17/{i}.ts"), &hex64(1), 17);
+                    barrier.wait();
+                    b.finish().unwrap();
+                    e
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    // Both runs share the hdr and the tables (Run3 builds the same), so
+    // the batch that committed first wrote four objects and the other two.
+    let rec_seq = seq_of_keys(&db, &[&records[0].key, &records[1].key]);
+    let (first, second) = if rec_seq[0] < rec_seq[1] {
+        (0, 1)
+    } else {
+        (1, 0)
+    };
+    let mut first_objects = seq_of_objects(&db, &runs[first].id_refs());
+    first_objects.sort_unstable();
+    assert_eq!(
+        first_objects,
+        (1..=4).collect::<Vec<_>>(),
+        "the first batch's four objects take the namespace's first numbers"
+    );
+    assert_eq!(rec_seq[first], 5, "then its record");
+    let second_objects = seq_of_objects(&db, &[&runs[second].ids.shape, &runs[second].ids.state]);
+    let mut sorted = second_objects.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        [6, 7],
+        "the second batch's two new objects: {second_objects:?}"
+    );
+    assert_eq!(
+        rec_seq[second], 8,
+        "then its record: the blocks do not interleave"
+    );
+    assert_eq!(
+        seq_of_objects(&db, &[&runs[second].ids.hdr, &runs[second].ids.tables]),
+        seq_of_objects(&db, &[&runs[first].ids.hdr, &runs[first].ids.tables]),
+        "an object stored already keeps its number"
+    );
+
+    // A plain put, a removal and the removal of the objects number after.
+    let s = db.open();
+    let later = s
+        .put_for_test(UNIT_C, S1, &hex64(5), Some(&hint(1)), &envelope(None, 1))
+        .unwrap();
+    assert_eq!(seq_of_keys(&db, &[&later.key]), [9]);
+    assert_eq!(s.remove(vec![records[0].clone()]).unwrap().len(), 1);
+    let gone = gone_rows(&db);
+    assert_eq!(
+        gone,
+        [(10, Some(records[0].key.clone()), None)],
+        "a gone row per removed key"
+    );
+    let ids = runs[0].id_refs();
+    age(&db, &ids, OBJECT_GRACE * 2);
+    assert_eq!(
+        s.remove_objects(&ids).unwrap(),
+        2,
+        "the shape and the state; the other record names the hdr and the tables"
+    );
+    let gone = gone_rows(&db);
+    assert_eq!(gone.len(), 3);
+    let mut objects: Vec<String> = gone[1..].iter().map(|g| g.2.clone().unwrap()).collect();
+    objects.sort();
+    let mut want = vec![runs[0].ids.shape.clone(), runs[0].ids.state.clone()];
+    want.sort();
+    assert_eq!(objects, want, "a gone row per removed object");
+    assert_eq!(gone[1..].iter().map(|g| g.0).collect::<Vec<_>>(), [11, 12]);
+    assert_eq!(
+        db.count("SELECT seq FROM {schema}.namespaces WHERE ns = 'test'"),
+        12
+    );
+    assert_eq!(
+        db.count("SELECT count(*) FROM {schema}.objects WHERE ns = 'test' AND seq IS NULL"),
+        0,
+        "no row is left unnumbered"
+    );
+}
+
+/// Test 18: inside a deferred batch, objects are queued and written first
+/// at finish and an object removal is queued and applied last, after the
+/// batch's removals, so the objects of a record the batch removes go in
+/// the same transaction; `prune_state_objects` is applied at once and
+/// leaves a gone row; the whole takes a bounded number of statements.
+#[test]
+fn a_batch_queues_objects_first_and_object_removals_last() {
+    let Some(db) = pg() else { return };
+    let s = db.open();
+    let r = db.open();
+    let old = Run3::build(&["src/t18/old.ts"]);
+    let new = Run3::build(&["src/t18/new.ts"]);
+    assert_eq!(s.put_objects(&old.new_objects()).unwrap(), 4);
+    let e_old = put3(&s, &old, UNIT_A, &hex64(1), 18);
+    let old_ids = old.id_refs();
+    age(&db, &old_ids, OBJECT_GRACE * 2);
+    assert_eq!(
+        s.remove_objects(&old_ids).unwrap(),
+        0,
+        "referenced by the stored record"
+    );
+
+    // The two runs share the hdr and the tables; the new run's own
+    // objects are its shape and its state.
+    let own: Vec<&str> = vec![&new.ids.shape, &new.ids.state];
+    let n0 = s.statements();
+    let b = s.batch().unwrap();
+    assert_eq!(s.put_objects(&new.new_objects()).unwrap(), 4, "queued");
+    assert!(
+        r.get_objects(&own).unwrap().is_empty(),
+        "queued objects are not visible before finish"
+    );
+    let e_new = put3(&s, &new, UNIT_A, &hex64(2), 19);
+    assert_eq!(s.remove(vec![e_old.clone()]).unwrap().len(), 1);
+    assert_eq!(
+        s.remove_objects(&old_ids).unwrap(),
+        0,
+        "queued: nothing is counted"
+    );
+    assert_eq!(
+        r.get_objects(&old_ids).unwrap().len(),
+        4,
+        "nothing is removed before finish"
+    );
+    b.finish().unwrap();
+    let used = s.statements() - n0;
+    eprintln!("the batch took {used} statement(s)");
+    assert!(
+        used <= 8,
+        "{used}: the unhinted put's slot read, then BEGIN, objects, attestations, removals, \
+         object removals, the stamp, COMMIT"
+    );
+    assert_eq!(r.get_objects(&new.id_refs()).unwrap().len(), 4);
+    let left = r.get_objects(&old_ids).unwrap();
+    assert_eq!(
+        left.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+        [old.ids.hdr.as_str(), old.ids.tables.as_str()],
+        "the removed record's aged shape and state went with it; the new record names the rest"
+    );
+    let l = r.list_units(&[UNIT_A]).unwrap().remove(0);
+    assert_eq!(keys(&l), std::slice::from_ref(&e_new.key));
+    let new_seq = seq_of_objects(&db, &own);
+    let rec_seq = seq_of_keys(&db, &[&e_new.key])[0];
+    let gone = gone_rows(&db);
+    assert_eq!(gone.len(), 3, "the key and the two objects");
+    assert!(
+        new_seq.iter().all(|o| *o < rec_seq) && gone.iter().all(|g| g.0 > rec_seq),
+        "objects {new_seq:?} before the record {rec_seq} before the gone rows {gone:?}"
+    );
+    assert_eq!(gone[0].1.as_deref(), Some(e_old.key.as_str()));
+
+    // The state TTL, applied at once inside a batch too.
+    let b = s.batch().unwrap();
+    age(&db, &[&new.ids.state], Duration::from_secs(3 * 86_400));
+    assert_eq!(
+        s.prune_state_objects(Duration::from_secs(2 * 86_400))
+            .unwrap(),
+        1
+    );
+    assert_eq!(r.get_objects(&[&new.ids.state]).unwrap().len(), 0);
+    b.finish().unwrap();
+    let gone = gone_rows(&db);
+    assert_eq!(gone.len(), 4);
+    assert_eq!(gone[3].2.as_deref(), Some(new.ids.state.as_str()));
+    assert_eq!(gone[3].0, rec_seq + 4);
+}
+
+/// Test 19: `upgrade_finish` is refused with the count while a row that is
+/// not a format-3 record exists in any namespace, and otherwise drops
+/// `manifests` and sets version 2, which this vci reads (and a 2.8 vci
+/// refuses); a manifest cannot be stored after it.
+#[test]
+fn upgrade_finish_closes_the_migration_window() {
+    let Some(db) = pg() else { return };
+    let s = db.open();
+    let other = PgStore::open(&selection(&db.url, &db.schema, "other"), &cx()).unwrap();
+    let run = Run3::build(&["src/t19/a.ts"]);
+    s.put_objects(&run.new_objects()).unwrap();
+    let e3 = put3(&s, &run, UNIT_A, &hex64(3), 19);
+    let e1 = s
+        .put_for_test(UNIT_A, S1, &hex64(1), Some(&hint(1)), &envelope(None, 1))
+        .unwrap();
+    let e_other = other
+        .put_for_test(UNIT_A, S1, &hex64(1), Some(&hint(1)), &envelope(None, 1))
+        .unwrap();
+    s.put_manifest(&hex64(9), &manifest("m", None)).unwrap();
+    assert_eq!(s.upgrade_finish().unwrap(), Finish::FormatOneRows(2));
+    assert!(has_table(&db, "manifests"));
+    s.remove(vec![e1]).unwrap();
+    assert_eq!(
+        s.upgrade_finish().unwrap(),
+        Finish::FormatOneRows(1),
+        "the other namespace's row counts too"
+    );
+    other.remove(vec![e_other]).unwrap();
+    assert_eq!(s.upgrade_finish().unwrap(), Finish::Done);
+    assert!(!has_table(&db, "manifests"));
+    assert_eq!(
+        s.status().unwrap(),
+        StoreStatus::Ready {
+            schema_version: Some(2)
+        }
+    );
+    let fresh = db.open();
+    assert_eq!(
+        fresh.status().unwrap(),
+        StoreStatus::Ready {
+            schema_version: Some(2)
+        }
+    );
+    let got = read_bytes(&fresh, UNIT_A);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, e3.key);
+    assert_eq!(fresh.get_objects(&run.id_refs()).unwrap().len(), 4);
+    assert!(fresh.manifest(&hex64(9)).unwrap().is_none());
+    assert!(fresh.manifest_roots().unwrap().is_empty());
+    assert_eq!(fresh.remove_manifests(&[&hex64(9)]).unwrap(), 0);
+    match fresh.put_manifest(&hex64(9), &manifest("m", None)) {
+        Err(StoreError::NotInitialized { .. }) => {}
+        other => panic!("expected NotInitialized, got {other:?}"),
+    }
+    put3(&fresh, &run, UNIT_B, &hex64(4), 20);
+    assert_eq!(fresh.count().unwrap(), 2);
+    assert_eq!(
+        fresh.upgrade_finish().unwrap(),
+        Finish::Already,
+        "idempotent: at version 2 already"
+    );
+    assert_eq!(fresh.upgrade_begin().map_err(|e| e.to_string()), Ok(()));
+}
+
+/// Test 23: `upgrade_finish` counts a format-1 row by its value's first
+/// byte, not by the `format` column: a 2.8 writer's upsert sets the key
+/// and the value alone (section 9 of vci-cli's store_backends: the frame's
+/// columns stay), so a format-1 value in a slot whose columns still say 3
+/// is counted, and a frame put without columns (what a copy out of
+/// git-meta passes) is not.
+#[test]
+fn upgrade_finish_counts_rows_by_their_value() {
+    let Some(db) = pg() else { return };
+    let s = db.open();
+    let run = Run3::build(&["src/t23/a.ts"]);
+    s.put_objects(&run.new_objects()).unwrap();
+    let e3 = put3(&s, &run, UNIT_A, &hex64(3), 23);
+    let format = |key: &str| -> Option<i16> {
+        db.query(&format!(
+            "SELECT format FROM {{schema}}.attestations WHERE key = '{key}'"
+        ))[0]
+            .get(0)
+    };
+    assert_eq!(format(&e3.key), Some(3));
+    // What 2.8 does to the frame's slot: the key and the value alone.
+    let hex: String = envelope(None, 1)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    db.query(&format!(
+        "UPDATE {{schema}}.attestations SET value = decode('{hex}', 'hex') WHERE key = '{}'",
+        e3.key
+    ));
+    assert_eq!(format(&e3.key), Some(3), "the frame's columns stay");
+    assert_eq!(
+        s.upgrade_finish().unwrap(),
+        Finish::FormatOneRows(1),
+        "a format-1 value under a 3"
+    );
+    assert!(has_table(&db, "manifests"));
+    // Without it, a frame put without columns does not hold the window.
+    s.remove(vec![e3]).unwrap();
+    let (rec, _cols) = run.record(UNIT_B, 1, 24);
+    let e4 = s
+        .put(&NewAttestation::for_test(
+            UNIT_B,
+            S1,
+            &hex64(4),
+            Some(&hint(4)),
+            &rec,
+        ))
+        .unwrap();
+    assert_eq!(format(&e4.key), None);
+    assert_eq!(s.upgrade_finish().unwrap(), Finish::Done);
+    assert!(!has_table(&db, "manifests"));
+}
+
+/// Test 20: an objects answer past `MAX_OBJECTS_ANSWER` is refused on its
+/// first row, nothing of it kept; the same ids one at a time are answered.
+#[test]
+fn an_objects_answer_past_the_bound_is_refused() {
+    let Some(db) = pg() else { return };
+    let s = db.open();
+    s.put_objects(&Run3::build(&["src/t20/a.ts"]).new_objects())
+        .unwrap();
+    // Two 34 MB objects, made on the server: 68 MB together, over 64 MiB.
+    for seed in [20, 21] {
+        db.sql(&format!(
+            "INSERT INTO {{schema}}.objects (ns, id, kind, bytes)
+             VALUES ('test', '{}', 1, decode(repeat('00', 34000000), 'hex'))",
+            hex64(seed)
+        ));
+    }
+    match s.get_objects(&[&hex64(20), &hex64(21)]) {
+        Err(StoreError::Invalid {
+            what: "objects", ..
+        }) => {}
+        other => panic!("expected Invalid objects, got {:?}", other.map(|v| v.len())),
+    }
+    let one = s.get_objects(&[&hex64(21)]).unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].bytes.len(), 34_000_000);
+}
+
+/// Test 21: `columns` and the object reads cost one statement whatever the
+/// length; a put of objects costs one; objects are per namespace.
+#[test]
+fn columns_and_objects_cost_one_statement_each() {
+    let Some(db) = pg() else { return };
+    let s = db.open();
+    let run = Run3::build(&["src/t21/a.ts", "src/t21/b.ts"]);
+    let units: Vec<String> = (0..300).map(|i| format!("src/t21/u{i}.test.ts")).collect();
+    {
+        let b = s.batch().unwrap();
+        s.put_objects(&run.new_objects()).unwrap();
+        for (i, u) in units.iter().enumerate() {
+            put3(&s, &run, u, &hex64(1), i as u32);
+        }
+        b.finish().unwrap();
+    }
+    let ids: Vec<&str> = units.iter().map(String::as_str).collect();
+    let listed: Vec<StoredEnvelope> = s.list_units(&ids).unwrap().into_iter().flatten().collect();
+    assert_eq!(listed.len(), 300);
+    let refs: Vec<&StoredEnvelope> = listed.iter().collect();
+    let n = s.statements();
+    let cols = s.columns(&refs).unwrap();
+    assert_eq!(s.statements() - n, 1, "columns of 300 entries");
+    assert_eq!(cols.len(), 300);
+    assert_eq!(cols[299].duration_ms, Some(2990));
+    assert_eq!(cols[0].commit.as_deref(), Some(&"00000000".repeat(5)[..]));
+    let n = s.statements();
+    assert_eq!(s.get_objects(&run.id_refs()).unwrap().len(), 4);
+    assert!(s.orphan_objects().unwrap().is_empty());
+    assert_eq!(s.statements() - n, 2, "one read each");
+    let n = s.statements();
+    assert_eq!(
+        s.put_objects(&Run3::build(&["src/t21/c.ts"]).new_objects())
+            .unwrap(),
+        2,
+        "its shape and state; the hdr and the tables are every run's"
+    );
+    assert_eq!(s.statements() - n, 1, "one put");
+
+    let other = PgStore::open(&selection(&db.url, &db.schema, "other"), &cx()).unwrap();
+    assert!(
+        other.get_objects(&run.id_refs()).unwrap().is_empty(),
+        "objects are per namespace"
+    );
+    assert_eq!(other.put_objects(&run.new_objects()).unwrap(), 4);
+    assert_eq!(
+        other.columns(&refs).unwrap(),
+        vec![Columns::default(); 300],
+        "another namespace's keys have no columns here"
+    );
+}
+
+/// Test 22: a put without columns clears them and one with other columns
+/// replaces them while the bytes stay, in a batch as outside one, and a
+/// row written behind the store's back with values no column can hold
+/// reads as having none of those.
+#[test]
+fn columns_follow_the_last_put_in_and_outside_batches() {
+    let Some(db) = pg() else { return };
+    let s = db.open();
+    let run = Run3::build(&["src/t22/a.ts"]);
+    let (rec, cols) = run.record(UNIT_A, 1, 22);
+    let e = s
+        .put(&NewAttestation::for_test(UNIT_A, S1, &hex64(1), None, &rec).with_columns(&cols))
+        .unwrap();
+    let l = s.list_units(&[UNIT_A]).unwrap().remove(0);
+    assert_eq!(s.columns(&[&l[0]]).unwrap()[0], cols);
+    let seq0 = seq_of_keys(&db, &[&e.key])[0];
+    {
+        let b = s.batch().unwrap();
+        s.put_for_test(UNIT_A, S1, &hex64(1), None, &rec).unwrap();
+        b.finish().unwrap();
+    }
+    assert_eq!(
+        s.columns(&[&l[0]]).unwrap()[0],
+        Columns::default(),
+        "a batched put of the same bytes without columns clears them"
+    );
+    let seq1 = seq_of_keys(&db, &[&e.key])[0];
+    assert!(seq1 > seq0, "a changed row is numbered again");
+    let mut cols2 = cols.clone();
+    cols2.duration_ms = Some(7);
+    {
+        let b = s.batch().unwrap();
+        s.put(&NewAttestation::for_test(UNIT_A, S1, &hex64(1), None, &rec).with_columns(&cols2))
+            .unwrap();
+        b.finish().unwrap();
+    }
+    assert_eq!(s.columns(&[&l[0]]).unwrap()[0], cols2);
+    assert_eq!(read_bytes(&s, UNIT_A)[0].1, rec, "the bytes stayed");
+    db.sql(&format!(
+        "UPDATE {{schema}}.attestations SET format = -1, duration_ms = -5 WHERE key = '{}'",
+        e.key
+    ));
+    let got = s.columns(&[&l[0]]).unwrap()[0].clone();
+    assert_eq!((got.format, got.duration_ms), (None, None));
+    assert_eq!(got.commit, cols2.commit);
 }

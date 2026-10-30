@@ -495,6 +495,13 @@ struct Probe {
 /// The script of the probe that boots the application.
 const BOOT_SCRIPT: &str = "require File.expand_path(\"config/environment\")";
 
+/// Env var (of a boot started ahead of time, [`StartedProbe`]): its run
+/// directory. Its stdin is then a pipe vci holds open and never writes to;
+/// when the pipe ends (vci exited, however: a SIGTERM or a SIGKILL runs
+/// none of vci's own cleanup), the collector removes that directory and
+/// ends the process.
+const RAILS_PROBE_PIPE_ENV: &str = "VCI_RAILS_PROBE_PIPE";
+
 /// The `-e` script of the probe that does not boot the application.
 fn light_script(rails_app: bool) -> String {
     format!("require \"bundler/setup\"; VciCollector::Probe.light!({rails_app})")
@@ -520,10 +527,28 @@ pub struct RailsAdapter {
 
 /// A probe process started without waiting for it.
 struct StartedProbe {
-    child: std::process::Child,
+    /// The process, until a probe takes it to wait for it.
+    child: Option<std::process::Child>,
     describe: String,
     /// Its run directory, kept until it has finished.
     _dirs: RunDirs,
+}
+
+/// A boot started ahead of time that no probe took (the plan compared no
+/// native library after all) is killed and reaped when the adapter goes,
+/// before its run directory is removed. Waiting for it instead would hold
+/// the plan's exit for the rest of a boot nobody reads (seconds on vex);
+/// left alone (as before 2.9) it outlived vci, booting the application
+/// beside the tests `vci ci` runs next, in a run directory removed under
+/// it. When vci ends without dropping the adapter (a signal), the boot
+/// ends itself: its stdin pipe ends with vci ([`RAILS_PROBE_PIPE_ENV`]).
+impl Drop for StartedProbe {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl std::fmt::Debug for StartedProbe {
@@ -789,6 +814,7 @@ impl RailsAdapter {
             RAILS_SHARDS_ENV,
             RAILS_AUTOLOAD_ENV,
             "SPRING_SERVER_COMMAND",
+            RAILS_PROBE_PIPE_ENV,
         ] {
             c.env_remove(k);
         }
@@ -898,11 +924,14 @@ impl RailsAdapter {
         };
         let mut cmd = self.ruby_cmd(env, "probe", &dirs, &collector);
         script_args(&mut cmd, &dirs, "vci-probe.rb", BOOT_SCRIPT);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .env(RAILS_PROBE_PIPE_ENV, dirs.base.as_str())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let describe = describe(&cmd);
         if let Ok(child) = cmd.spawn() {
             *slot = Some(StartedProbe {
-                child,
+                child: Some(child),
                 describe,
                 _dirs: dirs,
             });
@@ -928,12 +957,19 @@ impl RailsAdapter {
             None
         };
         let (out, described) = match started {
-            Some(sp) => (
-                sp.child
-                    .wait_with_output()
-                    .map_err(|e| self.not_installed(e))?,
-                sp.describe,
-            ),
+            Some(mut sp) => {
+                let mut child = sp
+                    .child
+                    .take()
+                    .expect("a started probe holds its process until taken");
+                // Its stdin stays open until it has finished:
+                // `wait_with_output` would close it first, which the boot
+                // takes for vci's exit.
+                let stdin = child.stdin.take();
+                let out = child.wait_with_output().map_err(|e| self.not_installed(e));
+                drop(stdin);
+                (out?, std::mem::take(&mut sp.describe))
+            }
             None => (
                 cmd.output().map_err(|e| self.not_installed(e))?,
                 describe(&cmd),
@@ -2627,6 +2663,33 @@ impl Adapter for RailsAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boot started ahead of time that no probe took is killed and reaped
+    /// when it is dropped (the adapter going at the end of a plan that
+    /// compared no native library): the drop does not wait for the boot,
+    /// and no process is left behind.
+    #[test]
+    fn a_started_boot_nobody_took_is_killed_when_dropped() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().to_string();
+        let started = StartedProbe {
+            child: Some(child),
+            describe: "sleep 30".into(),
+            _dirs: RunDirs::new().unwrap(),
+        };
+        let t = std::time::Instant::now();
+        drop(started);
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "the boot {pid} was left running");
+    }
 
     #[test]
     fn argv_env_lists_and_globals() {

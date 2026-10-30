@@ -315,6 +315,29 @@ impl World {
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
+    /// [`World::run`] writing format-1 records (`[store] record_format =
+    /// 1`, what vci 2.8 wrote: the envelope with its input manifest), for
+    /// the tests of what only that form holds: a stored manifest, the
+    /// `removed N input manifest(s)` line, and the per-entry explain text
+    /// on git-meta (a format-3 record there names no state object, so an
+    /// edited entry is reported as changed with the attested hash not
+    /// loaded: tests/e2e_m3.rs covers that text, and
+    /// `cargo_run_with_several_hdr_groups_is_written_and_planned` the
+    /// format-3 cargo run).
+    fn run_format1(&self, dir: &Path, units: &[&str], key: &Path) -> String {
+        let mut args = vec!["run"];
+        args.extend(units);
+        args.extend(["--key", key.to_str().unwrap()]);
+        let out = self.vci_env(dir, &args, &[("VCI_STORE_RECORD_FORMAT", "1")]);
+        assert!(
+            out.status.success(),
+            "vci run {units:?} (record_format = 1) exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
     fn plan_env(&self, dir: &Path, base: &str, env: &[(&str, &str)]) -> Plan {
         let out = self.vci_env(dir, &["plan", "--base-ref", base, "--format", "json"], env);
         assert!(out.status.success(), "vci plan failed");
@@ -414,17 +437,11 @@ impl World {
     /// The predicates stored for `test_id`.
     fn predicates(&self, test_id: &str) -> Vec<Value> {
         let repo = store_for(&self.work);
-        let b64 = base64::engine::general_purpose::STANDARD;
         AttestStore::new(&repo)
             .list(Some(test_id))
             .unwrap()
             .iter()
-            .map(|s| {
-                let env: Value = serde_json::from_slice(&s.bytes).unwrap();
-                let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
-                let st: Value = serde_json::from_slice(&payload).unwrap();
-                store_common::inline_manifest(&repo, st["predicate"].clone())
-            })
+            .map(|s| store_common::predicate_of(&repo, &s.bytes))
             .collect()
     }
 }
@@ -485,7 +502,7 @@ fn cargo_end_to_end_verification_steps() {
     // Step 1: attest b's integration test, then plan: skip only that unit.
     // Units are every target `cargo test --workspace` runs; b's library has
     // test = false, c and d have doctest = false.
-    w.run(&work, &[B], &w.trusted);
+    w.run_format1(&work, &[B], &w.trusted);
     let p = w.plan(&work, "main");
     assert_eq!(p.skip, set(&[B]), "step 1");
     assert_eq!(p.run, set(&[A_LIB, A_DOC, C, D]), "step 1");
@@ -561,7 +578,7 @@ fn cargo_end_to_end_verification_steps() {
 
     // Step 4: attest d (it builds crate a and the external hex). Editing a
     // runs d and a's units, b stays skipped.
-    w.run(&work, &[D], &w.trusted);
+    w.run_format1(&work, &[D], &w.trusted);
     let pred = &w.predicates(D)[0];
     let ext = &pred["manifest"]["externals"];
     assert_eq!(ext[0]["name"], "hex", "{ext}");
@@ -584,7 +601,7 @@ fn cargo_end_to_end_verification_steps() {
 
     // Step 4b: a's unit tests (one of them #[ignore]d) and its doctests are
     // units of their own; editing a doctest runs both (same source file).
-    let out = w.run(&work, &[A_LIB, A_DOC], &w.trusted);
+    let out = w.run_format1(&work, &[A_LIB, A_DOC], &w.trusted);
     assert!(out.contains("vci: attested a#lib "), "{out}");
     assert!(out.contains("vci: attested a#doc "), "{out}");
     assert_eq!(
@@ -619,7 +636,7 @@ fn cargo_end_to_end_verification_steps() {
     // Step 5: attest c. Its include_str! target and the file its build
     // script declares (both outside its package directory) are inputs; an
     // unrelated file next to them is not.
-    w.run(&work, &[C], &w.trusted);
+    w.run_format1(&work, &[C], &w.trusted);
     assert_eq!(
         w.plan(&work, "main").skip,
         set(&[A_LIB, A_DOC, B, C, D]),
@@ -738,7 +755,7 @@ fn cargo_end_to_end_verification_steps() {
     // input first so the trusted attestation no longer applies.
     let d_src = w.read("d/src/lib.rs");
     w.put("d/src/lib.rs", &format!("{d_src}\n// untrusted run\n"));
-    w.run(&work, &[D], &w.untrusted);
+    w.run_format1(&work, &[D], &w.untrusted);
     assert!(w.plan(&work, "main").run.contains(D), "step 9");
     let ex = w.explain(&work, D, "main");
     assert!(ex.contains("failed check: signer"), "{ex}");
@@ -888,7 +905,7 @@ fn cargo_run_refuses_unattestable_units() {
     w.git(&work, &["add", "-A"]);
     w.git(&work, &["commit", "-q", "-m", "declare what outside reads"]);
     let declared_base = w.git(&work, &["rev-parse", "HEAD"]);
-    w.run(&work, &["outside#lib"], &w.trusted);
+    w.run_format1(&work, &["outside#lib"], &w.trusted);
     let pred = &w.predicates("outside#lib")[0];
     assert_eq!(
         pred["declaredInputs"],
@@ -1668,7 +1685,7 @@ fn cargo_package_directory_walk() {
     );
     w.git(&work, &["add", "-A", "-f"]);
     w.git(&work, &["commit", "-q", "-m", "linked and nested fixtures"]);
-    w.run(&work, &["b#test:link", "b#test:nested"], &w.trusted);
+    w.run_format1(&work, &["b#test:link", "b#test:nested"], &w.trusted);
     let entries = w.entries("b#test:link");
     for want in ["b/tests/linkdir", "shared/dir", "shared/dir/x.json"] {
         assert!(entries.iter().any(|e| e == want), "{want}: {entries:?}");
@@ -2635,7 +2652,10 @@ fn cargo_blobless_clone_fetches_only_what_the_plan_reads() {
 
 /// Supersession in a blobless clone: the earlier attestation (fetched for
 /// the run) is deleted and so is the manifest only it referenced, although
-/// other units' attestations were never fetched.
+/// other units' attestations were never fetched. Format-1 records
+/// (`run_format1`): a format-3 run stores no manifest, and
+/// `cargo_two_blobless_clones_supersede_the_same_attestation_and_both_push`
+/// holds its supersession in a blobless clone.
 #[test]
 fn cargo_supersession_in_a_blobless_clone_removes_the_orphan_manifest() {
     let Some(w) = World::new() else { return };
@@ -2646,7 +2666,7 @@ fn cargo_supersession_in_a_blobless_clone_removes_the_orphan_manifest() {
         "{\"greeting\": \"hello\", \"v\": 2}\n",
     );
     w.git(&work, &["commit", "-qam", "b's data changes"]);
-    w.run(&work, &[B, C], &w.trusted);
+    w.run_format1(&work, &[B, C], &w.trusted);
     // An attestation of a unit no project lists any more: no plan or run
     // reads (or fetches) it.
     AttestStore::new(&store_for(&work))
@@ -2683,7 +2703,7 @@ fn cargo_supersession_in_a_blobless_clone_removes_the_orphan_manifest() {
     )
     .unwrap();
     w.git(&fresh, &["commit", "-qam", "b's data changes again"]);
-    let err = w.run(&fresh, &[B], &w.trusted);
+    let err = w.run_format1(&fresh, &[B], &w.trusted);
     assert!(
         err.contains("vci: removed 1 superseded attestation(s)"),
         "{err}"
@@ -2715,7 +2735,12 @@ fn cargo_supersession_in_a_blobless_clone_removes_the_orphan_manifest() {
 /// same files; the second to push lost its attestations to `could not
 /// fetch <the first's deletion record> from promisor remote`). The second
 /// clone fetches the first's tip at its push, merges the first's deletion
-/// record it never fetched into its tree, and must still push.
+/// record it never fetched into its tree, and must still push. Format-3
+/// records (the default): each clone supersedes a frame it fetched for
+/// the run, whose hdr object `vci run` prefetches before it reads the
+/// old record's platform (a blobless clone holds the object's key and not
+/// its value; without the prefetch the old record was kept as made for
+/// an unknown platform and nothing was superseded).
 #[test]
 fn cargo_two_blobless_clones_supersede_the_same_attestation_and_both_push() {
     let Some(w) = World::new() else { return };
@@ -2794,7 +2819,7 @@ fn cargo_prune_keeps_the_newest_n_per_signer() {
             &format!("{{\"greeting\": \"hello\", \"v\": {v}}}\n"),
         );
         w.git(&work, &["commit", "-qam", "b's data changes"]);
-        let err = w.run(&work, &[B], &w.trusted);
+        let err = w.run_format1(&work, &[B], &w.trusted);
         assert!(!err.contains("superseded"), "{err}");
         // issuedAt has second resolution: the next one is newer.
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -2839,6 +2864,8 @@ fn cargo_prune_keeps_the_newest_n_per_signer() {
 // ---- manifests by reference (vci 1.9.0) -----------------------------------
 
 /// The stored statements of `test_id`, as signed (no manifest inlined).
+/// The stored records of `test_id` with their statements, the predicate
+/// in its v1 form ([`store_common::predicate_of`]).
 fn raw_statements(work: &Path, test_id: &str) -> Vec<(vci_git::StoredEnvelope, Value)> {
     let b64 = base64::engine::general_purpose::STANDARD;
     AttestStore::new(&store_for(work))
@@ -2846,9 +2873,15 @@ fn raw_statements(work: &Path, test_id: &str) -> Vec<(vci_git::StoredEnvelope, V
         .unwrap()
         .into_iter()
         .map(|s| {
-            let env: Value = serde_json::from_slice(&s.bytes).unwrap();
+            let env: Value =
+                serde_json::from_slice(&store_common::envelope_json(&s.bytes)).unwrap();
             let payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
-            let st: Value = serde_json::from_slice(&payload).unwrap();
+            let mut st: Value = serde_json::from_slice(&payload).unwrap();
+            // A format-3 record's v2 statement, read as the v1 fields
+            // (`inputRoot` and the rest; no `manifestRef`).
+            if st["predicateType"] == vci_core::PREDICATE_TYPE_V2 {
+                st["predicate"] = store_common::predicate_of(&store_for(work), &s.bytes);
+            }
             (s, st)
         })
         .collect()
@@ -2875,7 +2908,7 @@ fn cargo_manifests_are_stored_once_by_reference() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
     let units = [A_LIB, A_DOC, B, C, D];
-    w.run(&work, &units, &w.trusted);
+    w.run_format1(&work, &units, &w.trusted);
     let p = w.plan(&work, "main");
     for u in units {
         assert!(p.skip.contains(u), "{u}: {p:?}");
@@ -2926,7 +2959,7 @@ fn cargo_manifests_are_stored_once_by_reference() {
     // Attesting again stores the same keys and values; the only value it
     // may add is this run's base (two units with the same entries share
     // them all, and a base has no externals, so it is its own value).
-    w.run(&work, &[A_LIB, A_DOC], &w.trusted);
+    w.run_format1(&work, &[A_LIB, A_DOC], &w.trusted);
     let again: BTreeSet<String> = store.manifests().unwrap().into_iter().collect();
     assert!(again.is_superset(&stored), "{again:?}");
     assert!(again.len() <= stored.len() + 1, "{again:?}");
@@ -2965,7 +2998,7 @@ fn cargo_manifests_are_stored_once_by_reference() {
 fn cargo_inline_manifest_attestation_still_verifies() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
-    w.run(&work, &[B], &w.trusted);
+    w.run_format1(&work, &[B], &w.trusted);
     let store_repo = store_for(&work);
     let store = AttestStore::new(&store_repo);
     let (stored, mut st) = raw_statements(&work, B).remove(0);
@@ -3019,7 +3052,7 @@ fn cargo_inline_manifest_attestation_still_verifies() {
 fn cargo_missing_or_forged_manifest_makes_the_unit_run() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
-    w.run(&work, &[B, C], &w.trusted);
+    w.run_format1(&work, &[B, C], &w.trusted);
     assert!(w.plan(&work, "main").skip.contains(B));
     let store_repo = store_for(&work);
     let store = AttestStore::new(&store_repo);
@@ -3183,8 +3216,8 @@ fn cargo_supersession_keeps_one_attestation_per_unit_and_signer() {
     let work = w.work.clone();
     // On the base commit, which `main` contains: never superseded from a
     // feature branch.
-    w.run(&work, &[B], &w.trusted);
-    w.run(&work, &[B], &w.untrusted);
+    w.run_format1(&work, &[B], &w.trusted);
+    w.run_format1(&work, &[B], &w.untrusted);
     assert_eq!(w.predicates(B).len(), 2, "one per signer");
     let on_main = raw_statements(&work, B);
     let keys = |v: &[(vci_git::StoredEnvelope, Value)]| -> BTreeSet<String> {
@@ -3198,7 +3231,7 @@ fn cargo_supersession_keeps_one_attestation_per_unit_and_signer() {
         "{\"greeting\": \"hello\", \"v\": 2}\n",
     );
     w.git(&work, &["commit", "-qam", "b's data changes"]);
-    let err = w.run(&work, &[B], &w.trusted);
+    let err = w.run_format1(&work, &[B], &w.trusted);
     assert!(!err.contains("superseded"), "main still needs it: {err}");
     assert_eq!(raw_statements(&work, B).len(), 3);
     // Pushed: `origin/feature` is this branch's own line, not another.
@@ -3214,7 +3247,7 @@ fn cargo_supersession_keeps_one_attestation_per_unit_and_signer() {
         "{\"greeting\": \"hello\", \"v\": 3}\n",
     );
     w.git(&work, &["commit", "-qam", "b's data changes again"]);
-    let err = w.run(&work, &[B], &w.trusted);
+    let err = w.run_format1(&work, &[B], &w.trusted);
     assert!(
         err.contains("vci: removed 1 superseded attestation(s)"),
         "{err}"
@@ -3236,7 +3269,7 @@ fn cargo_supersession_keeps_one_attestation_per_unit_and_signer() {
     }
     assert!(w.plan(&work, "main").skip.contains(B));
     // The other signer on this line: its `main` one is kept too.
-    let err = w.run(&work, &[B], &w.untrusted);
+    let err = w.run_format1(&work, &[B], &w.untrusted);
     assert!(!err.contains("superseded"), "{err}");
     assert_eq!(raw_statements(&work, B).len(), 4);
     // Work in progress on the same commit supersedes nothing: reverting the
@@ -3246,7 +3279,7 @@ fn cargo_supersession_keeps_one_attestation_per_unit_and_signer() {
         "b/tests/data/b.json",
         "{\"greeting\": \"hello\", \"v\": 4}\n",
     );
-    let err = w.run(&work, &[B], &w.trusted);
+    let err = w.run_format1(&work, &[B], &w.trusted);
     assert!(!err.contains("superseded"), "{err}");
     assert_eq!(raw_statements(&work, B).len(), 5);
     w.put("b/tests/data/b.json", &committed);
@@ -3287,7 +3320,7 @@ fn cargo_supersession_keeps_other_branches_attestations() {
 fn cargo_prune_deletes_unreferenced_manifests() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
-    w.run(&work, &[B, C], &w.trusted);
+    w.run_format1(&work, &[B, C], &w.trusted);
     let store_repo = store_for(&work);
     let store = AttestStore::new(&store_repo);
     let old_root = raw_statements(&work, B).remove(0).1["predicate"]["inputRoot"]
@@ -3299,7 +3332,7 @@ fn cargo_prune_deletes_unreferenced_manifests() {
         "{\"greeting\": \"hello\", \"v\": 2}\n",
     );
     w.git(&work, &["commit", "-qam", "b's data changes"]);
-    w.run(&work, &[B], &w.trusted);
+    w.run_format1(&work, &[B], &w.trusted);
     // The first attestation (made on `main`'s commit, which supersession
     // keeps) goes away, as an expired one would.
     let (old, new): (Vec<_>, Vec<_>) = raw_statements(&work, B)
@@ -3621,7 +3654,7 @@ fn cargo_a_manifest_another_clone_references_is_never_lost() {
     let Some(w) = World::new() else { return };
     let work = w.work.clone();
     feature_commit(&w);
-    w.run(&work, &[A_LIB, C], &w.trusted);
+    w.run_format1(&work, &[A_LIB, C], &w.trusted);
     w.git(&work, &["push", "-q", "origin", "feature"]);
     w.vci_ok(&work, &["push", "--remote", "origin"]);
     let root_of = |dir: &Path, id: &str| {
@@ -3634,11 +3667,11 @@ fn cargo_a_manifest_another_clone_references_is_never_lost() {
     let rc = root_of(&work, C);
     let x = clone_on(&w, "x", "feature");
     w.vci_ok(&x, &["fetch", "--remote", "origin"]);
-    w.run(&x, &[A_DOC], &w.trusted);
+    w.run_format1(&x, &[A_DOC], &w.trusted);
     assert_eq!(root_of(&x, A_DOC), r, "a#lib and a#doc share a manifest");
     w.vci_ok(&x, &["push", "--remote", "origin"]);
     // x also attests C with another key, and does not publish it yet.
-    w.run(&x, &[C], &w.untrusted);
+    w.run_format1(&x, &[C], &w.untrusted);
 
     // work, without fetching, supersedes a#lib and C: their manifests are
     // referenced by nothing work knows of, and are deleted.
@@ -3647,7 +3680,7 @@ fn cargo_a_manifest_another_clone_references_is_never_lost() {
     let c = w.read("c/src/lib.rs");
     w.put("c/src/lib.rs", &format!("{c}\n// change\n"));
     w.git(&work, &["commit", "-qam", "a and c change"]);
-    let err = w.run(&work, &[A_LIB, C], &w.trusted);
+    let err = w.run_format1(&work, &[A_LIB, C], &w.trusted);
     assert!(err.contains("removed 2 superseded"), "{err}");
     assert!(err.contains("removed 2 input manifest(s)"), "{err}");
     let manifest_value = |root: &str| {
@@ -3710,7 +3743,8 @@ fn cargo_prune_keeps_the_manifest_of_an_unparsable_attestation() {
     let root = st["predicate"]["inputRoot"].as_str().unwrap().to_owned();
     st["predicate"]["issuedAt"] = "2026-10-16T21:20:19.5+00:00 (a later format)".into();
     let b64 = base64::engine::general_purpose::STANDARD;
-    let mut env: Value = serde_json::from_slice(&stored.bytes).unwrap();
+    let mut env: Value =
+        serde_json::from_slice(&store_common::envelope_json(&stored.bytes)).unwrap();
     env["payload"] = b64.encode(serde_json::to_vec(&st).unwrap()).into();
     store
         .put(
@@ -4074,4 +4108,88 @@ fn every_command_appends_its_steps_to_the_metrics_log() {
             .success()
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+}
+
+/// A run of every unit of the fixture has several header groups (STORE-V2
+/// sections 1.3 and 1.4; the M3 tests row of section 6): each crate's
+/// units read that crate's `Cargo.toml` as a global input, so a's two
+/// units share one hdr and b, c and d have one each, with a tables object
+/// per group and one shape and state for the run. Every record names its
+/// group's hdr, which decodes to a global manifest listing the crate's
+/// manifest with the workspace's and the lock file; the plan skips every
+/// unit; and an edit of one crate's `Cargo.toml` runs that crate's units
+/// alone, the entry named.
+#[test]
+fn cargo_run_with_several_hdr_groups_is_written_and_planned() {
+    use vci_store::AttestationStore as _;
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let all = [A_LIB, A_DOC, B, C, D];
+    let (code, err) = w.run_env(&[], &[("VCI_TIMING", "1")]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        err.contains("format-3 run: 4 hdr, 4 tables, 1 shape, 1 state object(s) over 5 unit(s)"),
+        "{err}"
+    );
+    assert_eq!(w.plan(&work, "main").skip, set(&all));
+
+    let store = vci_git::GitMetaStore::new(store_for(&work));
+    let mut hdr_of: std::collections::BTreeMap<&str, String> = Default::default();
+    for unit in all {
+        let mut listed = store.list_units(&[unit]).unwrap().remove(0);
+        assert_eq!(listed.len(), 1, "one record of {unit}");
+        let mut refs: Vec<&mut vci_store::StoredEnvelope> = listed.iter_mut().collect();
+        store.read_values(&mut refs).unwrap();
+        let e = listed.remove(0);
+        let Ok(vci_store::Record::FormatThree(frame)) = vci_store::decode_record(&e.bytes) else {
+            panic!("{unit}: a format-3 frame");
+        };
+        let st: vci_attest::Statement = serde_json::from_slice(&frame.statement).unwrap();
+        assert_eq!(st.predicate_type, vci_core::PREDICATE_TYPE_V2);
+        let p: vci_core::VciPredicateV2 = serde_json::from_value(st.predicate.clone()).unwrap();
+        hdr_of.insert(unit, p.hdr);
+    }
+    assert_eq!(hdr_of[A_LIB], hdr_of[A_DOC], "a's units share a hdr");
+    let distinct: BTreeSet<&str> = hdr_of.values().map(String::as_str).collect();
+    assert_eq!(distinct.len(), 4, "{hdr_of:?}");
+    let ids: Vec<&str> = distinct.iter().copied().collect();
+    let objects = store.get_objects(&ids).unwrap();
+    assert_eq!(objects.len(), 4, "every hdr is stored");
+    for (unit, dir) in [(A_LIB, "a"), (B, "b"), (C, "c"), (D, "d")] {
+        let o = objects.iter().find(|o| o.id == hdr_of[unit]).unwrap();
+        let hdr = vci_core::Hdr::decode(&o.bytes).unwrap();
+        assert_eq!(hdr.adapter, "cargo");
+        let paths: BTreeSet<&str> = hdr
+            .global_manifest
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+        let own = format!("{dir}/Cargo.toml");
+        assert!(
+            paths.contains(own.as_str())
+                && paths.contains("Cargo.toml")
+                && paths.contains("Cargo.lock"),
+            "{unit}'s global manifest: {paths:?}"
+        );
+        for other in ["a", "b", "c", "d"] {
+            if other != dir {
+                assert!(
+                    !paths.contains(format!("{other}/Cargo.toml").as_str()),
+                    "{unit}'s global manifest lists only its crate: {paths:?}"
+                );
+            }
+        }
+    }
+
+    // One crate's manifest edited: its units run on their group's hdr,
+    // the others skip on theirs.
+    let toml = w.read("b/Cargo.toml");
+    w.put("b/Cargo.toml", &format!("{toml}\n# edited\n"));
+    let p = w.plan(&work, "main");
+    assert_eq!(p.run, set(&[B]), "{p:?}");
+    assert_eq!(p.skip, set(&[A_LIB, A_DOC, C, D]), "{p:?}");
+    let ex = w.explain(&work, B, "main");
+    assert!(ex.contains("b/Cargo.toml"), "{ex}");
+    w.put("b/Cargo.toml", &toml);
+    assert_eq!(w.plan(&work, "main").skip, set(&all));
 }

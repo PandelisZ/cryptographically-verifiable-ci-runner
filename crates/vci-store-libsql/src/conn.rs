@@ -20,10 +20,15 @@
 //!   server has answered one, it is given up after the connect timeout
 //!   too, so a server that accepts and never answers (or answers too
 //!   slowly to be used) costs the connect timeout, not the request
-//!   timeout. Every other request is given up after the request timeout.
-//!   The first failure to reach the server, and the first deadline that
-//!   runs out, latch the circuit breaker: every later call of the handle
-//!   fails at once.
+//!   timeout. Every other request is given up after the request timeout,
+//!   and, once the server has answered the handle, sent once more on a new
+//!   connection with a deadline of its own (a hint's write, at most
+//!   [`HINT_TIMEOUT`], is not; a transaction of a write batch is asked
+//!   about and left to its batch to send again, see
+//!   [`Conn::batch_checked`]). The first failure to reach the server, a
+//!   deadline before the server first answered, and a request out of time
+//!   again when sent again ([`TRIES_AFTER_TIMEOUT`]) latch the circuit
+//!   breaker: every later call of the handle fails at once.
 //! * **Lost connections.** A request whose connection was lost under it
 //!   (a keep-alive connection the server, or a proxy, closed while it sat
 //!   idle, found out only when the next request went out on it; a reset)
@@ -126,7 +131,8 @@ pub(crate) fn is_no_writes(e: &StoreError) -> bool {
     matches!(e, StoreError::Denied { detail, .. } if detail.contains(TAKES_NO_WRITES))
 }
 
-/// The most connections one handle opens.
+/// The most requests one handle sends at once (its pool holds one
+/// connection more, see [`Conn::checkout`]).
 const MAX_POOL: usize = 4;
 
 /// The error of a libSQL request that is not a store error of its own
@@ -450,15 +456,120 @@ impl tower_service::Service<http::Uri> for Connector {
 
 // ---- what a failure means ---------------------------------------------------------
 
-/// What a request is, for the words of its errors.
+/// What a request is, for the words of its errors and its deadline.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Op {
     /// The operation a privilege error names ("read", "write").
     pub(crate) verb: &'static str,
+    /// A hint's write (a memo, a flag): best effort, given at most
+    /// [`HINT_TIMEOUT`], never sent again after its deadline, and never
+    /// latching the breaker.
+    pub(crate) hint: bool,
+    /// The question whether a write transaction was committed (a read of
+    /// one row by its key): given at most [`Conn::probe_timeout`], so that
+    /// when the server answers neither the write nor the question, the
+    /// write is sent again within the process's retry time rather than the
+    /// question using it up.
+    pub(crate) probe: bool,
+    /// What a deadline that ran out does, once the server has answered
+    /// the handle (before that it latches the breaker).
+    pub(crate) on_timeout: OnTimeout,
 }
 
-pub(crate) const READ: Op = Op { verb: "read" };
-pub(crate) const WRITE: Op = Op { verb: "write" };
+/// See [`Op::on_timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnTimeout {
+    /// Sent once more, on a new connection, with a deadline of its own;
+    /// out of time again, it latches the breaker.
+    Resend,
+    /// Fails alone, latching nothing: a hint, or a request of a read of
+    /// values (`Remote::query_values`), which may share the connection's
+    /// bandwidth with others, so that one out of time may well be in time
+    /// alone or at half the size: the read sends its keys again itself, in
+    /// halves.
+    FailAlone,
+    /// Latches the breaker: the request sent again by its caller.
+    Latch,
+}
+
+pub(crate) const READ: Op = Op {
+    verb: "read",
+    hint: false,
+    probe: false,
+    on_timeout: OnTimeout::Resend,
+};
+pub(crate) const WRITE: Op = Op {
+    verb: "write",
+    hint: false,
+    probe: false,
+    on_timeout: OnTimeout::Resend,
+};
+/// A hint's write ([`Op::hint`]).
+pub(crate) const HINT: Op = Op {
+    verb: "write",
+    hint: true,
+    probe: false,
+    on_timeout: OnTimeout::FailAlone,
+};
+/// A request of a read of values, first sent ([`OnTimeout::FailAlone`]).
+pub(crate) const READ_SHARED: Op = Op {
+    verb: "read",
+    hint: false,
+    probe: false,
+    on_timeout: OnTimeout::FailAlone,
+};
+/// A read sent again by its caller after a [`READ_SHARED`] ran out of
+/// time ([`OnTimeout::Latch`]).
+pub(crate) const READ_AGAIN: Op = Op {
+    verb: "read",
+    hint: false,
+    probe: false,
+    on_timeout: OnTimeout::Latch,
+};
+/// A write transaction of the store's batches, whose caller asks, when
+/// its deadline runs out, whether the server committed it, and sends it
+/// again itself ([`Conn::batch_checked`]): it fails alone.
+const WRITE_ONCE: Op = Op {
+    verb: "write",
+    hint: false,
+    probe: false,
+    on_timeout: OnTimeout::FailAlone,
+};
+/// The question whether such a write was committed, given at most
+/// [`Conn::probe_timeout`]: unanswered in time, it fails alone (the write
+/// is then sent again, which is safe: its guard refuses a second copy).
+const PROBE: Op = Op {
+    verb: "read",
+    hint: false,
+    probe: true,
+    on_timeout: OnTimeout::FailAlone,
+};
+
+thread_local! {
+    /// How many requests the last call of this thread that succeeded sent
+    /// ([`last_requests`]).
+    static LAST_REQUESTS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many requests the last call of this thread that succeeded sent in
+/// its try that succeeded (2: a statement described first, then run).
+pub(crate) fn last_requests() -> u64 {
+    LAST_REQUESTS.with(Cell::get)
+}
+
+/// The longest a hint's write waits ([`Op::hint`]): it waits behind other
+/// writers for the server's one write lock, and nothing waits for it to
+/// be stored.
+pub(crate) const HINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many times a request whose deadline ran out (once the server has
+/// answered the handle) is sent, each on a new connection with a deadline
+/// of its own: one slow answer (a large read while other jobs write, a
+/// write that waited for the lock) costs that call a second try, not the
+/// handle; the same request out of time again means the server cannot be
+/// used, and latches the breaker. Counted per request, not per handle, so
+/// that the requests a read sends at once do not use up each other's try.
+const TRIES_AFTER_TIMEOUT: u32 = 2;
 
 /// Why a call failed: the tables are not there (reads answer as an empty
 /// store), or a store error.
@@ -677,6 +788,13 @@ pub(crate) struct Conn {
     /// The server has answered a request of this handle: later requests
     /// get the request timeout, not the connect timeout.
     answered: AtomicBool,
+    /// Bytes of the values (and other text and blob columns) read, as
+    /// stored (compressed values compressed): what the timing lines show.
+    received: AtomicU64,
+    /// The shortest time a request of this handle took to be answered, in
+    /// microseconds (`u64::MAX`: none yet): the wait every answer has,
+    /// whatever its size ([`Conn::fastest`]).
+    fastest_us: AtomicU64,
 }
 
 impl Conn {
@@ -708,6 +826,8 @@ impl Conn {
             requests: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             answered: AtomicBool::new(false),
+            received: AtomicU64::new(0),
+            fastest_us: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -726,6 +846,46 @@ impl Conn {
     /// connection was lost under them.
     pub(crate) fn retries(&self) -> u64 {
         self.retries.load(Ordering::Relaxed)
+    }
+
+    /// The most requests this handle sends at once (a read of values); the
+    /// pool holds one connection more.
+    pub(crate) fn max(&self) -> usize {
+        self.max
+    }
+
+    /// The request timeout.
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// The deadline of the question whether a write transaction out of
+    /// time was committed ([`Conn::batch_checked`]): a quarter of the
+    /// request timeout, at most [`HINT_TIMEOUT`] (5 s at the default 30 s).
+    /// It is a read of one row by its key, which does not wait for the
+    /// write lock. 2.8.2 as first reviewed gave it the whole request
+    /// timeout, so that while the server answered nothing one try of a
+    /// transaction cost two timeouts (60 s), the process's whole retry
+    /// time, and the transaction was never sent again.
+    pub(crate) fn probe_timeout(&self) -> Duration {
+        (self.timeout / 4).min(HINT_TIMEOUT)
+    }
+
+    /// Bytes of text and blob columns read so far (values as stored).
+    pub(crate) fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
+    }
+
+    /// The shortest time a request of this handle took to be answered
+    /// (zero before any was): about the wait for each answer that does not
+    /// grow with its size (the round trip, the server's own time, a
+    /// proxy's), which a read of values leaves out when it sizes its
+    /// requests (`Remote::query_values`).
+    pub(crate) fn fastest(&self) -> Duration {
+        match self.fastest_us.load(Ordering::Relaxed) {
+            u64::MAX => Duration::ZERO,
+            us => Duration::from_micros(us),
+        }
     }
 
     /// Whether the server has answered a request of this handle.
@@ -827,18 +987,26 @@ impl Conn {
         })
     }
 
-    /// A connection from the pool, a new one when none is idle and the pool
-    /// is not full; waiting at most the connect timeout otherwise.
-    fn checkout(&self) -> Result<Pooled, StoreError> {
+    /// A connection from the pool (one that has `sql` described, when one
+    /// that is idle has), a new one when none is idle and the pool is not
+    /// full; waiting at most the connect timeout otherwise. The pool holds
+    /// one connection more than requests are sent at once ([`Conn::max`]):
+    /// the one the plan's other reads use while the others read values or
+    /// are described ahead ([`Conn::describe_ahead`]).
+    fn checkout(&self, sql: Option<&str>) -> Result<Pooled, StoreError> {
         self.check()?;
         let db = self.database()?;
         let deadline = Instant::now() + self.connect_timeout;
         let mut p = self.lock_pool();
         loop {
+            let described = sql.and_then(|s| p.idle.iter().rposition(|c| c.stmts.contains_key(s)));
+            if let Some(i) = described {
+                return Ok(p.idle.remove(i));
+            }
             if let Some(c) = p.idle.pop() {
                 return Ok(c);
             }
-            if p.open < self.max {
+            if p.open < self.max + 1 {
                 p.open += 1;
                 drop(p);
                 let connected = guarded(|| db.connect()).unwrap_or_else(|()| {
@@ -1113,8 +1281,17 @@ impl Conn {
     /// again on a new connection ([`RESEND`], [`Conn::renew`]), and latches
     /// the breaker only when that fails too or the deadline leaves no time
     /// for it (before any answer, it latches the breaker at once). A panic
-    /// in the client is a latched `Unavailable`.
-    fn run<T, F>(&self, op: Op, bounded_first: bool, mut f: F) -> Result<T, Fail>
+    /// in the client is a latched `Unavailable`. With `until`, no try runs
+    /// past it: a try it cut short fails alone (latching nothing), and none
+    /// is sent again after it.
+    fn run<T, F>(
+        &self,
+        op: Op,
+        bounded_first: bool,
+        until: Option<Instant>,
+        sql: Option<&str>,
+        mut f: F,
+    ) -> Result<T, Fail>
     where
         F: for<'a> FnMut(
             &'a mut Pooled,
@@ -1123,24 +1300,41 @@ impl Conn {
         ) -> Pin<Box<dyn Future<Output = libsql::Result<T>> + 'a>>,
     {
         let rt = self.runtime()?;
-        let mut c = self.checkout()?;
+        let mut c = self.checkout(sql)?;
         // A server that accepts and never answers (a frozen server, a
         // stuck proxy) costs the connect timeout, not the request timeout.
-        let (timeout, operation) = if bounded_first && !self.answered() {
+        let first = bounded_first && !self.answered();
+        let (timeout, operation) = if first {
             (self.first_answer_timeout(), "the server's first answer")
+        } else if op.hint {
+            (self.timeout.min(HINT_TIMEOUT), "a hint's write")
+        } else if op.probe {
+            (
+                self.probe_timeout(),
+                "the question whether a write was committed",
+            )
         } else {
             (self.timeout, "a request")
         };
-        let deadline = Instant::now() + timeout;
+        // This try's deadline, and whether `until` cut it short.
+        let bound = |from: Instant| match until {
+            Some(u) if u < from + timeout => (u, true),
+            _ => (from + timeout, false),
+        };
+        let mut started = Instant::now();
+        let (mut deadline, mut cut_short) = bound(started);
         let mut pause = Duration::from_millis(10);
         let mut renewed = false;
         // Times sent again on a new connection.
         let mut resent = 0;
+        // Times its deadline ran out.
+        let mut timed_out = 0;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let fresh = c.used.elapsed() > STREAM_IDLE;
             // This attempt's requests (other threads send theirs at once).
             let sent = AtomicU64::new(0);
+            let tried = Instant::now();
             let r = guarded(|| {
                 rt.block_on(async {
                     if fresh {
@@ -1163,6 +1357,14 @@ impl Conn {
             match r {
                 Ok(Ok(v)) => {
                     self.answered.store(true, Ordering::Relaxed);
+                    // Each of its requests (a statement's description and
+                    // the statement) waited for its answer in turn.
+                    LAST_REQUESTS.with(|l| l.set(sent));
+                    let each = tried.elapsed() / u32::try_from(sent.max(1)).unwrap_or(u32::MAX);
+                    self.fastest_us.fetch_min(
+                        u64::try_from(each.as_micros()).unwrap_or(u64::MAX - 1),
+                        Ordering::Relaxed,
+                    );
                     self.give_back(Some(c));
                     return Ok(v);
                 }
@@ -1212,23 +1414,79 @@ impl Conn {
                         std::thread::sleep(wait);
                         if let Err(e) = self.renew(rt, &mut c) {
                             self.give_back(None);
-                            return Err(Fail::Store(self.latch(e)));
+                            return Err(Fail::Store(if op.hint { e } else { self.latch(e) }));
                         }
                         continue;
                     }
                     self.give_back((!class.lost).then_some(c));
+                    // A hint never latches: nothing waits for it, and the
+                    // calls that need the server find out themselves.
                     return Err(match class.fail {
-                        Fail::Store(e) if class.latch => Fail::Store(self.latch(e)),
+                        Fail::Store(e) if class.latch && !op.hint => Fail::Store(self.latch(e)),
                         other => other,
                     });
                 }
                 Err(_) => {
-                    self.give_back(None);
-                    return Err(Fail::Store(self.latch(StoreError::Timeout {
+                    let e = StoreError::Timeout {
                         backend: KIND,
-                        operation,
-                        after: timeout,
-                    })));
+                        operation: if cut_short {
+                            "a request (cut short: the read it is part of ran out of time)"
+                        } else {
+                            operation
+                        },
+                        after: if cut_short {
+                            deadline.saturating_duration_since(started)
+                        } else {
+                            timeout
+                        },
+                    };
+                    timed_out += 1;
+                    // A hint is dropped (nothing waits for it), a read
+                    // beside others is sent again by its caller, and a
+                    // request whose caller's time ran out fails alone.
+                    if (op.on_timeout == OnTimeout::FailAlone || cut_short)
+                        && !first
+                        && self.answered()
+                    {
+                        self.give_back(None);
+                        return Err(Fail::Store(e));
+                    }
+                    // Once the server has answered the handle, a request
+                    // whose deadline ran out is sent once more, on a new
+                    // connection (the one it went out on is in an unknown
+                    // state), with a deadline of its own; reads change
+                    // nothing, and a write is safe to send again (see
+                    // `Conn::batch`). A server that never answered is out
+                    // of reach: latched at once, as before.
+                    let answered = self.answered();
+                    if !first
+                        && op.on_timeout == OnTimeout::Resend
+                        && timed_out < TRIES_AFTER_TIMEOUT
+                        && answered
+                    {
+                        // The caller's time ran out: not sent again.
+                        if until.is_some_and(|u| Instant::now() >= u) {
+                            self.give_back(None);
+                            return Err(Fail::Store(e));
+                        }
+                        self.retries.fetch_add(sent.max(1), Ordering::Relaxed);
+                        // Unless another request latched the breaker
+                        // meanwhile.
+                        if let Err(e) = self.check() {
+                            self.give_back(None);
+                            return Err(Fail::Store(e));
+                        }
+                        if let Err(e) = self.renew(rt, &mut c) {
+                            self.give_back(None);
+                            return Err(Fail::Store(self.latch(e)));
+                        }
+                        started = Instant::now();
+                        (deadline, cut_short) = bound(started);
+                        pause = Duration::from_millis(10);
+                        continue;
+                    }
+                    self.give_back(None);
+                    return Err(Fail::Store(self.latch(e)));
                 }
             }
         }
@@ -1277,9 +1535,22 @@ impl Conn {
         sql: &str,
         params: Vec<libsql::Value>,
     ) -> Result<Vec<Vec<libsql::Value>>, Fail> {
+        self.query_until(op, sql, params, None)
+    }
+
+    /// [`Conn::query`], given up at `until` at the latest (see
+    /// [`Conn::run`]): a try it cuts short fails alone.
+    pub(crate) fn query_until(
+        &self,
+        op: Op,
+        sql: &str,
+        params: Vec<libsql::Value>,
+        until: Option<Instant>,
+    ) -> Result<Vec<Vec<libsql::Value>>, Fail> {
         let sql = sql.to_owned();
         let first = self.first_answer_timeout();
-        self.run(op, false, move |c, n, answered| {
+        let described = sql.clone();
+        let rows = self.run(op, false, until, Some(&described), move |c, n, answered| {
             let (sql, params) = (sql.clone(), params.clone());
             Box::pin(async move {
                 if !c.stmts.contains_key(&sql) {
@@ -1313,7 +1584,55 @@ impl Conn {
                 }
                 Ok(out)
             })
-        })
+        })?;
+        let got: usize = rows
+            .iter()
+            .flatten()
+            .map(|x| match x {
+                libsql::Value::Blob(b) => b.len(),
+                libsql::Value::Text(t) => t.len(),
+                _ => 0,
+            })
+            .sum();
+        self.received
+            .fetch_add(u64::try_from(got).unwrap_or(u64::MAX), Ordering::Relaxed);
+        Ok(rows)
+    }
+
+    /// Have the server describe `sqls` on as many connections as requests
+    /// go at once ([`Conn::max`]), at once, so that the reads that use them
+    /// later send
+    /// only their own request (the description, which libsql's statements
+    /// need, is one more round trip per statement and connection: about a
+    /// second each behind a link that waits that long for every answer).
+    /// Done by the store's warm-up, while the command works on other
+    /// things; a statement already described on a connection is not sent
+    /// again, and a failure only leaves the description to the read.
+    pub(crate) fn describe_ahead(&self, sqls: &[&str]) {
+        std::thread::scope(|sc| {
+            for _ in 0..self.max {
+                sc.spawn(|| {
+                    // Fails alone: a description out of time latches
+                    // nothing (the read describes it again).
+                    let _ = self.run(READ_SHARED, false, None, None, |c, n, answered| {
+                        let todo: Vec<String> = sqls
+                            .iter()
+                            .filter(|s| !c.stmts.contains_key(**s))
+                            .map(|s| (*s).to_owned())
+                            .collect();
+                        Box::pin(async move {
+                            for sql in todo {
+                                n.fetch_add(1, Ordering::Relaxed);
+                                let st = c.conn.prepare(&sql).await?;
+                                answered.store(true, Ordering::Relaxed);
+                                c.stmts.insert(sql, st);
+                            }
+                            Ok(())
+                        })
+                    });
+                });
+            }
+        });
     }
 
     /// Apply `statements` (literals only, no parameters) in one
@@ -1377,12 +1696,61 @@ impl Conn {
     /// batch sent again waits for it as for any other writer, within its
     /// deadline.
     pub(crate) fn batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
+        self.send_batch(op, statements)
+    }
+
+    /// A write transaction of the store's batches (`crate::batch`): sent
+    /// once, and when its deadline runs out (or it waited for the write
+    /// lock until then), `committed` (a read that returns a row only once
+    /// the transaction is applied: its nonce in the change log, `crate::
+    /// batch::Tx`) asks the server whether it committed it. One that has
+    /// committed is `Ok`; one that has not (or whose question went
+    /// unanswered within [`Conn::probe_timeout`]) is the timeout, which
+    /// latches nothing: the caller sends
+    /// it again as it was, within the process's retry time
+    /// (`Remote::spend_on_writes`). The question is a read, which does not
+    /// wait for the write lock, so a transaction still waiting for it
+    /// answers "not committed" and may commit afterwards (on vex's Turso
+    /// database it did, 30 s after the client gave up): the transaction's
+    /// first statement then refuses whichever of the two copies comes
+    /// second, so it is applied once.
+    pub(crate) fn batch_checked(
+        &self,
+        statements: &[String],
+        committed: Option<&str>,
+    ) -> Result<(), Fail> {
+        let r = self.send_batch(WRITE_ONCE, statements);
+        let Some(probe) = committed else {
+            return r;
+        };
+        match r {
+            Err(Fail::Store(e @ StoreError::Timeout { .. }))
+                if self.answered() && self.check().is_ok() =>
+            {
+                self.retries.fetch_add(1, Ordering::Relaxed);
+                match self.query(PROBE, probe, Vec::new()) {
+                    Ok(rows) if !rows.is_empty() => Ok(()),
+                    _ => Err(Fail::Store(e)),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Latch the circuit breaker with `e` (a timeout or an unavailable
+    /// server) from outside a request: the process's time for writes that
+    /// fail ran out (`Remote::spend_on_writes`).
+    pub(crate) fn latch_now(&self, e: StoreError) -> StoreError {
+        self.latch(e)
+    }
+
+    fn send_batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
         if statements.is_empty() {
             return Ok(());
         }
         let sql = format!("BEGIN IMMEDIATE;\n{};\nCOMMIT", statements.join(";\n"));
         let db = self.database()?;
-        self.run(op, true, move |c, n, _| {
+        self.run(op, true, None, None, move |c, n, _| {
             let sql = sql.clone();
             // libsql closes the stream with the batch only while it believes
             // the stream is outside a transaction, and a batch that stopped
@@ -1491,26 +1859,63 @@ pub(crate) fn col_int(v: &libsql::Value) -> Option<i64> {
     }
 }
 
-/// A stored value as it can be read: its bytes when its encoding is raw,
-/// else why not.
+/// The `encoding` of a value stored as it is.
+pub(crate) const RAW: i64 = 0;
+/// The `encoding` of a value stored as one zstd frame (2.8.2): what a
+/// reader decompresses, to at most [`MAX_RECORD`] bytes.
+pub(crate) const ZSTD: i64 = 1;
+
+/// The zstd level values are compressed at: about 3x smaller for vex's
+/// envelopes and manifests (JSON), a few milliseconds per value.
+const ZSTD_LEVEL: i32 = 6;
+
+/// `b` compressed as one zstd frame ([`ZSTD`]); `None` if that fails (the
+/// value is then stored as it is).
+pub(crate) fn compress(b: &[u8]) -> Option<Vec<u8>> {
+    zstd::bulk::compress(b, ZSTD_LEVEL).ok()
+}
+
+/// The bytes of one zstd frame, refused when they decompress to more than
+/// [`MAX_RECORD`] bytes (no value vci stores is larger).
+pub(crate) fn decompress(b: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    let cap = u64::try_from(MAX_RECORD).unwrap_or(u64::MAX);
+    zstd::stream::read::Decoder::with_buffer(b)
+        .and_then(|d| d.take(cap + 1).read_to_end(&mut out))
+        .map_err(|e| format!("the stored value is not a zstd frame vci can read ({e})"))?;
+    if out.len() > MAX_RECORD {
+        return Err(format!(
+            "the stored value decompresses to more than {MAX_RECORD} bytes"
+        ));
+    }
+    Ok(out)
+}
+
+/// A stored value as it can be read: its bytes (decompressed when stored
+/// compressed), else why not.
 pub(crate) fn col_value(
     value: &libsql::Value,
     encoding: &libsql::Value,
 ) -> Result<Vec<u8>, String> {
-    match col_int(encoding) {
-        Some(0) => {}
+    let enc = match col_int(encoding) {
+        Some(n @ (RAW | ZSTD)) => n,
         Some(n) => {
             return Err(format!(
-                "the {KIND} store holds this value in an encoding this vci cannot read ({n})"
+                "the {KIND} store holds this value in an encoding this vci cannot read ({n}): a newer vci wrote it"
             ));
         }
         None => return Err("the stored value has no valid encoding".to_owned()),
+    };
+    let bytes = match value {
+        libsql::Value::Blob(b) => b.as_slice(),
+        libsql::Value::Text(s) => s.as_bytes(),
+        _ => return Err("the stored value is not a byte string".to_owned()),
+    };
+    if enc == ZSTD {
+        return decompress(bytes);
     }
-    match value {
-        libsql::Value::Blob(b) => Ok(b.clone()),
-        libsql::Value::Text(s) => Ok(s.clone().into_bytes()),
-        _ => Err("the stored value is not a byte string".to_owned()),
-    }
+    Ok(bytes.to_vec())
 }
 
 #[cfg(test)]

@@ -16,10 +16,15 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::hash::{self, ABSENT_HASH, ChildType, Enc, INPUT_ROOT_DOMAIN, blake3_hex};
+use crate::objects::ShapeEntry;
 use crate::path::{PathError, RepoPath, strip_root};
 
 /// Maximum symlink hops followed from one observed path.
 pub const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Domain tag for [`InputManifest::entries_root`] (store format 3,
+/// `docs/design/STORE-V2.md` section 1.1: the signed `entriesRoot`).
+pub const ENTRIES_ROOT_DOMAIN: &[u8] = b"vci/entries-root/v1";
 
 /// `hash` of an [`EntryKind::Dir`] entry: BLAKE3 of the bytes `dir`.
 pub fn dir_type_hash() -> String {
@@ -326,6 +331,8 @@ pub enum ManifestError {
     NeedsBase(String),
     #[error("base input manifest {0} is not in the store")]
     MissingBase(String),
+    #[error("the observed entries do not follow the resolved set: {0}")]
+    Observed(String),
 }
 
 fn io_err(path: &Utf8Path, source: io::Error) -> ManifestError {
@@ -972,6 +979,60 @@ fn capture_one(
     Ok(out)
 }
 
+/// Observes every entry of `set[from..]` at `src`, in order: what a verifier
+/// finds at HEAD for an attested `(path, kind, exec)` set (store format 3,
+/// `docs/design/STORE-V2.md` section 1.5 step 8), and what a diff compares with
+/// the attested values. The attested kind only chooses how to look
+/// (type-only for a [`EntryKind::Dir`], the autoload index for an
+/// [`EntryKind::AutoloadMiss`]); the entry reports what is there now. An
+/// [`EntryKind::AutoloadDir`] and an [`EntryKind::Excluded`] entry are not
+/// inputs: they come back as their constant entries, having marked the
+/// autoload directories and the children the listings leave out, which,
+/// like `extra_excluded` (git-ignored children, since 2.0.3), are taken from
+/// the whole set.
+fn observe_from(
+    src: Source<'_>,
+    set: &[ShapeEntry],
+    extra_excluded: &[RepoPath],
+    from: usize,
+) -> Result<Vec<InputEntry>, ManifestError> {
+    let mut excl = exclusions(
+        set.iter()
+            .filter(|e| e.kind == EntryKind::Excluded)
+            .map(|e| &e.path),
+    );
+    for (parent, names) in exclusions(extra_excluded.iter()) {
+        excl.entry(parent).or_default().extend(names);
+    }
+    let autoload_dirs: Vec<RepoPath> = set
+        .iter()
+        .filter(|e| e.kind == EntryKind::AutoloadDir)
+        .map(|e| e.path.clone())
+        .collect();
+    let autoload_idx = if autoload_dirs.is_empty() {
+        AutoloadIndex::new()
+    } else {
+        src.autoload_index(&autoload_dirs)?
+    };
+    set[from.min(set.len())..]
+        .par_iter()
+        .map(|exp| {
+            Ok(match exp.kind {
+                EntryKind::AutoloadDir => InputEntry {
+                    path: exp.path.clone(),
+                    kind: EntryKind::AutoloadDir,
+                    exec: false,
+                    size: 0,
+                    hash: autoload_dir_hash(),
+                },
+                EntryKind::Excluded => InputEntry::excluded(exp.path.clone()),
+                EntryKind::AutoloadMiss => src.autoload_miss(&exp.path, &autoload_idx)?,
+                _ => src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?,
+            })
+        })
+        .collect()
+}
+
 fn validate_env_key(k: &str) -> Result<(), ManifestError> {
     if k.is_empty() || k.contains('=') || k.contains('\0') {
         return Err(ManifestError::InvalidEnvKey(k.to_owned()));
@@ -1128,22 +1189,13 @@ impl InputManifest {
     ///
     /// The result does not depend on the order of the vectors.
     pub fn root(&self) -> String {
-        let mut entries: Vec<&InputEntry> = self.entries.iter().collect();
-        entries.sort();
         let mut externals: Vec<&External> = self.externals.iter().collect();
         externals.sort();
         let mut env: Vec<&EnvEntry> = self.env.iter().collect();
         env.sort();
 
         let mut e = Enc::new(INPUT_ROOT_DOMAIN);
-        e.str("entries").u64(entries.len() as u64);
-        for x in entries {
-            e.str(x.path.as_str())
-                .str(x.kind.tag())
-                .u64(x.exec as u64)
-                .u64(x.size)
-                .str(&x.hash);
-        }
+        self.encode_entries(&mut e);
         e.str("externals").u64(externals.len() as u64);
         for x in externals {
             e.str(&x.name).str(&x.version);
@@ -1153,6 +1205,93 @@ impl InputManifest {
             e.str(&x.key).str(&x.hash);
         }
         e.finish()
+    }
+
+    /// The entries section of [`Self::root`]'s encoding: `"entries"`, the
+    /// count, then per entry in sorted order path, kind tag, exec, size and
+    /// hash.
+    fn encode_entries(&self, e: &mut Enc) {
+        let mut entries: Vec<&InputEntry> = self.entries.iter().collect();
+        entries.sort();
+        e.str("entries").u64(entries.len() as u64);
+        for x in entries {
+            e.str(x.path.as_str())
+                .str(x.kind.tag())
+                .u64(x.exec as u64)
+                .u64(x.size)
+                .str(&x.hash);
+        }
+    }
+
+    /// The signed `entriesRoot` of a format-3 statement (store format 3,
+    /// `docs/design/STORE-V2.md` section 1.1): lowercase hex BLAKE3 of the domain
+    /// tag [`ENTRIES_ROOT_DOMAIN`] followed by the entries section exactly
+    /// as [`Self::root`] encodes it (externals and env left out). `vci run`'s
+    /// supersession compares two records' entries through it ("the same
+    /// files") without decoding either manifest. Independent of the entries'
+    /// order.
+    pub fn entries_root(&self) -> String {
+        let mut e = Enc::new(ENTRIES_ROOT_DOMAIN);
+        self.encode_entries(&mut e);
+        e.finish()
+    }
+
+    /// Observes an attested `(path, kind, exec)` set (a descriptor resolved
+    /// against its shape, [`crate::ResolvedManifest::set`]) at the checkout
+    /// `cache` observes, one entry per element of `set` in its order, with
+    /// what is there now (store format 3, `docs/design/STORE-V2.md` section 1.5
+    /// step 8). The attested kind chooses only how to look; a
+    /// [`EntryKind::Dir`] is observed type-only, an [`EntryKind::AutoloadMiss`]
+    /// through the set's [`EntryKind::AutoloadDir`] directories, a listing
+    /// without the set's [`EntryKind::Excluded`] children and without
+    /// `extra_excluded` (what git ignores in this checkout), and the autoload
+    /// directories and the exclusions come back as their constant entries.
+    /// This is what [`Self::diff_against_cache_from`] observes before it
+    /// compares; [`Self::from_observed`] makes the manifest whose
+    /// [`Self::root`] must equal the signed input root.
+    pub fn observe(
+        set: &[ShapeEntry],
+        cache: &CheckoutCache,
+        extra_excluded: &[RepoPath],
+    ) -> Result<Vec<InputEntry>, ManifestError> {
+        observe_from(Source::Cache(cache), set, extra_excluded, 0)
+    }
+
+    /// The manifest of an observation ([`Self::observe`] of `set`, one
+    /// entry per element in its order) with the attested externals and env
+    /// of the resolved descriptor: its [`Self::root`] equals the signed
+    /// input root exactly when the observed `(path, kind, exec, size, hash)`
+    /// sequence is the attested one. The externals and env are attested
+    /// data, so root equality tests the files only; their own checks run on
+    /// the lists as today. An observation that does not follow the set
+    /// (another length, another path at an index) is
+    /// [`ManifestError::Observed`].
+    pub fn from_observed(
+        set: &[ShapeEntry],
+        observed: Vec<InputEntry>,
+        externals: Vec<External>,
+        env: Vec<EnvEntry>,
+    ) -> Result<Self, ManifestError> {
+        if observed.len() != set.len() {
+            return Err(ManifestError::Observed(format!(
+                "{} observed entries for a set of {}",
+                observed.len(),
+                set.len()
+            )));
+        }
+        if let Some((s, o)) = set.iter().zip(&observed).find(|(s, o)| s.path != o.path) {
+            return Err(ManifestError::Observed(format!(
+                "{} observed where {} was expected",
+                o.path, s.path
+            )));
+        }
+        let mut entries = observed;
+        entries.sort();
+        Ok(InputManifest {
+            entries,
+            externals,
+            env,
+        })
     }
 
     /// The compact encoding a manifest is stored in on its own (since vci
@@ -1489,49 +1628,28 @@ impl InputManifest {
     where
         F: Fn(&str) -> Option<OsString> + Sync,
     {
-        let mut excl = self.exclusions();
-        for (parent, names) in exclusions(extra_excluded.iter()) {
-            excl.entry(parent).or_default().extend(names);
-        }
-        let autoload_dirs: Vec<RepoPath> = self
-            .entries
+        let set: Vec<ShapeEntry> = self.entries.iter().map(ShapeEntry::of).collect();
+        let from = from.min(self.entries.len());
+        let observed = observe_from(src, &set, extra_excluded, from)?;
+        let mut out: Vec<Mismatch> = self.entries[from..]
             .iter()
-            .filter(|e| e.kind == EntryKind::AutoloadDir)
-            .map(|e| e.path.clone())
-            .collect();
-        let autoload_idx = if autoload_dirs.is_empty() {
-            AutoloadIndex::new()
-        } else {
-            src.autoload_index(&autoload_dirs)?
-        };
-        let entry_results: Vec<Option<Mismatch>> = self.entries[from.min(self.entries.len())..]
-            .par_iter()
-            .map(|exp| {
-                if exp.kind == EntryKind::AutoloadDir {
-                    // Only marks the directory for the lookups.
-                    return Ok(None);
+            .zip(&observed)
+            .filter_map(|(exp, act)| {
+                // An autoload directory only marks itself for the lookups;
+                // an exclusion is not an input, only its parent's listing
+                // leaves it out. Neither is compared.
+                if matches!(exp.kind, EntryKind::AutoloadDir | EntryKind::Excluded)
+                    || exp.same_state(act)
+                {
+                    return None;
                 }
-                if exp.kind == EntryKind::Excluded {
-                    // Not an input: only its parent's listing leaves it out.
-                    return Ok(None);
-                }
-                let act = if exp.kind == EntryKind::AutoloadMiss {
-                    src.autoload_miss(&exp.path, &autoload_idx)?
-                } else {
-                    src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?
-                };
-                Ok(if exp.same_state(&act) {
-                    None
-                } else {
-                    Some(Mismatch {
-                        what: format!("entry:{}", exp.path),
-                        expected: exp.describe(),
-                        actual: act.describe(),
-                    })
+                Some(Mismatch {
+                    what: format!("entry:{}", exp.path),
+                    expected: exp.describe(),
+                    actual: act.describe(),
                 })
             })
-            .collect::<Result<_, ManifestError>>()?;
-        let mut out: Vec<Mismatch> = entry_results.into_iter().flatten().collect();
+            .collect();
 
         for exp in &self.env {
             validate_env_key(&exp.key)?;

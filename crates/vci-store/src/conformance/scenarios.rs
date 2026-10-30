@@ -26,11 +26,14 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
+use vci_core::ObjectKind;
+
 use super::StoreFactory;
 use super::fixtures::{S1, S2, TREE_HEAD, UNIT_A, UNIT_B, UNIT_CARGO, UNIT_ROOT};
 use crate::{
-    AttestationStore, FailedStore, GONE, Hydration, KeyHint, NewAttestation, Prefetch, PushMode,
-    PushStatus, StoreError, StoreStatus, StoredEnvelope, ValueState, key,
+    AttestationStore, Columns, FailedStore, GONE, Hydration, KeyHint, ManifestRef, NewAttestation,
+    NewObject, OBJECT_GRACE, ObjectRefs, Prefetch, PushMode, PushStatus, Record, StoreError,
+    StoreStatus, StoredEnvelope, StoredObject, ValueState, decode_record, key,
 };
 
 /// A unit nothing is ever stored for.
@@ -330,6 +333,7 @@ pub fn c03_invalid_arguments_write_nothing(f: &dyn StoreFactory) {
             storage_key,
             hint: None,
             envelope,
+            columns: None,
         }
     }
     let (tk, target) = (key::test_key(UNIT_A), key::target_label(UNIT_A));
@@ -1952,4 +1956,775 @@ pub fn c34_copy_keeps_keys_and_targets(f: &dyn StoreFactory) {
         assert_eq!((&got.key, &got.target), (&r.key, &r.target));
     }
     assert_eq!(ok(dst.read_all(), "read_all of the copy"), records);
+}
+
+// ---- format-3 fixtures (STORE-V2) ----------------------------------------------
+
+/// The ids of a run's four objects, 64 lowercase hex each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIds {
+    /// The hdr object.
+    pub hdr: String,
+    /// The tables object.
+    pub tables: String,
+    /// The shape object.
+    pub shape: String,
+    /// The state object.
+    pub state: String,
+}
+
+/// A small format-3 run built with vci-core's encoders: one object of each
+/// kind over some paths, and records whose statements name the hdr and the
+/// tables and whose descriptors name the shape. The state object holds raw
+/// 32-byte hashes, so its bytes are not UTF-8: a backend that stores text
+/// has to base64 it, and reading it back equal is what the objects
+/// scenarios check on every backend.
+pub struct Run3 {
+    /// The four objects in the order hdr, tables, shape, state.
+    pub objects: Vec<(ObjectKind, Vec<u8>)>,
+    /// Their ids.
+    pub ids: RunIds,
+    tables: vci_core::Tables,
+}
+
+impl Run3 {
+    /// A run whose shape and state list `paths` (sorted) as files.
+    pub fn build(paths: &[&str]) -> Run3 {
+        let mut sorted: Vec<&str> = paths.to_vec();
+        sorted.sort_unstable();
+        let m = manifest_of(&sorted);
+        let hdr = vci_core::Hdr {
+            repo_id: "github.com/example/repo".into(),
+            adapter: "vitest".into(),
+            project_name: "web".into(),
+            project_dir: String::new(),
+            runner_project: String::new(),
+            tool_version: "2.9.0".into(),
+            rails_inputs: String::new(),
+            env_config_digest: [7; 32],
+            global_input_root: [8; 32],
+            global_manifest: manifest_of(&["package.json"]).entries,
+            global_externals: vec![],
+            global_env: vec![],
+            ignored_inputs: vec![],
+            env_set: vec![],
+            toolchain: vci_core::Toolchain {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                ..Default::default()
+            },
+        };
+        let tables = vci_core::Tables {
+            waivers: vec![],
+            env_names: vec!["TZ".into()],
+            externals: vec![],
+        };
+        let shape = vci_core::Shape {
+            entries: m.entries.iter().map(vci_core::ShapeEntry::of).collect(),
+            groups: vec![],
+        };
+        let state = vci_core::State {
+            entries: m.entries.clone(),
+        };
+        let objects = vec![
+            (ObjectKind::Hdr, hdr.encode().expect("a hdr")),
+            (ObjectKind::Tables, tables.encode().expect("a tables")),
+            (ObjectKind::Shape, shape.encode().expect("a shape")),
+            (ObjectKind::State, state.encode().expect("a state")),
+        ];
+        let id = |i: usize| vci_core::objects::hex32(&vci_core::object_id(&objects[i].1));
+        let ids = RunIds {
+            hdr: id(0),
+            tables: id(1),
+            shape: id(2),
+            state: id(3),
+        };
+        Run3 {
+            objects,
+            ids,
+            tables,
+        }
+    }
+
+    /// The objects as a put takes them.
+    pub fn new_objects(&self) -> Vec<NewObject<'_>> {
+        self.objects
+            .iter()
+            .map(|(k, b)| NewObject::new(*k, b))
+            .collect()
+    }
+
+    /// The four ids in the order hdr, tables, shape, state.
+    pub fn id_refs(&self) -> Vec<&str> {
+        vec![
+            &self.ids.hdr,
+            &self.ids.tables,
+            &self.ids.shape,
+            &self.ids.state,
+        ]
+    }
+
+    /// The hdr, tables and shape ids sorted: what
+    /// [`key::record_object_refs`] names for a record of this run.
+    pub fn named(&self) -> Vec<String> {
+        let mut v = vec![
+            self.ids.hdr.clone(),
+            self.ids.tables.clone(),
+            self.ids.shape.clone(),
+        ];
+        v.sort();
+        v
+    }
+
+    /// A format-3 record for `unit`: a statement naming the run's hdr and
+    /// tables, a synthetic SSHSIG blob, and a descriptor naming the shape
+    /// whose first `own` entries are the unit's; with the columns the
+    /// writer copies out of that statement. `seed` varies the signed bytes.
+    pub fn record(&self, unit: &str, own: usize, seed: u32) -> (Vec<u8>, Columns) {
+        let commit = format!("{seed:08x}").repeat(5);
+        let expires: i64 = 1_800_000_000 + i64::from(seed);
+        let duration_ms = u64::from(seed) * 10;
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": unit, "digest": {"blake3": hex64(9)}}],
+            "predicateType": vci_core::PREDICATE_TYPE_V2,
+            "predicate": {
+                "commit": commit,
+                "expiresAt": expires.to_string(),
+                "hdr": self.ids.hdr,
+                "tables": self.ids.tables,
+                "result": {"state": "passed", "tests": 1, "failed": 0, "skipped": 0,
+                            "duration_ms": duration_ms},
+                "testId": unit,
+            },
+        });
+        let shape = vci_core::objects::parse_hex32(&self.ids.shape).expect("a shape id");
+        let descriptor = vci_core::Descriptor {
+            shape,
+            group: None,
+            own: (0..own).collect(),
+            env_read: vec![],
+            env_values: vec![],
+            externals: vec![],
+            extras: vec![],
+        }
+        .encode(&self.tables)
+        .expect("a descriptor");
+        let record = vci_core::Frame {
+            statement: statement.to_string().into_bytes(),
+            keyid: "SHA256:conformance".into(),
+            sig: vci_core::FrameSig::SshSig(vec![0x53, 0x53, 0x48, seed as u8]),
+            descriptor,
+        }
+        .encode()
+        .expect("a frame")
+        .into_bytes();
+        let columns = Columns {
+            format: Some(3),
+            commit: Some(commit),
+            platform: Some("linux-x86_64".into()),
+            state: Some("passed".into()),
+            duration_ms: Some(duration_ms),
+            expires: Some(expires),
+            hdr: Some(self.ids.hdr.clone()),
+            tables: Some(self.ids.tables.clone()),
+            shape: Some(self.ids.shape.clone()),
+            state_obj: Some(self.ids.state.clone()),
+        };
+        (record, columns)
+    }
+}
+
+fn put3(
+    s: &dyn AttestationStore,
+    unit: &str,
+    signer: &str,
+    storage_key: &str,
+    record: &[u8],
+    columns: &Columns,
+) -> StoredEnvelope {
+    ok(
+        s.put(
+            &NewAttestation::for_test(unit, signer, storage_key, None, record)
+                .with_columns(columns),
+        ),
+        &format!("put a format-3 record {unit} {signer} {storage_key}"),
+    )
+}
+
+fn put_objects(s: &dyn AttestationStore, objects: &[NewObject<'_>]) -> usize {
+    ok(s.put_objects(objects), "put_objects")
+}
+
+/// These objects, prefetched first on a lazy store.
+fn get_objects(s: &dyn AttestationStore, ids: &[&str]) -> Vec<StoredObject> {
+    if s.caps().lazy_values {
+        ok(s.prefetch(Prefetch::Objects { ids }), "prefetch objects");
+    }
+    ok(s.get_objects(ids), "get_objects")
+}
+
+/// Whether the store keeps objects; says so and returns `false` otherwise.
+fn keeps_objects(f: &dyn StoreFactory, scenario: &str, s: &dyn AttestationStore) -> bool {
+    if s.caps().objects {
+        return true;
+    }
+    skip(f, scenario, "everything: the store keeps no objects");
+    false
+}
+
+/// Age `ids` on peer 0 by `by`, or say the world cannot and return `false`.
+fn aged(
+    f: &dyn StoreFactory,
+    scenario: &str,
+    w: &dyn super::World,
+    ids: &[&str],
+    by: Duration,
+) -> bool {
+    if w.age_objects(0, ids, by) {
+        return true;
+    }
+    skip(f, scenario, "the rest: the world cannot age objects");
+    false
+}
+
+// ---- the objects scenarios ---------------------------------------------------
+
+/// c35: The four objects of a run read back byte for byte with their kinds
+/// and ids (the state object is binary, so a text backend's base64 round
+/// trip is checked here); a second put stores nothing new; unknown ids are
+/// left out and duplicates answered once; another peer reads them. Without
+/// `Caps::objects` every object method is `Unsupported`.
+pub fn c35_objects_round_trip_and_idempotent_put(f: &dyn StoreFactory) {
+    const C: &str = "c35_objects_round_trip_and_idempotent_put";
+    let w = f.world();
+    let s = w.peer(0);
+    let run = Run3::build(&["src/c35/b.ts", "src/c35/a.ts"]);
+    if !s.caps().objects {
+        let unsupported = |what: &str, r: Result<(), StoreError>| match r {
+            Err(StoreError::Unsupported { .. }) => {}
+            other => panic!("{what} without Caps::objects: expected Unsupported, got {other:?}"),
+        };
+        unsupported("get_objects", s.get_objects(&run.id_refs()).map(drop));
+        unsupported("put_objects", s.put_objects(&run.new_objects()).map(drop));
+        unsupported("remove_objects", s.remove_objects(&run.id_refs()).map(drop));
+        unsupported("orphan_objects", s.orphan_objects().map(drop));
+        unsupported(
+            "prune_state_objects",
+            s.prune_state_objects(Duration::from_secs(1)).map(drop),
+        );
+        skip(f, C, "the rest: the store keeps no objects");
+        return;
+    }
+    assert!(
+        std::str::from_utf8(&run.objects[3].1).is_err(),
+        "the state object is binary"
+    );
+    assert_eq!(put_objects(&*s, &run.new_objects()), 4, "four new objects");
+    let got = get_objects(&*s, &run.id_refs());
+    assert_eq!(got.len(), 4, "every object, in the order asked");
+    for (o, (kind, bytes)) in got.iter().zip(&run.objects) {
+        assert_eq!(o.kind, *kind);
+        assert_eq!(&o.bytes, bytes, "the {kind} object read back byte for byte");
+        assert_eq!(
+            o.id,
+            vci_core::objects::hex32(&vci_core::object_id(&o.bytes)),
+            "filed under the BLAKE3 of its bytes"
+        );
+    }
+    assert_eq!(put_objects(&*s, &run.new_objects()), 0, "already stored");
+    assert_eq!(
+        get_objects(&*s, &run.id_refs()),
+        got,
+        "unchanged by the re-put"
+    );
+    let unknown = hex64(0xee);
+    let some = get_objects(&*s, &[&unknown, &run.ids.hdr, &run.ids.hdr]);
+    assert_eq!(
+        some.len(),
+        1,
+        "an unknown id is left out, a repeated one answered once"
+    );
+    assert_eq!(some[0].id, run.ids.hdr);
+    assert!(get_objects(&*s, &[]).is_empty());
+
+    w.sync(0, &[1]);
+    let p1 = w.peer(1);
+    assert_eq!(get_objects(&*p1, &run.id_refs()), got, "another peer");
+}
+
+/// c36: Object ids and objects are validated before anything is written:
+/// `Invalid` with what = `object id` (not 64 lowercase hex) and `object`
+/// (empty, over its kind's bound, or not headed by the magic and the kind
+/// byte), one bad object among good ones writes none, and a put whose
+/// columns name a bad id writes nothing.
+pub fn c36_objects_are_validated_and_bounded(f: &dyn StoreFactory) {
+    const C: &str = "c36_objects_are_validated_and_bounded";
+    let w = f.world();
+    let s = w.peer(0);
+    let run = Run3::build(&["src/c36/a.ts"]);
+    let invalid = |what: &'static str, r: Result<usize, StoreError>| match r {
+        Err(StoreError::Invalid { what: w, .. }) if w == what => {}
+        other => panic!("expected Invalid {what}, got {other:?}"),
+    };
+    let short = &hex64(1)[..62];
+    let upper = hex64(0xab).to_uppercase();
+    for id in ["NOT-AN-ID", short, &upper, ""] {
+        invalid("object id", s.get_objects(&[id]).map(|v| v.len()));
+        invalid("object id", s.remove_objects(&[id]));
+    }
+    invalid(
+        "object",
+        s.put_objects(&[NewObject::new(ObjectKind::Hdr, b"")]),
+    );
+    invalid(
+        "object",
+        s.put_objects(&[NewObject::new(ObjectKind::Tables, &run.objects[0].1)]),
+    );
+    invalid(
+        "object",
+        s.put_objects(&[NewObject::new(ObjectKind::Hdr, b"{\"not\": \"an object\"}")]),
+    );
+    let mut too_big = b"vo\x01\x01".to_vec();
+    too_big.resize(ObjectKind::Hdr.max_bytes() + 1, 0);
+    invalid(
+        "object",
+        s.put_objects(&[NewObject::new(ObjectKind::Hdr, &too_big)]),
+    );
+    let good = run.new_objects();
+    invalid(
+        "object",
+        s.put_objects(&[good[0], NewObject::new(ObjectKind::Hdr, b"")]),
+    );
+    let bad = Columns {
+        hdr: Some("nope".into()),
+        ..Columns::default()
+    };
+    match s.put(
+        &NewAttestation::for_test(UNIT_A, S1, &hex64(1), None, &envelope(None, "c36"))
+            .with_columns(&bad),
+    ) {
+        Err(StoreError::Invalid {
+            what: "object id", ..
+        }) => {}
+        other => panic!("a put with a bad object id: expected Invalid, got {other:?}"),
+    }
+    assert!(
+        listed(&*s, UNIT_A).is_empty(),
+        "the refused put wrote nothing"
+    );
+    if !keeps_objects(f, C, &*s) {
+        return;
+    }
+    assert!(
+        get_objects(&*s, &[&run.ids.hdr]).is_empty(),
+        "the refused puts wrote no object"
+    );
+    assert_eq!(
+        ok(s.remove_objects(&[&run.ids.hdr]), "remove_objects"),
+        0,
+        "an object never stored"
+    );
+    assert_eq!(
+        ok(s.orphan_objects(), "orphan_objects"),
+        Vec::<String>::new()
+    );
+}
+
+/// c37: Nothing within its grace period is removed, referenced or not; past
+/// it only an object no record's columns (or, without columns, no record's
+/// statement or descriptor) name goes, and a put, identical bytes included,
+/// restarts the grace; once the record is removed its objects are orphans,
+/// except the state object on a store without columns, which cannot see
+/// its referrers and leaves it to `prune_state_objects`.
+pub fn c37_orphan_rule_keeps_referenced_and_recent_objects(f: &dyn StoreFactory) {
+    const C: &str = "c37_orphan_rule_keeps_referenced_and_recent_objects";
+    let w = f.world();
+    let s = w.peer(0);
+    if !keeps_objects(f, C, &*s) {
+        return;
+    }
+    let run = Run3::build(&["src/c37/a.ts", "src/c37/b.ts"]);
+    let other = Run3::build(&["src/c37/other.ts"]);
+    let free_shape = other.new_objects()[2];
+    put_objects(&*s, &run.new_objects());
+    put_objects(&*s, &[free_shape]);
+    let (rec, cols) = run.record(UNIT_A, 2, 37);
+    let e = put3(&*s, UNIT_A, S1, &hex64(1), &rec, &cols);
+    let mut all = run.id_refs();
+    all.push(&other.ids.shape);
+    assert_eq!(
+        ok(s.remove_objects(&all), "remove_objects"),
+        0,
+        "within the grace period nothing goes"
+    );
+    assert!(ok(s.orphan_objects(), "orphan_objects").is_empty());
+    assert_eq!(get_objects(&*s, &all).len(), 5);
+    if !aged(f, C, &*w, &all, OBJECT_GRACE * 2) {
+        return;
+    }
+    assert_eq!(
+        ok(s.orphan_objects(), "orphan_objects"),
+        vec![other.ids.shape.clone()],
+        "past the grace, only the unreferenced shape"
+    );
+    assert_eq!(ok(s.remove_objects(&all), "remove_objects"), 1);
+    assert!(get_objects(&*s, &[&other.ids.shape]).is_empty());
+    assert_eq!(
+        get_objects(&*s, &run.id_refs()).len(),
+        4,
+        "the referenced objects stay"
+    );
+
+    // A put restarts the grace: of a new object, and of one already stored.
+    assert_eq!(put_objects(&*s, &[free_shape]), 1);
+    assert_eq!(
+        ok(s.remove_objects(&[&other.ids.shape]), "remove_objects"),
+        0,
+        "just put"
+    );
+    assert!(w.age_objects(0, &[&other.ids.shape], OBJECT_GRACE * 2));
+    assert_eq!(put_objects(&*s, &[free_shape]), 0, "already stored");
+    assert_eq!(
+        ok(s.remove_objects(&[&other.ids.shape]), "remove_objects"),
+        0,
+        "an idempotent put refreshes put_at"
+    );
+    assert!(w.age_objects(0, &[&other.ids.shape], OBJECT_GRACE * 2));
+    assert_eq!(
+        ok(s.remove_objects(&[&other.ids.shape]), "remove_objects"),
+        1
+    );
+
+    // Without the record, its (aged) objects are orphans.
+    ok(s.remove(vec![e]), "remove the record");
+    let with_columns = s.caps().columns;
+    let mut want: Vec<String> = run.id_refs().iter().map(|i| (*i).to_owned()).collect();
+    if !with_columns {
+        want.retain(|i| *i != run.ids.state);
+    }
+    want.sort();
+    assert_eq!(
+        ok(s.orphan_objects(), "orphan_objects"),
+        want,
+        "columns kept: {with_columns}"
+    );
+    let expect = if with_columns { 4 } else { 3 };
+    assert_eq!(
+        ok(s.remove_objects(&run.id_refs()), "remove_objects"),
+        expect
+    );
+    assert_eq!(get_objects(&*s, &run.id_refs()).len(), 4 - expect);
+}
+
+/// c38: `prune_state_objects(older_than)` removes a state object older than
+/// that even while a record references it, and touches no other kind.
+pub fn c38_state_objects_expire_even_while_referenced(f: &dyn StoreFactory) {
+    const C: &str = "c38_state_objects_expire_even_while_referenced";
+    let w = f.world();
+    let s = w.peer(0);
+    if !keeps_objects(f, C, &*s) {
+        return;
+    }
+    let run = Run3::build(&["src/c38/a.ts"]);
+    put_objects(&*s, &run.new_objects());
+    let (rec, cols) = run.record(UNIT_A, 1, 38);
+    let e = put3(&*s, UNIT_A, S1, &hex64(1), &rec, &cols);
+    let day = Duration::from_secs(24 * 60 * 60);
+    assert_eq!(
+        ok(s.prune_state_objects(day), "prune_state_objects"),
+        0,
+        "younger than a day"
+    );
+    if !aged(f, C, &*w, &run.id_refs(), 3 * day) {
+        return;
+    }
+    assert_eq!(
+        ok(s.prune_state_objects(2 * day), "prune_state_objects"),
+        1,
+        "the referenced state object past its TTL"
+    );
+    assert!(get_objects(&*s, &[&run.ids.state]).is_empty());
+    assert_eq!(
+        get_objects(&*s, &[&run.ids.hdr, &run.ids.tables, &run.ids.shape]).len(),
+        3,
+        "other kinds are not touched, however old"
+    );
+    let got = read_one(&*s, UNIT_A);
+    assert_eq!(keys(&got), one(&e.key), "the record stays");
+    assert_eq!(got[0].state(), ValueState::Read(&rec));
+    assert_eq!(
+        ok(s.prune_state_objects(Duration::ZERO), "prune_state_objects"),
+        0
+    );
+}
+
+/// c39: In a batch the objects go before the record: a reader on another
+/// handle that sees the record gets its objects too, and after `finish`
+/// both are there, on another peer as well.
+pub fn c39_objects_are_visible_before_their_record(f: &dyn StoreFactory) {
+    const C: &str = "c39_objects_are_visible_before_their_record";
+    let w = f.world();
+    let s = w.peer(0);
+    if !keeps_objects(f, C, &*s) {
+        return;
+    }
+    let run = Run3::build(&["src/c39/a.ts"]);
+    let (rec, cols) = run.record(UNIT_A, 1, 39);
+    let old = put(&*s, UNIT_A, S1, &hex64(1), None, &envelope(None, "old"));
+    let ids: Vec<String> = run.id_refs().iter().map(|i| (*i).to_owned()).collect();
+
+    let batch = ok(s.batch(), "batch");
+    let deferred = batch.defers_writes();
+    ok(s.put_objects(&run.new_objects()), "put_objects in a batch");
+    let e = put3(&*s, UNIT_A, S1, &hex64(2), &rec, &cols);
+    ok(s.remove(vec![old]), "remove in a batch");
+    if !deferred {
+        assert_eq!(
+            get_objects(&*s, &run.id_refs()).len(),
+            4,
+            "inside the batch"
+        );
+        assert_eq!(keys(&listed(&*s, UNIT_A)), one(&e.key), "inside the batch");
+    }
+    let watcher = {
+        let p1 = w.peer(1);
+        let key = e.key.clone();
+        let ids = ids.clone();
+        std::thread::spawn(move || {
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            for _ in 0..200 {
+                if let Ok(units) = p1.list_units(&[UNIT_A])
+                    && units[0].iter().any(|x| x.key == key)
+                {
+                    return Some(p1.get_objects(&ids).map(|v| v.len()).unwrap_or(0));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        })
+    };
+    ok(batch.finish(), "finish");
+    if let Some(n) = watcher.join().expect("the watcher") {
+        assert_eq!(n, 4, "a reader that saw the record saw its objects");
+    }
+    assert_eq!(keys(&listed(&*s, UNIT_A)), one(&e.key));
+    assert_eq!(get_objects(&*s, &run.id_refs()).len(), 4);
+    w.sync(0, &[1]);
+    let p1 = w.peer(1);
+    let got = read_one(&*p1, UNIT_A);
+    assert_eq!(keys(&got), one(&e.key), "another peer");
+    assert_eq!(got[0].state(), ValueState::Read(&rec), "another peer");
+    assert_eq!(get_objects(&*p1, &run.id_refs()).len(), 4, "another peer");
+}
+
+/// c40: `columns` gives back what the put passed, in input order, and none
+/// for a format-1 record, a record put without them, a key no longer
+/// stored, and everything on a store without `Caps::columns`; a put of the
+/// same bytes without columns clears them and one with other columns
+/// replaces them; a copy with `with_columns` keeps them.
+pub fn c40_columns_match_the_put(f: &dyn StoreFactory) {
+    const C: &str = "c40_columns_match_the_put";
+    let w = f.world();
+    let s = w.peer(0);
+    let run = Run3::build(&["src/c40/a.ts"]);
+    let (rec, cols) = run.record(UNIT_A, 1, 40);
+    let e3 = put3(&*s, UNIT_A, S1, &hex64(3), &rec, &cols);
+    let e1 = put(
+        &*s,
+        UNIT_A,
+        S1,
+        &hex64(1),
+        None,
+        &envelope(None, "format 1"),
+    );
+    let l = listed(&*s, UNIT_A);
+    assert_eq!(keys(&l), [e1.key.clone(), e3.key.clone()]);
+    let got = ok(s.columns(&[&l[0], &l[1]]), "columns");
+    assert_eq!(got.len(), 2, "one answer per entry");
+    assert_eq!(got[0], Columns::default(), "a format-1 record has none");
+    if !s.caps().columns {
+        assert_eq!(got[1], Columns::default(), "a store without columns");
+        skip(f, C, "the rest: the store keeps no columns");
+        return;
+    }
+    assert_eq!(got[1], cols, "the columns the writer passed");
+
+    let gone = put3(&*s, UNIT_B, S1, &hex64(4), &rec, &cols);
+    ok(s.remove(vec![gone.clone()]), "remove");
+    assert_eq!(
+        ok(s.columns(&[&l[1], &l[0], &gone]), "columns"),
+        [cols.clone(), Columns::default(), Columns::default()],
+        "input order; a removed key answers none"
+    );
+    assert!(ok(s.columns(&[]), "columns of nothing").is_empty());
+
+    put(&*s, UNIT_A, S1, &hex64(3), None, &rec);
+    let l = listed(&*s, UNIT_A);
+    assert_eq!(keys(&l), [e1.key.clone(), e3.key.clone()]);
+    assert_eq!(
+        ok(s.columns(&[&l[1]]), "columns")[0],
+        Columns::default(),
+        "the same bytes put without columns clear them"
+    );
+    let mut cols2 = cols.clone();
+    cols2.duration_ms = Some(999);
+    cols2.state_obj = None;
+    put3(&*s, UNIT_A, S1, &hex64(3), &rec, &cols2);
+    assert_eq!(
+        ok(s.columns(&[&l[1]]), "columns")[0],
+        cols2,
+        "the same bytes put with other columns replace them"
+    );
+
+    w.sync(0, &[1]);
+    let p1 = w.peer(1);
+    let l1 = listed(&*p1, UNIT_A);
+    assert_eq!(
+        ok(p1.columns(&[&l1[1]]), "columns")[0],
+        cols2,
+        "another peer"
+    );
+
+    let src = read_one(&*s, UNIT_A);
+    let w2 = f.world();
+    let dst = w2.peer(0);
+    let h = key::parse_key_hint(&src[1].key);
+    ok(
+        dst.put(&NewAttestation::copy_of(&src[1], h.as_ref()).with_columns(&cols2)),
+        "copy",
+    );
+    let ld = listed(&*dst, UNIT_A);
+    assert_eq!(keys(&ld), one(&e3.key));
+    assert_eq!(
+        ok(dst.columns(&[&ld[0]]), "columns")[0],
+        cols2,
+        "a copy keeps them"
+    );
+}
+
+/// c41: A format-1 envelope and a format-3 frame of one unit live side by
+/// side: listed in key order, read byte for byte, told apart by
+/// `decode_record`; the frame names no manifest (`ManifestRef::Inline`) so
+/// manifest collection goes on, and names its objects
+/// (`record_object_refs`); the count sees both.
+pub fn c41_mixed_formats_in_one_namespace(f: &dyn StoreFactory) {
+    let w = f.world();
+    let s = w.peer(0);
+    let root = put_manifest(&*s, &manifest_of(&["src/c41/one.rs"]));
+    let free = put_manifest(&*s, &manifest_of(&["src/c41/free.rs"]));
+    let run = Run3::build(&["src/c41/a.ts"]);
+    let (rec3, cols) = run.record(UNIT_A, 1, 41);
+    let rec1 = envelope(Some(&root), "format 1");
+    let e1 = put(
+        &*s,
+        UNIT_A,
+        S1,
+        &hex64(1),
+        Some(&hint(1, Some(TREE_HEAD))),
+        &rec1,
+    );
+    let e3 = put3(&*s, UNIT_A, S1, &hex64(3), &rec3, &cols);
+    let got = read_one(&*s, UNIT_A);
+    assert_eq!(keys(&got), [e1.key.clone(), e3.key.clone()]);
+    assert_eq!(got[0].state(), ValueState::Read(&rec1));
+    assert_eq!(got[1].state(), ValueState::Read(&rec3));
+    assert!(
+        matches!(decode_record(&got[0].bytes), Ok(Record::FormatOne(_))),
+        "an envelope"
+    );
+    match decode_record(&got[1].bytes) {
+        Ok(Record::FormatThree(frame)) => {
+            let shape = vci_core::Descriptor::shape_id(&frame.descriptor).expect("a shape id");
+            assert_eq!(vci_core::objects::hex32(&shape), run.ids.shape);
+            assert_eq!(frame.keyid, "SHA256:conformance");
+        }
+        other => panic!("a frame: got {other:?}"),
+    }
+    assert_eq!(got[0].manifest_ref(), ManifestRef::Root(root.clone()));
+    assert_eq!(
+        got[1].manifest_ref(),
+        ManifestRef::Inline,
+        "a frame names no manifest"
+    );
+    assert_eq!(
+        key::record_object_refs(&got[0].bytes),
+        ObjectRefs::FormatOne
+    );
+    assert_eq!(
+        key::record_object_refs(&got[1].bytes),
+        ObjectRefs::Named(run.named())
+    );
+    assert_eq!(
+        ok(s.orphan_manifests(&[&root, &free]), "orphan_manifests"),
+        vec![free.clone()],
+        "the frame blocks no manifest's collection"
+    );
+    assert_eq!(ok(s.count(), "count"), 2);
+    assert_eq!(ok(s.list_all(), "list_all").len(), 2);
+
+    ok(s.remove(vec![got[0].clone()]), "remove the envelope");
+    let mut both = vec![root.clone(), free.clone()];
+    both.sort();
+    assert_eq!(
+        ok(s.orphan_manifests(&[&root, &free]), "orphan_manifests"),
+        both
+    );
+    let got = read_one(&*s, UNIT_A);
+    assert_eq!(keys(&got), one(&e3.key));
+    assert_eq!(got[0].state(), ValueState::Read(&rec3));
+    w.sync(0, &[1]);
+    let got = read_one(&*w.peer(1), UNIT_A);
+    assert_eq!(keys(&got), one(&e3.key), "another peer");
+    assert_eq!(got[0].state(), ValueState::Read(&rec3), "another peer");
+}
+
+/// c42: Objects and a format-3 record reach another peer (a replica syncs
+/// them by `seq`), and so do the record's removal and, past the grace, the
+/// objects' (its `gone` rows): the peer then lists nothing, reads the stale
+/// entry as `GONE`, and gets no object.
+pub fn c42_object_deletions_reach_peers(f: &dyn StoreFactory) {
+    const C: &str = "c42_object_deletions_reach_peers";
+    let w = f.world();
+    let (p0, p1) = (w.peer(0), w.peer(1));
+    if !keeps_objects(f, C, &*p0) {
+        return;
+    }
+    let run = Run3::build(&["src/c42/a.ts"]);
+    put_objects(&*p0, &run.new_objects());
+    let (rec, cols) = run.record(UNIT_A, 1, 42);
+    let e = put3(&*p0, UNIT_A, S1, &hex64(1), &rec, &cols);
+    w.sync(0, &[1]);
+    let got = read_one(&*p1, UNIT_A);
+    assert_eq!(keys(&got), one(&e.key), "peer 1 sees the record");
+    assert_eq!(got[0].state(), ValueState::Read(&rec));
+    assert_eq!(
+        get_objects(&*p1, &run.id_refs()).len(),
+        4,
+        "and its objects"
+    );
+    let mut stale = got;
+
+    ok(p0.remove(vec![e.clone()]), "remove");
+    let removed = if w.age_objects(0, &run.id_refs(), OBJECT_GRACE * 2) {
+        let n = ok(p0.remove_objects(&run.id_refs()), "remove_objects");
+        assert_eq!(n, if p0.caps().columns { 4 } else { 3 });
+        n
+    } else {
+        skip(f, C, "the objects' removal: the world cannot age objects");
+        0
+    };
+    w.sync(0, &[1]);
+    assert!(
+        listed(&*p1, UNIT_A).is_empty(),
+        "the removal reached peer 1"
+    );
+    let mut refs: Vec<&mut StoredEnvelope> = stale.iter_mut().collect();
+    ok(p1.read_values(&mut refs), "read_values of a removed key");
+    assert_eq!(stale[0].state(), ValueState::Unreadable(GONE));
+    assert_eq!(
+        get_objects(&*p1, &run.id_refs()).len(),
+        4 - removed,
+        "the objects' removal reached peer 1"
+    );
 }

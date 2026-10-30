@@ -6,8 +6,10 @@
 //! file, so a write is visible to every peer at once and [`World::sync`]
 //! does nothing. The unreachable store is a file that is not a database; the
 //! read-only handle opens the file after it was made read-only (`chmod
-//! 0444`); raw records and unreadable values are written with SQL behind
-//! the store's back. Batches are immediate, so none can be made to fail.
+//! 0444`); raw records, unreadable values and the age of objects
+//! (`age_objects`, `UPDATE objects SET put_at = put_at - ?`) are written
+//! with SQL behind the store's back. Batches are immediate, so none can be
+//! made to fail.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
@@ -161,6 +163,20 @@ impl World for SqliteWorld {
             db.execute(
                 "UPDATE attestations SET encoding = 99 WHERE key = ?1",
                 [key],
+            )
+            .is_ok_and(|n| n == 1)
+        })
+    }
+
+    fn age_objects(&self, _i: usize, ids: &[&str], by: Duration) -> bool {
+        let Some(db) = self.raw() else {
+            return false;
+        };
+        let by = i64::try_from(by.as_secs()).unwrap_or(i64::MAX);
+        ids.iter().all(|id| {
+            db.execute(
+                "UPDATE objects SET put_at = put_at - ?2 WHERE id = ?1",
+                params![id, by],
             )
             .is_ok_and(|n| n == 1)
         })

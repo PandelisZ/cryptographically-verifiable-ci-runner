@@ -1,0 +1,52 @@
+{
+ "today": {
+  "A": {
+   "commit": 1,
+   "tree": 8936,
+   "blob": 1955
+  },
+  "A_raw": {
+   "commit": 1009,
+   "tree": 589867,
+   "blob": 36935381
+  },
+  "B_new": {
+   "commit": 1,
+   "tree": 1761,
+   "blob": 379
+  },
+  "B_raw": {
+   "commit": 1057,
+   "tree": 244071,
+   "blob": 5919410
+  },
+  "thin_B": 642771,
+  "pack_A": 3880792,
+  "repacked": 4470824
+ },
+ "v2": {
+  "A": {
+   "commit": 1,
+   "tree": 7962,
+   "blob": 977
+  },
+  "A_raw": {
+   "commit": 1009,
+   "tree": 466749,
+   "blob": 2336037
+  },
+  "B_new": {
+   "commit": 1,
+   "tree": 1573,
+   "blob": 188
+  },
+  "B_raw": {
+   "commit": 1057,
+   "tree": 131026,
+   "blob": 434738
+  },
+  "thin_B": 271567,
+  "pack_A": 1344881,
+  "repacked": 1584472
+ }
+}

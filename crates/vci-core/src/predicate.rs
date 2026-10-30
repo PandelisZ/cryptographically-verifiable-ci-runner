@@ -1,11 +1,26 @@
 //! Attestation predicate types (the in-toto `predicate` body).
+//!
+//! Two predicate versions: v1 ([`Predicate`] plus the vci-cli fields,
+//! together [`VciPredicate`]) carries every fact inline; v2
+//! ([`VciPredicateV2`], store format 3, `docs/design/STORE-V2.md` section 1.1)
+//! carries the unit's own facts and two digests, of a [`Hdr`] object (the
+//! facts every run at the same toolchain and global inputs shares) and of a
+//! [`Tables`] object (the waiver table its `waived` ids index). A verifier
+//! reads both through [`ResolvedPredicate`], which gives the v1 accessors
+//! over either, so one `Verifier::check` runs on the view.
+
+use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::InputManifest;
+use crate::manifest::{InputEntry, InputManifest};
+use crate::objects::{DecodeError, Hdr, ObjectId, Tables, hex32, object_id, parse_hex32};
 
 /// in-toto `predicateType` for vci test attestations.
 pub const PREDICATE_TYPE: &str = "https://vci.dev/test-attestation/v1";
+
+/// in-toto `predicateType` of a format-3 statement ([`VciPredicateV2`]).
+pub const PREDICATE_TYPE_V2: &str = "https://vci.dev/test-attestation/v2";
 
 /// Tool versions an attestation was made with.
 ///
@@ -323,9 +338,645 @@ pub fn test_key(test_id: &str) -> String {
     crate::hash::blake3_hex(test_id.as_bytes())
 }
 
+/// The whole v1 predicate as signed: the [`Predicate`] core plus the fields
+/// `vci run` adds (vci-cli's `VciPredicate` has the same fields and
+/// serialises identically; it reads them from here once the plan runs on
+/// [`ResolvedPredicate`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VciPredicate {
+    #[serde(flatten)]
+    pub core: Predicate,
+    /// BLAKE3 over the effective env configuration for this test file.
+    pub env_config_digest: String,
+    /// Project dir relative to the repo root.
+    pub project_dir: String,
+    /// Runner project name (Vitest `projects`), empty if none.
+    pub runner_project: String,
+    /// `[[projects]]` name in vci.toml; empty (and omitted) in the
+    /// single-project form, so those predicates serialise as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_name: String,
+    /// Go: repository files of the test whose inclusion in the build depends
+    /// on GOOS/GOARCH. When non-empty the attestation only holds on the
+    /// attested OS and architecture, whatever `policy.platform` says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platform_specific: Vec<String>,
+    /// Go: why the test's results may differ on another architecture. When
+    /// non-empty the attestation only holds on the attested architecture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arch_specific: Vec<String>,
+    /// Taints a policy waived when this attestation was made, as the
+    /// collector reported them; `vci plan` accepts the attestation only
+    /// while the base commit's policy still waives every one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waived: Vec<String>,
+    /// Cargo: target-dependent `cfg(...)` predicates in the unit's
+    /// repository code and manifests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cfg_predicates: Vec<String>,
+    /// The `[[inputs]] extra` globs declared for this test id when it was
+    /// attested.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_inputs: Vec<String>,
+    /// The env variables vci set itself (vci.toml `[env] set`, since vci
+    /// 1.6.0). Informational.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_set: Vec<String>,
+    /// Rails (2.7.36): the project's `rails_inputs` when the unit was
+    /// recorded, `"loose"` or `"strict"`; empty for the other adapters.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rails_inputs: String,
+    /// Rails (2.7.36): the globs whose paths were left out of the unit's
+    /// manifests. Informational.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_inputs: Vec<String>,
+}
+
+/// The v2 predicate (store format 3, `docs/design/STORE-V2.md` section 1.1):
+/// the unit's own facts, the digests of its [`Hdr`] and [`Tables`] objects,
+/// the entries root and its waived taints as ids into the tables' waiver
+/// table. The subject carries the test id and the input root, as in v1;
+/// everything of v1 that is not here is in the hdr. Fields are declared in
+/// the order of their JSON names, and [`Self::to_json`] writes the compact
+/// sorted-key form the statement is signed in; an empty list is omitted.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VciPredicateV2 {
+    /// Go: see [`VciPredicate::arch_specific`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arch_specific: Vec<String>,
+    pub argv: Vec<String>,
+    /// Cargo: see [`VciPredicate::cfg_predicates`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cfg_predicates: Vec<String>,
+    pub commit: String,
+    /// See [`VciPredicate::declared_inputs`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_inputs: Vec<String>,
+    /// [`InputManifest::entries_root`] of the unit's manifest, lowercase
+    /// hex: supersession's "same files" test.
+    pub entries_root: String,
+    /// RFC 3339 UTC.
+    pub expires_at: String,
+    /// The id of the hdr object, 64 lowercase hex digits.
+    pub hdr: String,
+    /// RFC 3339 UTC.
+    pub issued_at: String,
+    /// Go: see [`VciPredicate::platform_specific`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platform_specific: Vec<String>,
+    pub result: TestResult,
+    /// The id of the tables object, 64 lowercase hex digits.
+    pub tables: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tainted: Vec<String>,
+    pub test_id: String,
+    /// See [`Predicate::tree`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    pub tree_dirty: bool,
+    /// The waived taints as sorted distinct ids into the tables object's
+    /// waiver table (section 1.6 rule 7: an id out of range, a duplicate or
+    /// an unsorted list fails `statement`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waived: Vec<u16>,
+}
+
+/// `value` as compact JSON with the keys of every object sorted: the one
+/// spelling a format-3 statement is signed in (the whole statement, not
+/// only its predicate, is written this way).
+pub fn sorted_compact_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    fn sorted(v: serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => {
+                let mut pairs: Vec<(String, serde_json::Value)> = m.into_iter().collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut out = serde_json::Map::new();
+                for (k, v) in pairs {
+                    out.insert(k, sorted(v));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.into_iter().map(sorted).collect())
+            }
+            other => other,
+        }
+    }
+    serde_json::to_string(&sorted(serde_json::to_value(value)?))
+}
+
+impl VciPredicateV2 {
+    /// The predicate as compact JSON with sorted keys ([`sorted_compact_json`]).
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        sorted_compact_json(self)
+    }
+
+    /// The predicate of a statement's `predicate` member. Unknown members
+    /// are ignored, as for v1; a reader never re-serializes.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, PredicateError> {
+        serde_json::from_slice(bytes).map_err(|e| PredicateError::Json(e.to_string()))
+    }
+}
+
+/// Why a predicate cannot be resolved or converted. A v2 predicate that
+/// fails one of these fails its candidate's `statement` check, and the unit
+/// runs.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum PredicateError {
+    #[error("{field} is not 64 lowercase hex digits: {value:?}")]
+    Hex { field: &'static str, value: String },
+    #[error("waived {0:?} is not in the waiver table")]
+    Waiver(String),
+    #[error("waived id {id} is not below the waiver table's length {len}")]
+    WaivedId { id: u16, len: usize },
+    #[error("waived ids are not strictly increasing")]
+    WaivedUnsorted,
+    #[error("{what} object: its id {found} is not the statement's {expected}")]
+    ObjectId {
+        what: &'static str,
+        expected: String,
+        found: String,
+    },
+    #[error("{what} object: {source}")]
+    Object {
+        what: &'static str,
+        #[source]
+        source: DecodeError,
+    },
+    #[error("predicate JSON: {0}")]
+    Json(String),
+}
+
+/// The context of a v2 predicate: what its `hdr` and `tables` objects decode
+/// to, checked against the statement's ids ([`Context::decode`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Context {
+    pub hdr: Hdr,
+    pub tables: Tables,
+}
+
+impl Context {
+    /// Decodes the bytes the store returned for the predicate's `hdr` and
+    /// `tables` ids: an object whose BLAKE3 is not the signed id, or that
+    /// breaks a decoder rule, is refused (section 1.5 step 5: the candidate
+    /// fails `statement`).
+    pub fn decode(
+        p: &VciPredicateV2,
+        hdr_bytes: &[u8],
+        tables_bytes: &[u8],
+    ) -> Result<Self, PredicateError> {
+        check_id("hdr", &p.hdr, hdr_bytes)?;
+        check_id("tables", &p.tables, tables_bytes)?;
+        let hdr = Hdr::decode(hdr_bytes).map_err(|source| PredicateError::Object {
+            what: "hdr",
+            source,
+        })?;
+        let tables = Tables::decode(tables_bytes).map_err(|source| PredicateError::Object {
+            what: "tables",
+            source,
+        })?;
+        Ok(Context { hdr, tables })
+    }
+
+    /// The v1 view of `p` over this context; `input_root` is the subject's
+    /// digest.
+    pub fn resolve<'a>(
+        &'a self,
+        p: &'a VciPredicateV2,
+        input_root: &'a str,
+    ) -> Result<ResolvedPredicate<'a>, PredicateError> {
+        ResolvedPredicate::v2(p, input_root, &self.hdr, &self.tables)
+    }
+}
+
+fn check_id(what: &'static str, expected: &str, bytes: &[u8]) -> Result<(), PredicateError> {
+    let found = hex32(&object_id(bytes));
+    if found != expected {
+        return Err(PredicateError::ObjectId {
+            what,
+            expected: expected.to_owned(),
+            found,
+        });
+    }
+    Ok(())
+}
+
+/// Sorted distinct ids below the table's length (section 1.6 rule 7).
+fn check_waived_ids(ids: &[u16], len: usize) -> Result<(), PredicateError> {
+    if let Some(&id) = ids.iter().find(|&&id| usize::from(id) >= len) {
+        return Err(PredicateError::WaivedId { id, len });
+    }
+    if ids.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(PredicateError::WaivedUnsorted);
+    }
+    Ok(())
+}
+
+/// A predicate of either version read as the v1 fields: the plan's checks
+/// and the storage key take every value from here (decoded values, never
+/// bytes), so a v1 and a v2 record of the same facts are checked alike.
+#[derive(Debug, Clone, Copy)]
+pub enum ResolvedPredicate<'a> {
+    V1(&'a VciPredicate),
+    V2(V2View<'a>),
+}
+
+/// A v2 statement with the decoded objects it names, made only by
+/// [`ResolvedPredicate::v2`] (the fields are private), so that a view
+/// whose waived ids were never checked against the waiver table cannot
+/// exist:
+///
+/// ```compile_fail
+/// use vci_core::{Hdr, ResolvedPredicate, Tables, VciPredicateV2};
+/// fn make<'a>(s: &'a VciPredicateV2, h: &'a Hdr, t: &'a Tables) -> ResolvedPredicate<'a> {
+///     ResolvedPredicate::V2(vci_core::V2View { statement: s, input_root: "", hdr: h, tables: t })
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct V2View<'a> {
+    statement: &'a VciPredicateV2,
+    /// The subject's digest (v2 carries the input root nowhere else).
+    input_root: &'a str,
+    hdr: &'a Hdr,
+    tables: &'a Tables,
+}
+
+impl<'a> ResolvedPredicate<'a> {
+    pub fn v1(p: &'a VciPredicate) -> Self {
+        ResolvedPredicate::V1(p)
+    }
+
+    /// The view of a v2 predicate over its decoded objects (the caller
+    /// checked their ids, [`Context::decode`]); the waived ids are checked
+    /// against the waiver table here, so [`Self::waived`] cannot fail.
+    pub fn v2(
+        statement: &'a VciPredicateV2,
+        input_root: &'a str,
+        hdr: &'a Hdr,
+        tables: &'a Tables,
+    ) -> Result<Self, PredicateError> {
+        check_waived_ids(&statement.waived, tables.waivers.len())?;
+        Ok(ResolvedPredicate::V2(V2View {
+            statement,
+            input_root,
+            hdr,
+            tables,
+        }))
+    }
+
+    /// 1 or 2.
+    pub fn version(&self) -> u8 {
+        match self {
+            ResolvedPredicate::V1(_) => 1,
+            ResolvedPredicate::V2(_) => 2,
+        }
+    }
+
+    pub fn tool_version(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.tool_version,
+            ResolvedPredicate::V2(v) => &v.hdr.tool_version,
+        }
+    }
+
+    pub fn adapter(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.adapter,
+            ResolvedPredicate::V2(v) => &v.hdr.adapter,
+        }
+    }
+
+    pub fn test_id(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.test_id,
+            ResolvedPredicate::V2(v) => &v.statement.test_id,
+        }
+    }
+
+    pub fn argv(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.argv,
+            ResolvedPredicate::V2(v) => &v.statement.argv,
+        }
+    }
+
+    pub fn repo_id(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.repo_id,
+            ResolvedPredicate::V2(v) => &v.hdr.repo_id,
+        }
+    }
+
+    pub fn commit(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.commit,
+            ResolvedPredicate::V2(v) => &v.statement.commit,
+        }
+    }
+
+    pub fn tree_dirty(&self) -> bool {
+        match self {
+            ResolvedPredicate::V1(p) => p.core.tree_dirty,
+            ResolvedPredicate::V2(v) => v.statement.tree_dirty,
+        }
+    }
+
+    pub fn tree(&self) -> Option<&'a str> {
+        match self {
+            ResolvedPredicate::V1(p) => p.core.tree.as_deref(),
+            ResolvedPredicate::V2(v) => v.statement.tree.as_deref(),
+        }
+    }
+
+    pub fn toolchain(&self) -> &'a Toolchain {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.toolchain,
+            ResolvedPredicate::V2(v) => &v.hdr.toolchain,
+        }
+    }
+
+    /// Lowercase hex.
+    pub fn global_input_root(&self) -> Cow<'a, str> {
+        match self {
+            ResolvedPredicate::V1(p) => Cow::Borrowed(&p.core.global_input_root),
+            ResolvedPredicate::V2(v) => Cow::Owned(hex32(&v.hdr.global_input_root)),
+        }
+    }
+
+    /// Lowercase hex: the subject's digest.
+    pub fn input_root(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.input_root,
+            ResolvedPredicate::V2(v) => v.input_root,
+        }
+    }
+
+    /// The global manifest the plan rehashes (its root must be
+    /// [`Self::global_input_root`]).
+    pub fn global_manifest(&self) -> Cow<'a, InputManifest> {
+        match self {
+            ResolvedPredicate::V1(p) => Cow::Borrowed(&p.core.global_manifest),
+            ResolvedPredicate::V2(v) => Cow::Owned(v.hdr.global_manifest()),
+        }
+    }
+
+    pub fn result(&self) -> &'a TestResult {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.result,
+            ResolvedPredicate::V2(v) => &v.statement.result,
+        }
+    }
+
+    pub fn tainted(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.tainted,
+            ResolvedPredicate::V2(v) => &v.statement.tainted,
+        }
+    }
+
+    pub fn issued_at(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.issued_at,
+            ResolvedPredicate::V2(v) => &v.statement.issued_at,
+        }
+    }
+
+    pub fn expires_at(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.core.expires_at,
+            ResolvedPredicate::V2(v) => &v.statement.expires_at,
+        }
+    }
+
+    /// Lowercase hex.
+    pub fn env_config_digest(&self) -> Cow<'a, str> {
+        match self {
+            ResolvedPredicate::V1(p) => Cow::Borrowed(&p.env_config_digest),
+            ResolvedPredicate::V2(v) => Cow::Owned(hex32(&v.hdr.env_config_digest)),
+        }
+    }
+
+    pub fn project_dir(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.project_dir,
+            ResolvedPredicate::V2(v) => &v.hdr.project_dir,
+        }
+    }
+
+    pub fn runner_project(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.runner_project,
+            ResolvedPredicate::V2(v) => &v.hdr.runner_project,
+        }
+    }
+
+    pub fn project_name(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.project_name,
+            ResolvedPredicate::V2(v) => &v.hdr.project_name,
+        }
+    }
+
+    pub fn platform_specific(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.platform_specific,
+            ResolvedPredicate::V2(v) => &v.statement.platform_specific,
+        }
+    }
+
+    pub fn arch_specific(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.arch_specific,
+            ResolvedPredicate::V2(v) => &v.statement.arch_specific,
+        }
+    }
+
+    /// The waived taint strings: v1's list as signed; v2's ids resolved
+    /// through the waiver table (sorted and distinct by construction).
+    pub fn waived(&self) -> Vec<&'a str> {
+        match self {
+            ResolvedPredicate::V1(p) => p.waived.iter().map(String::as_str).collect(),
+            ResolvedPredicate::V2(v) => v
+                .statement
+                .waived
+                .iter()
+                .map(|&i| v.tables.waivers[usize::from(i)].as_str())
+                .collect(),
+        }
+    }
+
+    /// The waived strings sorted and distinct: the form a v2 statement
+    /// carries (its ids are sorted and distinct, so a v1 list's repeats and
+    /// order are not in it) and the one the storage key is computed over
+    /// for both versions (STORE-V2 section 1.1), so that a v1 and a v2
+    /// record of the same facts key the same slot. A v1 list that repeats
+    /// a string or is unsorted (most of the Rails sample) has another 2.8
+    /// key, which section 5.1 says.
+    pub fn waived_canonical(&self) -> Vec<&'a str> {
+        let mut w = self.waived();
+        w.sort_unstable();
+        w.dedup();
+        w
+    }
+
+    pub fn cfg_predicates(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.cfg_predicates,
+            ResolvedPredicate::V2(v) => &v.statement.cfg_predicates,
+        }
+    }
+
+    pub fn declared_inputs(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.declared_inputs,
+            ResolvedPredicate::V2(v) => &v.statement.declared_inputs,
+        }
+    }
+
+    pub fn env_set(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.env_set,
+            ResolvedPredicate::V2(v) => &v.hdr.env_set,
+        }
+    }
+
+    pub fn rails_inputs(&self) -> &'a str {
+        match self {
+            ResolvedPredicate::V1(p) => &p.rails_inputs,
+            ResolvedPredicate::V2(v) => &v.hdr.rails_inputs,
+        }
+    }
+
+    pub fn ignored_inputs(&self) -> &'a [String] {
+        match self {
+            ResolvedPredicate::V1(p) => &p.ignored_inputs,
+            ResolvedPredicate::V2(v) => &v.hdr.ignored_inputs,
+        }
+    }
+
+    /// The hdr object's id (v2 only), lowercase hex.
+    pub fn hdr_id(&self) -> Option<&'a str> {
+        match self {
+            ResolvedPredicate::V1(_) => None,
+            ResolvedPredicate::V2(v) => Some(&v.statement.hdr),
+        }
+    }
+
+    /// The tables object's id (v2 only), lowercase hex.
+    pub fn tables_id(&self) -> Option<&'a str> {
+        match self {
+            ResolvedPredicate::V1(_) => None,
+            ResolvedPredicate::V2(v) => Some(&v.statement.tables),
+        }
+    }
+
+    /// The signed entries root (v2 only), lowercase hex.
+    pub fn entries_root(&self) -> Option<&'a str> {
+        match self {
+            ResolvedPredicate::V1(_) => None,
+            ResolvedPredicate::V2(v) => Some(&v.statement.entries_root),
+        }
+    }
+}
+
+fn hex_field(field: &'static str, value: &str) -> Result<[u8; 32], PredicateError> {
+    parse_hex32(value).ok_or_else(|| PredicateError::Hex {
+        field,
+        value: value.to_owned(),
+    })
+}
+
+impl VciPredicate {
+    /// The hdr object of this predicate's run (section 1.1: the fields that
+    /// moved out of the statement). Every run at the same toolchain and
+    /// global inputs makes the same one. The digests must be 64 lowercase
+    /// hex digits; the global manifest's entries, externals and env are
+    /// carried sorted and distinct (the root does not depend on the order).
+    pub fn hdr(&self) -> Result<Hdr, PredicateError> {
+        let gm = &self.core.global_manifest;
+        let mut global_manifest: Vec<InputEntry> = gm.entries.clone();
+        global_manifest.sort();
+        global_manifest.dedup();
+        let mut global_externals = gm.externals.clone();
+        global_externals.sort();
+        global_externals.dedup();
+        let mut global_env = gm.env.clone();
+        global_env.sort();
+        global_env.dedup();
+        Ok(Hdr {
+            repo_id: self.core.repo_id.clone(),
+            adapter: self.core.adapter.clone(),
+            project_name: self.project_name.clone(),
+            project_dir: self.project_dir.clone(),
+            runner_project: self.runner_project.clone(),
+            tool_version: self.core.tool_version.clone(),
+            rails_inputs: self.rails_inputs.clone(),
+            env_config_digest: hex_field("envConfigDigest", &self.env_config_digest)?,
+            global_input_root: hex_field("globalInputRoot", &self.core.global_input_root)?,
+            global_manifest,
+            global_externals,
+            global_env,
+            ignored_inputs: self.ignored_inputs.clone(),
+            env_set: self.env_set.clone(),
+            toolchain: self.core.toolchain.clone(),
+        })
+    }
+
+    /// The v2 predicate of the same facts, for a run whose hdr and tables
+    /// objects have the ids `hdr` and `tables_id` and whose tables object
+    /// is `tables` (its waiver table must hold every waived string; the ids
+    /// are the sorted distinct positions, so repeated strings collapse);
+    /// `entries_root` is [`InputManifest::entries_root`] of the unit's
+    /// manifest. Used by tests and by `vci run` for the facts it has in v1
+    /// form.
+    pub fn to_v2(
+        &self,
+        hdr: &ObjectId,
+        tables_id: &ObjectId,
+        tables: &Tables,
+        entries_root: &str,
+    ) -> Result<VciPredicateV2, PredicateError> {
+        let mut waived: Vec<u16> = Vec::with_capacity(self.waived.len());
+        for w in &self.waived {
+            let i = tables
+                .waivers
+                .binary_search(w)
+                .map_err(|_| PredicateError::Waiver(w.clone()))?;
+            waived.push(u16::try_from(i).map_err(|_| PredicateError::WaivedId {
+                id: u16::MAX,
+                len: tables.waivers.len(),
+            })?);
+        }
+        waived.sort_unstable();
+        waived.dedup();
+        Ok(VciPredicateV2 {
+            arch_specific: self.arch_specific.clone(),
+            argv: self.core.argv.clone(),
+            cfg_predicates: self.cfg_predicates.clone(),
+            commit: self.core.commit.clone(),
+            declared_inputs: self.declared_inputs.clone(),
+            entries_root: entries_root.to_owned(),
+            expires_at: self.core.expires_at.clone(),
+            hdr: hex32(hdr),
+            issued_at: self.core.issued_at.clone(),
+            platform_specific: self.platform_specific.clone(),
+            result: self.core.result.clone(),
+            tables: hex32(tables_id),
+            tainted: self.core.tainted.clone(),
+            test_id: self.core.test_id.clone(),
+            tree: self.core.tree.clone(),
+            tree_dirty: self.core.tree_dirty,
+            waived,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objects::Encoded;
     use crate::{EntryKind, EnvEntry, External, InputEntry, RepoPath};
 
     fn sample() -> Predicate {
@@ -652,6 +1303,497 @@ mod tests {
         assert_eq!(v["rubyGems"][0], "nokogiri==1.19.4");
         assert!(!rb.diff(&sample().toolchain).is_empty());
         assert!(!sample().toolchain.diff(&rb).is_empty());
+    }
+
+    // ------------------------------------------------------------ v2 ----
+
+    /// A v1 predicate with every field set, as a Go unit with waivers and
+    /// declared inputs would carry it; the lists are sorted and distinct,
+    /// as `vci run` writes them.
+    fn sample_v1() -> VciPredicate {
+        let mut core = sample();
+        core.tree = Some("t".repeat(40));
+        core.global_input_root = "ab".repeat(32);
+        core.global_manifest = InputManifest {
+            entries: vec![
+                InputEntry {
+                    path: RepoPath::new("go.sum").unwrap(),
+                    kind: EntryKind::File,
+                    exec: false,
+                    size: 7,
+                    hash: "cd".repeat(32),
+                },
+                InputEntry {
+                    path: RepoPath::new("go.mod").unwrap(),
+                    kind: EntryKind::File,
+                    exec: true,
+                    size: 3,
+                    hash: "ef".repeat(32),
+                },
+            ],
+            externals: vec![],
+            env: vec![],
+        };
+        core.tainted = vec!["go:net:dial".into()];
+        core.toolchain = Toolchain {
+            go: "go1.26.2".into(),
+            go_env: vec!["CGO_ENABLED=1".into(), "GOFLAGS=".into()],
+            go_arch_level: "GOARM64=v8.0".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            superuser: true,
+            ..Default::default()
+        };
+        VciPredicate {
+            core,
+            env_config_digest: "12".repeat(32),
+            project_dir: "svc/api".into(),
+            runner_project: "unit".into(),
+            project_name: "api".into(),
+            platform_specific: vec!["a_darwin.go".into()],
+            arch_specific: vec!["fma".into()],
+            waived: vec!["go:net:dial: a".into(), "go:unsafe: b".into()],
+            cfg_predicates: vec!["cfg(x)".into()],
+            declared_inputs: vec!["fixtures/**".into()],
+            env_set: vec!["TZ".into()],
+            rails_inputs: "loose".into(),
+            ignored_inputs: vec!["log/**".into()],
+        }
+    }
+
+    /// The tables object of a run holding `p` and one more unit.
+    fn tables_for(p: &VciPredicate) -> Tables {
+        let mut waivers = p.waived.clone();
+        waivers.push("cargo:undeclared-reads: c".into());
+        waivers.sort();
+        waivers.dedup();
+        Tables {
+            waivers,
+            env_names: vec!["HOME".into(), "TZ".into()],
+            externals: vec![External {
+                name: "ms".into(),
+                version: "2.1.3".into(),
+            }],
+        }
+    }
+
+    /// `p` as a v2 statement with its hdr and tables encoded, as a run
+    /// would write them; the manifest's entries root is of `sample`'s.
+    fn convert(p: &VciPredicate) -> (VciPredicateV2, Encoded<Hdr>, Encoded<Tables>) {
+        let hdr = p.hdr().unwrap();
+        let hdr = Encoded::new(hdr.clone(), hdr.encode().unwrap());
+        let tables = tables_for(p);
+        let tables = Encoded::new(tables.clone(), tables.encode().unwrap());
+        let root = p.core.manifest.as_ref().unwrap().entries_root();
+        let v2 = p.to_v2(&hdr.id, &tables.id, &tables.value, &root).unwrap();
+        (v2, hdr, tables)
+    }
+
+    #[test]
+    fn v2_predicate_type_is_the_v2_url() {
+        assert_eq!(PREDICATE_TYPE_V2, "https://vci.dev/test-attestation/v2");
+        assert_ne!(PREDICATE_TYPE_V2, PREDICATE_TYPE);
+    }
+
+    #[test]
+    fn v2_json_is_compact_with_sorted_keys_and_round_trips() {
+        let (v2, _, _) = convert(&sample_v1());
+        let json = v2.to_json().unwrap();
+        assert!(!json.contains(' ') && !json.contains('\n'), "{json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "{json}");
+        assert_eq!(
+            keys,
+            [
+                "archSpecific",
+                "argv",
+                "cfgPredicates",
+                "commit",
+                "declaredInputs",
+                "entriesRoot",
+                "expiresAt",
+                "hdr",
+                "issuedAt",
+                "platformSpecific",
+                "result",
+                "tables",
+                "tainted",
+                "testId",
+                "tree",
+                "treeDirty",
+                "waived",
+            ]
+        );
+        // Nested objects are sorted too (TestResult's v1 order is not).
+        let result: Vec<&str> = v["result"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            result,
+            ["durationMs", "failed", "skipped", "state", "tests"]
+        );
+        assert_eq!(v["waived"], serde_json::json!([1, 2]));
+        assert_eq!(v["hdr"].as_str().unwrap().len(), 64);
+        // The whole statement goes through the same writer.
+        let stmt = sorted_compact_json(&serde_json::json!({
+            "subject": [{"name": "x", "digest": {"blake3": "0"}}],
+            "_type": "s",
+            "predicateType": PREDICATE_TYPE_V2,
+            "predicate": v2,
+        }))
+        .unwrap();
+        assert!(stmt.starts_with("{\"_type\":\"s\",\"predicate\":{\"archSpecific\""));
+        assert!(stmt.contains("\"digest\":{\"blake3\":\"0\"},\"name\":\"x\""));
+        let back = VciPredicateV2::from_json(json.as_bytes()).unwrap();
+        assert_eq!(back, v2);
+        assert_eq!(back.to_json().unwrap(), json);
+    }
+
+    #[test]
+    fn v2_json_omits_empty_lists_and_reads_them_back_empty() {
+        let (mut v2, _, _) = convert(&sample_v1());
+        v2.arch_specific.clear();
+        v2.cfg_predicates.clear();
+        v2.declared_inputs.clear();
+        v2.platform_specific.clear();
+        v2.tainted.clear();
+        v2.waived.clear();
+        v2.tree = None;
+        let json = v2.to_json().unwrap();
+        for k in [
+            "archSpecific",
+            "cfgPredicates",
+            "declaredInputs",
+            "platformSpecific",
+            "tainted",
+            "waived",
+            "tree",
+        ] {
+            assert!(!json.contains(&format!("\"{k}\":")), "{k} in {json}");
+        }
+        for k in [
+            "argv",
+            "commit",
+            "entriesRoot",
+            "expiresAt",
+            "hdr",
+            "issuedAt",
+            "result",
+            "tables",
+            "testId",
+            "treeDirty",
+        ] {
+            assert!(json.contains(&format!("\"{k}\":")), "{k} not in {json}");
+        }
+        assert_eq!(VciPredicateV2::from_json(json.as_bytes()).unwrap(), v2);
+        assert!(matches!(
+            VciPredicateV2::from_json(b"{\"argv\":[]}"),
+            Err(PredicateError::Json(_))
+        ));
+        assert!(VciPredicateV2::from_json(b"not json").is_err());
+    }
+
+    /// Every accessor of the resolved view gives, for a v1 predicate
+    /// converted to v2 with its hdr and tables (both through their encoded
+    /// bytes, the v2 through its JSON), what it gives for the v1.
+    #[test]
+    fn resolved_predicate_parity_between_v1_and_v2() {
+        let p = sample_v1();
+        let (v2, hdr, tables) = convert(&p);
+        let v2 = VciPredicateV2::from_json(v2.to_json().unwrap().as_bytes()).unwrap();
+        let ctx = Context::decode(&v2, &hdr.bytes, &tables.bytes).unwrap();
+        assert_eq!(ctx.hdr, hdr.value);
+        assert_eq!(ctx.tables, tables.value);
+        let a = ResolvedPredicate::v1(&p);
+        let b = ctx.resolve(&v2, &p.core.input_root).unwrap();
+        assert_eq!((a.version(), b.version()), (1, 2));
+        assert_eq!(a.tool_version(), b.tool_version());
+        assert_eq!(a.adapter(), b.adapter());
+        assert_eq!(a.test_id(), b.test_id());
+        assert_eq!(a.argv(), b.argv());
+        assert_eq!(a.repo_id(), b.repo_id());
+        assert_eq!(a.commit(), b.commit());
+        assert_eq!(a.tree_dirty(), b.tree_dirty());
+        assert_eq!(a.tree(), b.tree());
+        assert_eq!(a.toolchain(), b.toolchain());
+        assert_eq!(a.global_input_root(), b.global_input_root());
+        assert_eq!(a.input_root(), b.input_root());
+        // The hdr holds the entries sorted; the root does not depend on the order.
+        assert_eq!(a.global_manifest().root(), b.global_manifest().root());
+        assert_eq!(
+            b.global_manifest().entries,
+            p.hdr().unwrap().global_manifest
+        );
+        assert_eq!(a.result(), b.result());
+        assert_eq!(a.tainted(), b.tainted());
+        assert_eq!(a.issued_at(), b.issued_at());
+        assert_eq!(a.expires_at(), b.expires_at());
+        assert_eq!(a.env_config_digest(), b.env_config_digest());
+        assert_eq!(a.project_dir(), b.project_dir());
+        assert_eq!(a.runner_project(), b.runner_project());
+        assert_eq!(a.project_name(), b.project_name());
+        assert_eq!(a.platform_specific(), b.platform_specific());
+        assert_eq!(a.arch_specific(), b.arch_specific());
+        assert_eq!(a.waived(), b.waived());
+        assert_eq!(a.cfg_predicates(), b.cfg_predicates());
+        assert_eq!(a.declared_inputs(), b.declared_inputs());
+        assert_eq!(a.env_set(), b.env_set());
+        assert_eq!(a.rails_inputs(), b.rails_inputs());
+        assert_eq!(a.ignored_inputs(), b.ignored_inputs());
+        assert_eq!(a.hdr_id(), None);
+        assert_eq!(b.hdr_id(), Some(v2.hdr.as_str()));
+        assert_eq!(b.tables_id(), Some(v2.tables.as_str()));
+        assert_eq!(
+            b.entries_root().unwrap(),
+            p.core.manifest.as_ref().unwrap().entries_root()
+        );
+        assert_eq!(b.hdr_id().unwrap(), crate::objects::hex32(&hdr.id));
+        // The same holds with every optional field empty.
+        let mut p = sample_v1();
+        p.core.tree = None;
+        p.core.tainted.clear();
+        p.waived.clear();
+        p.platform_specific.clear();
+        p.arch_specific.clear();
+        p.cfg_predicates.clear();
+        p.declared_inputs.clear();
+        p.env_set.clear();
+        p.ignored_inputs.clear();
+        p.rails_inputs.clear();
+        p.project_name.clear();
+        let (v2, hdr, tables) = convert(&p);
+        let b = ResolvedPredicate::v2(&v2, &p.core.input_root, &hdr.value, &tables.value).unwrap();
+        let a = ResolvedPredicate::v1(&p);
+        assert_eq!(a.tree(), None);
+        assert_eq!(b.tree(), None);
+        assert!(b.waived().is_empty() && b.tainted().is_empty());
+        assert_eq!(a.project_name(), b.project_name());
+        assert_eq!(a.rails_inputs(), b.rails_inputs());
+        assert_eq!(a.env_set(), b.env_set());
+    }
+
+    #[test]
+    fn v1_to_hdr_conversion_rules() {
+        let p = sample_v1();
+        let h = p.hdr().unwrap();
+        assert_eq!(h.repo_id, "r");
+        assert_eq!(h.adapter, "vitest");
+        assert_eq!(h.project_name, "api");
+        assert_eq!(h.project_dir, "svc/api");
+        assert_eq!(h.runner_project, "unit");
+        assert_eq!(h.tool_version, "0.1.0");
+        assert_eq!(h.rails_inputs, "loose");
+        assert_eq!(h.env_config_digest, [0x12; 32]);
+        assert_eq!(h.global_input_root, [0xab; 32]);
+        assert_eq!(
+            h.global_manifest
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            ["go.mod", "go.sum"],
+            "sorted"
+        );
+        assert_eq!(h.ignored_inputs, ["log/**"]);
+        assert_eq!(h.env_set, ["TZ"]);
+        assert_eq!(h.toolchain, p.core.toolchain);
+        // The hdr round trips through its bytes, so a v1 record's facts
+        // name one object.
+        assert_eq!(Hdr::decode(&h.encode().unwrap()).unwrap(), h);
+        // A duplicate global entry collapses.
+        let mut d = p.clone();
+        let e = d.core.global_manifest.entries[0].clone();
+        d.core.global_manifest.entries.push(e);
+        assert_eq!(d.hdr().unwrap(), h);
+        // The digests must be lowercase hex.
+        let mut bad = p.clone();
+        bad.env_config_digest = "AB".repeat(32);
+        assert_eq!(
+            bad.hdr(),
+            Err(PredicateError::Hex {
+                field: "envConfigDigest",
+                value: "AB".repeat(32),
+            })
+        );
+        let mut bad = p.clone();
+        bad.core.global_input_root = "g".into();
+        assert!(matches!(
+            bad.hdr(),
+            Err(PredicateError::Hex {
+                field: "globalInputRoot",
+                ..
+            })
+        ));
+        // A global manifest with env entries (node-test's and Vitest's hold
+        // NODE_OPTIONS: 12 of the 1,175 sample units) or externals is
+        // carried whole, sorted, so that the hdr's root is the signed one.
+        let mut with_env = p.clone();
+        with_env.core.global_manifest.env.push(EnvEntry {
+            key: "TZ".into(),
+            hash: crate::ABSENT_HASH.into(),
+        });
+        with_env.core.global_manifest.env.push(EnvEntry {
+            key: "NODE_OPTIONS".into(),
+            hash: "cd".repeat(32),
+        });
+        with_env.core.global_manifest.externals.push(External {
+            name: "node".into(),
+            version: "24.11.0".into(),
+        });
+        let h = with_env.hdr().unwrap();
+        assert_eq!(
+            h.global_env
+                .iter()
+                .map(|e| e.key.as_str())
+                .collect::<Vec<_>>(),
+            ["NODE_OPTIONS", "TZ"]
+        );
+        assert_eq!(h.global_externals, with_env.core.global_manifest.externals);
+        assert_eq!(
+            h.global_manifest().root(),
+            with_env.core.global_manifest.root()
+        );
+        let back = Hdr::decode(&h.encode().unwrap()).unwrap();
+        assert_eq!(back, h);
+        let tables = tables_for(&with_env);
+        let stmt = with_env.to_v2(&[1; 32], &[2; 32], &tables, "e").unwrap();
+        let v2 = ResolvedPredicate::v2(&stmt, &with_env.core.input_root, &back, &tables).unwrap();
+        assert_eq!(
+            v2.global_manifest().root(),
+            with_env.core.global_manifest.root()
+        );
+    }
+
+    #[test]
+    fn v1_to_v2_waived_ids_are_sorted_distinct_positions_in_the_table() {
+        let p = sample_v1();
+        let tables = tables_for(&p);
+        let id = [7; 32];
+        let v2 = p.to_v2(&id, &id, &tables, "e").unwrap();
+        assert_eq!(v2.waived, [1, 2]);
+        assert_eq!(v2.hdr, "07".repeat(32));
+        assert_eq!(v2.entries_root, "e");
+        // Repeated and unsorted strings (a v1 unit lists a taint per
+        // occurrence) collapse to the set.
+        let mut dup = p.clone();
+        dup.waived = vec![
+            "go:unsafe: b".into(),
+            "go:net:dial: a".into(),
+            "go:unsafe: b".into(),
+        ];
+        let d = dup.to_v2(&id, &id, &tables, "e").unwrap();
+        assert_eq!(d.waived, [1, 2]);
+        let hdr = p.hdr().unwrap();
+        let r = ResolvedPredicate::v2(&d, "i", &hdr, &tables).unwrap();
+        assert_eq!(r.waived(), ["go:net:dial: a", "go:unsafe: b"]);
+        // A string the table lacks cannot be converted.
+        let mut missing = p.clone();
+        missing.waived.push("rails:network-db: x".into());
+        assert_eq!(
+            missing.to_v2(&id, &id, &tables, "e"),
+            Err(PredicateError::Waiver("rails:network-db: x".into()))
+        );
+    }
+
+    /// Section 1.6 rule 7: the resolved view refuses an id out of range, a
+    /// duplicate and an unsorted list, so `waived()` never indexes past the
+    /// table.
+    #[test]
+    fn resolved_v2_checks_the_waived_ids() {
+        let p = sample_v1();
+        let (v2, hdr, tables) = convert(&p);
+        let ok = |w: Vec<u16>| {
+            let mut s = v2.clone();
+            s.waived = w;
+            ResolvedPredicate::v2(&s, "i", &hdr.value, &tables.value).map(|r| {
+                r.waived()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(ok(vec![]), Ok(vec![]));
+        assert_eq!(
+            ok(vec![0, 2]),
+            Ok(vec![
+                "cargo:undeclared-reads: c".to_owned(),
+                "go:unsafe: b".to_owned()
+            ])
+        );
+        assert_eq!(ok(vec![3]), Err(PredicateError::WaivedId { id: 3, len: 3 }));
+        assert_eq!(
+            ok(vec![0, 65535]),
+            Err(PredicateError::WaivedId { id: 65535, len: 3 })
+        );
+        assert_eq!(ok(vec![1, 1]), Err(PredicateError::WaivedUnsorted));
+        assert_eq!(ok(vec![2, 1]), Err(PredicateError::WaivedUnsorted));
+        let empty = Tables::default();
+        let mut s = v2.clone();
+        s.waived = vec![0];
+        assert_eq!(
+            ResolvedPredicate::v2(&s, "i", &hdr.value, &empty).err(),
+            Some(PredicateError::WaivedId { id: 0, len: 0 })
+        );
+    }
+
+    /// Section 1.5 step 5: an object whose id is not the signed one, or
+    /// that does not decode, fails the context.
+    #[test]
+    fn context_decode_checks_ids_and_decoding() {
+        let p = sample_v1();
+        let (v2, hdr, tables) = convert(&p);
+        // The objects swapped: both ids are wrong.
+        let e = Context::decode(&v2, &tables.bytes, &hdr.bytes).unwrap_err();
+        assert_eq!(
+            e,
+            PredicateError::ObjectId {
+                what: "hdr",
+                expected: v2.hdr.clone(),
+                found: crate::objects::hex32(&tables.id),
+            }
+        );
+        let e = Context::decode(&v2, &hdr.bytes, &hdr.bytes).unwrap_err();
+        assert!(
+            matches!(e, PredicateError::ObjectId { what: "tables", .. }),
+            "{e}"
+        );
+        // A statement naming the id of corrupt bytes: the id matches, the
+        // decode does not.
+        let mut corrupt = hdr.bytes.clone();
+        corrupt.push(0);
+        let mut s = v2.clone();
+        s.hdr = crate::objects::hex32(&crate::objects::object_id(&corrupt));
+        let e = Context::decode(&s, &corrupt, &tables.bytes).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                PredicateError::Object {
+                    what: "hdr",
+                    source: DecodeError::Trailing(1)
+                }
+            ),
+            "{e}"
+        );
+        let mut s = v2.clone();
+        s.tables = crate::objects::hex32(&crate::objects::object_id(b"vo"));
+        let e = Context::decode(&s, &hdr.bytes, b"vo").unwrap_err();
+        assert!(
+            matches!(e, PredicateError::Object { what: "tables", .. }),
+            "{e}"
+        );
+        // Upper-case hex in the statement never matches (one spelling).
+        let mut s = v2.clone();
+        s.hdr = s.hdr.to_uppercase();
+        assert!(matches!(
+            Context::decode(&s, &hdr.bytes, &tables.bytes),
+            Err(PredicateError::ObjectId { what: "hdr", .. })
+        ));
+        assert!(Context::decode(&v2, &hdr.bytes, &tables.bytes).is_ok());
     }
 
     #[test]

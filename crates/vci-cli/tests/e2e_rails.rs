@@ -136,6 +136,15 @@ struct World {
     untrusted: PathBuf,
     gitconfig: PathBuf,
     ruby_bin: PathBuf,
+    /// Every `vci run` of this world writes format-1 records
+    /// (`VCI_STORE_RECORD_FORMAT=1`: the envelope with its input manifest,
+    /// as vci 2.8 wrote), for a test whose assertions hold only for that
+    /// form: a stored manifest (`stored_predicate`, the per-slot bases) or
+    /// the per-entry explain text on git-meta (a format-3 record there
+    /// names no state object, so an edited entry is reported as changed
+    /// with the attested hash not loaded; tests/e2e_m3.rs covers that
+    /// text).
+    format1: std::sync::atomic::AtomicBool,
 }
 
 fn keygen(path: &Path, comment: &str) {
@@ -219,6 +228,7 @@ impl World {
             base,
             _tmp: tmp,
             ruby_bin,
+            format1: std::sync::atomic::AtomicBool::new(false),
         };
         keygen(&w.trusted, "trusted");
         keygen(&w.untrusted, "untrusted");
@@ -350,6 +360,18 @@ end"##;
     }
 
     fn vci_env(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let out = self.vci_command(dir, args, env).output().unwrap();
+        eprintln!(
+            "$ vci {} {env:?}\n{}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    /// The `vci` command [`World::vci_env`] runs, not started.
+    fn vci_command(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut cmd = Command::cargo_bin("vci").unwrap();
         cmd.current_dir(dir)
             .args(args)
@@ -364,6 +386,9 @@ end"##;
         for k in SCRUB.iter().chain(vci_store::select::ENV_VARS) {
             cmd.env_remove(k);
         }
+        if self.format1.load(std::sync::atomic::Ordering::Relaxed) {
+            cmd.env("VCI_STORE_RECORD_FORMAT", "1");
+        }
         // `vci run` of several files runs them in batch mode, as it does
         // by default; VCI_E2E_RAILS_PER_FILE=1 runs every test one process
         // per file instead (to compare).
@@ -373,14 +398,7 @@ end"##;
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let out = cmd.output().unwrap();
-        eprintln!(
-            "$ vci {} {env:?}\n{}{}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out
+        cmd
     }
 
     fn vci(&self, dir: &Path, args: &[&str]) -> Output {
@@ -495,6 +513,8 @@ const ALL: &[&str] = &[A, B, C, D];
 #[test]
 fn rails_end_to_end_verification_steps() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
 
     // Step 1: attest B, then plan: skip B; run A, C, D.
@@ -630,7 +650,7 @@ fn rails_end_to_end_verification_steps() {
     let stored = store.list(Some(B)).unwrap();
     assert_eq!(stored.len(), 1);
     let good = stored[0].clone();
-    let mut env: Value = serde_json::from_slice(&good.bytes).unwrap();
+    let mut env: Value = serde_json::from_slice(&store_common::envelope_json(&good.bytes)).unwrap();
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut payload = b64.decode(env["payload"].as_str().unwrap()).unwrap();
     let pos = payload
@@ -909,6 +929,8 @@ fn rails_database_contents_are_not_an_input() {
     let Some(w) = World::build(&toml, copy_rails_fixture) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let dblist = "test/lib/dblist_test.rb";
     w.put(
@@ -1196,6 +1218,8 @@ fn rails_database_server_and_other_database_files() {
 #[test]
 fn rails_multi_database_schema_files_and_named_files() {
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let db = w.read("config/database.yml");
     w.put(
@@ -1906,12 +1930,7 @@ fn rails_init_writes_the_rails_template() {
 /// The predicate stored for `id` (the newest one).
 fn stored_predicate(work: &Path, id: &str) -> Value {
     let stored = AttestStore::new(&store_for(work)).list(Some(id)).unwrap();
-    let env: Value = serde_json::from_slice(&stored.last().unwrap().bytes).unwrap();
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(env["payload"].as_str().unwrap())
-        .unwrap();
-    let st: Value = serde_json::from_slice(&payload).unwrap();
-    store_common::inline_manifest(&store_for(work), st["predicate"].clone())
+    store_common::predicate_of(&store_for(work), &stored.last().unwrap().bytes)
 }
 
 /// A Minitest file that never loads Rails (it requires only minitest and a
@@ -2034,6 +2053,8 @@ fn rails_active_storage_with_libvips() {
     let Some(w) = World::build(VCI_TOML, copy_vips_fixture) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let vips = Command::new(w.ruby_bin.join("bundle"))
         .args(["exec", "ruby", "-e", "require 'vips'"])
         .current_dir(&w.work)
@@ -2682,6 +2703,170 @@ fn rails_plan_boots_the_application_once() {
     );
 }
 
+/// A store's first plans start the boot from the tables objects their
+/// candidates name (2.9), before any verdict; when every candidate then
+/// fails before the externals check (here: both attested files changed), no
+/// verdict reads it and no plan sets the natives flag. The first such plan
+/// pays for that boot; the plans after it boot only at an externals check,
+/// as before 2.9 (none here). Once the files are back, a plan compares
+/// libvips again and boots once.
+#[test]
+fn rails_plan_pays_for_an_unused_boot_hint_once() {
+    let Some(w) = World::build(VCI_TOML, copy_vips_fixture) else {
+        return;
+    };
+    let vips = w.ruby_cmd(&w.work, "bundle", &["exec", "ruby", "-e", "require 'vips'"]);
+    if !vips.status.success() {
+        eprintln!("SKIPPED: libvips is not installed (`brew install vips`)");
+        return;
+    }
+    let work = w.work.clone();
+    let files = ["test/models/caption_test.rb", "test/models/image_test.rb"];
+    w.run(&work, &files, &w.trusted);
+    for f in files {
+        let edited = format!("{}\n# edited\n", w.read(f));
+        w.put(f, &edited);
+    }
+    w.git(&work, &["commit", "-q", "-am", "edit both attested files"]);
+    let ruby = logging_ruby(&w);
+    let ruby = ruby.to_str().unwrap();
+    let log = w.base.join("ruby.log");
+    let mut boots = Vec::new();
+    for _ in 0..3 {
+        let _ = std::fs::remove_file(&log);
+        let p = w.plan_env(&work, "main", &[("VCI_RUBY", ruby)]);
+        assert!(p.skip.is_empty(), "{p:?}");
+        assert!(p.run.is_superset(&set(&files)), "{p:?}");
+        let log = std::fs::read_to_string(&log).unwrap();
+        boots.push(log.matches("config/environment").count());
+    }
+    assert_eq!(boots, [1, 0, 0]);
+
+    w.git(&work, &["revert", "--no-edit", "HEAD"]);
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(
+        w.plan_env(&work, "main", &[("VCI_RUBY", ruby)]).skip,
+        set(&files)
+    );
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(log.matches("config/environment").count(), 1, "{log}");
+}
+
+/// A boot `vci plan` started ahead of time ends with a `vci` that a signal
+/// ended, which runs none of vci's own cleanup (no destructor): its stdin
+/// is a pipe vci holds, and when the pipe ends the collector removes the
+/// boot's run directory and ends it. Simulated: a plan with the store's
+/// natives flag set starts the boot at once; the light probe takes 4 s and
+/// the boot 30 s; vci gets SIGTERM while both run. Before 2.9 the boot was
+/// left running (parent pid 1) with its run directory.
+#[test]
+fn rails_plan_boot_ends_with_a_signalled_vci() {
+    let Some(w) = World::build(VCI_TOML, copy_vips_fixture) else {
+        return;
+    };
+    let vips = w.ruby_cmd(&w.work, "bundle", &["exec", "ruby", "-e", "require 'vips'"]);
+    if !vips.status.success() {
+        eprintln!("SKIPPED: libvips is not installed (`brew install vips`)");
+        return;
+    }
+    let work = w.work.clone();
+    let files = ["test/models/caption_test.rb", "test/models/image_test.rb"];
+    w.run(&work, &files, &w.trusted);
+    // Compares libvips: sets the store's natives flag.
+    assert_eq!(w.plan(&work, "main").skip, set(&files));
+
+    let (pid_file, dir_file) = (w.base.join("boot.pid"), w.base.join("boot.dir"));
+    let shim = w.base.join("slow-ruby");
+    std::fs::write(
+        &shim,
+        format!(
+            r#"#!/bin/sh
+for a in "$@"; do
+  case "$a" in */vci-*.rb)
+    case "$(cat "$a")" in
+      'require File.expand_path("config/environment")')
+        dirname "$a" > '{dir}'
+        echo $$ > '{pid}'
+        exec '{ruby}' -e 'sleep 30';;
+      *Probe.light!*) sleep 4;;
+    esac;;
+  esac
+done
+exec '{ruby}' "$@"
+"#,
+            dir = dir_file.display(),
+            pid = pid_file.display(),
+            ruby = w.ruby_bin.join("ruby").display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The run directories, under the test's own directory.
+    let tmp = w.base.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut vci = w
+        .vci_command(
+            &work,
+            &["plan", "--base-ref", "main", "--format", "json"],
+            &[
+                ("VCI_RUBY", shim.to_str().unwrap()),
+                ("TMPDIR", tmp.to_str().unwrap()),
+            ],
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let wait_for = |what: &str, secs: u64, f: &dyn Fn() -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    wait_for("the boot started", 60, &|| {
+        std::fs::read_to_string(&pid_file).is_ok_and(|p| p.ends_with('\n'))
+    });
+    assert!(vci.try_wait().unwrap().is_none(), "vci is still planning");
+    let pid = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let run_dir = PathBuf::from(std::fs::read_to_string(&dir_file).unwrap().trim());
+    assert!(run_dir.is_dir(), "{run_dir:?}");
+    let alive = |pid: &str| {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(alive(&pid));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let term = Command::new("kill")
+        .args(["-TERM", &vci.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(term.success());
+    let status = vci.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(15), "{status:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while alive(&pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let left = alive(&pid);
+    if left {
+        let _ = Command::new("kill").args(["-KILL", &pid]).status();
+    }
+    assert!(!left, "the boot (pid {pid}) outlived vci");
+    wait_for("the boot's run directory removed", 10, &|| {
+        !run_dir.exists()
+    });
+}
+
 /// `vci plan` reads the Rails toolchain without booting the application and
 /// boots it only when an attestation records a native library (see
 /// `rails_plan_boots_the_application_once`): with none recorded it boots
@@ -3116,6 +3301,8 @@ fn rails_long_file_runs_as_shards() {
 fn rails_slot_failure_from_an_earlier_file_passes_on_its_own() {
     const SLOTS: &[(&str, &str)] = &[("VCI_RAILS_PER_FILE", "0"), ("VCI_RAILS_JOBS", "2")];
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     // A table of its own: fixture tables are reloaded before each
     // non-transactional test, so a leftover row in `widgets` would not be
     // seen; a table the schema does not have persists in the slot's
@@ -3193,6 +3380,13 @@ fn batch_gives_what_one_process_per_file_gives(batch: &[(&str, &str)]) {
     let in_slots = batch.iter().any(|(k, _)| *k == "VCI_RAILS_JOBS");
     let Some(alone) = World::new() else { return };
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): the per-slot bases below are
+    // the stored manifests' (vci 2.1.8), which a format-3 run does not
+    // write.
+    alone
+        .format1
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     add_batch_files(&alone);
     add_batch_files(&w);
     let files: Vec<&str> = BATCH_FILES.iter().map(|(f, _)| *f).collect();
@@ -3431,6 +3625,8 @@ fn rails_slots_give_what_one_process_per_file_gives() {
     batch_gives_what_one_process_per_file_gives(SLOTS);
 
     let Some(w) = World::new() else { return };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let collide = |n: &str| {
         format!(
             "require \"test_helper\"\n\nclass Collide{n}Test < ActiveSupport::TestCase\n  self.use_transactional_tests = false\n\n  test \"owns its row\" do\n    Widget.create!(name: \"collide\", size: {n})\n    sleep 2\n    assert_equal [{n}], Widget.where(name: \"collide\").pluck(:size)\n  ensure\n    Widget.where(name: \"collide\").delete_all\n  end\nend\n"
@@ -3510,6 +3706,8 @@ fn rails_autoload_lookups_rerun_only_tests_that_asked_for_a_new_constant() {
     let Some(w) = World::build(&toml, copy_rails_fixture) else {
         return;
     };
+    // Format-1 records (`World::format1`): this test asserts what only that form holds.
+    w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
     let work = w.work.clone();
     let asks = "test/models/asks_test.rb";
     let plain = "test/models/plain_test.rb";
@@ -3676,6 +3874,8 @@ fn rails_inputs_loose_skips_boot_file_changes_and_strict_does_not() {
         let Some(w) = World::build(&toml, copy_rails_fixture) else {
             return;
         };
+        // Format-1 records (`World::format1`): this test asserts what only that form holds.
+        w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
         let work = w.work.clone();
         let mode = if strict { "strict" } else { "loose" };
         let stderr = strip_ansi(&w.run(&work, &[B, D], &w.trusted));

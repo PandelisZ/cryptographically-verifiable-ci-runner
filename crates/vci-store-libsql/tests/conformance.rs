@@ -32,9 +32,21 @@ use std::time::Duration;
 use vci_store::conformance::{StoreFactory, World};
 use vci_store::select::{LibsqlMode, Source, Sourced};
 use vci_store::{
-    AttestationStore, Caps, Hydration, KeyHint, ManifestRef, NewAttestation, Prefetch, StoreError,
-    StoreStatus, StoredEnvelope, StoredManifest, WriteBatch, key,
+    AttestationStore, Caps, Columns, Hydration, KeyHint, ManifestRef, NewAttestation, NewObject,
+    Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, StoredObject, WriteBatch,
+    key,
 };
+
+/// The statement that moves the objects `ids` of namespace `ns` back in
+/// time by `by` (`World::age_objects`, behind the store's back).
+fn age_objects_sql(ns: &str, ids: &[&str], by: Duration) -> String {
+    let list = ids.iter().map(|i| lit(i)).collect::<Vec<_>>().join(", ");
+    format!(
+        "UPDATE {}objects SET put_at = put_at - {} WHERE id IN ({list})",
+        table_prefix(ns),
+        by.as_secs()
+    )
+}
 use vci_store_libsql::testkit;
 use vci_store_libsql::{LibsqlStore, table_prefix};
 
@@ -205,6 +217,22 @@ mod local {
                     .is_ok_and(|n| n == 1)
             })
         }
+
+        /// The local file has the SQLite store's `objects` table.
+        fn age_objects(&self, _i: usize, ids: &[&str], by: Duration) -> bool {
+            let list = ids.iter().map(|i| lit(i)).collect::<Vec<_>>().join(", ");
+            // Every id must be there (the SQLite world checks the same).
+            self.raw().is_some_and(|db| {
+                db.execute(
+                    &format!(
+                        "UPDATE objects SET put_at = put_at - {} WHERE id IN ({list})",
+                        by.as_secs()
+                    ),
+                    [],
+                )
+                .is_ok_and(|n| n == ids.len())
+            })
+        }
     }
 
     impl Drop for LocalWorld {
@@ -319,6 +347,10 @@ mod remote {
                 "UPDATE {p}attestations SET encoding = 99 WHERE key = {}",
                 lit(k)
             )])
+        }
+
+        fn age_objects(&self, _i: usize, ids: &[&str], by: Duration) -> bool {
+            self.raw(&[age_objects_sql(&self.ns, ids, by)])
         }
 
         /// A handle on the same namespace whose requests go to a path the
@@ -477,6 +509,26 @@ mod replica {
         fn set_flag(&self, name: &str) {
             self.writer.set_flag(name)
         }
+        // A replica's objects and columns are the server's: a fresh handle
+        // reads them as it would anything else.
+        fn get_objects(&self, ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+            self.fresh().get_objects(ids)
+        }
+        fn put_objects(&self, objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
+            self.writer.put_objects(objects)
+        }
+        fn remove_objects(&self, ids: &[&str]) -> Result<usize, StoreError> {
+            self.writer.remove_objects(ids)
+        }
+        fn orphan_objects(&self) -> Result<Vec<String>, StoreError> {
+            self.fresh().orphan_objects()
+        }
+        fn prune_state_objects(&self, older_than: Duration) -> Result<usize, StoreError> {
+            self.writer.prune_state_objects(older_than)
+        }
+        fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
+            self.fresh().columns(envs)
+        }
     }
 
     impl ReplicaWorld {
@@ -521,6 +573,13 @@ mod replica {
             setup
                 .__execute_for_test(&raw_insert(&self.ns, target, k, value))
                 .is_ok()
+        }
+
+        fn age_objects(&self, _i: usize, ids: &[&str], by: Duration) -> bool {
+            testkit::open_remote(&self.ns).is_some_and(|s| {
+                s.__execute_for_test(&[age_objects_sql(&self.ns, ids, by)])
+                    .is_ok()
+            })
         }
     }
 

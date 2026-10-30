@@ -1,106 +1,55 @@
-//! Shared context: repository, config, projects (each with its adapter), and
-//! the predicate wrapper.
+//! Shared context: repository, config, projects (each with its adapter), the
+//! predicate and its storage key.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use serde::{Deserialize, Serialize};
 use vci_adapter::Adapter;
-use vci_core::{Predicate, RepoPath};
+use vci_core::{RepoPath, ResolvedPredicate};
 use vci_git::Repo;
 
 use crate::config::{CONFIG_FILE, Config, EnvConfig, InputsConfig, Policy};
 use crate::envpolicy::{ChildEnvMap, FileEnv, build_child_env};
 
-/// The signed predicate: the `vci-core` [`Predicate`] plus vci-cli fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VciPredicate {
-    #[serde(flatten)]
-    pub core: Predicate,
-    /// BLAKE3 over the effective env configuration for this test file.
-    pub env_config_digest: String,
-    /// Project dir relative to the repo root.
-    pub project_dir: String,
-    /// Runner project name (Vitest `projects`), empty if none.
-    pub runner_project: String,
-    /// `[[projects]]` name in vci.toml; empty (and omitted) in the
-    /// single-project form, so those predicates serialise as before.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub project_name: String,
-    /// Go: repository files of the test whose inclusion in the build depends
-    /// on GOOS/GOARCH. When non-empty the attestation only holds on the
-    /// attested OS and architecture, whatever `policy.platform` says.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub platform_specific: Vec<String>,
-    /// Go: why the test's results may differ on another architecture
-    /// (floating-point code: the compiler fuses `x*y + z` on arm64 but not
-    /// on amd64). When non-empty the attestation only holds on the attested
-    /// architecture, whatever `policy.platform` says (the OS may differ).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub arch_specific: Vec<String>,
-    /// Taints a policy waived when this attestation was made, as the
-    /// collector reported them (any taint whose reason key
-    /// `policy.ignore_taints` matches, `go:net:` with `policy.go_allow_net`,
-    /// `cargo:undeclared-reads` with declared `[[inputs]]`). `vci plan`
-    /// accepts the attestation only while the base commit's policy still
-    /// waives every one (the `waived` check). Rails never writes one
-    /// since vci 1.4.0; a `rails:network-db:` entry (written under the
-    /// removed `policy.rails_allow_db`) is still read, and refused.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub waived: Vec<String>,
-    /// Cargo: target-dependent `cfg(...)` predicates in the unit's repository
-    /// code and manifests. On another host each must evaluate as it did on
-    /// the attesting host (`toolchain.rustCfg`), or the unit runs.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cfg_predicates: Vec<String>,
-    /// The `[[inputs]] extra` globs declared for this test id when it was
-    /// attested (they must still be exactly what the base config declares).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub declared_inputs: Vec<String>,
-    /// The env variables vci set itself (vci.toml `[env] set`, since vci
-    /// 1.6.0): their manifest entries hash the declared value, not the
-    /// attesting machine's. Informational (`envConfigDigest` covers the
-    /// declared values); empty and omitted when there are none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env_set: Vec<String>,
-    /// Rails (2.7.36): the project's `rails_inputs` when the unit was
-    /// recorded, `"loose"` or `"strict"`. Empty and omitted for the other
-    /// adapters, and in attestations made before 2.7.36 (every path the
-    /// test's process read is in their manifests).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub rails_inputs: String,
-    /// Rails (2.7.36): the globs (relative to the project dir) whose paths
-    /// were left out of the unit's manifests: the loose mode's list
-    /// (`vci_adapter::RAILS_LOOSE_IGNORED_INPUTS`, `.vci-autoload` naming
-    /// the autoload lookup records) and the project's `ignore_inputs`.
-    /// Informational: `vci plan` leaves the base vci.toml's list out of the
-    /// current global inputs of an attestation that records a mode, and the
-    /// `vci:config` external ties the mode and list to the base vci.toml.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ignored_inputs: Vec<String>,
-}
+/// The signed v1 predicate: `vci_core::VciPredicate`, the one definition
+/// (vci-cli's own copy, which serialised identically, is gone since the
+/// plan reads records of both versions through [`ResolvedPredicate`]).
+pub use vci_core::VciPredicate;
 
 /// Storage key for an attestation: everything that must match for two
 /// attestations to be interchangeable. Re-running with identical inputs
 /// replaces (renews) the stored envelope.
-pub fn storage_key(p: &VciPredicate) -> String {
-    let tc = &p.core.toolchain;
+///
+/// Computed over the resolved view of either predicate version (STORE-V2
+/// section 1.6 rule 7): every value comes from the decoded fields, never
+/// from bytes, so a writer's serialisation choices cannot move a slot, and
+/// a v1 and a v2 record of the same facts key the same slot. The waived
+/// list enters sorted and distinct ([`ResolvedPredicate::waived_canonical`]),
+/// the only form a v2 statement can carry; a v1 record whose list repeated
+/// a string or was unsorted (most of the Rails sample: 1,163 of 1,175
+/// units) therefore keys another slot than vci 2.8 gave it, and its 2.8
+/// record stays beside the new one as a second candidate until supersession
+/// or expiry removes it (section 5.1; fail-open, one more candidate per
+/// such test). Every other part of the key is spelled as 2.8 spelled it.
+pub fn storage_key(p: &ResolvedPredicate<'_>) -> String {
+    let tc = p.toolchain();
+    let global_input_root = p.global_input_root();
+    let env_config_digest = p.env_config_digest();
     let mut parts = vec![
         "vci/storage-key/v1",
-        p.core.repo_id.as_str(),
-        p.core.test_id.as_str(),
-        p.core.input_root.as_str(),
-        p.core.global_input_root.as_str(),
-        p.env_config_digest.as_str(),
+        p.repo_id(),
+        p.test_id(),
+        p.input_root(),
+        &global_input_root,
+        &env_config_digest,
         tc.node.as_str(),
         tc.vitest.as_str(),
         tc.vite.as_str(),
         tc.os.as_str(),
         tc.arch.as_str(),
     ];
-    let argv = p.core.argv.join("\0");
+    let argv = p.argv().join("\0");
     parts.push(&argv);
     // Fields added after v1 only join the key when set, so Vitest keys in the
     // single-project form are unchanged.
@@ -114,21 +63,21 @@ pub fn storage_key(p: &VciPredicate) -> String {
     } else {
         vci_core::blake3_hex(tc.go_env.join("\n").as_bytes())
     };
-    let platform_specific = p.platform_specific.join("\0");
-    let arch_specific = p.arch_specific.join("\0");
-    let waived = p.waived.join("\0");
+    let platform_specific = p.platform_specific().join("\0");
+    let arch_specific = p.arch_specific().join("\0");
+    let waived = p.waived_canonical().join("\0");
     let rust_cfg = if tc.rust_cfg.is_empty() {
         String::new()
     } else {
         vci_core::blake3_hex(tc.rust_cfg.join("\n").as_bytes())
     };
-    let cfg_predicates = p.cfg_predicates.join("\0");
+    let cfg_predicates = p.cfg_predicates().join("\0");
     let ruby_gems = if tc.ruby_gems.is_empty() {
         String::new()
     } else {
         vci_core::blake3_hex(tc.ruby_gems.join("\n").as_bytes())
     };
-    let declared_inputs = p.declared_inputs.join("\0");
+    let declared_inputs = p.declared_inputs().join("\0");
     let extra = [
         ("python", tc.python.as_str()),
         ("implementation", tc.implementation.as_str()),
@@ -155,14 +104,14 @@ pub fn storage_key(p: &VciPredicate) -> String {
         ("ruby_libs", tc.ruby_libs.as_str()),
         ("ruby_db", tc.ruby_db.as_str()),
         ("ruby_gems", &ruby_gems),
-        ("project", p.project_name.as_str()),
+        ("project", p.project_name()),
         ("superuser", if tc.superuser { "1" } else { "" }),
         (
             "adapter",
-            if p.core.adapter == "vitest" {
+            if p.adapter() == "vitest" {
                 ""
             } else {
-                p.core.adapter.as_str()
+                p.adapter()
             },
         ),
     ];
@@ -525,8 +474,272 @@ impl Ctx {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use vci_attest::{Envelope, Statement};
+    use vci_core::{
+        EntryKind, InputEntry, InputManifest, Predicate, Tables, TestResult, Toolchain, object_id,
+    };
+
     use super::*;
     use crate::config::RailsInputs;
+
+    /// The storage key as vci 2.8.1 computed it (`ctx.rs` at e6244e7): the
+    /// waived list joined as signed, repeats and order kept.
+    fn key_2_8_1(p: &VciPredicate) -> String {
+        let tc = &p.core.toolchain;
+        let mut parts = vec![
+            "vci/storage-key/v1",
+            p.core.repo_id.as_str(),
+            p.core.test_id.as_str(),
+            p.core.input_root.as_str(),
+            p.core.global_input_root.as_str(),
+            p.env_config_digest.as_str(),
+            tc.node.as_str(),
+            tc.vitest.as_str(),
+            tc.vite.as_str(),
+            tc.os.as_str(),
+            tc.arch.as_str(),
+        ];
+        let argv = p.core.argv.join("\0");
+        parts.push(&argv);
+        let hashed = |list: &[String]| {
+            if list.is_empty() {
+                String::new()
+            } else {
+                vci_core::blake3_hex(list.join("\n").as_bytes())
+            }
+        };
+        let dists = hashed(&tc.python_dists);
+        let go_env = hashed(&tc.go_env);
+        let platform_specific = p.platform_specific.join("\0");
+        let arch_specific = p.arch_specific.join("\0");
+        let waived = p.waived.join("\0");
+        let rust_cfg = hashed(&tc.rust_cfg);
+        let cfg_predicates = p.cfg_predicates.join("\0");
+        let ruby_gems = hashed(&tc.ruby_gems);
+        let declared_inputs = p.declared_inputs.join("\0");
+        let extra = [
+            ("python", tc.python.as_str()),
+            ("implementation", tc.implementation.as_str()),
+            ("pytest", tc.pytest.as_str()),
+            ("python_libs", tc.python_libs.as_str()),
+            ("python_dists", &dists),
+            ("go", tc.go.as_str()),
+            ("go_env", &go_env),
+            ("go_arch_level", tc.go_arch_level.as_str()),
+            ("platform_specific", &platform_specific),
+            ("arch_specific", &arch_specific),
+            ("waived", &waived),
+            ("rust", tc.rust.as_str()),
+            ("cargo", tc.cargo.as_str()),
+            ("rust_host", tc.rust_host.as_str()),
+            ("rust_cfg", &rust_cfg),
+            ("cfg_predicates", &cfg_predicates),
+            ("declared_inputs", &declared_inputs),
+            ("ruby", tc.ruby.as_str()),
+            ("ruby_engine", tc.ruby_engine.as_str()),
+            ("rails", tc.rails.as_str()),
+            ("bundler", tc.bundler.as_str()),
+            ("ruby_test", tc.ruby_test.as_str()),
+            ("ruby_libs", tc.ruby_libs.as_str()),
+            ("ruby_db", tc.ruby_db.as_str()),
+            ("ruby_gems", &ruby_gems),
+            ("project", p.project_name.as_str()),
+            ("superuser", if tc.superuser { "1" } else { "" }),
+            (
+                "adapter",
+                if p.core.adapter == "vitest" {
+                    ""
+                } else {
+                    p.core.adapter.as_str()
+                },
+            ),
+        ];
+        let extra: Vec<String> = extra
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        for e in &extra {
+            parts.push(e);
+        }
+        vci_core::blake3_hex(parts.join("\n").as_bytes())
+    }
+
+    /// The key of `p` through its v2 form: the hdr and tables objects of a
+    /// run holding this unit (the waiver table its distinct waived
+    /// strings), the v2 statement `to_v2` makes, and the view over them.
+    fn key_through_v2(p: &VciPredicate) -> String {
+        let hdr = p.hdr().expect("hdr");
+        let hdr_id = object_id(&hdr.encode().expect("hdr encodes"));
+        let mut waivers = p.waived.clone();
+        waivers.sort();
+        waivers.dedup();
+        let tables = Tables {
+            waivers,
+            env_names: vec![],
+            externals: vec![],
+        };
+        let tables_id = object_id(&tables.encode().expect("tables encode"));
+        let v2 = p
+            .to_v2(&hdr_id, &tables_id, &tables, &p.core.input_root)
+            .expect("to_v2");
+        let view = ResolvedPredicate::v2(&v2, &p.core.input_root, &hdr, &tables).expect("view");
+        assert_eq!(view.version(), 2);
+        storage_key(&view)
+    }
+
+    /// Whether the signed waived list is already sorted and distinct (then
+    /// the 2.8.1 key and this key agree).
+    fn canonical(waived: &[String]) -> bool {
+        waived.windows(2).all(|w| w[0] < w[1])
+    }
+
+    fn sample_predicate(adapter: &str, waived: &[&str]) -> VciPredicate {
+        let manifest = InputManifest {
+            entries: vec![InputEntry {
+                path: RepoPath::new("test/a_test.rb").unwrap(),
+                kind: EntryKind::File,
+                exec: false,
+                size: 10,
+                hash: "ab".repeat(32),
+            }],
+            ..Default::default()
+        };
+        VciPredicate {
+            core: Predicate {
+                tool_version: "2.9.0".into(),
+                adapter: adapter.into(),
+                test_id: "test/a_test.rb".into(),
+                argv: vec!["bin/rails".into(), "test".into()],
+                repo_id: "0123456789abcdef0123456789abcdef01234567".into(),
+                commit: "2cb18b86448f1a5d47490e33330b721398073236".into(),
+                tree_dirty: false,
+                tree: None,
+                toolchain: Toolchain {
+                    ruby: "3.4.1".into(),
+                    rails: "8.0.1".into(),
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    ..Default::default()
+                },
+                global_input_root: manifest.root(),
+                input_root: manifest.root(),
+                manifest: None,
+                manifest_ref: Some(manifest.root()),
+                global_manifest: manifest.clone(),
+                result: TestResult {
+                    state: "passed".into(),
+                    tests: 1,
+                    failed: 0,
+                    skipped: 0,
+                    duration_ms: 5,
+                },
+                tainted: vec![],
+                issued_at: "2026-10-28T04:11:29Z".into(),
+                expires_at: "2026-11-11T04:11:29Z".into(),
+            },
+            env_config_digest: vci_core::blake3_hex(b"env config"),
+            project_dir: ".".into(),
+            runner_project: String::new(),
+            project_name: "api".into(),
+            platform_specific: vec![],
+            arch_specific: vec![],
+            waived: waived.iter().map(|w| w.to_string()).collect(),
+            cfg_predicates: vec![],
+            declared_inputs: vec![],
+            env_set: vec![],
+            rails_inputs: "loose".into(),
+            ignored_inputs: vec![],
+        }
+    }
+
+    /// The key over the v1 view equals the key over the v2 view of the same
+    /// facts (STORE-V2 section 1.6 rule 7), and equals 2.8.1's key exactly
+    /// when the signed waived list was already sorted and distinct (section
+    /// 5.1's exception), over a synthetic sample that always runs.
+    #[test]
+    fn storage_key_is_the_same_over_both_views_and_moves_only_for_a_non_canonical_waived_list() {
+        for (adapter, waived, moves) in [
+            ("rails", &[][..], false),
+            ("rails", &["rails:network-db:a"][..], false),
+            (
+                "cargo",
+                &["cargo:undeclared-reads", "cargo:undeclared-reads"][..],
+                true,
+            ),
+            ("rails", &["t:b", "t:a"][..], true),
+            ("rails", &["t:a", "t:b", "t:c"][..], false),
+            ("go", &["go:net:x", "go:net:x", "go:net:y"][..], true),
+        ] {
+            let p = sample_predicate(adapter, waived);
+            let v1 = storage_key(&ResolvedPredicate::v1(&p));
+            assert_eq!(v1, key_through_v2(&p), "{adapter} {waived:?}");
+            assert_eq!(v1 != key_2_8_1(&p), moves, "{adapter} {waived:?}");
+            assert_eq!(!canonical(&p.waived), moves, "{adapter} {waived:?}");
+        }
+        // Two lists of the same strings in another order or with repeats
+        // key one slot; a list of other strings keys another.
+        let a = storage_key(&ResolvedPredicate::v1(&sample_predicate(
+            "rails",
+            &["t:b", "t:a"],
+        )));
+        let b = storage_key(&ResolvedPredicate::v1(&sample_predicate(
+            "rails",
+            &["t:a", "t:b", "t:a"],
+        )));
+        let c = storage_key(&ResolvedPredicate::v1(&sample_predicate("rails", &["t:a"])));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    /// The same over the real units of `VCI_PAIRS` (the 1,175-unit sample
+    /// STORE-V2 was measured on; skipped without it), and how many of
+    /// their keys move from 2.8.1's because the waived list enters sorted
+    /// and distinct: STORE-V2-DECISIONS.md says 1,163 of 1,175 (their slots are
+    /// re-created once; the old rows expire).
+    #[test]
+    fn storage_key_over_the_real_sample_matches_both_views_and_counts_the_moved_slots() {
+        let Some(path) = std::env::var_os("VCI_PAIRS") else {
+            eprintln!("SKIPPED: VCI_PAIRS is not set");
+            return;
+        };
+        let text = std::fs::read_to_string(&path).expect("VCI_PAIRS readable");
+        let file: BTreeMap<String, Vec<(String, String, String)>> =
+            serde_json::from_str(&text).expect("pairs JSON");
+        let pairs = &file["pairs"];
+        let (mut moved, mut repeated, mut unsorted) = (0usize, 0usize, 0usize);
+        for (i, (env_s, _, _)) in pairs.iter().enumerate() {
+            let envelope = Envelope::from_json(env_s.as_bytes()).expect("envelope");
+            let payload = envelope.payload_bytes().expect("payload");
+            let statement: Statement = serde_json::from_slice(&payload).expect("statement");
+            let p: VciPredicate =
+                serde_json::from_value(statement.predicate).expect("v1 predicate");
+            let v1 = storage_key(&ResolvedPredicate::v1(&p));
+            assert_eq!(v1, key_through_v2(&p), "unit {i} ({})", p.core.test_id);
+            let old = key_2_8_1(&p);
+            assert_eq!(v1 != old, !canonical(&p.waived), "unit {i}");
+            if v1 != old {
+                moved += 1;
+            }
+            let mut sorted = p.waived.clone();
+            sorted.sort();
+            if sorted.windows(2).any(|w| w[0] == w[1]) {
+                repeated += 1;
+            }
+            if sorted != p.waived {
+                unsorted += 1;
+            }
+        }
+        eprintln!(
+            "storage keys: {moved} of {} v1 records key another slot under 2.9 than under 2.8.1 (the waived list enters sorted and distinct: {repeated} repeat a string, {unsorted} are unsorted); the 2.8 rows stay as second candidates until they expire",
+            pairs.len()
+        );
+        if pairs.len() == 1175 {
+            assert_eq!((moved, repeated, unsorted), (1163, 1158, 1163));
+        }
+    }
 
     /// `rails_inputs` and `ignore_inputs` join the config hash only when not
     /// the default, so loose mode without a list hashes as 2.7.33 did (its

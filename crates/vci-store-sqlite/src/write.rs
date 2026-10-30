@@ -4,7 +4,7 @@
 //! Arguments are validated by the caller before the transaction starts.
 
 use rusqlite::{Connection, OptionalExtension, params};
-use vci_store::{ManifestRef, NewAttestation, StoredEnvelope, key};
+use vci_store::{ManifestRef, NewAttestation, NewObject, StoredEnvelope, key};
 
 use crate::schema::{REF_INLINE, REF_ROOT, REF_UNKNOWN};
 use crate::sql::plain as sql;
@@ -12,11 +12,13 @@ use crate::sql::plain as sql;
 use crate::sql::MEMO_KEEP_SECS;
 
 /// Store one attestation under the hinted key, or (without a hint) under
-/// the key its slot already has, else the plain key. The slot's UNIQUE
-/// constraint makes the replacement of an older key of the same slot one
-/// atomic upsert. Identical bytes under the same key change nothing (not
-/// even `stored_at`). A row whose value this vci cannot read (an unknown
-/// `encoding`) is rewritten. Returns the key stored under.
+/// the key its slot already has, else the plain key, with the format-3
+/// columns it carries (`NULL` without them). The slot's UNIQUE constraint
+/// makes the replacement of an older key of the same slot one atomic
+/// upsert. Identical bytes and columns under the same key change nothing
+/// (not even `stored_at`); the same bytes with other columns, or without
+/// them, replace the columns. A row whose value this vci cannot read (an
+/// unknown `encoding`) is rewritten. Returns the key stored under.
 pub(crate) fn put(
     conn: &Connection,
     att: &NewAttestation<'_>,
@@ -27,6 +29,8 @@ pub(crate) fn put(
         ManifestRef::Inline => (None, REF_INLINE),
         ManifestRef::Unknown => (None, REF_UNKNOWN),
     };
+    let c = att.columns.cloned().unwrap_or_default();
+    let duration_ms = c.duration_ms.and_then(|n| i64::try_from(n).ok());
     match att.hinted_key() {
         Some(k) => {
             let hint = key::parse_key_hint(&k);
@@ -44,6 +48,16 @@ pub(crate) fn put(
                     ref_state,
                     now,
                     att.envelope,
+                    c.format,
+                    c.commit,
+                    c.platform,
+                    c.state,
+                    duration_ms,
+                    c.expires,
+                    c.hdr,
+                    c.tables,
+                    c.shape,
+                    c.state_obj,
                 ],
                 |_| Ok(()),
             )
@@ -64,6 +78,16 @@ pub(crate) fn put(
                         ref_state,
                         now,
                         att.envelope,
+                        c.format,
+                        c.commit,
+                        c.platform,
+                        c.state,
+                        duration_ms,
+                        c.expires,
+                        c.hdr,
+                        c.tables,
+                        c.shape,
+                        c.state_obj,
                     ],
                     |r| r.get(0),
                 )
@@ -157,4 +181,53 @@ pub(crate) fn remember_passing(
 pub(crate) fn set_flag(conn: &Connection, name: &str, now: i64) -> rusqlite::Result<()> {
     conn.execute(&sql().flag_put, params![name, now])?;
     Ok(())
+}
+
+/// Store these (validated) objects, `ids` being each one's id: an id
+/// already stored has its `put_at` refreshed (one `UPDATE`, which changes a
+/// row exactly then), the others are inserted. Returns how many were
+/// inserted. An id given twice is stored once.
+pub(crate) fn put_objects(
+    conn: &Connection,
+    objects: &[NewObject<'_>],
+    ids: &[String],
+    now: i64,
+) -> rusqlite::Result<usize> {
+    let mut touch = conn.prepare(&sql().object_touch)?;
+    let mut insert = conn.prepare(&sql().object_insert)?;
+    let mut done = std::collections::BTreeSet::new();
+    let mut new = 0;
+    for (o, id) in objects.iter().zip(ids) {
+        if !done.insert(id.as_str()) || touch.execute(params![id, now])? > 0 {
+            continue;
+        }
+        insert.execute(params![id, o.kind as u8, now, o.bytes])?;
+        new += 1;
+    }
+    Ok(new)
+}
+
+/// Delete these (validated) objects under the orphan rule: each goes only
+/// when no attestation's object-id column names it and it was put before
+/// `before` (now less the grace). Returns how many went. The check and the
+/// delete are one statement in the caller's write transaction, and SQLite
+/// has one writer, so nothing can reference an object between them.
+pub(crate) fn remove_objects(
+    conn: &Connection,
+    ids: &[&str],
+    before: i64,
+) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(&sql().object_remove)?;
+    let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+    let mut n = 0;
+    for id in unique {
+        n += stmt.execute(params![id, before])?;
+    }
+    Ok(n)
+}
+
+/// Delete every state object put before `before`, referenced or not.
+/// Returns how many went.
+pub(crate) fn prune_state_objects(conn: &Connection, before: i64) -> rusqlite::Result<usize> {
+    conn.execute(&sql().prune_state_objects, [before])
 }

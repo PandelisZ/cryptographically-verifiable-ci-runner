@@ -6,10 +6,11 @@ use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde_json::json;
 use vci_adapter::Adapter;
-use vci_attest::{AllowedSigners, Envelope, verify_envelope};
+use vci_attest::{AllowedSigners, Envelope, FrameExt as _, verify_envelope};
 use vci_git::{AttestStore, SETUP_FILE};
 use vci_store::{
-    AttestationStore, Exchange, Prefetch, PushMode, PushStatus, StoreError, StoreStatus,
+    AttestationStore, Exchange, Prefetch, PushMode, PushStatus, Record, StoreError, StoreStatus,
+    StoredEnvelope, decode_record,
 };
 
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, template_for};
@@ -636,6 +637,7 @@ pub fn verify(
     trust: VerifyTrust<'_>,
     base_ref: Option<&str>,
     manifest_file: Option<&Utf8Path>,
+    print_envelope: bool,
 ) -> Result<i32> {
     let bytes = if envelope_path == "-" {
         let mut v = Vec::new();
@@ -644,6 +646,27 @@ pub fn verify(
     } else {
         std::fs::read(envelope_path).with_context(|| format!("reading {envelope_path}"))?
     };
+    // A format-3 record (the text frame a store holds since 2.9) is
+    // verified through the DSSE envelope rebuilt from it: the statement
+    // bytes exactly as signed and the signature re-armored, so that the
+    // checks below see what they see for a stored envelope. Its
+    // descriptor is kept for the manifest line. An envelope's bytes are
+    // used as read, as before.
+    let (bytes, descriptor) = match decode_record(&bytes) {
+        Ok(Record::FormatThree(frame)) => (frame.to_stored_json(), Some(frame.descriptor)),
+        // An envelope, or no record at all: the envelope parser says why.
+        Ok(Record::FormatOne(_)) | Err(_) => (bytes, None),
+    };
+    if print_envelope {
+        use std::io::Write as _;
+        Envelope::from_json(&bytes).with_context(|| format!("{envelope_path} is not a record"))?;
+        let mut out = std::io::stdout().lock();
+        out.write_all(&bytes)?;
+        if !bytes.ends_with(b"\n") {
+            out.write_all(b"\n")?;
+        }
+        return Ok(0);
+    }
     let now = now_unix();
     let mut note = None;
     let keyless = vci_attest::keyless::material_from_json(&bytes)?;
@@ -694,7 +717,7 @@ pub fn verify(
             println!("  trust root: {source}");
             Ok(1)
         }
-        Ok(v) => verified_details(v, &source, note, manifest_file, now),
+        Ok(v) => verified_details(v, &source, note, manifest_file, now, descriptor.as_deref()),
     }
 }
 
@@ -817,13 +840,17 @@ fn verify_ssh(
     Ok((verify_envelope(&env, &allowed, now), source))
 }
 
-/// `vci verify`'s report of a verified envelope; the exit code.
+/// `vci verify`'s report of a verified envelope; the exit code. A v2
+/// predicate (a format-3 record, whose `descriptor` is the frame's) is
+/// reported through the same lines, read from the resolved view over the
+/// hdr and tables objects of the repository's store.
 fn verified_details(
     v: vci_attest::Verified,
     source: &str,
     note: Option<String>,
     manifest_file: Option<&Utf8Path>,
     now: i64,
+    descriptor: Option<&[u8]>,
 ) -> Result<i32> {
     println!("VALID signature by {} ({})", v.principal, v.fingerprint);
     println!("  trust root: {source}");
@@ -831,6 +858,9 @@ fn verified_details(
         println!("{n}");
     }
     println!("  predicateType: {}", v.statement.predicate_type);
+    if v.statement.predicate_type == vci_core::PREDICATE_TYPE_V2 {
+        return verified_details_v2(&v, manifest_file, now, descriptor);
+    }
     match serde_json::from_value::<VciPredicate>(v.statement.predicate.clone()) {
         Ok(p) => {
             println!("  test: {}", p.core.test_id);
@@ -867,6 +897,204 @@ fn verified_details(
             Ok(1)
         }
     }
+}
+
+/// The run's hdr, tables and shape objects as `vci verify` needs them for
+/// a v2 predicate, read from the repository's store (the shape is the
+/// descriptor's, when a descriptor is at hand); or why they could not be.
+struct RunObjects {
+    hdr: Vec<u8>,
+    tables: Vec<u8>,
+    /// `None` without a descriptor; otherwise the shape's bytes, or why
+    /// they could not be taken (missing, or not the id's bytes), which
+    /// fails the manifest line alone: the hdr and tables still resolve.
+    shape: Option<Result<Vec<u8>, String>>,
+}
+
+fn run_objects(
+    p: &vci_core::VciPredicateV2,
+    descriptor: Option<&[u8]>,
+) -> Result<RunObjects, String> {
+    let shape_id = descriptor
+        .map(|d| {
+            vci_core::Descriptor::shape_id(d)
+                .map(|id| vci_core::objects::hex32(&id))
+                .map_err(|e| format!("the record's descriptor: {e}"))
+        })
+        .transpose()?;
+    let (repo, _) = open_repo().map_err(|e| {
+        format!("the hdr and tables objects are in the repository's attestation store, and {e:#}")
+    })?;
+    let store = crate::store::for_repo(&repo);
+    let mut ids: Vec<&str> = vec![&p.hdr, &p.tables];
+    ids.extend(shape_id.as_deref());
+    if store.caps().lazy_values {
+        // Fetched lazily (see `vci fetch`); a failure reads as not fetched.
+        let _ = store.prefetch(Prefetch::Objects { ids: &ids });
+    }
+    let got = store.get_objects(&ids).map_err(|e| {
+        format!(
+            "reading the run's objects from the {} store: {e}",
+            store.kind()
+        )
+    })?;
+    // Every object is taken by the id asked for, recomputed over the bytes
+    // the store returned (docs/CONTRACTS.md: a reader recomputes the id of
+    // every object it loads), never by the store's own id column alone:
+    // the hdr and tables are checked again by `Context::decode`, the shape
+    // nowhere else.
+    let take = |id: &str, what: &str| {
+        let o = got.iter().find(|o| o.id == id).ok_or_else(|| {
+            format!(
+                "the {what} object {id} is not in the {} store{}",
+                store.kind(),
+                if store.caps().lazy_values {
+                    " (run `vci fetch`)"
+                } else {
+                    ""
+                }
+            )
+        })?;
+        let found = vci_core::objects::hex32(&vci_core::object_id(&o.bytes));
+        if found != id {
+            return Err(format!(
+                "the {what} object {id} is corrupt (its BLAKE3 is {found})"
+            ));
+        }
+        Ok(o.bytes.clone())
+    };
+    Ok(RunObjects {
+        hdr: take(&p.hdr, "hdr")?,
+        tables: take(&p.tables, "tables")?,
+        shape: shape_id.as_deref().map(|id| take(id, "shape")),
+    })
+}
+
+/// [`verified_details`] of a v2 predicate: the same lines, from the
+/// resolved view over the run's objects; the manifest line from
+/// `--manifest FILE` (the compact JSON of the resolved manifest with its
+/// hashes, whose root must be the signed input root) or, without one,
+/// the set the descriptor resolves to against the run's shape and tables
+/// (the root is not recomputed then: the attested hashes are in no
+/// signed object).
+fn verified_details_v2(
+    v: &vci_attest::Verified,
+    manifest_file: Option<&Utf8Path>,
+    now: i64,
+    descriptor: Option<&[u8]>,
+) -> Result<i32> {
+    let p = match serde_json::from_value::<vci_core::VciPredicateV2>(v.statement.predicate.clone())
+    {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  predicate is not a vci test predicate (v2): {e}");
+            return Ok(1);
+        }
+    };
+    let input_root = v
+        .statement
+        .subject
+        .first()
+        .and_then(|s| s.digest.get("blake3"))
+        .cloned()
+        .unwrap_or_default();
+    println!("  test: {}", p.test_id);
+    let objects = run_objects(&p, descriptor);
+    let ctx = objects
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|o| vci_core::Context::decode(&p, &o.hdr, &o.tables).map_err(|e| e.to_string()));
+    let resolved = ctx
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|c| c.resolve(&p, &input_root).map_err(|e| e.to_string()));
+    match &resolved {
+        Ok(r) => println!("  repo id: {}", r.repo_id()),
+        Err(why) => println!("  repo id: (in the hdr object {}: {why})", p.hdr),
+    }
+    println!("  commit: {} (dirty: {})", p.commit, p.tree_dirty);
+    println!("  result: {} ({} tests)", p.result.state, p.result.tests);
+    println!("  input root: {input_root}");
+    let manifest_ok =
+        match verify_manifest_v2(&input_root, manifest_file, descriptor, &objects, &ctx) {
+            Ok(line) => {
+                println!("  manifest: {line}");
+                true
+            }
+            Err(line) => {
+                println!("  manifest: INVALID: {line}");
+                false
+            }
+        };
+    let expired = parse_rfc3339(&p.expires_at)
+        .map(|e| e <= now)
+        .unwrap_or(true);
+    println!(
+        "  issued {}, expires {}{}",
+        p.issued_at,
+        p.expires_at,
+        if expired { " (EXPIRED)" } else { "" }
+    );
+    Ok(if expired || !manifest_ok || resolved.is_err() {
+        1
+    } else {
+        0
+    })
+}
+
+/// The manifest line of a v2 predicate ([`verified_details_v2`]).
+fn verify_manifest_v2(
+    input_root: &str,
+    file: Option<&Utf8Path>,
+    descriptor: Option<&[u8]>,
+    objects: &Result<RunObjects, String>,
+    ctx: &Result<vci_core::Context, String>,
+) -> Result<String, String> {
+    if let Some(f) = file {
+        let bytes = std::fs::read(f).map_err(|e| format!("reading {f}: {e}"))?;
+        let m = vci_core::InputManifest::from_compact(&bytes)
+            .or_else(|e| serde_json::from_slice(&bytes).map_err(|_| e))
+            .map_err(|e| format!("{f}: {e}"))?;
+        let root = m.root();
+        if root != input_root {
+            return Err(format!(
+                "{f}: its root {root} is not the signed input root {input_root}"
+            ));
+        }
+        return Ok(format!(
+            "{} entries, {} externals, {} env (root verified; {f})",
+            m.entries.len(),
+            m.externals.len(),
+            m.env.len()
+        ));
+    }
+    let Some(d) = descriptor else {
+        return Err(
+            "the envelope was given without its record's descriptor (pass the format-3 record, or --manifest FILE)"
+                .to_owned(),
+        );
+    };
+    let ctx = ctx.as_ref().map_err(Clone::clone)?;
+    let shape_bytes = objects
+        .as_ref()
+        .map_err(Clone::clone)?
+        .shape
+        .as_ref()
+        .ok_or_else(|| "the shape object could not be read".to_owned())?
+        .as_deref()
+        .map_err(Clone::clone)?;
+    let shape = vci_core::Shape::decode(shape_bytes).map_err(|e| format!("shape object: {e}"))?;
+    let descriptor =
+        vci_core::Descriptor::decode(d, &ctx.tables).map_err(|e| format!("descriptor: {e}"))?;
+    let m = descriptor
+        .resolve(&shape, &ctx.tables)
+        .map_err(|e| format!("descriptor: {e}"))?;
+    Ok(format!(
+        "{} entries, {} externals, {} env (set resolved from the run's shape object; root not recomputed: the attested hashes are in no signed object, pass --manifest FILE with the manifest)",
+        m.set.len(),
+        m.externals.len(),
+        m.env.len()
+    ))
 }
 
 /// `vci init --oidc`: `.vci/identities.toml` trusting this repository's
@@ -1627,6 +1855,35 @@ pub fn store_info(json_out: bool) -> Result<i32> {
     }
 }
 
+/// `vci prune`'s options.
+pub struct PruneArgs {
+    pub dry_run: bool,
+    pub superseded: bool,
+    pub keep: usize,
+    /// `--objects`: only the object passes, leaving every attestation and
+    /// input manifest alone.
+    pub objects_only: bool,
+    /// `--older-than DAYS`: the state-object age for this run (default
+    /// `[store] explain_hashes_days`).
+    pub older_than: Option<u32>,
+}
+
+/// What a prune of the attestations found and did.
+#[derive(Default)]
+struct Pruned {
+    expired: usize,
+    kept: usize,
+    unreadable: usize,
+    /// Candidates the columns or the key hints named whose signed
+    /// statement did not confirm them (left alone; a store with columns
+    /// only).
+    unconfirmed: usize,
+    older: usize,
+    /// Manifests the remaining attestations reference; `None` once one of
+    /// them cannot be read.
+    referenced: Option<BTreeSet<String>>,
+}
+
 /// `vci prune`: delete attestations that have expired (git-meta tombstones,
 /// published by the next `vci push`). Only the claimed expiry is read; an
 /// envelope that cannot be parsed is left alone. Then delete the stored input
@@ -1634,7 +1891,26 @@ pub fn store_info(json_out: bool) -> Result<i32> {
 /// its manifest inline references none), unless an attestation's value, or
 /// the `manifestRef` of one left alone, cannot be read (what it references
 /// is then unknown).
-pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
+///
+/// Since 2.9 (store format 3): on a store that keeps listing columns
+/// (SQLite, PostgreSQL, libSQL) the listing's columns and key hints say
+/// which records are expired or beyond `--keep` without a value read, and
+/// those candidates (and, for `--keep`, the rest of their unit's records)
+/// alone are read, their signed statement deciding before a delete
+/// ([`prune_by_columns`]); a format-1 row, or one without columns, is read
+/// as before, and so is every row while the store holds an input manifest
+/// (a vci 2.8 may have written a format-1 value under a frame's columns).
+/// Then the objects no attestation references and the state objects older
+/// than `explain_hashes_days` (or `--older-than`) go; `--objects` does
+/// only that.
+pub fn prune(args: PruneArgs) -> Result<i32> {
+    let PruneArgs {
+        dry_run,
+        superseded,
+        keep,
+        objects_only,
+        older_than,
+    } = args;
     let (repo, _) = open_repo()?;
     let store = crate::store::for_repo(&repo);
     // A store that cannot be used fails here, before anything is read.
@@ -1646,7 +1922,6 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
         ""
     };
     let now = now_unix();
-    let (mut expired, mut kept, mut unreadable, mut older) = (0usize, 0usize, 0usize, 0usize);
     // Of a unit's attestations by one signer, the `keep` issued last are
     // kept (`--superseded`: one), and any made on a tree some ref still has
     // at its tip (2.1.12); an older one vouches for inputs the tree no
@@ -1661,11 +1936,76 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     } else {
         repo.live_trees().unwrap_or_default()
     };
+    let mut removed = 0usize;
+    if !objects_only {
+        let p = if store.caps().columns {
+            prune_by_columns(&*store, dry_run, keep, &live_trees, now)?
+        } else {
+            prune_by_values(&*store, dry_run, keep, &live_trees, now)?
+        };
+        let manifests = prune_manifests(&*store, dry_run, p.referenced, fetch_hint)?;
+        eprintln!(
+            "vci prune: {} expired{}{}, {} current, {} unreadable (left alone){}",
+            p.expired,
+            if superseded {
+                format!(", {} superseded", p.older)
+            } else {
+                String::new()
+            },
+            if dry_run { " (dry run)" } else { "" },
+            p.kept,
+            p.unreadable,
+            if p.unconfirmed > 0 {
+                format!(", {} unconfirmed (left alone)", p.unconfirmed)
+            } else {
+                String::new()
+            }
+        );
+        eprintln!(
+            "vci prune: {manifests} unreferenced input manifest(s){}",
+            if dry_run { " (dry run)" } else { " removed" }
+        );
+        removed += p.expired + p.older + manifests;
+    }
+    if store.caps().objects {
+        let days = older_than.unwrap_or_else(|| {
+            crate::store::selection_of(&repo)
+                .map(|s| s.explain_hashes_days.value)
+                .unwrap_or(vci_store::select::DEFAULT_EXPLAIN_HASHES_DAYS)
+        });
+        removed += prune_objects(&*store, dry_run, days)?;
+    } else if objects_only {
+        eprintln!(
+            "vci prune: the {} store keeps no objects of store format 3; nothing to do",
+            store.kind()
+        );
+    }
+    // A store with an exchange (git-meta) publishes its deletions on push;
+    // SQLite, PostgreSQL and libSQL removed theirs at once, and their `vci
+    // push` has nothing to do.
+    if removed > 0 && !dry_run && store.exchange().is_some() {
+        eprintln!(
+            "vci prune: run `vci push` to publish the deletions (`vci push --rewrite-history` also drops the deleted values from what a fetch downloads)"
+        );
+    }
+    Ok(0)
+}
+
+/// The attestations pass over every value (a store without listing
+/// columns, git-meta): every value is read, as vci 2.0 to 2.8 did.
+fn prune_by_values(
+    store: &dyn AttestationStore,
+    dry_run: bool,
+    keep: usize,
+    live_trees: &BTreeSet<String>,
+    now: i64,
+) -> Result<Pruned> {
+    let mut p = Pruned {
+        referenced: Some(BTreeSet::new()),
+        ..Pruned::default()
+    };
     let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
     let mut current = Vec::new();
-    // Manifests the remaining attestations reference; `None` once one of
-    // them cannot be read.
-    let mut referenced: Option<BTreeSet<String>> = Some(BTreeSet::new());
     // Every attestation's payload is read: fetch the ones not fetched yet
     // (on a large store, what a fetch downloaded before vci 2.0). One that
     // cannot be fetched is unreadable, and left alone.
@@ -1680,11 +2020,11 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
     }
     for e in store.read_all()? {
         if e.error.is_some() {
-            referenced = None;
+            p.referenced = None;
         }
-        match envelope_meta(&e.bytes) {
+        match record_meta(&e.bytes) {
             Some(m) if m.expires_at <= now => {
-                expired += 1;
+                p.expired += 1;
                 if dry_run {
                     println!("would remove {} {}", e.target, e.key);
                 } else {
@@ -1693,7 +2033,7 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
                 }
             }
             Some(m) => {
-                kept += 1;
+                p.kept += 1;
                 by_unit
                     .entry((m.test_id.clone(), e.signer.clone()))
                     .or_default()
@@ -1701,44 +2041,33 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
                 current.push((m, e));
             }
             None => {
-                unreadable += 1;
+                p.unreadable += 1;
                 // Left alone, so whatever it references stays: the
                 // manifest it names when that much can be read, else none
                 // is removed.
-                let r = envelope_statement(&e.bytes).and_then(|v| {
-                    v["predicate"]["manifestRef"]
-                        .as_str()
-                        .filter(|r| {
-                            vci_git::parse_manifest_key(&vci_git::manifest_key(r)).is_some()
-                        })
-                        .map(str::to_owned)
-                });
-                match (r, referenced.as_mut()) {
+                let r = unreadable_manifest_ref(&e.bytes);
+                match (r, p.referenced.as_mut()) {
                     (Some(r), Some(set)) => {
                         set.insert(r);
                     }
                     (Some(_), None) => {}
-                    (None, _) => referenced = None,
+                    (None, _) => p.referenced = None,
                 }
             }
         }
     }
     // The keys kept per unit and signer: the `keep` newest.
-    let mut keep_keys: BTreeSet<String> = BTreeSet::new();
-    for list in by_unit.values_mut() {
-        list.sort_by(|a, b| b.cmp(a));
-        keep_keys.extend(list.iter().take(keep).map(|(_, k)| k.clone()));
-    }
+    let keep_keys = keep_newest(&mut by_unit, keep);
     for (m, e) in current {
         let live = m.tree.as_deref().is_some_and(|t| live_trees.contains(t));
         if keep_keys.contains(&e.key) || live {
-            if let (Some(r), Some(set)) = (&m.manifest_ref, referenced.as_mut()) {
+            if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
                 set.insert(r.clone());
             }
             continue;
         }
-        older += 1;
-        kept -= 1;
+        p.older += 1;
+        p.kept -= 1;
         if dry_run {
             println!("would remove {} {} (superseded)", e.target, e.key);
         } else {
@@ -1746,9 +2075,271 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
             println!("removed {} {} (superseded)", e.target, e.key);
         }
     }
-    // The base manifests the referenced ones list their entries on top of
-    // (vci 2.1.8) are referenced too; one that cannot be read keeps every
-    // manifest (its base is unknown).
+    Ok(p)
+}
+
+/// What a listed record is read for on a store with columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The columns do not describe it (a format-1 row, which has none; a
+    /// record without a hint; a frame put without columns), or the store
+    /// is in the migration window: read and treated as before.
+    Read,
+    /// The `expires` column says it has expired: a candidate the signed
+    /// statement must confirm.
+    Expired,
+    /// Its unit and signer have a row beyond `keep` by the hints (or a row
+    /// read whole): the signed statements order the group.
+    Contested,
+}
+
+/// The attestations pass on a store with listing columns (STORE-V2 section
+/// 2.1 "Prune"): `list_all` with the columns gives every record's expiry
+/// (the `expires` column, from the statement the writer signed) and, from
+/// the key hint, its issue time and tree, without a value read. A record
+/// the columns do not describe (a format-1 row, which has none; a record
+/// without a hint; a frame put without columns) is read and treated as
+/// before, and so is every record while the store holds an input manifest
+/// (the migration window of section 5: a vci 2.8 that reuses a frame's
+/// slot leaves the frame's columns beside its format-1 value, and only the
+/// value says what the row is and which manifest it references). The
+/// expired candidates are then read and deleted only when the signed
+/// statement agrees ([`confirm_expired`]); a unit and signer with a record
+/// beyond `keep` by the hints has every described record read, and the
+/// signed `issuedAt`, `expiresAt` and tree order the group as they do on a
+/// store without columns. The columns pre-filter and order, the value
+/// decides (`decode_record` by its first byte), so a store writer who
+/// edits a column or a key's hint can cause extra value reads (the row's,
+/// or its unit's), never a wrong deletion.
+fn prune_by_columns(
+    store: &dyn AttestationStore,
+    dry_run: bool,
+    keep: usize,
+    live_trees: &BTreeSet<String>,
+    now: i64,
+) -> Result<Pruned> {
+    let all = store.list_all()?;
+    let refs: Vec<&StoredEnvelope> = all.iter().collect();
+    let columns = store.columns(&refs)?;
+    let window = !store.manifest_roots()?.is_empty();
+    let mut described: Vec<(StoredEnvelope, i64)> = Vec::new();
+    let mut rows: Vec<(StoredEnvelope, Role)> = Vec::new();
+    // The units and signers whose records the signed statements order.
+    let mut contested: BTreeSet<(String, String)> = BTreeSet::new();
+    for (e, c) in all.into_iter().zip(columns) {
+        match (c.format, c.expires, e.issued) {
+            (Some(3), Some(expires), Some(_)) if !window => described.push((e, expires)),
+            _ => {
+                contested.insert((e.test_key.clone(), e.signer.clone()));
+                rows.push((e, Role::Read));
+            }
+        }
+    }
+    let mut p = Pruned {
+        referenced: Some(BTreeSet::new()),
+        ..Pruned::default()
+    };
+    // The described records: expired by the column, to confirm; the rest
+    // ordered by the hints, and the groups with a record beyond `keep`
+    // (not on a tree at some ref's tip) read whole.
+    let mut by_hint: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
+    let mut hinted: Vec<StoredEnvelope> = Vec::new();
+    for (e, expires) in described {
+        if expires <= now {
+            rows.push((e, Role::Expired));
+        } else {
+            by_hint
+                .entry((e.test_key.clone(), e.signer.clone()))
+                .or_default()
+                .push((e.issued.expect("described"), e.key.clone()));
+            hinted.push(e);
+        }
+    }
+    let keep_by_hint = keep_newest(&mut by_hint, keep);
+    let mut hint_doomed: BTreeSet<String> = BTreeSet::new();
+    for e in &hinted {
+        let live = e
+            .tree
+            .as_deref()
+            .is_some_and(|t16| live_trees.iter().any(|t| t.starts_with(t16)));
+        if !keep_by_hint.contains(&e.key) && !live {
+            hint_doomed.insert(e.key.clone());
+            contested.insert((e.test_key.clone(), e.signer.clone()));
+        }
+    }
+    for e in hinted {
+        if contested.contains(&(e.test_key.clone(), e.signer.clone())) {
+            rows.push((e, Role::Contested));
+        } else {
+            // Current without a read: outside the window no manifest
+            // exists for it to reference.
+            p.kept += 1;
+        }
+    }
+    // One read of everything the statements must decide.
+    if !rows.is_empty() {
+        let mut refs: Vec<&mut StoredEnvelope> = rows.iter_mut().map(|(e, _)| e).collect();
+        store.read_values(&mut refs)?;
+    }
+    let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
+    let mut current: Vec<(EnvelopeMeta, StoredEnvelope)> = Vec::new();
+    let unreadable = |p: &mut Pruned, e: &StoredEnvelope| {
+        p.unreadable += 1;
+        // Left alone, so whatever it references stays: the manifest it
+        // names when that much can be read, else none is removed.
+        let r = unreadable_manifest_ref(&e.bytes);
+        match (r, p.referenced.as_mut()) {
+            (Some(r), Some(set)) => {
+                set.insert(r);
+            }
+            (Some(_), None) => {}
+            (None, _) => p.referenced = None,
+        }
+    };
+    for (e, role) in rows {
+        if e.error.is_some() {
+            p.referenced = None;
+        }
+        if role == Role::Expired {
+            match confirm_expired(&e, now) {
+                Ok(()) => {
+                    p.expired += 1;
+                    delete(store, dry_run, &e, "")?;
+                }
+                Err(Left::Unreadable) => unreadable(&mut p, &e),
+                Err(Left::Unconfirmed(m)) => {
+                    p.unconfirmed += 1;
+                    p.kept += 1;
+                    eprintln!(
+                        "vci prune: {} {}: left alone: its signed statement does not confirm the store's columns",
+                        e.target, e.key
+                    );
+                    if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
+                        set.insert(r.clone());
+                    }
+                }
+            }
+            continue;
+        }
+        match record_meta(&e.bytes) {
+            Some(m) if m.expires_at <= now => {
+                p.expired += 1;
+                delete(store, dry_run, &e, "")?;
+            }
+            Some(m) => {
+                p.kept += 1;
+                by_unit
+                    .entry((e.test_key.clone(), e.signer.clone()))
+                    .or_default()
+                    .push((m.issued_at, e.key.clone()));
+                current.push((m, e));
+            }
+            None => unreadable(&mut p, &e),
+        }
+    }
+    // The keys kept per unit and signer: the `keep` newest by the signed
+    // issue time.
+    let keep_keys = keep_newest(&mut by_unit, keep);
+    for (m, e) in current {
+        let live = m.tree.as_deref().is_some_and(|t| live_trees.contains(t));
+        if keep_keys.contains(&e.key) || live {
+            if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
+                set.insert(r.clone());
+            }
+            if hint_doomed.contains(&e.key) {
+                p.unconfirmed += 1;
+                eprintln!(
+                    "vci prune: {} {}: left alone: its signed statement does not confirm the store's columns",
+                    e.target, e.key
+                );
+            }
+            continue;
+        }
+        p.older += 1;
+        p.kept -= 1;
+        delete(store, dry_run, &e, " (superseded)")?;
+    }
+    Ok(p)
+}
+
+/// Why a candidate was left alone ([`confirm_expired`]).
+enum Left {
+    /// Its value could not be read or is no record.
+    Unreadable,
+    /// Its signed statement does not say what the columns said; what it
+    /// says, for the manifest it references.
+    Unconfirmed(Box<EnvelopeMeta>),
+}
+
+/// Whether the signed statement of a read candidate agrees with the
+/// `expires` column that named it: its `expiresAt` has passed. A format-1
+/// value in the slot (a vci 2.8 wrote it over a frame during the migration
+/// window, leaving the frame's columns) is read through today's envelope
+/// path: the columns never choose the parser.
+fn confirm_expired(e: &StoredEnvelope, now: i64) -> Result<(), Left> {
+    let Some(m) = record_meta(&e.bytes) else {
+        return Err(Left::Unreadable);
+    };
+    if m.expires_at <= now {
+        Ok(())
+    } else {
+        Err(Left::Unconfirmed(Box::new(m)))
+    }
+}
+
+/// The keys kept per unit and signer: the `keep` newest of each list.
+fn keep_newest(
+    by_unit: &mut BTreeMap<(String, String), Vec<(i64, String)>>,
+    keep: usize,
+) -> BTreeSet<String> {
+    let mut keep_keys: BTreeSet<String> = BTreeSet::new();
+    for list in by_unit.values_mut() {
+        list.sort_by(|a, b| b.cmp(a));
+        keep_keys.extend(list.iter().take(keep).map(|(_, k)| k.clone()));
+    }
+    keep_keys
+}
+
+/// Remove `e` (or say so on a dry run), `note` after the key.
+fn delete(
+    store: &dyn AttestationStore,
+    dry_run: bool,
+    e: &StoredEnvelope,
+    note: &str,
+) -> Result<()> {
+    if dry_run {
+        println!("would remove {} {}{note}", e.target, e.key);
+    } else {
+        store.remove(vec![e.clone()])?;
+        println!("removed {} {}{note}", e.target, e.key);
+    }
+    Ok(())
+}
+
+/// The stored manifest an unreadable value names when that much of it can
+/// be read (`manifestRef` of its statement), else `None`: whatever it
+/// references must stay.
+fn unreadable_manifest_ref(bytes: &[u8]) -> Option<String> {
+    envelope_statement(bytes).and_then(|v| {
+        v["predicate"]["manifestRef"]
+            .as_str()
+            .filter(|r| vci_git::parse_manifest_key(&vci_git::manifest_key(r)).is_some())
+            .map(str::to_owned)
+    })
+}
+
+/// The manifests pass: the base manifests the referenced ones list their
+/// entries on top of (vci 2.1.8) are referenced too; then every stored
+/// manifest nothing references goes. Returns how many went (on a dry run,
+/// how many would): one the backend kept by its own rule is said so and
+/// not counted.
+fn prune_manifests(
+    store: &dyn AttestationStore,
+    dry_run: bool,
+    mut referenced: Option<BTreeSet<String>>,
+    fetch_hint: &str,
+) -> Result<usize> {
+    // One that cannot be read keeps every manifest (its base is unknown).
     if let Some(set) = referenced.as_mut() {
         let roots: Vec<&str> = set.iter().map(String::as_str).collect();
         let _ = store.prefetch(Prefetch::Manifests { roots: &roots });
@@ -1783,13 +2374,21 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
                 if set.contains(&root) {
                     continue;
                 }
-                manifests += 1;
                 let key = vci_git::manifest_key(&root);
                 if dry_run {
+                    manifests += 1;
                     println!("would remove project {key} (unreferenced manifest)");
-                } else {
-                    store.remove_manifests(&[root.as_str()])?;
+                } else if store.remove_manifests(&[root.as_str()])? == 1 {
+                    manifests += 1;
                     println!("removed project {key} (unreferenced manifest)");
+                } else {
+                    // The backend's own rule kept it: a referrer it knows
+                    // of (a writer that stored one since the listing), or
+                    // its grace period on a shared store.
+                    eprintln!(
+                        "vci prune: project {key}: kept by the {} store (referenced, or put within its grace period)",
+                        store.kind()
+                    );
                 }
             }
         }
@@ -1797,25 +2396,52 @@ pub fn prune(dry_run: bool, superseded: bool, keep: usize) -> Result<i32> {
             "vci prune: an attestation could not be read{fetch_hint}, so no input manifest is removed"
         ),
     }
-    eprintln!(
-        "vci prune: {expired} expired{}{}, {kept} current, {unreadable} unreadable (left alone)",
-        if superseded {
-            format!(", {older} superseded")
-        } else {
-            String::new()
-        },
-        if dry_run { " (dry run)" } else { "" }
-    );
-    eprintln!(
-        "vci prune: {manifests} unreferenced input manifest(s){}",
-        if dry_run { " (dry run)" } else { " removed" }
-    );
-    if expired + older + manifests > 0 && !dry_run {
-        eprintln!(
-            "vci prune: run `vci push` to publish the deletions (`vci push --rewrite-history` also drops the deleted values from what a fetch downloads)"
+    Ok(manifests)
+}
+
+/// The objects pass (STORE-V2 sections 1.3 and 2.1): the objects no
+/// attestation references and put more than an hour ago (the store's
+/// orphan rule, applied again at the delete), then every state object put
+/// more than `days` days ago, referenced or not (the records stay valid;
+/// `vci explain` then prints the observed value without the attested
+/// hash). On git-meta both scans read every value, once each. Returns how
+/// many objects went.
+fn prune_objects(store: &dyn AttestationStore, dry_run: bool, days: u32) -> Result<usize> {
+    let orphans = match store.orphan_objects() {
+        Ok(ids) => ids,
+        Err(StoreError::Unsupported { .. }) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    for id in &orphans {
+        println!(
+            "{} project object {id} (unreferenced object)",
+            if dry_run { "would remove" } else { "removed" }
         );
     }
-    Ok(0)
+    let removed = if dry_run || orphans.is_empty() {
+        0
+    } else {
+        let ids: Vec<&str> = orphans.iter().map(String::as_str).collect();
+        store.remove_objects(&ids)?
+    };
+    eprintln!(
+        "vci prune: {} unreferenced object(s){}",
+        if dry_run { orphans.len() } else { removed },
+        if dry_run { " (dry run)" } else { " removed" }
+    );
+    let state = if dry_run {
+        eprintln!(
+            "vci prune: state objects older than {days} day(s): removed on a run without --dry-run"
+        );
+        0
+    } else {
+        let n = store.prune_state_objects(std::time::Duration::from_secs(
+            u64::from(days) * 24 * 60 * 60,
+        ))?;
+        eprintln!("vci prune: {n} state object(s) older than {days} day(s) removed");
+        n
+    };
+    Ok(removed + state)
 }
 
 /// What `prune` (and supersession on store) reads from an envelope's
@@ -1870,6 +2496,161 @@ pub(crate) fn envelope_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
         duration_ms: p["result"]["durationMs"].as_u64(),
         tree: p["tree"].as_str().map(str::to_owned),
     })
+}
+
+/// [`envelope_meta`] of a stored record of either format, told apart by
+/// its first byte ([`decode_record`]): a format-1 value as before; a
+/// format-3 frame from its signed statement, whose toolchain is in the hdr
+/// object (`os` and `arch` are empty here) and which names no stored
+/// manifest (`manifest_ref` is `None`). Unverified, as before: prune
+/// decides what to delete on it, never what to trust.
+pub(crate) fn record_meta(bytes: &[u8]) -> Option<EnvelopeMeta> {
+    match decode_record(bytes) {
+        Ok(Record::FormatOne(bytes)) => envelope_meta(bytes),
+        Ok(Record::FormatThree(frame)) => frame_meta(&frame),
+        Err(_) => None,
+    }
+}
+
+fn frame_meta(frame: &vci_core::Frame) -> Option<EnvelopeMeta> {
+    let v: serde_json::Value = serde_json::from_slice(&frame.statement).ok()?;
+    let p = &v["predicate"];
+    Some(EnvelopeMeta {
+        test_id: p["testId"].as_str()?.to_owned(),
+        issued_at: parse_rfc3339(p["issuedAt"].as_str()?).ok()?,
+        expires_at: parse_rfc3339(p["expiresAt"].as_str()?).ok()?,
+        commit: p["commit"].as_str().unwrap_or_default().to_owned(),
+        os: String::new(),
+        arch: String::new(),
+        manifest_ref: None,
+        duration_ms: p["result"]["durationMs"].as_u64(),
+        tree: p["tree"].as_str().map(str::to_owned),
+    })
+}
+
+/// What a backend's `upgrade_finish` came to ([`store_upgrade`]), in one
+/// shape over the backends' own.
+enum Done {
+    Finished,
+    Already,
+    FormatOneRows(usize),
+}
+
+#[cfg(any(feature = "sqlite", feature = "libsql"))]
+impl From<vci_store_sqlite::Finish> for Done {
+    fn from(f: vci_store_sqlite::Finish) -> Done {
+        match f {
+            vci_store_sqlite::Finish::Finished => Done::Finished,
+            vci_store_sqlite::Finish::AlreadyFinished => Done::Already,
+            vci_store_sqlite::Finish::FormatOneRows(n) => Done::FormatOneRows(n),
+        }
+    }
+}
+
+/// `vci store upgrade --begin` (`begin`) and `--finish` (STORE-V2 section
+/// 5, steps 2 and 4), on the store the repository's settings select, opened
+/// as the concrete backend: the upgrade steps are the backends' own
+/// methods, not the trait's, since a 2.8 schema is brought forward once by
+/// an operator and never by a reader. `--begin` adds the format-3 columns
+/// and tables in a request of its own (idempotent). `--finish` is refused
+/// with the count (exit 1) while an attestation that is not a format-3
+/// record remains, counted by the value's first byte on every backend,
+/// never by the `format` column; at zero it drops the input manifests and
+/// sets schema version 2. git-meta has no schema: nothing to do, exit 0.
+pub fn store_upgrade(begin: bool) -> Result<i32> {
+    let (repo, _) = open_repo()?;
+    let Some(sel) = crate::store::selection_of(&repo) else {
+        bail!("the store's settings could not be resolved (`vci store info` says why)");
+    };
+    let cx = crate::store::open_context(&repo, "store");
+    let kind = sel.kind.value.as_str();
+    let finished = |f: Done, location: &str| -> i32 {
+        match f {
+            Done::Finished => {
+                println!(
+                    "store: {kind} {location}: upgraded to schema version 2: the input manifests are dropped, and a vci before 2.9 reads this store as too new and fails open"
+                );
+                0
+            }
+            Done::Already => {
+                println!("store: {kind} {location}: at schema version 2 already");
+                0
+            }
+            Done::FormatOneRows(n) => {
+                println!(
+                    "store: {kind} {location}: not finished: {n} attestation(s) are not format-3 records, and a reader of them needs the input manifests; once they have expired (`vci prune`) or were attested again with `record_format = 3`, run `vci store upgrade --finish` again"
+                );
+                1
+            }
+        }
+    };
+    match kind {
+        "git-meta" => {
+            println!("store: git-meta has no schema: nothing to upgrade");
+            Ok(0)
+        }
+        #[cfg(feature = "sqlite")]
+        "sqlite" => {
+            use vci_store_sqlite::{SqliteFactory, SqliteOptions, SqliteStore};
+            let path = SqliteFactory::path(&sel, &cx);
+            let store = SqliteStore::open_path(
+                &path,
+                SqliteOptions {
+                    busy_timeout: sel.timeout.value,
+                    ..SqliteOptions::default()
+                },
+            );
+            let location = path.display().to_string();
+            if begin {
+                let added = store.upgrade_begin()?;
+                println!(
+                    "store: sqlite {location}: the format-3 columns and tables are {}",
+                    if added { "added" } else { "present" }
+                );
+                Ok(0)
+            } else {
+                Ok(finished(Done::from(store.upgrade_finish()?), &location))
+            }
+        }
+        #[cfg(feature = "postgres")]
+        "postgres" => {
+            let store = vci_store_postgres::PgStore::open(&sel, &cx)?;
+            let location = store.location();
+            if begin {
+                store.upgrade_begin()?;
+                println!("store: postgres {location}: the format-3 columns and tables are present");
+                Ok(0)
+            } else {
+                let f = match store.upgrade_finish()? {
+                    vci_store_postgres::Finish::Done => Done::Finished,
+                    vci_store_postgres::Finish::Already => Done::Already,
+                    vci_store_postgres::Finish::FormatOneRows(n) => {
+                        Done::FormatOneRows(usize::try_from(n).unwrap_or(usize::MAX))
+                    }
+                };
+                Ok(finished(f, &location))
+            }
+        }
+        #[cfg(feature = "libsql")]
+        "libsql" => {
+            let store = vci_store_libsql::LibsqlStore::open(&sel, &cx)?;
+            let location = store.location();
+            if begin {
+                let sent = store.upgrade_begin()?;
+                println!(
+                    "store: libsql {location}: the format-3 columns and tables are {}",
+                    if sent { "added" } else { "present" }
+                );
+                Ok(0)
+            } else {
+                Ok(finished(Done::from(store.upgrade_finish()?), &location))
+            }
+        }
+        other => bail!(
+            "this vci cannot upgrade a {other:?} store (from {}): it was built without that backend, or no such backend exists",
+            sel.kind.source
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1935,6 +2716,157 @@ mod tests {
         let (why, source) = t(None, p("i"), p("r")).unpinned(false).unwrap();
         assert!(why.contains("SSH-signed") && why.contains("without --allowed-signers"));
         assert_eq!(source, "--identities i, --trusted-root r");
+    }
+
+    /// A statement as `vci run` signs it, in the fields prune reads, with
+    /// these times (RFC 3339) and tree.
+    fn statement(issued: i64, expires: i64, tree: Option<&str>) -> Vec<u8> {
+        let mut p = json!({
+            "testId": "src/a.test.ts",
+            "issuedAt": rfc3339(issued),
+            "expiresAt": rfc3339(expires),
+            "commit": "c".repeat(40),
+            "toolchain": {"os": "linux", "arch": "x86_64"},
+            "manifestRef": "ab".repeat(32),
+            "result": {"state": "passed", "tests": 1, "failed": 0, "skipped": 0, "durationMs": 7},
+        });
+        if let Some(t) = tree {
+            p["tree"] = json!(t);
+        }
+        serde_json::to_vec(&json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "src/a.test.ts", "digest": {"blake3": "0".repeat(64)}}],
+            "predicateType": vci_core::PREDICATE_TYPE,
+            "predicate": p,
+        }))
+        .unwrap()
+    }
+
+    /// The statement as a format-1 value (an unsigned envelope: prune
+    /// never verifies) and as a format-3 frame.
+    fn both_formats(statement: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use base64::Engine as _;
+        let envelope = serde_json::to_vec(&json!({
+            "payloadType": vci_attest::PAYLOAD_TYPE,
+            "payload": base64::engine::general_purpose::STANDARD.encode(statement),
+            "signatures": [{"keyid": "", "sig": "AA=="}],
+        }))
+        .unwrap();
+        let frame = vci_core::Frame {
+            statement: statement.to_vec(),
+            keyid: "SHA256:test".into(),
+            sig: vci_core::FrameSig::SshSig(vec![1, 2, 3]),
+            descriptor: vec![0; 33],
+        }
+        .encode()
+        .unwrap()
+        .into_bytes();
+        (envelope, frame)
+    }
+
+    /// `record_meta` reads the same signed facts from a value of either
+    /// format, told apart by its first byte; a frame's toolchain is in its
+    /// hdr object (empty here) and it names no stored manifest.
+    #[test]
+    fn record_meta_reads_either_format() {
+        let (envelope, frame) = both_formats(&statement(1_000, 2_000, Some("t")));
+        let one = record_meta(&envelope).expect("a format-1 record");
+        let three = record_meta(&frame).expect("a format-3 record");
+        assert_eq!(
+            (one.test_id.as_str(), one.issued_at, one.expires_at),
+            ("src/a.test.ts", 1_000, 2_000)
+        );
+        assert_eq!(
+            (three.test_id, three.issued_at, three.expires_at),
+            (one.test_id.clone(), one.issued_at, one.expires_at)
+        );
+        assert_eq!((three.commit, three.tree), (one.commit, one.tree));
+        assert_eq!(three.duration_ms, Some(7));
+        assert_eq!((one.os.as_str(), one.arch.as_str()), ("linux", "x86_64"));
+        assert_eq!((three.os.as_str(), three.arch.as_str()), ("", ""));
+        assert_eq!(one.manifest_ref.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(three.manifest_ref, None);
+        // Byte for byte what `envelope_meta` read before 2.9.
+        let before = envelope_meta(&envelope).unwrap();
+        assert_eq!(
+            (
+                before.test_id,
+                before.issued_at,
+                before.expires_at,
+                before.manifest_ref
+            ),
+            (one.test_id, one.issued_at, one.expires_at, one.manifest_ref)
+        );
+        assert!(record_meta(b"vci3\n{}\nAA==\nAA==\n").is_none());
+        assert!(record_meta(b"").is_none());
+        assert!(
+            envelope_meta(&frame).is_none(),
+            "the format-1 parser alone refuses a frame"
+        );
+    }
+
+    /// A listed record with this key hint and value, as the columns path
+    /// reads it.
+    fn candidate(issued: i64, tree16: Option<&str>, value: Vec<u8>) -> StoredEnvelope {
+        let hint = vci_store::KeyHint {
+            issued,
+            tree: tree16.map(str::to_owned),
+        };
+        let key =
+            vci_store::key::attestation_key_hinted(&"1".repeat(64), &"2".repeat(16), "ab", &hint);
+        let mut e = StoredEnvelope::from_key("path:src/a.test.ts", &key).unwrap();
+        e.set_value(value);
+        e
+    }
+
+    /// The `expires` column only names a candidate: the signed statement
+    /// decides. It is confirmed by a signed `expiresAt` that has passed, in
+    /// either format (a 2.8 writer's format-1 value under a frame's
+    /// columns included); a statement that says otherwise leaves the
+    /// record alone with what it references, and a value that is no record
+    /// is unreadable.
+    #[test]
+    fn confirm_deletes_only_what_the_signed_statement_says() {
+        let now = 5_000;
+        for (what, bytes) in [
+            ("format 1", both_formats(&statement(1_000, 2_000, None)).0),
+            ("format 3", both_formats(&statement(1_000, 2_000, None)).1),
+        ] {
+            let e = candidate(1_000, None, bytes);
+            assert!(confirm_expired(&e, now).is_ok(), "{what}");
+        }
+        // The column said expired; the statement says not.
+        let e = candidate(1_000, None, both_formats(&statement(1_000, 9_000, None)).1);
+        assert!(matches!(
+            confirm_expired(&e, now),
+            Err(Left::Unconfirmed(m)) if m.issued_at == 1_000
+        ));
+        // No record at all.
+        let e = candidate(1_000, None, b"vci3z\n{}\nAA==\nAA==\n".to_vec());
+        assert!(matches!(confirm_expired(&e, now), Err(Left::Unreadable)));
+        let mut e = candidate(1_000, None, Vec::new());
+        e.set_error("gone");
+        assert!(matches!(confirm_expired(&e, now), Err(Left::Unreadable)));
+    }
+
+    /// Of each unit and signer, the `keep` newest by issue time are kept.
+    #[test]
+    fn keep_newest_keeps_the_latest_issued() {
+        let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
+        by_unit.insert(
+            ("u".into(), "s".into()),
+            vec![(1, "k1".into()), (3, "k3".into()), (2, "k2".into())],
+        );
+        by_unit.insert(("v".into(), "s".into()), vec![(5, "k5".into())]);
+        let kept = keep_newest(&mut by_unit, 2);
+        assert_eq!(
+            kept,
+            ["k2", "k3", "k5"].into_iter().map(String::from).collect()
+        );
+        assert_eq!(
+            keep_newest(&mut by_unit, 1),
+            ["k3", "k5"].into_iter().map(String::from).collect()
+        );
     }
 
     #[test]

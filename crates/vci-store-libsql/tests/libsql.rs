@@ -173,9 +173,13 @@ fn a_plan_costs_a_handful_of_requests() {
         let before = s.requests() - s.retries();
         b.finish().unwrap();
         // Requests sent again while another test's writer held the
-        // database are not the batch's own.
+        // database are not the batch's own. One transaction (one request)
+        // per 64 attestations, and the schema's.
         let used = s.requests() - s.retries() - before;
-        assert!(used <= 6, "a batch of {n} units took {used} requests");
+        assert!(
+            used <= (2 * n as u64).div_ceil(64) + 4,
+            "a batch of {n} units took {used} requests"
+        );
     }
     let p = open(&testkit::selection(
         LibsqlMode::Remote,
@@ -226,8 +230,11 @@ fn a_plan_costs_a_handful_of_requests() {
         after_prefetch,
         "the listings, the values and the manifests came from the cache"
     );
+    // The status, the listing, three requests of values (100 each, the
+    // first ones at once) and the statements' descriptions on each
+    // connection.
     assert!(
-        after_prefetch <= 8,
+        after_prefetch <= 10,
         "status and prefetch took {after_prefetch} requests"
     );
 }
@@ -623,6 +630,81 @@ struct Shared {
     canned: Mutex<Option<Vec<u8>>>,
     /// Requests it answered itself.
     canned_sent: AtomicUsize,
+    /// The next this many cursor requests (a read's rows) are never
+    /// answered: held until the client gives up and closes.
+    stall_cursors: AtomicUsize,
+    /// While set, every write (a request holding `BEGIN IMMEDIATE`) is
+    /// never answered.
+    stall_writes: AtomicBool,
+    /// Requests it held unanswered.
+    stalled: AtomicUsize,
+    /// The next this many cursor requests are cut off (as `cut_cursors`),
+    /// after `pass_cursors` more went through.
+    cut_next: AtomicUsize,
+    /// Cursor requests to let through before `cut_next` applies.
+    pass_cursors: AtomicUsize,
+    /// The next this many writes are sent on to the server, and its
+    /// answer is never passed on: held until the client gives up.
+    swallow_writes: AtomicUsize,
+    /// The next this many writes are never sent on, nor answered.
+    hold_writes: AtomicUsize,
+    /// The next this many writes are sent on with their `BEGIN IMMEDIATE`
+    /// misspelt, so the server refuses them (a syntax error: the
+    /// transaction is rolled back and answered at once, nothing is held).
+    break_writes: AtomicUsize,
+    /// Writes sent on broken.
+    broken: AtomicUsize,
+    /// The next this many writes are sent on `late_ms` after they arrived
+    /// (once the client gave up on them), and never answered: a write that
+    /// waited for the write lock past its deadline and then committed.
+    late_writes: AtomicUsize,
+    late_ms: AtomicUsize,
+    /// Late writes sent on and answered.
+    late_done: AtomicUsize,
+    /// Writes sent on to the server.
+    writes: AtomicUsize,
+    /// Bytes a second passed on from the server to the clients, all its
+    /// connections together (0: as fast as they come).
+    rate: AtomicUsize,
+    /// When the bytes passed on so far at `rate` are through.
+    rate_next: Mutex<Option<Instant>>,
+    /// Bytes passed on from the server to the clients.
+    passed: AtomicUsize,
+    /// What the next cursor requests get, in order, before any other
+    /// setting: `true` never answered (as `stall_cursors`), `false` sent
+    /// on.
+    schedule: Mutex<std::collections::VecDeque<bool>>,
+    /// Cursor requests that reached it.
+    cursors: AtomicUsize,
+    /// Milliseconds each answer waits before its first byte is passed on
+    /// (a server, or a link, slow to answer whatever the answer's size).
+    delay_ms: AtomicUsize,
+    /// The bytes of each write request sent on (a request holding `BEGIN
+    /// IMMEDIATE`), in order.
+    write_sizes: Mutex<Vec<usize>>,
+    /// When each write request sent on began, and when the last byte of
+    /// its answer was passed on, in order.
+    write_times: Mutex<Vec<(Instant, Option<Instant>)>>,
+}
+
+impl Shared {
+    /// Wait until `n` more bytes may go to a client at `rate`.
+    fn throttle(&self, n: usize) {
+        self.passed.fetch_add(n, Ordering::SeqCst);
+        let rate = self.rate.load(Ordering::SeqCst);
+        if rate == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let at = {
+            let mut next = self.rate_next.lock().unwrap();
+            let start = next.filter(|t| *t > now).unwrap_or(now);
+            let at = start + Duration::from_secs_f64(n as f64 / rate as f64);
+            *next = Some(at);
+            at
+        };
+        std::thread::sleep(at.saturating_duration_since(now));
+    }
 }
 
 /// The test server's `host:port` and token, when it speaks plain HTTP (a
@@ -687,6 +769,109 @@ impl Proxy {
     /// Cut off the answers to cursor requests from now on, or stop.
     fn cut_cursors(&self, on: bool) {
         self.shared.cut_cursors.store(on, Ordering::SeqCst);
+    }
+
+    /// Never answer the next `n` cursor requests.
+    fn stall_cursors(&self, n: usize) {
+        self.shared.stall_cursors.store(n, Ordering::SeqCst);
+    }
+
+    /// Never answer `n` cursor requests, after `pass` more went through.
+    fn stall_after(&self, pass: usize, n: usize) {
+        self.shared.pass_cursors.store(pass, Ordering::SeqCst);
+        self.shared.stall_cursors.store(n, Ordering::SeqCst);
+    }
+
+    /// The next cursor requests, in order: `true` never answered, `false`
+    /// sent on.
+    fn schedule(&self, next: &[bool]) {
+        *self.shared.schedule.lock().unwrap() = next.iter().copied().collect();
+    }
+
+    /// How many cursor requests (a read's rows) reached it.
+    fn cursors(&self) -> usize {
+        self.shared.cursors.load(Ordering::SeqCst)
+    }
+
+    /// Never answer a write from now on, or stop.
+    fn stall_writes(&self, on: bool) {
+        self.shared.stall_writes.store(on, Ordering::SeqCst);
+    }
+
+    /// Send the next `n` writes on, and never pass on their answers.
+    fn swallow_writes(&self, n: usize) {
+        self.shared.swallow_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Never send on, nor answer, the next `n` writes.
+    fn hold_writes(&self, n: usize) {
+        self.shared.hold_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Send the next `n` writes on with their first statement misspelt:
+    /// the server refuses each (rolled back, answered at once).
+    fn break_writes(&self, n: usize) {
+        self.shared.break_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// How many writes it sent on broken.
+    fn broken(&self) -> usize {
+        self.shared.broken.load(Ordering::SeqCst)
+    }
+
+    /// Send the next `n` writes on `ms` milliseconds late, and never
+    /// answer them.
+    fn late_writes(&self, n: usize, ms: usize) {
+        self.shared.late_ms.store(ms, Ordering::SeqCst);
+        self.shared.late_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Hold each answer `ms` milliseconds before passing on its first
+    /// byte (0: no wait).
+    fn delay_answers(&self, ms: usize) {
+        self.shared.delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// The size of each write request sent on, in order.
+    fn write_sizes(&self) -> Vec<usize> {
+        self.shared.write_sizes.lock().unwrap().clone()
+    }
+
+    /// The time from the end of each write's answer to the start of the
+    /// next write.
+    fn write_gaps(&self) -> Vec<Duration> {
+        let t = self.shared.write_times.lock().unwrap();
+        t.windows(2)
+            .filter_map(|w| Some(w[1].0.saturating_duration_since(w[0].1?)))
+            .collect()
+    }
+
+    /// How many bytes it passed on from the server.
+    fn passed(&self) -> usize {
+        self.shared.passed.load(Ordering::SeqCst)
+    }
+
+    /// How many writes it sent on to the server.
+    fn writes(&self) -> usize {
+        self.shared.writes.load(Ordering::SeqCst)
+    }
+
+    /// Pass on at most `bytes` a second from the server, all connections
+    /// together (0: no limit).
+    fn limit_rate(&self, bytes: usize) {
+        self.shared.rate.store(bytes, Ordering::SeqCst);
+    }
+
+    /// How many requests it held unanswered.
+    fn stalled(&self) -> usize {
+        self.shared.stalled.load(Ordering::SeqCst)
+    }
+
+    /// Cut off the answers to `n` cursor requests, after `pass` more went
+    /// through.
+    fn cut_next(&self, pass: usize, n: usize) {
+        self.shared.pass_cursors.store(pass, Ordering::SeqCst);
+        self.shared.cut_next.store(n, Ordering::SeqCst);
     }
 
     /// How many answers it cut off.
@@ -786,6 +971,10 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
     let mut waiting = false;
     // The answer to the request sent is to be cut off: what came of it.
     let mut cutting: Option<Vec<u8>> = None;
+    // The answer to the request sent is never passed on.
+    let mut swallowing = false;
+    // The request sent is a write: its bytes are counted.
+    let mut writing = false;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         if server.is_some()
@@ -832,9 +1021,102 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                         }
                         return;
                     }
-                    cutting = (sh.cut_cursors.load(Ordering::SeqCst)
-                        && buf[..n].starts_with(b"POST /v3/cursor"))
-                    .then(Vec::new);
+                    let cursor = buf[..n].starts_with(b"POST /v3/cursor");
+                    let write = buf[..n].windows(15).any(|w| w == b"BEGIN IMMEDIATE");
+                    let take_one = |n: &AtomicUsize| {
+                        n.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+                            .is_ok()
+                    };
+                    if cursor {
+                        sh.cursors.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let scheduled = if cursor {
+                        sh.schedule.lock().unwrap().pop_front()
+                    } else {
+                        None
+                    };
+                    let stall_one = scheduled.unwrap_or_else(|| {
+                        cursor
+                            && sh.stall_cursors.load(Ordering::SeqCst) > 0
+                            && !take_one(&sh.pass_cursors)
+                            && take_one(&sh.stall_cursors)
+                    });
+                    let hold_one = write && take_one(&sh.hold_writes);
+                    if write
+                        && take_one(&sh.break_writes)
+                        && let Some(i) = buf[..n].windows(15).position(|w| w == b"BEGIN IMMEDIATE")
+                    {
+                        // `BEGIN IMMEDIAT`: a syntax error the server
+                        // answers with at once; the same length, so the
+                        // request's framing holds.
+                        buf[i..i + 15].copy_from_slice(b"BEGIN IMMEDIAT ");
+                        sh.broken.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if write && take_one(&sh.late_writes) {
+                        // The whole request, sent on late; its answer
+                        // read and dropped.
+                        let mut request = buf[..n].to_vec();
+                        let mut quiet = Instant::now();
+                        while quiet.elapsed() < Duration::from_millis(50) {
+                            match take(&client, &mut buf) {
+                                Some(0) => break,
+                                Some(m) => {
+                                    request.extend_from_slice(&buf[..m]);
+                                    quiet = Instant::now();
+                                }
+                                None => std::thread::sleep(Duration::from_millis(1)),
+                            }
+                        }
+                        sh.stalled.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(
+                            sh.late_ms.load(Ordering::SeqCst) as u64,
+                        ));
+                        sh.writes.fetch_add(1, Ordering::SeqCst);
+                        if send_all(s, &request) {
+                            // Its answer: until it pauses 100 ms once begun.
+                            let until = Instant::now() + Duration::from_secs(10);
+                            let mut quiet: Option<Instant> = None;
+                            while Instant::now() < until
+                                && quiet.is_none_or(|q| q.elapsed() < Duration::from_millis(100))
+                            {
+                                match take(s, &mut buf) {
+                                    Some(0) => break,
+                                    Some(_) => quiet = Some(Instant::now()),
+                                    None => std::thread::sleep(Duration::from_millis(1)),
+                                }
+                            }
+                            sh.late_done.fetch_add(1, Ordering::SeqCst);
+                        }
+                        return;
+                    }
+                    if stall_one || hold_one || (write && sh.stall_writes.load(Ordering::SeqCst)) {
+                        // Held: read what the client sends until it closes.
+                        sh.stalled.fetch_add(1, Ordering::SeqCst);
+                        while !sh.gone.load(Ordering::SeqCst) {
+                            match take(&client, &mut buf) {
+                                Some(0) => return,
+                                Some(_) => {}
+                                None => std::thread::sleep(Duration::from_millis(2)),
+                            }
+                        }
+                        return;
+                    }
+                    let cut_one = cursor
+                        && sh.cut_next.load(Ordering::SeqCst) > 0
+                        && !take_one(&sh.pass_cursors)
+                        && take_one(&sh.cut_next);
+                    cutting = ((sh.cut_cursors.load(Ordering::SeqCst) && cursor) || cut_one)
+                        .then(Vec::new);
+                    swallowing = write && take_one(&sh.swallow_writes);
+                    writing = write;
+                    if write {
+                        sh.writes.fetch_add(1, Ordering::SeqCst);
+                        sh.write_sizes.lock().unwrap().push(0);
+                        sh.write_times.lock().unwrap().push((Instant::now(), None));
+                    }
+                }
+                if writing && let Some(last) = sh.write_sizes.lock().unwrap().last_mut() {
+                    *last += n;
                 }
                 if !send_all(s, &buf[..n]) {
                     return;
@@ -850,6 +1132,18 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                 return;
             }
             Some(n) => {
+                if swallowing {
+                    // The server answered; the client never hears it.
+                    sh.stalled.fetch_add(1, Ordering::SeqCst);
+                    while !sh.gone.load(Ordering::SeqCst) {
+                        match take(&client, &mut buf) {
+                            Some(0) => return,
+                            Some(_) => {}
+                            None => std::thread::sleep(Duration::from_millis(2)),
+                        }
+                    }
+                    return;
+                }
                 if let Some(head) = &mut cutting {
                     // The headers and the first bytes of the body, then a
                     // FIN.
@@ -862,8 +1156,17 @@ fn relay(client: std::net::TcpStream, upstream: &str, idle: Duration, close: Clo
                     }
                     (moved, last) = (true, Instant::now());
                 } else {
+                    let delay = sh.delay_ms.load(Ordering::SeqCst);
+                    if waiting && delay > 0 {
+                        // The first bytes of an answer.
+                        std::thread::sleep(Duration::from_millis(delay as u64));
+                    }
+                    sh.throttle(n);
                     if !send_all(&client, &buf[..n]) {
                         return;
+                    }
+                    if writing && let Some(last) = sh.write_times.lock().unwrap().last_mut() {
+                        last.1 = Some(Instant::now());
                     }
                     (moved, waiting, last) = (true, false, Instant::now());
                 }
@@ -2097,9 +2400,11 @@ fn a_replica_answers_orphans_as_its_server() {
     assert!(r.orphan_manifests(&[&root]).unwrap().is_empty());
 }
 
-/// A statement the server refuses (here a trigger's `RAISE`) fails its
-/// batch as `Backend`, writes nothing, and latches nothing: the handle's
-/// later reads and writes go on, remote and replica.
+/// A statement the server refuses (here a trigger's `RAISE`) loses the
+/// unit it writes, as `Backend`, and nothing else: the batch's transaction
+/// is split down to that unit, the other units are stored, nothing is
+/// latched, and the handle's later reads and writes go on, remote and
+/// replica.
 #[test]
 fn a_statement_the_server_refuses_latches_nothing() {
     let Some((s, ns)) = remote() else { return };
@@ -2142,29 +2447,39 @@ fn a_statement_the_server_refuses_latches_nothing() {
             &envelope(Some(&m.root()), "good"),
         )
         .unwrap();
-        h.put_for_test(
-            "src/a.test.ts",
-            S1,
-            &bad,
-            Some(&hint(5)),
-            &envelope(None, "bad"),
-        )
-        .unwrap();
-        match b.finish() {
-            Err(e @ StoreError::Backend(_)) => assert!(e.to_string().contains("boom"), "{e}"),
+        let refused = h
+            .put_for_test(
+                "src/a.test.ts",
+                S1,
+                &bad,
+                Some(&hint(5)),
+                &envelope(None, "bad"),
+            )
+            .unwrap();
+        // The unit whose write the server refuses is lost alone (2.8.1
+        // lost the whole batch): the other unit's attestation and manifest
+        // are stored.
+        let f = b
+            .finish_partial()
+            .unwrap_or_else(|e| panic!("replica {replica}: {e}"));
+        assert_eq!(f.lost_count(), 1, "replica {replica}");
+        match f.lost(&refused.key) {
+            Some(e @ StoreError::Backend(_)) => assert!(e.to_string().contains("boom"), "{e}"),
             other => panic!("replica {replica}: expected Backend, got {other:?}"),
         }
         let srv = testkit::open_remote(&ns).unwrap();
         assert!(
-            srv.manifest(&m.root()).unwrap().is_none(),
-            "the failed batch's manifest"
+            srv.manifest(&m.root()).unwrap().is_some(),
+            "the stored unit's manifest"
         );
-        assert!(
-            keys_of(&srv, "src/b.test.ts").is_empty(),
-            "the failed batch's attestation"
+        assert_eq!(
+            keys_of(&srv, "src/b.test.ts").len(),
+            1,
+            "the stored unit's attestation"
         );
+        assert_eq!(keys_of(&srv, "src/a.test.ts").len(), 1, "the refused one");
         // The handle goes on.
-        assert!(h.manifest(&m.root()).unwrap().is_none());
+        assert!(h.manifest(&m.root()).unwrap().is_some());
         h.put_for_test(
             "src/c.test.ts",
             S1,
@@ -2446,7 +2761,11 @@ fn a_server_that_blocks_writes_refuses_them_and_reads_go_on() {
         {
             let tag = format!("{says} {}", mode.name());
             let s = handle(mode, &ns, &format!("r{i}.libsql"));
-            let big = envelope(None, &"z".repeat(200_000));
+            // Hex digits of hashes: as large compressed (half) as not.
+            let noise: String = (0..3_200u32)
+                .map(|k| vci_core::blake3_hex(&k.to_le_bytes()))
+                .collect();
+            let big = envelope(None, &noise);
             let n = u8::try_from(2 + i * 4 + j * 2).unwrap();
             let put = s.put_for_test("src/new.test.ts", S1, &hex64(n), Some(&hint(2)), &big);
             match &put {
@@ -2599,4 +2918,1842 @@ fn the_store_commands_fail_on_a_replica_that_cannot_be_kept() {
         ));
     }
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ---- 2.8.2: bounded retries, hints, compression, leaner storage ----------------------------
+
+/// A handle through a [`Proxy`] whose requests are given `secs` each.
+fn proxied(proxy: &Proxy, token: Option<&str>, ns: &str, secs: u64) -> LibsqlStore {
+    let mut sel = testkit::selection(
+        LibsqlMode::Remote,
+        Some(&proxy.url()),
+        token,
+        Some(ns),
+        None,
+    );
+    sel.timeout = Sourced {
+        value: Duration::from_secs(secs),
+        source: Source::File,
+    };
+    open(&sel)
+}
+
+/// A read whose deadline runs out (a large read answered slowly while
+/// other jobs write) is sent once more on a new connection, with a
+/// deadline of its own: it succeeds, and nothing is latched (2.8.1
+/// latched the breaker, and the plan ran every unit). The same read out of
+/// time again latches it: the server cannot be used, and every later call
+/// fails at once.
+#[test]
+fn a_read_whose_deadline_runs_out_is_sent_again_once() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let put = |n: u8, unit: &str| {
+        s.put_for_test(unit, S1, &hex64(n), Some(&hint(1)), &envelope(None, unit))
+    };
+    put(1, "src/a.test.ts").unwrap();
+    proxy.stall_cursors(1);
+    let before = s.retries();
+    let t = Instant::now();
+    let all = s.list_all().unwrap_or_else(|e| panic!("sent again: {e}"));
+    assert_eq!(all.len(), 1);
+    assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    assert_eq!(proxy.stalled(), 1);
+    assert!(s.retries() > before, "the read was sent again");
+    put(2, "src/b.test.ts").unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    assert_eq!(s.list_all().unwrap().len(), 2);
+
+    proxy.stall_cursors(2);
+    let t = Instant::now();
+    let e = s.list_all().unwrap_err();
+    assert!(matches!(e, StoreError::Timeout { .. }), "{e:?}");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    assert_eq!(proxy.stalled(), 3);
+    proxy.stall_cursors(0);
+    let t = Instant::now();
+    let e = s.list_all().unwrap_err();
+    assert!(e.to_string().contains("not retried"), "{e}");
+    assert!(put(3, "src/c.test.ts").is_err());
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+}
+
+/// A hint's write (a memo, a flag) waits at most its own short deadline
+/// behind other writers, is never sent again, and latches nothing: the
+/// plan goes on reading and writing (2.8.1 waited the request timeout
+/// inside the native-library check every verdict thread waits on, then
+/// latched the breaker, and the second round and the memo failed).
+#[test]
+fn a_hint_write_is_dropped_after_its_deadline() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let e = s
+        .put_for_test(
+            "src/a.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(1)),
+            &envelope(None, "a"),
+        )
+        .unwrap();
+    proxy.stall_writes(true);
+    let t = Instant::now();
+    let before = s.retries();
+    s.remember_passing("0123456789abcdef", &[(e.test_key.clone(), e.key.clone())]);
+    s.set_flag("plan:natives:x");
+    assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+    assert_eq!(proxy.stalled(), 2, "each sent once");
+    assert_eq!(s.retries(), before, "never sent again");
+    proxy.stall_writes(false);
+    s.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    s.put_for_test(
+        "src/b.test.ts",
+        S1,
+        &hex64(2),
+        Some(&hint(1)),
+        &envelope(None, "b"),
+    )
+    .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    assert_eq!(s.list_all().unwrap().len(), 2);
+}
+
+/// A flag already set sends nothing, and a memo writes only the entries
+/// the server does not hold: a second plan of the same tree writes none
+/// (2.8.1 rewrote every passing entry, about 1,900 rows per vex plan).
+#[test]
+fn hints_send_only_what_is_new() {
+    let Some((s, ns)) = remote() else { return };
+    let mut entries = Vec::new();
+    for i in 0..3u8 {
+        let e = s
+            .put_for_test(
+                &unit(usize::from(i)),
+                S1,
+                &hex64(i),
+                Some(&hint(1)),
+                &envelope(None, "x"),
+            )
+            .unwrap();
+        entries.push((e.test_key.clone(), e.key.clone()));
+    }
+    let tree = "0123456789abcdef";
+    s.set_flag("plan:natives:x");
+    s.remember_passing(tree, &entries[..2]);
+    let fresh = || testkit::open_remote(&ns).unwrap();
+    let p = fresh();
+    assert!(p.flag("plan:natives:x"));
+    let n = p.requests();
+    p.set_flag("plan:natives:x");
+    assert_eq!(p.requests(), n, "a flag set already sends nothing");
+    assert_eq!(p.passing_on(tree).len(), 2);
+    let n = p.requests();
+    p.remember_passing(tree, &entries[..2]);
+    assert_eq!(p.requests(), n, "entries held already send nothing");
+    p.remember_passing(tree, &entries);
+    assert!(p.requests() > n, "a new entry is written");
+    let mut changed = entries.clone();
+    changed[0].1 = changed[1].1.clone();
+    p.remember_passing(tree, &changed);
+    let q = fresh();
+    let memo = q.passing_on(tree);
+    assert_eq!(memo.len(), 3);
+    assert_eq!(
+        memo[&entries[0].0], entries[1].1,
+        "a changed entry is written"
+    );
+}
+
+/// With `VCI_STORE_COMPRESS=zstd` values go to the server compressed
+/// (encoding 1) and come back as they were, to any 2.8.2 handle, whichever
+/// way it writes; the same bytes put again change nothing. A value of an
+/// encoding this vci does not know, or one that decompresses past the
+/// largest record, reads as unreadable: its unit runs.
+#[test]
+fn values_written_compressed_read_back_as_they_were() {
+    let Some((s, ns)) = remote() else { return };
+    s.__compress_for_test(true);
+    let p = table_prefix(&ns);
+    let m = manifest(
+        &(0..60)
+            .map(|i| format!("src/f{i}.rs"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let (root, bytes) = (m.root(), m.to_compact());
+    assert!(s.put_manifest(&root, bytes.as_bytes()).unwrap());
+    assert!(
+        !s.put_manifest(&root, bytes.as_bytes()).unwrap(),
+        "the same bytes, compressed the same"
+    );
+    let env = envelope(Some(&root), &"padding ".repeat(2_000));
+    let stored = s
+        .put_for_test("src/a.test.ts", S1, &hex64(1), Some(&hint(1)), &env)
+        .unwrap();
+    let rows = s
+        .__query_for_test(&format!(
+            "SELECT encoding, length(value) FROM {p}attestations \
+             UNION ALL SELECT encoding, length(value) FROM {p}manifests"
+        ))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (row, raw) in rows.iter().zip([env.len(), bytes.len()]) {
+        assert_eq!(row[0], "1", "{rows:?}");
+        let len: usize = row[1].parse().unwrap();
+        assert!(len * 2 < raw, "{len} of {raw}");
+    }
+    // Read by a handle that writes as they are.
+    let r = testkit::open_remote(&ns).unwrap();
+    r.__compress_for_test(false);
+    r.prefetch(Prefetch::Units {
+        test_ids: &["src/a.test.ts"],
+        choose: None,
+    })
+    .unwrap();
+    let mut l = r.list_units(&["src/a.test.ts"]).unwrap().remove(0);
+    r.read_values(&mut l.iter_mut().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(l[0].key, stored.key);
+    assert!(matches!(l[0].state(), ValueState::Read(b) if b == env.as_slice()));
+    let got = r.manifest(&root).unwrap().unwrap();
+    assert_eq!(got.bytes, bytes.as_bytes());
+    // It replaces the slot's compressed row with its own, as it is.
+    let env2 = envelope(Some(&root), "second");
+    r.put_for_test("src/a.test.ts", S1, &hex64(1), Some(&hint(2)), &env2)
+        .unwrap();
+    let rows = r
+        .__query_for_test(&format!("SELECT encoding FROM {p}attestations"))
+        .unwrap();
+    assert_eq!(rows, vec![vec!["0".to_owned()]]);
+    let q = testkit::open_remote(&ns).unwrap();
+    let mut l = q.read_units(&["src/a.test.ts"]).unwrap().remove(0);
+    assert!(matches!(l.remove(0).state(), ValueState::Read(b) if b == env2.as_slice()));
+
+    // An unknown encoding, and a frame past the largest record.
+    let bomb = zstd::bulk::compress(&vec![b'{'; 6_000_000], 3).unwrap();
+    let hex: String = bomb.iter().map(|b| format!("{b:02X}")).collect();
+    let tk = vci_core::test_key("src/a.test.ts");
+    s.__execute_for_test(&[
+        format!("UPDATE {p}attestations SET encoding = 2 WHERE test_key = '{tk}'"),
+        format!("UPDATE {p}manifests SET encoding = 1, value = X'{hex}'"),
+    ])
+    .unwrap();
+    let q = testkit::open_remote(&ns).unwrap();
+    let e = q
+        .read_units(&["src/a.test.ts"])
+        .unwrap()
+        .remove(0)
+        .remove(0);
+    match e.state() {
+        ValueState::Unreadable(why) => assert!(why.contains("newer vci"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let m = q.manifest(&root).unwrap().unwrap();
+    assert!(!m.is_read(), "{m:?}");
+}
+
+/// A write that supersedes attestations removes the manifests only they
+/// referenced, in the same transaction (2.8.1 left them for `vci prune`:
+/// 90% of vex's manifests were such orphans). A manifest another
+/// attestation references, or that is another's base, or that was put
+/// within the grace period, stays; the change log names what went.
+#[test]
+fn superseding_removes_the_manifests_left_without_a_reference() {
+    let Some(server) = testkit::server().ok().filter(|_| testkit::available()) else {
+        return;
+    };
+    for grace in [false, true] {
+        let ns = testkit::namespace();
+        let p = table_prefix(&ns);
+        // No grace: a long-running handle (as `vci prune`'s).
+        let s = LibsqlStore::open(
+            &testkit::selection(
+                LibsqlMode::Remote,
+                Some(&server.url),
+                server.token.as_deref(),
+                Some(&ns),
+                None,
+            ),
+            &testkit::cx_in(Path::new("/nonexistent/.git"), !grace),
+        )
+        .unwrap();
+        let ms: Vec<vci_core::InputManifest> = (1..=5)
+            .map(|i| manifest(&[&format!("src/m{i}.rs")]))
+            .collect();
+        let root = |i: usize| ms[i - 1].root();
+        for m in &ms {
+            s.put_manifest(&m.root(), m.to_compact().as_bytes())
+                .unwrap();
+        }
+        let att = |slot: u8, issued: i64, m: usize| {
+            s.put_for_test(
+                &format!("src/s{slot}.test.ts"),
+                S1,
+                &hex64(slot),
+                Some(&hint(issued)),
+                &envelope(Some(&root(m)), &format!("{slot}-{issued}")),
+            )
+            .unwrap()
+        };
+        att(1, 1, 1);
+        let a3 = att(3, 1, 3);
+        let a4 = att(4, 1, 3);
+        let a5 = att(5, 1, 5);
+        // A manifest whose base is m5.
+        s.__execute_for_test(&[format!(
+            "INSERT INTO {p}manifests (root, base, put_at, encoding, value) \
+             VALUES ('{}', '{}', 1, 0, CAST('{{}}' AS BLOB))",
+            hex64(0xee),
+            root(5)
+        )])
+        .unwrap();
+        let b = s.batch().unwrap();
+        // Slot 1 put again on m2: m1 loses its only reference.
+        att(1, 2, 2);
+        s.remove(vec![a3, a5]).unwrap();
+        b.finish().unwrap();
+        let roots = || -> Vec<String> {
+            let mut r: Vec<String> = s
+                .__query_for_test(&format!("SELECT root FROM {p}manifests"))
+                .unwrap()
+                .into_iter()
+                .map(|r| r[0].clone())
+                .collect();
+            r.sort();
+            r
+        };
+        let has = |i: usize| roots().contains(&root(i));
+        assert_eq!(!has(1), !grace, "grace {grace}: m1 {:?}", roots());
+        assert!(has(2) && has(3) && has(4) && has(5), "{:?}", roots());
+        s.remove(vec![a4]).unwrap();
+        assert_eq!(!has(3), !grace, "grace {grace}: m3");
+        if !grace {
+            // Each root: once put, once removed.
+            let logged = s
+                .__query_for_test(&format!(
+                    "SELECT count(*) FROM {p}log WHERE root IN ('{}', '{}') \
+                     UNION ALL SELECT count(*) FROM {p}log WHERE root = '{}'",
+                    root(1),
+                    root(3),
+                    root(2)
+                ))
+                .unwrap();
+            assert_eq!(logged[0][0], "4", "the change log names them");
+            assert_eq!(logged[1][0], "1", "put only");
+        }
+    }
+}
+
+/// Values are read 100 to a request: a request that fails costs only its
+/// own keys. A prefetch says how many it could not read (a warning) and
+/// leaves them to be read when asked for; a read that fails
+/// for some keys marks only those as unreadable (their units run), never
+/// failing the whole call (2.8.1 failed it, and the plan ran every unit).
+#[test]
+fn a_failed_request_of_values_costs_only_its_own_keys() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 600;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &i.to_string()),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let readable = |l: &[Vec<StoredEnvelope>]| {
+        l.iter()
+            .flatten()
+            .filter(|e| matches!(e.state(), ValueState::Read(_)))
+            .count()
+    };
+    // A prefetch: one request's values not read, then read when asked.
+    let r = proxied(&proxy, token.as_deref(), &ns, 30);
+    r.status().unwrap();
+    // The listing goes through, then one request of values is cut off.
+    proxy.cut_next(1, 1);
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    assert_eq!(proxy.cut(), 1);
+    assert!(h.error.is_none(), "read again when asked for: {h:?}");
+    assert!(
+        [250, 100].contains(&h.unresolved),
+        "one request's keys: {h:?}"
+    );
+    let mut listed = r.list_units(&ids).unwrap();
+    let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+    r.read_values(&mut refs).unwrap();
+    assert_eq!(readable(&listed), n, "the rest read when asked");
+
+    // A read of values: one request cut off, its keys unreadable alone.
+    let r = proxied(&proxy, token.as_deref(), &ns, 30);
+    let mut listed = r.list_units(&ids).unwrap();
+    proxy.cut_next(0, 1);
+    let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+    r.read_values(&mut refs).unwrap();
+    let failed: Vec<&StoredEnvelope> = listed
+        .iter()
+        .flatten()
+        .filter(|e| !matches!(e.state(), ValueState::Read(_)))
+        .collect();
+    assert!([250, 100].contains(&failed.len()), "{}", failed.len());
+    assert_eq!(proxy.cut(), 2);
+    for e in failed {
+        match e.state() {
+            ValueState::Unreadable(why) => {
+                assert!(why.contains("could not be read from the store"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    r.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+}
+
+/// A request of values sent beside others whose deadline runs out (they
+/// share the connection's bandwidth) fails alone and latches nothing: the
+/// read sends its keys again itself, one request at a time and half as
+/// many to a request, and every value is read.
+#[test]
+fn a_request_of_values_out_of_time_beside_others_is_read_again_alone() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 600;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &i.to_string()),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let r = proxied(&proxy, token.as_deref(), &ns, 2);
+    r.status().unwrap();
+    // The listing and the first request of values (sent alone) go
+    // through, then one of those sent at once is held.
+    proxy.stall_after(2, 1);
+    let t = Instant::now();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(proxy.stalled(), 1);
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    let n0 = r.requests();
+    let mut listed = r.list_units(&ids).unwrap();
+    let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+    r.read_values(&mut refs).unwrap();
+    assert_eq!(r.requests(), n0, "every value came from the prefetch");
+    assert!(
+        listed
+            .iter()
+            .flatten()
+            .all(|e| matches!(e.state(), ValueState::Read(_)))
+    );
+    r.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+}
+
+/// On a link whose bandwidth is the limit, requests of values sent at
+/// once share it and each takes as much longer: the first request goes
+/// alone, and how long it took sets how many go at once, so that none runs
+/// out of time beside others (2.8.2 as first written sent four at once,
+/// all four ran out of time, and their keys were read again in halves);
+/// and the whole read is given two request timeouts, the keys not read by
+/// then failed (their units run), nothing latched.
+#[test]
+fn a_read_of_values_on_a_slow_link_is_bounded_and_not_sent_at_once() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    // As they are (`VCI_STORE_COMPRESS=zstd` would make them small).
+    w.__compress_for_test(false);
+    // About 7.8 MB of values as they travel.
+    let n = 1_250;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let pad = "p".repeat(3_000);
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{pad}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let prefetch = |rate: usize| {
+        let r = proxied(&proxy, token.as_deref(), &ns, 3);
+        r.status().unwrap();
+        proxy.limit_rate(rate);
+        let (t, b) = (Instant::now(), proxy.passed());
+        let h = r
+            .prefetch(Prefetch::Units {
+                test_ids: &ids,
+                choose: None,
+            })
+            .unwrap();
+        let (took, bytes) = (t.elapsed(), proxy.passed() - b);
+        proxy.limit_rate(0);
+        r.status()
+            .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+        (h, took, bytes)
+    };
+    let (h, _, all) = prefetch(0);
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    // About 1 s a request alone: one at a time, about 5 s, every value
+    // read once (four at once took 4 s each and ran out of time after 3 s,
+    // and their keys were read again).
+    let (h, took, bytes) = prefetch(1_700_000);
+    assert_eq!(h.unresolved, 0, "{h:?} in {took:?}");
+    assert!(took < Duration::from_millis(6_500), "{took:?}");
+    assert!(bytes < all + all / 10, "read twice: {bytes} of {all}");
+    assert_eq!(proxy.stalled(), 0);
+    // About 2 s a request alone: the read stops after two request
+    // timeouts (6 s), with the values read by then (it took about 13 s).
+    let (h, took, _) = prefetch(1_000_000);
+    assert!(h.unresolved > 0 && h.unresolved < n, "{h:?} in {took:?}");
+    assert!(took < Duration::from_secs(7), "{took:?}");
+}
+
+/// A request of values that ran out of time is read again in halves, and a
+/// half that is answered counts though the other is not (2.8.2 as first
+/// reviewed dropped the rows of the whole request, and the plan read that
+/// half again); and once a read of values ran out of time, the handle's
+/// later reads of values end when it did: the keys that failed are not
+/// asked for again (2.8.2 as first reviewed gave the plan's read of its
+/// candidates, and each round, two more request timeouts each on the same
+/// slow link). Nothing is latched.
+#[test]
+fn a_read_of_values_out_of_time_keeps_its_halves_and_reads_no_more() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 200;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &i.to_string()),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let r = proxied(&proxy, token.as_deref(), &ns, 2);
+    r.status().unwrap();
+    // The listing goes through; both requests of values (sent at once)
+    // are held; then the first half of the first is answered, and its
+    // second half held until the read's time runs out.
+    proxy.schedule(&[false, true, true, false, true]);
+    let t = Instant::now();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    let took = t.elapsed();
+    assert_eq!(proxy.stalled(), 3, "in {took:?}");
+    assert_eq!(h.unresolved, 150, "{h:?} in {took:?}");
+    assert!(took < Duration::from_secs(6), "{took:?}");
+    let c0 = proxy.cursors();
+    let t = Instant::now();
+    let mut listed = r.list_units(&ids).unwrap();
+    let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+    r.read_values(&mut refs).unwrap();
+    assert_eq!(
+        proxy.cursors(),
+        c0,
+        "the keys that failed were asked for again"
+    );
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let read = listed
+        .iter()
+        .flatten()
+        .filter(|e| matches!(e.state(), ValueState::Read(_)))
+        .count();
+    assert_eq!(read, 50);
+    for e in listed.iter().flatten() {
+        match e.state() {
+            ValueState::Read(_) => {}
+            ValueState::Unreadable(why) => {
+                assert!(why.contains("could not be read from the store"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    r.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+}
+
+/// A read of values in one request whose deadline runs out is read again
+/// in halves, not sent again whole: on a link too slow for the whole
+/// request within the timeout, the first half is read within the read's
+/// time (2.8.2 as first reviewed sent it again whole, which ran out of the
+/// read's time too, and read nothing).
+#[test]
+fn a_lone_request_of_values_out_of_time_is_read_again_in_halves() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 100;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let pad = "p".repeat(3_000);
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{pad}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let read = |rate: usize| {
+        let r = proxied(&proxy, token.as_deref(), &ns, 2);
+        r.status().unwrap();
+        let mut listed = r.list_units(&ids).unwrap();
+        let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+        proxy.limit_rate(rate);
+        let (t, b) = (Instant::now(), proxy.passed());
+        let ok = r.read_values(&mut refs);
+        let (took, bytes) = (t.elapsed(), proxy.passed() - b);
+        proxy.limit_rate(0);
+        drop(refs);
+        let read = listed
+            .iter()
+            .flatten()
+            .filter(|e| matches!(e.state(), ValueState::Read(_)))
+            .count();
+        (ok.map(|()| read), took, bytes)
+    };
+    let (got, _, all) = read(0);
+    assert_eq!(got.unwrap(), n);
+    // The whole request in 2.5 s (the timeout is 2 s), a half in 1.25 s.
+    let (got, took, _) = read(all * 2 / 5);
+    let got = got.unwrap_or_else(|e| panic!("nothing read in {took:?}: {e}"));
+    assert!(got >= n / 2 && got < n, "{got} in {took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+}
+
+/// A large read of values is given one more request timeout for each 800
+/// values beyond 1,600: on a link that reads it in about two and a half
+/// timeouts, every value is read (2.8.2 as first reviewed gave every read
+/// two, and vex-api's 2,195 values took 29.9 to 58.6 s of its 60 s from a
+/// laptop).
+#[test]
+fn a_large_read_of_values_is_given_a_timeout_per_800_values() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 1_700;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let pad = "p".repeat(1_000);
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{pad}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let prefetch = |rate: usize| {
+        let r = proxied(&proxy, token.as_deref(), &ns, 2);
+        r.status().unwrap();
+        let mut listed = r.list_units(&ids).unwrap();
+        let mut refs: Vec<&mut StoredEnvelope> = listed.iter_mut().flatten().collect();
+        proxy.limit_rate(rate);
+        let (t, b) = (Instant::now(), proxy.passed());
+        r.read_values(&mut refs).unwrap();
+        let (took, bytes) = (t.elapsed(), proxy.passed() - b);
+        proxy.limit_rate(0);
+        drop(refs);
+        let read = listed
+            .iter()
+            .flatten()
+            .filter(|e| matches!(e.state(), ValueState::Read(_)))
+            .count();
+        (read, took, bytes)
+    };
+    let (read, _, all) = prefetch(0);
+    assert_eq!(read, n);
+    // All of it in 5 s: two timeouts are 4 s, three 6 s.
+    let (read, took, _) = prefetch(all / 5);
+    assert_eq!(read, n, "in {took:?}");
+    assert!(took < Duration::from_secs(7), "{took:?}");
+}
+
+/// A read of values that fits in one request brings the bases of the
+/// manifests it references in that request: a small project's prefetch is
+/// the listing and one request (2.8.2 as first reviewed read the bases in
+/// one more, sequential request).
+#[test]
+fn a_small_read_of_values_brings_its_bases_in_the_same_request() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let w = testkit::open_remote(&ns).unwrap();
+    let base = manifest(&["src/base.rs"]);
+    w.put_manifest(&base.root(), base.to_compact().as_bytes())
+        .unwrap();
+    // A manifest on that base.
+    let top = hex64(0xee);
+    w.__execute_for_test(&[format!(
+        "INSERT INTO {p}manifests (root, base, put_at, encoding, value) \
+         VALUES ('{top}', '{}', 1, 0, CAST('{{}}' AS BLOB))",
+        base.root()
+    )])
+    .unwrap();
+    let ids = ["src/a.test.ts", "src/b.test.ts", "src/c.test.ts"];
+    for id in ids {
+        w.put_for_test(id, S1, &hex64(1), Some(&hint(1)), &envelope(Some(&top), id))
+            .unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let r = proxied(&proxy, token.as_deref(), &ns, 30);
+    r.status().unwrap();
+    let c0 = proxy.cursors();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    assert_eq!(
+        proxy.cursors() - c0,
+        2,
+        "the listing and one request of values"
+    );
+    assert!(r.manifest(&top).unwrap().unwrap().is_read());
+    assert!(r.manifest(&base.root()).unwrap().unwrap().is_read());
+    assert_eq!(
+        proxy.cursors() - c0,
+        2,
+        "the manifests came with the values"
+    );
+}
+
+/// A write whose deadline ran out while the server committed it (it waited
+/// for the write lock, and the client gave up first) is not sent again: the
+/// client asks the server whether it holds the write's attestation first
+/// (it was sent again, waited for the lock again and wrote its change log
+/// a second time). One the server never got is sent again, once.
+#[test]
+fn a_write_out_of_time_is_sent_again_only_when_the_server_lacks_it() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let put = |n: u8, unit: &str| {
+        s.put_for_test(unit, S1, &hex64(n), Some(&hint(1)), &envelope(None, unit))
+    };
+    put(1, "src/a.test.ts").unwrap();
+    let logged = |unit: &str| {
+        s.__query_for_test(&format!(
+            "SELECT count(*) FROM {p}log WHERE test_key = '{}'",
+            vci_core::test_key(unit)
+        ))
+        .unwrap()[0][0]
+            .clone()
+    };
+
+    // Committed, its answer lost: asked about, not sent again.
+    proxy.swallow_writes(1);
+    let (w0, r0) = (proxy.writes(), s.retries());
+    let t = Instant::now();
+    put(2, "src/b.test.ts").unwrap_or_else(|e| panic!("committed: {e}"));
+    assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(proxy.stalled(), 1);
+    assert_eq!(proxy.writes() - w0, 1, "not sent again");
+    assert!(s.retries() > r0);
+    assert_eq!(logged("src/b.test.ts"), "1");
+
+    // Never reached the server: sent again, once.
+    proxy.hold_writes(1);
+    let w0 = proxy.writes();
+    put(3, "src/c.test.ts").unwrap_or_else(|e| panic!("sent again: {e}"));
+    assert_eq!(proxy.stalled(), 2);
+    assert_eq!(proxy.writes() - w0, 1, "sent again");
+    assert_eq!(logged("src/c.test.ts"), "1");
+    assert_eq!(s.list_all().unwrap().len(), 3);
+}
+
+/// A batch's objects go out first, in a transaction of their own when they
+/// fill one (here, with a manifest nothing references that fills it);
+/// when that transaction is lost, every later transaction of the batch
+/// carries the objects until one stores them, so that no record is stored
+/// on the server without the objects it names (section 6: objects, then
+/// records; STORE-V2 section 6's M2 row). A batch whose every transaction
+/// is refused stores neither, and its units are lost.
+#[test]
+fn a_batch_stores_no_record_without_its_objects() {
+    use vci_store::conformance::scenarios::Run3;
+    use vci_store::{NewAttestation, WriteBatch};
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let s = proxied(&proxy, token.as_deref(), &ns, 10);
+    // The namespace and its layout first: the DDL is a write of its own.
+    s.put_for_test(
+        "src/objects/first.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "first"),
+    )
+    .unwrap();
+    let units = ["src/objects/a.test.ts", "src/objects/b.test.ts"];
+    let stored_objects = |ids: &[&str]| -> i64 {
+        let list = ids
+            .iter()
+            .map(|i| format!("'{i}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.__query_for_test(&format!(
+            "SELECT count(*) FROM {p}objects WHERE id IN ({list})"
+        ))
+        .unwrap()[0][0]
+            .parse()
+            .unwrap()
+    };
+    let stored_records = |unit: &str| -> i64 {
+        s.__query_for_test(&format!(
+            "SELECT count(*) FROM {p}attestations WHERE test_key = '{}'",
+            vci_core::test_key(unit)
+        ))
+        .unwrap()[0][0]
+            .parse()
+            .unwrap()
+    };
+    // A manifest nothing references fills the first transaction (over
+    // `TX_BYTES`), so the objects go with it and the records after it.
+    let filler = vec![b'x'; 1_200_000];
+    let queue = |run: &Run3, seed: u32, root: &str| -> WriteBatch {
+        let b = s.batch().unwrap();
+        s.put_objects(&run.new_objects()).unwrap();
+        s.put_manifest(root, &filler).unwrap();
+        for (i, unit) in units.iter().enumerate() {
+            let (rec, cols) = run.record(unit, 1, seed + i as u32);
+            s.put(
+                &NewAttestation::for_test(unit, S1, &hex64(seed as u8), Some(&hint(1)), &rec)
+                    .with_columns(&cols),
+            )
+            .unwrap();
+        }
+        b
+    };
+
+    // The objects' transaction refused: the records' carries them.
+    let run = Run3::build(&["src/objects/a.ts"]);
+    proxy.break_writes(1);
+    let w0 = proxy.writes();
+    let f = queue(&run, 10, &hex64(0x91)).finish_partial().unwrap();
+    assert_eq!(proxy.broken(), 1);
+    assert_eq!(
+        proxy.writes() - w0,
+        2,
+        "the objects alone, then the records with them"
+    );
+    assert_eq!(f.lost_count(), 0, "{f:?}");
+    assert_eq!(
+        f.warnings.len(),
+        1,
+        "the manifest was not stored: {:?}",
+        f.warnings
+    );
+    assert!(f.warnings[0].contains("not stored"), "{:?}", f.warnings);
+    assert_eq!(stored_objects(&run.id_refs()), 4, "stored with the records");
+    for unit in units {
+        assert_eq!(stored_records(unit), 1, "{unit}");
+    }
+    assert!(s.manifest(&hex64(0x91)).unwrap().is_none(), "lost");
+
+    // Every transaction refused (the records' is split down to its units,
+    // each sent with the objects and refused): nothing stored, every unit
+    // lost.
+    let run2 = Run3::build(&["src/objects/b.ts"]);
+    proxy.break_writes(4);
+    let w0 = proxy.writes();
+    let f = queue(&run2, 20, &hex64(0x92)).finish_partial().unwrap();
+    assert_eq!(proxy.broken(), 5);
+    assert_eq!(
+        proxy.writes() - w0,
+        4,
+        "the objects alone, both units, each unit"
+    );
+    assert_eq!(f.lost_count(), 2, "{f:?}");
+    // The runs share their hdr and tables (stored above); this run's
+    // shape and state object were never stored.
+    assert_eq!(
+        stored_objects(&[&run2.ids.shape, &run2.ids.state]),
+        0,
+        "never stored"
+    );
+    assert_eq!(stored_objects(&run2.id_refs()), 2);
+    for unit in units {
+        assert_eq!(
+            stored_records(unit),
+            1,
+            "{unit}: the first batch's record, not this one's"
+        );
+    }
+    assert!(s.manifest(&hex64(0x92)).unwrap().is_none());
+}
+
+/// A replica synced by a vci that could not read some values (2.8.1, while
+/// another vci wrote them compressed) left them out yet moved its mark past
+/// them, so syncing what changed since never brings them back: a sidecar
+/// written by such a vci (its `v` older than this one's) is synced in full
+/// once, and the values come back.
+#[test]
+fn a_replica_synced_by_an_older_vci_is_synced_in_full_once() {
+    let Some((w, ns)) = remote() else { return };
+    // Values as they are: the test sets their encoding by hand.
+    w.__compress_for_test(false);
+    let p = table_prefix(&ns);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replica.libsql");
+    let side = dir.path().join("replica.libsql.sync");
+    let units = ["src/a.test.ts", "src/b.test.ts"];
+    for u in units {
+        w.put_for_test(u, S1, &hex64(1), Some(&hint(1)), &envelope(None, u))
+            .unwrap();
+    }
+    // b's value in an encoding no vci reads: the sync leaves it out.
+    let tk = vci_core::test_key("src/b.test.ts");
+    let set = |enc: u8| {
+        w.__execute_for_test(&[format!(
+            "UPDATE {p}attestations SET encoding = {enc} WHERE test_key = '{tk}'"
+        )])
+        .unwrap();
+    };
+    set(9);
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    let got = r.read_units(&units).unwrap();
+    assert_eq!(got[0].len(), 1);
+    assert!(got[1].is_empty(), "left out: {:?}", got[1]);
+    drop(r);
+    // Readable now, with no change in the log: as a value 2.8.1 could not
+    // read is to this vci. The sidecar as 2.8.1 wrote it.
+    set(0);
+    let text = std::fs::read_to_string(&side).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["v"] = serde_json::json!(1);
+    std::fs::write(&side, v.to_string()).unwrap();
+    let r = testkit::open_replica(&ns, &path).unwrap();
+    let got = r.read_units(&units).unwrap();
+    assert_eq!(got[1].len(), 1, "synced in full");
+    drop(r);
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&side).unwrap()).unwrap();
+    assert!(v["v"].as_i64().unwrap() >= 2, "{v}");
+}
+
+/// A batch is written as transactions of whole units of about a megabyte
+/// each, one after the other, not one request of everything (2.8.1 sent
+/// 8 MB, which held Turso's one write lock for 15 to 37 s while every
+/// other job's write waited): a unit's attestation and its manifest go in
+/// the same transaction, and every unit is stored.
+#[test]
+fn a_batch_is_written_as_short_transactions_of_whole_units() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 30);
+    s.status().unwrap();
+    // 120 units of about 20 kB of attestation and 20 kB of manifest: 4.8 MB.
+    let n = 120;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let pad = "p".repeat(20_000);
+    let w0 = proxy.writes();
+    {
+        let b = s.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let paths: Vec<String> = (0..120).map(|j| format!("src/m{i}/{j}.rs")).collect();
+            let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let m = manifest(&paths);
+            s.put_manifest(&m.root(), m.to_compact().as_bytes())
+                .unwrap();
+            s.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(Some(&m.root()), &format!("{i}{pad}")),
+            )
+            .unwrap();
+        }
+        let f = b.finish_partial().unwrap();
+        assert_eq!(f.lost_count(), 0);
+    }
+    let sizes: Vec<usize> = proxy.write_sizes()[w0..].to_vec();
+    assert!(sizes.len() >= 4, "{sizes:?}");
+    // At most a megabyte of values each, and the request's framing (the
+    // JSON escapes of the statements' text).
+    assert!(
+        sizes.iter().all(|&b| b < 1_600_000),
+        "a transaction too large: {sizes:?}"
+    );
+    let r = testkit::open_remote(&ns).unwrap();
+    let all = r.read_all().unwrap();
+    assert_eq!(all.len(), n);
+    for e in &all {
+        let ValueState::Read(v) = e.state() else {
+            panic!("unread: {e:?}");
+        };
+        let root = match vci_store::key::envelope_manifest_ref(v) {
+            vci_store::ManifestRef::Root(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert!(r.manifest(&root).unwrap().is_some(), "its manifest");
+    }
+}
+
+/// A write transaction that runs out of time and that the server does not
+/// hold is sent again after a pause, and the batch is stored whole, with
+/// nothing latched (2.8.1 latched the store, and every later write of the
+/// process failed: about 800 attestations lost per Rails job on Turso).
+/// Writes that keep running out of time cost the process at most about
+/// two request timeouts in all: then the breaker latches, the units not
+/// stored are lost (and only they: the transactions stored before stay),
+/// and every later call fails at once.
+#[test]
+fn writes_out_of_time_are_sent_again_within_a_bounded_time() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // About 0.4 MB an attestation as it travels (as it is, whatever
+    // `VCI_STORE_COMPRESS` says): two to a transaction.
+    let pad = "p".repeat(300_000);
+    let batch = |s: &LibsqlStore, from: usize, to: usize| {
+        s.__compress_for_test(false);
+        let b = s.batch().unwrap();
+        let mut keys = Vec::new();
+        for i in from..to {
+            keys.push(
+                s.put_for_test(
+                    &unit(i),
+                    S1,
+                    &hex64(1),
+                    Some(&hint(1)),
+                    &envelope(None, &format!("{i}{pad}")),
+                )
+                .unwrap()
+                .key,
+            );
+        }
+        (b.finish_partial().unwrap(), keys)
+    };
+
+    // One transaction held: out of time (2 s), not on the server, sent
+    // again; all stored.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    s.status().unwrap();
+    proxy.hold_writes(1);
+    let (w0, r0) = (proxy.writes(), s.retries());
+    let t = Instant::now();
+    let (f, _) = batch(&s, 0, 6);
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(proxy.stalled(), 1);
+    assert!(s.retries() > r0);
+    // 6 units of 0.4 MB: 3 transactions of 2, the held one sent again in
+    // halves.
+    assert!(proxy.writes() - w0 >= 4, "{}", proxy.writes() - w0);
+    s.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    assert_eq!(s.list_all().unwrap().len(), 6);
+
+    // A server that takes no writes from the second transaction on: the
+    // first is stored, the others lost after about two request timeouts
+    // (4 s) of tries, and the handle latched.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    s.status().unwrap();
+    let held = proxy.stalled();
+    let w0 = proxy.writes();
+    let stop = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            while proxy.writes() == w0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            proxy.stall_writes(true);
+        });
+        let t = Instant::now();
+        let (f, keys) = batch(&s, 10, 18);
+        (f, keys, t.elapsed())
+    });
+    proxy.stall_writes(false);
+    let (f, keys, took) = stop;
+    assert!(took < Duration::from_secs(9), "{took:?}");
+    assert!(proxy.stalled() - held >= 2, "{}", proxy.stalled() - held);
+    assert_eq!(f.lost_count(), 6, "the first transaction's 2 stored");
+    let stored: Vec<&String> = keys.iter().filter(|k| f.lost(k).is_none()).collect();
+    assert_eq!(stored.len(), 2);
+    let t = Instant::now();
+    let e = s.status().unwrap_err();
+    assert!(e.to_string().contains("not retried"), "{e}");
+    assert!(t.elapsed() < Duration::from_secs(1));
+    let r = testkit::open_remote(&ns).unwrap();
+    let on_server: Vec<String> = r.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert_eq!(on_server.len(), 8);
+    assert!(stored.iter().all(|k| on_server.contains(k)));
+}
+
+/// On a link where each answer waits long for its first byte but bytes
+/// then come fast (here 300 ms an answer), a read of values sends its
+/// first requests at once, one per connection, and makes the later ones
+/// larger: few round trips, with the manifests and their bases in the
+/// same requests (2.8.2 as first reviewed sent requests of 100 two at a
+/// time and the bases in one more request, slower there than 2.8.1's one
+/// request of everything).
+#[test]
+fn a_read_of_values_on_a_link_slow_to_answer_takes_few_round_trips() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 1_500;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let base = manifest(&["src/base.rs"]);
+    w.put_manifest(&base.root(), base.to_compact().as_bytes())
+        .unwrap();
+    let p = table_prefix(&ns);
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(Some(&hex64(0xaa)), &format!("{i}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    // Every attestation references one manifest on the base.
+    w.__execute_for_test(&[format!(
+        "INSERT INTO {p}manifests (root, base, put_at, encoding, value) \
+         VALUES ('{}', '{}', 1, 0, CAST('{{}}' AS BLOB))",
+        hex64(0xaa),
+        base.root()
+    )])
+    .unwrap();
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let r = proxied(&proxy, token.as_deref(), &ns, 30);
+    r.status().unwrap();
+    proxy.delay_answers(300);
+    let c0 = proxy.cursors();
+    let t = Instant::now();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    let took = t.elapsed();
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    let cursors = proxy.cursors() - c0;
+    assert!(r.manifest(&hex64(0xaa)).unwrap().unwrap().is_read());
+    assert!(r.manifest(&base.root()).unwrap().unwrap().is_read());
+    assert_eq!(proxy.cursors() - c0, cursors, "the manifests came along");
+    // The listing, then four requests of 100 at once, then the other
+    // 1,100 values in four larger ones at once.
+    assert!(cursors <= 9, "{cursors} requests");
+    // Each answer waits 300 ms, a statement's first description on a
+    // connection one more: the listing (2), the first requests (2), the
+    // later ones (1 or 2), with time to spare.
+    assert!(took < Duration::from_millis(3_600), "{took:?}");
+    let all: Vec<_> = r.list_units(&ids).unwrap().into_iter().flatten().collect();
+    assert_eq!(all.len(), n);
+}
+
+// ---- 2.8.2: the write review's findings ----------------------------------------------------
+
+/// A batch's queue is written early when it holds 4 MiB, but never in the
+/// middle of a unit: a unit's manifest, its attestation and the removal of
+/// the attestation it supersedes, queued one after the other, are written
+/// in one transaction, so that a write the server refuses loses the whole
+/// unit. A draft of 2.8.2 wrote the queue as soon as it was full: (1) a
+/// manifest that filled it went in one transaction, refused, while its
+/// attestation went in the next, stored and reported as attested on a
+/// manifest that was never stored; (2) an attestation that filled it went
+/// in one transaction, refused, while the removal of the attestation it
+/// supersedes went in the next and deleted it.
+#[test]
+fn an_early_write_of_a_batch_never_splits_a_unit() {
+    let Some((s, ns)) = remote() else { return };
+    s.__compress_for_test(false);
+    let p = table_prefix(&ns);
+    // About 2 MB an envelope (its payload base64): two fill the queue but
+    // for 194 kB.
+    let fill = "f".repeat(1_500_000);
+    let fills = |s: &LibsqlStore, tag: &str| {
+        for i in 0..2 {
+            s.put_for_test(
+                &format!("src/fill-{tag}{i}.test.ts"),
+                S1,
+                &hex64(9),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}{fill}")),
+            )
+            .unwrap();
+        }
+    };
+
+    // The tables, and the attestation (2) supersedes.
+    let old = s
+        .put_for_test(
+            "src/u.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(1)),
+            &envelope(None, "old"),
+        )
+        .unwrap();
+
+    // (1) The manifest fills the queue; the server refuses it.
+    let paths: Vec<String> = (0..2_400).map(|j| format!("src/split/{j}.rs")).collect();
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let m = manifest(&paths);
+    let bytes = m.to_compact();
+    assert!(bytes.len() > 200_000, "{}", bytes.len());
+    s.__execute_for_test(&[format!(
+        "CREATE TRIGGER {p}no_m BEFORE INSERT ON {p}manifests WHEN NEW.root = '{}' \
+         BEGIN SELECT RAISE(ABORT, 'mboom'); END",
+        m.root()
+    )])
+    .unwrap();
+    let b = s.batch().unwrap();
+    fills(&s, "a");
+    s.put_manifest(&m.root(), bytes.as_bytes()).unwrap();
+    let put = s
+        .put_for_test(
+            "src/m.test.ts",
+            S1,
+            &hex64(1),
+            Some(&hint(2)),
+            &envelope(Some(&m.root()), "m"),
+        )
+        .unwrap();
+    let f = b.finish_partial().unwrap();
+    match f.lost(&put.key) {
+        Some(e) => assert!(e.to_string().contains("mboom"), "{e}"),
+        None => panic!(
+            "the unit whose manifest was refused is not lost: {:?}",
+            f.warnings
+        ),
+    }
+    assert_eq!(f.lost_count(), 1);
+    let srv = testkit::open_remote(&ns).unwrap();
+    assert!(srv.manifest(&m.root()).unwrap().is_none());
+    assert!(
+        keys_of(&srv, "src/m.test.ts").is_empty(),
+        "an attestation stored without its manifest"
+    );
+    assert_eq!(keys_of(&srv, "src/fill-a0.test.ts").len(), 1);
+    assert_eq!(keys_of(&srv, "src/fill-a1.test.ts").len(), 1);
+
+    // (2) The attestation fills the queue; the server refuses it, and the
+    // attestation it supersedes stays.
+    let bad = hex64(0xbb);
+    s.__execute_for_test(&[format!(
+        "CREATE TRIGGER {p}no_u BEFORE INSERT ON {p}attestations WHEN NEW.storage_key = '{bad}' \
+         BEGIN SELECT RAISE(ABORT, 'uboom'); END"
+    )])
+    .unwrap();
+    let b = s.batch().unwrap();
+    fills(&s, "b");
+    let new = s
+        .put_for_test(
+            "src/u.test.ts",
+            S1,
+            &bad,
+            Some(&hint(2)),
+            &envelope(None, &format!("new{}", "n".repeat(200_000))),
+        )
+        .unwrap();
+    s.remove(vec![old.clone()]).unwrap();
+    let f = b.finish_partial().unwrap();
+    match f.lost(&new.key) {
+        Some(e) => assert!(e.to_string().contains("uboom"), "{e}"),
+        None => panic!("the refused unit is not lost"),
+    }
+    let srv = testkit::open_remote(&ns).unwrap();
+    assert_eq!(
+        keys_of(&srv, "src/u.test.ts"),
+        vec![old.key.clone()],
+        "the superseded attestation was removed though its successor was refused"
+    );
+    assert_eq!(keys_of(&srv, "src/fill-b1.test.ts").len(), 1);
+}
+
+/// A write transaction that waits for the write lock past its deadline is
+/// asked about (not committed yet: the question is a read, which does not
+/// wait for the lock) and sent again, and the first send then commits
+/// after all: the transaction is applied once, not twice. A draft of 2.8.2
+/// sent it again in halves, and the server applied both (on vex's Turso
+/// database the original committed after the question, and every slot of
+/// it was written and logged twice). The proxy sends the first send on
+/// 3 s late, after the copy (the write's deadline is 2 s); `sqld` itself
+/// drops a write that waits for the lock once its client is gone.
+#[test]
+fn a_write_committed_after_the_question_is_applied_once() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let p = table_prefix(&ns);
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    s.__compress_for_test(false);
+    s.put_for_test(
+        "src/seed.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "seed"),
+    )
+    .unwrap();
+    let units = [
+        "src/a.test.ts",
+        "src/b.test.ts",
+        "src/c.test.ts",
+        "src/d.test.ts",
+    ];
+    proxy.late_writes(1, 3_000);
+    let r0 = s.retries();
+    let b = s.batch().unwrap();
+    let keys: Vec<String> = units
+        .iter()
+        .map(|u| {
+            s.put_for_test(u, S1, &hex64(2), Some(&hint(2)), &envelope(None, u))
+                .unwrap()
+                .key
+        })
+        .collect();
+    let f = b.finish_partial().unwrap();
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    assert_eq!(proxy.stalled(), 1);
+    assert!(s.retries() > r0, "it ran out of time and was asked about");
+    // The first send reaches the server now.
+    let t = Instant::now();
+    while proxy.shared.late_done.load(Ordering::SeqCst) == 0
+        && t.elapsed() < Duration::from_secs(15)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(proxy.shared.late_done.load(Ordering::SeqCst), 1);
+    let r = testkit::open_remote(&ns).unwrap();
+    for (u, k) in units.iter().zip(&keys) {
+        assert_eq!(keys_of(&r, u), vec![k.clone()]);
+        let logged = r
+            .__query_for_test(&format!(
+                "SELECT count(*) FROM {p}log WHERE test_key = '{}'",
+                vci_core::test_key(u)
+            ))
+            .unwrap();
+        assert_eq!(logged, vec![vec!["1".to_owned()]], "{u} applied twice");
+    }
+}
+
+/// On a link where every answer waits 3 s for its first byte (and bytes
+/// then come fast), the requests of a read of values grow to their most
+/// after the first answers: the time beyond the shortest answer is what
+/// sizes them, not the whole time an answer took. A draft of 2.8.2 sized
+/// them from the whole time, so the 3 s wait kept them at about 150 values
+/// and vex-api's prefetch sent 12 to 14 requests where 2.8.1 sent 4.
+#[test]
+fn a_read_of_values_behind_a_long_wait_for_each_answer_takes_few_rounds() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let ns = testkit::namespace();
+    let w = testkit::open_remote(&ns).unwrap();
+    let n = 1_500;
+    let ids: Vec<String> = (0..n).map(unit).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    {
+        let b = w.batch().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            w.put_for_test(
+                id,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{i}")),
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    proxy.delay_answers(3_000);
+    let r = proxied(&proxy, token.as_deref(), &ns, 30);
+    r.status().unwrap();
+    let c0 = proxy.cursors();
+    let t = Instant::now();
+    let h = r
+        .prefetch(Prefetch::Units {
+            test_ids: &ids,
+            choose: None,
+        })
+        .unwrap();
+    let took = t.elapsed();
+    assert_eq!(h.unresolved, 0, "{h:?}");
+    let cursors = proxy.cursors() - c0;
+    // The listing, four requests of 100 at once, then the other 1,100 in
+    // three of up to 400 at once: 8 requests in about 15 s, where the
+    // draft sent 16 in 21 s (each a statement described, then run, on a
+    // new connection: two waits).
+    assert!(cursors <= 8, "{cursors} requests in {took:?}");
+    assert!(
+        took < Duration::from_secs(18),
+        "{cursors} requests in {took:?}"
+    );
+    let all: Vec<_> = r.list_units(&ids).unwrap().into_iter().flatten().collect();
+    assert_eq!(all.len(), n);
+}
+
+/// A batch of small units written as many transactions.
+fn small_batch(
+    s: &LibsqlStore,
+    tag: &str,
+    n: usize,
+    pad: usize,
+) -> (vci_store::Finished, Vec<String>) {
+    s.__compress_for_test(false);
+    let pad = "p".repeat(pad);
+    let b = s.batch().unwrap();
+    let keys = (0..n)
+        .map(|i| {
+            let u = format!("src/{tag}/{i}.test.ts");
+            s.put_for_test(
+                &u,
+                S1,
+                &hex64(1),
+                Some(&hint(1)),
+                &envelope(None, &format!("{u}{pad}")),
+            )
+            .unwrap()
+            .key
+        })
+        .collect();
+    (b.finish_partial().unwrap(), keys)
+}
+
+/// A write that runs out of time while the server answers nothing, not
+/// even the question whether it committed, is sent again: the question
+/// has a short deadline of its own (a quarter of the request timeout, at
+/// most 5 s), so one try costs about one request timeout. 2.8.2 as first
+/// reviewed gave the question the whole request timeout: one try cost two
+/// (60 s at the default), the whole of the process's retry time, the
+/// breaker latched and the units were lost without being sent again.
+#[test]
+fn a_write_whose_question_goes_unanswered_is_sent_again() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s request timeout: 4 s of retry time; the question 0.5 s.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    // The tables made first.
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    proxy.hold_writes(1);
+    let held = proxy.stalled();
+    let (f, keys, took) = std::thread::scope(|sc| {
+        // Once the write is held, the question after it goes unanswered too.
+        sc.spawn(|| {
+            let t = Instant::now();
+            while proxy.stalled() == held && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            proxy.stall_cursors(1);
+        });
+        let t = Instant::now();
+        let (f, keys) = small_batch(&s, "q", 4, 100);
+        (f, keys, t.elapsed())
+    });
+    assert_eq!(proxy.stalled() - held, 2, "the write and its question held");
+    assert_eq!(f.lost_count(), 0, "sent again: {:?}", f.into_error());
+    assert!(took < Duration::from_secs(6), "{took:?}");
+    s.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    let r = testkit::open_remote(&ns).unwrap();
+    let on_server: Vec<String> = r.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert!(keys.iter().all(|k| on_server.contains(k)));
+}
+
+/// A write's transactions go one right after the other: no pause between
+/// them. 2.8.2 as first reviewed paused a quarter of each transaction's
+/// time (200 ms to 2 s, randomized) for other writers' small writes, which
+/// cost a lone writer about 10% of its time and showed no benefit for the
+/// small writes on vex's Turso database.
+#[test]
+fn a_write_sends_its_transactions_without_a_pause() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 30);
+    s.status().unwrap();
+    // 64 attestations a transaction: 10 transactions.
+    let (f, _) = small_batch(&s, "gap", 640, 100);
+    assert_eq!(f.lost_count(), 0);
+    let mut gaps = proxy.write_gaps();
+    assert!(gaps.len() >= 9, "{gaps:?}");
+    gaps.sort();
+    let median = gaps[gaps.len() / 2];
+    assert!(median < Duration::from_millis(60), "paused: {gaps:?}");
+}
+
+/// A process's writes stop once they took six request timeouts in all
+/// (and the little more its small transactions earn by what they store),
+/// even when every transaction commits in time: the units still queued are
+/// lost at once (their units run again next time), the ones stored stay,
+/// nothing is latched, and a later write of the process is lost at once
+/// too. 2.8.2 as first reviewed bounded only the time of writes that
+/// failed, so a Rails job's 800 units, each transaction committing just
+/// within the timeout behind other writers, could take minutes.
+#[test]
+fn a_process_writes_for_a_bounded_time_in_all() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 1 s request timeout: 6 s of writes in all.
+    let s = proxied(&proxy, token.as_deref(), &ns, 1);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // Each answer held 250 ms: within the timeout, and the transactions
+    // keep their size (between a tenth and a third of it).
+    proxy.delay_answers(250);
+    let t = Instant::now();
+    // 64 a transaction: 40 transactions, more than 10 s without the bound.
+    let (f, keys) = small_batch(&s, "slow", 2_560, 100);
+    let took = t.elapsed();
+    let lost = f.lost_count();
+    assert!(lost > 0 && lost < keys.len(), "lost {lost}");
+    assert!(
+        took >= Duration::from_secs(6) && took < Duration::from_millis(7_500),
+        "{took:?}"
+    );
+    let why = f.into_error().unwrap().to_string();
+    assert!(why.contains("this process's writes"), "{why}");
+    // Not latched; a later write of the process is lost at once.
+    proxy.delay_answers(0);
+    s.status()
+        .unwrap_or_else(|e| panic!("nothing latched: {e}"));
+    let t = Instant::now();
+    let (f, _) = small_batch(&s, "later", 4, 100);
+    assert_eq!(f.lost_count(), 4);
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t.elapsed()
+    );
+    let r = testkit::open_remote(&ns).unwrap();
+    assert_eq!(r.list_all().unwrap().len(), 1 + keys.len() - lost);
+}
+
+/// A write's transactions keep their size while each commits within its
+/// deadline, however long the wait every answer has; one that ran out of
+/// time makes the next ones half as large (down to 256 KiB), and ones that
+/// commit fast beyond that wait make them larger again (up to 1 MiB). A
+/// draft halved them after any that took more than a third of the timeout:
+/// with each answer held 800 ms at a 2 s timeout they fell to 128 KiB,
+/// each paying the wait again (the review: 122 of 600 units stored within
+/// the bound against 503 at a constant size).
+#[test]
+fn a_write_sizes_its_transactions_from_their_commit_times() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    // The tables made first.
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // Each answer held 0.8 s: more than a third of the 2 s timeout, the
+    // same for any size.
+    proxy.delay_answers(800);
+    let w0 = proxy.write_sizes().len();
+    // 80 units of about 25 kB as sent: 2 MB, 2 transactions.
+    let (f, _) = small_batch(&s, "wait", 80, 20_000);
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let waited: Vec<usize> = proxy.write_sizes()[w0..].to_vec();
+    assert!(waited.len() <= 3, "{waited:?}");
+    assert!(waited[0] > 900_000, "{waited:?}");
+    assert!(
+        waited[..waited.len() - 1].iter().all(|&b| b > 900_000),
+        "kept their size: {waited:?}"
+    );
+    // A transaction out of time (committed, its answer never passed on):
+    // the next ones half as large.
+    proxy.delay_answers(0);
+    proxy.swallow_writes(1);
+    let w1 = proxy.write_sizes().len();
+    let (f, _) = small_batch(&s, "late", 80, 20_000);
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let late: Vec<usize> = proxy.write_sizes()[w1..].to_vec();
+    assert!(late[0] > 900_000, "{late:?}");
+    assert!(
+        late[1] < 600_000 && late[1] > 400_000,
+        "halved once: {late:?}"
+    );
+    // Fast again: they grow back.
+    let w2 = proxy.write_sizes().len();
+    let (f, _) = small_batch(&s, "fast", 80, 20_000);
+    assert_eq!(f.lost_count(), 0);
+    let fast: Vec<usize> = proxy.write_sizes()[w2..].to_vec();
+    assert!(fast.iter().any(|&b| b > 900_000), "grown back: {fast:?}");
+}
+
+/// A transaction out of time halves the next ones, and its copy sent again
+/// does not double them back: the copy measures no commit of that size
+/// (its guard refused it at once, the first copy having committed). A
+/// draft sized from the copy's time too, undoing the halving.
+#[test]
+fn a_copy_sent_again_does_not_size_a_write() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s timeout; the question 0.5 s.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // The first transaction commits, its answer is never passed on, and
+    // the question after it goes unanswered: it is sent again, and the
+    // copy's guard refuses it.
+    proxy.swallow_writes(1);
+    let held = proxy.stalled();
+    let w0 = proxy.write_sizes().len();
+    let (f, keys) = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let t = Instant::now();
+            while proxy.stalled() == held && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            proxy.stall_cursors(1);
+        });
+        small_batch(&s, "copy", 80, 20_000)
+    });
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let sizes: Vec<usize> = proxy.write_sizes()[w0..].to_vec();
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert_eq!(sizes[0], sizes[1], "sent again as it was: {sizes:?}");
+    // The next one halved (it then grows again, committing fast).
+    assert!(sizes[2] < 600_000, "still halved after the copy: {sizes:?}");
+    let r = testkit::open_remote(&ns).unwrap();
+    let on_server: Vec<String> = r.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert!(keys.iter().all(|k| on_server.contains(k)));
+}
+
+/// A transaction out of time that is to be sent again goes out even when
+/// the process's time for writes ran out meanwhile, as the transaction
+/// under way: it may have committed late (the question is a read, which
+/// does not wait for the lock), and the copy or its guard's refusal says
+/// that it is stored. A draft lost it unasked: its units were reported not
+/// attested while the server held them (the review: `lost 4 … timed out
+/// after 12s`, 4 of 4 on the server).
+#[test]
+fn a_write_out_of_time_is_sent_again_past_the_time_bound() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s timeout: 12 s of writes, and a little more for what is stored.
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // About 10 s of writes that commit, each answer held 1 s.
+    proxy.delay_answers(1_000);
+    let t = Instant::now();
+    let mut i = 0;
+    while t.elapsed() < Duration::from_millis(10_200) {
+        let (f, _) = small_batch(&s, &format!("burn{i}"), 1, 100);
+        assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+        i += 1;
+    }
+    proxy.delay_answers(0);
+    // The next transaction reaches the server 3 s late and commits: its
+    // deadline (2 s) and question (0.5 s) end first, which spends the
+    // process's time for writes, before it is sent again.
+    proxy.late_writes(1, 3_000);
+    let (f, keys) = small_batch(&s, "late", 4, 100);
+    assert_eq!(f.lost_count(), 0, "{:?}", f.into_error());
+    let r = testkit::open_remote(&ns).unwrap();
+    let on_server: Vec<String> = r.list_all().unwrap().into_iter().map(|e| e.key).collect();
+    assert!(keys.iter().all(|k| on_server.contains(k)));
+    // The bound holds for what was not sent yet.
+    let (f, _) = small_batch(&s, "after", 4, 100);
+    assert_eq!(f.lost_count(), 4);
+}
+
+/// The time a process may spend on writes grows with what its
+/// transactions store (a timeout for each 4 MiB): a slow server that keeps
+/// storing finishes a large write past six timeouts. A flat six timeouts
+/// lost 0 to 200 of 800 units per process on a quiet Turso database and up
+/// to 690 while vex's Rails jobs wrote (the fourth write review).
+#[test]
+fn a_process_that_keeps_storing_writes_past_six_timeouts() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 2 s timeout: 12 s of writes, and 2 s more for each 4 MiB stored
+    // (a 1 s timeout left a debug build's 1 MiB transaction too little).
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    let (f, _) = small_batch(&s, "seed", 1, 100);
+    assert_eq!(f.lost_count(), 0);
+    // Each answer held 800 ms: about 1 MiB a second.
+    proxy.delay_answers(800);
+    let t = Instant::now();
+    // 480 units of about 25 kB: 12 MB, 12 transactions, earning 6 s.
+    let (f, keys) = small_batch(&s, "big", 480, 20_000);
+    let took = t.elapsed();
+    assert_eq!(f.lost_count(), 0, "{took:?}: {:?}", f.into_error());
+    eprintln!("took {took:?}");
+    assert!(
+        took > Duration::from_secs(12),
+        "past six timeouts: {took:?}"
+    );
+    proxy.delay_answers(0);
+    let r = testkit::open_remote(&ns).unwrap();
+    assert_eq!(r.list_all().unwrap().len(), 1 + keys.len());
+}
+
+/// Removing unreferenced manifests is a write within the process's time
+/// for writes: once that is spent it sends nothing and says so. A draft
+/// sent it with the whole request timeout after `vci run`'s writes were
+/// cut short, so a slow server cost a job one more timeout past the bound.
+#[test]
+fn removing_manifests_keeps_to_the_time_for_writes() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    // A 1 s timeout: 6 s of writes in all.
+    let s = proxied(&proxy, token.as_deref(), &ns, 1);
+    let m = manifest(&["src/free.rs"]);
+    s.put_manifest(&m.root(), m.to_compact().as_bytes())
+        .unwrap();
+    proxy.delay_answers(250);
+    let (f, _) = small_batch(&s, "slow", 2_560, 100);
+    assert!(f.lost_count() > 0, "the time for writes spent");
+    proxy.delay_answers(0);
+    let n0 = s.requests();
+    let t = Instant::now();
+    let e = s.remove_manifests(&[&m.root()]).unwrap_err();
+    assert!(e.to_string().contains("this process's writes"), "{e}");
+    assert_eq!(s.requests(), n0, "nothing sent");
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
 }

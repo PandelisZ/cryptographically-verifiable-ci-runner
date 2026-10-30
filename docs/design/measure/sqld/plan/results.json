@@ -1,0 +1,7003 @@
+{
+ "runs": [
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "n": 1,
+   "exit": 0,
+   "wall": 5.066,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.05,
+    "rust: list test files": 0.06,
+    "vex-web: list test files": 0.09,
+    "rust: resolve toolchain and externals": 0.15,
+    "vex-roder: resolve toolchain and externals": 0.15,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.88,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.15,
+    "fetch the stored values the plan reads": 0.17,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "verdicts (rehash inputs, check candidates)": 3.61,
+    "verdicts again for what was fetched meanwhile": 0.03,
+    "remember the 1163 attestation(s) that passed on this tree": 0.01,
+    "plan total": 4.97,
+    "_time_real": 5.03,
+    "_time_user": 3.47,
+    "_time_sys": 2.28
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.15
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 6.7,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.3,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.2,
+     "manifest read": 0.0,
+     "manifest decode": 0.3,
+     "case collisions": 0.0,
+     "ignored children": 0.4,
+     "rehash": 5.9,
+     "externals": 37.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 285655040,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "n": 2,
+   "exit": 0,
+   "wall": 4.355,
+   "steps": {
+    "read the base commit's policy and signers": 0.14,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-web: list test files": 0.07,
+    "vex-roder: list test files": 0.14,
+    "rust: list test files": 0.15,
+    "rust: resolve toolchain and externals": 0.2,
+    "vex-roder: resolve toolchain and externals": 0.2,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.94,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.1,
+    "fetch the stored values the plan reads": 0.13,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 2.78,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.01,
+    "plan total": 4.22,
+    "_time_real": 4.32,
+    "_time_user": 3.36,
+    "_time_sys": 2.2
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.1
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 2.4,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.0,
+     "rehash": 1.3,
+     "externals": 32.1,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 291553280,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "n": 3,
+   "exit": 0,
+   "wall": 7.814,
+   "steps": {
+    "read the base commit's policy and signers": 0.21,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.15,
+    "vex-web: list test files": 0.15,
+    "rust: list test files": 0.15,
+    "vex-roder: resolve toolchain and externals": 0.23,
+    "rust: resolve toolchain and externals": 0.23,
+    "vex-api: list test files": 0.03,
+    "vex-api: resolve toolchain and externals": 1.72,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.15,
+    "fetch the stored values the plan reads": 0.18,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "verdicts (rehash inputs, check candidates)": 5.36,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 1163 attestation(s) that passed on this tree": 0.02,
+    "plan total": 7.68,
+    "_time_real": 7.75,
+    "_time_user": 4.02,
+    "_time_sys": 2.58
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.15
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.4,
+     "manifest read": 0.4,
+     "manifest decode": 0.8,
+     "case collisions": 0.1,
+     "ignored children": 1.9,
+     "rehash": 1.4,
+     "externals": 61.8,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 288604160,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "n": 4,
+   "exit": 0,
+   "wall": 5.145,
+   "steps": {
+    "read the base commit's policy and signers": 0.19,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.15,
+    "vex-web: list test files": 0.15,
+    "rust: list test files": 0.15,
+    "rust: resolve toolchain and externals": 0.23,
+    "vex-roder: resolve toolchain and externals": 0.24,
+    "vex-api: list test files": 0.03,
+    "vex-api: resolve toolchain and externals": 1.7,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.12,
+    "fetch the stored values the plan reads": 0.15,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 2.74,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.02,
+    "plan total": 5.02,
+    "_time_real": 5.09,
+    "_time_user": 3.77,
+    "_time_sys": 2.57
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.12
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.5,
+     "case collisions": 0.1,
+     "ignored children": 1.6,
+     "rehash": 1.7,
+     "externals": 29.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 288964608,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "n": 5,
+   "exit": 0,
+   "wall": 9.082,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.15,
+    "rust: list test files": 0.15,
+    "vex-web: list test files": 0.15,
+    "vex-roder: resolve toolchain and externals": 0.22,
+    "rust: resolve toolchain and externals": 0.22,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.12,
+    "fetch the stored values the plan reads": 0.14,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 6.95,
+    "verdicts again for what was fetched meanwhile": 0.04,
+    "remember the 1163 attestation(s) that passed on this tree": 0.03,
+    "plan total": 8.71,
+    "_time_real": 9.02,
+    "_time_user": 3.91,
+    "_time_sys": 2.43
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.12
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.7,
+     "globals": 0.4,
+     "manifest read": 4.0,
+     "manifest decode": 2.7,
+     "case collisions": 0.1,
+     "ignored children": 23.6,
+     "rehash": 6.9,
+     "externals": 46.8,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 267927552,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "n": 6,
+   "exit": 0,
+   "wall": 3.343,
+   "steps": {
+    "read the base commit's policy and signers": 0.14,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.04,
+    "rust: list test files": 0.04,
+    "vex-web: list test files": 0.07,
+    "rust: resolve toolchain and externals": 0.13,
+    "vex-roder: resolve toolchain and externals": 0.13,
+    "vex-api: resolve toolchain and externals": 0.54,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.11,
+    "fetch the stored values the plan reads": 0.14,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 2.02,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.24,
+    "_time_real": 3.31,
+    "_time_user": 3.31,
+    "_time_sys": 1.7
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.11
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.3,
+     "manifest read": 0.1,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 2.2,
+     "rehash": 0.3,
+     "externals": 22.4,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 287408128,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "n": 7,
+   "exit": 0,
+   "wall": 3.17,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-roder: list test files": 0.04,
+    "rust: list test files": 0.05,
+    "vex-web: list test files": 0.07,
+    "vex-roder: resolve toolchain and externals": 0.12,
+    "rust: resolve toolchain and externals": 0.12,
+    "vex-api: resolve toolchain and externals": 0.5,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.09,
+    "fetch the stored values the plan reads": 0.11,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 2.06,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.09,
+    "_time_real": 3.13,
+    "_time_user": 3.32,
+    "_time_sys": 1.66
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.09
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 4.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 2.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 2.0,
+     "rehash": 0.4,
+     "externals": 22.2,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 285130752,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "n": 1,
+   "exit": 0,
+   "wall": 10.208,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.32,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.11,
+    "fetch the stored values the plan reads": 0.16,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 8.34,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 10.11,
+    "_time_real": 10.17,
+    "_time_user": 3.34,
+    "_time_sys": 2.35
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.11
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.3,
+     "globals": 0.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.5,
+     "case collisions": 0.1,
+     "ignored children": 1.7,
+     "rehash": 1.8,
+     "externals": 105.9,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 275824640,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "n": 2,
+   "exit": 0,
+   "wall": 4.96,
+   "steps": {
+    "read the base commit's policy and signers": 0.13,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.98,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.12,
+    "fetch the stored values the plan reads": 0.15,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "verdicts (rehash inputs, check candidates)": 3.37,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.02,
+    "plan total": 4.81,
+    "_time_real": 4.91,
+    "_time_user": 3.2,
+    "_time_sys": 2.17
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.12
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.4,
+     "manifest read": 0.1,
+     "manifest decode": 0.5,
+     "case collisions": 0.1,
+     "ignored children": 0.8,
+     "rehash": 3.2,
+     "externals": 39.6,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 279232512,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "n": 3,
+   "exit": 0,
+   "wall": 4.286,
+   "steps": {
+    "read the base commit's policy and signers": 0.19,
+    "vex-api: resolve toolchain and externals": 0.72,
+    "vex-api: list test files": 0.01,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.14,
+    "fetch the stored values the plan reads": 0.17,
+    "look up the candidates": 0.02,
+    "read the candidates": 0.04,
+    "verdicts (rehash inputs, check candidates)": 2.11,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.07,
+    "plan total": 4.04,
+    "_time_real": 4.21,
+    "_time_user": 2.86,
+    "_time_sys": 1.45
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.14
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.7,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.2,
+     "rehash": 2.5,
+     "externals": 10.5,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 280510464,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "n": 4,
+   "exit": 0,
+   "wall": 7.708,
+   "steps": {
+    "read the base commit's policy and signers": 0.2,
+    "vex-api: list test files": 0.03,
+    "vex-api: resolve toolchain and externals": 1.78,
+    "store: libsql: list 2061 unit(s)": 0.04,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.21,
+    "fetch the stored values the plan reads": 0.24,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "verdicts (rehash inputs, check candidates)": 5.14,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 7.59,
+    "_time_real": 7.66,
+    "_time_user": 3.5,
+    "_time_sys": 2.34
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.04
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.21
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.5,
+     "manifest read": 0.1,
+     "manifest decode": 0.7,
+     "case collisions": 0.1,
+     "ignored children": 1.8,
+     "rehash": 1.5,
+     "externals": 64.4,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 275742720,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "n": 5,
+   "exit": 0,
+   "wall": 4.098,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.92,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.1,
+    "fetch the stored values the plan reads": 0.12,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 2.73,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 4.01,
+    "_time_real": 4.07,
+    "_time_user": 3.11,
+    "_time_sys": 2.08
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.1
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 2.9,
+     "manifest read": 0.0,
+     "manifest decode": 0.5,
+     "case collisions": 0.0,
+     "ignored children": 0.4,
+     "rehash": 1.2,
+     "externals": 31.7,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 281264128,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "n": 6,
+   "exit": 0,
+   "wall": 3.177,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-api: resolve toolchain and externals": 0.54,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.1,
+    "fetch the stored values the plan reads": 0.13,
+    "look up the candidates": 0.01,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 2.03,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.06,
+    "_time_real": 3.13,
+    "_time_user": 2.9,
+    "_time_sys": 1.62
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.1
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 2.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.3,
+     "rehash": 1.3,
+     "externals": 23.1,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 281214976,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "n": 7,
+   "exit": 0,
+   "wall": 3.89,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-api: resolve toolchain and externals": 0.57,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.1,
+    "fetch the stored values the plan reads": 0.12,
+    "look up the candidates": 0.01,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 2.7,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.79,
+    "_time_real": 3.86,
+    "_time_user": 3.04,
+    "_time_sys": 1.82
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.1
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.3,
+     "manifest read": 0.1,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.3,
+     "rehash": 1.4,
+     "externals": 32.4,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 280100864,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "n": 1,
+   "exit": 0,
+   "wall": 8.416,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-roder: list test files": 0.07,
+    "vex-web: list test files": 0.07,
+    "rust: list test files": 0.08,
+    "vex-roder: resolve toolchain and externals": 0.15,
+    "rust: resolve toolchain and externals": 0.15,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 4.46,
+    "store: libsql: list 2539 unit(s)": 0.24,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.84,
+    "fetch the stored values the plan reads": 0.94,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.46,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 8.21,
+    "_time_real": 8.3,
+    "_time_user": 0.86,
+    "_time_sys": 1.19
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.24
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.84
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 1.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 4.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 1.7,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 69238784,
+   "plan": {
+    "files": 2539,
+    "skip": 0,
+    "run": 2539,
+    "by_project": {
+     "rust": {
+      "skip": 0,
+      "run": 64
+     },
+     "vex-roder": {
+      "skip": 0,
+      "run": 13
+     },
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     },
+     "vex-web": {
+      "skip": 0,
+      "run": 401
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1167
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "n": 2,
+   "exit": 0,
+   "wall": 1.373,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-web: list test files": 0.09,
+    "vex-roder: list test files": 0.13,
+    "rust: list test files": 0.14,
+    "rust: resolve toolchain and externals": 0.19,
+    "vex-roder: resolve toolchain and externals": 0.19,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.98,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.05,
+    "fetch the stored values the plan reads": 0.07,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.06,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.32,
+    "_time_real": 1.34,
+    "_time_user": 0.78,
+    "_time_sys": 1.0
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.05
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.1,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 69091328,
+   "plan": {
+    "files": 2539,
+    "skip": 0,
+    "run": 2539,
+    "by_project": {
+     "rust": {
+      "skip": 0,
+      "run": 64
+     },
+     "vex-roder": {
+      "skip": 0,
+      "run": 13
+     },
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     },
+     "vex-web": {
+      "skip": 0,
+      "run": 401
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1167
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "n": 3,
+   "exit": 0,
+   "wall": 2.447,
+   "steps": {
+    "read the base commit's policy and signers": 0.19,
+    "vex-web: resolve toolchain and externals": 0.04,
+    "vex-roder: list test files": 0.17,
+    "rust: list test files": 0.17,
+    "vex-web: list test files": 0.18,
+    "vex-roder: resolve toolchain and externals": 0.24,
+    "rust: resolve toolchain and externals": 0.24,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.78,
+    "store: libsql: list 2539 unit(s)": 0.04,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.08,
+    "fetch the stored values the plan reads": 0.11,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.04,
+    "verdicts (rehash inputs, check candidates)": 0.08,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 2.37,
+    "_time_real": 2.4,
+    "_time_user": 0.96,
+    "_time_sys": 1.12
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.04
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.08
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.9,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 69206016,
+   "plan": {
+    "files": 2539,
+    "skip": 0,
+    "run": 2539,
+    "by_project": {
+     "rust": {
+      "skip": 0,
+      "run": 64
+     },
+     "vex-roder": {
+      "skip": 0,
+      "run": 13
+     },
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     },
+     "vex-web": {
+      "skip": 0,
+      "run": 401
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1167
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "n": 4,
+   "exit": 0,
+   "wall": 1.401,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-web: list test files": 0.08,
+    "vex-roder: list test files": 0.12,
+    "rust: list test files": 0.13,
+    "rust: resolve toolchain and externals": 0.18,
+    "vex-roder: resolve toolchain and externals": 0.18,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.94,
+    "store: libsql: list 2539 unit(s)": 0.05,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.12,
+    "fetch the stored values the plan reads": 0.14,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.07,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.34,
+    "_time_real": 1.37,
+    "_time_user": 0.83,
+    "_time_sys": 1.09
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.05
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.12
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.1,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.9,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 69369856,
+   "plan": {
+    "files": 2539,
+    "skip": 0,
+    "run": 2539,
+    "by_project": {
+     "rust": {
+      "skip": 0,
+      "run": 64
+     },
+     "vex-roder": {
+      "skip": 0,
+      "run": 13
+     },
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     },
+     "vex-web": {
+      "skip": 0,
+      "run": 401
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1167
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "n": 5,
+   "exit": 0,
+   "wall": 2.832,
+   "steps": {
+    "read the base commit's policy and signers": 0.16,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.15,
+    "rust: list test files": 0.15,
+    "vex-web: list test files": 0.17,
+    "vex-roder: resolve toolchain and externals": 0.22,
+    "rust: resolve toolchain and externals": 0.22,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 2.27,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.05,
+    "fetch the stored values the plan reads": 0.08,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.04,
+    "verdicts (rehash inputs, check candidates)": 0.09,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 2.77,
+    "_time_real": 2.8,
+    "_time_user": 0.95,
+    "_time_sys": 1.06
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.05
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 1.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 69550080,
+   "plan": {
+    "files": 2539,
+    "skip": 0,
+    "run": 2539,
+    "by_project": {
+     "rust": {
+      "skip": 0,
+      "run": 64
+     },
+     "vex-roder": {
+      "skip": 0,
+      "run": 13
+     },
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     },
+     "vex-web": {
+      "skip": 0,
+      "run": 401
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1167
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "n": 6,
+   "exit": 0,
+   "wall": 1.221,
+   "steps": {
+    "read the base commit's policy and signers": 0.09,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-roder: list test files": 0.03,
+    "rust: list test files": 0.03,
+    "vex-web: list test files": 0.08,
+    "vex-roder: resolve toolchain and externals": 0.1,
+    "rust: resolve toolchain and externals": 0.1,
+    "vex-api: resolve toolchain and externals": 0.48,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.04,
+    "fetch the stored values the plan reads": 0.06,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.06,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.16,
+    "_time_real": 1.18,
+    "_time_user": 0.76,
+    "_time_sys": 0.75
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.04
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 69451776,
+   "plan": {
+    "files": 2539,
+    "skip": 0,
+    "run": 2539,
+    "by_project": {
+     "rust": {
+      "skip": 0,
+      "run": 64
+     },
+     "vex-roder": {
+      "skip": 0,
+      "run": 13
+     },
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     },
+     "vex-web": {
+      "skip": 0,
+      "run": 401
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1167
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "n": 7,
+   "exit": 0,
+   "wall": 1.09,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-roder: list test files": 0.03,
+    "rust: list test files": 0.03,
+    "vex-web: list test files": 0.09,
+    "vex-roder: resolve toolchain and externals": 0.12,
+    "rust: resolve toolchain and externals": 0.12,
+    "vex-api: resolve toolchain and externals": 0.57,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)": 0.05,
+    "fetch the stored values the plan reads": 0.07,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.06,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.03,
+    "_time_real": 1.05,
+    "_time_user": 0.77,
+    "_time_sys": 0.67
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 4 request(s)",
+     0.05
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.7,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 69517312,
+   "plan": {
+    "files": 2539,
+    "skip": 0,
+    "run": 2539,
+    "by_project": {
+     "rust": {
+      "skip": 0,
+      "run": 64
+     },
+     "vex-roder": {
+      "skip": 0,
+      "run": 13
+     },
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     },
+     "vex-web": {
+      "skip": 0,
+      "run": 401
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1167
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "n": 1,
+   "exit": 0,
+   "wall": 1.246,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.84,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.05,
+    "fetch the stored values the plan reads": 0.07,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.06,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.18,
+    "_time_real": 1.21,
+    "_time_user": 0.59,
+    "_time_sys": 0.76
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.05
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.9,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 52543488,
+   "plan": {
+    "files": 2061,
+    "skip": 0,
+    "run": 2061,
+    "by_project": {
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     }
+    },
+    "reasons": [
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1156
+     ],
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "n": 2,
+   "exit": 0,
+   "wall": 2.032,
+   "steps": {
+    "read the base commit's policy and signers": 0.16,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.46,
+    "store: libsql: list 2061 unit(s)": 0.04,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.11,
+    "fetch the stored values the plan reads": 0.13,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.08,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.95,
+    "_time_real": 1.99,
+    "_time_user": 0.64,
+    "_time_sys": 1.02
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.04
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.11
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 1.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 52789248,
+   "plan": {
+    "files": 2061,
+    "skip": 0,
+    "run": 2061,
+    "by_project": {
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     }
+    },
+    "reasons": [
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1156
+     ],
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "n": 3,
+   "exit": 0,
+   "wall": 1.099,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-api: resolve toolchain and externals": 0.56,
+    "vex-api: list test files": 0.01,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.08,
+    "fetch the stored values the plan reads": 0.12,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "verdicts (rehash inputs, check candidates)": 0.07,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.03,
+    "_time_real": 1.06,
+    "_time_user": 0.58,
+    "_time_sys": 0.67
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.08
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 53592064,
+   "plan": {
+    "files": 2061,
+    "skip": 0,
+    "run": 2061,
+    "by_project": {
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     }
+    },
+    "reasons": [
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1156
+     ],
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "n": 4,
+   "exit": 0,
+   "wall": 2.227,
+   "steps": {
+    "read the base commit's policy and signers": 0.18,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.58,
+    "store: libsql: list 2061 unit(s)": 0.04,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.07,
+    "fetch the stored values the plan reads": 0.12,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "verdicts (rehash inputs, check candidates)": 0.11,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 2.14,
+    "_time_real": 2.18,
+    "_time_user": 0.64,
+    "_time_sys": 0.78
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.04
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.07
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 53379072,
+   "plan": {
+    "files": 2061,
+    "skip": 0,
+    "run": 2061,
+    "by_project": {
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     }
+    },
+    "reasons": [
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1156
+     ],
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "n": 5,
+   "exit": 0,
+   "wall": 1.293,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.91,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.05,
+    "fetch the stored values the plan reads": 0.07,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.07,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.24,
+    "_time_real": 1.26,
+    "_time_user": 0.59,
+    "_time_sys": 0.97
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.05
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.9,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 53657600,
+   "plan": {
+    "files": 2061,
+    "skip": 0,
+    "run": 2061,
+    "by_project": {
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     }
+    },
+    "reasons": [
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1156
+     ],
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "n": 6,
+   "exit": 0,
+   "wall": 1.071,
+   "steps": {
+    "read the base commit's policy and signers": 0.09,
+    "vex-api: resolve toolchain and externals": 0.55,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.05,
+    "fetch the stored values the plan reads": 0.07,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.07,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 1.02,
+    "_time_real": 1.04,
+    "_time_user": 0.55,
+    "_time_sys": 0.76
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.05
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.9,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 53624832,
+   "plan": {
+    "files": 2061,
+    "skip": 0,
+    "run": 2061,
+    "by_project": {
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     }
+    },
+    "reasons": [
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1156
+     ],
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "n": 7,
+   "exit": 0,
+   "wall": 1.013,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-api: resolve toolchain and externals": 0.6,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)": 0.04,
+    "fetch the stored values the plan reads": 0.07,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "verdicts (rehash inputs, check candidates)": 0.06,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 0 attestation(s) that passed on this tree": 0.0,
+    "plan total": 0.96,
+    "_time_real": 0.98,
+    "_time_user": 0.56,
+    "_time_sys": 0.77
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 4 request(s)",
+     0.04
+    ]
+   ],
+   "store_requests": 4,
+   "store_mb": 0.0,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 0,
+     "rehashed": 0,
+     "signature": 0.0,
+     "globals": 0.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": null,
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 53395456,
+   "plan": {
+    "files": 2061,
+    "skip": 0,
+    "run": 2061,
+    "by_project": {
+     "vex-api": {
+      "skip": 0,
+      "run": 2061
+     }
+    },
+    "reasons": [
+     [
+      "no valid attestation (N candidates; best failed envelope: envelope JSON)",
+      1156
+     ],
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "n": 1,
+   "exit": 0,
+   "wall": 6.01,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-web: list test files": 0.09,
+    "vex-roder: resolve toolchain and externals": 0.47,
+    "rust: resolve toolchain and externals": 0.47,
+    "vex-roder: list test files": 0.48,
+    "rust: list test files": 0.49,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 2.44,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB": 0.1,
+    "fetch the stored values the plan reads": 0.12,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 3.03,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.01,
+    "plan total": 5.85,
+    "_time_real": 5.88,
+    "_time_user": 3.67,
+    "_time_sys": 2.81
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB",
+     0.1
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 44.2,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.4,
+     "manifest read": 0.1,
+     "manifest decode": 0.4,
+     "case collisions": 0.1,
+     "ignored children": 1.4,
+     "rehash": 1.7,
+     "externals": 33.3,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 287752192,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "n": 2,
+   "exit": 0,
+   "wall": 4.79,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-web: list test files": 0.07,
+    "vex-roder: list test files": 0.13,
+    "rust: list test files": 0.13,
+    "vex-roder: resolve toolchain and externals": 0.18,
+    "rust: resolve toolchain and externals": 0.18,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.98,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB": 0.15,
+    "fetch the stored values the plan reads": 0.17,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 3.35,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.02,
+    "plan total": 4.73,
+    "_time_real": 4.75,
+    "_time_user": 3.38,
+    "_time_sys": 2.22
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB",
+     0.15
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 44.2,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 0.7,
+     "rehash": 4.7,
+     "externals": 37.1,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 290963456,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "n": 3,
+   "exit": 0,
+   "wall": 8.003,
+   "steps": {
+    "read the base commit's policy and signers": 0.22,
+    "vex-web: resolve toolchain and externals": 0.05,
+    "vex-roder: list test files": 0.19,
+    "rust: list test files": 0.2,
+    "vex-web: list test files": 0.26,
+    "vex-roder: resolve toolchain and externals": 0.29,
+    "rust: resolve toolchain and externals": 0.31,
+    "vex-api: list test files": 0.03,
+    "vex-api: resolve toolchain and externals": 1.83,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB": 0.13,
+    "fetch the stored values the plan reads": 0.17,
+    "look up the candidates": 0.01,
+    "read the candidates": 0.04,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 5.45,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 1163 attestation(s) that passed on this tree": 0.02,
+    "plan total": 7.91,
+    "_time_real": 7.94,
+    "_time_user": 4.04,
+    "_time_sys": 2.67
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB",
+     0.13
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 44.2,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 5.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.5,
+     "manifest read": 1.8,
+     "manifest decode": 0.8,
+     "case collisions": 0.1,
+     "ignored children": 1.5,
+     "rehash": 1.9,
+     "externals": 64.2,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 287883264,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "n": 4,
+   "exit": 0,
+   "wall": 7.928,
+   "steps": {
+    "read the base commit's policy and signers": 0.19,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.16,
+    "vex-web: list test files": 0.16,
+    "rust: list test files": 0.17,
+    "vex-roder: resolve toolchain and externals": 0.24,
+    "rust: resolve toolchain and externals": 0.24,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.65,
+    "store: libsql: list 2539 unit(s)": 0.05,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB": 0.17,
+    "fetch the stored values the plan reads": 0.21,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 5.54,
+    "verdicts again for what was fetched meanwhile": 0.03,
+    "remember the 1163 attestation(s) that passed on this tree": 0.06,
+    "plan total": 7.84,
+    "_time_real": 7.88,
+    "_time_user": 3.92,
+    "_time_sys": 2.54
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.05
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB",
+     0.17
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 44.2,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 4.7,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.4,
+     "manifest read": 0.2,
+     "manifest decode": 0.7,
+     "case collisions": 0.1,
+     "ignored children": 1.8,
+     "rehash": 2.4,
+     "externals": 64.6,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 5.5,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 286031872,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "n": 5,
+   "exit": 0,
+   "wall": 4.011,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-web: list test files": 0.07,
+    "vex-roder: list test files": 0.13,
+    "rust: list test files": 0.13,
+    "vex-roder: resolve toolchain and externals": 0.17,
+    "rust: resolve toolchain and externals": 0.17,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.85,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.1 MB": 0.07,
+    "fetch the stored values the plan reads": 0.09,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 2.77,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.95,
+    "_time_real": 3.98,
+    "_time_user": 3.46,
+    "_time_sys": 2.13
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.1 MB",
+     0.07
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 44.1,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.2,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 2.7,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.2,
+     "rehash": 1.5,
+     "externals": 31.5,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 294797312,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "n": 6,
+   "exit": 0,
+   "wall": 3.087,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-roder: list test files": 0.03,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "rust: list test files": 0.04,
+    "vex-web: list test files": 0.07,
+    "vex-roder: resolve toolchain and externals": 0.11,
+    "rust: resolve toolchain and externals": 0.11,
+    "vex-api: resolve toolchain and externals": 0.5,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB": 0.07,
+    "fetch the stored values the plan reads": 0.09,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 2.0,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.03,
+    "_time_real": 3.06,
+    "_time_user": 3.31,
+    "_time_sys": 1.65
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB",
+     0.07
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 44.2,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 2.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 2.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.8,
+     "rehash": 0.5,
+     "externals": 22.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 293519360,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "n": 7,
+   "exit": 0,
+   "wall": 3.289,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-web: resolve toolchain and externals": 0.05,
+    "vex-roder: list test files": 0.06,
+    "rust: list test files": 0.06,
+    "vex-web: list test files": 0.14,
+    "vex-roder: resolve toolchain and externals": 0.24,
+    "rust: resolve toolchain and externals": 0.24,
+    "vex-api: resolve toolchain and externals": 0.49,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB": 0.16,
+    "fetch the stored values the plan reads": 0.18,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 1.96,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1163 attestation(s) that passed on this tree": 0.14,
+    "plan total": 3.21,
+    "_time_real": 3.24,
+    "_time_user": 3.3,
+    "_time_sys": 1.63
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 44.2 MB",
+     0.16
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 44.2,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 3.8,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 1.9,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.2,
+     "manifest read": 0.1,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.2,
+     "rehash": 0.8,
+     "externals": 21.4,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 291586048,
+   "plan": {
+    "files": 2539,
+    "skip": 1163,
+    "run": 1376,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "n": 1,
+   "exit": 0,
+   "wall": 5.855,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 2.06,
+    "store: libsql: list 2061 unit(s)": 0.14,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB": 1.33,
+    "fetch the stored values the plan reads": 1.35,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 2.14,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 5.79,
+    "_time_real": 5.82,
+    "_time_user": 3.14,
+    "_time_sys": 2.05
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.14
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB",
+     1.33
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 43.3,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.1,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.8,
+     "rehash": 1.8,
+     "externals": 21.6,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 278626304,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "n": 2,
+   "exit": 0,
+   "wall": 6.107,
+   "steps": {
+    "read the base commit's policy and signers": 0.17,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.49,
+    "store: libsql: list 2061 unit(s)": 0.05,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB": 0.35,
+    "fetch the stored values the plan reads": 0.37,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 3.79,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 6.03,
+    "_time_real": 6.07,
+    "_time_user": 3.45,
+    "_time_sys": 2.37
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.05
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB",
+     0.35
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 43.3,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.6,
+     "manifest read": 0.5,
+     "manifest decode": 1.1,
+     "case collisions": 0.1,
+     "ignored children": 5.1,
+     "rehash": 4.1,
+     "externals": 38.9,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 271351808,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "n": 3,
+   "exit": 0,
+   "wall": 5.27,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.09,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB": 0.06,
+    "fetch the stored values the plan reads": 0.08,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 3.7,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.07,
+    "plan total": 5.18,
+    "_time_real": 5.2,
+    "_time_user": 2.98,
+    "_time_sys": 1.58
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB",
+     0.06
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 43.3,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.7,
+     "rehash": 0.4,
+     "externals": 47.6,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 285392896,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "n": 4,
+   "exit": 0,
+   "wall": 5.843,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.03,
+    "store: libsql: list 2061 unit(s)": 0.05,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB": 0.3,
+    "fetch the stored values the plan reads": 0.33,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 4.13,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 1155 attestation(s) that passed on this tree": 0.02,
+    "plan total": 5.76,
+    "_time_real": 5.8,
+    "_time_user": 3.33,
+    "_time_sys": 2.31
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.05
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB",
+     0.3
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 43.3,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.2,
+     "globals": 0.3,
+     "manifest read": 0.1,
+     "manifest decode": 0.8,
+     "case collisions": 0.1,
+     "ignored children": 1.7,
+     "rehash": 1.7,
+     "externals": 50.3,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 275808256,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "n": 5,
+   "exit": 0,
+   "wall": 3.889,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.86,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB": 0.06,
+    "fetch the stored values the plan reads": 0.08,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 2.64,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.82,
+    "_time_real": 3.84,
+    "_time_user": 3.03,
+    "_time_sys": 1.99
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB",
+     0.06
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 43.3,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 1.0,
+     "rehash": 1.4,
+     "externals": 31.7,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 282968064,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "n": 6,
+   "exit": 0,
+   "wall": 3.76,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-api: resolve toolchain and externals": 0.67,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB": 0.07,
+    "fetch the stored values the plan reads": 0.09,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 2.64,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.7,
+    "_time_real": 3.73,
+    "_time_user": 3.0,
+    "_time_sys": 1.66
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB",
+     0.07
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 43.3,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 2.0,
+     "rehash": 0.4,
+     "externals": 32.6,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 286605312,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "n": 7,
+   "exit": 0,
+   "wall": 3.414,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-api: resolve toolchain and externals": 0.56,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB": 0.07,
+    "fetch the stored values the plan reads": 0.1,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "load the verdict objects": 0.0,
+    "verdicts (rehash inputs, check candidates)": 2.18,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1155 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.36,
+    "_time_real": 3.38,
+    "_time_user": 2.95,
+    "_time_sys": 1.61
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 43.3 MB",
+     0.07
+    ]
+   ],
+   "store_requests": 12,
+   "store_mb": 43.3,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1155,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.4,
+     "case collisions": 0.0,
+     "ignored children": 2.1,
+     "rehash": 0.4,
+     "externals": 25.7,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 0 hdr, 0 tables, 0 shape, 0 state, 0 bytes, 0 candidate(s) past the cap, 0 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 283508736,
+   "plan": {
+    "files": 2061,
+    "skip": 1155,
+    "run": 906,
+    "by_project": {
+     "vex-api": {
+      "skip": 1155,
+      "run": 906
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ],
+     [
+      "no valid attestation (N candidates; best failed inputs: inputRoot)",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "n": 1,
+   "exit": 0,
+   "wall": 3.539,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-roder: list test files": 0.12,
+    "rust: list test files": 0.13,
+    "vex-web: resolve toolchain and externals": 0.13,
+    "vex-web: list test files": 0.41,
+    "vex-roder: resolve toolchain and externals": 0.46,
+    "rust: resolve toolchain and externals": 0.46,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.66,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB": 0.04,
+    "fetch the stored values the plan reads": 0.06,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 28 object(s), 2 request(s), 0.6 MB": 0.0,
+    "load the verdict objects": 1.52,
+    "verdicts (rehash inputs, check candidates)": 0.98,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1164 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.47,
+    "_time_real": 3.5,
+    "_time_user": 4.52,
+    "_time_sys": 2.33
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB",
+     0.04
+    ],
+    [
+     "store: libsql: read 28 object(s), 2 request(s), 0.6 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 3.3,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 5.0,
+     "rehash": 2.5,
+     "externals": 5.0,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 11 hdr, 10 tables, 7 shape, 0 state, 469753 bytes, 0 candidate(s) past the cap, 7 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 191397888,
+   "plan": {
+    "files": 2539,
+    "skip": 1164,
+    "run": 1375,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "n": 2,
+   "exit": 0,
+   "wall": 4.239,
+   "steps": {
+    "read the base commit's policy and signers": 0.21,
+    "vex-roder: list test files": 0.15,
+    "vex-web: resolve toolchain and externals": 0.14,
+    "rust: list test files": 0.16,
+    "vex-web: list test files": 0.51,
+    "rust: resolve toolchain and externals": 0.6,
+    "vex-roder: resolve toolchain and externals": 0.6,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.91,
+    "store: libsql: list 2539 unit(s)": 0.03,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB": 0.05,
+    "fetch the stored values the plan reads": 0.08,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 28 object(s), 2 request(s), 0.6 MB": 0.01,
+    "load the verdict objects": 1.59,
+    "verdicts (rehash inputs, check candidates)": 1.19,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1164 attestation(s) that passed on this tree": 0.04,
+    "plan total": 4.14,
+    "_time_real": 4.2,
+    "_time_user": 4.54,
+    "_time_sys": 2.83
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.03
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB",
+     0.05
+    ],
+    [
+     "store: libsql: read 28 object(s), 2 request(s), 0.6 MB",
+     0.01
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 3.3,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.6,
+     "rehash": 0.6,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 4.3,
+     "rehash": 3.0,
+     "externals": 7.1,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 11 hdr, 10 tables, 7 shape, 0 state, 469753 bytes, 0 candidate(s) past the cap, 7 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 192823296,
+   "plan": {
+    "files": 2539,
+    "skip": 1164,
+    "run": 1375,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "n": 3,
+   "exit": 0,
+   "wall": 7.851,
+   "steps": {
+    "read the base commit's policy and signers": 0.15,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.14,
+    "rust: list test files": 0.15,
+    "vex-web: list test files": 0.16,
+    "rust: resolve toolchain and externals": 0.23,
+    "vex-roder: resolve toolchain and externals": 0.23,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.46,
+    "store: libsql: list 2539 unit(s)": 0.03,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB": 0.08,
+    "fetch the stored values the plan reads": 0.12,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.04,
+    "store: libsql: read 28 object(s), 2 request(s), 0.6 MB": 0.01,
+    "load the verdict objects": 3.99,
+    "verdicts (rehash inputs, check candidates)": 1.73,
+    "verdicts again for what was fetched meanwhile": 0.02,
+    "remember the 1164 attestation(s) that passed on this tree": 0.02,
+    "plan total": 7.75,
+    "_time_real": 7.79,
+    "_time_user": 5.31,
+    "_time_sys": 2.42
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.03
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB",
+     0.08
+    ],
+    [
+     "store: libsql: read 28 object(s), 2 request(s), 0.6 MB",
+     0.01
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 3.3,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.6,
+     "rehash": 0.6,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 6.8,
+     "rehash": 3.5,
+     "externals": 11.4,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 11 hdr, 10 tables, 7 shape, 0 state, 469753 bytes, 0 candidate(s) past the cap, 7 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 181977088,
+   "plan": {
+    "files": 2539,
+    "skip": 1164,
+    "run": 1375,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "n": 4,
+   "exit": 0,
+   "wall": 7.923,
+   "steps": {
+    "read the base commit's policy and signers": 0.29,
+    "vex-web: resolve toolchain and externals": 0.05,
+    "vex-roder: list test files": 0.12,
+    "rust: list test files": 0.13,
+    "vex-web: list test files": 0.17,
+    "rust: resolve toolchain and externals": 0.24,
+    "vex-roder: resolve toolchain and externals": 0.24,
+    "vex-api: list test files": 0.04,
+    "vex-api: resolve toolchain and externals": 1.43,
+    "store: libsql: list 2539 unit(s)": 0.03,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB": 0.05,
+    "fetch the stored values the plan reads": 0.09,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.04,
+    "store: libsql: read 28 object(s), 2 request(s), 0.6 MB": 0.0,
+    "load the verdict objects": 3.6,
+    "verdicts (rehash inputs, check candidates)": 2.15,
+    "verdicts again for what was fetched meanwhile": 0.03,
+    "remember the 1164 attestation(s) that passed on this tree": 0.02,
+    "plan total": 7.82,
+    "_time_real": 7.88,
+    "_time_user": 5.11,
+    "_time_sys": 2.41
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.03
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB",
+     0.05
+    ],
+    [
+     "store: libsql: read 28 object(s), 2 request(s), 0.6 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 3.3,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.9,
+     "rehash": 0.5,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.5,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 6.2,
+     "rehash": 3.4,
+     "externals": 16.2,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.1,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 11 hdr, 10 tables, 7 shape, 0 state, 469753 bytes, 0 candidate(s) past the cap, 7 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 190464000,
+   "plan": {
+    "files": 2539,
+    "skip": 1164,
+    "run": 1375,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "n": 5,
+   "exit": 0,
+   "wall": 3.34,
+   "steps": {
+    "read the base commit's policy and signers": 0.14,
+    "vex-web: resolve toolchain and externals": 0.03,
+    "vex-roder: list test files": 0.13,
+    "rust: list test files": 0.14,
+    "vex-web: list test files": 0.15,
+    "vex-roder: resolve toolchain and externals": 0.21,
+    "rust: resolve toolchain and externals": 0.21,
+    "vex-api: resolve toolchain and externals": 0.65,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB": 0.04,
+    "fetch the stored values the plan reads": 0.06,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 28 object(s), 2 request(s), 0.6 MB": 0.0,
+    "load the verdict objects": 1.5,
+    "verdicts (rehash inputs, check candidates)": 0.78,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1164 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.27,
+    "_time_real": 3.31,
+    "_time_user": 4.48,
+    "_time_sys": 2.13
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB",
+     0.04
+    ],
+    [
+     "store: libsql: read 28 object(s), 2 request(s), 0.6 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 3.3,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.6,
+     "rehash": 0.3,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 4.1,
+     "rehash": 2.2,
+     "externals": 2.6,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.8,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 11 hdr, 10 tables, 7 shape, 0 state, 469753 bytes, 0 candidate(s) past the cap, 7 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 190939136,
+   "plan": {
+    "files": 2539,
+    "skip": 1164,
+    "run": 1375,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "n": 6,
+   "exit": 0,
+   "wall": 3.431,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-roder: list test files": 0.1,
+    "rust: list test files": 0.11,
+    "vex-web: list test files": 0.12,
+    "vex-roder: resolve toolchain and externals": 0.18,
+    "rust: resolve toolchain and externals": 0.18,
+    "vex-api: resolve toolchain and externals": 0.58,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB": 0.04,
+    "fetch the stored values the plan reads": 0.06,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 28 object(s), 2 request(s), 0.6 MB": 0.0,
+    "load the verdict objects": 1.51,
+    "verdicts (rehash inputs, check candidates)": 0.78,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1164 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.35,
+    "_time_real": 3.4,
+    "_time_user": 4.5,
+    "_time_sys": 2.05
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB",
+     0.04
+    ],
+    [
+     "store: libsql: read 28 object(s), 2 request(s), 0.6 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 3.3,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.7,
+     "rehash": 0.3,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 4.3,
+     "rehash": 2.0,
+     "externals": 2.3,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 11 hdr, 10 tables, 7 shape, 0 state, 469753 bytes, 0 candidate(s) past the cap, 7 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 191496192,
+   "plan": {
+    "files": 2539,
+    "skip": 1164,
+    "run": 1375,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "n": 7,
+   "exit": 0,
+   "wall": 3.843,
+   "steps": {
+    "read the base commit's policy and signers": 0.11,
+    "vex-web: resolve toolchain and externals": 0.02,
+    "vex-roder: list test files": 0.11,
+    "rust: list test files": 0.11,
+    "vex-web: list test files": 0.12,
+    "vex-roder: resolve toolchain and externals": 0.18,
+    "rust: resolve toolchain and externals": 0.18,
+    "vex-api: resolve toolchain and externals": 0.62,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2539 unit(s)": 0.02,
+    "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB": 0.04,
+    "fetch the stored values the plan reads": 0.06,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 28 object(s), 2 request(s), 0.6 MB": 0.01,
+    "load the verdict objects": 1.49,
+    "verdicts (rehash inputs, check candidates)": 1.33,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1164 attestation(s) that passed on this tree": 0.02,
+    "plan total": 3.78,
+    "_time_real": 3.81,
+    "_time_user": 4.55,
+    "_time_sys": 2.03
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2539 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2539 unit(s), 1167 value(s), 12 request(s), 2.7 MB",
+     0.04
+    ],
+    [
+     "store: libsql: read 28 object(s), 2 request(s), 0.6 MB",
+     0.01
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 3.3,
+   "store_values": 1167,
+   "listed": 2539,
+   "verdicts": {
+    "rust": {
+     "checked": 4,
+     "rehashed": 4,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.2,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-roder": {
+     "checked": 1,
+     "rehashed": 1,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.1,
+     "rehash": 0.1,
+     "externals": 0.0,
+     "env": 0.0
+    },
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 4.6,
+     "rehash": 2.3,
+     "externals": 10.6,
+     "env": 0.0
+    },
+    "vex-web": {
+     "checked": 6,
+     "rehashed": 6,
+     "signature": 0.0,
+     "globals": 0.0,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.0,
+     "ignored children": 0.0,
+     "rehash": 0.0,
+     "externals": 0.0,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 11 hdr, 10 tables, 7 shape, 0 state, 469753 bytes, 0 candidate(s) past the cap, 7 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 191381504,
+   "plan": {
+    "files": 2539,
+    "skip": 1164,
+    "run": 1375,
+    "by_project": {
+     "rust": {
+      "skip": 4,
+      "run": 60
+     },
+     "vex-roder": {
+      "skip": 1,
+      "run": 12
+     },
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     },
+     "vex-web": {
+      "skip": 3,
+      "run": 398
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      1372
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@tanstack/history (+8 more))",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:openapi-fetch)",
+      1
+     ],
+     [
+      "no valid attestation (N candidates; best failed externals: external:@opentelemetry/api (+19 more))",
+      1
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "n": 1,
+   "exit": 0,
+   "wall": 11.434,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-api: list test files": 0.05,
+    "vex-api: resolve toolchain and externals": 1.14,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB": 0.04,
+    "fetch the stored values the plan reads": 0.06,
+    "look up the candidates": 0.01,
+    "read the candidates": 0.02,
+    "store: libsql: read 5 object(s), 2 request(s), 0.3 MB": 0.0,
+    "load the verdict objects": 1.61,
+    "verdicts (rehash inputs, check candidates)": 7.82,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1156 attestation(s) that passed on this tree": 0.02,
+    "plan total": 11.2,
+    "_time_real": 11.34,
+    "_time_user": 4.43,
+    "_time_sys": 2.42
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB",
+     0.04
+    ],
+    [
+     "store: libsql: read 5 object(s), 2 request(s), 0.3 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 2.9,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.4,
+     "globals": 0.7,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 4.0,
+     "rehash": 22.0,
+     "externals": 80.3,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 1 hdr, 2 tables, 2 shape, 0 state, 188305 bytes, 0 candidate(s) past the cap, 2 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 168624128,
+   "plan": {
+    "files": 2061,
+    "skip": 1156,
+    "run": 905,
+    "by_project": {
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "n": 2,
+   "exit": 0,
+   "wall": 5.263,
+   "steps": {
+    "read the base commit's policy and signers": 0.25,
+    "vex-api: resolve toolchain and externals": 0.97,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB": 0.07,
+    "fetch the stored values the plan reads": 0.09,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.03,
+    "store: libsql: read 5 object(s), 2 request(s), 0.3 MB": 0.01,
+    "load the verdict objects": 1.85,
+    "verdicts (rehash inputs, check candidates)": 1.72,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1156 attestation(s) that passed on this tree": 0.01,
+    "plan total": 5.19,
+    "_time_real": 5.23,
+    "_time_user": 4.46,
+    "_time_sys": 2.19
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB",
+     0.07
+    ],
+    [
+     "store: libsql: read 5 object(s), 2 request(s), 0.3 MB",
+     0.01
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 2.9,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 4.0,
+     "rehash": 2.8,
+     "externals": 16.2,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 1 hdr, 2 tables, 2 shape, 0 state, 188305 bytes, 0 candidate(s) past the cap, 2 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 169312256,
+   "plan": {
+    "files": 2061,
+    "skip": 1156,
+    "run": 905,
+    "by_project": {
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "n": 3,
+   "exit": 0,
+   "wall": 3.568,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-api: resolve toolchain and externals": 0.8,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB": 0.05,
+    "fetch the stored values the plan reads": 0.08,
+    "look up the candidates": 0.01,
+    "read the candidates": 0.02,
+    "store: libsql: read 5 object(s), 2 request(s), 0.3 MB": 0.0,
+    "load the verdict objects": 1.51,
+    "verdicts (rehash inputs, check candidates)": 0.77,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1156 attestation(s) that passed on this tree": 0.03,
+    "plan total": 3.49,
+    "_time_real": 3.53,
+    "_time_user": 4.05,
+    "_time_sys": 1.9
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB",
+     0.05
+    ],
+    [
+     "store: libsql: read 5 object(s), 2 request(s), 0.3 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 2.9,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.2,
+     "globals": 0.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 3.1,
+     "rehash": 2.6,
+     "externals": 1.7,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 1 hdr, 2 tables, 2 shape, 0 state, 188305 bytes, 0 candidate(s) past the cap, 2 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 192675840,
+   "plan": {
+    "files": 2061,
+    "skip": 1156,
+    "run": 905,
+    "by_project": {
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "n": 4,
+   "exit": 0,
+   "wall": 5.839,
+   "steps": {
+    "read the base commit's policy and signers": 0.14,
+    "vex-api: list test files": 0.05,
+    "vex-api: resolve toolchain and externals": 1.25,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB": 0.04,
+    "fetch the stored values the plan reads": 0.06,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 5 object(s), 2 request(s), 0.3 MB": 0.0,
+    "load the verdict objects": 1.46,
+    "verdicts (rehash inputs, check candidates)": 2.52,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1156 attestation(s) that passed on this tree": 0.02,
+    "plan total": 5.63,
+    "_time_real": 5.8,
+    "_time_user": 4.24,
+    "_time_sys": 2.44
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB",
+     0.04
+    ],
+    [
+     "store: libsql: read 5 object(s), 2 request(s), 0.3 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 2.9,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 5.9,
+     "rehash": 4.1,
+     "externals": 24.8,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 1 hdr, 2 tables, 2 shape, 0 state, 188305 bytes, 0 candidate(s) past the cap, 2 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 174112768,
+   "plan": {
+    "files": 2061,
+    "skip": 1156,
+    "run": 905,
+    "by_project": {
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "n": 5,
+   "exit": 0,
+   "wall": 3.72,
+   "steps": {
+    "read the base commit's policy and signers": 0.12,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 0.89,
+    "store: libsql: list 2061 unit(s)": 0.02,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB": 0.05,
+    "fetch the stored values the plan reads": 0.07,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 5 object(s), 2 request(s), 0.3 MB": 0.0,
+    "load the verdict objects": 1.62,
+    "verdicts (rehash inputs, check candidates)": 0.84,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1156 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.65,
+    "_time_real": 3.68,
+    "_time_user": 4.17,
+    "_time_sys": 2.03
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.02
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB",
+     0.05
+    ],
+    [
+     "store: libsql: read 5 object(s), 2 request(s), 0.3 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 2.9,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 3.3,
+     "rehash": 3.0,
+     "externals": 4.8,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 1 hdr, 2 tables, 2 shape, 0 state, 188305 bytes, 0 candidate(s) past the cap, 2 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 191954944,
+   "plan": {
+    "files": 2061,
+    "skip": 1156,
+    "run": 905,
+    "by_project": {
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "n": 6,
+   "exit": 0,
+   "wall": 4.791,
+   "steps": {
+    "read the base commit's policy and signers": 0.19,
+    "vex-api: list test files": 0.02,
+    "vex-api: resolve toolchain and externals": 1.38,
+    "store: libsql: list 2061 unit(s)": 0.04,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB": 0.07,
+    "fetch the stored values the plan reads": 0.11,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.04,
+    "store: libsql: read 5 object(s), 2 request(s), 0.3 MB": 0.0,
+    "load the verdict objects": 2.18,
+    "verdicts (rehash inputs, check candidates)": 0.65,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1156 attestation(s) that passed on this tree": 0.01,
+    "plan total": 4.7,
+    "_time_real": 4.75,
+    "_time_user": 4.46,
+    "_time_sys": 2.05
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.04
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB",
+     0.07
+    ],
+    [
+     "store: libsql: read 5 object(s), 2 request(s), 0.3 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 2.9,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.4,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 4.4,
+     "rehash": 3.5,
+     "externals": 0.7,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 1 hdr, 2 tables, 2 shape, 0 state, 188305 bytes, 0 candidate(s) past the cap, 2 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 193806336,
+   "plan": {
+    "files": 2061,
+    "skip": 1156,
+    "run": 905,
+    "by_project": {
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "n": 7,
+   "exit": 0,
+   "wall": 3.149,
+   "steps": {
+    "read the base commit's policy and signers": 0.1,
+    "vex-api: resolve toolchain and externals": 0.55,
+    "vex-api: list test files": 0.02,
+    "store: libsql: list 2061 unit(s)": 0.01,
+    "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB": 0.03,
+    "fetch the stored values the plan reads": 0.05,
+    "look up the candidates": 0.0,
+    "read the candidates": 0.02,
+    "store: libsql: read 5 object(s), 2 request(s), 0.3 MB": 0.0,
+    "load the verdict objects": 1.49,
+    "verdicts (rehash inputs, check candidates)": 0.72,
+    "verdicts again for what was fetched meanwhile": 0.01,
+    "remember the 1156 attestation(s) that passed on this tree": 0.01,
+    "plan total": 3.1,
+    "_time_real": 3.12,
+    "_time_user": 4.08,
+    "_time_sys": 1.69
+   },
+   "store_lines": [
+    [
+     "store: libsql: list 2061 unit(s)",
+     0.01
+    ],
+    [
+     "store: libsql: prefetch 2061 unit(s), 1156 value(s), 12 request(s), 2.6 MB",
+     0.03
+    ],
+    [
+     "store: libsql: read 5 object(s), 2 request(s), 0.3 MB",
+     0.0
+    ]
+   ],
+   "store_requests": 14,
+   "store_mb": 2.9,
+   "store_values": 1156,
+   "listed": 2061,
+   "verdicts": {
+    "vex-api": {
+     "checked": 1156,
+     "rehashed": 1156,
+     "signature": 0.1,
+     "globals": 0.3,
+     "manifest read": 0.0,
+     "manifest decode": 0.0,
+     "case collisions": 0.1,
+     "ignored children": 3.4,
+     "rehash": 2.6,
+     "externals": 3.2,
+     "env": 0.0
+    }
+   },
+   "objects": "objects: 1 hdr, 2 tables, 2 shape, 0 state, 188305 bytes, 0 candidate(s) past the cap, 2 distinct run(s)",
+   "warnings": [
+    "vci: warning: the base commit 47bb7b8f318f9bffe2c95b367e65a40be7ca187c (HEAD) is HEAD or contains it, so allowed_signers and policy come from the commit under test and a change to them there would be trusted. In CI pass the target branch's commit (e.g. github.event.pull_request.base.sha) as --base-r"
+   ],
+   "max_rss_bytes": 193724416,
+   "plan": {
+    "files": 2061,
+    "skip": 1156,
+    "run": 905,
+    "by_project": {
+     "vex-api": {
+      "skip": 1156,
+      "run": 905
+     }
+    },
+    "reasons": [
+     [
+      "no attestation",
+      905
+     ]
+    ],
+    "runAll": null
+   }
+  }
+ ],
+ "summary": [
+  {
+   "config": "281-f1",
+   "variant": "all",
+   "runs": 7,
+   "wall_median": 5.066,
+   "wall_all": [
+    5.066,
+    4.355,
+    7.814,
+    5.145,
+    9.082,
+    3.343,
+    3.17
+   ],
+   "user_median": 3.47,
+   "rss_mb_median": 287.408128,
+   "store_requests_median": 4,
+   "store_mb_median": 0.0,
+   "skip": 1163,
+   "run": 1376,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.14,
+   "vex-api: resolve toolchain and externals": 0.94,
+   "fetch the stored values the plan reads": 0.14,
+   "read the candidates": 0.02,
+   "load the verdict objects": null,
+   "verdicts (rehash inputs, check candidates)": 2.78,
+   "plan total": 4.97,
+   "verdict_threads_median": {
+    "rust.checked": 4,
+    "rust.rehashed": 4,
+    "rust.signature": 0.0,
+    "rust.globals": 0.0,
+    "rust.manifest read": 0.0,
+    "rust.manifest decode": 0.0,
+    "rust.case collisions": 0.0,
+    "rust.ignored children": 0.1,
+    "rust.rehash": 0.1,
+    "rust.externals": 0.0,
+    "rust.env": 0.0,
+    "vex-roder.checked": 1,
+    "vex-roder.rehashed": 1,
+    "vex-roder.signature": 0.0,
+    "vex-roder.globals": 0.0,
+    "vex-roder.manifest read": 0.0,
+    "vex-roder.manifest decode": 0.0,
+    "vex-roder.case collisions": 0.0,
+    "vex-roder.ignored children": 0.0,
+    "vex-roder.rehash": 0.0,
+    "vex-roder.externals": 0.0,
+    "vex-roder.env": 0.0,
+    "vex-api.checked": 1156,
+    "vex-api.rehashed": 1155,
+    "vex-api.signature": 0.2,
+    "vex-api.globals": 0.3,
+    "vex-api.manifest read": 0.0,
+    "vex-api.manifest decode": 0.4,
+    "vex-api.case collisions": 0.0,
+    "vex-api.ignored children": 1.9,
+    "vex-api.rehash": 1.4,
+    "vex-api.externals": 32.1,
+    "vex-api.env": 0.0,
+    "vex-web.checked": 6,
+    "vex-web.rehashed": 6,
+    "vex-web.signature": 0.0,
+    "vex-web.globals": 0.0,
+    "vex-web.manifest read": 0.0,
+    "vex-web.manifest decode": 0.0,
+    "vex-web.case collisions": 0.0,
+    "vex-web.ignored children": 0.0,
+    "vex-web.rehash": 0.0,
+    "vex-web.externals": 0.0,
+    "vex-web.env": 0.0
+   }
+  },
+  {
+   "config": "281-f1",
+   "variant": "api",
+   "runs": 7,
+   "wall_median": 4.286,
+   "wall_all": [
+    10.208,
+    4.96,
+    4.286,
+    7.708,
+    4.098,
+    3.177,
+    3.89
+   ],
+   "user_median": 3.11,
+   "rss_mb_median": 280.100864,
+   "store_requests_median": 4,
+   "store_mb_median": 0.0,
+   "skip": 1155,
+   "run": 906,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.12,
+   "vex-api: resolve toolchain and externals": 0.92,
+   "fetch the stored values the plan reads": 0.15,
+   "read the candidates": 0.02,
+   "load the verdict objects": null,
+   "verdicts (rehash inputs, check candidates)": 2.73,
+   "plan total": 4.04,
+   "verdict_threads_median": {
+    "vex-api.checked": 1156,
+    "vex-api.rehashed": 1155,
+    "vex-api.signature": 0.2,
+    "vex-api.globals": 0.4,
+    "vex-api.manifest read": 0.0,
+    "vex-api.manifest decode": 0.5,
+    "vex-api.case collisions": 0.0,
+    "vex-api.ignored children": 1.3,
+    "vex-api.rehash": 1.5,
+    "vex-api.externals": 32.4,
+    "vex-api.env": 0.0
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "all",
+   "runs": 7,
+   "wall_median": 1.401,
+   "wall_all": [
+    8.416,
+    1.373,
+    2.447,
+    1.401,
+    2.832,
+    1.221,
+    1.09
+   ],
+   "user_median": 0.83,
+   "rss_mb_median": 69.369856,
+   "store_requests_median": 4,
+   "store_mb_median": 0.0,
+   "skip": 0,
+   "run": 2539,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.11,
+   "vex-api: resolve toolchain and externals": 0.98,
+   "fetch the stored values the plan reads": 0.08,
+   "read the candidates": 0.02,
+   "load the verdict objects": null,
+   "verdicts (rehash inputs, check candidates)": 0.07,
+   "plan total": 1.34,
+   "verdict_threads_median": {
+    "rust.checked": 0,
+    "rust.rehashed": 0,
+    "rust.signature": 0.0,
+    "rust.globals": 0.0,
+    "rust.manifest read": 0.0,
+    "rust.manifest decode": 0.0,
+    "rust.case collisions": 0.0,
+    "rust.ignored children": 0.0,
+    "rust.rehash": 0.0,
+    "rust.externals": 0.0,
+    "rust.env": 0.0,
+    "vex-roder.checked": 0,
+    "vex-roder.rehashed": 0,
+    "vex-roder.signature": 0.0,
+    "vex-roder.globals": 0.0,
+    "vex-roder.manifest read": 0.0,
+    "vex-roder.manifest decode": 0.0,
+    "vex-roder.case collisions": 0.0,
+    "vex-roder.ignored children": 0.0,
+    "vex-roder.rehash": 0.0,
+    "vex-roder.externals": 0.0,
+    "vex-roder.env": 0.0,
+    "vex-api.checked": 0,
+    "vex-api.rehashed": 0,
+    "vex-api.signature": 0.0,
+    "vex-api.globals": 0.9,
+    "vex-api.manifest read": 0.0,
+    "vex-api.manifest decode": 0.0,
+    "vex-api.case collisions": 0.0,
+    "vex-api.ignored children": 0.0,
+    "vex-api.rehash": 0.0,
+    "vex-api.externals": 0.0,
+    "vex-api.env": 0.0,
+    "vex-web.checked": 0,
+    "vex-web.rehashed": 0,
+    "vex-web.signature": 0.0,
+    "vex-web.globals": 0.0,
+    "vex-web.manifest read": 0.0,
+    "vex-web.manifest decode": 0.0,
+    "vex-web.case collisions": 0.0,
+    "vex-web.ignored children": 0.0,
+    "vex-web.rehash": 0.0,
+    "vex-web.externals": 0.0,
+    "vex-web.env": 0.0
+   }
+  },
+  {
+   "config": "281-f3",
+   "variant": "api",
+   "runs": 7,
+   "wall_median": 1.246,
+   "wall_all": [
+    1.246,
+    2.032,
+    1.099,
+    2.227,
+    1.293,
+    1.071,
+    1.013
+   ],
+   "user_median": 0.59,
+   "rss_mb_median": 53.395456,
+   "store_requests_median": 4,
+   "store_mb_median": 0.0,
+   "skip": 0,
+   "run": 2061,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.11,
+   "vex-api: resolve toolchain and externals": 0.84,
+   "fetch the stored values the plan reads": 0.07,
+   "read the candidates": 0.02,
+   "load the verdict objects": null,
+   "verdicts (rehash inputs, check candidates)": 0.07,
+   "plan total": 1.18,
+   "verdict_threads_median": {
+    "vex-api.checked": 0,
+    "vex-api.rehashed": 0,
+    "vex-api.signature": 0.0,
+    "vex-api.globals": 0.9,
+    "vex-api.manifest read": 0.0,
+    "vex-api.manifest decode": 0.0,
+    "vex-api.case collisions": 0.0,
+    "vex-api.ignored children": 0.0,
+    "vex-api.rehash": 0.0,
+    "vex-api.externals": 0.0,
+    "vex-api.env": 0.0
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "all",
+   "runs": 7,
+   "wall_median": 4.79,
+   "wall_all": [
+    6.01,
+    4.79,
+    8.003,
+    7.928,
+    4.011,
+    3.087,
+    3.289
+   ],
+   "user_median": 3.46,
+   "rss_mb_median": 290.963456,
+   "store_requests_median": 12,
+   "store_mb_median": 44.2,
+   "skip": 1163,
+   "run": 1376,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.11,
+   "vex-api: resolve toolchain and externals": 0.98,
+   "fetch the stored values the plan reads": 0.17,
+   "read the candidates": 0.02,
+   "load the verdict objects": 0.0,
+   "verdicts (rehash inputs, check candidates)": 3.03,
+   "plan total": 4.73,
+   "verdict_threads_median": {
+    "rust.checked": 4,
+    "rust.rehashed": 4,
+    "rust.signature": 0.0,
+    "rust.globals": 0.0,
+    "rust.manifest read": 0.0,
+    "rust.manifest decode": 0.0,
+    "rust.case collisions": 0.0,
+    "rust.ignored children": 0.1,
+    "rust.rehash": 0.1,
+    "rust.externals": 0.0,
+    "rust.env": 0.0,
+    "vex-roder.checked": 1,
+    "vex-roder.rehashed": 1,
+    "vex-roder.signature": 0.0,
+    "vex-roder.globals": 0.0,
+    "vex-roder.manifest read": 0.0,
+    "vex-roder.manifest decode": 0.0,
+    "vex-roder.case collisions": 0.0,
+    "vex-roder.ignored children": 0.0,
+    "vex-roder.rehash": 0.0,
+    "vex-roder.externals": 0.0,
+    "vex-roder.env": 0.0,
+    "vex-api.checked": 1156,
+    "vex-api.rehashed": 1155,
+    "vex-api.signature": 0.1,
+    "vex-api.globals": 0.3,
+    "vex-api.manifest read": 0.1,
+    "vex-api.manifest decode": 0.4,
+    "vex-api.case collisions": 0.0,
+    "vex-api.ignored children": 1.4,
+    "vex-api.rehash": 1.7,
+    "vex-api.externals": 33.3,
+    "vex-api.env": 0.0,
+    "vex-web.checked": 6,
+    "vex-web.rehashed": 6,
+    "vex-web.signature": 0.0,
+    "vex-web.globals": 0.0,
+    "vex-web.manifest read": 0.0,
+    "vex-web.manifest decode": 0.0,
+    "vex-web.case collisions": 0.0,
+    "vex-web.ignored children": 0.0,
+    "vex-web.rehash": 0.0,
+    "vex-web.externals": 0.0,
+    "vex-web.env": 0.0
+   }
+  },
+  {
+   "config": "v2-f1",
+   "variant": "api",
+   "runs": 7,
+   "wall_median": 5.27,
+   "wall_all": [
+    5.855,
+    6.107,
+    5.27,
+    5.843,
+    3.889,
+    3.76,
+    3.414
+   ],
+   "user_median": 3.03,
+   "rss_mb_median": 282.968064,
+   "store_requests_median": 12,
+   "store_mb_median": 43.3,
+   "skip": 1155,
+   "run": 906,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.11,
+   "vex-api: resolve toolchain and externals": 1.03,
+   "fetch the stored values the plan reads": 0.1,
+   "read the candidates": 0.02,
+   "load the verdict objects": 0.0,
+   "verdicts (rehash inputs, check candidates)": 2.64,
+   "plan total": 5.18,
+   "verdict_threads_median": {
+    "vex-api.checked": 1156,
+    "vex-api.rehashed": 1155,
+    "vex-api.signature": 0.1,
+    "vex-api.globals": 0.3,
+    "vex-api.manifest read": 0.0,
+    "vex-api.manifest decode": 0.4,
+    "vex-api.case collisions": 0.0,
+    "vex-api.ignored children": 1.8,
+    "vex-api.rehash": 1.4,
+    "vex-api.externals": 32.6,
+    "vex-api.env": 0.0
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "all",
+   "runs": 7,
+   "wall_median": 3.843,
+   "wall_all": [
+    3.539,
+    4.239,
+    7.851,
+    7.923,
+    3.34,
+    3.431,
+    3.843
+   ],
+   "user_median": 4.54,
+   "rss_mb_median": 191.381504,
+   "store_requests_median": 14,
+   "store_mb_median": 3.3,
+   "skip": 1164,
+   "run": 1375,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.14,
+   "vex-api: resolve toolchain and externals": 0.66,
+   "fetch the stored values the plan reads": 0.06,
+   "read the candidates": 0.02,
+   "load the verdict objects": 1.52,
+   "verdicts (rehash inputs, check candidates)": 1.19,
+   "plan total": 3.78,
+   "verdict_threads_median": {
+    "rust.checked": 4,
+    "rust.rehashed": 4,
+    "rust.signature": 0.0,
+    "rust.globals": 0.0,
+    "rust.manifest read": 0.0,
+    "rust.manifest decode": 0.0,
+    "rust.case collisions": 0.0,
+    "rust.ignored children": 0.6,
+    "rust.rehash": 0.3,
+    "rust.externals": 0.0,
+    "rust.env": 0.0,
+    "vex-roder.checked": 1,
+    "vex-roder.rehashed": 1,
+    "vex-roder.signature": 0.0,
+    "vex-roder.globals": 0.0,
+    "vex-roder.manifest read": 0.0,
+    "vex-roder.manifest decode": 0.0,
+    "vex-roder.case collisions": 0.0,
+    "vex-roder.ignored children": 0.2,
+    "vex-roder.rehash": 0.1,
+    "vex-roder.externals": 0.0,
+    "vex-roder.env": 0.0,
+    "vex-api.checked": 1156,
+    "vex-api.rehashed": 1156,
+    "vex-api.signature": 0.1,
+    "vex-api.globals": 0.3,
+    "vex-api.manifest read": 0.0,
+    "vex-api.manifest decode": 0.0,
+    "vex-api.case collisions": 0.1,
+    "vex-api.ignored children": 4.6,
+    "vex-api.rehash": 2.5,
+    "vex-api.externals": 7.1,
+    "vex-api.env": 0.0,
+    "vex-web.checked": 6,
+    "vex-web.rehashed": 6,
+    "vex-web.signature": 0.0,
+    "vex-web.globals": 0.0,
+    "vex-web.manifest read": 0.0,
+    "vex-web.manifest decode": 0.0,
+    "vex-web.case collisions": 0.0,
+    "vex-web.ignored children": 0.0,
+    "vex-web.rehash": 0.0,
+    "vex-web.externals": 0.0,
+    "vex-web.env": 0.0
+   }
+  },
+  {
+   "config": "v2-f3",
+   "variant": "api",
+   "runs": 7,
+   "wall_median": 4.791,
+   "wall_all": [
+    11.434,
+    5.263,
+    3.568,
+    5.839,
+    3.72,
+    4.791,
+    3.149
+   ],
+   "user_median": 4.24,
+   "rss_mb_median": 191.954944,
+   "store_requests_median": 14,
+   "store_mb_median": 2.9,
+   "skip": 1156,
+   "run": 905,
+   "exit": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "read the base commit's policy and signers": 0.12,
+   "vex-api: resolve toolchain and externals": 0.97,
+   "fetch the stored values the plan reads": 0.07,
+   "read the candidates": 0.02,
+   "load the verdict objects": 1.61,
+   "verdicts (rehash inputs, check candidates)": 0.84,
+   "plan total": 4.7,
+   "verdict_threads_median": {
+    "vex-api.checked": 1156,
+    "vex-api.rehashed": 1156,
+    "vex-api.signature": 0.1,
+    "vex-api.globals": 0.4,
+    "vex-api.manifest read": 0.0,
+    "vex-api.manifest decode": 0.0,
+    "vex-api.case collisions": 0.1,
+    "vex-api.ignored children": 4.0,
+    "vex-api.rehash": 3.0,
+    "vex-api.externals": 4.8,
+    "vex-api.env": 0.0
+   }
+  }
+ ],
+ "meta": {
+  "host": "Apple M3 Max, 14 CPUs, 36 GB, macOS (Darwin 27.0.0)",
+  "sqld": "0.24.32 on 127.0.0.1:18181, throwaway data dir",
+  "binaries": {
+   "store-v2": "target/release/vci built from branch store-v2 (vci 2.8.1 + format 3), release profile",
+   "2.8.1": "/opt/homebrew/bin/vci 2.8.1"
+  },
+  "checkout": {
+   "worktree": "meas-v2/vex-at-5eb7312 (removed at the end)",
+   "base": "origin/master 5eb73122037c6d01da60551f3df9f716af599d1c",
+   "head": "47bb7b8f318f9bffe2c95b367e65a40be7ca187c (adds the measurement key to .vci/allowed_signers)",
+   "tree": "4250525740c7b5abfdca5d2e567641dbad8f56a1",
+   "attested_commit_of_the_973_run": "2cb18b86448f1a5d47490e33330b721398073236 (not in the local clone; not fetched)"
+  },
+  "namespaces": {
+   "meas3c": "format 3 (store-v2 harness)",
+   "meas1c": "format 1 (store-v2 harness, 2.8.1 encoding)"
+  },
+  "harness": {
+   "format3": {
+    "bases_found": 6,
+    "bases_wanted": 10,
+    "commit": "47bb7b8f318f9bffe2c95b367e65a40be7ca187c",
+    "entries_total": 581180,
+    "expires_at": "2026-11-12T03:42:06Z",
+    "format3": {
+     "objects": 54,
+     "objects_bytes": 971747,
+     "record_max": 3385,
+     "record_p50": 1760,
+     "records": 1175,
+     "records_bytes": 2095787,
+     "seconds": 7.103097916
+    },
+    "issued_at": "2026-10-29T03:42:06Z",
+    "reconstruction_root_checked": 904,
+    "reconstruction_root_ok": 904,
+    "runs": 9,
+    "signer": "bab4528bffd2059e",
+    "substituted_bases": {
+     "4b1e020ed3923b4014d8101d0307ec3bbd55a7fc35b69ea4f6ff4ad2a5417173": "fb87af7dffc5903da07bbab1eba6ce97c7cb9585b8f09a4172bb2acb310358f0",
+     "7699a6c1d5b6278f20b9f339001df3c224d013b3860042d442c3f256b08c93f9": "42a0bc666072ade9d9731ce79716c7333ff01e7cd7f79b353573045eab690583",
+     "9c766563497ec0ac18c65004357187b4d21abe5c3d292fa3e0e09c81fad9ce3b": "fb87af7dffc5903da07bbab1eba6ce97c7cb9585b8f09a4172bb2acb310358f0",
+     "c556bfcd0327bf6b117fd62372766e59f2112a84ad347cfa797bc893b6637d01": "fb87af7dffc5903da07bbab1eba6ce97c7cb9585b8f09a4172bb2acb310358f0"
+    },
+    "total_seconds": 22.694448,
+    "units": 1175
+   },
+   "format1": {
+    "bases_found": 6,
+    "bases_wanted": 10,
+    "commit": "47bb7b8f318f9bffe2c95b367e65a40be7ca187c",
+    "entries_total": 581180,
+    "expires_at": "2026-11-12T03:43:55Z",
+    "format1": {
+     "base_bytes": 434221,
+     "envelope_bytes": 24921526,
+     "manifest_bytes": 17771000,
+     "seconds": 18.504649792
+    },
+    "issued_at": "2026-10-29T03:43:55Z",
+    "reconstruction_root_checked": 904,
+    "reconstruction_root_ok": 904,
+    "runs": 9,
+    "signer": "bab4528bffd2059e",
+    "substituted_bases": {
+     "4b1e020ed3923b4014d8101d0307ec3bbd55a7fc35b69ea4f6ff4ad2a5417173": "fb87af7dffc5903da07bbab1eba6ce97c7cb9585b8f09a4172bb2acb310358f0",
+     "7699a6c1d5b6278f20b9f339001df3c224d013b3860042d442c3f256b08c93f9": "42a0bc666072ade9d9731ce79716c7333ff01e7cd7f79b353573045eab690583",
+     "9c766563497ec0ac18c65004357187b4d21abe5c3d292fa3e0e09c81fad9ce3b": "fb87af7dffc5903da07bbab1eba6ce97c7cb9585b8f09a4172bb2acb310358f0",
+     "c556bfcd0327bf6b117fd62372766e59f2112a84ad347cfa797bc893b6637d01": "fb87af7dffc5903da07bbab1eba6ce97c7cb9585b8f09a4172bb2acb310358f0"
+    },
+    "total_seconds": 54.652493084,
+    "units": 1175
+   }
+  },
+  "production_plan1_medians_27oct": {
+   "total_s": 13.12,
+   "total_max_s": 74.28,
+   "toolchain_s": 0.85,
+   "prefetch_s": 1.31,
+   "prefetch_values": 643,
+   "prefetch_max_s": 20.92,
+   "fetch_s": 5.46,
+   "fetch_max_s": 32.0,
+   "reads_s": 1.94,
+   "reads_values": 976,
+   "reads_max_s": 17.35,
+   "verdicts_s": 0.81,
+   "memo_s": 0.81,
+   "memo_max_s": 30.0,
+   "jobs": 164
+  },
+  "design_expectation": "STORE-V2 section 3: plan 1 at ~8-10 s median (task brief: 5-9 s); 4.7-16 MB read per plan",
+  "method": "see RESULTS.md"
+ }
+}
