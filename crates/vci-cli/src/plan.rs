@@ -782,6 +782,10 @@ struct ObjectCache {
     verdict_bytes: usize,
     /// How many objects of each kind were loaded and decoded.
     loaded: [usize; 4],
+    /// How many times object bytes were hashed and decoded: once per
+    /// `(kind, id)` a round loads, however many candidates name it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    decodes: usize,
     /// Every shape id a candidate named, loaded or not: the distinct runs
     /// the plan's candidates come from.
     shapes_named: BTreeSet<String>,
@@ -824,9 +828,17 @@ impl ObjectLoader {
     /// expects, which refuses an object of another kind (bounded by the
     /// kind's size limit, outside the lock); then, for a verdict object,
     /// the byte cap. A later insert of an id already kept as loaded is a
-    /// no-op; one kept as unavailable is replaced (a round that fetched
-    /// more may make it readable).
+    /// no-op, found before the bytes are hashed or decoded; one kept as
+    /// unavailable is replaced (a round that fetched more may make it
+    /// readable).
     fn insert(&self, kind: ObjectKind, id: &str, bytes: &[u8]) {
+        {
+            let mut c = self.lock();
+            if matches!(c.by_id.get(id), Some(Ok(_))) {
+                return;
+            }
+            c.decodes += 1;
+        }
         let found = hex32(&object_id(bytes));
         let decoded: Result<Object, ObjectUnavailable> = if found != id {
             Err(ObjectUnavailable {
@@ -883,16 +895,22 @@ impl ObjectLoader {
     /// Load the objects of `wanted` not loaded yet, in one `get_objects`
     /// (after a `Prefetch::Objects` on a lazy store), keeping each in the
     /// order given: the caller orders them by candidate priority, so that
-    /// the byte cap falls on the least likely candidates.
+    /// the byte cap falls on the least likely candidates. `wanted` names an
+    /// object once per candidate (a run's 1,000 units name its one shape
+    /// 1,000 times); each `(kind, id)` is decoded at its first place in the
+    /// order only, which is where the cap is decided: a repeat of the same
+    /// bytes under the same kind would decode to the same result, and the
+    /// cap, which only grows, would refuse it again.
     fn load(&self, store: &dyn AttestationStore, timers: &Timers, wanted: &[(ObjectKind, String)]) {
         let mut ids: Vec<&str> = Vec::new();
+        let mut asked: HashSet<&str> = HashSet::new();
         {
             let mut c = self.lock();
             for (kind, id) in wanted {
-                if *kind == ObjectKind::Shape {
+                if *kind == ObjectKind::Shape && !c.shapes_named.contains(id) {
                     c.shapes_named.insert(id.clone());
                 }
-                if !matches!(c.by_id.get(id), Some(Ok(_))) && !ids.contains(&id.as_str()) {
+                if !matches!(c.by_id.get(id), Some(Ok(_))) && asked.insert(id.as_str()) {
                     ids.push(id);
                 }
             }
@@ -915,8 +933,9 @@ impl ObjectLoader {
                     .iter()
                     .map(|o| (o.id.as_str(), o.bytes.as_slice()))
                     .collect();
+                let mut decoded: HashSet<(ObjectKind, &str)> = HashSet::new();
                 for (kind, id) in wanted {
-                    if !ids.contains(&id.as_str()) {
+                    if !asked.contains(id.as_str()) || !decoded.insert((*kind, id.as_str())) {
                         continue;
                     }
                     match by_id.get(id.as_str()) {
@@ -5606,6 +5625,71 @@ adapter = "pytest"
         loader.insert(ObjectKind::Shape, &sid, b"vo\x03\x01junk");
         assert!(loader.shape(&store, &timers, &sid).is_ok());
         assert_eq!(loader.lock().verdict_bytes, sb.len());
+    }
+
+    /// A round's candidates name their run's objects once each (a run of
+    /// 1,000 units names its one shape 1,000 times): each `(kind, id)` is
+    /// hashed and decoded once, at its first place in the candidate order,
+    /// and a later round naming it again decodes nothing. An id named under
+    /// two kinds is still tried under each (the kind byte inside decides
+    /// which loads), and an object past the cap at its first place stays
+    /// out at its repeats.
+    #[test]
+    fn objects_named_by_many_candidates_are_decoded_once() {
+        use vci_store::conformance::scenarios::Run3;
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let run = Run3::build(&["src/a.ts", "src/b.ts"]);
+        s.put_objects(&run.new_objects()).unwrap();
+        let id = |i: usize| hex32(&object_id(&run.objects[i].1));
+        let (hdr, tables, shape) = (id(0), id(1), id(2));
+        let mut wanted = Vec::new();
+        for _ in 0..1000 {
+            wanted.push((ObjectKind::Hdr, hdr.clone()));
+            wanted.push((ObjectKind::Tables, tables.clone()));
+            wanted.push((ObjectKind::Shape, shape.clone()));
+        }
+        let timers = Timers::default();
+        let loader = ObjectLoader::default();
+        let reads = s.object_reads();
+        loader.load(&s, &timers, &wanted);
+        assert_eq!(s.object_reads(), reads + 1, "one read for the round");
+        assert_eq!(loader.lock().decodes, 3);
+        assert_eq!(loader.lock().loaded, [1, 1, 1, 0]);
+        assert!(loader.hdr(&s, &timers, &hdr).is_ok());
+        assert!(loader.tables(&s, &timers, &tables).is_ok());
+        assert!(loader.shape(&s, &timers, &shape).is_ok());
+        loader.load(&s, &timers, &wanted);
+        assert_eq!(loader.lock().decodes, 3, "loaded already: nothing decoded");
+        assert_eq!(s.object_reads(), reads + 1, "nor read");
+
+        // The tables object named as a hdr first (a decode failure kept),
+        // then as tables: tried under both kinds, once each.
+        let loader = ObjectLoader::default();
+        let twice = [
+            (ObjectKind::Hdr, tables.clone()),
+            (ObjectKind::Hdr, tables.clone()),
+            (ObjectKind::Tables, tables.clone()),
+            (ObjectKind::Tables, tables.clone()),
+        ];
+        loader.load(&s, &timers, &twice);
+        assert_eq!(loader.lock().decodes, 2);
+        assert!(loader.tables(&s, &timers, &tables).is_ok());
+
+        // The cap decided at the shape's first place holds at its repeats.
+        let loader = ObjectLoader::default();
+        let shape_len = run.objects[2].1.len();
+        loader.lock().verdict_bytes = VERDICT_OBJECT_BYTES - shape_len + 1;
+        loader.load(
+            &s,
+            &timers,
+            &[
+                (ObjectKind::Shape, shape.clone()),
+                (ObjectKind::Shape, shape.clone()),
+            ],
+        );
+        assert_eq!(loader.lock().decodes, 1);
+        let e = loader.shape(&s, &timers, &shape).unwrap_err();
+        assert!(e.past_cap, "{e:?}");
     }
 
     /// The `entry:` text of a format-3 candidate whose observed root is not
