@@ -258,7 +258,10 @@ jobs:
           git config --global user.email ci@vci.invalid
           git config --global user.name vci
           for i in $(seq 30); do curl -sf "$VCI_TEST_LIBSQL_URL/health" >/dev/null && break; sleep 1; done
-          cargo test --locked -p vci-store --features vci-store/conformance -p vci-git -p vci-store-sqlite -p vci-store-postgres -p vci-store-libsql
+          cargo test --locked -p vci-store --features vci-store/conformance -p vci-git -p vci-store-sqlite -p vci-store-postgres
+          # One sqld serves every libSQL test: run them one at a time, or a
+          # hundred concurrent writers queue on its one write lock and time out.
+          cargo test --locked -p vci-store-libsql -- --test-threads=1
 
   # The store crates' rustdoc: vci-store is the contract a backend implements
   # (its rustdoc is authoritative), and every public item is documented.
