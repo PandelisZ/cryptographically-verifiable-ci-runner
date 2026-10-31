@@ -1204,7 +1204,7 @@ url = "postgres://vci@db.internal:5432/ci?sslmode=verify-full"  # the server, ne
 token_command = ["op", "read", "op://ci/vci-store/password"]    # prints the credential (below); VCI_STORE_TOKEN wins
 connect_timeout = "5s"        # overridden by VCI_STORE_CONNECT_TIMEOUT_SECS
 timeout = "30s"               # one statement or request; overridden by VCI_STORE_TIMEOUT_SECS
-compress = "off"              # 2.8.2, libSQL only: "zstd" stores format-1 values compressed; VCI_STORE_COMPRESS wins
+compress = "off"              # 2.9.0, libSQL only: "zstd" stores format-1 values compressed; VCI_STORE_COMPRESS wins
 record_format = 3             # 2.9: 3 (default) writes format-3 records on a store that keeps objects; 1 writes the
                               # envelope JSON a vci 2.8 reads, for one release; VCI_STORE_RECORD_FORMAT wins
 explain_hashes = true         # 2.9: write the run's state object (the attested hashes `vci explain` prints; no verdict
@@ -3080,19 +3080,19 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
 - **Values compressed** (2.8.2). A value's `encoding` column, there since schema v1 for this, says how its bytes are
   stored: 0 as they are, 1 as one zstd frame (level 6). A format-3 record frame (2.9) is never compressed, whatever
   the setting: its first byte says its format on the server (the `--finish` count, the replica's sync by `seq`), and
-  it is under 2 kB of mostly base64. Every reader from 2.8.2 reads both, decompressing at most
+  it is under 2 kB of mostly base64. Every reader from 2.9.0 reads both, decompressing at most
   5,000,000 bytes (no value vci stores is larger; past that the value reads as unreadable, its unit runs), and the
   key, the signature and every check cover the bytes as they were, so verification is unchanged. Writers compress
   when `VCI_STORE_COMPRESS=zstd`, else when `vci.toml` says `[store] compress = "zstd"` (the variable wins, `off`
   turning it off for one command; unset and absent: as they are; any other value is a `Config` error; `vci store
   info` shows `compress` and where it came from; another store ignores `[store] compress` with a warning). A vci older
-  than 2.8.2 refuses a `vci.toml` with `[store] compress` (an unknown key of `[store]`), which is why it belongs there
-  only once every vci that reads the repository is 2.8.2 or later. The schema stays
+  than 2.9.0 refuses a `vci.toml` with `[store] compress` (an unknown key of `[store]`), which is why it belongs there
+  only once every vci that reads the repository is 2.9.0 or later. The schema stays
   version 1, since the tables do not change: a 2.8.1 reader reads a compressed value as one `in an encoding this vci
   cannot read (1)`, so that unit runs (never a wrong skip; a 2.8.1 replica leaves such a value out of its file, and
   2.8.2 syncs a file 2.8.1 synced in full once, see "The replica mode"), and a 2.8.1 writer replaces a compressed row of a slot it
   puts with its own, as it is (its upsert rewrites a row whose encoding is not 0). So a namespace takes compressed
-  writes once every reader is 2.8.2 or later; until then the rows written raw and compressed coexist, and rows written
+  writes once every reader is 2.9.0 or later; until then the rows written raw and compressed coexist, and rows written
   before stay as they are until a unit is attested again. On vex's values (JSON) zstd stores envelopes and manifests
   about 3x smaller (16.1 MB to 5.45 MB over 825 sampled rows; their reads 2.7x faster from a laptop). A value of an
   encoding above 1 says `a newer vci wrote it`.

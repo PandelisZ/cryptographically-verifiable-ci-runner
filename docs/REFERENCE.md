@@ -1404,7 +1404,7 @@ time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (t
 holding `vci_collector.rb`; looked up like `VCI_PY_PLUGIN`). The attestation store: `VCI_STORE`, `VCI_STORE_URL`,
 `VCI_STORE_NAMESPACE`, `VCI_STORE_CONNECT_TIMEOUT_SECS`, `VCI_STORE_TIMEOUT_SECS` (since 2.8.0; see [Choosing a
 store](#choosing-a-store)), `VCI_STORE_COMPRESS` (`zstd`: the libSQL store writes values to its server compressed,
-`off`: not; it wins over `[store] compress`; since 2.8.2, see [libSQL](#libsql-turso)), `VCI_STORE_RECORD_FORMAT`
+`off`: not; it wins over `[store] compress`; since 2.9.0, see [libSQL](#libsql-turso)), `VCI_STORE_RECORD_FORMAT`
 (`3`, the default, or `1`: the record format `vci run` writes; wins over `[store] record_format`; since 2.9.0),
 `VCI_STORE_EXPLAIN_HASHES` (`true`, the default, or `false`: whether `vci run` writes the run's state object; wins
 over `[store] explain_hashes`; since 2.9.0), `VCI_STORE_EXPLAIN_HASHES_DAYS` (days a state object is kept while
@@ -1974,17 +1974,17 @@ The store has three modes:
 - **Bounded time.** Connecting, and waiting for the server's first answer, takes at most 5 s
   (`VCI_STORE_CONNECT_TIMEOUT_SECS`): a server or proxy that accepts and never answers costs that. A later request
   waits at most 30 s (`VCI_STORE_TIMEOUT_SECS`; ten minutes for `vci prune`); one that runs out of time is sent once
-  more on a new connection (since 2.8.2), so a slow answer while other jobs write costs that request a second try. A
+  more on a new connection (since 2.9.0), so a slow answer while other jobs write costs that request a second try. A
   server that cannot be reached, or a request out of time twice, makes every later call of the command fail at
   once, so a server that is down costs one or two timeouts, and the plan runs everything. A plan reads its values in
-  several requests (since 2.8.2), so a request that fails costs only its own units, which run: 100 values to each of
+  several requests (since 2.9.0), so a request that fails costs only its own units, which run: 100 values to each of
   the first ones, as many at once as `min(VCI_JOBS, 4)`, then requests sized from how long the answers took beyond
   the wait every answer has (each aimed at 15% of the timeout, 25 to 400 values), fewer at once when one takes more than half of the timeout; each
   request brings the input manifests and base manifests its values need; a request out of time is read again in
   halves, not whole. The whole read is given two timeouts (one more per 800 values beyond 1,600), the units not read
   by then running, and once a read ran out of time the plan's later reads of values end when it did, so a slow link
   costs the plan that once, not once per round. `vci run` writes its units in transactions of at most a megabyte, one
-  right after the other (since 2.8.2), so that none holds the database's one write lock for long, halving them (down
+  right after the other (since 2.9.0), so that none holds the database's one write lock for long, halving them (down
   to 256 KiB) after one runs out of time and doubling them again while they commit fast, and never splits a unit
   across two transactions; a transaction that runs out of time asks the server (within a quarter of the timeout, at
   most 5 s) whether it was stored and is sent again as it was after a pause if not (each transaction carries a nonce,
@@ -2000,21 +2000,21 @@ The store has three modes:
   The timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`) sets both. The plan's memo and flags are written
   only when new, and each such write waits at most 5 s and never stops the command. A statement the server refuses (a
   trigger, say) costs the unit it writes: `vci run` reports it and exits 2 after the run.
-- **Compressed values** (since 2.8.2). `[store] compress = "zstd"` in `vci.toml`, or `VCI_STORE_COMPRESS=zstd` (which
+- **Compressed values** (since 2.9.0). `[store] compress = "zstd"` in `vci.toml`, or `VCI_STORE_COMPRESS=zstd` (which
   wins: `VCI_STORE_COMPRESS=off` turns it off for one command), stores each attestation and input manifest
   compressed (about 3x smaller for vex's; they travel at about two thirds of their size, as hex). On vex's Turso database,
   measured from a laptop while vex's CI wrote, the time a write took swung more with that load than with
   compression (three processes of 100 units each, interleaved: 8.2 to 104.9 s compressed, 10.3 to 132.4 s as they are), so
   compression is no promise of faster writes on a busy database.
-  `vci store info` shows `compress` and where it came from. A vci older than 2.8.2 refuses a `vci.toml` that sets
+  `vci store info` shows `compress` and where it came from. A vci older than 2.9.0 refuses a `vci.toml` that sets
   `[store] compress`. Every vci from
-  2.8.2 reads both forms; 2.8.1 and earlier read a compressed value as one they cannot read, and run its unit (never
+  2.9.0 reads both forms; 2.8.1 and earlier read a compressed value as one they cannot read, and run its unit (never
   skip it wrongly). A replica file (`VCI_STORE_SYNC=replica`) that 2.8.1 synced while compressed values were written
-  left them out and keeps lacking them after the upgrade until it syncs in full, which 2.8.2 does once on a file
+  left them out and keeps lacking them after the upgrade until it syncs in full, which 2.9.0 does once on a file
   2.8.1 synced (deleting `<file>.sync` beside it forces that with any version). So set it for every writer of a database (CI's jobs, and developers who store) once every machine
-  that plans from it runs 2.8.2 or later (in `vci.toml`, once every vci that reads the repository is); values stored
+  that plans from it runs 2.9.0 or later (in `vci.toml`, once every vci that reads the repository is); values stored
   before stay as they were until their units are attested again.
-- **Superseded manifests go with their attestations** (since 2.8.2): a write that replaces or removes an attestation
+- **Superseded manifests go with their attestations** (since 2.9.0): a write that replaces or removes an attestation
   also removes the input manifest only it referenced, once that was stored more than an hour before (vex's database
   held ten unreferenced manifests for each referenced one, 730 MB). `vci prune` removes the ones left from earlier.
 - **A record of 5,000,000 bytes or more is not stored on a server.** `sqld` refuses such a row, so vci refuses a unit
@@ -2482,8 +2482,8 @@ extra = ["testdata/**"]
 # token_command = ["com", "secrets", "get", "vci-store-token", "--org", "acme"]  # prints the credential; VCI_STORE_TOKEN wins
 # connect_timeout = "5s" # a network store's connect bound (VCI_STORE_CONNECT_TIMEOUT_SECS wins)
 # timeout = "30s"        # one statement or wait (VCI_STORE_TIMEOUT_SECS wins)
-# compress = "zstd"      # since 2.8.2: the libsql store writes values compressed; "off" (default); VCI_STORE_COMPRESS wins;
-#                        # only once every vci reading the repository is 2.8.2 or later (older ones refuse the key)
+# compress = "zstd"      # since 2.9.0: the libsql store writes values compressed; "off" (default); VCI_STORE_COMPRESS wins;
+#                        # only once every vci reading the repository is 2.9.0 or later (older ones refuse the key)
 # record_format = 3      # since 2.9.0: 3 (default) writes format-3 records; 1 writes the envelope JSON a vci 2.8 reads,
 #                        # for one release; VCI_STORE_RECORD_FORMAT wins (older vci refuse the key)
 # explain_hashes = true  # since 2.9.0: write the run's state object (the attested hashes `vci explain` prints; no verdict
