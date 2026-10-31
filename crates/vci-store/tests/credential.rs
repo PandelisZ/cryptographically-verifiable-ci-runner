@@ -502,8 +502,10 @@ fn a_command_that_hangs_is_stopped_after_its_time() {
     assert!(!alive, "pid {} still runs", pid.trim());
 }
 
-/// Whether the process `pid` ends within `within` (killed, it is reaped by
-/// whoever adopted it).
+/// Whether the process `pid` ends within `within`: it is gone, or it is a
+/// zombie. Killed after its parent, it is adopted by the init process of its
+/// PID namespace, which may never reap it: a GitHub job's `container:` has
+/// `tail -f /dev/null` as PID 1, and there `kill -0` finds the zombie.
 fn ends_within(pid: &str, within: Duration) -> bool {
     let until = Instant::now() + within;
     loop {
@@ -513,7 +515,7 @@ fn ends_within(pid: &str, within: Duration) -> bool {
             .status()
             .unwrap()
             .success();
-        if !alive {
+        if !alive || zombie(pid) {
             return true;
         }
         if Instant::now() >= until {
@@ -521,6 +523,20 @@ fn ends_within(pid: &str, within: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Whether `pid` has ended and is not yet reaped, where `/proc` says so
+/// (Linux: the state after the command name in `/proc/<pid>/stat` is `Z`).
+/// Elsewhere it is false, and an ended process is found gone once its
+/// adopter reaps it.
+fn zombie(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
 }
 
 /// A command that does not finish in time is stopped with every process it
@@ -544,6 +560,9 @@ fn a_command_that_hangs_is_stopped_with_what_it_started() {
         pid("left.pid"),
         pid("right.pid")
     ));
+    // Every case runs before the assertion: one left running does not hide
+    // another.
+    let mut left = Vec::new();
     for (cmd, files) in [
         (argv(&[&wrapper]), &["wrapped.pid"][..]),
         (pipeline, &["left.pid", "right.pid"]),
@@ -555,7 +574,6 @@ fn a_command_that_hangs_is_stopped_with_what_it_started() {
             m.contains("did not finish within 2 s (it was stopped)"),
             "{m}"
         );
-        let mut left = Vec::new();
         for f in files {
             let p = std::fs::read_to_string(d.join(f)).unwrap();
             let p = p.trim().to_owned();
@@ -565,11 +583,11 @@ fn a_command_that_hangs_is_stopped_with_what_it_started() {
                 let _ = std::process::Command::new("kill")
                     .args(["-KILL", &p])
                     .status();
-                left.push(format!("{f} ({p})"));
+                left.push(format!("{cmd:?} left {f} ({p})"));
             }
         }
-        assert!(left.is_empty(), "{cmd:?} left {left:?} running");
     }
+    assert!(left.is_empty(), "running: {left:?}");
 }
 
 /// A command that leaves a process behind holding its output (a secrets

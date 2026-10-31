@@ -175,8 +175,12 @@ fn output_within(cmd: &mut Command, secs: u64) -> std::io::Result<(std::process:
         if std::time::Instant::now() >= deadline {
             stopped = true;
             // The group: a test's own children would keep the pipes open.
+            // After `--`, as POSIX asks of a negative operand: without it
+            // procps' `kill` (Linux) misreads `-<pgid>`, and may kill vci's
+            // own process group, or not the file's (see the credential
+            // module's `stop`, in vci-store).
             let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
+                .args(["-KILL", "--", &format!("-{}", child.id())])
                 .status();
             let _ = child.kill();
             break child.wait()?;
@@ -2663,6 +2667,33 @@ impl Adapter for RailsAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file's process that runs past its time is stopped with its whole
+    /// group: a process it started, holding its output open, does not keep
+    /// vci reading until that process ends on its own.
+    #[test]
+    fn a_stopped_file_takes_what_it_started_with_it() {
+        let t = tempfile::tempdir().unwrap();
+        let pid_file = t.path().join("started.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sh -c 'echo $$ > {:?}; exec sleep 120'; echo done",
+            pid_file.to_str().unwrap()
+        ));
+        let started = std::time::Instant::now();
+        let (out, stopped) = output_within(&mut cmd, 1).unwrap();
+        let took = started.elapsed();
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        // Not left behind by this test either, if the group kill missed it.
+        let _ = Command::new("kill")
+            .args(["-KILL", pid])
+            .stderr(Stdio::null())
+            .status();
+        assert!(stopped);
+        assert!(!out.status.success());
+        assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+    }
 
     /// A boot started ahead of time that no probe took is killed and reaped
     /// when it is dropped (the adapter going at the end of a plan that
