@@ -2675,7 +2675,13 @@ fn a_replica_that_cannot_be_used_refuses_writes() {
     let ro = dir.path().join("ro");
     std::fs::create_dir(&ro).unwrap();
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-    for path in [garbage.clone(), ro.join("r.libsql")] {
+    let mut paths = vec![garbage.clone()];
+    if refuses_writes(&ro) {
+        paths.push(ro.join("r.libsql"));
+    } else {
+        eprintln!("SKIPPED the read-only directory case: this user writes into a 0o555 directory");
+    }
+    for path in paths {
         let r = testkit::open_replica(&ns, &path).unwrap();
         let put = r.put_for_test("src/w.test.ts", S1, &hex64(1), Some(&hint(1)), b"{}");
         assert!(
@@ -2862,6 +2868,20 @@ fn a_replica_reads_a_key_removed_since_it_was_listed_as_gone() {
     assert_eq!(r2.requests(), before, "reads after a prefetch send nothing");
 }
 
+/// Whether `dir` really refuses new files. Root (a CI job in a `container:`)
+/// writes into a 0o555 directory anyway, so a case built on that refusal has
+/// nothing to show there and is left out.
+fn refuses_writes(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 // ---- a replica the store commands cannot keep ---------------------------------------------------
 
 /// `vci store info`, fetch, push and prune (the commands about the store
@@ -2886,6 +2906,12 @@ fn the_store_commands_fail_on_a_replica_that_cannot_be_kept() {
     let ro = dir.path().join("ro");
     std::fs::create_dir(&ro).unwrap();
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if !refuses_writes(&ro) {
+        eprintln!(
+            "SKIPPED: this user writes into a 0o555 directory, so no replica here is one vci cannot keep"
+        );
+        return;
+    }
     let server = testkit::server().unwrap();
     let replica = |ns: &str, command: &str| {
         let sel = testkit::selection(
