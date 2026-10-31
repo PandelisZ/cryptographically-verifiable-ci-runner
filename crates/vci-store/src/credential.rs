@@ -455,11 +455,17 @@ impl Drained {
 /// killed (with the `kill` utility: this crate has no unsafe code to call
 /// `kill(2)`) before the child is reaped, so its number cannot have been
 /// taken by another group yet.
+///
+/// The group is named after `--`, as POSIX asks of a negative operand.
+/// Without it the procps `kill` of Linux distributions misreads `-<pgid>`:
+/// procps-ng 3.3.17 (Ubuntu 22.04) killed vci's own process group instead
+/// of the command's, and 4.0.4 (Ubuntu 24.04), depending on the number,
+/// killed vci's group as well as the command's, or nothing at all.
 fn stop(child: &mut Child) {
     #[cfg(unix)]
     {
         let mut kill = Command::new("kill");
-        kill.args(["-KILL", &format!("-{}", child.id())])
+        kill.args(["-KILL", "--", &format!("-{}", child.id())])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
