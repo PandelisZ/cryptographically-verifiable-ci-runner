@@ -1247,9 +1247,11 @@ A plain `bundle exec rspec` still reads all of them; only vci's runs do not.
 - **SimpleCov**: in an RSpec process its results (and the earlier results it would merge, `.last_run.json`) are
   written to the process's temp dir instead of `coverage/`, and its configuration files outside the repository
   (`~/.simplecov`, `.simplecov` in directories above the repository, which its upward search would try) look absent.
-  A `.simplecov` in the project is read (an input). So a coverage run of your own is not affected, and vci's runs
-  neither leave reports nor read old ones. `SimpleCov.minimum_coverage` is checked per file: a file whose own run is
-  below it exits 2 and is refused (`vci:process-exit:2`, see "Results"). (Minitest processes keep SimpleCov's own
+  A `.simplecov` in the project is read (an input). SimpleCov 1.x's git lookups (the branch and commit its history
+  and JSON report record; the branch picks the `maximum_coverage_drop` baseline) run no git: the project looks like no
+  git checkout to SimpleCov, so its exit status cannot depend on the checkout's branch. So a coverage run of your own
+  is not affected, and vci's runs neither leave reports nor read old ones. `SimpleCov.minimum_coverage` is checked per
+  file: a file whose own run is below it exits 2 and is refused (`vci:process-exit:2`, see "Results"). (Minitest processes keep SimpleCov's own
   directory: writes to the git-ignored `coverage/` are allowed there.)
 
 **What is recorded** for a spec file, on top of the Rails list: `.rspec` (global), `spec/spec_helper.rb` and

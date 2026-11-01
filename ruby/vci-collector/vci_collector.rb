@@ -3330,6 +3330,14 @@ module VciCollector
         defined?(::RSpec::Core::Example) && RSpecSupport.install
     },
     simplecov: -> { defined?(::SimpleCov) && ::SimpleCov.respond_to?(:coverage_path) && RSpecSupport.install_simplecov },
+    # Loaded after SimpleCov answers coverage_path (see install_simplecov_git).
+    simplecov_history: lambda {
+      defined?(::SimpleCov::History) && RSpecSupport.install_simplecov_git(::SimpleCov::History, :git)
+    },
+    simplecov_json_commit: lambda {
+      defined?(::SimpleCov::Formatter::JSONFormatter::ResultHashFormatter) &&
+        RSpecSupport.install_simplecov_git(::SimpleCov::Formatter::JSONFormatter::ResultHashFormatter, :git_commit)
+    },
     code_stats: -> { defined?(::Rails::CodeStatistics) && ::Rails::CodeStatistics.respond_to?(:directories) && install_code_stats },
     rails_config: -> { defined?(::Rails::Application::Configuration) && install_rails_config },
     parallelize: -> { Batch.install_parallelize },
@@ -4892,7 +4900,8 @@ module VciCollector
   #   file was attested and in CI; defined order stays defined, and a seed
   #   given in .rspec, SPEC_OPTS or `config.seed =` is honoured;
   # - SimpleCov writes (and merges earlier results from) a directory in vci's
-  #   temp dir instead of coverage/.
+  #   temp dir instead of coverage/, and SimpleCov 1.x runs no git for its
+  #   history and JSON report: the branch and commit they record are nil.
   # In collect mode the reporter is hooked to count examples, and what makes
   # a run unattestable is refused (see `taints`).
   module RSpecSupport
@@ -5002,6 +5011,28 @@ module VciCollector
           def coverage_path
             VciCollector::RSpecSupport.coverage_dir
           end
+        end)
+        true
+      end
+
+      # SimpleCov 1.x asks git for the branch and commit when it reports
+      # (`git -C <root> rev-parse ...`, a spawn): its history
+      # (coverage/.history.json, SimpleCov::History.git) records both, and
+      # the branch picks the baseline maximum_coverage_drop compares
+      # against, so it can change the exit status; the JSON report's meta
+      # (ResultHashFormatter.git_commit, also behind the HTML report)
+      # records the commit. In an RSpec process the project looks like no
+      # git checkout to them: no git process, branch and commit nil, the
+      # same where the file was attested and in CI. Another SimpleCov that
+      # runs git elsewhere, or a spawn of the test's own, still taints.
+      def install_simplecov_git(target, name)
+        return true unless rspec?
+        sc = target.singleton_class
+        private = sc.private_method_defined?(name)
+        return false unless private || sc.method_defined?(name)
+        sc.prepend(Module.new do
+          define_method(name) { |*| nil }
+          private(name) if private
         end)
         true
       end
