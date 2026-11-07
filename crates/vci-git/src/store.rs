@@ -188,6 +188,27 @@ impl GitMetaStore {
             .filter(|r| among.is_none_or(|a| a.contains(r.id.as_str())))
             .collect())
     }
+
+    /// Remove the run-state links ([`vci_store::key::run_state_key`]) of
+    /// runs no stored attestation's key carries the hint of any more: one
+    /// range query of the links and, only when there is one, one of the
+    /// attestation keys (values not read). Returns how many were removed.
+    fn prune_run_state_links(&self) -> Result<usize, StoreError> {
+        let all = format!("{}:", vci_store::RUN_STATE_PREFIX);
+        let links = self.with_reader(|r| r.run_state_keys(&all))?;
+        if links.is_empty() {
+            return Ok(0);
+        }
+        let runs = self.with_reader(Reader::attestation_hints)?;
+        let stale: Vec<String> = links
+            .into_iter()
+            .filter(|k| {
+                vci_store::parse_run_state_key(k)
+                    .is_some_and(|(_, h, _)| !runs.contains(&vci_store::hint_segment(&h)))
+            })
+            .collect();
+        Ok(self.attest_store().remove_run_state_keys(stale)?)
+    }
 }
 
 /// `d` as milliseconds, saturating.
@@ -397,7 +418,12 @@ impl AttestationStore for GitMetaStore {
 
     /// Every state object whose row was last put or fetched here more than
     /// `older_than` ago, deleted whatever names it (values not read; the
-    /// listing of the object keys on a pooled reader).
+    /// listing of the object keys on a pooled reader). Then the run-state
+    /// links of runs that have no record left here (no attestation key
+    /// carries their hint): a link outlives its state object while the
+    /// run's records stay, so that the plan can say the state expired, and
+    /// goes with the run's last record. Returns how many state objects
+    /// were removed.
     fn prune_state_objects(&self, older_than: Duration) -> Result<usize, StoreError> {
         let cutoff = now_ms().saturating_sub(millis(older_than));
         let keys: Vec<String> = self
@@ -406,7 +432,69 @@ impl AttestationStore for GitMetaStore {
             .filter(|r| r.kind == ObjectKind::State && r.put_at < cutoff)
             .map(|r| object_key(r.kind, &r.id))
             .collect();
-        Ok(self.attest_store().remove_object_keys(keys)?)
+        let removed = self.attest_store().remove_object_keys(keys)?;
+        // Housekeeping: a link left behind costs a key, never a verdict, so
+        // a failure here is not the prune's.
+        let _ = self.prune_run_state_links();
+        Ok(removed)
+    }
+
+    /// The state object of each record's run from the run-state links
+    /// ([`vci_store::key::run_state_key`]): the key's hint and the shape
+    /// give the link's prefix, and its first key the state id. One key
+    /// lookup per distinct run, on a pooled reader; values not read (a link
+    /// not fetched yet names its state as well). `None` for a record whose
+    /// key has no hint or whose run wrote no link (a vci before 2.9.1).
+    fn run_state_objects(
+        &self,
+        runs: &[vci_store::RunOf<'_>],
+    ) -> Result<Vec<Option<String>>, StoreError> {
+        let prefixes: Vec<Option<String>> = runs
+            .iter()
+            .map(|r| {
+                let hint = vci_store::parse_key_hint(&r.record.key)?;
+                key::is_object_id(r.shape).then(|| vci_store::run_state_prefix(r.shape, &hint))
+            })
+            .collect();
+        let distinct: BTreeSet<&str> = prefixes.iter().flatten().map(String::as_str).collect();
+        if distinct.is_empty() {
+            return Ok(vec![None; runs.len()]);
+        }
+        let found: BTreeMap<&str, Option<String>> = self.with_reader(|r| {
+            distinct
+                .iter()
+                .map(|p| {
+                    let state = r.run_state_keys(p)?.into_iter().find_map(|k| {
+                        vci_store::parse_run_state_key(&k).map(|(_, _, s)| s.to_owned())
+                    });
+                    Ok((*p, state))
+                })
+                .collect()
+        })?;
+        Ok(prefixes
+            .iter()
+            .map(|p| p.as_deref().and_then(|p| found.get(p).cloned().flatten()))
+            .collect())
+    }
+
+    /// A run-state link per distinct hint (inside the open batch, with the
+    /// run's objects), so that [`AttestationStore::run_state_objects`]
+    /// finds the run's state object from its records' keys.
+    fn put_run_state(
+        &self,
+        shape: &str,
+        hints: &[vci_store::KeyHint],
+        state: &str,
+    ) -> Result<usize, StoreError> {
+        key::check_object_id(shape)?;
+        key::check_object_id(state)?;
+        let keys: BTreeSet<String> = hints
+            .iter()
+            .map(|h| vci_store::run_state_key(shape, h, state))
+            .collect();
+        let links: Vec<(String, String)> =
+            keys.into_iter().map(|k| (k, state.to_owned())).collect();
+        Ok(self.attest_store().put_run_state_links(&links)?)
     }
 
     /// git-meta's log rows older than the last materialization and a day,

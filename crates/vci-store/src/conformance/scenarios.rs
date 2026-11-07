@@ -2728,3 +2728,90 @@ pub fn c42_object_deletions_reach_peers(f: &dyn StoreFactory) {
         "the objects' removal reached peer 1"
     );
 }
+
+/// c43: `run_state_objects` names the state object of a record's run: the
+/// record's `state_obj` column on a store with columns; on one without, the
+/// run-state link `put_run_state` wrote (in the batch, with the run's
+/// objects) for the run's key hint and shape, on another peer too after a
+/// sync. `None` for a record whose run named none (no column, no link), and
+/// an answer per run in order, the same run asked twice answered twice.
+pub fn c43_run_state_objects_name_the_runs_state(f: &dyn StoreFactory) {
+    const C: &str = "c43_run_state_objects_name_the_runs_state";
+    let w = f.world();
+    let s = w.peer(0);
+    if !keeps_objects(f, C, &*s) {
+        return;
+    }
+    let run = Run3::build(&["src/c43/a.ts"]);
+    let hint = KeyHint {
+        issued: 4_300,
+        tree: Some(TREE_HEAD.into()),
+    };
+    let (rec, cols) = run.record(UNIT_A, 1, 43);
+    let batch = ok(s.batch(), "batch");
+    put_objects(&*s, &run.new_objects());
+    ok(
+        s.put_run_state(&run.ids.shape, std::slice::from_ref(&hint), &run.ids.state),
+        "put_run_state",
+    );
+    let e = ok(
+        s.put(
+            &NewAttestation::for_test(UNIT_A, S1, &hex64(1), Some(&hint), &rec).with_columns(&cols),
+        ),
+        "put a frame",
+    );
+    ok(batch.finish(), "finish");
+    // Another run of another unit, which named no state object: no column,
+    // no link.
+    let other = KeyHint {
+        issued: 4_400,
+        tree: None,
+    };
+    let (rec_b, mut cols_b) = run.record(UNIT_B, 1, 44);
+    cols_b.state_obj = None;
+    let e_b = ok(
+        s.put(
+            &NewAttestation::for_test(UNIT_B, S1, &hex64(2), Some(&other), &rec_b)
+                .with_columns(&cols_b),
+        ),
+        "put another frame",
+    );
+    let shape = run.ids.shape.as_str();
+    let runs = [
+        crate::RunOf { record: &e, shape },
+        crate::RunOf {
+            record: &e_b,
+            shape,
+        },
+        crate::RunOf { record: &e, shape },
+    ];
+    assert_eq!(
+        ok(s.run_state_objects(&runs), "run_state_objects"),
+        vec![
+            Some(run.ids.state.clone()),
+            None,
+            Some(run.ids.state.clone())
+        ],
+        "columns kept: {}",
+        s.caps().columns
+    );
+    assert!(
+        ok(s.run_state_objects(&[]), "run_state_objects of none").is_empty(),
+        "no runs, no answers"
+    );
+    w.sync(0, &[1]);
+    let p1 = w.peer(1);
+    let got = listed(&*p1, UNIT_A);
+    assert_eq!(keys(&got), one(&e.key), "another peer lists the record");
+    assert_eq!(
+        ok(
+            p1.run_state_objects(&[crate::RunOf {
+                record: &got[0],
+                shape,
+            }]),
+            "run_state_objects on another peer"
+        ),
+        vec![Some(run.ids.state.clone())],
+        "another peer"
+    );
+}

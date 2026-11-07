@@ -791,7 +791,10 @@ fn explain_prints_the_format_1_entry_text_with_the_unsigned_label_or_not_loaded(
     assert!(!three.contains(HASH_NOT_LOADED), "{three}");
 
     let none = snapshot(&[SQLITE, &[("VCI_STORE_EXPLAIN_HASHES", "false")]].concat());
-    let (expected, actual) = detail(&none, &format!("entry: changed ({HASH_NOT_LOADED})"));
+    let (expected, actual) = detail(
+        &none,
+        &format!("entry: changed ({HASH_NOT_LOADED}: no state object for the run)"),
+    );
     assert!(expected.starts_with("input root "), "{expected}");
     assert!(actual.starts_with("input root "), "{actual}");
     assert!(!none.contains(UNSIGNED_LABEL), "{none}");
@@ -1197,7 +1200,9 @@ fn prune_objects_removes_the_state_object_and_the_records_stay(env: &[(&str, &st
     assert_eq!((skip, run), (set(&[A, C, D]), set(&[B])));
     let ex = w.explain(B, env);
     assert!(
-        ex.contains(&format!("entry: changed ({HASH_NOT_LOADED})")),
+        ex.contains(&format!(
+            "entry: changed ({HASH_NOT_LOADED}: state expired)"
+        )),
         "{ex}"
     );
     assert!(!ex.contains(UNSIGNED_LABEL), "{ex}");
@@ -1300,4 +1305,432 @@ fn store_upgrade_finish_is_refused_until_the_expired_format_1_rows_are_pruned() 
     assert_eq!(w.plan(SQLITE).0, set(&[A, C, D]));
     let all = records(&w.sqlite());
     assert!(all.values().all(|r| r.v2.is_some()));
+}
+
+// ---------------------------------------------------------------------------
+// (j) The plan names the input that changed (2.9.1).
+
+/// The text plan's line of `unit` (`RUN  <unit>  (<reason>)`).
+fn plan_line<'t>(plan: &'t str, unit: &str) -> &'t str {
+    plan.lines()
+        .find(|l| l.split_whitespace().nth(1) == Some(unit))
+        .unwrap_or_else(|| panic!("no line for {unit} in:\n{plan}"))
+}
+
+/// After the verdicts, the plan loads the state object of the run whose
+/// records the units that run failed on (git-meta: the run-state link the
+/// run wrote; SQLite: the record's column), once for every unit of that
+/// run, and names the input that changed as format 1 did (`best failed
+/// inputs: entry:<path>`), with the inputs that made units run summed up
+/// before the last line, and `vci explain` gives the attested hash,
+/// labelled unsigned. A plan that skips everything loads no state object.
+/// When the state object is past the plan's budget (`[store]
+/// plan_states_mib`, `plan_states`), removed by its TTL (`vci prune
+/// --objects --older-than 0`), or never written (`explain_hashes =
+/// false`), the text says so after `attested hash not loaded`.
+fn the_plan_names_the_changed_input(env: &[(&str, &str)]) {
+    let w = World::new();
+    w.run(&[], env);
+    let timed = [env, &[("VCI_TIMING", "1")]].concat();
+    let out = w.vci(&["plan", "--base-ref", "main"], &timed);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).ends_with("4 to skip, 0 to run\n"),
+        "{}",
+        text(&out)
+    );
+    assert!(!stdout(&out).contains("changed inputs"), "{}", text(&out));
+    assert!(
+        !stderr(&out).contains("changed inputs:"),
+        "every unit skips: no state object is asked for: {}",
+        text(&out)
+    );
+    assert!(
+        stderr(&out).contains(" shape, 0 state, "),
+        "{}",
+        stderr(&out)
+    );
+
+    // B's fixture and C's module edited: both run, on records of one run.
+    let original_b = w.read("fixtures/b.json");
+    let original_c = w.read("src/c.ts");
+    w.write(
+        "fixtures/b.json",
+        "{ \"greeting\": \"hello\", \"edited\": true }\n",
+    );
+    w.write("src/c.ts", &format!("{original_c}// edited\n"));
+    let out = w.vci(&["plan", "--base-ref", "main"], &timed);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let plan = stdout(&out);
+    assert!(
+        plan_line(&plan, B).ends_with("best failed inputs: entry:fixtures/b.json))"),
+        "{plan}"
+    );
+    assert!(
+        plan_line(&plan, C).ends_with("best failed inputs: entry:src/c.ts))"),
+        "{plan}"
+    );
+    assert!(
+        plan.ends_with(
+            "changed inputs, by the units each made run:\n  1  fixtures/b.json\n  1  src/c.ts\n2 to skip, 2 to run\n"
+        ),
+        "{plan}"
+    );
+    assert!(
+        stderr(&out).contains(
+            "changed inputs: 2 candidate(s) without the attested hashes, 2 named, 0 state expired, 0 over the budget, 0 without a state object; state objects: 1 wanted, 1 loaded"
+        ),
+        "one state object for both units: {}",
+        stderr(&out)
+    );
+    let ex = w.explain(B, env);
+    let (expected, actual) = detail(&ex, "entry:fixtures/b.json");
+    assert!(
+        expected.contains(&vci_core::blake3_hex(original_b.as_bytes()))
+            && expected.ends_with(&format!("({UNSIGNED_LABEL})")),
+        "{expected}"
+    );
+    assert!(
+        actual.contains(&vci_core::blake3_hex(w.read("fixtures/b.json").as_bytes())),
+        "{actual}"
+    );
+    let json = w.vci_ok(&["plan", "--base-ref", "main", "--format", "json"], env);
+    assert!(
+        json.contains("best failed inputs: entry:fixtures/b.json"),
+        "{json}"
+    );
+
+    // A directory listing, which each unit observes with its own
+    // exclusions: a new module beside C's computed import changes the
+    // listing C attested, and the plan names it.
+    w.write("src/c.ts", &original_c);
+    w.write("src/impl-y.ts", "export const name = \"y\";\n");
+    let plan = w.vci_ok(&["plan", "--base-ref", "main"], env);
+    assert!(
+        plan_line(&plan, C).contains("best failed inputs: entry:src (+")
+            || plan_line(&plan, C).ends_with("best failed inputs: entry:src))"),
+        "{plan}"
+    );
+    let ex = w.explain(C, env);
+    let (expected, actual) = detail(&ex, "entry:src");
+    assert!(
+        expected.starts_with("dirListing entries=")
+            && expected.ends_with(&format!("({UNSIGNED_LABEL})")),
+        "{expected}"
+    );
+    assert!(actual.starts_with("dirListing entries="), "{actual}");
+    std::fs::remove_file(w.work.join("src/impl-y.ts")).unwrap();
+    w.write("src/c.ts", &format!("{original_c}// edited\n"));
+
+    // Over the plan's budget: in bytes, and in count.
+    for budget in [
+        ("VCI_STORE_PLAN_STATES_MIB", "0"),
+        ("VCI_STORE_PLAN_STATES", "0"),
+    ] {
+        let plan = w.vci_ok(&["plan", "--base-ref", "main"], &[env, &[budget]].concat());
+        assert!(
+            plan_line(&plan, B).contains(&format!(
+                "best failed inputs: entry: changed ({HASH_NOT_LOADED}: over the plan's budget))"
+            )),
+            "{budget:?}: {plan}"
+        );
+        assert!(
+            plan.ends_with(&format!(
+                "  2  unit(s) ran on changed inputs not named ({HASH_NOT_LOADED})\n2 to skip, 2 to run\n"
+            )),
+            "{budget:?}: {plan}"
+        );
+    }
+
+    // Removed by its TTL (which compares whole seconds): the state expired.
+    std::thread::sleep(Duration::from_millis(1_100));
+    let out = w.vci(&["prune", "--objects", "--older-than", "0"], env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let plan = w.vci_ok(&["plan", "--base-ref", "main"], env);
+    assert!(
+        plan_line(&plan, B).contains(&format!(
+            "best failed inputs: entry: changed ({HASH_NOT_LOADED}: state expired))"
+        )),
+        "{plan}"
+    );
+    let ex = w.explain(B, env);
+    assert!(
+        ex.contains(&format!(
+            "entry: changed ({HASH_NOT_LOADED}: state expired)"
+        )),
+        "{ex}"
+    );
+
+    // A run that writes no state object: none for the run.
+    w.write("fixtures/b.json", &original_b);
+    w.write("src/c.ts", &original_c);
+    w.run(
+        &[B],
+        &[env, &[("VCI_STORE_EXPLAIN_HASHES", "false")]].concat(),
+    );
+    w.write(
+        "fixtures/b.json",
+        "{ \"greeting\": \"hello\", \"edited\": 2 }\n",
+    );
+    let plan = w.vci_ok(&["plan", "--base-ref", "main"], env);
+    assert!(
+        plan_line(&plan, B).contains(&format!(
+            "entry: changed ({HASH_NOT_LOADED}: no state object for the run))"
+        )),
+        "{plan}"
+    );
+    w.write("fixtures/b.json", &original_b);
+    assert_eq!(w.plan(env).0, set(UNITS));
+}
+
+#[test]
+fn the_plan_names_the_changed_input_on_git_meta() {
+    the_plan_names_the_changed_input(GIT_META);
+}
+
+#[test]
+fn the_plan_names_the_changed_input_on_sqlite() {
+    the_plan_names_the_changed_input(SQLITE);
+}
+
+/// The seconds a `VCI_TIMING` line of `stderr` gives for `step`.
+fn timing_of(stderr: &str, step: &str) -> Option<f64> {
+    let prefix = format!("vci: timing: {step}: ");
+    stderr
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|rest| rest.trim_end_matches('s').parse().ok())
+}
+
+/// Not a check, a measurement (`cargo test -p vci-cli --test e2e_m3 --
+/// --ignored --nocapture measure_`): what naming the changed input adds to
+/// a plan, on a Vitest project of `VCI_MEASURE_UNITS` (default 1,000) test
+/// files that each import `VCI_MEASURE_SHARED` (default 500) shared modules
+/// through one barrel, attested in one run (one state object for all of
+/// them, as a vex Rails partition has), with `VCI_MEASURE_BIN` (a release
+/// build) as the vci under test. Prints, for git-meta and SQLite, the
+/// plan's wall time with every unit skipping and with one shared module
+/// edited (every unit runs, its input named) against the same plan with
+/// `VCI_STORE_PLAN_STATES=0` (the 2.9.0 text, no state object read), each
+/// the median of `VCI_MEASURE_REPEAT` (default 5), and the pass's own
+/// `VCI_TIMING` line; on git-meta also a fresh clone after `vci fetch`, so
+/// the state object is fetched (from a local remote) by the plan.
+#[test]
+#[ignore]
+fn measure_naming_the_changed_input() {
+    let var = |k: &str, d: usize| -> usize {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (units, shared, repeat) = (
+        var("VCI_MEASURE_UNITS", 1_000),
+        var("VCI_MEASURE_SHARED", 500),
+        var("VCI_MEASURE_REPEAT", 5),
+    );
+    let bin = std::env::var("VCI_MEASURE_BIN").ok();
+    let vci = |w: &World, dir: &Path, args: &[&str], env: &[(&str, &str)]| -> (Output, f64) {
+        let cmd = match &bin {
+            Some(b) => Command::new(b),
+            None => Command::cargo_bin("vci").unwrap(),
+        };
+        let mut cmd = cmd;
+        cmd.current_dir(dir);
+        let t = std::time::Instant::now();
+        let out = {
+            // `World::command` runs in `work`; a clone's plan runs in its own
+            // directory with the same scrubbed environment.
+            let mut c = cmd;
+            c.args(args)
+                .env("VCI_JS_PLUGIN", workspace_root().join("js/vitest-plugin"))
+                .env("GIT_CONFIG_GLOBAL", &w.gitconfig)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("NO_COLOR", "1")
+                .env("VCI_TIMING", "1");
+            for k in vci_store::select::ENV_VARS.iter().chain(&[
+                "VCI_BASE_REF",
+                "GITHUB_BASE_REF",
+                "GITHUB_REF",
+                "CI",
+            ]) {
+                c.env_remove(k);
+            }
+            for (k, v) in env {
+                c.env(k, v);
+            }
+            c.output().unwrap()
+        };
+        (out, t.elapsed().as_secs_f64())
+    };
+    let median = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let generate = |w: &World| {
+        let src = w.work.join("src");
+        std::fs::create_dir_all(src.join("lib")).unwrap();
+        std::fs::create_dir_all(src.join("own")).unwrap();
+        let mut all = String::new();
+        let mut total = String::from("export const total = () => 0");
+        for j in 0..shared {
+            std::fs::write(
+                src.join(format!("lib/m{j:04}.ts")),
+                format!("export const m{j} = {j};\n"),
+            )
+            .unwrap();
+            all.push_str(&format!("import {{ m{j} }} from \"./m{j:04}\";\n"));
+            total.push_str(&format!(" + m{j}"));
+        }
+        all.push_str(&total);
+        all.push_str(";\n");
+        std::fs::write(src.join("lib/all.ts"), all).unwrap();
+        for i in 0..units {
+            std::fs::write(
+                src.join(format!("own/o{i:04}.ts")),
+                format!("export const own = () => {i} + 1;\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                src.join(format!("u{i:04}.test.ts")),
+                format!(
+                    "import {{ expect, test }} from \"vitest\";\nimport {{ total }} from \"./lib/all\";\nimport {{ own }} from \"./own/o{i:04}\";\n\ntest(\"u{i}\", () => {{\n  expect(total() + own()).toBeGreaterThan(0);\n}});\n"
+                ),
+            )
+            .unwrap();
+        }
+    };
+    let plans = |w: &World, dir: &Path, env: &[(&str, &str)], label: &str| {
+        for (what, extra) in [
+            ("named (default budget)", vec![]),
+            (
+                "not named (VCI_STORE_PLAN_STATES=0)",
+                vec![("VCI_STORE_PLAN_STATES", "0")],
+            ),
+        ] {
+            let env = [env, &extra].concat();
+            let mut walls = Vec::new();
+            let mut passes = Vec::new();
+            let mut totals = Vec::new();
+            let mut sample = String::new();
+            for _ in 0..repeat {
+                let (out, wall) = vci(w, dir, &["plan", "--base-ref", "main"], &env);
+                assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+                walls.push(wall);
+                let err = stderr(&out);
+                passes.push(
+                    timing_of(&err, "name the inputs that changed for the units that run")
+                        .unwrap_or(0.0),
+                );
+                totals.push(timing_of(&err, "plan total").unwrap_or(0.0));
+                sample = err
+                    .lines()
+                    .filter(|l| l.starts_with("vci: timing: "))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let plan = stdout(&out);
+                if let Some(l) = plan.lines().find(|l| l.starts_with("RUN ")) {
+                    sample.push_str(&format!("\n{l}"));
+                }
+                if let Some(i) = plan.find("changed inputs, by") {
+                    sample.push_str(&format!("\n{}", &plan[i..]));
+                }
+            }
+            eprintln!(
+                "MEASURE {label}: {what}: wall median {:.3} s (min {:.3}), plan total median {:.3} s, naming pass median {:.3} s\n{sample}\n",
+                median(walls.clone()),
+                walls.iter().cloned().fold(f64::INFINITY, f64::min),
+                median(totals),
+                median(passes)
+            );
+        }
+    };
+    let stores = std::env::var("VCI_MEASURE_STORES").unwrap_or_else(|_| "git-meta,sqlite".into());
+    for env in [GIT_META, SQLITE] {
+        let label = if env.is_empty() { "git-meta" } else { "sqlite" };
+        if !stores.split(',').any(|s| s == label) {
+            continue;
+        }
+        let w = World::new();
+        generate(&w);
+        w.commit("the generated units");
+        let (out, wall) = vci(&w, &w.work, &["run", "--key", w.key.to_str().unwrap()], env);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        eprintln!(
+            "MEASURE {label}: vci run of {} unit(s): {wall:.1} s",
+            units + UNITS.len()
+        );
+        plans(&w, &w.work, env, &format!("{label}, every unit skips"));
+        let edited = w.work.join("src/lib/m0007.ts");
+        std::fs::write(&edited, "export const m7 = 7 + 0;\n").unwrap();
+        plans(
+            &w,
+            &w.work,
+            env,
+            &format!("{label}, one shared module edited"),
+        );
+        std::fs::write(&edited, "export const m7 = 7;\n").unwrap();
+        if env.is_empty() {
+            // A fresh clone: the plan fetches the state object (and the
+            // candidates) from the remote, a local bare repository.
+            let remote = w.base.join("origin.git");
+            w.git(&w.base, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+            w.git(&remote, &["config", "uploadpack.allowFilter", "true"]);
+            w.git(
+                &w.work,
+                &["remote", "add", "origin", remote.to_str().unwrap()],
+            );
+            w.git(&w.work, &["push", "-q", "origin", "main", "feature"]);
+            let (out, _) = vci(&w, &w.work, &["push", "--remote", "origin"], env);
+            assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+            for n in 0..repeat.min(3) {
+                let fresh = w.base.join(format!("fresh{n}"));
+                w.git(
+                    &w.base,
+                    &[
+                        "clone",
+                        "-q",
+                        "--no-local",
+                        remote.to_str().unwrap(),
+                        fresh.to_str().unwrap(),
+                    ],
+                );
+                w.git(&fresh, &["checkout", "-q", "feature"]);
+                let st = Command::new("cp")
+                    .arg("-R")
+                    .arg(w.work.join("node_modules"))
+                    .arg(fresh.join("node_modules"))
+                    .status()
+                    .unwrap();
+                assert!(st.success());
+                let (out, _) = vci(&w, &fresh, &["fetch", "--remote", "origin"], env);
+                assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+                std::fs::write(fresh.join("src/lib/m0007.ts"), "export const m7 = 7 + 0;\n")
+                    .unwrap();
+                let budget: &[(&str, &str)] = if n % 2 == 0 {
+                    &[]
+                } else {
+                    &[("VCI_STORE_PLAN_STATES", "0")]
+                };
+                let (out, wall) = vci(&w, &fresh, &["plan", "--base-ref", "main"], budget);
+                assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+                let err = stderr(&out);
+                eprintln!(
+                    "MEASURE git-meta, fresh clone after vci fetch, {}: wall {wall:.3} s, naming pass {:.3} s, plan total {:.3} s\n{}\n",
+                    if n % 2 == 0 {
+                        "named"
+                    } else {
+                        "not named (VCI_STORE_PLAN_STATES=0)"
+                    },
+                    timing_of(&err, "name the inputs that changed for the units that run")
+                        .unwrap_or(0.0),
+                    timing_of(&err, "plan total").unwrap_or(0.0),
+                    err.lines()
+                        .filter(|l| l.contains("changed inputs:") || l.contains("objects:"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
+    }
 }

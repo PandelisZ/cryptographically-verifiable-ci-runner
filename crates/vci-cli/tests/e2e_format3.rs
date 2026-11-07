@@ -346,8 +346,9 @@ fn set(ids: &[&str]) -> BTreeSet<String> {
 
 /// git-meta: the frame alone skips the unit; an edited fixture runs it with
 /// the entry named and its attested hash reported as not loaded (no
-/// columns, so no state object); the record under another signer's slot
-/// fails `signer`.
+/// columns, and the record was put without the run-state link a run
+/// writes, so no state object for the run); the record under another
+/// signer's slot fails `signer`.
 #[test]
 fn a_format3_record_on_git_meta_skips_names_the_entry_and_needs_its_signer() {
     let w = World::new();
@@ -365,9 +366,10 @@ fn a_format3_record_on_git_meta_skips_names_the_entry_and_needs_its_signer() {
     assert!(ex.contains("signer: trusted@example.com"), "{ex}");
 
     // The fixture edited: B runs on its inputs (an `entry:` detail, which
-    // round 2 keys on). git-meta keeps no columns, so no state object names
-    // the attested hashes and the entry that changed cannot be told from
-    // the others: the text says so, with both roots.
+    // round 2 keys on). git-meta keeps no columns and this record was put
+    // without a run-state link, so no state object names the attested
+    // hashes and the entry that changed cannot be told from the others: the
+    // text says so, and why, with both roots.
     let original = w.read("fixtures/b.json");
     w.write("fixtures/b.json", "{ \"greeting\": \"hello, world\" }\n");
     let (skip, run) = w.plan(&[]);
@@ -375,7 +377,7 @@ fn a_format3_record_on_git_meta_skips_names_the_entry_and_needs_its_signer() {
     let ex = w.explain(&[]);
     assert!(ex.contains("failed check: inputs"), "{ex}");
     assert!(
-        ex.contains("entry: changed (attested hash not loaded)"),
+        ex.contains("entry: changed (attested hash not loaded: no state object for the run)"),
         "{ex}"
     );
     assert!(
@@ -389,7 +391,9 @@ fn a_format3_record_on_git_meta_skips_names_the_entry_and_needs_its_signer() {
     let ex = w.explain(&[]);
     assert!(ex.contains("entry:fixtures/b.json"), "{ex}");
     assert!(
-        ex.contains("file exec=false changed (attested hash not loaded)"),
+        ex.contains(
+            "file exec=false changed (attested hash not loaded: no state object for the run)"
+        ),
         "{ex}"
     );
     assert!(ex.contains("actual:   absent"), "{ex}");
