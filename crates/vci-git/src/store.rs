@@ -409,6 +409,14 @@ impl AttestationStore for GitMetaStore {
         Ok(self.attest_store().remove_object_keys(keys)?)
     }
 
+    /// git-meta's log rows older than the last materialization and a day,
+    /// then the free pages ([`AttestStore::compact_store`]). The pooled
+    /// readers are dropped first: an open read keeps `VACUUM` from running.
+    fn compact(&self) -> Result<Option<(u64, u64)>, StoreError> {
+        self.refresh_readers();
+        Ok(self.attest_store().compact_store()?.vacuumed)
+    }
+
     /// One pooled reader and one targeted query per unit, values read with
     /// it (what `AttestStore::list(Some(id))` does), never the default's
     /// scan of every row plus a `git cat-file` per call: supersession calls

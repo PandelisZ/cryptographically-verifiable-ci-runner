@@ -1866,6 +1866,126 @@ pub struct PruneArgs {
     /// `--older-than DAYS`: the state-object age for this run (default
     /// `[store] explain_hashes_days`).
     pub older_than: Option<u32>,
+    /// `--max-age DAYS`: the age limit for this run (default `[store]
+    /// max_age_days`; 0: none).
+    pub max_age: Option<u32>,
+}
+
+/// Why the prune rules remove a current attestation ([`decide`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Why {
+    /// Beyond the `keep` newest of its unit and signer, on no tree some
+    /// ref has at its tip.
+    Superseded,
+    /// Issued more than `max_age_days` ago, and not its unit's newest by
+    /// its signer.
+    Aged,
+    /// A format-1 record issued before its unit and signer's newest
+    /// format-3 one.
+    FormatOne,
+}
+
+impl Why {
+    /// What `vci prune` prints after the key.
+    fn note(self) -> &'static str {
+        match self {
+            Why::Superseded => " (superseded)",
+            Why::Aged => " (older than max_age_days)",
+            Why::FormatOne => " (format 1, older than its unit's newest format-3 attestation)",
+        }
+    }
+}
+
+/// What decides which of the current (unexpired) attestations a prune
+/// keeps ([`decide`]).
+#[derive(Debug, Default)]
+struct Policy {
+    /// How many of a unit's attestations by one signer to keep, newest
+    /// first.
+    keep: usize,
+    /// The trees some branch, remote-tracking branch or tag has at its tip.
+    live_trees: BTreeSet<String>,
+    /// The attestations issued before this (unix seconds) are removed by
+    /// age unless they are their unit's newest by their signer (`[store]
+    /// max_age_days`; `None`: no limit).
+    aged_before: Option<i64>,
+    /// The keys of the attestations a plan of the checked-out commit's tree
+    /// remembered passing ([`AttestationStore::passing_on`]): never
+    /// removed by these rules (only by expiry).
+    used: BTreeSet<String>,
+    /// Remove the format-1 records of a unit and signer that has a
+    /// format-3 one (off while `[store] record_format = 1`: the fleet still
+    /// reads format 1).
+    format_rule: bool,
+}
+
+/// One current attestation as the rules read it: its key, signed issue
+/// time and tree, and its record format (1 or 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cand {
+    key: String,
+    issued: i64,
+    tree: Option<String>,
+    format: u8,
+}
+
+/// Which of one unit's current attestations by one signer the rules
+/// remove, by index into `group`, and why. In order:
+///
+/// 1. one a plan of the checked-out commit used ([`Policy::used`]) stays;
+/// 2. a format-1 record issued before the group's newest format-3 one
+///    goes ([`Why::FormatOne`]): the signer has moved to format 3 since (a
+///    newer format-1 record, from a writer still on `record_format = 1` or
+///    on a vci 2.8, is ranked with the rest);
+/// 3. of the rest, ranked newest first by signed issue time, the newest
+///    stays: no rule but expiry empties a unit;
+/// 4. one issued before [`Policy::aged_before`] goes ([`Why::Aged`]),
+///    whatever tree it was made on;
+/// 5. the `keep` newest and one made on a tree some ref has at its tip
+///    stay, the others go ([`Why::Superseded`], 2.1.12's and 2.2's rule).
+fn decide(group: &[Cand], p: &Policy) -> Vec<(usize, Why)> {
+    let mut order: Vec<usize> = (0..group.len()).collect();
+    order.sort_by(|&a, &b| (group[b].issued, &group[b].key).cmp(&(group[a].issued, &group[a].key)));
+    // The newest format-3 record, in the same order.
+    let three = group
+        .iter()
+        .filter(|c| p.format_rule && c.format == 3)
+        .map(|c| (c.issued, &c.key))
+        .max();
+    let mut out = Vec::new();
+    let mut rank = 0usize;
+    for i in order {
+        let c = &group[i];
+        let used = p.used.contains(&c.key);
+        if c.format == 1 && !used && three.is_some_and(|t| (c.issued, &c.key) < t) {
+            out.push((i, Why::FormatOne));
+            continue;
+        }
+        let r = rank;
+        rank += 1;
+        if used || r == 0 {
+            continue;
+        }
+        if p.aged_before.is_some_and(|t| c.issued < t) {
+            out.push((i, Why::Aged));
+            continue;
+        }
+        let live = c.tree.as_deref().is_some_and(|t| p.live_trees.contains(t));
+        if r >= p.keep && !live {
+            out.push((i, Why::Superseded));
+        }
+    }
+    out
+}
+
+/// The format of a stored record by its first byte ([`decode_record`]):
+/// 1, 3, or `None` when it is neither.
+fn record_format(bytes: &[u8]) -> Option<u8> {
+    match decode_record(bytes) {
+        Ok(Record::FormatOne(_)) => Some(1),
+        Ok(Record::FormatThree(_)) => Some(3),
+        Err(_) => None,
+    }
 }
 
 /// What a prune of the attestations found and did.
@@ -1878,10 +1998,37 @@ struct Pruned {
     /// statement did not confirm them (left alone; a store with columns
     /// only).
     unconfirmed: usize,
+    /// Removed by each rule of [`decide`].
     older: usize,
+    aged: usize,
+    format_one: usize,
+    /// The format-1 records left (kept, or unreadable ones that may be).
+    format_one_left: usize,
     /// Manifests the remaining attestations reference; `None` once one of
     /// them cannot be read.
     referenced: Option<BTreeSet<String>>,
+    /// What to remove, in one batch at the end: the record and what to
+    /// print after its key.
+    doomed: Vec<(StoredEnvelope, &'static str)>,
+}
+
+impl Pruned {
+    /// Count `e` as removed by `why` and queue it.
+    fn doom(&mut self, e: StoredEnvelope, why: Why) {
+        match why {
+            Why::Superseded => self.older += 1,
+            Why::Aged => self.aged += 1,
+            Why::FormatOne => self.format_one += 1,
+        }
+        self.kept -= 1;
+        self.doomed.push((e, why.note()));
+    }
+
+    /// Count `e` as expired and queue it.
+    fn expire(&mut self, e: StoredEnvelope) {
+        self.expired += 1;
+        self.doomed.push((e, ""));
+    }
 }
 
 /// `vci prune`: delete attestations that have expired (git-meta tombstones,
@@ -1903,6 +2050,16 @@ struct Pruned {
 /// Then the objects no attestation references and the state objects older
 /// than `explain_hashes_days` (or `--older-than`) go; `--objects` does
 /// only that.
+///
+/// Since 2.10 the rules of [`decide`] also remove the attestations older
+/// than `[store] max_age_days` (14) that are not their unit's newest, and
+/// the format-1 records issued before their unit's newest format-3 one, and keep any
+/// a plan of the checked-out commit used; the summary counts each rule.
+/// On git-meta it then drops the deletion records older than `[store]
+/// deletion_records_hours` (6), publishes the store as one commit once the
+/// fetched history holds more than `[store] history_max_commits` (2000)
+/// commits, and compacts the local store's file ([`AttestationStore::compact`],
+/// which SQLite does too).
 pub fn prune(args: PruneArgs) -> Result<i32> {
     let PruneArgs {
         dry_run,
@@ -1910,11 +2067,13 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
         keep,
         objects_only,
         older_than,
+        max_age,
     } = args;
     let (repo, _) = open_repo()?;
     let store = crate::store::for_repo(&repo);
     // A store that cannot be used fails here, before anything is read.
     store.status()?;
+    let selection = crate::store::selection_of(&repo);
     // What to say about a value the store does not hold here yet.
     let fetch_hint = if store.caps().lazy_values {
         " (run `vci fetch`)"
@@ -1928,31 +2087,52 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
     // longer has (or soon will not), and every stored attestation costs
     // each plan a download (vci 2.2: vex kept five per file).
     // `--superseded` keeps the documented meaning: only the newest, whatever
-    // the branch; `--keep` also keeps one made on a tree some ref still has
-    // at its tip, as `vci run`'s supersession does (2.1.12).
+    // the branch or the plan; `--keep` also keeps one made on a tree some
+    // ref still has at its tip, as `vci run`'s supersession does (2.1.12),
+    // and (2.10) one a plan of the checked-out commit used.
     let keep = if superseded { 1 } else { keep.max(1) };
-    let live_trees = if superseded {
-        BTreeSet::new()
-    } else {
-        repo.live_trees().unwrap_or_default()
+    let max_age_days = max_age.unwrap_or_else(|| {
+        selection
+            .as_ref()
+            .map(|s| s.max_age_days.value)
+            .unwrap_or(vci_store::select::DEFAULT_MAX_AGE_DAYS)
+    });
+    let policy = Policy {
+        keep,
+        live_trees: if superseded {
+            BTreeSet::new()
+        } else {
+            repo.live_trees().unwrap_or_default()
+        },
+        aged_before: (max_age_days > 0).then(|| now - i64::from(max_age_days) * 24 * 60 * 60),
+        used: if superseded {
+            BTreeSet::new()
+        } else {
+            plan_used(&repo, &*store)
+        },
+        format_rule: selection
+            .as_ref()
+            .is_none_or(|s| s.record_format.value != 1),
     };
     let mut removed = 0usize;
     if !objects_only {
-        let p = if store.caps().columns {
-            prune_by_columns(&*store, dry_run, keep, &live_trees, now)?
+        let mut p = if store.caps().columns {
+            prune_by_columns(&*store, &policy, now)?
         } else {
-            prune_by_values(&*store, dry_run, keep, &live_trees, now)?
+            prune_by_values(&*store, &policy, now)?
         };
-        let manifests = prune_manifests(&*store, dry_run, p.referenced, fetch_hint)?;
+        let doomed = std::mem::take(&mut p.doomed);
+        apply_removals(&*store, dry_run, doomed)?;
+        let manifests = prune_manifests(&*store, dry_run, p.referenced.clone(), fetch_hint)?;
+        let dry = if dry_run { " (dry run)" } else { "" };
         eprintln!(
-            "vci prune: {} expired{}{}, {} current, {} unreadable (left alone){}",
+            "vci prune: {} expired{}{dry}, {} current, {} unreadable (left alone){}",
             p.expired,
             if superseded {
                 format!(", {} superseded", p.older)
             } else {
                 String::new()
             },
-            if dry_run { " (dry run)" } else { "" },
             p.kept,
             p.unreadable,
             if p.unconfirmed > 0 {
@@ -1962,14 +2142,56 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
             }
         );
         eprintln!(
+            "vci prune: attestations by rule{dry}: {} expired, {} beyond the {keep} newest of their unit and signer, {} older than {} (not their unit's newest), {} format-1 (older than their unit's newest format-3 attestation by the same signer){}",
+            p.expired,
+            p.older,
+            p.aged,
+            if max_age_days > 0 {
+                format!("{max_age_days} day(s)")
+            } else {
+                "max_age_days (0: none)".to_owned()
+            },
+            p.format_one,
+            if policy.used.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; kept whatever the rules: the {} attestation(s) a plan of the checked-out commit used",
+                    policy.used.len()
+                )
+            }
+        );
+        eprintln!(
             "vci prune: {manifests} unreferenced input manifest(s){}",
             if dry_run { " (dry run)" } else { " removed" }
         );
-        removed += p.expired + p.older + manifests;
+        if p.format_one_left == 0 {
+            eprintln!(
+                "vci prune: no format-1 attestation remains{} (`vci store upgrade --finish` says so too{})",
+                if dry_run { " after this prune" } else { "" },
+                if store.caps().columns {
+                    ", and ends the format-3 migration"
+                } else {
+                    ""
+                }
+            );
+        } else {
+            eprintln!(
+                "vci prune: {} format-1 attestation(s) remain{}",
+                p.format_one_left,
+                if policy.format_rule {
+                    " (none older than a format-3 attestation of their unit by the same signer, or a plan of the checked-out commit used them)"
+                } else {
+                    " ([store] record_format = 1 keeps them)"
+                }
+            );
+        }
+        removed += p.expired + p.older + p.aged + p.format_one + manifests;
     }
     if store.caps().objects {
         let days = older_than.unwrap_or_else(|| {
-            crate::store::selection_of(&repo)
+            selection
+                .as_ref()
                 .map(|s| s.explain_hashes_days.value)
                 .unwrap_or(vci_store::select::DEFAULT_EXPLAIN_HASHES_DAYS)
         });
@@ -1980,10 +2202,36 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
             store.kind()
         );
     }
+    // git-meta: its deletion records and its history (2.10).
+    let mut published = false;
+    if store.exchange().is_some() && store.kind() == "git-meta" && !objects_only {
+        let gm = AttestStore::new(&repo);
+        removed += prune_deletion_records(&gm, dry_run);
+        let history_max = selection
+            .as_ref()
+            .map(|s| s.history_max_commits.value)
+            .unwrap_or(vci_store::select::DEFAULT_HISTORY_MAX_COMMITS);
+        published = rewrite_long_history(&gm, &*store, dry_run, history_max);
+    }
+    if !dry_run {
+        match store.compact() {
+            Ok(Some((before, after))) => eprintln!(
+                "vci prune: compacted the {} store's file from {} to {}",
+                store.kind(),
+                megabytes(before),
+                megabytes(after)
+            ),
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "vci prune: warning: could not compact the {} store's file: {e}",
+                store.kind()
+            ),
+        }
+    }
     // A store with an exchange (git-meta) publishes its deletions on push;
     // SQLite, PostgreSQL and libSQL removed theirs at once, and their `vci
     // push` has nothing to do.
-    if removed > 0 && !dry_run && store.exchange().is_some() {
+    if removed > 0 && !dry_run && !published && store.exchange().is_some() {
         eprintln!(
             "vci prune: run `vci push` to publish the deletions (`vci push --rewrite-history` also drops the deleted values from what a fetch downloads)"
         );
@@ -1991,21 +2239,158 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// The attestations pass over every value (a store without listing
-/// columns, git-meta): every value is read, as vci 2.0 to 2.8 did.
-fn prune_by_values(
+/// `bytes` in MB with one decimal.
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+}
+
+/// The keys of the attestations a plan of the checked-out commit's tree
+/// remembered passing (`vci plan` and `vci run` remember them in the store
+/// for a week): what that commit's plan would use. Empty when HEAD has no
+/// tree or nothing was remembered.
+fn plan_used(repo: &vci_git::Repo, store: &dyn AttestationStore) -> BTreeSet<String> {
+    let Ok(tree) = repo.head_tree() else {
+        return BTreeSet::new();
+    };
+    let tree16: String = tree.chars().take(16).collect();
+    store.passing_on(&tree16).into_values().collect()
+}
+
+/// Remove the doomed records in one batch (or say what would go on a dry
+/// run), printing a line for each.
+fn apply_removals(
     store: &dyn AttestationStore,
     dry_run: bool,
-    keep: usize,
-    live_trees: &BTreeSet<String>,
-    now: i64,
-) -> Result<Pruned> {
+    doomed: Vec<(StoredEnvelope, &'static str)>,
+) -> Result<()> {
+    if dry_run {
+        for (e, note) in &doomed {
+            println!("would remove {} {}{note}", e.target, e.key);
+        }
+        return Ok(());
+    }
+    if doomed.is_empty() {
+        return Ok(());
+    }
+    let envs: Vec<StoredEnvelope> = doomed.iter().map(|(e, _)| e.clone()).collect();
+    store.remove(envs)?;
+    for (e, note) in &doomed {
+        println!("removed {} {}{note}", e.target, e.key);
+    }
+    Ok(())
+}
+
+/// git-meta: drop the deletion records older than `[store]
+/// deletion_records_hours` from the local store and metadata tree (the
+/// next push publishes the drop), or count them on a dry run. Returns how
+/// many went. A failure is a warning: the store is no worse than before.
+fn prune_deletion_records(gm: &AttestStore<'_>, dry_run: bool) -> usize {
+    let counts = match gm.deletion_record_counts() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("vci prune: warning: could not count the deletion records: {e}");
+            return 0;
+        }
+    };
+    let hours = counts.window_secs as f64 / 3600.0;
+    if dry_run {
+        eprintln!(
+            "vci prune: {} of {} deletion record(s) are older than {hours} hour(s) ([store] deletion_records_hours): dropped on a run without --dry-run",
+            counts.old, counts.total
+        );
+        return 0;
+    }
+    match gm.drop_deletion_records() {
+        Ok(n) => {
+            let n = n.unwrap_or(0);
+            eprintln!(
+                "vci prune: {n} of {} deletion record(s) older than {hours} hour(s) dropped ([store] deletion_records_hours)",
+                counts.total
+            );
+            n
+        }
+        Err(e) => {
+            eprintln!("vci prune: warning: could not drop the old deletion records: {e}");
+            0
+        }
+    }
+}
+
+/// git-meta: once the metadata history fetched from the remote holds more
+/// than `max` commits (`[store] history_max_commits`; 0: never), publish
+/// the store as one commit without parents (`vci push --rewrite-history`),
+/// so that a fetch downloads the current tree rather than every version
+/// ever published (vex, November 2026: 7,426 commits whose trees are 21
+/// million objects, more than 3 GB). Returns whether it published. A
+/// failure is a warning: the prune stands, and a later one publishes.
+fn rewrite_long_history(
+    gm: &AttestStore<'_>,
+    store: &dyn AttestationStore,
+    dry_run: bool,
+    max: u32,
+) -> bool {
+    if max == 0 {
+        return false;
+    }
+    let commits = match gm.history_commits() {
+        Ok(Some(n)) => n,
+        Ok(None) => return false,
+        Err(e) => {
+            eprintln!("vci prune: warning: could not count the metadata history: {e}");
+            return false;
+        }
+    };
+    if commits <= u64::from(max) {
+        return false;
+    }
+    let what = format!(
+        "the metadata history has {commits} commits, more than [store] history_max_commits = {max}"
+    );
+    if dry_run {
+        eprintln!(
+            "vci prune: {what}: a run without --dry-run publishes the store as one commit (`vci push --rewrite-history`)"
+        );
+        return false;
+    }
+    let Some(exchange) = store.exchange() else {
+        return false;
+    };
+    eprintln!(
+        "vci prune: {what}: publishing the store as one commit (`vci push --rewrite-history`)"
+    );
+    match exchange.push(None, PushMode::RewriteHistory) {
+        Ok(out) => {
+            for w in &out.warnings {
+                eprintln!("vci prune: warning: {w}");
+            }
+            eprintln!(
+                "vci prune: published the store to {}'s {} as one commit{}",
+                out.remote,
+                exchange.exchange_point(),
+                if out.status == PushStatus::UpToDate {
+                    " (nothing new to send)"
+                } else {
+                    ""
+                }
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "vci prune: warning: publishing the store as one commit failed (a later prune tries again; `vci push` publishes the deletions): {e}"
+            );
+            false
+        }
+    }
+}
+
+/// The attestations pass over every value (a store without listing
+/// columns, git-meta): every value is read, as vci 2.0 to 2.8 did.
+fn prune_by_values(store: &dyn AttestationStore, policy: &Policy, now: i64) -> Result<Pruned> {
     let mut p = Pruned {
         referenced: Some(BTreeSet::new()),
         ..Pruned::default()
     };
-    let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
-    let mut current = Vec::new();
     // Every attestation's payload is read: fetch the ones not fetched yet
     // (on a large store, what a fetch downloaded before vci 2.0). One that
     // cannot be fetched is unreadable, and left alone.
@@ -2018,30 +2403,21 @@ fn prune_by_values(
         Ok(_) => {}
         Err(e) => eprintln!("vci prune: warning: could not fetch the attestations' values: {e:#}"),
     }
+    let mut current: Vec<Current> = Vec::new();
     for e in store.read_all()? {
         if e.error.is_some() {
             p.referenced = None;
         }
         match record_meta(&e.bytes) {
-            Some(m) if m.expires_at <= now => {
-                p.expired += 1;
-                if dry_run {
-                    println!("would remove {} {}", e.target, e.key);
-                } else {
-                    store.remove(vec![e.clone()])?;
-                    println!("removed {} {}", e.target, e.key);
-                }
-            }
+            Some(m) if m.expires_at <= now => p.expire(e),
             Some(m) => {
                 p.kept += 1;
-                by_unit
-                    .entry((m.test_id.clone(), e.signer.clone()))
-                    .or_default()
-                    .push((m.issued_at, e.key.clone()));
-                current.push((m, e));
+                let format = record_format(&e.bytes).unwrap_or(1);
+                current.push((m, e, format));
             }
             None => {
                 p.unreadable += 1;
+                p.format_one_left += 1;
                 // Left alone, so whatever it references stays: the
                 // manifest it names when that much can be read, else none
                 // is removed.
@@ -2056,26 +2432,54 @@ fn prune_by_values(
             }
         }
     }
-    // The keys kept per unit and signer: the `keep` newest.
-    let keep_keys = keep_newest(&mut by_unit, keep);
-    for (m, e) in current {
-        let live = m.tree.as_deref().is_some_and(|t| live_trees.contains(t));
-        if keep_keys.contains(&e.key) || live {
-            if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
-                set.insert(r.clone());
+    apply_rules(&mut p, current, policy, |m, e| {
+        (m.test_id.clone(), e.signer.clone())
+    });
+    Ok(p)
+}
+
+/// A current attestation as read: what its statement says, the record,
+/// and its format (1 or 3).
+type Current = (EnvelopeMeta, StoredEnvelope, u8);
+
+/// Group the current attestations by unit and signer (`group_of`), apply
+/// [`decide`] to each group, queue what it removes and note the manifests
+/// the rest reference.
+fn apply_rules(
+    p: &mut Pruned,
+    current: Vec<Current>,
+    policy: &Policy,
+    group_of: impl Fn(&EnvelopeMeta, &StoredEnvelope) -> (String, String),
+) {
+    let mut groups: BTreeMap<(String, String), Vec<Current>> = BTreeMap::new();
+    for (m, e, f) in current {
+        groups.entry(group_of(&m, &e)).or_default().push((m, e, f));
+    }
+    for (_, group) in groups {
+        let cands: Vec<Cand> = group
+            .iter()
+            .map(|(m, e, f)| Cand {
+                key: e.key.clone(),
+                issued: m.issued_at,
+                tree: m.tree.clone(),
+                format: *f,
+            })
+            .collect();
+        let doomed: BTreeMap<usize, Why> = decide(&cands, policy).into_iter().collect();
+        for (i, (m, e, f)) in group.into_iter().enumerate() {
+            match doomed.get(&i) {
+                Some(why) => p.doom(e, *why),
+                None => {
+                    if f == 1 {
+                        p.format_one_left += 1;
+                    }
+                    if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
+                        set.insert(r.clone());
+                    }
+                }
             }
-            continue;
-        }
-        p.older += 1;
-        p.kept -= 1;
-        if dry_run {
-            println!("would remove {} {} (superseded)", e.target, e.key);
-        } else {
-            store.remove(vec![e.clone()])?;
-            println!("removed {} {} (superseded)", e.target, e.key);
         }
     }
-    Ok(p)
 }
 
 /// What a listed record is read for on a store with columns.
@@ -2088,8 +2492,8 @@ enum Role {
     /// The `expires` column says it has expired: a candidate the signed
     /// statement must confirm.
     Expired,
-    /// Its unit and signer have a row beyond `keep` by the hints (or a row
-    /// read whole): the signed statements order the group.
+    /// Its unit and signer have a row the rules remove by the hints (or a
+    /// row read whole): the signed statements order the group.
     Contested,
 }
 
@@ -2105,19 +2509,14 @@ enum Role {
 /// value says what the row is and which manifest it references). The
 /// expired candidates are then read and deleted only when the signed
 /// statement agrees ([`confirm_expired`]); a unit and signer with a record
-/// beyond `keep` by the hints has every described record read, and the
-/// signed `issuedAt`, `expiresAt` and tree order the group as they do on a
-/// store without columns. The columns pre-filter and order, the value
-/// decides (`decode_record` by its first byte), so a store writer who
-/// edits a column or a key's hint can cause extra value reads (the row's,
-/// or its unit's), never a wrong deletion.
-fn prune_by_columns(
-    store: &dyn AttestationStore,
-    dry_run: bool,
-    keep: usize,
-    live_trees: &BTreeSet<String>,
-    now: i64,
-) -> Result<Pruned> {
+/// the rules ([`decide`]) remove by the hints, or with a record read whole
+/// (a format-1 row), has every described record read, and the signed
+/// `issuedAt`, `expiresAt` and tree order the group as they do on a store
+/// without columns. The columns pre-filter and order, the value decides
+/// (`decode_record` by its first byte), so a store writer who edits a
+/// column or a key's hint can cause extra value reads (the row's, or its
+/// unit's), never a wrong deletion.
+fn prune_by_columns(store: &dyn AttestationStore, policy: &Policy, now: i64) -> Result<Pruned> {
     let all = store.list_all()?;
     let refs: Vec<&StoredEnvelope> = all.iter().collect();
     let columns = store.columns(&refs)?;
@@ -2140,10 +2539,9 @@ fn prune_by_columns(
         ..Pruned::default()
     };
     // The described records: expired by the column, to confirm; the rest
-    // ordered by the hints, and the groups with a record beyond `keep`
-    // (not on a tree at some ref's tip) read whole.
-    let mut by_hint: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
-    let mut hinted: Vec<StoredEnvelope> = Vec::new();
+    // ordered by the hints, and the groups with a record the rules remove
+    // read whole.
+    let mut by_hint: BTreeMap<(String, String), Vec<StoredEnvelope>> = BTreeMap::new();
     for (e, expires) in described {
         if expires <= now {
             rows.push((e, Role::Expired));
@@ -2151,29 +2549,48 @@ fn prune_by_columns(
             by_hint
                 .entry((e.test_key.clone(), e.signer.clone()))
                 .or_default()
-                .push((e.issued.expect("described"), e.key.clone()));
-            hinted.push(e);
+                .push(e);
         }
     }
-    let keep_by_hint = keep_newest(&mut by_hint, keep);
-    let mut hint_doomed: BTreeSet<String> = BTreeSet::new();
-    for e in &hinted {
-        let live = e
-            .tree
-            .as_deref()
-            .is_some_and(|t16| live_trees.iter().any(|t| t.starts_with(t16)));
-        if !keep_by_hint.contains(&e.key) && !live {
-            hint_doomed.insert(e.key.clone());
-            contested.insert((e.test_key.clone(), e.signer.clone()));
+    // key -> target of the records the hints say the rules remove.
+    let mut hint_doomed: BTreeMap<String, String> = BTreeMap::new();
+    for (group, list) in &by_hint {
+        // The hint's tree is 16 characters: a live tree that starts with it.
+        let cands: Vec<Cand> = list
+            .iter()
+            .map(|e| Cand {
+                key: e.key.clone(),
+                issued: e.issued.expect("described"),
+                tree: e.tree.as_deref().and_then(|t16| {
+                    policy
+                        .live_trees
+                        .iter()
+                        .find(|t| t.starts_with(t16))
+                        .cloned()
+                }),
+                format: 3,
+            })
+            .collect();
+        let doomed = decide(&cands, policy);
+        if !doomed.is_empty() {
+            contested.insert(group.clone());
+            hint_doomed.extend(
+                doomed
+                    .into_iter()
+                    .map(|(i, _)| (list[i].key.clone(), list[i].target.clone())),
+            );
         }
     }
-    for e in hinted {
-        if contested.contains(&(e.test_key.clone(), e.signer.clone())) {
-            rows.push((e, Role::Contested));
-        } else {
-            // Current without a read: outside the window no manifest
-            // exists for it to reference.
-            p.kept += 1;
+    for (group, list) in by_hint {
+        let role = contested.contains(&group);
+        for e in list {
+            if role {
+                rows.push((e, Role::Contested));
+            } else {
+                // Current without a read: outside the window no manifest
+                // exists for it to reference.
+                p.kept += 1;
+            }
         }
     }
     // One read of everything the statements must decide.
@@ -2181,10 +2598,10 @@ fn prune_by_columns(
         let mut refs: Vec<&mut StoredEnvelope> = rows.iter_mut().map(|(e, _)| e).collect();
         store.read_values(&mut refs)?;
     }
-    let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
-    let mut current: Vec<(EnvelopeMeta, StoredEnvelope)> = Vec::new();
+    let mut current: Vec<Current> = Vec::new();
     let unreadable = |p: &mut Pruned, e: &StoredEnvelope| {
         p.unreadable += 1;
+        p.format_one_left += 1;
         // Left alone, so whatever it references stays: the manifest it
         // names when that much can be read, else none is removed.
         let r = unreadable_manifest_ref(&e.bytes);
@@ -2202,10 +2619,7 @@ fn prune_by_columns(
         }
         if role == Role::Expired {
             match confirm_expired(&e, now) {
-                Ok(()) => {
-                    p.expired += 1;
-                    delete(store, dry_run, &e, "")?;
-                }
+                Ok(()) => p.expire(e),
                 Err(Left::Unreadable) => unreadable(&mut p, &e),
                 Err(Left::Unconfirmed(m)) => {
                     p.unconfirmed += 1;
@@ -2214,6 +2628,9 @@ fn prune_by_columns(
                         "vci prune: {} {}: left alone: its signed statement does not confirm the store's columns",
                         e.target, e.key
                     );
+                    if record_format(&e.bytes) == Some(1) {
+                        p.format_one_left += 1;
+                    }
                     if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
                         set.insert(r.clone());
                     }
@@ -2222,42 +2639,30 @@ fn prune_by_columns(
             continue;
         }
         match record_meta(&e.bytes) {
-            Some(m) if m.expires_at <= now => {
-                p.expired += 1;
-                delete(store, dry_run, &e, "")?;
-            }
+            Some(m) if m.expires_at <= now => p.expire(e),
             Some(m) => {
                 p.kept += 1;
-                by_unit
-                    .entry((e.test_key.clone(), e.signer.clone()))
-                    .or_default()
-                    .push((m.issued_at, e.key.clone()));
-                current.push((m, e));
+                let format = record_format(&e.bytes).unwrap_or(1);
+                current.push((m, e, format));
             }
             None => unreadable(&mut p, &e),
         }
     }
-    // The keys kept per unit and signer: the `keep` newest by the signed
-    // issue time.
-    let keep_keys = keep_newest(&mut by_unit, keep);
-    for (m, e) in current {
-        let live = m.tree.as_deref().is_some_and(|t| live_trees.contains(t));
-        if keep_keys.contains(&e.key) || live {
-            if let (Some(r), Some(set)) = (&m.manifest_ref, p.referenced.as_mut()) {
-                set.insert(r.clone());
-            }
-            if hint_doomed.contains(&e.key) {
-                p.unconfirmed += 1;
-                eprintln!(
-                    "vci prune: {} {}: left alone: its signed statement does not confirm the store's columns",
-                    e.target, e.key
-                );
-            }
-            continue;
+    // The signed statements decide; a current record the hints doomed
+    // that they keep is said so.
+    let current_keys: BTreeSet<String> = current.iter().map(|(_, e, _)| e.key.clone()).collect();
+    let before = p.doomed.len();
+    apply_rules(&mut p, current, policy, |_, e| {
+        (e.test_key.clone(), e.signer.clone())
+    });
+    let removed: BTreeSet<&String> = p.doomed[before..].iter().map(|(e, _)| &e.key).collect();
+    for (k, target) in &hint_doomed {
+        if current_keys.contains(k) && !removed.contains(k) {
+            p.unconfirmed += 1;
+            eprintln!(
+                "vci prune: {target} {k}: left alone: its signed statement does not confirm the store's columns"
+            );
         }
-        p.older += 1;
-        p.kept -= 1;
-        delete(store, dry_run, &e, " (superseded)")?;
     }
     Ok(p)
 }
@@ -2287,35 +2692,6 @@ fn confirm_expired(e: &StoredEnvelope, now: i64) -> Result<(), Left> {
     }
 }
 
-/// The keys kept per unit and signer: the `keep` newest of each list.
-fn keep_newest(
-    by_unit: &mut BTreeMap<(String, String), Vec<(i64, String)>>,
-    keep: usize,
-) -> BTreeSet<String> {
-    let mut keep_keys: BTreeSet<String> = BTreeSet::new();
-    for list in by_unit.values_mut() {
-        list.sort_by(|a, b| b.cmp(a));
-        keep_keys.extend(list.iter().take(keep).map(|(_, k)| k.clone()));
-    }
-    keep_keys
-}
-
-/// Remove `e` (or say so on a dry run), `note` after the key.
-fn delete(
-    store: &dyn AttestationStore,
-    dry_run: bool,
-    e: &StoredEnvelope,
-    note: &str,
-) -> Result<()> {
-    if dry_run {
-        println!("would remove {} {}{note}", e.target, e.key);
-    } else {
-        store.remove(vec![e.clone()])?;
-        println!("removed {} {}{note}", e.target, e.key);
-    }
-    Ok(())
-}
-
 /// The stored manifest an unreadable value names when that much of it can
 /// be read (`manifestRef` of its statement), else `None`: whatever it
 /// references must stay.
@@ -2340,13 +2716,19 @@ fn prune_manifests(
     fetch_hint: &str,
 ) -> Result<usize> {
     // One that cannot be read keeps every manifest (its base is unknown).
+    // One the store does not hold at all (2.10) has no base to keep: the
+    // attestations that reference it cannot be verified anyway (on vex one
+    // such reference kept all 24,681 manifests).
     if let Some(set) = referenced.as_mut() {
         let roots: Vec<&str> = set.iter().map(String::as_str).collect();
         let _ = store.prefetch(Prefetch::Manifests { roots: &roots });
         let mut bases = BTreeSet::new();
         for r in set.iter() {
-            let base = store
-                .manifest(r)?
+            let stored = store.manifest(r)?;
+            if stored.is_none() {
+                continue;
+            }
+            let base = stored
                 .filter(|m| m.error.is_none())
                 .map(|m| vci_core::InputManifest::compact_base(&m.bytes));
             match base {
@@ -2547,6 +2929,63 @@ impl From<vci_store_sqlite::Finish> for Done {
     }
 }
 
+/// `vci store upgrade --finish` on git-meta (since 2.10). There is no
+/// schema to move, but the migration ends as on the other backends: once
+/// every attestation is a format-3 record (by each value's first byte; one
+/// not fetched or not a record counts against it), the input manifests
+/// left go, since no format-3 record names one, and the next `vci push`
+/// publishes their removal. Refused with the count while such an
+/// attestation remains (exit 1). Every attestation not fetched yet is
+/// fetched first, as `vci prune` does.
+fn git_meta_finish(repo: &vci_git::Repo) -> Result<i32> {
+    let store = crate::store::for_repo(repo);
+    store.status()?;
+    match store.prefetch(Prefetch::Attestations) {
+        Ok(h) if h.unresolved > 0 => eprintln!(
+            "vci: warning: {} attestation value(s) could not be fetched{}",
+            h.unresolved,
+            h.error.map(|e| format!(": {e}")).unwrap_or_default()
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("vci: warning: could not fetch the attestations' values: {e:#}"),
+    }
+    let (mut one, mut unreadable) = (0usize, 0usize);
+    for e in store.read_all()? {
+        match record_format(&e.bytes) {
+            Some(3) => {}
+            Some(_) => one += 1,
+            None => unreadable += 1,
+        }
+    }
+    if one + unreadable > 0 {
+        println!(
+            "store: git-meta: not finished: {one} attestation(s) are format-1 records{}, and a reader of them needs the input manifests; once they have expired or been superseded (`vci prune`) or were attested again with `record_format = 3`, run `vci store upgrade --finish` again",
+            if unreadable > 0 {
+                format!(" and {unreadable} could not be read (run `vci fetch`)")
+            } else {
+                String::new()
+            }
+        );
+        return Ok(1);
+    }
+    let roots = store.manifest_roots()?;
+    let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+    let n = if refs.is_empty() {
+        0
+    } else {
+        store.remove_manifests(&refs)?
+    };
+    println!(
+        "store: git-meta: finished: no format-1 attestation remains; {n} input manifest(s) removed{}",
+        if n > 0 {
+            " (run `vci push` to publish their removal)"
+        } else {
+            ""
+        }
+    );
+    Ok(0)
+}
+
 /// `vci store upgrade --begin` (`begin`) and `--finish` (STORE-V2 section
 /// 5, steps 2 and 4), on the store the repository's settings select, opened
 /// as the concrete backend: the upgrade steps are the backends' own
@@ -2556,7 +2995,9 @@ impl From<vci_store_sqlite::Finish> for Done {
 /// with the count (exit 1) while an attestation that is not a format-3
 /// record remains, counted by the value's first byte on every backend,
 /// never by the `format` column; at zero it drops the input manifests and
-/// sets schema version 2. git-meta has no schema: nothing to do, exit 0.
+/// sets schema version 2. git-meta has no schema: `--begin` has nothing to
+/// do (exit 0), and `--finish` (since 2.10) counts the same way and, at
+/// zero, removes the input manifests left ([`git_meta_finish`]).
 pub fn store_upgrade(begin: bool) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let Some(sel) = crate::store::selection_of(&repo) else {
@@ -2585,10 +3026,11 @@ pub fn store_upgrade(begin: bool) -> Result<i32> {
         }
     };
     match kind {
-        "git-meta" => {
+        "git-meta" if begin => {
             println!("store: git-meta has no schema: nothing to upgrade");
             Ok(0)
         }
+        "git-meta" => git_meta_finish(&repo),
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             use vci_store_sqlite::{SqliteFactory, SqliteOptions, SqliteStore};
@@ -2849,23 +3291,249 @@ mod tests {
         assert!(matches!(confirm_expired(&e, now), Err(Left::Unreadable)));
     }
 
-    /// Of each unit and signer, the `keep` newest by issue time are kept.
+    fn cand(key: &str, issued: i64, tree: Option<&str>, format: u8) -> Cand {
+        Cand {
+            key: key.to_owned(),
+            issued,
+            tree: tree.map(str::to_owned),
+            format,
+        }
+    }
+
+    /// `decide`'s removals as (key, why), sorted by key.
+    fn decided(group: &[Cand], p: &Policy) -> Vec<(String, Why)> {
+        let mut out: Vec<(String, Why)> = decide(group, p)
+            .into_iter()
+            .map(|(i, w)| (group[i].key.clone(), w))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// On a store with columns (2.10's rules through the trait, as on
+    /// SQLite, PostgreSQL and libSQL): the key hints pick the groups to
+    /// read, and the signed statements decide. Unit a's format-3 record
+    /// made 30 days ago on a live tree goes by age, its format-1 record by
+    /// the format rule, its newest stays; unit b, two current format-3
+    /// records within the age, is kept without a value read; a record whose
+    /// hint says old but whose statement says new is left alone and said so.
+    #[test]
+    fn prune_by_columns_applies_the_age_and_format_rules() {
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let now = 100 * 86_400;
+        let day = 86_400;
+        let tree = "f".repeat(40);
+        let signer = "2".repeat(16);
+        let put = |unit: &str, sk: u8, issued_hint: i64, issued: i64, tree: Option<&str>, f: u8| {
+            let st = statement(issued, now + 30 * day, tree);
+            let (one, three) = both_formats(&st);
+            let hint = vci_store::KeyHint {
+                issued: issued_hint,
+                tree: tree.map(|t| t[..16].to_owned()),
+            };
+            let sk = format!("{sk:02x}").repeat(32);
+            let columns = vci_store::Columns {
+                format: Some(3),
+                expires: Some(now + 30 * day),
+                ..vci_store::Columns::default()
+            };
+            let value = if f == 1 { one } else { three };
+            let att = vci_store::NewAttestation::for_test(unit, &signer, &sk, Some(&hint), &value);
+            let att = if f == 3 {
+                att.with_columns(&columns)
+            } else {
+                att
+            };
+            s.put(&att).unwrap().key
+        };
+        let a_new = put("src/a.test.ts", 1, now - day, now - day, None, 3);
+        let a_old = put(
+            "src/a.test.ts",
+            2,
+            now - 30 * day,
+            now - 30 * day,
+            Some(&tree),
+            3,
+        );
+        let a_one = put("src/a.test.ts", 3, now - 2 * day, now - 2 * day, None, 1);
+        let b_1 = put("src/b.test.ts", 4, now - day, now - day, None, 3);
+        let b_2 = put("src/b.test.ts", 5, now - 2 * day, now - 2 * day, None, 3);
+        // Unit c: the hint says 40 days old, the statement says a day.
+        let c_new = put("src/c.test.ts", 6, now, now, None, 3);
+        let c_lying = put("src/c.test.ts", 7, now - 40 * day, now - day, None, 3);
+        let mut policy = Policy {
+            keep: 2,
+            aged_before: Some(now - 14 * day),
+            format_rule: true,
+            ..Policy::default()
+        };
+        policy.live_trees.insert(tree.clone());
+        let p = prune_by_columns(&s, &policy, now).unwrap();
+        let mut doomed: Vec<(String, &str)> =
+            p.doomed.iter().map(|(e, n)| (e.key.clone(), *n)).collect();
+        doomed.sort();
+        let mut want = vec![
+            (a_old.clone(), Why::Aged.note()),
+            (a_one.clone(), Why::FormatOne.note()),
+        ];
+        want.sort();
+        assert_eq!(doomed, want);
+        assert_eq!((p.aged, p.format_one, p.older, p.expired), (1, 1, 0, 0));
+        assert_eq!(p.format_one_left, 0);
+        assert_eq!(p.unconfirmed, 1, "c's lying hint");
+        assert_eq!(p.kept, 5, "a_new, b_1, b_2, c_new, c_lying");
+        for k in [&a_new, &b_1, &b_2, &c_new, &c_lying] {
+            assert!(s.keys().contains(k), "nothing removed yet: {k}");
+        }
+        // Without the age limit only the format rule removes.
+        policy.aged_before = None;
+        let p = prune_by_columns(&s, &policy, now).unwrap();
+        assert_eq!((p.aged, p.format_one, p.older), (0, 1, 0));
+        // A plan of the checked-out commit used a's format-1 record.
+        policy.used.insert(a_one.clone());
+        let p = prune_by_columns(&s, &policy, now).unwrap();
+        assert_eq!((p.format_one, p.format_one_left), (0, 1));
+    }
+
+    /// Of each unit and signer, the `keep` newest by issue time are kept,
+    /// and one made on a tree some ref has at its tip.
     #[test]
     fn keep_newest_keeps_the_latest_issued() {
-        let mut by_unit: BTreeMap<(String, String), Vec<(i64, String)>> = BTreeMap::new();
-        by_unit.insert(
-            ("u".into(), "s".into()),
-            vec![(1, "k1".into()), (3, "k3".into()), (2, "k2".into())],
-        );
-        by_unit.insert(("v".into(), "s".into()), vec![(5, "k5".into())]);
-        let kept = keep_newest(&mut by_unit, 2);
+        let g = [
+            cand("k1", 1, None, 3),
+            cand("k3", 3, None, 3),
+            cand("k2", 2, None, 3),
+        ];
+        let mut p = Policy {
+            keep: 2,
+            ..Policy::default()
+        };
+        assert_eq!(decided(&g, &p), [("k1".to_owned(), Why::Superseded)]);
+        p.keep = 1;
         assert_eq!(
-            kept,
-            ["k2", "k3", "k5"].into_iter().map(String::from).collect()
+            decided(&g, &p),
+            [
+                ("k1".to_owned(), Why::Superseded),
+                ("k2".to_owned(), Why::Superseded)
+            ]
         );
+        p.live_trees.insert("t".to_owned());
+        let g = [cand("k1", 1, Some("t"), 3), cand("k3", 3, None, 3)];
+        assert!(decided(&g, &p).is_empty(), "on a live tree");
+        // Equal issue times: the larger key is the newer.
+        let g = [cand("a", 5, None, 3), cand("b", 5, None, 3)];
+        assert_eq!(decided(&g, &p), [("a".to_owned(), Why::Superseded)]);
+    }
+
+    /// The age limit (2.10) removes what is older than it whatever tree it
+    /// was made on, never the unit's newest, never what a plan of the
+    /// checked-out commit used; within it, `keep` and the live trees decide.
+    #[test]
+    fn the_age_limit_spares_the_newest_and_what_the_plan_used() {
+        let mut p = Policy {
+            keep: 2,
+            aged_before: Some(100),
+            ..Policy::default()
+        };
+        p.live_trees.insert("t".to_owned());
+        // Every one old: only the newest stays.
+        let g = [
+            cand("old1", 10, Some("t"), 3),
+            cand("old2", 20, None, 3),
+            cand("old3", 30, Some("t"), 3),
+        ];
         assert_eq!(
-            keep_newest(&mut by_unit, 1),
-            ["k3", "k5"].into_iter().map(String::from).collect()
+            decided(&g, &p),
+            [
+                ("old1".to_owned(), Why::Aged),
+                ("old2".to_owned(), Why::Aged)
+            ]
+        );
+        // One a plan of the checked-out commit used stays, and counts as
+        // kept.
+        p.used.insert("old1".to_owned());
+        assert_eq!(decided(&g, &p), [("old2".to_owned(), Why::Aged)]);
+        p.used.clear();
+        // Mixed: within the age, keep 2 and the live tree.
+        let g = [
+            cand("new1", 400, None, 3),
+            cand("new2", 300, None, 3),
+            cand("new3", 200, Some("t"), 3),
+            cand("new4", 150, None, 3),
+            cand("old", 50, Some("t"), 3),
+        ];
+        assert_eq!(
+            decided(&g, &p),
+            [
+                ("new4".to_owned(), Why::Superseded),
+                ("old".to_owned(), Why::Aged)
+            ]
+        );
+        // No age limit: as before 2.10.
+        p.aged_before = None;
+        assert_eq!(decided(&g, &p), [("new4".to_owned(), Why::Superseded)]);
+    }
+
+    /// Once a unit and signer has a format-3 record, its format-1 ones
+    /// issued before it go, even on a live tree, unless a plan of the
+    /// checked-out commit used them or the rule is off (`record_format =
+    /// 1`); a format-1 record issued after the newest format-3 one (a writer
+    /// still on format 1) is ranked with the rest, as are the format-1 ones
+    /// of a unit without a format-3 record.
+    #[test]
+    fn format_one_records_older_than_a_format_three_one_go() {
+        let mut p = Policy {
+            keep: 2,
+            format_rule: true,
+            ..Policy::default()
+        };
+        p.live_trees.insert("t".to_owned());
+        let g = [
+            cand("f3", 30, None, 3),
+            cand("f1a", 20, Some("t"), 1),
+            cand("f1b", 10, None, 1),
+        ];
+        assert_eq!(
+            decided(&g, &p),
+            [
+                ("f1a".to_owned(), Why::FormatOne),
+                ("f1b".to_owned(), Why::FormatOne)
+            ]
+        );
+        p.used.insert("f1a".to_owned());
+        assert_eq!(decided(&g, &p), [("f1b".to_owned(), Why::FormatOne)]);
+        p.used.clear();
+        p.format_rule = false;
+        assert_eq!(decided(&g, &p), [("f1b".to_owned(), Why::Superseded)]);
+        p.format_rule = true;
+        // A format-1 record newer than the format-3 one: ranked as before
+        // (the newest stays), the older format-1 one goes.
+        let g = [
+            cand("f1new", 30, None, 1),
+            cand("f3", 20, None, 3),
+            cand("f1old", 10, None, 1),
+        ];
+        assert_eq!(decided(&g, &p), [("f1old".to_owned(), Why::FormatOne)]);
+        // Format 1 only: ranked as before.
+        let g = [
+            cand("a", 30, None, 1),
+            cand("b", 20, None, 1),
+            cand("c", 10, None, 1),
+        ];
+        assert_eq!(decided(&g, &p), [("c".to_owned(), Why::Superseded)]);
+        // The format-1 records removed do not count towards `keep`.
+        let g = [
+            cand("a", 40, None, 3),
+            cand("f1", 35, None, 1),
+            cand("b", 30, None, 3),
+            cand("c", 20, None, 3),
+        ];
+        assert_eq!(
+            decided(&g, &p),
+            [
+                ("c".to_owned(), Why::Superseded),
+                ("f1".to_owned(), Why::FormatOne)
+            ]
         );
     }
 

@@ -795,6 +795,13 @@ every record while the store holds an input manifest, since a 2.8 writer may hav
 frame's columns), deletes an expired one only when its signed `expiresAt` has passed and orders a unit's records by
 their signed `issuedAt` and `tree`, counting a record the hints doomed and the statements keep as unconfirmed and
 left alone; then the unreferenced objects and the aged state objects (`--objects`, `--older-than DAYS`).
+Since 2.10 one decision per unit and signer (cmds.rs `decide`, on signed values only) also removes the format-1
+records issued before the group's newest format-3 one (not under `record_format = 1`) and, but the group's newest, the records
+issued more than `[store] max_age_days` ago whatever their tree, and keeps whatever a plan of the checked-out
+commit's tree remembered passing (only expiry and `--superseded` remove it); a referenced manifest the store does
+not hold keeps no other manifest. On git-meta it then drops the deletion records older than `[store]
+deletion_records_hours`, publishes the store as one commit past `[store] history_max_commits`, and
+`AttestationStore::compact` frees the local file's pages (git-meta, SQLite, libSQL's local file).
 
 A clone deletes a manifest knowing only its own attestations, so another clone may hold or have published one that
 references it. Every merge of a fetched tip (`vci fetch`, `vci push`, `--fetch`) puts back the manifests it leaves

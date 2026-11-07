@@ -1809,3 +1809,49 @@ fn an_object_removal_in_a_batch_is_applied_at_once() {
     batch.finish().unwrap();
     assert_eq!(ids_of(&other.get_objects(&all).unwrap()), new.id_refs());
 }
+
+/// `compact` (2.10, after `vci prune`'s removals) leaves a file with few
+/// free pages alone, and gives back the pages of a large removal: the
+/// first time with the `VACUUM` that turns the file's incremental mode on,
+/// the next with `PRAGMA incremental_vacuum`; what is left reads as
+/// before. A file that does not exist is not created.
+#[test]
+fn compact_frees_the_pages_of_a_large_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(dir.path());
+    let s = store(dir.path());
+    assert_eq!(s.compact().unwrap(), None);
+    assert!(!path.exists(), "not created");
+    let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+    let mode = |p: &Path| -> i64 {
+        raw(p)
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap()
+    };
+    for round in 0..2u8 {
+        // About 24 MiB of attestations, then all but one removed.
+        let mut doomed = Vec::new();
+        for i in 0..48u8 {
+            let e = put(
+                &s,
+                A,
+                S1,
+                &hex64(round * 100 + i + 1),
+                Some(&hint(1_000 + i64::from(i), Some(TREE1))),
+                &envelope(None, 512 * 1024),
+            );
+            doomed.push(e);
+        }
+        let keep = doomed.pop().unwrap();
+        assert_eq!(s.compact().unwrap(), None, "nothing free yet");
+        assert_eq!(s.remove(doomed).unwrap().len(), 47);
+        let (from, to) = s.compact().unwrap().expect("compacted");
+        assert!(to < from / 4, "round {round}: {from} -> {to}");
+        assert!(size(&path) < from / 4, "round {round}: {}", size(&path));
+        assert_eq!(mode(&path), 2, "incremental from the first compaction on");
+        assert_eq!(s.compact().unwrap(), None, "nothing left to free");
+        let left = read_unit(&s, A);
+        assert!(left.iter().any(|e| e.key == keep.key && e.error.is_none()));
+        assert_eq!(left.len(), usize::from(round) + 1);
+    }
+}
