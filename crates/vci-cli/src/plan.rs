@@ -5254,13 +5254,34 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
             // Single project: files relative to the project dir (what the
             // runner takes). Several projects: repo-relative test ids, plus
             // `run_<name>=` per project with project-relative files.
-            // Every name and reason [`printable`]: a control character in
-            // one cannot end the line of an output or a workflow command.
-            let name = |f: &FileVerdict| {
-                printable(if res.multi { &f.test_id } else { &f.file }).into_owned()
-            };
-            let run: Vec<String> = res.to_run().map(name).collect();
-            let skip: Vec<String> = res.skipped().map(name).collect();
+            // The file lists are data for the runner: names as they are
+            // (2.10's first cut escaped them, and a runner given
+            // `src/t\tab.test.ts` found no such file and ran the others
+            // only). A line break alone would end an output's line, and no
+            // escaped form of it names the file: a file to run whose name
+            // holds one runs everything instead (`run_all`, with a
+            // warning), and a skipped one is left out of `skip=` (which
+            // runs it, for a workflow that runs what is not skipped). The
+            // notices' and warnings' text is [`printable`] (see
+            // [`github_data`]).
+            let breaks = |s: &str| s.contains(['\n', '\r']);
+            fn name(multi: bool, f: &FileVerdict) -> &str {
+                if multi { &f.test_id } else { &f.file }
+            }
+            let unlisted: Vec<&FileVerdict> = res
+                .to_run()
+                .filter(|f| breaks(name(res.multi, f)))
+                .collect();
+            let run: Vec<&str> = res
+                .to_run()
+                .map(|f| name(res.multi, f))
+                .filter(|n| !breaks(n))
+                .collect();
+            let skip: Vec<&str> = res
+                .skipped()
+                .map(|f| name(res.multi, f))
+                .filter(|n| !breaks(n))
+                .collect();
             for f in res.skipped() {
                 println!(
                     "::notice title=vci skip::{}",
@@ -5273,23 +5294,35 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
                     github_data(&format!("running everything: {r}"))
                 );
             }
+            if let Some(first) = unlisted.first() {
+                println!(
+                    "::warning title=vci::{}",
+                    github_data(&format!(
+                        "running everything: {} test file(s) to run have a line break in their name, which an output line cannot hold (first: {})",
+                        unlisted.len(),
+                        first.test_id
+                    ))
+                );
+            }
             let mut lines = format!(
                 "run_all={}\nrun={}\nskip={}\n",
-                res.run_all.is_some(),
+                res.run_all.is_some() || !unlisted.is_empty(),
                 run.join(" "),
                 skip.join(" ")
             );
             if res.multi {
                 for (i, p) in res.projects.iter().enumerate() {
-                    let files: Vec<String> = res
+                    let files: Vec<&str> = res
                         .to_run()
                         .filter(|f| f.project_idx == i)
-                        .map(|f| printable(&f.file).into_owned())
+                        .map(|f| f.file.as_str())
                         .collect();
+                    let all = p.run_all.is_some() || files.iter().any(|f| breaks(f));
+                    let files: Vec<&str> = files.into_iter().filter(|f| !breaks(f)).collect();
                     lines.push_str(&format!(
                         "run_all_{0}={1}\nrun_{0}={2}\n",
                         printable(&p.name),
-                        p.run_all.is_some(),
+                        all,
                         files.join(" ")
                     ));
                 }

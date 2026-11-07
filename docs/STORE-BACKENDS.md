@@ -2241,11 +2241,19 @@ and not 24: on vex on 6 November 2026, 145,306 of the tree's 148,423 attestation
 old and 22,897 under six hours (each run supersedes the last one's attestations, most within hours of their issue); a
 record only stops a clone whose history does not reach the deletion from publishing the value again, and such a value
 (superseded, expired, aged out, unreferenced) is deleted again by the next prune. The merge without a common ancestor
-(`merge_from_paths`, after a rewrite) is three-way on the tip this clone last fetched (`rewritten_base`): the
-tracking ref as `fetch_named` read it before `git fetch` force-updated it, else the tip the store last materialized
-(the `materialized` marker, which a fetch killed between its `git fetch` and its merge leaves behind), the first that
-`refs/meta/local/main` contains and whose tree is here, when the root of the tip's history is a `vci: metadata
-history rewritten` commit. The rewrite published a tree that descends from every tip before it, so a value the clone
+(`merge_from_paths`, after a rewrite) is three-way on the newest tip this clone had (`rewritten_base`), when the
+root of the tip's history is a `vci: metadata history rewritten` commit, and whose tree is here: that root itself
+when its `Rewrite-of: <commit>` trailer (2.10, `orphan_commit`) names a commit `refs/meta/local/main` contains and
+whose tree it has (the clone's own rewrite, killed after `git push` landed and before the local ref moved to it);
+else the first that `refs/meta/local/main` contains, or that is such a rewrite, of the tracking ref as `fetch_named`
+read it before `git fetch` force-updated it, the tips earlier fetches noted before their `git fetch` moved it and
+whose merge did not finish (`vci-materialized-<ref>.unmerged`, newest first, removed once a merge or push finishes),
+then the `materialized` marker (the tip last merged, or since 2.10 the commit the last push published, written once
+the local ref is that commit). (`git push` itself moves the tracking ref through the remote's fetch refspec, and a
+process killed before vci finishes leaves it at a tip nothing was merged with; before 2.10's fixes the marker named
+the tip before the clone's last push, and that push's values then counted as the clone's own additions.) A tree equal
+to the tree of a commit in the local history is not taken as a base: a value added and deleted again, its record
+dropped, makes a tree an older commit had. The rewrite published a tree that descends from every tip before it, so a value the clone
 got from its last fetched tip that the new tip lacks was deleted there (git-meta's three-way merge deletes it; the
 values the clone added since are kept), and the fetch notes `<remote>'s metadata history was rewritten since this
 clone last fetched it: merged it on the tip this clone last fetched (<id>), so the N value(s) deleted there since are
@@ -2258,7 +2266,10 @@ blob is fetched when missing; a row put since, or an object put again, which mov
 value; before, a manifest or object always kept the local side and such a clone published every one the rewrite's
 prune had deleted). With the attestation rule alone, every restore of a CI cache saved before a rewrite published
 again every value deleted since whose record had passed the window (`store_rewrite_stale_cache.rs` without the base:
-3 of 3 jobs restoring one cache).
+3 of 3 jobs restoring one cache). Whatever the base, a merge commit whose tree holds both a value and the deletion
+record of its key drops the value where the record is newer (`settle_value_and_record`): an attestation key's always,
+a manifest's or object's by `deleted_after_written`; not a key the fetched tip itself holds both of (the push's check
+would put the value back), and no other key.
 `crates/vci-git/tests/store_history_rewrite.rs` (7 tests) holds it: a clone holding the history before a rewrite
 and the deleted attestation's value pushes one commit on top of the new history without that attestation, while a
 third clone's push in the rewrite's window makes its lease fail and is kept by its next round; a value whose record
@@ -2267,6 +2278,10 @@ attestation and its addition in the rewrite's window all kept, and the local met
 once published; two clones that both find the history long rewrite it once, and a clone that fetched before the
 rewrite pushes on top of it; a stale deletion record of a state object and a manifest put again does not delete them;
 without a base, a manifest or object written before the tip's record goes and one written after stays.
+`store_rewrite_killed.rs` (8 tests) kills a fetch after `git fetch` and a push or rewrite after `git push` (the
+`fetch-after-git-fetch` and `push-after-git-push` failpoints) and checks that nothing deleted since comes back, from
+the clone or from a cache saved in that state, and that a merged tree keeps the record, not the value;
+`store_ref_damage.rs` (2 tests) a local or tracking ref naming a commit the clone lacks.
 `store_rewrite_stale_cache.rs` (4 tests)
 restores one pre-rewrite cache three times (none brings the deleted value back, without a rewrite or with one, and
 with a cache saved mid-fetch), and keeps every value of a clone that never fetched; `store_deletion_records_unpublished.rs`

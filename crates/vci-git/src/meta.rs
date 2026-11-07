@@ -218,6 +218,12 @@ const SESSION_LOCK: &str = "git-meta.sqlite.vci-lock";
 const EXCHANGE_LOCK: &str = "git-meta.vci-exchange.lock";
 /// The files recording the tip each tracking ref last materialized.
 const MATERIALIZED_PREFIX: &str = "vci-materialized-";
+/// Beside a tracking ref's marker (the same name, this suffix): the tips
+/// the ref had before a `git fetch` moved it, while no fetch since has
+/// finished its merge (see [`AttestStore::fetch_named`]).
+const UNMERGED_SUFFIX: &str = ".unmerged";
+/// How many such tips are kept, newest first.
+const UNMERGED_TIPS_MAX: usize = 16;
 /// git-meta's history-index checkpoint (its `index_state`), in the git
 /// directory of the repository a session opens.
 const INDEX_STATE_FILE: &str = "git-meta-index.json";
@@ -239,6 +245,11 @@ const ABSENT_REF: &str = "";
 ///   returned, before vci checked the commit it wrote (2.10: before, the
 ///   local metadata commit was already git-meta's there, unchecked, as it
 ///   was left on vex on 6 November 2026 with 4,484 shared values dropped).
+/// * `fetch-after-git-fetch`: right after a fetch's `git fetch` moved the
+///   tracking ref, before anything was merged.
+/// * `push-after-git-push`: right after a push landed, before vci moved
+///   the local metadata commit or the tracking ref (git's push already
+///   moved the tracking ref, which the remote's fetch refspec maps).
 fn failpoint(name: &str) {
     if std::env::var_os("VCI_FAILPOINT").is_some_and(|v| v == name) {
         eprintln!("vci: failpoint {name}: killing this process");
@@ -246,6 +257,32 @@ fn failpoint(name: &str) {
             .args(["-KILL", &std::process::id().to_string()])
             .status();
         std::process::abort();
+    }
+}
+
+/// The commit ids `path` lists, one a line (none when it is missing or
+/// unreadable).
+fn read_tips(path: &Utf8Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| is_oid(l))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write `tips` to `path`, one a line, through a file renamed over it (a
+/// process killed meanwhile leaves the old list or the new one). Best
+/// effort, as the marker always was: a store whose directory cannot be
+/// written still fetches.
+fn write_tips(path: &Utf8Path, tips: &[String]) {
+    let tmp = Utf8PathBuf::from(format!("{path}.tmp"));
+    let body: String = tips.iter().map(|t| format!("{t}\n")).collect();
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1806,6 +1843,9 @@ const DELETION_RECORDS_KEEP_SECS: i64 = 6 * 60 * 60;
 /// The message of the commit without parents `vci push --rewrite-history`
 /// publishes (see [`AttestStore::rewritten_base`]).
 const REWRITE_MESSAGE: &str = "vci: metadata history rewritten (vci push --rewrite-history)";
+/// The trailer of such a commit naming the local metadata commit whose tree
+/// it publishes (2.10, see [`AttestStore::rewritten_base`]).
+const REWRITE_SOURCE: &str = "Rewrite-of";
 /// How many deletion records past the window make a push drop them (`vci
 /// prune` drops any); `VCI_DELETION_RECORDS_DROP_AT`. 20,000 until 2.9.
 const DELETION_RECORDS_DROP_AT: i64 = 2_000;
@@ -3926,6 +3966,17 @@ impl<'a> AttestStore<'a> {
              CREATE TRIGGER IF NOT EXISTS vci_cover_other_records AFTER DELETE ON tombstones
                WHEN OLD.tombstone_type != 'metadata'
                BEGIN DELETE FROM vci_cover; END;",
+        )?;
+        // 2.10: a dropped deletion record is forgotten here by its key, one
+        // statement per record; without an index each one scanned the rows
+        // the same merge's deletions had just noted. The first fetch of a
+        // CI cache saved before `vci prune` rewrote vex's history deleted
+        // 23,300 values and dropped 103,700 records: 190 s of a 224 s
+        // fetch (37 s with the index). Last, so a store that cannot take it
+        // still has the triggers.
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS vci_cover_gone_key
+               ON vci_cover_gone (target_type, target_value, key);",
         )
     }
 
@@ -4982,6 +5033,12 @@ impl<'a> AttestStore<'a> {
             .join(format!("{MATERIALIZED_PREFIX}{name}")))
     }
 
+    /// The file listing the tips noted before fetches that did not finish
+    /// their merge, beside `marker` (see [`UNMERGED_SUFFIX`]).
+    fn unmerged_tips_file(marker: &Utf8Path) -> Utf8PathBuf {
+        Utf8PathBuf::from(format!("{marker}{UNMERGED_SUFFIX}"))
+    }
+
     fn tracking_ref(&self, name: &str, ns: &str) -> Result<String, GitError> {
         let side = self.remotes()?.iter().any(|r| r.0 == name && r.2 && r.3);
         Ok(if side {
@@ -5005,6 +5062,64 @@ impl<'a> AttestStore<'a> {
             return Ok(None);
         }
         Err(command_error(&describe, &out))
+    }
+
+    /// Delete each of `refnames` that names an object this clone lacks (or
+    /// one that is not a commit), with a warning (2.10).
+    ///
+    /// Such a ref (a CI cache restored with its refs but not every object
+    /// they name, a copy made by hand) failed every `git fetch` (git checks
+    /// every ref: `fatal: bad object refs/meta/local/main`) and every
+    /// serialization, so the clone could neither fetch nor push until the
+    /// ref was removed by hand. The store holds the values: without the
+    /// local ref, the next serialization writes the whole store as a new
+    /// local metadata commit, merged with the remote's tip as any local
+    /// history is; without the tracking ref, the fetch takes the remote's
+    /// tip again. One `git cat-file` for all of them when they are fine.
+    fn drop_unreadable_refs(&self, refnames: &[&str], report: &mut Report) -> Result<(), GitError> {
+        let input: String = refnames.iter().map(|r| format!("{r}\n")).collect();
+        let out = self
+            .repo
+            .git()
+            .args(["cat-file", "--batch-check=%(objecttype)"])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_with_stdin(input.as_bytes())?;
+        let types: Vec<String> = String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for (i, refname) in refnames.iter().enumerate() {
+            if types.get(i).map(String::as_str) == Some("commit") {
+                continue;
+            }
+            // Missing (no such ref, or its object is not here), or not a
+            // commit: the ref's own value, when there is one.
+            let (_, raw) = self
+                .repo
+                .git()
+                .args(["rev-parse", "--verify", "--quiet", refname])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .output_described()?;
+            if !raw.status.success() {
+                continue;
+            }
+            let Ok(named) = parse_oid(&raw.stdout) else {
+                continue;
+            };
+            if self.read_ref(refname)?.is_some() {
+                continue;
+            }
+            self.cas_ref(
+                refname,
+                None,
+                &named,
+                "vci: drop a ref naming an object this clone lacks",
+            )?;
+            report.warn(format!(
+                "{refname} named {named}, which this clone does not have (a cache restored without it?): deleted it, as every fetch and push failed on it"
+            ));
+        }
+        Ok(())
     }
 
     /// Point `refname` at `new` if it still points at `old` (`None`: delete).
@@ -6757,6 +6872,15 @@ impl<'a> AttestStore<'a> {
         let remote_ref = format!("refs/{ns}/main");
         let local_ref = format!("refs/{ns}/local/main");
         let tracking = self.tracking_ref(name, &ns)?;
+        // A ref naming a commit this clone lacks fails every `git fetch`
+        // (see [`AttestStore::drop_unreadable_refs`]).
+        self.drop_unreadable_refs(&[&local_ref, &tracking], report)?;
+        // git-meta imports a side remote's values as rows of their own
+        // (never serialized, the local ref left alone), not as a merge.
+        let side = self
+            .remotes()?
+            .iter()
+            .any(|r| r.3 && tracking == format!("refs/{ns}/remotes/{}/main", r.0));
         // Commits and trees only (a tree's paths are its keys): values are
         // fetched when read (see the module docs). The first fetch of the
         // tracking ref takes the commits alone (`tree:0`) and then the tip's
@@ -6770,6 +6894,42 @@ impl<'a> AttestStore<'a> {
         // rewritten history (see [`AttestStore::rewritten_base`]).
         let fetched_before = self.read_ref(&tracking)?;
         let first = fetched_before.is_none();
+        // A tip materialized into this store last time needs no listing
+        // (1.7 s for vex's 200k entries, on every plan): it was clean, or
+        // the marker would name the sanitized commit made on top of it. It
+        // is listed below when the merge runs after all. (2.10: also the
+        // commit this clone's last push published, see `push_impl`.)
+        let marker = self.materialized_marker(&tracking)?;
+        let previous = std::fs::read_to_string(&marker)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| is_oid(s));
+        // 2.10: the tips this clone had before a `git fetch` moved the
+        // tracking ref, while no fetch since finished its merge, newest
+        // first; noted before this one's `git fetch` moves it again. The
+        // marker says what the last finished fetch or push had; a fetch
+        // killed (or failing) between its `git fetch` and the end of its
+        // merge leaves the tracking ref at a tip nothing here was merged
+        // with, and when that tip was a rewritten history, the tip before
+        // it (this clone's own last push, say) was known nowhere else: the
+        // next merge took an older base, and what this clone had pushed
+        // since looked like its own additions, published again after
+        // another clone deleted them.
+        let unmerged_file = Self::unmerged_tips_file(&marker);
+        let mut unmerged = if side {
+            Vec::new()
+        } else {
+            read_tips(&unmerged_file)
+        };
+        if !side
+            && let Some(before) = &fetched_before
+            && previous.as_ref() != Some(before)
+            && !unmerged.contains(before)
+        {
+            unmerged.insert(0, before.clone());
+            unmerged.truncate(UNMERGED_TIPS_MAX);
+            write_tips(&unmerged_file, &unmerged);
+        }
         let refspec = format!("+{remote_ref}:{tracking}");
         // One round trip: fetch the ref, and read "not there yet" from git's
         // own error (an `ls-remote` first would be a second round trip, about
@@ -6826,6 +6986,7 @@ impl<'a> AttestStore<'a> {
             Err(e) => return Err(e),
         };
         step("git fetch (commits and trees)", t);
+        failpoint("fetch-after-git-fetch");
         if found && let Some(tip) = self.read_ref(&tracking)? {
             let t = std::time::Instant::now();
             self.complete_tree(name, &tip)?;
@@ -6842,15 +7003,6 @@ impl<'a> AttestStore<'a> {
         let mut session = self.session()?;
         let mut remote_deleted = BTreeSet::new();
         let mut tip_snap: Option<KeySnapshot> = None;
-        // A tip materialized into this store last time needs no listing
-        // (1.7 s for vex's 200k entries, on every plan): it was clean, or
-        // the marker would name the sanitized commit made on top of it. It
-        // is listed below when the merge runs after all.
-        let marker = self.materialized_marker(&tracking)?;
-        let previous = std::fs::read_to_string(&marker)
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| is_oid(s));
         let raw_tip = if found {
             self.read_ref(&tracking)?
         } else {
@@ -6934,7 +7086,7 @@ impl<'a> AttestStore<'a> {
         let t = std::time::Instant::now();
         self.serialize_checked(&session, &local_ref)?;
         step("serialize the local metadata", t);
-        // Materializing is skipped when the fetched tip is the one
+        // Materializing a side remote's tip is skipped when it is the one
         // materialized into this store last time (and nothing had to be
         // restored into the store, which would mean it is not that store any
         // more).
@@ -6954,16 +7106,18 @@ impl<'a> AttestStore<'a> {
             }
             _ => false,
         };
-        // git-meta imports a side remote's values as rows of their own
-        // (never serialized, the local ref left alone), not as a merge.
-        let side = self
-            .remotes()?
-            .iter()
-            .any(|r| r.3 && tracking == format!("refs/{ns}/remotes/{}/main", r.0));
-        let materialized = (descends && !side)
-            || tip_now
+        // (2.10: the primary remote's only when the local commit descends
+        // from it. The marker alone also skipped it when the local commit no
+        // longer did, a local ref deleted and serialized again, say, and
+        // every push then refused: "does not contain ... after
+        // materializing".)
+        let materialized = if side {
+            tip_now
                 .as_deref()
-                .is_some_and(|tip| restored == 0 && previous.as_deref() == Some(tip));
+                .is_some_and(|tip| restored == 0 && previous.as_deref() == Some(tip))
+        } else {
+            descends
+        };
         if found && !materialized {
             if tip_snap.is_none()
                 && let Some(tip) = &tip_now
@@ -7013,19 +7167,21 @@ impl<'a> AttestStore<'a> {
             // imports side remotes and is the fallback for anything else.
             // `VCI_MATERIALIZE=full` (tests): git-meta's merge, every value
             // fetched and read, to compare with.
-            // The tips this clone last had from the remote, newest first: a
-            // merge with a history rewritten since then takes the first one
-            // its local commit contains as the base.
-            let last_fetched: Vec<String> =
-                fetched_before
-                    .iter()
-                    .chain(previous.iter())
-                    .fold(Vec::new(), |mut v, c| {
-                        if !v.contains(c) {
-                            v.push(c.clone());
-                        }
-                        v
-                    });
+            // The tips this clone last had from the remote, newest first
+            // (the tracking ref before this fetch, those noted before
+            // fetches that did not finish, the marker): a merge with a
+            // history rewritten since then takes the first one its local
+            // commit has as the base (see [`AttestStore::rewritten_base`]).
+            let last_fetched: Vec<String> = fetched_before
+                .iter()
+                .chain(unmerged.iter())
+                .chain(previous.iter())
+                .fold(Vec::new(), |mut v, c| {
+                    if !v.contains(c) {
+                        v.push(c.clone());
+                    }
+                    v
+                });
             let lazy = match (&tip_now, &tip_snap) {
                 (Some(tip), Some(snap)) if !side && !full => match self.materialize_lazy(
                     &session,
@@ -7165,7 +7321,22 @@ impl<'a> AttestStore<'a> {
                 ));
             }
             if let Some(tip) = &tip_now {
-                let _ = std::fs::write(&marker, format!("{tip}\n"));
+                write_tips(&marker, std::slice::from_ref(tip));
+                let _ = std::fs::remove_file(&unmerged_file);
+            }
+        } else if found
+            && !side
+            && let Some(tip) = &tip_now
+        {
+            // Nothing to merge: the local commit contains the tip, which is
+            // then the newest tip this store has (2.10: noted, so that a
+            // later merge with a rewritten history takes it as the base
+            // even when a fetch is killed before then).
+            if descends && previous.as_ref() != Some(tip) {
+                write_tips(&marker, std::slice::from_ref(tip));
+            }
+            if !unmerged.is_empty() {
+                let _ = std::fs::remove_file(&unmerged_file);
             }
         }
         // 2.10: values of the fetched tip the local metadata commit lost
@@ -7773,7 +7944,7 @@ impl<'a> AttestStore<'a> {
         // The tip this clone last fetched, when the merge took it as the
         // base of a rewritten history.
         let mut rebased: Option<String> = None;
-        let (from_tree, to_commit, merged) = match &local {
+        let (from_tree, mut to_commit, merged) = match &local {
             None if !tip_snap.others.is_empty() => {
                 return fallback(set_or_list(&tip_snap.others[0]));
             }
@@ -7797,8 +7968,18 @@ impl<'a> AttestStore<'a> {
         };
         part(if merged { "merge commit" } else { "base" });
         let merged_snap;
+        // How many values the merge left out for their deletion records.
+        let mut settled = 0;
         let to_snap = if merged {
-            merged_snap = self.snapshot_keys(&to_commit)?;
+            let mut snap = self.snapshot_keys(&to_commit)?;
+            if let Some((commit, n)) =
+                self.settle_value_and_record(remote, &to_commit, &snap, tip_snap)?
+            {
+                settled = n;
+                to_commit = commit;
+                snap = self.snapshot_keys(&to_commit)?;
+            }
+            merged_snap = snap;
             &merged_snap
         } else {
             tip_snap
@@ -7955,6 +8136,11 @@ impl<'a> AttestStore<'a> {
                 .filter(|k| !to_snap.tombstones.contains(*k) && parse_key(&k.key).is_some())
                 .count()
         };
+        if settled > 0 {
+            report.note(format!(
+                "the merge held both a value and a deletion record of {settled} key(s); the record, the newer change, was kept"
+            ));
+        }
         if let Some(base) = &rebased {
             report.note(format!(
                 "{remote}'s metadata history was rewritten since this clone last fetched it: merged it on the tip this clone last fetched ({}), so the {} value(s) deleted there since are deleted here too",
@@ -8263,6 +8449,81 @@ impl<'a> AttestStore<'a> {
         Ok(Ok((parse_oid(&git.run()?)?, rebased)))
     }
 
+    /// The merge commit `merged` (whose tree `snap` lists; `tip_snap`, the
+    /// fetched tip's) without the values whose deletion record its tree
+    /// also holds where the record is the newer change, and how many it
+    /// left out; `None` when there are none (2.10).
+    ///
+    /// An attestation's record always is: its key is never written twice
+    /// (its storage key is the digest of what was signed, its hint the
+    /// issue time), so the record was written after the value. A
+    /// manifest's or an object's (keyed by content: a later run may put it
+    /// again) when the store's row was written no later than the record
+    /// (see [`AttestStore::deleted_after_written`]). Any other key, and a
+    /// key the tip itself holds both of (published so by an older client;
+    /// the push's check would put the value back), keep the value, as
+    /// git-meta's parse does.
+    ///
+    /// A merge on a base older than what this clone last had from the
+    /// remote (its last push lost to a kill, say) takes what it had since
+    /// for its own additions, and the tip's records of them for the tip's:
+    /// the merged tree held both, the value won, and the push published
+    /// again what another clone had deleted (or undid this clone's own
+    /// deletion of a value the tip held).
+    fn settle_value_and_record(
+        &self,
+        remote: &str,
+        merged: &str,
+        snap: &KeySnapshot,
+        tip_snap: &KeySnapshot,
+    ) -> Result<Option<(String, usize)>, GitError> {
+        let mut drop: Vec<&Key> = Vec::new();
+        let mut content: BTreeMap<&Key, &String> = BTreeMap::new();
+        for (k, record) in &snap.tombstone_blobs {
+            if !snap.values.contains(k)
+                || (tip_snap.values.contains(k) && tip_snap.tombstones.contains(k))
+            {
+                continue;
+            }
+            if parse_key(&k.key).is_some() {
+                drop.push(k);
+            } else if k.target_type == TargetType::Project
+                && (parse_manifest_key(&k.key).is_some() || parse_object_key(&k.key).is_some())
+            {
+                content.insert(k, record);
+            }
+        }
+        drop.extend(self.deleted_after_written(remote, &content)?);
+        if drop.is_empty() {
+            return Ok(None);
+        }
+        let mut removed = Vec::with_capacity(drop.len());
+        for k in &drop {
+            let Ok(p) = git_meta_lib::tree_paths::tree_path(&k.to_target(), &k.key) else {
+                continue;
+            };
+            removed.push(p);
+        }
+        let tree = self.tree_with(Some(&format!("{merged}^{{tree}}")), &[], &removed)?;
+        let parents = self
+            .repo
+            .git()
+            .args(["rev-list", "--parents", "-n", "1", merged])
+            .run_str()?;
+        let mut git = self
+            .repo
+            .git()
+            .args(["commit-tree", "--no-gpg-sign", &tree]);
+        for p in parents.split_whitespace().skip(1) {
+            git = git.args(["-p", p]);
+        }
+        for (k, v) in IDENTITY {
+            git = git.env(k, v);
+        }
+        let commit = parse_oid(&git.args(["-m", "materialize"]).run()?)?;
+        Ok(Some((commit, drop.len())))
+    }
+
     /// Of `records` (a key of the local metadata and the blob of the
     /// fetched tip's deletion record of it), the keys whose row in the
     /// store was last written (put, or fetched) no later than the record's
@@ -8316,12 +8577,23 @@ impl<'a> AttestStore<'a> {
     /// fetched tip `tip` it shares no history with, when `tip`'s history
     /// was rewritten since this clone last fetched (`vci push
     /// --rewrite-history`, which `vci prune` runs once the history is long:
-    /// the root of `tip`'s history is such a commit): the first of
-    /// `last_fetched` (the tracking ref before this fetch moved it, then the
-    /// tip this store last materialized) that `local` contains and whose
-    /// tree is here. The rewrite published a tree that descends from every
-    /// tip before it, so a value this clone got from such a tip that the
-    /// new one lacks was deleted there, and the merge deletes it here too.
+    /// a root of `tip`'s history is such a commit). The rewrite published a
+    /// tree that descends from every tip before it, so a value this clone
+    /// had from such a tip that the new one lacks was deleted there, and the
+    /// merge deletes it here too. The first of these that this clone has,
+    /// with its tree here:
+    ///
+    /// * a rewrite commit of `tip`'s history made from a commit `local`
+    ///   contains (its message names it, see [`REWRITE_SOURCE`]): the
+    ///   rewrite published exactly what this clone had there (2.10: its
+    ///   own `vci prune`'s rewrite, killed after the push landed and before
+    ///   the local metadata commit moved to it);
+    /// * then each of `last_fetched` (the tips this clone last had from the
+    ///   remote, newest first: the tracking ref before this fetch moved it,
+    ///   those noted before fetches that did not finish their merge, then
+    ///   the marker, which names the tip of the last finished fetch or the
+    ///   commit of the last push) that `local` contains, or that is a
+    ///   rewrite made from a commit `local` contains.
     ///
     /// 2.10: without a base, git-meta's merge keeps every local value, and a
     /// clone that last fetched before a rewrite published again every value
@@ -8329,9 +8601,12 @@ impl<'a> AttestStore<'a> {
     /// CI cache saved before the rewrite did it again each time it was
     /// restored (on vex a day-old cache held about 34,000 attestations,
     /// most superseded within the day, and the manifests and objects
-    /// pruned since). `None` (a clone that never fetched, a tip from
-    /// another history, a base that cannot be read): the merge stays
-    /// two-way.
+    /// pruned since). A base older than what this clone last had is as
+    /// bad: what it had since (its own pushes) are then its own additions.
+    /// (Equal trees are not enough: a value added and deleted again, its
+    /// record dropped, gives a tree an older commit had.) `None` (a clone
+    /// that never fetched, a tip from another history, a base that cannot
+    /// be read): the merge stays two-way.
     fn rewritten_base(
         &self,
         remote: &str,
@@ -8339,25 +8614,73 @@ impl<'a> AttestStore<'a> {
         tip: &str,
         last_fetched: &[String],
     ) -> Option<String> {
-        // The subjects of the commits without parents `tip` reaches.
-        let rewritten = || -> bool {
-            self.repo
-                .git()
-                .args(["log", "--max-parents=0", "--format=%s", tip])
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .run_str()
-                .is_ok_and(|subjects| subjects.lines().any(|l| l.trim() == REWRITE_MESSAGE))
-        };
-        if last_fetched.is_empty() || !rewritten() {
+        // The commits without parents `tip` reaches that a rewrite made.
+        let roots: Vec<String> = self
+            .repo
+            .git()
+            .args(["log", "--max-parents=0", "--format=%H %s", tip])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()
+            .ok()?
+            .lines()
+            .filter_map(|l| {
+                let (c, subject) = l.split_once(' ')?;
+                (subject.trim() == REWRITE_MESSAGE && is_oid(c)).then(|| c.to_owned())
+            })
+            .collect();
+        if roots.is_empty() {
             return None;
+        }
+        let made_here = |c: &str| {
+            self.rewrite_source(c)
+                .is_some_and(|s| self.is_ancestor(&s, local).unwrap_or(false))
+        };
+        let usable = |c: &str| self.complete_tree(remote, c).is_ok();
+        for c in &roots {
+            if made_here(c) && usable(c) {
+                return Some(c.clone());
+            }
         }
         last_fetched
             .iter()
-            .filter(|c| c.as_str() != tip && is_oid(c))
-            .find(|c| {
-                self.is_ancestor(c, local).unwrap_or(false) && self.complete_tree(remote, c).is_ok()
-            })
+            .filter(|c| is_oid(c))
+            .find(|c| (self.is_ancestor(c, local).unwrap_or(false) || made_here(c)) && usable(c))
             .cloned()
+    }
+
+    /// The commit the rewrite commit `commit` (one `vci push
+    /// --rewrite-history` made) publishes the tree of, as its message
+    /// names it (2.10) and when it has the same tree; `None` for any other
+    /// commit, or one an earlier vci made.
+    fn rewrite_source(&self, commit: &str) -> Option<String> {
+        let out = self
+            .repo
+            .git()
+            .args(["log", "-1", "--format=%T%x00%s%x00%b", commit])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()
+            .ok()?;
+        let mut f = out.splitn(3, '\0');
+        let (tree, subject, body) = (f.next()?, f.next()?, f.next()?);
+        if subject.trim() != REWRITE_MESSAGE {
+            return None;
+        }
+        let source = body.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix(REWRITE_SOURCE)
+                .and_then(|r| r.strip_prefix(':'))
+                .map(|o| o.trim().to_owned())
+                .filter(|o| is_oid(o))
+        })?;
+        let source_tree = self
+            .repo
+            .git()
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("{source}^{{tree}}"))
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()
+            .ok()?;
+        (source_tree.trim() == tree.trim()).then_some(source)
     }
 
     /// [`AttestStore::merge_from_paths`] when `local` and `tip` changed
@@ -9529,28 +9852,46 @@ impl<'a> AttestStore<'a> {
                 );
             }
             if out.status.success() {
+                failpoint("push-after-git-push");
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let status = if stdout.lines().any(|l| l.starts_with("=\t")) {
                     PushStatus::UpToDate
                 } else {
                     PushStatus::Pushed
                 };
-                if pushed != rebased
-                    && let Err(e) = self.cas_ref(
+                let mut moved = pushed == rebased;
+                if pushed != rebased {
+                    match self.cas_ref(
                         &local_ref,
                         Some(&pushed),
                         &rebased,
                         "vci push --rewrite-history",
-                    )
-                {
-                    report.warn(format!(
-                        "published {pushed} as one commit, but {local_ref} could not move to it ({e}); the next fetch merges it"
-                    ));
+                    ) {
+                        Ok(()) => moved = true,
+                        Err(e) => report.warn(format!(
+                            "published {pushed} as one commit, but {local_ref} could not move to it ({e}); the next fetch merges it"
+                        )),
+                    }
                 }
                 self.repo
                     .git()
                     .args(["update-ref", "-m", "vci push", &tracking, &pushed])
                     .run()?;
+                // 2.10: the commit published is the newest tip this store
+                // has: the marker names it (2.7.24 left it on the tip
+                // before the push, which a later fetch's merge with a
+                // rewritten history then took as its base: what this push
+                // published counted as this clone's own additions, and was
+                // published again after another clone deleted it; and the
+                // tip before a rewrite stayed what vex's cache step kept
+                // the tree of, 25 MB more a cache). Not when the local
+                // metadata commit is elsewhere: the marker would skip the
+                // merge that brings it the published commit.
+                if moved {
+                    let marker = self.materialized_marker(&tracking)?;
+                    write_tips(&marker, std::slice::from_ref(&pushed));
+                    let _ = std::fs::remove_file(Self::unmerged_tips_file(&marker));
+                }
                 return Ok(done(status, report, rewrite_now));
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -10247,7 +10588,11 @@ impl<'a> AttestStore<'a> {
     }
 
     /// A commit without parents holding `local`'s tree (`local` itself when
-    /// it has none); no ref moves (see [`AttestStore::push_impl`]).
+    /// it has none); no ref moves (see [`AttestStore::push_impl`]). Its
+    /// message names `local` ([`REWRITE_SOURCE`], 2.10), so that a clone
+    /// killed after the push landed, before its local metadata commit moved
+    /// to it, merges what follows on it (see
+    /// [`AttestStore::rewritten_base`]).
     fn orphan_commit(&self, local: &str) -> Result<String, GitError> {
         let parents = self
             .repo
@@ -10264,10 +10609,12 @@ impl<'a> AttestStore<'a> {
             .arg(format!("{local}^{{tree}}"))
             .run()?;
         let tree = parse_oid(&tree)?;
-        let mut git =
-            self.repo
-                .git()
-                .args(["commit-tree", "--no-gpg-sign", &tree, "-m", REWRITE_MESSAGE]);
+        let mut git = self
+            .repo
+            .git()
+            .args(["commit-tree", "--no-gpg-sign", &tree, "-m", REWRITE_MESSAGE])
+            .arg("-m")
+            .arg(format!("{REWRITE_SOURCE}: {local}"));
         for (k, v) in IDENTITY {
             git = git.env(k, v);
         }

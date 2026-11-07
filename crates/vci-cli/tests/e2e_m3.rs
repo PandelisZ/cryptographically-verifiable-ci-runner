@@ -1752,6 +1752,81 @@ fn a_control_character_in_an_input_path_cannot_forge_plan_lines_in_format_1() {
     )]);
 }
 
+/// 2.10.0: the github format's file lists are data for the runner, so a
+/// test file whose name holds a tab or the Arabic letter mark is listed as
+/// it is on disk (2.10's first cut listed `src/t\tab.test.ts`, a file that
+/// does not exist, and vitest given the list ran the others only, exit 0
+/// with the new test failing), while the text plan and the notices escape
+/// it. A name with a line break, which no output line can carry, is left
+/// out of the list and the plan says `run_all=true` with a warning.
+#[test]
+fn the_github_file_lists_name_test_files_as_they_are_on_disk() {
+    let w = World::new();
+    w.run(&[], GIT_META);
+    let body =
+        "import { expect, test } from \"vitest\";\ntest(\"t\", () => { expect(1).toBe(1); });\n";
+    let tab = "src/t\tab.test.ts";
+    let alm = "src/al\u{61c}m.test.ts";
+    w.write(tab, body);
+    w.write(alm, body);
+    let output = w.base.join("github-output");
+    let gh_env = [("GITHUB_OUTPUT", output.to_str().unwrap())];
+    let lines = |gh: &str| -> BTreeMap<String, String> {
+        gh.lines()
+            .filter(|l| !l.starts_with("::"))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    };
+    let gh = w.vci_ok(
+        &["plan", "--base-ref", "main", "--format", "github"],
+        &gh_env,
+    );
+    let out = lines(&gh);
+    assert_eq!(out["run_all"], "false", "{gh}");
+    // Every file listed is on disk (C runs too: it lists `src/`).
+    let listed = |out: &BTreeMap<String, String>, k: &str| -> BTreeSet<String> {
+        out[k].split(' ').map(str::to_owned).collect()
+    };
+    let run = listed(&out, "run");
+    assert!(run.contains(tab) && run.contains(alm), "{gh:?}");
+    for f in run.iter().chain(&listed(&out, "skip")) {
+        assert!(w.work.join(f).is_file(), "{f:?} is not a file: {gh:?}");
+    }
+    let written = std::fs::read_to_string(&output).unwrap();
+    assert_eq!(written.lines().count(), 3, "{written:?}");
+    assert_eq!(lines(&written), out);
+    // The text plan escapes them.
+    let plan = w.vci_ok(&["plan", "--base-ref", "main"], GIT_META);
+    assert!(
+        !plan.contains('\t') && !plan.contains('\u{61c}'),
+        "a raw tab or letter mark: {plan:?}"
+    );
+    assert!(plan.contains("src/t\\tab.test.ts"), "{plan}");
+    assert!(plan.contains("src/al\\u{61c}m.test.ts"), "{plan}");
+
+    // A line break in a name to run: everything runs.
+    let nl = "src/n\nSKIP x.test.ts";
+    w.write(nl, body);
+    std::fs::remove_file(&output).unwrap();
+    let gh = w.vci_ok(
+        &["plan", "--base-ref", "main", "--format", "github"],
+        &gh_env,
+    );
+    let out = lines(&gh);
+    assert_eq!(out["run_all"], "true", "{gh}");
+    let still = listed(&out, "run");
+    assert_eq!(still, run, "the others are still listed: {gh:?}");
+    assert!(
+        gh.contains("::warning title=vci::running everything: 1 test file(s) to run have a line break in their name, which an output line cannot hold (first: src/n\\nSKIP x.test.ts)"),
+        "{gh}"
+    );
+    assert!(!gh.lines().any(|l| l.starts_with("SKIP")), "{gh}");
+    let written = std::fs::read_to_string(&output).unwrap();
+    assert_eq!(written.lines().count(), 3, "{written:?}");
+    assert_eq!(lines(&written), out);
+}
+
 /// 2.10.0: with a budget of one state object, `vci explain` loads the
 /// state object of the candidate its reason names (the unit's best) and
 /// says "over the plan's budget" for the others, so it names the input the
