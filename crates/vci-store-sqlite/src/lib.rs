@@ -710,7 +710,7 @@ impl AttestationStore for SqliteStore {
     }
 
     /// The file's free pages, once they are a quarter of it and at least
-    /// 16 MiB ([`compact_file`]), on a pooled connection outside any
+    /// 16 MiB (`compact_file`), on a pooled connection outside any
     /// transaction. A read-only handle, or a file that does not exist,
     /// frees nothing.
     fn compact(&self) -> Result<Option<(u64, u64)>, StoreError> {
