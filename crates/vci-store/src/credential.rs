@@ -501,7 +501,21 @@ fn ended(status: ExitStatus) -> String {
 fn run(cmd: &TokenCommand, cwd: &Path, timeout: Duration) -> Fetched {
     let what = format!("the token_command ({})", cmd.display());
     let failed = |kind: String| format!("{what} {kind}; {HINT}");
-    let mut child = cmd.command(cwd).spawn().map_err(|e| {
+    // Linux refuses to run a file some process still has open for writing
+    // (ETXTBSY): a script written just before, while another thread forked
+    // a child that holds the writer's descriptor until its exec. That lasts
+    // moments, so try again for up to half a second.
+    let mut busy = 0;
+    let spawned = loop {
+        match cmd.command(cwd).spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && busy < 50 => {
+                busy += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            r => break r,
+        }
+    };
+    let mut child = spawned.map_err(|e| {
         if !cwd.is_dir() {
             format!(
                 "{what} could not be started in {}, which is not a directory ({e})",
