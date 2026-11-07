@@ -406,7 +406,7 @@ store"). The environment wins over `[store]` in the working tree's `vci.toml`; a
 | `VCI_STORE_CONNECT_TIMEOUT_SECS` | seconds a connection may take (more than 0, at most 3600) | `[store] connect_timeout`, else 5 |
 | `VCI_STORE_TIMEOUT_SECS` | seconds one statement, request or wait may take (more than 0, at most 3600); `vci prune` gives PostgreSQL and a libSQL server ten minutes | `[store] timeout`, else 30 |
 | `VCI_STORE_MAX_AGE_DAYS` | since 2.10: `vci prune` removes a unit's attestations issued more than this many days ago but its newest by each signer, whatever tree they were made on (0: no limit, at most 3650) | `[store] max_age_days`, else 14 |
-| `VCI_STORE_DELETION_RECORDS_HOURS` | since 2.10, git-meta: hours a deletion record stays in the metadata tree before `vci prune` or a push drops it (0 to 720; `VCI_DELETION_RECORDS_KEEP_SECS` wins) | `[store] deletion_records_hours`, else 6 |
+| `VCI_STORE_DELETION_RECORDS_HOURS` | since 2.10, git-meta: hours a deletion record stays in the metadata tree before `vci prune` or a push drops it, once its deletion is published (0 to 720; `VCI_DELETION_RECORDS_KEEP_SECS` wins) | `[store] deletion_records_hours`, else 6 |
 | `VCI_STORE_HISTORY_MAX_COMMITS` | since 2.10, git-meta: `vci prune` publishes the store as one commit once the fetched metadata history has more commits (0: never) | `[store] history_max_commits`, else 2000 |
 | `VCI_STORE_SYNC` | `off`: the SQLite files (git-meta's store, the SQLite store, libSQL's local file and replica) do not sync to disk after a write. `replica`: the libSQL store reads a local replica of its server (as `[store.libsql] replica = true`) | git-meta's store does not sync when `CI` is set; the others sync; libSQL reads its server |
 

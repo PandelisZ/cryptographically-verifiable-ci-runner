@@ -2620,6 +2620,164 @@ fn cargo_prune_rewrites_a_long_history_and_drops_old_deletion_records() {
     }
 }
 
+/// A format-1 record of b on branch `old` and a format-3 one on `new`
+/// (same signer), both published: `vci prune` removes the format-1 one and
+/// its manifest (two deletion records, written in the store only).
+fn superseded_format_1_record(w: &World) {
+    let work = w.work.clone();
+    feature_commit(w);
+    w.git(&work, &["checkout", "-q", "-b", "old", "feature"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "old"]);
+    w.run_format1(&work, &[B], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.git(&work, &["checkout", "-q", "-b", "new", "feature"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 3}\n",
+    );
+    w.git(&work, &["commit", "-qam", "new"]);
+    w.run(&work, &[B], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+}
+
+/// How many attestations of `unit` a fresh clone of the remote holds after
+/// `vci fetch`.
+fn published(w: &World, name: &str, unit: &str) -> usize {
+    let fresh = w.base.join(name);
+    w.git(&w.base, &["clone", "-q", w.remote.to_str().unwrap(), name]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    AttestStore::new(&store_for(&fresh))
+        .list(Some(unit))
+        .unwrap()
+        .len()
+}
+
+/// `[store] deletion_records_hours = 0` (documented range 0 to 720): `vci
+/// prune` keeps the deletion records it has just written until a push has
+/// published them, then drops them. 2.10's first prune dropped them before
+/// anything serialized them, and the store could never push or fetch again
+/// (`serializing the local git-meta store would drop 2 value(s) of
+/// refs/meta/local/main that it has no deletion record for`), the prune's
+/// own history rewrite included: neither the deletion nor any later
+/// attestation was published from that clone.
+#[test]
+fn cargo_prune_with_a_zero_hour_window_publishes_its_deletions() {
+    for rewrite in [false, true] {
+        let Some(w) = World::new() else { return };
+        let work = w.work.clone();
+        superseded_format_1_record(&w);
+        let mut env = vec![("VCI_STORE_DELETION_RECORDS_HOURS", "0")];
+        if rewrite {
+            env.push(("VCI_STORE_HISTORY_MAX_COMMITS", "1"));
+        }
+        let out = w.vci_env(&work, &["prune"], &env);
+        let first = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{first}");
+        let removed = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(removed.contains("(format 1, older than"), "{removed}");
+        assert_eq!(first.contains("published the store to"), rewrite, "{first}");
+        for what in ["push", "push", "fetch", "push"] {
+            let o = w.vci_env(&work, &[what, "--remote", "origin"], &env);
+            assert!(
+                o.status.success(),
+                "rewrite={rewrite}: vci {what}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        // A new attestation, pushed with the default settings.
+        w.run(&work, &[C], &w.trusted);
+        w.vci_ok(&work, &["push", "--remote", "origin"]);
+        assert_eq!(published(&w, "fresh", B), 1, "rewrite={rewrite}");
+        assert_eq!(published(&w, "fresh2", C), 1, "rewrite={rewrite}");
+        assert!(
+            first.contains("vci prune: 0 of 2 deletion record(s) older than 0 hour(s) dropped ([store] deletion_records_hours); 2 more past the window kept until a `vci push` publishes their deletion"),
+            "rewrite={rewrite}: {first}"
+        );
+        // Published now: the next prune drops the records, and the push
+        // after it publishes the drop.
+        let out = w.vci_env(&work, &["prune"], &[env[0]]);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        assert!(
+            err.contains("vci prune: 2 of 2 deletion record(s) older than 0 hour(s) dropped ([store] deletion_records_hours)\n"),
+            "rewrite={rewrite}: {err}"
+        );
+        w.vci_ok(&work, &["push", "--remote", "origin"]);
+        let tree = w.git(
+            &w.remote,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "--full-tree",
+                "refs/meta/main",
+            ],
+        );
+        assert!(!tree.contains("__tombstones"), "{tree}");
+        assert_eq!(published(&w, "fresh3", B), 1, "rewrite={rewrite}");
+    }
+}
+
+/// Default window: deletion records a prune wrote that nothing has
+/// serialized or pushed stay past the window (a second prune seven hours
+/// later, the records aged by SQL, keeps them), and the push publishes the
+/// deletions; the prune after that drops them. 2.10's first prune dropped
+/// them, and the next push put the values back (`restored 2 entries of
+/// refs/meta/local/main into this repository's git-meta store`), undoing
+/// the deletions.
+#[test]
+fn cargo_prune_keeps_a_deletion_record_past_the_window_until_a_push_publishes_it() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    superseded_format_1_record(&w);
+    let out = w.vci(&work, &["prune"]);
+    assert!(out.status.success());
+    let age = |dir: &Path| {
+        let db = rusqlite::Connection::open(dir.join(".git/git-meta.sqlite")).unwrap();
+        db.execute(
+            "UPDATE tombstones SET timestamp = timestamp - 25200000 WHERE tombstone_type = 'metadata'",
+            [],
+        )
+        .unwrap()
+    };
+    assert_eq!(age(&work), 2);
+    let dry = w.vci(&work, &["prune", "--dry-run"]);
+    let dry = String::from_utf8_lossy(&dry.stderr).into_owned();
+    let out = w.vci(&work, &["prune"]);
+    let second = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{second}");
+    for what in ["push", "fetch", "push"] {
+        let o = w.vci(&work, &[what, "--remote", "origin"]);
+        let e = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "vci {what}: {e}");
+        assert!(!e.contains("restored"), "vci {what}: {e}");
+    }
+    assert_eq!(published(&w, "fresh", B), 1);
+    assert_eq!(w.predicates(B).len(), 1);
+    assert!(
+        dry.contains("vci prune: 0 of 2 deletion record(s) are older than 6 hour(s) ([store] deletion_records_hours): dropped on a run without --dry-run; 2 more past the window would be kept until a `vci push` publishes their deletion"),
+        "{dry}"
+    );
+    assert!(
+        second.contains("vci prune: 0 of 2 deletion record(s) older than 6 hour(s) dropped"),
+        "{second}"
+    );
+    // Published: the next prune drops them.
+    let out = w.vci(&work, &["prune"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("vci prune: 2 of 2 deletion record(s) older than 6 hour(s) dropped"),
+        "{err}"
+    );
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    assert_eq!(published(&w, "fresh2", B), 1);
+}
+
 /// Once a unit has a format-3 attestation by a signer, `vci prune` (2.10)
 /// removes that signer's format-1 attestations of it issued before it, even one made on a
 /// tree a branch still has at its tip, with the input manifests only they

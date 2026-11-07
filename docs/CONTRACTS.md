@@ -266,8 +266,9 @@ another git process wins a ref lock):
   download (`GIT_NO_LAZY_FETCH=1`): a promised row reads as ``value not fetched: run `vci fetch` online (a git-meta
   promised entry; ...)`` in `StoredEnvelope::error` / `StoredManifest::error`.
 - Merges are done from paths, with git-meta's results: a fast-forward applies what `git diff-tree` reports; diverged
-  local and remote commits use git-meta's three-way (or two-way) rules on blob ids, as a merge commit; a clone's first
-  fetch takes the tip's entries. Set and list values, side remotes and unexpected paths fetch every value of the trees
+  local and remote commits use git-meta's three-way (or two-way) rules on blob ids, as a merge commit (since 2.10 a
+  remote history rewritten since this clone's last fetch is merged three-way on the tip it last fetched, when its
+  local history contains it, rather than two-way); a clone's first fetch takes the tip's entries. Set and list values, side remotes and unexpected paths fetch every value of the trees
   involved and use git-meta's full merge (`VCI_MATERIALIZE=full` forces it, for tests). A merged value this clone
   never fetched that the tip no longer holds takes the tip's state (no push could publish it).
 - Serialization puts promised values of a target it rebuilds back at the blob ids the previous commit held; the
@@ -800,7 +801,8 @@ records issued before the group's newest format-3 one (not under `record_format 
 issued more than `[store] max_age_days` ago whatever their tree, and keeps whatever a plan of the checked-out
 commit's tree remembered passing (only expiry and `--superseded` remove it); a referenced manifest the store does
 not hold keeps no other manifest. On git-meta it then drops the deletion records older than `[store]
-deletion_records_hours`, publishes the store as one commit past `[store] history_max_commits`, and
+deletion_records_hours` whose deletion is published (neither the local metadata tree nor the remote tip last fetched
+or pushed holds the value), publishes the store as one commit past `[store] history_max_commits`, and
 `AttestationStore::compact` frees the local file's pages (git-meta, SQLite, libSQL's local file).
 
 A clone deletes a manifest knowing only its own attestations, so another clone may hold or have published one that

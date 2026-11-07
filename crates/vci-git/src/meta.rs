@@ -1696,6 +1696,9 @@ impl Drop for ScratchGitDir {
 /// without one); such a value is superseded, expired or unreferenced, and
 /// the next `vci prune` deletes it again.
 const DELETION_RECORDS_KEEP_SECS: i64 = 6 * 60 * 60;
+/// The message of the commit without parents `vci push --rewrite-history`
+/// publishes (see [`AttestStore::rewritten_base`]).
+const REWRITE_MESSAGE: &str = "vci: metadata history rewritten (vci push --rewrite-history)";
 /// How many deletion records past the window make a push drop them (`vci
 /// prune` drops any); `VCI_DELETION_RECORDS_DROP_AT`. 20,000 until 2.9.
 const DELETION_RECORDS_DROP_AT: i64 = 2_000;
@@ -1732,12 +1735,21 @@ fn deletion_records_keep_ms() -> i64 {
     secs.max(0).saturating_mul(1000)
 }
 
-/// The deletion records of the local store: how many there are, and how
-/// many are older than the window ([`AttestStore::deletion_record_counts`]).
+/// The deletion records of the local store: how many there are, how many
+/// are older than the window, and of those how many wait for their
+/// deletion to be published ([`AttestStore::deletion_record_counts`]), or
+/// were dropped ([`AttestStore::drop_deletion_records`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeletionRecords {
     pub total: usize,
     pub old: usize,
+    /// Of the old ones, those kept because their deletion is not published
+    /// yet: the local metadata tree, or the remote tip this clone last
+    /// fetched or pushed, still holds the value (see
+    /// [`AttestStore::drop_deletion_records`]).
+    pub unpublished: usize,
+    /// Rows removed from the store (by a drop; 0 when counted).
+    pub dropped: usize,
     /// The window, in seconds.
     pub window_secs: i64,
 }
@@ -6630,7 +6642,11 @@ impl<'a> AttestStore<'a> {
         // commits since the tip they have, with their trees, so the local
         // metadata commit and the remote's keep the history (and the merge
         // bases' trees) they share.
-        let first = self.read_ref(&tracking)?.is_none();
+        // The tip this clone last fetched, read before `git fetch`
+        // force-updates the tracking ref: the base of a merge with a
+        // rewritten history (see [`AttestStore::rewritten_base`]).
+        let fetched_before = self.read_ref(&tracking)?;
+        let first = fetched_before.is_none();
         let refspec = format!("+{remote_ref}:{tracking}");
         // One round trip: fetch the ref, and read "not there yet" from git's
         // own error (an `ls-remote` first would be a second round trip, about
@@ -6874,10 +6890,30 @@ impl<'a> AttestStore<'a> {
             // imports side remotes and is the fallback for anything else.
             // `VCI_MATERIALIZE=full` (tests): git-meta's merge, every value
             // fetched and read, to compare with.
+            // The tips this clone last had from the remote, newest first: a
+            // merge with a history rewritten since then takes the first one
+            // its local commit contains as the base.
+            let last_fetched: Vec<String> =
+                fetched_before
+                    .iter()
+                    .chain(previous.iter())
+                    .fold(Vec::new(), |mut v, c| {
+                        if !v.contains(c) {
+                            v.push(c.clone());
+                        }
+                        v
+                    });
             let lazy = match (&tip_now, &tip_snap) {
-                (Some(tip), Some(snap)) if !side && !full => match self
-                    .materialize_lazy(&session, name, &local_ref, &tracking, tip, snap, report)
-                {
+                (Some(tip), Some(snap)) if !side && !full => match self.materialize_lazy(
+                    &session,
+                    name,
+                    &local_ref,
+                    &tracking,
+                    tip,
+                    snap,
+                    &last_fetched,
+                    report,
+                ) {
                     Ok(m) => m,
                     Err(e) => {
                         report.note(format!(
@@ -7103,9 +7139,11 @@ impl<'a> AttestStore<'a> {
         tx.commit().map_err(e)
     }
 
-    /// How many deletion records the local store holds, and how many of
-    /// them are older than the window (`vci prune`, which drops those:
-    /// [`AttestStore::drop_deletion_records`]). Zeros without a store.
+    /// How many deletion records the local store holds, how many of them
+    /// are older than the window, and how many of those wait for their
+    /// deletion to be published (`vci prune --dry-run`; a prune drops the
+    /// rest: [`AttestStore::drop_deletion_records`]). Zeros without a
+    /// store.
     pub fn deletion_record_counts(&self) -> Result<DeletionRecords, GitError> {
         let window_ms = deletion_records_keep_ms();
         let mut out = DeletionRecords {
@@ -7115,34 +7153,131 @@ impl<'a> AttestStore<'a> {
         let Some((path, db)) = self.db_rw()? else {
             return Ok(out);
         };
-        let (total, old): (i64, i64) = db
+        let total: i64 = db
             .query_row(
-                "SELECT count(*), coalesce(sum(timestamp < ?1), 0) FROM tombstones \
-                 WHERE tombstone_type = 'metadata'",
-                [now_ms() - window_ms],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT count(*) FROM tombstones WHERE tombstone_type = 'metadata'",
+                [],
+                |r| r.get(0),
             )
             .map_err(|e| sql_err(&path, e))?;
         out.total = usize::try_from(total).unwrap_or(0);
-        out.old = usize::try_from(old).unwrap_or(0);
+        let old = Self::old_deletion_records(&path, &db, now_ms() - window_ms)?;
+        drop(db);
+        out.old = old.len();
+        if !old.is_empty() {
+            let ns = self.namespace()?;
+            let local = self.read_ref(&format!("refs/{ns}/local/main"))?;
+            let tip = self.read_ref(&format!("refs/{ns}/remotes/main"))?;
+            out.unpublished = self
+                .published_deletions(old, local.as_deref(), tip.as_deref())?
+                .1;
+        }
         Ok(out)
     }
 
-    /// Drop every deletion record older than the window from the store and
-    /// the local metadata tree now, whatever their number (`vci prune`; a
-    /// push drops them once there are [`DELETION_RECORDS_DROP_AT`]): how
-    /// many, `None` when there were none or the store has no local commit.
-    /// The next push publishes the drop.
-    pub fn drop_deletion_records(&self) -> Result<Option<usize>, GitError> {
+    /// Drop the deletion records older than the window whose deletion is
+    /// published from the store and the local metadata tree now, whatever
+    /// their number (`vci prune`; a push drops them once there are
+    /// [`DELETION_RECORDS_DROP_AT`]); the next push publishes the drop.
+    ///
+    /// A record goes only once the local metadata tree no longer holds its
+    /// value (the deletion was serialized) and neither does the remote tip
+    /// this clone last fetched or pushed (it was published there, or never
+    /// was there). Dropping every record past the window, as `vci prune`
+    /// first did, left the store without the value or a record of its
+    /// deletion for one a prune or a run had written and nothing had
+    /// serialized yet (with `[store] deletion_records_hours = 0`, the
+    /// records the prune had just written), while the local tree still
+    /// held the value: every serialization after it refused to drop the
+    /// value without a record (no push or fetch from that clone again),
+    /// or, past the default window, a later merge put the value back; and
+    /// the push of a deletion serialized but never published put it back
+    /// too, as a value the local metadata lost without a record.
+    pub fn drop_deletion_records(&self) -> Result<DeletionRecords, GitError> {
         let _lock = self.exchange_lock()?;
         let ns = self.namespace()?;
         let local_ref = format!("refs/{ns}/local/main");
-        let Some(local) = self.read_ref(&local_ref)? else {
-            return Ok(None);
+        let local = self.read_ref(&local_ref)?;
+        let tip = self.read_ref(&format!("refs/{ns}/remotes/main"))?;
+        let total = self.deletion_record_total()?;
+        let (mut out, _) =
+            self.drop_old_deletion_records(&local_ref, local.as_deref(), tip.as_deref(), Some(1))?;
+        out.total = total;
+        Ok(out)
+    }
+
+    /// How many deletion records the store holds.
+    fn deletion_record_total(&self) -> Result<usize, GitError> {
+        let Some((path, db)) = self.db_rw()? else {
+            return Ok(0);
         };
-        Ok(self
-            .drop_old_deletion_records(&local_ref, &local, Some(1))?
-            .map(|(_, n)| n))
+        let total: i64 = db
+            .query_row(
+                "SELECT count(*) FROM tombstones WHERE tombstone_type = 'metadata'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql_err(&path, e))?;
+        Ok(usize::try_from(total).unwrap_or(0))
+    }
+
+    /// The keys of the store's deletion records stamped before `cutoff`.
+    fn old_deletion_records(
+        path: &Utf8Path,
+        db: &rusqlite::Connection,
+        cutoff: i64,
+    ) -> Result<Vec<Key>, GitError> {
+        let e = |err| sql_err(path, err);
+        let mut stmt = db
+            .prepare(
+                "SELECT target_type, target_value, key FROM tombstones \
+                 WHERE tombstone_type = 'metadata' AND timestamp < ?1",
+            )
+            .map_err(e)?;
+        let rows = stmt
+            .query_map([cutoff], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(e)?;
+        Ok(rows
+            .flatten()
+            .filter_map(|(ty, value, key)| {
+                Some(Key {
+                    target_type: TargetType::from_str(&ty).ok()?,
+                    target_value: value,
+                    key,
+                })
+            })
+            .collect())
+    }
+
+    /// Of the deletion records `old`, those whose deletion is published
+    /// (neither the local metadata commit `local` nor the remote tip `tip`
+    /// holds the value: the deletion was serialized, and the remote no
+    /// longer has the value or never had it), and how many others there
+    /// are. Their trees are listed (from the listing kept for the last one,
+    /// see [`AttestStore::snapshot_keys`]).
+    fn published_deletions(
+        &self,
+        old: Vec<Key>,
+        local: Option<&str>,
+        tip: Option<&str>,
+    ) -> Result<(Vec<Key>, usize), GitError> {
+        let mut held: BTreeSet<Key> = BTreeSet::new();
+        for c in [local, tip]
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<&str>>()
+        {
+            held.extend(self.snapshot_keys(c)?.values);
+        }
+        let (unpublished, published): (Vec<Key>, Vec<Key>) =
+            old.into_iter().partition(|k| held.contains(k));
+        Ok((published, unpublished.len()))
     }
 
     /// How many commits the metadata history fetched from the primary
@@ -7232,10 +7367,14 @@ impl<'a> AttestStore<'a> {
         Ok(out)
     }
 
-    /// Remove the deletion records older than the retention window from the
+    /// Remove the deletion records older than the retention window whose
+    /// deletion is published (see [`AttestStore::drop_deletion_records`];
+    /// `tip`: the remote tip this clone last fetched or pushed) from the
     /// store and from the tree of `local` (the tip of `local_ref`), as a
-    /// commit on top of it, once there are at least `at` of them (`None`:
-    /// [`DELETION_RECORDS_DROP_AT`]): `(the new commit, how many)`.
+    /// commit on top of it, once there are at least `at` past the window
+    /// (`None`: [`DELETION_RECORDS_DROP_AT`]): the new commit (`None` when
+    /// the tree did not change), how many rows went and how many past the
+    /// window wait for their deletion to be published.
     ///
     /// 2.7.20: vex's metadata tree held 465,000 entries, 431,000 of them
     /// deletion records written in the week before (each run's superseded
@@ -7250,9 +7389,10 @@ impl<'a> AttestStore<'a> {
     fn drop_old_deletion_records(
         &self,
         local_ref: &str,
-        local: &str,
+        local: Option<&str>,
+        tip: Option<&str>,
         at: Option<usize>,
-    ) -> Result<Option<(String, usize)>, GitError> {
+    ) -> Result<(DeletionRecords, Option<String>), GitError> {
         let at = at.unwrap_or_else(|| {
             std::env::var("VCI_DELETION_RECORDS_DROP_AT")
                 .ok()
@@ -7260,65 +7400,57 @@ impl<'a> AttestStore<'a> {
                 .unwrap_or(DELETION_RECORDS_DROP_AT)
                 .max(1) as usize
         });
-        let cutoff = now_ms() - deletion_records_keep_ms();
+        let window_ms = deletion_records_keep_ms();
+        let mut out = DeletionRecords {
+            window_secs: window_ms / 1000,
+            ..DeletionRecords::default()
+        };
+        let cutoff = now_ms() - window_ms;
         let Some((path, mut db)) = self.db_rw()? else {
-            return Ok(None);
+            return Ok((out, None));
         };
         let e = |err| sql_err(&path, err);
-        let old: Vec<Key> = {
-            let mut stmt = db
-                .prepare(
-                    "SELECT target_type, target_value, key FROM tombstones \
-                     WHERE tombstone_type = 'metadata' AND timestamp < ?1",
-                )
-                .map_err(e)?;
-            let rows = stmt
-                .query_map([cutoff], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(e)?;
-            rows.flatten()
-                .filter_map(|(ty, value, key)| {
-                    Some(Key {
-                        target_type: TargetType::from_str(&ty).ok()?,
-                        target_value: value,
-                        key,
-                    })
-                })
-                .collect()
-        };
+        let old = Self::old_deletion_records(&path, &db, cutoff)?;
+        out.old = old.len();
         if old.len() < at {
-            return Ok(None);
+            return Ok((out, None));
         }
-        let was_covered = self.covered_commit().as_deref() == Some(local);
-        let session = self.session()?;
-        let repo = session.repo();
-        let gerr = |err: &dyn std::fmt::Display| {
-            GitError::Meta(format!("writing the metadata tree: {err}"))
+        let (old, unpublished) = self.published_deletions(old, local, tip)?;
+        out.unpublished = unpublished;
+        if old.is_empty() {
+            return Ok((out, None));
+        }
+        let was_covered = local.is_some() && self.covered_commit().as_deref() == local;
+        // The local tree without the records (a path it does not have is
+        // left alone).
+        let edited = match local {
+            None => None,
+            Some(local) => {
+                let session = self.session()?;
+                let repo = session.repo();
+                let gerr = |err: &dyn std::fmt::Display| {
+                    GitError::Meta(format!("writing the metadata tree: {err}"))
+                };
+                let prev_tree = repo
+                    .rev_parse_single(format!("{local}^{{tree}}").as_str())
+                    .map_err(|err| gerr(&err))?
+                    .detach();
+                let mut editor = repo.edit_tree(prev_tree).map_err(|err| gerr(&err))?;
+                for k in &old {
+                    let Ok(p) = git_meta_lib::tree_paths::tombstone_path(&k.to_target(), &k.key)
+                    else {
+                        continue;
+                    };
+                    let _ = editor.remove(p.as_str());
+                }
+                let tree = editor
+                    .write()
+                    .map_err(|err| gerr(&err))?
+                    .detach()
+                    .to_string();
+                Some((local, tree != prev_tree.to_string().as_str(), tree))
+            }
         };
-        let prev_tree = repo
-            .rev_parse_single(format!("{local}^{{tree}}").as_str())
-            .map_err(|err| gerr(&err))?
-            .detach();
-        let mut editor = repo.edit_tree(prev_tree).map_err(|err| gerr(&err))?;
-        for k in &old {
-            let Ok(p) = git_meta_lib::tree_paths::tombstone_path(&k.to_target(), &k.key) else {
-                continue;
-            };
-            // A path the tree does not have is left alone.
-            let _ = editor.remove(p.as_str());
-        }
-        let tree = editor
-            .write()
-            .map_err(|err| gerr(&err))?
-            .detach()
-            .to_string();
-        drop(editor);
-        drop(session);
         let tx = db.transaction().map_err(e)?;
         let _ = Self::cover_schema(&tx);
         {
@@ -7336,13 +7468,14 @@ impl<'a> AttestStore<'a> {
                 )
                 .map_err(e)?;
             for k in &old {
-                del.execute(rusqlite::params![
-                    k.target_type.as_str(),
-                    k.target_value,
-                    k.key,
-                    cutoff
-                ])
-                .map_err(e)?;
+                out.dropped += del
+                    .execute(rusqlite::params![
+                        k.target_type.as_str(),
+                        k.target_value,
+                        k.key,
+                        cutoff
+                    ])
+                    .map_err(e)?;
                 forget
                     .execute(rusqlite::params![
                         k.target_type.as_str(),
@@ -7354,11 +7487,14 @@ impl<'a> AttestStore<'a> {
         }
         tx.commit().map_err(e)?;
         drop(db);
-        if tree == prev_tree.to_string().as_str() {
+        let Some((local, changed, tree)) = edited else {
+            return Ok((out, None));
+        };
+        if !changed {
             if was_covered {
                 self.set_covered_commit(local);
             }
-            return Ok(None);
+            return Ok((out, None));
         }
         let mut git = self.repo.git().args([
             "commit-tree",
@@ -7369,7 +7505,7 @@ impl<'a> AttestStore<'a> {
             "-m",
             &format!(
                 "vci: drop {} deletion record(s) older than the retention window",
-                old.len()
+                out.dropped
             ),
         ]);
         for (k, v) in IDENTITY {
@@ -7391,7 +7527,7 @@ impl<'a> AttestStore<'a> {
         if was_covered {
             self.set_covered_commit(&commit);
         }
-        Ok(Some((commit, old.len())))
+        Ok((out, Some(commit)))
     }
 
     /// The merge base of two commits, `None` when they share no history.
@@ -7421,7 +7557,11 @@ impl<'a> AttestStore<'a> {
     ///   says changed is taken, as git-meta's fast-forward does.
     /// * Otherwise git-meta's three-way merge (two-way when the commits share
     ///   no history) of the trees' entries makes a merge commit, and what
-    ///   differs between the local commit and it is taken.
+    ///   differs between the local commit and it is taken. A remote whose
+    ///   history was rewritten since this clone last fetched it is merged
+    ///   three-way on the first of `last_fetched` (the tips this clone last
+    ///   had from it) that the local commit contains (2.10, see
+    ///   [`AttestStore::rewritten_base`]).
     ///
     /// A value taken becomes a row pointing at its blob (promised when the
     /// blob is not here, see [`AttestStore::mark_values`]); deletion records
@@ -7447,6 +7587,7 @@ impl<'a> AttestStore<'a> {
         tracking: &str,
         tip: &str,
         tip_snap: &KeySnapshot,
+        last_fetched: &[String],
         report: &mut Report,
     ) -> Result<Option<Materialized>, GitError> {
         // Taken before anything is read: a row another writer stores from
@@ -7498,6 +7639,9 @@ impl<'a> AttestStore<'a> {
             }
             t = std::time::Instant::now();
         };
+        // The tip this clone last fetched, when the merge took it as the
+        // base of a rewritten history.
+        let mut rebased: Option<String> = None;
         let (from_tree, to_commit, merged) = match &local {
             None if !tip_snap.others.is_empty() => {
                 return fallback(set_or_list(&tip_snap.others[0]));
@@ -7506,7 +7650,7 @@ impl<'a> AttestStore<'a> {
             Some(l) if self.is_ancestor(l, tip)? => {
                 (format!("{l}^{{tree}}"), tip.to_owned(), false)
             }
-            Some(l) => match self.merge_from_paths(remote, l, tip, tip_snap) {
+            Some(l) => match self.merge_from_paths(remote, l, tip, tip_snap, last_fetched) {
                 Err(e) => {
                     if timed {
                         vci_core::timing_line!("materialize: merging from paths failed: {e}");
@@ -7514,7 +7658,10 @@ impl<'a> AttestStore<'a> {
                     return Err(e);
                 }
                 Ok(Err(why)) => return fallback(why),
-                Ok(Ok(m)) => (format!("{l}^{{tree}}"), m, true),
+                Ok(Ok((m, base))) => {
+                    rebased = base;
+                    (format!("{l}^{{tree}}"), m, true)
+                }
             },
         };
         part(if merged { "merge commit" } else { "base" });
@@ -7666,10 +7813,24 @@ impl<'a> AttestStore<'a> {
             .collect();
         // (A fast-forward stamps a value whose record the tree holds too,
         // as git-meta's does; that one was not dropped without a record.)
-        let without_record = legacy
-            .iter()
-            .filter(|k| !to_snap.tombstones.contains(*k) && parse_key(&k.key).is_some())
-            .count();
+        // A merge on the tip this clone last fetched before a rewrite
+        // deletes what the remote deleted since, whose records passed the
+        // window before the rewrite: said in a note below instead.
+        let without_record = if rebased.is_some() {
+            0
+        } else {
+            legacy
+                .iter()
+                .filter(|k| !to_snap.tombstones.contains(*k) && parse_key(&k.key).is_some())
+                .count()
+        };
+        if let Some(base) = &rebased {
+            report.note(format!(
+                "{remote}'s metadata history was rewritten since this clone last fetched it: merged it on the tip this clone last fetched ({}), so the {} value(s) deleted there since are deleted here too",
+                &base[..base.len().min(12)],
+                removed.len()
+            ));
+        }
         // In git-meta's order: the tree's records, the restamped ones, then
         // the values deleted now; in one transaction (2.7.9).
         let batch: Vec<(&Key, &str, i64)> = tombstones
@@ -7754,19 +7915,28 @@ impl<'a> AttestStore<'a> {
     /// tip `tip` (three-way on their merge base, two-way without one), on
     /// the trees' entries with blob ids standing in for the values, written
     /// as a merge commit (parents `local` and `tip`) without reading a
-    /// value. `Ok(Err(why))` when a tree holds what only git-meta's own
-    /// merge reads.
+    /// value: the commit, and the tip this clone last fetched when it was
+    /// the base (a rewritten history, see [`AttestStore::rewritten_base`]).
+    /// `Ok(Err(why))` when a tree holds what only git-meta's own merge
+    /// reads.
     fn merge_from_paths(
         &self,
         remote: &str,
         local: &str,
         tip: &str,
         tip_snap: &KeySnapshot,
-    ) -> Result<Result<String, String>, GitError> {
+        last_fetched: &[String],
+    ) -> Result<Result<(String, Option<String>), String>, GitError> {
         use git_meta_lib::tree::merge::{
             merge_tombstones, three_way_merge, two_way_merge_no_common_ancestor,
         };
-        let base = self.merge_base(local, tip)?;
+        let (base, rebased) = match self.merge_base(local, tip)? {
+            Some(b) => (Some(b), None),
+            None => match self.rewritten_base(remote, local, tip, last_fetched) {
+                Some(b) => (Some(b.clone()), Some(b)),
+                None => (None, None),
+            },
+        };
         // 2.7.10: when no path changed on both sides since the merge base,
         // the merge is each side's changes on the base (git-meta's merge
         // agrees: a key only one side touched takes that side's state), and
@@ -7776,7 +7946,7 @@ impl<'a> AttestStore<'a> {
         if let Some(b) = &base
             && let Some(commit) = self.merge_disjoint(b, local, tip)?
         {
-            return Ok(Ok(commit));
+            return Ok(Ok((commit, rebased)));
         }
         LAST_MERGE.with(|m| m.set(Some("git-meta")));
         let ours = self.snapshot_keys(local)?;
@@ -7935,7 +8105,55 @@ impl<'a> AttestStore<'a> {
         for (k, v) in IDENTITY {
             git = git.env(k, v);
         }
-        Ok(Ok(parse_oid(&git.run()?)?))
+        Ok(Ok((parse_oid(&git.run()?)?, rebased)))
+    }
+
+    /// The base of a merge of the local metadata commit `local` with a
+    /// fetched tip `tip` it shares no history with, when `tip`'s history
+    /// was rewritten since this clone last fetched (`vci push
+    /// --rewrite-history`, which `vci prune` runs once the history is long:
+    /// the root of `tip`'s history is such a commit): the first of
+    /// `last_fetched` (the tracking ref before this fetch moved it, then the
+    /// tip this store last materialized) that `local` contains and whose
+    /// tree is here. The rewrite published a tree that descends from every
+    /// tip before it, so a value this clone got from such a tip that the
+    /// new one lacks was deleted there, and the merge deletes it here too.
+    ///
+    /// 2.10: without a base, git-meta's merge keeps every local value, and a
+    /// clone that last fetched before a rewrite published again every value
+    /// deleted there since whose deletion record had passed the window: a
+    /// CI cache saved before the rewrite did it again each time it was
+    /// restored (on vex a day-old cache held about 34,000 attestations,
+    /// most superseded within the day, and the manifests and objects
+    /// pruned since). `None` (a clone that never fetched, a tip from
+    /// another history, a base that cannot be read): the merge stays
+    /// two-way.
+    fn rewritten_base(
+        &self,
+        remote: &str,
+        local: &str,
+        tip: &str,
+        last_fetched: &[String],
+    ) -> Option<String> {
+        // The subjects of the commits without parents `tip` reaches.
+        let rewritten = || -> bool {
+            self.repo
+                .git()
+                .args(["log", "--max-parents=0", "--format=%s", tip])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run_str()
+                .is_ok_and(|subjects| subjects.lines().any(|l| l.trim() == REWRITE_MESSAGE))
+        };
+        if last_fetched.is_empty() || !rewritten() {
+            return None;
+        }
+        last_fetched
+            .iter()
+            .filter(|c| c.as_str() != tip && is_oid(c))
+            .find(|c| {
+                self.is_ancestor(c, local).unwrap_or(false) && self.complete_tree(remote, c).is_ok()
+            })
+            .cloned()
     }
 
     /// [`AttestStore::merge_from_paths`] when `local` and `tip` changed
@@ -8778,14 +8996,24 @@ impl<'a> AttestStore<'a> {
                 carried = std::mem::take(&mut report.notes);
                 continue;
             }
-            let mut local = match self.drop_old_deletion_records(&local_ref, &local, None) {
-                Ok(Some((commit, n))) => {
-                    report.note(format!(
-                        "dropped {n} deletion record(s) older than the retention window from the metadata tree"
-                    ));
-                    commit
+            // Only the records whose deletion the tip just fetched already
+            // has (see `drop_deletion_records`): this push publishes the
+            // others first.
+            let mut local = match self.drop_old_deletion_records(
+                &local_ref,
+                Some(&local),
+                tip.as_deref(),
+                None,
+            ) {
+                Ok((d, commit)) => {
+                    if d.dropped > 0 {
+                        report.note(format!(
+                            "dropped {} deletion record(s) older than the retention window from the metadata tree",
+                            d.dropped
+                        ));
+                    }
+                    commit.unwrap_or(local)
                 }
-                Ok(None) => local,
                 Err(e) => {
                     report.warn(format!("dropping old deletion records failed: {e}"));
                     local
@@ -9755,13 +9983,10 @@ impl<'a> AttestStore<'a> {
             .arg(format!("{local}^{{tree}}"))
             .run()?;
         let tree = parse_oid(&tree)?;
-        let mut git = self.repo.git().args([
-            "commit-tree",
-            "--no-gpg-sign",
-            &tree,
-            "-m",
-            "vci: metadata history rewritten (vci push --rewrite-history)",
-        ]);
+        let mut git =
+            self.repo
+                .git()
+                .args(["commit-tree", "--no-gpg-sign", &tree, "-m", REWRITE_MESSAGE]);
         for (k, v) in IDENTITY {
             git = git.env(k, v);
         }

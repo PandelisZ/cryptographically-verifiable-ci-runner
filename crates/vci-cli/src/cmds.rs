@@ -2281,33 +2281,48 @@ fn apply_removals(
 }
 
 /// git-meta: drop the deletion records older than `[store]
-/// deletion_records_hours` from the local store and metadata tree (the
-/// next push publishes the drop), or count them on a dry run. Returns how
-/// many went. A failure is a warning: the store is no worse than before.
+/// deletion_records_hours` whose deletion is published from the local
+/// store and metadata tree (the next push publishes the drop), or count
+/// them on a dry run. Returns how many went. A record whose deletion is not
+/// published yet (this prune's own, a run's supersession nothing has
+/// pushed) stays until a push has published it (dropped before, it left
+/// the store unable to push, or the push put the value back). A failure is
+/// a warning: the store is no worse than before.
 fn prune_deletion_records(gm: &AttestStore<'_>, dry_run: bool) -> usize {
-    let counts = match gm.deletion_record_counts() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("vci prune: warning: could not count the deletion records: {e}");
-            return 0;
+    let waiting = |n: usize, what: &str| {
+        if n == 0 {
+            String::new()
+        } else {
+            format!("; {n} {what} kept until a `vci push` publishes their deletion")
         }
     };
-    let hours = counts.window_secs as f64 / 3600.0;
     if dry_run {
+        let counts = match gm.deletion_record_counts() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("vci prune: warning: could not count the deletion records: {e}");
+                return 0;
+            }
+        };
+        let hours = counts.window_secs as f64 / 3600.0;
         eprintln!(
-            "vci prune: {} of {} deletion record(s) are older than {hours} hour(s) ([store] deletion_records_hours): dropped on a run without --dry-run",
-            counts.old, counts.total
+            "vci prune: {} of {} deletion record(s) are older than {hours} hour(s) ([store] deletion_records_hours): dropped on a run without --dry-run{}",
+            counts.old - counts.unpublished,
+            counts.total,
+            waiting(counts.unpublished, "more past the window would be")
         );
         return 0;
     }
     match gm.drop_deletion_records() {
-        Ok(n) => {
-            let n = n.unwrap_or(0);
+        Ok(d) => {
+            let hours = d.window_secs as f64 / 3600.0;
             eprintln!(
-                "vci prune: {n} of {} deletion record(s) older than {hours} hour(s) dropped ([store] deletion_records_hours)",
-                counts.total
+                "vci prune: {} of {} deletion record(s) older than {hours} hour(s) dropped ([store] deletion_records_hours){}",
+                d.dropped,
+                d.total,
+                waiting(d.unpublished, "more past the window")
             );
-            n
+            d.dropped
         }
         Err(e) => {
             eprintln!("vci prune: warning: could not drop the old deletion records: {e}");

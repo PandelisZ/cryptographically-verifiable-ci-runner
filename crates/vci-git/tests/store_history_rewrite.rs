@@ -2,8 +2,8 @@
 //! does it once the history passes `[store] history_max_commits`, through
 //! `vci push --rewrite-history`), and the clones that still hold the old
 //! history: they fetch, merge and push on top of the new one without
-//! losing a value, without a refusal, and without publishing for good an
-//! attestation deleted before the rewrite. (Its own binary: one test sets
+//! losing a value, without a refusal, and without publishing again a value
+//! deleted before the rewrite. (Its own binary: one test sets
 //! the process's deletion-record window.)
 
 mod common;
@@ -157,13 +157,13 @@ fn stale_and_concurrent_clones_push_on_top_of_a_rewritten_history() {
 
 /// A clone that has not fetched since before the deletion record of a
 /// value was dropped (past `[store] deletion_records_hours`), then
-/// rewritten away, publishes that value again once: nothing tells it the
-/// value was deleted. Its push is not refused, no value is lost, the next
-/// removal (the next `vci prune`) deletes it again, and the stale clone's
-/// later pushes do not bring it back: it merged the new history, and
-/// merges three-way from then on.
+/// rewritten away, does not publish that value again (2.10; it did once
+/// before): it merges the new history three-way on the tip it last
+/// fetched, which held the value, so the new tip's lack of it is a
+/// deletion. Its push is not refused, its own attestation is published,
+/// and so are its later ones.
 #[test]
-fn a_value_deleted_before_the_window_comes_back_once_and_goes_again() {
+fn a_value_deleted_before_the_window_stays_deleted_after_a_rewrite() {
     let w = world(2);
     let (a, s) = (&w.clones[0], &w.clones[1]);
     let (ra, rs) = (repo(a), repo(s));
@@ -180,7 +180,7 @@ fn a_value_deleted_before_the_window_comes_back_once_and_goes_again() {
     // Past the window: `vci prune` drops the record, then rewrites.
     std::thread::sleep(Duration::from_millis(20));
     vci_git::meta::set_deletion_records_keep(Duration::ZERO);
-    assert_eq!(sa.drop_deletion_records().unwrap(), Some(1));
+    assert_eq!(sa.drop_deletion_records().unwrap().dropped, 1);
     vci_git::meta::set_deletion_records_keep(Duration::from_secs(6 * 3600));
     sa.push_rewriting_history(Some("origin")).unwrap();
     assert_eq!(remote_keys(&w), set(&[2]));
@@ -199,20 +199,24 @@ fn a_value_deleted_before_the_window_comes_back_once_and_goes_again() {
         "no deletion record left"
     );
 
-    // The stale clone publishes a1 again with its own attestation.
+    // The stale clone publishes its own attestation, not a1.
     ss.put(C, S1, &hex64(3), b"c1").unwrap();
-    assert_eq!(ss.push(Some("origin")).unwrap().status, PushStatus::Pushed);
-    assert_eq!(remote_keys(&w), set(&[1, 2, 3]), "a1 came back once");
+    let out = ss.push(Some("origin")).unwrap();
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("history was rewritten since this clone last fetched it")),
+        "{out:?}"
+    );
+    assert!(
+        out.warnings.is_empty(),
+        "no warning about values dropped without a record: {out:?}"
+    );
+    assert_eq!(remote_keys(&w), set(&[2, 3]), "a1 stays deleted");
+    assert_eq!(keys(&ss), set(&[2, 3]), "and is deleted here too");
 
-    // The pruner fetches it (no refusal) and deletes it again.
-    sa.fetch(Some("origin")).unwrap();
-    assert_eq!(keys(&sa), set(&[1, 2, 3]));
-    let again = sa.list(Some(A)).unwrap().remove(0);
-    assert!(sa.remove(&again).unwrap());
-    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
-    assert_eq!(remote_keys(&w), set(&[2, 3]));
-
-    // The stale clone's next pushes keep it deleted.
+    // Its next pushes keep it deleted; every clone converges.
     ss.put(D, S1, &hex64(4), b"d1").unwrap();
     assert_eq!(ss.push(Some("origin")).unwrap().status, PushStatus::Pushed);
     assert_eq!(remote_keys(&w), set(&[2, 3, 4]));

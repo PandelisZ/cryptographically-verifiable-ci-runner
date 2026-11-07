@@ -1248,7 +1248,7 @@ explain_hashes = true         # 2.9: write the run's state object (the attested 
                               # reads it); false writes three objects a run; VCI_STORE_EXPLAIN_HASHES wins
 max_age_days = 14             # 2.10: vci prune removes a unit's attestations issued more than this many days ago but its
                               # newest by each signer, whatever tree they were made on (0: none); VCI_STORE_MAX_AGE_DAYS wins
-deletion_records_hours = 6    # 2.10, git-meta: hours a deletion record stays in the metadata tree; VCI_STORE_DELETION_RECORDS_HOURS
+deletion_records_hours = 6    # 2.10, git-meta: hours a published deletion's record stays in the metadata tree; VCI_STORE_DELETION_RECORDS_HOURS
 history_max_commits = 2000    # 2.10, git-meta: vci prune publishes the store as one commit past this; VCI_STORE_HISTORY_MAX_COMMITS
 explain_hashes_days = 2       # 2.9: a state object older than this is removed even while referenced, by `vci run`'s
                               # orphan pass and `vci prune` (0 to 365; 0 writes the run's state object and removes it
@@ -2190,23 +2190,45 @@ objects another clone deleted (not the state object) and publishing them, the or
 the record cannot be fetched and fetching it once online, and an idempotent put inside a batch restarting the grace.
 **Keeping it small (2.10).** `vci prune` on git-meta (cmds.rs `prune_deletion_records`, `rewrite_long_history`)
 calls three `AttestStore` methods beside the trait: `deletion_record_counts()` (how many records, how many older than
-the window), `drop_deletion_records()` (every record past the window, whatever their number: the `tombstones` rows and
-their paths in a commit on top of `refs/meta/local/main`, under the exchange lock; a push drops them once there are
-`VCI_DELETION_RECORDS_DROP_AT`, 2,000) and `history_commits()` (`git rev-list --count` of `refs/<ns>/remotes/main`;
-`None` before the first fetch), then the trait's push with `PushMode::RewriteHistory` once the history passes
-`[store] history_max_commits`. The window is process-wide (`meta::set_deletion_records_keep`, set by vci-cli from
+the window, and how many of those wait for their deletion to be published), `drop_deletion_records()` (every record
+past the window whose deletion is published, whatever their number: the `tombstones` rows and their paths in a commit
+on top of `refs/meta/local/main`, under the exchange lock; a push drops them once there are
+`VCI_DELETION_RECORDS_DROP_AT`, 2,000, past the window; both return a `DeletionRecords` with `total`, `old`,
+`unpublished` and the rows actually `dropped`) and `history_commits()` (`git rev-list --count` of
+`refs/<ns>/remotes/main`; `None` before the first fetch), then the trait's push with `PushMode::RewriteHistory` once
+the history passes `[store] history_max_commits`. A record is published (`published_deletions`) when neither
+`refs/meta/local/main`'s tree nor the remote tip last fetched or pushed (`refs/<ns>/remotes/main`; the tip just
+fetched, in a push) holds its value: the deletion was serialized and the remote has it. Until then it stays,
+however old. Dropped earlier, a record nothing had serialized (a prune with `deletion_records_hours = 0` would drop
+the ones it had just written) leaves the store with neither the value nor a record while the local tree holds the
+value, and every serialization after it refuses (no push or fetch from that clone again); one serialized but not
+pushed lets the push's check of lost values put the value back. The window is process-wide (`meta::set_deletion_records_keep`, set by vci-cli from
 `[store] deletion_records_hours` when it opens a git-meta store; `VCI_DELETION_RECORDS_KEEP_SECS` wins). Why 6 hours
 and not 24: on vex on 6 November 2026, 145,306 of the tree's 148,423 attestation deletion records were under a day
 old and 22,897 under six hours (each run supersedes the last one's attestations, most within hours of their issue); a
 record only stops a clone whose history does not reach the deletion from publishing the value again, and such a value
 (superseded, expired, aged out, unreferenced) is deleted again by the next prune. The merge without a common ancestor
-(`merge_from_paths`, after a rewrite) takes git-meta's two-way merge, local side first, except that the tip's
+(`merge_from_paths`, after a rewrite) is three-way on the tip this clone last fetched (`rewritten_base`): the
+tracking ref as `fetch_named` read it before `git fetch` force-updated it, else the tip the store last materialized
+(the `materialized` marker, which a fetch killed between its `git fetch` and its merge leaves behind), the first that
+`refs/meta/local/main` contains and whose tree is here, when the root of the tip's history is a `vci: metadata
+history rewritten` commit. The rewrite published a tree that descends from every tip before it, so a value the clone
+got from its last fetched tip that the new tip lacks was deleted there (git-meta's three-way merge deletes it; the
+values the clone added since are kept), and the fetch notes `<remote>'s metadata history was rewritten since this
+clone last fetched it: merged it on the tip this clone last fetched (<id>), so the N value(s) deleted there since are
+deleted here too` instead of warning about attestations dropped without a record. Without such a base (a clone that
+never fetched, a tip of another history) it takes git-meta's two-way merge, local side first, except that the tip's
 deletion record of an attestation key (`vci:attestation:...`, `parse_key`) wins over the local value (such a key is
-never written twice: the record is the newer change); a manifest or object keeps the local side.
+never written twice: the record is the newer change); a manifest or object keeps the local side. With that rule
+alone, every restore of a CI cache saved before a rewrite published again every value deleted since whose record
+had passed the window (`store_rewrite_stale_cache.rs` without the base: 3 of 3 jobs restoring one cache).
 `crates/vci-git/tests/store_history_rewrite.rs` (3 tests) holds it: a clone holding the history before a rewrite
 and the deleted attestation's value pushes one commit on top of the new history without that attestation, while a
 third clone's push in the rewrite's window makes its lease fail and is kept by its next round; a value whose record
-was dropped before the rewrite comes back once, is deleted again and stays deleted; the counts and the drop.
+was dropped before the rewrite stays deleted; the counts and the drop. `store_rewrite_stale_cache.rs` (4 tests)
+restores one pre-rewrite cache three times (none brings the deleted value back, without a rewrite or with one, and
+with a cache saved mid-fetch), and keeps every value of a clone that never fetched; `store_deletion_records_unpublished.rs`
+(3 tests) keeps a record not yet serialized, or serialized and not pushed, past the window until a push publishes it.
 `compact()` removes git-meta's log rows older than the last materialization and a day, then frees the file's pages
 (section 4); `store_crash_safety.rs` checks that it keeps the rows a killed serialization's journal still needs.
 
