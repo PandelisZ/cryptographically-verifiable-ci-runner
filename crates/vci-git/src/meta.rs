@@ -1862,6 +1862,19 @@ fn split_ls_tree(out: &[u8]) -> Vec<TreeRecord<'_>> {
 
 // ---- writing and exchange -----------------------------------------------------
 
+/// Whether a push publishes the local metadata as one commit without
+/// parents ([`AttestStore::push_impl`]).
+#[derive(Debug, Clone, Copy)]
+enum Rewrite {
+    /// Never: one commit on top of the remote's tip (`vci push`).
+    Never,
+    /// Always (`vci push --rewrite-history`).
+    Always,
+    /// When the history the attempt fetched holds more than this many
+    /// commits (`vci prune` past `[store] history_max_commits`).
+    LongerThan(u64),
+}
+
 /// What one fetch-and-merge round found.
 struct Round {
     found: bool,
@@ -7289,13 +7302,21 @@ impl<'a> AttestStore<'a> {
         let Some(tip) = self.read_ref(&format!("refs/{ns}/remotes/main"))? else {
             return Ok(None);
         };
+        self.commit_count(&tip).map(Some)
+    }
+
+    /// How many commits `commit`'s history holds (`git rev-list --count`;
+    /// a fetch takes every commit, never a shallow history).
+    fn commit_count(&self, commit: &str) -> Result<u64, GitError> {
         let n = self
             .repo
             .git()
-            .args(["rev-list", "--count", &tip])
+            .args(["rev-list", "--count", commit])
             .env("GIT_NO_LAZY_FETCH", "1")
             .run_str()?;
-        Ok(n.trim().parse::<u64>().ok())
+        n.trim()
+            .parse::<u64>()
+            .map_err(|_| GitError::Meta(format!("counting the commits of {commit}: {n:?}")))
     }
 
     /// Keep the local store's file small (`vci prune`): remove git-meta's
@@ -8017,15 +8038,24 @@ impl<'a> AttestStore<'a> {
                 // cache. An attestation's key is never written twice (its
                 // storage key is the digest of what was signed, its hint
                 // the issue time), so a record of it was written after the
-                // value: the deletion is the newer change. A manifest or an
-                // object (keyed by content, put again by a later run) keeps
-                // the local side, and the next prune deletes it again when
-                // nothing references it.
+                // value: the deletion is the newer change.
+                //
+                // A manifest or an object is keyed by its content, so a
+                // later run may put it again after the record: the tip's
+                // record wins only over a value this store did not write or
+                // fetch after the record was made (the record's time
+                // against the row's; an object put again moves its row to
+                // now, and a manifest or object an attestation here
+                // references is put back after the merge anyway). Before,
+                // the local value always won, and a clone without a base
+                // published again every manifest and object the rewrite's
+                // prune had deleted, until the next prune.
+                let mut content: BTreeMap<&Key, &String> = BTreeMap::new();
                 for (k, o) in &tip_snap.tombstone_blobs {
-                    if parse_key(&k.key).is_some()
-                        && ours.value_blobs.contains_key(k)
-                        && !tip_snap.value_blobs.contains_key(k)
-                    {
+                    if !ours.value_blobs.contains_key(k) || tip_snap.value_blobs.contains_key(k) {
+                        continue;
+                    }
+                    if parse_key(&k.key).is_some() {
                         mv.remove(k);
                         mt.insert(
                             k.clone(),
@@ -8034,7 +8064,22 @@ impl<'a> AttestStore<'a> {
                                 email: o.clone(),
                             },
                         );
+                    } else if k.target_type == TargetType::Project
+                        && (parse_manifest_key(&k.key).is_some()
+                            || parse_object_key(&k.key).is_some())
+                    {
+                        content.insert(k, o);
                     }
+                }
+                for k in self.deleted_after_written(remote, &content)? {
+                    mv.remove(k);
+                    mt.insert(
+                        k.clone(),
+                        Tombstone {
+                            timestamp: 0,
+                            email: content[k].clone(),
+                        },
+                    );
                 }
                 (mv, mt)
             }
@@ -8106,6 +8151,55 @@ impl<'a> AttestStore<'a> {
             git = git.env(k, v);
         }
         Ok(Ok((parse_oid(&git.run()?)?, rebased)))
+    }
+
+    /// Of `records` (a key of the local metadata and the blob of the
+    /// fetched tip's deletion record of it), the keys whose row in the
+    /// store was last written (put, or fetched) no later than the record's
+    /// time: the record is the newer change. A record that cannot be
+    /// fetched or read, or a key without a row, is left out (the local
+    /// value is kept, as before 2.10).
+    fn deleted_after_written<'k>(
+        &self,
+        remote: &str,
+        records: &BTreeMap<&'k Key, &String>,
+    ) -> Result<Vec<&'k Key>, GitError> {
+        use rusqlite::OptionalExtension as _;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let oids: BTreeSet<String> = records.values().map(|o| (*o).clone()).collect();
+        let _ = self.ensure_blobs(remote, &oids)?;
+        let read = self.read_blobs(&oids)?;
+        let Some((path, db)) = self.db_rw()? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = db
+            .prepare(
+                "SELECT last_timestamp FROM metadata
+                 WHERE target_type = ?1 AND target_value = ?2 AND key = ?3 AND source_ref IS NULL",
+            )
+            .map_err(|e| sql_err(&path, e))?;
+        let mut out = Vec::new();
+        for (k, o) in records {
+            let Some(deleted) = read
+                .get(*o)
+                .and_then(|b| serde_json::from_slice::<Tombstone>(b).ok())
+            else {
+                continue;
+            };
+            let written: Option<i64> = stmt
+                .query_row(
+                    rusqlite::params![k.target_type.as_str(), k.target_value, k.key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| sql_err(&path, e))?;
+            if written.is_some_and(|w| w <= deleted.timestamp) {
+                out.push(*k);
+            }
+        }
+        Ok(out)
     }
 
     /// The base of a merge of the local metadata commit `local` with a
@@ -8874,7 +8968,7 @@ impl<'a> AttestStore<'a> {
     /// stay in the history until this). Other clones' next fetch merges onto
     /// the new history.
     pub fn push_rewriting_history(&self, remote: Option<&str>) -> Result<PushOutcome, GitError> {
-        self.push_impl(remote, |_| {}, true)
+        self.push_impl(remote, |_| {}, Rewrite::Always)
     }
 
     /// `push_rewriting_history`, calling `before_push(attempt)` right
@@ -8885,7 +8979,42 @@ impl<'a> AttestStore<'a> {
         remote: Option<&str>,
         before_push: impl FnMut(u32),
     ) -> Result<PushOutcome, GitError> {
-        self.push_impl(remote, before_push, true)
+        self.push_impl(remote, before_push, Rewrite::Always)
+    }
+
+    /// [`AttestStore::push_rewriting_history`] when the remote's history,
+    /// as each attempt's fetch finds it, holds more than `max_commits`
+    /// commits, else [`AttestStore::push`] (2.10: `vci prune` past `[store]
+    /// history_max_commits`). Counted after the fetch, not before: a clone
+    /// that last fetched before another one rewrote the history (vex's two
+    /// hourly attest jobs prune at the same time) pushes on top of that
+    /// rewrite instead of rewriting it again, which dropped the first
+    /// rewrite and what was pushed on it from the history; and of two
+    /// rewrites racing, the one whose lease fails merges the other and
+    /// pushes on top of it. [`PushOutcome::rewritten`] says which it did.
+    pub fn push_rewriting_history_longer_than(
+        &self,
+        remote: Option<&str>,
+        max_commits: u32,
+    ) -> Result<PushOutcome, GitError> {
+        self.push_impl(remote, |_| {}, Rewrite::LongerThan(u64::from(max_commits)))
+    }
+
+    /// `push_rewriting_history_longer_than`, calling `before_push(attempt)`
+    /// right before each `git push` (tests: a concurrent writer in that
+    /// window).
+    #[doc(hidden)]
+    pub fn push_rewriting_history_longer_than_with_hook(
+        &self,
+        remote: Option<&str>,
+        max_commits: u32,
+        before_push: impl FnMut(u32),
+    ) -> Result<PushOutcome, GitError> {
+        self.push_impl(
+            remote,
+            before_push,
+            Rewrite::LongerThan(u64::from(max_commits)),
+        )
     }
 
     /// `push`, calling `before_push(attempt)` right before each `git push`.
@@ -8897,14 +9026,14 @@ impl<'a> AttestStore<'a> {
         remote: Option<&str>,
         before_push: impl FnMut(u32),
     ) -> Result<PushOutcome, GitError> {
-        self.push_impl(remote, before_push, false)
+        self.push_impl(remote, before_push, Rewrite::Never)
     }
 
     fn push_impl(
         &self,
         remote: Option<&str>,
         mut before_push: impl FnMut(u32),
-        rewrite: bool,
+        rewrite: Rewrite,
     ) -> Result<PushOutcome, GitError> {
         let _lock = self.exchange_lock()?;
         let name = self.ensure_remote(remote)?;
@@ -8926,11 +9055,12 @@ impl<'a> AttestStore<'a> {
         // Whether a failed push already fetched every deletion record of
         // the pushed tree this clone lacks (see below).
         let mut fetched_tombstones = false;
-        let done = |status, report: Report| PushOutcome {
+        let done = |status, report: Report, rewritten: bool| PushOutcome {
             remote: name.clone(),
             status,
             warnings: report.warnings,
             notes: report.notes,
+            rewritten,
         };
         let mut attempt: u32 = 0;
         // Rounds that merged again because the remote moved, without
@@ -8961,9 +9091,28 @@ impl<'a> AttestStore<'a> {
             }
             let t = std::time::Instant::now();
             let Some(local) = self.read_ref(&local_ref)? else {
-                return Ok(done(PushStatus::NothingStored, report));
+                return Ok(done(PushStatus::NothingStored, report, false));
             };
             let tip = self.read_ref(&tracking)?;
+            // Whether this round publishes one commit without parents:
+            // decided on the history this round fetched (2.10), so that a
+            // clone that last fetched before another one rewrote the
+            // history pushes on top of that rewrite rather than rewriting
+            // it again, and a round after a failed lease (another clone's
+            // rewrite landed first) does the same.
+            let rewrite_now = match (rewrite, tip.as_deref()) {
+                (Rewrite::Never, _) | (Rewrite::LongerThan(_), None) => false,
+                (Rewrite::Always, _) => true,
+                (Rewrite::LongerThan(max), Some(t)) => {
+                    let n = self.commit_count(t)?;
+                    if n <= max {
+                        report.note(format!(
+                            "{name}'s {remote_ref} history holds {n} commit(s), not more than {max}: pushed on top of it rather than as one commit"
+                        ));
+                    }
+                    n > max
+                }
+            };
             // Checked before the checks and the fetch of what the pack needs
             // (2.7.17: about 18 s on vex, wasted on every round that then
             // found the tip moved).
@@ -9024,8 +9173,8 @@ impl<'a> AttestStore<'a> {
             // about 3.5 s each on vex's 180,000-entry tree).
             let mut ours_snap = self.snapshot_keys(&local)?;
             if let Some(tip) = &tip {
-                if *tip == local && round.found && !rewrite {
-                    return Ok(done(PushStatus::UpToDate, report));
+                if *tip == local && round.found && !rewrite_now {
+                    return Ok(done(PushStatus::UpToDate, report, false));
                 }
                 if !self.is_ancestor(tip, &local)? {
                     // Materialize always merges the tip in; pushing a tree
@@ -9081,7 +9230,8 @@ impl<'a> AttestStore<'a> {
             // as the remote's own history says) and the round starts over.
             // A commit without parents (`--rewrite-history`) sends its
             // whole tree: every value must be here.
-            let unsendable = self.unsendable(&name, &ours_snap, theirs_snap.as_ref(), !rewrite)?;
+            let unsendable =
+                self.unsendable(&name, &ours_snap, theirs_snap.as_ref(), !rewrite_now)?;
             if let Some((first, why)) = unsendable.stuck.first() {
                 return Err(GitError::Meta(format!(
                     "the local metadata holds {} value(s) this clone never fetched that {name} did not serve (first: {} {}){}; not pushing (`vci fetch` and push again)",
@@ -9139,10 +9289,19 @@ impl<'a> AttestStore<'a> {
                     Err(e) => return Err(e),
                 }
             }
-            let mut pushed = self.read_ref(&local_ref)?.unwrap_or(local);
-            if rewrite {
-                pushed = self.orphan_of(&local_ref, &pushed)?;
-            }
+            let rebased = self.read_ref(&local_ref)?.unwrap_or(local);
+            // A rewrite's commit without parents is made beside the local
+            // metadata commit, which moves to it only once the push has
+            // landed (2.10). Moved before, a round whose lease failed
+            // (another clone pushed in between) merged the new tip into a
+            // commit that shares no history with it, where the local side
+            // wins: a manifest or object that clone had just deleted was
+            // published again.
+            let pushed = if rewrite_now {
+                self.orphan_commit(&rebased)?
+            } else {
+                rebased.clone()
+            };
             if timing {
                 vci_core::timing_line!(
                     "push: put the local metadata on top of {name}'s: {:.2}s",
@@ -9242,7 +9401,7 @@ impl<'a> AttestStore<'a> {
                 "--no-verify",
                 "--recurse-submodules=no",
             ]);
-            if rewrite {
+            if rewrite_now {
                 // Only on top of the tip this round fetched.
                 git = git.arg(format!(
                     "--force-with-lease={remote_ref}:{}",
@@ -9266,11 +9425,23 @@ impl<'a> AttestStore<'a> {
                 } else {
                     PushStatus::Pushed
                 };
+                if pushed != rebased
+                    && let Err(e) = self.cas_ref(
+                        &local_ref,
+                        Some(&pushed),
+                        &rebased,
+                        "vci push --rewrite-history",
+                    )
+                {
+                    report.warn(format!(
+                        "published {pushed} as one commit, but {local_ref} could not move to it ({e}); the next fetch merges it"
+                    ));
+                }
                 self.repo
                     .git()
                     .args(["update-ref", "-m", "vci push", &tracking, &pushed])
                     .run()?;
-                return Ok(done(status, report));
+                return Ok(done(status, report, rewrite_now));
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
             let rejected: Vec<&str> = stdout.lines().filter(|l| l.starts_with("!\t")).collect();
@@ -9344,7 +9515,7 @@ impl<'a> AttestStore<'a> {
                             ));
                             continue;
                         }
-                        if !rewrite && self.replace_lost_tombstone(&local_ref, &pushed, &o)? {
+                        if !rewrite_now && self.replace_lost_tombstone(&local_ref, &pushed, &o)? {
                             report.note(format!(
                                 "push attempt {attempt}: {last}; replaced the lost deletion record {o} with a new one for the same key and trying again"
                             ));
@@ -9965,9 +10136,9 @@ impl<'a> AttestStore<'a> {
         Ok(out)
     }
 
-    /// Rewrite `local_ref` as a commit without parents holding `local`'s
-    /// tree (a no-op when it has none), returning the commit.
-    fn orphan_of(&self, local_ref: &str, local: &str) -> Result<String, GitError> {
+    /// A commit without parents holding `local`'s tree (`local` itself when
+    /// it has none); no ref moves (see [`AttestStore::push_impl`]).
+    fn orphan_commit(&self, local: &str) -> Result<String, GitError> {
         let parents = self
             .repo
             .git()
@@ -9991,12 +10162,6 @@ impl<'a> AttestStore<'a> {
             git = git.env(k, v);
         }
         let commit = parse_oid(&git.run()?)?;
-        self.cas_ref(
-            local_ref,
-            Some(&commit),
-            local,
-            "vci push --rewrite-history",
-        )?;
         if self.known_complete(local) {
             self.mark_complete(&commit);
         }

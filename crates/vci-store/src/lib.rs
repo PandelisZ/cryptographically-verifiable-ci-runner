@@ -884,6 +884,11 @@ pub struct PushOutcome {
     pub warnings: Vec<String>,
     /// As for [`FetchOutcome::notes`].
     pub notes: Vec<String>,
+    /// Whether the push published the local state as a new history (one
+    /// commit without parents): [`PushMode::RewriteHistory`], or
+    /// [`PushMode::RewriteHistoryLongerThan`] when the remote's history was
+    /// still that long (2.10).
+    pub rewritten: bool,
 }
 
 /// How [`Exchange::push`] publishes.
@@ -897,6 +902,14 @@ pub enum PushMode {
     /// costing every fetch (`vci push --rewrite-history`). An exchange
     /// without history returns [`StoreError::Unsupported`].
     RewriteHistory,
+    /// [`PushMode::RewriteHistory`] when the remote's history, as the
+    /// push's own fetch finds it, holds more than this many commits, and
+    /// [`PushMode::Merge`] otherwise (2.10: `vci prune` past `[store]
+    /// history_max_commits`). Decided again on each attempt, after its
+    /// fetch: of two clones that find the history long at once, the one
+    /// whose rewrite lands second merges onto it and pushes on top, so
+    /// crossing the limit leads to one rewrite.
+    RewriteHistoryLongerThan(u32),
 }
 
 /// Whether a store exists ([`AttestationStore::status`]).

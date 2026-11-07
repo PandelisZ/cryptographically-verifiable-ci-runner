@@ -8,11 +8,14 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use base64::Engine as _;
 use camino::Utf8Path;
 use common::*;
+use git_meta_lib::Target;
+use vci_core::ObjectKind;
 use vci_git::{AttestStore, PushStatus, Repo};
 
 const S1: &str = "0123456789abcdef";
@@ -253,4 +256,326 @@ fn deletion_records_are_counted_and_dropped_and_the_history_counted() {
     assert!(counts.old <= 1, "{counts:?}");
     // The store's file: nothing worth freeing in a store this small.
     assert_eq!(sa.compact_store().unwrap().vacuumed, None);
+}
+
+// ---- rewrites racing other clones (2.10) ------------------------------------
+
+/// The paths and blob ids of `rev`'s tree in `dir`.
+fn tree_blobs(dir: &Utf8Path, rev: &str) -> BTreeMap<String, String> {
+    git(dir, &["ls-tree", "-r", "--full-tree", rev])
+        .lines()
+        .filter_map(|l| {
+            let (meta, path) = l.split_once('\t')?;
+            let mut f = meta.split(' ');
+            let (_, kind, oid) = (f.next()?, f.next()?, f.next()?);
+            (kind == "blob").then(|| (path.to_owned(), oid.to_owned()))
+        })
+        .collect()
+}
+
+fn manifest_path(root: &str) -> String {
+    git_meta_lib::tree_paths::tree_path(&Target::project(), &vci_git::manifest_key(root)).unwrap()
+}
+
+/// An object of `kind` (bytes made from `tag`): (kind, id, base64).
+fn object(kind: ObjectKind, tag: &str) -> (ObjectKind, String, String) {
+    let bytes = format!("object {tag} {}", "o".repeat(500)).into_bytes();
+    (
+        kind,
+        vci_core::blake3_hex(&bytes),
+        base64::engine::general_purpose::STANDARD.encode(&bytes),
+    )
+}
+
+fn object_key(o: &(ObjectKind, String, String)) -> String {
+    vci_store::key::object_key(o.0, &o.1)
+}
+
+fn object_path(o: &(ObjectKind, String, String)) -> String {
+    git_meta_lib::tree_paths::tree_path(&Target::project(), &object_key(o)).unwrap()
+}
+
+/// The parentless commits `rev`'s history holds in `dir`.
+fn roots(dir: &Utf8Path, rev: &str) -> Vec<String> {
+    git(dir, &["rev-list", "--max-parents=0", rev])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Another clone deletes a manifest and an attestation and adds one while
+/// the rewrite is in flight (in the window before its `git push`): the
+/// rewrite's lease fails, and its next round merges that push on the tip
+/// both shared, so the deletions and the addition all survive, as do the
+/// rewriter's own deletion and addition. 2.10 moved the local metadata
+/// commit to the parentless commit before the push landed, so that round
+/// merged without a common ancestor and the local side won: the manifest
+/// came back (the attestation only through the rule that the tip's record
+/// of one wins). The local metadata commit moves to the rewrite once it is
+/// published.
+#[test]
+fn what_a_clone_pushes_during_a_rewrite_is_kept() {
+    let w = world(2);
+    let (ra, rc) = (repo(&w.clones[0]), repo(&w.clones[1]));
+    let (sa, sc) = (AttestStore::new(&ra), AttestStore::new(&rc));
+    let m = hex64(0xe1);
+    sa.put_manifest(&m, format!("manifest {}", "m".repeat(300)).as_bytes())
+        .unwrap();
+    sa.put(A, S1, &hex64(1), b"a1").unwrap();
+    sa.put(B, S1, &hex64(2), b"b1").unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    grow_history(&sa, 3, 10);
+    sc.fetch(Some("origin")).unwrap();
+    sc.hydrate_attestations().unwrap();
+    // The rewriter deletes b1 and attests e.
+    let b1 = sa.list(Some(B)).unwrap().remove(0);
+    assert!(sa.remove(&b1).unwrap());
+    sa.put(E, S1, &hex64(5), b"e1").unwrap();
+
+    let mut raced = false;
+    let out = sa
+        .push_rewriting_history_with_hook(Some("origin"), |attempt| {
+            if attempt == 1 {
+                assert_eq!(sc.remove_manifests([m.as_str()]).unwrap(), 1);
+                let a1 = sc.list(Some(A)).unwrap().remove(0);
+                assert!(sc.remove(&a1).unwrap());
+                sc.put(C, S1, &hex64(3), b"c1").unwrap();
+                assert_eq!(sc.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+                raced = true;
+            }
+        })
+        .unwrap();
+    assert!(raced);
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    assert!(out.rewritten, "{out:?}");
+    assert_eq!(commits(&w.remote, "refs/meta/main"), 1, "one commit");
+    let after = tree_blobs(&w.remote, "refs/meta/main");
+    assert!(
+        !after.contains_key(&manifest_path(&m)),
+        "the manifest the other clone deleted during the rewrite was published again"
+    );
+    let want = set(&[3, 5, 10, 11, 12]);
+    assert_eq!(remote_keys(&w), want, "a1 and b1 deleted, c1 and e1 kept");
+    let tip = git(&w.remote, &["rev-parse", "refs/meta/main"]);
+    assert_eq!(
+        git(&w.clones[0], &["rev-parse", "refs/meta/local/main"]),
+        tip,
+        "the local metadata commit is the published rewrite"
+    );
+    // Both clones converge, with nothing left to push.
+    for st in [&sa, &sc] {
+        st.fetch(Some("origin")).unwrap();
+        assert_eq!(keys(st), want);
+        assert!(st.manifest(&m).unwrap().is_none());
+        assert_eq!(
+            st.push(Some("origin")).unwrap().status,
+            PushStatus::UpToDate
+        );
+    }
+    assert_eq!(remote_keys(&w), want);
+}
+
+/// `vci prune`'s rewrite past `[store] history_max_commits` decides on the
+/// history each attempt fetched: two clones that both find it long (vex's
+/// two hourly attest jobs) rewrite it once. The second one's lease fails,
+/// and its next round finds the first one's rewrite, one commit, and
+/// pushes its own deletion and attestation on top of it; a clone that last
+/// fetched before the rewrite does the same. 2.10 counted the history as
+/// last fetched, and such a clone rewrote it again, dropping the first
+/// rewrite and what was pushed on it.
+#[test]
+fn a_long_history_is_rewritten_once_by_clones_that_both_find_it_long() {
+    let w = world(3);
+    let (ra, rb, rc) = (repo(&w.clones[0]), repo(&w.clones[1]), repo(&w.clones[2]));
+    let (sa, sb, sc) = (
+        AttestStore::new(&ra),
+        AttestStore::new(&rb),
+        AttestStore::new(&rc),
+    );
+    sa.put(A, S1, &hex64(1), b"a1").unwrap();
+    sa.put(B, S1, &hex64(2), b"b1").unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    grow_history(&sa, 4, 10);
+    for s in [&sb, &sc] {
+        s.fetch(Some("origin")).unwrap();
+        s.hydrate_attestations().unwrap();
+    }
+    assert_eq!(sb.history_commits().unwrap(), Some(5));
+    // Under the limit: a plain push on top.
+    sa.put(C, S1, &hex64(3), b"c1").unwrap();
+    let out = sa
+        .push_rewriting_history_longer_than(Some("origin"), 9)
+        .unwrap();
+    assert!(!out.rewritten, "{out:?}");
+    assert_eq!(out.status, PushStatus::Pushed);
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("history holds 5 commit(s), not more than 9")),
+        "{out:?}"
+    );
+    assert_eq!(commits(&w.remote, "refs/meta/main"), 6);
+
+    // Both prune (a1 by one, b1 by the other) and find the history long.
+    let a1 = sa.list(Some(A)).unwrap().remove(0);
+    assert!(sa.remove(&a1).unwrap());
+    let b1 = sb.list(Some(B)).unwrap().remove(0);
+    assert!(sb.remove(&b1).unwrap());
+    sb.put(D, S1, &hex64(4), b"d1").unwrap();
+    let mut first = None;
+    let out = sb
+        .push_rewriting_history_longer_than_with_hook(Some("origin"), 3, |attempt| {
+            if attempt == 1 {
+                let out = sa
+                    .push_rewriting_history_longer_than(Some("origin"), 3)
+                    .unwrap();
+                assert!(out.rewritten, "{out:?}");
+                first = Some(git(&w.remote, &["rev-parse", "refs/meta/main"]));
+            }
+        })
+        .unwrap();
+    let first = first.expect("the other clone rewrote first");
+    assert!(!out.rewritten, "the second clone rewrote again: {out:?}");
+    assert_eq!(out.status, PushStatus::Pushed);
+    assert_eq!(
+        roots(&w.remote, "refs/meta/main"),
+        std::slice::from_ref(&first)
+    );
+    assert_eq!(commits(&w.remote, "refs/meta/main"), 2);
+    let want = set(&[3, 4, 10, 11, 12, 13]);
+    assert_eq!(remote_keys(&w), want, "both deletions and d1 published");
+
+    // A clone that last fetched before the rewrite: on top of it as well.
+    assert_eq!(sc.history_commits().unwrap(), Some(5), "its stale count");
+    sc.put(E, S1, &hex64(5), b"e1").unwrap();
+    let out = sc
+        .push_rewriting_history_longer_than(Some("origin"), 3)
+        .unwrap();
+    assert!(!out.rewritten, "{out:?}");
+    assert_eq!(out.status, PushStatus::Pushed);
+    assert_eq!(roots(&w.remote, "refs/meta/main"), [first]);
+    assert_eq!(commits(&w.remote, "refs/meta/main"), 3);
+    let mut want = want;
+    want.insert(hex64(5));
+    assert_eq!(remote_keys(&w), want, "a1 and b1 not published again");
+}
+
+/// After a rewrite, a clone whose stale tree still carries the deletion
+/// record of a state object and a manifest that a later run stored again
+/// keeps them: it merges three-way on the tip it last fetched, where the
+/// record was already there, so the value is the remote's newer change.
+#[test]
+fn a_stale_record_does_not_delete_a_value_stored_again_after_a_rewrite() {
+    let w = world(2);
+    let (ra, rs) = (repo(&w.clones[0]), repo(&w.clones[1]));
+    let (sa, ss) = (AttestStore::new(&ra), AttestStore::new(&rs));
+    let st = object(ObjectKind::State, "state");
+    let m = hex64(0xe1);
+    let mbytes = format!("manifest {}", "m".repeat(300)).into_bytes();
+    sa.put_objects(std::slice::from_ref(&st)).unwrap();
+    sa.put_manifest(&m, &mbytes).unwrap();
+    sa.put(A, S1, &hex64(1), b"a1").unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    ss.fetch(Some("origin")).unwrap();
+    sa.remove_object_keys(vec![object_key(&st)]).unwrap();
+    sa.remove_manifests([m.as_str()]).unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    ss.fetch(Some("origin")).unwrap();
+    // A later run stores the same state and manifest again.
+    sa.put_objects(std::slice::from_ref(&st)).unwrap();
+    sa.put_manifest(&m, &mbytes).unwrap();
+    sa.put(B, S1, &hex64(2), b"b1").unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    sa.push_rewriting_history(Some("origin")).unwrap();
+    ss.put(C, S1, &hex64(3), b"c1").unwrap();
+    let out = ss.push(Some("origin")).unwrap();
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    let after = tree_blobs(&w.remote, "refs/meta/main");
+    assert!(
+        after.contains_key(&object_path(&st)),
+        "state object deleted"
+    );
+    assert!(after.contains_key(&manifest_path(&m)), "manifest deleted");
+    assert_eq!(remote_keys(&w), set(&[1, 2, 3]));
+}
+
+/// A clone without a base for the rewritten history (it never fetched, so
+/// nothing says what it had from the remote) merges it without a common
+/// ancestor: the new tip's deletion record of a manifest or object
+/// (content-addressed: a later run may put it again) wins over the value
+/// the clone wrote before the record was made, and loses to one written
+/// after it. Before, the local value always won, and such a clone
+/// published again what the rewrite's prune had deleted, until the next
+/// prune. (No attestation here: an attestation this clone cannot read
+/// might reference any object, and the merge then puts every one back.)
+#[test]
+fn without_a_base_a_deletion_record_wins_over_a_manifest_or_object_written_before_it() {
+    let pause = || std::thread::sleep(Duration::from_millis(20));
+    let w = world(3);
+    let (ra, rs, rn) = (repo(&w.clones[0]), repo(&w.clones[1]), repo(&w.clones[2]));
+    let (sa, ss, sn) = (
+        AttestStore::new(&ra),
+        AttestStore::new(&rs),
+        AttestStore::new(&rn),
+    );
+    let hdr = object(ObjectKind::Hdr, "hdr");
+    let state = object(ObjectKind::State, "state");
+    let m = hex64(0xe1);
+    let mbytes = format!("manifest {}", "m".repeat(300)).into_bytes();
+    let put_all = |s: &AttestStore<'_>| {
+        s.put_objects(&[hdr.clone(), state.clone()]).unwrap();
+        s.put_manifest(&m, &mbytes).unwrap();
+    };
+    let paths = [
+        ("hdr", object_path(&hdr)),
+        ("state", object_path(&state)),
+        ("manifest", manifest_path(&m)),
+    ];
+    let on_remote = || -> Vec<&str> {
+        let t = tree_blobs(&w.remote, "refs/meta/main");
+        paths
+            .iter()
+            .filter(|(_, p)| t.contains_key(p))
+            .map(|(n, _)| *n)
+            .collect()
+    };
+    // The stale clone holds them first (an earlier run of the same inputs).
+    put_all(&ss);
+    pause();
+    // The pruner had them too, deletes them (nothing references them) and
+    // rewrites the history.
+    put_all(&sa);
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    sa.remove_object_keys(vec![object_key(&hdr), object_key(&state)])
+        .unwrap();
+    sa.remove_manifests([m.as_str()]).unwrap();
+    assert_eq!(sa.push(Some("origin")).unwrap().status, PushStatus::Pushed);
+    sa.push_rewriting_history(Some("origin")).unwrap();
+    assert_eq!(commits(&w.remote, "refs/meta/main"), 1);
+    assert!(on_remote().is_empty());
+    pause();
+    // Another clone that never fetched either runs them again now.
+    put_all(&sn);
+
+    // The stale clone publishes a manifest of its own, and not the others.
+    let m2 = hex64(0xe2);
+    ss.put_manifest(&m2, format!("manifest {}", "n".repeat(300)).as_bytes())
+        .unwrap();
+    let out = ss.push(Some("origin")).unwrap();
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    assert!(
+        on_remote().is_empty(),
+        "the stale clone published again {:?}",
+        on_remote()
+    );
+    assert!(
+        tree_blobs(&w.remote, "refs/meta/main").contains_key(&manifest_path(&m2)),
+        "its own manifest"
+    );
+    assert!(ss.manifest(&m).unwrap().is_none(), "deleted there too");
+
+    // The one written after the records publishes them.
+    let out = sn.push(Some("origin")).unwrap();
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    assert_eq!(on_remote(), ["hdr", "state", "manifest"]);
 }

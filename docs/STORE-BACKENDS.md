@@ -125,7 +125,7 @@ this:
 | `vci plan`, `vci explain` | status; key-only listing of every unit; the chosen values in one batch; about 2,000 manifests from many threads; memo and flags | memo, flags |
 | `vci run` (and `vci ci`) | each attested unit's earlier attestations with values (supersession, from worker threads); last durations | manifests, attestations, removals of superseded attestations, orphan manifests (nothing in `vci ci` without `--push` on a shared store) |
 | `vci fetch`, `vci push` | status (store without an exchange), count, location | the exchange (git-meta only) |
-| `vci prune` | status; every attestation with values; every manifest root; the referenced manifests; the memo of the checked-out commit's tree (2.10) | removals; on git-meta (2.10) the drop of old deletion records and, past `history_max_commits`, a push of the store as one commit; the local file's free pages (`compact`) |
+| `vci prune` | status; every attestation with values; every manifest root; the referenced manifests; the memo of the checked-out commit's tree (2.10) | removals; on git-meta (2.10) the drop of old deletion records and, past `history_max_commits` and in CI only, a push of the store as one commit (`PushMode::RewriteHistoryLongerThan`); the local file's free pages (`compact`) |
 | `vci verify` (an envelope with a `manifestRef`) | one manifest and its base | none |
 | `vci store info` | settings, caps, status, count, location | none |
 
@@ -1172,7 +1172,7 @@ share one handle, one pool and one circuit breaker. On any error, selecting or o
 | `VCI_STORE_SYNC` | `off` disables SQLite `synchronous`, in git-meta's store (which also turns it off when `CI` is set) and in the SQLite backend and libSQL's files (which do not look at `CI`); `replica` asks the libSQL store for its replica mode | unchanged |
 | `VCI_STORE_MAX_AGE_DAYS` | 2.10: `vci prune` removes a unit's attestations issued more than this many days ago but its newest by each signer (0: no limit, at most 3650) | `[store] max_age_days`, else 14 |
 | `VCI_STORE_DELETION_RECORDS_HOURS` | 2.10, git-meta: hours a deletion record stays in the metadata tree (0 to 720) | `[store] deletion_records_hours`, else 6 |
-| `VCI_STORE_HISTORY_MAX_COMMITS` | 2.10, git-meta: `vci prune` publishes the store as one commit once the fetched history has more commits (0: never) | `[store] history_max_commits`, else 2000 |
+| `VCI_STORE_HISTORY_MAX_COMMITS` | 2.10, git-meta: `vci prune` in CI (`CI` set) publishes the store as one commit once the fetched history has more commits (0: never) | `[store] history_max_commits`, else 2000 |
 | unchanged, git-meta only | `VCI_FETCH_JOBS`, `VCI_LOCK_TIMEOUT_SECS`, `VCI_DELETION_RECORDS_DROP_AT` (2,000 since 2.10, 20,000 before), `VCI_DELETION_RECORDS_KEEP_SECS` (wins over `deletion_records_hours`) | |
 | tests only | `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require`, `VCI_TEST_PG_BINDIR` (section 14); `VCI_TEST_LIBSQL_URL`, `VCI_TEST_LIBSQL_TOKEN`, `VCI_TEST_LIBSQL=require` (section 18) | |
 
@@ -1249,7 +1249,7 @@ explain_hashes = true         # 2.9: write the run's state object (the attested 
 max_age_days = 14             # 2.10: vci prune removes a unit's attestations issued more than this many days ago but its
                               # newest by each signer, whatever tree they were made on (0: none); VCI_STORE_MAX_AGE_DAYS wins
 deletion_records_hours = 6    # 2.10, git-meta: hours a published deletion's record stays in the metadata tree; VCI_STORE_DELETION_RECORDS_HOURS
-history_max_commits = 2000    # 2.10, git-meta: vci prune publishes the store as one commit past this; VCI_STORE_HISTORY_MAX_COMMITS
+history_max_commits = 2000    # 2.10, git-meta: vci prune in CI publishes the store as one commit past this; VCI_STORE_HISTORY_MAX_COMMITS
 explain_hashes_days = 2       # 2.9: a state object older than this is removed even while referenced, by `vci run`'s
                               # orphan pass and `vci prune` (0 to 365; 0 writes the run's state object and removes it
                               # at the end of the same run: use explain_hashes = false instead); every writer applies
@@ -2137,8 +2137,10 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   query holds an `@` (it masks up to the last `@`), and it also masks `password=`, `sslpassword=`, `sslkey=` and
   `authToken=` values in a query. `redact_userinfo` is still used for remotes the user typed, in warnings.
 - `fetch` is `AttestStore::fetch`.
-- `push(Merge)` is `push`, and `push(RewriteHistory)` is `push_rewriting_history`. A future `PushMode` is
-  `Unsupported{git-meta, "this kind of push"}`.
+- `push(Merge)` is `push`, `push(RewriteHistory)` is `push_rewriting_history`, and (2.10)
+  `push(RewriteHistoryLongerThan(n))` is `push_rewriting_history_longer_than(n)`: a rewrite on each attempt whose
+  fetched history has more than `n` commits, else a merge on top (`PushOutcome::rewritten` says which). A future
+  `PushMode` is `Unsupported{git-meta, "this kind of push"}`.
 
 **Errors**: `From<GitError>` (in store.rs) maps `Invalid{what, value, reason}` field for field. Every other variant
 becomes `StoreError::Backend(Box<GitError>)`, so the display text is byte-identical and `downcast_backend::<GitError>()`
@@ -2195,8 +2197,17 @@ past the window whose deletion is published, whatever their number: the `tombsto
 on top of `refs/meta/local/main`, under the exchange lock; a push drops them once there are
 `VCI_DELETION_RECORDS_DROP_AT`, 2,000, past the window; both return a `DeletionRecords` with `total`, `old`,
 `unpublished` and the rows actually `dropped`) and `history_commits()` (`git rev-list --count` of
-`refs/<ns>/remotes/main`; `None` before the first fetch), then the trait's push with `PushMode::RewriteHistory` once
-the history passes `[store] history_max_commits`. A record is published (`published_deletions`) when neither
+`refs/<ns>/remotes/main`; `None` before the first fetch), then, in CI only (`CI` set to anything but empty, `false` or
+`0`; elsewhere a note says to run `vci push --rewrite-history`), the trait's push with
+`PushMode::RewriteHistoryLongerThan(history_max_commits)` once that count passes `[store] history_max_commits`. The
+count only decides whether to try: `push_impl` counts the tip each attempt fetched (`commit_count`) and rewrites only
+when it is still longer, else pushes on top of it (`PushOutcome::rewritten` false, and a note): a clone whose
+tracking ref predates another clone's rewrite, or whose rewrite lost the lease to one, pushes on top of that rewrite
+instead of rewriting it again (it used to count before its fetch, and vex's two parallel attest jobs would each
+rewrite). The parentless commit is built beside `refs/meta/local/main`, which moves to it (compare-and-swap from
+the commit it was made from) only once `git push` succeeds: moved before, an attempt whose lease failed merged the
+new tip into a commit that shares no history with it, local side first, and a manifest another clone deleted during
+the rewrite came back. A record is published (`published_deletions`) when neither
 `refs/meta/local/main`'s tree nor the remote tip last fetched or pushed (`refs/<ns>/remotes/main`; the tip just
 fetched, in a push) holds its value: the deletion was serialized and the remote has it. Until then it stays,
 however old. Dropped earlier, a record nothing had serialized (a prune with `deletion_records_hours = 0` would drop
@@ -2219,13 +2230,22 @@ clone last fetched it: merged it on the tip this clone last fetched (<id>), so t
 deleted here too` instead of warning about attestations dropped without a record. Without such a base (a clone that
 never fetched, a tip of another history) it takes git-meta's two-way merge, local side first, except that the tip's
 deletion record of an attestation key (`vci:attestation:...`, `parse_key`) wins over the local value (such a key is
-never written twice: the record is the newer change); a manifest or object keeps the local side. With that rule
-alone, every restore of a CI cache saved before a rewrite published again every value deleted since whose record
-had passed the window (`store_rewrite_stale_cache.rs` without the base: 3 of 3 jobs restoring one cache).
-`crates/vci-git/tests/store_history_rewrite.rs` (3 tests) holds it: a clone holding the history before a rewrite
+never written twice: the record is the newer change), and so does the record of a manifest or object key over a
+local value whose row's `last_timestamp` is not after the record's `timestamp` (`deleted_after_written`; the record's
+blob is fetched when missing; a row put since, or an object put again, which moves its row to now, keeps the local
+value; before, a manifest or object always kept the local side and such a clone published every one the rewrite's
+prune had deleted). With the attestation rule alone, every restore of a CI cache saved before a rewrite published
+again every value deleted since whose record had passed the window (`store_rewrite_stale_cache.rs` without the base:
+3 of 3 jobs restoring one cache).
+`crates/vci-git/tests/store_history_rewrite.rs` (7 tests) holds it: a clone holding the history before a rewrite
 and the deleted attestation's value pushes one commit on top of the new history without that attestation, while a
 third clone's push in the rewrite's window makes its lease fail and is kept by its next round; a value whose record
-was dropped before the rewrite stays deleted; the counts and the drop. `store_rewrite_stale_cache.rs` (4 tests)
+was dropped before the rewrite stays deleted; the counts and the drop; a clone's deletion of a manifest and an
+attestation and its addition in the rewrite's window all kept, and the local metadata commit moved to the rewrite
+once published; two clones that both find the history long rewrite it once, and a clone that fetched before the
+rewrite pushes on top of it; a stale deletion record of a state object and a manifest put again does not delete them;
+without a base, a manifest or object written before the tip's record goes and one written after stays.
+`store_rewrite_stale_cache.rs` (4 tests)
 restores one pre-rewrite cache three times (none brings the deleted value back, without a rewrite or with one, and
 with a cache saved mid-fetch), and keeps every value of a clone that never fetched; `store_deletion_records_unpublished.rs`
 (3 tests) keeps a record not yet serialized, or serialized and not pushed, past the window until a push publishes it.

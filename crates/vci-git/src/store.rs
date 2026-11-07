@@ -668,13 +668,17 @@ impl Exchange for GitMetaStore {
         Ok(out?)
     }
 
-    /// [`AttestStore::push`], or [`AttestStore::push_rewriting_history`];
-    /// then the reader pool is emptied.
+    /// [`AttestStore::push`], [`AttestStore::push_rewriting_history`] or
+    /// [`AttestStore::push_rewriting_history_longer_than`]; then the
+    /// reader pool is emptied.
     fn push(&self, remote: Option<&str>, mode: PushMode) -> Result<PushOutcome, StoreError> {
         let st = self.attest_store();
         let out = match mode {
             PushMode::Merge => st.push(remote),
             PushMode::RewriteHistory => st.push_rewriting_history(remote),
+            PushMode::RewriteHistoryLongerThan(max) => {
+                st.push_rewriting_history_longer_than(remote, max)
+            }
             _ => {
                 return Err(StoreError::Unsupported {
                     backend: KIND,
