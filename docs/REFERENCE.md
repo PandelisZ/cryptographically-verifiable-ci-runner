@@ -2146,7 +2146,8 @@ keys, so during a rollout set the variable instead):
    history, never the old one. A clone that pushes while the rewrite is in flight makes the rewrite's lease fail;
    its next round merges that push and publishes one commit again.
 6. **The local file.** On git-meta, git-meta's log rows older than both the last materialization and a day are
-   removed (an incremental serialization reads only later ones; a developer's `.git/git-meta.sqlite` on vex had grown
+   removed (an incremental serialization reads only later ones, and the materialization is the one a serialization
+   that did not finish recorded, which it puts back; a developer's `.git/git-meta.sqlite` on vex had grown
    to 1.8 GB, a fresh clone's to 390 MB, two thirds of it deletion records and the log of applying them). On
    git-meta and SQLite the file's free pages are given back once they are a quarter of it and at least 16 MiB
    (`PRAGMA incremental_vacuum`, after the one `VACUUM` that turns the file's incremental mode on): `vci prune:

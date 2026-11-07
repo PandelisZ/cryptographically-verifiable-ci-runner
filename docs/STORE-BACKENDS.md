@@ -762,7 +762,10 @@ state them:
   later compaction costs the pages freed, not the file's size; then `PRAGMA wal_checkpoint(TRUNCATE)`. Returns the
   file's size before and after when it freed anything. git-meta first removes its log rows (`metadata_log`) older
   than both the last materialization and a day (an incremental serialization reads only rows after the
-  materialization). A server (PostgreSQL, libSQL remote and replica) reclaims its own space: `None`. Never removes a
+  materialization), in one write transaction with reading the marker; while a serialization journal is open (a
+  git-meta serialization killed, or failing, before vci checked its commit, or one under way) the journal's marker,
+  which that serialization puts back, counts instead when it is older, and a journal without one keeps every row. A
+  server (PostgreSQL, libSQL remote and replica) reclaims its own space: `None`. Never removes a
   record; a failure is a warning in `vci prune`.
 - **`run_state_objects(runs) -> Vec<Option<String>>`** (2.10): the state object each of these records' runs
   wrote (`RunOf { record, shape }`: a listed record and the shape its descriptor names), one per entry in order,
@@ -2205,7 +2208,7 @@ and the deleted attestation's value pushes one commit on top of the new history 
 third clone's push in the rewrite's window makes its lease fail and is kept by its next round; a value whose record
 was dropped before the rewrite comes back once, is deleted again and stays deleted; the counts and the drop.
 `compact()` removes git-meta's log rows older than the last materialization and a day, then frees the file's pages
-(section 4).
+(section 4); `store_crash_safety.rs` checks that it keeps the rows a killed serialization's journal still needs.
 
 The conformance world's `age_objects` moves `last_timestamp` in `.git/git-meta.sqlite`, so c35 to c42 run in full
 (c40's columns half skips: git-meta keeps none).

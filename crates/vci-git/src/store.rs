@@ -497,8 +497,9 @@ impl AttestationStore for GitMetaStore {
         Ok(self.attest_store().put_run_state_links(&links)?)
     }
 
-    /// git-meta's log rows older than the last materialization and a day,
-    /// then the free pages ([`AttestStore::compact_store`]). The pooled
+    /// git-meta's log rows older than the last materialization (or the
+    /// one an open serialization journal recorded) and a day, then the
+    /// free pages ([`AttestStore::compact_store`]). The pooled
     /// readers are dropped first: an open read keeps `VACUUM` from running.
     fn compact(&self) -> Result<Option<(u64, u64)>, StoreError> {
         self.refresh_readers();

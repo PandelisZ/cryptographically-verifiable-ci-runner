@@ -357,6 +357,112 @@ fn a_serialization_killed_after_git_meta_leaves_the_local_ref_where_it_was() {
     assert_eq!(sa.list(Some(C)).unwrap().len(), 1);
 }
 
+/// `vci prune`'s compaction (`compact_store`) after a serialization was
+/// killed between git-meta's marker and vci's check: git-meta had moved the
+/// store's marker past the rows it serialized, and the journal puts it back
+/// so that the next command serializes them again, so the compaction must
+/// keep the log rows after the journal's marker, not only those after the
+/// store's, even once they are more than a day old. Removed, the next push
+/// would publish nothing of what was being serialized.
+#[test]
+fn compaction_after_a_killed_serialization_keeps_what_it_still_has_to_serialize() {
+    let w = lazy_world(1);
+    let _p = publish(&w);
+    let f = fresh_clone(&w, "fresh");
+    let rf = repo(&f);
+    let sf = AttestStore::new(&rf);
+    sf.fetch(Some("origin")).unwrap();
+    let r3 = hex64(0xe3);
+    sf.put_manifest(&r3, &manifest("three")).unwrap();
+    sf.put(C, S2, &hex64(3), &env("c2", &r3)).unwrap();
+    let out = in_child(
+        &f,
+        "push",
+        &[
+            ("VCI_SERIALIZE", "git-meta"),
+            ("VCI_FAILPOINT", "serialize-after-git-meta"),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "the child was not killed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Two days later: the log, the store's marker and the journal's all
+    // moved back together, so every row is older than the day the
+    // compaction keeps.
+    let db = rusqlite::Connection::open(f.join(".git/git-meta.sqlite")).unwrap();
+    let journal: Option<i64> = db
+        .query_row(
+            "SELECT marker FROM vci_serialize_pending WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let marker: i64 = db
+        .query_row(
+            "SELECT last_materialized FROM sync_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        journal.is_some_and(|j| j < marker),
+        "git-meta moved the marker past the journal's: {journal:?} {marker}"
+    );
+    let two_days = 2 * 24 * 60 * 60 * 1000_i64;
+    db.execute_batch(&format!(
+        "UPDATE metadata_log SET timestamp = timestamp - {two_days};
+         UPDATE sync_state SET last_materialized = last_materialized - {two_days};
+         UPDATE vci_serialize_pending SET marker = marker - {two_days};"
+    ))
+    .unwrap();
+    let after_journal: i64 = db
+        .query_row(
+            "SELECT count(*) FROM metadata_log WHERE timestamp > ?1",
+            [journal.unwrap() - two_days],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(after_journal > 0, "no row after the journal's marker");
+    drop(db);
+
+    sf.compact_store().unwrap();
+    let db = rusqlite::Connection::open(f.join(".git/git-meta.sqlite")).unwrap();
+    let kept: i64 = db
+        .query_row(
+            "SELECT count(*) FROM metadata_log WHERE timestamp > ?1",
+            [journal.unwrap() - two_days],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        kept, after_journal,
+        "the compaction removed rows to serialize"
+    );
+    drop(db);
+
+    // The next push serializes them again and publishes them.
+    let out = sf.push(Some("origin")).unwrap();
+    assert_eq!(out.status, PushStatus::Pushed, "{out:?}");
+    let remote = tree_blobs(&w.remote, "refs/meta/main");
+    assert!(
+        remote.contains_key(&manifest_path(&r3)),
+        "{r3} not published"
+    );
+    assert!(remote.contains_key(&attestation_path(C, S2, &hex64(3))));
+    // With no journal left, the compaction removes the rows older than the
+    // store's marker and a day.
+    let db = rusqlite::Connection::open(f.join(".git/git-meta.sqlite")).unwrap();
+    db.execute_batch(&format!(
+        "UPDATE metadata_log SET timestamp = timestamp - {two_days};
+         UPDATE sync_state SET last_materialized = last_materialized - {two_days};"
+    ))
+    .unwrap();
+    drop(db);
+    assert!(sf.compact_store().unwrap().log_rows > 0);
+}
+
 /// git-meta's serialization, run in its scratch directory, still lands:
 /// the local ref moves to the checked commit (the values not fetched
 /// grafted back) and the scratch directory is gone.

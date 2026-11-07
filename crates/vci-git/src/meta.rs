@@ -7169,13 +7169,25 @@ impl<'a> AttestStore<'a> {
     /// pages once they are a quarter of the file ([`compact_sqlite`]). On
     /// vex a developer's store had grown to 1.8 GB, a fresh clone's to 390
     /// MB, two thirds of it deletion records and the log of applying them.
+    ///
+    /// The last materialization is the one a serialization journal recorded
+    /// when there is one (`serialize_with_git_meta`): git-meta moves the
+    /// marker before vci checks its commit, and a serialization killed or
+    /// failing in between (or under way in another process) puts it back,
+    /// so the rows after the recorded one are serialized again and must
+    /// still be here then; a journal that recorded no marker keeps every
+    /// row. The marker, the journal and the removal are one write
+    /// transaction.
     pub fn compact_store(&self) -> Result<Compacted, GitError> {
         let mut out = Compacted::default();
-        let Some((path, db)) = self.db_rw()? else {
+        let Some((path, mut db)) = self.db_rw()? else {
             return Ok(out);
         };
         let e = |err| sql_err(&path, err);
-        let marker: Option<i64> = db
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(e)?;
+        let marker: Option<i64> = tx
             .query_row(
                 "SELECT last_materialized FROM sync_state WHERE id = 1",
                 [],
@@ -7183,12 +7195,39 @@ impl<'a> AttestStore<'a> {
             )
             .ok()
             .flatten();
-        if let Some(m) = marker {
+        let journal: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'vci_serialize_pending'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(e)?;
+        // `None`: no journal; `Some(None)`: one that recorded no marker.
+        let pending: Option<Option<i64>> = if journal == 0 {
+            None
+        } else {
+            match tx.query_row(
+                "SELECT marker FROM vci_serialize_pending WHERE id = 1",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            ) {
+                Ok(m) => Some(m),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(err) => return Err(e(err)),
+            }
+        };
+        let floor = match (marker, pending) {
+            (Some(m), None) => Some(m),
+            (Some(m), Some(Some(p))) => Some(m.min(p)),
+            (None, _) | (_, Some(None)) => None,
+        };
+        if let Some(m) = floor {
             let cutoff = m.min(now_ms() - 24 * 60 * 60 * 1000);
-            out.log_rows = db
+            out.log_rows = tx
                 .execute("DELETE FROM metadata_log WHERE timestamp < ?1", [cutoff])
                 .map_err(e)?;
         }
+        tx.commit().map_err(e)?;
         out.vacuumed = compact_sqlite(&db).map_err(e)?;
         Ok(out)
     }
