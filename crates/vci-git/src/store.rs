@@ -444,7 +444,7 @@ impl AttestationStore for GitMetaStore {
     /// give the link's prefix, and its first key the state id. One key
     /// lookup per distinct run, on a pooled reader; values not read (a link
     /// not fetched yet names its state as well). `None` for a record whose
-    /// key has no hint or whose run wrote no link (a vci before 2.9.1).
+    /// key has no hint or whose run wrote no link (a vci before 2.10).
     fn run_state_objects(
         &self,
         runs: &[vci_store::RunOf<'_>],

@@ -435,7 +435,7 @@ fn an_idempotent_put_in_a_batch_restarts_the_grace_period() {
     assert_eq!(objects(&s, &run.id_refs()), vec![run.ids.state.clone()]);
 }
 
-/// Run-state links (2.9.1): `put_run_state` stores one string value per
+/// Run-state links (2.10): `put_run_state` stores one string value per
 /// hint under `vci:run-state:<shape>:<hint>:<state>` on the project target
 /// (published by a push like any value); another clone names the run's
 /// state object from the record's key alone, with the link not fetched

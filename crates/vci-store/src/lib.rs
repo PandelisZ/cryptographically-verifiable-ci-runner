@@ -1803,7 +1803,7 @@ pub trait AttestationStore: Send + Sync {
     /// 1.5 step 9), one per entry in order: the id the store says the run
     /// wrote, or `None` when it says none (the run wrote none, `[store]
     /// explain_hashes = false`; or nothing names it, as for a git-meta
-    /// record of a vci before 2.9.1). The id is **store data**, in no
+    /// record of a vci before 2.10). The id is **store data**, in no
     /// signed field: it chooses which state object the plan's failure text
     /// loads, which may since have been removed (its TTL), and never a
     /// verdict. Values are not read. Cost: one round trip, or one key
@@ -2449,7 +2449,7 @@ pub mod key {
     //! vci:attestation:<test key>:<signer>:<storage key>[:<issued hex>.<tree16 | ->]
     //! vci:manifest:<input root>
     //! vci:object:<kind>:<object id>                  (vci 2.9, a backend that files objects by key)
-    //! vci:run-state:<shape id>:<hint>:<state id>     (vci 2.9.1, a backend without listing columns)
+    //! vci:run-state:<shape id>:<hint>:<state id>     (vci 2.10, a backend without listing columns)
     //! ```
     //!
     //! * `<test key>` is the BLAKE3 hash of the test id, 64 lowercase hex
@@ -2482,7 +2482,7 @@ pub mod key {
     /// by key (git-meta: `vci:object:<kind>:<id>`, STORE-V2 section 2.2).
     pub const OBJECT_PREFIX: &str = "vci:object";
     /// Key namespace of the run-state links of a backend without listing
-    /// columns (git-meta, vci 2.9.1): [`run_state_key`].
+    /// columns (git-meta, vci 2.10): [`run_state_key`].
     pub const RUN_STATE_PREFIX: &str = "vci:run-state";
     /// Length of an object id: 32 bytes of BLAKE3 as lowercase hex.
     pub const OBJECT_ID_LEN: usize = 64;
@@ -2628,7 +2628,7 @@ pub mod key {
         format!("{RUN_STATE_PREFIX}:{shape}:{}:", hint_segment(hint))
     }
 
-    /// The key of a run-state link (vci 2.9.1, git-meta, which keeps no
+    /// The key of a run-state link (vci 2.10, git-meta, which keeps no
     /// listing columns): `vci:run-state:<shape id>:<hint>:<state id>`, which
     /// says that the run whose records carry this hint in their keys and
     /// name this shape in their descriptors wrote this state object. A
@@ -3120,9 +3120,9 @@ pub mod select {
         /// How many state objects a plan loads after its verdicts, for the
         /// units that run whose entries changed, to name the input that
         /// changed (`entry:<path> (+N more)`) instead of `attested hash not
-        /// loaded` (default 8, since 2.9.1, at most 256; 0: none, the plan
+        /// loaded` (default 8, since 2.10, at most 256; 0: none, the plan
         /// reads no state object). `VCI_STORE_PLAN_STATES` wins over it. A
-        /// vci older than 2.9.1 refuses a `vci.toml` that sets it (an
+        /// vci older than 2.10.0 refuses a `vci.toml` that sets it (an
         /// unknown key).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plan_states: Option<u32>,

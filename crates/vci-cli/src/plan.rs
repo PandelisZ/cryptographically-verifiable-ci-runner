@@ -1352,7 +1352,7 @@ const STATE_EXPIRED: &str = "state expired";
 /// units needed.
 const OVER_BUDGET: &str = "over the plan's budget";
 /// Why: the store names no state object for the record's run (the run
-/// wrote none, `explain_hashes = false`, or a vci before 2.9.1 wrote the
+/// wrote none, `explain_hashes = false`, or a vci before 2.10 wrote the
 /// record on git-meta, which then kept no link to it).
 const NO_STATE: &str = "no state object for the run";
 
@@ -3162,7 +3162,7 @@ struct NamedInputs {
 }
 
 /// After the verdicts and their rounds (STORE-V2 section 1.5 step 9, vci
-/// 2.9.1): name the input that changed for the units that run. A format-3
+/// 2.10): name the input that changed for the units that run. A format-3
 /// record keeps no per-input hash (they are in its run's state object,
 /// which no verdict reads), so the verdicts say `entry: changed (attested
 /// hash not loaded)`; here, for the best candidate of each unit that runs
@@ -6707,7 +6707,7 @@ adapter = "pytest"
     /// The verdicts' one batch of objects per round names and loads no
     /// state object, and asks the store for no column: only the units that
     /// run need one, after the verdicts, so a plan that skips everything
-    /// reads none (2.9.1; 2.9.0 asked for every candidate's column per round
+    /// reads none (2.10; 2.9.0 asked for every candidate's column per round
     /// and loaded up to 16 state objects during the verdicts).
     #[test]
     fn the_verdict_objects_load_names_no_state_object() {

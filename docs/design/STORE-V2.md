@@ -303,7 +303,7 @@ A partial or cancelled job stores what it signed: every unit is its own record, 
    (attested hash not loaded)` past it or when the object was pruned (section 1.3). A hash printed from a state
    object is labelled `attested (unsigned, from the run's state object)`, because the object is bound by nothing
    the signer signed: a store writer who replaces it can only mislabel this text, never a verdict.
-   *Amended in 2.9.1:* the verdicts load no state object; after them, only the best candidates of the units that
+   *Amended in 2.10:* the verdicts load no state object; after them, only the best candidates of the units that
    run whose text says the hash was not loaded have their run's state object named (`run_state_objects`: the
    column, or on git-meta, which has none, a run-state link `vci:run-state:<shape>:<hint>:<state>` that `vci run`
    writes beside its objects), loaded once per distinct id, most-needed first, within `[store] plan_states = 8` and

@@ -1,6 +1,6 @@
 //! The local metadata commit never holds an unchecked serialization, and a
 //! clone whose local metadata lost shared values without deleting them gets
-//! them back by itself (2.9.1).
+//! them back by itself (2.10).
 //!
 //! On 6 November 2026 a vex laptop's `refs/meta/local/main` became a
 //! git-meta serialization that dropped 4,484 manifests and objects the
@@ -315,7 +315,7 @@ fn a_serialization_killed_after_git_meta_leaves_the_local_ref_where_it_was() {
         "{stderr}"
     );
     // The local ref is where it was (it held git-meta's commit, which drops
-    // the values this clone never fetched, before 2.9.1), every value is
+    // the values this clone never fetched, before 2.10), every value is
     // still in it, and nothing was published.
     assert_eq!(local_ref(&f), before);
     let ours = tree_blobs(&f, "refs/meta/local/main");

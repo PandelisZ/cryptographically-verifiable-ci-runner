@@ -1308,7 +1308,7 @@ fn store_upgrade_finish_is_refused_until_the_expired_format_1_rows_are_pruned() 
 }
 
 // ---------------------------------------------------------------------------
-// (j) The plan names the input that changed (2.9.1).
+// (j) The plan names the input that changed (2.10).
 
 /// The text plan's line of `unit` (`RUN  <unit>  (<reason>)`).
 fn plan_line<'t>(plan: &'t str, unit: &str) -> &'t str {

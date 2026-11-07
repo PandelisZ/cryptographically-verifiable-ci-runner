@@ -164,7 +164,7 @@ fn a_frame_names_no_manifest_and_names_its_objects() {
     assert_eq!(e.manifest_ref(), ManifestRef::Inline);
 }
 
-/// A run-state link's key (2.9.1): shape, hint and state round-trip, the
+/// A run-state link's key (2.10): shape, hint and state round-trip, the
 /// hint spelt as an attestation key spells it (so a record's key names its
 /// run's link prefix), and anything else is foreign.
 #[test]

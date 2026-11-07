@@ -72,7 +72,7 @@
 //! first copies into the store whatever that ref holds and the store has no
 //! row or deletion record for, refuses any serialization that would drop a
 //! key without a deletion record, ignores tree entries git-meta cannot
-//! read, and removes store rows git-meta cannot serialize. Since 2.9.1
+//! read, and removes store rows git-meta cannot serialize. Since 2.10
 //! git-meta serializes in a scratch git directory and the ref moves only to
 //! a commit vci checked (`serialize_with_git_meta`), and a push or fetch
 //! puts back the values of the remote's tip the local commit lost without
@@ -236,7 +236,7 @@ const ABSENT_REF: &str = "";
 /// tests; unset, it costs one environment lookup.
 ///
 /// * `serialize-after-git-meta`: right after git-meta's own serialization
-///   returned, before vci checked the commit it wrote (2.9.1: before, the
+///   returned, before vci checked the commit it wrote (2.10: before, the
 ///   local metadata commit was already git-meta's there, unchecked, as it
 ///   was left on vex on 6 November 2026 with 4,484 shared values dropped).
 fn failpoint(name: &str) {
@@ -2901,7 +2901,7 @@ impl<'a> AttestStore<'a> {
         self.remove_project_keys(keys)
     }
 
-    /// Store run-state links (vci 2.9.1: [`vci_store::key::run_state_key`],
+    /// Store run-state links (vci 2.10: [`vci_store::key::run_state_key`],
     /// each with its state id as the value) on the `project` target, inside
     /// the batch when one is open, as [`AttestStore::put_objects`] stores
     /// objects. A link already stored is left as it is. Returns how many
@@ -5462,7 +5462,7 @@ impl<'a> AttestStore<'a> {
     /// for everyone.
     ///
     /// `local_ref` only ever moves to a commit that passed that check
-    /// (2.9.1): git-meta serializes onto a copy of it in a scratch git
+    /// (2.10): git-meta serializes onto a copy of it in a scratch git
     /// directory, and the ref moves (compare-and-swap) once the commit is
     /// checked, so a process killed at any instant, or a step that fails,
     /// leaves it at the previous commit or at a checked one (see
@@ -6140,7 +6140,7 @@ impl<'a> AttestStore<'a> {
 
     /// Mark the store serialized as of `now`, once the local ref holds
     /// what [`AttestStore::serialize_changed`] read. A failure here is not
-    /// one of the serialization (2.9.1): the ref already holds the entries,
+    /// one of the serialization (2.10): the ref already holds the entries,
     /// and a marker left behind only makes the next serialization write
     /// them again, which changes nothing. It used to fail the
     /// serialization and hand it to git-meta, which serialized the same
@@ -6464,7 +6464,7 @@ impl<'a> AttestStore<'a> {
     /// Returns the new commit, now the tip of `local_ref`, and the note
     /// that says so.
     ///
-    /// 2.9.1: on 6 November 2026 a vex laptop's local metadata commit had
+    /// 2.10: on 6 November 2026 a vex laptop's local metadata commit had
     /// lost 4,484 manifests and objects the remote held (see
     /// [`AttestStore::serialize_with_git_meta`]), the merges after it kept
     /// them out, and every push refused to delete them for everyone until
@@ -7009,7 +7009,7 @@ impl<'a> AttestStore<'a> {
                 let _ = std::fs::write(&marker, format!("{tip}\n"));
             }
         }
-        // 2.9.1: values of the fetched tip the local metadata commit lost
+        // 2.10: values of the fetched tip the local metadata commit lost
         // without this store deleting them are put back, so this clone's
         // plans can read them again (a push does it in its own check, which
         // lists both trees anyway). Never fails the fetch.
@@ -8771,7 +8771,7 @@ impl<'a> AttestStore<'a> {
                 // Every value of the remote tip must still be there, unless
                 // this store deleted it (vci prune, git meta rm). One the
                 // local metadata lost otherwise is put back, at the remote's
-                // blob (2.9.1; before, the push refused, and every push
+                // blob (2.10; before, the push refused, and every push
                 // after it, until the store was reset by hand).
                 let theirs_keys = self.snapshot_keys(tip)?;
                 let lost: BTreeMap<Key, String> = theirs_keys
