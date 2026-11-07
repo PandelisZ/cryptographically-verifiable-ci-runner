@@ -1936,7 +1936,11 @@ struct Cand {
 /// 2. a format-1 record issued before the group's newest format-3 one
 ///    goes ([`Why::FormatOne`]): the signer has moved to format 3 since (a
 ///    newer format-1 record, from a writer still on `record_format = 1` or
-///    on a vci 2.8, is ranked with the rest);
+///    on a vci 2.8, is ranked with the rest); unless it was made on a tree
+///    some ref has at its tip and is within the age limit, as rules 4 and 5
+///    spare any record (2.10: before, a branch whose plan skipped a unit
+///    on such a record ran it after a prune elsewhere); a record spared so
+///    does not count towards `keep`;
 /// 3. of the rest, ranked newest first by signed issue time, the newest
 ///    stays: no rule but expiry empties a unit;
 /// 4. one issued before [`Policy::aged_before`] goes ([`Why::Aged`]),
@@ -1957,7 +1961,12 @@ fn decide(group: &[Cand], p: &Policy) -> Vec<(usize, Why)> {
     for i in order {
         let c = &group[i];
         let used = p.used.contains(&c.key);
+        let aged = p.aged_before.is_some_and(|t| c.issued < t);
+        let live = c.tree.as_deref().is_some_and(|t| p.live_trees.contains(t));
         if c.format == 1 && !used && three.is_some_and(|t| (c.issued, &c.key) < t) {
+            if live && !aged {
+                continue;
+            }
             out.push((i, Why::FormatOne));
             continue;
         }
@@ -1966,11 +1975,10 @@ fn decide(group: &[Cand], p: &Policy) -> Vec<(usize, Why)> {
         if used || r == 0 {
             continue;
         }
-        if p.aged_before.is_some_and(|t| c.issued < t) {
+        if aged {
             out.push((i, Why::Aged));
             continue;
         }
-        let live = c.tree.as_deref().is_some_and(|t| p.live_trees.contains(t));
         if r >= p.keep && !live {
             out.push((i, Why::Superseded));
         }
@@ -2053,12 +2061,14 @@ impl Pruned {
 ///
 /// Since 2.10 the rules of [`decide`] also remove the attestations older
 /// than `[store] max_age_days` (14) that are not their unit's newest, and
-/// the format-1 records issued before their unit's newest format-3 one, and keep any
-/// a plan of the checked-out commit used; the summary counts each rule.
+/// the format-1 records issued before their unit's newest format-3 one
+/// (but one on a live tree within the age limit), and keep any a plan of
+/// the checked-out commit used; the summary counts each rule.
 /// On git-meta it then drops the deletion records older than `[store]
 /// deletion_records_hours` (6), publishes the store as one commit once the
 /// fetched history holds more than `[store] history_max_commits` (2000)
-/// commits, and compacts the local store's file ([`AttestationStore::compact`],
+/// commits (in CI only; elsewhere it says how: [`rewrite_long_history`]),
+/// and compacts the local store's file ([`AttestationStore::compact`],
 /// which SQLite does too).
 pub fn prune(args: PruneArgs) -> Result<i32> {
     let PruneArgs {
@@ -2180,7 +2190,7 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
                 "vci prune: {} format-1 attestation(s) remain{}",
                 p.format_one_left,
                 if policy.format_rule {
-                    " (none older than a format-3 attestation of their unit by the same signer, or a plan of the checked-out commit used them)"
+                    " (none older than a format-3 attestation of their unit by the same signer, or made within max_age_days on a tree some branch or tag has at its tip, or a plan of the checked-out commit used them)"
                 } else {
                     " ([store] record_format = 1 keeps them)"
                 }
@@ -2211,7 +2221,8 @@ pub fn prune(args: PruneArgs) -> Result<i32> {
             .as_ref()
             .map(|s| s.history_max_commits.value)
             .unwrap_or(vci_store::select::DEFAULT_HISTORY_MAX_COMMITS);
-        published = rewrite_long_history(&gm, &*store, dry_run, history_max);
+        let ci = is_ci(std::env::var_os("CI").as_deref());
+        published = rewrite_long_history(&gm, &*store, dry_run, history_max, ci);
     }
     if !dry_run {
         match store.compact() {
@@ -2331,18 +2342,40 @@ fn prune_deletion_records(gm: &AttestStore<'_>, dry_run: bool) -> usize {
     }
 }
 
+/// Whether `CI` (its value here) says this runs in CI: set, and neither
+/// empty, `false` nor `0` (GitHub Actions and most CI services set
+/// `CI=true`).
+fn is_ci(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.to_string_lossy();
+        let v = v.trim();
+        !v.is_empty() && !v.eq_ignore_ascii_case("false") && v != "0"
+    })
+}
+
 /// git-meta: once the metadata history fetched from the remote holds more
 /// than `max` commits (`[store] history_max_commits`; 0: never), publish
 /// the store as one commit without parents (`vci push --rewrite-history`),
 /// so that a fetch downloads the current tree rather than every version
 /// ever published (vex, November 2026: 7,426 commits whose trees are 21
-/// million objects, more than 3 GB). Returns whether it published. A
-/// failure is a warning: the prune stands, and a later one publishes.
+/// million objects, more than 3 GB). Returns whether it published.
+///
+/// Only in CI (`ci`, see [`is_ci`]): elsewhere (a laptop) a prune
+/// publishes nothing by itself, and says how to rewrite the history
+/// instead. The count read here (the history as this clone last fetched
+/// it) only decides whether to try: the push counts again after its own
+/// fetch, on every attempt, and pushes on top of the remote's history
+/// when another clone has rewritten it since
+/// ([`PushMode::RewriteHistoryLongerThan`]): before, a clone that last
+/// fetched before another one's rewrite rewrote the history again,
+/// dropping that rewrite and what was pushed on it. A failure is a
+/// warning: the prune stands, and a later one publishes.
 fn rewrite_long_history(
     gm: &AttestStore<'_>,
     store: &dyn AttestationStore,
     dry_run: bool,
     max: u32,
+    ci: bool,
 ) -> bool {
     if max == 0 {
         return false;
@@ -2361,9 +2394,15 @@ fn rewrite_long_history(
     let what = format!(
         "the metadata history has {commits} commits, more than [store] history_max_commits = {max}"
     );
+    if !ci {
+        eprintln!(
+            "vci prune: note: {what}: `vci push --rewrite-history` publishes the store as one commit (`vci prune` does that itself only in CI, where CI is set)"
+        );
+        return false;
+    }
     if dry_run {
         eprintln!(
-            "vci prune: {what}: a run without --dry-run publishes the store as one commit (`vci push --rewrite-history`)"
+            "vci prune: {what}: a run without --dry-run publishes the store as one commit (`vci push --rewrite-history`), unless another clone has since"
         );
         return false;
     }
@@ -2371,23 +2410,39 @@ fn rewrite_long_history(
         return false;
     };
     eprintln!(
-        "vci prune: {what}: publishing the store as one commit (`vci push --rewrite-history`)"
+        "vci prune: {what}: publishing the store as one commit (`vci push --rewrite-history`), unless another clone has since"
     );
-    match exchange.push(None, PushMode::RewriteHistory) {
+    match exchange.push(None, PushMode::RewriteHistoryLongerThan(max)) {
         Ok(out) => {
+            for n in &out.notes {
+                eprintln!("vci prune: note: {n}");
+            }
             for w in &out.warnings {
                 eprintln!("vci prune: warning: {w}");
             }
-            eprintln!(
-                "vci prune: published the store to {}'s {} as one commit{}",
-                out.remote,
-                exchange.exchange_point(),
-                if out.status == PushStatus::UpToDate {
-                    " (nothing new to send)"
-                } else {
-                    ""
-                }
-            );
+            if out.rewritten {
+                eprintln!(
+                    "vci prune: published the store to {}'s {} as one commit{}",
+                    out.remote,
+                    exchange.exchange_point(),
+                    if out.status == PushStatus::UpToDate {
+                        " (nothing new to send)"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                eprintln!(
+                    "vci prune: {}'s {} was published as one commit since this clone last fetched it: {}",
+                    out.remote,
+                    exchange.exchange_point(),
+                    if out.status == PushStatus::Pushed {
+                        "published the store on top of it"
+                    } else {
+                        "nothing to publish on top of it"
+                    }
+                );
+            }
             true
         }
         Err(e) => {
@@ -3490,11 +3545,12 @@ mod tests {
     }
 
     /// Once a unit and signer has a format-3 record, its format-1 ones
-    /// issued before it go, even on a live tree, unless a plan of the
-    /// checked-out commit used them or the rule is off (`record_format =
-    /// 1`); a format-1 record issued after the newest format-3 one (a writer
-    /// still on format 1) is ranked with the rest, as are the format-1 ones
-    /// of a unit without a format-3 record.
+    /// issued before it go, unless a plan of the checked-out commit used
+    /// them, the rule is off (`record_format = 1`), or (2.10) one was made
+    /// on a live tree within the age limit; a format-1 record issued after
+    /// the newest format-3 one (a writer still on format 1) is ranked with
+    /// the rest, as are the format-1 ones of a unit without a format-3
+    /// record.
     #[test]
     fn format_one_records_older_than_a_format_three_one_go() {
         let mut p = Policy {
@@ -3505,7 +3561,7 @@ mod tests {
         p.live_trees.insert("t".to_owned());
         let g = [
             cand("f3", 30, None, 3),
-            cand("f1a", 20, Some("t"), 1),
+            cand("f1a", 20, None, 1),
             cand("f1b", 10, None, 1),
         ];
         assert_eq!(
@@ -3550,6 +3606,82 @@ mod tests {
                 ("f1".to_owned(), Why::FormatOne)
             ]
         );
+    }
+
+    /// 2.10: a format-1 record made on a tree some ref has at its tip stays
+    /// while it is within the age limit (or there is none), as the age and
+    /// live-tree rules spare any record, and does not count towards `keep`;
+    /// past the age limit it goes. Before, the format rule removed it
+    /// whatever the tree, and a branch whose plan skipped the unit on it
+    /// ran the unit after a prune elsewhere.
+    #[test]
+    fn a_format_one_record_on_a_live_tree_stays_within_the_age_limit() {
+        let mut p = Policy {
+            keep: 2,
+            format_rule: true,
+            aged_before: Some(100),
+            ..Policy::default()
+        };
+        p.live_trees.insert("t".to_owned());
+        let g = [
+            cand("f3", 300, None, 3),
+            cand("f1live", 200, Some("t"), 1),
+            cand("f1dead", 150, None, 1),
+            cand("f3b", 120, None, 3),
+            cand("f3c", 110, None, 3),
+        ];
+        // f1live stays and takes no place among the 2 newest: f3b does.
+        assert_eq!(
+            decided(&g, &p),
+            [
+                ("f1dead".to_owned(), Why::FormatOne),
+                ("f3c".to_owned(), Why::Superseded)
+            ]
+        );
+        // No age limit: within it, whatever its age.
+        p.aged_before = None;
+        assert_eq!(
+            decided(&g, &p),
+            [
+                ("f1dead".to_owned(), Why::FormatOne),
+                ("f3c".to_owned(), Why::Superseded)
+            ]
+        );
+        // Past the age limit it goes, live tree or not.
+        p.aged_before = Some(250);
+        assert_eq!(
+            decided(&g, &p),
+            [
+                ("f1dead".to_owned(), Why::FormatOne),
+                ("f1live".to_owned(), Why::FormatOne),
+                ("f3b".to_owned(), Why::Aged),
+                ("f3c".to_owned(), Why::Aged)
+            ]
+        );
+        // `--superseded` names no live tree: it goes.
+        p.aged_before = Some(100);
+        p.live_trees.clear();
+        assert_eq!(
+            decided(&g, &p),
+            [
+                ("f1dead".to_owned(), Why::FormatOne),
+                ("f1live".to_owned(), Why::FormatOne),
+                ("f3c".to_owned(), Why::Superseded)
+            ]
+        );
+    }
+
+    /// `CI` says CI when set to anything but empty, `false` or `0`.
+    #[test]
+    fn ci_is_any_value_but_empty_false_or_zero() {
+        use std::ffi::OsStr;
+        assert!(!is_ci(None));
+        for v in ["", " ", "false", "FALSE", "False", "0"] {
+            assert!(!is_ci(Some(OsStr::new(v))), "{v:?}");
+        }
+        for v in ["true", "1", "yes", "woodpecker"] {
+            assert!(is_ci(Some(OsStr::new(v))), "{v:?}");
+        }
     }
 
     #[test]

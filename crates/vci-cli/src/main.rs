@@ -177,7 +177,7 @@ enum Cmd {
         #[arg(long)]
         remote: Option<String>,
     },
-    /// Delete expired, superseded and old attestations and the manifests and objects nothing references from the attestation store (git-meta by default: the local store, publish with `vci push`; since 2.10 it also drops old deletion records and, once the metadata history passes `[store] history_max_commits`, publishes the store as one commit).
+    /// Delete expired, superseded and old attestations and the manifests and objects nothing references from the attestation store (git-meta by default: the local store, publish with `vci push`; since 2.10 it also drops old deletion records and, once the metadata history passes `[store] history_max_commits`, publishes the store as one commit in CI (`CI` set, as GitHub Actions does), elsewhere says to run `vci push --rewrite-history`).
     Prune {
         /// Only list what would be deleted.
         #[arg(long)]
