@@ -32,9 +32,9 @@ use libsql::Value as V;
 use vci_core::ObjectKind;
 use vci_store::timing::Step;
 use vci_store::{
-    Choose, Columns, GONE, Hydration, MAX_OBJECTS_ANSWER, NewObject, OBJECT_GRACE, Prefetch,
-    StoreError, StoreStatus, StoredEnvelope, StoredManifest, StoredObject, key, object_from_base64,
-    object_kind,
+    Choose, Columns, GONE, Hydration, MAX_OBJECTS_ANSWER, NewObject, OBJECT_GRACE, ObjectSize,
+    Prefetch, StoreError, StoreStatus, StoredEnvelope, StoredManifest, StoredObject, key,
+    object_from_base64, object_kind,
 };
 use vci_store_sqlite::sql::{Names, Sql};
 
@@ -176,6 +176,9 @@ pub(crate) struct Tables {
     get_objects: String,
     /// Which of these ids (`?1`) are stored.
     existing_objects: String,
+    /// The objects under these ids (`?1`), bytes not read: id, kind, the
+    /// length of the value and its type (`text`: base64).
+    object_sizes: String,
     /// The listing columns of these keys (`?1`).
     columns: String,
     /// The orphan objects: unreferenced and put before `?1`, sorted.
@@ -563,6 +566,9 @@ impl Tables {
             ),
             get_objects: format!("SELECT id, kind, bytes FROM {o} WHERE id IN ({set})"),
             existing_objects: format!("SELECT id FROM {o} WHERE id IN ({set})"),
+            object_sizes: format!(
+                "SELECT id, kind, length(bytes), typeof(bytes) FROM {o} WHERE id IN ({set})"
+            ),
             columns: format!("SELECT key, {columns} FROM {a} WHERE key IN ({set})"),
             orphan_objects: format!(
                 "SELECT o.id FROM {o} AS o WHERE o.put_at < ?1 AND {unreferenced} ORDER BY o.id"
@@ -2259,6 +2265,68 @@ impl Remote {
             }
         }
         Ok(out)
+    }
+
+    /// Whether the server holds each of these ids and its size, bytes not
+    /// read (one request per [`CHUNK`] ids; an id whose bytes this handle
+    /// has cached answers from the cache): base64 text as
+    /// [`vci_store::base64_decoded_bound`] of its length, a kind no object
+    /// has as held but unreadable, an id the server lacks as absent.
+    pub(crate) fn object_sizes(&self, ids: &[&str]) -> Result<Vec<ObjectSize>, StoreError> {
+        for id in ids {
+            key::check_object_id(id)?;
+        }
+        let mut known: HashMap<String, ObjectSize> = HashMap::new();
+        {
+            let c = self.objects_cache();
+            for id in ids {
+                if let Some(Some((_, b))) = c.get(*id) {
+                    known.insert((*id).to_owned(), ObjectSize::Held(Some(b.len() as u64)));
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let want: Vec<&str> = ids
+            .iter()
+            .copied()
+            .filter(|id| !known.contains_key(*id) && seen.insert(*id))
+            .collect();
+        if !want.is_empty() {
+            let t = self.ready()?;
+            if self.version()?.is_some() && self.v2()? {
+                for chunk in want.chunks(CHUNK) {
+                    let r = self.query(
+                        READ,
+                        &t.object_sizes,
+                        vec![json_list(chunk.iter().copied())],
+                    );
+                    for row in Fail::or_absent(r, Vec::new)? {
+                        if row.len() < 4 {
+                            return Err(malformed("object sizes"));
+                        }
+                        let Some(id) = col_text(&row[0]) else {
+                            continue;
+                        };
+                        let kind = col_int(&row[1])
+                            .and_then(|k| u8::try_from(k).ok())
+                            .and_then(object_kind);
+                        let len = col_int(&row[2]).and_then(|n| u64::try_from(n).ok());
+                        let size = match (kind, len, col_text(&row[3]).as_deref()) {
+                            (Some(_), Some(n), Some("text")) => {
+                                Some(vci_store::base64_decoded_bound(n))
+                            }
+                            (Some(_), Some(n), Some("blob")) => Some(n),
+                            _ => None,
+                        };
+                        known.insert(id, ObjectSize::Held(size));
+                    }
+                }
+            }
+        }
+        Ok(ids
+            .iter()
+            .map(|id| known.get(*id).copied().unwrap_or(ObjectSize::Absent))
+            .collect())
     }
 
     /// Store `objects` now, in one transaction (a batch of one); how many

@@ -15,14 +15,14 @@
 //! the writers of a namespace queue behind each other for that statement
 //! and the commit, not for a whole flush.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use postgres::Row;
 use postgres::types::Type;
 use vci_store::timing::Step;
 use vci_store::{
-    Columns, MAX_OBJECTS_ANSWER, NewObject, OBJECT_GRACE, StoreError, StoredEnvelope, StoredObject,
-    key, object_kind,
+    Columns, MAX_OBJECTS_ANSWER, NewObject, OBJECT_GRACE, ObjectSize, StoreError, StoredEnvelope,
+    StoredObject, key, object_kind,
 };
 
 use crate::Inner;
@@ -79,6 +79,7 @@ fn unreferenced(a: &str) -> String {
 /// The statements of one schema.
 pub(crate) struct Sql {
     get: String,
+    sizes: String,
     put: String,
     remove: String,
     orphans: String,
@@ -102,6 +103,9 @@ impl Sql {
             get: format!(
                 "SELECT id, kind, bytes, sum(octet_length(bytes)) OVER () FROM {o} \
                  WHERE ns = $1 AND id = ANY($2)"
+            ),
+            sizes: format!(
+                "SELECT id, kind, octet_length(bytes)::int8 FROM {o} WHERE ns = $1 AND id = ANY($2)"
             ),
             // `xmax = 0` on a returned row: inserted, not updated.
             put: format!(
@@ -288,6 +292,43 @@ pub(crate) fn get_objects(inner: &Inner, ids: &[&str]) -> Result<Vec<StoredObjec
         ids.len()
     ));
     Ok(found)
+}
+
+/// Whether the namespace holds each of these ids and its size, bytes not
+/// read (one statement per [`CHUNK`] ids): a kind no object has is held but
+/// unreadable (`get_objects` leaves it out), an id not stored absent.
+pub(crate) fn object_sizes(inner: &Inner, ids: &[&str]) -> Result<Vec<ObjectSize>, StoreError> {
+    let wanted = distinct_ids(ids)?;
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ns = inner.ready()?;
+    let mut known: HashMap<String, ObjectSize> = HashMap::new();
+    for chunk in wanted.chunks(CHUNK) {
+        let r = inner.conn.run(READ, |db| {
+            db.for_each(
+                &inner.objects_sql.sizes,
+                &[(&ns, Type::TEXT), (&chunk, Type::TEXT_ARRAY)],
+                |row| {
+                    let id: String = row.try_get(0)?;
+                    let kind: i16 = row.try_get(1)?;
+                    let size: Option<i64> = row.try_get(2)?;
+                    let held = u8::try_from(kind)
+                        .ok()
+                        .and_then(object_kind)
+                        .and(size)
+                        .and_then(|n| u64::try_from(n).ok());
+                    known.insert(id, ObjectSize::Held(held));
+                    Ok(())
+                },
+            )
+        });
+        Fail::or_absent(r, || ())?;
+    }
+    Ok(ids
+        .iter()
+        .map(|id| known.get(*id).copied().unwrap_or(ObjectSize::Absent))
+        .collect())
 }
 
 pub(crate) fn orphan_objects(inner: &Inner) -> Result<Vec<String>, StoreError> {

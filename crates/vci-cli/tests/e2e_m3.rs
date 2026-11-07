@@ -1493,6 +1493,336 @@ fn the_plan_names_the_changed_input_on_sqlite() {
     the_plan_names_the_changed_input(SQLITE);
 }
 
+/// `.git/git-meta.sqlite` of `dir`, opened behind the store's back.
+fn git_meta_db(dir: &Path) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(dir.join(".git/git-meta.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(20)).unwrap();
+    db
+}
+
+/// (key, is_promised) of every state object row on git-meta in `dir`.
+fn state_rows(dir: &Path) -> Vec<(String, bool)> {
+    git_meta_db(dir)
+        .prepare(
+            "SELECT key, is_promised FROM metadata
+             WHERE target_type = 'project' AND key LIKE 'vci:object:4:%' ORDER BY key",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// 2.10.0: `[store] plan_states_mib = 0` fetches no state object. On a
+/// fresh clone after `vci fetch` (a partial clone of a local remote, as
+/// GitHub serves), the plan of an edited unit says the state object is
+/// over the plan's budget and leaves it not fetched; 2.10's first cut
+/// fetched it (and read it) before it looked at the budget's bytes. With
+/// the default budget the plan fetches it and names the input.
+#[test]
+fn a_byte_budget_of_none_fetches_no_state_object() {
+    let w = World::new();
+    w.run(&[], GIT_META);
+    let remote = w.base.join("origin.git");
+    w.git(&w.base, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+    w.git(&remote, &["config", "uploadpack.allowFilter", "true"]);
+    w.git(
+        &w.work,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    w.git(&w.work, &["push", "-q", "origin", "main", "feature"]);
+    w.vci_ok(&["push", "--remote", "origin"], GIT_META);
+    let fresh = w.base.join("fresh");
+    w.git(
+        &w.base,
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            remote.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ],
+    );
+    w.git(&fresh, &["checkout", "-q", "feature"]);
+    let st = Command::new("cp")
+        .arg("-R")
+        .arg(w.work.join("node_modules"))
+        .arg(fresh.join("node_modules"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let in_fresh = |args: &[&str], env: &[(&str, &str)]| -> Output {
+        let mut c = Command::cargo_bin("vci").unwrap();
+        c.current_dir(&fresh)
+            .args(args)
+            .env("VCI_JS_PLUGIN", workspace_root().join("js/vitest-plugin"))
+            .env("GIT_CONFIG_GLOBAL", &w.gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("NO_COLOR", "1");
+        for k in vci_store::select::ENV_VARS.iter().chain(&[
+            "VCI_BASE_REF",
+            "GITHUB_BASE_REF",
+            "GITHUB_REF",
+            "CI",
+            "VCI_TIMING",
+        ]) {
+            c.env_remove(k);
+        }
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().unwrap();
+        eprintln!(
+            "$ vci {} {env:?} -> {:?}\n{}",
+            args.join(" "),
+            out.status.code(),
+            text(&out)
+        );
+        out
+    };
+    let out = in_fresh(&["fetch", "--remote", "origin"], GIT_META);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let rows = state_rows(&fresh);
+    assert_eq!(rows.len(), 1, "one run, one state object: {rows:?}");
+    assert!(rows[0].1, "not fetched by `vci fetch`: {rows:?}");
+    std::fs::write(
+        fresh.join("fixtures/b.json"),
+        "{ \"greeting\": \"hello\", \"edited\": true }\n",
+    )
+    .unwrap();
+    let out = in_fresh(
+        &["plan", "--base-ref", "main"],
+        &[("VCI_STORE_PLAN_STATES_MIB", "0"), ("VCI_TIMING", "1")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        plan_line(&stdout(&out), B).ends_with(&format!(
+            "best failed inputs: entry: changed ({HASH_NOT_LOADED}: over the plan's budget)))"
+        )),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        state_rows(&fresh)[0].1,
+        "a budget of no byte fetched the state object: {}",
+        text(&out)
+    );
+    // The default budget fetches it and names the input.
+    let out = in_fresh(&["plan", "--base-ref", "main"], GIT_META);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        plan_line(&stdout(&out), B).ends_with("best failed inputs: entry:fixtures/b.json))"),
+        "{}",
+        text(&out)
+    );
+    assert!(!state_rows(&fresh)[0].1, "fetched for the plan");
+}
+
+/// 2.10.0: a state object git-meta holds whose value is not base64 is not
+/// "expired" (its TTL did not remove it): the text stays `attested hash not
+/// loaded`, the unit runs and the plan exits 0. 2.10's first cut said
+/// `state expired` for any state object `get_objects` left out.
+#[test]
+fn a_corrupt_state_object_on_git_meta_is_not_called_expired() {
+    let w = World::new();
+    w.run(&[], GIT_META);
+    let n = git_meta_db(&w.work)
+        .execute(
+            "UPDATE metadata SET value = '\"!!! not base64 !!!\"'
+             WHERE target_type = 'project' AND key LIKE 'vci:object:4:%'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "one state object");
+    w.write(
+        "fixtures/b.json",
+        "{ \"greeting\": \"hello\", \"edited\": true }\n",
+    );
+    let out = w.vci(&["plan", "--base-ref", "main"], &[("VCI_TIMING", "1")]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        plan_line(&stdout(&out), B).ends_with(&format!(
+            "best failed inputs: entry: changed ({HASH_NOT_LOADED})))"
+        )),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stderr(&out).contains(" 0 state expired, "),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A file name that, printed raw, would start lines of its own: a forged
+/// `SKIP` line, a forged last line, a carriage return, a terminal escape
+/// and a Unicode line separator.
+const FORGING_NAME: &str =
+    "x\nSKIP forged.test.ts  (attested by nobody)\r\u{1b}[2K\u{2028}9 to skip, 0 to run";
+
+/// 2.10.0: an input path holding control characters (committed file names
+/// may) is printed escaped in the text plan's reasons and its changed-input
+/// summary, in `vci explain` and in the github format, so it cannot add
+/// lines the action's `grep -c '^SKIP '` or the step summary's `N to skip`
+/// read: B's test reads such a file, which is then edited. Format 1 and
+/// SQLite reasons printed paths raw since they named them; 2.10's first
+/// cut named them on git-meta too.
+fn a_control_character_in_an_input_path_cannot_forge_plan_lines(env: &[(&str, &str)]) {
+    let w = World::new();
+    let name = format!("fixtures/{FORGING_NAME}");
+    w.write(&name, "one\n");
+    w.write(
+        "src/b.test.ts",
+        &format!(
+            "import {{ expect, test }} from \"vitest\";\nimport {{ readFileSync }} from \"node:fs\";\nimport {{ dirname, join }} from \"node:path\";\nimport {{ fileURLToPath }} from \"node:url\";\nimport {{ loadGreeting }} from \"./b\";\n\nconst here = dirname(fileURLToPath(import.meta.url));\n\ntest(\"reads fixture\", () => {{\n  expect(loadGreeting(join(here, \"../fixtures/b.json\"))).toBe(\"hello\");\n  expect(readFileSync(join(here, \"..\", {}), \"utf8\").length).toBeGreaterThan(0);\n}});\n",
+            serde_json::to_string(&name).unwrap()
+        ),
+    );
+    w.commit("a file with control characters in its name");
+    w.run(&[], env);
+    w.write(&name, "two\n");
+    let escaped =
+        "x\\nSKIP forged.test.ts  (attested by nobody)\\r\\u{1b}[2K\\u{2028}9 to skip, 0 to run";
+    let raw = |s: &str| {
+        s.chars()
+            .any(|c| (c.is_control() && c != '\n') || c == '\u{2028}')
+    };
+    let plan = w.vci_ok(&["plan", "--base-ref", "main"], env);
+    assert!(!raw(&plan), "a raw control character: {plan:?}");
+    let lines: Vec<&str> = plan.lines().collect();
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("SKIP ")).count(),
+        3,
+        "{plan}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("RUN ")).count(),
+        1,
+        "{plan}"
+    );
+    assert_eq!(lines.last(), Some(&"3 to skip, 1 to run"), "{plan}");
+    // What the action's step summary reads to (`sed -n '1,/^[0-9][0-9]*
+    // to skip, /p'`): the last line only.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l
+                .split_once(" to skip, ")
+                .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+            .count(),
+        1,
+        "{plan}"
+    );
+    assert!(
+        plan_line(&plan, B).contains(&format!("entry:fixtures/{escaped}")),
+        "{plan}"
+    );
+    assert!(
+        plan.contains(&format!("  1  fixtures/{escaped}\n3 to skip, 1 to run\n")),
+        "the changed-input summary: {plan}"
+    );
+    let ex = w.explain(B, env);
+    assert!(!raw(&ex), "a raw control character: {ex:?}");
+    assert!(
+        ex.lines()
+            .any(|l| l.trim() == format!("entry:fixtures/{escaped}")),
+        "{ex}"
+    );
+    let gh = w.vci_ok(&["plan", "--base-ref", "main", "--format", "github"], env);
+    assert!(!raw(&gh), "a raw control character: {gh:?}");
+    assert!(gh.contains("\nrun=src/b.test.ts\n"), "{gh}");
+}
+
+#[test]
+fn a_control_character_in_an_input_path_cannot_forge_plan_lines_on_git_meta() {
+    a_control_character_in_an_input_path_cannot_forge_plan_lines(GIT_META);
+}
+
+#[test]
+fn a_control_character_in_an_input_path_cannot_forge_plan_lines_on_sqlite() {
+    a_control_character_in_an_input_path_cannot_forge_plan_lines(SQLITE);
+}
+
+#[test]
+fn a_control_character_in_an_input_path_cannot_forge_plan_lines_in_format_1() {
+    a_control_character_in_an_input_path_cannot_forge_plan_lines(&[(
+        "VCI_STORE_RECORD_FORMAT",
+        "1",
+    )]);
+}
+
+/// 2.10.0: with a budget of one state object, `vci explain` loads the
+/// state object of the candidate its reason names (the unit's best) and
+/// says "over the plan's budget" for the others, so it names the input the
+/// plan names; and both ask the store only about the runs they can load
+/// (`runs: 1 asked of …`). B is attested on three sibling branches (none an
+/// ancestor of another, so the three records stay) with three versions of
+/// its fixture, and the fixture edited again here. 2.10's first cut asked
+/// about every candidate's run and loaded state objects by id, so `vci
+/// explain` said "over the plan's budget" for its own reason two times in
+/// three.
+#[test]
+fn explain_names_the_input_the_plan_names_within_a_budget_of_one() {
+    let w = World::new();
+    for i in 0..3 {
+        w.git(
+            &w.work,
+            &["checkout", "-q", "-b", &format!("sib{i}"), "main"],
+        );
+        w.write(
+            "fixtures/b.json",
+            &format!("{{ \"greeting\": \"hello\", \"sib\": {i} }}\n"),
+        );
+        w.commit(&format!("sibling {i}"));
+        w.run(&[B], GIT_META);
+    }
+    w.git(&w.work, &["checkout", "-q", "feature"]);
+    w.write(
+        "fixtures/b.json",
+        "{ \"greeting\": \"hello\", \"edited\": true }\n",
+    );
+    let env = [("VCI_STORE_PLAN_STATES", "1"), ("VCI_TIMING", "1")];
+    let out = w.vci(&["plan", "--base-ref", "main"], &env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let named = "(no valid attestation (3 candidates; best failed inputs: entry:fixtures/b.json))";
+    assert!(
+        plan_line(&stdout(&out), B).ends_with(named),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stderr(&out).contains("runs: 1 asked of 1;"),
+        "{}",
+        stderr(&out)
+    );
+    let out = w.vci(&["explain", B, "--base-ref", "main"], &env);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let ex = stdout(&out);
+    assert!(
+        ex.lines().any(|l| l == format!("{B}: RUN {named}")),
+        "the reason names what the plan names: {ex}"
+    );
+    assert_eq!(
+        ex.lines()
+            .filter(|l| l.trim() == "entry:fixtures/b.json")
+            .count(),
+        1,
+        "{ex}"
+    );
+    assert_eq!(
+        ex.matches(&format!("({HASH_NOT_LOADED}: over the plan's budget)"))
+            .count(),
+        2,
+        "{ex}"
+    );
+    assert!(
+        stderr(&out).contains("runs: 1 asked of 3;"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// The seconds a `VCI_TIMING` line of `stderr` gives for `step`.
 fn timing_of(stderr: &str, step: &str) -> Option<f64> {
     let prefix = format!("vci: timing: {step}: ");

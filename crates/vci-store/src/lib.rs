@@ -96,6 +96,7 @@
 //! | hints: [`passing_on`], [`flag`] (keep nothing)  | the backend can keep two small tables                           |
 //! | [`exchange`] (`None`)                           | writes reach other machines only through a push and a fetch     |
 //! | objects: [`get_objects`], [`put_objects`], [`remove_objects`], [`orphan_objects`], [`prune_state_objects`] (`Unsupported`) | the backend keeps format-3 objects ([`Caps::objects`]) |
+//! | [`object_sizes`] (unknown)                      | the backend can say whether it holds an object, and its size, without reading it |
 //! | [`columns`] (none)                              | the backend keeps the listing columns ([`Caps::columns`])       |
 //! | [`run_state_objects`] (the `state_obj` column), [`put_run_state`] (nothing) | the backend keeps no columns but can say which state object a run wrote (git-meta's run-state links) |
 //!
@@ -179,6 +180,7 @@
 //! [`flag`]: AttestationStore::flag
 //! [`exchange`]: AttestationStore::exchange
 //! [`get_objects`]: AttestationStore::get_objects
+//! [`object_sizes`]: AttestationStore::object_sizes
 //! [`put_objects`]: AttestationStore::put_objects
 //! [`remove_objects`]: AttestationStore::remove_objects
 //! [`orphan_objects`]: AttestationStore::orphan_objects
@@ -531,6 +533,25 @@ pub struct StoredObject {
     pub bytes: Vec<u8>,
 }
 
+/// What a store can say of an object without reading it
+/// ([`AttestationStore::object_sizes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectSize {
+    /// The store holds no object under the id (never stored, or removed:
+    /// a state object past its TTL).
+    Absent,
+    /// The store holds a value under the id: at most this many bytes once
+    /// read ([`AttestationStore::get_objects`]'s `bytes`; for a backend
+    /// that keeps text, [`base64_decoded_bound`] of its length), or `None`
+    /// when that is not known without reading or fetching it (a git-meta
+    /// value not fetched yet). A value held that
+    /// [`AttestationStore::get_objects`] then leaves out is unreadable (not
+    /// base64, a foreign row), not absent.
+    Held(Option<u64>),
+    /// The store cannot say without reading (the default).
+    Unknown,
+}
+
 /// One object to store ([`AttestationStore::put_objects`]). The id is
 /// computed from the bytes by the store, so a stored id is always the
 /// BLAKE3 of the bytes it files.
@@ -619,6 +640,14 @@ pub fn object_from_base64(text: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(text)
         .map_err(|e| format!("object base64: {e}"))
+}
+
+/// The most bytes base64 text of `text_len` characters decodes to (three
+/// for every four characters, padding or quotes around it included), for a
+/// backend that keeps objects as text and answers
+/// [`AttestationStore::object_sizes`] from the text's length.
+pub fn base64_decoded_bound(text_len: u64) -> u64 {
+    text_len.saturating_mul(3) / 4
 }
 
 /// A stored record told apart by its first byte ([`decode_record`]).
@@ -1680,6 +1709,26 @@ pub trait AttestationStore: Send + Sync {
         Err(self.objects_unsupported())
     }
 
+    /// Whether the store holds each of these objects, and how many bytes
+    /// [`AttestationStore::get_objects`] would answer for it, **without
+    /// reading or fetching any** ([`ObjectSize`]), one per id in order.
+    /// Every id is validated first. Cost: one round trip, or one index
+    /// lookup per id (git-meta: also one `git cat-file --batch-check` of
+    /// the fetched values' blobs).
+    ///
+    /// Default: [`ObjectSize::Unknown`] for every id.
+    ///
+    /// Used by: plan.rs, for the state objects it loads after the verdicts
+    /// (STORE-V2 section 1.5 step 9): within `[store] plan_states_mib` it
+    /// reads only the ones that fit, and it calls a state object expired
+    /// only when the store says it does not hold it.
+    fn object_sizes(&self, ids: &[&str]) -> Result<Vec<ObjectSize>, StoreError> {
+        for id in ids {
+            key::check_object_id(id)?;
+        }
+        Ok(vec![ObjectSize::Unknown; ids.len()])
+    }
+
     /// Store these objects, each under the BLAKE3 of its bytes, **idempotent
     /// by id**: an id already stored is not written again, but its `put_at`
     /// is refreshed, so that the grace period ([`OBJECT_GRACE`]) of a
@@ -2283,6 +2332,9 @@ impl AttestationStore for FailedStore {
         Err(self.error())
     }
     fn get_objects(&self, _ids: &[&str]) -> Result<Vec<StoredObject>, StoreError> {
+        Err(self.error())
+    }
+    fn object_sizes(&self, _ids: &[&str]) -> Result<Vec<ObjectSize>, StoreError> {
         Err(self.error())
     }
     fn put_objects(&self, _objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
@@ -2952,12 +3004,14 @@ pub mod select {
     /// publishes the store as one commit (default 2000, `0`: never). Wins
     /// over `[store] history_max_commits`.
     pub const ENV_HISTORY_MAX_COMMITS: &str = "VCI_STORE_HISTORY_MAX_COMMITS";
-    /// How many state objects a plan loads after its verdicts to name the
-    /// changed input of each unit that runs (default 8; 0: none). Wins
-    /// over `[store] plan_states`.
+    /// How many state objects a plan asks for, fetches and reads after its
+    /// verdicts to name the changed input of each unit that runs (default
+    /// 8; 0: none). Wins over `[store] plan_states`.
     pub const ENV_PLAN_STATES: &str = "VCI_STORE_PLAN_STATES";
-    /// How many MiB of state objects a plan loads for that (default 16).
-    /// Wins over `[store] plan_states_mib`.
+    /// How many MiB of those state objects a plan reads, in order, the
+    /// first that would pass it and every one after it not read (default
+    /// 16; 0: none asked for, fetched or read). Wins over `[store]
+    /// plan_states_mib`.
     pub const ENV_PLAN_STATES_MIB: &str = "VCI_STORE_PLAN_STATES_MIB";
     /// Every variable this module reads. The e2e harnesses remove them all.
     pub const ENV_VARS: &[&str] = &[
@@ -3126,8 +3180,9 @@ pub mod select {
         /// unknown key).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plan_states: Option<u32>,
-        /// How many MiB of state objects a plan loads for that (default
-        /// 16, at most 4096). `VCI_STORE_PLAN_STATES_MIB` wins over it.
+        /// How many MiB of those state objects a plan reads, in order
+        /// (default 16, at most 4096; 0: none asked for, fetched or read).
+        /// `VCI_STORE_PLAN_STATES_MIB` wins over it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plan_states_mib: Option<u32>,
         /// `[store.sqlite]`.
@@ -4180,8 +4235,8 @@ pub mod select {
         /// (`VCI_STORE_PLAN_STATES`, else `[store] plan_states`, else
         /// [`DEFAULT_PLAN_STATES`]).
         pub plan_states: Sourced<u32>,
-        /// How many MiB of them (`VCI_STORE_PLAN_STATES_MIB`, else `[store]
-        /// plan_states_mib`, else [`DEFAULT_PLAN_STATES_MIB`]).
+        /// How many MiB of them it reads (`VCI_STORE_PLAN_STATES_MIB`, else
+        /// `[store] plan_states_mib`, else [`DEFAULT_PLAN_STATES_MIB`]).
         pub plan_states_mib: Sourced<u32>,
         /// `[store.sqlite]` as resolved.
         pub sqlite: SqliteSelection,
@@ -5461,7 +5516,7 @@ macro_rules! conformance_suite {
             c38_state_objects_expire_even_while_referenced,
             c39_objects_are_visible_before_their_record, c40_columns_match_the_put,
             c41_mixed_formats_in_one_namespace, c42_object_deletions_reach_peers,
-            c43_run_state_objects_name_the_runs_state,
+            c43_run_state_objects_name_the_runs_state, c44_object_sizes_say_what_is_held,
         );
     };
 }

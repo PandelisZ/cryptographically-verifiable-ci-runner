@@ -690,6 +690,16 @@ impl AttestationStore for LibsqlStore {
         }
     }
 
+    /// Local: the file's. Remote and replica: the server's (one request),
+    /// the handle's cached objects answered from its cache.
+    fn object_sizes(&self, ids: &[&str]) -> Result<Vec<vci_store::ObjectSize>, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.object_sizes(ids),
+            Inner::Remote(r) => r.object_sizes(ids),
+            Inner::Replica(p) => p.remote.object_sizes(ids),
+        }
+    }
+
     /// Remote and replica: queued in the open batch of this thread (written
     /// before any record of it), else one transaction now.
     fn put_objects(&self, objects: &[NewObject<'_>]) -> Result<usize, StoreError> {

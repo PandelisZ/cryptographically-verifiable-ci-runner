@@ -369,6 +369,15 @@ pub mod mem {
         /// server would answer with a request each.
         columns_calls: AtomicUsize,
         object_reads: AtomicUsize,
+        /// How many records `columns` was asked about, how many times
+        /// `object_sizes` was called, and how many bytes `get_objects`
+        /// answered.
+        column_records: AtomicUsize,
+        size_asks: AtomicUsize,
+        object_bytes: AtomicUsize,
+        /// Objects `get_objects` leaves out although they are stored, as a
+        /// backend does with a value it cannot decode.
+        unreadable: Mutex<std::collections::BTreeSet<String>>,
     }
 
     impl State {
@@ -495,6 +504,28 @@ pub mod mem {
         /// request each on a server).
         pub fn object_reads(&self) -> usize {
             self.state.object_reads.load(Ordering::SeqCst)
+        }
+
+        /// How many records [`AttestationStore::columns`] was asked about.
+        pub fn column_records(&self) -> usize {
+            self.state.column_records.load(Ordering::SeqCst)
+        }
+
+        /// How many times [`AttestationStore::object_sizes`] was called.
+        pub fn size_asks(&self) -> usize {
+            self.state.size_asks.load(Ordering::SeqCst)
+        }
+
+        /// How many bytes [`AttestationStore::get_objects`] answered.
+        pub fn object_bytes(&self) -> usize {
+            self.state.object_bytes.load(Ordering::SeqCst)
+        }
+
+        /// Keep the object `id` stored but leave it out of every
+        /// `get_objects` answer, as a backend does with a value that does
+        /// not decode (not base64).
+        pub fn make_unreadable(&self, id: &str) {
+            self.state.unreadable.lock().unwrap().insert(id.to_owned());
         }
 
         /// The stored attestations' keys.
@@ -680,16 +711,39 @@ pub mod mem {
                 return Err(self.objects_unsupported());
             }
             let d = self.state.data.lock().unwrap();
+            let unreadable = self.state.unreadable.lock().unwrap();
             let mut seen = std::collections::BTreeSet::new();
-            Ok(ids
+            let out: Vec<StoredObject> = ids
                 .iter()
-                .filter(|id| seen.insert(**id))
+                .filter(|id| seen.insert(**id) && !unreadable.contains(**id))
                 .filter_map(|id| {
                     d.objects.get(*id).map(|(kind, bytes, _)| StoredObject {
                         id: (*id).to_owned(),
                         kind: *kind,
                         bytes: bytes.clone(),
                     })
+                })
+                .collect();
+            self.state
+                .object_bytes
+                .fetch_add(out.iter().map(|o| o.bytes.len()).sum(), Ordering::SeqCst);
+            Ok(out)
+        }
+
+        fn object_sizes(&self, ids: &[&str]) -> Result<Vec<vci_store::ObjectSize>, StoreError> {
+            self.state.size_asks.fetch_add(1, Ordering::SeqCst);
+            for id in ids {
+                key::check_object_id(id)?;
+            }
+            if !self.state.objects.load(Ordering::SeqCst) {
+                return Err(self.objects_unsupported());
+            }
+            let d = self.state.data.lock().unwrap();
+            Ok(ids
+                .iter()
+                .map(|id| match d.objects.get(*id) {
+                    Some((_, bytes, _)) => vci_store::ObjectSize::Held(Some(bytes.len() as u64)),
+                    None => vci_store::ObjectSize::Absent,
                 })
                 .collect())
         }
@@ -773,6 +827,9 @@ pub mod mem {
 
         fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
             self.state.columns_calls.fetch_add(1, Ordering::SeqCst);
+            self.state
+                .column_records
+                .fetch_add(envs.len(), Ordering::SeqCst);
             let d = self.state.data.lock().unwrap();
             Ok(envs
                 .iter()

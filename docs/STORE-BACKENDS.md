@@ -485,6 +485,7 @@ that is correct for a backend whose values are always present and whose writes a
 | | `put_for_test(test_id, signer, sk, hint, bytes)` | | `put(NewAttestation::for_test(..))` | run |
 | | `batch() -> WriteBatch` | | `WriteBatch::none()` | run's store loop |
 | objects (2.9) | `get_objects(&[&str]) -> Vec<StoredObject>` | | `Unsupported` | plan (hdr, tables and shape objects, then state objects), explain, verify |
+| | `object_sizes(&[&str]) -> Vec<ObjectSize>` (2.10) | | `Unknown` for every id | plan, after the verdicts (which state objects are held, and which fit `plan_states_mib`) |
 | | `put_objects(&[NewObject]) -> usize` | | `Unsupported` | run (the run's four objects, before its records) |
 | | `remove_objects(&[&str]) -> usize` (the orphan rule, one hour of grace) | | `Unsupported` | run after supersession, prune |
 | | `orphan_objects() -> Vec<String>` | | `Unsupported` | prune |
@@ -726,6 +727,15 @@ state them:
   it. Every id is validated first (`check_object_id`, `what` = `object id`). An answer that would pass
   `MAX_OBJECTS_ANSWER` (64 MiB) is refused as `Invalid` (`what` = `objects`) before it is allocated. A lazy store
   answers from what it holds here: `prefetch(Prefetch::Objects { ids })` first. Cost: one round trip for tens of ids.
+- **`object_sizes(ids) -> Vec<ObjectSize>`** (2.10): what the store can say of each id **without reading or fetching
+  the object**, one answer per id in order: `Absent` (it holds none: never stored, or removed by the state TTL),
+  `Held(Some(n))` (it holds a value, and `get_objects` would answer at most `n` bytes for it: a text backend gives
+  `base64_decoded_bound` of the text's length), `Held(None)` (it holds a value whose size it cannot give without
+  reading or fetching it: a git-meta value not fetched yet, a row whose kind no object has), or `Unknown` (the
+  default: it cannot say). A value held that `get_objects` then leaves out is unreadable (not base64), not absent.
+  Every id is validated first. Cost: one round trip, or one index lookup per id. The plan uses it for the state
+  objects it loads after the verdicts: it reads, in order, only those that fit `[store] plan_states_mib`, reads one
+  of unknown size alone, and calls a state object expired only when the answer is `Absent`. Scenario c44.
 - **`put_objects(objects) -> usize`**: each under the BLAKE3 of its bytes, **idempotent by id**: an id already stored
   is not written again but its `put_at` is refreshed, so a concurrent writer's objects (queued before its records)
   start their grace at its own put. `NewObject::validate` first (non-empty, within the kind's bound, headed by the
@@ -1730,10 +1740,13 @@ Hence `AttestationStore: Send + Sync`.
     (`Prefetch::Objects` first on a lazy store) under a 16 MiB verdict-object cap, recomputes each id, checks the hdr
     once per `(project, hdr id)`, resolves the descriptor and observes the resolved set at HEAD (`inputs`); after
     the verdicts (since 2.10; 2.9.0 loaded at most 16 during them, named by the `state_obj` column), for the best
-    candidates of the units that run whose `entry:` text says the attested hash was not loaded, it asks
-    `run_state_objects` once and loads the distinct state objects, most-needed first, in one `get_objects`
-    (`Prefetch::Objects` first on a lazy store) within `[store] plan_states` and `plan_states_mib`, for the
-    failure text only; and `run` calls `put_run_state` after `put_objects` (git-meta's run-state link);
+    candidates of the units that run whose `entry:` text says the attested hash was not loaded, it groups them by
+    run (shape and key hint), ranks the runs (the most units' best candidates first, then the most candidates, then
+    the newest), asks `run_state_objects` only for the runs whose state objects `[store] plan_states` can load
+    (once for that many runs, again for twice as many while fewer were named), and loads the distinct state objects in the runs' order: `Prefetch::Objects` of at most
+    `plan_states` on a lazy store, then `object_sizes`, then `get_objects` of as many at a time as fit `[store]
+    plan_states_mib` (nothing at all with either at 0), for the failure text only; and `run` calls `put_run_state`
+    after `put_objects` (git-meta's run-state link);
   - prune (cmds.rs) lists with `list_all` and `columns` on a store that keeps them, reads the expired candidates,
     the records of a unit with one beyond `keep` by the hints, the rows the columns do not describe, and every row
     while a manifest remains (`manifest_roots`), confirms each delete from the signed statement (expiry; the
@@ -1833,7 +1846,7 @@ What the scenarios can and cannot check through the trait:
   back, so that c37, c38 and c42 can cross the one-hour grace and the state TTL without waiting (`UPDATE objects SET
   put_at = put_at - ?` on a SQL store; on git-meta `UPDATE metadata SET last_timestamp = last_timestamp - ?` for the
   object's key of each kind in `.git/git-meta.sqlite`).
-- **Objects (2.9).** c35 to c39, c42 and c43 (2.10) run only on a store whose `Caps::objects` is set and skip otherwise, after c35
+- **Objects (2.9).** c35 to c39, c42, c43 and c44 (2.10) run only on a store whose `Caps::objects` is set and skip otherwise, after c35
   has checked that every object method of such a store is `Unsupported`; c36's validation and c40's and c41's
   format-3 records run everywhere (a store without `Caps::columns` answers none in c40 and skips its second half).
   The fixtures are `conformance::scenarios::Run3` (a run's four objects built with vci-core's encoders, their ids, and
@@ -1890,6 +1903,7 @@ whose base64 payload carries `predicate.manifestRef`.
 | c41 | mixed_formats_in_one_namespace | an envelope and a frame of one unit side by side: key order, byte-exact reads, `decode_record` tells them apart, the frame's `ManifestRef` is `Inline` so `orphan_manifests` goes on, `record_object_refs` names its objects; `count` sees both |
 | c42 | object_deletions_reach_peers | objects and a frame reach another peer (a replica, by `seq`), and so do the record's removal and, aged past the grace, the objects' (`gone` rows): the peer lists nothing, reads the stale entry as `GONE`, gets no object |
 | c43 | run_state_objects_name_the_runs_state | `run_state_objects` names the run's state object of a record put in a batch with its objects and `put_run_state` (the `state_obj` column, or git-meta's link), one answer per run in order (the same run twice, twice), `None` for a record whose run named none (no column, no link), none for no runs, and the same on another peer after a sync |
+| c44 | object_sizes_say_what_is_held | `object_sizes` answers one per id in order (a repeated id twice), reading no object: a stored object `Held` with a size no smaller than the bytes `get_objects` answers and at most 4 more (or `Held(None)`), an id never stored `Absent`, both `Held` on another peer after a sync, a state object removed by its TTL `Absent`; an invalid id refused, none asked none answered; a backend that says `Unknown` for every id skips the rest (2.10) |
 
 Backends keep their own tests for what is theirs:
 
@@ -2069,6 +2083,12 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   through `cat-file`, or not fetched). A promised row, a missing blob or a text that is not base64 is **left out**
   (prefetch `Objects` first); the answer is refused as `Invalid{objects}` once the decoded sizes would pass
   `MAX_OBJECTS_ANSWER`, before that decode.
+- `object_sizes` (2.10): on a pooled reader `Reader::object_size_rows`, four indexed lookups an id (the object key of
+  each kind, the lowest kind's string row first, as `get_objects` reads it; the value's length or blob id, never the
+  value), then one `git rev-list --missing=allow-any` and `git cat-file --batch-check` for the sizes of the fetched
+  values kept as blobs (`present_sizes`; nothing fetched). Inline text: `Held(base64_decoded_bound(length))`; a blob
+  the object database holds: the same of its size; a promised row, a blob it lacks, or a row whose value is not a
+  string: `Held(None)`; no row of any kind: `Absent`.
 - `remove_objects` and `orphan_objects` apply the orphan rule at once, as the referrer scan `orphan_manifests` is:
   `hydrate_attestations` first (every attestation not fetched yet is fetched: a run's records are on every path target,
   so any of them could name an object; `vci prune` has prefetched them already), the pool emptied, then
@@ -2099,7 +2119,9 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   `vci:run-state:<shape id>:<hint>:<state id>` (`key::run_state_key`: the hint spelt as an attestation key spells it,
   `<issued hex>.<tree16 | ->`; the value is the state id again), at `project/vci/run-state/<shape>/<hint>/<state>/__value`.
   `run_state_objects` finds it from what a plan has without reading a value: the record's key hint and the shape its
-  descriptor names give the prefix `key::run_state_prefix`, one indexed range query of the keys per distinct run on a
+  descriptor names give the prefix `key::run_state_prefix`, one range of the `(target_type, target_value, key)` index
+  per distinct run (`key >= prefix AND key < ` the prefix with its last `:` as `;`; the 2.10 development builds tested
+  `substr(key, …)` of every `project` row instead, 3.2 ms a run on vex's 32,358 rows, 0.003 ms now) on a
   pooled reader, promised rows included (a lazy clone needs no fetch for it), the first link's state id. A record
   without a hint, or whose run wrote no link (a vci before 2.10, `explain_hashes = false`), gets `None`. Links are
   immutable (everything is in the key) and two writers never write one key with different values, so merges keep
@@ -2421,6 +2443,9 @@ Schema version 2 is this without the `manifests` table. The libSQL store shares 
   `MAX_OBJECTS_ANSWER`, refused as `Invalid{what: "objects"}` past it before a byte is read, then `SELECT kind,
   bytes` per id, in the order asked; a missing id, a row whose `kind` names no kind, and a row whose `bytes` is not a
   BLOB are left out. Timing line `store: sqlite: read N object(s)`. Nothing is read on a file without the additions.
+- (2.10) `object_sizes`: the same `SELECT kind, length(bytes) FROM objects WHERE id = ?1` per id, no blob read: a
+  row `Held(length)` (`Held(None)` when its `kind` names no kind), no row `Absent`; every id `Absent` on a file that
+  does not exist or has no additions.
 - (2.9) `orphan_objects`: `SELECT id FROM objects WHERE put_at < now - 3600 AND NOT EXISTS (SELECT 1 FROM
   attestations WHERE hdr = objects.id OR tables_id = objects.id OR shape = objects.id OR state_obj = objects.id)
   ORDER BY id` (the four partial indexes), ids that are not object ids (a foreign row) left out; no value read.
@@ -2802,6 +2827,7 @@ Each read is served from the cache when it can be, and otherwise:
 | `manifest` | a single-row query |
 | `manifests` | `root = ANY($2)` |
 | `columns` (2.9) | `SELECT key, format, commit_id, platform, state, duration_ms, expires, hdr, tables_id, shape, state_obj FROM … WHERE ns=$1 AND key = ANY($2)`, in chunks of 5,000 keys, never cached; none for a key not returned, a NULL column, or a value no column can hold (a negative `format` or `duration_ms`) |
+| `object_sizes` (2.10) | `SELECT id, kind, octet_length(bytes)::int8 FROM vci.objects WHERE ns=$1 AND id = ANY($2)`, distinct ids in chunks of 5,000, no `bytes` read: a row `Held(octet_length)` (`Held(None)` when its `kind` names no kind), an id without one `Absent` |
 | `get_objects` (2.9) | `SELECT id, kind, bytes, sum(octet_length(bytes)) OVER () FROM vci.objects WHERE ns=$1 AND id = ANY($2)`, distinct ids in chunks of 5,000, the answer put back in the order asked; the window sum rides on every row, so an answer past `MAX_OBJECTS_ANSWER` is refused on its first row with the rest read off the connection and dropped; a `kind` no kind has is a foreign row, left out; never cached (`Prefetch::Objects` does nothing) |
 
 The rest go to the server directly:
@@ -3500,7 +3526,10 @@ cut`. `orphan_objects` is one read. `columns` answers what an open batch on the 
 one request per 5,000 keys. `get_objects` answers from the handle's object cache (a `prefetch(Objects)`, or its own
 writes, which `settle` caches) and asks the server for the rest in one request per 5,000 ids; each id answered leaves
 the cache, as a value read does, so the next call sees another writer's removal (c42). The answer is bounded at
-`MAX_OBJECTS_ANSWER` while it is decoded.
+`MAX_OBJECTS_ANSWER` while it is decoded. `object_sizes` (2.10) answers an id whose bytes the handle has cached from
+its cache and asks the server for the rest, `SELECT id, kind, length(bytes), typeof(bytes)` in one request per 5,000
+ids, no bytes read: base64 text `Held(base64_decoded_bound(length))`, a blob `Held(length)`, a `kind` no kind has
+`Held(None)`, an id without a row `Absent` (a replica asks its server; a local file answers as SQLite does).
 
 **Short transactions** (2.8.2). 2.8.1 sent a project's queue in one transaction, flushed early at 8 MiB: on vex's CI
 each such request took about 15 s to commit (about 0.5 MB/s) even alone, held the database's one write lock while
