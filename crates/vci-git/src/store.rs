@@ -33,12 +33,12 @@ use vci_store::select::Selection;
 use vci_store::{
     AttestationStore, BackendFactory, BatchEnd, Caps, EMPTY_VALUE, Exchange, FetchOutcome,
     Hydration, MAX_OBJECTS_ANSWER, ManifestRef, NewAttestation, NewObject, OBJECT_GRACE,
-    OpenContext, Prefetch, PushMode, PushOutcome, StoreError, StoreStatus, StoredEnvelope,
-    StoredManifest, StoredObject, WriteBatch, key,
+    ObjectSize, OpenContext, Prefetch, PushMode, PushOutcome, StoreError, StoreStatus,
+    StoredEnvelope, StoredManifest, StoredObject, WriteBatch, key,
 };
 
 use crate::GitError;
-use crate::meta::{AttestStore, BatchGuard, ObjectRow, Reader, now_ms};
+use crate::meta::{AttestStore, BatchGuard, ObjectRow, ObjectSizeRow, Reader, now_ms};
 use crate::repo::Repo;
 
 /// The backend's name ([`AttestationStore::kind`]).
@@ -372,6 +372,48 @@ impl AttestationStore for GitMetaStore {
             out.push(StoredObject { id, kind, bytes });
         }
         Ok(out)
+    }
+
+    /// The object rows on a pooled reader (four index lookups an id, values
+    /// not read), then one `git rev-list` and `git cat-file --batch-check`
+    /// for the sizes of the fetched values kept as blobs (none fetched):
+    /// held with [`vci_store::base64_decoded_bound`] of the text's length;
+    /// held, size unknown, for a value not fetched yet (or a blob the
+    /// object database lacks, or one whose size git cannot say); absent
+    /// when no kind's row holds the id.
+    fn object_sizes(&self, ids: &[&str]) -> Result<Vec<ObjectSize>, StoreError> {
+        for id in ids {
+            key::check_object_id(id)?;
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self.with_reader(|r| r.object_size_rows(ids))?;
+        let oids: BTreeSet<String> = rows
+            .iter()
+            .flatten()
+            .filter_map(|r| match r {
+                ObjectSizeRow::Blob(oid) => Some(oid.clone()),
+                _ => None,
+            })
+            .collect();
+        // Best effort: a size git cannot give is unknown, not an error.
+        let blobs = self.attest_store().present_sizes(&oids).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .map(|r| match r {
+                None => ObjectSize::Absent,
+                Some(ObjectSizeRow::Inline(len)) => {
+                    ObjectSize::Held(Some(vci_store::base64_decoded_bound(len)))
+                }
+                Some(ObjectSizeRow::Blob(oid)) => {
+                    ObjectSize::Held(blobs.get(&oid).map(|n| vci_store::base64_decoded_bound(*n)))
+                }
+                Some(ObjectSizeRow::NotFetched | ObjectSizeRow::NotAString) => {
+                    ObjectSize::Held(None)
+                }
+            })
+            .collect())
     }
 
     /// Every object validated first (its id computed from its bytes), then

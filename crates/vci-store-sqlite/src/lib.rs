@@ -594,6 +594,25 @@ impl AttestationStore for SqliteStore {
         Ok(out)
     }
 
+    /// Every id validated, then one index lookup each, no byte read. A
+    /// file that does not exist, or has no format-3 additions, holds none.
+    fn object_sizes(&self, ids: &[&str]) -> Result<Vec<vci_store::ObjectSize>, StoreError> {
+        for id in ids {
+            key::check_object_id(id)?;
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let got = self.inner.read(|c, s| {
+            if s.v2 {
+                read::object_sizes(c, ids)
+            } else {
+                Ok(vec![vci_store::ObjectSize::Absent; ids.len()])
+            }
+        })?;
+        Ok(got.unwrap_or_else(|| vec![vci_store::ObjectSize::Absent; ids.len()]))
+    }
+
     /// Every object validated, then in one `BEGIN IMMEDIATE` transaction
     /// (or the batch's) an `UPDATE` of `put_at` per object, and an `INSERT`
     /// for each the update did not find. Nothing is written for an empty

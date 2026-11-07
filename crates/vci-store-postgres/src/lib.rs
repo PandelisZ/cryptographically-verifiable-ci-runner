@@ -517,6 +517,10 @@ impl AttestationStore for PgStore {
         objects::get_objects(&self.inner, ids)
     }
 
+    fn object_sizes(&self, ids: &[&str]) -> Result<Vec<vci_store::ObjectSize>, StoreError> {
+        objects::object_sizes(&self.inner, ids)
+    }
+
     /// Inside a deferred batch the objects are queued and written first
     /// at `finish`; the count is of what the batch did not hold yet.
     fn put_objects(&self, objs: &[NewObject<'_>]) -> Result<usize, StoreError> {

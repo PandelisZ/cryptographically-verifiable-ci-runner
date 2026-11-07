@@ -27,7 +27,7 @@ use vci_store::{
 use crate::config::{ALLOWED_SIGNERS_FILE, CONFIG_FILE, Config, Libraries, Platform};
 use crate::ctx::{Ctx, Project, TestFile, VciPredicate, mark_cross_project_ambiguity, open_repo};
 use crate::envpolicy::{ChildEnvMap, lookup};
-use crate::util::{glob_match, now_unix, parse_rfc3339};
+use crate::util::{glob_match, now_unix, parse_rfc3339, printable};
 
 /// Allowed clock skew for `issued_at` in the future.
 const CLOCK_SKEW_SECS: i64 = 300;
@@ -1097,98 +1097,149 @@ impl ObjectLoader {
     }
 
     /// Load the state objects `ids` (most wanted first), for the failure
-    /// text only (STORE-V2 section 1.5 step 9), within `budget`: the first
-    /// [`StateBudget::objects`] of them are asked for in one
-    /// `get_objects` (after one `Prefetch::Objects` on a lazy store; one id
-    /// at a time only when the store refuses the batch as over its answer
-    /// bound), then kept in order while their bytes stay within
-    /// [`StateBudget::bytes`]. Each id's outcome: loaded (its BLAKE3 is its
-    /// id and it decodes as a state object), expired (the store does not
-    /// hold it: its TTL removed it), over the budget, or unavailable (the
-    /// store or the fetch failed, or it is corrupt or malformed), for which
-    /// the text stays as it was. Never fails.
+    /// text only (STORE-V2 section 1.5 step 9), within `budget`:
+    ///
+    /// - with a budget of no object or no byte, nothing is asked, fetched
+    ///   or read: every id is over the budget;
+    /// - only the first [`StateBudget::objects`] are asked for, the rest
+    ///   over the budget; on a lazy store they are fetched in one
+    ///   `Prefetch::Objects` (at most that many objects, each within the
+    ///   state object's 16 MiB bound);
+    /// - then [`AttestationStore::object_sizes`] says which the store holds
+    ///   and how big they are, and they are read in order, as many at a
+    ///   time as fit, within [`StateBudget::bytes`] (of every state object
+    ///   this plan read): the first that would take the total past it is
+    ///   not read, and neither is any after it. One whose size the store
+    ///   cannot tell is read alone and kept only if it fits.
+    ///
+    /// Each id's outcome: loaded (its BLAKE3 is its id and it decodes as a
+    /// state object); expired (the store says it does not hold it: its TTL
+    /// removed it); over the budget; or unavailable (the store or the fetch
+    /// failed, or the store holds a value it cannot answer, or it is corrupt
+    /// or malformed), for which the text stays as it was. Never fails.
     fn load_states(
         &self,
         store: &dyn AttestationStore,
         ids: &[String],
         budget: StateBudget,
     ) -> HashMap<String, StateLoad> {
+        let asked = if budget.bytes == 0 { 0 } else { budget.objects };
         let mut out: HashMap<String, StateLoad> = ids
             .iter()
-            .skip(budget.objects)
+            .skip(asked)
             .map(|id| (id.clone(), StateLoad::OverBudget))
             .collect();
         let take: Vec<&str> = ids
             .iter()
-            .take(budget.objects)
+            .take(asked)
             .map(String::as_str)
             .filter(|id| parse_hex32(id).is_some())
             .collect();
         if take.is_empty() {
             return out;
         }
-        let mut fetched = true;
         if store.caps().lazy_values {
-            fetched = matches!(
-                store.prefetch(Prefetch::Objects { ids: &take }),
-                Ok(h) if h.error.is_none()
-            );
+            // A failed fetch leaves values unread: they are unavailable.
+            let _ = store.prefetch(Prefetch::Objects { ids: &take });
         }
-        // The ids a read failed for: unavailable, not expired.
-        let mut failed: HashSet<&str> = HashSet::new();
-        let got: Vec<vci_store::StoredObject> = match store.get_objects(&take) {
-            Ok(v) => v,
-            // Over the answer's bound (a few states near their 16 MiB
-            // limit): one at a time, each within it.
-            Err(StoreError::Invalid {
-                what: "objects", ..
-            }) => {
-                let mut v = Vec::new();
-                for id in &take {
-                    match store.get_objects(&[id]) {
-                        Ok(o) => v.extend(o),
-                        Err(_) => {
-                            failed.insert(id);
-                        }
-                    }
-                }
-                v
-            }
-            Err(_) => {
-                for id in take {
-                    out.insert(id.to_owned(), StateLoad::Unavailable);
-                }
-                return out;
-            }
+        let sizes = match store.object_sizes(&take) {
+            Ok(v) if v.len() == take.len() => v,
+            _ => vec![vci_store::ObjectSize::Unknown; take.len()],
         };
-        let by_id: HashMap<&str, &[u8]> = got
-            .iter()
-            .map(|o| (o.id.as_str(), o.bytes.as_slice()))
-            .collect();
-        let mut spent = false;
-        for id in take {
-            let load = match by_id.get(id) {
-                None if fetched && !failed.contains(id) => StateLoad::Expired,
-                None => StateLoad::Unavailable,
-                Some(bytes) => {
-                    let mut c = self.lock();
-                    if spent || c.state_bytes + bytes.len() > budget.bytes {
-                        spent = true;
-                        StateLoad::OverBudget
-                    } else {
-                        c.state_bytes += bytes.len();
-                        drop(c);
-                        match self.decode(ObjectKind::State, id, bytes) {
-                            Ok(Object::State(st)) => {
-                                self.lock().loaded[ObjectKind::State as usize - 1] += 1;
-                                StateLoad::Loaded(st)
-                            }
-                            _ => StateLoad::Unavailable,
+        let mut stopped = false;
+        let mut i = 0;
+        while i < take.len() {
+            if stopped {
+                out.insert(take[i].to_owned(), StateLoad::OverBudget);
+                i += 1;
+                continue;
+            }
+            // The next read: the ids from here whose sizes fit the budget
+            // (and one answer's bound), or one whose size is not known.
+            let spent = self.lock().state_bytes;
+            let mut batch: Vec<usize> = Vec::new();
+            let mut planned = 0usize;
+            while i < take.len() {
+                match sizes[i] {
+                    vci_store::ObjectSize::Absent => {
+                        out.insert(take[i].to_owned(), StateLoad::Expired);
+                        i += 1;
+                    }
+                    vci_store::ObjectSize::Held(Some(n)) => {
+                        let n = usize::try_from(n).unwrap_or(usize::MAX);
+                        if spent.saturating_add(planned).saturating_add(n) > budget.bytes {
+                            stopped = true;
+                            break;
                         }
+                        if !batch.is_empty()
+                            && planned.saturating_add(n) > vci_store::MAX_OBJECTS_ANSWER
+                        {
+                            break;
+                        }
+                        planned += n;
+                        batch.push(i);
+                        i += 1;
+                    }
+                    vci_store::ObjectSize::Held(None) | vci_store::ObjectSize::Unknown => {
+                        if batch.is_empty() {
+                            batch.push(i);
+                            i += 1;
+                        }
+                        break;
                     }
                 }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            let want: Vec<&str> = batch.iter().map(|&j| take[j]).collect();
+            let got: Vec<vci_store::StoredObject> = match store.get_objects(&want) {
+                Ok(v) => v,
+                // Over the answer's bound after all: one at a time.
+                Err(StoreError::Invalid {
+                    what: "objects", ..
+                }) if want.len() > 1 => want
+                    .iter()
+                    .filter_map(|id| store.get_objects(&[id]).ok())
+                    .flatten()
+                    .collect(),
+                Err(_) => Vec::new(),
             };
-            out.insert(id.to_owned(), load);
+            let mut by_id: HashMap<&str, &[u8]> = got
+                .iter()
+                .map(|o| (o.id.as_str(), o.bytes.as_slice()))
+                .collect();
+            // A value bigger than its size said (or one whose size was not
+            // known) that does not fit: it and every one after it are over.
+            let mut over = false;
+            for &j in &batch {
+                let id = take[j];
+                let load = match by_id.remove(id) {
+                    // Held, or not known to be absent, but not answered:
+                    // unreadable (not base64, not fetched), not expired.
+                    None => StateLoad::Unavailable,
+                    Some(_) if over => StateLoad::OverBudget,
+                    Some(bytes) => {
+                        let mut c = self.lock();
+                        if c.state_bytes.saturating_add(bytes.len()) > budget.bytes {
+                            over = true;
+                            StateLoad::OverBudget
+                        } else {
+                            c.state_bytes += bytes.len();
+                            drop(c);
+                            match self.decode(ObjectKind::State, id, bytes) {
+                                Ok(Object::State(st)) => {
+                                    self.lock().loaded[ObjectKind::State as usize - 1] += 1;
+                                    StateLoad::Loaded(st)
+                                }
+                                _ => StateLoad::Unavailable,
+                            }
+                        }
+                    }
+                };
+                out.insert(id.to_owned(), load);
+            }
+            stopped |= over;
         }
         out
     }
@@ -1393,11 +1444,13 @@ impl StateBudget {
 #[derive(Clone)]
 enum StateLoad {
     Loaded(Arc<State>),
-    /// The store does not hold it (any more).
+    /// The store says it does not hold it (any more):
+    /// [`vci_store::ObjectSize::Absent`].
     Expired,
-    /// Not asked for, or not kept: the budget was spent.
+    /// Not asked for, or not read: the budget was spent.
     OverBudget,
-    /// The store, the fetch or the object failed: the text stays.
+    /// The store, the fetch or the object failed, or the store holds a
+    /// value it cannot answer (not base64): the text stays.
     Unavailable,
 }
 
@@ -2760,7 +2813,7 @@ fn plan_with(
         timing("name the inputs that changed for the units that run", t);
         if vci_core::metrics::on() {
             vci_core::timing_line!(
-                "changed inputs: {} candidate(s) without the attested hashes, {} named, {} state expired, {} over the budget, {} without a state object{}; state objects: {} wanted, {} loaded; ask {:.2}s, load {:.2}s, details {:.2}s",
+                "changed inputs: {} candidate(s) without the attested hashes, {} named, {} state expired, {} over the budget, {} without a state object{}; state objects: {} wanted, {} loaded; runs: {} asked of {}; ask {:.3}s, load {:.3}s, details {:.3}s",
                 named.asked,
                 named.named,
                 named.expired,
@@ -2773,6 +2826,8 @@ fn plan_with(
                 },
                 named.wanted,
                 named.loaded,
+                named.runs_asked,
+                named.runs,
                 named.ask.as_secs_f64(),
                 named.load.as_secs_f64(),
                 named.details.as_secs_f64()
@@ -3149,9 +3204,13 @@ struct NamedInputs {
     expired: usize,
     over_budget: usize,
     no_state: usize,
-    /// Distinct state objects wanted, and loaded.
+    /// Distinct state objects the runs asked about named, and loaded.
     wanted: usize,
     loaded: usize,
+    /// Distinct runs (shape and key hint) of the candidates, and how many
+    /// of them the store was asked about (within the budget).
+    runs: usize,
+    runs_asked: usize,
     /// The store could not say which state objects (the texts stay).
     failed: bool,
     /// Wall time asking the store which state objects, loading them, and
@@ -3161,23 +3220,142 @@ struct NamedInputs {
     details: std::time::Duration,
 }
 
+/// A candidate whose changed input the pass after the verdicts names
+/// ([`ask_state_objects`]).
+struct RunCandidate<'a> {
+    record: &'a StoredEnvelope,
+    /// Its descriptor's shape object, 64 hex.
+    shape: &'a str,
+    /// Whether it is the best candidate of a unit that runs (the one its
+    /// reason names).
+    best: bool,
+}
+
+/// What [`ask_state_objects`] found, per candidate in order: the state
+/// object its run wrote (`None` too when its run was not asked) and whether
+/// its run was asked; then the distinct state objects named, most wanted
+/// first; how many runs the candidates come from, and how many were asked.
+struct AskedStates {
+    named: Vec<Option<String>>,
+    asked: Vec<bool>,
+    ids: Vec<String>,
+    runs: usize,
+    runs_asked: usize,
+}
+
+/// Which state object the runs of `cands` wrote, asked only for the runs
+/// whose state objects `budget` can load. The candidates are grouped by
+/// run (their shape and their key's hint, which give git-meta's run-state
+/// link; a record without a hint is a run of its own), the runs ranked by
+/// the units whose best candidate they hold, then by their candidates,
+/// then the newest (equal ranks by shape and hint), and asked in that order
+/// ([`AttestationStore::run_state_objects`]: once for the first
+/// `budget.objects` runs, and only while fewer distinct state objects were
+/// named, again for the next ones, twice as many each time) until
+/// `budget.objects` are named. Nothing is asked with a budget of no object
+/// or no byte. `None` when the store cannot say.
+fn ask_state_objects(
+    store: &dyn AttestationStore,
+    cands: &[RunCandidate<'_>],
+    budget: StateBudget,
+) -> Option<AskedStates> {
+    let mut by_run: BTreeMap<(&str, String), Vec<usize>> = BTreeMap::new();
+    for (k, c) in cands.iter().enumerate() {
+        let run = match vci_store::parse_key_hint(&c.record.key) {
+            Some(h) => vci_store::hint_segment(&h),
+            None => format!("key {}", c.record.key),
+        };
+        by_run.entry((c.shape, run)).or_default().push(k);
+    }
+    type Rank = (usize, usize, Option<i64>);
+    let mut runs: Vec<(Rank, Vec<usize>)> = by_run
+        .into_values()
+        .map(|ks| {
+            let rank = (
+                ks.iter().filter(|&&k| cands[k].best).count(),
+                ks.len(),
+                ks.iter().filter_map(|&k| cands[k].record.issued).max(),
+            );
+            (rank, ks)
+        })
+        .collect();
+    // Stable: equal ranks keep the (shape, hint) order.
+    runs.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let mut out = AskedStates {
+        named: vec![None; cands.len()],
+        asked: vec![false; cands.len()],
+        ids: Vec::new(),
+        runs: runs.len(),
+        runs_asked: 0,
+    };
+    let mut next = 0;
+    let mut round = 0u32;
+    while budget.objects > 0
+        && budget.bytes > 0
+        && next < runs.len()
+        && out.ids.len() < budget.objects
+    {
+        // As many runs as the budget has room for, twice as many at each
+        // round after one that named fewer (runs that wrote none: records
+        // of a vci before 2.10 on git-meta, `explain_hashes = false`), so
+        // that a store answering in a round trip is asked a few times.
+        let room = (budget.objects - out.ids.len()).saturating_mul(1 << round.min(20));
+        round += 1;
+        let chunk = &runs[next..next.saturating_add(room).min(runs.len())];
+        next += chunk.len();
+        let ks: Vec<usize> = chunk
+            .iter()
+            .flat_map(|(_, ks)| ks.iter().copied())
+            .collect();
+        let asking: Vec<vci_store::RunOf<'_>> = ks
+            .iter()
+            .map(|&k| vci_store::RunOf {
+                record: cands[k].record,
+                shape: cands[k].shape,
+            })
+            .collect();
+        let named = match store.run_state_objects(&asking) {
+            Ok(n) if n.len() == ks.len() => n,
+            _ => return None,
+        };
+        out.runs_asked += chunk.len();
+        for (&k, id) in ks.iter().zip(named) {
+            out.asked[k] = true;
+            if let Some(id) = &id
+                && !out.ids.contains(id)
+            {
+                out.ids.push(id.clone());
+            }
+            out.named[k] = id;
+        }
+    }
+    Some(out)
+}
+
 /// After the verdicts and their rounds (STORE-V2 section 1.5 step 9, vci
 /// 2.10): name the input that changed for the units that run. A format-3
 /// record keeps no per-input hash (they are in its run's state object,
 /// which no verdict reads), so the verdicts say `entry: changed (attested
 /// hash not loaded)`; here, for the best candidate of each unit that runs
 /// with that text (every such candidate of the unit `vci explain` asks
-/// about, with `every_candidate`), the store says which state object its
-/// run wrote ([`AttestationStore::run_state_objects`]: the record's
-/// listing column, or git-meta's run-state link), the distinct ones are
-/// loaded once each, the ones most units need first, within `budget`
-/// ([`ObjectLoader::load_states`]), and each candidate's `entry:` details
-/// are made again from it ([`Verifier::entries_with_state`]), so that the
-/// reason reads as format 1's did (`inputs: entry:<path> (+N more)`).
-/// Where the state is gone, past the budget, or named by nothing, the text
-/// says so (`attested hash not loaded: state expired`); any other failure
-/// leaves it as it was. Text only: no verdict changes, and a plan in which
-/// every unit skips asks the store nothing here.
+/// about, with `every_candidate`), the candidates are grouped by run (the
+/// shape and the key's hint, which give git-meta's run-state link) and the
+/// runs ranked: the most units' best candidates first (so `vci explain`
+/// spends its budget on the candidate the plan names first), then the
+/// most candidates, then the newest. Only the runs whose state objects can
+/// be loaded are asked about, in that order
+/// ([`AttestationStore::run_state_objects`]: the record's listing column,
+/// or git-meta's run-state link; one call for as many runs as
+/// `[store] plan_states`, more only while fewer state objects were named,
+/// each for twice as many runs); the others are over the budget. The state objects are loaded once each, in the runs' order,
+/// within `budget` ([`ObjectLoader::load_states`]), and each candidate's
+/// `entry:` details are made again from its run's
+/// ([`Verifier::entries_with_state`]), so that the reason reads as format
+/// 1's did (`inputs: entry:<path> (+N more)`). Where the state is gone, past
+/// the budget, or named by nothing, the text says so (`attested hash not
+/// loaded: state expired`); any other failure leaves it as it was. Text
+/// only: no verdict changes, and a plan in which every unit skips asks the
+/// store nothing here.
 #[allow(clippy::too_many_arguments)]
 fn name_changed_inputs(
     store: &dyn AttestationStore,
@@ -3190,13 +3368,15 @@ fn name_changed_inputs(
     budget: StateBudget,
     every_candidate: bool,
 ) -> NamedInputs {
-    /// One candidate to name: where its verdict is, its record, its shape.
+    /// One candidate to name: where its verdict is, its record, its shape,
+    /// whether it is its unit's best.
     struct Pending<'a> {
         pi: usize,
         fi: usize,
         ci: usize,
         record: &'a StoredEnvelope,
         shape: String,
+        best: bool,
     }
     let mut pending: Vec<Pending<'_>> = Vec::new();
     for (pi, vs) in verdicts.iter().enumerate() {
@@ -3242,6 +3422,7 @@ fn name_changed_inputs(
                     ci,
                     record,
                     shape: hex32(&shape),
+                    best: !out.skip && out.best == Some(ci),
                 });
             }
         }
@@ -3253,36 +3434,29 @@ fn name_changed_inputs(
     if pending.is_empty() {
         return stats;
     }
-    // Which state object each candidate's run wrote (none asked for with a
-    // budget of none).
     let t = std::time::Instant::now();
-    let named: Vec<Option<String>> = if budget.objects == 0 {
-        vec![None; pending.len()]
-    } else {
-        let runs: Vec<vci_store::RunOf<'_>> = pending
-            .iter()
-            .map(|p| vci_store::RunOf {
-                record: p.record,
-                shape: &p.shape,
-            })
-            .collect();
-        match store.run_state_objects(&runs) {
-            Ok(n) if n.len() == pending.len() => n,
-            _ => {
-                stats.failed = true;
-                return stats;
-            }
-        }
+    let cands: Vec<RunCandidate<'_>> = pending
+        .iter()
+        .map(|p| RunCandidate {
+            record: p.record,
+            shape: &p.shape,
+            best: p.best,
+        })
+        .collect();
+    let Some(AskedStates {
+        named,
+        asked: asked_run,
+        ids,
+        runs,
+        runs_asked,
+    }) = ask_state_objects(store, &cands, budget)
+    else {
+        stats.failed = true;
+        return stats;
     };
+    stats.runs = runs;
+    stats.runs_asked = runs_asked;
     stats.ask = t.elapsed();
-    // The state objects that name the most candidates first.
-    let mut count: BTreeMap<&str, usize> = BTreeMap::new();
-    for id in named.iter().flatten() {
-        *count.entry(id.as_str()).or_default() += 1;
-    }
-    let mut order: Vec<(&str, usize)> = count.into_iter().collect();
-    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    let ids: Vec<String> = order.iter().map(|(id, _)| (*id).to_owned()).collect();
     stats.wanted = ids.len();
     let t = std::time::Instant::now();
     let loads = objects.load_states(store, &ids, budget);
@@ -3294,19 +3468,20 @@ fn name_changed_inputs(
     // The details made again, once per run: the records of one run (one
     // project, shape and state object) together.
     let t = std::time::Instant::now();
-    let mut runs: BTreeMap<(usize, &str, &str), Vec<usize>> = BTreeMap::new();
+    let mut remake: BTreeMap<(usize, &str, &str), Vec<usize>> = BTreeMap::new();
     for (k, id) in named.iter().enumerate() {
         if let Some(id) = id
             && matches!(loads.get(id), Some(StateLoad::Loaded(_)))
         {
             let p = &pending[k];
-            runs.entry((p.pi, p.shape.as_str(), id.as_str()))
+            remake
+                .entry((p.pi, p.shape.as_str(), id.as_str()))
                 .or_default()
                 .push(k);
         }
     }
     let mut remade: HashMap<usize, Vec<Detail>> = HashMap::new();
-    for ((pi, shape, id), ks) in runs {
+    for ((pi, shape, id), ks) in remake {
         let (Some(Ok(v)), Some(StateLoad::Loaded(st))) = (verifiers.get(pi), loads.get(id)) else {
             continue;
         };
@@ -3340,7 +3515,7 @@ fn name_changed_inputs(
             stats.named += 1;
         } else {
             let why = match named[k].as_ref() {
-                None if budget.objects == 0 => Some(OVER_BUDGET),
+                None if !asked_run[k] => Some(OVER_BUDGET),
                 None => Some(NO_STATE),
                 Some(id) => match loads.get(id) {
                     Some(StateLoad::Expired) => Some(STATE_EXPIRED),
@@ -5079,20 +5254,24 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
             // Single project: files relative to the project dir (what the
             // runner takes). Several projects: repo-relative test ids, plus
             // `run_<name>=` per project with project-relative files.
+            // Every name and reason [`printable`]: a control character in
+            // one cannot end the line of an output or a workflow command.
             let name = |f: &FileVerdict| {
-                if res.multi {
-                    f.test_id.clone()
-                } else {
-                    f.file.clone()
-                }
+                printable(if res.multi { &f.test_id } else { &f.file }).into_owned()
             };
             let run: Vec<String> = res.to_run().map(name).collect();
             let skip: Vec<String> = res.skipped().map(name).collect();
             for f in res.skipped() {
-                println!("::notice title=vci skip::{} {}", f.test_id, f.reason);
+                println!(
+                    "::notice title=vci skip::{}",
+                    github_data(&format!("{} {}", f.test_id, f.reason))
+                );
             }
             if let Some(r) = &res.run_all {
-                println!("::warning title=vci::running everything: {r}");
+                println!(
+                    "::warning title=vci::{}",
+                    github_data(&format!("running everything: {r}"))
+                );
             }
             let mut lines = format!(
                 "run_all={}\nrun={}\nskip={}\n",
@@ -5102,14 +5281,14 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
             );
             if res.multi {
                 for (i, p) in res.projects.iter().enumerate() {
-                    let files: Vec<&str> = res
+                    let files: Vec<String> = res
                         .to_run()
                         .filter(|f| f.project_idx == i)
-                        .map(|f| f.file.as_str())
+                        .map(|f| printable(&f.file).into_owned())
                         .collect();
                     lines.push_str(&format!(
                         "run_all_{0}={1}\nrun_{0}={2}\n",
-                        p.name,
+                        printable(&p.name),
                         p.run_all.is_some(),
                         files.join(" ")
                     ));
@@ -5129,30 +5308,36 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
             }
         }
         _ => {
+            // Every name, key and reason [`printable`]: one line per unit,
+            // whatever a committed file name holds.
             match (&res.base_ref, &res.base_commit) {
-                (Some(r), Some(c)) => println!("base: {r} ({c})"),
+                (Some(r), Some(c)) => println!("base: {} ({})", printable(r), printable(c)),
                 _ => println!("base: none"),
             }
             if let Some(r) = &res.run_all {
-                println!("running everything: {r}");
+                println!("running everything: {}", printable(r));
             } else if res.multi {
                 for p in &res.projects {
                     if let Some(r) = &p.run_all {
-                        println!("running everything in {}: {r}", p.name);
+                        println!(
+                            "running everything in {}: {}",
+                            printable(&p.name),
+                            printable(r)
+                        );
                     }
                 }
             }
             for f in &res.files {
                 let project = if res.multi {
-                    format!(" [{}]", f.project)
+                    format!(" [{}]", printable(&f.project))
                 } else {
                     String::new()
                 };
                 println!(
                     "{} {}{project}  ({})",
                     if f.skip { "SKIP" } else { "RUN " },
-                    f.test_id,
-                    f.reason
+                    printable(&f.test_id),
+                    printable(&f.reason)
                 );
             }
             for line in changed_inputs_lines(res, CHANGED_INPUTS_SHOWN) {
@@ -5162,6 +5347,13 @@ pub fn print(res: &PlanResult, format: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `s` as the data of a GitHub workflow command (`::notice …::<data>`):
+/// [`printable`], then `%` as `%25` so that GitHub's decoding (`%25`,
+/// `%0D`, `%0A`) gives the text back as printed.
+fn github_data(s: &str) -> String {
+    printable(s).replace('%', "%25")
 }
 
 /// How many changed inputs the text plan's summary names.
@@ -5232,7 +5424,7 @@ fn changed_inputs_lines(res: &PlanResult, top: usize) -> Vec<String> {
             "changed inputs, by the units each made run:".to_owned()
         });
         for (path, n) in ranked.into_iter().take(shown) {
-            out.push(format!("  {n:>width$}  {path}"));
+            out.push(format!("  {n:>width$}  {}", printable(path)));
         }
     }
     if unnamed > 0 {
@@ -5253,16 +5445,16 @@ fn summary_line(res: &PlanResult) -> String {
     if res.run_all.is_some() {
         return format!("{skip} to skip, running everything ({run} test files listed)");
     }
-    let all: Vec<&str> = res
+    let all: Vec<std::borrow::Cow<'_, str>> = res
         .projects
         .iter()
         .filter(|p| p.run_all.is_some())
         .map(|p| {
-            if p.name.is_empty() {
+            printable(if p.name.is_empty() {
                 p.path.as_str()
             } else {
                 p.name.as_str()
-            }
+            })
         })
         .collect();
     if all.is_empty() {
@@ -5276,23 +5468,25 @@ fn summary_line(res: &PlanResult) -> String {
 }
 
 /// `vci explain`: every candidate and its first failed check.
+/// Every name, key, reason and detail is [`printable`], as in the text plan.
 pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
+    let p = |s: &str| printable(s).into_owned();
     if let (Some(r), Some(c)) = (&res.base_ref, &res.base_commit) {
-        println!("base: {r} ({c})");
+        println!("base: {} ({})", p(r), p(c));
     }
     if let Some(r) = &res.run_all {
-        println!("{test_id}: RUN, running everything: {r}");
+        println!("{}: RUN, running everything: {}", p(test_id), p(r));
         return Ok(0);
     }
     let Some(f) = res.files.iter().find(|f| f.test_id == test_id) else {
-        println!("{test_id}: not a listed test file");
+        println!("{}: not a listed test file", p(test_id));
         return Ok(1);
     };
     println!(
         "{}: {} ({})",
-        f.test_id,
+        p(&f.test_id),
         if f.skip { "SKIP" } else { "RUN" },
-        f.reason
+        p(&f.reason)
     );
     if f.libraries == Libraries::Any {
         println!("{LIBRARIES_ANY_POLICY_LINE}");
@@ -5305,20 +5499,21 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
             "candidate {}: {} {} {}",
             i + 1,
             res.store_kind,
-            c.info.target,
-            c.info.meta_key
+            p(&c.info.target),
+            p(&c.info.meta_key)
         );
-        if let Some(p) = &c.info.principal {
+        if let Some(who) = &c.info.principal {
             println!(
-                "  signer: {p} {}",
-                c.info.fingerprint.clone().unwrap_or_default()
+                "  signer: {} {}",
+                p(who),
+                p(c.info.fingerprint.as_deref().unwrap_or_default())
             );
         }
         if let (Some(a), Some(b)) = (&c.info.issued_at, &c.info.expires_at) {
-            println!("  issued {a}, expires {b}");
+            println!("  issued {}, expires {}", p(a), p(b));
         }
         for a in &c.info.accepted_by_policy {
-            println!("  accepted by policy.libraries = \"any\": {a}");
+            println!("  accepted by policy.libraries = \"any\": {}", p(a));
         }
         if f.rails_inputs.is_some() && c.info.issued_at.is_some() {
             if c.info.rails_inputs.is_empty() {
@@ -5337,9 +5532,9 @@ pub fn explain(res: &PlanResult, test_id: &str) -> Result<i32> {
                     "    (expected: recorded in the attestation; actual: this checkout / CI now)"
                 );
                 for d in &fl.details {
-                    println!("    {}", d.what);
-                    println!("      expected: {}", d.expected);
-                    println!("      actual:   {}", d.actual);
+                    println!("    {}", p(&d.what));
+                    println!("      expected: {}", p(&d.expected));
+                    println!("      actual:   {}", p(&d.actual));
                 }
             }
         }
@@ -5401,7 +5596,7 @@ pub fn rails_inputs_line(mode: crate::config::RailsInputs, ignored: &[String]) -
     let list = if ignored.is_empty() {
         "nothing".to_owned()
     } else {
-        ignored.join(", ")
+        printable(&ignored.join(", ")).into_owned()
     };
     match mode {
         crate::config::RailsInputs::Loose => format!(
@@ -6809,6 +7004,241 @@ adapter = "pytest"
         let l = loader.load_states(&s, &ids, StateBudget { objects: 0, ..big });
         assert_eq!(s.object_reads(), before, "a budget of none asks nothing");
         assert!(ids.iter().all(|id| kind(&l, id) == "over"));
+    }
+
+    /// Two runs' state objects in a store with objects, their ids, and a
+    /// name for what became of each.
+    fn two_states() -> (crate::store::mem::MemStore, [String; 2], [usize; 2]) {
+        use vci_store::conformance::scenarios::Run3;
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let one = Run3::build(&["src/a.ts"]);
+        let two = Run3::build(&["src/b.ts", "src/c.ts"]);
+        s.put_objects(&one.new_objects()).unwrap();
+        s.put_objects(&two.new_objects()).unwrap();
+        (
+            s,
+            [one.ids.state.clone(), two.ids.state.clone()],
+            [one.objects[3].1.len(), two.objects[3].1.len()],
+        )
+    }
+
+    fn load_kind(l: &HashMap<String, StateLoad>, id: &str) -> &'static str {
+        match l.get(id) {
+            Some(StateLoad::Loaded(_)) => "loaded",
+            Some(StateLoad::Expired) => "expired",
+            Some(StateLoad::OverBudget) => "over",
+            Some(StateLoad::Unavailable) => "unavailable",
+            None => "none",
+        }
+    }
+
+    /// 2.10.0: `plan_states_mib` bounds what is read, in order: with none,
+    /// nothing is asked, sized or read; with room for the first state
+    /// object only, the second is never read. 2.10's first cut read every
+    /// object within the count in one `get_objects` (and fetched them on a
+    /// lazy store), then dropped what did not fit, so a plan held
+    /// `plan_states` x 16 MiB whatever `plan_states_mib` said.
+    #[test]
+    fn state_objects_are_read_within_the_byte_budget() {
+        let (s, ids, len) = two_states();
+        let (reads, sized) = (s.object_reads(), s.size_asks());
+        let loader = ObjectLoader::default();
+        let l = loader.load_states(
+            &s,
+            &ids,
+            StateBudget {
+                objects: 8,
+                bytes: 0,
+            },
+        );
+        assert_eq!(
+            (s.object_reads(), s.size_asks()),
+            (reads, sized),
+            "no byte: nothing asked"
+        );
+        assert_eq!(
+            [load_kind(&l, &ids[0]), load_kind(&l, &ids[1])],
+            ["over", "over"]
+        );
+
+        let answered = s.object_bytes();
+        let loader = ObjectLoader::default();
+        let l = loader.load_states(
+            &s,
+            &ids,
+            StateBudget {
+                objects: 8,
+                bytes: len[0],
+            },
+        );
+        assert_eq!(
+            [load_kind(&l, &ids[0]), load_kind(&l, &ids[1])],
+            ["loaded", "over"]
+        );
+        assert_eq!(
+            s.object_bytes() - answered,
+            len[0],
+            "only what fits is read"
+        );
+        assert_eq!(loader.lock().state_bytes, len[0]);
+    }
+
+    /// 2.10.0: a state object the store holds but cannot answer (a value
+    /// that is not base64) is unavailable, and its text stays; only one the
+    /// store says it does not hold is expired. 2.10's first cut called
+    /// every object `get_objects` left out expired.
+    #[test]
+    fn an_unreadable_state_object_is_unavailable_not_expired() {
+        let (s, ids, _) = two_states();
+        s.make_unreadable(&ids[0]);
+        let gone = "e".repeat(64);
+        let loader = ObjectLoader::default();
+        let l = loader.load_states(
+            &s,
+            &[ids[0].clone(), gone.clone(), ids[1].clone()],
+            StateBudget {
+                objects: 8,
+                bytes: 1 << 20,
+            },
+        );
+        assert_eq!(
+            [
+                load_kind(&l, &ids[0]),
+                load_kind(&l, &gone),
+                load_kind(&l, &ids[1])
+            ],
+            ["unavailable", "expired", "loaded"]
+        );
+    }
+
+    /// 2.10.0: the runs asked which state object they wrote are only the
+    /// ones whose state objects the budget can load, best first: the run
+    /// that holds the most units' best candidates (the one `vci explain`'s
+    /// reason names, over a run with more candidates or a lower state id),
+    /// then the most candidates, then the newest. 2.10's first cut asked
+    /// for every candidate's run (3 ms a run on vex's store) and loaded the
+    /// state objects by how many candidates named them, then by id, so
+    /// `vci explain` could spend its budget on other candidates and say
+    /// "over the plan's budget" for the one its reason names.
+    #[test]
+    fn only_the_runs_the_budget_can_load_are_asked_the_best_candidates_first() {
+        use vci_store::conformance::scenarios::Run3;
+        use vci_store::{KeyHint, NewAttestation};
+        let s = crate::store::mem::MemStore::new().objects(true);
+        let run = Run3::build(&["src/a.ts"]);
+        let signer = "2".repeat(16);
+        // (unit, issued, state id): B's candidates from four runs, its best
+        // from the run whose state id is the highest; A's and C's from one
+        // run (two candidates, no best).
+        let rows = [
+            ("src/b.ts", 10, "1"),
+            ("src/b.ts", 11, "2"),
+            ("src/b.ts", 12, "3"),
+            ("src/b.ts", 13, "4"),
+            ("src/a.ts", 20, "5"),
+            ("src/c.ts", 20, "5"),
+        ];
+        let mut stored = Vec::new();
+        for (i, (unit, issued, state)) in rows.iter().enumerate() {
+            let (bytes, mut columns) = run.record(unit, 1, 1);
+            columns.state_obj = Some(state.repeat(64));
+            let hint = KeyHint {
+                issued: *issued,
+                tree: None,
+            };
+            let sk = format!("{i:02x}");
+            let att = NewAttestation::for_test(unit, &signer, &sk, Some(&hint), &bytes)
+                .with_columns(&columns);
+            stored.push(s.put(&att).unwrap());
+        }
+        let cands = |best: &[usize]| -> Vec<RunCandidate<'_>> {
+            stored
+                .iter()
+                .enumerate()
+                .map(|(k, e)| RunCandidate {
+                    record: e,
+                    shape: &run.ids.shape,
+                    best: best.contains(&k),
+                })
+                .collect()
+        };
+        let budget = |objects| StateBudget {
+            objects,
+            bytes: 1 << 20,
+        };
+
+        // `vci explain` of B: B's best candidate (the fourth) first.
+        let asked_before = s.column_records();
+        let got = ask_state_objects(&s, &cands(&[3]), budget(1)).unwrap();
+        assert_eq!(got.ids, vec!["4".repeat(64)]);
+        assert_eq!((got.runs, got.runs_asked), (5, 1));
+        assert_eq!(
+            s.column_records() - asked_before,
+            1,
+            "only the best candidate's run is asked"
+        );
+        assert_eq!(got.asked, [false, false, false, true, false, false]);
+        assert_eq!(got.named[3].as_deref(), Some("4".repeat(64).as_str()));
+        assert!(
+            got.named
+                .iter()
+                .enumerate()
+                .all(|(k, n)| k == 3 || n.is_none())
+        );
+
+        // Room for two: then the run with two candidates.
+        let got = ask_state_objects(&s, &cands(&[3]), budget(2)).unwrap();
+        assert_eq!(got.ids, vec!["4".repeat(64), "5".repeat(64)]);
+        assert_eq!(got.runs_asked, 2);
+
+        // A plan: every candidate is a unit's best; the run with two units
+        // first, then the newest.
+        let got = ask_state_objects(&s, &cands(&[0, 1, 2, 3, 4, 5]), budget(3)).unwrap();
+        assert_eq!(
+            got.ids,
+            vec!["5".repeat(64), "4".repeat(64), "3".repeat(64)]
+        );
+
+        // B's best candidate's run wrote no state object: the next runs are
+        // asked, twice as many, and the first state object named is loaded
+        // first.
+        let (bytes, mut columns) = run.record("src/d.ts", 1, 1);
+        columns.state_obj = None;
+        let hint = KeyHint {
+            issued: 30,
+            tree: None,
+        };
+        let none = s
+            .put(
+                &NewAttestation::for_test("src/d.ts", &signer, "06", Some(&hint), &bytes)
+                    .with_columns(&columns),
+            )
+            .unwrap();
+        let mut with_none = cands(&[]);
+        with_none.push(RunCandidate {
+            record: &none,
+            shape: &run.ids.shape,
+            best: true,
+        });
+        let got = ask_state_objects(&s, &with_none, budget(1)).unwrap();
+        assert_eq!((got.runs, got.runs_asked), (6, 3));
+        assert_eq!(got.ids[0], "5".repeat(64));
+        assert!(got.asked[6] && got.named[6].is_none());
+
+        // A budget of no object or no byte asks nothing.
+        let calls = s.columns_calls();
+        for b in [
+            budget(0),
+            StateBudget {
+                objects: 8,
+                bytes: 0,
+            },
+        ] {
+            let got = ask_state_objects(&s, &cands(&[3]), b).unwrap();
+            assert!(got.ids.is_empty() && got.asked.iter().all(|a| !a));
+            assert_eq!((got.runs, got.runs_asked), (5, 0));
+        }
+        assert_eq!(s.columns_calls(), calls, "nothing asked");
     }
 
     /// A store with listing columns names a record's run's state object by

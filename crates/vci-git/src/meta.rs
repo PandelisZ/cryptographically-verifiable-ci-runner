@@ -733,6 +733,31 @@ fn meta_err(e: git_meta_lib::Error) -> GitError {
     GitError::Meta(e.to_string())
 }
 
+/// [`Reader::run_state_keys`]: the `project` target's keys in one range of
+/// the store's (target, key) index, `?2` the prefix and `?3` its
+/// [`prefix_upper`].
+const RUN_STATE_KEYS_SQL: &str = "SELECT key FROM metadata
+     WHERE target_type = ?1 AND target_value = '' AND key >= ?2 AND key < ?3
+       AND value_type = 'string'
+     ORDER BY key";
+
+/// The least string above every string that starts with `prefix`, in
+/// SQLite's binary (UTF-8 byte) order: `prefix` with its last character
+/// replaced by the next one (`vci:run-state:` gives `vci:run-state;`), so
+/// that `key >= prefix AND key < upper` is a range on an index of `key`.
+/// `None` for an empty prefix, or one whose last character has no next.
+fn prefix_upper(prefix: &str) -> Option<String> {
+    let mut chars = prefix.chars();
+    let last = chars.next_back()?;
+    let next = match last {
+        '\u{D7FF}' => '\u{E000}',
+        c => char::from_u32(u32::from(c) + 1)?,
+    };
+    let mut upper = chars.as_str().to_owned();
+    upper.push(next);
+    Some(upper)
+}
+
 fn sql_err(path: &Utf8Path, e: rusqlite::Error) -> GitError {
     GitError::Store(format!("{path}: {e}"))
 }
@@ -1249,30 +1274,38 @@ impl Reader {
     /// [`vci_store::RUN_STATE_PREFIX`] and `:` for every link), sorted,
     /// values not read: a link not fetched yet (a promised row) is listed
     /// too, since its key says everything. Keys that do not parse as links
-    /// are foreign and left out.
+    /// are foreign and left out. One key range on the store's (target, key)
+    /// index (`key >= prefix AND key < `[`prefix_upper`]): a `substr` test
+    /// of the key read every `project` row instead, 3 ms a lookup on vex's
+    /// 32,358 (2.10.0).
     pub fn run_state_keys(&self, prefix: &str) -> Result<Vec<String>, GitError> {
         let Some((path, db)) = &self.db else {
             return Ok(Vec::new());
         };
         READER_QUERIES.with(|n| n.set(n.get() + 1));
         let ty = TargetType::Project.as_str();
+        // Every prefix vci asks for ends in `:`, whose successor is `;`; one
+        // without a successor (empty) is every key from it on.
+        let upper = prefix_upper(prefix);
         let mut stmt = db
-            .prepare_cached(
+            .prepare_cached(if upper.is_some() {
+                RUN_STATE_KEYS_SQL
+            } else {
                 "SELECT key FROM metadata
-                 WHERE target_type = ?1 AND target_value = '' AND substr(key, 1, ?2) = ?3
+                 WHERE target_type = ?1 AND target_value = '' AND key >= ?2 AND ?3 IS NULL
                    AND value_type = 'string'
-                 ORDER BY key",
-            )
+                 ORDER BY key"
+            })
             .map_err(|e| sql_err(path, e))?;
         let rows = stmt
-            .query_map(rusqlite::params![ty, prefix.len() as i64, prefix], |r| {
+            .query_map(rusqlite::params![ty, prefix, upper], |r| {
                 r.get::<_, String>(0)
             })
             .map_err(|e| sql_err(path, e))?;
         let mut out = Vec::new();
         for r in rows {
             let key = r.map_err(|e| sql_err(path, e))?;
-            if vci_store::parse_run_state_key(&key).is_some() {
+            if key.starts_with(prefix) && vci_store::parse_run_state_key(&key).is_some() {
                 out.push(key);
             }
         }
@@ -1360,6 +1393,67 @@ impl Reader {
             if let Some(text) = self.object(*kind, id)? {
                 out.push(((*id).to_owned(), *kind, text));
             }
+        }
+        Ok(out)
+    }
+
+    /// What the store holds under each of these object ids (each 64
+    /// lowercase hex), values not read: per id, the row of the lowest kind
+    /// whose value is a string ([`Reader::objects`] reads that one), else
+    /// [`ObjectSizeRow::NotAString`] when some kind's row holds another
+    /// type, else `None` (no row: not held). Four index lookups per id.
+    pub fn object_size_rows(&self, ids: &[&str]) -> Result<Vec<Option<ObjectSizeRow>>, GitError> {
+        use rusqlite::OptionalExtension as _;
+        let Some((path, db)) = &self.db else {
+            return Ok(vec![None; ids.len()]);
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let mut stmt = db
+            .prepare_cached(
+                "SELECT value_type, is_git_ref, is_promised,
+                        CASE WHEN is_git_ref = 1 THEN value ELSE '' END, length(value)
+                 FROM metadata WHERE target_type = ?1 AND target_value = '' AND key = ?2",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let ty = TargetType::Project.as_str();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut found = None;
+            for kind in [
+                ObjectKind::Hdr,
+                ObjectKind::Tables,
+                ObjectKind::Shape,
+                ObjectKind::State,
+            ] {
+                let row = stmt
+                    .query_row(rusqlite::params![ty, object_key(kind, id)], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, bool>(1)?,
+                            r.get::<_, bool>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                        ))
+                    })
+                    .optional()
+                    .map_err(|e| sql_err(path, e))?;
+                let Some((vt, git_ref, promised, oid, len)) = row else {
+                    continue;
+                };
+                if vt != "string" {
+                    found.get_or_insert(ObjectSizeRow::NotAString);
+                    continue;
+                }
+                found = Some(if promised {
+                    ObjectSizeRow::NotFetched
+                } else if git_ref {
+                    ObjectSizeRow::Blob(oid.trim().to_owned())
+                } else {
+                    ObjectSizeRow::Inline(u64::try_from(len).unwrap_or(0))
+                });
+                break;
+            }
+            out.push(found);
         }
         Ok(out)
     }
@@ -1470,6 +1564,19 @@ impl Reader {
 /// One stored object as [`Reader::objects`] reads it: its id, the kind it is
 /// filed under, and its base64 text or why it cannot be read.
 pub type ObjectText = (String, ObjectKind, Result<Vec<u8>, String>);
+
+/// What [`Reader::object_size_rows`] found under an object id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectSizeRow {
+    /// Fetched and kept in the row: the text's length.
+    Inline(u64),
+    /// Fetched as a blob reference: the blob's id.
+    Blob(String),
+    /// A promised row: held, not fetched yet.
+    NotFetched,
+    /// A row whose value is not a string (`get_objects` cannot read it).
+    NotAString,
+}
 
 /// One stored format-3 object as [`Reader::object_rows`] lists it (value
 /// not read).
@@ -4167,7 +4274,10 @@ impl<'a> AttestStore<'a> {
     /// `--ignore-missing` an absent object named on its input is left out
     /// instead of being a `bad object`: it lists what is present, and only
     /// that is then asked for.
-    fn present_sizes(&self, oids: &BTreeSet<String>) -> Result<BTreeMap<String, u64>, GitError> {
+    pub(crate) fn present_sizes(
+        &self,
+        oids: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, u64>, GitError> {
         if oids.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -10392,6 +10502,75 @@ mod tests {
         assert!(
             AttestStore::classify_change("A", "000000", "100644", b"project/k\xff/__value")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_prefix_upper_bound_is_above_every_key_of_the_prefix_and_no_other() {
+        assert_eq!(
+            prefix_upper("vci:run-state:").as_deref(),
+            Some("vci:run-state;")
+        );
+        assert_eq!(prefix_upper("a\u{D7FF}").as_deref(), Some("a\u{E000}"));
+        assert_eq!(prefix_upper(""), None);
+        assert_eq!(prefix_upper("a\u{10FFFF}"), None);
+        let p = "vci:run-state:ab:";
+        let u = prefix_upper(p).unwrap();
+        for k in [
+            "vci:run-state:ab:",
+            "vci:run-state:ab:ff",
+            "vci:run-state:ab:\u{10FFFF}",
+        ] {
+            assert!(k >= p && k < u.as_str(), "{k}");
+        }
+        for k in [
+            "vci:run-state:ab",
+            "vci:run-state:ab;",
+            "vci:run-state:ac:",
+            "vci:run-state:a",
+        ] {
+            assert!(!(k >= p && k < u.as_str()), "{k}");
+        }
+    }
+
+    /// 2.10.0: the run-state lookup is a range of the (target, key) index on
+    /// git-meta's own schema. It was a `substr` test of every `project`
+    /// row's key (`SEARCH ... (target_type=? AND target_value=?)`), 3 ms a
+    /// lookup on vex's 32,358 rows and 4.1 s for a plan that asked for its
+    /// 1,117 runs.
+    #[test]
+    fn the_run_state_lookup_is_a_key_range_of_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let repo = Repo::discover(&root).unwrap();
+        let st = AttestStore::new(&repo);
+        st.put("src/a.test.ts", "0123456789abcdef", &"1".repeat(64), b"{}")
+            .unwrap();
+        let db = rusqlite::Connection::open(root.join(".git/git-meta.sqlite")).unwrap();
+        let plan: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {RUN_STATE_KEYS_SQL}"))
+            .unwrap()
+            .query_map(
+                rusqlite::params!["project", "vci:run-state:", "vci:run-state;"],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.contains("key>? AND key<?")),
+            "not a key range: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|d| d.contains("TEMP B-TREE")),
+            "sorted apart from the index: {plan:?}"
         );
     }
 
