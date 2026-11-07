@@ -32,7 +32,7 @@ Built and in use (vci 2.8.0):
   (section 7), `vci store info` exists, and none of `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` reaches a
   child process.
 - **The plan reads the candidates it set aside** even when a round fetched nothing (section 5).
-- **The conformance suite** (section 14): its 42 scenarios, run against git-meta, SQLite, PostgreSQL and libSQL (in
+- **The conformance suite** (section 14): its 43 scenarios, run against git-meta, SQLite, PostgreSQL and libSQL (in
   each of its three modes) from each backend's `tests/conformance.rs`.
 - **The trait's format-3 side** (2.9, STORE-V2 M2): the object methods (`get_objects`, `put_objects`,
   `remove_objects`, `orphan_objects`, `prune_state_objects`), `Prefetch::Objects`, the listing `Columns` carried by a
@@ -50,6 +50,11 @@ Built and in use (vci 2.8.0):
   and collects objects (`--objects`, `--older-than`); `vci store upgrade --begin` and `--finish`, `vci verify
   --envelope` and `--manifest FILE` for a frame (section 2, "The frame and the decoder rules", "Migration from
   format 1"; section 13).
+- **The changed input named on format 3** (2.9.1): `run_state_objects` (the state object of a record's run: the
+  `state_obj` column by default, git-meta's run-state links) and `put_run_state` (the link `vci run` writes beside
+  its objects on a store without columns), scenario c43; the plan loads state objects only after its verdicts, for
+  the units that run, within `[store] plan_states` and `plan_states_mib` (section 4, "Objects and columns"; section
+  14; section 15, git-meta, "Run-state links").
 - **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14), the temporary libSQL server
   (`vci_store_libsql::testkit`, section 18) and the CI jobs that run all of the above (`store-stock-git`,
   `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`; the libSQL server is the
@@ -485,6 +490,8 @@ that is correct for a backend whose values are always present and whose writes a
 | | `orphan_objects() -> Vec<String>` | | `Unsupported` | prune |
 | | `prune_state_objects(Duration) -> usize` | | `Unsupported` | prune, run's orphan pass |
 | columns (2.9) | `columns(&[&StoredEnvelope]) -> Vec<Columns>` | | every field `None` | supersession, last durations, prune |
+| run state (2.9.1) | `run_state_objects(&[RunOf]) -> Vec<Option<String>>` | | the `state_obj` column where `Caps::columns`, else `None` | plan, after the verdicts (the changed input of each unit that runs) |
+| | `put_run_state(shape, &[KeyHint], state) -> usize` | | ids checked, nothing kept | run (after the run's objects, before its records) |
 | prefetch | `prefetch(Prefetch)` (`Units`, `Manifests`, `Attestations`, `Objects`) | | no-op | plan, run, verify, prune |
 | | `warm()` | | no-op | plan start |
 | hints | `passing_on`, `remember_passing`, `flag`, `set_flag` | | keep nothing | plan |
@@ -747,8 +754,22 @@ state them:
   everything on a store without `Caps::columns`. Values are not read. Cost: one round trip whatever the length, or
   the listing's own cache. A put without columns on a store that keeps them clears the slot's columns; a put of the
   same bytes with other columns replaces them (the bytes being a no-op does not make the columns one).
+- **`run_state_objects(runs) -> Vec<Option<String>>`** (2.9.1): the state object each of these records' runs
+  wrote (`RunOf { record, shape }`: a listed record and the shape its descriptor names), one per entry in order,
+  values not read; `None` where the store says none. The default answers from the `state_obj` column on a store with
+  `Caps::columns` (one `columns` call) and `None` elsewhere; a store without columns that can say it overrides it
+  (git-meta's run-state links, section 15). Store data like a column: it chooses which state object the plan's
+  failure text loads, which may have expired since, and never a verdict. The plan calls it once, after the verdicts,
+  for the best candidates of the units that run whose `entry:` text says the attested hash was not loaded, and never
+  when every unit skips.
+- **`put_run_state(shape, hints, state) -> usize`** (2.9.1): say that the run whose records carry these key hints
+  and name this shape wrote this state object, on a store that keeps no columns; inside the open batch, after the
+  run's objects. The default checks the ids and keeps nothing (a store with columns has the id in each record's
+  `state_obj` column). `vci run` warns on an error and attests anyway: no verdict reads it.
 - **Fail open**: a plan whose `get_objects` fails runs the candidates that needed them; `vci run` warns on a failed
-  `remove_objects` or `prune_state_objects` as it does on a failed manifest collection; prune exits 2.
+  `remove_objects` or `prune_state_objects` as it does on a failed manifest collection; prune exits 2. A failed
+  `run_state_objects`, or a state object that cannot be fetched or decoded, leaves the plan's text as the verdict
+  wrote it.
 
 ### Provided reads
 
@@ -1687,8 +1708,12 @@ Hence `AttestationStore: Send + Sync`.
     compares the key's signer segment with the verified key's signer id (`signer`), loads the hdr, tables and shape
     objects its format-3 candidates name through one `get_objects` per round in candidate-priority order
     (`Prefetch::Objects` first on a lazy store) under a 16 MiB verdict-object cap, recomputes each id, checks the hdr
-    once per `(project, hdr id)`, resolves the descriptor and observes the resolved set at HEAD (`inputs`), and loads
-    at most 16 state objects, named by the records' `state_obj` column, for the failure text;
+    once per `(project, hdr id)`, resolves the descriptor and observes the resolved set at HEAD (`inputs`); after
+    the verdicts (since 2.9.1; 2.9.0 loaded at most 16 during them, named by the `state_obj` column), for the best
+    candidates of the units that run whose `entry:` text says the attested hash was not loaded, it asks
+    `run_state_objects` once and loads the distinct state objects, most-needed first, in one `get_objects`
+    (`Prefetch::Objects` first on a lazy store) within `[store] plan_states` and `plan_states_mib`, for the
+    failure text only; and `run` calls `put_run_state` after `put_objects` (git-meta's run-state link);
   - prune (cmds.rs) lists with `list_all` and `columns` on a store that keeps them, reads the expired candidates,
     the records of a unit with one beyond `keep` by the hints, the rows the columns do not describe, and every row
     while a manifest remains (`manifest_roots`), confirms each delete from the signed statement (expiry; the
@@ -1778,7 +1803,7 @@ What the scenarios can and cannot check through the trait:
   back, so that c37, c38 and c42 can cross the one-hour grace and the state TTL without waiting (`UPDATE objects SET
   put_at = put_at - ?` on a SQL store; on git-meta `UPDATE metadata SET last_timestamp = last_timestamp - ?` for the
   object's key of each kind in `.git/git-meta.sqlite`).
-- **Objects (2.9).** c35 to c39 and c42 run only on a store whose `Caps::objects` is set and skip otherwise, after c35
+- **Objects (2.9).** c35 to c39, c42 and c43 (2.9.1) run only on a store whose `Caps::objects` is set and skip otherwise, after c35
   has checked that every object method of such a store is `Unsupported`; c36's validation and c40's and c41's
   format-3 records run everywhere (a store without `Caps::columns` answers none in c40 and skips its second half).
   The fixtures are `conformance::scenarios::Run3` (a run's four objects built with vci-core's encoders, their ids, and
@@ -1834,6 +1859,7 @@ whose base64 payload carries `predicate.manifestRef`.
 | c40 | columns_match_the_put | `columns` gives back what the put passed, in input order; none for a format-1 record, a put without them, a removed key, and everything without `Caps::columns`; a re-put without columns clears them, with others replaces them; a copy with `with_columns` keeps them |
 | c41 | mixed_formats_in_one_namespace | an envelope and a frame of one unit side by side: key order, byte-exact reads, `decode_record` tells them apart, the frame's `ManifestRef` is `Inline` so `orphan_manifests` goes on, `record_object_refs` names its objects; `count` sees both |
 | c42 | object_deletions_reach_peers | objects and a frame reach another peer (a replica, by `seq`), and so do the record's removal and, aged past the grace, the objects' (`gone` rows): the peer lists nothing, reads the stale entry as `GONE`, gets no object |
+| c43 | run_state_objects_name_the_runs_state | `run_state_objects` names the run's state object of a record put in a batch with its objects and `put_run_state` (the `state_obj` column, or git-meta's link), one answer per run in order (the same run twice, twice), `None` for a record whose run named none (no column, no link), none for no runs, and the same on another peer after a sync |
 
 Backends keep their own tests for what is theirs:
 
@@ -2029,9 +2055,26 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   objects: a manifest's referrers are on the paths it lists, an object's can be any record), which is `vci prune`'s
   cost and not a per-run one: `vci run` does not call them on a store without columns (section 4).
 - `prune_state_objects(older_than)`: the object rows of kind 4 whose `last_timestamp` is older than that, deleted
-  whatever names them (values not read).
+  whatever names them (values not read). Since 2.9.1 it then removes the run-state links (below) of runs no
+  attestation key carries the hint of any more (one range query of the links; only when there is one, one of the
+  attestation keys, values not read), so a link outlives its state object while its run's records stay, and goes
+  with the last of them.
 - `columns` is the default: `Columns::default()` for every entry (the hint is the key; the columns a put passes are
   ignored).
+- **Run-state links (2.9.1).** No signed field names a run's state object and git-meta keeps no `state_obj` column,
+  so before 2.9.1 nothing on git-meta said which state object a record's run wrote, and a plan could never name a
+  changed input of a format-3 record there (`entry: changed (attested hash not loaded)`: 477,407 of 500,784 Rails
+  re-runs in a day at vex). `put_run_state(shape, hints, state)` writes, inside the run's batch after its objects,
+  one string value per distinct hint on the `project` target under
+  `vci:run-state:<shape id>:<hint>:<state id>` (`key::run_state_key`: the hint spelt as an attestation key spells it,
+  `<issued hex>.<tree16 | ->`; the value is the state id again), at `project/vci/run-state/<shape>/<hint>/<state>/__value`.
+  `run_state_objects` finds it from what a plan has without reading a value: the record's key hint and the shape its
+  descriptor names give the prefix `key::run_state_prefix`, one indexed range query of the keys per distinct run on a
+  pooled reader, promised rows included (a lazy clone needs no fetch for it), the first link's state id. A record
+  without a hint, or whose run wrote no link (a vci before 2.9.1, `explain_hashes = false`), gets `None`. Links are
+  immutable (everything is in the key) and two writers never write one key with different values, so merges keep
+  them as any value; a vci before 2.9.1 lists none of them (they are not attestation, manifest or object keys) and
+  deletes none.
 - **The merge's put-back rule applies to objects by id** (`restore_referenced_objects`, beside
   `restore_referenced_manifests`): after a fetch merged a tip that deleted an object, the deletion records of object
   keys the store held before the merge or the tip holds are candidates; the ones a local attestation names

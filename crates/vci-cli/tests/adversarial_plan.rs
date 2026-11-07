@@ -443,9 +443,10 @@ fn edited_columns_never_decide_a_verdict() {
     assert!(ex.contains("all checks passed"), "{ex}");
 
     // The input edited: B runs on its signed root, whatever the columns
-    // say; the state object column names no object, so no attested hash,
+    // say; the state object column names an object the store does not
+    // hold (expired, as far as the plan can tell), so no attested hash,
     // and the file's kind did not change, so no entry can be named: the
-    // one line says the entries changed and gives both roots.
+    // one line says the entries changed, and why, and gives both roots.
     let original = w.read("fixtures/b.json");
     w.write("fixtures/b.json", "{ \"greeting\": \"hello, world\" }\n");
     let (skip, run) = w.plan();
@@ -453,7 +454,9 @@ fn edited_columns_never_decide_a_verdict() {
     let ex = w.explain(B);
     assert!(ex.contains("failed check: inputs"), "{ex}");
     assert!(
-        ex.contains(&format!("entry: changed ({HASH_NOT_LOADED})")),
+        ex.contains(&format!(
+            "entry: changed ({HASH_NOT_LOADED}: state expired)"
+        )),
         "{ex}"
     );
     assert!(!ex.contains("entry:fixtures/b.json"), "{ex}");

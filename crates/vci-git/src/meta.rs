@@ -1211,6 +1211,72 @@ impl Reader {
         Ok(out)
     }
 
+    /// The keys of the run-state links on the `project` target that start
+    /// with `prefix` (a [`vci_store::key::run_state_prefix`], or
+    /// [`vci_store::RUN_STATE_PREFIX`] and `:` for every link), sorted,
+    /// values not read: a link not fetched yet (a promised row) is listed
+    /// too, since its key says everything. Keys that do not parse as links
+    /// are foreign and left out.
+    pub fn run_state_keys(&self, prefix: &str) -> Result<Vec<String>, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(Vec::new());
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let ty = TargetType::Project.as_str();
+        let mut stmt = db
+            .prepare_cached(
+                "SELECT key FROM metadata
+                 WHERE target_type = ?1 AND target_value = '' AND substr(key, 1, ?2) = ?3
+                   AND value_type = 'string'
+                 ORDER BY key",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let rows = stmt
+            .query_map(rusqlite::params![ty, prefix.len() as i64, prefix], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| sql_err(path, e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let key = r.map_err(|e| sql_err(path, e))?;
+            if vci_store::parse_run_state_key(&key).is_some() {
+                out.push(key);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The hint segments ([`vci_store::hint_segment`]) of every stored
+    /// attestation's key, on any target, values not read: the runs that
+    /// still have a record here.
+    pub fn attestation_hints(&self) -> Result<BTreeSet<String>, GitError> {
+        let Some((path, db)) = &self.db else {
+            return Ok(BTreeSet::new());
+        };
+        READER_QUERIES.with(|n| n.set(n.get() + 1));
+        let prefix = format!("{KEY_PREFIX}:");
+        let mut stmt = db
+            .prepare_cached(
+                "SELECT key FROM metadata WHERE substr(key, 1, ?1) = ?2 AND value_type = 'string'",
+            )
+            .map_err(|e| sql_err(path, e))?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix.len() as i64, prefix], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| sql_err(path, e))?;
+        let mut out = BTreeSet::new();
+        for r in rows {
+            let key = r.map_err(|e| sql_err(path, e))?;
+            if parse_key(&key).is_some()
+                && let Some(h) = vci_store::parse_key_hint(&key)
+            {
+                out.insert(vci_store::hint_segment(&h));
+            }
+        }
+        Ok(out)
+    }
+
     /// The stored object of this kind and id, as stored (its base64 text):
     /// `None` when the store has none, `Some(Err)` when its value cannot be
     /// read (not fetched, a blob missing from the object database).
@@ -2557,6 +2623,53 @@ impl<'a> AttestStore<'a> {
     /// rule or the state TTL; nothing is checked here. Returns how many
     /// existed.
     pub fn remove_object_keys(&self, keys: Vec<String>) -> Result<usize, GitError> {
+        self.remove_project_keys(keys)
+    }
+
+    /// Store run-state links (vci 2.9.1: [`vci_store::key::run_state_key`],
+    /// each with its state id as the value) on the `project` target, inside
+    /// the batch when one is open, as [`AttestStore::put_objects`] stores
+    /// objects. A link already stored is left as it is. Returns how many
+    /// were not stored before.
+    pub fn put_run_state_links(&self, links: &[(String, String)]) -> Result<usize, GitError> {
+        if links.is_empty() {
+            return Ok(0);
+        }
+        let project = Target::project();
+        let batched = self.in_batch(|db, session, written| {
+            let now = now_ms();
+            let mut new = 0;
+            for (key, state) in links {
+                if !current_is(db, session, &project, key, state)? {
+                    set_string(db, &project, key, state, session.email(), now)?;
+                    written.push((project.clone(), key.clone()));
+                    new += 1;
+                }
+            }
+            Ok(new)
+        });
+        if let Some(r) = batched {
+            return r;
+        }
+        let session = self.write_session()?;
+        let handle = session.target(&project);
+        let mut stored = Vec::new();
+        for (key, state) in links {
+            let current = handle.get_value(key).ok().flatten();
+            if current != Some(MetaValue::String(state.clone())) {
+                handle.set(key, state.as_str()).map_err(meta_err)?;
+                stored.push(key.clone());
+            }
+        }
+        if !stored.is_empty() {
+            self.stamp_written(stored.iter().map(|k| (&project, k.as_str())))?;
+        }
+        Ok(stored.len())
+    }
+
+    /// Delete these run-state links in one session (tombstones, which
+    /// `push` publishes). Returns how many existed.
+    pub fn remove_run_state_keys(&self, keys: Vec<String>) -> Result<usize, GitError> {
         self.remove_project_keys(keys)
     }
 

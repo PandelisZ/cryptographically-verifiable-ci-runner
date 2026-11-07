@@ -97,6 +97,7 @@
 //! | [`exchange`] (`None`)                           | writes reach other machines only through a push and a fetch     |
 //! | objects: [`get_objects`], [`put_objects`], [`remove_objects`], [`orphan_objects`], [`prune_state_objects`] (`Unsupported`) | the backend keeps format-3 objects ([`Caps::objects`]) |
 //! | [`columns`] (none)                              | the backend keeps the listing columns ([`Caps::columns`])       |
+//! | [`run_state_objects`] (the `state_obj` column), [`put_run_state`] (nothing) | the backend keeps no columns but can say which state object a run wrote (git-meta's run-state links) |
 //!
 //! Then add a [`BackendFactory`] and register it in vci-cli's
 //! `store::factories` (one line, or a [`MissingBackend`] when its cargo
@@ -183,6 +184,8 @@
 //! [`orphan_objects`]: AttestationStore::orphan_objects
 //! [`prune_state_objects`]: AttestationStore::prune_state_objects
 //! [`columns`]: AttestationStore::columns
+//! [`run_state_objects`]: AttestationStore::run_state_objects
+//! [`put_run_state`]: AttestationStore::put_run_state
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -194,9 +197,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use key::{
-    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, OBJECT_PREFIX, ObjectRefs, attestation_key,
-    attestation_key_hinted, envelope_manifest_ref, manifest_key, object_key, parse_key,
-    parse_key_hint, parse_manifest_key, parse_object_key, record_object_refs, target_label,
+    KEY_PREFIX, MANIFEST_PREFIX, ManifestRef, OBJECT_PREFIX, ObjectRefs, RUN_STATE_PREFIX,
+    attestation_key, attestation_key_hinted, envelope_manifest_ref, hint_segment, manifest_key,
+    object_key, parse_key, parse_key_hint, parse_manifest_key, parse_object_key,
+    parse_run_state_key, record_object_refs, run_state_key, run_state_prefix, target_label,
     test_key,
 };
 
@@ -496,6 +500,19 @@ impl Columns {
         }
         Ok(())
     }
+}
+
+/// A listed format-3 record and the shape object its descriptor names: the
+/// run a plan asks the state object of
+/// ([`AttestationStore::run_state_objects`]). Its key's hint (when it was
+/// issued, on which tree) and the shape say which run made it on a store
+/// that keeps no listing columns.
+#[derive(Debug, Clone, Copy)]
+pub struct RunOf<'a> {
+    /// The record, as listed (its value need not be read).
+    pub record: &'a StoredEnvelope,
+    /// The shape object's id, 64 lowercase hex.
+    pub shape: &'a str,
 }
 
 /// One object read back from a store ([`AttestationStore::get_objects`]):
@@ -1766,6 +1783,62 @@ pub trait AttestationStore: Send + Sync {
         Ok(vec![Columns::default(); envs.len()])
     }
 
+    /// The state object of each of these records' runs (STORE-V2 section
+    /// 1.5 step 9), one per entry in order: the id the store says the run
+    /// wrote, or `None` when it says none (the run wrote none, `[store]
+    /// explain_hashes = false`; or nothing names it, as for a git-meta
+    /// record of a vci before 2.9.1). The id is **store data**, in no
+    /// signed field: it chooses which state object the plan's failure text
+    /// loads, which may since have been removed (its TTL), and never a
+    /// verdict. Values are not read. Cost: one round trip, or one key
+    /// lookup per distinct run.
+    ///
+    /// Default: the `state_obj` listing column ([`AttestationStore::columns`])
+    /// on a store with [`Caps::columns`], else `None` for every record. A
+    /// backend without columns that keeps run-state links
+    /// ([`AttestationStore::put_run_state`], git-meta) overrides it.
+    ///
+    /// Used by: plan.rs, after the verdicts, for the best candidates of the
+    /// units that run whose entries changed.
+    fn run_state_objects(&self, runs: &[RunOf<'_>]) -> Result<Vec<Option<String>>, StoreError> {
+        if !self.caps().columns {
+            return Ok(vec![None; runs.len()]);
+        }
+        let envs: Vec<&StoredEnvelope> = runs.iter().map(|r| r.record).collect();
+        let columns = self.columns(&envs)?;
+        let mut out: Vec<Option<String>> = columns
+            .into_iter()
+            .map(|c| c.state_obj.filter(|id| key::is_object_id(id)))
+            .collect();
+        out.resize(runs.len(), None);
+        Ok(out)
+    }
+
+    /// Say that the run whose records carry these key hints and name the
+    /// shape `shape` wrote the state object `state`, on a store that keeps
+    /// no listing columns (git-meta: a run-state link,
+    /// [`key::run_state_key`], for each hint), so that
+    /// [`AttestationStore::run_state_objects`] can name it; inside a batch
+    /// when one is open, with the run's objects. Store data, like a column:
+    /// no verdict reads it. Returns how many links were not stored before.
+    /// Every id is validated first.
+    ///
+    /// Default: nothing (a store with [`Caps::columns`] keeps the id in the
+    /// record's `state_obj` column, which the put passes), `Ok(0)`.
+    ///
+    /// Used by: run.rs, after the run's objects and before its records.
+    fn put_run_state(
+        &self,
+        shape: &str,
+        hints: &[KeyHint],
+        state: &str,
+    ) -> Result<usize, StoreError> {
+        key::check_object_id(shape)?;
+        key::check_object_id(state)?;
+        let _ = hints;
+        Ok(0)
+    }
+
     /// The error every default of the objects section returns.
     #[doc(hidden)]
     fn objects_unsupported(&self) -> StoreError {
@@ -2211,6 +2284,17 @@ impl AttestationStore for FailedStore {
     fn columns(&self, _envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {
         Err(self.error())
     }
+    fn run_state_objects(&self, _runs: &[RunOf<'_>]) -> Result<Vec<Option<String>>, StoreError> {
+        Err(self.error())
+    }
+    fn put_run_state(
+        &self,
+        _shape: &str,
+        _hints: &[KeyHint],
+        _state: &str,
+    ) -> Result<usize, StoreError> {
+        Err(self.error())
+    }
     fn batch(&self) -> Result<WriteBatch, StoreError> {
         Err(self.error())
     }
@@ -2348,6 +2432,8 @@ pub mod key {
     //! ```text
     //! vci:attestation:<test key>:<signer>:<storage key>[:<issued hex>.<tree16 | ->]
     //! vci:manifest:<input root>
+    //! vci:object:<kind>:<object id>                  (vci 2.9, a backend that files objects by key)
+    //! vci:run-state:<shape id>:<hint>:<state id>     (vci 2.9.1, a backend without listing columns)
     //! ```
     //!
     //! * `<test key>` is the BLAKE3 hash of the test id, 64 lowercase hex
@@ -2359,6 +2445,10 @@ pub mod key {
     //! * The hint gives when the attestation was issued (seconds, in hex) and
     //!   the first 16 hex digits of the tree it was made on (`-` when
     //!   unknown). Keys written before vci 2.2 have no hint.
+    //! * A run-state link ([`run_state_key`]) names the state object of the
+    //!   run whose records carry `<hint>` and name `<shape id>`: a store
+    //!   without listing columns says there what a SQL store's `state_obj`
+    //!   column says.
     //!
     //! Segments are separated by `:`. git-meta turns each segment into a tree
     //! directory, the only place a `/` form appears; the other backends store
@@ -2375,6 +2465,9 @@ pub mod key {
     /// Key namespace of the format-3 objects on a backend that files them
     /// by key (git-meta: `vci:object:<kind>:<id>`, STORE-V2 section 2.2).
     pub const OBJECT_PREFIX: &str = "vci:object";
+    /// Key namespace of the run-state links of a backend without listing
+    /// columns (git-meta, vci 2.9.1): [`run_state_key`].
+    pub const RUN_STATE_PREFIX: &str = "vci:run-state";
     /// Length of an object id: 32 bytes of BLAKE3 as lowercase hex.
     pub const OBJECT_ID_LEN: usize = 64;
     /// Length of a signer id.
@@ -2494,16 +2587,55 @@ pub mod key {
         storage_key: &str,
         hint: &KeyHint,
     ) -> String {
+        format!(
+            "{KEY_PREFIX}:{test_key}:{signer}:{storage_key}:{}",
+            hint_segment(hint)
+        )
+    }
+
+    /// A hint as a key spells it: `<issued hex>.<tree16 | ->` (the tree as
+    /// `-` unless it gives 16 hex characters, a negative `issued` as 0), so
+    /// that the same hint is the same segment in every key that holds one.
+    pub fn hint_segment(hint: &KeyHint) -> String {
         let tree = hint
             .tree
             .as_deref()
             .map(|t| t.chars().take(16).collect::<String>())
             .filter(|t| t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit()))
             .unwrap_or_else(|| "-".to_owned());
-        format!(
-            "{KEY_PREFIX}:{test_key}:{signer}:{storage_key}:{:x}.{tree}",
-            hint.issued.max(0)
-        )
+        format!("{:x}.{tree}", hint.issued.max(0))
+    }
+
+    /// The prefix of the run-state links of one run's shape
+    /// ([`run_state_key`]): `vci:run-state:<shape id>:<hint>:`.
+    pub fn run_state_prefix(shape: &str, hint: &KeyHint) -> String {
+        format!("{RUN_STATE_PREFIX}:{shape}:{}:", hint_segment(hint))
+    }
+
+    /// The key of a run-state link (vci 2.9.1, git-meta, which keeps no
+    /// listing columns): `vci:run-state:<shape id>:<hint>:<state id>`, which
+    /// says that the run whose records carry this hint in their keys and
+    /// name this shape in their descriptors wrote this state object. A
+    /// plan finds the state object of a record's run from the key alone
+    /// (the value, the state id again, is never read), so a link not
+    /// fetched yet serves as well. Store data, like a listing column: it
+    /// chooses which state object the failure text loads, never a verdict.
+    pub fn run_state_key(shape: &str, hint: &KeyHint, state: &str) -> String {
+        format!("{}{state}", run_state_prefix(shape, hint))
+    }
+
+    /// (shape id, hint, state id) of a run-state link's key
+    /// ([`run_state_key`]); any other key: `None`.
+    pub fn parse_run_state_key(key: &str) -> Option<(&str, KeyHint, &str)> {
+        let rest = key.strip_prefix(RUN_STATE_PREFIX)?.strip_prefix(':')?;
+        let mut parts = rest.split(':');
+        let (Some(shape), Some(hint), Some(state), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let hint = parse_hint(hint)?;
+        (is_object_id(shape) && is_object_id(state)).then_some((shape, hint, state))
     }
 
     fn parse_hint(part: &str) -> Option<KeyHint> {
@@ -2793,6 +2925,13 @@ pub mod select {
     /// `vci prune` and `vci run`'s orphan pass remove an older one. Wins
     /// over `[store] explain_hashes_days`.
     pub const ENV_EXPLAIN_HASHES_DAYS: &str = "VCI_STORE_EXPLAIN_HASHES_DAYS";
+    /// How many state objects a plan loads after its verdicts to name the
+    /// changed input of each unit that runs (default 8; 0: none). Wins
+    /// over `[store] plan_states`.
+    pub const ENV_PLAN_STATES: &str = "VCI_STORE_PLAN_STATES";
+    /// How many MiB of state objects a plan loads for that (default 16).
+    /// Wins over `[store] plan_states_mib`.
+    pub const ENV_PLAN_STATES_MIB: &str = "VCI_STORE_PLAN_STATES_MIB";
     /// Every variable this module reads. The e2e harnesses remove them all.
     pub const ENV_VARS: &[&str] = &[
         ENV_STORE,
@@ -2807,6 +2946,8 @@ pub mod select {
         ENV_RECORD_FORMAT,
         ENV_EXPLAIN_HASHES,
         ENV_EXPLAIN_HASHES_DAYS,
+        ENV_PLAN_STATES,
+        ENV_PLAN_STATES_MIB,
     ];
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
@@ -2843,6 +2984,16 @@ pub mod select {
     pub const DEFAULT_EXPLAIN_HASHES_DAYS: u32 = 2;
     /// The most days `explain_hashes_days` may name.
     pub const MAX_EXPLAIN_HASHES_DAYS: u32 = 365;
+    /// The state objects a plan loads to name changed inputs, when nothing
+    /// chooses how many.
+    pub const DEFAULT_PLAN_STATES: u32 = 8;
+    /// The most state objects `plan_states` may name.
+    pub const MAX_PLAN_STATES: u32 = 256;
+    /// The MiB of state objects a plan loads to name changed inputs, when
+    /// nothing chooses how many.
+    pub const DEFAULT_PLAN_STATES_MIB: u32 = 16;
+    /// The most MiB `plan_states_mib` may name.
+    pub const MAX_PLAN_STATES_MIB: u32 = 4096;
 
     /// A `vci.toml` key that is refused: it deserializes from anything
     /// (without keeping or echoing the value) so the error can name the key.
@@ -2901,6 +3052,19 @@ pub mod select {
         /// loaded`. `VCI_STORE_EXPLAIN_HASHES_DAYS` wins over it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub explain_hashes_days: Option<u32>,
+        /// How many state objects a plan loads after its verdicts, for the
+        /// units that run whose entries changed, to name the input that
+        /// changed (`entry:<path> (+N more)`) instead of `attested hash not
+        /// loaded` (default 8, since 2.9.1, at most 256; 0: none, the plan
+        /// reads no state object). `VCI_STORE_PLAN_STATES` wins over it. A
+        /// vci older than 2.9.1 refuses a `vci.toml` that sets it (an
+        /// unknown key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plan_states: Option<u32>,
+        /// How many MiB of state objects a plan loads for that (default
+        /// 16, at most 4096). `VCI_STORE_PLAN_STATES_MIB` wins over it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plan_states_mib: Option<u32>,
         /// `[store.sqlite]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sqlite: Option<SqliteSettings>,
@@ -3933,6 +4097,13 @@ pub mod select {
         /// (`VCI_STORE_EXPLAIN_HASHES_DAYS`, else `[store]
         /// explain_hashes_days`, else [`DEFAULT_EXPLAIN_HASHES_DAYS`]).
         pub explain_hashes_days: Sourced<u32>,
+        /// How many state objects a plan loads to name changed inputs
+        /// (`VCI_STORE_PLAN_STATES`, else `[store] plan_states`, else
+        /// [`DEFAULT_PLAN_STATES`]).
+        pub plan_states: Sourced<u32>,
+        /// How many MiB of them (`VCI_STORE_PLAN_STATES_MIB`, else `[store]
+        /// plan_states_mib`, else [`DEFAULT_PLAN_STATES_MIB`]).
+        pub plan_states_mib: Sourced<u32>,
         /// `[store.sqlite]` as resolved.
         pub sqlite: SqliteSelection,
         /// `[store.postgres]` as resolved.
@@ -3975,6 +4146,8 @@ pub mod select {
                 record_format: Sourced::default_value(DEFAULT_RECORD_FORMAT),
                 explain_hashes: Sourced::default_value(true),
                 explain_hashes_days: Sourced::default_value(DEFAULT_EXPLAIN_HASHES_DAYS),
+                plan_states: Sourced::default_value(DEFAULT_PLAN_STATES),
+                plan_states_mib: Sourced::default_value(DEFAULT_PLAN_STATES_MIB),
                 sqlite: SqliteSelection { path: None },
                 postgres: PostgresSelection {
                     schema: Sourced::default_value(DEFAULT_SCHEMA.to_owned()),
@@ -4137,6 +4310,16 @@ pub mod select {
                 "explain_hashes_days",
                 self.explain_hashes_days.value.to_string(),
                 self.explain_hashes_days.source,
+            ));
+            v.push(line(
+                "plan_states",
+                self.plan_states.value.to_string(),
+                self.plan_states.source,
+            ));
+            v.push(line(
+                "plan_states_mib",
+                self.plan_states_mib.value.to_string(),
+                self.plan_states_mib.source,
             ));
             v
         }
@@ -4823,6 +5006,24 @@ pub mod select {
                     .filter(|d| *d <= MAX_EXPLAIN_HASHES_DAYS)
             },
         )?;
+        let plan_states = setting(
+            &var,
+            ENV_PLAN_STATES,
+            file.and_then(|f| f.plan_states),
+            "plan_states",
+            DEFAULT_PLAN_STATES,
+            "a number of state objects, 0 to 256",
+            |v| v.parse::<u32>().ok().filter(|n| *n <= MAX_PLAN_STATES),
+        )?;
+        let plan_states_mib = setting(
+            &var,
+            ENV_PLAN_STATES_MIB,
+            file.and_then(|f| f.plan_states_mib),
+            "plan_states_mib",
+            DEFAULT_PLAN_STATES_MIB,
+            "a number of MiB, 0 to 4096",
+            |v| v.parse::<u32>().ok().filter(|n| *n <= MAX_PLAN_STATES_MIB),
+        )?;
         let schema = match f_pg.and_then(|p| p.schema.clone()) {
             Some(s) => Sourced {
                 value: s,
@@ -4896,6 +5097,8 @@ pub mod select {
             record_format,
             explain_hashes,
             explain_hashes_days,
+            plan_states,
+            plan_states_mib,
             sqlite,
             postgres: PostgresSelection {
                 schema,
@@ -5108,6 +5311,7 @@ macro_rules! conformance_suite {
             c38_state_objects_expire_even_while_referenced,
             c39_objects_are_visible_before_their_record, c40_columns_match_the_put,
             c41_mixed_formats_in_one_namespace, c42_object_deletions_reach_peers,
+            c43_run_state_objects_name_the_runs_state,
         );
     };
 }

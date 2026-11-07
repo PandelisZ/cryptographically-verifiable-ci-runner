@@ -434,3 +434,96 @@ fn an_idempotent_put_in_a_batch_restarts_the_grace_period() {
     assert_eq!(s.remove_objects(&run.id_refs()).unwrap(), 3);
     assert_eq!(objects(&s, &run.id_refs()), vec![run.ids.state.clone()]);
 }
+
+/// Run-state links (2.9.1): `put_run_state` stores one string value per
+/// hint under `vci:run-state:<shape>:<hint>:<state>` on the project target
+/// (published by a push like any value); another clone names the run's
+/// state object from the record's key alone, with the link not fetched
+/// (a promised row) and the state object not fetched either; the state
+/// TTL removes the state object and keeps the link while the run has a
+/// record here (so the plan can say the state expired); and the link goes
+/// with the run's last record, at the next prune.
+#[test]
+fn a_run_state_link_names_the_state_object_and_goes_with_the_runs_last_record() {
+    use vci_store::{KeyHint, RunOf, run_state_key};
+    let w = lazy_world(1);
+    let a_dir = &w.clones[0];
+    let a = store(a_dir);
+    let run = Run3::build(&["src/a.test.ts"]);
+    let hint = KeyHint {
+        issued: 0x6a00_0000,
+        tree: Some("0123456789abcdef".into()),
+    };
+    let batch = a.batch().unwrap();
+    a.put_objects(&run.new_objects()).unwrap();
+    assert_eq!(
+        a.put_run_state(
+            &run.ids.shape,
+            &[hint.clone(), hint.clone()],
+            &run.ids.state
+        )
+        .unwrap(),
+        1,
+        "one link per distinct hint"
+    );
+    let (rec, cols) = run.record(A, 1, 7);
+    a.put(&NewAttestation::for_test(A, S1, &hex64(3), Some(&hint), &rec).with_columns(&cols))
+        .unwrap();
+    batch.finish().unwrap();
+    assert_eq!(
+        a.put_run_state(&run.ids.shape, std::slice::from_ref(&hint), &run.ids.state)
+            .unwrap(),
+        0,
+        "stored before"
+    );
+    let link = run_state_key(&run.ids.shape, &hint, &run.ids.state);
+    let session = Session::open(a_dir.as_std_path()).unwrap();
+    assert_eq!(
+        session.target(&Target::project()).get_value(&link).unwrap(),
+        Some(MetaValue::String(run.ids.state.clone()))
+    );
+    drop(session);
+    push(&a);
+
+    let b_dir = fresh_clone(&w, "b");
+    let b = store(&b_dir);
+    assert!(fetch(&b).found);
+    let listed = b.list_units(&[A]).unwrap().remove(0);
+    assert_eq!(listed.len(), 1);
+    let ask = |s: &GitMetaStore, shape: &str| {
+        s.run_state_objects(&[RunOf {
+            record: &listed[0],
+            shape,
+        }])
+        .unwrap()
+    };
+    assert_eq!(
+        ask(&b, &run.ids.shape),
+        vec![Some(run.ids.state.clone())],
+        "from the promised link's key"
+    );
+    assert_eq!(ask(&b, &hex64(9)), vec![None], "another shape: no link");
+
+    // The state TTL takes the state object, not the link: the run's record
+    // is still here.
+    age(&b_dir, &[&run.ids.state], Duration::from_secs(3 * 86_400));
+    assert_eq!(
+        b.prune_state_objects(Duration::from_secs(2 * 86_400))
+            .unwrap(),
+        1
+    );
+    assert!(objects(&b, &[&run.ids.state]).is_empty());
+    assert_eq!(ask(&b, &run.ids.shape), vec![Some(run.ids.state.clone())]);
+
+    // The run's last record gone: the next prune drops the link too.
+    b.remove(listed.clone()).unwrap();
+    assert_eq!(b.prune_state_objects(Duration::ZERO).unwrap(), 0);
+    let left = b
+        .attest_store()
+        .reader()
+        .unwrap()
+        .run_state_keys("vci:run-state:")
+        .unwrap();
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(ask(&b, &run.ids.shape), vec![None]);
+}

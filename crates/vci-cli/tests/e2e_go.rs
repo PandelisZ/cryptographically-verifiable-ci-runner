@@ -98,12 +98,12 @@ struct World {
     untrusted: PathBuf,
     gitconfig: PathBuf,
     /// Every `vci run` of this world writes format-1 records
-    /// (`VCI_STORE_RECORD_FORMAT=1`: the envelope with its input manifest,
-    /// as vci 2.8 wrote), for a test whose assertions hold only for that
-    /// form: a stored manifest or the per-entry explain text on git-meta
-    /// (a format-3 record there names no state object, so an edited entry
-    /// is reported as changed with the attested hash not loaded;
-    /// tests/e2e_m3.rs covers that text).
+    /// (`VCI_STORE_RECORD_FORMAT=1`: the envelope with its input manifest, as
+    /// vci 2.8 wrote), for a test whose assertions hold only for that form: a
+    /// stored manifest or the per-entry explain text on git-meta (a format-3
+    /// record's attested hash comes from its run's state object, labelled
+    /// unsigned, and only while that object is kept; tests/e2e_m3.rs covers
+    /// that text).
     format1: std::sync::atomic::AtomicBool,
 }
 

@@ -276,12 +276,11 @@ impl World {
         let _ = out;
     }
 
-    /// `vci run` writing a format-1 record (`[store] record_format = 1`,
-    /// what vci 2.8 wrote: the envelope with its input manifest), for the
-    /// tests of what only that form holds. A format-3 record on git-meta
-    /// (no listing columns name the run's state object) reports an edited
-    /// entry as changed with the attested hash not loaded, without naming
-    /// it: tests/e2e_format3.rs and tests/e2e_m3.rs cover that text.
+    /// `vci run` writing a format-1 record (`[store] record_format = 1`, what
+    /// vci 2.8 wrote: the envelope with its input manifest), for the tests of
+    /// what only that form holds. A format-3 record names an edited entry from
+    /// its run's state object, labelled unsigned, and only while that object is
+    /// kept: tests/e2e_format3.rs and tests/e2e_m3.rs cover that text.
     fn run_format1(&self, dir: &Path, file: &str, key: &Path) {
         let out = self.vci_env(
             dir,

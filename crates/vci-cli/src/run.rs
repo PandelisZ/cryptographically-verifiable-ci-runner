@@ -387,6 +387,29 @@ impl<'s> StoreLoop<'s> {
         self.done.store_secs += t.elapsed().as_secs_f64();
     }
 
+    /// Say which state object the run wrote, on a store that keeps no
+    /// listing columns ([`AttestationStore::put_run_state`]: git-meta's
+    /// run-state link), after the objects and inside the batch, so that a
+    /// plan can name a changed input from it. A store that refuses it is a
+    /// warning, never a refused unit: no verdict reads it.
+    fn put_run_state(&mut self, run: &Run3) {
+        let Some(state) = run.state.as_deref() else {
+            return;
+        };
+        if self.mode == StoreMode::SignOnly || self.objects_failed.is_some() || run.hints.is_empty()
+        {
+            return;
+        }
+        let t = std::time::Instant::now();
+        if let Err(e) = self.store.put_run_state(&run.shape, &run.hints, state) {
+            self.note(format!(
+                "vci: warning: noting the run's state object in the {} store: {e} (plans will not name the inputs that changed for this run's records)",
+                self.store.kind()
+            ));
+        }
+        self.done.store_secs += t.elapsed().as_secs_f64();
+    }
+
     fn deferred(&self) -> bool {
         self.batch.as_ref().is_some_and(WriteBatch::defers_writes)
     }
@@ -3252,16 +3275,7 @@ pub fn run_units(
                             test_id: p.core.test_id.clone(),
                             input_root: p.core.input_root.clone(),
                             storage_key: storage_key(&vci_core::ResolvedPredicate::v1(p)),
-                            hint: crate::util::parse_rfc3339(&p.core.issued_at).ok().map(
-                                |issued| KeyHint {
-                                    issued,
-                                    tree: p
-                                        .core
-                                        .tree
-                                        .as_ref()
-                                        .map(|t| t.chars().take(16).collect()),
-                                },
-                            ),
+                            hint: record_hint(p),
                             envelope: record,
                             columns,
                             doomed,
@@ -3283,6 +3297,7 @@ pub fn run_units(
                 // The run's objects before any record that names them.
                 if let Some(r) = run3 {
                     stores.put_objects(&r.objects);
+                    stores.put_run_state(r);
                 }
                 for job in rx {
                     stores.apply(job);
@@ -4047,6 +4062,10 @@ struct Run3 {
     shape: String,
     /// The state object's id, hex, when it is written.
     state: Option<String>,
+    /// The key hints the run's records carry (one: the run's issue time
+    /// and tree), for the run-state link of a store without listing
+    /// columns ([`AttestationStore::put_run_state`]).
+    hints: Vec<KeyHint>,
     /// By unit index.
     units: BTreeMap<usize, Unit3>,
     /// Units whose header object could not be made, with why: refused.
@@ -4065,6 +4084,7 @@ fn build_run3(
     let mut inputs: Vec<UnitInputs<'_>> = Vec::with_capacity(units.len());
     let mut indices: Vec<usize> = Vec::with_capacity(units.len());
     let mut entries_roots: Vec<String> = Vec::with_capacity(units.len());
+    let mut hints: Vec<KeyHint> = Vec::new();
     let mut failed = BTreeMap::new();
     for (i, a, group) in units {
         let bytes = a
@@ -4102,6 +4122,11 @@ fn build_run3(
         });
         indices.push(*i);
         entries_roots.push(a.manifest.entries_root());
+        if let Some(h) = record_hint(&a.predicate)
+            && !hints.contains(&h)
+        {
+            hints.push(h);
+        }
     }
     let run =
         vci_core::Run::build(&inputs).map_err(|e| format!("building the run's objects: {e}"))?;
@@ -4157,9 +4182,21 @@ fn build_run3(
         tables,
         shape: vci_core::objects::hex32(&shape.id),
         state: state_id,
+        hints,
         units,
         failed,
     })
+}
+
+/// The hint the key of a unit's record carries (when it was issued, the
+/// tree it was made on): the one [`ToStore::hint`] is.
+fn record_hint(p: &VciPredicate) -> Option<KeyHint> {
+    crate::util::parse_rfc3339(&p.core.issued_at)
+        .ok()
+        .map(|issued| KeyHint {
+            issued,
+            tree: p.core.tree.as_ref().map(|t| t.chars().take(16).collect()),
+        })
 }
 
 /// Sign unit `u` of a built run as a format-3 record (STORE-V2 section 1.4
