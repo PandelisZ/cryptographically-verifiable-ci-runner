@@ -1712,6 +1712,9 @@ fn the_answer_cap_and_foreign_object_rows() {
         .query_row("SELECT count(*) FROM objects", [], |r| r.get(0))
         .unwrap();
     assert_eq!(left, 5, "the four of the run and the foreign row");
+    // put_at is in whole seconds and the prune takes what is older than
+    // now: unaged, a run that stays within one second keeps it.
+    age(&path, &[&run.ids.state], 1);
     assert_eq!(
         s.prune_state_objects(Duration::ZERO).unwrap(),
         1,
