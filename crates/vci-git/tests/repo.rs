@@ -265,10 +265,11 @@ fn moved_on_only_along_one_line_of_history() {
         !moved_on_both(&repo, &f4, &f4b).unwrap(),
         "a branch holds f4 again"
     );
-    // A commit this full clone does not have is on none of its refs; a
-    // shallow clone may just lack it, and concludes nothing. Not a commit
+    // A commit this clone does not have: nothing is concluded from it
+    // (another pull request's merge commit, which a pull request's
+    // checkout never fetches, is not a commit rebased away). Not a commit
     // id: nothing either.
-    assert!(moved_on_both(&repo, &"0".repeat(40), &d).unwrap());
+    assert!(!moved_on_both(&repo, &"0".repeat(40), &d).unwrap());
     assert!(!moved_on_both(&repo, "HEAD", &d).unwrap());
     let base = w.remote.parent().unwrap();
     let shallow_dir = base.join("shallow");

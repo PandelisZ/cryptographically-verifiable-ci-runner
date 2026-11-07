@@ -455,7 +455,7 @@ impl Repo {
             return Ok(true);
         }
         if !self.has_object(old)? {
-            return self.moved_on(old, new);
+            return Ok(false);
         }
         let (_, out) = self
             .git()
@@ -478,15 +478,20 @@ impl Repo {
     /// name). Any other ref containing `old` (`main` under a feature branch,
     /// a sibling branch, a release tag) may be checked out with `old`'s
     /// files, and so may `old` itself when `new` is behind it (a bisect).
-    /// An `old` this clone does not have at all is on none of its refs: moved
-    /// on in a full clone; `false` in a shallow one, which may just lack it
-    /// (nothing is concluded from a history that is not there).
+    /// An `old` this clone does not have at all is `false`, shallow or not
+    /// (since 2.9.1): nothing is concluded from a commit that is not here.
+    /// A CI checkout of one pull request never holds another pull request's
+    /// merge commit (`refs/pull/<n>/merge` is not fetched), so taking a
+    /// missing commit for one rebased away let every pull request job
+    /// delete the other pull requests' attestations of the files it ran
+    /// (vex, 6 Nov 2026: 133,397 of 138,019 records the shared pull request
+    /// key published in a day). What is left behind, `vci prune` removes.
     pub fn moved_on(&self, old: &str, new: &str) -> Result<bool, GitError> {
         if !is_oid(old) || !is_oid(new) || old == new {
             return Ok(false);
         }
         if !self.has_object(old)? {
-            return Ok(!self.is_shallow()?);
+            return Ok(false);
         }
         let namesakes = self.branch_namesakes()?;
         let counts = |r: &str| namesakes.iter().any(|n| n == r) || r.ends_with("/HEAD");

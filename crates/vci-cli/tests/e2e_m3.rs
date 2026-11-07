@@ -1097,6 +1097,55 @@ fn supersession_across_moved_on_commits_removes_the_right_records_and_their_obje
     );
 }
 
+/// Another pull request's attestation, made on a commit this clone does
+/// not have (its merge commit, which a pull request's checkout never
+/// fetches), is not superseded when this pull request runs the same unit
+/// with other inputs: nothing is concluded from a commit that is not here
+/// (vex, 6 Nov 2026: pull request jobs deleted 133,397 of the 138,019
+/// records the shared pull request key published in a day).
+#[test]
+fn an_attestation_made_on_a_commit_this_clone_lacks_is_not_superseded() {
+    let w = World::new();
+    let base = w.head();
+    // Pull request A: its own edit of a.ts, attested on its commit.
+    w.git(&w.work, &["checkout", "-q", "-b", "pr-a"]);
+    w.write(
+        "src/a.ts",
+        "export const add = (x: number, y: number) => x + y; // pull request a\n",
+    );
+    w.commit("pull request a");
+    let commit_a = w.head();
+    let out = w.run(&[A], SQLITE);
+    let key_a = attested_keys(&out)[A].clone();
+    // This clone never had that commit: gone from every ref and from the
+    // object database, as another pull request's merge commit is.
+    w.git(&w.work, &["checkout", "-q", "-b", "pr-b", &base]);
+    w.git(&w.work, &["branch", "-D", "pr-a"]);
+    w.git(&w.work, &["reflog", "expire", "--expire=now", "--all"]);
+    w.git(&w.work, &["gc", "-q", "--prune=now"]);
+    let gone = Command::new("git")
+        .current_dir(&w.work)
+        .args(["cat-file", "-e", &commit_a])
+        .env("GIT_CONFIG_GLOBAL", &w.gitconfig)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(!gone.success(), "the commit is gone from this clone");
+    // Pull request B: another edit of a.ts, the same unit.
+    w.write(
+        "src/a.ts",
+        "export const add = (x: number, y: number) => x + y; // pull request b\n",
+    );
+    w.commit("pull request b");
+    let out = w.run(&[A], SQLITE);
+    let err = stderr(&out);
+    assert!(!err.contains("superseded"), "{err}");
+    let key_b = attested_keys(&out)[A].clone();
+    let now = records(&w.sqlite());
+    assert!(now.contains_key(&key_a), "pull request a's record is kept");
+    assert!(now.contains_key(&key_b));
+}
+
 // ---------------------------------------------------------------------------
 // (h) vci prune --objects --older-than.
 

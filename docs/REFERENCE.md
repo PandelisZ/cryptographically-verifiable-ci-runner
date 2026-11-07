@@ -1583,12 +1583,14 @@ so every clone that prunes must be on 2.1.8 or later.
 architecture) when their files differ from the new one's and they were made on an earlier commit of the same line of
 history that nothing else still contains: the new commit descends from it, and every branch, remote-tracking branch
 and tag containing it contains the new commit too (`origin/<branch>` of the branch being worked on counts as the same
-line); or, since 2.1.3, a commit on no branch, remote-tracking branch or tag at all (rebased or amended away, or one
-a full clone does not have: no name can check its files out), as a pull request's earlier pushes are after a rebase.
+line); or, since 2.1.3, a commit this clone has that is on no branch, remote-tracking branch or tag at all (rebased
+or amended away: no name can check its files out), as a pull request's earlier pushes are after a rebase.
 Kept: one made on a sibling branch or pull request, on a commit `main` (or a tag, or another branch) still
 contains, such as an attestation of `main`'s tip when a feature branch re-attests the unit, one made on the same
-commit (work in progress), one of the same files under another environment or toolchain, one on a commit a shallow
-clone does not have, and (since 2.1.12) one made on a tree some branch, remote-tracking branch or tag still has at its
+commit (work in progress), one of the same files under another environment or toolchain, one on a commit this clone
+does not have at all (since 2.9.1, full clone or shallow: another pull request's merge commit is never in a pull
+request's checkout, and 2.1.3 to 2.9.0 took it for one rebased away, so each pull request job deleted the other pull
+requests' attestations of the units it ran; `vci prune` removes what is left behind), and (since 2.1.12) one made on a tree some branch, remote-tracking branch or tag still has at its
 tip, whatever its commit (an attestation records the checkout's git tree when the working tree was clean): a pull
 request's merge commit is on no ref once the pull request is squash-merged, yet master's tip has its tree and master's
 next run skips with it, so another pull request's run must not delete it. The published tree so keeps one attestation per unit and signer as a line of work moves on,
