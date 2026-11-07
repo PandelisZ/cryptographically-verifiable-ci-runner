@@ -23,9 +23,9 @@ mod store;
 mod validate;
 
 pub use meta::{
-    AttestStore, FetchOutcome, Hydration, KEY_PREFIX, KeyHint, MANIFEST_PREFIX, PushOutcome,
-    PushStatus, Reader, SETUP_FILE, StoredEnvelope, StoredManifest, attestation_key_hinted,
-    manifest_key, parse_key_hint, parse_manifest_key,
+    AttestStore, Compacted, DeletionRecords, FetchOutcome, Hydration, KEY_PREFIX, KeyHint,
+    MANIFEST_PREFIX, PushOutcome, PushStatus, Reader, SETUP_FILE, StoredEnvelope, StoredManifest,
+    attestation_key_hinted, manifest_key, parse_key_hint, parse_manifest_key,
 };
 pub use repo::Repo;
 pub use store::{GitMetaFactory, GitMetaStore};

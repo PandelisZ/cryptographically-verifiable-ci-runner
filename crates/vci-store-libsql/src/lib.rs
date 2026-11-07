@@ -690,6 +690,16 @@ impl AttestationStore for LibsqlStore {
         }
     }
 
+    /// Local: the file's. Remote and replica: the server's (one request),
+    /// the handle's cached objects answered from its cache.
+    fn object_sizes(&self, ids: &[&str]) -> Result<Vec<vci_store::ObjectSize>, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.object_sizes(ids),
+            Inner::Remote(r) => r.object_sizes(ids),
+            Inner::Replica(p) => p.remote.object_sizes(ids),
+        }
+    }
+
     /// Remote and replica: queued in the open batch of this thread (written
     /// before any record of it), else one transaction now.
     fn put_objects(&self, objects: &[NewObject<'_>]) -> Result<usize, StoreError> {
@@ -739,6 +749,16 @@ impl AttestationStore for LibsqlStore {
             Inner::Local(s) => s.prune_state_objects(older_than),
             Inner::Remote(r) => r.prune_state_objects(older_than),
             Inner::Replica(p) => p.remote.prune_state_objects(older_than),
+        }
+    }
+
+    /// Local: the file's free pages, as the SQLite store frees them. Remote
+    /// and replica: nothing (the server reclaims its own space, and the
+    /// replica file is libsql's to keep).
+    fn compact(&self) -> Result<Option<(u64, u64)>, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.compact(),
+            Inner::Remote(_) | Inner::Replica(_) => Ok(None),
         }
     }
 

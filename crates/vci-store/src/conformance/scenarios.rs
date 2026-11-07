@@ -32,8 +32,8 @@ use super::StoreFactory;
 use super::fixtures::{S1, S2, TREE_HEAD, UNIT_A, UNIT_B, UNIT_CARGO, UNIT_ROOT};
 use crate::{
     AttestationStore, Columns, FailedStore, GONE, Hydration, KeyHint, ManifestRef, NewAttestation,
-    NewObject, OBJECT_GRACE, ObjectRefs, Prefetch, PushMode, PushStatus, Record, StoreError,
-    StoreStatus, StoredEnvelope, StoredObject, ValueState, decode_record, key,
+    NewObject, OBJECT_GRACE, ObjectRefs, ObjectSize, Prefetch, PushMode, PushStatus, Record,
+    StoreError, StoreStatus, StoredEnvelope, StoredObject, ValueState, decode_record, key,
 };
 
 /// A unit nothing is ever stored for.
@@ -1735,6 +1735,7 @@ pub fn c31_failed_store_fails_every_call(f: &dyn StoreFactory) {
     );
     unavailable("batch", s.batch().map(drop));
     unavailable("prefetch", s.prefetch(Prefetch::Attestations).map(drop));
+    unavailable("object_sizes", s.object_sizes(&[&hex64(1)]).map(drop));
     s.remember_passing(TREE_HEAD, &[(key::test_key(UNIT_A), hex64(1))]);
     s.set_flag("plan:natives:conformance");
     assert!(s.passing_on(TREE_HEAD).is_empty());
@@ -2726,5 +2727,171 @@ pub fn c42_object_deletions_reach_peers(f: &dyn StoreFactory) {
         get_objects(&*p1, &run.id_refs()).len(),
         4 - removed,
         "the objects' removal reached peer 1"
+    );
+}
+
+/// c43: `run_state_objects` names the state object of a record's run: the
+/// record's `state_obj` column on a store with columns; on one without, the
+/// run-state link `put_run_state` wrote (in the batch, with the run's
+/// objects) for the run's key hint and shape, on another peer too after a
+/// sync. `None` for a record whose run named none (no column, no link), and
+/// an answer per run in order, the same run asked twice answered twice.
+pub fn c43_run_state_objects_name_the_runs_state(f: &dyn StoreFactory) {
+    const C: &str = "c43_run_state_objects_name_the_runs_state";
+    let w = f.world();
+    let s = w.peer(0);
+    if !keeps_objects(f, C, &*s) {
+        return;
+    }
+    let run = Run3::build(&["src/c43/a.ts"]);
+    let hint = KeyHint {
+        issued: 4_300,
+        tree: Some(TREE_HEAD.into()),
+    };
+    let (rec, cols) = run.record(UNIT_A, 1, 43);
+    let batch = ok(s.batch(), "batch");
+    put_objects(&*s, &run.new_objects());
+    ok(
+        s.put_run_state(&run.ids.shape, std::slice::from_ref(&hint), &run.ids.state),
+        "put_run_state",
+    );
+    let e = ok(
+        s.put(
+            &NewAttestation::for_test(UNIT_A, S1, &hex64(1), Some(&hint), &rec).with_columns(&cols),
+        ),
+        "put a frame",
+    );
+    ok(batch.finish(), "finish");
+    // Another run of another unit, which named no state object: no column,
+    // no link.
+    let other = KeyHint {
+        issued: 4_400,
+        tree: None,
+    };
+    let (rec_b, mut cols_b) = run.record(UNIT_B, 1, 44);
+    cols_b.state_obj = None;
+    let e_b = ok(
+        s.put(
+            &NewAttestation::for_test(UNIT_B, S1, &hex64(2), Some(&other), &rec_b)
+                .with_columns(&cols_b),
+        ),
+        "put another frame",
+    );
+    let shape = run.ids.shape.as_str();
+    let runs = [
+        crate::RunOf { record: &e, shape },
+        crate::RunOf {
+            record: &e_b,
+            shape,
+        },
+        crate::RunOf { record: &e, shape },
+    ];
+    assert_eq!(
+        ok(s.run_state_objects(&runs), "run_state_objects"),
+        vec![
+            Some(run.ids.state.clone()),
+            None,
+            Some(run.ids.state.clone())
+        ],
+        "columns kept: {}",
+        s.caps().columns
+    );
+    assert!(
+        ok(s.run_state_objects(&[]), "run_state_objects of none").is_empty(),
+        "no runs, no answers"
+    );
+    w.sync(0, &[1]);
+    let p1 = w.peer(1);
+    let got = listed(&*p1, UNIT_A);
+    assert_eq!(keys(&got), one(&e.key), "another peer lists the record");
+    assert_eq!(
+        ok(
+            p1.run_state_objects(&[crate::RunOf {
+                record: &got[0],
+                shape,
+            }]),
+            "run_state_objects on another peer"
+        ),
+        vec![Some(run.ids.state.clone())],
+        "another peer"
+    );
+}
+
+/// c44: `object_sizes` says, reading no object, which objects the store
+/// holds and, where it can, a size no smaller than the bytes `get_objects`
+/// answers (and at most 4 bytes more: base64 text's bound); an id never
+/// stored, or a state object removed by its TTL, is absent; one answer per
+/// id in order, a repeated id answered twice; an invalid id refused, and
+/// none asked none answered. A backend that cannot tell says `Unknown` for
+/// every id.
+pub fn c44_object_sizes_say_what_is_held(f: &dyn StoreFactory) {
+    const C: &str = "c44_object_sizes_say_what_is_held";
+    let w = f.world();
+    let s = w.peer(0);
+    if !keeps_objects(f, C, &*s) {
+        return;
+    }
+    let run = Run3::build(&["src/c44/a.ts", "src/c44/b.ts"]);
+    put_objects(&*s, &run.new_objects());
+    let (state, hdr) = (run.ids.state.as_str(), run.ids.hdr.as_str());
+    let never = hex64(44);
+    let sizes = ok(s.object_sizes(&[state, &never, state, hdr]), "object_sizes");
+    assert_eq!(sizes.len(), 4, "one answer per id: {sizes:?}");
+    if sizes.iter().all(|z| *z == ObjectSize::Unknown) {
+        skip(f, C, "the rest: the backend cannot tell (Unknown)");
+        return;
+    }
+    assert!(
+        !sizes.contains(&ObjectSize::Unknown),
+        "Unknown for some ids only: {sizes:?}"
+    );
+    let got = get_objects(&*s, &[state, hdr]);
+    let len = |id: &str| {
+        got.iter()
+            .find(|o| o.id == id)
+            .map(|o| o.bytes.len() as u64)
+            .expect("stored")
+    };
+    for (i, id) in [(0, state), (2, state), (3, hdr)] {
+        match sizes[i] {
+            ObjectSize::Held(Some(n)) => assert!(
+                n >= len(id) && n <= len(id) + 4,
+                "{id}: {n} for {} bytes",
+                len(id)
+            ),
+            ObjectSize::Held(None) => {}
+            other => panic!("{id} is stored: {other:?}"),
+        }
+    }
+    assert_eq!(sizes[0], sizes[2], "the same id, the same answer");
+    assert_eq!(sizes[1], ObjectSize::Absent, "never stored");
+    assert!(
+        matches!(
+            s.object_sizes(&["not an id"]),
+            Err(StoreError::Invalid { .. })
+        ),
+        "an invalid id is refused"
+    );
+    assert!(ok(s.object_sizes(&[]), "object_sizes of none").is_empty());
+    // Another peer after a sync holds them too (a lazy one may not know
+    // their size before it fetches them).
+    w.sync(0, &[1]);
+    let p1 = w.peer(1);
+    for z in ok(
+        p1.object_sizes(&[state, hdr]),
+        "object_sizes on another peer",
+    ) {
+        assert!(matches!(z, ObjectSize::Held(_)), "another peer: {z:?}");
+    }
+    // Removed by its TTL: absent.
+    let day = Duration::from_secs(24 * 60 * 60);
+    if !aged(f, C, &*w, &[state], 3 * day) {
+        return;
+    }
+    assert_eq!(ok(s.prune_state_objects(2 * day), "prune_state_objects"), 1);
+    assert_eq!(
+        ok(s.object_sizes(&[state, hdr]), "object_sizes after the TTL")[0],
+        ObjectSize::Absent,
+        "removed by its TTL"
     );
 }

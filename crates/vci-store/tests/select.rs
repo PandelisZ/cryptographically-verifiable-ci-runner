@@ -2045,3 +2045,121 @@ fn explain_hashes_days_is_two_by_default_and_at_most_a_year() {
     assert!(d.explain_hashes.value);
     assert_eq!(d.explain_hashes_days.value, 2);
 }
+
+/// The prune settings (2.10): `max_age_days` 14 by default (0 to 3650, 0
+/// being no limit), git-meta's `deletion_records_hours` 6 (0 to 720) and
+/// `history_max_commits` 2000 (0: never); each variable wins over its key;
+/// the git-meta keys on another store are a warning; `vci store info`
+/// shows `max_age_days` everywhere and the git-meta ones on git-meta.
+#[test]
+fn the_prune_settings_have_their_defaults_bounds_and_sources() {
+    let triple = |vars: &[(&str, &str)], toml: Option<&str>| {
+        sel(vars, toml).map(|s| {
+            (
+                (s.max_age_days.value, s.max_age_days.source),
+                (
+                    s.deletion_records_hours.value,
+                    s.deletion_records_hours.source,
+                ),
+                (s.history_max_commits.value, s.history_max_commits.source),
+            )
+        })
+    };
+    assert_eq!(
+        triple(&[], None).unwrap(),
+        (
+            (select::DEFAULT_MAX_AGE_DAYS, Source::Default),
+            (select::DEFAULT_DELETION_RECORDS_HOURS, Source::Default),
+            (select::DEFAULT_HISTORY_MAX_COMMITS, Source::Default)
+        )
+    );
+    assert_eq!(
+        (
+            select::DEFAULT_MAX_AGE_DAYS,
+            select::DEFAULT_DELETION_RECORDS_HOURS,
+            select::DEFAULT_HISTORY_MAX_COMMITS
+        ),
+        (14, 6, 2000)
+    );
+    let toml = "[store]\nmax_age_days = 0\ndeletion_records_hours = 720\nhistory_max_commits = 0";
+    assert_eq!(
+        triple(&[], Some(toml)).unwrap(),
+        ((0, Source::File), (720, Source::File), (0, Source::File))
+    );
+    let vars = [
+        (select::ENV_MAX_AGE_DAYS, "7"),
+        (select::ENV_DELETION_RECORDS_HOURS, "1"),
+        (select::ENV_HISTORY_MAX_COMMITS, "500"),
+    ];
+    assert_eq!(
+        triple(&vars, Some(toml)).unwrap(),
+        (
+            (7, Source::Env(select::ENV_MAX_AGE_DAYS)),
+            (1, Source::Env(select::ENV_DELETION_RECORDS_HOURS)),
+            (500, Source::Env(select::ENV_HISTORY_MAX_COMMITS))
+        )
+    );
+    for (var, bad) in [
+        (select::ENV_MAX_AGE_DAYS, "3651"),
+        (select::ENV_MAX_AGE_DAYS, "-1"),
+        (select::ENV_DELETION_RECORDS_HOURS, "721"),
+        (select::ENV_DELETION_RECORDS_HOURS, "6h"),
+        (select::ENV_HISTORY_MAX_COMMITS, "many"),
+    ] {
+        let m = config_err(&[(var, bad)], None);
+        assert!(m.contains(var), "{bad}: {m}");
+    }
+    let m = config_err(&[], Some("[store]\nmax_age_days = 4000"));
+    assert!(
+        m.contains("[store] max_age_days") && m.contains("4000"),
+        "{m}"
+    );
+    // git-meta's keys on another store: kept, and a warning.
+    let s = sel(
+        &[],
+        Some("[store]\nbackend = \"sqlite\"\nhistory_max_commits = 10"),
+    )
+    .unwrap();
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.contains("[store] history_max_commits is ignored")),
+        "{:?}",
+        s.warnings
+    );
+    assert!(sel(&[], Some(toml)).unwrap().warnings.is_empty());
+    let names = |s: &Selection| -> Vec<&'static str> {
+        s.describe()
+            .into_iter()
+            .map(|l| l.name)
+            .filter(|n| {
+                [
+                    "max_age_days",
+                    "deletion_records_hours",
+                    "history_max_commits",
+                ]
+                .contains(n)
+            })
+            .collect()
+    };
+    assert_eq!(
+        names(&sel(&[], None).unwrap()),
+        [
+            "max_age_days",
+            "deletion_records_hours",
+            "history_max_commits"
+        ]
+    );
+    assert_eq!(
+        names(&sel(&[], Some("[store]\nbackend = \"sqlite\"")).unwrap()),
+        ["max_age_days"]
+    );
+    // The variables are among those every harness removes.
+    for v in [
+        select::ENV_MAX_AGE_DAYS,
+        select::ENV_DELETION_RECORDS_HOURS,
+        select::ENV_HISTORY_MAX_COMMITS,
+    ] {
+        assert!(select::ENV_VARS.contains(&v), "{v}");
+    }
+}

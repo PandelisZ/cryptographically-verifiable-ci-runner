@@ -1364,14 +1364,14 @@ checkout, clock, policy and environment.
 |---|---|
 | `vci init [--key K] [--principal P] [--project DIR] [--adapter vitest\|pytest\|go\|cargo\|rails\|node-test] [--no-install] [--meta-url URL] [--oidc]` | Write `vci.toml`, `.vci/allowed_signers` (adding key `K`) and `.git-meta` (`url:` the metadata remote, default origin's URL), configure the git-meta remote, `npm install` `@vci/vitest` (Vitest; node-test prints the test command it read instead), print a CI snippet. `--oidc` (since 2.0) also writes `.vci/identities.toml`, trusting pushes to origin's default branch by the repository's workflow (its only file under `.github/workflows`, else `*`, to narrow) as principal `github-actions` (an existing file is left alone), and `.vci/sigstore-trusted-root.json` from `gh attestation trusted-root` (refreshed each time; without `gh`, a note says to write it): see [Keyless signing (OIDC)](#keyless-signing-oidc) |
 | `vci run [FILES…] [--key PATH \| --oidc[=github\|public-good]] [--ttl 14d] [--summary FILE]` | Run tests with collection on; sign and store an attestation for every attestable file (Go: package directory; Cargo: `<package dir>#<target>` unit, or a package directory for all its units). Exit code is the runner's (non-zero if any pytest, `go test`, `cargo test`, `bin/rails test` or `rspec` process failed). Prints one line per unit not attested and a count of files per reason (see below); `--summary FILE` writes every unit with its reasons as JSON. Since 1.9.0 each distinct input manifest is stored once, as its own value (`vci:manifest:<input root>`), and the attestation references it; storing an attestation deletes the same signer's attestations of that unit it supersedes (an earlier commit of this line of history, other files: see [git-meta](#git-meta); every store does the same), printing `vci: removed N superseded attestation(s) ...` and how many manifests nothing references any more (since 2.0 it first fetches, in one batch, the stored attestations of those units that were not fetched yet; one that cannot be fetched is kept). `--oidc` (since 2.0; GitHub Actions with `permissions: id-token: write`) signs keylessly with the job's OIDC token instead of a key, through GitHub's Sigstore instance or, with `--oidc=public-good`, sigstore.dev's; the instance needs the `=` (`vci run --oidc a_test.go` runs `a_test.go`). See [Keyless signing (OIDC)](#keyless-signing-oidc). Since 2.1, once a project's tests have finished, its units are checked and signed in parallel (`$VCI_JOBS` at a time, default one per CPU; `ssh-keygen` processes, or keyless signatures, several at once), and each path of the checkout is read once for the whole run (its contents hash, a directory's children, git's answer to whether it is ignored), since the tree no longer changes (each unit still compares its inputs with the snapshot taken before the tests ran); the lines, `--summary` and the exit code are as before, in the units' order, and the store is written one unit at a time in that order. Since 2.1.3 the units are handed to the runner longest first, by the duration their newest stored attestation records (units without one first, in the listing's order), so that a runner that takes several at once does not end on its longest file; the lines, summary and store keep the listing's order. The attestations a new one supersedes are found in parallel too, and removed as it is stored. `VCI_TIMING=1` prints `read the last duration of N unit(s)`, `check, sign and store N unit(s) of P (J at a time)` and the thread-seconds of each part. Since 2.9.0, on a store that keeps objects (SQLite, PostgreSQL, libSQL, git-meta) and unless `[store] record_format = 1` keeps the 1.9.0 manifest behaviour above, a run stores no manifest: it puts its four objects (hdr, tables, shape, state: [docs/STORE-BACKENDS.md](STORE-BACKENDS.md), "Format-3 records") in the batch before its records, and when they cannot be put prints `vci: warning: storing the run's N object(s) in the <kind> store: <error>` and refuses every format-3 unit after it (`signing or storing failed`), so that no record names an object the store does not hold; after supersession it removes the superseded records' objects nothing references any more (`vci: removed N object(s) no attestation references any more`) and, on a store with listing columns (not git-meta, which leaves them to `vci prune`), the state objects older than `[store] explain_hashes_days` (`vci: removed N state object(s) older than D day(s) ([store] explain_hashes_days)`), each writer applying its own working tree's setting |
-| `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]] [--project NAME]...` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally. `--project NAME` (repeatable) plans only those `[[projects]]` entries (by `name`, as the base commit's vci.toml names them): the other projects are not listed, probed or verified (their toolchains need not be installed) and are absent from the output. An unknown name is an error (exit 2) naming the configured projects; the single-project form has no names, so `--project` is an error there. Since 2.1 files are verified in parallel (`$VCI_JOBS` threads, default one per CPU), each file's candidates newest first, and each path of the checkout is read once per plan (see [Verification](#verification-vci-plan), "Cost") |
+| `vci plan [--base-ref R] [--format text\|json\|github] [--fetch [R]] [--project NAME]...` | Print which test files can be skipped and why the others run. `--fetch` first fetches attestations as `vci fetch [--remote R]` does, while the projects are probed; a failed fetch is a warning (stderr; a `::warning title=vci::` line unless the format is `json`) and the plan uses what is stored locally. `--project NAME` (repeatable) plans only those `[[projects]]` entries (by `name`, as the base commit's vci.toml names them): the other projects are not listed, probed or verified (their toolchains need not be installed) and are absent from the output. An unknown name is an error (exit 2) naming the configured projects; the single-project form has no names, so `--project` is an error there. Since 2.1 files are verified in parallel (`$VCI_JOBS` threads, default one per CPU), each file's candidates newest first, and each path of the checkout is read once per plan (see [Verification](#verification-vci-plan), "Cost"). Since 2.10 a unit that runs because a format-3 record's inputs changed names the input as a format-1 record did, `no valid attestation (3 candidates; best failed inputs: entry:app/models/organization.rb (+2 more))`, from its run's state object, which the plan loads after the verdicts for the units that run (at most `[store] plan_states` = 8 objects asked for and fetched, of which it reads at most `plan_states_mib` = 16 MiB; with either at 0 none is asked for, fetched or read; none either when every unit skips); where it cannot, the text says why: `entry: changed (attested hash not loaded: state expired)`, `... over the plan's budget)` or `... no state object for the run)` (see [Verification](#verification-vci-plan), "Naming the input that changed"). The text format then lists, before its last line, the inputs that made the most units run: `changed inputs, by the units each made run (top 5 of 12):`, then one `  <units>  <path>` line each, and `  <N>  unit(s) ran on changed inputs not named (attested hash not loaded)` for the rest. Since 2.10 the text format and the github format's notices print every path, key and reason with its control characters escaped (`\n`, `\u{1b}`), so a file name cannot add a line, while the github format's file lists give names as they are, a file to run whose name holds a line break making `run_all=true` (see [Verification](#verification-vci-plan), "What the text output escapes"); `--format json` gives the exact names |
 | `vci ci [--base-ref R] [--audit-log PATH] [--fetch [R]] [--project NAME]... [--partition I/N] [--key PATH \| --oidc[=INSTANCE] [--ttl 14d] [--push [--remote R]]]` | `--fetch` as for `vci plan` (a failed fetch is also in the audit log's `warnings`). `--project` as for `vci plan`: only those projects are planned, run (and with `--key` attested), and only they appear in the printed plan and in the audit log's `projects`, `skipped` and `ran`; one CI job per suite (`vci ci --fetch origin --base-ref "$BASE" --project web`). `--partition I/N` (since 2.0; `1 <= I <= N`, anything else is a usage error, exit 2) splits a suite over N jobs: of the units the plan runs (for a project that runs everything, every unit it lists), this job runs only those in partition I. Since 2.4, a project whose units are all files is split by size: every unit it lists, skipped or not, largest file first, goes to the partition with the fewest bytes so far (ties: the lowest partition, then the smaller test id), so the jobs get about the same amount of tests (a file's size stands for how long it takes; vex's two Rails jobs had 2,762 and 3,231 s of tests split by test id, 3,047 and 2,946 s by size). Any other project (a unit that is not a file, such as a cargo unit), and every project with `VCI_PARTITION_BY=hash`, is split by test id: the first 8 bytes of the unit's storage key, BLAKE3 of the test id, big-endian, modulo N, plus one. Either way the split depends only on the checkout, never on what the plan skips or on the order or the other jobs, so every unit runs in exactly one partition, and a job run again after the others pushed agrees with them. What the plan skips is skipped in every partition. A project that runs everything and whose units cannot be listed runs whole in every partition that cannot list it, with a `::warning` (each job lists on its own and cannot know whether another listed it, so such a project may run in more than one job, never in none); without any readable project every partition runs the default project. After the plan it prints `partition 2/3: 41 of 120 units to run`; the exit code is this partition's tests'; the audit log's `ran` holds this partition's units and `partition` is `{index, count, units, total, unlisted}` (`units`: this partition's, `total`: all partitions', `unlisted`: projects this partition runs whole because it could not list them), `null` without the flag. With `--key --push` each job attests and publishes its own share (concurrent pushes merge and retry), so the next plan skips every partition's units: `vci ci --fetch origin --base-ref "$BASE" --project rust --partition ${{ matrix.part }}/3 --key ci-key --push --remote origin`. `--partition 1/1` runs what `vci ci` without it runs. Plan, run the remainder, write a JSON audit log of every skip. With `--key`, the remainder runs as `vci run --key` runs it (collectors on, inputs recorded, an attestation signed and stored for every unit that passed and is attestable; a unit that refuses still runs, and only test failures make the exit code non-zero); when the plan runs everything (`policy.no_skip_refs`, an unreadable base policy), every unit is attested: the run the next commit's plan reuses. `--push` then publishes as `vci push --remote R` does, whatever the tests did; a failed push prints a `::warning title=vci::` line and does not change the exit code. When a project cannot be listed or run with the collectors, the others are still run and attested and that project alone runs without attesting (a `::warning`); nothing that ran is run again, and the exit code is every test's. When nothing can be attested (the key cannot be read, the run cannot be prepared) everything runs without attesting. `--key` attests nothing (a `::warning`; the tests still run, nothing is pushed) when its principal is in `policy.no_skip_refs_except` and the current ref does not match `policy.no_skip_refs` (or the base `allowed_signers` cannot be read there): such a run, e.g. a pull request's, would let main skip code only it ran; give other refs a key outside that list, or name the principal in `policy.attest_on_any_ref` (since 1.9.2) to let pull requests attest with it on purpose. `--oidc[=INSTANCE]` (since 2.0) attests as `--key` does, keylessly as `vci run --oidc` signs, and refuses on the same terms with the principals of the base `.vci/identities.toml` entries the job's identity matches (or when that file cannot be read there); a job without a token (no `permissions: id-token: write`) fails before anything runs, and an identity that matches no entry attests with a `::warning` that nothing will trust it. `--key` and `--oidc` exclude each other; `--ttl` and `--push` need one of them. The audit log lists `attested` units, `attestErrors` (units or projects that could not be attested or run with the collectors), `notAttested` (why nothing was attested, or `null`) and `pushed` (`true`, `false`, or `null` without `--push` or when nothing was attested on purpose). On a shared store (PostgreSQL, since 2.8.0) `--push` is what stores: without it `vci ci` signs but stores nothing, its `attested` entries carry `"stored": false` and `pushed` is `false` (the publication gate, see [PostgreSQL](#postgresql)); on SQLite `--push` has nothing to do |
 | `vci verify <envelope\|-> [--allowed-signers F] [--identities F --trusted-root F] [--base-ref R] [--manifest FILE] [--envelope]` | Verify one DSSE envelope against `.vci/allowed_signers` (SSH-signed) or `.vci/identities.toml` and `.vci/sigstore-trusted-root.json` (keyless) at `--base-ref` or HEAD, or against the files given: once any trust file is given, an envelope whose kind needs one that was not is INVALID (the repository's files are then not used). It prints its claims, including the input manifest: inline (before 1.9.0) or the one it references, read from `--manifest FILE` (its compact encoding, as `git meta get project vci:manifest:<root>` prints it) or else from the attestation store of the repository it runs in, whichever it is (since 2.8.0; on git-meta, since 2.0 fetched from the metadata remote when it was not fetched yet), which runs `[store] token_command` as any command reading the store does (a compact `--manifest FILE` on a base manifest reads the base from there too); its root must be the signed input root (exit 1 otherwise, or when it is not available). A keyless envelope prints the identity, the principal it matched, the timestamp authority and the run URL. Since 2.9.0 the file may be a format-3 record (the `vci3` text frame a store holds): it is verified as the DSSE envelope rebuilt from it, the statement bytes unchanged and the signature re-armored; its input set is resolved from the run's objects in the repository's store (every object is taken by the id asked for, recomputed over the bytes the store returned: a missing or mismatched hdr or tables object, or a descriptor that does not resolve, is INVALID with `repo id: (in the hdr object <id>: <why>)`, and a shape object whose bytes are not its id with `manifest: INVALID: the shape object <id> is corrupt (its BLAKE3 is <found>)`, exit 1), and its root is recomputed only against `--manifest FILE` (the compact JSON of the resolved manifest, `InputManifest::to_compact`, or its JSON; no base support), since the attested hashes are in no signed object: without the file it prints the set's size and `root not recomputed: the attested hashes are in no signed object, pass --manifest FILE` and exits 0, and it never observes HEAD (that is the plan's check). `--envelope` prints the envelope JSON of the record and verifies nothing (exit 0): for a frame the rebuilt envelope, which in-toto tooling verifies as it does a stored one; for an envelope its bytes as read; a file that is neither exits 2 |
-| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | On SQLite, PostgreSQL and libSQL (since 2.8.0) there is nothing to exchange: each says so, `vci fetch` with the number of attestations stored, and exits 0 (a libSQL replica that cannot sync exits 2), and `--remote` and `--rewrite-history` exit 2 (see [Where attestations live](#where-attestations-live)). On git-meta, the default: git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history. Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed; since 2.0 a fetch downloads keys, not values (blobless; values are fetched when a plan, verify, run or prune reads them), and every merge is done from the trees' paths (`VCI_TIMING=1` prints `materialize (from paths, N changed entries, M not fetched)` or `materialize (full)`); and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against". Since 2.1.3 `VCI_TIMING=1` prints a push's parts: fetch and materialize the remote's metadata, check what the push would delete and what it sends, put the local metadata on top of the remote's, `git push`. Since 2.1.11 the values a plan or run reads are fetched by several `git fetch` processes at once, `VCI_FETCH_JOBS` of them (default 4; `1` fetches one batch after the other): a plan's 16,000 values came in 20 s instead of 37 on one laptop. Since 2.7.34 (2.7.35 on git 2.43, which merges commits only) a merge whose only paths changed on both sides are deletion records (a run's two jobs deleting the same superseded attestations) writes ours into the tip's tree before `git merge-tree` merges, with `-X no-renames`, so a blobless clone merges trees alone instead of failing on a missing blob and falling back to git-meta's merge of three listed trees (20 to 120 s on vex) |
-| `vci prune [--dry-run] [--superseded] [--keep N] [--objects] [--older-than DAYS]` | Delete attestations whose claimed expiry has passed from the attestation store (git-meta: the local store, as tombstones `vci push` publishes; SQLite, PostgreSQL and libSQL: at once, and a shared server, PostgreSQL or libSQL, removes the unreferenced manifests without its hour of grace), and (since 2.2) per unit and signer every attestation but the `N` issued last (default 2; `--superseded`, since 1.8.2, is `--keep 1`), except one made on a tree some branch, remote-tracking branch or tag still has at its tip (2.1.12's rule): an older one vouches for inputs the tree no longer has, or soon will not, and every stored attestation costs each plan a download. Since 1.9.0 it then deletes the stored input manifests (`vci:manifest:<root>`) no remaining attestation references (none while an attestation, or the manifest reference of one it leaves alone, cannot be read), and prints how many (since 2.1.8 the base manifests the kept manifests list their entries on top of count as referenced, and a kept manifest that cannot be read keeps every manifest). Since 2.0 it reads every attestation, so it first fetches the ones a blobless fetch left out (one batch; on a large store most of what a fetch downloaded before 2.0); one that cannot be fetched is left alone, with a warning. Since 2.9.0, on a store that keeps listing columns (SQLite, PostgreSQL, libSQL) it reads only the expired candidates, the records of a unit and signer with one beyond `keep` by the keys' hints, and the rows the columns do not describe; a candidate is deleted only when its signed `expiresAt` has passed, and a unit's records are ordered by their signed `issuedAt` and `tree` (a record the hints put beyond `keep` that the statements keep is counted `unconfirmed (left alone)`). While the store holds an input manifest (the migration window from 2.8, whose writer may have put a format-1 value under a frame's columns) every row is read as before. A manifest the store keeps against the removal (referenced since the listing, or within a shared store's grace) is said so and not counted. git-meta's prune reads every value as before. It then removes the format-3 objects no attestation references (hdr, tables, shape and state objects put more than an hour ago: `removed project object <id> (unreferenced object)`) and the state objects older than `--older-than DAYS` (default `[store] explain_hashes_days`, 2), whether or not an attestation references them; `--objects` runs only these two passes and leaves every attestation and manifest alone. A dry run lists the orphan objects and says `state objects older than N day(s): removed on a run without --dry-run` |
+| `vci push [--rewrite-history]` / `vci fetch` `[--remote R]` | On SQLite, PostgreSQL and libSQL (since 2.8.0) there is nothing to exchange: each says so, `vci fetch` with the number of attestations stored, and exits 0 (a libSQL replica that cannot sync exits 2), and `--remote` and `--rewrite-history` exit 2 (see [Where attestations live](#where-attestations-live)). On git-meta, the default: git-meta push / pull of `refs/meta/main` (git-meta's merge; push retried as a single fast-forward commit when the remote moved; `vci push` says `nothing to push` when nothing was sent). `R`: a git-meta remote, or a git remote or URL to use as one; default: the configured git-meta remote, else `.git-meta`'s `url:`, else origin. `--rewrite-history` (since 1.8.2) publishes the metadata as one commit without parents (with a lease on the tip just fetched): what a fetch downloads is then the attestations the tree holds, not every version ever published; other clones merge onto it at their next fetch. Use it after `vci prune`, whose deletions otherwise leave the deleted values in the history (since 2.10 `vci prune` does it itself in CI once the fetched history passes `[store] history_max_commits`, and since 2.10 a clone that last fetched before the rewrite merges it three-way on the newest tip it had, so what was deleted since is not published again, and without such a tip the new tip's deletion record of an attestation, or of a manifest or object the clone put before the record, wins over the value a clone still holds; the local metadata commit moves to the rewrite only once it is published, and the rewrite's commit names the local commit it publishes (`Rewrite-of: <id>`), so a clone killed in between merges what follows on it: [Keeping the store small](#keeping-the-store-small)). Since 1.9.0 a fetched tip that the local metadata commit is an ancestor of is merged by applying only the tree entries that changed; since 2.0 a fetch downloads keys, not values (blobless; values are fetched when a plan, verify, run or prune reads them), and every merge is done from the trees' paths (`VCI_TIMING=1` prints `materialize (from paths, N changed entries, M not fetched)` or `materialize (full)`); and every merge puts back the input manifests an attestation in the store still references that a prune or supersession elsewhere deleted (`put back N input manifest(s) ...`; the next push publishes them). See "What `vci fetch` and `vci push` guard against": since 2.10 the local metadata commit only ever moves to a checked serialization, even when a command is killed, and a push or fetch puts back the values of the remote tip the local commit lost without this store deleting them (`note: restored N value(s) of <remote>'s refs/meta/main that this store had lost without deleting them (first: ...)`) instead of refusing to push. Since 2.1.3 `VCI_TIMING=1` prints a push's parts: fetch and materialize the remote's metadata, check what the push would delete and what it sends, put the local metadata on top of the remote's, `git push`. Since 2.1.11 the values a plan or run reads are fetched by several `git fetch` processes at once, `VCI_FETCH_JOBS` of them (default 4; `1` fetches one batch after the other): a plan's 16,000 values came in 20 s instead of 37 on one laptop. Since 2.7.34 (2.7.35 on git 2.43, which merges commits only) a merge whose only paths changed on both sides are deletion records (a run's two jobs deleting the same superseded attestations) writes ours into the tip's tree before `git merge-tree` merges, with `-X no-renames`, so a blobless clone merges trees alone instead of failing on a missing blob and falling back to git-meta's merge of three listed trees (20 to 120 s on vex) |
+| `vci prune [--dry-run] [--superseded] [--keep N] [--max-age DAYS] [--objects] [--older-than DAYS]` | Since 2.10, also: per unit and signer, the attestations issued more than `[store] max_age_days` ago (14; `--max-age DAYS` for one run, 0 for no limit) other than the newest, whatever tree they were made on, and the format-1 attestations issued before the unit's newest format-3 one by the same signer (not while `[store] record_format = 1`, nor one made on a tree some branch or tag has at its tip within `max_age_days`); never, but by expiry and `--superseded`, one a plan of the checked-out commit used (`vci plan` and `vci run` remember those in the store for a week); on git-meta the deletion records older than `[store] deletion_records_hours` (6), the publication of the store as one commit once the fetched metadata history passes `[store] history_max_commits` (2000), in CI only (`CI` set; elsewhere a note says to run `vci push --rewrite-history`), unless the history the push fetches is short again (another clone rewrote it), and on git-meta and SQLite the local file's free pages; on git-meta its deletions are published by the next `vci push`, so prune, then push; it prints a count per rule (`vci prune: attestations by rule: N expired, N beyond the K newest of their unit and signer, N older than D day(s) (not their unit's newest), N format-1 (...)`) and whether a format-1 attestation remains, and a dry run says what each step would do. See [Keeping the store small](#keeping-the-store-small). As before 2.10, it deletes attestations whose claimed expiry has passed from the attestation store (git-meta: the local store, as tombstones `vci push` publishes; SQLite, PostgreSQL and libSQL: at once, and a shared server, PostgreSQL or libSQL, removes the unreferenced manifests without its hour of grace), and (since 2.2) per unit and signer every attestation but the `N` issued last (default 2; `--superseded`, since 1.8.2, is `--keep 1`), except one made on a tree some branch, remote-tracking branch or tag still has at its tip (2.1.12's rule): an older one vouches for inputs the tree no longer has, or soon will not, and every stored attestation costs each plan a download. Since 1.9.0 it then deletes the stored input manifests (`vci:manifest:<root>`) no remaining attestation references (none while an attestation, or the manifest reference of one it leaves alone, cannot be read), and prints how many (since 2.1.8 the base manifests the kept manifests list their entries on top of count as referenced, and a kept manifest that cannot be read keeps every manifest). Since 2.0 it reads every attestation, so it first fetches the ones a blobless fetch left out (one batch; on a large store most of what a fetch downloaded before 2.0); one that cannot be fetched is left alone, with a warning. Since 2.9.0, on a store that keeps listing columns (SQLite, PostgreSQL, libSQL) it reads only the expired candidates, the records of a unit and signer with one beyond `keep` by the keys' hints, and the rows the columns do not describe; a candidate is deleted only when its signed `expiresAt` has passed, and a unit's records are ordered by their signed `issuedAt` and `tree` (a record the hints put beyond `keep` that the statements keep is counted `unconfirmed (left alone)`). While the store holds an input manifest (the migration window from 2.8, whose writer may have put a format-1 value under a frame's columns) every row is read as before. A manifest the store keeps against the removal (referenced since the listing, or within a shared store's grace) is said so and not counted. git-meta's prune reads every value as before. It then removes the format-3 objects no attestation references (hdr, tables, shape and state objects put more than an hour ago: `removed project object <id> (unreferenced object)`) and the state objects older than `--older-than DAYS` (default `[store] explain_hashes_days`, 2), whether or not an attestation references them; `--objects` runs only these two passes and leaves every attestation and manifest alone. A dry run lists the orphan objects and says `state objects older than N day(s): removed on a run without --dry-run` |
 | `vci store info [--format text\|json]` | Since 2.8.0: which attestation store the repository uses (git-meta, SQLite, PostgreSQL or libSQL) and how it was chosen: its location (never a password or a token; git-meta's in a linked worktree is the common git directory's store it shares), every setting with its source (`$VCI_STORE_URL`, `vci.toml`, the default), what it can do, whether it exists and how many attestations it holds. Exit 0 when the store can be read (also when nothing is stored yet), 2 otherwise, after the error. See [Choosing a store](#choosing-a-store) |
-| `vci store upgrade --begin \| --finish` | Since 2.9.0: the store format 3 migration of a SQLite, PostgreSQL or libSQL store (git-meta has no schema). `--begin` adds the format-3 columns and tables in a request of its own, ahead of a rollout (idempotent; the first `vci run` of 2.9 does the same before its first write on a store that lacks them). `--finish` ends the migration window once every attestation is a format-3 record: it drops the input manifests and sets schema version 2, after which a vci before 2.9 reads the store as too new and fails open; refused, with the count, while a format-1 attestation remains (exit 1; the count is by each value's first byte, never by a column), and on libSQL this release ends the migration at gate 3: `--finish` at zero prints `vci: error: the libsql store does not support finishing the format-3 upgrade (dropping the manifests table and the change log): a later vci does it` and exits 2 (run it to read the count all the same), the namespace stays at schema version 1, a 2.8 writer is never turned away (rotate the Turso write token, or run `vci update` on every machine that writes), and each 2.8 write re-opens the manifest-collection path until a 2.9 `vci prune` or supersession removes its manifest (libSQL's `--finish` lands in 2.10). Exits 2 when the store cannot be opened. Order and gates: [docs/STORE-BACKENDS.md](STORE-BACKENDS.md), section 2, "Migration from format 1" |
-| `vci explain <test-file> [--base-ref R]` | Every candidate attestation checked (newest first since 2.1, up to the first that passes) and the first check it failed, with expected vs actual (an env failure names the variable and its class under the base policy, `env:DATABASE_URL (hash)`, never its value). It plans as `vci plan` does, fetching the values it reads; one that could not be fetched fails its candidate's `envelope` check with ``unreadable: value not fetched: run `vci fetch` online``. Since 2.9.0 a format-3 candidate whose inputs differ names the entry from the run's state object when the plan loaded it (at most 16 state objects a plan, in candidate order), its hash labelled `attested (unsigned, from the run's state object)`, since no signed field names that object; past the count, after the object was removed (`[store] explain_hashes_days`, 2 by default) or on git-meta (no column names it) the detail is `entry:<path>` with expected `<kind> exec=<bool> changed (attested hash not loaded)` for an entry whose kind or exec bit differs, else one `entry: changed (attested hash not loaded)` with both roots |
+| `vci store upgrade --begin \| --finish` | Since 2.9.0: the store format 3 migration of a SQLite, PostgreSQL or libSQL store (git-meta has no schema: `--begin` has nothing to do; since 2.10 `--finish` reads every attestation, fetching the ones not fetched yet, and is refused with the count, `store: git-meta: not finished: N attestation(s) are format-1 records` and exit 1, while a format-1 attestation or one that cannot be read remains; at zero it removes the input manifests left, which the next `vci push` publishes, and prints `store: git-meta: finished: no format-1 attestation remains; N input manifest(s) removed`). `--begin` adds the format-3 columns and tables in a request of its own, ahead of a rollout (idempotent; the first `vci run` of 2.9 does the same before its first write on a store that lacks them). `--finish` ends the migration window once every attestation is a format-3 record: it drops the input manifests and sets schema version 2, after which a vci before 2.9 reads the store as too new and fails open; refused, with the count, while a format-1 attestation remains (exit 1; the count is by each value's first byte, never by a column), and on libSQL this release ends the migration at gate 3: `--finish` at zero prints `vci: error: the libsql store does not support finishing the format-3 upgrade (dropping the manifests table and the change log): a later vci does it` and exits 2 (run it to read the count all the same), the namespace stays at schema version 1, a 2.8 writer is never turned away (rotate the Turso write token, or run `vci update` on every machine that writes), and each 2.8 write re-opens the manifest-collection path until a 2.9 `vci prune` or supersession removes its manifest (libSQL's `--finish` lands in 2.10). Exits 2 when the store cannot be opened. Order and gates: [docs/STORE-BACKENDS.md](STORE-BACKENDS.md), section 2, "Migration from format 1" |
+| `vci explain <test-file> [--base-ref R]` | Every candidate attestation checked (newest first since 2.1, up to the first that passes) and the first check it failed, with expected vs actual (an env failure names the variable and its class under the base policy, `env:DATABASE_URL (hash)`, never its value). It plans as `vci plan` does, fetching the values it reads; one that could not be fetched fails its candidate's `envelope` check with ``unreadable: value not fetched: run `vci fetch` online``. Since 2.9.0 a format-3 candidate whose inputs differ names the entry from the run's state object when the plan loaded it, its hash labelled `attested (unsigned, from the run's state object)`, since no signed field names that object; without it the detail is `entry:<path>` with expected `<kind> exec=<bool> changed (attested hash not loaded)` for an entry whose kind or exec bit differs, else one `entry: changed (attested hash not loaded)` with both roots. Since 2.10 the state objects are loaded after the verdicts, for every candidate of the file that failed this way (2.9.0 loaded the first 16 a plan needed, in candidate order, during the verdicts), within `[store] plan_states` and `plan_states_mib`, the state object of the candidate the reason names first (so `vci explain` names the input `vci plan` names), and git-meta names them too (a run-state link the run writes; a record a vci before 2.10 wrote on git-meta has none); without one the text says why after `attested hash not loaded`: `state expired` (the store names the object and says it no longer holds it: `[store] explain_hashes_days`, 2 by default), `over the plan's budget`, or `no state object for the run` (the run wrote none, `explain_hashes = false`, or nothing names it); a state object the store holds but cannot read (a value that is not base64) leaves the text as it was. Paths, keys, reasons and details are printed escaped, as in `vci plan`'s text |
 | `vci env [--base-ref R] [--project NAME] [--format text\|json]` | Print the effective environment policy of each project: every variable `[env]` and the runner's built-in lists name, its class (`set`, `hash`, `ignore`, `built-in hash`, `built-in ignore`, `stripped`), where the rule comes from (`vci.toml set`, `vci.toml hash`, an old key name, `built-in <adapter>`, `test script`) and what it is here (the value vci sets; `present (<hash prefix>)` or `absent`); variables present here that the tests will not see are listed as removed. With `--base-ref`, a `BASE` column says where the base commit's policy differs (CI judges with it). Runs nothing (docs/ENV.md, "vci env") |
 | `vci update [--check] [--version X.Y.Z] [--keep-old]` (alias `vci upgrade`) | Since 2.7.33: install the latest release the way this `vci` was installed. The latest release is where `https://github.com/PandelisZ/cryptographically-verifiable-ci-runner/releases/latest` redirects (one request through `curl`, no API call, no token; curl's proxy variables apply); when it is the running version, it prints `vci: 2.7.33 is the latest release` and exits 0. Otherwise, by the running executable's real path: under `Cellar/vci/` (or `$HOMEBREW_PREFIX/opt/vci`) it runs `brew update` and `brew upgrade pandelisz/tap/vci`, showing their output; in `$CARGO_HOME/bin` (`~/.cargo/bin`), or with `VCI_HOME` set or `~/.local/share/vci/.git` present, it runs that clone's `scripts/install.sh` with `VCI_REF=vX.Y.Z`, or prints the `curl ... install.sh \| VCI_REF=vX.Y.Z sh` command when there is no clone (exit 1); beside cargo's `.fingerprint` (built in a checkout) it refuses; anywhere else it downloads `vci-<target>.tar.gz` and `SHA256SUMS-<target>` from the release, checks the SHA-256 (a mismatch changes nothing), unpacks the binary, runs its `--version` (it must name the release), writes it to a temporary file in the executable's directory and renames it over the executable. A directory it cannot write to is refused with the `sudo <path> update` command to run; `--keep-old` keeps the replaced binary as `vci.old`; collectors in a `share/vci` above the binary are not updated, and it says so. `--check` only prints both versions: exit 0 when current, 1 when there is an update. `--version X.Y.Z` installs that release (a release binary, or the install script at its tag; Homebrew installs only the tap's version). A failed lookup or download is an error (exit 2). `VCI_UPDATE_REPO=owner/name` reads another repository's releases; `VCI_UPDATE_BASE_URL` replaces `https://github.com/<repo>/releases` (`<base>/latest`, `<base>/download/<tag>/<asset>`; http and `file://` allowed; a `latest` without a redirect may hold the tag or the API's JSON) |
 
@@ -1412,7 +1412,12 @@ store](#choosing-a-store)), `VCI_STORE_COMPRESS` (`zstd`: the libSQL store write
 over `[store] explain_hashes`; since 2.9.0), `VCI_STORE_EXPLAIN_HASHES_DAYS` (days a state object is kept while
 referenced, default 2, at most 365; 0 writes the run's state object and removes it at the end of the same run, so
 `VCI_STORE_EXPLAIN_HASHES=false` is the setting for a run that wants none; every writer applies its own setting to
-the shared store; wins over `[store] explain_hashes_days`; since 2.9.0).
+the shared store; wins over `[store] explain_hashes_days`; since 2.9.0), `VCI_STORE_PLAN_STATES` (how many state
+objects a plan asks for, fetches and reads after its verdicts to name the inputs that changed for the units that
+run, default 8, at most 256, 0: none; wins over `[store] plan_states`; since 2.10) and `VCI_STORE_PLAN_STATES_MIB`
+(how many MiB of them it reads, default 16, at most 4096, 0: none asked for, fetched or read; wins over `[store]
+plan_states_mib`; since 2.10). An invalid value of any of them is an
+error of the store's selection, as for the others: the plan then runs everything.
 
 Every collector directory is resolved to its real path before use, and what a test process reads of vci's own
 collector files is never an input, whichever path reached them: Homebrew installs them in
@@ -1527,7 +1532,12 @@ What every store has in common:
   `[store] explain_hashes_days` (2) and not written under `explain_hashes = false`. Objects are stored under the
   BLAKE3 of their bytes (`vci:object:<kind>:<id>` on git-meta, an `objects` table on the SQL stores) and the plan
   recomputes every id it loads; the store contributes paths, kinds and ids, and the signed root over what the plan
-  observes at HEAD decides. On vex's sample of 1,175 units a record is 1,782 B instead of 36,320 B, and a run's
+  observes at HEAD decides. No signed field names the state object: a SQL store keeps its id in the record's
+  `state_obj` listing column, and since 2.10 a run on git-meta, which keeps no columns, writes a run-state link
+  `vci:run-state:<shape id>:<the records' key hint>:<state id>` beside its objects (a string value on the `project`
+  target, its value the state id again), which the plan finds from a record's key and descriptor alone; `vci prune`
+  and `vci run`'s orphan pass remove a link once no record carries its hint (it outlives its state object while
+  the run's records stay, so the plan can say the state expired). On vex's sample of 1,175 units a record is 1,782 B instead of 36,320 B, and a run's
   records and objects together 2,499 B a unit, 14.5x less ([docs/STORE-BACKENDS.md](STORE-BACKENDS.md), section 2,
   "Measured (format 3)"). vci 2.9 reads both formats and writes format 3 on a store that keeps objects (every store
   does); `[store] record_format = 1` keeps writing format 1 for one release while readers are upgraded. A vci before
@@ -1705,10 +1715,56 @@ concurrent runs in one clone wait for each other instead of failing on ref locks
   shared; a ref fetched by hand) would publish their deletion. vci first copies into the store every value of the ref it has no row
   and no deletion record for (and the ref's deletion records that are newer than the store's row), printing
   `note: restored N entries`. `vci run`, `vci fetch` and `vci push` work in any worktree;
-- **a serialization or push that would drop someone's values.** If serializing would drop a value without a deletion
-  record in the store (a `meta:filter` / `local:meta:filter` rule that excludes or routes `vci:` keys), vci undoes it
-  and stops with an error; a push that would remove a value of the remote tip that this store never deleted is
-  refused. Only `vci prune`, `git meta rm` and deletion records fetched from the remote delete anything;
+- **a serialization or push that would drop someone's values.** vci serializes the store's changes onto
+  `refs/meta/local/main` itself; when git-meta must do it instead (filter or prune rules, a set or list value, a
+  changed value this clone never fetched), git-meta rebuilds each changed target from the rows it holds values for,
+  which leaves out the values this clone never fetched. Since 2.10 git-meta writes that
+  commit in a scratch git directory of its own (`<git common dir>/vci-serialize-<pid>`, whose objects and store are
+  symbolic links to the repository's), vci puts the left-out values back at the blobs the previous commit held, and
+  only then moves `refs/meta/local/main`, from the commit it read (compare-and-swap): a process killed at any instant,
+  or a step that fails, leaves the ref at the previous commit or at a checked one, and the store's marker of what is
+  serialized, which git-meta moves first, is put back (at once, or by the next command after a kill) so the next
+  serialization writes the same changes again. Before, git-meta moved the ref itself and vci checked afterwards: on
+  6 November 2026 a vex laptop's push failed on the marker write (most likely `database is locked`) between the
+  two, and its local metadata commit dropped 4,484 shared manifests and objects. A failed marker write after vci's own
+  serialization moved the ref is no longer an error at all (the next serialization writes the same entries again,
+  which changes nothing); it used to hand the same changes to git-meta. If serializing would drop a value without a
+  deletion record in the store (a `meta:filter` / `local:meta:filter` rule that excludes or routes `vci:` keys), vci
+  moves nothing and stops with an error;
+- **a local metadata commit that lost shared values** (since 2.10). The published tree holds every value of the
+  remote tip except those this store holds a deletion record for. A push that finds values of the remote tip missing
+  from the local metadata without a deletion record (a clone that a vci before 2.10 left with an unchecked git-meta
+  serialization, as above) puts them back at the remote's blobs, without downloading them, gives the store a row for
+  each it has none for (not fetched, as a fetch makes it), prints `note: restored N value(s) of <remote>'s
+  refs/meta/main that this store had lost without deleting them (first: <target> <key>)` and pushes; before, it
+  refused (`pushing would delete N value(s) of <remote>'s refs/meta/main that this store never deleted`) on every
+  attempt until the store was reset by hand. `vci fetch` does the same after merging (from the difference between
+  the fetched tip and the local commit, so a fetch with nothing lost pays one `git diff-tree`), so this clone's plans
+  read those values again; a failure there is a warning, never a failed fetch. Only `vci prune`, `git meta rm` and
+  deletion records fetched from the remote delete anything;
+- **a fetch or push killed half-way** (since 2.10). `git fetch` moves the tracking ref (`refs/meta/remotes/main`)
+  before vci merges, and `git push` moves it too (the remote's fetch refspec maps it), before vci moves its own refs.
+  A merge with a history rewritten since (see [Keeping the store small](#keeping-the-store-small), item 5) needs the
+  newest tip this clone had; the marker beside the store (`vci-materialized-<ref>`) now names the commit each push
+  published as well as each merged tip, a fetch notes the tip it moves the ref from (`vci-materialized-<ref>.unmerged`)
+  until its merge is done, and a rewrite's commit names the local commit it publishes (`Rewrite-of: <id>` in its
+  message), so a process killed between git's move and vci's (the 5-minute timeout of a CI step, a cancel) leaves
+  nothing a later merge takes for this clone's own additions, and a CI cache saved in that state publishes nothing
+  deleted since, however often it is restored. Before, the merge took the tip before this clone's last push as its
+  base: what that push published, if another clone then deleted it and rewrote the history, was published again (by
+  every job restoring such a cache), and the clone's own deletion of a value its killed rewrite had published was
+  undone. Whatever the base, a merged tree no longer holds both a value and the deletion record of its key where the
+  record is the newer change: an attestation's record always is (its key is never written twice), a manifest's or
+  object's when this store wrote the value no later than the record; the record is kept (`note: the merge held both
+  a value and a deletion record of N key(s); the record, the newer change, was kept`). A key the fetched tip itself
+  holds both of keeps the value, as git-meta's parse does;
+- **a metadata ref naming a commit this clone lacks** (since 2.10: a CI cache restored with its refs but not every
+  object they name). Every `git fetch` failed (`fatal: bad object refs/meta/local/main`: git checks every ref), and so
+  did every serialization, until the ref was removed by hand. A fetch or push now deletes such a local metadata ref
+  or tracking ref with a warning (`refs/meta/local/main named <id>, which this clone does not have ...: deleted it`):
+  the next serialization writes the whole store as a new local commit, which is merged with the remote's tip like any
+  local history, and the tracking ref is fetched again. (A marker naming the remote's tip no longer skips that merge:
+  only a local commit that contains the tip does, for the primary remote);
 - **entries git-meta cannot read.** One tree entry whose name is not UTF-8, or whose target git-meta cannot serialize
   (a path target under 3 bytes), used to make every fetch and push fail, and the second kind stayed in each clone's
   store. vci leaves such entries out (a deterministic commit on top of the fetched tip without them, which the next
@@ -2053,6 +2109,146 @@ The store has three modes:
   took 4.8-10.1 s, one on an empty namespace 1.2 s, and storing 819 attestations 22-42 s, in a namespace of at most
   3,276 attestations ([benchmarks](https://pandelisz.github.io/cryptographically-verifiable-ci-runner/benchmarks.html#turso-hosted)).
   A replica on an ephemeral runner was no faster than remote there.
+
+### Keeping the store small
+
+Since 2.10 a plain `vci prune`, run where attestations are made (a CI job that attests the default branch, before its
+`vci push`), is what keeps every store small; nothing else needs scheduling. On git-meta the prune's deletions are
+written in the local store only, and the push after it publishes them: prune, then push (vex's attest jobs end with
+`vci prune || true; vci push || true`); a prune after the job's last push leaves its deletions unpublished until some
+later push. Its steps, each with a setting under
+`[store]` in `vci.toml` (the variable beside it wins; a vci before 2.10 refuses a `vci.toml` that sets one of these
+keys, so during a rollout set the variable instead):
+
+1. **Attestations.** Expired ones go, as before. Then, for each unit and signer, the current ones are ranked newest
+   first by their signed `issuedAt`, and, in this order:
+   - one that a plan of the checked-out commit's tree used (`vci plan` and `vci run` remember which attestation passed
+     for each unit, in the store, for a week) stays: on the default branch's attest job, what that branch's plan uses is
+     never removed by these rules (only by expiry; `--superseded` ignores this, as it ignores branches);
+   - a format-1 record issued before the unit's newest format-3 record by the same signer goes (store format 3,
+     2.9.0: the signer has moved on), unless `record_format = 1` is set (the fleet still reads format 1), or it was
+     made on a tree some branch, remote-tracking branch or tag has at its tip and is within `max_age_days`, as any
+     record there is (that branch's plan still skips the unit on it; such a record does not count towards `--keep`,
+     and goes once it is older than `max_age_days`); a format-1 record issued after it (a writer still on format 1)
+     is ranked with the rest;
+   - of the rest, the newest stays: no rule but expiry leaves a unit without an attestation by a signer that had one;
+   - one issued more than `max_age_days` ago goes (default 14, `VCI_STORE_MAX_AGE_DAYS`, `--max-age DAYS` for one run,
+     0 for no limit), **even when it was made on a tree some branch or tag still has at its tip**: before 2.10 such
+     an attestation was kept until it expired, however stale the branch;
+   - one of the `--keep` newest (2), or made on a tree some branch, remote-tracking branch or tag has at its tip, stays;
+     the others go.
+
+   The summary line counts each rule: `vci prune: attestations by rule: 60 expired, 4237 beyond the 2 newest of their
+   unit and signer, 0 older than 14 day(s) (not their unit's newest), 291 format-1 (older than their unit's newest
+   format-3 attestation by the same signer)`, then `vci prune: N format-1 attestation(s) remain (...)` or `vci prune: no format-1
+   attestation remains` (`vci store upgrade --finish` then ends the migration, on git-meta too). On SQLite,
+   PostgreSQL and libSQL the same rules run on the signed statements the columns and key hints point to (a column
+   or hint only chooses what is read).
+2. **Input manifests** no remaining attestation references go, as before; since 2.10 a referenced manifest the store
+   does not hold at all no longer keeps every manifest (its attestation cannot be verified anyway; on vex one such
+   reference kept all 24,681), only one that is stored and cannot be read does.
+3. **Objects**: the unreferenced ones and the state objects older than `explain_hashes_days`, as in 2.9.0.
+4. **git-meta: deletion records.** The deletion records older than `deletion_records_hours` (default 6, 0 to 720,
+   `VCI_STORE_DELETION_RECORDS_HOURS`; 24 before 2.10) whose deletion is published are dropped from the local store
+   and the local metadata tree, and the next push publishes the drop (a push also drops them once there are 2,000
+   past the window, `VCI_DELETION_RECORDS_DROP_AT`; `VCI_DELETION_RECORDS_KEEP_SECS` still wins over the setting).
+   A deletion is published once neither the local metadata tree nor the remote tip this clone last fetched or pushed
+   holds the value; until then its record stays however old, and the prune says so: `vci prune: 0 of 2 deletion
+   record(s) older than 0 hour(s) dropped ([store] deletion_records_hours); 2 more past the window kept until a `vci
+   push` publishes their deletion` (the records a prune has just written, with `deletion_records_hours = 0`, go at
+   the first prune after the push that publishes them). Dropped before, the record of a deletion nothing had
+   serialized left the store with neither the value nor a record of its deletion, and every push and fetch from that
+   clone was refused; one serialized but not pushed let the push put the value back. On vex on 6 November 2026 the
+   shared tree held 148,423 attestation deletion records: 145,306 written in the 24 hours before (each run
+   supersedes the last one's attestations, most within hours of their issue) and 22,897 in the last 6, so the
+   window decided the tree's size, not the drop. A record only matters to a clone whose metadata history does not
+   reach the deletion: any merge with a history that has the value deletes it without one, and so does a merge of a
+   rewritten history with a clone that fetched before the rewrite (item 5). A clone that has never fetched a tip
+   holding the value cannot bring it back; one whose last fetched tip is not in its local metadata history (for
+   example a tip of another remote) publishes the value again once; the value is an attestation that was superseded,
+   has expired or aged out, or a manifest or object nothing references, so it costs at most a candidate read, the
+   next `vci prune` deletes it again, and the clone, whose history now reaches that deletion, does not bring it back.
+   No push is refused for it: the push check only refuses to drop a value of the remote tip that this store never
+   deleted.
+5. **git-meta: history.** Once the metadata history fetched from the remote has more than `history_max_commits`
+   commits (default 2000, `VCI_STORE_HISTORY_MAX_COMMITS`, 0: never), `vci prune` in CI (the `CI` variable set to
+   anything but empty, `false` or `0`, as GitHub Actions and most CI services set it) publishes the store as one
+   commit without parents, as `vci push --rewrite-history` does (with a lease on the tip it fetched; it fetches every
+   value the tree holds that this clone lacks, since git sends a parentless commit's whole tree), and prints `vci
+   prune: published the store to <remote>'s refs/meta/main as one commit`; then `vci push` has nothing to send.
+   Elsewhere (a laptop) it publishes nothing and says how: `vci prune: note: the metadata history has N commits, more
+   than [store] history_max_commits = 2000: `vci push --rewrite-history` publishes the store as one commit (`vci
+   prune` does that itself only in CI, where CI is set)`; `CI=true vci prune` does what CI does (before, a prune past
+   the limit published a rewrite wherever it ran). The history this clone last fetched only decides whether to try: the push
+   counts again after its own fetch, on every attempt, and when another clone has rewritten the history since (vex's
+   two hourly attest jobs, `attest` and `attest-rust`, prune at the same time), it publishes the store on top of that
+   rewrite instead (`vci prune: <remote>'s refs/meta/main was published as one commit since this clone last fetched
+   it: published the store on top of it`). Of two rewrites racing, the second one's lease fails, and its next attempt
+   finds the first one's: crossing the limit leads to one rewrite. Before, such a clone rewrote the history again,
+   dropping the first rewrite and what had been pushed on it from the history, and forcing every other clone into
+   another merge without a common ancestor. A failure is a warning, and a later prune tries again. On vex the
+   history had 7,426 commits in three weeks (650 to 1,000 a day),
+   whose trees are 21.3 million objects (a full blobless fetch of them passed 3 GB before it was stopped), against
+   377,200 tree objects (33 MB) for the tip; at the default the history is rewritten every two to three days.
+   Another clone still holding the old history merges the new one at its next fetch without a common ancestor, on
+   the newest tip it had from the remote as the base, when the new history's root is the rewrite's commit: that
+   commit itself when it was made from a commit the clone's local metadata history contains (its message names it:
+   the clone's own rewrite, killed before its local commit moved to it), else the first of the tracking ref
+   `refs/meta/remotes/main` before the fetch moves it, the tips earlier fetches killed before their merge moved it
+   from, and the marker (the tip it last merged, or since 2.10 the commit it last pushed) that its local metadata
+   history contains (see "a fetch or push killed half-way" in [git-meta](#git-meta)): values it alone holds are
+   kept (its own attestations are published on top), and a value it had from the remote that the new tip lacks was
+   deleted there, before or after the rewrite, so it is deleted here too, whether or not a deletion record is left
+   (`note: meta's metadata history was rewritten since this clone last fetched it:
+   merged it on the tip this clone last fetched (<id>), so the N value(s) deleted there since are deleted here
+   too`). A CI cache saved before the rewrite therefore publishes nothing deleted since, however many times it is
+   restored; before, each restore published again every value deleted since it was saved whose record had passed
+   the window (on vex a day-old cache holds about 34,000 attestations, most superseded within the day). Without
+   such a base, a deletion record of an attestation in the new tip wins over the value the clone still holds (an
+   attestation's key is never written twice, so the record is newer), and so does one of a manifest or object
+   (keyed by content: a later run may store it again) over a value the clone put or fetched no later than the
+   record was made; one it put since is kept and published (2.10; before, the clone published every such manifest
+   and object again, until the next prune). Its push is one commit on top of the new history, never the old one. A
+   clone that pushes while the rewrite is in flight makes the rewrite's lease fail; its next round merges that push
+   on the tip both shared, so what that clone added and what it deleted both stay, and publishes one commit again
+   (the local metadata commit moves to the rewrite only once it is published; it used to move before the push, so
+   that round merged without a common ancestor, the local side won, and a manifest the other clone had deleted came
+   back). **Rolling out:** a vci before 2.10 merges a rewritten history without a common ancestor, keeping every
+   value it holds, so a clone on 2.9 that last fetched before the first rewrite publishes again what was deleted
+   since, and the records dropped (on a copy of vex just after the rewrite, a 2.9.1 clone's fetch and push put back
+   845 deleted values, 354 attestations and 491 manifests, and about 74,000 dropped deletion records, taking the
+   tree from 91,383 entries back to 168,106; once per such clone and rewrite, the next 2.10 prune deleting them
+   again). Upgrade every clone that pushes (laptops included) and let the jobs already running 2.9 finish before the
+   first rewrite, or set `VCI_STORE_HISTORY_MAX_COMMITS=0` in the jobs that prune until then.
+6. **The local file.** On git-meta, git-meta's log rows older than both the last materialization and a day are
+   removed (an incremental serialization reads only later ones, and the materialization is the one a serialization
+   that did not finish recorded, which it puts back; a developer's `.git/git-meta.sqlite` on vex had grown
+   to 1.8 GB, a fresh clone's to 390 MB, two thirds of it deletion records and the log of applying them). On
+   git-meta and SQLite the file's free pages are given back once they are a quarter of it and at least 16 MiB
+   (`PRAGMA incremental_vacuum`, after the one `VACUUM` that turns the file's incremental mode on): `vci prune:
+   compacted the <kind> store's file from X MB to Y MB`; on a copy of a fresh vex clone's store, dropping the records
+   past the window, removing those log rows and compacting took it from 397 to 294 MB (a long-lived store gains more
+   from the log). PostgreSQL and libSQL servers reclaim their own space, and libSQL's local file is compacted like
+   SQLite's.
+
+`vci prune --dry-run` lists what each step would remove and says what the git-meta steps would do (`N of M deletion
+record(s) are older than H hour(s) ...: dropped on a run without --dry-run`, followed by `; K more past the window
+would be kept until a `vci push` publishes their deletion` when some are not published, `the metadata history has N commits, more
+than [store] history_max_commits = 2000: a run without --dry-run publishes the store as one commit (`vci push
+--rewrite-history`), unless another clone has since` in CI, the note above elsewhere). Measured with
+this release's dry run (`CI=true vci prune --dry-run`, defaults) on a copy of vex's store at its tip of 7 November 2026
+04:57 UTC (195,083 tree entries: 34,893 attestations, 121,034 attestation deletion records, 24,935 manifests, 6,790
+objects and 7,431 deletion records of manifests and objects; 7,612 commits): 60 attestations expired, 4,237 beyond the 2 newest of their unit and signer (not a 2.10
+rule: 2.9.1's dry run of the same store removes 4,248 as superseded), none older than 14 days and 291 format-1 ones
+(older than their unit's newest format-3 one; the others were made within `max_age_days` on a tree a branch has at
+its tip, item 1), 4,588 in all; 18,658 unreferenced manifests, 51 unreferenced objects, and 103,692 of 128,465
+deletion records past 6 hours; `--max-age 7` would remove 7,771 attestations, `--max-age 3` 14,038. The prune itself
+(117 s on that copy, a local remote) published the store as one commit of 91,383 entries (30,305 attestations, 23,777
+attestation deletion records, 6,277 manifests, 6,736 objects, the rest their records; 192,590 tree objects against
+352,606), and compacted `git-meta.sqlite` from 455 to 238 MB; the `vci push` after it had nothing to send. (The
+figures 2.10's development builds printed here, 2,008 format-1 attestations and 4 beyond `--keep` on the tip of 6
+November, were made before item 1 kept format-1 records made on a live branch's tree, and before 2.9.1, whose own
+runs stopped superseding the attestations of other pull requests.)
 
 ### Choosing a store
 
@@ -2495,6 +2691,17 @@ extra = ["testdata/**"]
 # explain_hashes_days = 2  # since 2.9.0: days a state object is kept while referenced, 0 to 365 (0: written, then removed at
 #                        # the end of the same run; prefer explain_hashes = false); every writer applies its own setting
 #                        # to the shared store; VCI_STORE_EXPLAIN_HASHES_DAYS wins
+# max_age_days = 14      # since 2.10: vci prune removes a unit's attestations issued more than this many days ago but its
+#                        # newest by each signer, whatever tree they were made on (0: no limit, at most 3650);
+#                        # VCI_STORE_MAX_AGE_DAYS wins (older vci refuse the key: set the variable during a rollout)
+# deletion_records_hours = 6   # since 2.10, git-meta: hours a deletion record stays in the metadata tree (0 to 720)
+#                        # once its deletion is published; VCI_STORE_DELETION_RECORDS_HOURS wins
+# history_max_commits = 2000   # since 2.10, git-meta: vci prune in CI (CI set) publishes the store as one commit once
+#                        # the fetched metadata history has more commits (0: never); VCI_STORE_HISTORY_MAX_COMMITS wins
+# plan_states = 8        # since 2.10: state objects a plan loads after its verdicts to name the inputs that changed for
+#                        # the units that run, 0 to 256 (0: none); VCI_STORE_PLAN_STATES wins (older vci refuse the key)
+# plan_states_mib = 16   # since 2.10: and reads at most this many MiB of them, 0 to 4096 (0: none asked for,
+#                        # fetched or read); VCI_STORE_PLAN_STATES_MIB wins
 
 # [store.sqlite]
 # path = "vci-store.sqlite"   # relative to the git common directory, no `..` (absolute: VCI_STORE_URL=sqlite:<path>)
@@ -3255,13 +3462,96 @@ verdict objects per plan, past which a candidate fails `inputs` and is counted; 
 and its kind byte must be the one expected. The hdr's global-manifest checks (its root against the signed
 `globalInputRoot` and the rehash of its entries) run once per hdr per project per plan instead of once per
 candidate; its scalar checks (repo id, adapter, project, env configuration, toolchain, platform) run per candidate.
-A shape group's case-collision check runs once per group and a candidate folds its own entries against it. For the
-failure text the plan loads at most 16 state objects (named by the record's listing column on SQLite, PostgreSQL
-and libSQL, fetched in one request per round with the verdict objects; git-meta has none), in candidate order. `VCI_TIMING=1`
+A shape group's case-collision check runs once per group and a candidate folds its own entries against it. The
+verdicts load no state object (2.9.0 loaded up to 16 during them, named by a listing column fetched every round, for
+the failure text of any candidate that failed on an entry, whether its unit then skipped or not). `VCI_TIMING=1`
 prints `objects: N hdr, M tables, K shape, S state, B bytes, C candidate(s) past the cap, R distinct run(s)`. A
 plan whose `get_objects` fails runs the candidates that needed them. A libSQL replica (`VCI_STORE_SYNC=replica`)
 keeps no objects and no columns in 2.9.0 and asks the server for them, so a replica cut off from its server
 verifies no format-3 candidate (every such unit runs).
+
+**Naming the input that changed** (since 2.10). A format-3 record keeps no per-input hash: the attested sizes and
+hashes are in its run's state object, which no verdict reads, so a unit whose inputs changed fails `inputs` with
+`entry: changed (attested hash not loaded)` (2.9.0 printed that for 477,407 of 500,784 Rails re-runs in a day at
+vex, where format 1 had named the file). After the verdicts and their rounds, for each unit that runs whose best
+candidate failed that way (every such candidate of the file `vci explain` asks about), the plan groups the candidates
+by run (the shape their descriptor names and their key's hint) and ranks the runs: the one holding the most units'
+best candidates first (in `vci explain`, the run of the candidate its reason names), then the one with the most
+candidates, then the newest. It asks the store which state object a run wrote only for the runs whose state objects
+the budget can load, in that order, until `[store] plan_states` distinct ones are named (one request for that many
+runs, more only while the runs asked named fewer, each for twice as many runs: the record's `state_obj` listing column on SQLite, PostgreSQL and libSQL; on git-meta, which keeps no columns, the
+run-state link `vci:run-state:<shape id>:<hint>:<state id>` that `vci run` writes beside its objects since 2.10,
+found from the record's key hint and the shape, one range of the store's index a run, without reading a value); a
+candidate of a run not asked is over the budget. It loads each distinct state object once, in the runs' order,
+within the budget, which bounds exactly this:
+
+- `[store] plan_states` (default 8): how many state objects are asked for, fetched and read. Past it an object is not
+  asked for. On a git-meta clone that has not fetched them, the ones within it are fetched in one `git fetch` before
+  their sizes are known, so a plan downloads at most `plan_states` state objects (each at most 16 MiB).
+- `[store] plan_states_mib` (default 16): how many bytes of state objects are read and kept. The store first says,
+  reading none, which it holds and how big they are (`object_sizes`: a git-meta value's length, or its blob's size
+  from `git cat-file --batch-check`; a SQL store's `length`), and they are read in order, as many at a time as fit;
+  the first whose bytes would pass the budget is not read, and neither is any after it. One whose size the store
+  cannot say is read alone and kept only if it fits.
+- Either at 0: nothing is asked for, fetched or read, and every such unit's text says `over the plan's budget`.
+
+It then makes the candidates' `entry:` details again from it, once per run:
+the entries every unit observes the same way (files, symlinks, absences, directory types) are observed once for all
+of the run's units, and each unit's directory listings and autoload lookups with its own exclusions, ignored children
+and autoload directories, as its verdict observed them, all through the plan's checkout cache. The reason then reads
+as format 1's did, `best failed inputs:
+entry:vex-api/app/models/organization.rb (+3 more)`, the hashes labelled `attested (unsigned, from the run's state
+object)` in `vci explain`. Where it cannot, the reason says why: `entry: changed (attested hash not loaded: state
+expired)` (the store names an object and says it no longer holds it, `[store] explain_hashes_days`), `(attested hash
+not loaded: over the plan's budget)`, `(attested hash not loaded: no state object for the run)` (the run wrote none,
+`explain_hashes = false`, or a vci before 2.10 wrote the record on git-meta); any other failure (the store cannot
+say, the fetch fails, the store holds a value it cannot read, such as one that is not base64, or the object is
+corrupt) leaves the text as it was. It is text only: no verdict changes, every error leaves the 2.9.0
+text, and a plan in which every unit skips asks the store nothing here. The text format sums it up before its last
+line:
+
+```text
+RUN  test/models/organization_test.rb  (no valid attestation (3 candidates; best failed inputs: entry:app/models/organization.rb))
+RUN  test/models/team_test.rb  (no valid attestation (2 candidates; best failed inputs: entry:app/models/organization.rb (+1 more)))
+changed inputs, by the units each made run (top 5 of 7):
+  412  app/models/organization.rb
+   37  config/routes.rb
+  ...
+   12  unit(s) ran on changed inputs not named (attested hash not loaded)
+88 to skip, 461 to run
+```
+
+counting, for each unit that runs, every input its reason's best failure names (`inputs` and `global-inputs`), once
+per unit. `VCI_TIMING=1` prints `name the inputs that changed for the units that run` and `changed inputs: N
+candidate(s) without the attested hashes, M named, E state expired, O over the budget, S without a state object;
+state objects: W wanted, L loaded; runs: Q asked of R; ask A s, load B s, details C s`. On a copy of vex's git-meta
+store (32,358 `project` rows, 1,117 runs), one run's lookup takes 0.003 ms (the 2.10 development builds tested
+every `project` key with `substr`: 3.2 ms a lookup, 4.1 s for a plan whose running units came from all 1,117 runs,
+which they all asked about whatever the budget; `measure_run_state` in `crates/vci-git/tests`). Measured (the ignored test
+`measure_naming_the_changed_input` of `crates/vci-cli/tests/e2e_m3.rs`, a release build): on 1,004 Vitest units that
+share 500 modules (about 505 entries a unit, one run, one state object), a plan in which every unit skips spends
+nothing here; with one shared module edited, naming it for the 1,000 units that run took a median 0.18 s on git-meta
+and on SQLite, and 0.29 to 0.30 s in a fresh git-meta clone, where the plan fetches the state object first. The
+details are made once per run (made once per unit, as the verdicts observe, they cost about 40 ms a unit).
+
+**What the text output escapes** (since 2.10). The text format of `vci plan`, the github format's notices and
+warnings, the plan `vci ci` prints and `vci explain` print every path, key, name and reason with these characters
+escaped as a Rust string literal writes them: the control characters (C0, DEL and C1: `\t`, `\n` and `\r`, the
+others as `\u{hex}`, ESC as `\u{1b}`), the Unicode line and paragraph separators (`\u{2028}`, `\u{2029}`) and the
+bidirectional formatting characters (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069). The github format's
+file lists (`run=`, `skip=`, `run_<name>=`) are what a runner is given, so they name each file as it is on disk (a
+tab, U+061C or ESC included: no escaped form of a name is a file the runner can find); only a line break would end
+the output's line, so a file to run whose name holds `\n` or `\r` makes `run_all=true` (and `run_all_<name>=true`)
+with `::warning title=vci::running everything: N test file(s) to run have a line break in their name, which an
+output line cannot hold (first: ...)`, and a skipped one is left out of `skip=`. A committed file named
+`fixtures/x<newline>SKIP forged.test.ts  (…)` is then one line, `RUN  src/b.test.ts  (… entry:fixtures/x\nSKIP
+forged.test.ts  (…))`, and cannot add a `SKIP` line the action's `grep -c '^SKIP '` counts, a `N to skip, M to run`
+line its step summary stops at, an output line in `$GITHUB_OUTPUT` or a workflow command (the github format also
+writes `%` as `%25` in its `::notice` and `::warning` lines). Every other character, a backslash too, is printed as
+it is, so the text is for reading: `--format json` gives the exact names, which JSON escapes. vci 2.9 and earlier
+printed format-1 and SQLite reasons raw; the 2.10 development builds printed git-meta's raw too, and in the new
+changed-input summary, and one escaped the github format's file lists too (a runner given `src/t\tab.test.ts`
+found no such file and ran the others only).
 
 ## Threat model (v1)
 
@@ -3762,7 +4052,9 @@ word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
   hashed) and nothing else; an unset `TZ` is refused. npm's builtin config file (`<npm dir>/npmrc`) is not read for
   `node-options`, and yarn Plug'n'Play layouts are not supported. Each file runs in its own `node --test` process, as node:test's default process isolation does; the
   `@vci/vitest` version is not part of the attestation (like the other collectors).
-- Attestation metadata grows; `vci prune` deletes expired attestations (`--superseded`: and those a newer one of the
+- Attestation metadata grows unless `vci prune` runs where attestations are made (since 2.10 it also removes old,
+  stale-branch and replaced format-1 attestations, drops old deletion records and rewrites a long git-meta history:
+  [Keeping the store small](#keeping-the-store-small)); `vci prune` deletes expired attestations (`--superseded`: and those a newer one of the
   same unit by the same signer replaced) and, since 1.9.0, the input manifests nothing references any more; `vci run`
   deletes the attestations a re-attestation supersedes on the same line of history (see [git-meta](#git-meta)); `vci push --rewrite-history` drops what was deleted from the published history, and git-meta's own auto-prune (`meta:prune:max-keys`) may drop the least recently written keys (those units
   then run). No spot-check re-runs or transparency log.

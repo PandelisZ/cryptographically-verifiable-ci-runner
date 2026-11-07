@@ -2493,7 +2493,7 @@ fn two_eight_on_a_libsql_namespace(replica: bool) {
     let ex = w.explain("b");
     assert!(ex.contains("failed check: inputs"), "{ex}");
     assert!(
-        ex.contains("entry: changed (attested hash not loaded)"),
+        ex.contains("entry: changed (attested hash not loaded: state expired)"),
         "{ex}"
     );
 }

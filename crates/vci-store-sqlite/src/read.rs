@@ -283,6 +283,36 @@ pub(crate) fn objects(
     Ok(Ok(out))
 }
 
+/// Whether the store holds each of these (validated) ids and its size in
+/// bytes, none read: one index lookup each ([`vci_store::ObjectSize`]). A
+/// row whose kind column names no kind is held but unreadable (`objects`
+/// leaves it out): its size is not given.
+pub(crate) fn object_sizes(
+    conn: &Connection,
+    ids: &[&str],
+) -> rusqlite::Result<Vec<vci_store::ObjectSize>> {
+    let mut sizes = conn.prepare(&sql().object_size)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row: Option<(i64, i64)> = sizes
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        out.push(match row {
+            None => vci_store::ObjectSize::Absent,
+            Some((kind, len))
+                if u8::try_from(kind)
+                    .ok()
+                    .and_then(vci_store::object_kind)
+                    .is_some() =>
+            {
+                vci_store::ObjectSize::Held(u64::try_from(len).ok())
+            }
+            Some(_) => vci_store::ObjectSize::Held(None),
+        });
+    }
+    Ok(out)
+}
+
 /// The ids of the objects the orphan rule would remove now: no
 /// attestation's object-id column names them and they were put before
 /// `before`; sorted, one index scan and four index lookups per object, no

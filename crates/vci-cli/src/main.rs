@@ -177,7 +177,7 @@ enum Cmd {
         #[arg(long)]
         remote: Option<String>,
     },
-    /// Delete expired attestations from the attestation store (git-meta by default: the local store, publish with `vci push`).
+    /// Delete expired, superseded and old attestations and the manifests and objects nothing references from the attestation store (git-meta by default: the local store, publish with `vci push`; since 2.10 it also drops old deletion records and, once the metadata history passes `[store] history_max_commits`, publishes the store as one commit in CI (`CI` set, as GitHub Actions does), elsewhere says to run `vci push --rewrite-history`).
     Prune {
         /// Only list what would be deleted.
         #[arg(long)]
@@ -185,9 +185,12 @@ enum Cmd {
         /// Keep only the newest one of a unit's attestations by the same signer (the same as `--keep 1`).
         #[arg(long)]
         superseded: bool,
-        /// How many of a unit's attestations by the same signer to keep, newest first; one made on a tree some branch or tag still has at its tip is always kept. Every stored attestation costs each plan a download.
+        /// How many of a unit's attestations by the same signer to keep, newest first; one made on a tree some branch or tag still has at its tip is kept too (within --max-age), and so is one a plan of the checked-out commit used. Every stored attestation costs each plan a download.
         #[arg(long, default_value_t = 2)]
         keep: usize,
+        /// Remove the attestations issued more than this many days ago that are not their unit's newest by their signer, whatever tree they were made on, unless a plan of the checked-out commit used them (since 2.10); 0: no age limit. Default: `[store] max_age_days` (14).
+        #[arg(long, value_name = "DAYS")]
+        max_age: Option<u32>,
         /// Only the objects (since 2.9.0): remove the objects of store format 3 no attestation references (hdr, tables, shape and state objects put more than an hour ago) and the state objects older than --older-than, and leave every attestation and input manifest alone. Without it, `vci prune` does this after the attestations and manifests.
         #[arg(long)]
         objects: bool,
@@ -442,12 +445,14 @@ fn main() {
             keep,
             objects,
             older_than,
+            max_age,
         } => cmds::prune(cmds::PruneArgs {
             dry_run,
             superseded,
             keep,
             objects_only: objects,
             older_than,
+            max_age,
         }),
         Cmd::Env {
             base_ref,
@@ -636,12 +641,21 @@ mod tests {
             keep,
             objects,
             older_than,
+            max_age,
         } = cli.cmd
         else {
             panic!("not prune")
         };
         assert!(objects && !dry_run && !superseded);
-        assert_eq!((keep, older_than), (2, Some(0)));
+        assert_eq!((keep, older_than, max_age), (2, Some(0), None));
+        let cli = Cli::try_parse_from(["vci", "prune", "--max-age", "7"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Prune {
+                max_age: Some(7),
+                ..
+            }
+        ));
         let cli = Cli::try_parse_from(["vci", "prune"]).unwrap();
         assert!(matches!(
             cli.cmd,

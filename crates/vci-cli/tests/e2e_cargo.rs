@@ -2473,6 +2473,482 @@ fn cargo_prune_superseded_and_rewrite_history() {
     assert!(p.skip.contains(B) && p.skip.contains(C), "{p:?}");
 }
 
+// ---- keeping the store small (vci 2.10) -------------------------------------
+
+/// `vci prune` keeps git-meta small (2.10): a dry run counts each rule,
+/// the deletion records past `[store] deletion_records_hours` and whether
+/// the fetched history passes `[store] history_max_commits`, and changes
+/// nothing; outside CI a run past the limit publishes nothing and says how
+/// to; in CI it publishes the store as one commit, and a clone that still
+/// holds the old history (and the superseded attestation it read) fetches,
+/// plans and pushes on top of it without publishing that attestation again
+/// (the new tip's deletion record wins) or the old history; a later prune
+/// past the window drops the deletion record.
+#[test]
+fn cargo_prune_rewrites_a_long_history_and_drops_old_deletion_records() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    // Off main's tree, so that the next run of b supersedes this one.
+    feature_commit(&w);
+    w.run(&work, &[B], &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    // A clone that fetches this history and reads b's attestation.
+    let old = w.base.join("old-clone");
+    w.git(
+        &w.base,
+        &["clone", "-q", w.remote.to_str().unwrap(), "old-clone"],
+    );
+    w.git(&old, &["checkout", "-q", "feature"]);
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
+    assert!(w.plan(&old, "main").skip.contains(B));
+    // b superseded (a deletion record), and two more publications.
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(err.contains("removed 1 superseded"), "{err}");
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    w.run(&work, &[C], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let history = |dir: &Path, r: &str| -> u32 {
+        w.git(dir, &["rev-list", "--count", r])
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let before = history(&w.remote, "refs/meta/main");
+    assert!(before >= 3, "{before}");
+    let stderr = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+
+    let long = [("VCI_STORE_HISTORY_MAX_COMMITS", "2"), ("CI", "true")];
+    let out = w.vci_env(
+        &work,
+        &["prune", "--dry-run"],
+        &[long[0], long[1], ("VCI_STORE_DELETION_RECORDS_HOURS", "0")],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains(
+            "vci prune: attestations by rule (dry run): 0 expired, 0 beyond the 2 newest of their unit and signer, 0 older than 14 day(s) (not their unit's newest), 0 format-1"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("vci prune: no format-1 attestation remains"),
+        "{err}"
+    );
+    assert!(
+        err.contains("deletion record(s) are older than 0 hour(s) ([store] deletion_records_hours): dropped on a run without --dry-run"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "vci prune: the metadata history has {before} commits, more than [store] history_max_commits = 2: a run without --dry-run publishes the store as one commit"
+        )),
+        "{err}"
+    );
+    assert_eq!(history(&w.remote, "refs/meta/main"), before, "a dry run");
+
+    // Outside CI (`CI` unset, empty, `false` or `0`: a laptop), nothing is
+    // published: one note says how (2.10's first prune published a
+    // rewrite wherever it ran).
+    let tip = w.git(&w.remote, &["rev-parse", "refs/meta/main"]);
+    for ci in [None, Some(""), Some("false"), Some("0")] {
+        let mut env = vec![long[0]];
+        if let Some(v) = ci {
+            env.push(("CI", v));
+        }
+        for args in [&["prune", "--dry-run"][..], &["prune"][..]] {
+            let out = w.vci_env(&work, args, &env);
+            let err = stderr(&out);
+            assert!(out.status.success(), "{err}");
+            assert!(
+                err.contains(&format!(
+                    "vci prune: note: the metadata history has {before} commits, more than [store] history_max_commits = 2: `vci push --rewrite-history` publishes the store as one commit (`vci prune` does that itself only in CI, where CI is set)\n"
+                )),
+                "CI={ci:?} {args:?}: {err}"
+            );
+            assert!(!err.contains("published the store"), "CI={ci:?}: {err}");
+        }
+        assert_eq!(
+            w.git(&w.remote, &["rev-parse", "refs/meta/main"]),
+            tip,
+            "CI={ci:?}: nothing published"
+        );
+    }
+
+    // In CI, past the limit: one commit, the deletion record kept (6 hours).
+    let out = w.vci_env(&work, &["prune"], &long);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("published the store to"), "{err}");
+    assert!(!err.contains("run `vci push` to publish"), "{err}");
+    assert_eq!(history(&w.remote, "refs/meta/main"), 1);
+    let tree = |dir: &Path| {
+        w.git(
+            dir,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "--full-tree",
+                "refs/meta/main",
+            ],
+        )
+    };
+    assert!(tree(&w.remote).contains("__tombstones"), "the record stays");
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("vci: nothing to push"),
+        "{}",
+        stderr(&out)
+    );
+
+    // The old clone merges the new history: b's superseded attestation,
+    // which it holds, stays deleted; it attests d and publishes one commit
+    // on top of the rewrite.
+    w.git(&old, &["fetch", "-q", "origin"]);
+    w.git(&old, &["merge", "-q", "--ff-only", "origin/feature"]);
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&old, "main");
+    assert!(p.skip.contains(B) && p.skip.contains(C), "{p:?}");
+    w.run(&old, &[D], &w.trusted);
+    w.vci_ok(&old, &["push", "--remote", "origin"]);
+    assert_eq!(history(&w.remote, "refs/meta/main"), 2);
+    w.vci_ok(&work, &["fetch", "--remote", "origin"]);
+    assert_eq!(w.predicates(B).len(), 1, "b's old attestation is not back");
+
+    // Past the window, the record goes from the published tree.
+    let out = w.vci_env(
+        &work,
+        &["prune"],
+        &[("VCI_STORE_DELETION_RECORDS_HOURS", "0")],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("deletion record(s) older than 0 hour(s) dropped"),
+        "{err}"
+    );
+    assert!(err.contains("run `vci push` to publish"), "{err}");
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    assert!(
+        !tree(&w.remote).contains("__tombstones"),
+        "{}",
+        tree(&w.remote)
+    );
+    w.vci_ok(&old, &["fetch", "--remote", "origin"]);
+    let p = w.plan(&old, "main");
+    for u in [B, C, D] {
+        assert!(p.skip.contains(u), "{u}: {p:?}");
+    }
+}
+
+/// A format-1 record of b on branch `old` and a format-3 one on `new`
+/// (same signer), both published: `vci prune` removes the format-1 one and
+/// its manifest (two deletion records, written in the store only).
+fn superseded_format_1_record(w: &World) {
+    let work = w.work.clone();
+    feature_commit(w);
+    w.git(&work, &["checkout", "-q", "-b", "old", "feature"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "old"]);
+    w.run_format1(&work, &[B], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.git(&work, &["checkout", "-q", "-b", "new", "feature"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 3}\n",
+    );
+    w.git(&work, &["commit", "-qam", "new"]);
+    w.run(&work, &[B], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    // Off every branch: a format-1 record on a tree a branch has at its tip
+    // stays within max_age_days (2.10).
+    w.git(&work, &["branch", "-q", "-D", "old"]);
+}
+
+/// How many attestations of `unit` a fresh clone of the remote holds after
+/// `vci fetch`.
+fn published(w: &World, name: &str, unit: &str) -> usize {
+    let fresh = w.base.join(name);
+    w.git(&w.base, &["clone", "-q", w.remote.to_str().unwrap(), name]);
+    w.vci_ok(&fresh, &["fetch", "--remote", "origin"]);
+    AttestStore::new(&store_for(&fresh))
+        .list(Some(unit))
+        .unwrap()
+        .len()
+}
+
+/// `[store] deletion_records_hours = 0` (documented range 0 to 720): `vci
+/// prune` keeps the deletion records it has just written until a push has
+/// published them, then drops them. 2.10's first prune dropped them before
+/// anything serialized them, and the store could never push or fetch again
+/// (`serializing the local git-meta store would drop 2 value(s) of
+/// refs/meta/local/main that it has no deletion record for`), the prune's
+/// own history rewrite included: neither the deletion nor any later
+/// attestation was published from that clone.
+#[test]
+fn cargo_prune_with_a_zero_hour_window_publishes_its_deletions() {
+    for rewrite in [false, true] {
+        let Some(w) = World::new() else { return };
+        let work = w.work.clone();
+        superseded_format_1_record(&w);
+        let mut env = vec![("VCI_STORE_DELETION_RECORDS_HOURS", "0")];
+        if rewrite {
+            env.push(("VCI_STORE_HISTORY_MAX_COMMITS", "1"));
+            env.push(("CI", "true"));
+        }
+        let out = w.vci_env(&work, &["prune"], &env);
+        let first = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{first}");
+        let removed = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(removed.contains("(format 1, older than"), "{removed}");
+        assert_eq!(first.contains("published the store to"), rewrite, "{first}");
+        for what in ["push", "push", "fetch", "push"] {
+            let o = w.vci_env(&work, &[what, "--remote", "origin"], &env);
+            assert!(
+                o.status.success(),
+                "rewrite={rewrite}: vci {what}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        // A new attestation, pushed with the default settings.
+        w.run(&work, &[C], &w.trusted);
+        w.vci_ok(&work, &["push", "--remote", "origin"]);
+        assert_eq!(published(&w, "fresh", B), 1, "rewrite={rewrite}");
+        assert_eq!(published(&w, "fresh2", C), 1, "rewrite={rewrite}");
+        assert!(
+            first.contains("vci prune: 0 of 2 deletion record(s) older than 0 hour(s) dropped ([store] deletion_records_hours); 2 more past the window kept until a `vci push` publishes their deletion"),
+            "rewrite={rewrite}: {first}"
+        );
+        // Published now: the next prune drops the records, and the push
+        // after it publishes the drop.
+        let out = w.vci_env(&work, &["prune"], &[env[0]]);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        assert!(
+            err.contains("vci prune: 2 of 2 deletion record(s) older than 0 hour(s) dropped ([store] deletion_records_hours)\n"),
+            "rewrite={rewrite}: {err}"
+        );
+        w.vci_ok(&work, &["push", "--remote", "origin"]);
+        let tree = w.git(
+            &w.remote,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "--full-tree",
+                "refs/meta/main",
+            ],
+        );
+        assert!(!tree.contains("__tombstones"), "{tree}");
+        assert_eq!(published(&w, "fresh3", B), 1, "rewrite={rewrite}");
+    }
+}
+
+/// Default window: deletion records a prune wrote that nothing has
+/// serialized or pushed stay past the window (a second prune seven hours
+/// later, the records aged by SQL, keeps them), and the push publishes the
+/// deletions; the prune after that drops them. 2.10's first prune dropped
+/// them, and the next push put the values back (`restored 2 entries of
+/// refs/meta/local/main into this repository's git-meta store`), undoing
+/// the deletions.
+#[test]
+fn cargo_prune_keeps_a_deletion_record_past_the_window_until_a_push_publishes_it() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    superseded_format_1_record(&w);
+    let out = w.vci(&work, &["prune"]);
+    assert!(out.status.success());
+    let age = |dir: &Path| {
+        let db = rusqlite::Connection::open(dir.join(".git/git-meta.sqlite")).unwrap();
+        db.execute(
+            "UPDATE tombstones SET timestamp = timestamp - 25200000 WHERE tombstone_type = 'metadata'",
+            [],
+        )
+        .unwrap()
+    };
+    assert_eq!(age(&work), 2);
+    let dry = w.vci(&work, &["prune", "--dry-run"]);
+    let dry = String::from_utf8_lossy(&dry.stderr).into_owned();
+    let out = w.vci(&work, &["prune"]);
+    let second = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{second}");
+    for what in ["push", "fetch", "push"] {
+        let o = w.vci(&work, &[what, "--remote", "origin"]);
+        let e = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "vci {what}: {e}");
+        assert!(!e.contains("restored"), "vci {what}: {e}");
+    }
+    assert_eq!(published(&w, "fresh", B), 1);
+    assert_eq!(w.predicates(B).len(), 1);
+    assert!(
+        dry.contains("vci prune: 0 of 2 deletion record(s) are older than 6 hour(s) ([store] deletion_records_hours): dropped on a run without --dry-run; 2 more past the window would be kept until a `vci push` publishes their deletion"),
+        "{dry}"
+    );
+    assert!(
+        second.contains("vci prune: 0 of 2 deletion record(s) older than 6 hour(s) dropped"),
+        "{second}"
+    );
+    // Published: the next prune drops them.
+    let out = w.vci(&work, &["prune"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("vci prune: 2 of 2 deletion record(s) older than 6 hour(s) dropped"),
+        "{err}"
+    );
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    assert_eq!(published(&w, "fresh2", B), 1);
+}
+
+/// Once a unit has a format-3 attestation by a signer, `vci prune` (2.10)
+/// removes that signer's format-1 attestations of it issued before it,
+/// with the input manifests only they referenced, unless a plan of the
+/// checked-out commit used one, `[store] record_format = 1` keeps format 1,
+/// or one was made on a tree a branch still has at its tip within `[store]
+/// max_age_days` (the branch's plan still skips the unit on it); and `vci
+/// store upgrade --finish` on git-meta is refused while a format-1
+/// attestation remains, then says the migration is over.
+#[test]
+fn cargo_prune_removes_format_1_records_once_the_unit_has_a_format_3_one() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    let stderr = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    w.git(&work, &["checkout", "-q", "-b", "old", "main"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data, old"]);
+    w.run_format1(&work, &[B], &w.trusted);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.git(&work, &["checkout", "-q", "-b", "new", "main"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 3}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data, new"]);
+    let err = w.run(&work, &[B], &w.trusted);
+    assert!(!err.contains("superseded"), "another line: {err}");
+    assert_eq!(raw_statements(&work, B).len(), 2);
+    let manifests = || {
+        AttestStore::new(&store_for(&work))
+            .manifests()
+            .unwrap()
+            .len()
+    };
+    assert!(manifests() > 0, "the format-1 record's manifest");
+
+    let out = w.vci(&work, &["store", "upgrade", "--finish"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("store: git-meta: not finished: 1 attestation(s) are format-1 records"),
+        "{out:?}"
+    );
+
+    // A plan of the old branch's commit uses the format-1 record: kept.
+    w.git(&work, &["checkout", "-q", "old"]);
+    assert!(w.plan(&work, "main").skip.contains(B));
+    let out = w.vci(&work, &["prune", "--dry-run"]);
+    assert!(out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains(", 0 format-1 (older than their unit"), "{err}");
+    assert!(
+        err.contains(
+            "; kept whatever the rules: the 1 attestation(s) a plan of the checked-out commit used"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("vci prune: 1 format-1 attestation(s) remain"),
+        "{err}"
+    );
+    // `record_format = 1` keeps format 1 whatever the plan.
+    w.git(&work, &["checkout", "-q", "new"]);
+    let out = w.vci_env(
+        &work,
+        &["prune", "--dry-run"],
+        &[("VCI_STORE_RECORD_FORMAT", "1")],
+    );
+    let err = stderr(&out);
+    assert!(err.contains(", 0 format-1 (older than their unit"), "{err}");
+    assert!(
+        err.contains("[store] record_format = 1 keeps them"),
+        "{err}"
+    );
+
+    // On the new branch, while the old branch is at the format-1 record's
+    // tree: kept (2.10: the format rule removed it, and the old branch's
+    // plan ran b again).
+    let out = w.vci(&work, &["prune"]);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains(", 0 format-1 (older than their unit"), "{err}");
+    assert!(
+        err.contains(
+            "vci prune: 1 format-1 attestation(s) remain (none older than a format-3 attestation of their unit by the same signer, or made within max_age_days on a tree some branch or tag has at its tip"
+        ),
+        "{err}"
+    );
+    assert_eq!(raw_statements(&work, B).len(), 2, "on a live tree");
+    w.git(&work, &["checkout", "-q", "old"]);
+    assert!(w.plan(&work, "main").skip.contains(B), "the old branch");
+    w.git(&work, &["checkout", "-q", "new"]);
+
+    // Once the old branch is gone: listed, then removed with its manifests.
+    w.git(&work, &["branch", "-q", "-D", "old"]);
+    let out = w.vci(&work, &["prune", "--dry-run"]);
+    let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        listed
+            .lines()
+            .filter(|l| l.ends_with("(format 1, older than its unit's newest format-3 attestation)"))
+            .count(),
+        1,
+        "{listed}"
+    );
+    let err = stderr(&out);
+    assert!(err.contains(", 1 format-1 (older than their unit"), "{err}");
+    assert!(
+        err.contains("vci prune: no format-1 attestation remains after this prune"),
+        "{err}"
+    );
+    assert_eq!(raw_statements(&work, B).len(), 2, "a dry run");
+    let out = w.vci(&work, &["prune"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let left = raw_statements(&work, B);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(
+        left[0].1["predicateType"],
+        vci_core::PREDICATE_TYPE_V2,
+        "the format-3 record stays"
+    );
+    assert_eq!(manifests(), 0, "the manifests only it referenced went");
+    assert!(w.plan(&work, "main").skip.contains(B));
+
+    let out = w.vci(&work, &["store", "upgrade", "--finish"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(
+            "store: git-meta: finished: no format-1 attestation remains; 0 input manifest(s) removed"
+        ),
+        "{out:?}"
+    );
+    let out = w.vci(&work, &["store", "upgrade", "--begin"]);
+    assert_eq!(out.status.code(), Some(0));
+}
+
 // ---- lazy metadata (vci 2.0) ------------------------------------------------
 
 /// The blob ids of `test_id`'s stored attestations and of the manifests
@@ -4192,4 +4668,184 @@ fn cargo_run_with_several_hdr_groups_is_written_and_planned() {
     assert!(ex.contains("b/Cargo.toml"), "{ex}");
     w.put("b/Cargo.toml", &toml);
     assert_eq!(w.plan(&work, "main").skip, set(&all));
+}
+
+// ---- keeping the store small: rewrites, CI and live branches (2.10) ---------
+
+/// The remote's refs/meta/main paths that are values (not deletion
+/// records) containing `needle`.
+fn remote_values(w: &World, needle: &str) -> Vec<String> {
+    w.git(
+        &w.remote,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "--full-tree",
+            "refs/meta/main",
+        ],
+    )
+    .lines()
+    .filter(|p| p.contains(needle) && !p.contains("__tombstones"))
+    .map(str::to_owned)
+    .collect()
+}
+
+/// `vci prune` in CI past `[store] history_max_commits`, and two clones
+/// that fetched before its rewrite: the first one's push does not publish
+/// again the manifest the rewrite's prune deleted (it merges the new
+/// history on the tip it last fetched), and the second one's prune, whose
+/// fetched history is still the long one, pushes on top of the rewrite
+/// instead of rewriting the history again. 2.10 counted the history as the
+/// clone last fetched it, and the second prune published another parentless
+/// commit, dropping the first rewrite and the first clone's attestation of
+/// d from the history.
+#[test]
+fn cargo_prune_rewrites_the_history_once_and_stale_clones_push_on_top() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    feature_commit(&w);
+    w.run_format1(&work, &[B], &w.trusted);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let clone = |name: &str| {
+        let dir = w.base.join(name);
+        w.git(&w.base, &["clone", "-q", w.remote.to_str().unwrap(), name]);
+        w.git(&dir, &["checkout", "-q", "feature"]);
+        w.vci_ok(&dir, &["fetch", "--remote", "origin"]);
+        dir
+    };
+    let s1 = clone("stale-1");
+    assert!(!remote_values(&w, "vci/manifest").is_empty());
+    // b attested again in format 3 on the same line: the format-1 record is
+    // superseded, its manifest unreferenced.
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "b's data changes"]);
+    w.git(&work, &["push", "-q", "origin", "feature"]);
+    w.run(&work, &[B], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    w.run(&work, &[C], &w.trusted);
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    // The second stale clone fetches the long history, then nothing more.
+    let s2 = clone("stale-2");
+    let long = [("VCI_STORE_HISTORY_MAX_COMMITS", "2"), ("CI", "true")];
+    let stderr = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let out = w.vci_env(&work, &["prune"], &long);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("published the store to"), "{err}");
+    let count = |r: &str| -> u32 {
+        w.git(&w.remote, &["rev-list", "--count", r])
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(count("refs/meta/main"), 1);
+    let rewrite = w.git(&w.remote, &["rev-parse", "refs/meta/main"]);
+    assert_eq!(remote_values(&w, "vci/manifest"), Vec::<String>::new());
+
+    // The first stale clone attests d and pushes.
+    w.git(&s1, &["fetch", "-q", "origin"]);
+    w.git(&s1, &["merge", "-q", "--ff-only", "origin/feature"]);
+    w.run(&s1, &[D], &w.trusted);
+    w.vci_ok(&s1, &["push", "--remote", "origin"]);
+    assert_eq!(
+        remote_values(&w, "vci/manifest"),
+        Vec::<String>::new(),
+        "the first stale clone published again the manifest the prune deleted"
+    );
+
+    // The second one prunes in CI without a fetch since the rewrite.
+    let out = w.vci_env(&s2, &["prune"], &long);
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        !err.contains("published the store to"),
+        "the second stale clone rewrote the history again: {err}"
+    );
+    assert!(
+        err.contains(
+            "vci prune: meta's refs/meta/main was published as one commit since this clone last fetched it: "
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        w.git(
+            &w.remote,
+            &["rev-list", "--max-parents=0", "refs/meta/main"]
+        ),
+        rewrite,
+        "the first rewrite is still the root of the history"
+    );
+    assert!(count("refs/meta/main") <= 3);
+    assert_eq!(published(&w, "fresh", D), 1, "d's attestation");
+    assert_eq!(published(&w, "fresh2", B), 1);
+    assert_eq!(remote_values(&w, "vci/manifest"), Vec::<String>::new());
+}
+
+/// A live branch whose plan skips b on a format-1 record made a second
+/// before another branch's format-3 record of b (same signer): a plain
+/// `vci prune` on the other branch keeps it (within max_age_days, on a
+/// tree a branch has at its tip), and the live branch's next plan still
+/// skips b. 2.10's format rule removed it, whatever the tree.
+#[test]
+fn cargo_prune_keeps_a_format_1_record_a_live_branch_plan_uses() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    feature_commit(&w);
+    w.git(&work, &["checkout", "-q", "-b", "old", "feature"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 2}\n",
+    );
+    w.git(&work, &["commit", "-qam", "old"]);
+    w.run_format1(&work, &[B], &w.trusted);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    w.git(&work, &["checkout", "-q", "-b", "new", "feature"]);
+    w.put(
+        "b/tests/data/b.json",
+        "{\"greeting\": \"hello\", \"v\": 3}\n",
+    );
+    w.git(&work, &["commit", "-qam", "new"]);
+    w.run(&work, &[B], &w.trusted);
+    w.git(&work, &["checkout", "-q", "old"]);
+    assert!(w.plan(&work, "main").skip.contains(B));
+    w.git(&work, &["checkout", "-q", "new"]);
+    let out = w.vci(&work, &["prune"]);
+    assert!(out.status.success());
+    let removed = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!removed.contains("(format 1, older than"), "{removed}");
+    w.git(&work, &["checkout", "-q", "old"]);
+    assert!(
+        w.plan(&work, "main").skip.contains(B),
+        "the live branch's plan lost its skip of b"
+    );
+}
+
+/// REFERENCE.md "Keeping the store small": on git-meta a prune's deletions
+/// are published by a push after it, so a job prunes, then pushes (as vex
+/// does: `vci prune || true; vci push || true`). A prune after the job's
+/// push, as the text said before, leaves them unpublished until some later
+/// push.
+#[test]
+fn cargo_prune_then_push_publishes_the_deletions() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    superseded_format_1_record(&w);
+    // Push, then prune: nothing published.
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    let out = w.vci(&work, &["prune"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("vci prune: run `vci push` to publish the deletions"),
+        "{err}"
+    );
+    assert_eq!(published(&w, "fresh", B), 2);
+    // Then the push publishes them.
+    w.vci_ok(&work, &["push", "--remote", "origin"]);
+    assert_eq!(published(&w, "fresh2", B), 1);
 }

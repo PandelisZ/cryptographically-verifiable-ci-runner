@@ -164,6 +164,95 @@ fn a_frame_names_no_manifest_and_names_its_objects() {
     assert_eq!(e.manifest_ref(), ManifestRef::Inline);
 }
 
+/// A run-state link's key (2.10): shape, hint and state round-trip, the
+/// hint spelt as an attestation key spells it (so a record's key names its
+/// run's link prefix), and anything else is foreign.
+#[test]
+fn run_state_keys_round_trip_and_share_the_records_hint() {
+    use vci_store::{KeyHint, parse_run_state_key, run_state_key, run_state_prefix};
+    let (shape, state) = (hex64(0x31), hex64(0xa4));
+    let hint = KeyHint {
+        issued: 0x6a1b_2c3d,
+        tree: Some("0123456789abcdef0123".into()),
+    };
+    let k = run_state_key(&shape, &hint, &state);
+    assert_eq!(
+        k,
+        format!("vci:run-state:{shape}:6a1b2c3d.0123456789abcdef:{state}")
+    );
+    assert!(k.starts_with(&run_state_prefix(&shape, &hint)));
+    let want = KeyHint {
+        tree: Some("0123456789abcdef".into()),
+        ..hint.clone()
+    };
+    assert_eq!(
+        parse_run_state_key(&k),
+        Some((shape.as_str(), want.clone(), state.as_str()))
+    );
+    // The record of that run carries the same segment.
+    let record = key::attestation_key_hinted(&hex64(1), &"1".repeat(16), &hex64(2), &hint);
+    assert!(record.ends_with(&format!(":{}", key::hint_segment(&hint))));
+    assert_eq!(key::parse_key_hint(&record), Some(want));
+    let dirty = KeyHint {
+        issued: -5,
+        tree: None,
+    };
+    assert_eq!(key::hint_segment(&dirty), "0.-");
+    assert_eq!(
+        parse_run_state_key(&run_state_key(&shape, &dirty, &state)),
+        Some((
+            shape.as_str(),
+            KeyHint {
+                issued: 0,
+                tree: None
+            },
+            state.as_str()
+        ))
+    );
+    for foreign in [
+        format!("vci:run-state:{shape}:1.-"),
+        format!("vci:run-state:{shape}:1.-:{state}:x"),
+        format!("vci:run-state:{shape}:nothex.-:{state}"),
+        format!("vci:run-state:{}:1.-:{state}", &shape[..62]),
+        format!("vci:run-state:{shape}:1.-:{}", state.to_uppercase()),
+        format!("vci:run-states:{shape}:1.-:{state}"),
+        object_key(ObjectKind::State, &state),
+    ] {
+        assert_eq!(parse_run_state_key(&foreign), None, "{foreign}");
+    }
+}
+
+/// The trait's defaults for a run's state object: a store without columns
+/// names none and keeps no link (`put_run_state` checks its ids and writes
+/// nothing).
+#[test]
+fn run_state_defaults_name_nothing_without_columns() {
+    use vci_store::{KeyHint, RunOf};
+    let store = Bare;
+    let e = StoredEnvelope::from_key(
+        "project",
+        &key::attestation_key(&hex64(1), &"1".repeat(16), &hex64(2)),
+    )
+    .unwrap();
+    let shape = hex64(3);
+    let runs = [RunOf {
+        record: &e,
+        shape: &shape,
+    }; 2];
+    assert_eq!(store.run_state_objects(&runs).unwrap(), vec![None, None]);
+    let hint = KeyHint {
+        issued: 1,
+        tree: None,
+    };
+    assert_eq!(
+        store
+            .put_run_state(&shape, std::slice::from_ref(&hint), &hex64(4))
+            .unwrap(),
+        0
+    );
+    assert!(store.put_run_state("zz", &[hint], &hex64(4)).is_err());
+}
+
 #[test]
 fn object_keys_and_ids() {
     let id = hex64(0x5a);

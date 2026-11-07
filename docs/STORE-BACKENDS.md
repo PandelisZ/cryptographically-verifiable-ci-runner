@@ -32,7 +32,7 @@ Built and in use (vci 2.8.0):
   (section 7), `vci store info` exists, and none of `VCI_STORE_URL`, `VCI_STORE_TOKEN` and `VCI_STORE` reaches a
   child process.
 - **The plan reads the candidates it set aside** even when a round fetched nothing (section 5).
-- **The conformance suite** (section 14): its 42 scenarios, run against git-meta, SQLite, PostgreSQL and libSQL (in
+- **The conformance suite** (section 14): its 43 scenarios, run against git-meta, SQLite, PostgreSQL and libSQL (in
   each of its three modes) from each backend's `tests/conformance.rs`.
 - **The trait's format-3 side** (2.9, STORE-V2 M2): the object methods (`get_objects`, `put_objects`,
   `remove_objects`, `orphan_objects`, `prune_state_objects`), `Prefetch::Objects`, the listing `Columns` carried by a
@@ -50,6 +50,11 @@ Built and in use (vci 2.8.0):
   and collects objects (`--objects`, `--older-than`); `vci store upgrade --begin` and `--finish`, `vci verify
   --envelope` and `--manifest FILE` for a frame (section 2, "The frame and the decoder rules", "Migration from
   format 1"; section 13).
+- **The changed input named on format 3** (2.10): `run_state_objects` (the state object of a record's run: the
+  `state_obj` column by default, git-meta's run-state links) and `put_run_state` (the link `vci run` writes beside
+  its objects on a store without columns), scenario c43; the plan loads state objects only after its verdicts, for
+  the units that run, within `[store] plan_states` and `plan_states_mib` (section 4, "Objects and columns"; section
+  14; section 15, git-meta, "Run-state links").
 - **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14), the temporary libSQL server
   (`vci_store_libsql::testkit`, section 18) and the CI jobs that run all of the above (`store-stock-git`,
   `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`; the libSQL server is the
@@ -120,7 +125,7 @@ this:
 | `vci plan`, `vci explain` | status; key-only listing of every unit; the chosen values in one batch; about 2,000 manifests from many threads; memo and flags | memo, flags |
 | `vci run` (and `vci ci`) | each attested unit's earlier attestations with values (supersession, from worker threads); last durations | manifests, attestations, removals of superseded attestations, orphan manifests (nothing in `vci ci` without `--push` on a shared store) |
 | `vci fetch`, `vci push` | status (store without an exchange), count, location | the exchange (git-meta only) |
-| `vci prune` | status; every attestation with values; every manifest root; the referenced manifests | removals |
+| `vci prune` | status; every attestation with values; every manifest root; the referenced manifests; the memo of the checked-out commit's tree (2.10) | removals; on git-meta (2.10) the drop of old deletion records and, past `history_max_commits` and in CI only, a push of the store as one commit (`PushMode::RewriteHistoryLongerThan`); the local file's free pages (`compact`) |
 | `vci verify` (an envelope with a `manifestRef`) | one manifest and its base | none |
 | `vci store info` | settings, caps, status, count, location | none |
 
@@ -480,11 +485,15 @@ that is correct for a backend whose values are always present and whose writes a
 | | `put_for_test(test_id, signer, sk, hint, bytes)` | | `put(NewAttestation::for_test(..))` | run |
 | | `batch() -> WriteBatch` | | `WriteBatch::none()` | run's store loop |
 | objects (2.9) | `get_objects(&[&str]) -> Vec<StoredObject>` | | `Unsupported` | plan (hdr, tables and shape objects, then state objects), explain, verify |
+| | `object_sizes(&[&str]) -> Vec<ObjectSize>` (2.10) | | `Unknown` for every id | plan, after the verdicts (which state objects are held, and which fit `plan_states_mib`) |
 | | `put_objects(&[NewObject]) -> usize` | | `Unsupported` | run (the run's four objects, before its records) |
 | | `remove_objects(&[&str]) -> usize` (the orphan rule, one hour of grace) | | `Unsupported` | run after supersession, prune |
 | | `orphan_objects() -> Vec<String>` | | `Unsupported` | prune |
 | | `prune_state_objects(Duration) -> usize` | | `Unsupported` | prune, run's orphan pass |
+| space (2.10) | `compact() -> Option<(u64, u64)>` | | `None` | prune, after its removals |
 | columns (2.9) | `columns(&[&StoredEnvelope]) -> Vec<Columns>` | | every field `None` | supersession, last durations, prune |
+| run state (2.10) | `run_state_objects(&[RunOf]) -> Vec<Option<String>>` | | the `state_obj` column where `Caps::columns`, else `None` | plan, after the verdicts (the changed input of each unit that runs) |
+| | `put_run_state(shape, &[KeyHint], state) -> usize` | | ids checked, nothing kept | run (after the run's objects, before its records) |
 | prefetch | `prefetch(Prefetch)` (`Units`, `Manifests`, `Attestations`, `Objects`) | | no-op | plan, run, verify, prune |
 | | `warm()` | | no-op | plan start |
 | hints | `passing_on`, `remember_passing`, `flag`, `set_flag` | | keep nothing | plan |
@@ -718,6 +727,15 @@ state them:
   it. Every id is validated first (`check_object_id`, `what` = `object id`). An answer that would pass
   `MAX_OBJECTS_ANSWER` (64 MiB) is refused as `Invalid` (`what` = `objects`) before it is allocated. A lazy store
   answers from what it holds here: `prefetch(Prefetch::Objects { ids })` first. Cost: one round trip for tens of ids.
+- **`object_sizes(ids) -> Vec<ObjectSize>`** (2.10): what the store can say of each id **without reading or fetching
+  the object**, one answer per id in order: `Absent` (it holds none: never stored, or removed by the state TTL),
+  `Held(Some(n))` (it holds a value, and `get_objects` would answer at most `n` bytes for it: a text backend gives
+  `base64_decoded_bound` of the text's length), `Held(None)` (it holds a value whose size it cannot give without
+  reading or fetching it: a git-meta value not fetched yet, a row whose kind no object has), or `Unknown` (the
+  default: it cannot say). A value held that `get_objects` then leaves out is unreadable (not base64), not absent.
+  Every id is validated first. Cost: one round trip, or one index lookup per id. The plan uses it for the state
+  objects it loads after the verdicts: it reads, in order, only those that fit `[store] plan_states_mib`, reads one
+  of unknown size alone, and calls a state object expired only when the answer is `Absent`. Scenario c44.
 - **`put_objects(objects) -> usize`**: each under the BLAKE3 of its bytes, **idempotent by id**: an id already stored
   is not written again but its `put_at` is refreshed, so a concurrent writer's objects (queued before its records)
   start their grace at its own put. `NewObject::validate` first (non-empty, within the kind's bound, headed by the
@@ -747,8 +765,34 @@ state them:
   everything on a store without `Caps::columns`. Values are not read. Cost: one round trip whatever the length, or
   the listing's own cache. A put without columns on a store that keeps them clears the slot's columns; a put of the
   same bytes with other columns replaces them (the bytes being a no-op does not make the columns one).
+- **`compact() -> Option<(u64, u64)>`** (2.10): give the file system back the space of what was removed when that is
+  cheap, after `vci prune`'s removals. A local SQLite file (the SQLite store's, git-meta's, the libSQL local mode's)
+  frees its pages once they are a quarter of it and at least 16 MiB: `PRAGMA incremental_vacuum` when the file is in
+  incremental mode, else the one `VACUUM` that puts it there (`PRAGMA auto_vacuum = INCREMENTAL; VACUUM`), so every
+  later compaction costs the pages freed, not the file's size; then `PRAGMA wal_checkpoint(TRUNCATE)`. Returns the
+  file's size before and after when it freed anything. git-meta first removes its log rows (`metadata_log`) older
+  than both the last materialization and a day (an incremental serialization reads only rows after the
+  materialization), in one write transaction with reading the marker; while a serialization journal is open (a
+  git-meta serialization killed, or failing, before vci checked its commit, or one under way) the journal's marker,
+  which that serialization puts back, counts instead when it is older, and a journal without one keeps every row. A
+  server (PostgreSQL, libSQL remote and replica) reclaims its own space: `None`. Never removes a
+  record; a failure is a warning in `vci prune`.
+- **`run_state_objects(runs) -> Vec<Option<String>>`** (2.10): the state object each of these records' runs
+  wrote (`RunOf { record, shape }`: a listed record and the shape its descriptor names), one per entry in order,
+  values not read; `None` where the store says none. The default answers from the `state_obj` column on a store with
+  `Caps::columns` (one `columns` call) and `None` elsewhere; a store without columns that can say it overrides it
+  (git-meta's run-state links, section 15). Store data like a column: it chooses which state object the plan's
+  failure text loads, which may have expired since, and never a verdict. The plan calls it once, after the verdicts,
+  for the best candidates of the units that run whose `entry:` text says the attested hash was not loaded, and never
+  when every unit skips.
+- **`put_run_state(shape, hints, state) -> usize`** (2.10): say that the run whose records carry these key hints
+  and name this shape wrote this state object, on a store that keeps no columns; inside the open batch, after the
+  run's objects. The default checks the ids and keeps nothing (a store with columns has the id in each record's
+  `state_obj` column). `vci run` warns on an error and attests anyway: no verdict reads it.
 - **Fail open**: a plan whose `get_objects` fails runs the candidates that needed them; `vci run` warns on a failed
-  `remove_objects` or `prune_state_objects` as it does on a failed manifest collection; prune exits 2.
+  `remove_objects` or `prune_state_objects` as it does on a failed manifest collection; prune exits 2. A failed
+  `run_state_objects`, or a state object that cannot be fetched or decoded, leaves the plan's text as the verdict
+  wrote it.
 
 ### Provided reads
 
@@ -1136,10 +1180,13 @@ share one handle, one pool and one circuit breaker. On any error, selecting or o
 | `VCI_STORE_CONNECT_TIMEOUT_SECS` | bound on connecting, in seconds (a number, more than 0 and at most 3600) | 5 |
 | `VCI_STORE_TIMEOUT_SECS` | bound on one statement or request, same form | 30 (a network backend lifts it to 10 min for `vci prune`, `OpenContext::long_running`) |
 | `VCI_STORE_SYNC` | `off` disables SQLite `synchronous`, in git-meta's store (which also turns it off when `CI` is set) and in the SQLite backend and libSQL's files (which do not look at `CI`); `replica` asks the libSQL store for its replica mode | unchanged |
-| unchanged, git-meta only | `VCI_FETCH_JOBS`, `VCI_LOCK_TIMEOUT_SECS`, `VCI_DELETION_RECORDS_DROP_AT`, `VCI_DELETION_RECORDS_KEEP_SECS` | |
+| `VCI_STORE_MAX_AGE_DAYS` | 2.10: `vci prune` removes a unit's attestations issued more than this many days ago but its newest by each signer (0: no limit, at most 3650) | `[store] max_age_days`, else 14 |
+| `VCI_STORE_DELETION_RECORDS_HOURS` | 2.10, git-meta: hours a deletion record stays in the metadata tree (0 to 720) | `[store] deletion_records_hours`, else 6 |
+| `VCI_STORE_HISTORY_MAX_COMMITS` | 2.10, git-meta: `vci prune` in CI (`CI` set) publishes the store as one commit once the fetched history has more commits (0: never) | `[store] history_max_commits`, else 2000 |
+| unchanged, git-meta only | `VCI_FETCH_JOBS`, `VCI_LOCK_TIMEOUT_SECS`, `VCI_DELETION_RECORDS_DROP_AT` (2,000 since 2.10, 20,000 before), `VCI_DELETION_RECORDS_KEEP_SECS` (wins over `deletion_records_hours`) | |
 | tests only | `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require`, `VCI_TEST_PG_BINDIR` (section 14); `VCI_TEST_LIBSQL_URL`, `VCI_TEST_LIBSQL_TOKEN`, `VCI_TEST_LIBSQL=require` (section 18) | |
 
-`vci_store::select::ENV_VARS` lists the eight `VCI_STORE*` variables `resolve` reads (`VCI_STORE_SYNC` since the
+`vci_store::select::ENV_VARS` lists the fifteen `VCI_STORE*` variables `resolve` reads (`VCI_STORE_SYNC` since the
 libSQL replica). Every e2e
 harness removes them from the environment of the commands it starts, so a developer's exported store never reaches
 the git-specific assertions.
@@ -1209,6 +1256,10 @@ record_format = 3             # 2.9: 3 (default) writes format-3 records on a st
                               # envelope JSON a vci 2.8 reads, for one release; VCI_STORE_RECORD_FORMAT wins
 explain_hashes = true         # 2.9: write the run's state object (the attested hashes `vci explain` prints; no verdict
                               # reads it); false writes three objects a run; VCI_STORE_EXPLAIN_HASHES wins
+max_age_days = 14             # 2.10: vci prune removes a unit's attestations issued more than this many days ago but its
+                              # newest by each signer, whatever tree they were made on (0: none); VCI_STORE_MAX_AGE_DAYS wins
+deletion_records_hours = 6    # 2.10, git-meta: hours a published deletion's record stays in the metadata tree; VCI_STORE_DELETION_RECORDS_HOURS
+history_max_commits = 2000    # 2.10, git-meta: vci prune in CI publishes the store as one commit past this; VCI_STORE_HISTORY_MAX_COMMITS
 explain_hashes_days = 2       # 2.9: a state object older than this is removed even while referenced, by `vci run`'s
                               # orphan pass and `vci prune` (0 to 365; 0 writes the run's state object and removes it
                               # at the end of the same run: use explain_hashes = false instead); every writer applies
@@ -1663,7 +1714,7 @@ Hence `AttestationStore: Send + Sync`.
     `exchange_point` (section 7). `vci ci --push` calls the same `push_with` as `vci push` with the ci's repository;
   - push uses `PushMode`; `PushStatus` matches have a `_` arm (`vci: push to <remote> finished`, which git-meta never
     reaches);
-  - prune uses `status()`, `prefetch(Attestations)`, `read_all`, `remove(vec![e])`, `prefetch(Manifests)`,
+  - prune uses `status()`, `prefetch(Attestations)`, `read_all`, `remove` (one call for every record since 2.10), `prefetch(Manifests)`,
     `manifest`, `manifest_roots` and `remove_manifests(&[root])`; its "(run `vci fetch`)" hints appear only when
     `caps().lazy_values`;
   - verify uses `prefetch(Manifests)` and `manifest`. Its message for an envelope verified outside a repository, `…
@@ -1687,13 +1738,30 @@ Hence `AttestationStore: Send + Sync`.
     compares the key's signer segment with the verified key's signer id (`signer`), loads the hdr, tables and shape
     objects its format-3 candidates name through one `get_objects` per round in candidate-priority order
     (`Prefetch::Objects` first on a lazy store) under a 16 MiB verdict-object cap, recomputes each id, checks the hdr
-    once per `(project, hdr id)`, resolves the descriptor and observes the resolved set at HEAD (`inputs`), and loads
-    at most 16 state objects, named by the records' `state_obj` column, for the failure text;
+    once per `(project, hdr id)`, resolves the descriptor and observes the resolved set at HEAD (`inputs`); after
+    the verdicts (since 2.10; 2.9.0 loaded at most 16 during them, named by the `state_obj` column), for the best
+    candidates of the units that run whose `entry:` text says the attested hash was not loaded, it groups them by
+    run (shape and key hint), ranks the runs (the most units' best candidates first, then the most candidates, then
+    the newest), asks `run_state_objects` only for the runs whose state objects `[store] plan_states` can load
+    (once for that many runs, again for twice as many while fewer were named), and loads the distinct state objects in the runs' order: `Prefetch::Objects` of at most
+    `plan_states` on a lazy store, then `object_sizes`, then `get_objects` of as many at a time as fit `[store]
+    plan_states_mib` (nothing at all with either at 0), for the failure text only; and `run` calls `put_run_state`
+    after `put_objects` (git-meta's run-state link);
   - prune (cmds.rs) lists with `list_all` and `columns` on a store that keeps them, reads the expired candidates,
     the records of a unit with one beyond `keep` by the hints, the rows the columns do not describe, and every row
     while a manifest remains (`manifest_roots`), confirms each delete from the signed statement (expiry; the
     unit's order by the signed `issuedAt`), then `orphan_objects`, `remove_objects` and `prune_state_objects` (`--objects` runs only these,
     `--older-than DAYS` sets the state age for one run); git-meta's prune reads every value as before;
+  - since 2.10 both of prune's passes hand each unit and signer's current records to one decision (cmds.rs
+    `decide`): one a plan of the checked-out commit's tree used (`passing_on` of `head_tree`) stays; a format-1
+    record issued before the group's newest format-3 one goes (not under `record_format = 1`); of the rest the newest stays; one
+    issued before `now - max_age_days` goes whatever its tree; the `keep` newest and those on a live tree stay. On a
+    store with columns the key hints run the same decision first to choose which groups are read, and the signed
+    statements decide. Then, after the objects, git-meta's deletion records and history (section 15) and
+    `compact()`. A referenced manifest the store does not hold no longer keeps every manifest; one that is stored
+    and cannot be read still does. `vci store upgrade --finish` on git-meta counts the format-1 records by their
+    first byte after `prefetch(Attestations)` and, at zero, calls `remove_manifests` with every root left. On a
+    shared store (PostgreSQL, libSQL) the memo is the server's, so a plan of that tree on any machine counts;
   - `vci store upgrade --begin` and `--finish` reach `SqliteStore`, `PgStore` and `LibsqlStore` directly (the trait
     has no upgrade method: the DDL is an operator action on one concrete backend); `vci verify` decodes a frame to
     its envelope (`--envelope` prints it and verifies nothing), resolves the set from the run's objects and checks the
@@ -1778,7 +1846,7 @@ What the scenarios can and cannot check through the trait:
   back, so that c37, c38 and c42 can cross the one-hour grace and the state TTL without waiting (`UPDATE objects SET
   put_at = put_at - ?` on a SQL store; on git-meta `UPDATE metadata SET last_timestamp = last_timestamp - ?` for the
   object's key of each kind in `.git/git-meta.sqlite`).
-- **Objects (2.9).** c35 to c39 and c42 run only on a store whose `Caps::objects` is set and skip otherwise, after c35
+- **Objects (2.9).** c35 to c39, c42, c43 and c44 (2.10) run only on a store whose `Caps::objects` is set and skip otherwise, after c35
   has checked that every object method of such a store is `Unsupported`; c36's validation and c40's and c41's
   format-3 records run everywhere (a store without `Caps::columns` answers none in c40 and skips its second half).
   The fixtures are `conformance::scenarios::Run3` (a run's four objects built with vci-core's encoders, their ids, and
@@ -1834,6 +1902,8 @@ whose base64 payload carries `predicate.manifestRef`.
 | c40 | columns_match_the_put | `columns` gives back what the put passed, in input order; none for a format-1 record, a put without them, a removed key, and everything without `Caps::columns`; a re-put without columns clears them, with others replaces them; a copy with `with_columns` keeps them |
 | c41 | mixed_formats_in_one_namespace | an envelope and a frame of one unit side by side: key order, byte-exact reads, `decode_record` tells them apart, the frame's `ManifestRef` is `Inline` so `orphan_manifests` goes on, `record_object_refs` names its objects; `count` sees both |
 | c42 | object_deletions_reach_peers | objects and a frame reach another peer (a replica, by `seq`), and so do the record's removal and, aged past the grace, the objects' (`gone` rows): the peer lists nothing, reads the stale entry as `GONE`, gets no object |
+| c43 | run_state_objects_name_the_runs_state | `run_state_objects` names the run's state object of a record put in a batch with its objects and `put_run_state` (the `state_obj` column, or git-meta's link), one answer per run in order (the same run twice, twice), `None` for a record whose run named none (no column, no link), none for no runs, and the same on another peer after a sync |
+| c44 | object_sizes_say_what_is_held | `object_sizes` answers one per id in order (a repeated id twice), reading no object: a stored object `Held` with a size no smaller than the bytes `get_objects` answers and at most 4 more (or `Held(None)`), an id never stored `Absent`, both `Held` on another peer after a sync, a state object removed by its TTL `Absent`; an invalid id refused, none asked none answered; a backend that says `Unknown` for every id skips the rest (2.10) |
 
 Backends keep their own tests for what is theirs:
 
@@ -2013,6 +2083,12 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   through `cat-file`, or not fetched). A promised row, a missing blob or a text that is not base64 is **left out**
   (prefetch `Objects` first); the answer is refused as `Invalid{objects}` once the decoded sizes would pass
   `MAX_OBJECTS_ANSWER`, before that decode.
+- `object_sizes` (2.10): on a pooled reader `Reader::object_size_rows`, four indexed lookups an id (the object key of
+  each kind, the lowest kind's string row first, as `get_objects` reads it; the value's length or blob id, never the
+  value), then one `git rev-list --missing=allow-any` and `git cat-file --batch-check` for the sizes of the fetched
+  values kept as blobs (`present_sizes`; nothing fetched). Inline text: `Held(base64_decoded_bound(length))`; a blob
+  the object database holds: the same of its size; a promised row, a blob it lacks, or a row whose value is not a
+  string: `Held(None)`; no row of any kind: `Absent`.
 - `remove_objects` and `orphan_objects` apply the orphan rule at once, as the referrer scan `orphan_manifests` is:
   `hydrate_attestations` first (every attestation not fetched yet is fetched: a run's records are on every path target,
   so any of them could name an object; `vci prune` has prefetched them already), the pool emptied, then
@@ -2029,9 +2105,28 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   objects: a manifest's referrers are on the paths it lists, an object's can be any record), which is `vci prune`'s
   cost and not a per-run one: `vci run` does not call them on a store without columns (section 4).
 - `prune_state_objects(older_than)`: the object rows of kind 4 whose `last_timestamp` is older than that, deleted
-  whatever names them (values not read).
+  whatever names them (values not read). Since 2.10 it then removes the run-state links (below) of runs no
+  attestation key carries the hint of any more (one range query of the links; only when there is one, one of the
+  attestation keys, values not read), so a link outlives its state object while its run's records stay, and goes
+  with the last of them.
 - `columns` is the default: `Columns::default()` for every entry (the hint is the key; the columns a put passes are
   ignored).
+- **Run-state links (2.10).** No signed field names a run's state object and git-meta keeps no `state_obj` column,
+  so before 2.10 nothing on git-meta said which state object a record's run wrote, and a plan could never name a
+  changed input of a format-3 record there (`entry: changed (attested hash not loaded)`: 477,407 of 500,784 Rails
+  re-runs in a day at vex). `put_run_state(shape, hints, state)` writes, inside the run's batch after its objects,
+  one string value per distinct hint on the `project` target under
+  `vci:run-state:<shape id>:<hint>:<state id>` (`key::run_state_key`: the hint spelt as an attestation key spells it,
+  `<issued hex>.<tree16 | ->`; the value is the state id again), at `project/vci/run-state/<shape>/<hint>/<state>/__value`.
+  `run_state_objects` finds it from what a plan has without reading a value: the record's key hint and the shape its
+  descriptor names give the prefix `key::run_state_prefix`, one range of the `(target_type, target_value, key)` index
+  per distinct run (`key >= prefix AND key < ` the prefix with its last `:` as `;`; the 2.10 development builds tested
+  `substr(key, …)` of every `project` row instead, 3.2 ms a run on vex's 32,358 rows, 0.003 ms now) on a
+  pooled reader, promised rows included (a lazy clone needs no fetch for it), the first link's state id. A record
+  without a hint, or whose run wrote no link (a vci before 2.10, `explain_hashes = false`), gets `None`. Links are
+  immutable (everything is in the key) and two writers never write one key with different values, so merges keep
+  them as any value; a vci before 2.10 lists none of them (they are not attestation, manifest or object keys) and
+  deletes none.
 - **The merge's put-back rule applies to objects by id** (`restore_referenced_objects`, beside
   `restore_referenced_manifests`): after a fetch merged a tip that deleted an object, the deletion records of object
   keys the store held before the merge or the tip holds are candidates; the ones a local attestation names
@@ -2064,8 +2159,10 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   query holds an `@` (it masks up to the last `@`), and it also masks `password=`, `sslpassword=`, `sslkey=` and
   `authToken=` values in a query. `redact_userinfo` is still used for remotes the user typed, in warnings.
 - `fetch` is `AttestStore::fetch`.
-- `push(Merge)` is `push`, and `push(RewriteHistory)` is `push_rewriting_history`. A future `PushMode` is
-  `Unsupported{git-meta, "this kind of push"}`.
+- `push(Merge)` is `push`, `push(RewriteHistory)` is `push_rewriting_history`, and (2.10)
+  `push(RewriteHistoryLongerThan(n))` is `push_rewriting_history_longer_than(n)`: a rewrite on each attempt whose
+  fetched history has more than `n` commits, else a merge on top (`PushOutcome::rewritten` says which). A future
+  `PushMode` is `Unsupported{git-meta, "this kind of push"}`.
 
 **Errors**: `From<GitError>` (in store.rs) maps `Invalid{what, value, reason}` field for field. Every other variant
 becomes `StoreError::Backend(Box<GitError>)`, so the display text is byte-identical and `downcast_backend::<GitError>()`
@@ -2115,6 +2212,83 @@ refused by a serde_json envelope parse without an error (and `Inline` for manife
 fetched by one `Prefetch::Objects` (4 resolved, 4 blobs) and left out before it, the merge putting back the three named
 objects another clone deleted (not the state object) and publishing them, the orphan scan keeping every object while
 the record cannot be fetched and fetching it once online, and an idempotent put inside a batch restarting the grace.
+**Keeping it small (2.10).** `vci prune` on git-meta (cmds.rs `prune_deletion_records`, `rewrite_long_history`)
+calls three `AttestStore` methods beside the trait: `deletion_record_counts()` (how many records, how many older than
+the window, and how many of those wait for their deletion to be published), `drop_deletion_records()` (every record
+past the window whose deletion is published, whatever their number: the `tombstones` rows and their paths in a commit
+on top of `refs/meta/local/main`, under the exchange lock; a push drops them once there are
+`VCI_DELETION_RECORDS_DROP_AT`, 2,000, past the window; both return a `DeletionRecords` with `total`, `old`,
+`unpublished` and the rows actually `dropped`) and `history_commits()` (`git rev-list --count` of
+`refs/<ns>/remotes/main`; `None` before the first fetch), then, in CI only (`CI` set to anything but empty, `false` or
+`0`; elsewhere a note says to run `vci push --rewrite-history`), the trait's push with
+`PushMode::RewriteHistoryLongerThan(history_max_commits)` once that count passes `[store] history_max_commits`. The
+count only decides whether to try: `push_impl` counts the tip each attempt fetched (`commit_count`) and rewrites only
+when it is still longer, else pushes on top of it (`PushOutcome::rewritten` false, and a note): a clone whose
+tracking ref predates another clone's rewrite, or whose rewrite lost the lease to one, pushes on top of that rewrite
+instead of rewriting it again (it used to count before its fetch, and vex's two parallel attest jobs would each
+rewrite). The parentless commit is built beside `refs/meta/local/main`, which moves to it (compare-and-swap from
+the commit it was made from) only once `git push` succeeds: moved before, an attempt whose lease failed merged the
+new tip into a commit that shares no history with it, local side first, and a manifest another clone deleted during
+the rewrite came back. A record is published (`published_deletions`) when neither
+`refs/meta/local/main`'s tree nor the remote tip last fetched or pushed (`refs/<ns>/remotes/main`; the tip just
+fetched, in a push) holds its value: the deletion was serialized and the remote has it. Until then it stays,
+however old. Dropped earlier, a record nothing had serialized (a prune with `deletion_records_hours = 0` would drop
+the ones it had just written) leaves the store with neither the value nor a record while the local tree holds the
+value, and every serialization after it refuses (no push or fetch from that clone again); one serialized but not
+pushed lets the push's check of lost values put the value back. The window is process-wide (`meta::set_deletion_records_keep`, set by vci-cli from
+`[store] deletion_records_hours` when it opens a git-meta store; `VCI_DELETION_RECORDS_KEEP_SECS` wins). Why 6 hours
+and not 24: on vex on 6 November 2026, 145,306 of the tree's 148,423 attestation deletion records were under a day
+old and 22,897 under six hours (each run supersedes the last one's attestations, most within hours of their issue); a
+record only stops a clone whose history does not reach the deletion from publishing the value again, and such a value
+(superseded, expired, aged out, unreferenced) is deleted again by the next prune. The merge without a common ancestor
+(`merge_from_paths`, after a rewrite) is three-way on the newest tip this clone had (`rewritten_base`), when the
+root of the tip's history is a `vci: metadata history rewritten` commit, and whose tree is here: that root itself
+when its `Rewrite-of: <commit>` trailer (2.10, `orphan_commit`) names a commit `refs/meta/local/main` contains and
+whose tree it has (the clone's own rewrite, killed after `git push` landed and before the local ref moved to it);
+else the first that `refs/meta/local/main` contains, or that is such a rewrite, of the tracking ref as `fetch_named`
+read it before `git fetch` force-updated it, the tips earlier fetches noted before their `git fetch` moved it and
+whose merge did not finish (`vci-materialized-<ref>.unmerged`, newest first, removed once a merge or push finishes),
+then the `materialized` marker (the tip last merged, or since 2.10 the commit the last push published, written once
+the local ref is that commit). (`git push` itself moves the tracking ref through the remote's fetch refspec, and a
+process killed before vci finishes leaves it at a tip nothing was merged with; before 2.10's fixes the marker named
+the tip before the clone's last push, and that push's values then counted as the clone's own additions.) A tree equal
+to the tree of a commit in the local history is not taken as a base: a value added and deleted again, its record
+dropped, makes a tree an older commit had. The rewrite published a tree that descends from every tip before it, so a value the clone
+got from its last fetched tip that the new tip lacks was deleted there (git-meta's three-way merge deletes it; the
+values the clone added since are kept), and the fetch notes `<remote>'s metadata history was rewritten since this
+clone last fetched it: merged it on the tip this clone last fetched (<id>), so the N value(s) deleted there since are
+deleted here too` instead of warning about attestations dropped without a record. Without such a base (a clone that
+never fetched, a tip of another history) it takes git-meta's two-way merge, local side first, except that the tip's
+deletion record of an attestation key (`vci:attestation:...`, `parse_key`) wins over the local value (such a key is
+never written twice: the record is the newer change), and so does the record of a manifest or object key over a
+local value whose row's `last_timestamp` is not after the record's `timestamp` (`deleted_after_written`; the record's
+blob is fetched when missing; a row put since, or an object put again, which moves its row to now, keeps the local
+value; before, a manifest or object always kept the local side and such a clone published every one the rewrite's
+prune had deleted). With the attestation rule alone, every restore of a CI cache saved before a rewrite published
+again every value deleted since whose record had passed the window (`store_rewrite_stale_cache.rs` without the base:
+3 of 3 jobs restoring one cache). Whatever the base, a merge commit whose tree holds both a value and the deletion
+record of its key drops the value where the record is newer (`settle_value_and_record`): an attestation key's always,
+a manifest's or object's by `deleted_after_written`; not a key the fetched tip itself holds both of (the push's check
+would put the value back), and no other key.
+`crates/vci-git/tests/store_history_rewrite.rs` (7 tests) holds it: a clone holding the history before a rewrite
+and the deleted attestation's value pushes one commit on top of the new history without that attestation, while a
+third clone's push in the rewrite's window makes its lease fail and is kept by its next round; a value whose record
+was dropped before the rewrite stays deleted; the counts and the drop; a clone's deletion of a manifest and an
+attestation and its addition in the rewrite's window all kept, and the local metadata commit moved to the rewrite
+once published; two clones that both find the history long rewrite it once, and a clone that fetched before the
+rewrite pushes on top of it; a stale deletion record of a state object and a manifest put again does not delete them;
+without a base, a manifest or object written before the tip's record goes and one written after stays.
+`store_rewrite_killed.rs` (8 tests) kills a fetch after `git fetch` and a push or rewrite after `git push` (the
+`fetch-after-git-fetch` and `push-after-git-push` failpoints) and checks that nothing deleted since comes back, from
+the clone or from a cache saved in that state, and that a merged tree keeps the record, not the value;
+`store_ref_damage.rs` (2 tests) a local or tracking ref naming a commit the clone lacks.
+`store_rewrite_stale_cache.rs` (4 tests)
+restores one pre-rewrite cache three times (none brings the deleted value back, without a rewrite or with one, and
+with a cache saved mid-fetch), and keeps every value of a clone that never fetched; `store_deletion_records_unpublished.rs`
+(3 tests) keeps a record not yet serialized, or serialized and not pushed, past the window until a push publishes it.
+`compact()` removes git-meta's log rows older than the last materialization and a day, then frees the file's pages
+(section 4); `store_crash_safety.rs` checks that it keeps the rows a killed serialization's journal still needs.
+
 The conformance world's `age_objects` moves `last_timestamp` in `.git/git-meta.sqlite`, so c35 to c42 run in full
 (c40's columns half skips: git-meta keeps none).
 
@@ -2304,6 +2478,9 @@ Schema version 2 is this without the `manifests` table. The libSQL store shares 
   `MAX_OBJECTS_ANSWER`, refused as `Invalid{what: "objects"}` past it before a byte is read, then `SELECT kind,
   bytes` per id, in the order asked; a missing id, a row whose `kind` names no kind, and a row whose `bytes` is not a
   BLOB are left out. Timing line `store: sqlite: read N object(s)`. Nothing is read on a file without the additions.
+- (2.10) `object_sizes`: the same `SELECT kind, length(bytes) FROM objects WHERE id = ?1` per id, no blob read: a
+  row `Held(length)` (`Held(None)` when its `kind` names no kind), no row `Absent`; every id `Absent` on a file that
+  does not exist or has no additions.
 - (2.9) `orphan_objects`: `SELECT id FROM objects WHERE put_at < now - 3600 AND NOT EXISTS (SELECT 1 FROM
   attestations WHERE hdr = objects.id OR tables_id = objects.id OR shape = objects.id OR state_obj = objects.id)
   ORDER BY id` (the four partial indexes), ids that are not object ids (a foreign row) left out; no value read.
@@ -2685,6 +2862,7 @@ Each read is served from the cache when it can be, and otherwise:
 | `manifest` | a single-row query |
 | `manifests` | `root = ANY($2)` |
 | `columns` (2.9) | `SELECT key, format, commit_id, platform, state, duration_ms, expires, hdr, tables_id, shape, state_obj FROM … WHERE ns=$1 AND key = ANY($2)`, in chunks of 5,000 keys, never cached; none for a key not returned, a NULL column, or a value no column can hold (a negative `format` or `duration_ms`) |
+| `object_sizes` (2.10) | `SELECT id, kind, octet_length(bytes)::int8 FROM vci.objects WHERE ns=$1 AND id = ANY($2)`, distinct ids in chunks of 5,000, no `bytes` read: a row `Held(octet_length)` (`Held(None)` when its `kind` names no kind), an id without one `Absent` |
 | `get_objects` (2.9) | `SELECT id, kind, bytes, sum(octet_length(bytes)) OVER () FROM vci.objects WHERE ns=$1 AND id = ANY($2)`, distinct ids in chunks of 5,000, the answer put back in the order asked; the window sum rides on every row, so an answer past `MAX_OBJECTS_ANSWER` is refused on its first row with the rest read off the connection and dropped; a `kind` no kind has is a foreign row, left out; never cached (`Prefetch::Objects` does nothing) |
 
 The rest go to the server directly:
@@ -3383,7 +3561,10 @@ cut`. `orphan_objects` is one read. `columns` answers what an open batch on the 
 one request per 5,000 keys. `get_objects` answers from the handle's object cache (a `prefetch(Objects)`, or its own
 writes, which `settle` caches) and asks the server for the rest in one request per 5,000 ids; each id answered leaves
 the cache, as a value read does, so the next call sees another writer's removal (c42). The answer is bounded at
-`MAX_OBJECTS_ANSWER` while it is decoded.
+`MAX_OBJECTS_ANSWER` while it is decoded. `object_sizes` (2.10) answers an id whose bytes the handle has cached from
+its cache and asks the server for the rest, `SELECT id, kind, length(bytes), typeof(bytes)` in one request per 5,000
+ids, no bytes read: base64 text `Held(base64_decoded_bound(length))`, a blob `Held(length)`, a `kind` no kind has
+`Held(None)`, an id without a row `Absent` (a replica asks its server; a local file answers as SQLite does).
 
 **Short transactions** (2.8.2). 2.8.1 sent a project's queue in one transaction, flushed early at 8 MiB: on vex's CI
 each such request took about 15 s to commit (about 0.5 MB/s) even alone, held the database's one write lock while

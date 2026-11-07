@@ -145,8 +145,73 @@ pub fn parse_rfc3339(s: &str) -> Result<i64> {
     Ok(t.as_second())
 }
 
+/// `s` as vci's text output prints it (`vci plan`'s text format and the
+/// github format's notices and warnings, not its file lists; `vci explain`,
+/// and the plan `vci ci` prints): every control character (C0 and C1, DEL),
+/// the Unicode line and paragraph separators (U+2028, U+2029) and the
+/// bidirectional formatting characters (U+061C, U+200E, U+200F, U+202A to
+/// U+202E, U+2066 to U+2069) written as Rust writes them in a
+/// string literal: `\t`, `\n`, `\r` or `\u{hex}` (ESC is `\u{1b}`). So a
+/// committed file name, a store key or a reason cannot start a line of its
+/// own (a forged `SKIP …` or `N to skip, M to run` that the action's `grep -c
+/// '^SKIP '` would count), end a GitHub output or workflow command, move
+/// the terminal's cursor or reorder what is shown. Every other character,
+/// a backslash too, is printed as it is: the text is for reading, and
+/// `--format json` gives the exact names (serde escapes them there).
+pub fn printable(s: &str) -> std::borrow::Cow<'_, str> {
+    fn escaped(c: char) -> bool {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{061C}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    }
+    if !s.chars().any(escaped) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if escaped(c) => out.push_str(&format!("\\u{{{:x}}}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
+    /// 2.10.0: control characters, line separators and bidirectional
+    /// formatting characters are written as escapes, nothing else changes.
+    #[test]
+    fn printable_escapes_what_could_break_a_line_or_the_terminal() {
+        assert!(matches!(
+            super::printable("src/a b.test.ts \\ é"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            super::printable("x\nSKIP f  (y)\r\t\u{1b}[2J\u{7f}\u{85}"),
+            "x\\nSKIP f  (y)\\r\\t\\u{1b}[2J\\u{7f}\\u{85}"
+        );
+        assert_eq!(
+            super::printable("a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}"),
+            "a\\u{2028}b\\u{2029}c\\u{202e}d\\u{2066}e\\u{200f}"
+        );
+        // The Arabic letter mark, the third of Unicode's Bidi_Control
+        // marks with U+200E and U+200F.
+        assert_eq!(super::printable("al\u{61c}m"), "al\\u{61c}m");
+        assert_eq!(super::printable("\0"), "\\u{0}");
+    }
+
     use super::*;
 
     #[test]
