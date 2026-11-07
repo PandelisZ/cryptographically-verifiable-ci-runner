@@ -742,6 +742,16 @@ impl AttestationStore for LibsqlStore {
         }
     }
 
+    /// Local: the file's free pages, as the SQLite store frees them. Remote
+    /// and replica: nothing (the server reclaims its own space, and the
+    /// replica file is libsql's to keep).
+    fn compact(&self) -> Result<Option<(u64, u64)>, StoreError> {
+        match &self.inner {
+            Inner::Local(s) => s.compact(),
+            Inner::Remote(_) | Inner::Replica(_) => Ok(None),
+        }
+    }
+
     /// Remote and replica: the server's (what an open batch on this thread
     /// queued for a key first).
     fn columns(&self, envs: &[&StoredEnvelope]) -> Result<Vec<Columns>, StoreError> {

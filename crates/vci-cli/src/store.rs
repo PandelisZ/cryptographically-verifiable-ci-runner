@@ -251,6 +251,13 @@ fn open(repo: &Repo, env: &dyn Fn(&str) -> Option<String>) -> Opened {
             };
         }
     };
+    // git-meta's deletion records: how long a push or `vci prune` keeps
+    // them (`[store] deletion_records_hours`, since 2.10).
+    if sel.kind.value == "git-meta" {
+        vci_git::meta::set_deletion_records_keep(std::time::Duration::from_secs(
+            u64::from(sel.deletion_records_hours.value) * 3600,
+        ));
+    }
     let store = vci_store::open(&factories, &sel, &cx)
         .unwrap_or_else(|e| Arc::new(FailedStore::for_request(&factories, &sel.kind.value, &e)));
     Opened {

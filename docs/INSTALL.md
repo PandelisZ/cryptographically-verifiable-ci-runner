@@ -222,7 +222,7 @@ An agent uses the same commands. Give it:
 | `vci ci` | Plan, run the rest, write an audit log |
 | `vci explain <file>` | Show why a file was not skipped |
 | `vci push` / `vci fetch` | git-meta push / pull of the attestations (`refs/meta/main`) |
-| `vci prune` | Delete expired attestations (publish with `vci push`) |
+| `vci prune` | Delete expired, superseded, old (`[store] max_age_days`) and replaced format-1 attestations and what nothing references; on git-meta also old deletion records, and past `[store] history_max_commits` it publishes the store as one commit (otherwise publish with `vci push`) |
 | `vci verify <envelope>` | Verify one attestation |
 | `vci update [--check]` | Install the latest release the way vci was installed; `--check` only compares |
 

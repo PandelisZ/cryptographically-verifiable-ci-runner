@@ -689,6 +689,52 @@ impl AttestationStore for SqliteStore {
             self.inner.opts.kind
         )]
     }
+
+    /// The file's free pages, once they are a quarter of it and at least
+    /// 16 MiB ([`compact_file`]), on a pooled connection outside any
+    /// transaction. A read-only handle, or a file that does not exist,
+    /// frees nothing.
+    fn compact(&self) -> Result<Option<(u64, u64)>, StoreError> {
+        if self.inner.opts.read_only || !self.inner.exists()? {
+            return Ok(None);
+        }
+        Ok(self
+            .inner
+            .with_conn(Mode::Write, |c| {
+                compact_file(&c.db).map_err(|e| self.inner.error("compact the file", e))
+            })?
+            .flatten())
+    }
+}
+
+/// Free the pages of a SQLite file once they are a quarter of it and at
+/// least 16 MiB: `PRAGMA incremental_vacuum` when the file is in
+/// incremental mode, else the one `VACUUM` that puts it there (every later
+/// one is then incremental, a cost in the pages freed rather than the
+/// file's size). Returns the file's size in bytes before and after when it
+/// freed anything. (vci-git's `compact_sqlite` does the same for
+/// git-meta's file.)
+fn compact_file(db: &Connection) -> rusqlite::Result<Option<(u64, u64)>> {
+    let pragma = |name: &str| -> rusqlite::Result<i64> {
+        db.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+    };
+    let page = pragma("page_size")?.max(0) as u64;
+    let pages = pragma("page_count")?.max(0) as u64;
+    let free = pragma("freelist_count")?.max(0) as u64;
+    if free * page < 16 * 1024 * 1024 || free * 4 < pages {
+        return Ok(None);
+    }
+    if pragma("auto_vacuum")? == 2 {
+        // It frees a page a step: stepped to the end, not run once.
+        let mut stmt = db.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+    } else {
+        db.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+    }
+    let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    let after = pragma("page_count")?.max(0) as u64 * page;
+    Ok(Some((pages * page, after)))
 }
 
 // ---- connections -----------------------------------------------------------------

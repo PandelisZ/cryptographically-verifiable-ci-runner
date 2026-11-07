@@ -1614,12 +1614,105 @@ impl Drop for ScratchGitDir {
     }
 }
 
-/// How long a deletion record is kept before a push drops it (see
-/// [`AttestStore::drop_old_deletion_records`]); `VCI_DELETION_RECORDS_KEEP_SECS`.
-const DELETION_RECORDS_KEEP_SECS: i64 = 24 * 60 * 60;
-/// How many deletion records past that make a push drop them;
-/// `VCI_DELETION_RECORDS_DROP_AT`.
-const DELETION_RECORDS_DROP_AT: i64 = 20_000;
+/// How long a deletion record is kept before a push or `vci prune` drops it
+/// (see [`AttestStore::drop_old_deletion_records`]) when the command line
+/// set no window ([`set_deletion_records_keep`], `[store]
+/// deletion_records_hours`); `VCI_DELETION_RECORDS_KEEP_SECS` wins over
+/// both.
+///
+/// 24 hours from 2.7.20 to 2.9; 6 since 2.10: on 6 November vex's
+/// metadata tree held 148,423 attestation deletion records, 145,306 of them
+/// written in the 24 hours before (each run's superseded attestations,
+/// most deleted within hours of being issued) and 22,897 in the last 6, so
+/// the window, not the drop, decided the tree's size. A record only stops a
+/// clone whose history does not reach the deletion from bringing the value
+/// back (a merge with any clone whose history has the value deletes it
+/// without one); such a value is superseded, expired or unreferenced, and
+/// the next `vci prune` deletes it again.
+const DELETION_RECORDS_KEEP_SECS: i64 = 6 * 60 * 60;
+/// How many deletion records past the window make a push drop them (`vci
+/// prune` drops any); `VCI_DELETION_RECORDS_DROP_AT`. 20,000 until 2.9.
+const DELETION_RECORDS_DROP_AT: i64 = 2_000;
+
+/// The window [`set_deletion_records_keep`] set, in seconds; negative while
+/// unset.
+static DELETION_RECORDS_KEEP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Set how long this process keeps deletion records before a push or `vci
+/// prune` drops them (`[store] deletion_records_hours`, resolved by the
+/// command line); `VCI_DELETION_RECORDS_KEEP_SECS` still wins.
+pub fn set_deletion_records_keep(window: Duration) {
+    DELETION_RECORDS_KEEP.store(
+        i64::try_from(window.as_secs()).unwrap_or(i64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The deletion-record window in milliseconds: `VCI_DELETION_RECORDS_KEEP_SECS`,
+/// else what [`set_deletion_records_keep`] set, else
+/// [`DELETION_RECORDS_KEEP_SECS`].
+fn deletion_records_keep_ms() -> i64 {
+    let secs = std::env::var("VCI_DELETION_RECORDS_KEEP_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or_else(|| {
+            let set = DELETION_RECORDS_KEEP.load(std::sync::atomic::Ordering::Relaxed);
+            if set >= 0 {
+                set
+            } else {
+                DELETION_RECORDS_KEEP_SECS
+            }
+        });
+    secs.max(0).saturating_mul(1000)
+}
+
+/// The deletion records of the local store: how many there are, and how
+/// many are older than the window ([`AttestStore::deletion_record_counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeletionRecords {
+    pub total: usize,
+    pub old: usize,
+    /// The window, in seconds.
+    pub window_secs: i64,
+}
+
+/// What [`AttestStore::compact_store`] did to the local store's file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compacted {
+    /// git-meta's log rows removed (older than the last materialization
+    /// and than a day).
+    pub log_rows: usize,
+    /// The file's size before and after, when it was vacuumed.
+    pub vacuumed: Option<(u64, u64)>,
+}
+
+/// Free the pages of a SQLite file once they are a quarter of it and at
+/// least 16 MiB: `PRAGMA incremental_vacuum` when the file is in
+/// incremental mode, else the one `VACUUM` that puts it there (later ones
+/// are then incremental). Returns the file's size in bytes before and after
+/// when it freed anything.
+pub(crate) fn compact_sqlite(db: &rusqlite::Connection) -> rusqlite::Result<Option<(u64, u64)>> {
+    let pragma = |name: &str| -> rusqlite::Result<i64> {
+        db.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+    };
+    let page = pragma("page_size")?.max(0) as u64;
+    let pages = pragma("page_count")?.max(0) as u64;
+    let free = pragma("freelist_count")?.max(0) as u64;
+    if free * page < 16 * 1024 * 1024 || free * 4 < pages {
+        return Ok(None);
+    }
+    if pragma("auto_vacuum")? == 2 {
+        // It frees a page a step: stepped to the end, not run once.
+        let mut stmt = db.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+    } else {
+        db.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+    }
+    let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    let after = pragma("page_count")?.max(0) as u64 * page;
+    Ok(Some((pages * page, after)))
+}
 
 /// Nanoseconds `put_manifest` spent in each of its parts.
 static PUT_NS: [std::sync::atomic::AtomicU64; 4] = [
@@ -6897,10 +6990,100 @@ impl<'a> AttestStore<'a> {
         tx.commit().map_err(e)
     }
 
+    /// How many deletion records the local store holds, and how many of
+    /// them are older than the window (`vci prune`, which drops those:
+    /// [`AttestStore::drop_deletion_records`]). Zeros without a store.
+    pub fn deletion_record_counts(&self) -> Result<DeletionRecords, GitError> {
+        let window_ms = deletion_records_keep_ms();
+        let mut out = DeletionRecords {
+            window_secs: window_ms / 1000,
+            ..DeletionRecords::default()
+        };
+        let Some((path, db)) = self.db_rw()? else {
+            return Ok(out);
+        };
+        let (total, old): (i64, i64) = db
+            .query_row(
+                "SELECT count(*), coalesce(sum(timestamp < ?1), 0) FROM tombstones \
+                 WHERE tombstone_type = 'metadata'",
+                [now_ms() - window_ms],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| sql_err(&path, e))?;
+        out.total = usize::try_from(total).unwrap_or(0);
+        out.old = usize::try_from(old).unwrap_or(0);
+        Ok(out)
+    }
+
+    /// Drop every deletion record older than the window from the store and
+    /// the local metadata tree now, whatever their number (`vci prune`; a
+    /// push drops them once there are [`DELETION_RECORDS_DROP_AT`]): how
+    /// many, `None` when there were none or the store has no local commit.
+    /// The next push publishes the drop.
+    pub fn drop_deletion_records(&self) -> Result<Option<usize>, GitError> {
+        let _lock = self.exchange_lock()?;
+        let ns = self.namespace()?;
+        let local_ref = format!("refs/{ns}/local/main");
+        let Some(local) = self.read_ref(&local_ref)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .drop_old_deletion_records(&local_ref, &local, Some(1))?
+            .map(|(_, n)| n))
+    }
+
+    /// How many commits the metadata history fetched from the primary
+    /// remote holds (`refs/<ns>/remotes/main` and its ancestors: what a
+    /// clone's first fetch downloads the commits of, and every later one
+    /// the trees of what is new); `None` before the first fetch.
+    pub fn history_commits(&self) -> Result<Option<u64>, GitError> {
+        let ns = self.namespace()?;
+        let Some(tip) = self.read_ref(&format!("refs/{ns}/remotes/main"))? else {
+            return Ok(None);
+        };
+        let n = self
+            .repo
+            .git()
+            .args(["rev-list", "--count", &tip])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .run_str()?;
+        Ok(n.trim().parse::<u64>().ok())
+    }
+
+    /// Keep the local store's file small (`vci prune`): remove git-meta's
+    /// log rows older than both the last materialization (an incremental
+    /// serialization reads only the rows after it) and a day, then free the
+    /// pages once they are a quarter of the file ([`compact_sqlite`]). On
+    /// vex a developer's store had grown to 1.8 GB, a fresh clone's to 390
+    /// MB, two thirds of it deletion records and the log of applying them.
+    pub fn compact_store(&self) -> Result<Compacted, GitError> {
+        let mut out = Compacted::default();
+        let Some((path, db)) = self.db_rw()? else {
+            return Ok(out);
+        };
+        let e = |err| sql_err(&path, err);
+        let marker: Option<i64> = db
+            .query_row(
+                "SELECT last_materialized FROM sync_state WHERE id = 1",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(m) = marker {
+            let cutoff = m.min(now_ms() - 24 * 60 * 60 * 1000);
+            out.log_rows = db
+                .execute("DELETE FROM metadata_log WHERE timestamp < ?1", [cutoff])
+                .map_err(e)?;
+        }
+        out.vacuumed = compact_sqlite(&db).map_err(e)?;
+        Ok(out)
+    }
+
     /// Remove the deletion records older than the retention window from the
     /// store and from the tree of `local` (the tip of `local_ref`), as a
-    /// commit on top of it, once there are at least
-    /// [`DELETION_RECORDS_DROP_AT`] of them: `(the new commit, how many)`.
+    /// commit on top of it, once there are at least `at` of them (`None`:
+    /// [`DELETION_RECORDS_DROP_AT`]): `(the new commit, how many)`.
     ///
     /// 2.7.20: vex's metadata tree held 465,000 entries, 431,000 of them
     /// deletion records written in the week before (each run's superseded
@@ -6916,17 +7099,16 @@ impl<'a> AttestStore<'a> {
         &self,
         local_ref: &str,
         local: &str,
+        at: Option<usize>,
     ) -> Result<Option<(String, usize)>, GitError> {
-        let env = |name: &str, default: i64| {
-            std::env::var(name)
+        let at = at.unwrap_or_else(|| {
+            std::env::var("VCI_DELETION_RECORDS_DROP_AT")
                 .ok()
                 .and_then(|v| v.trim().parse::<i64>().ok())
-                .unwrap_or(default)
-        };
-        let keep_ms =
-            env("VCI_DELETION_RECORDS_KEEP_SECS", DELETION_RECORDS_KEEP_SECS).max(0) * 1000;
-        let at = env("VCI_DELETION_RECORDS_DROP_AT", DELETION_RECORDS_DROP_AT).max(1) as usize;
-        let cutoff = now_ms() - keep_ms;
+                .unwrap_or(DELETION_RECORDS_DROP_AT)
+                .max(1) as usize
+        });
+        let cutoff = now_ms() - deletion_records_keep_ms();
         let Some((path, mut db)) = self.db_rw()? else {
             return Ok(None);
         };
@@ -7497,12 +7679,41 @@ impl<'a> AttestStore<'a> {
                 (mv, mt)
             }
             None => {
-                let (mv, mt, _) = two_way_merge_no_common_ancestor(
+                let (mut mv, mut mt, _) = two_way_merge_no_common_ancestor(
                     &values(&ours),
                     &tombstones(&ours),
                     &values(tip_snap),
                     &tombstones(tip_snap),
                 );
+                // 2.10: the tip's deletion record of an attestation wins
+                // over the local value. git-meta's merge without a common
+                // ancestor keeps the local side of every conflict, so a
+                // clone that still held the history before a rewrite
+                // (`vci prune` rewrites it once it is long) published again
+                // every attestation deleted since its last fetch: on vex,
+                // whose runs delete 145,000 a day, thousands a stale CI
+                // cache. An attestation's key is never written twice (its
+                // storage key is the digest of what was signed, its hint
+                // the issue time), so a record of it was written after the
+                // value: the deletion is the newer change. A manifest or an
+                // object (keyed by content, put again by a later run) keeps
+                // the local side, and the next prune deletes it again when
+                // nothing references it.
+                for (k, o) in &tip_snap.tombstone_blobs {
+                    if parse_key(&k.key).is_some()
+                        && ours.value_blobs.contains_key(k)
+                        && !tip_snap.value_blobs.contains_key(k)
+                    {
+                        mv.remove(k);
+                        mt.insert(
+                            k.clone(),
+                            Tombstone {
+                                timestamp: 0,
+                                email: o.clone(),
+                            },
+                        );
+                    }
+                }
                 (mv, mt)
             }
         };
@@ -8296,6 +8507,17 @@ impl<'a> AttestStore<'a> {
         self.push_impl(remote, |_| {}, true)
     }
 
+    /// `push_rewriting_history`, calling `before_push(attempt)` right
+    /// before each `git push` (tests: a concurrent writer in that window).
+    #[doc(hidden)]
+    pub fn push_rewriting_history_with_hook(
+        &self,
+        remote: Option<&str>,
+        before_push: impl FnMut(u32),
+    ) -> Result<PushOutcome, GitError> {
+        self.push_impl(remote, before_push, true)
+    }
+
     /// `push`, calling `before_push(attempt)` right before each `git push`.
     /// Exists so tests can simulate a concurrent writer landing in that
     /// window.
@@ -8404,7 +8626,7 @@ impl<'a> AttestStore<'a> {
                 carried = std::mem::take(&mut report.notes);
                 continue;
             }
-            let mut local = match self.drop_old_deletion_records(&local_ref, &local) {
+            let mut local = match self.drop_old_deletion_records(&local_ref, &local, None) {
                 Ok(Some((commit, n))) => {
                     report.note(format!(
                         "dropped {n} deletion record(s) older than the retention window from the metadata tree"

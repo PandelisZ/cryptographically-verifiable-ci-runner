@@ -120,7 +120,7 @@ this:
 | `vci plan`, `vci explain` | status; key-only listing of every unit; the chosen values in one batch; about 2,000 manifests from many threads; memo and flags | memo, flags |
 | `vci run` (and `vci ci`) | each attested unit's earlier attestations with values (supersession, from worker threads); last durations | manifests, attestations, removals of superseded attestations, orphan manifests (nothing in `vci ci` without `--push` on a shared store) |
 | `vci fetch`, `vci push` | status (store without an exchange), count, location | the exchange (git-meta only) |
-| `vci prune` | status; every attestation with values; every manifest root; the referenced manifests | removals |
+| `vci prune` | status; every attestation with values; every manifest root; the referenced manifests; the memo of the checked-out commit's tree (2.10) | removals; on git-meta (2.10) the drop of old deletion records and, past `history_max_commits`, a push of the store as one commit; the local file's free pages (`compact`) |
 | `vci verify` (an envelope with a `manifestRef`) | one manifest and its base | none |
 | `vci store info` | settings, caps, status, count, location | none |
 
@@ -484,6 +484,7 @@ that is correct for a backend whose values are always present and whose writes a
 | | `remove_objects(&[&str]) -> usize` (the orphan rule, one hour of grace) | | `Unsupported` | run after supersession, prune |
 | | `orphan_objects() -> Vec<String>` | | `Unsupported` | prune |
 | | `prune_state_objects(Duration) -> usize` | | `Unsupported` | prune, run's orphan pass |
+| space (2.10) | `compact() -> Option<(u64, u64)>` | | `None` | prune, after its removals |
 | columns (2.9) | `columns(&[&StoredEnvelope]) -> Vec<Columns>` | | every field `None` | supersession, last durations, prune |
 | prefetch | `prefetch(Prefetch)` (`Units`, `Manifests`, `Attestations`, `Objects`) | | no-op | plan, run, verify, prune |
 | | `warm()` | | no-op | plan start |
@@ -747,6 +748,15 @@ state them:
   everything on a store without `Caps::columns`. Values are not read. Cost: one round trip whatever the length, or
   the listing's own cache. A put without columns on a store that keeps them clears the slot's columns; a put of the
   same bytes with other columns replaces them (the bytes being a no-op does not make the columns one).
+- **`compact() -> Option<(u64, u64)>`** (2.10): give the file system back the space of what was removed when that is
+  cheap, after `vci prune`'s removals. A local SQLite file (the SQLite store's, git-meta's, the libSQL local mode's)
+  frees its pages once they are a quarter of it and at least 16 MiB: `PRAGMA incremental_vacuum` when the file is in
+  incremental mode, else the one `VACUUM` that puts it there (`PRAGMA auto_vacuum = INCREMENTAL; VACUUM`), so every
+  later compaction costs the pages freed, not the file's size; then `PRAGMA wal_checkpoint(TRUNCATE)`. Returns the
+  file's size before and after when it freed anything. git-meta first removes its log rows (`metadata_log`) older
+  than both the last materialization and a day (an incremental serialization reads only rows after the
+  materialization). A server (PostgreSQL, libSQL remote and replica) reclaims its own space: `None`. Never removes a
+  record; a failure is a warning in `vci prune`.
 - **Fail open**: a plan whose `get_objects` fails runs the candidates that needed them; `vci run` warns on a failed
   `remove_objects` or `prune_state_objects` as it does on a failed manifest collection; prune exits 2.
 
@@ -1136,10 +1146,13 @@ share one handle, one pool and one circuit breaker. On any error, selecting or o
 | `VCI_STORE_CONNECT_TIMEOUT_SECS` | bound on connecting, in seconds (a number, more than 0 and at most 3600) | 5 |
 | `VCI_STORE_TIMEOUT_SECS` | bound on one statement or request, same form | 30 (a network backend lifts it to 10 min for `vci prune`, `OpenContext::long_running`) |
 | `VCI_STORE_SYNC` | `off` disables SQLite `synchronous`, in git-meta's store (which also turns it off when `CI` is set) and in the SQLite backend and libSQL's files (which do not look at `CI`); `replica` asks the libSQL store for its replica mode | unchanged |
-| unchanged, git-meta only | `VCI_FETCH_JOBS`, `VCI_LOCK_TIMEOUT_SECS`, `VCI_DELETION_RECORDS_DROP_AT`, `VCI_DELETION_RECORDS_KEEP_SECS` | |
+| `VCI_STORE_MAX_AGE_DAYS` | 2.10: `vci prune` removes a unit's attestations issued more than this many days ago but its newest by each signer (0: no limit, at most 3650) | `[store] max_age_days`, else 14 |
+| `VCI_STORE_DELETION_RECORDS_HOURS` | 2.10, git-meta: hours a deletion record stays in the metadata tree (0 to 720) | `[store] deletion_records_hours`, else 6 |
+| `VCI_STORE_HISTORY_MAX_COMMITS` | 2.10, git-meta: `vci prune` publishes the store as one commit once the fetched history has more commits (0: never) | `[store] history_max_commits`, else 2000 |
+| unchanged, git-meta only | `VCI_FETCH_JOBS`, `VCI_LOCK_TIMEOUT_SECS`, `VCI_DELETION_RECORDS_DROP_AT` (2,000 since 2.10, 20,000 before), `VCI_DELETION_RECORDS_KEEP_SECS` (wins over `deletion_records_hours`) | |
 | tests only | `VCI_TEST_POSTGRES_URL`, `VCI_TEST_POSTGRES=require`, `VCI_TEST_PG_BINDIR` (section 14); `VCI_TEST_LIBSQL_URL`, `VCI_TEST_LIBSQL_TOKEN`, `VCI_TEST_LIBSQL=require` (section 18) | |
 
-`vci_store::select::ENV_VARS` lists the eight `VCI_STORE*` variables `resolve` reads (`VCI_STORE_SYNC` since the
+`vci_store::select::ENV_VARS` lists the fifteen `VCI_STORE*` variables `resolve` reads (`VCI_STORE_SYNC` since the
 libSQL replica). Every e2e
 harness removes them from the environment of the commands it starts, so a developer's exported store never reaches
 the git-specific assertions.
@@ -1209,6 +1222,10 @@ record_format = 3             # 2.9: 3 (default) writes format-3 records on a st
                               # envelope JSON a vci 2.8 reads, for one release; VCI_STORE_RECORD_FORMAT wins
 explain_hashes = true         # 2.9: write the run's state object (the attested hashes `vci explain` prints; no verdict
                               # reads it); false writes three objects a run; VCI_STORE_EXPLAIN_HASHES wins
+max_age_days = 14             # 2.10: vci prune removes a unit's attestations issued more than this many days ago but its
+                              # newest by each signer, whatever tree they were made on (0: none); VCI_STORE_MAX_AGE_DAYS wins
+deletion_records_hours = 6    # 2.10, git-meta: hours a deletion record stays in the metadata tree; VCI_STORE_DELETION_RECORDS_HOURS
+history_max_commits = 2000    # 2.10, git-meta: vci prune publishes the store as one commit past this; VCI_STORE_HISTORY_MAX_COMMITS
 explain_hashes_days = 2       # 2.9: a state object older than this is removed even while referenced, by `vci run`'s
                               # orphan pass and `vci prune` (0 to 365; 0 writes the run's state object and removes it
                               # at the end of the same run: use explain_hashes = false instead); every writer applies
@@ -1663,7 +1680,7 @@ Hence `AttestationStore: Send + Sync`.
     `exchange_point` (section 7). `vci ci --push` calls the same `push_with` as `vci push` with the ci's repository;
   - push uses `PushMode`; `PushStatus` matches have a `_` arm (`vci: push to <remote> finished`, which git-meta never
     reaches);
-  - prune uses `status()`, `prefetch(Attestations)`, `read_all`, `remove(vec![e])`, `prefetch(Manifests)`,
+  - prune uses `status()`, `prefetch(Attestations)`, `read_all`, `remove` (one call for every record since 2.10), `prefetch(Manifests)`,
     `manifest`, `manifest_roots` and `remove_manifests(&[root])`; its "(run `vci fetch`)" hints appear only when
     `caps().lazy_values`;
   - verify uses `prefetch(Manifests)` and `manifest`. Its message for an envelope verified outside a repository, `…
@@ -1694,6 +1711,16 @@ Hence `AttestationStore: Send + Sync`.
     while a manifest remains (`manifest_roots`), confirms each delete from the signed statement (expiry; the
     unit's order by the signed `issuedAt`), then `orphan_objects`, `remove_objects` and `prune_state_objects` (`--objects` runs only these,
     `--older-than DAYS` sets the state age for one run); git-meta's prune reads every value as before;
+  - since 2.10 both of prune's passes hand each unit and signer's current records to one decision (cmds.rs
+    `decide`): one a plan of the checked-out commit's tree used (`passing_on` of `head_tree`) stays; a format-1
+    record issued before the group's newest format-3 one goes (not under `record_format = 1`); of the rest the newest stays; one
+    issued before `now - max_age_days` goes whatever its tree; the `keep` newest and those on a live tree stay. On a
+    store with columns the key hints run the same decision first to choose which groups are read, and the signed
+    statements decide. Then, after the objects, git-meta's deletion records and history (section 15) and
+    `compact()`. A referenced manifest the store does not hold no longer keeps every manifest; one that is stored
+    and cannot be read still does. `vci store upgrade --finish` on git-meta counts the format-1 records by their
+    first byte after `prefetch(Attestations)` and, at zero, calls `remove_manifests` with every root left. On a
+    shared store (PostgreSQL, libSQL) the memo is the server's, so a plan of that tree on any machine counts;
   - `vci store upgrade --begin` and `--finish` reach `SqliteStore`, `PgStore` and `LibsqlStore` directly (the trait
     has no upgrade method: the DDL is an operator action on one concrete backend); `vci verify` decodes a frame to
     its envelope (`--envelope` prints it and verifies nothing), resolves the set from the run's objects and checks the
@@ -2115,6 +2142,28 @@ refused by a serde_json envelope parse without an error (and `Inline` for manife
 fetched by one `Prefetch::Objects` (4 resolved, 4 blobs) and left out before it, the merge putting back the three named
 objects another clone deleted (not the state object) and publishing them, the orphan scan keeping every object while
 the record cannot be fetched and fetching it once online, and an idempotent put inside a batch restarting the grace.
+**Keeping it small (2.10).** `vci prune` on git-meta (cmds.rs `prune_deletion_records`, `rewrite_long_history`)
+calls three `AttestStore` methods beside the trait: `deletion_record_counts()` (how many records, how many older than
+the window), `drop_deletion_records()` (every record past the window, whatever their number: the `tombstones` rows and
+their paths in a commit on top of `refs/meta/local/main`, under the exchange lock; a push drops them once there are
+`VCI_DELETION_RECORDS_DROP_AT`, 2,000) and `history_commits()` (`git rev-list --count` of `refs/<ns>/remotes/main`;
+`None` before the first fetch), then the trait's push with `PushMode::RewriteHistory` once the history passes
+`[store] history_max_commits`. The window is process-wide (`meta::set_deletion_records_keep`, set by vci-cli from
+`[store] deletion_records_hours` when it opens a git-meta store; `VCI_DELETION_RECORDS_KEEP_SECS` wins). Why 6 hours
+and not 24: on vex on 6 November 2026, 145,306 of the tree's 148,423 attestation deletion records were under a day
+old and 22,897 under six hours (each run supersedes the last one's attestations, most within hours of their issue); a
+record only stops a clone whose history does not reach the deletion from publishing the value again, and such a value
+(superseded, expired, aged out, unreferenced) is deleted again by the next prune. The merge without a common ancestor
+(`merge_from_paths`, after a rewrite) takes git-meta's two-way merge, local side first, except that the tip's
+deletion record of an attestation key (`vci:attestation:...`, `parse_key`) wins over the local value (such a key is
+never written twice: the record is the newer change); a manifest or object keeps the local side.
+`crates/vci-git/tests/store_history_rewrite.rs` (3 tests) holds it: a clone holding the history before a rewrite
+and the deleted attestation's value pushes one commit on top of the new history without that attestation, while a
+third clone's push in the rewrite's window makes its lease fail and is kept by its next round; a value whose record
+was dropped before the rewrite comes back once, is deleted again and stays deleted; the counts and the drop.
+`compact()` removes git-meta's log rows older than the last materialization and a day, then frees the file's pages
+(section 4).
+
 The conformance world's `age_objects` moves `last_timestamp` in `.git/git-meta.sqlite`, so c35 to c42 run in full
 (c40's columns half skips: git-meta keeps none).
 

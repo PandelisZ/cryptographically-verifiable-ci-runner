@@ -1749,6 +1749,22 @@ pub trait AttestationStore: Send + Sync {
         Err(self.objects_unsupported())
     }
 
+    /// Give back to the file system the space of what was removed, when
+    /// that is cheap enough to do after a prune: a local SQLite file frees
+    /// its pages once they are a quarter of it and at least 16 MiB
+    /// (`PRAGMA incremental_vacuum`, after the one `VACUUM` that turns the
+    /// file's incremental mode on). Returns the file's size in bytes before
+    /// and after when it freed anything, `None` when there was nothing
+    /// worth freeing or nothing local to free (a server reclaims its own
+    /// space). Never removes a record.
+    ///
+    /// Default: `Ok(None)`.
+    ///
+    /// Used by: `vci prune` (since 2.10), after its removals.
+    fn compact(&self) -> Result<Option<(u64, u64)>, StoreError> {
+        Ok(None)
+    }
+
     /// The listing columns of these listed records ([`Columns`]), one per
     /// entry in order, matched by key. [`Columns::default`] (every field
     /// `None`) for a record stored without columns, a format-1 row, a key
@@ -2793,6 +2809,17 @@ pub mod select {
     /// `vci prune` and `vci run`'s orphan pass remove an older one. Wins
     /// over `[store] explain_hashes_days`.
     pub const ENV_EXPLAIN_HASHES_DAYS: &str = "VCI_STORE_EXPLAIN_HASHES_DAYS";
+    /// Days after its issue that `vci prune` removes an attestation that
+    /// is not its unit's newest by its signer (default 14, `0`: never by
+    /// age). Wins over `[store] max_age_days`.
+    pub const ENV_MAX_AGE_DAYS: &str = "VCI_STORE_MAX_AGE_DAYS";
+    /// Hours a git-meta deletion record stays in the metadata tree
+    /// (default 6). Wins over `[store] deletion_records_hours`.
+    pub const ENV_DELETION_RECORDS_HOURS: &str = "VCI_STORE_DELETION_RECORDS_HOURS";
+    /// Commits of git-meta's metadata history past which `vci prune`
+    /// publishes the store as one commit (default 2000, `0`: never). Wins
+    /// over `[store] history_max_commits`.
+    pub const ENV_HISTORY_MAX_COMMITS: &str = "VCI_STORE_HISTORY_MAX_COMMITS";
     /// Every variable this module reads. The e2e harnesses remove them all.
     pub const ENV_VARS: &[&str] = &[
         ENV_STORE,
@@ -2807,6 +2834,9 @@ pub mod select {
         ENV_RECORD_FORMAT,
         ENV_EXPLAIN_HASHES,
         ENV_EXPLAIN_HASHES_DAYS,
+        ENV_MAX_AGE_DAYS,
+        ENV_DELETION_RECORDS_HOURS,
+        ENV_HISTORY_MAX_COMMITS,
     ];
     /// Variables vci removes from its own environment at start-up (keeping
     /// their values in memory), and that the child environment builder drops
@@ -2843,6 +2873,20 @@ pub mod select {
     pub const DEFAULT_EXPLAIN_HASHES_DAYS: u32 = 2;
     /// The most days `explain_hashes_days` may name.
     pub const MAX_EXPLAIN_HASHES_DAYS: u32 = 365;
+    /// The days after its issue that `vci prune` removes an attestation
+    /// that is not its unit's newest by its signer, when nothing chooses
+    /// them.
+    pub const DEFAULT_MAX_AGE_DAYS: u32 = 14;
+    /// The most days `max_age_days` may name.
+    pub const MAX_MAX_AGE_DAYS: u32 = 3650;
+    /// The hours a git-meta deletion record stays in the metadata tree when
+    /// nothing chooses them (vci 2.7.20 to 2.9: 24).
+    pub const DEFAULT_DELETION_RECORDS_HOURS: u32 = 6;
+    /// The most hours `deletion_records_hours` may name (30 days).
+    pub const MAX_DELETION_RECORDS_HOURS: u32 = 720;
+    /// The commits of git-meta's metadata history past which `vci prune`
+    /// publishes the store as one commit, when nothing chooses them.
+    pub const DEFAULT_HISTORY_MAX_COMMITS: u32 = 2000;
 
     /// A `vci.toml` key that is refused: it deserializes from anything
     /// (without keeping or echoing the value) so the error can name the key.
@@ -2901,6 +2945,27 @@ pub mod select {
         /// loaded`. `VCI_STORE_EXPLAIN_HASHES_DAYS` wins over it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub explain_hashes_days: Option<u32>,
+        /// Days after its issue that `vci prune` removes an attestation
+        /// (default 14, `0`: never by age, at most 3650), even one made on a
+        /// tree some branch or tag has at its tip, unless it is its unit's
+        /// newest by its signer or a plan of the checked-out commit used it.
+        /// `VCI_STORE_MAX_AGE_DAYS` wins over it. A vci older than 2.10.0
+        /// refuses a `vci.toml` that sets it (an unknown key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_age_days: Option<u32>,
+        /// git-meta: hours a deletion record stays in the metadata tree
+        /// before a push or `vci prune` drops it (default 6, at most 720).
+        /// `VCI_STORE_DELETION_RECORDS_HOURS` wins over it. A vci older than
+        /// 2.10.0 refuses a `vci.toml` that sets it (an unknown key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub deletion_records_hours: Option<u32>,
+        /// git-meta: commits of the published metadata history past which
+        /// `vci prune` publishes the store as one commit without parents
+        /// (`vci push --rewrite-history`; default 2000, `0`: never).
+        /// `VCI_STORE_HISTORY_MAX_COMMITS` wins over it. A vci older than
+        /// 2.10.0 refuses a `vci.toml` that sets it (an unknown key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub history_max_commits: Option<u32>,
         /// `[store.sqlite]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sqlite: Option<SqliteSettings>,
@@ -3933,6 +3998,20 @@ pub mod select {
         /// (`VCI_STORE_EXPLAIN_HASHES_DAYS`, else `[store]
         /// explain_hashes_days`, else [`DEFAULT_EXPLAIN_HASHES_DAYS`]).
         pub explain_hashes_days: Sourced<u32>,
+        /// Days after its issue that `vci prune` removes an attestation that
+        /// is not its unit's newest by its signer, `0` for never
+        /// (`VCI_STORE_MAX_AGE_DAYS`, else `[store] max_age_days`, else
+        /// [`DEFAULT_MAX_AGE_DAYS`]).
+        pub max_age_days: Sourced<u32>,
+        /// Hours a git-meta deletion record stays in the metadata tree
+        /// (`VCI_STORE_DELETION_RECORDS_HOURS`, else `[store]
+        /// deletion_records_hours`, else [`DEFAULT_DELETION_RECORDS_HOURS`]).
+        pub deletion_records_hours: Sourced<u32>,
+        /// Commits of git-meta's metadata history past which `vci prune`
+        /// publishes the store as one commit, `0` for never
+        /// (`VCI_STORE_HISTORY_MAX_COMMITS`, else `[store]
+        /// history_max_commits`, else [`DEFAULT_HISTORY_MAX_COMMITS`]).
+        pub history_max_commits: Sourced<u32>,
         /// `[store.sqlite]` as resolved.
         pub sqlite: SqliteSelection,
         /// `[store.postgres]` as resolved.
@@ -3975,6 +4054,9 @@ pub mod select {
                 record_format: Sourced::default_value(DEFAULT_RECORD_FORMAT),
                 explain_hashes: Sourced::default_value(true),
                 explain_hashes_days: Sourced::default_value(DEFAULT_EXPLAIN_HASHES_DAYS),
+                max_age_days: Sourced::default_value(DEFAULT_MAX_AGE_DAYS),
+                deletion_records_hours: Sourced::default_value(DEFAULT_DELETION_RECORDS_HOURS),
+                history_max_commits: Sourced::default_value(DEFAULT_HISTORY_MAX_COMMITS),
                 sqlite: SqliteSelection { path: None },
                 postgres: PostgresSelection {
                     schema: Sourced::default_value(DEFAULT_SCHEMA.to_owned()),
@@ -4138,6 +4220,23 @@ pub mod select {
                 self.explain_hashes_days.value.to_string(),
                 self.explain_hashes_days.source,
             ));
+            v.push(line(
+                "max_age_days",
+                self.max_age_days.value.to_string(),
+                self.max_age_days.source,
+            ));
+            if self.kind.value == "git-meta" {
+                v.push(line(
+                    "deletion_records_hours",
+                    self.deletion_records_hours.value.to_string(),
+                    self.deletion_records_hours.source,
+                ));
+                v.push(line(
+                    "history_max_commits",
+                    self.history_max_commits.value.to_string(),
+                    self.history_max_commits.source,
+                ));
+            }
             v
         }
     }
@@ -4823,6 +4922,54 @@ pub mod select {
                     .filter(|d| *d <= MAX_EXPLAIN_HASHES_DAYS)
             },
         )?;
+        let max_age_days = setting(
+            &var,
+            ENV_MAX_AGE_DAYS,
+            file.and_then(|f| f.max_age_days),
+            "max_age_days",
+            DEFAULT_MAX_AGE_DAYS,
+            "a number of days, 0 (never by age) to 3650",
+            |v| v.parse::<u32>().ok().filter(|d| *d <= MAX_MAX_AGE_DAYS),
+        )?;
+        let deletion_records_hours = setting(
+            &var,
+            ENV_DELETION_RECORDS_HOURS,
+            file.and_then(|f| f.deletion_records_hours),
+            "deletion_records_hours",
+            DEFAULT_DELETION_RECORDS_HOURS,
+            "a number of hours, 0 to 720",
+            |v| {
+                v.parse::<u32>()
+                    .ok()
+                    .filter(|h| *h <= MAX_DELETION_RECORDS_HOURS)
+            },
+        )?;
+        let history_max_commits = setting(
+            &var,
+            ENV_HISTORY_MAX_COMMITS,
+            file.and_then(|f| f.history_max_commits),
+            "history_max_commits",
+            DEFAULT_HISTORY_MAX_COMMITS,
+            "a number of commits (0: never)",
+            |v| v.parse::<u32>().ok(),
+        )?;
+        for (set, name) in [
+            (
+                deletion_records_hours.source == Source::File,
+                "deletion_records_hours",
+            ),
+            (
+                history_max_commits.source == Source::File,
+                "history_max_commits",
+            ),
+        ] {
+            if set && k != "git-meta" {
+                warnings.push(format!(
+                    "vci.toml [store] {name} is ignored: only the git-meta store keeps deletion records and a history, and the store is {k} (from {})",
+                    kind.source
+                ));
+            }
+        }
         let schema = match f_pg.and_then(|p| p.schema.clone()) {
             Some(s) => Sourced {
                 value: s,
@@ -4896,6 +5043,9 @@ pub mod select {
             record_format,
             explain_hashes,
             explain_hashes_days,
+            max_age_days,
+            deletion_records_hours,
+            history_max_commits,
             sqlite,
             postgres: PostgresSelection {
                 schema,
