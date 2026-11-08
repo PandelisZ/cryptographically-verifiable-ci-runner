@@ -1016,21 +1016,151 @@ fn observe_from(
     };
     set[from.min(set.len())..]
         .par_iter()
-        .map(|exp| {
-            Ok(match exp.kind {
-                EntryKind::AutoloadDir => InputEntry {
-                    path: exp.path.clone(),
-                    kind: EntryKind::AutoloadDir,
-                    exec: false,
-                    size: 0,
-                    hash: autoload_dir_hash(),
-                },
-                EntryKind::Excluded => InputEntry::excluded(exp.path.clone()),
-                EntryKind::AutoloadMiss => src.autoload_miss(&exp.path, &autoload_idx)?,
-                _ => src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?,
-            })
-        })
+        .map(|exp| observe_one(src, exp, &excl, &autoload_idx))
         .collect()
+}
+
+/// The entries section of [`InputManifest::root`]'s encoding: `"entries"`,
+/// the count, then per entry in sorted order path, kind tag, exec, size and
+/// hash.
+fn encode_entries(e: &mut Enc, mut entries: Vec<&InputEntry>) {
+    entries.sort();
+    e.str("entries").u64(entries.len() as u64);
+    for x in entries {
+        e.str(x.path.as_str())
+            .str(x.kind.tag())
+            .u64(x.exec as u64)
+            .u64(x.size)
+            .str(&x.hash);
+    }
+}
+
+/// One entry of a set as [`observe_from`] observes it, with the set's
+/// exclusions and autoload index.
+fn observe_one(
+    src: Source<'_>,
+    exp: &ShapeEntry,
+    excl: &Exclusions,
+    autoload_idx: &AutoloadIndex,
+) -> Result<InputEntry, ManifestError> {
+    Ok(match exp.kind {
+        EntryKind::AutoloadDir => InputEntry {
+            path: exp.path.clone(),
+            kind: EntryKind::AutoloadDir,
+            exec: false,
+            size: 0,
+            hash: autoload_dir_hash(),
+        },
+        EntryKind::Excluded => InputEntry::excluded(exp.path.clone()),
+        EntryKind::AutoloadMiss => src.autoload_miss(&exp.path, autoload_idx)?,
+        _ => src.observe(&exp.path, exp.kind == EntryKind::Dir, excl.get(&exp.path))?,
+    })
+}
+
+/// What [`InputManifest::observe`] finds at a checkout for the entries of
+/// one shape (store format 3), shared by every set of its entries a plan
+/// observes: the units of a run name one shape, and most of their entries
+/// (their group's) are the same. An entry whose observation does not
+/// depend on the rest of its set is observed once and kept (a file, a
+/// symbolic link, an absence, a directory's type, an exclusion, an
+/// autoload directory); a directory listing (it leaves out the set's
+/// exclusions and `extra_excluded`) and an autoload lookup (it reads the
+/// set's autoload directories) are observed for each set, and so is an
+/// entry whose observation failed. The autoload index of each set of
+/// autoload directories is made once. Through the same [`CheckoutCache`]
+/// every time, which nothing invalidates (the checkout does not change).
+pub struct ShapeObservations {
+    seen: Vec<std::sync::OnceLock<InputEntry>>,
+    autoload: Mutex<HashMap<Vec<usize>, Arc<AutoloadIndex>>>,
+}
+
+impl ShapeObservations {
+    /// For a shape of `len` entries.
+    pub fn new(len: usize) -> Self {
+        ShapeObservations {
+            seen: (0..len).map(|_| std::sync::OnceLock::new()).collect(),
+            autoload: Mutex::default(),
+        }
+    }
+
+    /// [`InputManifest::observe`] of the set `idx` names in `entries` (the
+    /// entries of the shape these observations are of; `idx` sorted and
+    /// distinct, each in range), at the checkout `cache` observes: one entry
+    /// per index, in its order, each the one that observation gives (the
+    /// same exclusions and autoload directories, taken from the whole set,
+    /// and the same error when it fails: an autoload index that cannot be
+    /// made first, then an entry that cannot be observed). The entries kept
+    /// from an earlier set are borrowed.
+    pub fn observe<'s>(
+        &'s self,
+        entries: &[ShapeEntry],
+        idx: &[usize],
+        cache: &CheckoutCache,
+        extra_excluded: &[RepoPath],
+    ) -> Result<Vec<std::borrow::Cow<'s, InputEntry>>, ManifestError> {
+        let src = Source::Cache(cache);
+        let autoload_dirs: Vec<usize> = idx
+            .iter()
+            .copied()
+            .filter(|&i| entries[i].kind == EntryKind::AutoloadDir)
+            .collect();
+        let autoload_idx = if autoload_dirs.is_empty() {
+            Arc::new(AutoloadIndex::new())
+        } else {
+            let kept = locked(&self.autoload).get(&autoload_dirs).cloned();
+            match kept {
+                Some(a) => a,
+                None => {
+                    let dirs: Vec<RepoPath> = autoload_dirs
+                        .iter()
+                        .map(|&i| entries[i].path.clone())
+                        .collect();
+                    let a = Arc::new(src.autoload_index(&dirs)?);
+                    locked(&self.autoload).insert(autoload_dirs, a.clone());
+                    a
+                }
+            }
+        };
+        let missing: Vec<usize> = (0..idx.len())
+            .filter(|&k| self.seen[idx[k]].get().is_none())
+            .collect();
+        // The observations kept for this set only, by position (ascending).
+        let mut fresh: Vec<(usize, InputEntry)> = Vec::new();
+        if !missing.is_empty() {
+            let mut excl = exclusions(
+                idx.iter()
+                    .map(|&i| &entries[i])
+                    .filter(|e| e.kind == EntryKind::Excluded)
+                    .map(|e| &e.path),
+            );
+            for (parent, names) in exclusions(extra_excluded.iter()) {
+                excl.entry(parent).or_default().extend(names);
+            }
+            let got: Vec<InputEntry> = missing
+                .par_iter()
+                .map(|&k| observe_one(src, &entries[idx[k]], &excl, &autoload_idx))
+                .collect::<Result<_, _>>()?;
+            for (&k, e) in missing.iter().zip(got) {
+                if matches!(e.kind, EntryKind::DirListing | EntryKind::AutoloadMiss) {
+                    fresh.push((k, e));
+                } else {
+                    // Another set may have kept the same observation first.
+                    let _ = self.seen[idx[k]].set(e);
+                }
+            }
+        }
+        let mut fresh = fresh.into_iter().peekable();
+        Ok((0..idx.len())
+            .map(|k| match fresh.next_if(|(at, _)| *at == k) {
+                Some((_, e)) => std::borrow::Cow::Owned(e),
+                None => std::borrow::Cow::Borrowed(
+                    self.seen[idx[k]]
+                        .get()
+                        .expect("kept by this call or an earlier one"),
+                ),
+            })
+            .collect())
+    }
 }
 
 fn validate_env_key(k: &str) -> Result<(), ManifestError> {
@@ -1189,13 +1319,19 @@ impl InputManifest {
     ///
     /// The result does not depend on the order of the vectors.
     pub fn root(&self) -> String {
-        let mut externals: Vec<&External> = self.externals.iter().collect();
+        Self::root_of(self.entries.iter().collect(), &self.externals, &self.env)
+    }
+
+    /// [`Self::root`] of the manifest of these entries, externals and env,
+    /// without making it (the entries in any order).
+    pub fn root_of(entries: Vec<&InputEntry>, externals: &[External], env: &[EnvEntry]) -> String {
+        let mut externals: Vec<&External> = externals.iter().collect();
         externals.sort();
-        let mut env: Vec<&EnvEntry> = self.env.iter().collect();
+        let mut env: Vec<&EnvEntry> = env.iter().collect();
         env.sort();
 
         let mut e = Enc::new(INPUT_ROOT_DOMAIN);
-        self.encode_entries(&mut e);
+        encode_entries(&mut e, entries);
         e.str("externals").u64(externals.len() as u64);
         for x in externals {
             e.str(&x.name).str(&x.version);
@@ -1207,22 +1343,6 @@ impl InputManifest {
         e.finish()
     }
 
-    /// The entries section of [`Self::root`]'s encoding: `"entries"`, the
-    /// count, then per entry in sorted order path, kind tag, exec, size and
-    /// hash.
-    fn encode_entries(&self, e: &mut Enc) {
-        let mut entries: Vec<&InputEntry> = self.entries.iter().collect();
-        entries.sort();
-        e.str("entries").u64(entries.len() as u64);
-        for x in entries {
-            e.str(x.path.as_str())
-                .str(x.kind.tag())
-                .u64(x.exec as u64)
-                .u64(x.size)
-                .str(&x.hash);
-        }
-    }
-
     /// The signed `entriesRoot` of a format-3 statement (store format 3,
     /// `docs/design/STORE-V2.md` section 1.1): lowercase hex BLAKE3 of the domain
     /// tag [`ENTRIES_ROOT_DOMAIN`] followed by the entries section exactly
@@ -1232,7 +1352,7 @@ impl InputManifest {
     /// order.
     pub fn entries_root(&self) -> String {
         let mut e = Enc::new(ENTRIES_ROOT_DOMAIN);
-        self.encode_entries(&mut e);
+        encode_entries(&mut e, self.entries.iter().collect());
         e.finish()
     }
 

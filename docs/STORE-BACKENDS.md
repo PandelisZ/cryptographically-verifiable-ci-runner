@@ -1663,7 +1663,8 @@ Hence `AttestationStore: Send + Sync`.
   round that fetched values keeps 2.7's line, `round N: fetch K more value(s) for U unit(s) not skipped, check them
   again (R still not)`; one that fetched nothing but read set-aside candidates prints `round N: read K candidate(s)
   set aside for U unit(s) not skipped, check them again (R still not)`; `round N: nothing more to fetch for U unit(s)
-  not skipped` is unchanged.
+  not skipped` is unchanged. Since 2.10.1 a round that checks units again first prints `round N: K candidate
+  outcome(s) kept from the rounds before` (no seconds, so not a step: the round's own line keeps its key).
 - **SQLite** prints `store: sqlite: list N unit(s)`, `store: sqlite: read N value(s)` and, when a batch finishes,
   `store: sqlite: write N record(s)`; its `timing_report()` adds the handle's total, `store: sqlite: N write(s): S s`.
 - **PostgreSQL** labels include statement counts (`store: postgres: prefetch N unit(s), M value(s), K statement(s)`,

@@ -21,11 +21,12 @@ pub use frame::{
 pub use hash::{ABSENT_HASH, blake3_hex};
 pub use manifest::{
     AUTOLOAD_MARK, CheckoutCache, ENTRIES_ROOT_DOMAIN, EntryKind, EnvEntry, External, InputEntry,
-    InputManifest, ManifestError, Mismatch, Observation, autoload_name, env_value_hash,
+    InputManifest, ManifestError, Mismatch, Observation, ShapeObservations, autoload_name,
+    env_value_hash,
 };
 pub use objects::{
-    DecodeError, Descriptor, EncodeError, Encoded, Hdr, ObjectId, ObjectKind, ResolvedManifest,
-    Run, Shape, ShapeEntry, State, Tables, UnitInputs, UnitRecord, object_id,
+    DecodeError, Descriptor, EncodeError, Encoded, Hdr, ObjectId, ObjectKind, ResolvedIndices,
+    ResolvedManifest, Run, Shape, ShapeEntry, State, Tables, UnitInputs, UnitRecord, object_id,
 };
 pub use path::{PathError, RepoPath};
 pub use predicate::{
