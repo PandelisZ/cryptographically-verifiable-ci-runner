@@ -173,6 +173,81 @@ impl Git {
         }
     }
 
+    /// [`Git::run_with_stdin`], stopped once `stop` says so (asked every
+    /// 10 ms): its process group (git's own children too, a transport and
+    /// `index-pack`: git runs in a group of its own here) is killed, and it
+    /// fails as stopped. `Ok(None)` when stopped, else as
+    /// [`Git::run_with_stdin`].
+    pub fn run_with_stdin_until(
+        mut self,
+        input: &[u8],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+        let describe = self.describe();
+        self.cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let slow = SlowGit::start(&self);
+        let mut child = self.cmd.spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let pipe = |r: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                if let Some(mut r) = r {
+                    let _ = r.read_to_end(&mut b);
+                }
+                b
+            })
+        };
+        let out = pipe(child.stdout.take().map(|r| Box::new(r) as _));
+        let err = pipe(child.stderr.take().map(|r| Box::new(r) as _));
+        let mut stopped = false;
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                break st;
+            }
+            if stop() {
+                stopped = true;
+                // The group, before the process is waited for (its id, the
+                // group's, is not reused before then). After `--`, as
+                // POSIX asks of a negative operand (procps' `kill` misreads
+                // `-<pgid>` without it).
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = writer.join();
+        let stdout = out.join().unwrap_or_default();
+        let stderr = err.join().unwrap_or_default();
+        slow.done();
+        if stopped {
+            return Ok(None);
+        }
+        let out = Output {
+            status,
+            stdout,
+            stderr,
+        };
+        if out.status.success() {
+            Ok(Some(out.stdout))
+        } else {
+            Err(command_error(&describe, &out))
+        }
+    }
+
     /// Start a long-running command with piped stdin and stdout (stderr
     /// discarded), such as `cat-file --batch`.
     pub fn spawn_piped(mut self) -> Result<std::process::Child, GitError> {

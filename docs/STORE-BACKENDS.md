@@ -851,10 +851,12 @@ state them:
 
 `Prefetch::Units{test_ids, choose}`, `Prefetch::Manifests{roots}`, `Prefetch::Attestations`, `Prefetch::Objects{ids}`
 or (2.10.1) `Prefetch::UnitsWithObjects{test_ids, choose, objects}`: `Units` and `Objects` at once, in one round trip
-on a lazy store (git-meta: the objects' blobs in `git fetch` processes of their own beside the units', tried once, so
-that their failure is never the units'; and only when the units' values are fetched, so that the objects never cost
-a round trip of their own); the `Hydration` counts the units' values only. A network store does both as it would
-apart (libSQL remote: the units, then the objects' cache; PostgreSQL: the units).
+on a lazy store (git-meta: the objects' blobs in a `git fetch` of their own beside the units', tried once, so that
+their failure is never the units'; only when the units' values are fetched, so that the objects never cost a round
+trip of their own; and stopped, its process group killed, once the units' fetch ended and the objects' took as long
+again (at least 1 s), so that a slow or large object never holds the units' round trip up longer: what it did not
+bring stays promised and is fetched by whoever reads it); the `Hydration` counts the units' values only. A network
+store does both as it would apart (libSQL remote: the units, then the objects' cache; PostgreSQL: the units).
 
 - **Effect**: makes the named data cheap to read next.
   - A lazy store downloads it (git-meta's `hydrate_*`).
@@ -3444,15 +3446,27 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
 - **One write transaction at a time per handle** (2.10.1, `Conn::write_turn`). The server applies one write
   transaction at a time, so a handle's threads that write at once take turns in the client: a write transaction (a
   batch's, a put's, the tables' DDL, a hint's) waits until the handle's one under way ends, then checks out its
-  connection, holding none while it waits. It waits at most its request timeout (a hint's, at most `HINT_TIMEOUT`); a
-  turn that does not come in time is `Timeout{operation: "waiting for this handle's write under way"}` for a write
-  that was not sent: it latches nothing and is not asked about, and a batch counts it as a transaction out of time
-  (sent again within the process's time for writes that fail). A waiter woken after the breaker latched fails at once.
-  Reads never wait for it. 2.10.0 sent such writes at once: each held a connection of the pool while it queued on the
-  server's write lock (in CI on 7 November 2026 the conformance suite's c12, eight threads on one handle, had all five
-  of its connections waiting there on a stalled lock and the other three threads timing out on the pool), and `sqld`
-  0.24.32's queue for that lock can stall for good when several writers wait in it (section 21, item 17). `vci run`
-  sends its units' writes from one thread, so a command seldom has two at once; the suite's handles have many.
+  connection, holding none while it waits. The wait is the other write's time, not the server's answer to this one:
+  it has no request timeout, and a batch counts it against none of the process's times for writes (retry time, write
+  time) nor as a transaction out of time (which halves the next ones). A waiter gives up only when the write under
+  way holds the turn past the most its requests may take (`Conn::turn_bound`: its tries, each the request timeout and
+  a connection, a batch's question whether its transaction committed, a connection of the pool, the token command
+  before the first connection, and a second; a hint's after `HINT_TIMEOUT` in all): `Timeout{operation: "waiting for
+  this handle's write under way"}` for a write that was not sent, which latches nothing, is not asked about, and a
+  batch sends again within its tries. A batch's transaction that failed keeps the turn until the batch counted the
+  failure (and latched the breaker when the retry time ran out), and a latch wakes every waiter, which fails at once
+  with the breaker's reason: a server that stops answering writes fails a handle's writing threads together within
+  the retry time, and the breaker names the server's timeout, never the wait. Reads never wait for a turn. A turn
+  lasts the write's whole round trip, so one handle's writes take turns over the link's latency too (12 puts from
+  four threads, each answer held 100 ms: 1.3 s, against 0.34 s sent at once). As first merged, 2.10.1 gave each
+  waiter the request timeout and counted a turn that ran out as a transaction out of time: four threads behind a link
+  that held each answer 1.5 s, at a 4 s timeout, lost 6 to 9 of their 12 puts to a healthy server, and the breaker
+  latched with `waiting for this handle's write under way timed out after 4s` as its reason. 2.10.0 sent such writes
+  at once: each held a connection of the pool while it queued on the server's write lock (in CI on 7 November 2026
+  the conformance suite's c12, eight threads on one handle, had all five of its connections waiting there on a
+  stalled lock and the other three threads timing out on the pool), and `sqld` 0.24.32's queue for that lock can
+  stall for good when several writers wait in it (section 21, item 17). `vci run` sends its units' writes from one
+  thread, so a command seldom has two at once; the suite's handles have many.
 - **Namespace.** As PostgreSQL's: `VCI_STORE_NAMESPACE`, else `[store.libsql] namespace`, else the repository id; a
   shallow clone needs an explicit one, and a namespace is 1 to 128 of `A-Z a-z 0-9 . _ : / @ -`.
 
@@ -4194,8 +4208,11 @@ store commands failing on a replica they cannot keep (an unwritable directory, a
 ignored outside release builds, 1,200 units of 18 KB. `src/conn.rs` checks that the connector's sockets close
 without lingering, which errors mean a server takes no more writes, and which mean a connection lost under a request
 (sent again) rather than one that could not be made, a read's rows cut off (not latched) or an answer of the server
-whatever its body says (not sent again), and that a handle's write transactions take turns (a turn not given back
-within the request timeout is a timeout that latches nothing; a waiter woken to a latched breaker fails at once).
+whatever its body says (not sent again), and that a handle's write transactions take turns (a turn given back after
+more than the request timeout still comes; one held past the holder's bound is a timeout that latches nothing; a
+waiter woken to a latched breaker fails at once, with its reason). `tests/libsql.rs` checks that six threads of one
+handle behind a slow link store every write, latching nothing, and that a server that stops answering writes latches
+a handle six threads write through with the server's timeout as the reason.
 `tests/conformance.rs` runs the 34 scenarios in each mode (102 tests); the remote and replica ones need a server and
 skip without one. Its worlds:
 

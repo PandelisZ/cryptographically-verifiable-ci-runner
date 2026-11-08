@@ -187,6 +187,14 @@ const ADDED_WITH_OBJECTS: usize = 64;
 /// at most (records the plan set aside, whose values are here, are not
 /// promised and say nothing).
 const ADDED_WITH_LOOKUPS: usize = 256;
+/// Why the objects fetched beside a plan's candidates did not all come
+/// ([`AttestStore::fetch_blobs_beside`]): their `git fetch` was stopped.
+const BESIDE_STOPPED: &str =
+    "stopped: the candidates' fetch ended, and the objects beside them took longer than the grace";
+/// The least time the objects fetched beside a plan's candidates
+/// ([`AttestStore::fetch_blobs_beside`]) are given once the candidates'
+/// fetch ended (as long again as that fetch took, when longer).
+const BESIDE_GRACE_MIN: Duration = Duration::from_secs(1);
 /// Below this many blobs a fetch runs alone; above, in parallel batches of
 /// at least this many.
 ///
@@ -3858,10 +3866,11 @@ impl<'a> AttestStore<'a> {
                     "fetch {} object(s) beside them ({} blob(s) downloaded{}): {:.2}s",
                     beside_out.resolved,
                     beside_out.fetched,
-                    if beside_out.error.is_some() {
-                        ", the fetch failed"
-                    } else {
-                        ""
+                    match beside_out.error.as_deref() {
+                        Some(e) if e.contains(BESIDE_STOPPED) =>
+                            ", the fetch stopped after its grace",
+                        Some(_) => ", the fetch failed",
+                        None => "",
                     },
                     started.elapsed().as_secs_f64()
                 );
@@ -4662,11 +4671,16 @@ impl<'a> AttestStore<'a> {
     }
 
     /// [`AttestStore::fetch_blobs`] of `oids` and, at the same time, of
-    /// `beside` (2.10.1): one round trip for both, the second in `git
-    /// fetch` processes of its own, tried once, whose failure (an object the
-    /// remote no longer serves fails a whole `git fetch`) is never the
-    /// first's. Nothing is fetched without `oids`. Returns the first's
-    /// outcome, then the second's.
+    /// `beside` (2.10.1): one round trip for both, the second in a `git
+    /// fetch` of its own, tried once, whose failure (an object the remote no
+    /// longer serves fails a whole `git fetch`) is never the first's, and
+    /// which never holds the first up by more than a grace: once the first
+    /// ended, the second is given as long again as the first took (at least
+    /// [`BESIDE_GRACE_MIN`]), then stopped (its process group killed), and
+    /// what it did not bring is fetched by whoever reads it, as after a
+    /// failure (a guessed object that is slow to come, or large, costs the
+    /// candidates' round trip no more than that). Nothing is fetched without
+    /// `oids`. Returns the first's outcome, then the second's.
     fn fetch_blobs_beside(
         &self,
         remote: &str,
@@ -4685,9 +4699,23 @@ impl<'a> AttestStore<'a> {
             let again = GitError::Meta(e.to_string());
             return (Err(e), Err(again));
         }
+        // When the second must end: set once the first ended.
+        let stop_at: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let stop = || {
+            stop_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some_and(|at| std::time::Instant::now() >= at)
+        };
         let out = std::thread::scope(|s| {
-            let extra = s.spawn(|| self.fetch_blobs_unpacked(remote, beside, false));
+            let extra = s.spawn(|| self.fetch_objects_until(remote, beside, &stop));
+            let started = std::time::Instant::now();
             let main = self.fetch_blobs_unpacked(remote, oids, true);
+            let grace = started.elapsed().max(BESIDE_GRACE_MIN);
+            *stop_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::time::Instant::now() + grace);
             let extra = extra
                 .join()
                 .unwrap_or_else(|p| std::panic::resume_unwind(p));
@@ -4695,6 +4723,47 @@ impl<'a> AttestStore<'a> {
         });
         self.consolidate_packs();
         out
+    }
+
+    /// The blobs `oids` from `remote` ([`AttestStore::fetch_objects`]: in
+    /// batches of [`FETCH_BLOB_BATCH`], one `git fetch` at a time), tried
+    /// once, until `stop` says so: the `git fetch` under way is then
+    /// stopped ([`crate::cmd::Git::run_with_stdin_until`]) and no other
+    /// starts, and it fails as [`BESIDE_STOPPED`].
+    fn fetch_objects_until(
+        &self,
+        remote: &str,
+        oids: &[&String],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(), GitError> {
+        for batch in oids.chunks(FETCH_BLOB_BATCH) {
+            if stop() {
+                return Err(GitError::Meta(BESIDE_STOPPED.to_owned()));
+            }
+            let mut input = Vec::new();
+            for o in batch {
+                input.extend_from_slice(o.as_bytes());
+                input.push(b'\n');
+            }
+            let done = self
+                .filtered_fetch(remote, "blob:none")?
+                .args(["-c", "fetch.negotiationAlgorithm=noop"])
+                .args([
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--recurse-submodules=no",
+                    "--filter=blob:none",
+                    "--stdin",
+                    remote,
+                ])
+                .run_with_stdin_until(&input, stop)?;
+            if done.is_none() {
+                return Err(GitError::Meta(BESIDE_STOPPED.to_owned()));
+            }
+        }
+        Ok(())
     }
 
     /// The `git fetch` processes of [`AttestStore::fetch_blobs`], without

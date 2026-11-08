@@ -80,13 +80,18 @@ struct World {
     /// The blob ids of the objects the run that changed a global input
     /// published (hdr, shape, state).
     global_run_blobs: Vec<String>,
+    /// The blob id of the state object of the run that attested the x
+    /// units on b's change (no text reads it: the x units skip).
+    b_state_blob: String,
 }
 
 /// The `git` wrapper: logs each `git fetch` to `$VCI_TEST_GIT_LOG` (its
 /// start time and arguments), sleeps `$VCI_TEST_GIT_DELAY` seconds first
-/// when set, and fails a `git fetch --stdin` whose object ids include one
+/// when set, fails a `git fetch --stdin` whose object ids include one
 /// listed in the file `$VCI_TEST_GIT_POISON` (as a remote that no longer
-/// serves an object fails the whole fetch).
+/// serves an object fails the whole fetch), and stalls one whose object ids
+/// include one listed in `$VCI_TEST_GIT_HANG` for `$VCI_TEST_GIT_HANG_SECS`
+/// seconds before it fetches (a transfer that hangs).
 fn wrapper_script(real_git: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
@@ -104,6 +109,10 @@ if [ "$sub" = fetch ]; then
       if [ -n "$VCI_TEST_GIT_POISON" ] && printf '%s\n' "$input" | grep -qFf "$VCI_TEST_GIT_POISON"; then
         echo "fatal: remote error: upload-pack: not our ref" >&2
         exit 128
+      fi
+      if [ -n "$VCI_TEST_GIT_HANG" ] && printf '%s\n' "$input" | grep -qFf "$VCI_TEST_GIT_HANG"; then
+        if [ -n "$VCI_TEST_GIT_LOG" ]; then echo "$(date +%s) hang" >> "$VCI_TEST_GIT_LOG.hang"; fi
+        sleep "${{VCI_TEST_GIT_HANG_SECS:-60}}"
       fi
       printf '%s\n' "$input" | "{real_git}" "$@"
       exit $?;;
@@ -165,6 +174,8 @@ impl World {
             "VCI_TEST_GIT_LOG",
             "VCI_TEST_GIT_DELAY",
             "VCI_TEST_GIT_POISON",
+            "VCI_TEST_GIT_HANG",
+            "VCI_TEST_GIT_HANG_SECS",
         ]
         .iter()
         .chain(vci_store::select::ENV_VARS)
@@ -300,6 +311,7 @@ impl World {
             wrapper,
             cached: base.join("cached"),
             global_run_blobs: vec![],
+            b_state_blob: String::new(),
         };
 
         // The main branch: every unit attested in one run, pushed.
@@ -391,6 +403,19 @@ impl World {
         // another the g units on a change of g.ts and of a global input
         // (new hdr objects), each in a run of its own, and pushed.
         w.attest_elsewhere("b", "x", false);
+        // The state object b's run published (kind 4): the tip's commit
+        // added it.
+        let tip = w.git(&remote, &["rev-parse", "refs/meta/main"]);
+        let added = w.git(
+            &remote,
+            &["diff-tree", "-r", "--no-commit-id", "--diff-filter=A", &tip],
+        );
+        w.b_state_blob = added
+            .lines()
+            .find(|l| l.contains("project/vci/object/4/"))
+            .and_then(|l| l.split_whitespace().nth(3))
+            .unwrap_or_else(|| panic!("b's run's state object: {added}"))
+            .to_owned();
         w.attest_elsewhere("d", "g", true);
         // The objects d's run published (hdr, shape, state): the tip's
         // commit added them.
@@ -479,6 +504,9 @@ struct Planned {
     explain: String,
     round_trips: f64,
     fetches: usize,
+    /// The JSON plan's `plan total` (seconds) and stderr.
+    total: f64,
+    stderr: String,
 }
 
 /// `vci plan --fetch origin` of the pull request in fresh copies of the
@@ -502,6 +530,9 @@ fn plan(w: &World, tag: &str, env: &[(&str, &str)]) -> Planned {
         .lines()
         .count();
     let json = stdout(&out);
+    let json_err = stderr(&out);
+    let total = timing_number(&json_err, "plan total: ")
+        .unwrap_or_else(|| panic!("no plan total: {json_err}"));
     let dir = w.copy(&format!("{tag}-text"));
     let out = w.vci_ok(&dir, &[&args[..], &["--format", "text"]].concat(), &env);
     assert_eq!(
@@ -527,6 +558,8 @@ fn plan(w: &World, tag: &str, env: &[(&str, &str)]) -> Planned {
         explain: stdout(&out),
         round_trips,
         fetches,
+        total,
+        stderr: json_err,
     }
 }
 
@@ -608,6 +641,59 @@ fn a_failed_guess_changes_nothing() {
     assert!(
         d.iter().filter(|u| u.0.contains("/g")).all(|u| !u.1),
         "{d:?}"
+    );
+    assert_eq!(after.text, before.text);
+    assert_eq!(after.explain, before.explain);
+}
+
+/// 2.10.1: the objects fetched beside the candidates never hold the
+/// candidates' round trip up by more than a grace. Here every `git fetch`
+/// asking for the state object of b's run stalls for 60 s: only the guess
+/// asks for it (the x units skip on b's attestations, and no text reads
+/// it), and 2.10.0's fetching never does. Once the candidates' fetch ended,
+/// the objects' is given as long again (at least 1 s), then stopped (its
+/// process group killed); the objects it did not bring are fetched where
+/// 2.10.0 fetched them, and the plan decides, says and explains what
+/// 2.10.0's fetching does. 2.10.1 as first merged waited for the stalled
+/// fetch: a plan of 3.35 s took 22.74 s with a 20 s stall.
+#[test]
+fn a_stalled_guess_does_not_hold_up_the_plan() {
+    let w = World::new();
+    let hang = w.base.join("hang");
+    std::fs::write(&hang, format!("{}\n", w.b_state_blob)).unwrap();
+    let hang = hang.to_str().unwrap().to_owned();
+    let env = [
+        ("VCI_TEST_GIT_HANG", hang.as_str()),
+        ("VCI_TEST_GIT_HANG_SECS", "60"),
+    ];
+    let before = plan(
+        &w,
+        "before",
+        &[&env[..], &[("VCI_FETCH_BESIDE", "0")]].concat(),
+    );
+    assert!(
+        !w.base.join("git-before.log.hang").exists(),
+        "2.10.0's fetching never asks for b's state object"
+    );
+    let after = plan(&w, "after", &env);
+    assert!(
+        w.base.join("git-after.log.hang").exists(),
+        "the guess asked for b's state object"
+    );
+    assert!(
+        after.total < 45.0,
+        "the plan waited for the stalled fetch: {} s",
+        after.total
+    );
+    assert!(
+        after.stderr.contains("the fetch stopped after its grace"),
+        "{}",
+        after.stderr
+    );
+    assert_eq!(
+        decisions(&after.json),
+        decisions(&before.json),
+        "the same plan"
     );
     assert_eq!(after.text, before.text);
     assert_eq!(after.explain, before.explain);

@@ -1047,12 +1047,14 @@ impl Remote {
 
     /// A transaction of the store's batches: [`Remote::write`] sent once,
     /// asking `committed` whether the server applied it when its deadline
-    /// ran out ([`Conn::batch_checked`]).
+    /// ran out ([`Conn::batch_checked`]), with how long it waited for the
+    /// handle's turn to write, whether it went out, and the turn while it
+    /// failed.
     pub(crate) fn write_checked(
         &self,
         statements: &[String],
         committed: Option<&str>,
-    ) -> Result<(), Fail> {
+    ) -> crate::conn::Checked<'_> {
         self.conn.batch_checked(statements, committed)
     }
 
