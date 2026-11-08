@@ -2064,8 +2064,13 @@ The store has three modes:
   while one that keeps storing finishes a large job's writes. A unit reported not attested may still have been
   stored, when its transaction ran out of time, was given up and committed afterwards; the next plan then finds it.
   The timeout (`[store] timeout`, `VCI_STORE_TIMEOUT_SECS`) sets both. The plan's memo and flags are written
-  only when new, and each such write waits at most 5 s and never stops the command. A statement the server refuses (a
-  trigger, say) costs the unit it writes: `vci run` reports it and exits 2 after the run.
+  only when new, and each such write waits at most 5 s and never stops the command. A command sends the store one
+  write transaction at a time (since 2.10.1): the server applies one at a time anyway, so a write another of the
+  command's threads has meanwhile waits in vci, holding no connection, for at most the timeout (`waiting for this
+  handle's write under way timed out after …`, counted as a transaction out of time), rather than in the server's
+  queue for its write lock, which `sqld` 0.24.32 can leave stalled for good when several writers wait in it. A
+  statement the server refuses (a trigger, say) costs the unit it writes: `vci run` reports it and exits 2 after the
+  run.
 - **Compressed values** (since 2.9.0). `[store] compress = "zstd"` in `vci.toml`, or `VCI_STORE_COMPRESS=zstd` (which
   wins: `VCI_STORE_COMPRESS=off` turns it off for one command), stores each attestation and input manifest
   compressed (about 3x smaller for vex's; they travel at about two thirds of their size, as hex). On vex's Turso database,

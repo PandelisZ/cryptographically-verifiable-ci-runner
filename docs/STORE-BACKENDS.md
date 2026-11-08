@@ -3441,6 +3441,18 @@ CREATE INDEX IF NOT EXISTS <prefix>log_at ON <prefix>log (at);
   on Linux), and the conformance suite's 5,900 connections a run ran macOS out of its 16,384 when two runs came close
   together or the machine was loaded (`Can't assign requested address`, section 21). Only connections whose answer
   was read, or that were given up, are closed.
+- **One write transaction at a time per handle** (2.10.1, `Conn::write_turn`). The server applies one write
+  transaction at a time, so a handle's threads that write at once take turns in the client: a write transaction (a
+  batch's, a put's, the tables' DDL, a hint's) waits until the handle's one under way ends, then checks out its
+  connection, holding none while it waits. It waits at most its request timeout (a hint's, at most `HINT_TIMEOUT`); a
+  turn that does not come in time is `Timeout{operation: "waiting for this handle's write under way"}` for a write
+  that was not sent: it latches nothing and is not asked about, and a batch counts it as a transaction out of time
+  (sent again within the process's time for writes that fail). A waiter woken after the breaker latched fails at once.
+  Reads never wait for it. 2.10.0 sent such writes at once: each held a connection of the pool while it queued on the
+  server's write lock (in CI on 7 November 2026 the conformance suite's c12, eight threads on one handle, had all five
+  of its connections waiting there on a stalled lock and the other three threads timing out on the pool), and `sqld`
+  0.24.32's queue for that lock can stall for good when several writers wait in it (section 21, item 17). `vci run`
+  sends its units' writes from one thread, so a command seldom has two at once; the suite's handles have many.
 - **Namespace.** As PostgreSQL's: `VCI_STORE_NAMESPACE`, else `[store.libsql] namespace`, else the repository id; a
   shallow clone needs an explicit one, and a namespace is 1 to 128 of `A-Z a-z 0-9 . _ : / @ -`.
 
@@ -4174,13 +4186,16 @@ first write, a replica of an unreachable server; a handle reading its own remova
 reading its own write; a replica of a namespace dropped and made again; a replica's orphans answered as its
 server's; a statement the server refuses latching nothing (remote and replica); a record too large for the server
 refused alone; a replica that cannot be used refusing writes; a server that takes no more writes (blocked, full)
-refusing them as `Denied`, an empty namespace's included, with reads going on (remote and replica); a replica's
+refusing them as `Denied`, an empty namespace's included, with reads going on (remote and replica); six threads
+of one handle writing at once sending one write transaction at a time, each after the one before it was answered
+(2.10.1, `a_handles_threads_write_one_transaction_at_a_time`, behind a proxy holding each answer 100 ms); a replica's
 `read_values` before a prefetch reading a key removed since it was listed as gone, and after one sending nothing; the
 store commands failing on a replica they cannot keep (an unwritable directory, an empty namespace or not); and,
 ignored outside release builds, 1,200 units of 18 KB. `src/conn.rs` checks that the connector's sockets close
 without lingering, which errors mean a server takes no more writes, and which mean a connection lost under a request
 (sent again) rather than one that could not be made, a read's rows cut off (not latched) or an answer of the server
-whatever its body says (not sent again).
+whatever its body says (not sent again), and that a handle's write transactions take turns (a turn not given back
+within the request timeout is a timeout that latches nothing; a waiter woken to a latched breaker fails at once).
 `tests/conformance.rs` runs the 34 scenarios in each mode (102 tests); the remote and replica ones need a server and
 skip without one. Its worlds:
 
@@ -4517,12 +4532,33 @@ Still open:
     15 ms on a slot in `Failure` handed it to the next one. A reviewer's run hit it after 216 failed promotions
     (`Cannot promote read transaction to write transaction`) of namespaces' first batches, each leaving the slot in
     `Failure` until its stream closed; with decision 28 a write whose snapshot went stale while it waited is retried
-    inside the server within milliseconds instead. vci cannot prevent the stall from the client; meanwhile it fails
-    open (each write is given up at the request timeout, which latches the store, and `vci run` keeps the tests' exit
-    code). A `sqld` whose writes stop needs a restart; Turso's hosted service runs its own server, not measured. The
-    suite still opens a connection per read (libsql's), and on a server that keeps its namespaces (an external one)
-    its scenarios slow as the tables of earlier runs accumulate (four runs in a row took 10, 28, 42 and 50 s; 15 to
-    18 s for the remote ones at 7,500 schema objects, against 2.5 to 4.8 s at a few hundred, in an earlier
+    inside the server within milliseconds instead. The same file has a second way to leave an entry behind:
+    `acquire()` returns `SQLITE_BUSY` whenever it finds a checkpoint holding the slot, also on a later turn of its
+    loop, after it queued its connection, and a queued writer turns its loop whenever the deadline it parked with (the
+    start of the slot it saw plus the 5 s transaction timeout) passes, so a writer that waited that long and woke
+    during a WAL checkpoint (one every 1,000 pages) leaves its entry behind and queues again through the busy handler.
+    Which of the two stalled a given server was not traced. On 7 November 2026 CI's `store-stock-git` (one `sqld`
+    0.24.32 service for the job, this crate's tests one at a time since 31 October) stalled so at c12 on commit
+    7799515 (run 42351614573), which passed on a32fc72 with the same code: on the handle with eight threads all five
+    connections of its pool waited on the lock and the other three threads gave up on the pool after 30 s (`a
+    connection from the pool timed out after 30s`), the handles with two threads each ran out of time on the request,
+    and each handle latched its breaker after its minute of writes that fail; then each later conformance test that
+    writes failed at its first write after two request timeouts (`a request timed out after 30s (failed earlier in this
+    process; not retried)`, the breaker of that test's own handle: tests share no handle), 65 of 132 tests failing in
+    65 minutes while reads went on. On a laptop (14 CPUs, other work keeping the load average at 190 to 600, the
+    remote half of the suite and a fresh `sqld` for each run, both under `nice -n 20`, a 10 s write sent to the
+    server after the run telling a stall from a failure), 2.10.0 stalled the server at c12 in 5 of 27 runs (and in 1
+    of 10 without `nice`, at a load of 35 to 60). Since 2.10.1 a handle sends one write transaction at a time
+    (section 18, "One write transaction at a time per handle"), so c12 has at most four write transactions at the server
+    at once (one per handle) instead of up to 11 (five, its pool's size, from the handle with eight threads), and no
+    connection of a pool waits on the lock for another of the same handle: run beside those, at the same time and load,
+    it stalled in 0 of 27 runs (and 0 of 10 without `nice`, at a load of 317 to 366). Writers of different handles or
+    processes still queue at the server, so a `sqld` 0.24.32 shared by several writing processes can still stall; vci
+    then fails open (each write is given up at the request timeout, which latches the store, and `vci run` keeps the
+    tests' exit code). A `sqld` whose writes stop needs a restart; Turso's hosted service runs its own server, not
+    measured. The suite still opens a connection per read (libsql's), and on a server that keeps its namespaces (an
+    external one) its scenarios slow as the tables of earlier runs accumulate (four runs in a row took 10, 28, 42 and
+    50 s; 15 to 18 s for the remote ones at 7,500 schema objects, against 2.5 to 4.8 s at a few hundred, in an earlier
     measurement).
 18. **Compressed values travel as hex.** A libSQL write is SQL text (libsql's `execute_batch` takes no parameters),
     so a zstd frame, which is not UTF-8, is sent as a hex literal, twice its size: vex's values travel at about two

@@ -4530,6 +4530,68 @@ fn a_write_sends_its_transactions_without_a_pause() {
     assert!(median < Duration::from_millis(60), "paused: {gaps:?}");
 }
 
+/// Threads of one handle that write at once send one write transaction at
+/// a time: each goes out once the one before it was answered, and the
+/// others wait in the client (holding no connection of the pool) rather
+/// than on the server's write lock. 2.10.0 sent them all at once: they
+/// queued on the lock, and on `sqld` 0.24.32 that queue stalled for good
+/// under the conformance suite's c12 (14 writer threads on four handles,
+/// eight on one), so that every later write of the CI job waited out its
+/// deadlines (7 November 2026).
+#[test]
+fn a_handles_threads_write_one_transaction_at_a_time() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 30);
+    // The tables made first.
+    s.put_for_test(
+        "src/seed.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "seed"),
+    )
+    .unwrap();
+    let first = proxy.writes();
+    // Each answer held 100 ms: writes sent at once would overlap.
+    proxy.delay_answers(100);
+    let start = std::sync::Barrier::new(6);
+    std::thread::scope(|sc| {
+        for t in 0..6 {
+            let (s, start) = (&s, &start);
+            sc.spawn(move || {
+                start.wait();
+                for i in 0..2u8 {
+                    let u = format!("src/turns/{t}.test.ts");
+                    s.put_for_test(&u, S1, &hex64(i + 1), Some(&hint(1)), &envelope(None, &u))
+                        .unwrap_or_else(|e| panic!("thread {t}, put {i}: {e}"));
+                }
+            });
+        }
+    });
+    proxy.delay_answers(0);
+    let times: Vec<(Instant, Option<Instant>)> =
+        proxy.shared.write_times.lock().unwrap()[first..].to_vec();
+    assert_eq!(times.len(), 12, "one transaction a put");
+    // The proxy notes an answer's end on the write that went out last: a
+    // write without one was still unanswered when the next went out.
+    for w in times.windows(2) {
+        let ended = w[0]
+            .1
+            .expect("a write went out before the one before it was answered");
+        assert!(
+            w[1].0 >= ended,
+            "a write went out {:?} before the one before it was answered",
+            ended - w[1].0
+        );
+    }
+    assert!(times[11].1.is_some(), "the last write was answered");
+    assert_eq!(s.list_all().unwrap().len(), 13);
+}
+
 /// A process's writes stop once they took six request timeouts in all
 /// (and the little more its small transactions earn by what they store),
 /// even when every transaction commits in time: the units still queued are

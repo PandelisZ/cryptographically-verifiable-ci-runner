@@ -58,6 +58,12 @@
 //!   [`StoreError::Backend`] (or `Unsupported` for a record larger than the
 //!   server takes, `Denied` for a write to a server that takes no more
 //!   writes: blocked over a quota, or full) and latches nothing.
+//! * **One write at a time.** A handle sends one write transaction at a
+//!   time ([`Conn::write_turn`]): the server applies one at a time anyway,
+//!   so threads of a handle that write at once take turns in the client,
+//!   holding no connection of the pool while they wait, instead of queueing
+//!   on the server's write lock (where `sqld` 0.24.32's queue can stall
+//!   for good, `docs/STORE-BACKENDS.md` section 21, item 17).
 //! * **Connections** are hyper's, kept alive, except after a read: libsql
 //!   drops a read's answer before the end of its HTTP body, so hyper closes
 //!   that connection. The connector's sockets close with a reset, leaving
@@ -780,6 +786,10 @@ pub(crate) struct Conn {
     pool: Mutex<Pool>,
     freed: Condvar,
     max: usize,
+    /// A write transaction of this handle is under way ([`Conn::write_turn`]).
+    writing: Mutex<bool>,
+    /// Signalled when it ends.
+    wrote: Condvar,
     broken: OnceLock<String>,
     requests: AtomicU64,
     /// Requests sent again (the server was busy, had dropped the stream,
@@ -822,6 +832,8 @@ impl Conn {
             }),
             freed: Condvar::new(),
             max: jobs.clamp(1, MAX_POOL),
+            writing: Mutex::new(false),
+            wrote: Condvar::new(),
             broken: OnceLock::new(),
             requests: AtomicU64::new(0),
             retries: AtomicU64::new(0),
@@ -1695,7 +1707,13 @@ impl Conn {
     /// it holds the write lock until the server expires its stream, and the
     /// batch sent again waits for it as for any other writer, within its
     /// deadline.
+    ///
+    /// It waits for this handle's turn to write first ([`Conn::write_turn`]).
     pub(crate) fn batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let _turn = self.write_turn(op)?;
         self.send_batch(op, statements)
     }
 
@@ -1713,13 +1731,21 @@ impl Conn {
     /// answers "not committed" and may commit afterwards (on vex's Turso
     /// database it did, 30 s after the client gave up): the transaction's
     /// first statement then refuses whichever of the two copies comes
-    /// second, so it is applied once.
+    /// second, so it is applied once. It waits for this handle's turn to
+    /// write first ([`Conn::write_turn`]), and gives it back before the
+    /// question; one whose turn did not come in time was not sent, and is
+    /// not asked about.
     pub(crate) fn batch_checked(
         &self,
         statements: &[String],
         committed: Option<&str>,
     ) -> Result<(), Fail> {
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let turn = self.write_turn(WRITE_ONCE)?;
         let r = self.send_batch(WRITE_ONCE, statements);
+        drop(turn);
         let Some(probe) = committed else {
             return r;
         };
@@ -1744,6 +1770,49 @@ impl Conn {
         self.latch(e)
     }
 
+    /// This handle's turn to send a write transaction: at once when none of
+    /// its own is under way, else once that one ends, waiting at most the
+    /// request timeout (a hint's write, at most [`HINT_TIMEOUT`]); failing
+    /// at once when the breaker has latched, or latches meanwhile. The server
+    /// applies one write transaction at a time, so writes that a handle's
+    /// threads send at once only queue on its write lock, each holding a
+    /// connection of the pool (the handle's reads then wait for one), and
+    /// `sqld` 0.24.32's queue for that lock can stall for good when several
+    /// writers wait in it (`docs/STORE-BACKENDS.md` section 21, item 17):
+    /// here they wait in the client, holding no connection. A turn that
+    /// does not come in time is a timeout of a write that was not sent,
+    /// which latches nothing.
+    pub(crate) fn write_turn(&self, op: Op) -> Result<WriteTurn<'_>, StoreError> {
+        let wait = if op.hint {
+            self.timeout.min(HINT_TIMEOUT)
+        } else {
+            self.timeout
+        };
+        self.check()?;
+        let deadline = Instant::now() + wait;
+        let mut busy = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        while *busy {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(StoreError::Timeout {
+                    backend: KIND,
+                    operation: "waiting for this handle's write under way",
+                    after: wait,
+                });
+            }
+            busy = self
+                .wrote
+                .wait_timeout(busy, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            self.check()?;
+        }
+        *busy = true;
+        Ok(WriteTurn(self))
+    }
+
+    /// One write transaction, sent now (the caller holds the handle's
+    /// turn, [`Conn::write_turn`]).
     fn send_batch(&self, op: Op, statements: &[String]) -> Result<(), Fail> {
         if statements.is_empty() {
             return Ok(());
@@ -1768,6 +1837,23 @@ impl Conn {
                 Ok(())
             })
         })
+    }
+}
+
+/// A handle's turn to send a write transaction ([`Conn::write_turn`]),
+/// given back when dropped.
+pub(crate) struct WriteTurn<'a>(&'a Conn);
+
+impl Drop for WriteTurn<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .writing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
+        // Every waiter: one that wakes to a latched breaker leaves without
+        // taking the turn.
+        self.0.wrote.notify_all();
     }
 }
 
@@ -2030,6 +2116,75 @@ mod tests {
         ] {
             assert!(!takes_no_writes(&text.to_ascii_lowercase()), "{text}");
         }
+    }
+
+    /// A handle's write transactions take turns: a second one waits until
+    /// the first gives its turn back, at most the request timeout (then it
+    /// is a timeout of a write not sent, latching nothing), and one that
+    /// wakes to a latched breaker, or asks once it latched, fails without
+    /// taking the turn.
+    #[test]
+    fn a_handles_writes_take_turns() {
+        let conn = |timeout: Duration| {
+            let url = Secret::new("http://127.0.0.1:9");
+            let (target, _) = Target::parse(&url, None).unwrap();
+            Conn::new(
+                target,
+                url,
+                "$VCI_STORE_URL",
+                None,
+                Duration::from_secs(5),
+                timeout,
+                4,
+            )
+        };
+        let c = conn(Duration::from_millis(300));
+        let turn = c.write_turn(WRITE).unwrap();
+        let t = Instant::now();
+        let e = c.write_turn(WRITE).err().expect("no second turn");
+        assert!(
+            t.elapsed() >= Duration::from_millis(300),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(
+            matches!(e, StoreError::Timeout { .. })
+                && e.to_string().contains("this handle's write under way"),
+            "{e}"
+        );
+        assert!(c.check().is_ok(), "nothing latched");
+        drop(turn);
+        let again = c.write_turn(HINT).expect("the turn given back");
+        drop(again);
+
+        let c = conn(Duration::from_secs(30));
+        let turn = c.write_turn(WRITE).unwrap();
+        let given_back = AtomicBool::new(false);
+        std::thread::scope(|sc| {
+            let waiter = sc.spawn(|| {
+                let t = Instant::now();
+                let r = c.write_turn(WRITE).map(|_| t.elapsed());
+                (r, given_back.load(Ordering::SeqCst))
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            given_back.store(true, Ordering::SeqCst);
+            drop(turn);
+            let (r, after) = waiter.join().unwrap();
+            let waited = r.expect("the turn once given back");
+            assert!(after, "a second turn while the first was held");
+            assert!(waited < Duration::from_secs(10), "{waited:?}");
+        });
+
+        let turn = c.write_turn(WRITE).unwrap();
+        std::thread::scope(|sc| {
+            let waiter = sc.spawn(|| c.write_turn(WRITE).err());
+            std::thread::sleep(Duration::from_millis(100));
+            c.latch_now(StoreError::unavailable(KIND, "gone".to_owned()));
+            drop(turn);
+            let e = waiter.join().unwrap().expect("no turn once latched");
+            assert!(matches!(e, StoreError::Unavailable { .. }), "{e}");
+        });
+        assert!(c.write_turn(WRITE).is_err(), "no turn once latched");
     }
 
     /// A connection lost under a request (libsql's words for hyper's and
