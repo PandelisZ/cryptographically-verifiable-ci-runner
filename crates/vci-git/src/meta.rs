@@ -187,6 +187,11 @@ const ADDED_WITH_OBJECTS: usize = 64;
 /// at most (records the plan set aside, whose values are here, are not
 /// promised and say nothing).
 const ADDED_WITH_LOOKUPS: usize = 256;
+/// How long [`AttestStore::objects_added_with`]'s lookups may take in all:
+/// a `git log` that walks a long history to a record published long ago
+/// is stopped then, and its run names no object. On vex, 2.10.1's walks
+/// took 2.9 to 3.8 s on 4 of 26 plans, more than the round trip they save.
+const ADDED_WITH_TIME: std::time::Duration = std::time::Duration::from_millis(300);
 /// Why the objects fetched beside a plan's candidates did not all come
 /// ([`AttestStore::fetch_blobs_beside`]): their `git fetch` was stopped.
 const BESIDE_STOPPED: &str =
@@ -3483,7 +3488,10 @@ impl<'a> AttestStore<'a> {
     /// in parallel; a commit that added more than `ADDED_WITH_OBJECTS` (64)
     /// objects (a rewritten history) names none, and so does a merge. Best
     /// effort, local only (nothing is fetched: a commit or tree this clone
-    /// lacks names nothing). One list per record, in order.
+    /// lacks names nothing), and within `ADDED_WITH_TIME` (300 ms) in all: a
+    /// lookup still running then (a walk to a record published hundreds of
+    /// commits ago) is stopped and its run names nothing. One list per
+    /// record, in order.
     pub fn objects_added_with(
         &self,
         records: &[&StoredEnvelope],
@@ -3558,36 +3566,53 @@ impl<'a> AttestStore<'a> {
         if by_hint.is_empty() {
             return out;
         }
+        // Every lookup shares one deadline (they run in parallel): one that
+        // runs past it is stopped and names nothing.
+        let started = std::time::Instant::now();
+        let deadline = started + ADDED_WITH_TIME;
+        let past_deadline = || std::time::Instant::now() >= deadline;
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let within = |out: Result<Option<Vec<u8>>, GitError>| -> Option<Vec<u8>> {
+            match out {
+                Ok(Some(b)) => Some(b),
+                Ok(None) => {
+                    stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
+                Err(_) => None,
+            }
+        };
         let added = |from: &str, record_path: &str| -> Option<Vec<(ObjectKind, String)>> {
-            let commit = self
-                .repo
-                .git()
-                .args(["log", "-1", "--format=%H", from, "--", record_path])
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .run_str()
-                .ok()?;
+            let commit = within(
+                self.repo
+                    .git()
+                    .args(["log", "-1", "--format=%H", from, "--", record_path])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .run_with_stdin_until(b"", &past_deadline),
+            )?;
+            let commit = String::from_utf8(commit).ok()?;
             let commit = commit.trim();
             if !is_oid(commit) {
                 return None;
             }
-            let listing = self
-                .repo
-                .git()
-                .args([
-                    "diff-tree",
-                    "-r",
-                    "-z",
-                    "--root",
-                    "--no-commit-id",
-                    "--name-only",
-                    "--diff-filter=A",
-                    commit,
-                    "--",
-                    "project",
-                ])
-                .env("GIT_NO_LAZY_FETCH", "1")
-                .run()
-                .ok()?;
+            let listing = within(
+                self.repo
+                    .git()
+                    .args([
+                        "diff-tree",
+                        "-r",
+                        "-z",
+                        "--root",
+                        "--no-commit-id",
+                        "--name-only",
+                        "--diff-filter=A",
+                        commit,
+                        "--",
+                        "project",
+                    ])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .run_with_stdin_until(b"", &past_deadline),
+            )?;
             let mut objects = Vec::new();
             for p in listing.split(|b| *b == 0) {
                 let Ok(p) = std::str::from_utf8(p) else {
@@ -3619,6 +3644,13 @@ impl<'a> AttestStore<'a> {
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         });
+        if stopped.load(std::sync::atomic::Ordering::Relaxed) && vci_core::metrics::on() {
+            vci_core::timing_line!(
+                "round 2: the publishing commits' lookup stopped at its deadline ({} run(s)): {:.2}s",
+                groups.len(),
+                started.elapsed().as_secs_f64()
+            );
+        }
         for ((_, _, members), objects) in groups.iter().zip(found) {
             for &i in members {
                 out[i] = objects.clone().unwrap_or_default();

@@ -91,7 +91,10 @@ struct World {
 /// listed in the file `$VCI_TEST_GIT_POISON` (as a remote that no longer
 /// serves an object fails the whole fetch), and stalls one whose object ids
 /// include one listed in `$VCI_TEST_GIT_HANG` for `$VCI_TEST_GIT_HANG_SECS`
-/// seconds before it fetches (a transfer that hangs).
+/// seconds before it fetches (a transfer that hangs), and sleeps
+/// `$VCI_TEST_GIT_LOG_DELAY` seconds before the `git log -1 --format=%H
+/// <commit> -- <record path>` that looks up a run's publishing commit (a
+/// walk of a long history, as on vex).
 fn wrapper_script(real_git: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
@@ -100,6 +103,13 @@ for a in "$@"; do
   if [ $skip = 1 ]; then skip=0; continue; fi
   case "$a" in -c|-C) skip=1;; -*) ;; *) sub="$a"; break;; esac
 done
+if [ "$sub" = log ] && [ -n "$VCI_TEST_GIT_LOG_DELAY" ]; then
+  case " $* " in
+    *" -1 --format=%H "*" -- path/"*)
+      if [ -n "$VCI_TEST_GIT_LOG" ]; then echo "$(date +%s) log" >> "$VCI_TEST_GIT_LOG.log-walk"; fi
+      sleep "$VCI_TEST_GIT_LOG_DELAY";;
+  esac
+fi
 if [ "$sub" = fetch ]; then
   if [ -n "$VCI_TEST_GIT_LOG" ]; then echo "$(date +%s) $*" >> "$VCI_TEST_GIT_LOG"; fi
   if [ -n "$VCI_TEST_GIT_DELAY" ]; then sleep "$VCI_TEST_GIT_DELAY"; fi
@@ -689,6 +699,65 @@ fn a_stalled_guess_does_not_hold_up_the_plan() {
         after.stderr.contains("the fetch stopped after its grace"),
         "{}",
         after.stderr
+    );
+    assert_eq!(
+        decisions(&after.json),
+        decisions(&before.json),
+        "the same plan"
+    );
+    assert_eq!(after.text, before.text);
+    assert_eq!(after.explain, before.explain);
+}
+
+/// The lookups that name a run's objects from the commit that published it
+/// stop at their deadline: on vex, 2.10.1's `git log` walk to a record
+/// published hundreds of commits before took 2.9 to 3.8 s on 4 of 26 plans,
+/// more than the round trip it saves. With every walk taking 5 s, the guess
+/// gives up within a second, the objects it would have named are fetched
+/// where 2.10.0 fetched them, and the plan decides, says and explains what
+/// 2.10.0's fetching does.
+#[test]
+fn a_slow_history_walk_does_not_hold_up_the_plan() {
+    let w = World::new();
+    let env = [("VCI_TEST_GIT_LOG_DELAY", "5")];
+    let before = plan(
+        &w,
+        "before",
+        &[&env[..], &[("VCI_FETCH_BESIDE", "0")]].concat(),
+    );
+    assert!(
+        !w.base.join("git-before.log.log-walk").exists(),
+        "2.10.0's fetching looks up no publishing commit"
+    );
+    let after = plan(&w, "after", &env);
+    assert!(
+        w.base.join("git-after.log.log-walk").exists(),
+        "the guess looked up a publishing commit: {}",
+        after.stderr
+    );
+    assert!(
+        after
+            .stderr
+            .contains("the publishing commits' lookup stopped at its deadline"),
+        "{}",
+        after.stderr
+    );
+    let guess = after
+        .stderr
+        .lines()
+        .find_map(|l| {
+            let rest = l
+                .split("object(s) to fetch beside the candidates: ")
+                .nth(1)?;
+            rest.trim().trim_end_matches('s').parse::<f64>().ok()
+        })
+        .unwrap_or_else(|| panic!("no guess line: {}", after.stderr));
+    assert!(guess < 1.5, "the guess waited for the walk: {guess} s");
+    assert!(
+        after.total < before.total + 2.0,
+        "the plan waited for the walk: {} s against {} s",
+        after.total,
+        before.total
     );
     assert_eq!(
         decisions(&after.json),

@@ -3614,8 +3614,9 @@ beside its candidates and in the same round trip, the objects it can name from k
 - the hdr, tables and shape objects of the runs of the candidates it fetches (at most 64): the shape and state of
   every run-state link that carries a candidate's key hint (a run's links name them), and the objects the metadata
   commit that published the candidate added (the run's hdr and tables too, when they were new then; at most 8 runs
-  looked up, from the commits `vci fetch` brought with their trees; a commit that added more than 64 objects names
-  none);
+  looked up, from the commits `vci fetch` brought with their trees, within 300 ms in all: a `git log` still walking
+  the history then is stopped and its run names nothing (2.10.2; on vex, walks to records published hundreds of
+  commits before took 2.9 to 3.8 s); a commit that added more than 64 objects names none);
 - the state objects the failure text after the verdicts could load: those of the runs of the candidates it would
   name for the units round 2 does not check again, and of every candidate of the units it does check again, from
   their runs' links. Only when they are at most `[store] plan_states` (and `plan_states_mib` is not 0): then every
@@ -3647,8 +3648,9 @@ instead of 3.57 s (plan total 3.85 s instead of 5.75 s), 27 blobs instead of 26.
 the same reasons.
 
 It is one round trip after the first verdicts when the state objects the text could load are at most `plan_states`
-and the commit that published each run of round 2's candidates added at most 64 objects (or its hdr and tables
-objects are loaded already); otherwise it is two. Measured independently with release builds on lazy clones of local
+and the commit that published each run of round 2's candidates added at most 64 objects and was found within 300 ms
+(or its hdr and tables objects are loaded already); otherwise it is two, or three when the state objects do not fit
+either. Measured independently with release builds on lazy clones of local
 remotes, every `git fetch` slowed by 0.8 s (medians of 7 to 9 plans each, 2.10.0 against this release): with 150
 Vitest files, a pull request whose changed units round 2 checks again were attested by 4 runs took one round trip
 instead of three, 1.17 s instead of 3.08 s from the end of the first verdicts (plan total 2.80 s instead of 4.72 s);
