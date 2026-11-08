@@ -250,7 +250,7 @@ The October measurements, release by release, are on the [benchmarks page][8].
 
 ## Status and what it costs
 
-v2.10.0, MIT. Six runners: Vitest, node:test, pytest, Go, Cargo, and Rails with RSpec. Each has an end-to-end suite
+v2.10.2, MIT. Six runners: Vitest, node:test, pytest, Go, Cargo, and Rails with RSpec. Each has an end-to-end suite
 that drives the real CLI against a bare git remote. On vex's 2,350-file Rails suite, vci adds about 22 seconds to a
 job (medians: 11 s to install, fetch and plan, 4 s to restore its store, 7 s to publish). What you save beyond that
 is every test that already ran on the same inputs. What you pay beyond that, when nothing ran before, is one process
