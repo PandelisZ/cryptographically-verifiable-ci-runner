@@ -21,24 +21,47 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-/// Streaming writer for the canonical length-prefixed encoding.
-pub(crate) struct Enc(blake3::Hasher);
+/// Streaming writer for the canonical length-prefixed encoding. The fields
+/// are gathered in a buffer and hashed [`ENC_BUFFER`] bytes at a time: the
+/// same byte stream, so the same BLAKE3 output, as hashing each field as it
+/// comes, without two small hasher updates per field (an input root of a
+/// manifest of 4,000 entries is 50,000 fields, and its hashing took about
+/// a millisecond that way; whole buffers also let BLAKE3 hash several
+/// chunks at once).
+pub(crate) struct Enc {
+    hasher: blake3::Hasher,
+    buf: Vec<u8>,
+}
+
+/// How many encoded bytes [`Enc`] gathers before hashing them.
+const ENC_BUFFER: usize = 64 << 10;
 
 impl Enc {
     pub(crate) fn new(domain: &[u8]) -> Self {
-        let mut e = Enc(blake3::Hasher::new());
+        let mut e = Enc {
+            hasher: blake3::Hasher::new(),
+            buf: Vec::with_capacity(256),
+        };
         e.bytes(domain);
         e
     }
 
+    fn put(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+        if self.buf.len() >= ENC_BUFFER {
+            self.hasher.update(&self.buf);
+            self.buf.clear();
+        }
+    }
+
     pub(crate) fn u64(&mut self, n: u64) -> &mut Self {
-        self.0.update(&n.to_le_bytes());
+        self.put(&n.to_le_bytes());
         self
     }
 
     pub(crate) fn bytes(&mut self, b: &[u8]) -> &mut Self {
         self.u64(b.len() as u64);
-        self.0.update(b);
+        self.put(b);
         self
     }
 
@@ -46,8 +69,10 @@ impl Enc {
         self.bytes(s.as_bytes())
     }
 
-    pub(crate) fn finish(&self) -> String {
-        self.0.finalize().to_hex().to_string()
+    pub(crate) fn finish(&mut self) -> String {
+        self.hasher.update(&self.buf);
+        self.buf.clear();
+        self.hasher.finalize().to_hex().to_string()
     }
 }
 
@@ -107,6 +132,43 @@ mod tests {
         );
         assert_eq!(ABSENT_HASH.len(), 64);
         assert!(ABSENT_HASH.bytes().all(|b| b == b'0'));
+    }
+
+    /// The buffered encoding hashes exactly the byte stream the fields
+    /// make, whatever their sizes and however many buffers they fill: its
+    /// output is BLAKE3 of the stream written out in one piece.
+    #[test]
+    fn the_buffered_encoding_is_blake3_of_the_field_stream() {
+        let mut fields: Vec<Vec<u8>> = Vec::new();
+        let mut x: u64 = 7;
+        for i in 0..3_000usize {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = match i % 7 {
+                0 => 0,
+                1 => (x >> 40) as usize % 200,
+                2 => ENC_BUFFER - 3,
+                _ => (x >> 33) as usize % 70,
+            };
+            fields.push((0..len).map(|k| (x >> (k % 56)) as u8).collect());
+        }
+        for n in [0, 1, 2, 5, 300, fields.len()] {
+            let mut e = Enc::new(b"vci/test");
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&(8u64).to_le_bytes());
+            stream.extend_from_slice(b"vci/test");
+            for (i, f) in fields[..n].iter().enumerate() {
+                if i % 3 == 0 {
+                    e.u64(f.len() as u64 * 3);
+                    stream.extend_from_slice(&(f.len() as u64 * 3).to_le_bytes());
+                }
+                e.bytes(f);
+                stream.extend_from_slice(&(f.len() as u64).to_le_bytes());
+                stream.extend_from_slice(f);
+            }
+            assert_eq!(e.finish(), blake3_hex(&stream), "{n} fields");
+        }
     }
 
     #[test]

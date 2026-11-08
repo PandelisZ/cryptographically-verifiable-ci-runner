@@ -1857,6 +1857,219 @@ fn from_observed_reproduces_the_root_for_every_kind() {
     assert_ne!(back.root(), m.root());
 }
 
+/// The observations of a shape shared by its units' sets
+/// ([`ShapeObservations`], 2.10.1) give each set exactly what
+/// [`InputManifest::observe`] gives it: the same entries in the same order,
+/// with the set's own exclusions (a listing two sets share is hashed with
+/// each set's) and autoload directories, whichever set came first and with
+/// or without git-ignored children; [`Descriptor::resolve_indices`] names
+/// the entries [`Descriptor::resolve`] copies, and
+/// [`InputManifest::root_of`] the observation's sorted entries is the root
+/// of the manifest `from_observed` makes. A path that cannot be observed
+/// fails every set that names it the same way, however often.
+#[test]
+fn shape_observations_give_each_set_what_observe_gives_it() {
+    let (r, obs) = every_kind_repo();
+    let env = env_of(&[("TZ", "UTC")]);
+    let m = every_kind_manifest(&r, &obs, &env);
+    // Units sharing most of m's paths: one lists `build` without leaving
+    // `target` out, one has no autoload directory (its lookup of `user`
+    // then finds nothing), one reads a file m does not.
+    let lists = capture(&r.root, &[read("src/a.rb"), readdir("build")]);
+    let no_autoload = capture(
+        &r.root,
+        &[
+            read("src/a.rb"),
+            (rp(".vci-autoload/user"), Observation::AutoloadMiss),
+        ],
+    );
+    let other = capture(&r.root, &[read("src/a.rb"), read("src/b.rb")]);
+    let waived: Vec<String> = vec![];
+    let all = [&m, &lists, &no_autoload, &other];
+    let units: Vec<UnitInputs<'_>> = all
+        .iter()
+        .map(|m| UnitInputs {
+            header: 0,
+            group: Some(""),
+            manifest: m,
+            waived: &waived,
+        })
+        .collect();
+    let run = Run::build(&units).unwrap();
+    let shape = Shape::decode(&run.shape.bytes).unwrap();
+    let tables = Tables::decode(&run.tables[0].bytes).unwrap();
+    assert_eq!(shape.groups.len(), 1, "a group the units share");
+    let descriptors: Vec<Descriptor> = run
+        .units
+        .iter()
+        .map(|u| Descriptor::decode(&u.descriptor.encode(&tables).unwrap(), &tables).unwrap())
+        .collect();
+    let same =
+        |cache: &CheckoutCache, seen: &ShapeObservations, order: &[usize], extra: &[RepoPath]| {
+            for &u in order {
+                let d = &descriptors[u];
+                let resolved = d.resolve(&shape, &tables).unwrap();
+                let idx = d.resolve_indices(&shape, &tables).unwrap();
+                let copied: Vec<ShapeEntry> =
+                    idx.set.iter().map(|&i| shape.entries[i].clone()).collect();
+                assert_eq!(copied, resolved.set, "unit {u}");
+                assert_eq!(idx.externals, resolved.externals);
+                assert_eq!(idx.env, resolved.env);
+                let want = InputManifest::observe(&resolved.set, cache, extra).unwrap();
+                let got: Vec<InputEntry> = seen
+                    .observe(&shape.entries, &idx.set, cache, extra)
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.into_owned())
+                    .collect();
+                assert_eq!(got, want, "unit {u}, extra {extra:?}");
+                let manifest = InputManifest::from_observed(
+                    &resolved.set,
+                    want,
+                    resolved.externals.clone(),
+                    resolved.env.clone(),
+                )
+                .unwrap();
+                let mut sorted: Vec<&InputEntry> = got.iter().collect();
+                sorted.reverse();
+                assert_eq!(
+                    InputManifest::root_of(sorted, &resolved.externals, &resolved.env),
+                    manifest.root()
+                );
+            }
+        };
+    let cache = CheckoutCache::new(&r.root);
+    let idx = descriptors[0].resolve_indices(&shape, &tables).unwrap();
+    let seen = ShapeObservations::new(shape.entries.len());
+    let observed = seen.observe(&shape.entries, &idx.set, &cache, &[]).unwrap();
+    assert_eq!(
+        InputManifest::root_of(
+            observed.iter().map(|e| &**e).collect(),
+            &idx.externals,
+            &idx.env
+        ),
+        m.root(),
+        "nothing changed since m was captured"
+    );
+    for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 0, 3, 2]] {
+        let seen = ShapeObservations::new(shape.entries.len());
+        same(&cache, &seen, &order, &[]);
+        same(&cache, &seen, &order, &[]);
+    }
+    // The listing of `build` differs between m (target left out) and the
+    // unit that lists it whole, through the same observations.
+    let seen = ShapeObservations::new(shape.entries.len());
+    let build = |u: usize| -> InputEntry {
+        let idx = descriptors[u].resolve_indices(&shape, &tables).unwrap();
+        seen.observe(&shape.entries, &idx.set, &cache, &[])
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path.as_str() == "build")
+            .unwrap()
+            .into_owned()
+    };
+    let (whole, without_target) = (build(1), build(0));
+    assert_eq!((whole.kind, whole.size), (EntryKind::DirListing, 2));
+    assert_eq!(
+        (without_target.kind, without_target.size),
+        (EntryKind::DirListing, 1)
+    );
+
+    // A git-ignored child of the listed directory, left out or not.
+    r.write("build/ignored.log", "x\n");
+    let cache = CheckoutCache::new(&r.root);
+    let seen = ShapeObservations::new(shape.entries.len());
+    same(&cache, &seen, &[0, 1, 2, 3], &[]);
+    same(&cache, &seen, &[0, 1, 2, 3], &[rp("build/ignored.log")]);
+    r.rm("build/ignored.log");
+
+    // Sets that cannot be observed fail every time with observe's error:
+    // an autoload marker without a parent directory (the autoload index
+    // cannot be made, before any entry is observed) and a lookup whose path
+    // is not `.vci-autoload/<name>` (one entry cannot be observed).
+    let se = |path: RepoPath, kind: EntryKind| ShapeEntry {
+        path,
+        kind,
+        exec: false,
+    };
+    let bad = Shape {
+        entries: vec![
+            se(RepoPath::root(), EntryKind::AutoloadDir),
+            se(rp("app/models/.vci-autoload"), EntryKind::AutoloadDir),
+            se(rp("src/a.rb"), EntryKind::File),
+            se(rp("src/not/a/lookup"), EntryKind::AutoloadMiss),
+        ],
+        groups: vec![],
+    };
+    let seen = ShapeObservations::new(bad.entries.len());
+    for idx in [vec![0, 2], vec![1, 2, 3], vec![2, 3], vec![2]] {
+        for _ in 0..2 {
+            let set: Vec<ShapeEntry> = idx.iter().map(|&i| bad.entries[i].clone()).collect();
+            let want = InputManifest::observe(&set, &cache, &[]).map_err(|e| e.to_string());
+            let got = seen
+                .observe(&bad.entries, &idx, &cache, &[])
+                .map(|v| v.into_iter().map(|e| e.into_owned()).collect::<Vec<_>>())
+                .map_err(|e| e.to_string());
+            assert_eq!(got, want, "{idx:?}");
+            assert_eq!(want.is_err(), idx != [2], "{idx:?}: {want:?}");
+        }
+    }
+}
+
+/// [`Descriptor::resolve_indices`] fails where [`Descriptor::resolve`]
+/// does, with the same error: an index past the shape, an own entry the
+/// group has, a group the shape lacks.
+#[test]
+fn resolve_indices_fails_as_resolve_does() {
+    let (r, obs) = every_kind_repo();
+    let env = env_of(&[("TZ", "UTC")]);
+    let m = every_kind_manifest(&r, &obs, &env);
+    let other = capture(&r.root, &[read("src/a.rb"), read("src/b.rb")]);
+    let waived: Vec<String> = vec![];
+    let units = [
+        UnitInputs {
+            header: 0,
+            group: Some(""),
+            manifest: &m,
+            waived: &waived,
+        },
+        UnitInputs {
+            header: 0,
+            group: Some(""),
+            manifest: &other,
+            waived: &waived,
+        },
+    ];
+    let run = Run::build(&units).unwrap();
+    let shape = Shape::decode(&run.shape.bytes).unwrap();
+    let tables = Tables::decode(&run.tables[0].bytes).unwrap();
+    let d = Descriptor::decode(&run.units[0].descriptor.encode(&tables).unwrap(), &tables).unwrap();
+    let g = d.group.expect("a group");
+    let both = |d: &Descriptor| {
+        (
+            d.resolve(&shape, &tables)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            d.resolve_indices(&shape, &tables)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        )
+    };
+    let mut past = d.clone();
+    past.own.push(shape.entries.len() + 3);
+    let mut overlap = d.clone();
+    overlap.own.push(shape.groups[g as usize][0]);
+    overlap.own.sort_unstable();
+    let mut no_group = d.clone();
+    no_group.group = Some(g + 1);
+    for bad in [past, overlap, no_group] {
+        let (a, b) = both(&bad);
+        assert!(a.is_err(), "{bad:?}");
+        assert_eq!(a, b);
+    }
+    assert_eq!(both(&d), (Ok(()), Ok(())));
+}
+
 /// STORE-V2 section 1.6 (end) and section 6 M1: the ten store-side
 /// mutations the security review's harness ran
 /// (the design security review's attack run, unit #896: docs/design/STORE-V2.md section 4), here on a

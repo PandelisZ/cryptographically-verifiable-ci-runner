@@ -1249,6 +1249,22 @@ impl Descriptor {
     /// shape or tables, a group the shape lacks, an own entry the group has,
     /// or an inline external the tables have.
     pub fn resolve(&self, shape: &Shape, tables: &Tables) -> Result<ResolvedManifest, DecodeError> {
+        let r = self.resolve_indices(shape, tables)?;
+        Ok(ResolvedManifest {
+            set: r.set.iter().map(|&i| shape.entries[i].clone()).collect(),
+            externals: r.externals,
+            env: r.env,
+        })
+    }
+
+    /// [`Descriptor::resolve`] with the set as indices into the shape's
+    /// entries (sorted and distinct, each in range), not copies of them:
+    /// the same checks, failing the same way.
+    pub fn resolve_indices(
+        &self,
+        shape: &Shape,
+        tables: &Tables,
+    ) -> Result<ResolvedIndices, DecodeError> {
         let group: &[usize] = match self.group {
             None => &[],
             Some(g) => shape.groups.get(g as usize).ok_or(DecodeError::Group(g))?,
@@ -1283,7 +1299,7 @@ impl Descriptor {
                 }
                 (None, None) => break,
             };
-            set.push(shape.entries[table(what, i, shape.entries.len())?].clone());
+            set.push(table(what, i, shape.entries.len())?);
         }
         let mut env = Vec::with_capacity(self.env_read.len());
         let mut values = self.env_values.iter().peekable();
@@ -1315,12 +1331,25 @@ impl Descriptor {
         }
         externals.extend(self.extras.iter().cloned());
         externals.sort();
-        Ok(ResolvedManifest {
+        Ok(ResolvedIndices {
             set,
             externals,
             env,
         })
     }
+}
+
+/// A descriptor resolved against its shape and tables
+/// ([`Descriptor::resolve_indices`]): a [`ResolvedManifest`] whose set is
+/// indices into the shape's entries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedIndices {
+    /// Sorted and distinct indices into the shape's entries.
+    pub set: Vec<usize>,
+    /// Sorted and distinct.
+    pub externals: Vec<External>,
+    /// Sorted by key; [`ABSENT_HASH`] for a name that was unset.
+    pub env: Vec<EnvEntry>,
 }
 
 /// A descriptor resolved against its shape and tables: today's
