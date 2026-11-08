@@ -541,6 +541,10 @@ pub(crate) fn orphan_manifests(inner: &Inner, roots: &[&str]) -> Result<Vec<Stri
 pub(crate) fn prefetch(inner: &Inner, what: Prefetch<'_>) -> Result<Hydration, StoreError> {
     match what {
         Prefetch::Units { test_ids, choose } => prefetch_units(inner, test_ids, choose),
+        // Objects are read with the request that needs them, as apart.
+        Prefetch::UnitsWithObjects {
+            test_ids, choose, ..
+        } => prefetch_units(inner, test_ids, choose),
         Prefetch::Manifests { roots } => {
             let ns = inner.ready()?;
             let want: Vec<String> = {

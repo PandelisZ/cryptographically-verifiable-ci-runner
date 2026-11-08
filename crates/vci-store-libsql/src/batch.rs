@@ -58,7 +58,14 @@
 //! under way when it runs out, and a transaction out of time sent again):
 //! past that every unit still queued, and every later write's (removing
 //! unreferenced manifests included), is lost at once, latching nothing, so
-//! that a server that takes writes slowly costs a job a bounded time.
+//! that a server that takes writes slowly costs a job a bounded time. The
+//! time a transaction waits for its handle's turn to write (another
+//! thread's write under way, [`crate::conn::Conn::write_turn`]) is not the
+//! server's: it counts against neither bound and sizes no transaction, and
+//! one whose turn did not come was not sent and is queued again within its
+//! tries. A transaction that failed keeps the turn until its failure is
+//! counted (and the breaker latched, when the retry time ran out), so that
+//! no other thread's write goes out to the server before then.
 //!
 //! A unit reported lost was not always left unstored: a transaction that
 //! ran out of time and was given up (its tries or the retry time spent,
@@ -1242,6 +1249,10 @@ pub(crate) fn write_all(
     let mut fresh: VecDeque<Pending> = units(p).into();
     let mut queue: VecDeque<(Vec<Pending>, u32, Option<Tx>)> = VecDeque::new();
     let (mut txs, mut bytes, mut longest, mut lost) = (0usize, 0usize, Duration::ZERO, 0usize);
+    // The time spent waiting for the handle's turn to write: another of its
+    // writes' (another thread's), counted against none of the process's
+    // times for writes.
+    let mut turn_waits = Duration::ZERO;
     // Why a transaction of objects alone was lost: reported only if no
     // later transaction stores them.
     let mut objects_why: Option<StoreError> = None;
@@ -1269,7 +1280,7 @@ pub(crate) fn write_all(
         // past the bound, as the transaction under way: it may have
         // committed late, and the copy, or its guard's refusal, says so.
         // Losing it unasked reported units the server stored as lost.
-        if !resend && remote.writing_out_of_time(began.elapsed()) {
+        if !resend && remote.writing_out_of_time(began.elapsed().saturating_sub(turn_waits)) {
             // Every unit still queued, at once.
             let mut failed = vec![group];
             failed.extend(queue.drain(..).map(|(g, _, _)| g));
@@ -1300,14 +1311,20 @@ pub(crate) fn write_all(
                 prepare(remote, p, &keep)
             }
         };
-        let (tx, r) = match built {
+        // The handle's turn to write, held while a transaction that went
+        // out failed, until its failure is counted below (and the breaker
+        // latched, when the retry time ran out): no other thread's write
+        // goes out to the server meanwhile.
+        let (tx, r, waited, went_out, mut turn) = match built {
             Ok(tx) => {
-                let r = send(remote, &tx);
-                (Some(tx), r)
+                let s = send(remote, &tx);
+                (Some(tx), s.result, s.waited, s.went_out, s.turn)
             }
-            Err(e) => (None, Err(e)),
+            Err(e) => (None, Err(e), Duration::ZERO, true, None),
         };
-        let took = t.elapsed();
+        // The transaction's own time: not the wait for its turn.
+        turn_waits += waited;
+        let took = t.elapsed().saturating_sub(waited);
         longest = longest.max(took);
         let e = match (r, tx) {
             (Ok(n), Some(tx)) => {
@@ -1346,6 +1363,17 @@ pub(crate) fn write_all(
         };
         if remote.conn.check().is_err() || hopeless(&why) {
             give_up(&mut why, &mut failed);
+        } else if !went_out {
+            // Its turn did not come (the write under way held it past the
+            // most its requests may take): not sent, so the server said
+            // nothing, and no retry time is spent nor size learnt. Queued
+            // again as it was (a copy sent before stays that copy), within
+            // its tries.
+            if tries + 1 < MAX_TRIES {
+                let group = failed.pop().unwrap_or_default();
+                queue.push_front((group, tries + 1, if resend { tx } else { None }));
+                continue;
+            }
         } else if worth_again(&why) && tries + 1 < MAX_TRIES {
             // Out of time: the transactions after it are made smaller.
             if !resend {
@@ -1354,7 +1382,10 @@ pub(crate) fn write_all(
             // Time spent on a write that failed, and the pause before it is
             // sent again, count against the process's retry time.
             let pause = backoff(tries);
-            if remote.spend_on_writes(took + pause) {
+            let left = remote.spend_on_writes(took + pause);
+            if left {
+                // The others may write while this one waits.
+                drop(turn.take());
                 std::thread::sleep(pause);
                 // As it was sent: should the first commit after all (it
                 // waited for the lock while the server answered that it had
@@ -1385,7 +1416,7 @@ pub(crate) fn write_all(
         }
         w.unstored = unstored;
     }
-    remote.spent_writing(began.elapsed());
+    remote.spent_writing(began.elapsed().saturating_sub(turn_waits));
     step.done(format_args!(
         "write batch: {} manifest(s), {} attestation(s), {} removal(s), {txs} transaction(s), {} request(s), {}{}, longest {:.2}s{}",
         counts.0,
@@ -1436,30 +1467,61 @@ pub(crate) struct Tx {
     only_removals: bool,
 }
 
+/// How [`send`] went: the bytes of values sent, or why not; the time it
+/// waited for the handle's turn to write ([`crate::conn::Conn::write_turn`]:
+/// another write's time, not the server's); whether it went out (not when
+/// its turn did not come); and the turn, held while it failed until
+/// [`write_all`] counted the failure.
+struct Sent<'a> {
+    result: Result<usize, StoreError>,
+    waited: Duration,
+    went_out: bool,
+    turn: Option<crate::conn::WriteTurn<'a>>,
+}
+
 /// Send `tx` (one request, and when its deadline runs out, one more asking
-/// whether the server committed it); the bytes of values sent.
-fn send(remote: &Remote, tx: &Tx) -> Result<usize, StoreError> {
+/// whether the server committed it).
+fn send<'a>(remote: &'a Remote, tx: &Tx) -> Sent<'a> {
     if tx.stmts.is_empty() {
-        return Ok(0);
+        return Sent {
+            result: Ok(0),
+            waited: Duration::ZERO,
+            went_out: true,
+            turn: None,
+        };
     }
-    match remote.write_checked(&tx.stmts, Some(&tx.probe)) {
-        Ok(()) => {}
+    let c = remote.write_checked(&tx.stmts, Some(&tx.probe));
+    let result = match c.result {
+        Ok(()) => Ok(()),
         // Its guard: a send of it before this one committed.
-        Err(Fail::Store(e)) if e.to_string().contains(&tx.nonce) => {}
+        Err(Fail::Store(e)) if e.to_string().contains(&tx.nonce) => Ok(()),
         // Only removals, and no tables: nothing to remove.
-        Err(Fail::Absent) if tx.only_removals => return Ok(0),
-        Err(Fail::Absent) => {
-            return Err(StoreError::NotInitialized {
-                backend: KIND,
-                advice: "the namespace's tables went away while vci wrote: run it again".to_owned(),
-            });
+        Err(Fail::Absent) if tx.only_removals => Err(None),
+        Err(Fail::Absent) => Err(Some(StoreError::NotInitialized {
+            backend: KIND,
+            advice: "the namespace's tables went away while vci wrote: run it again".to_owned(),
+        })),
+        Err(Fail::Store(e)) => Err(Some(e)),
+    };
+    let result = match result {
+        Ok(()) => {
+            if tx.prune {
+                remote.log_pruned.store(true, Ordering::Relaxed);
+            }
+            Ok(tx.sent)
         }
-        Err(Fail::Store(e)) => return Err(e),
+        Err(None) => Ok(0),
+        Err(Some(e)) => Err(e),
+    };
+    // Held only while it failed (a refusal of a copy that committed before
+    // is no failure).
+    let turn = if result.is_err() { c.turn } else { None };
+    Sent {
+        result,
+        waited: c.waited,
+        went_out: c.sent,
+        turn,
     }
-    if tx.prune {
-        remote.log_pruned.store(true, Ordering::Relaxed);
-    }
-    Ok(tx.sent)
 }
 
 /// `p` as one transaction ([`Tx`]). `keep`: roots the whole queue

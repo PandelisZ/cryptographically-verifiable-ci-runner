@@ -16,7 +16,7 @@ use vci_core::objects::{hex32, parse_hex32};
 use vci_core::{
     CheckoutCache, Descriptor, EntryKind, Hdr, InputEntry, InputManifest, Mismatch, ObjectKind,
     Observation, PREDICATE_TYPE, PREDICATE_TYPE_V2, RepoPath, ResolvedPredicate, Shape, ShapeEntry,
-    State, Tables, VciPredicateV2, env_value_hash, object_id,
+    ShapeObservations, State, Tables, VciPredicateV2, env_value_hash, object_id,
 };
 use vci_git::Repo;
 use vci_store::{
@@ -432,8 +432,59 @@ struct Verifier<'a> {
     /// The case-folded prefixes and collisions of each shape group, made
     /// once per `(shape id, group)` (see [`GroupCase`]).
     group_cases: Mutex<HashMap<(String, u8), Arc<GroupCase>>>,
+    /// The outcome of each candidate checked so far that no later round can
+    /// change (see [`Outcome`]), by unit and key: a round after the first
+    /// checks a unit's candidates again with the ones it read, and takes
+    /// these from here instead of checking them a second time.
+    outcomes: Mutex<HashMap<(String, String), Arc<Outcome>>>,
+    /// What the checkout holds for the entries of each shape a format-3
+    /// candidate names, observed once for every unit of its run where the
+    /// rest of a unit's set does not matter (see [`ShapeObservations`]).
+    shapes_seen: Mutex<HashMap<String, Arc<ShapeObservations>>>,
+    /// Each unit's current global manifests ([`Verifier::globals_of`]).
+    globals_by_unit: Mutex<HashMap<String, Arc<GlobalsNow>>>,
+    /// What each descriptor (by tables id and descriptor bytes) observes
+    /// (see [`SeenInputs`]).
+    inputs_seen: Mutex<HashMap<DescriptorKey, Arc<SeenInputs>>>,
+    /// `VCI_PLAN_RECHECK=1`: no outcome is kept for a later round, no
+    /// observation is shared between candidates and a unit's global
+    /// manifests are made again in each round (every candidate checked in
+    /// full each time, as 2.10.0 did), to compare.
+    recheck: bool,
     /// Where the verdicts phase spends its time (`VCI_TIMING=1`).
     timers: Timers,
+}
+
+/// What a format-3 candidate's set observes at HEAD, kept for every
+/// candidate with the same descriptor over the same tables object (the
+/// same unit attested by two runs of one shape): the root of the manifest
+/// of the observation and, once a candidate whose signed root is another
+/// needed them, the entries whose kind or exec bit is not the set's
+/// ([`kind_mismatches`]). Both follow from the descriptor, the tables and
+/// shape it names (by id: their bytes are checked against it) and the
+/// checkout, which does not change during a plan.
+struct SeenInputs {
+    root: String,
+    kinds: std::sync::OnceLock<Vec<Mismatch>>,
+}
+
+/// A descriptor as [`SeenInputs`] are kept by: its tables object's id and
+/// its bytes (which name its shape).
+type DescriptorKey = (String, Vec<u8>);
+
+/// A candidate's outcome, kept for the rounds after the one that checked it
+/// (2.10.1): what the check filled in and its result, with the BLAKE3 of
+/// the value it checked (a value read again later is taken from here only
+/// when it is the same). Kept only for a format-3 record whose checks read
+/// nothing a later round can make readable: no value error, every hdr,
+/// tables and shape object it names loaded, its global manifests made and
+/// its inputs observed (the checkout cache keeps no failed observation). A
+/// format-1 record (its manifest and base are fetched by the rounds) and a
+/// candidate whose check panicked are checked again, as before.
+struct Outcome {
+    value: [u8; 32],
+    info: CandidateInfo,
+    result: Result<(), Failure>,
 }
 
 /// Nanoseconds spent in each part of checking candidates, summed over
@@ -442,6 +493,8 @@ struct Verifier<'a> {
 #[derive(Default)]
 pub(crate) struct Timers {
     candidates: std::sync::atomic::AtomicU64,
+    /// Candidates whose outcome an earlier round kept ([`Outcome`]).
+    reused: std::sync::atomic::AtomicU64,
     rehashed: std::sync::atomic::AtomicU64,
     signature: std::sync::atomic::AtomicU64,
     globals: std::sync::atomic::AtomicU64,
@@ -1486,56 +1539,82 @@ fn say_why_not_loaded(f: &mut Failure, why: &str) {
 /// entry whose observed kind or exec bit is not the shape's, and when no
 /// entry differs that way one line saying the entries changed and the
 /// attested hash was not loaded. Never empty: the root differs, so the
-/// candidate fails `inputs` on an entry, which round 2 keys on.
-fn entry_mismatches(
-    set: &[ShapeEntry],
-    observed: &InputManifest,
+/// candidate fails `inputs` on an entry, which round 2 keys on. `set`: the
+/// attested set, sorted (as a shape's entries are); `observed`: the
+/// observed manifest's entries, sorted; `observed_root`: its root. An
+/// observed entry is compared with the set's last entry at its path. (The
+/// verdict makes it of its parts, [`kind_mismatches`] and
+/// [`or_root_changed`], keeping the first for its descriptor.)
+#[cfg_attr(not(test), allow(dead_code))]
+fn entry_mismatches<'a>(
+    set: impl IntoIterator<Item = &'a ShapeEntry>,
+    observed: &[&InputEntry],
     state: Option<&State>,
     input_root: &str,
+    observed_root: &str,
+) -> Vec<Mismatch> {
+    let out = match state {
+        Some(st) => observed
+            .iter()
+            .filter_map(|o| state_mismatch(o, st))
+            .collect(),
+        None => kind_mismatches(set, observed),
+    };
+    or_root_changed(out, input_root, observed_root)
+}
+
+/// [`entry_mismatches`] without the state: every observed entry whose kind
+/// or exec bit is not the set's (its last entry at the path), none when no
+/// entry differs that way.
+fn kind_mismatches<'a>(
+    set: impl IntoIterator<Item = &'a ShapeEntry>,
+    observed: &[&InputEntry],
 ) -> Vec<Mismatch> {
     let compared = |kind: EntryKind| !matches!(kind, EntryKind::AutoloadDir | EntryKind::Excluded);
     let mut out = Vec::new();
-    match state {
-        Some(st) => out.extend(
-            observed
-                .entries
-                .iter()
-                .filter_map(|o| state_mismatch(o, st)),
-        ),
-        None => {
-            let by_path: HashMap<&str, &ShapeEntry> =
-                set.iter().map(|e| (e.path.as_str(), e)).collect();
-            for o in &observed.entries {
-                if !compared(o.kind) {
-                    continue;
-                }
-                if let Some(a) = by_path.get(o.path.as_str())
-                    && (a.kind != o.kind || a.exec != o.exec)
-                {
-                    let exec = if a.kind == EntryKind::File {
-                        format!(" exec={}", a.exec)
-                    } else {
-                        String::new()
-                    };
-                    out.push(Mismatch {
-                        what: format!("entry:{}", o.path),
-                        expected: format!(
-                            "{}{exec} changed ({HASH_NOT_LOADED})",
-                            kind_label(a.kind)
-                        ),
-                        actual: describe_entry(o),
-                    });
-                }
-            }
+    // Both sorted by path: one walk finds each path's last set entry
+    // (2.10.1; a map of a Rails unit's ~2,850 paths, made for each candidate
+    // that failed, cost more than the rest of the comparison).
+    let set: Vec<&ShapeEntry> = set.into_iter().collect();
+    debug_assert!(set.windows(2).all(|w| w[0].path <= w[1].path));
+    debug_assert!(observed.windows(2).all(|w| w[0].path <= w[1].path));
+    let mut at = 0;
+    for o in observed {
+        if !compared(o.kind) {
+            continue;
+        }
+        while at < set.len() && set[at].path < o.path {
+            at += 1;
+        }
+        let last = set[at..].iter().take_while(|a| a.path == o.path).last();
+        if let Some(a) = last
+            && (a.kind != o.kind || a.exec != o.exec)
+        {
+            let exec = if a.kind == EntryKind::File {
+                format!(" exec={}", a.exec)
+            } else {
+                String::new()
+            };
+            out.push(Mismatch {
+                what: format!("entry:{}", o.path),
+                expected: format!("{}{exec} changed ({HASH_NOT_LOADED})", kind_label(a.kind)),
+                actual: describe_entry(o),
+            });
         }
     }
+    out
+}
+
+/// `out`, or when it is empty the one line saying the entries changed and
+/// the attested hash was not loaded (see [`entry_mismatches`]).
+fn or_root_changed(mut out: Vec<Mismatch>, input_root: &str, observed_root: &str) -> Vec<Mismatch> {
     if out.is_empty() {
         out.push(Mismatch {
             what: format!("entry: changed ({HASH_NOT_LOADED})"),
             expected: format!("input root {input_root}"),
             actual: format!(
                 "input root {} (recomputed from the files at HEAD; which entries changed is known only from the run's state object, which is not at hand)",
-                observed.root()
+                observed_root
             ),
         });
     }
@@ -2696,6 +2775,7 @@ fn plan_with(
     let checkout = CheckoutCache::new(&ctx.root);
     let ignored = IgnoredChildren::default();
     let head_tree = ctx.repo.head_tree().ok();
+    let recheck = std::env::var_os("VCI_PLAN_RECHECK").is_some_and(|v| v == "1");
     let verifiers: Vec<Result<Verifier<'_>, String>> = ctx
         .projects
         .iter()
@@ -2733,6 +2813,11 @@ fn plan_with(
                     collisions: Mutex::default(),
                     base_checks: Mutex::default(),
                     group_cases: Mutex::default(),
+                    outcomes: Mutex::default(),
+                    shapes_seen: Mutex::default(),
+                    globals_by_unit: Mutex::default(),
+                    inputs_seen: Mutex::default(),
+                    recheck,
                     timers: Timers::default(),
                 }),
             },
@@ -2769,6 +2854,9 @@ fn plan_with(
             .collect()
     });
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
+    // The round trips to the remote for values from here on (2.10.1: a vex
+    // plan made three, one after the other; see `round_two_objects`).
+    let round_trips = vci_git::meta::value_round_trips();
     let mut verdicts = verdicts;
     let t = std::time::Instant::now();
     // A plan that verifies no project reads nothing from the store (its
@@ -2783,6 +2871,7 @@ fn plan_with(
     } else {
         BTreeMap::new()
     };
+    let budget = StateBudget::of(&ctx.repo);
     let current = hydrate_more(
         store,
         &files,
@@ -2792,6 +2881,7 @@ fn plan_with(
         &memos,
         &mut verdicts,
         res,
+        Beside::new(budget, opts.only.is_some()),
     );
     timing("verdicts again for what was fetched meanwhile", t);
     // The changed input of each unit that runs, from its run's state object
@@ -2805,7 +2895,7 @@ fn plan_with(
         &current,
         &mut verdicts,
         &objects,
-        StateBudget::of(&ctx.repo),
+        budget,
         opts.only.is_some(),
     );
     drop(current);
@@ -2835,6 +2925,12 @@ fn plan_with(
         }
     }
     objects.report();
+    if store.caps().lazy_values && vci_core::metrics::on() {
+        vci_core::timing_line!(
+            "round trips for values after the first verdicts: {}",
+            vci_git::meta::value_round_trips() - round_trips
+        );
+    }
     // What passed on this tree, for the plans whose base commit it is
     // (2.7.29; see `passing_memos`).
     if let Some(head) = head_tree.as_deref() {
@@ -2969,8 +3065,11 @@ type SetAside = BTreeMap<String, BTreeSet<String>>;
 /// PostgreSQL: 2.8.0; before, a round that fetched nothing ended the plan,
 /// and those units ran). A unit whose newest attestation matches never gets
 /// here. Bounded: a round that fetched nothing and whose read made no
-/// candidate readable ends it. Returns the candidates the rounds read again,
-/// by unit (the others are as `by_id` holds them).
+/// candidate readable ends it. On a lazy store, round 2 fetches beside its
+/// candidates, in the same round trip, the objects its verdicts and the
+/// failure text after them will read ([`round_two_objects`], 2.10.1;
+/// `beside`). Returns the candidates the rounds read again, by unit (the
+/// others are as `by_id` holds them).
 #[allow(clippy::too_many_arguments)]
 fn hydrate_more(
     store: &dyn AttestationStore,
@@ -2981,6 +3080,7 @@ fn hydrate_more(
     memos: &BTreeMap<String, String>,
     verdicts: &mut [Vec<FileVerdict>],
     res: &mut PlanResult,
+    beside: Beside,
 ) -> BTreeMap<String, Vec<StoredEnvelope>> {
     // A unit whose remembered attestation (the one that passed on the base
     // commit's tree, see `passing_memos`) was read and failed on its inputs
@@ -3075,15 +3175,45 @@ fn hydrate_more(
                 .filter(|&i| !older.contains(&cands[i].key))
                 .collect()
         };
-        let h = store
-            .prefetch(Prefetch::Units {
+        // Round 2 on a lazy store (2.10.1): beside the candidates, in the
+        // same round trip, the objects the verdicts and the failure text
+        // after them will read (see `round_two_objects`).
+        let guessed: Vec<String> =
+            if round == 2 && beside.on && store.caps().lazy_values && !unread_ids.is_empty() {
+                let t = std::time::Instant::now();
+                let g = round_two_objects(
+                    store, files, verifiers, verdicts, by_id, &current, &ids, &unread, &older,
+                    beside,
+                );
+                timing(
+                    &format!(
+                        "round {round}: {} object(s) to fetch beside the candidates",
+                        g.len()
+                    ),
+                    t,
+                );
+                g
+            } else {
+                Vec::new()
+            };
+        let guessed: Vec<&str> = guessed.iter().map(String::as_str).collect();
+        let choose = (!older.is_empty()).then_some(&skip_older as Choose<'_>);
+        let units = if guessed.is_empty() {
+            Prefetch::Units {
                 test_ids: &unread_ids,
-                choose: (!older.is_empty()).then_some(&skip_older as Choose<'_>),
-            })
-            .and_then(|mut h| {
-                h.add(store.prefetch(Prefetch::Manifests { roots: &root_ids })?);
-                Ok(h)
-            });
+                choose,
+            }
+        } else {
+            Prefetch::UnitsWithObjects {
+                test_ids: &unread_ids,
+                choose,
+                objects: &guessed,
+            }
+        };
+        let h = store.prefetch(units).and_then(|mut h| {
+            h.add(store.prefetch(Prefetch::Manifests { roots: &root_ids })?);
+            Ok(h)
+        });
         let warning = match &h {
             Ok(h) => h.error.as_ref().map(|e| {
                 format!(
@@ -3145,7 +3275,16 @@ fn hydrate_more(
             });
             preload_objects(store, v.objects, &v.timers, cands, v.head_tree.as_deref());
         }
-        // Checked again with every candidate readable.
+        // Checked again with every candidate readable (the outcomes the
+        // rounds before kept are taken as they were: see `Outcome`).
+        let reused = || -> u64 {
+            verifiers
+                .iter()
+                .flatten()
+                .map(|v| v.timers.reused.load(std::sync::atomic::Ordering::Relaxed))
+                .sum()
+        };
+        let reused_before = reused();
         let fresh = &current;
         let mut rechecked = 0usize;
         in_plan_pool(|| {
@@ -3182,6 +3321,13 @@ fn hydrate_more(
         } else {
             format!("read {readable} candidate(s) set aside")
         };
+        if vci_core::metrics::on() {
+            // Not a step (no seconds): the round's line below keeps its key.
+            vci_core::timing_line!(
+                "round {round}: {} candidate outcome(s) kept from the rounds before",
+                reused() - reused_before
+            );
+        }
         timing(
             &format!(
                 "round {round}: {what} for {} unit(s) not skipped, check them again ({rechecked} still not)",
@@ -3191,6 +3337,168 @@ fn hydrate_more(
         );
     }
     current
+}
+
+/// Whether round 2 fetches objects beside the candidates on a lazy store
+/// ([`round_two_objects`]), and what the failure text after the verdicts
+/// may load ([`name_changed_inputs`]'s budget and mode).
+#[derive(Debug, Clone, Copy)]
+struct Beside {
+    /// `VCI_FETCH_BESIDE=0` turns it off: round 2 fetches the candidates
+    /// alone, as 2.10.0 did (to compare).
+    on: bool,
+    budget: StateBudget,
+    every_candidate: bool,
+}
+
+impl Beside {
+    fn new(budget: StateBudget, every_candidate: bool) -> Self {
+        let on = std::env::var("VCI_FETCH_BESIDE").map_or(true, |v| v.trim() != "0");
+        Beside {
+            on,
+            budget,
+            every_candidate,
+        }
+    }
+}
+
+/// At most this many hdr, tables and shape objects are guessed for round 2
+/// ([`round_two_objects`]).
+const ROUND_TWO_VERDICT_OBJECTS: usize = 64;
+
+/// What round 2 fetches on a lazy store beside the candidates it reads, in
+/// the same round trip (2.10.1; before, the candidates, then the verdict
+/// objects they name, then the state objects after the verdicts were three
+/// round trips one after the other, about 0.8 s each against GitHub). Ids
+/// from keys alone ([`AttestationStore::run_objects`]: git-meta's
+/// run-state links by the keys' hints, and the objects published with a
+/// record); nothing here is a verdict (each object is checked against its
+/// id when read):
+///
+/// - the hdr, tables and shape objects of the runs of the candidates the
+///   round fetches, not loaded yet, at most [`ROUND_TWO_VERDICT_OBJECTS`];
+/// - the state objects the failure text after the verdicts
+///   ([`name_changed_inputs`]) could load: of the runs of the candidates it
+///   would name for the units round 2 does not check again (their verdicts
+///   stand), and of every candidate of the units it checks again (any of
+///   them may become the one the reason names). A run's links by its hint
+///   name every state object the text can ask of it, and maybe more. Only
+///   when they are at most `[store] plan_states` (and `plan_states_mib` is
+///   not 0): then every state object the text loads is among them, and a
+///   plan still downloads at most `plan_states`; otherwise none is guessed
+///   and the text fetches its own, as before.
+#[allow(clippy::too_many_arguments)]
+fn round_two_objects(
+    store: &dyn AttestationStore,
+    files: &[TestFile],
+    verifiers: &[Result<Verifier<'_>, String>],
+    verdicts: &[Vec<FileVerdict>],
+    by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
+    current: &BTreeMap<String, Vec<StoredEnvelope>>,
+    ids: &BTreeSet<&str>,
+    unread: &BTreeSet<&str>,
+    older: &BTreeSet<String>,
+    beside: Beside,
+) -> Vec<String> {
+    let cands_of = |id: &str| -> &[StoredEnvelope] {
+        current
+            .get(id)
+            .or_else(|| by_id.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
+    let readable = |c: &StoredEnvelope| matches!(c.state(), ValueState::Read(_));
+    // Every record the text after the verdicts could name, and whether the
+    // round fetches it.
+    let mut records: Vec<(&StoredEnvelope, bool)> = Vec::new();
+    for (pi, vs) in verdicts.iter().enumerate() {
+        if verifiers.get(pi).is_none_or(Result::is_err) {
+            continue;
+        }
+        let mine = files.iter().filter(|f| f.project == pi);
+        for (f, out) in mine.zip(vs.iter()) {
+            let id = f.test_id.as_str();
+            let cands = cands_of(id);
+            if ids.contains(id) {
+                // Checked again: any candidate read by the end of the rounds
+                // may be the one the reason names (a candidate never read
+                // for it, `older`, is not).
+                for c in cands {
+                    if readable(c) {
+                        records.push((c, false));
+                    } else if unread.contains(id) && !older.contains(&c.key) {
+                        records.push((c, true));
+                    }
+                }
+                continue;
+            }
+            let which: Vec<usize> = if beside.every_candidate {
+                (0..out.candidates.len()).collect()
+            } else if out.skip {
+                Vec::new()
+            } else {
+                out.best.into_iter().collect()
+            };
+            for ci in which {
+                let Some(c) = out.candidates.get(ci) else {
+                    continue;
+                };
+                if !c.failure.as_ref().is_some_and(hash_not_loaded) {
+                    continue;
+                }
+                if let Some(record) = cands
+                    .iter()
+                    .find(|s| s.key == c.info.meta_key && s.target == c.info.target)
+                {
+                    records.push((record, false));
+                }
+            }
+        }
+    }
+    if !records.iter().any(|(_, fetched)| *fetched) {
+        return Vec::new();
+    }
+    let envs: Vec<&StoredEnvelope> = records.iter().map(|(r, _)| *r).collect();
+    let run_objects = match store.run_objects(&envs) {
+        Ok(r) if r.len() == envs.len() => r,
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    // The verdict objects of the records fetched, those not loaded yet.
+    let loaded = |id: &str| {
+        verifiers
+            .iter()
+            .flatten()
+            .next()
+            .is_some_and(|v| matches!(v.objects.lock().by_id.get(id), Some(Ok(_))))
+    };
+    for ((_, fetched), objects) in records.iter().zip(&run_objects) {
+        if !fetched {
+            continue;
+        }
+        for (kind, id) in objects {
+            if *kind != ObjectKind::State
+                && out.len() < ROUND_TWO_VERDICT_OBJECTS
+                && !out.contains(id)
+                && !loaded(id)
+            {
+                out.push(id.clone());
+            }
+        }
+    }
+    let budget = beside.budget;
+    if budget.objects > 0 && budget.bytes > 0 {
+        let states: BTreeSet<&String> = run_objects
+            .iter()
+            .flatten()
+            .filter(|(k, _)| *k == ObjectKind::State)
+            .map(|(_, id)| id)
+            .collect();
+        if states.len() <= budget.objects {
+            out.extend(states.into_iter().cloned());
+        }
+    }
+    out
 }
 
 /// What [`name_changed_inputs`] did (its `VCI_TIMING` line, and tests).
@@ -3773,15 +4081,7 @@ impl Verifier<'_> {
         // them for an attestation made before 2.7.36, and without what the
         // project leaves out for one that records `rails_inputs`.
         let t = std::time::Instant::now();
-        let all = self.global_now(f, false);
-        let global_now = GlobalsNow {
-            ignored: if self.project.ignored_inputs.is_empty() {
-                all.clone()
-            } else {
-                self.global_now(f, true)
-            },
-            all,
-        };
+        let global_now = self.globals_of(f);
         Timers::add(&self.timers.globals, t);
         // Newest first (by the issuedAt each says, unread ones last; ties
         // in store order): the first that passes is used, and a newer
@@ -3807,11 +4107,35 @@ impl Verifier<'_> {
                 meta_key: s.key.clone(),
                 ..Default::default()
             };
-            // Catch panics too: a bug in a check must never become a skip.
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.check(f, s, &global_now, &mut info)
-            }))
-            .unwrap_or_else(|_| Err(Failure::one("internal", 0, "panic while checking", "", "")));
+            let r = match self.outcome_of(f, s) {
+                Some(o) => {
+                    Timers::count(&self.timers.reused);
+                    info = CandidateInfo {
+                        target: info.target,
+                        meta_key: info.meta_key,
+                        ..o.info.clone()
+                    };
+                    o.result.clone()
+                }
+                None => {
+                    // Whether nothing a later round reads can change this
+                    // outcome (see `Outcome`); a check clears it.
+                    let mut lasting = s.error.is_none();
+                    // Catch panics too: a bug in a check must never become
+                    // a skip.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.check(f, s, &global_now, &mut info, &mut lasting)
+                    }))
+                    .unwrap_or_else(|_| {
+                        lasting = false;
+                        Err(Failure::one("internal", 0, "panic while checking", "", ""))
+                    });
+                    if lasting {
+                        self.keep_outcome(f, s, &info, &r);
+                    }
+                    r
+                }
+            };
             let passed = r.is_ok();
             stored_at.push(i);
             out.candidates.push(Candidate {
@@ -3845,6 +4169,95 @@ impl Verifier<'_> {
         out.reason = no_valid_reason(out.candidates.len(), best.map(|(_, f)| f));
         out.best = best.map(|(k, _)| k);
         out
+    }
+
+    /// [`GlobalsNow`] of `f`, made once for the plan's rounds (a round
+    /// after the first checks the unit again): each `global_now` call lists
+    /// the file's global observations from the checkout again.
+    fn globals_of(&self, f: &TestFile) -> Arc<GlobalsNow> {
+        let make = || {
+            let all = self.global_now(f, false);
+            Arc::new(GlobalsNow {
+                ignored: if self.project.ignored_inputs.is_empty() {
+                    all.clone()
+                } else {
+                    self.global_now(f, true)
+                },
+                all,
+            })
+        };
+        if self.recheck {
+            return make();
+        }
+        let kept = self
+            .globals_by_unit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(f.test_id.as_str())
+            .cloned();
+        if let Some(g) = kept {
+            return g;
+        }
+        let g = make();
+        // A failure is not kept: each round makes it again, as before.
+        if g.all.is_ok() && g.ignored.is_ok() {
+            self.globals_by_unit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(f.test_id.as_str().to_owned(), g.clone());
+        }
+        g
+    }
+
+    /// The observations of the shape `shape_id` (of `len` entries): new
+    /// ones for each candidate with `VCI_PLAN_RECHECK=1`.
+    fn shape_observations(&self, shape_id: &str, len: usize) -> Arc<ShapeObservations> {
+        if self.recheck {
+            return Arc::new(ShapeObservations::new(len));
+        }
+        self.shapes_seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(shape_id.to_owned())
+            .or_insert_with(|| Arc::new(ShapeObservations::new(len)))
+            .clone()
+    }
+
+    /// The outcome kept for candidate `s` of `f` by an earlier round, when
+    /// its value is the one checked then.
+    fn outcome_of(&self, f: &TestFile, s: &StoredEnvelope) -> Option<Arc<Outcome>> {
+        if s.error.is_some() || self.recheck {
+            return None;
+        }
+        let o = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(f.test_id.as_str().to_owned(), s.key.clone()))
+            .cloned()?;
+        (o.value == object_id(&s.bytes)).then_some(o)
+    }
+
+    /// Keep candidate `s`'s outcome for the later rounds (see [`Outcome`]).
+    fn keep_outcome(
+        &self,
+        f: &TestFile,
+        s: &StoredEnvelope,
+        info: &CandidateInfo,
+        result: &Result<(), Failure>,
+    ) {
+        if self.recheck {
+            return;
+        }
+        let o = Arc::new(Outcome {
+            value: object_id(&s.bytes),
+            info: info.clone(),
+            result: result.clone(),
+        });
+        self.outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((f.test_id.as_str().to_owned(), s.key.clone()), o);
     }
 
     /// A keyless envelope: certificate chain and timestamp against the base
@@ -4073,8 +4486,10 @@ impl Verifier<'_> {
     fn inputs_v2(
         &self,
         frame: &Frame,
+        tables_id: &str,
         tables: &Tables,
         input_root: &str,
+        lasting: &mut bool,
     ) -> Result<(Arc<InputManifest>, Vec<Mismatch>), Failure> {
         let inputs = |what: String, expected: String, actual: String| {
             Failure::one("inputs", 15, what, expected, actual)
@@ -4091,6 +4506,8 @@ impl Verifier<'_> {
             .objects
             .shape(self.store, &self.timers, &shape_id)
             .map_err(|u| {
+                // An object not at hand may be loaded by a later round.
+                *lasting = false;
                 inputs(
                     u.what,
                     format!("the shape object {shape_id} the descriptor names"),
@@ -4104,20 +4521,22 @@ impl Verifier<'_> {
                 e.to_string(),
             )
         })?;
-        let resolved = descriptor.resolve(&shape, tables).map_err(|e| {
+        let resolved = descriptor.resolve_indices(&shape, tables).map_err(|e| {
             inputs(
                 "descriptor".into(),
                 format!("a descriptor over the shape object {shape_id} and the tables object"),
                 e.to_string(),
             )
         })?;
+        // The set, as the shape's entries (2.10.1: by index, not copies).
+        let set = || resolved.set.iter().map(|&i| &shape.entries[i]);
         // Lookups instead of listings (2.5.0) only where the base policy
         // accepts what they leave out.
-        self.autoload_policy(resolved.set.iter().map(|e| e.kind))?;
+        self.autoload_policy(set().map(|e| e.kind))?;
         // The whole set as a manifest of paths, for a check that needs all
         // of them (made only then: it is ~2,850 clones on vex).
         let all_paths = || InputManifest {
-            entries: resolved.set.iter().map(path_entry).collect(),
+            entries: set().map(path_entry).collect(),
             externals: vec![],
             env: vec![],
         };
@@ -4157,9 +4576,7 @@ impl Verifier<'_> {
         // listing hashes leave out): asked about the listings alone.
         let t = std::time::Instant::now();
         let listings = InputManifest {
-            entries: resolved
-                .set
-                .iter()
+            entries: set()
                 .filter(|e| e.kind == EntryKind::DirListing)
                 .map(path_entry)
                 .collect(),
@@ -4170,16 +4587,84 @@ impl Verifier<'_> {
         Timers::add(&self.timers.ignored, t);
         Timers::count(&self.timers.rehashed);
         let t = std::time::Instant::now();
-        let observed = InputManifest::observe(&resolved.set, self.checkout, &extra)
-            .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
-        let m =
-            InputManifest::from_observed(&resolved.set, observed, resolved.externals, resolved.env)
-                .map_err(|e| Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string()))?;
-        let mut diff = Vec::new();
-        if m.root() != input_root {
-            diff = entry_mismatches(&resolved.set, &m, None, input_root);
+        // The files are not the attested ones: the candidate fails `inputs`
+        // on its `entry:` mismatches (never empty) whatever its env, as
+        // `check` would make the failure of them.
+        let changed = |kinds: &[Mismatch], root: &str| Failure {
+            check: "inputs",
+            rank: 15,
+            details: or_root_changed(kinds.to_vec(), input_root, root)
+                .into_iter()
+                .map(detail_of)
+                .collect(),
+        };
+        // The same descriptor over the same tables observed before (2.10.1;
+        // see `SeenInputs`).
+        let key = (tables_id.to_owned(), frame.descriptor.clone());
+        let seen_before = if self.recheck {
+            None
+        } else {
+            self.inputs_seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&key)
+                .cloned()
+        };
+        if let Some(seen) = &seen_before
+            && seen.root != input_root
+            && let Some(kinds) = seen.kinds.get()
+        {
+            Timers::add(&self.timers.rehash, t);
+            return Err(changed(kinds, &seen.root));
         }
+        // Observed at HEAD as `InputManifest::observe` observes the set,
+        // through the shape's observations: what does not depend on the
+        // rest of the set is observed once for every unit of the run
+        // (2.10.1; see `ShapeObservations`).
+        let seen = self.shape_observations(&shape_id, shape.entries.len());
+        let observed = seen
+            .observe(&shape.entries, &resolved.set, self.checkout, &extra)
+            .map_err(|e| {
+                // The checkout cache keeps no failed observation: the next
+                // round observes the path again.
+                *lasting = false;
+                Failure::one("inputs", 15, "rehash", "re-hashable", e.to_string())
+            })?;
+        let mut sorted: Vec<&InputEntry> = observed.iter().map(|e| &**e).collect();
+        sorted.sort();
+        let seen = match seen_before {
+            Some(seen) => seen,
+            None => {
+                let root =
+                    InputManifest::root_of(sorted.clone(), &resolved.externals, &resolved.env);
+                let seen = Arc::new(SeenInputs {
+                    root,
+                    kinds: std::sync::OnceLock::new(),
+                });
+                if !self.recheck {
+                    self.inputs_seen
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(key, seen.clone());
+                }
+                seen
+            }
+        };
+        if seen.root != input_root {
+            let kinds = seen.kinds.get_or_init(|| kind_mismatches(set(), &sorted));
+            Timers::add(&self.timers.rehash, t);
+            return Err(changed(kinds, &seen.root));
+        }
+        // The manifest of the observation (`InputManifest::from_observed`):
+        // its entries sorted, the attested externals and env.
+        let m = InputManifest {
+            entries: sorted.into_iter().cloned().collect(),
+            externals: resolved.externals,
+            env: resolved.env,
+        };
+        drop(observed);
         Timers::add(&self.timers.rehash, t);
+        let mut diff = Vec::new();
         // The attested env against the child environment, as the format-1
         // rehash compares it.
         let env = lookup(&self.child);
@@ -4249,15 +4734,15 @@ impl Verifier<'_> {
             .map(|s| self.unit_indices(s, &shape))
             .collect();
         // The other entries of every unit, observed once for the run.
-        let mut shared: Vec<usize> = units
-            .iter()
-            .flatten()
-            .flatten()
-            .copied()
-            .filter(|&i| !per_unit(shape.entries[i].kind))
+        // (Marked, not sorted: a run of 2,000 units of 4,000 entries each
+        // is 8 million indices.)
+        let mut named = vec![false; shape.entries.len()];
+        for &i in units.iter().flatten().flatten() {
+            named[i] = true;
+        }
+        let shared: Vec<usize> = (0..shape.entries.len())
+            .filter(|&i| named[i] && !per_unit(shape.entries[i].kind))
             .collect();
-        shared.sort_unstable();
-        shared.dedup();
         let set: Vec<ShapeEntry> = shared.iter().map(|&i| shape.entries[i].clone()).collect();
         let Ok(observed) = InputManifest::observe(&set, self.checkout, &[]) else {
             return none();
@@ -4356,12 +4841,15 @@ impl Verifier<'_> {
         Ok(())
     }
 
+    /// `lasting`: cleared when the outcome depends on something a later
+    /// round can make readable (see [`Outcome`]).
     fn check(
         &self,
         f: &TestFile,
         s: &StoredEnvelope,
         globals_now: &GlobalsNow,
         info: &mut CandidateInfo,
+        lasting: &mut bool,
     ) -> Result<(), Failure> {
         // A value the store could not read (e.g. a blob missing from the
         // object database) only fails its own candidate.
@@ -4391,6 +4879,8 @@ impl Verifier<'_> {
         // checked against the base identities.toml and trust root.
         let (env, material, frame) = match &record {
             Record::FormatOne(bytes) => {
+                // Its manifest (and base) may be fetched by a later round.
+                *lasting = false;
                 let env = Envelope::from_json(bytes).map_err(|e| {
                     Failure::one(
                         "envelope",
@@ -4617,14 +5107,21 @@ impl Verifier<'_> {
                         u.actual,
                     )
                 };
+                // An object not at hand may be loaded by a later round.
                 let hdr = self
                     .objects
                     .hdr(self.store, &self.timers, &p.hdr)
-                    .map_err(|u| object("hdr", &p.hdr, u))?;
+                    .map_err(|u| {
+                        *lasting = false;
+                        object("hdr", &p.hdr, u)
+                    })?;
                 let tables = self
                     .objects
                     .tables(self.store, &self.timers, &p.tables)
-                    .map_err(|u| object("tables", &p.tables, u))?;
+                    .map_err(|u| {
+                        *lasting = false;
+                        object("tables", &p.tables, u)
+                    })?;
                 Owned::V2(Box::new(p), hdr, tables)
             }
         };
@@ -4911,6 +5408,8 @@ impl Verifier<'_> {
                 ));
             }
             Err(e) => {
+                // Listing them again (the next round does) may succeed.
+                *lasting = false;
                 return Err(Failure::one(
                     "global-inputs",
                     14,
@@ -4926,7 +5425,9 @@ impl Verifier<'_> {
         // the mismatches of its files and its env.
         let (m, diff) = match (&owned, frame) {
             (Owned::V1(p1), _) => self.inputs_v1(p1)?,
-            (Owned::V2(_, _, tables), Some(frame)) => self.inputs_v2(frame, tables, &input_root)?,
+            (Owned::V2(p2, _, tables), Some(frame)) => {
+                self.inputs_v2(frame, &p2.tables, tables, &input_root, lasting)?
+            }
             (Owned::V2(..), None) => unreachable!("a v2 predicate comes from a frame"),
         };
         let m: &InputManifest = &m;
@@ -6864,6 +7365,17 @@ adapter = "pytest"
     /// observed one, labelled unsigned; without it, the entries whose kind
     /// or exec bit changed, else one line saying the entries changed; a
     /// state object that does not list a path says so. Never empty.
+    /// [`entry_mismatches`] of a manifest of observed entries against the
+    /// attested root `"root"`.
+    fn mismatches_of(
+        set: &[ShapeEntry],
+        m: &InputManifest,
+        state: Option<&State>,
+    ) -> Vec<Mismatch> {
+        let sorted: Vec<&InputEntry> = m.entries.iter().collect();
+        entry_mismatches(set, &sorted, state, "root", &m.root())
+    }
+
     #[test]
     fn entry_text_from_the_state_object_or_without_it() {
         let path = |p: &str| RepoPath::new(p).unwrap();
@@ -6894,7 +7406,7 @@ adapter = "pytest"
                 file("b.txt", "b1"),
             ],
         };
-        let got = entry_mismatches(&set, &observed, Some(&state), "root");
+        let got = mismatches_of(&set, &observed, Some(&state));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].what, "entry:b.txt");
         assert_eq!(
@@ -6904,7 +7416,7 @@ adapter = "pytest"
             )
         );
         assert_eq!(got[0].actual, "file exec=false size=3 blake3=bb");
-        let got = entry_mismatches(&set, &observed, None, "root");
+        let got = mismatches_of(&set, &observed, None);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].what, "entry: changed (attested hash not loaded)");
         assert_eq!(got[0].expected, "input root root");
@@ -6915,7 +7427,7 @@ adapter = "pytest"
         );
         let mut gone = observed.clone();
         gone.entries[1] = InputEntry::absent(path("b.txt"));
-        let got = entry_mismatches(&set, &gone, None, "root");
+        let got = mismatches_of(&set, &gone, None);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].what, "entry:b.txt");
         assert_eq!(
@@ -6923,7 +7435,7 @@ adapter = "pytest"
             "file exec=false changed (attested hash not loaded)"
         );
         assert_eq!(got[0].actual, "absent");
-        let got = entry_mismatches(&set, &gone, Some(&State::default()), "root");
+        let got = mismatches_of(&set, &gone, Some(&State::default()));
         assert_eq!(got.len(), 2);
         assert!(
             got[0].expected.contains("does not list the path"),
@@ -7343,7 +7855,7 @@ adapter = "pytest"
         let failure = |m: &InputManifest| Failure {
             check: "inputs",
             rank: 15,
-            details: entry_mismatches(&set, m, None, "root")
+            details: mismatches_of(&set, m, None)
                 .into_iter()
                 .map(|m| Detail {
                     what: m.what,

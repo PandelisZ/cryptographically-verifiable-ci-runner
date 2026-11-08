@@ -4530,6 +4530,207 @@ fn a_write_sends_its_transactions_without_a_pause() {
     assert!(median < Duration::from_millis(60), "paused: {gaps:?}");
 }
 
+/// Threads of one handle that write at once send one write transaction at
+/// a time: each goes out once the one before it was answered, and the
+/// others wait in the client (holding no connection of the pool) rather
+/// than on the server's write lock. 2.10.0 sent them all at once: they
+/// queued on the lock, and on `sqld` 0.24.32 that queue stalled for good
+/// under the conformance suite's c12 (14 writer threads on four handles,
+/// eight on one), so that every later write of the CI job waited out its
+/// deadlines (7 November 2026).
+#[test]
+fn a_handles_threads_write_one_transaction_at_a_time() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(60), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 30);
+    // The tables made first.
+    s.put_for_test(
+        "src/seed.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "seed"),
+    )
+    .unwrap();
+    let first = proxy.writes();
+    // Each answer held 100 ms: writes sent at once would overlap.
+    proxy.delay_answers(100);
+    let start = std::sync::Barrier::new(6);
+    std::thread::scope(|sc| {
+        for t in 0..6 {
+            let (s, start) = (&s, &start);
+            sc.spawn(move || {
+                start.wait();
+                for i in 0..2u8 {
+                    let u = format!("src/turns/{t}.test.ts");
+                    s.put_for_test(&u, S1, &hex64(i + 1), Some(&hint(1)), &envelope(None, &u))
+                        .unwrap_or_else(|e| panic!("thread {t}, put {i}: {e}"));
+                }
+            });
+        }
+    });
+    proxy.delay_answers(0);
+    let times: Vec<(Instant, Option<Instant>)> =
+        proxy.shared.write_times.lock().unwrap()[first..].to_vec();
+    assert_eq!(times.len(), 12, "one transaction a put");
+    // The proxy notes an answer's end on the write that went out last: a
+    // write without one was still unanswered when the next went out.
+    for w in times.windows(2) {
+        let ended = w[0]
+            .1
+            .expect("a write went out before the one before it was answered");
+        assert!(
+            w[1].0 >= ended,
+            "a write went out {:?} before the one before it was answered",
+            ended - w[1].0
+        );
+    }
+    assert!(times[11].1.is_some(), "the last write was answered");
+    assert_eq!(s.list_all().unwrap().len(), 13);
+}
+
+/// The wait for a handle's turn to write is another write's time, not the
+/// server's: six threads of one handle behind a link that holds every
+/// answer 1 s, at a 3 s request timeout, wait longer than the timeout for
+/// their turns and still store every put, latching nothing. 2.10.1 as first
+/// merged gave each wait the request timeout and counted one that ran out as
+/// a write that failed (against the process's retry time, and halving the
+/// next transactions): behind a link holding answers 1.5 s, at a 4 s
+/// timeout, four threads of 3 puts each lost 6 to 9 of them and latched the
+/// breaker on a server that would have taken them all.
+#[test]
+fn a_handles_threads_on_a_slow_link_store_every_write() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(120), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 3);
+    s.put_for_test(
+        "src/seed.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "seed"),
+    )
+    .unwrap();
+    s.status().unwrap();
+    proxy.delay_answers(1000);
+    let start = std::sync::Barrier::new(6);
+    let t = Instant::now();
+    let errors: Vec<String> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..6)
+            .map(|th| {
+                let (s, start) = (&s, &start);
+                sc.spawn(move || {
+                    start.wait();
+                    let u = format!("src/slow/{th}.test.ts");
+                    s.put_for_test(&u, S1, &hex64(2), Some(&hint(1)), &envelope(None, &u))
+                        .err()
+                        .map(|e| format!("thread {th}: {e}"))
+                })
+            })
+            .collect();
+        hs.into_iter().filter_map(|h| h.join().unwrap()).collect()
+    });
+    let took = t.elapsed();
+    proxy.delay_answers(0);
+    assert!(errors.is_empty(), "lost on a healthy server: {errors:?}");
+    assert!(
+        took >= Duration::from_secs(5),
+        "six writes one at a time, each answered after 1 s: {took:?}"
+    );
+    s.status().expect("nothing latched");
+    assert_eq!(s.list_all().unwrap().len(), 7);
+}
+
+/// A server that stops answering writes (sqld's stalled write lock) while
+/// six threads of one handle write: every write fails within the process's
+/// retry time (two request timeouts of writes that failed, sent one at a
+/// time), the breaker latches, and its reason, which every later call and
+/// a CI log show, is the server's request that timed out, never the wait
+/// for the handle's turn (2.10.1 as first merged latched it with "waiting
+/// for this handle's write under way timed out", the waits counted as
+/// writes that failed).
+#[test]
+fn a_stalled_server_latches_a_handle_written_by_six_threads_with_its_reason() {
+    let Some((server, token)) = proxied_server() else {
+        return;
+    };
+    let proxy = Proxy::start(&server, Duration::from_secs(120), Close::Fin);
+    let ns = testkit::namespace();
+    let s = proxied(&proxy, token.as_deref(), &ns, 2);
+    s.put_for_test(
+        "src/seed.test.ts",
+        S1,
+        &hex64(1),
+        Some(&hint(1)),
+        &envelope(None, "seed"),
+    )
+    .unwrap();
+    s.status().unwrap();
+    proxy.stall_writes(true);
+    let start = std::sync::Barrier::new(6);
+    let t = Instant::now();
+    let results: Vec<(Duration, Option<String>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..6)
+            .map(|th| {
+                let (s, start) = (&s, &start);
+                sc.spawn(move || {
+                    start.wait();
+                    let u = format!("src/stall/{th}.test.ts");
+                    let r = s.put_for_test(&u, S1, &hex64(2), Some(&hint(1)), &envelope(None, &u));
+                    (t.elapsed(), r.err().map(|e| e.to_string()))
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let all = t.elapsed();
+    let reason = s.status().err().map(|e| e.to_string());
+    let t = Instant::now();
+    let later = s.put_for_test(
+        "src/stall/later.test.ts",
+        S1,
+        &hex64(3),
+        Some(&hint(1)),
+        &envelope(None, "later"),
+    );
+    let later_took = t.elapsed();
+    proxy.stall_writes(false);
+    for (i, (d, why)) in results.iter().enumerate() {
+        eprintln!("thread {i}: {d:?}: {why:?}");
+    }
+    assert!(results.iter().all(|(_, e)| e.is_some()), "a write stored");
+    // Two request timeouts of writes that fail, one at a time, the pause
+    // between them and the question whether the first committed.
+    assert!(
+        all < Duration::from_secs(10),
+        "every thread through after {all:?}"
+    );
+    let reason = reason.expect("latched");
+    assert!(
+        reason.contains("writes kept failing") && reason.contains("a request timed out after 2s"),
+        "the server's failure: {reason}"
+    );
+    assert!(
+        !reason.contains("write under way"),
+        "the turn's wait named: {reason}"
+    );
+    for (_, why) in &results {
+        let why = why.as_deref().unwrap_or_default();
+        assert!(!why.contains("write under way"), "{why}");
+    }
+    assert!(later.is_err(), "a later write fails: latched");
+    assert!(
+        later_took < Duration::from_secs(1),
+        "at once: {later_took:?}"
+    );
+}
+
 /// A process's writes stop once they took six request timeouts in all
 /// (and the little more its small transactions earn by what they store),
 /// even when every transaction commits in time: the units still queued are

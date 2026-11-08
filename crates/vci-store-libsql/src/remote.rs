@@ -1047,12 +1047,14 @@ impl Remote {
 
     /// A transaction of the store's batches: [`Remote::write`] sent once,
     /// asking `committed` whether the server applied it when its deadline
-    /// ran out ([`Conn::batch_checked`]).
+    /// ran out ([`Conn::batch_checked`]), with how long it waited for the
+    /// handle's turn to write, whether it went out, and the turn while it
+    /// failed.
     pub(crate) fn write_checked(
         &self,
         statements: &[String],
         committed: Option<&str>,
-    ) -> Result<(), Fail> {
+    ) -> crate::conn::Checked<'_> {
         self.conn.batch_checked(statements, committed)
     }
 
@@ -2542,6 +2544,18 @@ impl Remote {
                 Ok(Hydration::default())
             }
             Prefetch::Units { test_ids, choose } => self.prefetch_units(test_ids, choose),
+            // As apart: the units, then the objects, best effort.
+            Prefetch::UnitsWithObjects {
+                test_ids,
+                choose,
+                objects,
+            } => {
+                let h = self.prefetch_units(test_ids, choose)?;
+                if objects.iter().all(|id| key::is_object_id(id)) {
+                    let _ = self.fetch_objects(objects);
+                }
+                Ok(h)
+            }
             Prefetch::Manifests { roots } => {
                 let t = self.ready()?;
                 let want: Vec<String> = {

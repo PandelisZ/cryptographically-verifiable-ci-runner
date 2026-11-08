@@ -176,6 +176,25 @@ const PRUNE_KEYS: &[&str] = &["meta:prune:max-keys", "meta:prune:max-size"];
 /// Blobs asked for in one `git fetch --stdin` (git-meta's batch size: GitHub
 /// rejects very large want lists).
 const FETCH_BLOB_BATCH: usize = 4000;
+/// How many runs (distinct key hints) [`AttestStore::objects_added_with`]
+/// looks up the publishing commit of, at most.
+const ADDED_WITH_HINTS: usize = 8;
+/// A commit that added more objects than this (a rewritten history, a
+/// store copied in at once) names none for
+/// [`AttestStore::objects_added_with`].
+const ADDED_WITH_OBJECTS: usize = 64;
+/// How many rows [`AttestStore::objects_added_with`] asks the store about,
+/// at most (records the plan set aside, whose values are here, are not
+/// promised and say nothing).
+const ADDED_WITH_LOOKUPS: usize = 256;
+/// Why the objects fetched beside a plan's candidates did not all come
+/// ([`AttestStore::fetch_blobs_beside`]): their `git fetch` was stopped.
+const BESIDE_STOPPED: &str =
+    "stopped: the candidates' fetch ended, and the objects beside them took longer than the grace";
+/// The least time the objects fetched beside a plan's candidates
+/// ([`AttestStore::fetch_blobs_beside`]) are given once the candidates'
+/// fetch ended (as long again as that fetch took, when longer).
+const BESIDE_GRACE_MIN: Duration = Duration::from_secs(1);
 /// Below this many blobs a fetch runs alone; above, in parallel batches of
 /// at least this many.
 ///
@@ -305,6 +324,16 @@ static STORE_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::n
 #[doc(hidden)]
 pub fn store_notes() -> Vec<String> {
     STORE_NOTES.lock().map(|n| n.clone()).unwrap_or_default()
+}
+
+static VALUE_ROUND_TRIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many round trips to a remote this process made for values (one per
+/// batch of blobs fetched, however many `git fetch` processes it ran at
+/// once): `vci plan` prints those made after its first verdicts under
+/// `VCI_TIMING` (2.10.1).
+pub fn value_round_trips() -> u64 {
+    VALUE_ROUND_TRIPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -3185,6 +3214,22 @@ impl<'a> AttestStore<'a> {
         test_ids: impl IntoIterator<Item = &'s str>,
         choose: impl Fn(&[StoredEnvelope]) -> Vec<usize>,
     ) -> Result<Hydration, GitError> {
+        self.hydrate_units_with_objects(test_ids, choose, &BTreeSet::new())
+    }
+
+    /// [`AttestStore::hydrate_units_choosing`] and, in the same round trip
+    /// as the envelopes, the stored format-3 objects among `objects` not
+    /// fetched yet (2.10.1, [`vci_store::Prefetch::UnitsWithObjects`]): in a
+    /// `git fetch` of their own, so that their failure is never the
+    /// units', and only when the envelopes are fetched (a guess never
+    /// costs a round trip of its own). The [`Hydration`] counts the units'
+    /// values only.
+    pub fn hydrate_units_with_objects<'s>(
+        &self,
+        test_ids: impl IntoIterator<Item = &'s str>,
+        choose: impl Fn(&[StoredEnvelope]) -> Vec<usize>,
+        objects: &BTreeSet<&str>,
+    ) -> Result<Hydration, GitError> {
         let ids: BTreeSet<&str> = test_ids.into_iter().collect();
         if ids.is_empty() || self.reader()?.promised()? == 0 {
             return Ok(Hydration::default());
@@ -3234,19 +3279,27 @@ impl<'a> AttestStore<'a> {
         }
         drop(reader);
         part("choose the candidates");
-        let mut out = self.hydrate_with(&mut ctx, &remote, |k| {
-            parse_key(&k.key).is_some_and(|(tk, _, _)| {
-                wanted.contains(&(
+        let (mut out, _) = self.hydrate_with_beside(
+            &mut ctx,
+            &remote,
+            |k| {
+                parse_key(&k.key).is_some_and(|(tk, _, _)| {
+                    wanted.contains(&(
+                        k.target_type.as_str().to_owned(),
+                        k.target_value.clone(),
+                        tk.to_owned(),
+                    ))
+                }) && chosen_keys.contains(&(
                     k.target_type.as_str().to_owned(),
                     k.target_value.clone(),
-                    tk.to_owned(),
+                    k.key.clone(),
                 ))
-            }) && chosen_keys.contains(&(
-                k.target_type.as_str().to_owned(),
-                k.target_value.clone(),
-                k.key.clone(),
-            ))
-        })?;
+            },
+            |k| {
+                k.target_type == TargetType::Project
+                    && parse_object_key(&k.key).is_some_and(|(_, id)| objects.contains(id))
+            },
+        )?;
         part("fetch the chosen envelopes");
         // The manifest each chosen attestation names, remembered by its
         // blob id when read before (2.7.19); only the others are read.
@@ -3417,6 +3470,163 @@ impl<'a> AttestStore<'a> {
         })
     }
 
+    /// The format-3 objects the metadata commit that added each of these
+    /// records also added (2.10.1), for the records not fetched yet (the
+    /// runs another clone published, which this clone never read): a run's
+    /// records, objects and run-state link are published by one
+    /// serialization, so the commit that added a record added the run's
+    /// hdr, tables, shape and state objects that were new then. One `git
+    /// log -1` of a record's path from the commit whose materialization
+    /// wrote its row (its `promised_commit`: the walk ends among the commits
+    /// that fetch brought) and one `git diff-tree` of the commit found, per
+    /// distinct key hint (a run's), for at most `ADDED_WITH_HINTS` (8) hints,
+    /// in parallel; a commit that added more than `ADDED_WITH_OBJECTS` (64)
+    /// objects (a rewritten history) names none, and so does a merge. Best
+    /// effort, local only (nothing is fetched: a commit or tree this clone
+    /// lacks names nothing). One list per record, in order.
+    pub fn objects_added_with(
+        &self,
+        records: &[&StoredEnvelope],
+    ) -> Vec<Vec<(ObjectKind, String)>> {
+        let mut out = vec![Vec::new(); records.len()];
+        // The records still promised, by hint: the first of each hint
+        // stands for its run, with the commit its row came with.
+        let Ok(Some((_, db))) = self.db_rw() else {
+            return out;
+        };
+        let mut by_hint: BTreeMap<String, (String, String, Vec<usize>)> = BTreeMap::new();
+        // Hints whose run was looked up (its first promised record stands
+        // for it), and how many rows were asked about.
+        let mut checked: BTreeSet<String> = BTreeSet::new();
+        let mut lookups = 0usize;
+        {
+            let Ok(mut stmt) = db.prepare_cached(
+                "SELECT promised_commit FROM metadata
+                 WHERE target_type = ?1 AND target_value = ?2 AND key = ?3 AND is_promised = 1",
+            ) else {
+                return out;
+            };
+            for (i, r) in records.iter().enumerate() {
+                // A value read here is fetched.
+                if matches!(r.state(), vci_store::ValueState::Read(_)) {
+                    continue;
+                }
+                let Some(hint) = vci_store::parse_key_hint(&r.key) else {
+                    continue;
+                };
+                let hint = vci_store::hint_segment(&hint);
+                if let Some((_, _, members)) = by_hint.get_mut(&hint) {
+                    members.push(i);
+                    continue;
+                }
+                if by_hint.len() >= ADDED_WITH_HINTS
+                    || lookups >= ADDED_WITH_LOOKUPS
+                    || checked.contains(&hint)
+                {
+                    continue;
+                }
+                let Ok(target) = Target::parse(&r.target) else {
+                    continue;
+                };
+                lookups += 1;
+                // `None`: not promised (set aside by the plan, or fetched
+                // since it was listed), the next record of the run is asked.
+                let Some(commit) = stmt
+                    .query_row(
+                        rusqlite::params![
+                            target.target_type().as_str(),
+                            target.value().unwrap_or(""),
+                            r.key
+                        ],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                else {
+                    continue;
+                };
+                checked.insert(hint.clone());
+                let Some(commit) = commit.filter(|c| is_oid(c)) else {
+                    continue;
+                };
+                let Ok(p) = git_meta_lib::tree_paths::tree_path(&target, &r.key) else {
+                    continue;
+                };
+                by_hint.insert(hint, (commit, p, vec![i]));
+            }
+        }
+        drop(db);
+        if by_hint.is_empty() {
+            return out;
+        }
+        let added = |from: &str, record_path: &str| -> Option<Vec<(ObjectKind, String)>> {
+            let commit = self
+                .repo
+                .git()
+                .args(["log", "-1", "--format=%H", from, "--", record_path])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run_str()
+                .ok()?;
+            let commit = commit.trim();
+            if !is_oid(commit) {
+                return None;
+            }
+            let listing = self
+                .repo
+                .git()
+                .args([
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "--diff-filter=A",
+                    commit,
+                    "--",
+                    "project",
+                ])
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .run()
+                .ok()?;
+            let mut objects = Vec::new();
+            for p in listing.split(|b| *b == 0) {
+                let Ok(p) = std::str::from_utf8(p) else {
+                    continue;
+                };
+                let parts: Vec<&str> = p.split('/').collect();
+                let Ok((TargetType::Project, _, key_parts)) = parse_path_parts(&parts) else {
+                    continue;
+                };
+                if let PathKey::Value(k) = classify_key_parts(key_parts)
+                    && let Some((kind, id)) = parse_object_key(&k)
+                {
+                    objects.push((kind, id.to_owned()));
+                    if objects.len() > ADDED_WITH_OBJECTS {
+                        return None;
+                    }
+                }
+            }
+            Some(objects)
+        };
+        let groups: Vec<(String, String, Vec<usize>)> = by_hint.into_values().collect();
+        let found: Vec<Option<Vec<(ObjectKind, String)>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = groups
+                .iter()
+                .map(|(c, p, _)| s.spawn(|| added(c, p)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        for ((_, _, members), objects) in groups.iter().zip(found) {
+            for &i in members {
+                out[i] = objects.clone().unwrap_or_default();
+            }
+        }
+        out
+    }
+
     /// Fetch every stored attestation not fetched yet (input manifests
     /// excluded): what reading the whole store (`vci prune`) needs. On a
     /// large store that is most of what a full fetch used to download.
@@ -3545,49 +3755,96 @@ impl<'a> AttestStore<'a> {
         remote: &str,
         wanted: impl Fn(&Key) -> bool,
     ) -> Result<Hydration, GitError> {
+        Ok(self.hydrate_with_beside(ctx, remote, wanted, |_| false)?.0)
+    }
+
+    /// [`AttestStore::hydrate_with`] for the rows `wanted` selects and, in
+    /// the same round trip, the rows `beside` selects that `wanted` does not
+    /// ([`AttestStore::fetch_blobs_beside`]: a `git fetch` of their own,
+    /// whose failure is never `wanted`'s). The first [`Hydration`] counts
+    /// `wanted`'s rows, the second `beside`'s (2.10.1).
+    fn hydrate_with_beside(
+        &self,
+        ctx: &mut HydrateCtx,
+        remote: &str,
+        wanted: impl Fn(&Key) -> bool,
+        beside: impl Fn(&Key) -> bool,
+    ) -> Result<(Hydration, Hydration), GitError> {
         let started = std::time::Instant::now();
         let promised: Vec<Key> = ctx.promised.iter().filter(|k| wanted(k)).cloned().collect();
+        // `beside` rides on `wanted`'s fetch only.
         if promised.is_empty() {
-            return Ok(Hydration::default());
+            return Ok((Hydration::default(), Hydration::default()));
         }
+        let extra: Vec<Key> = ctx
+            .promised
+            .iter()
+            .filter(|k| !wanted(k) && beside(k))
+            .cloned()
+            .collect();
         if ctx.snap.is_none() {
             let Some(local) = self.read_ref(&ctx.local_ref)? else {
-                return Ok(Hydration {
-                    unresolved: promised.len(),
-                    error: Some(format!("{} does not exist", ctx.local_ref)),
-                    ..Default::default()
-                });
+                return Ok((
+                    Hydration {
+                        unresolved: promised.len(),
+                        error: Some(format!("{} does not exist", ctx.local_ref)),
+                        ..Default::default()
+                    },
+                    Hydration::default(),
+                ));
             };
             ctx.snap = Some(self.snapshot_keys(&local)?);
         }
         let snap = ctx.snap.as_ref().expect("snapshot read above");
-        let blobs: BTreeMap<&Key, &String> = promised
-            .iter()
-            .filter_map(|k| snap.value_blobs.get(k).map(|o| (k, o)))
+        let blobs_of = |keys: &[Key]| -> BTreeMap<Key, String> {
+            keys.iter()
+                .filter_map(|k| snap.value_blobs.get(k).map(|o| (k.clone(), o.clone())))
+                .collect()
+        };
+        let blobs = blobs_of(&promised);
+        let extra_blobs = blobs_of(&extra);
+        let oids: BTreeSet<String> = blobs.values().cloned().collect();
+        let extra_oids: BTreeSet<String> = extra_blobs
+            .values()
+            .filter(|o| !oids.contains(*o))
+            .cloned()
             .collect();
-        let oids: BTreeSet<String> = blobs.values().map(|o| (*o).clone()).collect();
-        let (have, fetched, error) = self.ensure_blobs(remote, &oids)?;
+        let (have, fetched, error, extra_fetched, extra_error) =
+            self.ensure_blobs_beside(remote, &oids, &extra_oids)?;
         let mut out = Hydration {
             fetched,
             error,
             ..Default::default()
         };
+        let mut beside_out = Hydration {
+            fetched: extra_fetched,
+            error: extra_error,
+            ..Default::default()
+        };
         let resolve: Vec<(&Key, &String)> = blobs
             .iter()
-            .filter(|(_, o)| have.contains(**o))
-            .map(|(k, o)| (*k, *o))
+            .chain(extra_blobs.iter())
+            .filter(|(_, o)| have.contains(*o))
             .collect();
-        out.unresolved = promised.len() - resolve.len();
+        out.unresolved =
+            promised.len() - blobs.keys().filter(|k| have.contains(&blobs[*k])).count();
+        beside_out.unresolved =
+            extra.len() - extra_blobs.values().filter(|o| have.contains(*o)).count();
         if let Some((path, db)) = self.db_rw()? {
             let tx = db.unchecked_transaction().map_err(|e| sql_err(&path, e))?;
             for (k, oid) in &resolve {
-                out.resolved += tx
+                let n = tx
                     .execute(
                         "UPDATE metadata SET value = ?4, value_type = 'string', is_git_ref = 1, is_promised = 0
                          WHERE target_type = ?1 AND target_value = ?2 AND key = ?3 AND is_promised = 1",
                         rusqlite::params![k.target_type.as_str(), k.target_value, k.key, oid],
                     )
                     .map_err(|e| sql_err(&path, e))?;
+                if blobs.contains_key(*k) {
+                    out.resolved += n;
+                } else {
+                    beside_out.resolved += n;
+                }
             }
             tx.commit().map_err(|e| sql_err(&path, e))?;
         }
@@ -3596,14 +3853,30 @@ impl<'a> AttestStore<'a> {
             ctx.promised.remove(k);
         }
         if vci_core::metrics::on() {
-            vci_core::timing_line!(
-                "fetch {} value(s) ({} blob(s) downloaded): {:.2}s",
-                out.resolved,
-                out.fetched,
-                started.elapsed().as_secs_f64()
-            );
+            if !promised.is_empty() {
+                vci_core::timing_line!(
+                    "fetch {} value(s) ({} blob(s) downloaded): {:.2}s",
+                    out.resolved,
+                    out.fetched,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            if !extra.is_empty() {
+                vci_core::timing_line!(
+                    "fetch {} object(s) beside them ({} blob(s) downloaded{}): {:.2}s",
+                    beside_out.resolved,
+                    beside_out.fetched,
+                    match beside_out.error.as_deref() {
+                        Some(e) if e.contains(BESIDE_STOPPED) =>
+                            ", the fetch stopped after its grace",
+                        Some(_) => ", the fetch failed",
+                        None => "",
+                    },
+                    started.elapsed().as_secs_f64()
+                );
+            }
         }
-        Ok(out)
+        Ok((out, beside_out))
     }
 
     /// The objects reachable from `commit` but not from `tip` (the remote's,
@@ -4390,6 +4663,118 @@ impl<'a> AttestStore<'a> {
     /// Download the blobs `oids` from `remote` as a blobless clone fetches a
     /// value it reads (`git fetch --filter=blob:none --stdin`, in batches).
     fn fetch_blobs(&self, remote: &str, oids: &[&String]) -> Result<(), GitError> {
+        VALUE_ROUND_TRIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out = self.fetch_blobs_unpacked(remote, oids, true);
+        // Each fetch adds a pack: merged once they near gix's slots.
+        self.consolidate_packs();
+        out
+    }
+
+    /// [`AttestStore::fetch_blobs`] of `oids` and, at the same time, of
+    /// `beside` (2.10.1): one round trip for both, the second in a `git
+    /// fetch` of its own, tried once, whose failure (an object the remote no
+    /// longer serves fails a whole `git fetch`) is never the first's, and
+    /// which never holds the first up by more than a grace: once the first
+    /// ended, the second is given as long again as the first took (at least
+    /// [`BESIDE_GRACE_MIN`]), then stopped (its process group killed), and
+    /// what it did not bring is fetched by whoever reads it, as after a
+    /// failure (a guessed object that is slow to come, or large, costs the
+    /// candidates' round trip no more than that). Nothing is fetched without
+    /// `oids`. Returns the first's outcome, then the second's.
+    fn fetch_blobs_beside(
+        &self,
+        remote: &str,
+        oids: &[&String],
+        beside: &[&String],
+    ) -> (Result<(), GitError>, Result<(), GitError>) {
+        if oids.is_empty() {
+            return (Ok(()), Ok(()));
+        }
+        if beside.is_empty() {
+            return (self.fetch_blobs(remote, oids), Ok(()));
+        }
+        VALUE_ROUND_TRIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The promisor remote is configured before either process starts.
+        if let Err(e) = self.ensure_no_lazy_fetch_remote() {
+            let again = GitError::Meta(e.to_string());
+            return (Err(e), Err(again));
+        }
+        // When the second must end: set once the first ended.
+        let stop_at: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let stop = || {
+            stop_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some_and(|at| std::time::Instant::now() >= at)
+        };
+        let out = std::thread::scope(|s| {
+            let extra = s.spawn(|| self.fetch_objects_until(remote, beside, &stop));
+            let started = std::time::Instant::now();
+            let main = self.fetch_blobs_unpacked(remote, oids, true);
+            let grace = started.elapsed().max(BESIDE_GRACE_MIN);
+            *stop_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::time::Instant::now() + grace);
+            let extra = extra
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p));
+            (main, extra)
+        });
+        self.consolidate_packs();
+        out
+    }
+
+    /// The blobs `oids` from `remote` ([`AttestStore::fetch_objects`]: in
+    /// batches of [`FETCH_BLOB_BATCH`], one `git fetch` at a time), tried
+    /// once, until `stop` says so: the `git fetch` under way is then
+    /// stopped ([`crate::cmd::Git::run_with_stdin_until`]) and no other
+    /// starts, and it fails as [`BESIDE_STOPPED`].
+    fn fetch_objects_until(
+        &self,
+        remote: &str,
+        oids: &[&String],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(), GitError> {
+        for batch in oids.chunks(FETCH_BLOB_BATCH) {
+            if stop() {
+                return Err(GitError::Meta(BESIDE_STOPPED.to_owned()));
+            }
+            let mut input = Vec::new();
+            for o in batch {
+                input.extend_from_slice(o.as_bytes());
+                input.push(b'\n');
+            }
+            let done = self
+                .filtered_fetch(remote, "blob:none")?
+                .args(["-c", "fetch.negotiationAlgorithm=noop"])
+                .args([
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--recurse-submodules=no",
+                    "--filter=blob:none",
+                    "--stdin",
+                    remote,
+                ])
+                .run_with_stdin_until(&input, stop)?;
+            if done.is_none() {
+                return Err(GitError::Meta(BESIDE_STOPPED.to_owned()));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `git fetch` processes of [`AttestStore::fetch_blobs`], without
+    /// consolidating the packs they add; with `retry`, each process that
+    /// fails is run once more.
+    fn fetch_blobs_unpacked(
+        &self,
+        remote: &str,
+        oids: &[&String],
+        retry: bool,
+    ) -> Result<(), GitError> {
         // Several `git fetch` processes at once (since 2.1.11): the server
         // packs each want list on its own, so a plan's 8,000 values come in
         // a quarter of the time with four connections. VCI_FETCH_JOBS sets
@@ -4397,10 +4782,8 @@ impl<'a> AttestStore<'a> {
         let jobs = fetch_jobs();
         if jobs <= 1 || oids.len() <= FETCH_BLOB_PARALLEL_MIN {
             for batch in oids.chunks(FETCH_BLOB_BATCH) {
-                self.fetch_objects(remote, batch)?;
+                self.fetch_objects_retrying(remote, batch, retry)?;
             }
-            // Each fetch adds a pack: merged once they near gix's slots.
-            self.consolidate_packs();
             return Ok(());
         }
         self.ensure_no_lazy_fetch_remote()?;
@@ -4420,7 +4803,7 @@ impl<'a> AttestStore<'a> {
                             let Some(b) = batches.get(i) else {
                                 return Ok(());
                             };
-                            self.fetch_objects(remote, b)?;
+                            self.fetch_objects_retrying(remote, b, retry)?;
                         }
                     })
                 })
@@ -4430,9 +4813,7 @@ impl<'a> AttestStore<'a> {
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         });
-        let out: Result<(), GitError> = results.into_iter().collect();
-        self.consolidate_packs();
-        out
+        results.into_iter().collect()
     }
 
     /// Merge the packs a batched fetch left (one per `git fetch`) into
@@ -4492,6 +4873,17 @@ impl<'a> AttestStore<'a> {
     /// git's own lazy fetch runs, except that `remote` is a promisor for
     /// this command only (see the module docs).
     fn fetch_objects(&self, remote: &str, oids: &[&String]) -> Result<(), GitError> {
+        self.fetch_objects_retrying(remote, oids, true)
+    }
+
+    /// [`AttestStore::fetch_objects`], run once more after a failure only
+    /// with `retry`.
+    fn fetch_objects_retrying(
+        &self,
+        remote: &str,
+        oids: &[&String],
+        retry: bool,
+    ) -> Result<(), GitError> {
         let mut input = Vec::new();
         for o in oids {
             input.extend_from_slice(o.as_bytes());
@@ -4514,8 +4906,13 @@ impl<'a> AttestStore<'a> {
         };
         // Once more after a transfer given up as crawling (see
         // `filtered_fetch`) or any other failure.
-        if fetch().is_err() {
-            fetch()?;
+        match fetch() {
+            Err(_) if retry => {
+                fetch()?;
+            }
+            r => {
+                r?;
+            }
         }
         Ok(())
     }
@@ -4776,6 +5173,53 @@ impl<'a> AttestStore<'a> {
         let fetched = now.len();
         have.extend(now);
         Ok((have, fetched, error))
+    }
+
+    /// [`AttestStore::ensure_blobs`] of `oids` and, in the same round trip,
+    /// of `beside` ([`AttestStore::fetch_blobs_beside`]): (the blobs of
+    /// either present now, how many of `oids` were downloaded, why their
+    /// fetch failed, the same two for `beside`).
+    #[allow(clippy::type_complexity)]
+    fn ensure_blobs_beside(
+        &self,
+        remote: &str,
+        oids: &BTreeSet<String>,
+        beside: &BTreeSet<String>,
+    ) -> Result<
+        (
+            BTreeSet<String>,
+            usize,
+            Option<String>,
+            usize,
+            Option<String>,
+        ),
+        GitError,
+    > {
+        if beside.is_empty() {
+            let (have, fetched, error) = self.ensure_blobs(remote, oids)?;
+            return Ok((have, fetched, error, 0, None));
+        }
+        let all: BTreeSet<String> = oids.union(beside).cloned().collect();
+        let mut have = self.present(&all)?;
+        let missing: Vec<&String> = oids.iter().filter(|o| !have.contains(*o)).collect();
+        let extra: Vec<&String> = beside.iter().filter(|o| !have.contains(*o)).collect();
+        // `beside` only rides on a round trip `oids` makes anyway: a guess
+        // never costs a round trip of its own.
+        if missing.is_empty() {
+            return Ok((have, 0, None, 0, None));
+        }
+        let (main, side) = self.fetch_blobs_beside(remote, &missing, &extra);
+        let now = self.present(&missing.iter().chain(&extra).map(|o| (*o).clone()).collect())?;
+        let fetched = missing.iter().filter(|o| now.contains(**o)).count();
+        let extra_fetched = extra.iter().filter(|o| now.contains(**o)).count();
+        have.extend(now);
+        Ok((
+            have,
+            fetched,
+            main.err().map(|e| e.to_string()),
+            extra_fetched,
+            side.err().map(|e| e.to_string()),
+        ))
     }
 
     /// The contents of the blobs `oids` that can be read.
