@@ -1096,6 +1096,24 @@ pub enum Prefetch<'a> {
         /// The object ids, 64 lowercase hex each.
         ids: &'a [&'a str],
     },
+    /// [`Prefetch::Units`] and [`Prefetch::Objects`] at once (vci 2.10.1):
+    /// a lazy store fetches both in one round trip (git-meta: the objects'
+    /// blobs in a `git fetch` of their own beside the units', so that a
+    /// failure there, or an object the remote no longer serves, never fails
+    /// the units' fetch; and only when the units' values are fetched, so
+    /// that the objects never cost a round trip of their own). The
+    /// [`Hydration`] counts the units' values only:
+    /// the objects are a guess of what will be read next (best effort, never
+    /// reported; a later `Prefetch::Objects` asks again for any still
+    /// missing). A network store does both as it would apart.
+    UnitsWithObjects {
+        /// The units (test ids).
+        test_ids: &'a [&'a str],
+        /// Which entries of each unit; `None` means every entry.
+        choose: Option<Choose<'a>>,
+        /// The object ids, 64 lowercase hex each.
+        objects: &'a [&'a str],
+    },
 }
 
 impl fmt::Debug for Prefetch<'_> {
@@ -1114,6 +1132,16 @@ impl fmt::Debug for Prefetch<'_> {
             Prefetch::Objects { ids } => {
                 f.debug_struct("Objects").field("ids", &ids.len()).finish()
             }
+            Prefetch::UnitsWithObjects {
+                test_ids,
+                choose,
+                objects,
+            } => f
+                .debug_struct("UnitsWithObjects")
+                .field("test_ids", &test_ids.len())
+                .field("choose", &choose.is_some())
+                .field("objects", &objects.len())
+                .finish(),
         }
     }
 }
@@ -1890,6 +1918,28 @@ pub trait AttestationStore: Send + Sync {
             .collect();
         out.resize(runs.len(), None);
         Ok(out)
+    }
+
+    /// The format-3 objects the run of each of these records wrote, as far
+    /// as the store can tell **from keys alone**, without reading or
+    /// fetching a value: one list per record, in order, of (kind, id), each
+    /// id 64 lowercase hex. A lazy store fetches them with the records, in
+    /// the same round trip ([`Prefetch::UnitsWithObjects`]), so that the
+    /// verdicts that read the records, and the failure text after them,
+    /// find the objects here. Store data, like a run-state link: it chooses
+    /// what to fetch, never a verdict (each object is checked against its
+    /// id when read, and a record names its objects in signed fields).
+    /// Cost: local lookups only.
+    ///
+    /// Default: nothing for any record (a store that holds every value, or
+    /// that loads objects in a request of their own).
+    ///
+    /// Used by: plan.rs, round 2 on a lazy store (vci 2.10.1).
+    fn run_objects(
+        &self,
+        records: &[&StoredEnvelope],
+    ) -> Result<Vec<Vec<(vci_core::ObjectKind, String)>>, StoreError> {
+        Ok(vec![Vec::new(); records.len()])
     }
 
     /// Say that the run whose records carry these key hints and name the

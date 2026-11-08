@@ -527,3 +527,131 @@ fn a_run_state_link_names_the_state_object_and_goes_with_the_runs_last_record() 
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(ask(&b, &run.ids.shape), vec![None]);
 }
+
+/// Put `run`'s objects, its run-state link for `hint` and one record of it
+/// carrying `hint` (signer S1, storage key `sk`), in one batch, as `vci run`
+/// does.
+fn put_run_hinted(s: &GitMetaStore, run: &Run3, hint: &vci_store::KeyHint, sk: &str) {
+    let batch = s.batch().unwrap();
+    s.put_objects(&run.new_objects()).unwrap();
+    s.put_run_state(&run.ids.shape, std::slice::from_ref(hint), &run.ids.state)
+        .unwrap();
+    let (rec, cols) = run.record(A, 1, 7);
+    s.put(&NewAttestation::for_test(A, S1, sk, Some(hint), &rec).with_columns(&cols))
+        .unwrap();
+    batch.finish().unwrap();
+}
+
+/// 2.10.1: a record not fetched yet names its run's objects from keys
+/// alone: the shape and state objects of the run-state link its hint
+/// carries, and the objects the metadata commit that added it added (the
+/// first run's four; the second run's hdr, shape and state, its tables
+/// object having been stored before). One prefetch fetches the unit's
+/// records and those objects (`Prefetch::UnitsWithObjects`); with nothing
+/// of the units left to fetch, the objects are not fetched (no round trip
+/// of their own).
+#[test]
+fn a_new_records_run_objects_come_from_keys_and_its_records_round_trip() {
+    use vci_store::{KeyHint, hint_segment};
+    let w = lazy_world(1);
+    let a = store(&w.clones[0]);
+    let hint1 = KeyHint {
+        issued: 0x6a00_0000,
+        tree: Some("0123456789abcdef".into()),
+    };
+    let run1 = Run3::build(&[A, "src/b.ts"]);
+    put_run_hinted(&a, &run1, &hint1, &hex64(3));
+    push(&a);
+    let f = fresh_clone(&w, "fresh");
+    let b = store(&f);
+    assert!(fetch(&b).found);
+
+    // A run on another hdr (another tool version), published after b's
+    // fetch.
+    let mut run2 = Run3::build(&[A, "src/c.ts"]);
+    let mut hdr = vci_core::Hdr::decode(&run2.objects[0].1).unwrap();
+    hdr.tool_version = "2.10.1".into();
+    let bytes = hdr.encode().unwrap();
+    run2.ids.hdr = vci_core::objects::hex32(&vci_core::object_id(&bytes));
+    run2.objects[0] = (ObjectKind::Hdr, bytes);
+    assert_eq!(run2.ids.tables, run1.ids.tables, "one tables object");
+    let hint2 = KeyHint {
+        issued: 0x6a00_0100,
+        tree: Some("fedcba9876543210".into()),
+    };
+    put_run_hinted(&a, &run2, &hint2, &hex64(4));
+    push(&a);
+    assert!(fetch(&b).found);
+
+    let listed = b.list_units(&[A]).unwrap().remove(0);
+    let of = |h: &KeyHint| {
+        listed
+            .iter()
+            .find(|r| r.key.ends_with(&hint_segment(h)))
+            .unwrap()
+    };
+    let (r1, r2) = (of(&hint1), of(&hint2));
+    let sorted = |mut v: Vec<(ObjectKind, String)>| {
+        v.sort();
+        v
+    };
+    let got = b.run_objects(&[r1, r2]).unwrap();
+    assert_eq!(
+        sorted(got[0].clone()),
+        sorted(vec![
+            (ObjectKind::Hdr, run1.ids.hdr.clone()),
+            (ObjectKind::Tables, run1.ids.tables.clone()),
+            (ObjectKind::Shape, run1.ids.shape.clone()),
+            (ObjectKind::State, run1.ids.state.clone()),
+        ]),
+        "the first run: its link, and its commit added all four"
+    );
+    assert_eq!(
+        sorted(got[1].clone()),
+        sorted(vec![
+            (ObjectKind::Hdr, run2.ids.hdr.clone()),
+            (ObjectKind::Shape, run2.ids.shape.clone()),
+            (ObjectKind::State, run2.ids.state.clone()),
+        ]),
+        "the second run: its link and what its commit added (not the tables)"
+    );
+
+    let fetched = |ids: &[&String]| -> Vec<bool> {
+        let rows = b.attest_store().reader().unwrap().object_rows().unwrap();
+        ids.iter()
+            .map(|id| rows.iter().find(|r| &&r.id == id).unwrap().fetched)
+            .collect()
+    };
+    let two: Vec<&str> = got[1].iter().map(|(_, id)| id.as_str()).collect();
+    let h = b
+        .prefetch(Prefetch::UnitsWithObjects {
+            test_ids: &[A],
+            choose: None,
+            objects: &two,
+        })
+        .unwrap();
+    assert_eq!(
+        (h.resolved, h.unresolved, h.fetched),
+        (2, 0, 2),
+        "the units' values only: {h:?}"
+    );
+    assert_eq!(
+        fetched(&[&run2.ids.hdr, &run2.ids.shape, &run2.ids.state]),
+        [true; 3],
+        "with them"
+    );
+    let one: Vec<&str> = got[0].iter().map(|(_, id)| id.as_str()).collect();
+    let h = b
+        .prefetch(Prefetch::UnitsWithObjects {
+            test_ids: &[A],
+            choose: None,
+            objects: &one,
+        })
+        .unwrap();
+    assert_eq!(h, vci_store::Hydration::default());
+    assert_eq!(
+        fetched(&[&run1.ids.shape, &run1.ids.state]),
+        [false; 2],
+        "no round trip of their own"
+    );
+}

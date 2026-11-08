@@ -519,6 +519,62 @@ impl AttestationStore for GitMetaStore {
             .collect())
     }
 
+    /// From keys alone (2.10.1): the shape and state objects of every
+    /// run-state link that carries the record's hint (one listing of the
+    /// links on a pooled reader; a run's links name its shape and state
+    /// object), and, for the records the last fetch brought that are not
+    /// fetched yet, the objects the metadata commit that added the record
+    /// added ([`AttestStore::objects_added_with`]: the run's hdr and tables
+    /// objects too, when they were new). Best effort: a lookup that fails
+    /// names nothing.
+    fn run_objects(
+        &self,
+        records: &[&StoredEnvelope],
+    ) -> Result<Vec<Vec<(ObjectKind, String)>>, StoreError> {
+        let hints: Vec<Option<String>> = records
+            .iter()
+            .map(|r| vci_store::parse_key_hint(&r.key).map(|h| vci_store::hint_segment(&h)))
+            .collect();
+        if hints.iter().all(Option::is_none) {
+            return Ok(vec![Vec::new(); records.len()]);
+        }
+        let links = self
+            .with_reader(|r| r.run_state_keys(&format!("{}:", vci_store::RUN_STATE_PREFIX)))
+            .unwrap_or_default();
+        let mut by_hint: BTreeMap<String, Vec<(ObjectKind, String)>> = BTreeMap::new();
+        for k in &links {
+            if let Some((shape, hint, state)) = vci_store::parse_run_state_key(k) {
+                let objects = by_hint.entry(vci_store::hint_segment(&hint)).or_default();
+                for o in [
+                    (ObjectKind::Shape, shape.to_owned()),
+                    (ObjectKind::State, state.to_owned()),
+                ] {
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+            }
+        }
+        let added = self.attest_store().objects_added_with(records);
+        Ok(hints
+            .iter()
+            .zip(added)
+            .map(|(h, added)| {
+                let mut objects: Vec<(ObjectKind, String)> = h
+                    .as_ref()
+                    .and_then(|h| by_hint.get(h))
+                    .cloned()
+                    .unwrap_or_default();
+                for o in added {
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+                objects
+            })
+            .collect())
+    }
+
     /// A run-state link per distinct hint (inside the open batch, with the
     /// run's objects), so that [`AttestationStore::run_state_objects`]
     /// finds the run's state object from its records' keys.
@@ -643,6 +699,29 @@ impl AttestationStore for GitMetaStore {
             Prefetch::Manifests { roots } => st.hydrate_manifests(roots.iter().copied()),
             Prefetch::Attestations => st.hydrate_attestations(),
             Prefetch::Objects { ids } => st.hydrate_objects(ids.iter().copied()),
+            Prefetch::UnitsWithObjects {
+                test_ids,
+                choose,
+                objects,
+            } => {
+                let objects: BTreeSet<&str> = objects
+                    .iter()
+                    .copied()
+                    .filter(|id| key::is_object_id(id))
+                    .collect();
+                match choose {
+                    Some(choose) => st.hydrate_units_with_objects(
+                        test_ids.iter().copied(),
+                        |c| choose(c),
+                        &objects,
+                    ),
+                    None => st.hydrate_units_with_objects(
+                        test_ids.iter().copied(),
+                        |c| (0..c.len()).collect(),
+                        &objects,
+                    ),
+                }
+            }
             _ => Ok(Hydration::default()),
         };
         self.refresh_readers();

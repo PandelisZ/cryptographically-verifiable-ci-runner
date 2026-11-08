@@ -2542,6 +2542,18 @@ impl Remote {
                 Ok(Hydration::default())
             }
             Prefetch::Units { test_ids, choose } => self.prefetch_units(test_ids, choose),
+            // As apart: the units, then the objects, best effort.
+            Prefetch::UnitsWithObjects {
+                test_ids,
+                choose,
+                objects,
+            } => {
+                let h = self.prefetch_units(test_ids, choose)?;
+                if objects.iter().all(|id| key::is_object_id(id)) {
+                    let _ = self.fetch_objects(objects);
+                }
+                Ok(h)
+            }
             Prefetch::Manifests { roots } => {
                 let t = self.ready()?;
                 let want: Vec<String> = {

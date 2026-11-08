@@ -2769,6 +2769,9 @@ fn plan_with(
             .collect()
     });
     timing("verdicts (rehash inputs, check candidates)", t_verdicts);
+    // The round trips to the remote for values from here on (2.10.1: a vex
+    // plan made three, one after the other; see `round_two_objects`).
+    let round_trips = vci_git::meta::value_round_trips();
     let mut verdicts = verdicts;
     let t = std::time::Instant::now();
     // A plan that verifies no project reads nothing from the store (its
@@ -2783,6 +2786,7 @@ fn plan_with(
     } else {
         BTreeMap::new()
     };
+    let budget = StateBudget::of(&ctx.repo);
     let current = hydrate_more(
         store,
         &files,
@@ -2792,6 +2796,7 @@ fn plan_with(
         &memos,
         &mut verdicts,
         res,
+        Beside::new(budget, opts.only.is_some()),
     );
     timing("verdicts again for what was fetched meanwhile", t);
     // The changed input of each unit that runs, from its run's state object
@@ -2805,7 +2810,7 @@ fn plan_with(
         &current,
         &mut verdicts,
         &objects,
-        StateBudget::of(&ctx.repo),
+        budget,
         opts.only.is_some(),
     );
     drop(current);
@@ -2835,6 +2840,12 @@ fn plan_with(
         }
     }
     objects.report();
+    if store.caps().lazy_values && vci_core::metrics::on() {
+        vci_core::timing_line!(
+            "round trips for values after the first verdicts: {}",
+            vci_git::meta::value_round_trips() - round_trips
+        );
+    }
     // What passed on this tree, for the plans whose base commit it is
     // (2.7.29; see `passing_memos`).
     if let Some(head) = head_tree.as_deref() {
@@ -2969,8 +2980,11 @@ type SetAside = BTreeMap<String, BTreeSet<String>>;
 /// PostgreSQL: 2.8.0; before, a round that fetched nothing ended the plan,
 /// and those units ran). A unit whose newest attestation matches never gets
 /// here. Bounded: a round that fetched nothing and whose read made no
-/// candidate readable ends it. Returns the candidates the rounds read again,
-/// by unit (the others are as `by_id` holds them).
+/// candidate readable ends it. On a lazy store, round 2 fetches beside its
+/// candidates, in the same round trip, the objects its verdicts and the
+/// failure text after them will read ([`round_two_objects`], 2.10.1;
+/// `beside`). Returns the candidates the rounds read again, by unit (the
+/// others are as `by_id` holds them).
 #[allow(clippy::too_many_arguments)]
 fn hydrate_more(
     store: &dyn AttestationStore,
@@ -2981,6 +2995,7 @@ fn hydrate_more(
     memos: &BTreeMap<String, String>,
     verdicts: &mut [Vec<FileVerdict>],
     res: &mut PlanResult,
+    beside: Beside,
 ) -> BTreeMap<String, Vec<StoredEnvelope>> {
     // A unit whose remembered attestation (the one that passed on the base
     // commit's tree, see `passing_memos`) was read and failed on its inputs
@@ -3075,15 +3090,45 @@ fn hydrate_more(
                 .filter(|&i| !older.contains(&cands[i].key))
                 .collect()
         };
-        let h = store
-            .prefetch(Prefetch::Units {
+        // Round 2 on a lazy store (2.10.1): beside the candidates, in the
+        // same round trip, the objects the verdicts and the failure text
+        // after them will read (see `round_two_objects`).
+        let guessed: Vec<String> =
+            if round == 2 && beside.on && store.caps().lazy_values && !unread_ids.is_empty() {
+                let t = std::time::Instant::now();
+                let g = round_two_objects(
+                    store, files, verifiers, verdicts, by_id, &current, &ids, &unread, &older,
+                    beside,
+                );
+                timing(
+                    &format!(
+                        "round {round}: {} object(s) to fetch beside the candidates",
+                        g.len()
+                    ),
+                    t,
+                );
+                g
+            } else {
+                Vec::new()
+            };
+        let guessed: Vec<&str> = guessed.iter().map(String::as_str).collect();
+        let choose = (!older.is_empty()).then_some(&skip_older as Choose<'_>);
+        let units = if guessed.is_empty() {
+            Prefetch::Units {
                 test_ids: &unread_ids,
-                choose: (!older.is_empty()).then_some(&skip_older as Choose<'_>),
-            })
-            .and_then(|mut h| {
-                h.add(store.prefetch(Prefetch::Manifests { roots: &root_ids })?);
-                Ok(h)
-            });
+                choose,
+            }
+        } else {
+            Prefetch::UnitsWithObjects {
+                test_ids: &unread_ids,
+                choose,
+                objects: &guessed,
+            }
+        };
+        let h = store.prefetch(units).and_then(|mut h| {
+            h.add(store.prefetch(Prefetch::Manifests { roots: &root_ids })?);
+            Ok(h)
+        });
         let warning = match &h {
             Ok(h) => h.error.as_ref().map(|e| {
                 format!(
@@ -3191,6 +3236,168 @@ fn hydrate_more(
         );
     }
     current
+}
+
+/// Whether round 2 fetches objects beside the candidates on a lazy store
+/// ([`round_two_objects`]), and what the failure text after the verdicts
+/// may load ([`name_changed_inputs`]'s budget and mode).
+#[derive(Debug, Clone, Copy)]
+struct Beside {
+    /// `VCI_FETCH_BESIDE=0` turns it off: round 2 fetches the candidates
+    /// alone, as 2.10.0 did (to compare).
+    on: bool,
+    budget: StateBudget,
+    every_candidate: bool,
+}
+
+impl Beside {
+    fn new(budget: StateBudget, every_candidate: bool) -> Self {
+        let on = std::env::var("VCI_FETCH_BESIDE").map_or(true, |v| v.trim() != "0");
+        Beside {
+            on,
+            budget,
+            every_candidate,
+        }
+    }
+}
+
+/// At most this many hdr, tables and shape objects are guessed for round 2
+/// ([`round_two_objects`]).
+const ROUND_TWO_VERDICT_OBJECTS: usize = 64;
+
+/// What round 2 fetches on a lazy store beside the candidates it reads, in
+/// the same round trip (2.10.1; before, the candidates, then the verdict
+/// objects they name, then the state objects after the verdicts were three
+/// round trips one after the other, about 0.8 s each against GitHub). Ids
+/// from keys alone ([`AttestationStore::run_objects`]: git-meta's
+/// run-state links by the keys' hints, and the objects published with a
+/// record); nothing here is a verdict (each object is checked against its
+/// id when read):
+///
+/// - the hdr, tables and shape objects of the runs of the candidates the
+///   round fetches, not loaded yet, at most [`ROUND_TWO_VERDICT_OBJECTS`];
+/// - the state objects the failure text after the verdicts
+///   ([`name_changed_inputs`]) could load: of the runs of the candidates it
+///   would name for the units round 2 does not check again (their verdicts
+///   stand), and of every candidate of the units it checks again (any of
+///   them may become the one the reason names). A run's links by its hint
+///   name every state object the text can ask of it, and maybe more. Only
+///   when they are at most `[store] plan_states` (and `plan_states_mib` is
+///   not 0): then every state object the text loads is among them, and a
+///   plan still downloads at most `plan_states`; otherwise none is guessed
+///   and the text fetches its own, as before.
+#[allow(clippy::too_many_arguments)]
+fn round_two_objects(
+    store: &dyn AttestationStore,
+    files: &[TestFile],
+    verifiers: &[Result<Verifier<'_>, String>],
+    verdicts: &[Vec<FileVerdict>],
+    by_id: &BTreeMap<String, Vec<StoredEnvelope>>,
+    current: &BTreeMap<String, Vec<StoredEnvelope>>,
+    ids: &BTreeSet<&str>,
+    unread: &BTreeSet<&str>,
+    older: &BTreeSet<String>,
+    beside: Beside,
+) -> Vec<String> {
+    let cands_of = |id: &str| -> &[StoredEnvelope] {
+        current
+            .get(id)
+            .or_else(|| by_id.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
+    let readable = |c: &StoredEnvelope| matches!(c.state(), ValueState::Read(_));
+    // Every record the text after the verdicts could name, and whether the
+    // round fetches it.
+    let mut records: Vec<(&StoredEnvelope, bool)> = Vec::new();
+    for (pi, vs) in verdicts.iter().enumerate() {
+        if verifiers.get(pi).is_none_or(Result::is_err) {
+            continue;
+        }
+        let mine = files.iter().filter(|f| f.project == pi);
+        for (f, out) in mine.zip(vs.iter()) {
+            let id = f.test_id.as_str();
+            let cands = cands_of(id);
+            if ids.contains(id) {
+                // Checked again: any candidate read by the end of the rounds
+                // may be the one the reason names (a candidate never read
+                // for it, `older`, is not).
+                for c in cands {
+                    if readable(c) {
+                        records.push((c, false));
+                    } else if unread.contains(id) && !older.contains(&c.key) {
+                        records.push((c, true));
+                    }
+                }
+                continue;
+            }
+            let which: Vec<usize> = if beside.every_candidate {
+                (0..out.candidates.len()).collect()
+            } else if out.skip {
+                Vec::new()
+            } else {
+                out.best.into_iter().collect()
+            };
+            for ci in which {
+                let Some(c) = out.candidates.get(ci) else {
+                    continue;
+                };
+                if !c.failure.as_ref().is_some_and(hash_not_loaded) {
+                    continue;
+                }
+                if let Some(record) = cands
+                    .iter()
+                    .find(|s| s.key == c.info.meta_key && s.target == c.info.target)
+                {
+                    records.push((record, false));
+                }
+            }
+        }
+    }
+    if !records.iter().any(|(_, fetched)| *fetched) {
+        return Vec::new();
+    }
+    let envs: Vec<&StoredEnvelope> = records.iter().map(|(r, _)| *r).collect();
+    let run_objects = match store.run_objects(&envs) {
+        Ok(r) if r.len() == envs.len() => r,
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    // The verdict objects of the records fetched, those not loaded yet.
+    let loaded = |id: &str| {
+        verifiers
+            .iter()
+            .flatten()
+            .next()
+            .is_some_and(|v| matches!(v.objects.lock().by_id.get(id), Some(Ok(_))))
+    };
+    for ((_, fetched), objects) in records.iter().zip(&run_objects) {
+        if !fetched {
+            continue;
+        }
+        for (kind, id) in objects {
+            if *kind != ObjectKind::State
+                && out.len() < ROUND_TWO_VERDICT_OBJECTS
+                && !out.contains(id)
+                && !loaded(id)
+            {
+                out.push(id.clone());
+            }
+        }
+    }
+    let budget = beside.budget;
+    if budget.objects > 0 && budget.bytes > 0 {
+        let states: BTreeSet<&String> = run_objects
+            .iter()
+            .flatten()
+            .filter(|(k, _)| *k == ObjectKind::State)
+            .map(|(_, id)| id)
+            .collect();
+        if states.len() <= budget.objects {
+            out.extend(states.into_iter().cloned());
+        }
+    }
+    out
 }
 
 /// What [`name_changed_inputs`] did (its `VCI_TIMING` line, and tests).

@@ -55,6 +55,11 @@ Built and in use (vci 2.8.0):
   its objects on a store without columns), scenario c43; the plan loads state objects only after its verdicts, for
   the units that run, within `[store] plan_states` and `plan_states_mib` (section 4, "Objects and columns"; section
   14; section 15, git-meta, "Run-state links").
+- **Round 2's objects in the candidates' round trip** (2.10.1): `run_objects` (the objects a record's run wrote, from
+  keys alone: git-meta's run-state links by the key's hint, and the objects the metadata commit that added a record
+  not fetched yet added) and `Prefetch::UnitsWithObjects` (the units and those objects in one round trip); the plan's
+  round 2 on a lazy store fetches the verdict and state objects it will read beside the candidates, instead of in
+  two more round trips after them (section 4, "Objects and columns"; section 15, git-meta, "Run-state links").
 - **The temporary-PostgreSQL test helper** (`vci_store_postgres::testkit`, section 14), the temporary libSQL server
   (`vci_store_libsql::testkit`, section 18) and the CI jobs that run all of the above (`store-stock-git`,
   `store-docs`, `store-cli`, `store-pg-initdb` in `.github/workflows/ci.yml`; the libSQL server is the
@@ -494,7 +499,8 @@ that is correct for a backend whose values are always present and whose writes a
 | columns (2.9) | `columns(&[&StoredEnvelope]) -> Vec<Columns>` | | every field `None` | supersession, last durations, prune |
 | run state (2.10) | `run_state_objects(&[RunOf]) -> Vec<Option<String>>` | | the `state_obj` column where `Caps::columns`, else `None` | plan, after the verdicts (the changed input of each unit that runs) |
 | | `put_run_state(shape, &[KeyHint], state) -> usize` | | ids checked, nothing kept | run (after the run's objects, before its records) |
-| prefetch | `prefetch(Prefetch)` (`Units`, `Manifests`, `Attestations`, `Objects`) | | no-op | plan, run, verify, prune |
+| | `run_objects(&[&StoredEnvelope]) -> Vec<Vec<(ObjectKind, String)>>` (2.10.1) | | nothing for any record | plan, round 2 on a lazy store (what to fetch beside the candidates) |
+| prefetch | `prefetch(Prefetch)` (`Units`, `Manifests`, `Attestations`, `Objects`, `UnitsWithObjects` since 2.10.1) | | no-op | plan, run, verify, prune |
 | | `warm()` | | no-op | plan start |
 | hints | `passing_on`, `remember_passing`, `flag`, `set_flag` | | keep nothing | plan |
 | reporting | `timing_report() -> Vec<String>` | | none | run |
@@ -793,6 +799,15 @@ state them:
   `remove_objects` or `prune_state_objects` as it does on a failed manifest collection; prune exits 2. A failed
   `run_state_objects`, or a state object that cannot be fetched or decoded, leaves the plan's text as the verdict
   wrote it.
+- **`run_objects(records) -> Vec<Vec<(ObjectKind, String)>>`** (2.10.1): the objects (kind and id) each record's
+  run wrote, as far as the store can tell from keys alone, without reading or fetching a value, one list per record
+  in order. The default names none (a store that holds every value, or that loads objects in a request of their
+  own). git-meta names the shape and state objects of every run-state link that carries the record's hint, and, for
+  a record not fetched yet, the objects the metadata commit that added it added (the run's hdr and tables too, when
+  they were new; section 15). Store data: it chooses what a lazy store fetches beside
+  the candidates (`Prefetch::UnitsWithObjects`), never a verdict; each object is still checked against its id when
+  read. The plan calls it once per plan at most, in round 2 on a lazy store, and only for the records of the units
+  that round checks again and the ones its failure text could name.
 
 ### Provided reads
 
@@ -834,7 +849,12 @@ state them:
 
 ### `prefetch(what) -> Hydration`
 
-`Prefetch::Units{test_ids, choose}`, `Prefetch::Manifests{roots}` or `Prefetch::Attestations`.
+`Prefetch::Units{test_ids, choose}`, `Prefetch::Manifests{roots}`, `Prefetch::Attestations`, `Prefetch::Objects{ids}`
+or (2.10.1) `Prefetch::UnitsWithObjects{test_ids, choose, objects}`: `Units` and `Objects` at once, in one round trip
+on a lazy store (git-meta: the objects' blobs in `git fetch` processes of their own beside the units', tried once, so
+that their failure is never the units'; and only when the units' values are fetched, so that the objects never cost
+a round trip of their own); the `Hydration` counts the units' values only. A network store does both as it would
+apart (libSQL remote: the units, then the objects' cache; PostgreSQL: the units).
 
 - **Effect**: makes the named data cheap to read next.
   - A lazy store downloads it (git-meta's `hydrate_*`).
@@ -2127,6 +2147,16 @@ the time it was last put here, or fetched (the merge marks a fetched row with th
   immutable (everything is in the key) and two writers never write one key with different values, so merges keep
   them as any value; a vci before 2.10 lists none of them (they are not attestation, manifest or object keys) and
   deletes none.
+- **`run_objects` (2.10.1) reads the links by hint alone**, before a record's value (and so its shape) is here: one
+  listing of every link on a pooled reader, the shape and state of each link whose hint is the record's. For a record
+  still promised, it also asks git which commit added the record (`git log -1 <promised_commit> -- <the record's
+  path>`, from the commit whose materialization wrote the row, so the walk ends among the commits that fetch brought)
+  and which object keys that commit added (`git diff-tree -r --root --diff-filter=A`, under `project`): a run's
+  records, objects and link are published by one serialization, so these are the run's hdr, tables, shape and state
+  objects that were new then. At most 8 runs (distinct hints) are looked up, in parallel, after at most 256 row
+  lookups, with `GIT_NO_LAZY_FETCH` (a commit whose tree this clone never fetched, as a first fetch's history, names
+  nothing), and a commit that added more than 64 objects (a rewritten history) or a merge names none. Best effort
+  throughout: what cannot be said names nothing, and the plan fetches those objects later, as before.
 - **The merge's put-back rule applies to objects by id** (`restore_referenced_objects`, beside
   `restore_referenced_manifests`): after a fetch merged a tip that deleted an object, the deletion records of object
   keys the store held before the merge or the tip holds are candidates; the ones a local attestation names
