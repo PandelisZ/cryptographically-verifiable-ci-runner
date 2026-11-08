@@ -1660,7 +1660,10 @@ by `vci run`; your index, `HEAD` and work tree are never touched) and is exchang
   in one more batch, the other candidates of the units it could not skip and their manifests, which are checked
   again (`VCI_TIMING=1` prints `round 2: fetch N more value(s) for M unit(s) not skipped, ...`; since 2.8.0 a round
   that fetched nothing still reads the candidates the plan set aside when they are already here, see
-  [Verification](#verification-vci-plan)). The store's promised rows and the local
+  [Verification](#verification-vci-plan)). Since 2.10.1 that batch also fetches, in a `git fetch` of its own run at
+  the same time, the format-3 objects the round's verdicts and the failure text after them will read, so that the
+  plan makes one round trip to the remote after its first verdicts instead of three (see "Round 2 in one round
+  trip" under [Verification](#verification-vci-plan)). The store's promised rows and the local
   metadata tree are listed once for all of a plan's batches (2.1.13: listing them for each took 12 of a vex job's 24 s);
   `vci verify` fetches the one manifest it reads, `vci run` the attestations of the units it attests (supersession
   reads them), and `vci prune` every attestation (on a large store, what a fetch downloaded before 2.0). A value that
@@ -3533,6 +3536,44 @@ share 500 modules (about 505 entries a unit, one run, one state object), a plan 
 nothing here; with one shared module edited, naming it for the 1,000 units that run took a median 0.18 s on git-meta
 and on SQLite, and 0.29 to 0.30 s in a fresh git-meta clone, where the plan fetches the state object first. The
 details are made once per run (made once per unit, as the verdicts observe, they cost about 40 ms a unit).
+
+**Round 2 in one round trip** (since 2.10.1, git-meta). On a lazy clone the values a plan reads after its first
+verdicts came in three `git fetch` round trips, one after the other: round 2's candidates (those set aside or not
+fetched, of the units the first verdicts could not skip), then the hdr, tables and shape objects those candidates
+name (known only once they are read), then, after the verdicts, the state objects that name the changed inputs. On
+vex's Rails pull request jobs each took about 0.8 s against GitHub (`fetch 2 value(s) (2 blob(s) downloaded):
+0.85s`, `fetch 4 value(s) ...: 0.81s`, `fetch 5 value(s) ...: 0.88s` in a plan of 9.01 s). Round 2 now fetches,
+beside its candidates and in the same round trip, the objects it can name from keys alone:
+
+- the hdr, tables and shape objects of the runs of the candidates it fetches (at most 64): the shape and state of
+  every run-state link that carries a candidate's key hint (a run's links name them), and the objects the metadata
+  commit that published the candidate added (the run's hdr and tables too, when they were new then; at most 8 runs
+  looked up, from the commits `vci fetch` brought with their trees; a commit that added more than 64 objects names
+  none);
+- the state objects the failure text after the verdicts could load: those of the runs of the candidates it would
+  name for the units round 2 does not check again, and of every candidate of the units it does check again, from
+  their runs' links. Only when they are at most `[store] plan_states` (and `plan_states_mib` is not 0): then every
+  state object the text loads is among them, so a plan still downloads at most `plan_states` state objects;
+  otherwise none is fetched beside the candidates and the text fetches its own after the verdicts, as in 2.10.0.
+
+They are fetched by `git fetch` processes of their own, started with the candidates', tried once: a failure there (a
+remote that no longer serves one of the objects fails the whole `git fetch`) never fails the candidates' fetch, and
+nothing is fetched beside the candidates when the candidates themselves need no fetch, so a guess never costs a round
+trip of its own. Which objects are fetched decides nothing: every object is still checked against its id when read,
+the verdicts read the same candidates, and an object still missing is fetched where 2.10.0 fetched it. The plan
+decides, says and explains exactly what 2.10.0 does (`crates/vci-cli/tests/e2e_round_trips.rs` compares both on the
+same clone, and with the objects' fetch failing). `VCI_TIMING=1` prints `round 2: N object(s) to fetch beside the
+candidates`, `fetch N object(s) beside them (M blob(s) downloaded)` beside the candidates' `fetch N value(s)` line,
+and `round trips for values after the first verdicts: N` at the end of every plan on git-meta.
+`VCI_FETCH_BESIDE=0` fetches round 2's candidates alone, as 2.10.0 did (to compare). Measured with release builds
+on a cached clone of 68 Vitest units, every `git fetch` slowed by 0.8 s as a round trip to GitHub (five plans each,
+medians, on a loaded machine): its pull request changes one module that 12 units import, which another clone
+attested in a run of its own since the clone last fetched, and one that 12 other units import; from the end of the
+first verdicts to the end of the plan took 1.64 s instead of 3.57 s (plan total 4.42 s instead of 5.88 s), and the
+plan downloaded 15 blobs instead of 14 (1.7 KB more: the other run's state object, which no text then read). With
+that run made on a changed global input as well (12 new hdr objects, found from the commit that published them):
+1.54 s instead of 3.57 s (plan total 3.85 s instead of 5.75 s), 27 blobs instead of 26. The same units skipped and
+ran, with the same reasons.
 
 **What the text output escapes** (since 2.10). The text format of `vci plan`, the github format's notices and
 warnings, the plan `vci ci` prints and `vci explain` print every path, key, name and reason with these characters
