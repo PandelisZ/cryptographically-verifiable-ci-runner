@@ -3337,6 +3337,78 @@ fn cargo_prune_keeps_the_newest_n_per_signer() {
     assert_eq!(st.manifests().unwrap().len(), 1);
 }
 
+/// A push keeps the store the size of what plans use, with no `vci prune`
+/// (2.10.3): six attestations of b by one signer, made on six branches
+/// since deleted, become the four newest when `vci push` publishes, in the
+/// clone and on the remote, and nothing was fetched or read to decide it.
+/// One made on a tree a branch still has at its tip stays whatever its
+/// age, and `VCI_STORE_AUTO_PRUNE=0` keeps every one, as 2.10.2 did. vex,
+/// 8 to 12 November 2026: with the hourly `vci prune` job switched off, the
+/// store went from about 30,000 attestations to 289,159 and a plan from
+/// 9 s to 400 s.
+#[test]
+fn cargo_push_keeps_the_newest_attestations_of_a_unit_without_a_prune() {
+    let Some(w) = World::new() else { return };
+    let work = w.work.clone();
+    for v in 2..=7 {
+        w.git(&work, &["checkout", "-q", "-b", &format!("b{v}"), "main"]);
+        w.put(
+            "b/tests/data/b.json",
+            &format!("{{\"greeting\": \"hello\", \"v\": {v}}}\n"),
+        );
+        w.git(&work, &["commit", "-qam", "b's data changes"]);
+        w.run(&work, &[B], &w.trusted);
+        // issuedAt has second resolution: the next one is newer.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+    let count = |dir: &Path| {
+        AttestStore::new(&store_for(dir))
+            .list(Some(B))
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count(&work), 6);
+    // Every tree at a branch tip: a push removes nothing.
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("vci: removed"), "{err}");
+    assert_eq!(count(&work), 6);
+    // The five older branches gone, and switched off: still nothing.
+    w.git(&work, &["checkout", "-q", "b7"]);
+    for v in 2..=6 {
+        w.git(&work, &["branch", "-D", &format!("b{v}")]);
+    }
+    let out = w.vci_env(
+        &work,
+        &["push", "--remote", "origin"],
+        &[("VCI_STORE_AUTO_PRUNE", "0")],
+    );
+    assert!(out.status.success());
+    assert_eq!(count(&work), 6);
+    assert_eq!(published(&w, "all", B), 6);
+    // A push: the four newest stay, here and on the remote.
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains("vci: removed 2 of ") && err.contains("older than the 4 newest"),
+        "{err}"
+    );
+    assert_eq!(count(&work), 4);
+    assert_eq!(published(&w, "kept", B), 4);
+    // The newest is the one the checkout's plan skips with.
+    let plan = w.plan(&work, "main");
+    assert!(plan.skip.contains(B), "{:?} {:?}", plan.skip, plan.run);
+    // A second push has nothing to remove.
+    let out = w.vci(&work, &["push", "--remote", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success() && !err.contains("vci: removed"),
+        "{err}"
+    );
+}
+
 // ---- manifests by reference (vci 1.9.0) -----------------------------------
 
 /// The stored statements of `test_id`, as signed (no manifest inlined).

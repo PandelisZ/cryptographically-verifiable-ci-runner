@@ -2135,6 +2135,30 @@ The store has three modes:
 
 ### Keeping the store small
 
+**Since 2.10.3 a push does it.** On git-meta, `vci push` (and `vci ci --push`) removes, before it publishes, the
+attestations of each unit by one signer that are older than the 4 newest, except one made on a tree some branch or
+tag has at its tip, and the state objects past `[store] explain_hashes_days`. It decides from the keys alone (a key
+says when its attestation was issued and on which tree), so nothing is fetched or read: a CI job's lazy clone does
+it in the time it takes to list the keys. It says `vci: removed N of M attestation(s): older than the 4 newest of
+their unit and signer, ...`, and the push publishes the deletions. `VCI_STORE_AUTO_PRUNE=N` keeps N instead (`0`:
+every one, as before 2.10.3). A key that does not say when it was issued (before vci 2.2) is left alone. Nothing
+needs scheduling or running by hand for the store to stay the size of what plans use. `vci prune` remains for the
+rest: expired attestations, the 2 newest instead of 4, unreferenced manifests and objects, deletion records, and
+publishing a long history as one commit.
+
+Why: on vex the only `vci prune` ran in an hourly job. From 8 to 12 November 2026 that job was switched off, and
+pull request jobs, each publishing an attestation of every file they ran, took the store from about 30,000
+attestations to 289,159 (125 of each Rails file). A plan went from 9 s to 400 s: 99 s to fetch and merge the store,
+then 288 s in round 2, which fetched and read every one of the 180,033 candidates of the 1,798 files it could not
+skip (214 s of it in a `git repack` of the packs those fetches left).
+
+**Round 2 reads a unit's newest candidates (2.10.3).** After its first pass a plan reads, for each unit it could not
+skip, at most its 16 newest candidates not read yet (fewer when many units are left: 16,384 in all, 2 a unit at
+least); `VCI_PLAN_CANDIDATES=N` sets the number a unit, `0` reads every one as before. A unit only an older
+attestation covers then runs, and the plan warns: `the git-meta store holds more attestations of N unit(s) this plan
+could not skip than a plan reads (16 newest each after its first pass): M older one(s) were not read, ...`. A store
+a push or a prune keeps small never reaches the cap (vex's held about 10 a unit).
+
 Since 2.10 a plain `vci prune`, run where attestations are made (a CI job that attests the default branch, before its
 `vci push`), is what keeps every store small; nothing else needs scheduling. On git-meta the prune's deletions are
 written in the local store only, and the push after it publishes them: prune, then push (vex's attest jobs end with

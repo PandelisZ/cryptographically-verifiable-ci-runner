@@ -525,6 +525,64 @@ fn round_two_decides_and_explains_as_checking_every_candidate_again_on_git_meta(
     same_decisions_and_reasons(GIT_META);
 }
 
+/// Round 2 reads a unit's newest candidates only (2.10.3). Five runs by one
+/// signer on five inputs, the oldest on the inputs the pull request has:
+/// a plan reads all five and skips every unit on the oldest, as before;
+/// with `VCI_PLAN_CANDIDATES=2` it reads each unit's two newest after its
+/// first pass, the units run, and it says that older attestations were not
+/// read and that `vci prune` removes them. On vex, 12 November 2026, a
+/// store nothing had pruned for four days held 125 attestations of each
+/// Rails file, and round 2 fetched and read 180,033 of them in 288 s.
+fn round_two_reads_the_newest_candidates(env: &[(&str, &str)]) {
+    let w = World::new(|_| {});
+    for (i, shared) in [1, 2, 3, 4, 5].into_iter().enumerate() {
+        w.attest(&format!("r{}", i + 1), shared, &w.key, &[], &[], env);
+    }
+    w.git(&["checkout", "-q", "-b", "pr", "main"]);
+    w.write("src/shared.ts", "export const shared = 1;\n");
+    // Another tree than the oldest run's, so that the first pass, which
+    // reads the candidate made on the checkout's tree, reads the newest.
+    w.write("docs/pull-request.md", "no unit reads this\n");
+    w.commit("the pull request");
+    let snapshot = w.snapshot();
+    let plan = |extra: &[(&str, &str)]| -> (BTreeMap<String, (bool, String)>, String) {
+        w.restore(&snapshot);
+        let env: Vec<(&str, &str)> = [env, extra].concat();
+        let out = w.command(
+            None,
+            &["plan", "--base-ref", "main", "--format", "json"],
+            &env,
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        (
+            verdicts(&String::from_utf8_lossy(&out.stdout)),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (all, err) = plan(&[]);
+    assert!(all.values().all(|(skip, _)| *skip), "{all:?}\n{err}");
+    assert!(!err.contains("were not read"), "{err}");
+    let (capped, err) = plan(&[("VCI_PLAN_CANDIDATES", "2")]);
+    assert!(capped.values().all(|(skip, _)| !*skip), "{capped:?}\n{err}");
+    assert!(
+        err.contains("older one(s) were not read") && err.contains("`vci prune`"),
+        "{err}"
+    );
+    // Every one again with the cap off.
+    let (off, _) = plan(&[("VCI_PLAN_CANDIDATES", "0")]);
+    assert_eq!(off, all);
+}
+
+#[test]
+fn round_two_reads_the_newest_candidates_on_sqlite() {
+    round_two_reads_the_newest_candidates(SQLITE);
+}
+
+#[test]
+fn round_two_reads_the_newest_candidates_on_git_meta() {
+    round_two_reads_the_newest_candidates(GIT_META);
+}
+
 /// The seconds the first `VCI_TIMING` line of `stderr` starting with
 /// `step` and containing `with` gives (the number after its last `: `).
 fn timing_of(stderr: &str, step: &str, with: &str) -> Option<f64> {

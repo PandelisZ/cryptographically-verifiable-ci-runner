@@ -3046,6 +3046,26 @@ fn hydrate_for_plan(
     timing("fetch the stored values the plan reads", t);
 }
 
+/// How many candidates of one unit round 2 reads at most, the newest first
+/// (`VCI_PLAN_CANDIDATES`, default 16; 0: every one, as before 2.10.3), and
+/// how many in all: with `units` units to read for, each gets its share of
+/// [`ROUND_CANDIDATES`], 2 at least. A pruned store holds 2 attestations of
+/// a unit by each signer and the ones live branches' trees were attested
+/// on, about 10 a unit on vex, so the cap only bites on a store nothing
+/// prunes.
+fn round_candidates(units: usize) -> usize {
+    let a_unit = std::env::var("VCI_PLAN_CANDIDATES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(ROUND_CANDIDATES_A_UNIT);
+    if a_unit == 0 {
+        return usize::MAX;
+    }
+    (ROUND_CANDIDATES / units.max(1)).clamp(2.min(a_unit), a_unit)
+}
+const ROUND_CANDIDATES_A_UNIT: usize = 16;
+const ROUND_CANDIDATES: usize = 16_384;
+
 /// The candidates a plan set aside after its lookup
 /// ([`StoredEnvelope::mark_not_fetched`]): it checks a unit's likeliest
 /// candidates first and reads the others only for the units it cannot skip
@@ -3154,9 +3174,55 @@ fn hydrate_more(
                     }
                 }
                 ids.insert(id);
-                if set_aside.contains_key(id) || cands.iter().any(StoredEnvelope::not_fetched) {
+                if set_aside.contains_key(id)
+                    || cands
+                        .iter()
+                        .any(|c| c.not_fetched() && !older.contains(&c.key))
+                {
                     unread.insert(id);
                 }
+            }
+        }
+        // Round 2 reads the newest candidates of a unit only (2.10.3): a
+        // store nothing prunes holds every attestation ever made of a unit,
+        // and a plan that fetched and read them all for every unit it could
+        // not skip took minutes (vex, 12 November 2026: 180,033 values for
+        // 1,798 units, 125 a unit, 288 s). The older ones are never read:
+        // a unit only one of them covers runs, and the plan says so.
+        if round == 2 {
+            let cap = round_candidates(unread.len());
+            let (mut units, mut left_out) = (0usize, 0usize);
+            for id in &unread {
+                let cands = current
+                    .get(*id)
+                    .or_else(|| by_id.get(*id))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let mut pending: Vec<&StoredEnvelope> = cands
+                    .iter()
+                    .filter(|c| {
+                        !older.contains(&c.key)
+                            && (c.not_fetched()
+                                || set_aside.get(*id).is_some_and(|s| s.contains(&c.key)))
+                    })
+                    .collect();
+                if pending.len() <= cap {
+                    continue;
+                }
+                // Newest first; one whose key does not say when it was
+                // issued (before vci 2.2) is the oldest.
+                pending.sort_by(|a, b| b.issued.cmp(&a.issued).then_with(|| a.key.cmp(&b.key)));
+                units += 1;
+                left_out += pending.len() - cap;
+                older.extend(pending[cap..].iter().map(|c| c.key.clone()));
+            }
+            if left_out > 0 {
+                let w = format!(
+                    "the {} store holds more attestations of {units} unit(s) this plan could not skip than a plan reads ({cap} newest each after its first pass): {left_out} older one(s) were not read, and a unit only one of those covers runs; `vci prune`, then `vci push`, removes the superseded ones",
+                    store.kind()
+                );
+                eprintln!("vci: warning: {w}");
+                res.warnings.push(w);
             }
         }
         let roots: BTreeSet<String> = verifiers

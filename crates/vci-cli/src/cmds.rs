@@ -1681,6 +1681,7 @@ fn push_with(
     } else {
         PushMode::Merge
     };
+    drop_superseded(store);
     let out = ex.push(remote, mode)?;
     let point = ex.exchange_point();
     print_default_remote(kind, ex, remote, &out.remote);
@@ -1701,6 +1702,105 @@ fn push_with(
         _ => eprintln!("vci: push to {} finished", out.remote),
     }
     Ok(0)
+}
+
+/// How many of a unit's attestations by one signer a push keeps, the newest
+/// first: `VCI_STORE_AUTO_PRUNE` (default 4; 0: every one, as before
+/// 2.10.3).
+fn auto_keep() -> usize {
+    std::env::var("VCI_STORE_AUTO_PRUNE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(AUTO_KEEP)
+}
+const AUTO_KEEP: usize = 4;
+
+/// What a push removes of the store before it publishes (2.10.3), so that
+/// the store stays the size of what plans use with no `vci prune` run by
+/// hand or on a schedule: of each unit's attestations by one signer, the
+/// ones older than the [`auto_keep`] newest, decided from the keys alone
+/// (when each was issued and on which tree: nothing is fetched or read,
+/// so a CI job's lazy clone does it in the time it takes to list the
+/// keys), except one made on a tree some branch or tag has at its tip, as
+/// `vci prune` keeps; and the state objects past `[store]
+/// explain_hashes_days`. A key that does not say when it was issued
+/// (before vci 2.2) is left alone. The push that follows publishes the
+/// deletions. vex, 8 to 12 November 2026: with the hourly job that ran
+/// `vci prune` switched off, pull request jobs took the store from about
+/// 30,000 attestations to 289,159 (125 of each Rails file), and a plan
+/// from 9 s to 400 s. A failure is a warning: the store is no worse than
+/// before, and the push goes on.
+fn drop_superseded(store: &dyn AttestationStore) {
+    let keep = auto_keep();
+    if keep == 0 {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let Ok((repo, _)) = open_repo() else {
+        return;
+    };
+    // Without the live trees nothing is removed: one of them may be the
+    // only attestation a branch's plan skips with.
+    let Ok(live) = repo.live_trees() else {
+        return;
+    };
+    let live: BTreeSet<String> = live
+        .into_iter()
+        .map(|t| t.chars().take(16).collect())
+        .collect();
+    let all = match store.list_all() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "vci: warning: cannot list the store's attestations to remove superseded ones: {e}"
+            );
+            return;
+        }
+    };
+    let total = all.len();
+    let mut groups: BTreeMap<(String, String), Vec<StoredEnvelope>> = BTreeMap::new();
+    for e in all {
+        if e.issued.is_some() {
+            groups
+                .entry((e.test_key.clone(), e.signer.clone()))
+                .or_default()
+                .push(e);
+        }
+    }
+    let mut doomed: Vec<StoredEnvelope> = Vec::new();
+    for (_, mut group) in groups {
+        if group.len() <= keep {
+            continue;
+        }
+        group.sort_by(|a, b| b.issued.cmp(&a.issued).then_with(|| a.key.cmp(&b.key)));
+        doomed.extend(
+            group
+                .into_iter()
+                .skip(keep)
+                .filter(|e| !e.tree.as_deref().is_some_and(|t| live.contains(t))),
+        );
+    }
+    if !doomed.is_empty() {
+        match store.remove(doomed) {
+            Ok(removed) => eprintln!(
+                "vci: removed {} of {total} attestation(s): older than the {keep} newest of their unit and signer, on no tree a branch or tag has at its tip (VCI_STORE_AUTO_PRUNE=0 keeps them)",
+                removed.len()
+            ),
+            Err(e) => eprintln!("vci: warning: cannot remove superseded attestations: {e}"),
+        }
+    }
+    if store.caps().objects {
+        let days = crate::store::selection_of(&repo)
+            .map(|s| s.explain_hashes_days.value)
+            .unwrap_or(vci_store::select::DEFAULT_EXPLAIN_HASHES_DAYS);
+        if let Ok(n) = store.prune_state_objects(std::time::Duration::from_secs(
+            u64::from(days) * 24 * 60 * 60,
+        )) && n > 0
+        {
+            eprintln!("vci: removed {n} state object(s) older than {days} day(s)");
+        }
+    }
+    crate::plan::timing("remove superseded attestations before the push", t);
 }
 
 pub fn fetch(remote: Option<&str>) -> Result<i32> {
