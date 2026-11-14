@@ -2226,9 +2226,11 @@ order:
    when the clone does not hold it (a CI job's blobless clone never fetched the values of objects only other runs
    name); when that fetch fails the push fails as a whole and publishes nothing (`cannot put back N object(s) ...:
    fetching their values failed`), and the next push tries again. **A vci before 2.11 writing meanwhile** (a laptop
-   or a pinned workflow still on 2.10, while CI runs 2.11): its record has no links, so when one whose value is not
-   in the clone arrives in the merge, the merge puts back every object this push removed (the cleanup of objects
-   waits until such writers have moved to 2.11). A clone that holds the values of more than 10,000 records made
+   or a pinned workflow still on 2.10, while CI runs 2.11): its record has no links, so while the clone holds such a record whose value is
+   not here (one arrived in the merge), the merge puts back every object this clone removed that the remote still
+   holds (the cleanup of objects waits until such writers have moved to 2.11; an object the remote has already
+   removed, by a `vci prune` elsewhere for instance, is put back only when a record read here or a live link names
+   it). A clone that holds the values of more than 10,000 records made
    before 2.11 does not read them and keeps every hdr, tables and shape object: `vci: note: kept every hdr, tables
    and shape object: the N attestation(s) made before vci 2.11 may name any of them and they are more than the 10000
    a push reads`. One push removes at most 10,000 objects and links (`VCI_STORE_REMOVALS_MAX`), hdr, tables and

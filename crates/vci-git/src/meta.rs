@@ -10174,22 +10174,26 @@ impl<'a> AttestStore<'a> {
         if candidates.is_empty() {
             return Ok(0);
         }
+        let keys = self.reader()?.gc_keys()?;
         // 2.11: a record whose run wrote no run-object links (a vci before
         // 2.11, such as a laptop or a pinned workflow still on 2.10) and
-        // whose value is not here may name any of them, whether it was
-        // here at the collection (which then removed no hdr, tables or
-        // shape object) or another clone published it since this one
-        // fetched: then every candidate is put back.
-        let keys = self.reader()?.gc_keys()?;
-        let mut referenced = if crate::gc::unread_legacy(&keys) > 0 {
-            None
-        } else {
-            // Which attestations name them needs every attestation this
-            // clone holds read (one it never fetched is not one its plans
-            // relied on, as for manifests); one that cannot be read might
-            // name any of them, so then every candidate is put back.
-            self.referenced_objects(true)?
-        };
+        // whose value is not here may name any of them. While there is one,
+        // every removal of this clone's that the remote's tip does not
+        // have yet (its tip still holds the object) is put back: such a
+        // record here at the collection kept it from removing any hdr,
+        // tables or shape object, and one another clone published since
+        // this one fetched may name an object this push removed. (An
+        // object the remote has already removed is put back only if a
+        // record read here or a live link names it, as below: a `vci
+        // prune` elsewhere is not undone.)
+        let legacy_unread =
+            !crate::gc::unread_legacy(&keys.records, &keys.run_object_links).is_empty();
+        let own_removal = |k: &String| legacy_unread && tip_blobs.contains_key(k);
+        // Which attestations name them needs every attestation this clone
+        // holds read (one it never fetched is not one its plans relied on,
+        // as for manifests); one that cannot be read might name any of
+        // them, so then every candidate is put back.
+        let mut referenced = self.referenced_objects(true)?;
         // 2.11: and every object a run-object link of a run with a record
         // here names (keys only): a record another clone pushed since this
         // one fetched, whose value is not here, names its objects through
@@ -10205,7 +10209,9 @@ impl<'a> AttestStore<'a> {
         drop(keys);
         let wanted: Vec<&String> = candidates
             .iter()
-            .filter(|(_, (_, id))| referenced.as_ref().is_none_or(|r| r.contains(id)))
+            .filter(|(k, (_, id))| {
+                own_removal(k) || referenced.as_ref().is_none_or(|r| r.contains(id))
+            })
             .map(|(k, _)| k)
             .collect();
         if wanted.is_empty() {
@@ -10299,9 +10305,10 @@ impl<'a> AttestStore<'a> {
             .keys()
             .filter(|k| !put.contains(k))
             .filter(|k| {
-                referenced
-                    .as_ref()
-                    .is_none_or(|r| r.contains(&candidates[*k].1))
+                own_removal(k)
+                    || referenced
+                        .as_ref()
+                        .is_none_or(|r| r.contains(&candidates[*k].1))
             })
             .filter(|k| {
                 tip_blobs

@@ -1263,6 +1263,10 @@ fn merged(
 #[test]
 fn push_after_a_fresh_clone_plan_publishes_the_merge() {
     let w = World::new(Some(small()));
+    // The pushes merge and publish; the cleanup a push does first (2.11)
+    // would add deletion records of the store's aged state objects that
+    // neither side has, which this test does not compare.
+    const KEEP: &[(&str, &str)] = &[("VCI_STORE_AUTO_PRUNE", "0")];
     let key = w.key.to_str().unwrap().to_owned();
     let remote_tip = |w: &World| listing(w, &w.remote, "refs/meta/main");
     let t0 = remote_tip(&w);
@@ -1326,10 +1330,10 @@ fn push_after_a_fresh_clone_plan_publishes_the_merge() {
         "{}",
         text(&o)
     );
-    w.vci_ok(None, &f, &["push", "--remote", "origin"], &[]);
+    w.vci_ok(None, &f, &["push", "--remote", "origin"], KEEP);
     let t1 = remote_tip(&w);
     // The fresh clone pushes: a merge with the full clone's push.
-    w.vci_ok(None, &x, &["push", "--remote", "origin"], &[]);
+    w.vci_ok(None, &x, &["push", "--remote", "origin"], KEEP);
     let t2 = remote_tip(&w);
     merged(
         &t0,
@@ -1358,7 +1362,7 @@ fn push_after_a_fresh_clone_plan_publishes_the_merge() {
         None,
         &r,
         &["push", "--rewrite-history", "--remote", "origin"],
-        &[],
+        KEEP,
     );
     assert_eq!(
         w.git(&w.remote, &["rev-list", "--count", "refs/meta/main"]),
@@ -1377,7 +1381,7 @@ fn push_after_a_fresh_clone_plan_publishes_the_merge() {
         "{}",
         text(&o)
     );
-    w.vci_ok(None, &x, &["push", "--remote", "origin"], &[]);
+    w.vci_ok(None, &x, &["push", "--remote", "origin"], KEEP);
     let t4 = remote_tip(&w);
     let values = |t: &BTreeMap<String, String>| -> BTreeMap<String, String> {
         t.iter()

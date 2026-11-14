@@ -38,7 +38,17 @@
 //! idempotent put moves the row's time to now) keeps it. A record pushed
 //! by another clone after this one fetched names objects through its own
 //! links: the merge of the push puts back an object this clone removed that
-//! a live family names ([`crate::AttestStore`]'s put-back of objects).
+//! a live family names, fetching its value from the remote when it is not
+//! here, and, while a legacy record whose value is not here is in the store
+//! (one a vci before 2.11 published since), every object this clone removed
+//! that the remote still holds ([`crate::AttestStore`]'s put-back of
+//! objects).
+//!
+//! Not covered: a family is a key hint (one-second resolution, a tree) and a
+//! signer, so a legacy record signed by the same key on the same tree in the
+//! same second as a 2.11 run counts as that run's, and an object only it
+//! names can go (its unit runs once). Telling them apart needs a key per
+//! record or a record key older readers cannot parse.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -265,18 +275,18 @@ fn hint_issued(seg: &str) -> Option<i64> {
     i64::from_str_radix(issued, 16).ok()
 }
 
-/// How many records have no family of run-object links (see [`decide`]:
-/// legacy) and no value here: such a record may name any object.
-pub fn unread_legacy(keys: &Keys) -> usize {
-    let families: BTreeSet<(&str, &str)> = keys
-        .run_object_links
+/// The records that have no family of run-object links (see [`decide`]:
+/// legacy) and no value here: each may name any object. `records` as
+/// [`Keys::records`], `links` as [`Keys::run_object_links`].
+pub fn unread_legacy<'a>(records: &'a [(String, bool)], links: &[String]) -> BTreeSet<&'a str> {
+    let families: BTreeSet<(&str, &str)> = links
         .iter()
         .filter_map(|k| {
             let (hint, signer, _, _) = vci_store::parse_run_object_key(k)?;
             Some((hint, signer))
         })
         .collect();
-    keys.records
+    records
         .iter()
         .filter(|(_, promised)| *promised)
         .filter(|(key, _)| {
@@ -286,7 +296,8 @@ pub fn unread_legacy(keys: &Keys) -> usize {
             vci_store::parse_key_hint(key)
                 .is_none_or(|h| !families.contains(&(vci_store::hint_segment(&h).as_str(), signer)))
         })
-        .count()
+        .map(|(k, _)| k.as_str())
+        .collect()
 }
 
 /// The ids of the objects the live families name, and the shape and state
@@ -551,9 +562,10 @@ mod tests {
             run_object_links: links(NOW - DAY, SIGNER, &[(ObjectKind::Hdr, '1')]),
             ..Keys::default()
         };
-        assert_eq!(unread_legacy(&keys), 0, "b's value is here");
+        let unread = |k: &Keys| unread_legacy(&k.records, &k.run_object_links).len();
+        assert_eq!(unread(&keys), 0, "b's value is here");
         keys.records.push((record('c', OTHER, NOW - DAY), true));
-        assert_eq!(unread_legacy(&keys), 1, "c's signer has no family");
+        assert_eq!(unread(&keys), 1, "c's signer has no family");
     }
 
     #[test]
