@@ -266,7 +266,7 @@ slow integration or end-to-end tests would pass all three.
 
 ## Status and what it costs
 
-v2.11.0, MIT. Six runners: Vitest, node:test, pytest, Go, Cargo, and Rails with RSpec. Each has an end-to-end suite
+v2.11.1, MIT. Six runners: Vitest, node:test, pytest, Go, Cargo, and Rails with RSpec. Each has an end-to-end suite
 that drives the real CLI against a bare git remote. On our monorepo, vci's own steps in a node:test job (fetch and
 plan, sign and publish) take about 13 s. What you save beyond that is every test that already ran on the same
 inputs. What you pay beyond that, when nothing ran before, is one process per test file plus signing and pushing.
