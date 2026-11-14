@@ -20,7 +20,12 @@
 //! `<assignments> node <every option of the command> --test <files>`; of
 //! every file, the command itself (`<package manager> run <script>`).
 
+mod procs;
 mod shell;
+
+pub use procs::{
+    FILE_TIMEOUT_ENV as NODE_TEST_FILE_TIMEOUT_ENV, TASKS_PER_FILE as NODE_TEST_TASKS_PER_FILE,
+};
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -1185,52 +1190,80 @@ impl NodeTestAdapter {
         Ok(cmd.status()?.code())
     }
 
-    /// Run `files` (project-relative) one per process, at most `jobs` at a
-    /// time; `make` builds each process. Output goes to stderr in blocks.
-    fn run_each(
-        &self,
-        files: &[String],
-        make: &(dyn Fn(usize, &Utf8Path) -> Result<Command, AdapterError> + Sync),
-    ) -> Result<Vec<(String, std::process::ExitStatus)>, AdapterError> {
-        use std::io::Write as _;
-        // The script's --test-concurrency (tests that share a database or a
-        // port often set 1) bounds vci's parallelism too.
+    /// How many files run at once: the script's `--test-concurrency` (tests
+    /// that share a database or a port often set 1) bounds `VCI_JOBS`, else
+    /// [`procs::default_jobs`] (the processors, and a container's process
+    /// and thread limit).
+    fn jobs(&self) -> usize {
         let limit = self
             .invocation()
             .ok()
             .and_then(|i| i.concurrency)
             .unwrap_or(usize::MAX);
-        let jobs = crate::pytest_jobs().min(limit).max(1);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let results: std::sync::Mutex<
-            Vec<(usize, Result<std::process::ExitStatus, AdapterError>)>,
-        > = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|s| {
-            for _ in 0..jobs.min(files.len().max(1)) {
-                s.spawn(|| {
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if i >= files.len() {
-                            break;
-                        }
-                        let abs = self.project_dir.join(&files[i]);
-                        let r = make(i, &abs).and_then(|mut cmd| {
-                            let out = cmd.stdin(Stdio::null()).output()?;
-                            let mut err = std::io::stderr().lock();
-                            let _ = err.write_all(&out.stdout);
-                            let _ = err.write_all(&out.stderr);
-                            Ok(out.status)
-                        });
-                        results.lock().expect("lock").push((i, r));
+        let jobs = match std::env::var(crate::pytest::JOBS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            Some(n) => n,
+            None => procs::default_jobs(),
+        };
+        jobs.min(limit).max(1)
+    }
+
+    /// Run `files` (project-relative) one per process, [`Self::jobs`] at a
+    /// time, each stopped past its deadline ([`procs`]); `make` builds each
+    /// process. Each file's output goes to stderr in one block, as it ends.
+    fn run_each(
+        &self,
+        files: &[String],
+        make: &(dyn Fn(usize, &Utf8Path) -> Result<Command, AdapterError> + Sync),
+    ) -> Vec<(String, procs::Ended)> {
+        use std::io::Write as _;
+        let results: std::sync::Mutex<Vec<(usize, procs::Ended)>> =
+            std::sync::Mutex::new(Vec::new());
+        let make_i = |i: usize| -> std::io::Result<Command> {
+            make(i, &self.project_dir.join(&files[i])).map_err(std::io::Error::other)
+        };
+        procs::run_files(
+            files.len(),
+            self.jobs(),
+            procs::file_timeout(),
+            &make_i,
+            &|c: &mut Command| c.spawn(),
+            &|i, run| {
+                let mut err = std::io::stderr().lock();
+                let _ = err.write_all(&run.output);
+                match &run.ended {
+                    procs::Ended::Exited(_) | procs::Ended::Cancelled => {}
+                    procs::Ended::Stopped(t) => {
+                        let _ = writeln!(
+                            err,
+                            "vci: {}: its processes ran for {} s, past {} s, and were stopped ({}); not attested",
+                            files[i],
+                            t.as_secs(),
+                            procs::file_timeout().map_or(0, |d| d.as_secs()),
+                            procs::FILE_TIMEOUT_ENV
+                        );
                     }
-                });
-            }
-        });
-        let mut v = results.into_inner().expect("lock");
+                    procs::Ended::NotStarted(e) => {
+                        let _ = writeln!(
+                            err,
+                            "vci: {}: its process could not be started ({e}); not attested",
+                            files[i]
+                        );
+                    }
+                }
+                drop(err);
+                results
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((i, run.ended));
+            },
+        );
+        let mut v = results.into_inner().unwrap_or_else(|p| p.into_inner());
         v.sort_by_key(|(i, _)| *i);
-        v.into_iter()
-            .map(|(i, r)| r.map(|st| (files[i].clone(), st)))
-            .collect()
+        v.into_iter().map(|(i, e)| (files[i].clone(), e)).collect()
     }
 }
 
@@ -1475,15 +1508,29 @@ impl Adapter for NodeTestAdapter {
                 .env("VCI_ROOT", self.project_dir.as_str());
             Ok(cmd)
         };
-        let statuses = self.run_each(files, &make)?;
+        let ended = self.run_each(files, &make);
         let mut observed = Vec::new();
         let mut exit_code = if unrunnable.is_empty() {
             Some(0)
         } else {
             Some(1)
         };
-        for (i, (_file, status)) in statuses.iter().enumerate() {
+        for (i, (_file, ended)) in ended.iter().enumerate() {
             let out_dir = run_dir_p.join(i.to_string());
+            // A file stopped past its deadline, or whose process could not
+            // be started, fails, and what it recorded is not used: nothing
+            // is attested for it.
+            let status = match ended {
+                procs::Ended::Exited(st) => st,
+                procs::Ended::Stopped(_)
+                | procs::Ended::NotStarted(_)
+                | procs::Ended::Cancelled => {
+                    if exit_code == Some(0) {
+                        exit_code = Some(1);
+                    }
+                    continue;
+                }
+            };
             match (exit_code, status.code()) {
                 (Some(0), c) => exit_code = c,
                 (Some(_), None) => exit_code = None,

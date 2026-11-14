@@ -45,6 +45,7 @@ import {
   isInNodeModules,
   isInternalPath,
   isOwnPath,
+  installsCode,
   isUnder,
   linkedPackagePath,
   localCopyPackage,
@@ -316,9 +317,12 @@ class Collector {
 
   /**
    * An installed package: `name@version`, unless it is a copy of a repository directory (its
-   * version does not change with that directory's content).
+   * version does not change with that directory's content), or `abs` is a native addon (`.node`,
+   * loaded, read or looked for) of a package whose installation runs code that may build or
+   * download one (node-gyp's `build/Release/*.node`): the tarball the version names holds every
+   * other file, or its absence, but not those.
    * @param {string} abs a file of the package
-   * @param {{name: string, version: string}} pkg
+   * @param {{name: string, version: string, dir?: string}} pkg
    */
   emitExternal(abs, pkg) {
     let local = null;
@@ -329,6 +333,19 @@ class Collector {
     }
     if (local) {
       this.emit({ kind: "taint", reason: `external-local-directory:${local} (a copy of a repository directory, identified only by its version)` });
+      return;
+    }
+    let native = false;
+    try {
+      native = /\.node$/i.test(abs) && (!pkg.dir || installsCode(pkg.dir));
+    } catch {
+      native = true;
+    }
+    if (native) {
+      this.emit({
+        kind: "taint",
+        reason: `external-native-installed:${pkg.name}@${pkg.version} (${abs}: a native addon of a package whose installation runs code, which its version does not pin)`,
+      });
     } else {
       this.emit({ kind: "external", name: pkg.name, version: pkg.version });
     }
@@ -750,11 +767,15 @@ class Collector {
     this.busy = true;
     try {
       // A candidate that exists although this resolution failed (a hook retrying with a suffix,
-      // Node not trying extensions) is recorded as a read, not a probe.
+      // Node not trying extensions) is recorded as a read, not a probe. One inside an installed
+      // package is that package's (its name@version, as when the fs reads it): napi-rs and
+      // rolldown loaders `require('./<name>.<platform>.node')` beside themselves before the
+      // platform package (vci 2.10.3 recorded those as paths inside node_modules, which no run
+      // can vouch for, so every file that loaded @napi-rs/canvas or rolldown was refused).
       for (const c of resolutionCandidates(base)) {
         if (this.isSelfProduced(c)) continue;
         const kind = candidateKind(c);
-        if (kind) this.emit({ kind, path: this.unlinked(c) });
+        if (kind) this.recordPath(kind, c);
       }
     } finally {
       this.busy = false;

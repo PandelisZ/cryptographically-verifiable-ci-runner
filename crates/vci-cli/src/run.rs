@@ -2163,11 +2163,27 @@ pub(crate) fn git_check_ignore(root: &Utf8Path, paths: &[String]) -> (Vec<String
     let Ok(mut child) = child else {
         return (vec![], false);
     };
-    if let Some(mut i) = child.stdin.take() {
-        let _ = i.write_all(paths.join("\n").as_bytes());
-        let _ = i.write_all(b"\n");
+    // The paths are written while git's answers are read: git answers each
+    // line as it reads it, and once its answers filled the pipe (64 KiB, a
+    // thousand ignored paths) it stopped reading, while vci, still writing
+    // and not yet reading, waited for it forever.
+    let input = format!("{}\n", paths.join("\n")).into_bytes();
+    let writer = child.stdin.take().map(|mut i| {
+        std::thread::Builder::new().spawn(move || {
+            let _ = i.write_all(&input);
+        })
+    });
+    if matches!(writer, Some(Err(_))) {
+        // No thread to write with: no answer (nothing treated as ignored).
+        let _ = child.kill();
+        let _ = child.wait();
+        return (vec![], false);
     }
-    let Ok(out) = child.wait_with_output() else {
+    let out = child.wait_with_output();
+    if let Some(Ok(w)) = writer {
+        let _ = w.join();
+    }
+    let Ok(out) = out else {
         return (vec![], false);
     };
     let lines = String::from_utf8_lossy(&out.stdout)
@@ -4564,6 +4580,35 @@ fn select_units(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `git check-ignore --stdin` answers each path as it reads it: with
+    /// more ignored paths than its answers fit in a pipe, vci (writing every
+    /// path before reading any answer) and git (waiting for vci to read)
+    /// waited for each other forever.
+    #[test]
+    fn many_ignored_paths_are_answered() {
+        let t = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(t.path().canonicalize().unwrap()).unwrap();
+        let st = std::process::Command::new("git")
+            .args(["init", "-q", root.as_str()])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        let paths: Vec<String> = (0..60_000)
+            .map(|i| format!("node_modules/pkg{}/lib/deep/path/file{i}.js", i % 500))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (r, p) = (root.clone(), paths.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(git_check_ignore(&r, &p));
+        });
+        let (ignored, answered) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("git check-ignore and vci waited for each other");
+        assert!(answered);
+        assert_eq!(ignored.len(), paths.len());
+    }
 
     #[test]
     fn defined_names_are_every_constant_path_after_defined() {

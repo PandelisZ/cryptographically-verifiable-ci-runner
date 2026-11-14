@@ -130,7 +130,7 @@ export function idToFsPath(id) {
   return p;
 }
 
-/** @type {Map<string, {name: string, version: string} | null>} */
+/** @type {Map<string, {name: string, version: string, dir: string} | null>} */
 const pkgCache = new Map();
 
 /**
@@ -138,8 +138,9 @@ const pkgCache = new Map();
  * `name` and `version`, walking up but not beyond the package root that follows the last
  * `node_modules` segment.
  * @param {string} file absolute path
- * @returns {{name: string, version: string} | null | undefined} undefined if not in node_modules,
- *   null if in node_modules but no usable package.json
+ * @returns {{name: string, version: string, dir: string} | null | undefined} undefined if not in
+ *   node_modules, null if in node_modules but no usable package.json; `dir` holds that
+ *   package.json
  */
 export function packageOf(file) {
   const p = toSlash(file);
@@ -159,7 +160,7 @@ export function packageOf(file) {
     try {
       const json = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
       if (json && typeof json.name === "string" && typeof json.version === "string") {
-        result = { name: json.name, version: json.version };
+        result = { name: json.name, version: json.version, dir };
         break;
       }
     } catch {
@@ -171,6 +172,44 @@ export function packageOf(file) {
   }
   pkgCache.set(pkgRoot + "|" + path.dirname(p), result);
   return result;
+}
+
+/** @type {Map<string, boolean>} */
+const installsCache = new Map();
+
+/** Lifecycle scripts npm and pnpm run when they install a package from the registry. */
+const INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"];
+
+/**
+ * Whether installing the package in `dir` runs code that may build or download files into it:
+ * a `preinstall`, `install` or `postinstall` script, or a `binding.gyp` (for which npm and pnpm
+ * run `node-gyp rebuild` when there is no install script). Such files are not in the package's
+ * tarball, so its name and version do not pin them. Any doubt (an unreadable package.json):
+ * true.
+ * @param {string} dir a package directory (holding its package.json)
+ */
+export function installsCode(dir) {
+  const cached = installsCache.get(dir);
+  if (cached !== undefined) return cached;
+  let out = true;
+  try {
+    const json = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
+    const scripts = (json && typeof json.scripts === "object" && json.scripts) || {};
+    out = INSTALL_SCRIPTS.some((k) => typeof scripts[k] === "string" && scripts[k].trim() !== "");
+    if (!out) {
+      try {
+        lstatSync(path.join(dir, "binding.gyp"));
+        out = true;
+      } catch (e) {
+        const code = /** @type {any} */ (e).code;
+        out = !(code === "ENOENT" || code === "ENOTDIR");
+      }
+    }
+  } catch {
+    out = true;
+  }
+  installsCache.set(dir, out);
+  return out;
 }
 
 /**

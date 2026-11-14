@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 
 import { scanSource, staticDirOf } from "../src/scan.js";
-import { PACKAGE_DIR, idToFsPath, isOwnPath, packageOf } from "../src/util.js";
+import { PACKAGE_DIR, idToFsPath, installsCode, isOwnPath, packageOf } from "../src/util.js";
 import { FIXTURE, tmpDir } from "./helpers.js";
 
 test("staticDirOf", () => {
@@ -36,15 +36,34 @@ test("scanSource finds globs and computed imports", () => {
 });
 
 test("packageOf uses the nearest package.json with name and version", () => {
-  assert.deepEqual(packageOf(path.join(FIXTURE, "node_modules/ms/index.js")), { name: "ms", version: "2.1.3" });
+  assert.deepEqual(packageOf(path.join(FIXTURE, "node_modules/ms/index.js")), { name: "ms", version: "2.1.3", dir: path.join(FIXTURE, "node_modules/ms") });
   assert.equal(packageOf(path.join(FIXTURE, "src/a.ts")), undefined);
   const d = tmpDir("vci-pkg-");
   fs.mkdirSync(path.join(d, "node_modules/@s/p/dist"), { recursive: true });
   fs.writeFileSync(path.join(d, "node_modules/@s/p/package.json"), JSON.stringify({ name: "@s/p", version: "1.2.3" }));
   fs.writeFileSync(path.join(d, "node_modules/@s/p/dist/package.json"), JSON.stringify({ type: "module" }));
-  assert.deepEqual(packageOf(path.join(d, "node_modules/@s/p/dist/x.js")), { name: "@s/p", version: "1.2.3" });
+  assert.deepEqual(packageOf(path.join(d, "node_modules/@s/p/dist/x.js")), { name: "@s/p", version: "1.2.3", dir: path.join(d, "node_modules/@s/p") });
   fs.mkdirSync(path.join(d, "node_modules/nover"), { recursive: true });
   assert.equal(packageOf(path.join(d, "node_modules/nover/x.js")), null);
+});
+
+test("installsCode: install scripts and binding.gyp, and any doubt", () => {
+  const d = tmpDir("vci-installs-");
+  /** @param {string} name @param {any} pj @param {Record<string, string>} [files] */
+  const pkg = (name, pj, files = {}) => {
+    const dir = path.join(d, name);
+    fs.mkdirSync(dir, { recursive: true });
+    if (pj !== undefined) fs.writeFileSync(path.join(dir, "package.json"), typeof pj === "string" ? pj : JSON.stringify(pj));
+    for (const [f, c] of Object.entries(files)) fs.writeFileSync(path.join(dir, f), c);
+    return dir;
+  };
+  assert.equal(installsCode(pkg("plain", { name: "a", version: "1.0.0", scripts: { build: "napi build", version: "napi version" } })), false);
+  for (const k of ["preinstall", "install", "postinstall"]) {
+    assert.equal(installsCode(pkg(k, { name: "a", version: "1.0.0", scripts: { [k]: "node x.js" } })), true, k);
+  }
+  assert.equal(installsCode(pkg("gyp", { name: "a", version: "1.0.0" }, { "binding.gyp": "{}" })), true);
+  assert.equal(installsCode(pkg("nopj", undefined)), true);
+  assert.equal(installsCode(pkg("badpj", "{")), true);
 });
 
 test("idToFsPath", () => {

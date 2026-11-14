@@ -33,10 +33,11 @@ pub use golang::{
 pub use jsonl::{Observed, parse_jsonl_dir, parse_jsonl_file, parse_jsonl_text};
 
 pub use nodetest::{
-    Invocation as NodeTestInvocation, NODE_TEST_HASH, NODE_TEST_LOOSE_HASH, NODE_TEST_RUN_VARS,
-    NODE_TEST_TS_LOADERS, NodeTestAdapter, NodeTestOptions, Preload as NodeTestPreload,
-    find_node_test_collector, glob_escape as node_test_glob_escape,
-    package_manager as node_package_manager, parse_script as parse_node_test_script,
+    Invocation as NodeTestInvocation, NODE_TEST_FILE_TIMEOUT_ENV, NODE_TEST_HASH,
+    NODE_TEST_LOOSE_HASH, NODE_TEST_RUN_VARS, NODE_TEST_TASKS_PER_FILE, NODE_TEST_TS_LOADERS,
+    NodeTestAdapter, NodeTestOptions, Preload as NodeTestPreload, find_node_test_collector,
+    glob_escape as node_test_glob_escape, package_manager as node_package_manager,
+    parse_script as parse_node_test_script,
 };
 pub use pytest::{
     JOBS_ENV, PY_PLUGIN_ENV, PYTEST_CONFIG_NAMES, PYTEST_HASH, PYTEST_IGNORE, PYTEST_LOOSE_HASH,

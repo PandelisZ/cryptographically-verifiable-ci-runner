@@ -2184,3 +2184,416 @@ hash = ["TZ"]
     let p = w.plan(&work, "main");
     assert_eq!(p.skip, set(&[lib, ms]), "{p:?}");
 }
+
+/// A pnpm virtual store entry `node_modules/.pnpm/<name>@<version>/node_modules/<name>`
+/// (at the repository root) holding `files`, with `deps` (`name@version`)
+/// linked beside it and, when `link_from` names a project, linked into that
+/// project's `node_modules` as pnpm links a direct dependency.
+fn pnpm_package(
+    root: &Path,
+    name: &str,
+    version: &str,
+    files: &[(&str, &str)],
+    deps: &[&str],
+    link_from: Option<&str>,
+) {
+    let entry_of = |n: &str, v: &str| {
+        root.join("node_modules/.pnpm")
+            .join(format!("{}@{v}", n.replace('/', "+")))
+            .join("node_modules")
+    };
+    let dir = entry_of(name, version).join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (rel, body) in files {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    for d in deps {
+        let (dn, dv) = d.rsplit_once('@').unwrap();
+        let link = entry_of(name, version).join(dn);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(entry_of(dn, dv).join(dn), link).unwrap();
+    }
+    if let Some(project) = link_from {
+        let link = root.join(project).join("node_modules").join(name);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, link).unwrap();
+    }
+}
+
+/// The platform package of [`addon_loader`]'s addon at `version` (a stand-in
+/// for napi-rs's `@napi-rs/canvas-linux-x64-gnu`: the binary would be its
+/// `.node` file).
+fn addon_plat(root: &Path, version: &str, v: u32) {
+    let pj = format!(r#"{{"name":"addon-plat","version":"{version}","main":"addon.plat.js"}}"#);
+    let js = format!("module.exports = {{ v: {v} }};\n");
+    pnpm_package(
+        root,
+        "addon-plat",
+        version,
+        &[("package.json", &pj), ("addon.plat.js", &js)],
+        &[],
+        None,
+    );
+}
+
+/// The addon package at 1.0.0, whose loader (as napi-rs and rolldown write
+/// it) first requires the binary beside itself, `./addon.plat.node`, and
+/// then the platform package `addon-plat` at `plat`.
+fn addon_loader(root: &Path, plat: &str) {
+    let pj = format!(
+        r#"{{"name":"addon","version":"1.0.0","main":"index.js","optionalDependencies":{{"addon-plat":"{plat}"}}}}"#
+    );
+    let dir = root.join("node_modules/.pnpm/addon@1.0.0");
+    let _ = std::fs::remove_dir_all(&dir);
+    pnpm_package(
+        root,
+        "addon",
+        "1.0.0",
+        &[
+            ("package.json", &pj),
+            (
+                "index.js",
+                "let b;\ntry { b = require('./addon.plat.node'); } catch (e) { if (e.code !== 'MODULE_NOT_FOUND') throw e; b = require('addon-plat'); }\nmodule.exports = b;\n",
+            ),
+        ],
+        &[&format!("addon-plat@{plat}")],
+        Some("apps/web"),
+    );
+}
+
+/// vex-web on vci 2.10.3: eight of its 458 files, the slowest, could never
+/// be attested, so every pull request ran them: three loaded
+/// @napi-rs/canvas and one rolldown, whose loaders first require the
+/// binary beside themselves (`./skia.linux-x64-gnu.node`) before the
+/// platform package, and four looked for npm's hidden lockfile
+/// `node_modules/.package-lock.json`, which pnpm never writes. Both were
+/// recorded as paths inside node_modules ("inside a directory vci does not
+/// track"). The failed require is now the package's (its name@version, as
+/// its other files), and an absent name directly in a node_modules
+/// directory is an input checked like any other absent path. A file is
+/// still run when the addon or the absent file changes: the platform
+/// package's version, the hidden lockfile appearing (at the repository
+/// root or in the project's node_modules), the addon's version.
+#[test]
+fn pnpm_native_addons_and_the_hidden_lockfile_are_attested() {
+    let toml = r#"[policy]
+no_skip_refs = ["refs/heads/release/*"]
+
+[[projects]]
+name = "web"
+path = "apps/web"
+adapter = "node-test"
+
+[env]
+hash = ["TZ"]
+"#;
+    let tests: &[(&str, &str)] = &[
+        (
+            "apps/web/src/addon.test.ts",
+            "import assert from 'node:assert/strict';\nimport { test } from 'node:test';\nimport addon from 'addon';\n\ntest('loads the addon', () => {\n  assert.equal(addon.v, 1);\n});\n",
+        ),
+        (
+            "apps/web/src/hidden.test.ts",
+            "import assert from 'node:assert/strict';\nimport { test } from 'node:test';\nimport finder from 'lockfinder';\n\ntest('no hidden lockfile', () => {\n  assert.deepEqual(finder.find(), []);\n});\n",
+        ),
+        (
+            "apps/web/src/gyp.test.ts",
+            "import assert from 'node:assert/strict';\nimport { test } from 'node:test';\nimport g from 'gypaddon';\n\ntest('loads', () => {\n  assert.equal(g.v, 3);\n});\n",
+        ),
+    ];
+    let w = World::new_with(Fixture::Pnpm, tests, toml);
+    let work = w.work.clone();
+    addon_plat(&work, "1.0.0", 1);
+    addon_loader(&work, "1.0.0");
+    // A library that looks for npm's hidden lockfile from the project dir
+    // and from the repository root, as package managers' detectors do.
+    pnpm_package(
+        &work,
+        "lockfinder",
+        "2.0.0",
+        &[
+            ("package.json", r#"{"name":"lockfinder","version":"2.0.0"}"#),
+            (
+                "index.js",
+                "const fs = require('node:fs');\nconst path = require('node:path');\nexports.find = () => ['.', '../..'].map((d) => path.join(process.cwd(), d, 'node_modules/.package-lock.json')).filter((f) => fs.existsSync(f));\n",
+            ),
+        ],
+        &[],
+        Some("apps/web"),
+    );
+    // node-gyp's output is not in the package's tarball: refused.
+    pnpm_package(
+        &work,
+        "gypaddon",
+        "3.0.0",
+        &[
+            (
+                "package.json",
+                r#"{"name":"gypaddon","version":"3.0.0","scripts":{"install":"node-gyp rebuild"}}"#,
+            ),
+            (
+                "index.js",
+                "let b;\ntry { b = require('./build/Release/gypaddon.node'); } catch (e) { b = { v: 3 }; }\nmodule.exports = b;\n",
+            ),
+        ],
+        &[],
+        Some("apps/web"),
+    );
+    let addon = "apps/web/src/addon.test.ts";
+    let hidden = "apps/web/src/hidden.test.ts";
+    let gyp = "apps/web/src/gyp.test.ts";
+    let out = w.run(&work, &[addon, hidden, gyp], &w.trusted);
+    assert!(out.contains("vci: 2 attested, 1 not attested"), "{out}");
+    assert!(
+        refused_line(&out, gyp).contains("external-native-installed:gypaddon@3.0.0"),
+        "{out}"
+    );
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[addon, hidden]), "{p:?}");
+
+    // The hidden lockfile appears at the repository root, or in the
+    // project's node_modules: the file that looked for it runs.
+    for at in [
+        "node_modules/.package-lock.json",
+        "apps/web/node_modules/.package-lock.json",
+    ] {
+        w.write(at, "{}");
+        let p = w.plan(&work, "main");
+        assert_eq!(p.skip, set(&[addon]), "{at}: {p:?}");
+        assert!(
+            w.explain(&work, hidden, "main").contains(at),
+            "{at}: the explanation names it"
+        );
+        w.remove(at);
+    }
+    assert_eq!(w.plan(&work, "main").skip, set(&[addon, hidden]));
+
+    // Another platform package (a new binary) installed in place of the
+    // attested one (pnpm prunes the old one from its store): the file that
+    // loads it runs. (Installed beside it, as only a hand-made store has
+    // both, the lockfile, a global input, is what changes.)
+    let old = work.join("node_modules/.pnpm/addon-plat@1.0.0");
+    std::fs::remove_dir_all(&old).unwrap();
+    addon_plat(&work, "1.0.1", 2);
+    addon_loader(&work, "1.0.1");
+    let p = w.plan(&work, "main");
+    assert_eq!(p.skip, set(&[hidden]), "{p:?}");
+    assert!(
+        w.explain(&work, addon, "main").contains("addon-plat"),
+        "the explanation names the platform package"
+    );
+    // Back to the attested one.
+    std::fs::remove_dir_all(work.join("node_modules/.pnpm/addon-plat@1.0.1")).unwrap();
+    addon_plat(&work, "1.0.0", 1);
+    addon_loader(&work, "1.0.0");
+    assert_eq!(w.plan(&work, "main").skip, set(&[addon, hidden]));
+
+    // The addon package at another version.
+    let pj = work.join("node_modules/.pnpm/addon@1.0.0/node_modules/addon/package.json");
+    let text = std::fs::read_to_string(&pj).unwrap();
+    std::fs::write(
+        &pj,
+        text.replace("\"1.0.0\",\"main\"", "\"1.0.2\",\"main\""),
+    )
+    .unwrap();
+    assert_eq!(w.plan(&work, "main").skip, set(&[hidden]));
+}
+
+impl World {
+    /// [`World::vci_env`], killed (and `None`) when it has not ended after
+    /// `secs` seconds; `on_start` is called with its process id once it runs.
+    fn vci_within(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        env: &[(&str, Option<&str>)],
+        secs: u64,
+        on_start: &dyn Fn(u32),
+    ) -> Option<Output> {
+        let mut cmd = Command::cargo_bin("vci").unwrap();
+        cmd.current_dir(dir)
+            .args(args)
+            .env("VCI_JS_PLUGIN", workspace_root().join("js/vitest-plugin"))
+            .env("GIT_CONFIG_GLOBAL", &self.gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("NO_COLOR", "1")
+            .env("TZ", "UTC")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for k in [
+            "VCI_BASE_REF",
+            "VCI_OUT",
+            "NODE_OPTIONS",
+            "NODE_ENV",
+            "TEST_CONCURRENCY",
+        ]
+        .iter()
+        .chain(vci_store::select::ENV_VARS)
+        {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        let mut child = cmd.spawn().unwrap();
+        on_start(child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                let out = child.wait_with_output().unwrap();
+                eprintln!(
+                    "$ vci {}\n{}{}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return Some(out);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// Whether process `pid` exists (`kill -0`).
+fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A test file whose process writes its id to `$VCI_E2E_PIDS/<name>` and
+/// then never ends (a promise nothing settles, a timer keeping it alive),
+/// as one of vex-web's files did on vex's benchmark runner when its native
+/// addons could not start their threads.
+fn hanging_test(name: &str) -> String {
+    format!(
+        "import fs from 'node:fs';\nimport path from 'node:path';\nimport {{ test }} from 'node:test';\n\ntest('never settles', () => new Promise(() => {{\n  fs.writeFileSync(path.join(process.env.VCI_E2E_PIDS, '{name}'), String(process.pid));\n  setInterval(() => {{}}, 1000);\n}}));\n"
+    )
+}
+
+/// vci 2.10.3 waited for a test file's process without a limit: on vex's
+/// benchmark runner one of vex-web's files never ended, and `vci run` waited
+/// 57 minutes for it, until the job's timeout. Each file's processes now
+/// run in a process group of their own, stopped with it past
+/// `VCI_NODE_TEST_FILE_TIMEOUT` seconds: that file fails, unattested, and
+/// the others are attested; a process a file leaves running that holds its
+/// output open (2.10.3 read the output through pipes until they closed)
+/// does not keep vci either.
+#[test]
+fn a_file_that_never_ends_is_stopped_at_its_deadline() {
+    let w = World::new();
+    let work = w.work.clone();
+    let pids = w.base.join("pids");
+    std::fs::create_dir_all(&pids).unwrap();
+    w.write("src/hang.test.mjs", &hanging_test("hang"));
+    w.write(
+        "src/linger.test.mjs",
+        "import { test } from 'node:test';\nimport { spawn } from 'node:child_process';\n\ntest('leaves a process holding stderr', () => {\n  spawn('sleep', ['300'], { stdio: ['ignore', 'ignore', 'inherit'] }).unref();\n});\n",
+    );
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let env = [
+        ("VCI_NODE_TEST_FILE_TIMEOUT", Some("3")),
+        ("VCI_E2E_PIDS", Some(pids.to_str().unwrap())),
+    ];
+    let started = std::time::Instant::now();
+    let out = w
+        .vci_within(
+            &work,
+            &[
+                "run",
+                "src/hang.test.mjs",
+                "src/linger.test.mjs",
+                B,
+                "--key",
+                &key,
+            ],
+            &env,
+            120,
+            &|_| {},
+        )
+        .expect("vci run waited for the file that never ends");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(100),
+        "{:?}",
+        started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_ne!(out.status.code(), Some(0), "the stopped file fails the run");
+    assert!(
+        stderr.contains("vci: src/hang.test.mjs: its processes ran for")
+            && stderr.contains("(VCI_NODE_TEST_FILE_TIMEOUT); not attested"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&format!("vci: attested {B} ")), "{stderr}");
+    assert!(
+        !stderr.contains("vci: attested src/hang.test.mjs"),
+        "{stderr}"
+    );
+    // The file's process went with its group.
+    let pid = std::fs::read_to_string(pids.join("hang")).unwrap();
+    assert!(
+        !alive(pid.trim()),
+        "the file's process {pid} is still running"
+    );
+}
+
+/// SIGTERM (or SIGINT, SIGHUP) while the files run: every file's process
+/// group is killed before vci goes, as the signal would have reached them
+/// had they been in vci's own process group.
+#[test]
+fn a_stop_signal_takes_the_test_processes_with_vci() {
+    let w = World::new();
+    let work = w.work.clone();
+    let pids = w.base.join("pids");
+    std::fs::create_dir_all(&pids).unwrap();
+    w.write("src/hang.test.mjs", &hanging_test("hang"));
+    let key = w.trusted.to_str().unwrap().to_owned();
+    let env = [
+        ("VCI_NODE_TEST_FILE_TIMEOUT", Some("0")),
+        ("VCI_E2E_PIDS", Some(pids.to_str().unwrap())),
+    ];
+    let pid_file = pids.join("hang");
+    let out = w.vci_within(
+        &work,
+        &["run", "src/hang.test.mjs", "--key", &key],
+        &env,
+        120,
+        &|vci| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !pid_file.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let st = Command::new("kill")
+                .args(["-TERM", &vci.to_string()])
+                .status()
+                .unwrap();
+            assert!(st.success());
+        },
+    );
+    let out = out.expect("vci did not end on SIGTERM");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&out.status),
+        Some(15),
+        "vci goes as SIGTERM takes it: {:?}",
+        out.status
+    );
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !alive(pid.trim()),
+        "the file's process {pid} is still running"
+    );
+}
