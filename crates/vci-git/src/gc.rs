@@ -67,6 +67,48 @@ pub fn run_grace_secs() -> i64 {
 /// every hdr, tables and shape object.
 pub const LEGACY_READS_MAX: usize = 10_000;
 
+/// [`LEGACY_READS_MAX`], or `VCI_STORE_LEGACY_READS_MAX` (tests).
+pub fn legacy_reads_max() -> usize {
+    std::env::var("VCI_STORE_LEGACY_READS_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(LEGACY_READS_MAX)
+}
+
+/// The most objects and links one collection removes (`VCI_STORE_REMOVALS_MAX`
+/// in tests): each becomes a changed entry and a deletion record of the
+/// push, so the first collection of a large store (vex's of 14 November:
+/// about 44,000 objects and as many links) is spread over several pushes
+/// of a second or so each instead of one that serializes 110,000 entries
+/// (about 30 s).
+pub const REMOVALS_MAX: usize = 10_000;
+
+/// [`REMOVALS_MAX`], or `VCI_STORE_REMOVALS_MAX` (at least 1).
+pub fn removals_max() -> usize {
+    std::env::var("VCI_STORE_REMOVALS_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(REMOVALS_MAX, |v| v.max(1))
+}
+
+/// Keep at most `max` of what `d` removes, hdr, tables and shape objects
+/// first, then state objects, then links (each in key order, so that
+/// clones collecting at once choose the same ones); how many were left
+/// for a later collection. Leaving any of them is safe: what is named is
+/// decided again at each collection, from what remains.
+pub fn cap(d: &mut Decision, max: usize) -> usize {
+    let mut room = max;
+    let mut deferred = 0;
+    for v in [&mut d.objects, &mut d.state, &mut d.links] {
+        if v.len() > room {
+            deferred += v.len() - room;
+            v.truncate(room);
+        }
+        room -= v.len();
+    }
+    deferred
+}
+
 /// What the store holds, as keys (values not read).
 #[derive(Debug, Default)]
 pub struct Keys {
@@ -178,7 +220,7 @@ pub fn decide(
     out.legacy_unread = legacy.iter().filter(|(_, p)| *p).count();
     let legacy_names: LegacyNames = if legacy.is_empty() {
         Some(BTreeSet::new())
-    } else if out.legacy_unread > 0 || legacy.len() > LEGACY_READS_MAX {
+    } else if out.legacy_unread > 0 || legacy.len() > legacy_reads_max() {
         None
     } else {
         let ks: Vec<&str> = legacy.iter().map(|(k, _)| *k).collect();
@@ -221,6 +263,30 @@ fn note_state<'a>(map: &mut BTreeMap<&'a str, i64>, id: &'a str, hint: &str) {
 fn hint_issued(seg: &str) -> Option<i64> {
     let (issued, _) = seg.split_once('.')?;
     i64::from_str_radix(issued, 16).ok()
+}
+
+/// How many records have no family of run-object links (see [`decide`]:
+/// legacy) and no value here: such a record may name any object.
+pub fn unread_legacy(keys: &Keys) -> usize {
+    let families: BTreeSet<(&str, &str)> = keys
+        .run_object_links
+        .iter()
+        .filter_map(|k| {
+            let (hint, signer, _, _) = vci_store::parse_run_object_key(k)?;
+            Some((hint, signer))
+        })
+        .collect();
+    keys.records
+        .iter()
+        .filter(|(_, promised)| *promised)
+        .filter(|(key, _)| {
+            let Some((_, signer, _)) = vci_store::parse_key(key) else {
+                return false;
+            };
+            vci_store::parse_key_hint(key)
+                .is_none_or(|h| !families.contains(&(vci_store::hint_segment(&h).as_str(), signer)))
+        })
+        .count()
 }
 
 /// The ids of the objects the live families name, and the shape and state
@@ -455,6 +521,39 @@ mod tests {
         };
         let d = decide(&keys, NOW, 7 * DAY, RUN_GRACE_SECS, never);
         assert!(d.objects.is_empty() && d.links.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn a_cap_keeps_the_first_objects_then_state_then_links() {
+        let mut d = Decision {
+            objects: vec!["o1".into(), "o2".into()],
+            state: vec!["s1".into(), "s2".into()],
+            links: vec!["l1".into()],
+            ..Decision::default()
+        };
+        assert_eq!(cap(&mut d, 3), 2);
+        assert_eq!(d.objects, ["o1", "o2"]);
+        assert_eq!(d.state, ["s1"]);
+        assert!(d.links.is_empty());
+        let mut d = Decision {
+            objects: vec!["o1".into()],
+            ..Decision::default()
+        };
+        assert_eq!(cap(&mut d, 10_000), 0);
+        assert_eq!(d.objects, ["o1"]);
+    }
+
+    #[test]
+    fn unread_legacy_counts_promised_records_without_a_family() {
+        let linked = record('a', SIGNER, NOW - DAY);
+        let mut keys = Keys {
+            records: vec![(linked, true), (record('b', SIGNER, NOW - 2 * DAY), false)],
+            run_object_links: links(NOW - DAY, SIGNER, &[(ObjectKind::Hdr, '1')]),
+            ..Keys::default()
+        };
+        assert_eq!(unread_legacy(&keys), 0, "b's value is here");
+        keys.records.push((record('c', OTHER, NOW - DAY), true));
+        assert_eq!(unread_legacy(&keys), 1, "c's signer has no family");
     }
 
     #[test]

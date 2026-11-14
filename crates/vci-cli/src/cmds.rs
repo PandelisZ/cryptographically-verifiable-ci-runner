@@ -151,7 +151,13 @@ pub fn ci(args: CiArgs) -> Result<i32> {
     }
     let pushed = if push_wanted {
         // Best effort: CI's result is the tests', never the publication's.
-        match push_with(&*store, args.remote.as_deref(), false, OnRemote::Ignore) {
+        match push_with(
+            &*store,
+            args.remote.as_deref(),
+            false,
+            OnRemote::Ignore,
+            args.base_ref.as_deref(),
+        ) {
             Ok(_) => Some(true),
             Err(e) => {
                 github_warning(&format!(
@@ -1633,7 +1639,7 @@ enum OnRemote {
 pub fn push(remote: Option<&str>, rewrite_history: bool) -> Result<i32> {
     let (repo, _) = open_repo()?;
     let store = crate::store::for_repo(&repo);
-    push_with(&*store, remote, rewrite_history, OnRemote::Refuse)
+    push_with(&*store, remote, rewrite_history, OnRemote::Refuse, None)
 }
 
 /// `vci push`'s work (also `vci ci --push`): publish the store's local
@@ -1644,6 +1650,7 @@ fn push_with(
     remote: Option<&str>,
     rewrite_history: bool,
     on_remote: OnRemote,
+    base_ref: Option<&str>,
 ) -> Result<i32> {
     let kind = store.kind();
     let Some(ex) = store.exchange() else {
@@ -1676,7 +1683,7 @@ fn push_with(
         );
         return Ok(0);
     };
-    drop_superseded(store);
+    drop_superseded(store, base_ref);
     let auto = if rewrite_history {
         None
     } else {
@@ -1757,10 +1764,14 @@ const AUTO_KEEP: usize = 4;
 /// the push goes on.
 ///
 /// 1. (2.11) The attestations issued longer ago than the longest
-///    `max_ttl` of the working tree's `vci.toml` (the top-level one and
-///    every project's), from the key's issue time: under that policy each
-///    is expired, or was signed for longer than it allows (refused); a plan
-///    skips with neither. ([`expiry_cutoff`].)
+///    `max_ttl` of `vci.toml` (the top-level one and every project's) in
+///    the working tree, at the base commit (`base_ref`, as a plan resolves
+///    it) and at every branch, remote-tracking branch and tag tip here,
+///    from the key's issue time: under each of those policies each is
+///    expired, or was signed for longer than it allows (refused); a plan
+///    skips with neither. A branch's lower `max_ttl` does not shorten the
+///    attestations its base or another branch here still accepts.
+///    ([`expiry_cutoff`].)
 /// 2. (2.10.3) Of each unit's attestations by one signer, the ones older
 ///    than the [`auto_keep`] newest, except one made on a tree some branch
 ///    or tag has at its tip, as `vci prune` keeps. A key that does not say
@@ -1776,7 +1787,7 @@ const AUTO_KEEP: usize = 4;
 ///    attestation, and its grace period counted from when a row was last
 ///    fetched, so a prune from a fresh clone removed none of them (vex, 14
 ///    November: 40,753 unreferenced objects, 39% of the store).
-fn drop_superseded(store: &dyn AttestationStore) {
+fn drop_superseded(store: &dyn AttestationStore, base_ref: Option<&str>) {
     let keep = auto_keep();
     if keep == 0 {
         return;
@@ -1804,7 +1815,7 @@ fn drop_superseded(store: &dyn AttestationStore) {
         }
     };
     let total = all.len();
-    let expiry = expiry_cutoff(&root, now_unix());
+    let expiry = expiry_cutoff(&repo, &root, base_ref, now_unix());
     let mut expired: Vec<StoredEnvelope> = Vec::new();
     let mut groups: BTreeMap<(String, String), Vec<StoredEnvelope>> = BTreeMap::new();
     for e in all {
@@ -1844,7 +1855,7 @@ fn drop_superseded(store: &dyn AttestationStore) {
                     && let Some((_, ttl)) = &expiry
                 {
                     eprintln!(
-                        "vci: removed {gone_expired} of {total} attestation(s): issued more than {ttl} ago, the longest [policy] max_ttl of vci.toml, so expired or refused by every plan (VCI_STORE_AUTO_PRUNE=0 keeps them)"
+                        "vci: removed {gone_expired} of {total} attestation(s): issued more than {ttl} ago, the longest [policy] max_ttl of vci.toml here, at the base commit and at every branch and tag tip, so expired or refused by every plan (VCI_STORE_AUTO_PRUNE=0 keeps them)"
                     );
                 }
                 if superseded > 0 {
@@ -1876,6 +1887,26 @@ fn drop_superseded(store: &dyn AttestationStore) {
                         "vci: note: kept every hdr, tables and shape object: {} of the {} attestation(s) made before vci 2.11 have no value here and may name any of them (they go as they expire or are superseded; then the next push removes the objects nothing names)",
                         c.legacy_unread, c.legacy
                     );
+                } else if c.blocked {
+                    let why = if c.legacy > vci_git::gc::legacy_reads_max() {
+                        format!(
+                            "they are more than the {} a push reads",
+                            vci_git::gc::legacy_reads_max()
+                        )
+                    } else {
+                        "one of them cannot be read".to_owned()
+                    };
+                    eprintln!(
+                        "vci: note: kept every hdr, tables and shape object: the {} attestation(s) made before vci 2.11 may name any of them and {why} (they go as they expire or are superseded; then the next push removes the objects nothing names)",
+                        c.legacy
+                    );
+                }
+                if c.deferred > 0 {
+                    eprintln!(
+                        "vci: note: left {} more object(s) and link(s) nothing names for the next push (at most {} a push)",
+                        c.deferred,
+                        vci_git::gc::removals_max()
+                    );
                 }
             }
             Err(e) => eprintln!("vci: warning: cannot remove unreferenced objects: {e}"),
@@ -1896,31 +1927,59 @@ fn drop_superseded(store: &dyn AttestationStore) {
 const EXPIRY_MARGIN_SECS: i64 = 60 * 60;
 
 /// The issue time before which an attestation is expired or refused under
-/// the working tree's `vci.toml` (`now` minus its longest `max_ttl`, the
-/// top-level one and each project's, minus [`EXPIRY_MARGIN_SECS`]), with
-/// that `max_ttl` as written; `None` (nothing removed by age) when a
-/// `max_ttl` does not parse or the file cannot be read. A missing file is
-/// the defaults'.
-fn expiry_cutoff(root: &Utf8Path, now: i64) -> Option<(i64, String)> {
+/// every `vci.toml` a plan may judge it by: `now` minus the longest
+/// `max_ttl` (the top-level one and each project's) of the working tree's
+/// file, the base commit's (`base_ref`, resolved as a plan resolves it)
+/// and the file at every branch, remote-tracking branch and tag tip here,
+/// minus [`EXPIRY_MARGIN_SECS`], with that `max_ttl` as written. A plan
+/// judges an attestation by its base commit's policy, so the pushing
+/// branch's own file alone would let a branch that lowers `max_ttl` (or a
+/// typo, "1h") empty the shared store for every other branch. `None`
+/// (nothing removed by age) when one of them cannot be read here (no base
+/// commit, a partial clone without a tip's file) or a `max_ttl` does not
+/// parse. A missing file is the defaults'.
+fn expiry_cutoff(
+    repo: &vci_git::Repo,
+    root: &Utf8Path,
+    base_ref: Option<&str>,
+    now: i64,
+) -> Option<(i64, String)> {
     let path = root.join(CONFIG_FILE);
-    let cfg = if path.exists() {
-        crate::config::Config::parse(&std::fs::read_to_string(&path).ok()?).ok()?
+    let mut files: Vec<Option<Vec<u8>>> = vec![if path.exists() {
+        Some(std::fs::read(&path).ok()?)
     } else {
-        crate::config::Config::default()
-    };
-    let mut longest = (cfg.policy.max_ttl_secs().ok()?, cfg.policy.max_ttl.clone());
-    for p in &cfg.projects {
-        if let Some(v) = p.policy.as_ref().and_then(|o| o.max_ttl.as_ref()) {
-            let secs = crate::util::parse_duration(v).ok()?;
-            if secs > longest.0 {
-                longest = (secs, v.clone());
+        None
+    }];
+    let (_, base) = crate::plan::resolve_base(repo, base_ref).ok()?;
+    files.push(repo.show_file(&base, CONFIG_FILE).ok()?);
+    files.extend(repo.top_file_at_ref_tips(CONFIG_FILE).ok()?);
+    expiry_cutoff_of(&files, now)
+}
+
+/// [`expiry_cutoff`] of these `vci.toml` contents (`None`: no file).
+fn expiry_cutoff_of(files: &[Option<Vec<u8>>], now: i64) -> Option<(i64, String)> {
+    let mut longest: Option<(i64, String)> = None;
+    for f in files {
+        let cfg = match f {
+            Some(bytes) => crate::config::Config::parse(std::str::from_utf8(bytes).ok()?).ok()?,
+            None => crate::config::Config::default(),
+        };
+        let mut ttls = vec![(cfg.policy.max_ttl_secs().ok()?, cfg.policy.max_ttl.clone())];
+        for p in &cfg.projects {
+            if let Some(v) = p.policy.as_ref().and_then(|o| o.max_ttl.as_ref()) {
+                ttls.push((crate::util::parse_duration(v).ok()?, v.clone()));
+            }
+        }
+        for t in ttls {
+            if longest.as_ref().is_none_or(|l| t.0 > l.0) {
+                longest = Some(t);
             }
         }
     }
+    let (secs, written) = longest?;
     Some((
-        now.saturating_sub(longest.0)
-            .saturating_sub(EXPIRY_MARGIN_SECS),
-        longest.1,
+        now.saturating_sub(secs).saturating_sub(EXPIRY_MARGIN_SECS),
+        written,
     ))
 }
 
@@ -3473,14 +3532,17 @@ mod tests {
     #[test]
     fn pushing_a_store_without_an_exchange_sends_nothing() {
         let s = crate::store::mem::MemStore::new();
-        assert_eq!(push_with(&s, None, false, OnRemote::Ignore).unwrap(), 0);
         assert_eq!(
-            push_with(&s, Some("origin"), false, OnRemote::Ignore).unwrap(),
+            push_with(&s, None, false, OnRemote::Ignore, None).unwrap(),
             0
         );
-        let e = push_with(&s, Some("origin"), false, OnRemote::Refuse).unwrap_err();
+        assert_eq!(
+            push_with(&s, Some("origin"), false, OnRemote::Ignore, None).unwrap(),
+            0
+        );
+        let e = push_with(&s, Some("origin"), false, OnRemote::Refuse, None).unwrap_err();
         assert_eq!(e.to_string(), "the memory store does not support a remote");
-        let e = push_with(&s, None, true, OnRemote::Ignore).unwrap_err();
+        let e = push_with(&s, None, true, OnRemote::Ignore, None).unwrap_err();
         assert_eq!(
             e.to_string(),
             "the memory store does not support rewriting history"
@@ -3975,26 +4037,32 @@ mod tests {
 
     #[test]
     fn the_expiry_cutoff_is_the_longest_max_ttl_and_an_hour() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8Path::from_path(dir.path()).unwrap();
         let now = 1_000_000_000;
         // No vci.toml: the default (30d).
         assert_eq!(
-            expiry_cutoff(root, now),
+            expiry_cutoff_of(&[None], now),
             Some((now - 30 * 86_400 - 3600, "30d".to_owned()))
         );
-        std::fs::write(
-            root.join(CONFIG_FILE),
-            "[policy]\nmax_ttl = \"14d\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n[projects.policy]\nmax_ttl = \"20d\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n",
-        )
-        .unwrap();
+        let mixed = b"[policy]\nmax_ttl = \"14d\"\n\n[[projects]]\nname = \"a\"\npath = \"a\"\nadapter = \"rails\"\n[projects.policy]\nmax_ttl = \"20d\"\n\n[[projects]]\nname = \"b\"\npath = \"b\"\nadapter = \"rails\"\n".to_vec();
         assert_eq!(
-            expiry_cutoff(root, now),
+            expiry_cutoff_of(&[Some(mixed.clone())], now),
             Some((now - 20 * 86_400 - 3600, "20d".to_owned()))
         );
+        // A branch that lowers max_ttl does not shorten what its base (or
+        // another branch) accepts: the longest of every file.
+        let short = b"[policy]\nmax_ttl = \"1d\"\n".to_vec();
+        assert_eq!(
+            expiry_cutoff_of(&[Some(short.clone()), Some(mixed), None], now),
+            Some((now - 30 * 86_400 - 3600, "30d".to_owned()))
+        );
+        assert_eq!(
+            expiry_cutoff_of(&[Some(short)], now),
+            Some((now - 86_400 - 3600, "1d".to_owned()))
+        );
         // One that does not parse: nothing is removed by age.
-        std::fs::write(root.join(CONFIG_FILE), "[policy]\nmax_ttl = \"soon\"\n").unwrap();
-        assert_eq!(expiry_cutoff(root, now), None);
+        let bad = b"[policy]\nmax_ttl = \"soon\"\n".to_vec();
+        assert_eq!(expiry_cutoff_of(&[None, Some(bad)], now), None);
+        assert_eq!(expiry_cutoff_of(&[], now), None);
     }
 
     #[test]

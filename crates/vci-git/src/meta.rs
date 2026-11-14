@@ -8197,6 +8197,7 @@ impl<'a> AttestStore<'a> {
                 }
                 let back = self.restore_referenced_objects(
                     &session,
+                    name,
                     &objects_before,
                     local_before.as_deref(),
                     &remote_object_blobs,
@@ -10143,6 +10144,7 @@ impl<'a> AttestStore<'a> {
     fn restore_referenced_objects(
         &self,
         session: &Session,
+        remote: &str,
         before: &BTreeSet<String>,
         local_before: Option<&str>,
         tip_blobs: &BTreeMap<String, String>,
@@ -10172,24 +10174,35 @@ impl<'a> AttestStore<'a> {
         if candidates.is_empty() {
             return Ok(0);
         }
-        // Which attestations name them needs every attestation this clone
-        // holds read (one it never fetched is not one its plans relied on,
-        // as for manifests); one that cannot be read might name any of
-        // them, so then every candidate is put back.
-        let mut referenced = self.referenced_objects(true)?;
+        // 2.11: a record whose run wrote no run-object links (a vci before
+        // 2.11, such as a laptop or a pinned workflow still on 2.10) and
+        // whose value is not here may name any of them, whether it was
+        // here at the collection (which then removed no hdr, tables or
+        // shape object) or another clone published it since this one
+        // fetched: then every candidate is put back.
+        let keys = self.reader()?.gc_keys()?;
+        let mut referenced = if crate::gc::unread_legacy(&keys) > 0 {
+            None
+        } else {
+            // Which attestations name them needs every attestation this
+            // clone holds read (one it never fetched is not one its plans
+            // relied on, as for manifests); one that cannot be read might
+            // name any of them, so then every candidate is put back.
+            self.referenced_objects(true)?
+        };
         // 2.11: and every object a run-object link of a run with a record
         // here names (keys only): a record another clone pushed since this
         // one fetched, whose value is not here, names its objects through
         // its run's links, so an object this clone's push removed and that
         // record names is put back.
         if let Some(r) = referenced.as_mut() {
-            let keys = self.reader()?.gc_keys()?;
             r.extend(crate::gc::live_named(
                 &keys,
                 now_ms() / 1000,
                 crate::gc::run_grace_secs(),
             ));
         }
+        drop(keys);
         let wanted: Vec<&String> = candidates
             .iter()
             .filter(|(_, (_, id))| referenced.as_ref().is_none_or(|r| r.contains(id)))
@@ -10240,6 +10253,18 @@ impl<'a> AttestStore<'a> {
             .flatten()
             .cloned()
             .collect();
+        // A lazy (blobless) clone, as every CI job's is, never fetched the
+        // value of an object only another clone's record names: it is
+        // fetched from the remote's tip here (only the ones not here), or
+        // the object could not be put back and the push would publish its
+        // removal.
+        let from_tip: BTreeSet<String> = wanted
+            .iter()
+            .filter(|k| local_blobs.get(**k).is_none_or(|o| !oids.contains(o)))
+            .filter_map(|k| tip_blobs.get(*k))
+            .cloned()
+            .collect();
+        let (present, _, fetch_error) = self.ensure_blobs(remote, &from_tip)?;
         let bytes = self.read_blobs(&oids)?;
         let project = Target::project();
         let mut put_back: Vec<String> = Vec::new();
@@ -10264,6 +10289,31 @@ impl<'a> AttestStore<'a> {
                 put_back.push(key.clone());
                 break;
             }
+        }
+        // An object a record names whose value is on the remote's tip but
+        // could not be fetched: publishing this merge would remove it, so
+        // nothing is (the push fails as a whole; the removal stays local
+        // and the next push puts it back or publishes it).
+        let put: BTreeSet<&String> = put_back.iter().collect();
+        let unread = candidates
+            .keys()
+            .filter(|k| !put.contains(k))
+            .filter(|k| {
+                referenced
+                    .as_ref()
+                    .is_none_or(|r| r.contains(&candidates[*k].1))
+            })
+            .filter(|k| {
+                tip_blobs
+                    .get(*k)
+                    .is_some_and(|o| !present.contains(o) && !bytes.contains_key(o))
+            })
+            .count();
+        if unread > 0 {
+            return Err(GitError::Meta(format!(
+                "cannot put back {unread} object(s) that attestations name, which this store removed and {remote}'s refs/meta/main holds: fetching their values failed ({}); nothing was pushed",
+                fetch_error.as_deref().unwrap_or("not in the fetched pack")
+            )));
         }
         self.stamp_written(put_back.iter().map(|k| (&project, k.as_str())))?;
         Ok(put_back.len())

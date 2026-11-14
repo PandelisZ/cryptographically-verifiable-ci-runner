@@ -522,6 +522,13 @@ pub struct Collected {
     /// Of those, the ones whose value is not here: while there is one, no
     /// hdr, tables or shape object is removed (it may name any of them).
     pub legacy_unread: usize,
+    /// Whether the legacy records kept every hdr, tables and shape object:
+    /// one has no value here, one cannot be read, or there are more than
+    /// the collection reads (git-meta: 10,000).
+    pub blocked: bool,
+    /// What the rules would remove beyond the most one collection removes
+    /// (git-meta: 10,000 objects and links), left for the next push.
+    pub deferred: usize,
     /// Objects the rules would remove but that were put or named again
     /// since the collection began (a run beside it), left for the next
     /// push.

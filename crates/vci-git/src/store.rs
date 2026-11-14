@@ -659,6 +659,8 @@ impl AttestationStore for GitMetaStore {
             },
         );
         drop(keys);
+        let mut d = d;
+        let deferred = crate::gc::cap(&mut d, crate::gc::removals_max());
         if vci_core::metrics::on() {
             vci_core::timing_line!(
                 "collect objects: list the keys and decide: {:.2}s ({} objects, {} state objects, {} links to remove)",
@@ -672,6 +674,8 @@ impl AttestationStore for GitMetaStore {
         let mut out = vci_store::Collected {
             legacy: d.legacy,
             legacy_unread: d.legacy_unread,
+            blocked: d.blocked,
+            deferred,
             ..vci_store::Collected::default()
         };
         let (n, t) = st.remove_project_keys_untouched(d.objects, began)?;

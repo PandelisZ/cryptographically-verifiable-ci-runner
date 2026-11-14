@@ -17,6 +17,9 @@ use crate::validate;
 /// contents is left alone: a partial clone of the code needs those fetched.
 const NO_LAZY_FETCH: &str = "GIT_NO_LAZY_FETCH";
 
+/// An object `git cat-file --batch` printed: its type and contents.
+type BatchObject = (String, Vec<u8>);
+
 /// A git repository, identified by its root directory (the work tree root, or
 /// the git directory for a bare repository).
 #[derive(Debug, Clone)]
@@ -248,6 +251,140 @@ impl Repo {
             }
         }
         Ok(trees)
+    }
+
+    /// The distinct contents of the file `name` at the top of the tree of
+    /// every branch, remote-tracking branch and tag tip (`None` once when
+    /// some tip has no such file), read without fetching anything: an
+    /// error when one is here as something other than a regular file or
+    /// its contents are not here (a partial clone), so that a caller that
+    /// needs every tip's file can tell it does not have them all.
+    pub fn top_file_at_ref_tips(&self, name: &str) -> Result<Vec<Option<Vec<u8>>>, GitError> {
+        let out = self
+            .git()
+            .args([
+                "for-each-ref",
+                "--format=%(tree)%09%(*tree)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ])
+            .env(NO_LAZY_FETCH, "1")
+            .run_str()?;
+        let trees: BTreeSet<&str> = out
+            .lines()
+            .flat_map(|l| l.split('\t'))
+            .map(str::trim)
+            .filter(|t| is_oid(t))
+            .collect();
+        if trees.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch = |oids: &mut dyn Iterator<Item = &str>| -> Result<Vec<u8>, GitError> {
+            let mut input = Vec::new();
+            for o in oids {
+                input.extend_from_slice(o.as_bytes());
+                input.push(b'\n');
+            }
+            self.git()
+                .args(["cat-file", "--batch"])
+                .env(NO_LAZY_FETCH, "1")
+                .run_with_stdin(&input)
+        };
+        // `<oid> <type> <size>\n<contents>\n` or `<oid> missing\n`, in order.
+        let objects = |out: &[u8]| -> Result<Vec<Option<BatchObject>>, GitError> {
+            let mut objs = Vec::new();
+            let mut rest = out;
+            while !rest.is_empty() {
+                let Some(nl) = rest.iter().position(|b| *b == b'\n') else {
+                    break;
+                };
+                let header = String::from_utf8_lossy(&rest[..nl]).into_owned();
+                rest = &rest[nl + 1..];
+                let parts: Vec<&str> = header.split(' ').collect();
+                match parts.as_slice() {
+                    [_, "missing"] => objs.push(None),
+                    [_, kind, size] => {
+                        let size: usize = size.parse().map_err(|_| {
+                            GitError::Meta(format!("git cat-file --batch: {header}"))
+                        })?;
+                        if rest.len() < size {
+                            return Err(GitError::Meta("git cat-file --batch: short".into()));
+                        }
+                        objs.push(Some(((*kind).to_owned(), rest[..size].to_vec())));
+                        rest = rest.get(size + 1..).unwrap_or(&[]);
+                    }
+                    _ => return Err(GitError::Meta(format!("git cat-file --batch: {header}"))),
+                }
+            }
+            Ok(objs)
+        };
+        let listed: Vec<&str> = trees.iter().copied().collect();
+        let read = objects(&batch(&mut listed.iter().copied())?)?;
+        if read.len() != listed.len() {
+            return Err(GitError::Meta("git cat-file --batch: wrong count".into()));
+        }
+        let mut blobs: BTreeSet<String> = BTreeSet::new();
+        let mut without = false;
+        for (tree, obj) in listed.iter().zip(read) {
+            let Some((kind, body)) = obj.filter(|(k, _)| k == "tree") else {
+                return Err(GitError::Meta(format!("tree {tree} is not here")));
+            };
+            debug_assert_eq!(kind, "tree");
+            let raw = tree.len() / 2;
+            let mut found = None;
+            let mut rest = &body[..];
+            while !rest.is_empty() {
+                let Some(sp) = rest.iter().position(|b| *b == b' ') else {
+                    break;
+                };
+                let Some(nul) = rest.iter().position(|b| *b == 0) else {
+                    break;
+                };
+                if nul < sp || rest.len() < nul + 1 + raw {
+                    break;
+                }
+                let (mode, entry) = (&rest[..sp], &rest[sp + 1..nul]);
+                let oid: String = rest[nul + 1..nul + 1 + raw]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                rest = &rest[nul + 1 + raw..];
+                if entry == name.as_bytes() {
+                    found = Some((mode.to_vec(), oid));
+                    break;
+                }
+            }
+            match found {
+                None => without = true,
+                Some((mode, oid)) if mode == b"100644" || mode == b"100755" => {
+                    blobs.insert(oid);
+                }
+                Some(_) => {
+                    return Err(GitError::Meta(format!(
+                        "{name} at tree {tree} is not a regular file"
+                    )));
+                }
+            }
+        }
+        let mut contents: Vec<Option<Vec<u8>>> = Vec::new();
+        if without {
+            contents.push(None);
+        }
+        if !blobs.is_empty() {
+            let listed: Vec<&str> = blobs.iter().map(String::as_str).collect();
+            let read = objects(&batch(&mut listed.iter().copied())?)?;
+            if read.len() != listed.len() {
+                return Err(GitError::Meta("git cat-file --batch: wrong count".into()));
+            }
+            for (oid, obj) in listed.iter().zip(read) {
+                match obj {
+                    Some((kind, body)) if kind == "blob" => contents.push(Some(body)),
+                    _ => return Err(GitError::Meta(format!("{name} ({oid}) is not here"))),
+                }
+            }
+        }
+        Ok(contents)
     }
 
     /// `refs/remotes/<remote>/<branch>` for every remote, when HEAD is on a

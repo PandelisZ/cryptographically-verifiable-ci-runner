@@ -2187,10 +2187,18 @@ running by hand for the store to stay the size of what plans use. `VCI_STORE_AUT
 order:
 
 1. **Expired attestations (2.11).** An attestation whose key says it was issued longer ago than the longest
-   `max_ttl` of the working tree's `vci.toml` (the top-level `[policy]` one and every project's), plus an hour for
-   clock skew, goes: under that policy it has expired, or was signed for longer than the policy allows, and a plan
-   skips with neither. `vci: removed N of M attestation(s): issued more than 30d ago, the longest [policy] max_ttl of
-   vci.toml, so expired or refused by every plan`. A `max_ttl` that does not parse removes nothing by age.
+   `max_ttl` (the top-level `[policy]` one and every project's) of `vci.toml` in the working tree, at the base
+   commit (`vci ci --base-ref`, else resolved as `vci plan` resolves it: `VCI_BASE_REF`, `GITHUB_BASE_REF`,
+   `origin/HEAD`, `origin/main`, ...) and at the tip of every branch, remote-tracking branch and tag in the clone,
+   plus an hour for clock skew, goes: under each of those policies it has expired, or was signed for longer than the
+   policy allows, and a plan skips with neither. `vci: removed N of M attestation(s): issued more than 30d ago, the
+   longest [policy] max_ttl of vci.toml here, at the base commit and at every branch and tag tip, so expired or
+   refused by every plan`. A plan judges an attestation by its base commit's policy, so a branch that lowers
+   `max_ttl` in its own `vci.toml` (or a typo such as `"1h"`) does not shorten what its base or another branch in
+   the clone accepts. Nothing is removed by age when the base commit cannot be resolved, a
+   tip's `vci.toml` is not in the clone (a partial clone of the code) or a `max_ttl` does not parse. Not covered: a
+   branch the clone does not have whose `vci.toml` allows longer than all of these (a CI clone has only its own
+   branch and its base); its older attestations go, and its units run once and are attested again.
 2. **Superseded attestations (2.10.3).** Of each unit's attestations by one signer, those older than the 4 newest,
    except one made on a tree some branch or tag has at its tip: `vci: removed N of M attestation(s): older than the 4
    newest of their unit and signer, ...`. A key that does not say when it was issued (before vci 2.2) is left alone
@@ -2214,7 +2222,24 @@ order:
    object again (the same inputs give the same object) after this one fetched, and pushes first: this clone's push
    merges that clone's records and links before it publishes, and the merge puts back an object it removed that a
    link of a run with a record left names (keys only: that record's value need not be here), as it has put back,
-   since 2.10, the objects of the records whose values are here. Before 2.11 only `vci prune` removed unreferenced
+   since 2.10, the objects of the records whose values are here. The object's value is fetched from the remote's tip
+   when the clone does not hold it (a CI job's blobless clone never fetched the values of objects only other runs
+   name); when that fetch fails the push fails as a whole and publishes nothing (`cannot put back N object(s) ...:
+   fetching their values failed`), and the next push tries again. **A vci before 2.11 writing meanwhile** (a laptop
+   or a pinned workflow still on 2.10, while CI runs 2.11): its record has no links, so when one whose value is not
+   in the clone arrives in the merge, the merge puts back every object this push removed (the cleanup of objects
+   waits until such writers have moved to 2.11). A clone that holds the values of more than 10,000 records made
+   before 2.11 does not read them and keeps every hdr, tables and shape object: `vci: note: kept every hdr, tables
+   and shape object: the N attestation(s) made before vci 2.11 may name any of them and they are more than the 10000
+   a push reads`. One push removes at most 10,000 objects and links (`VCI_STORE_REMOVALS_MAX`), hdr, tables and
+   shape objects first, and leaves the rest for the next push: `vci: note: left N more object(s) and link(s)
+   nothing names for the next push (at most 10000 a push)`; each removal is a changed entry and a deletion record to
+   serialize and send, so the first cleanup of a store of vex's size is spread over several CI jobs. **Not
+   covered:** a family of links is a run's key hint and signer, and the hint has one-second resolution and names a
+   tree, so a vci before 2.11 and a 2.11 run signing the same tree with the same key in the same second (parallel
+   jobs of one commit in a mixed fleet) share it: the older vci's records then count as the 2.11 run's, and an hdr,
+   tables or shape object only they name can go; their units run once and are attested again. Telling such records
+   apart needs a key per record (about 34,000 more entries on vex) or a record key 2.10 cannot read. Before 2.11 only `vci prune` removed unreferenced
    objects, by reading every attestation, and its hour of grace counted from when a row was last fetched, so a prune
    from a fresh clone removed none (vex, 12 November 2026: 0); on 14 November vex's store held 40,753 objects no
    record named, 39% of its 104,721 entries.
@@ -2246,7 +2271,9 @@ fetch` 9 to 25 s). With the runs' links (records made by 2.11): the first push l
 removes 43,488 objects, 825 state objects (of runs issued more than 2 days ago) and 43,488 links in 2.8 s, and takes
 33 s in all against 0.7 s with `VCI_STORE_AUTO_PRUNE=0` (13.5 s of it the push's fetch and merge, the rest
 serializing and sending the deletions); the remote then holds 15,687 objects, exactly those the remaining
-attestations' runs name. The next job's push spends 0.15 s on the cleanup (0.07 s for the attestations, 0.08 s for
+attestations' runs name. (That was one push removing all 87,801; a push now removes at most 10,000, so the same
+cleanup is spread over 9 pushes. Their times were not measured; an independent run of the uncapped first push on
+a vex-shaped store took 36 s against 8.3 s for 2.10.3, 11.6 s of it serializing 108,716 changed entries.) The next job's push spends 0.15 s on the cleanup (0.07 s for the attestations, 0.08 s for
 the objects) and removes nothing. Without links (the store as vex's is, every record made before 2.11, no value in
 the clone): 0.25 s, 824 state objects removed, no hdr, tables or shape object, and the note. A CI push past the
 limit on that store after the cleanup (66,000 entries) published it as one commit in 9.5 s, 5.2 s of it fetching
@@ -2807,7 +2834,7 @@ adapter = "vitest"     # or "pytest", "go", "cargo", "rails", "node-test"
 platform = "any"       # "any" | "same-os" | "exact": which OS/arch may satisfy CI
 libraries = "exact"    # "exact" | "any": native libraries (FFI) by file and hash, interpreter library versions (see below)
 max_ttl = "30d"        # longest accepted attestation lifetime (since 2.11 a push removes attestations issued longer
-                       # ago than the longest max_ttl of the file, from their keys)
+                       # ago than the longest max_ttl of this file, the base commit's and every branch tip's, from their keys)
 allow_dirty = true     # accept attestations made from an uncommitted working tree
 no_skip_refs = ["refs/heads/main", "refs/tags/**"]   # never skip on these refs (the `vci init` default)
 no_skip_refs_except = ["github-actions"]             # ...except attestations by these principals (allowed_signers or
