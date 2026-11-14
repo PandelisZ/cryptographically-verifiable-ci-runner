@@ -3682,6 +3682,101 @@ fn rails_slots_give_what_one_process_per_file_gives() {
     }
 }
 
+/// 2.11.0: a batch draws the application's routes in its boot, before its
+/// files' processes fork (`rails_inputs = "loose"`, the default), instead
+/// of in each file's process that needs them. A route's constraint class
+/// the draw autoloads (`app/constraints/even_id_constraint.rb`) is then
+/// loaded before the fork, and is still an input of the file whose test
+/// goes through that route, and of every other file of the batch too (a
+/// superset: what the boot loaded is an input of every file). A change to
+/// it runs them again; with `VCI_RAILS_PRELOAD_ROUTES=0` (each process
+/// draws the routes itself, as before) the file that never draws them does
+/// not have it, and the one that does still has it.
+#[test]
+fn rails_batch_routes_drawn_in_the_boot_are_inputs_of_every_file() {
+    const CONSTRAINT: &str = "app/constraints/even_id_constraint.rb";
+    const FILES: [&str; 3] = [
+        "test/controllers/evens_test.rb",
+        "test/controllers/d_test.rb",
+        "test/models/b_test.rb",
+    ];
+    let world = || {
+        let w = World::new()?;
+        // Format-1 records: entries_of reads the stored manifests.
+        w.format1.store(true, std::sync::atomic::Ordering::Relaxed);
+        w.put(
+            CONSTRAINT,
+            "class EvenIdConstraint\n  def matches?(request) = request.path.split(\"/\").last.to_i.even?\nend\n",
+        );
+        w.put(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  get \"codes/:id\" => \"codes#show\", as: :code\n  get \"evens/:id\" => \"codes#show\", as: :even, constraints: EvenIdConstraint.new\nend\n",
+        );
+        w.put(
+            "test/controllers/evens_test.rb",
+            "require \"test_helper\"\n\nclass EvensTest < ActionDispatch::IntegrationTest\n  test \"even ids only\" do\n    get \"/evens/4\"\n    assert_response :success\n    get \"/evens/3\"\n    assert_response :not_found\n  end\nend\n",
+        );
+        w.git(&w.work, &["add", "-A"]);
+        w.git(&w.work, &["commit", "-q", "-m", "a constrained route"]);
+        Some(w)
+    };
+    let run = |w: &World, env: &[(&str, &str)]| {
+        let key = w.trusted.to_str().unwrap().to_owned();
+        let mut args = vec!["run"];
+        args.extend(FILES);
+        args.extend(["--key", key.as_str()]);
+        let out = w.vci_env(&w.work, &args, env);
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("vci: 3 attested, 0 not attested"),
+            "{stderr}"
+        );
+        stderr
+    };
+    let has = |w: &World, id: &str| entries_of(&w.work, id).iter().any(|(p, _)| p == CONSTRAINT);
+
+    let Some(w) = world() else { return };
+    let stderr = run(&w, &[]);
+    assert!(
+        stderr.contains("vci: the batch drew the application's routes in its boot in "),
+        "{stderr}"
+    );
+    for f in FILES {
+        assert!(
+            has(&w, f),
+            "{f}: the constraint the boot loaded is its input"
+        );
+    }
+    let p = w.plan(&w.work, "main");
+    assert!(FILES.iter().all(|f| p.skip.contains(*f)), "{p:?}");
+    // A change to the constraint runs every file of the batch again.
+    w.put(
+        CONSTRAINT,
+        "class EvenIdConstraint\n  # Even ids only.\n  def matches?(request) = request.path.split(\"/\").last.to_i.even?\nend\n",
+    );
+    let p = w.plan(&w.work, "main");
+    assert!(FILES.iter().all(|f| p.run.contains(*f)), "{p:?}");
+
+    // Each process draws the routes itself: only the files that draw them
+    // load the constraint, and a change to it runs only those.
+    let Some(w) = world() else { return };
+    let stderr = run(&w, &[("VCI_RAILS_PRELOAD_ROUTES", "0")]);
+    assert!(
+        !stderr.contains("drew the application's routes"),
+        "{stderr}"
+    );
+    assert!(has(&w, "test/controllers/evens_test.rb"));
+    assert!(!has(&w, "test/models/b_test.rb"));
+    w.put(
+        CONSTRAINT,
+        "class EvenIdConstraint\n  # Even ids only.\n  def matches?(request) = request.path.split(\"/\").last.to_i.even?\nend\n",
+    );
+    let p = w.plan(&w.work, "main");
+    assert!(p.run.contains("test/controllers/evens_test.rb"), "{p:?}");
+    assert!(p.skip.contains("test/models/b_test.rb"), "{p:?}");
+}
+
 /// `policy.rails_autoload_lookups` (2.6.0): Zeitwerk's listing of an
 /// autoload directory is not an input; the constant names a test looked up
 /// without loading are. A file added to app/models that defines a constant
