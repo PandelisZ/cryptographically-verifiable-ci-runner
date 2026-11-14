@@ -10,12 +10,13 @@
 //! in them (rolldown's and @napi-rs/canvas's thread pools, sized to the 64
 //! processors the container shows) could not start their threads, four
 //! failed in a second, and one never finished: `vci run` waited for it for
-//! 57 minutes, until the job's timeout. A process a test leaves behind that
-//! holds the output open (a `git` or `sleep` it started) kept vci reading
-//! until that process ended on its own.
+//! 57 minutes, until the job's timeout.
 //!
-//! Now each process writes to a file, not a pipe (what a test leaves behind
-//! never keeps vci waiting); a process that runs past its deadline
+//! Now each process writes to a file, not a pipe, so that vci itself never
+//! waits for a pipe to close. (A process a test leaves running that holds
+//! the file process's output open still keeps that file running: `node
+//! --test` waits for its file process's pipes. The deadline bounds it.) A
+//! process that runs past its deadline
 //! ([`FILE_TIMEOUT_ENV`], default 600 s) is killed with its process group
 //! (the `node --test` process, the file's process and what they started) and
 //! its file fails, unattested; a process that cannot be started for want of
@@ -139,6 +140,9 @@ pub enum Ended {
     Exited(ExitStatus),
     /// It ran past its deadline and was killed with its process group.
     Stopped(Duration),
+    /// It was killed with its process group because vci was asked to stop
+    /// (`SIGINT`, `SIGTERM`, `SIGHUP`) while it ran.
+    Interrupted,
     /// It could not be started (the error, after the retries).
     NotStarted(String),
     /// It was not started: vci was asked to stop (`SIGINT`, `SIGTERM`,
@@ -209,7 +213,28 @@ impl Gate {
 struct Running {
     pid: libc::pid_t,
     deadline: Option<Instant>,
-    stopped: bool,
+    stopped: Option<Kill>,
+}
+
+/// Why vci killed a file's process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kill {
+    /// It ran past its deadline.
+    Deadline,
+    /// vci was asked to stop.
+    Signal,
+}
+
+/// Whether, and why, a process started at `deadline`'s run is to be killed
+/// now.
+fn kill_now(deadline: Option<Instant>) -> Option<Kill> {
+    if stop_asked() {
+        Some(Kill::Signal)
+    } else if deadline.is_some_and(|d| Instant::now() >= d) {
+        Some(Kill::Deadline)
+    } else {
+        None
+    }
 }
 
 /// A signal that asked vci to stop while files ran (0: none).
@@ -294,21 +319,29 @@ fn kill_group(pgid: libc::pid_t) {
 /// Block until process `pid` (a child of this process) has ended, without
 /// reaping it: its id, and its process group's, stay its own until
 /// [`std::process::Child::wait`]. False when that cannot be done (the caller
-/// then stops counting on the id).
+/// then stops counting on the id). macOS's `waitid(WEXITED | WNOWAIT)` also
+/// returns for a child that only stopped (`CLD_STOPPED`): such a child has
+/// not ended, so it is looked at again a little later (and still meets its
+/// deadline: the watchdog kills it, stopped or not).
 fn wait_ended(pid: libc::pid_t) -> bool {
     loop {
         // SAFETY: waitid(2) on our own child, with WNOWAIT: nothing is reaped.
-        let r = unsafe {
+        let (r, code) = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
-            libc::waitid(
+            let r = libc::waitid(
                 libc::P_PID,
                 pid as libc::id_t,
                 &mut info,
                 libc::WEXITED | libc::WNOWAIT,
-            )
+            );
+            (r, info.si_code)
         };
         if r == 0 {
-            return true;
+            if matches!(code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             return false;
@@ -444,11 +477,11 @@ impl Files<'_> {
     /// Kill every process past its deadline (every one, when vci was asked
     /// to stop): only processes not reaped yet are in the table.
     fn watch(&self) {
-        let stop = stop_asked();
-        let now = Instant::now();
         for r in self.running().values_mut() {
-            if !r.stopped && (stop || r.deadline.is_some_and(|d| now >= d)) {
-                r.stopped = true;
+            if r.stopped.is_none()
+                && let Some(why) = kill_now(r.deadline)
+            {
+                r.stopped = Some(why);
                 kill_group(r.pid);
             }
         }
@@ -472,6 +505,28 @@ impl Files<'_> {
             .stdout(Stdio::from(o))
             .stderr(Stdio::from(e))
             .process_group(0);
+        // In a group of its own, the process no longer gets a signal sent to
+        // vci's group, and nothing at all when vci is SIGKILLed (`timeout -s
+        // KILL`, a runner's last resort): on Linux the kernel kills it when
+        // the thread that started it (which waits for it) goes.
+        #[cfg(target_os = "linux")]
+        {
+            let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+            // SAFETY: prctl and getppid are async-signal-safe; nothing is
+            // allocated between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        // vci went before the setting took.
+                        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut delay = Duration::from_millis(50);
         let mut attempt = 1;
         let mut child = loop {
@@ -503,20 +558,20 @@ impl Files<'_> {
         let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
         let started = Instant::now();
         let deadline = self.timeout.map(|t| started + t);
-        let mut stopped = false;
+        let mut stopped = None;
         let status = if !poll {
             self.running().insert(
                 i,
                 Running {
                     pid,
                     deadline,
-                    stopped: false,
+                    stopped: None,
                 },
             );
             let ended = wait_ended(pid);
             // Out of the table before it is reaped: from then on its id may
             // be another process's.
-            stopped = self.running().remove(&i).is_some_and(|r| r.stopped);
+            stopped = self.running().remove(&i).and_then(|r| r.stopped);
             if ended {
                 child.wait()
             } else {
@@ -529,9 +584,10 @@ impl Files<'_> {
         let _ = out.rewind();
         let _ = out.read_to_end(&mut output);
         let ended = match (stopped, status) {
-            (true, _) => Ended::Stopped(started.elapsed()),
-            (false, Ok(st)) => Ended::Exited(st),
-            (false, Err(e)) => Ended::NotStarted(format!("waiting for it: {e}")),
+            (Some(Kill::Deadline), _) => Ended::Stopped(started.elapsed()),
+            (Some(Kill::Signal), _) => Ended::Interrupted,
+            (None, Ok(st)) => Ended::Exited(st),
+            (None, Err(e)) => Ended::NotStarted(format!("waiting for it: {e}")),
         };
         FileRun { ended, output }
     }
@@ -544,15 +600,17 @@ fn poll_until(
     child: &mut std::process::Child,
     pid: libc::pid_t,
     deadline: Option<Instant>,
-    stopped: &mut bool,
+    stopped: &mut Option<Kill>,
 ) -> std::io::Result<ExitStatus> {
     let mut nap = Duration::from_millis(1);
     loop {
         if let Some(st) = child.try_wait()? {
             return Ok(st);
         }
-        if !*stopped && (stop_asked() || deadline.is_some_and(|d| Instant::now() >= d)) {
-            *stopped = true;
+        if stopped.is_none()
+            && let Some(why) = kill_now(deadline)
+        {
+            *stopped = Some(why);
             kill_group(pid);
         }
         std::thread::sleep(nap);
@@ -632,6 +690,98 @@ mod tests {
             }
         }
         assert!(!alive, "the group's other process was left running");
+    }
+
+    /// A process that is stopped (SIGSTOP), not ended, still meets its
+    /// deadline: on macOS `waitid(WEXITED | WNOWAIT)` also returns for a
+    /// child that only stopped, and vci took it off the deadline table and
+    /// then waited for it forever.
+    #[test]
+    fn a_stopped_process_still_meets_its_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runs = collect(
+                1,
+                1,
+                Some(Duration::from_secs(2)),
+                &|_| Ok(sh("echo stopping; kill -STOP $$; echo resumed")),
+                &|c| c.spawn(),
+            );
+            let _ = tx.send(runs);
+        });
+        let runs = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("vci waited for a stopped process past its deadline");
+        assert!(matches!(runs[0].ended, Ended::Stopped(_)), "{:?}", runs[0]);
+        assert_eq!(runs[0].output, b"stopping\n");
+    }
+
+    /// Run by [`a_file_process_goes_when_vci_is_killed`] in a process of its
+    /// own: one file's process that writes its id and sleeps.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "a helper of a_file_process_goes_when_vci_is_killed"]
+    fn pdeathsig_helper() {
+        let Ok(f) = std::env::var("VCI_PDEATHSIG_PID_FILE") else {
+            return;
+        };
+        let _ = collect(
+            1,
+            1,
+            None,
+            &move |_| Ok(sh(&format!("echo $$ > {f}; exec sleep 300"))),
+            &|c| c.spawn(),
+        );
+    }
+
+    /// SIGKILL to vci (`timeout -s KILL`) reaches no process group of a
+    /// file's: on Linux the file's process goes with vci all the same.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_process_goes_when_vci_is_killed() {
+        let t = tempfile::tempdir().unwrap();
+        let pid_file = t.path().join("file.pid");
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "nodetest::procs::tests::pdeathsig_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("VCI_PDEATHSIG_PID_FILE", &pid_file)
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
+        let pid: i32 = loop {
+            if let Some(p) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break p;
+            }
+            assert!(Instant::now() < until, "the file's process never started");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        helper.kill().unwrap();
+        let _ = helper.wait();
+        // Running, not a zombie nobody reaped yet.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit(')').next().map(|r| r.trim().to_owned()))
+                .is_some_and(|r| !r.starts_with('Z') && !r.starts_with('X'))
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        while running() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let alive = running();
+        if alive {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(!alive, "the file's process outlived vci");
     }
 
     /// A process a test leaves behind holding the output open does not keep

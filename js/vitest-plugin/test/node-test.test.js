@@ -526,3 +526,63 @@ test("a native addon of a package that builds or downloads code when installed i
   const s = runFile(q, "src/gyp.test.cjs");
   assert.ok(taints(s.recs).some((t) => t.startsWith("external-native-installed:gypaddon@3.0.0")), JSON.stringify(s.recs));
 });
+
+/** A node-gyp-build style loader that reads (for the test, instead of dlopen) its addon. */
+const GYP_BUILD_LOADER =
+  "const fs = require('node:fs');\nconst path = require('node:path');\n" +
+  "const built = path.join(__dirname, 'build/Release/addon.node');\n" +
+  "const f = fs.existsSync(built) ? built : path.join(__dirname, 'prebuilds/any/addon.node');\n" +
+  "module.exports = JSON.parse(fs.readFileSync(f, 'utf8'));\n";
+
+test("a prebuilt addon node-gyp-build loads from the package's tarball is accepted, its build/ recorded absent", () => {
+  const body = "const assert = require('node:assert');\nconst { test } = require('node:test');\ntest('a', () => { assert.equal(require('ngb').v, 4); });\n";
+  const p = makeProject({ "src/ngb.test.cjs": body });
+  // bufferutil, utf-8-validate: "install": "node-gyp-build", prebuilds/ in the tarball.
+  pnpmPackage(p, "ngb", "4.0.9", {
+    "package.json": JSON.stringify({ name: "ngb", version: "4.0.9", scripts: { install: "node-gyp-build" } }),
+    "binding.gyp": "{}\n",
+    "index.js": GYP_BUILD_LOADER,
+    "prebuilds/any/addon.node": JSON.stringify({ v: 4 }),
+  });
+  const r = runFile(p, "src/ngb.test.cjs");
+  assert.equal(result(r.recs).state, "passed", r.output);
+  assert.deepEqual(taints(r.recs), [], JSON.stringify(r.recs));
+  assert.ok(r.recs.some((x) => x.kind === "external" && x.name === "ngb" && x.version === "4.0.9"));
+  const dir = path.join(p, "node_modules/.pnpm/ngb@4.0.9/node_modules/ngb");
+  assert.ok(paths(r.recs, "probe").has(path.join(dir, "build")), JSON.stringify(r.recs));
+
+  // Built locally (node-gyp-build found no prebuild, or someone ran node-gyp): build/ is not the
+  // tarball's, whichever file was loaded.
+  fs.mkdirSync(path.join(dir, "build/Release"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "build/Release/addon.node"), JSON.stringify({ v: 4 }));
+  const b = runFile(p, "src/ngb.test.cjs");
+  assert.ok(taints(b.recs).some((t) => t.startsWith("external-native-installed:ngb@4.0.9")), JSON.stringify(b.recs));
+
+  // Any other install code (prebuild-install downloads into build/Release; a script may write
+  // anywhere): a prebuilds/ addon is refused too.
+  const q = makeProject({ "src/ngb.test.cjs": body });
+  pnpmPackage(q, "ngb", "4.0.9", {
+    "package.json": JSON.stringify({ name: "ngb", version: "4.0.9", scripts: { install: "node fetch-binary.js" } }),
+    "index.js": GYP_BUILD_LOADER,
+    "prebuilds/any/addon.node": JSON.stringify({ v: 4 }),
+  });
+  const s = runFile(q, "src/ngb.test.cjs");
+  assert.ok(taints(s.recs).some((t) => t.startsWith("external-native-installed:ngb@4.0.9")), JSON.stringify(s.recs));
+});
+
+test("an addon below a nested package.json is judged by the installed package around it", () => {
+  const p = makeProject({
+    "src/nested.test.cjs": "const assert = require('node:assert');\nconst { test } = require('node:test');\ntest('a', () => { assert.equal(require('gyp').v, 5); });\n",
+  });
+  // gyp@1.0.0 runs node-gyp at install; its build/ holds a package.json with a name and version
+  // of its own (2.11.0's first cut attributed the addon to it and accepted it).
+  pnpmPackage(p, "gyp", "1.0.0", {
+    "package.json": JSON.stringify({ name: "gyp", version: "1.0.0", scripts: { install: "node-gyp rebuild" } }),
+    "build/package.json": JSON.stringify({ name: "gyp-build", version: "0.0.0" }),
+    "build/Release/gyp.node": JSON.stringify({ v: 5 }),
+    "index.js": "const fs = require('node:fs');\nconst path = require('node:path');\nmodule.exports = JSON.parse(fs.readFileSync(path.join(__dirname, 'build/Release/gyp.node'), 'utf8'));\n",
+  });
+  const r = runFile(p, "src/nested.test.cjs");
+  assert.equal(result(r.recs).state, "passed", r.output);
+  assert.ok(taints(r.recs).some((t) => t.startsWith("external-native-installed:gyp-build@0.0.0")), JSON.stringify(r.recs));
+});

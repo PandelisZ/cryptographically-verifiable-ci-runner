@@ -488,6 +488,40 @@ impl TreeStat {
         })
     }
 
+    /// An absent entry `rel` anywhere below a `node_modules` directory (the
+    /// first directory vci does not walk on its way) that the unit's run
+    /// only ever found absent (a probe, never a read, a listing, a stat or
+    /// a load: what the test saw there was nothing) and that is absent now,
+    /// when the manifest records it: what the manifest says is what the
+    /// test saw. (Absent before the run, which the snapshot cannot tell
+    /// inside a package, says nothing more: neither notices a path that
+    /// came and went during the run, and the test saw it absent each time
+    /// it looked.) The `build/` of a package whose prebuilt addon was
+    /// loaded, recorded so that a later local build runs the file again.
+    pub fn probed_absent_below_node_modules(&self, e: &InputEntry) -> bool {
+        if e.kind != EntryKind::Absent {
+            return false;
+        }
+        let rel = e.path.as_str();
+        let parts: Vec<&str> = rel.split('/').collect();
+        let Some(i) = parts.iter().position(|c| SKIP_DIRS.contains(c)) else {
+            return false;
+        };
+        if parts[i] != "node_modules" || i + 1 >= parts.len() {
+            return false;
+        }
+        let nm = self.root.join(parts[..=i].join("/"));
+        if self.skip.iter().any(|s| nm.starts_with(s))
+            || self.nested.iter().any(|n| nm.starts_with(n) && nm != *n)
+        {
+            return false;
+        }
+        matches!(
+            std::fs::symlink_metadata(e.path.to_abs(&self.root)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     /// Names and kinds of `dir`'s children in the snapshot, without `skip`.
     fn children_before(
         &self,

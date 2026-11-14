@@ -45,7 +45,9 @@ import {
   isInNodeModules,
   isInternalPath,
   isOwnPath,
+  installedPackageRoot,
   installsCode,
+  installsOnlyNodeGypBuild,
   isUnder,
   linkedPackagePath,
   localCopyPackage,
@@ -68,6 +70,7 @@ const STACK_LIMIT = 400;
 const orig = {
   appendFileSync: fs.appendFileSync,
   mkdirSync: fs.mkdirSync,
+  lstatSync: fs.lstatSync,
 };
 
 /** @typedef {"read" | "stat" | "readdir" | "exists" | "open"} FsKind */
@@ -318,9 +321,8 @@ class Collector {
   /**
    * An installed package: `name@version`, unless it is a copy of a repository directory (its
    * version does not change with that directory's content), or `abs` is a native addon (`.node`,
-   * loaded, read or looked for) of a package whose installation runs code that may build or
-   * download one (node-gyp's `build/Release/*.node`): the tarball the version names holds every
-   * other file, or its absence, but not those.
+   * loaded, read or looked for) that installing the package may have built or downloaded: the
+   * tarball the version names holds every other file, or its absence, but not those.
    * @param {string} abs a file of the package
    * @param {{name: string, version: string, dir?: string}} pkg
    */
@@ -335,20 +337,58 @@ class Collector {
       this.emit({ kind: "taint", reason: `external-local-directory:${local} (a copy of a repository directory, identified only by its version)` });
       return;
     }
-    let native = false;
+    /** @type {string | null} */
+    let why = null;
     try {
-      native = /\.node$/i.test(abs) && (!pkg.dir || installsCode(pkg.dir));
+      why = /\.node$/i.test(abs) ? this.nativeProblem(abs, pkg) : null;
     } catch {
-      native = true;
+      why = "it could not be told whether installing its package builds or downloads it";
     }
-    if (native) {
-      this.emit({
-        kind: "taint",
-        reason: `external-native-installed:${pkg.name}@${pkg.version} (${abs}: a native addon of a package whose installation runs code, which its version does not pin)`,
-      });
+    if (why) {
+      this.emit({ kind: "taint", reason: `external-native-installed:${pkg.name}@${pkg.version} (${abs}: ${why})` });
     } else {
       this.emit({ kind: "external", name: pkg.name, version: pkg.version });
     }
+  }
+
+  /**
+   * Why native addon `abs` of `pkg` is not pinned by the version (null when it is). Installing a
+   * package runs code when it, or the installed package it is nested in (a `package.json` with a
+   * name and version below the package's own directory is not another installed package), has a
+   * `preinstall`, `install` or `postinstall` script or a `binding.gyp`. When that code is exactly
+   * `node-gyp-build` and the package has no `build/` directory, the addon (a prebuilt binary under
+   * `prebuilds/`, or the absence of `build/Release/*.node` that node-gyp-build looks for first) is
+   * still the tarball's: node-gyp-build only ever builds into `build/`, which is then recorded as
+   * absent, so a later local build runs the file again. Anything else (node-gyp's `build/Release`,
+   * `prebuild-install` downloading into it, other scripts) is refused. A git dependency's `prepare`
+   * script is not considered.
+   * @param {string} abs
+   * @param {{name: string, version: string, dir?: string}} pkg
+   * @returns {string | null}
+   */
+  nativeProblem(abs, pkg) {
+    const root = installedPackageRoot(abs);
+    const dirs = [...new Set([root, pkg.dir].filter((d) => typeof d === "string"))];
+    if (dirs.length === 0) return "its package's directory is unknown";
+    const installing = dirs.filter((d) => installsCode(/** @type {string} */ (d)));
+    if (installing.length === 0) return null;
+    const top = /** @type {string} */ (root || pkg.dir);
+    if (installing.every((d) => installsOnlyNodeGypBuild(/** @type {string} */ (d)))) {
+      const build = path.join(top, "build");
+      let absent = false;
+      try {
+        orig.lstatSync(build);
+      } catch (e) {
+        const code = /** @type {any} */ (e).code;
+        absent = code === "ENOENT" || code === "ENOTDIR";
+      }
+      if (absent) {
+        this.emit({ kind: "probe", path: build });
+        return null;
+      }
+      return "a build/ directory beside the prebuilt binaries, which node-gyp-build would load first";
+    }
+    return "a native addon of a package whose installation runs code, which its version does not pin";
   }
 
   /**

@@ -213,6 +213,43 @@ export function installsCode(dir) {
 }
 
 /**
+ * Whether the only code installing the package in `dir` runs is `node-gyp-build` (its `install`
+ * script, no `preinstall` or `postinstall`): it loads or builds nothing at install when a prebuilt
+ * binary under the package's `prebuilds/` (from its tarball) fits, and otherwise builds into
+ * `build/` with node-gyp. It never writes under `prebuilds/`. Any doubt: false.
+ * @param {string} dir a package directory (holding its package.json)
+ */
+export function installsOnlyNodeGypBuild(dir) {
+  try {
+    const json = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
+    const scripts = (json && typeof json.scripts === "object" && json.scripts) || {};
+    const set = (/** @type {string} */ k) => typeof scripts[k] === "string" && scripts[k].trim() !== "";
+    return !set("preinstall") && !set("postinstall") && set("install") && scripts.install.trim() === "node-gyp-build";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The installed package directory a file below `node_modules` belongs to: the path up to the
+ * package name (`@scope/name` or `name`) after the last `node_modules/` segment; null when there is
+ * none (a file directly in `node_modules`, or `.pnpm`'s own files).
+ * @param {string} file absolute path
+ * @returns {string | null}
+ */
+export function installedPackageRoot(file) {
+  const p = toSlash(file);
+  const marker = "/node_modules/";
+  const idx = p.lastIndexOf(marker);
+  if (idx < 0) return null;
+  const rest = p.slice(idx + marker.length).split("/");
+  if (!rest[0] || rest[0].startsWith(".")) return null;
+  const n = rest[0].startsWith("@") ? 2 : 1;
+  if (rest.length <= n) return null;
+  return p.slice(0, idx + marker.length) + rest.slice(0, n).join("/");
+}
+
+/**
  * For a path below `node_modules/<pkg>` where `<pkg>` is a link to a directory outside every
  * `node_modules` (a linked workspace package: pnpm, npm and yarn workspaces link them), the same
  * path below the link's real target. That code is repository content: it must be hashed, never

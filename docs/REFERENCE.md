@@ -163,22 +163,28 @@ that names a directory is refused (Node 26 searches it, older versions do not).
 
 `vci run` runs `node --require <collector> <the script's options> --import <late hooks> --test-reporter=<vci reporter>
 --test-reporter=spec --test <file>` once per file (in parallel, `$VCI_JOBS` at a time, default: CPUs up to 8, and
-since 2.11.0, in a container that limits its processes and threads (cgroup `pids.max`), no more than one file per
+since 2.11.1, in a container that limits its processes and threads (cgroup `pids.max`), no more than one file per
 256 of those left; the script's `--test-concurrency` bounds either), with
 the script's assignments set. node:test starts a child process for the file, which inherits the options: the
 collector is installed there before any of your `--require`/`--import` preloads, and a second set of module hooks
 after them sees every resolution and load of the whole hook chain, including what your hooks answer themselves (an
 `@/` alias, extensionless imports, `?raw` loads). The reporter counts the file's tests from node:test's events.
-Since 2.11.0 each file's processes run in a process group of their own and write to a file rather than a pipe:
+Since 2.11.1 each file's processes run in a process group of their own and write to a file rather than a pipe:
 a file whose processes run past `VCI_NODE_TEST_FILE_TIMEOUT` seconds (default 600, `0`: no limit) is stopped with its
 whole group (`vci: <file>: its processes ran for N s, past 600 s, and were stopped (VCI_NODE_TEST_FILE_TIMEOUT); not
-attested`), fails the run and is not attested, while the other files go on; a process the test leaves running that
-holds the output open no longer keeps vci waiting (2.10.3 waited for each file without a limit, and once waited 57
-minutes for a file that never ended); a file whose process cannot be started for want of resources (`EAGAIN`, a
-container's process or thread limit) is tried again with one file fewer at once each time, for about 7 seconds, then
-fails unattested (`vci: <file>: its process could not be started (...); not attested`); and `SIGINT`, `SIGTERM` or
-`SIGHUP` kills every running file's process group before vci goes (as the signal would have reached them in vci's
-own group).
+attested`), fails the run and is not attested, while the other files go on (2.10.3 waited for each file without a
+limit, and once waited 57 minutes for a file that never ended). A process stopped with `SIGSTOP` meets its deadline
+too. A process the test leaves running that holds the file's output open still keeps that file running, because
+`node --test` waits for its file process's output to close: the deadline bounds it. The deadline's kill reaches the
+group only: a process a test starts in another group or session (`detached: true`, `setsid`) is not stopped. A file
+whose process cannot be started for want of resources (`EAGAIN`, a container's process or thread limit) is tried
+again with one file fewer at once each time, for about 7 seconds, then fails unattested (`vci: <file>: its process
+could not be started (...); not attested`). `SIGINT`, `SIGTERM` or `SIGHUP` to vci kills every running file's
+process group before vci goes, as the signal would have reached them in vci's own group (`vci: <file>: its processes
+were stopped because vci was asked to stop (a signal); not attested`). `SIGKILL` to vci (`timeout -s KILL`, a
+runner's last resort) cannot be caught and no longer reaches the files' groups: on Linux the kernel then kills each
+file's `node --test` process (`PR_SET_PDEATHSIG`), but not the file's own process that one started, nor anything
+detached; on macOS nothing is killed, and those processes run until they end.
 `vci ci --key` runs the remaining files the same way (one process per file, recorded and attested). `vci ci` without
 `--key` records nothing, so it runs the remaining files in **one** `node --test` process, the script restricted to
 them: from the project dir, with the script's assignments, `node <every option of the script> --test <files>` (the
@@ -212,7 +218,7 @@ creating one of them is noticed. A package that is a **copy of a repository dire
 `node_modules/.pnpm/<name>@file+...` store entries of `file:` and injected dependencies, or a real
 `node_modules/<name>` directory that the package.json beside it declares as `file:<dir>`, as npm with
 `install-links` and yarn 1 install them) is not identified by its version: the file is refused
-(`external-local-directory:<name>`). Since 2.11.0 a relative `require` that fails inside an installed package (the
+(`external-local-directory:<name>`). Since 2.11.1 a relative `require` that fails inside an installed package (the
 napi-rs and rolldown loaders try `require('./skia.linux-x64-gnu.node')` beside themselves before the platform package
 `@napi-rs/canvas-linux-x64-gnu`) records that package's `name@version`, as its other files do (2.10.3 recorded the
 candidates as paths inside `node_modules`, so every file that loaded @napi-rs/canvas or rolldown was refused: `input
@@ -220,12 +226,19 @@ cannot be checked for changes: ...: inside a directory vci does not track`); the
 recorded as its own `name@version`. A native addon (`*.node`) loaded, read or looked for in a package whose
 installation runs code (a `preinstall`, `install` or `postinstall` script, or a `binding.gyp`, for which npm and pnpm
 run `node-gyp rebuild`) is refused instead (`external-native-installed:<name>@<version>`): what it builds or
-downloads is not in the tarball its version names. Since 2.11.0 a path looked for and absent directly in a
+downloads is not in the tarball its version names (better-sqlite3, node-pty, isolated-vm, tree-sitter and sqlite3
+build or download into `build/Release`, and stay refused). The exception is a package whose only install code is
+`"install": "node-gyp-build"` (bufferutil, utf-8-validate, classic-level) and that has no `build/` directory: its
+addon is a prebuilt binary under `prebuilds/` from its tarball (node-gyp-build only ever builds into `build/`), so it
+is identified by `name@version`, and the absent `build/` is recorded, so that a later local build runs the file
+again. Whether installation runs code is judged by the installed package (the directory after the last
+`node_modules/`) and by the nearest `package.json` with a name and version, when it is another one below it. A git
+dependency's `prepare` script, which npm runs when it installs one, is not considered. Since 2.11.1 a path looked for and absent directly in a
 `node_modules` directory (npm's hidden lockfile `node_modules/.package-lock.json`, which pnpm never writes), or below
 a name absent there, or in a `node_modules` directory that does not exist, is an absent input like any other: checked
 as absent before the run (the snapshot lists each `node_modules` directory it meets, without walking it) and after,
-and a file whose run looked for it runs again once it exists. Deeper absent paths (inside a package) are still
-refused.
+and a file whose run looked for it runs again once it exists. A deeper absent path (inside a package) is an input
+when the run only ever found it absent (no read, listing or load of it) and it is absent after the run.
 
 Global inputs of every file: the project's settings in `vci.toml` (the `vci:config` external, 2.7.0); `package.json`, lockfiles (`package-lock.json`, `pnpm-lock.yaml`,
 `yarn.lock`, `bun.lock`), `pnpm-workspace.yaml`, `.npmrc` and every `patches/` directory (its listing and files:
@@ -1471,7 +1484,7 @@ binary), `VCI_JOBS` (parallel pytest or `go test` processes in `vci run`, and th
 in full in every round, each observing its inputs on its own, as 2.10.0 did: the same verdicts and text, slower; for
 comparing, see [Verification](#verification-vci-plan)), `VCI_RAILS_JOBS` (the slots of a Rails batch: files at once, each slot with a database of its own as Rails' parallel workers have; `1`: one at a time; default: `PARALLEL_WORKERS` above 1, `VCI_JOBS`, or the number of CPUs, capped by `parallelize(workers:)`, for projects that call Rails' `parallelize`; `PARALLEL_WORKERS=1` or `workers: 1` turns them off), `VCI_METRICS` (since 2.5: every vci command appends one JSON line to `<git common dir>/vci-metrics.jsonl` with its version, command, flag names (never their values), exit code, duration, machine (OS, architecture, CPUs, CI or not) and every step it timed, the lines `VCI_TIMING` prints; `vci metrics [--last N] [--command C] [--format json]` gives each step's median, 95th percentile and maximum over recent commands; `VCI_METRICS=<file>` writes elsewhere, `VCI_METRICS=0` writes nothing; in GitHub Actions `vci ci` also adds its slowest steps to the job's step summary; the log keeps about its last 4 MB), `VCI_RAILS_SHARD_SECONDS` (a Minitest file whose last run took at least twice this many seconds runs as shards of about this long, one process each, in a batch's slots; default 30, `0`: off; since 2.3), `VCI_RAILS_FILE_TIMEOUT` (seconds a Rails test file's process may run, in a batch's slot or on its own, before it is stopped; default 600, `0`: no limit; a stopped file fails, is not attested and is not run again, and a file still running after two minutes is named on stderr; since 2.7.2), `VCI_NODE_TEST_FILE_TIMEOUT` (seconds a node:test file's processes may run in `vci run` and `vci ci --key` before
 they are stopped with their process group; default 600, `0`: no limit; a stopped file fails and is not attested;
-since 2.11.0), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_RAILS_SHARED_OUTPUT` (`0`: in a Rails batch, each file's process writes all of its output instead of only what it does not share with the other files of its boot), `VCI_RAILS_OWN_OUTPUT` (`0`, since 2.11: in a Rails batch, each file's process makes all of its lines and splits off the shared ones, instead of making only the lines of what it recorded after the fork; the same lines either way), `VCI_RAILS_PRELOAD_ROUTES` (`0`, since 2.11: a Rails batch does not draw the application's routes in its boot; see "What a batch file's process costs"), `VCI_RAILS_PROFILE` (`1`, since 2.7.34: each Rails file's process prints one `vci-profile` line with its top-level requires' time and count, the routes' first draw, the garbage collector's time and count (since 2.11 also its major and minor collections), its own time from the fork, and since 2.11 its user and system CPU time; the batch's output carries them), `VCI_RAILS_EXPERIMENT` (since 2.7.34, measurement switches of a Rails batch, comma separated, each measured on vex's runners and found not to change a file's process beyond noise: `eager` eager-loads the application and draws its routes in the batch's process before the slots fork, so every file records them as inputs; `routes` draws the routes only (since 2.11 a batch does it by default with `rails_inputs = "loose"`); `warmup` calls `Process.warmup` in each slot once it is set up; `iseq` keeps each source file's compiled instruction sequence under this run's output directory, keyed by path, size and mtime, so a batch compiles a file once instead of once per process), `VCI_GO`
+since 2.11.1), `VCI_RAILS_PER_FILE` (`1`: `vci run` starts one Ruby process per Rails file instead of booting once per runner and forking one process per file), `VCI_RAILS_SHARED_OUTPUT` (`0`: in a Rails batch, each file's process writes all of its output instead of only what it does not share with the other files of its boot), `VCI_RAILS_OWN_OUTPUT` (`0`, since 2.11: in a Rails batch, each file's process makes all of its lines and splits off the shared ones, instead of making only the lines of what it recorded after the fork; the same lines either way), `VCI_RAILS_PRELOAD_ROUTES` (`0`, since 2.11: a Rails batch does not draw the application's routes in its boot; see "What a batch file's process costs"), `VCI_RAILS_PROFILE` (`1`, since 2.7.34: each Rails file's process prints one `vci-profile` line with its top-level requires' time and count, the routes' first draw, the garbage collector's time and count (since 2.11 also its major and minor collections), its own time from the fork, and since 2.11 its user and system CPU time; the batch's output carries them), `VCI_RAILS_EXPERIMENT` (since 2.7.34, measurement switches of a Rails batch, comma separated, each measured on vex's runners and found not to change a file's process beyond noise: `eager` eager-loads the application and draws its routes in the batch's process before the slots fork, so every file records them as inputs; `routes` draws the routes only (since 2.11 a batch does it by default with `rails_inputs = "loose"`); `warmup` calls `Process.warmup` in each slot once it is set up; `iseq` keeps each source file's compiled instruction sequence under this run's output directory, keyed by path, size and mtime, so a batch compiles a file once instead of once per process), `VCI_GO`
 (go binary), `VCI_CARGO` (cargo binary; rustc is `$RUSTC` when declared, else `rustc` on PATH), `VCI_CARGO_JOBS` (Cargo test
 executables run at once in `vci run` and `vci ci`; default: the number of CPUs; cargo itself runs one build at a
 time), `VCI_RUBY` (ruby binary, default `ruby` on PATH), `VCI_RUBY_COLLECTOR` (the `ruby/vci-collector` directory
@@ -3060,10 +3073,11 @@ and every module the worker's module runner evaluated (this catches computed `im
 or stat'ed, every failed lookup (so creating a file that was probed as absent invalidates), directory listings
 (including the static prefix of `import.meta.glob` and template `import()`, aliased prefixes included), external
 packages as `name@version`, and env vars (`set` and `hash` variables, built-in hash ones such as `VITE_*`, and anything read that is not `ignore`).
-Since 2.11.0 a native addon (`*.node`) a test loads, reads or looks for in a package whose installation runs code (a
+Since 2.11.1 a native addon (`*.node`) a test loads, reads or looks for in a package whose installation runs code (a
 `preinstall`, `install` or `postinstall` script, or a `binding.gyp`) refuses the file
 (`external-native-installed:<name>@<version>`, Vitest and node:test alike): node-gyp's output, or a binary an install
-script downloads, is not in the tarball the version names.
+script downloads, is not in the tarball the version names. A package whose only install code is `node-gyp-build` and
+that has no `build/` directory is the exception (see the node:test adapter).
 Also:
 
 - the resolution candidates of every relative or absolute import: candidates that do not exist are probes (so an
@@ -4428,7 +4442,10 @@ word) is the `demo-oidc` job of `.github/workflows/ci.yml`.
 - Vitest config imports are found by scanning for relative string literals (per-module `tsconfig.json` files and
   custom snapshot paths are covered by the collectors, see "What is hashed").
 - External packages are identified by `name@version`: editing code inside `node_modules` without changing the
-  version is not noticed (documented above; hashing reached package directories would be a stricter policy).
+  version is not noticed (documented above; hashing reached package directories would be a stricter policy). So
+  is creating a file inside an installed package that the test looked for and did not find, at the same version
+  and lockfile (node:test since 2.11.1: a failed relative `require('./x.node')` inside a package is that package's
+  `name@version`, as an `fs.existsSync` of the same path already was; 2.10.3 refused such a file instead).
 - Resolution candidates follow Node's and Vite's default extension lists plus `resolve.extensions`; custom resolvers
   in third-party plugins (e.g. tsconfig `paths` plugins) are covered only through the modules they resolve to.
 - `DirListing` includes ignored files, so listings of directories with build output differ between machines (those

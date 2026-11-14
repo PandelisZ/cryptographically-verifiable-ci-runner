@@ -2489,9 +2489,9 @@ fn hanging_test(name: &str) -> String {
 /// 57 minutes for it, until the job's timeout. Each file's processes now
 /// run in a process group of their own, stopped with it past
 /// `VCI_NODE_TEST_FILE_TIMEOUT` seconds: that file fails, unattested, and
-/// the others are attested; a process a file leaves running that holds its
-/// output open (2.10.3 read the output through pipes until they closed)
-/// does not keep vci either.
+/// the others are attested. A file that leaves a process running that
+/// holds its output open (`node --test` waits for its file process's pipes
+/// to close) is bounded by the same deadline: it is stopped too.
 #[test]
 fn a_file_that_never_ends_is_stopped_at_its_deadline() {
     let w = World::new();
@@ -2538,6 +2538,10 @@ fn a_file_that_never_ends_is_stopped_at_its_deadline() {
         "{stderr}"
     );
     assert!(stderr.contains(&format!("vci: attested {B} ")), "{stderr}");
+    assert!(
+        stderr.contains("vci: src/linger.test.mjs: its processes ran for"),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("vci: attested src/hang.test.mjs"),
         "{stderr}"
@@ -2590,10 +2594,103 @@ fn a_stop_signal_takes_the_test_processes_with_vci() {
         "vci goes as SIGTERM takes it: {:?}",
         out.status
     );
+    // Regression: 2.11.0's first cut said the file ran past its deadline
+    // (`past 0 s ... (VCI_NODE_TEST_FILE_TIMEOUT)`) with no deadline set.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "vci: src/hang.test.mjs: its processes were stopped because vci was asked to stop (a signal); not attested"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("VCI_NODE_TEST_FILE_TIMEOUT"), "{stderr}");
     let pid = std::fs::read_to_string(&pid_file).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(
         !alive(pid.trim()),
         "the file's process {pid} is still running"
     );
+}
+
+/// A package whose only install code is `node-gyp-build` (bufferutil,
+/// utf-8-validate) loads a prebuilt addon from the `prebuilds/` its tarball
+/// holds: 2.10.3 attested such a file, the first cut of 2.11 refused it
+/// (`external-native-installed`) as it refuses every addon of a package
+/// whose installation runs code. It is attested again, with the package's
+/// absent `build/` recorded (node-gyp-build loads `build/Release` first and
+/// builds only there), so that a local build runs the file again. A package
+/// whose install code is anything else stays refused.
+#[test]
+fn a_node_gyp_build_prebuilt_addon_is_attested() {
+    let toml = r#"[policy]
+no_skip_refs = ["refs/heads/release/*"]
+
+[[projects]]
+name = "web"
+path = "apps/web"
+adapter = "node-test"
+
+[env]
+hash = ["TZ"]
+"#;
+    let test = |pkg: &str| {
+        format!(
+            "import assert from 'node:assert/strict';\nimport {{ test }} from 'node:test';\nimport a from '{pkg}';\n\ntest('loads', () => {{\n  assert.equal(a.v, 4);\n}});\n"
+        )
+    };
+    let ngb = test("ngb");
+    let fetch = test("fetchbin");
+    let w = World::new_with(
+        Fixture::Pnpm,
+        &[
+            ("apps/web/src/ngb.test.ts", &ngb),
+            ("apps/web/src/fetch.test.ts", &fetch),
+        ],
+        toml,
+    );
+    let work = w.work.clone();
+    // Reads its addon instead of loading it (a stand-in for dlopen, which
+    // the collector records the same way).
+    let loader = "const fs = require('node:fs');\nconst path = require('node:path');\nconst built = path.join(__dirname, 'build/Release/addon.node');\nconst f = fs.existsSync(built) ? built : path.join(__dirname, 'prebuilds/any/addon.node');\nmodule.exports = JSON.parse(fs.readFileSync(f, 'utf8'));\n";
+    for (name, install) in [
+        ("ngb", "node-gyp-build"),
+        ("fetchbin", "node fetch-binary.js"),
+    ] {
+        let pj =
+            format!(r#"{{"name":"{name}","version":"4.0.9","scripts":{{"install":"{install}"}}}}"#);
+        pnpm_package(
+            &work,
+            name,
+            "4.0.9",
+            &[
+                ("package.json", &pj),
+                ("binding.gyp", "{}\n"),
+                ("index.js", loader),
+                ("prebuilds/any/addon.node", r#"{"v":4}"#),
+            ],
+            &[],
+            Some("apps/web"),
+        );
+    }
+    let ngb_id = "apps/web/src/ngb.test.ts";
+    let fetch_id = "apps/web/src/fetch.test.ts";
+    let out = w.run(&work, &[ngb_id, fetch_id], &w.trusted);
+    assert!(out.contains("vci: 1 attested, 1 not attested"), "{out}");
+    assert!(
+        refused_line(&out, fetch_id).contains("external-native-installed:fetchbin@4.0.9"),
+        "{out}"
+    );
+    assert!(w.plan(&work, "main").skip.contains(ngb_id));
+    // Built locally: node-gyp-build would load build/Release now.
+    let build = work.join("node_modules/.pnpm/ngb@4.0.9/node_modules/ngb/build");
+    std::fs::create_dir_all(build.join("Release")).unwrap();
+    let p = w.plan(&work, "main");
+    assert!(p.run.contains(ngb_id), "{p:?}");
+    assert!(
+        w.explain(&work, ngb_id, "main")
+            .contains("node_modules/.pnpm/ngb@4.0.9/node_modules/ngb/build"),
+        "the explanation names it"
+    );
+    std::fs::remove_dir_all(&build).unwrap();
+    assert!(w.plan(&work, "main").skip.contains(ngb_id));
 }

@@ -1246,6 +1246,13 @@ impl NodeTestAdapter {
                             procs::FILE_TIMEOUT_ENV
                         );
                     }
+                    procs::Ended::Interrupted => {
+                        let _ = writeln!(
+                            err,
+                            "vci: {}: its processes were stopped because vci was asked to stop (a signal); not attested",
+                            files[i]
+                        );
+                    }
                     procs::Ended::NotStarted(e) => {
                         let _ = writeln!(
                             err,
@@ -1523,6 +1530,7 @@ impl Adapter for NodeTestAdapter {
             let status = match ended {
                 procs::Ended::Exited(st) => st,
                 procs::Ended::Stopped(_)
+                | procs::Ended::Interrupted
                 | procs::Ended::NotStarted(_)
                 | procs::Ended::Cancelled => {
                     if exit_code == Some(0) {

@@ -1830,10 +1830,28 @@ fn check_one(
             excluded.entry(parent).or_default().insert(name.to_owned());
         }
     }
+    // The paths the run only ever found absent (probes, and nothing else).
+    let probe_only: BTreeSet<RepoPath> = o
+        .probes
+        .iter()
+        .filter(|p| {
+            !(o.reads.contains(*p)
+                || o.modules.contains(*p)
+                || o.readdirs.contains(*p)
+                || o.stats.contains(*p))
+        })
+        .filter_map(|p| RepoPath::from_abs(&ctx.root, p).ok())
+        .collect();
     for e in &manifest.entries {
-        pre_stat
-            .unchanged_excluding(e, excluded.get(&e.path))
-            .map_err(|r| r.to_string())?;
+        match pre_stat.unchanged_excluding(e, excluded.get(&e.path)) {
+            Ok(()) => {}
+            // Inside a package (a node-gyp-build package's absent `build/`):
+            // what the test found absent, and absent now.
+            Err(crate::treestat::Unverified::Untracked(_))
+                if probe_only.contains(&e.path) && pre_stat.probed_absent_below_node_modules(e) => {
+            }
+            Err(r) => return Err(r.to_string()),
+        }
     }
     for e in &gm.entries {
         pre_stat.unchanged(e).map_err(|r| r.to_string())?;
